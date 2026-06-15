@@ -1,0 +1,31 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="64" y="64" width="896" height="896" rx="188" fill="#101820"/>
+  <rect x="64" y="64" width="896" height="896" rx="188" fill="url(#bgGlow)"/>
+  <path d="M220 630L420 406L812 484L612 708L220 630Z" fill="#6F7B82"/>
+  <path d="M220 630L420 406L812 484L612 708L220 630Z" fill="url(#plateShade)"/>
+  <path d="M220 630L420 406L812 484" stroke="#C8D3D9" stroke-width="28" stroke-linejoin="round"/>
+  <path d="M220 630L612 708L812 484" stroke="#2C3A42" stroke-width="28" stroke-linejoin="round"/>
+  <path d="M312 604L462 440M402 622L552 458M492 640L642 476M582 658L732 494" stroke="#AEB9BF" stroke-width="10" stroke-linecap="round" opacity="0.5"/>
+  <path d="M306 564L684 640" stroke="#EAF5FF" stroke-width="8" stroke-linecap="round" stroke-dasharray="22 22" opacity="0.72"/>
+  <path d="M282 308C378 236 504 220 622 262C718 296 790 360 836 450" stroke="#2F7DFF" stroke-width="54" stroke-linecap="round"/>
+  <path d="M306 306C402 252 510 246 610 282C696 314 760 370 800 448" stroke="#5DCEFF" stroke-width="18" stroke-linecap="round"/>
+  <path d="M252 420L300 376L342 426L294 470L252 420Z" fill="#EF2029"/>
+  <path d="M252 420L300 376L342 426L294 470L252 420Z" stroke="#FFFFFF" stroke-width="18" stroke-linejoin="round"/>
+  <circle cx="690" cy="558" r="70" fill="#EF2029"/>
+  <circle cx="690" cy="558" r="34" fill="#101820"/>
+  <circle cx="690" cy="558" r="104" stroke="#EF2029" stroke-width="18" opacity="0.28"/>
+  <path d="M286 754H724" stroke="#2F7DFF" stroke-width="38" stroke-linecap="round"/>
+  <path d="M336 754H674" stroke="#4ED463" stroke-width="14" stroke-linecap="round"/>
+  <defs>
+    <radialGradient id="bgGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(330 248) rotate(44) scale(808)">
+      <stop stop-color="#243746"/>
+      <stop offset="0.55" stop-color="#101820"/>
+      <stop offset="1" stop-color="#080D12"/>
+    </radialGradient>
+    <linearGradient id="plateShade" x1="380" y1="436" x2="628" y2="700" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#CAD5D9"/>
+      <stop offset="0.48" stop-color="#7E8A91"/>
+      <stop offset="1" stop-color="#3C4950"/>
+    </linearGradient>
+  </defs>
+</svg>
