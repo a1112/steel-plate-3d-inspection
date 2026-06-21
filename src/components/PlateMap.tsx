@@ -2,8 +2,9 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Check, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type WheelEvent } from 'react';
 import { DoubleSide, type Mesh, type PerspectiveCamera } from 'three';
+import steelPlateSurfaceImage from '../assets/plate-surfaces/steel-plate-surface.png';
 import type { DefectItem, DefectType } from '../data/inspection';
-import { surfaceLabels } from '../data/inspection';
+import { severityLabels, surfaceLabels } from '../data/inspection';
 import { clampPreviewPositionM, DEFAULT_PLATE_LENGTH_M, type SurfaceDisplayMode } from '../state/inspection-ui';
 import { Panel } from './Panel';
 
@@ -43,8 +44,16 @@ const MIN_PLATE_3D_ZOOM = 0.72;
 const MAX_PLATE_3D_ZOOM = 2.2;
 const PLATE_3D_ZOOM_STEP = 0.12;
 
+function yOffsetToPercentValue(offset: number) {
+  return Math.max(10, Math.min(90, 50 - (offset / 1.5) * 37));
+}
+
 function yOffsetToPercent(offset: number) {
-  return `${Math.max(10, Math.min(90, 50 - (offset / 1.5) * 37))}%`;
+  return `${yOffsetToPercentValue(offset)}%`;
+}
+
+function getDefectSizeText(defect: Pick<DefectItem, 'widthMm' | 'heightMm' | 'depthMm'>) {
+  return `${defect.widthMm.toFixed(2)} x ${defect.heightMm.toFixed(2)} x ${Math.abs(defect.depthMm).toFixed(2)}mm`;
 }
 
 function DefectMarker({
@@ -52,16 +61,19 @@ function DefectMarker({
   type,
   selected,
   onSelect,
+  onHoverChange,
 }: {
   defect: DefectItem;
   type: DefectType;
   selected: boolean;
   onSelect: () => void;
+  onHoverChange: (defectId: string | null) => void;
 }) {
   return (
     <button
       type="button"
       className={`defect-marker ${type.shape} ${selected ? 'selected' : ''}`}
+      aria-label={`${defect.typeLabel}，${surfaceLabels[defect.surface]}，距头${defect.distanceHeadMm}mm`}
       style={{
         left: `${defect.xRatio * 100}%`,
         top: yOffsetToPercent(defect.yOffsetMm),
@@ -69,7 +81,72 @@ function DefectMarker({
       }}
       title={`${defect.typeLabel} ${surfaceLabels[defect.surface]} ${defect.distanceHeadMm}mm`}
       onClick={onSelect}
+      onMouseEnter={() => onHoverChange(defect.id)}
+      onMouseLeave={() => onHoverChange(null)}
+      onFocus={() => onHoverChange(defect.id)}
+      onBlur={() => onHoverChange(null)}
     />
+  );
+}
+
+function DefectHoverCard({ defect, type }: { defect: DefectItem; type: DefectType }) {
+  const xPercent = defect.xRatio * 100;
+  const yPercent = yOffsetToPercentValue(defect.yOffsetMm);
+  const edgeClass = `${xPercent > 76 ? 'near-right' : xPercent < 24 ? 'near-left' : ''} ${yPercent < 44 ? 'near-top' : ''}`;
+
+  return (
+    <div
+      className={`defect-hover-card ${edgeClass}`}
+      role="tooltip"
+      style={
+        {
+          left: `${xPercent}%`,
+          top: `${yPercent}%`,
+          '--defect-color': type.color,
+        } as CSSProperties
+      }
+    >
+      <div className="defect-hover-title">
+        <i />
+        <strong>{defect.typeLabel}</strong>
+        <span>{defect.id}</span>
+      </div>
+      {defect.previewImageUrl ? (
+        <div className="defect-hover-preview">
+          <img src={defect.previewImageUrl} alt={`${defect.typeLabel}缺陷小图`} />
+        </div>
+      ) : null}
+      <dl>
+        <div>
+          <dt>表面</dt>
+          <dd>{surfaceLabels[defect.surface]}</dd>
+        </div>
+        <div>
+          <dt>等级</dt>
+          <dd className={defect.severity}>{severityLabels[defect.severity]}</dd>
+        </div>
+        <div>
+          <dt>距头</dt>
+          <dd>{defect.distanceHeadMm}mm</dd>
+        </div>
+        <div>
+          <dt>深度</dt>
+          <dd>{defect.depthMm.toFixed(2)}mm</dd>
+        </div>
+        <div>
+          <dt>操作侧</dt>
+          <dd>{defect.operatorSideMm}mm</dd>
+        </div>
+        <div>
+          <dt>传动侧</dt>
+          <dd>{defect.driveSideMm}mm</dd>
+        </div>
+        <div className="wide">
+          <dt>尺寸</dt>
+          <dd>{getDefectSizeText(defect)}</dd>
+        </div>
+      </dl>
+    </div>
   );
 }
 
@@ -86,19 +163,29 @@ function SurfaceStrip({
   defects,
   defectTypes,
   selectedDefectId,
+  hoveredDefectId,
   previewPositionM,
   plateLengthM,
   onSelectDefect,
+  onHoverDefect,
+  onDefectNavigationKeyDown,
+  onDefectNavigationWheel,
 }: {
   surface: 'top' | 'bottom';
   defects: DefectItem[];
   defectTypes: DefectType[];
   selectedDefectId: string | null;
+  hoveredDefectId: string | null;
   previewPositionM: number;
   plateLengthM: number;
   onSelectDefect: (defectId: string) => void;
+  onHoverDefect: (defectId: string | null) => void;
+  onDefectNavigationKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
+  onDefectNavigationWheel: (event: WheelEvent<HTMLDivElement>) => void;
 }) {
   const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
+  const hoveredDefect = defects.find((defect) => defect.id === hoveredDefectId && defect.surface === surface) ?? null;
+  const hoveredType = hoveredDefect ? defectTypes.find((type) => type.id === hoveredDefect.typeId) : null;
 
   return (
     <div className="surface-row">
@@ -108,7 +195,20 @@ function SurfaceStrip({
           <span key={tick}>{tick}</span>
         ))}
       </div>
-      <div className="plate-strip" style={{ '--preview-position': `${previewPercent}%` } as CSSProperties}>
+      <div
+        className="plate-strip"
+        role="region"
+        tabIndex={0}
+        aria-label={`${surface === 'top' ? '上表面' : '下表面'}缺陷显示切换`}
+        style={
+          {
+            '--preview-position': `${previewPercent}%`,
+            '--plate-surface-image': `url(${steelPlateSurfaceImage})`,
+          } as CSSProperties
+        }
+        onKeyDown={onDefectNavigationKeyDown}
+        onWheel={onDefectNavigationWheel}
+      >
         <span className="side-note operator">操作侧</span>
         <span className="side-note drive">传动侧</span>
         <div className="center-line" />
@@ -132,9 +232,11 @@ function SurfaceStrip({
                 type={type}
                 selected={defect.id === selectedDefectId}
                 onSelect={() => onSelectDefect(defect.id)}
+                onHoverChange={onHoverDefect}
               />
             );
           })}
+        {hoveredDefect && hoveredType ? <DefectHoverCard defect={hoveredDefect} type={hoveredType} /> : null}
       </div>
     </div>
   );
@@ -605,9 +707,43 @@ export function PlateMap({
   onSelectDefect,
 }: PlateMapProps) {
   const [viewMode, setViewMode] = useState<PlateMapViewMode>('2d');
+  const [hoveredDefectId, setHoveredDefectId] = useState<string | null>(null);
   const showAllSurfaces = surfaceMode === 'all';
   const selectedSurface = surfaceMode === 'all' ? 'top' : surfaceMode;
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
+  const selectRelativeDefect = (step: number) => {
+    if (defects.length === 0) {
+      return;
+    }
+    const selectedIndex = defects.findIndex((defect) => defect.id === selectedDefectId);
+    const currentIndex = selectedIndex >= 0 ? selectedIndex : step > 0 ? -1 : 0;
+    const nextIndex = (currentIndex + step + defects.length) % defects.length;
+    onSelectDefect(defects[nextIndex].id);
+  };
+
+  const handleDefectNavigationKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      selectRelativeDefect(1);
+    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      selectRelativeDefect(-1);
+    } else if (event.key === 'Home' && defects[0]) {
+      event.preventDefault();
+      onSelectDefect(defects[0].id);
+    } else if (event.key === 'End' && defects[defects.length - 1]) {
+      event.preventDefault();
+      onSelectDefect(defects[defects.length - 1].id);
+    }
+  };
+
+  const handleDefectNavigationWheel = (event: WheelEvent<HTMLDivElement>) => {
+    if (defects.length < 2 || Math.abs(event.deltaY) < 1) {
+      return;
+    }
+    event.preventDefault();
+    selectRelativeDefect(event.deltaY > 0 ? 1 : -1);
+  };
 
   return (
     <Panel
@@ -664,9 +800,13 @@ export function PlateMap({
             defects={defects}
             defectTypes={defectTypes}
             selectedDefectId={selectedDefectId}
+            hoveredDefectId={hoveredDefectId}
             previewPositionM={previewPositionM}
             plateLengthM={safePlateLengthM}
             onSelectDefect={onSelectDefect}
+            onHoverDefect={setHoveredDefectId}
+            onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
+            onDefectNavigationWheel={handleDefectNavigationWheel}
           />
           <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} />
           <SurfaceStrip
@@ -674,9 +814,13 @@ export function PlateMap({
             defects={defects}
             defectTypes={defectTypes}
             selectedDefectId={selectedDefectId}
+            hoveredDefectId={hoveredDefectId}
             previewPositionM={previewPositionM}
             plateLengthM={safePlateLengthM}
             onSelectDefect={onSelectDefect}
+            onHoverDefect={setHoveredDefectId}
+            onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
+            onDefectNavigationWheel={handleDefectNavigationWheel}
           />
         </>
       ) : (
@@ -686,9 +830,13 @@ export function PlateMap({
             defects={defects}
             defectTypes={defectTypes}
             selectedDefectId={selectedDefectId}
+            hoveredDefectId={hoveredDefectId}
             previewPositionM={previewPositionM}
             plateLengthM={safePlateLengthM}
             onSelectDefect={onSelectDefect}
+            onHoverDefect={setHoveredDefectId}
+            onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
+            onDefectNavigationWheel={handleDefectNavigationWheel}
           />
           <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} />
         </>

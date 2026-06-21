@@ -1,7 +1,6 @@
-import { Download, RotateCcw, Search } from 'lucide-react';
-import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { Download, FileText, RotateCcw, Search } from 'lucide-react';
 import type { ChangeEvent, CSSProperties } from 'react';
-import type { DefectItem, DefectType, Severity, Surface } from '../data/inspection';
+import type { DefectItem, DefectType, PlateInspection, Severity } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import type { ReportFilters, ReportMetrics } from '../state/operations';
 import { Panel } from './Panel';
@@ -25,6 +24,54 @@ const severityColors: Record<Severity, string> = {
   minor: '#2f7dff',
 };
 
+interface PlateReportRow {
+  plateNo: string;
+  steelGrade: string;
+  thicknessMm: number;
+  widthMm: number;
+  lengthMm: number;
+  detectedAt: string;
+  total: number;
+  severe: number;
+  review: number;
+  minor: number;
+  top: number;
+  bottom: number;
+  maxDepthMm: number;
+  distanceRange: string;
+}
+
+function createPlateReportRows(rows: DefectItem[], inspections: PlateInspection[]): PlateReportRow[] {
+  const plateByNo = new Map(inspections.map((inspection) => [inspection.plate.plateNo, inspection.plate]));
+  const grouped = new Map<string, DefectItem[]>();
+  rows.forEach((defect) => {
+    grouped.set(defect.plateNo, [...(grouped.get(defect.plateNo) ?? []), defect]);
+  });
+
+  return Array.from(grouped.entries())
+    .map(([plateNo, defects]) => {
+      const plate = plateByNo.get(plateNo);
+      const distances = defects.map((defect) => defect.distanceHeadMm);
+      return {
+        plateNo,
+        steelGrade: plate?.steelGrade ?? '--',
+        thicknessMm: plate?.thicknessMm ?? 0,
+        widthMm: plate?.widthMm ?? 0,
+        lengthMm: plate?.lengthMm ?? 0,
+        detectedAt: plate?.detectedAt ?? '--',
+        total: defects.length,
+        severe: defects.filter((defect) => defect.severity === 'severe').length,
+        review: defects.filter((defect) => defect.severity === 'review').length,
+        minor: defects.filter((defect) => defect.severity === 'minor').length,
+        top: defects.filter((defect) => defect.surface === 'top').length,
+        bottom: defects.filter((defect) => defect.surface === 'bottom').length,
+        maxDepthMm: Math.max(...defects.map((defect) => Math.abs(defect.depthMm))),
+        distanceRange: `${Math.min(...distances)}-${Math.max(...distances)}mm`,
+      };
+    })
+    .sort((a, b) => b.total - a.total || a.plateNo.localeCompare(b.plateNo));
+}
+
 function DefectRows({
   rows,
   page,
@@ -40,7 +87,7 @@ function DefectRows({
     return (
       <tbody>
         <tr>
-          <td colSpan={8} className="empty-cell">
+          <td colSpan={10} className="empty-cell">
             当前筛选条件下无缺陷记录
           </td>
         </tr>
@@ -57,6 +104,8 @@ function DefectRows({
           <td>{surfaceLabels[defect.surface]}</td>
           <td className={defect.severity}>{severityLabels[defect.severity]}</td>
           <td>{defect.distanceHeadMm}mm</td>
+          <td>{defect.operatorSideMm}mm</td>
+          <td>{defect.driveSideMm}mm</td>
           <td>{`${defect.widthMm.toFixed(2)} x ${defect.heightMm.toFixed(2)}`}</td>
           <td>{defect.depthMm.toFixed(2)}mm</td>
         </tr>
@@ -67,6 +116,7 @@ function DefectRows({
 
 export function ReportPage({
   defectTypes,
+  inspections,
   rows,
   pageRows,
   metrics,
@@ -84,6 +134,7 @@ export function ReportPage({
   onExportJson,
 }: {
   defectTypes: DefectType[];
+  inspections: PlateInspection[];
   rows: DefectItem[];
   pageRows: DefectItem[];
   metrics: ReportMetrics;
@@ -100,10 +151,7 @@ export function ReportPage({
   onExportCsv: () => void;
   onExportJson: () => void;
 }) {
-  const surfaceData = [
-    { name: '上表面', count: metrics.top },
-    { name: '下表面', count: metrics.bottom },
-  ];
+  const plateRows = createPlateReportRows(rows, inspections);
   const donutStyle = {
     '--severe': metrics.severe,
     '--review': metrics.review,
@@ -122,124 +170,167 @@ export function ReportPage({
 
   return (
     <main className="workspace-page report-page">
-      <section className="report-metrics">
-        <div>
-          <span>筛选结果</span>
-          <strong>{metrics.total}</strong>
-        </div>
-        <div className="severe">
-          <span>严重缺陷</span>
-          <strong>{metrics.severe}</strong>
-        </div>
-        <div className="review">
-          <span>待复核</span>
-          <strong>{metrics.review}</strong>
-        </div>
-        <div>
-          <span>最大深度</span>
-          <strong>{metrics.maxDepthMm.toFixed(2)}mm</strong>
-        </div>
-      </section>
-
-      <section className="report-layout">
-        <Panel title="报表查询条件" className="report-filter-panel">
-          <label>
-            <span>关键字</span>
-            <input value={filters.keyword} onChange={(event) => onFilterChange({ keyword: event.target.value })} placeholder="钢板号 / 缺陷 / 距离" />
-          </label>
-          <label>
-            <span>缺陷等级</span>
-            <select value={filters.severity} onChange={(event) => handleSelect(event, 'severity')}>
-              {severityOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>检测表面</span>
-            <select value={filters.surface} onChange={(event) => handleSelect(event, 'surface')}>
-              {surfaceOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>缺陷类别</span>
-            <select value={filters.typeId} onChange={(event) => handleSelect(event, 'typeId')}>
-              <option value="all">全部类别</option>
-              {defectTypes.map((type) => (
-                <option key={type.id} value={type.id}>
-                  {type.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="form-actions">
-            <button type="button" onClick={onApply}>
-              <Search size={15} />
-              查询
-            </button>
-            <button type="button" onClick={onReset}>
-              <RotateCcw size={15} />
-              重置
-            </button>
+      <section className="report-document">
+        <header className="report-document-header">
+          <div>
+            <span>钢板 3D 表面检测系统</span>
+            <h1>钢板表面缺陷检测报表</h1>
           </div>
-          <div className="form-actions">
-            <button type="button" onClick={onExportCsv}>
-              <Download size={15} />
-              导出CSV
-            </button>
-            <button type="button" onClick={onExportJson}>
-              <Download size={15} />
-              导出JSON
-            </button>
+          <div className="report-document-meta">
+            <span>报表编号 RPT-20260613-1900</span>
+            <span>数据来源 本地检测快照</span>
+            <span>记录数 {rows.length}</span>
           </div>
-        </Panel>
+        </header>
 
-        <Panel title="缺陷趋势与等级分布" className="report-chart-panel">
-          <div className="report-charts">
-            <div>
-              <h3>表面分布</h3>
-              <ResponsiveContainer width="100%" height="88%">
-                <BarChart data={surfaceData}>
-                  <CartesianGrid stroke="var(--line)" vertical={false} />
-                  <XAxis dataKey="name" tick={{ fill: 'var(--muted)', fontSize: 12 }} tickLine={false} axisLine={false} />
-                  <YAxis allowDecimals={false} tick={{ fill: 'var(--muted)', fontSize: 12 }} tickLine={false} axisLine={false} />
-                  <Tooltip />
-                  <Bar dataKey="count" radius={[4, 4, 0, 0]} fill="var(--blue)" />
-                </BarChart>
-              </ResponsiveContainer>
+        <Panel
+          title="查询条件"
+          className="report-filter-panel"
+          action={
+            <div className="report-export-actions">
+              <button type="button" onClick={onExportCsv}>
+                <Download size={15} />
+                CSV
+              </button>
+              <button type="button" onClick={onExportJson}>
+                <Download size={15} />
+                JSON
+              </button>
             </div>
-            <div>
-              <h3>等级占比</h3>
-              <div className="report-donut-wrap">
-                <div className="report-donut" style={donutStyle}>
-                  <span>{metrics.total}</span>
-                </div>
-                <div className="report-pie-legend">
-                  <span>
-                    <i style={{ background: severityColors.severe }} />
-                    严重 {metrics.severe}
-                  </span>
-                  <span>
-                    <i style={{ background: severityColors.review }} />
-                    待复核 {metrics.review}
-                  </span>
-                  <span>
-                    <i style={{ background: severityColors.minor }} />
-                    轻微 {metrics.minor}
-                  </span>
-                </div>
-              </div>
+          }
+        >
+          <div className="report-filter-grid">
+            <label>
+              <span>关键字</span>
+              <input value={filters.keyword} onChange={(event) => onFilterChange({ keyword: event.target.value })} placeholder="钢板号 / 缺陷 / 距离" />
+            </label>
+            <label>
+              <span>缺陷等级</span>
+              <select value={filters.severity} onChange={(event) => handleSelect(event, 'severity')}>
+                {severityOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>检测表面</span>
+              <select value={filters.surface} onChange={(event) => handleSelect(event, 'surface')}>
+                {surfaceOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>缺陷类别</span>
+              <select value={filters.typeId} onChange={(event) => handleSelect(event, 'typeId')}>
+                <option value="all">全部类别</option>
+                {defectTypes.map((type) => (
+                  <option key={type.id} value={type.id}>
+                    {type.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="form-actions report-query-actions">
+              <button type="button" onClick={onApply}>
+                <Search size={15} />
+                查询
+              </button>
+              <button type="button" onClick={onReset}>
+                <RotateCcw size={15} />
+                重置
+              </button>
             </div>
           </div>
         </Panel>
 
-        <Panel title="报表明细" className="report-table-panel">
+        <section className="report-metrics">
+          <div>
+            <span>钢板数</span>
+            <strong>{plateRows.length}</strong>
+          </div>
+          <div>
+            <span>缺陷记录</span>
+            <strong>{metrics.total}</strong>
+          </div>
+          <div className="severe">
+            <span>严重缺陷</span>
+            <strong>{metrics.severe}</strong>
+          </div>
+          <div className="review">
+            <span>待复核</span>
+            <strong>{metrics.review}</strong>
+          </div>
+          <div>
+            <span>上/下表面</span>
+            <strong>{metrics.top}/{metrics.bottom}</strong>
+          </div>
+          <div>
+            <span>最大深度</span>
+            <strong>{metrics.maxDepthMm.toFixed(2)}mm</strong>
+          </div>
+        </section>
+
+        <section className="report-layout">
+          <Panel title="钢板汇总" className="report-plate-panel">
+            <table className="report-table plate-summary-table">
+              <thead>
+                <tr>
+                  <th>钢板号</th>
+                  <th>钢种</th>
+                  <th>规格 mm</th>
+                  <th>检测时间</th>
+                  <th>缺陷数</th>
+                  <th>严重</th>
+                  <th>待复核</th>
+                  <th>轻微</th>
+                  <th>上/下表</th>
+                  <th>最大深度</th>
+                  <th>距头范围</th>
+                </tr>
+              </thead>
+              <tbody>
+                {plateRows.length > 0 ? (
+                  plateRows.map((plateRow) => (
+                    <tr key={plateRow.plateNo}>
+                      <td>{plateRow.plateNo}</td>
+                      <td>{plateRow.steelGrade}</td>
+                      <td>{`${plateRow.widthMm} x ${plateRow.lengthMm} x ${plateRow.thicknessMm}`}</td>
+                      <td>{plateRow.detectedAt}</td>
+                      <td>{plateRow.total}</td>
+                      <td className="severe">{plateRow.severe}</td>
+                      <td className="review">{plateRow.review}</td>
+                      <td className="minor">{plateRow.minor}</td>
+                      <td>{plateRow.top}/{plateRow.bottom}</td>
+                      <td>{plateRow.maxDepthMm.toFixed(2)}mm</td>
+                      <td>{plateRow.distanceRange}</td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={11} className="empty-cell">
+                      当前筛选条件下无钢板记录
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </Panel>
+
+          <Panel
+            title="缺陷明细"
+            className="report-table-panel"
+            action={
+              <span className="report-table-action">
+                <FileText size={15} />
+                共 {rows.length} 条，{page} / {pageCount} 页
+              </span>
+            }
+          >
           <table className="report-table">
             <thead>
               <tr>
@@ -249,6 +340,8 @@ export function ReportPage({
                 <th>表面</th>
                 <th>等级</th>
                 <th>距头距离</th>
+                <th>操作侧</th>
+                <th>传动侧</th>
                 <th>尺寸</th>
                 <th>深度</th>
               </tr>
@@ -270,42 +363,72 @@ export function ReportPage({
           </div>
         </Panel>
 
-        <Panel title="选中缺陷复核摘要" className="report-detail-panel">
-          {selectedDefect ? (
-            <>
-              <dl className="report-detail-list">
-                <div>
-                  <dt>缺陷编号</dt>
-                  <dd>{selectedDefect.id}</dd>
+          <Panel title="等级与选中缺陷" className="report-detail-panel">
+            <div className="report-detail-grid">
+              <div className="report-donut-wrap">
+                <div className="report-donut" style={donutStyle}>
+                  <span>{metrics.total}</span>
                 </div>
-                <div>
-                  <dt>缺陷类别</dt>
-                  <dd>{selectedDefect.typeLabel}</dd>
+                <div className="report-pie-legend">
+                  <span>
+                    <i style={{ background: severityColors.severe }} />
+                    严重 {metrics.severe}
+                  </span>
+                  <span>
+                    <i style={{ background: severityColors.review }} />
+                    待复核 {metrics.review}
+                  </span>
+                  <span>
+                    <i style={{ background: severityColors.minor }} />
+                    轻微 {metrics.minor}
+                  </span>
                 </div>
-                <div>
-                  <dt>等级</dt>
-                  <dd className={selectedDefect.severity}>{severityLabels[selectedDefect.severity]}</dd>
-                </div>
-                <div>
-                  <dt>定位</dt>
-                  <dd>{`${surfaceLabels[selectedDefect.surface]} / ${selectedDefect.distanceHeadMm}mm`}</dd>
-                </div>
-                <div>
-                  <dt>尺寸</dt>
-                  <dd>{`${selectedDefect.widthMm.toFixed(2)} x ${selectedDefect.heightMm.toFixed(2)} x ${Math.abs(selectedDefect.depthMm).toFixed(2)}mm`}</dd>
-                </div>
-              </dl>
-              <div className="report-preview-strip" style={reportPreviewStyle}>
-                <span style={{ left: `${selectedDefect.previewX}%`, top: `${selectedDefect.previewY}%` }} />
               </div>
-            </>
-          ) : (
-            <div className="report-empty-detail">
-              <h3>无匹配缺陷</h3>
-              <p>请调整筛选条件或从报表明细中选择缺陷记录。</p>
+              {selectedDefect ? (
+                <>
+                  <dl className="report-detail-list">
+                    <div>
+                      <dt>缺陷编号</dt>
+                      <dd>{selectedDefect.id}</dd>
+                    </div>
+                    <div>
+                      <dt>钢板号</dt>
+                      <dd>{selectedDefect.plateNo}</dd>
+                    </div>
+                    <div>
+                      <dt>缺陷类别</dt>
+                      <dd>{selectedDefect.typeLabel}</dd>
+                    </div>
+                    <div>
+                      <dt>等级</dt>
+                      <dd className={selectedDefect.severity}>{severityLabels[selectedDefect.severity]}</dd>
+                    </div>
+                    <div>
+                      <dt>定位</dt>
+                      <dd>{`${surfaceLabels[selectedDefect.surface]} / 距头 ${selectedDefect.distanceHeadMm}mm`}</dd>
+                    </div>
+                    <div>
+                      <dt>边部距离</dt>
+                      <dd>{`操作侧 ${selectedDefect.operatorSideMm}mm / 传动侧 ${selectedDefect.driveSideMm}mm`}</dd>
+                    </div>
+                    <div>
+                      <dt>尺寸</dt>
+                      <dd>{`${selectedDefect.widthMm.toFixed(2)} x ${selectedDefect.heightMm.toFixed(2)} x ${Math.abs(selectedDefect.depthMm).toFixed(2)}mm`}</dd>
+                    </div>
+                  </dl>
+                  <div className="report-preview-strip" style={reportPreviewStyle}>
+                    <span style={{ left: `${selectedDefect.previewX}%`, top: `${selectedDefect.previewY}%` }} />
+                  </div>
+                </>
+              ) : (
+                <div className="report-empty-detail">
+                  <h3>无匹配缺陷</h3>
+                  <p>请调整筛选条件或从报表明细中选择缺陷记录。</p>
+                </div>
+              )}
             </div>
-          )}
-        </Panel>
+          </Panel>
+        </section>
       </section>
     </main>
   );

@@ -1,4 +1,4 @@
-import { AlertTriangle, ClipboardList, Gauge, MonitorCog, Settings } from 'lucide-react';
+import { AlertTriangle, ClipboardList, Gauge, MonitorCog } from 'lucide-react';
 import type { ElementType, MouseEvent } from 'react';
 import type { InspectionSummary } from '../data/inspection';
 import type { InspectionUiState } from '../state/inspection-ui';
@@ -8,7 +8,6 @@ type NavKey = InspectionUiState['activeNav'];
 const navItems: Array<{ id: NavKey; label: string; icon: ElementType }> = [
   { id: 'online', label: '在线检测', icon: Gauge },
   { id: 'report', label: '缺陷报表', icon: ClipboardList },
-  { id: 'settings', label: '系统设置', icon: Settings },
   { id: 'status', label: '系统状态', icon: MonitorCog },
 ];
 

@@ -77,6 +77,8 @@ describe('AlarmAnalysis', () => {
     const viewer = screen.getByTestId('point-cloud-viewer');
     expect(viewer).toHaveAttribute('data-point-cloud-yaw', '-0.320');
     expect(viewer).toHaveAttribute('data-point-cloud-zoom', '1.00');
+    expect(viewer).toHaveAttribute('data-point-cloud-points', '1643');
+    expect(Number(viewer.getAttribute('data-point-cloud-memory-bytes'))).toBeLessThan(40000);
     expect(screen.getByText('缩放 1.00x')).toBeInTheDocument();
 
     const verticalPointerDown = new Event('pointerdown', { bubbles: true, cancelable: true });

@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
+import { X } from 'lucide-react';
 import { getAllDefects, getMockInspectionSnapshot, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
+import type { DefectItem, Severity } from './data/inspection';
 import type { InspectionUiState } from './state/inspection-ui';
 import {
   createInitialUiState,
@@ -11,7 +13,6 @@ import {
   selectDefect,
   clampPreviewPositionM,
   toggleDefectType,
-  toggleTheme,
 } from './state/inspection-ui';
 import {
   applyInspectionSettingsToDefects,
@@ -48,6 +49,7 @@ import './styles.css';
 const DEFECT_PAGE_SIZE = 10;
 const RECORD_PAGE_SIZE = 10;
 const REPORT_PAGE_SIZE = 8;
+const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
 
 function readViewportSize() {
   if (typeof window === 'undefined') {
@@ -66,10 +68,15 @@ function downloadTextFile(filename: string, content: string, mimeType = 'text/pl
   URL.revokeObjectURL(url);
 }
 
+function filterDefectsBySelectedSeverities(defects: DefectItem[], selectedSeverities: ReadonlySet<Severity>) {
+  return defects.filter((defect) => selectedSeverities.has(defect.severity));
+}
+
 export default function App() {
   const snapshot = useMemo(() => getMockInspectionSnapshot(), []);
   const [uiState, setUiState] = useState(() => createInitialUiState(snapshot));
   const [onlineFilters, setOnlineFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
+  const [selectedOnlineSeverities, setSelectedOnlineSeverities] = useState<Set<Severity>>(() => new Set(ALL_SEVERITY_FILTERS));
   const [reportFilters, setReportFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
   const [recordSearchFilters, setRecordSearchFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
   const [defectFilterOpen, setDefectFilterOpen] = useState(false);
@@ -81,6 +88,7 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [viewportSize, setViewportSize] = useState(readViewportSize);
   const [analysisCollapsed, setAnalysisCollapsed] = useState(false);
+  const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const windowApi = useMemo(() => getTauriWindowApi(), []);
   const responsiveClassName = getResponsiveProfileClassName(getResponsiveProfile(viewportSize));
 
@@ -90,6 +98,19 @@ export default function App() {
     handleResize();
     return () => window.removeEventListener('resize', handleResize);
   }, []);
+
+  useEffect(() => {
+    if (!settingsModalOpen) {
+      return;
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setSettingsModalOpen(false);
+      }
+    };
+    document.addEventListener('keydown', closeOnEscape);
+    return () => document.removeEventListener('keydown', closeOnEscape);
+  }, [settingsModalOpen]);
 
   const activeSnapshot = useMemo(() => getPlateInspectionSnapshot(snapshot, uiState.selectedRecordId), [snapshot, uiState.selectedRecordId]);
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
@@ -105,8 +126,12 @@ export default function App() {
   const deviceStatus = useMemo(() => getDeviceStatusWithOperation(activeSnapshot.status, operationState), [activeSnapshot.status, operationState]);
   const categoryVisibleDefects = useMemo(() => getVisibleDefects(currentPlateDefects, uiState), [currentPlateDefects, uiState]);
   const legendCountDefects = useMemo(
-    () => filterDefectsForReport(filterDefectsBySurfaceMode(currentPlateDefects, uiState.surfaceDisplayMode), onlineFilters),
-    [currentPlateDefects, uiState.surfaceDisplayMode, onlineFilters],
+    () =>
+      filterDefectsBySelectedSeverities(
+        filterDefectsForReport(filterDefectsBySurfaceMode(currentPlateDefects, uiState.surfaceDisplayMode), onlineFilters),
+        selectedOnlineSeverities,
+      ),
+    [currentPlateDefects, uiState.surfaceDisplayMode, onlineFilters, selectedOnlineSeverities],
   );
   const defectTypeCounts = useMemo(
     () =>
@@ -121,8 +146,8 @@ export default function App() {
     [categoryVisibleDefects, uiState.surfaceDisplayMode],
   );
   const visibleDefects = useMemo(
-    () => filterDefectsForReport(surfaceVisibleDefects, onlineFilters),
-    [surfaceVisibleDefects, onlineFilters],
+    () => filterDefectsBySelectedSeverities(filterDefectsForReport(surfaceVisibleDefects, onlineFilters), selectedOnlineSeverities),
+    [surfaceVisibleDefects, onlineFilters, selectedOnlineSeverities],
   );
   const reportRows = useMemo(() => filterDefectsForReport(allDefects, reportFilters), [allDefects, reportFilters]);
   const reportMetrics = useMemo(() => getReportMetrics(reportRows), [reportRows]);
@@ -173,6 +198,23 @@ export default function App() {
 
   const updateOnlineFilters = (patch: Partial<ReportFilters>) => {
     setOnlineFilters((current) => ({ ...current, ...patch }));
+    if (patch.severity) {
+      setSelectedOnlineSeverities(new Set(patch.severity === 'all' ? ALL_SEVERITY_FILTERS : [patch.severity]));
+    }
+    setState({ defectPage: 1 });
+  };
+
+  const toggleOnlineSeverity = (severity: Severity) => {
+    setOnlineFilters((current) => (current.severity === 'all' ? current : { ...current, severity: 'all' }));
+    setSelectedOnlineSeverities((current) => {
+      const next = new Set(current);
+      if (next.has(severity)) {
+        next.delete(severity);
+      } else {
+        next.add(severity);
+      }
+      return next;
+    });
     setState({ defectPage: 1 });
   };
 
@@ -241,8 +283,9 @@ export default function App() {
     <div className={`app-shell theme-${uiState.theme} ${responsiveClassName}`}>
       <BrandHeader
         status={deviceStatus}
+        plate={activeSnapshot.currentPlate}
         theme={uiState.theme}
-        onThemeToggle={() => setUiState((current) => ({ ...current, theme: toggleTheme(current.theme) }))}
+        onSettingsOpen={() => setSettingsModalOpen(true)}
         onDragMouseDown={(event) => void handleTitlebarMouseDown(event)}
       />
       <Toast message={toast} tone="success" onClear={() => setToast(null)} />
@@ -319,8 +362,8 @@ export default function App() {
                 <StatisticsPanel
                   plate={activeSnapshot.currentPlate}
                   summary={activeSummary}
-                  activeSeverityFilter={onlineFilters.severity}
-                  onSeverityFilterChange={(severity) => updateOnlineFilters({ severity })}
+                  selectedSeverityFilters={selectedOnlineSeverities}
+                  onSeverityFilterToggle={toggleOnlineSeverity}
                   onOpenReport={openCurrentPlateReport}
                 />
               </aside>
@@ -338,6 +381,7 @@ export default function App() {
           {uiState.activeNav === 'report' ? (
             <ReportPage
               defectTypes={snapshot.defectTypes}
+              inspections={snapshot.inspections}
               rows={reportRows}
               pageRows={reportPageRows}
               metrics={reportMetrics}
@@ -367,11 +411,38 @@ export default function App() {
                 setToast('缺陷报表 JSON 已导出');
               }}
             />
-          ) : uiState.activeNav === 'settings' ? (
+          ) : (
+            <SystemStatusPage status={deviceStatus} operation={operationState} onAction={handleSystemAction} />
+          )}
+        </>
+      )}
+      {settingsModalOpen ? (
+        <div
+          className="settings-modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setSettingsModalOpen(false);
+            }
+          }}
+        >
+          <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" data-no-drag>
+            <header className="settings-modal-header">
+              <div>
+                <span>系统参数</span>
+                <h2 id="settings-modal-title">系统设置</h2>
+              </div>
+              <button type="button" aria-label="关闭系统设置" onClick={() => setSettingsModalOpen(false)}>
+                <X size={18} />
+              </button>
+            </header>
             <SettingsPage
+              embedded
+              theme={uiState.theme}
               draft={settingsDraft}
               saved={savedSettings}
               errors={settingsErrors}
+              onThemeChange={(theme) => setState({ theme })}
               onDraftChange={(patch) => {
                 const nextDraft = { ...settingsDraft, ...patch };
                 setSettingsDraft(nextDraft);
@@ -383,11 +454,9 @@ export default function App() {
               onReset={resetSettings}
               onApplyToPlate={() => saveSettings('参数已应用到当前钢板')}
             />
-          ) : (
-            <SystemStatusPage status={deviceStatus} operation={operationState} onAction={handleSystemAction} />
-          )}
-        </>
-      )}
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

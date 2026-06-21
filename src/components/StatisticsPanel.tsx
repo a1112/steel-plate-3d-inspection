@@ -1,7 +1,6 @@
 import type { CSSProperties } from 'react';
 import type { InspectionSummary, Severity, SteelPlate } from '../data/inspection';
 import { severityLabels } from '../data/inspection';
-import type { ReportSeverityFilter } from '../state/operations';
 import { Panel } from './Panel';
 
 const severityOrder: Severity[] = ['severe', 'review', 'minor'];
@@ -9,14 +8,14 @@ const severityOrder: Severity[] = ['severe', 'review', 'minor'];
 export function StatisticsPanel({
   plate,
   summary,
-  activeSeverityFilter,
-  onSeverityFilterChange,
+  selectedSeverityFilters,
+  onSeverityFilterToggle,
   onOpenReport,
 }: {
   plate: SteelPlate;
   summary: InspectionSummary;
-  activeSeverityFilter: ReportSeverityFilter;
-  onSeverityFilterChange: (severity: ReportSeverityFilter) => void;
+  selectedSeverityFilters: ReadonlySet<Severity>;
+  onSeverityFilterToggle: (severity: Severity) => void;
   onOpenReport: () => void;
 }) {
   const severe = summary.bySeverity.severe;
@@ -46,7 +45,7 @@ export function StatisticsPanel({
         </div>
         <div className="severity-cards">
           {severityOrder.map((severity) => {
-            const active = activeSeverityFilter === severity;
+            const active = selectedSeverityFilters.has(severity);
             return (
               <button
                 key={severity}
@@ -54,7 +53,7 @@ export function StatisticsPanel({
                 className={`severity-card ${severity} ${active ? 'active' : ''}`}
                 aria-pressed={active}
                 aria-label={`${severityLabels[severity]}等级过滤，当前${severityCounts[severity]}项`}
-                onClick={() => onSeverityFilterChange(active ? 'all' : severity)}
+                onClick={() => onSeverityFilterToggle(severity)}
               >
                 <span>{severityLabels[severity]}</span>
                 <strong>{severityCounts[severity]}</strong>

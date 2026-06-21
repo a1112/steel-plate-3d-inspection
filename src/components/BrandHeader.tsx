@@ -1,14 +1,15 @@
-import { Activity, Bell, Camera, Cpu, Moon, Server, Sun } from 'lucide-react';
+import { Activity, Bell, Camera, Cpu, Server, Settings } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
 import ustbLogoDark from '../assets/USTB-dark.png';
 import ustbLogo from '../assets/USTB.png';
-import type { DeviceStatus, ThemeMode } from '../data/inspection';
+import type { DeviceStatus, SteelPlate, ThemeMode } from '../data/inspection';
 import { WindowControls } from './WindowControls';
 
 interface BrandHeaderProps {
   status: DeviceStatus;
+  plate: SteelPlate;
   theme: ThemeMode;
-  onThemeToggle: () => void;
+  onSettingsOpen: () => void;
   onDragMouseDown: (event: MouseEvent<HTMLElement>) => void;
 }
 
@@ -177,8 +178,33 @@ function StatusBlock({ label, value, tone = 'ok' }: { label: string; value: stri
   );
 }
 
-export function BrandHeader({ status, theme, onThemeToggle, onDragMouseDown }: BrandHeaderProps) {
-  const logoSrc = theme === 'dark' ? ustbLogoDark : ustbLogo;
+function ProductionMeta({ plate }: { plate: SteelPlate }) {
+  const items = [
+    ['产线', '2250mm热轧'],
+    ['钢板号', plate.plateNo],
+    ['钢种', plate.steelGrade],
+    ['规格', `${plate.thicknessMm.toFixed(1)} x ${plate.widthMm} mm`],
+    ['板长', `${(plate.lengthMm / 1000).toFixed(3)} m`],
+    ['板宽', `${(plate.widthMm / 1000).toFixed(3)} m`],
+    ['检测时间', plate.detectedAt],
+    ['线速', '2.35 m/s'],
+    ['温度', '36.5 C'],
+  ];
+
+  return (
+    <div className="production-meta" aria-label="当前钢板生产参数">
+      {items.map(([label, value]) => (
+        <span key={label}>
+          <b>{label}:</b>
+          {value}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+export function BrandHeader({ status, plate, theme, onSettingsOpen, onDragMouseDown }: BrandHeaderProps) {
+  const logoSrc = theme === 'light' ? ustbLogo : ustbLogoDark;
   const [activeDetail, setActiveDetail] = useState<'receiver' | 'camera' | null>(null);
   const receiverWrapRef = useRef<HTMLDivElement>(null);
   const cameraWrapRef = useRef<HTMLDivElement>(null);
@@ -232,7 +258,10 @@ export function BrandHeader({ status, theme, onThemeToggle, onDragMouseDown }: B
         <img src={logoSrc} alt="北科工研" className="ustb-logo" draggable={false} />
       </div>
 
-      <div className="system-title">钢板3D表面检测系统</div>
+      <div className="title-meta-group">
+        <div className="system-title">钢板3D表面检测系统</div>
+        <ProductionMeta plate={plate} />
+      </div>
 
       <div className="brand-status">
         <div className="port-status-stack">
@@ -266,10 +295,25 @@ export function BrandHeader({ status, theme, onThemeToggle, onDragMouseDown }: B
         <StatusBlock label="编码器" value={status.encoder === 'sync' ? '同步正常' : '离线'} />
         <StatusBlock label="PLC" value={status.plc === 'normal' ? '正常' : '异常'} />
         <StatusBlock label="L2" value={status.l2 === 'normal' ? '正常' : '异常'} />
+        <div className="run-indicator" aria-label="系统运行状态">
+          <i />
+          <span>运行中</span>
+        </div>
         <div className="alarm-status">
           <Bell size={20} fill="currentColor" />
           <span>{status.alarmCount}</span>
         </div>
+        <button
+          className="header-settings-button"
+          type="button"
+          title="系统设置"
+          aria-label="打开系统设置"
+          data-no-drag
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={onSettingsOpen}
+        >
+          <Settings size={18} />
+        </button>
       </div>
 
       <div className="brand-right">
@@ -279,9 +323,6 @@ export function BrandHeader({ status, theme, onThemeToggle, onDragMouseDown }: B
           <Cpu size={13} />
           <Activity size={13} />
         </div>
-        <button className="theme-toggle" type="button" title="切换主题" onClick={onThemeToggle}>
-          {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
-        </button>
         <WindowControls />
       </div>
     </header>

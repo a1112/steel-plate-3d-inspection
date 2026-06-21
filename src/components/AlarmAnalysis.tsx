@@ -5,6 +5,7 @@ import { BufferGeometry, Float32BufferAttribute } from 'three';
 import { useMemo, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react';
 import type { ChartPoint, DefectItem } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
+import { createPointCloudGeometryArrays } from '../lib/point-cloud-simulator';
 import { createSectionProfiles } from '../lib/section-profiles';
 import { Panel } from './Panel';
 
@@ -54,28 +55,13 @@ function SurfacePointCloud() {
   const [zoom, setZoom] = useState(1);
   const [dragging, setDragging] = useState(false);
   const dragState = useRef<{ pointerId: number; startX: number; startYaw: number } | null>(null);
+  const pointCloud = useMemo(() => createPointCloudGeometryArrays(), []);
   const geometry = useMemo(() => {
-    const positions: number[] = [];
-    const colors: number[] = [];
-    for (let x = -52; x <= 52; x += 2) {
-      for (let y = -30; y <= 30; y += 2) {
-        const dip = Math.exp(-((x - 16) ** 2 + (y + 5) ** 2) / 90) * -0.65;
-        const wave = Math.sin(x * 0.18) * 0.08 + Math.cos(y * 0.22) * 0.06;
-        const z = dip + wave;
-        positions.push(x / 30, z, y / 25);
-        const t = Math.max(0, Math.min(1, (z + 0.7) / 0.95));
-        if (t < 0.5) {
-          colors.push(0.04, 0.28 + t * 1.25, 0.96 - t * 1.1);
-        } else {
-          colors.push((t - 0.5) * 1.8, 0.92 - (t - 0.5) * 0.32, 0.12);
-        }
-      }
-    }
     const mesh = new BufferGeometry();
-    mesh.setAttribute('position', new Float32BufferAttribute(positions, 3));
-    mesh.setAttribute('color', new Float32BufferAttribute(colors, 3));
+    mesh.setAttribute('position', new Float32BufferAttribute(pointCloud.positions, 3));
+    mesh.setAttribute('color', new Float32BufferAttribute(pointCloud.colors, 3));
     return mesh;
-  }, []);
+  }, [pointCloud]);
 
   const stopDragging = (event: PointerEvent<HTMLDivElement>) => {
     if (dragState.current?.pointerId !== event.pointerId) {
@@ -100,6 +86,8 @@ function SurfacePointCloud() {
       data-testid="point-cloud-viewer"
       data-point-cloud-yaw={yaw.toFixed(3)}
       data-point-cloud-zoom={zoom.toFixed(2)}
+      data-point-cloud-points={pointCloud.pointCount}
+      data-point-cloud-memory-bytes={pointCloud.memoryBytes}
       aria-label="点云图，左右拖拽调整视角，滚轮放大缩小"
       onPointerDown={(event) => {
         if (event.button !== 0) {

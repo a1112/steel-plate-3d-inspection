@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import type { InspectionSummary, SteelPlate } from '../data/inspection';
+import type { InspectionSummary, Severity, SteelPlate } from '../data/inspection';
 import { StatisticsPanel } from './StatisticsPanel';
 
 const plate: SteelPlate = {
@@ -26,39 +26,39 @@ const summary: InspectionSummary = {
 };
 
 describe('StatisticsPanel', () => {
-  it('filters by severity from the summary cards and clears the active severity on repeat click', () => {
-    const onSeverityFilterChange = vi.fn();
+  it('shows all severity cards selected by default and toggles each card', () => {
+    const onSeverityFilterToggle = vi.fn();
     const { rerender } = render(
       <StatisticsPanel
         plate={plate}
         summary={summary}
-        activeSeverityFilter="all"
-        onSeverityFilterChange={onSeverityFilterChange}
+        selectedSeverityFilters={new Set<Severity>(['severe', 'review', 'minor'])}
+        onSeverityFilterToggle={onSeverityFilterToggle}
         onOpenReport={vi.fn()}
       />,
     );
 
     const severeCard = screen.getByRole('button', { name: '严重等级过滤，当前4项' });
-    expect(severeCard).toHaveAttribute('aria-pressed', 'false');
+    const reviewCard = screen.getByRole('button', { name: '待复核等级过滤，当前3项' });
+    const minorCard = screen.getByRole('button', { name: '轻微等级过滤，当前5项' });
+    expect(severeCard).toHaveAttribute('aria-pressed', 'true');
+    expect(reviewCard).toHaveAttribute('aria-pressed', 'true');
+    expect(minorCard).toHaveAttribute('aria-pressed', 'true');
 
     fireEvent.click(severeCard);
-    expect(onSeverityFilterChange).toHaveBeenCalledWith('severe');
+    expect(onSeverityFilterToggle).toHaveBeenCalledWith('severe');
 
     rerender(
       <StatisticsPanel
         plate={plate}
         summary={summary}
-        activeSeverityFilter="severe"
-        onSeverityFilterChange={onSeverityFilterChange}
+        selectedSeverityFilters={new Set<Severity>(['review', 'minor'])}
+        onSeverityFilterToggle={onSeverityFilterToggle}
         onOpenReport={vi.fn()}
       />,
     );
 
-    const activeSevereCard = screen.getByRole('button', { name: '严重等级过滤，当前4项' });
-    expect(activeSevereCard).toHaveAttribute('aria-pressed', 'true');
-    expect(activeSevereCard).toHaveClass('active');
-
-    fireEvent.click(activeSevereCard);
-    expect(onSeverityFilterChange).toHaveBeenCalledWith('all');
+    expect(screen.getByRole('button', { name: '严重等级过滤，当前4项' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: '待复核等级过滤，当前3项' })).toHaveClass('active');
   });
 });

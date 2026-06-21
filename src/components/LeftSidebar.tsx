@@ -102,7 +102,24 @@ export function LeftSidebar({
         </dl>
       </Panel>
 
-      <Panel title="记录查询" className="record-search-panel">
+      <Panel
+        title="记录查询"
+        className="record-search-panel"
+        action={
+          <select
+            className="record-search-field-select"
+            value={activeSearchField}
+            aria-label="查询条件"
+            onChange={handleSearchFieldChange}
+          >
+            {recordSearchOptions.map((option) => (
+              <option key={option.field} value={option.field}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        }
+      >
         <form className="record-search-form" onSubmit={handleSubmit}>
           <div className="record-search-condition">
             <label className="record-search-input-wrap">
@@ -114,13 +131,6 @@ export function LeftSidebar({
                 onChange={handleSearchValueChange}
               />
             </label>
-            <select value={activeSearchField} aria-label="查询条件" onChange={handleSearchFieldChange}>
-              {recordSearchOptions.map((option) => (
-                <option key={option.field} value={option.field}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
           </div>
           <div className="record-search-actions">
             <button type="submit">

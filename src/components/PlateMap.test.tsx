@@ -26,7 +26,7 @@ const defects: DefectItem[] = [
     yOffsetMm: 0.5,
     previewX: 50,
     previewY: 50,
-    previewImageUrl: '',
+    previewImageUrl: '/mock-defect-pit.png',
   },
   {
     id: 'D-BOTTOM',
@@ -249,6 +249,88 @@ describe('PlateMap', () => {
 
     fireEvent.wheel(view, { deltaY: 120 });
     expect(view).toHaveAttribute('data-view-zoom', '1.00');
+  });
+
+  it('shows a defect detail card on marker hover and keyboard focus', () => {
+    render(
+      <PlateMap
+        defectTypes={defectTypes}
+        defects={defects}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId="D-TOP"
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    const marker = screen.getByRole('button', { name: '凹坑，上表面，距头1000mm' });
+    fireEvent.mouseEnter(marker);
+
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: '凹坑缺陷小图' })).toHaveAttribute('src', '/mock-defect-pit.png');
+    expect(screen.getByText('D-TOP')).toBeInTheDocument();
+    expect(screen.getByText('严重')).toBeInTheDocument();
+    expect(screen.getByText('0.40 x 0.30 x 0.12mm')).toBeInTheDocument();
+
+    fireEvent.mouseLeave(marker);
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+
+    fireEvent.focus(marker);
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+  });
+
+  it('switches selected defects with keyboard arrows and mouse wheel on the 2D strip', () => {
+    const onSelectDefect = vi.fn();
+    const { rerender } = render(
+      <PlateMap
+        defectTypes={defectTypes}
+        defects={defects}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId="D-TOP"
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={onSelectDefect}
+      />,
+    );
+
+    const topStrip = screen.getByRole('region', { name: '上表面缺陷显示切换' });
+    fireEvent.keyDown(topStrip, { key: 'ArrowRight' });
+    expect(onSelectDefect).toHaveBeenLastCalledWith('D-BOTTOM');
+
+    rerender(
+      <PlateMap
+        defectTypes={defectTypes}
+        defects={defects}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId="D-BOTTOM"
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={onSelectDefect}
+      />,
+    );
+
+    const bottomStrip = screen.getByRole('region', { name: '下表面缺陷显示切换' });
+    fireEvent.wheel(bottomStrip, { deltaY: -120 });
+    expect(onSelectDefect).toHaveBeenLastCalledWith('D-TOP');
+
+    fireEvent.keyDown(bottomStrip, { key: 'End' });
+    expect(onSelectDefect).toHaveBeenLastCalledWith('D-BOTTOM');
   });
 
   it('updates the preview position from click and drag on the length ruler', () => {

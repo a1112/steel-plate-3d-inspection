@@ -2,7 +2,7 @@ import defectInclusionImage from '../assets/mock-defects/defect-inclusion.png';
 import defectPitImage from '../assets/mock-defects/defect-pit.png';
 import defectScratchImage from '../assets/mock-defects/defect-scratch.png';
 
-export type ThemeMode = 'dark' | 'light';
+export type ThemeMode = 'dark' | 'light' | 'graphite' | 'cobalt' | 'emerald';
 export type Severity = 'severe' | 'review' | 'minor';
 export type Surface = 'top' | 'bottom';
 

@@ -41,10 +41,6 @@ export function createInitialUiState(snapshot: InspectionSnapshot): InspectionUi
   };
 }
 
-export function toggleTheme(theme: ThemeMode): ThemeMode {
-  return theme === 'dark' ? 'light' : 'dark';
-}
-
 export function toggleDefectType(state: InspectionUiState, typeId: string): InspectionUiState {
   const hiddenDefectTypeIds = new Set(state.hiddenDefectTypeIds);
   if (hiddenDefectTypeIds.has(typeId)) {

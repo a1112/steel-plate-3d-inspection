@@ -9,7 +9,6 @@ import {
   selectRecord,
   selectDefect,
   toggleDefectType,
-  toggleTheme,
 } from './inspection-ui';
 
 describe('inspection UI state helpers', () => {
@@ -77,8 +76,8 @@ describe('inspection UI state helpers', () => {
     expect(paginateItems(rows, 10, 4)).toEqual([9, 10]);
   });
 
-  it('toggles between dark and light themes', () => {
-    expect(toggleTheme('dark')).toBe('light');
-    expect(toggleTheme('light')).toBe('dark');
+  it('keeps the default inspection theme on the industrial dark palette', () => {
+    const snapshot = getMockInspectionSnapshot();
+    expect(createInitialUiState(snapshot).theme).toBe('dark');
   });
 });
