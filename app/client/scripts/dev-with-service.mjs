@@ -1,26 +1,23 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const appDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const repoDir = resolve(appDir, '..');
-const backendDir = resolve(repoDir, 'backend/cpp');
-const backendBuildDir = resolve(backendDir, 'build');
-const backendBinary = resolve(backendBuildDir, 'steel_inspection_backend');
-const backendPort = process.env.INSPECTION_BACKEND_PORT ?? '4873';
+const clientDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const serviceDir = resolve(clientDir, '..', 'service');
+const serviceBinary = resolve(serviceDir, 'target', 'debug', process.platform === 'win32' ? 'steel-inspection-service.exe' : 'steel-inspection-service');
+const servicePort = process.env.INSPECTION_SERVICE_PORT ?? '4873';
 
 const children = new Set();
 
 function run(command, args, options = {}) {
   const child = spawn(command, args, {
-    cwd: appDir,
+    cwd: clientDir,
     stdio: 'inherit',
     env: {
       ...process.env,
-      INSPECTION_BACKEND_PORT: backendPort,
-      VITE_INSPECTION_BACKEND_ORIGIN: `http://127.0.0.1:${backendPort}`,
+      INSPECTION_SERVICE_PORT: servicePort,
+      VITE_INSPECTION_SERVICE_ORIGIN: `http://127.0.0.1:${servicePort}`,
     },
     ...options,
   });
@@ -60,16 +57,14 @@ process.on('SIGTERM', () => {
   process.exit(143);
 });
 
-await mkdir(backendBuildDir, { recursive: true });
-await runChecked('cmake', ['-S', backendDir, '-B', backendBuildDir]);
-await runChecked('cmake', ['--build', backendBuildDir, '--config', 'Debug']);
+await runChecked('cargo', ['build', '--manifest-path', resolve(serviceDir, 'Cargo.toml')]);
 
-if (!existsSync(backendBinary)) {
-  throw new Error(`Backend binary missing: ${backendBinary}`);
+if (!existsSync(serviceBinary)) {
+  throw new Error(`Service binary missing: ${serviceBinary}`);
 }
 
-const backend = run(backendBinary, [], { cwd: appDir });
-const vite = run('vite', ['--host', '0.0.0.0'], { cwd: appDir });
+const service = run(serviceBinary, [], { cwd: clientDir });
+const vite = run('vite', ['--host', '0.0.0.0'], { cwd: clientDir });
 
 await new Promise((resolvePromise) => {
   let resolved = false;
@@ -80,6 +75,6 @@ await new Promise((resolvePromise) => {
       resolvePromise(code ?? 0);
     }
   };
-  backend.once('exit', finish);
+  service.once('exit', finish);
   vite.once('exit', finish);
 });

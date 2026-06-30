@@ -3,7 +3,7 @@ import defectPitImage from '../assets/mock-defects/defect-pit.png';
 import defectScratchImage from '../assets/mock-defects/defect-scratch.png';
 import type { DefectItem, InspectionSnapshot } from '../data/inspection';
 
-const DEFAULT_BACKEND_ORIGIN = 'http://127.0.0.1:4873';
+const DEFAULT_SERVICE_ORIGIN = 'http://127.0.0.1:4873';
 
 const defectPreviewImages: Record<string, string> = {
   pit: defectPitImage,
@@ -18,9 +18,9 @@ const defectPreviewImages: Record<string, string> = {
   review: defectPitImage,
 };
 
-function getBackendOrigin() {
-  const configuredOrigin = import.meta.env.VITE_INSPECTION_BACKEND_ORIGIN;
-  return configuredOrigin && configuredOrigin.trim().length > 0 ? configuredOrigin : DEFAULT_BACKEND_ORIGIN;
+function getServiceOrigin() {
+  const configuredOrigin = import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN;
+  return configuredOrigin && configuredOrigin.trim().length > 0 ? configuredOrigin : DEFAULT_SERVICE_ORIGIN;
 }
 
 function withPreviewImage(defect: DefectItem): DefectItem {
@@ -43,7 +43,7 @@ function normalizeInspectionSnapshot(snapshot: InspectionSnapshot): InspectionSn
 }
 
 export async function fetchInspectionSnapshot(signal?: AbortSignal): Promise<InspectionSnapshot> {
-  const response = await fetch(`${getBackendOrigin()}/api/inspection/snapshot`, {
+  const response = await fetch(`${getServiceOrigin()}/api/inspection/snapshot`, {
     headers: { Accept: 'application/json' },
     signal,
   });

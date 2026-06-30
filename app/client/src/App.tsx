@@ -108,7 +108,7 @@ export default function App() {
         <section className="app-loading-panel" role="status" aria-live="polite">
           <span>后台数据系统</span>
           <h1>{loadError ? '后台连接失败' : '正在连接后台数据服务'}</h1>
-          <p>{loadError ?? '正在从 C++ 检测后台获取钢板、缺陷、设备和历史记录数据...'}</p>
+          <p>{loadError ?? '正在从 Rust 数据服务获取钢板、缺陷、设备和历史记录数据...'}</p>
         </section>
       </div>
     );

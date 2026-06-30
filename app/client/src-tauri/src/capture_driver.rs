@@ -76,6 +76,7 @@ struct LvmDevStateRaw {
 
 type DeviceChangeCb = extern "C" fn(c_int, LvmCamInfoRaw) -> c_int;
 
+#[cfg(capture_sdk)]
 #[link(name = "nvt_lvm_sdk")]
 extern "C" {
     fn lvm_init_sdk(cb: Option<DeviceChangeCb>, log_path: *const c_char) -> c_int;
@@ -91,13 +92,142 @@ extern "C" {
     fn lvm_set_param_int_value(dev: *mut LvmDev, key: *const c_char, value: c_int) -> c_int;
     fn lvm_set_param_float_value(dev: *mut LvmDev, key: *const c_char, value: c_float) -> c_int;
     fn lvm_get_depth_map_width(dev: *mut LvmDev, height: c_int) -> c_int;
-    fn lvm_alloc_depth_map_buf(dev: *mut LvmDev, data_mode: c_int, width: c_int, height: c_int, frame_num: c_int) -> *mut LvmBuf;
+    fn lvm_alloc_depth_map_buf(
+        dev: *mut LvmDev,
+        data_mode: c_int,
+        width: c_int,
+        height: c_int,
+        frame_num: c_int,
+    ) -> *mut LvmBuf;
     fn lvm_bind_buf(dev: *mut LvmDev, buf: *mut LvmBuf) -> c_int;
     fn lvm_trigger_en_ctrl(dev: *mut LvmDev, enable: bool) -> c_int;
     fn lvm_grab_frame(dev: *mut LvmDev, timeout_ms: c_int) -> *mut c_void;
-    fn lvm_save_depth_map(dev: *mut LvmDev, file_path: *const c_char, depth_map: *mut c_void) -> c_int;
+    fn lvm_save_depth_map(
+        dev: *mut LvmDev,
+        file_path: *const c_char,
+        depth_map: *mut c_void,
+    ) -> c_int;
     fn lvm_grab_stop(dev: *mut LvmDev) -> c_int;
     fn lvm_free_buf(buf: *mut LvmBuf) -> c_int;
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_init_sdk(_cb: Option<DeviceChangeCb>, _log_path: *const c_char) -> c_int {
+    DEV_NOT_LINK_ERROR
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_deinit_sdk() -> c_int {
+    CORRECT
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_get_sdk_version() -> *const c_char {
+    static VERSION: &[u8] = b"nvt_lvm_sdk unavailable\0";
+    VERSION.as_ptr().cast::<c_char>()
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_get_cam_info(cam_info: *mut *mut LvmCamInfoRaw, cam_num: *mut c_int) -> c_int {
+    if !cam_info.is_null() {
+        *cam_info = ptr::null_mut();
+    }
+    if !cam_num.is_null() {
+        *cam_num = 0;
+    }
+    DEV_NOT_LINK_ERROR
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_create_dev(_ip: *mut c_char, _dev_type: c_int) -> *mut LvmDev {
+    ptr::null_mut()
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_connect_dev(_dev: *mut LvmDev) -> c_int {
+    DEV_NOT_LINK_ERROR
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_disconnect_dev(_dev: *mut LvmDev) -> c_int {
+    CORRECT
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_destroy_dev(_dev: *mut LvmDev) {}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_get_dev_connect_status(_dev: *mut LvmDev) -> c_int {
+    0
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_get_dev_id(_dev: *mut LvmDev) -> c_int {
+    -1
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_set_param_int_value(_dev: *mut LvmDev, _key: *const c_char, _value: c_int) -> c_int {
+    DEV_NOT_LINK_ERROR
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_set_param_float_value(
+    _dev: *mut LvmDev,
+    _key: *const c_char,
+    _value: c_float,
+) -> c_int {
+    DEV_NOT_LINK_ERROR
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_get_depth_map_width(_dev: *mut LvmDev, _height: c_int) -> c_int {
+    0
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_alloc_depth_map_buf(
+    _dev: *mut LvmDev,
+    _data_mode: c_int,
+    _width: c_int,
+    _height: c_int,
+    _frame_num: c_int,
+) -> *mut LvmBuf {
+    ptr::null_mut()
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_bind_buf(_dev: *mut LvmDev, _buf: *mut LvmBuf) -> c_int {
+    DEV_NOT_LINK_ERROR
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_trigger_en_ctrl(_dev: *mut LvmDev, _enable: bool) -> c_int {
+    DEV_NOT_LINK_ERROR
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_grab_frame(_dev: *mut LvmDev, _timeout_ms: c_int) -> *mut c_void {
+    ptr::null_mut()
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_save_depth_map(
+    _dev: *mut LvmDev,
+    _file_path: *const c_char,
+    _depth_map: *mut c_void,
+) -> c_int {
+    DEV_NOT_LINK_ERROR
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_grab_stop(_dev: *mut LvmDev) -> c_int {
+    CORRECT
+}
+
+#[cfg(not(capture_sdk))]
+unsafe fn lvm_free_buf(_buf: *mut LvmBuf) -> c_int {
+    CORRECT
 }
 
 #[derive(Clone, Serialize)]
@@ -301,7 +431,13 @@ trait CameraDriverBackend {
     fn status(&mut self, ip: Option<String>) -> CaptureCameraStatus;
     fn connect(&mut self, ip: String, dev_type: Option<i32>) -> CaptureCommandResult;
     fn disconnect(&mut self, ip: Option<String>) -> CaptureCommandResult;
-    fn set_param(&mut self, ip: Option<String>, key: String, type_name: String, value: f64) -> CaptureCommandResult;
+    fn set_param(
+        &mut self,
+        ip: Option<String>,
+        key: String,
+        type_name: String,
+        value: f64,
+    ) -> CaptureCommandResult;
     fn capture_depth_map(
         &mut self,
         ip: Option<String>,
@@ -352,7 +488,12 @@ impl LvmNvtDriver {
         code
     }
 
-    fn push_log(&mut self, level: impl Into<String>, camera_ip: Option<String>, message: impl Into<String>) {
+    fn push_log(
+        &mut self,
+        level: impl Into<String>,
+        camera_ip: Option<String>,
+        message: impl Into<String>,
+    ) {
         let event = CaptureLogEvent {
             id: format!("CAP-{index:04}", index = self.next_log_index),
             time: now_millis_string(),
@@ -372,7 +513,10 @@ impl LvmNvtDriver {
             vendor: "Capture 6.7 SDK".to_string(),
             transport: "GigE/Network".to_string(),
             sdk_version: unsafe { c_string(lvm_get_sdk_version()) },
-            supported_models: vec!["LVM3450CA".to_string(), "LVM compatible 3D line camera".to_string()],
+            supported_models: vec![
+                "LVM3450CA".to_string(),
+                "LVM compatible 3D line camera".to_string(),
+            ],
             features: vec![
                 "discover".to_string(),
                 "multi-connect".to_string(),
@@ -423,7 +567,10 @@ impl LvmNvtDriver {
     }
 
     fn config_for_ip(&self, ip: &str) -> Option<&CaptureCameraConfig> {
-        self.applied_config.cameras.iter().find(|camera| camera.ip == ip)
+        self.applied_config
+            .cameras
+            .iter()
+            .find(|camera| camera.ip == ip)
     }
 
     fn select_handle(&self, ip: Option<&str>) -> Option<&CameraHandle> {
@@ -469,7 +616,9 @@ impl LvmNvtDriver {
             ip: handle.ip.clone(),
             driver_id: LVM_DRIVER_ID.to_string(),
             model: if handle.model.is_empty() {
-                config.map(|config| config.model_hint.clone()).unwrap_or_default()
+                config
+                    .map(|config| config.model_hint.clone())
+                    .unwrap_or_default()
             } else {
                 handle.model.clone()
             },
@@ -493,11 +642,19 @@ impl LvmNvtDriver {
             temperature_j30: state.map(|state| state.temperature_j30),
             lost_pulse_counter: state.map(|state| state.lost_pulse_counter),
             buffer_overflow_counter: state.map(|state| state.buffer_overflow_counter),
-            error: if connected { None } else { Some("device disconnected".to_string()) },
+            error: if connected {
+                None
+            } else {
+                Some("device disconnected".to_string())
+            },
         }
     }
 
-    fn status_from_config(&self, config: &CaptureCameraConfig, discovered: Option<&CaptureCamera>) -> CaptureCameraStatus {
+    fn status_from_config(
+        &self,
+        config: &CaptureCameraConfig,
+        discovered: Option<&CaptureCamera>,
+    ) -> CaptureCameraStatus {
         CaptureCameraStatus {
             connected: false,
             device_id: -1,
@@ -507,7 +664,9 @@ impl LvmNvtDriver {
                 .map(|camera| camera.model.clone())
                 .filter(|model| !model.is_empty())
                 .unwrap_or_else(|| config.model_hint.clone()),
-            sn: discovered.map(|camera| camera.sn.clone()).unwrap_or_default(),
+            sn: discovered
+                .map(|camera| camera.sn.clone())
+                .unwrap_or_default(),
             config_id: Some(config.id.clone()),
             name: Some(config.name.clone()),
             role: Some(config.role.clone()),
@@ -532,7 +691,11 @@ impl LvmNvtDriver {
             temperature_j30: None,
             lost_pulse_counter: None,
             buffer_overflow_counter: None,
-            error: if config.enabled { Some("not connected".to_string()) } else { None },
+            error: if config.enabled {
+                Some("not connected".to_string())
+            } else {
+                None
+            },
         }
     }
 
@@ -598,7 +761,10 @@ impl Drop for LvmNvtDriver {
 impl CameraDriverBackend for LvmNvtDriver {
     fn health(&mut self) -> CaptureHealth {
         let code = self.ensure_sdk();
-        let connected = self.devices.values().any(|handle| unsafe { lvm_get_dev_connect_status(handle.dev) == 1 });
+        let connected = self
+            .devices
+            .values()
+            .any(|handle| unsafe { lvm_get_dev_connect_status(handle.dev) == 1 });
         let ip = self
             .devices
             .values()
@@ -726,12 +892,21 @@ impl CameraDriverBackend for LvmNvtDriver {
         }
 
         let config = self.config_for_ip(&ip).cloned();
-        let discovered = self.discover_cameras().cameras.into_iter().find(|camera| camera.ip == ip);
+        let discovered = self
+            .discover_cameras()
+            .cameras
+            .into_iter()
+            .find(|camera| camera.ip == ip);
         let mut ip_bytes = [0_u8; DEVICE_NET_INFO_LEN];
         let source = ip.as_bytes();
         let len = source.len().min(DEVICE_NET_INFO_LEN - 1);
         ip_bytes[..len].copy_from_slice(&source[..len]);
-        let dev = unsafe { lvm_create_dev(ip_bytes.as_mut_ptr().cast::<c_char>(), dev_type.unwrap_or(-1)) };
+        let dev = unsafe {
+            lvm_create_dev(
+                ip_bytes.as_mut_ptr().cast::<c_char>(),
+                dev_type.unwrap_or(-1),
+            )
+        };
         if dev.is_null() {
             return command_error(DEV_INIT_FAILED, "create device failed");
         }
@@ -746,12 +921,25 @@ impl CameraDriverBackend for LvmNvtDriver {
                     .map(|camera| camera.model.clone())
                     .or_else(|| config.as_ref().map(|config| config.model_hint.clone()))
                     .unwrap_or_default(),
-                sn: discovered.as_ref().map(|camera| camera.sn.clone()).unwrap_or_default(),
+                sn: discovered
+                    .as_ref()
+                    .map(|camera| camera.sn.clone())
+                    .unwrap_or_default(),
                 config_id: config.as_ref().map(|config| config.id.clone()),
             };
             if let Some(config) = config.as_ref() {
-                let _ = LvmNvtDriver::set_param_for_handle(&handle, "ExposureTime", "int", f64::from(config.exposure_us));
-                let _ = LvmNvtDriver::set_param_for_handle(&handle, "GainK", "float", f64::from(config.gain));
+                let _ = LvmNvtDriver::set_param_for_handle(
+                    &handle,
+                    "ExposureTime",
+                    "int",
+                    f64::from(config.exposure_us),
+                );
+                let _ = LvmNvtDriver::set_param_for_handle(
+                    &handle,
+                    "GainK",
+                    "float",
+                    f64::from(config.gain),
+                );
             }
             self.devices.insert(ip.clone(), handle);
             self.push_log("info", Some(ip.clone()), "camera connected");
@@ -759,7 +947,11 @@ impl CameraDriverBackend for LvmNvtDriver {
             unsafe {
                 lvm_destroy_dev(dev);
             }
-            self.push_log("error", Some(ip.clone()), format!("camera connect failed: {code}"));
+            self.push_log(
+                "error",
+                Some(ip.clone()),
+                format!("camera connect failed: {code}"),
+            );
         }
 
         CaptureCommandResult {
@@ -809,16 +1001,30 @@ impl CameraDriverBackend for LvmNvtDriver {
         }
     }
 
-    fn set_param(&mut self, ip: Option<String>, key: String, type_name: String, value: f64) -> CaptureCommandResult {
+    fn set_param(
+        &mut self,
+        ip: Option<String>,
+        key: String,
+        type_name: String,
+        value: f64,
+    ) -> CaptureCommandResult {
         let Some(handle) = self.select_handle(ip.as_deref()) else {
             return command_error(DEV_NOT_LINK_ERROR, "camera not connected");
         };
         let target_ip = handle.ip.clone();
         let code = LvmNvtDriver::set_param_for_handle(handle, &key, &type_name, value);
         if code == CORRECT {
-            self.push_log("info", Some(target_ip.clone()), format!("parameter {key} applied"));
+            self.push_log(
+                "info",
+                Some(target_ip.clone()),
+                format!("parameter {key} applied"),
+            );
         } else {
-            self.push_log("warning", Some(target_ip.clone()), format!("parameter {key} failed: {code}"));
+            self.push_log(
+                "warning",
+                Some(target_ip.clone()),
+                format!("parameter {key} failed: {code}"),
+            );
         }
 
         CaptureCommandResult {
@@ -847,7 +1053,8 @@ impl CameraDriverBackend for LvmNvtDriver {
             return command_error(DEV_NOT_LINK_ERROR, "camera not connected");
         };
         let target_ip = handle.ip.clone();
-        let output = output.unwrap_or_else(|| format!("capture-depth-{}.png", target_ip.replace('.', "-")));
+        let output =
+            output.unwrap_or_else(|| format!("capture-depth-{}.png", target_ip.replace('.', "-")));
 
         let mut width = unsafe { lvm_get_depth_map_width(handle.dev, lines) };
         if width <= 0 {
@@ -886,9 +1093,17 @@ impl CameraDriverBackend for LvmNvtDriver {
         }
 
         if code == CORRECT {
-            self.push_log("info", Some(target_ip.clone()), format!("depth map captured: {output}"));
+            self.push_log(
+                "info",
+                Some(target_ip.clone()),
+                format!("depth map captured: {output}"),
+            );
         } else {
-            self.push_log("error", Some(target_ip.clone()), format!("depth map failed: {code}"));
+            self.push_log(
+                "error",
+                Some(target_ip.clone()),
+                format!("depth map failed: {code}"),
+            );
         }
 
         CaptureCommandResult {
@@ -916,8 +1131,18 @@ impl CameraDriverBackend for LvmNvtDriver {
         let connected_ips: Vec<String> = self.devices.keys().cloned().collect();
         for ip in connected_ips {
             if let (Some(handle), Some(config)) = (self.devices.get(&ip), self.config_for_ip(&ip)) {
-                let _ = LvmNvtDriver::set_param_for_handle(handle, "ExposureTime", "int", f64::from(config.exposure_us));
-                let _ = LvmNvtDriver::set_param_for_handle(handle, "GainK", "float", f64::from(config.gain));
+                let _ = LvmNvtDriver::set_param_for_handle(
+                    handle,
+                    "ExposureTime",
+                    "int",
+                    f64::from(config.exposure_us),
+                );
+                let _ = LvmNvtDriver::set_param_for_handle(
+                    handle,
+                    "GainK",
+                    "float",
+                    f64::from(config.gain),
+                );
             }
         }
         self.push_log("info", None, format!("config applied: {name}"));
@@ -1165,17 +1390,27 @@ pub fn capture_driver_statuses(driver: tauri::State<'_, CaptureDriver>) -> Captu
 }
 
 #[tauri::command]
-pub fn capture_driver_status(driver: tauri::State<'_, CaptureDriver>, ip: Option<String>) -> CaptureCameraStatus {
+pub fn capture_driver_status(
+    driver: tauri::State<'_, CaptureDriver>,
+    ip: Option<String>,
+) -> CaptureCameraStatus {
     driver.with_backend(|backend| backend.status(ip))
 }
 
 #[tauri::command]
-pub fn capture_driver_connect(driver: tauri::State<'_, CaptureDriver>, ip: String, dev_type: Option<i32>) -> CaptureCommandResult {
+pub fn capture_driver_connect(
+    driver: tauri::State<'_, CaptureDriver>,
+    ip: String,
+    dev_type: Option<i32>,
+) -> CaptureCommandResult {
     driver.with_backend(|backend| backend.connect(ip, dev_type))
 }
 
 #[tauri::command]
-pub fn capture_driver_disconnect(driver: tauri::State<'_, CaptureDriver>, ip: Option<String>) -> CaptureCommandResult {
+pub fn capture_driver_disconnect(
+    driver: tauri::State<'_, CaptureDriver>,
+    ip: Option<String>,
+) -> CaptureCommandResult {
     driver.with_backend(|backend| backend.disconnect(ip))
 }
 
@@ -1202,12 +1437,17 @@ pub fn capture_driver_capture_depth_map(
 }
 
 #[tauri::command]
-pub fn capture_driver_apply_config(driver: tauri::State<'_, CaptureDriver>, config: CaptureAppliedConfig) -> CaptureCommandResult {
+pub fn capture_driver_apply_config(
+    driver: tauri::State<'_, CaptureDriver>,
+    config: CaptureAppliedConfig,
+) -> CaptureCommandResult {
     driver.with_backend(|backend| backend.apply_config(config))
 }
 
 #[tauri::command]
-pub fn capture_driver_capabilities(driver: tauri::State<'_, CaptureDriver>) -> CaptureCapabilitySet {
+pub fn capture_driver_capabilities(
+    driver: tauri::State<'_, CaptureDriver>,
+) -> CaptureCapabilitySet {
     driver.with_backend(|backend| backend.capabilities())
 }
 

@@ -65,6 +65,17 @@ fn find_capture_service_exe() -> Option<PathBuf> {
                     .join("Release")
                     .join("steel_capture_service.exe"),
             );
+            candidates.push(
+                exe_dir
+                    .join("..")
+                    .join("..")
+                    .join("..")
+                    .join("..")
+                    .join("capture")
+                    .join("build")
+                    .join("Release")
+                    .join("steel_capture_service.exe"),
+            );
         }
     }
     if let Ok(current_dir) = std::env::current_dir() {
@@ -85,7 +96,9 @@ fn find_capture_service_exe() -> Option<PathBuf> {
         );
     }
 
-    candidates.into_iter().find(|path| normalize_path(path).is_file())
+    candidates
+        .into_iter()
+        .find(|path| normalize_path(path).is_file())
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -168,11 +181,12 @@ pub fn run() {
             capture_driver::capture_driver_logs
         ])
         .setup(|app| {
-            let capture_process = if std::env::var("STEEL_CAPTURE_HTTP_AUTOSTART").as_deref() == Ok("1") {
-                start_capture_service()
-            } else {
-                None
-            };
+            let capture_process =
+                if std::env::var("STEEL_CAPTURE_HTTP_AUTOSTART").as_deref() == Ok("1") {
+                    start_capture_service()
+                } else {
+                    None
+                };
             app.manage(CaptureServiceProcess(Mutex::new(capture_process)));
             if let Some(window) = app.get_webview_window("main") {
                 window.center()?;
