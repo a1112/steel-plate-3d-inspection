@@ -3,3 +3,4 @@
 本目录保存采集管理独立应用的界面概念图，便于后续 UI 实现、评审和沟通。
 
 - `capture-management-ui-concept.svg`: 配置驱动采集、主界面相机状态总览、单相机详情页、日志与控制 API 的整体界面关系。
+- `capture-management-dashboard-reference.png`: 采集管理主界面设计参考图，强调相机状态总览、快速操作、最新事件和独立软件外壳。
