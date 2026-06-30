@@ -1,16 +1,27 @@
 import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
+import { getMockInspectionSnapshot } from './data/inspection';
 
 function getDefectTableRows(container: HTMLElement) {
   return Array.from(container.querySelectorAll('.defect-table tbody tr')).map((row) => row.textContent?.trim() ?? '');
 }
 
 describe('App online severity filters', () => {
-  it('defaults all statistics severities selected and toggles them from the online defect list', () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => getMockInspectionSnapshot(),
+      }),
+    );
+  });
+
+  it('defaults all statistics severities selected and toggles them from the online defect list', async () => {
     const { container } = render(<App />);
 
-    const severeCard = screen.getByRole('button', { name: '严重等级过滤，当前4项' });
+    const severeCard = await screen.findByRole('button', { name: '严重等级过滤，当前4项' });
     const reviewCard = screen.getByRole('button', { name: '待复核等级过滤，当前3项' });
     const minorCard = screen.getByRole('button', { name: '轻微等级过滤，当前5项' });
     expect(severeCard).toHaveAttribute('aria-pressed', 'true');

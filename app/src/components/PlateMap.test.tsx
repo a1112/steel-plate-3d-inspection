@@ -163,8 +163,45 @@ describe('PlateMap', () => {
     expect(screen.getByTestId('plate-map-3d-view')).toBeInTheDocument();
     expect(screen.queryByRole('slider', { name: '预览位置' })).not.toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole('button', { name: '点云' }));
+
+    expect(screen.getByRole('button', { name: '点云' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('plate-point-cloud-view')).toBeInTheDocument();
+    expect(screen.queryByTestId('plate-map-3d-view')).not.toBeInTheDocument();
+    expect(screen.queryByRole('slider', { name: '预览位置' })).not.toBeInTheDocument();
+
     fireEvent.click(screen.getByRole('button', { name: '2D' }));
     expect(screen.getByRole('slider', { name: '预览位置' })).toBeInTheDocument();
+  });
+
+  it('renders point-cloud mode as top and bottom height unfolded maps', () => {
+    render(
+      <PlateMap
+        defectTypes={defectTypes}
+        defects={defects}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId="D-TOP"
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '点云' }));
+    const view = screen.getByTestId('plate-point-cloud-view');
+
+    expect(Number(view.getAttribute('data-point-cloud-points'))).toBeGreaterThan(5000);
+    expect(screen.getByText('上表面 Top 3D 高度展开图')).toBeInTheDocument();
+    expect(screen.getByText('下表面 Bottom 3D 高度展开图')).toBeInTheDocument();
+    expect(screen.getByLabelText('上表面高度色标')).toBeInTheDocument();
+    expect(screen.getByLabelText('下表面高度色标')).toBeInTheDocument();
+    expect(screen.getByLabelText('凹坑点云标注，上表面，距头1000mm')).toBeInTheDocument();
+    expect(screen.getByLabelText('辊印点云标注，下表面，距头2000mm')).toBeInTheDocument();
   });
 
   it('limits 3D view control to horizontal dragging', () => {

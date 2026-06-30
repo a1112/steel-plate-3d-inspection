@@ -2,6 +2,8 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Check, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type WheelEvent } from 'react';
 import { DoubleSide, type Mesh, type PerspectiveCamera } from 'three';
+import heightMapBottomImage from '../assets/plate-surfaces/height-map-bottom.png';
+import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
 import steelPlateSurfaceImage from '../assets/plate-surfaces/steel-plate-surface.png';
 import type { DefectItem, DefectType } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
@@ -29,11 +31,12 @@ const surfaceModeOptions: { id: SurfaceDisplayMode; label: string }[] = [
   { id: 'all', label: '全部' },
 ];
 
-type PlateMapViewMode = '2d' | '3d';
+type PlateMapViewMode = '2d' | '3d' | 'point-cloud';
 
 const viewModeOptions: { id: PlateMapViewMode; label: string }[] = [
   { id: '2d', label: '2D' },
   { id: '3d', label: '3D' },
+  { id: 'point-cloud', label: '点云' },
 ];
 
 const PLATE_3D_LENGTH = 10;
@@ -552,6 +555,160 @@ function Plate3DGroup({
   );
 }
 
+function PointCloudHeatDefect({
+  defect,
+  type,
+  selected,
+}: {
+  defect: DefectItem;
+  type: DefectType | undefined;
+  selected: boolean;
+}) {
+  const xPercent = Math.max(2, Math.min(98, defect.xRatio * 100));
+  const yPercent = yOffsetToPercentValue(defect.yOffsetMm);
+  const hot = Math.abs(defect.depthMm) >= 0.1 || defect.severity === 'severe';
+
+  return (
+    <>
+      <span
+        className={`point-cloud-heat-blob ${hot ? 'hot' : 'cool'}`}
+        style={
+          {
+            left: `${xPercent}%`,
+            top: `${yPercent}%`,
+            '--defect-color': type?.color ?? '#ff3f47',
+          } as CSSProperties
+        }
+      />
+      <button
+        type="button"
+        className={`point-cloud-defect-label ${selected ? 'selected' : ''}`}
+        style={
+          {
+            left: `${Math.min(88, xPercent + 1.5)}%`,
+            top: `${Math.max(8, yPercent - 16)}%`,
+            '--defect-color': type?.color ?? '#ff3f47',
+          } as CSSProperties
+        }
+        aria-label={`${defect.typeLabel}点云标注，${surfaceLabels[defect.surface]}，距头${defect.distanceHeadMm}mm`}
+        title={`${defect.typeLabel} ${surfaceLabels[defect.surface]} ${defect.distanceHeadMm}mm`}
+      >
+        <span>{defect.id.replace(/^D-/, '').slice(0, 5)}</span>
+        <b />
+      </button>
+    </>
+  );
+}
+
+function PointCloudSurfaceStrip({
+  surface,
+  defects,
+  defectTypes,
+  selectedDefectId,
+  previewPositionM,
+  plateLengthM,
+}: {
+  surface: 'top' | 'bottom';
+  defects: DefectItem[];
+  defectTypes: DefectType[];
+  selectedDefectId: string | null;
+  previewPositionM: number;
+  plateLengthM: number;
+}) {
+  const surfaceDefects = defects.filter((defect) => defect.surface === surface);
+  const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
+  const title = surface === 'top' ? '上表面 Top 3D 高度展开图' : '下表面 Bottom 3D 高度展开图';
+  const heightMapImage = surface === 'top' ? heightMapTopImage : heightMapBottomImage;
+
+  return (
+    <div className="point-cloud-unfold-row">
+      <div className="point-cloud-unfold-title">
+        <strong>{title}</strong>
+        <span>单位：mm</span>
+      </div>
+      <div className="point-cloud-unfold-axis" aria-hidden="true">
+        {[1125, 750, 375, 0].map((tick) => (
+          <span key={tick}>{tick}</span>
+        ))}
+      </div>
+      <div
+        className="point-cloud-unfold-map"
+        role="img"
+        aria-label={`${surfaceLabels[surface]}点云高度展开图`}
+        style={{ '--point-cloud-surface-image': `url(${heightMapImage})` } as CSSProperties}
+      >
+        <div className="point-cloud-texture" />
+        <span className="point-cloud-preview-line" style={{ left: `${previewPercent}%` }} />
+        {surfaceDefects.map((defect) => (
+          <PointCloudHeatDefect
+            key={defect.id}
+            defect={defect}
+            type={defectTypes.find((item) => item.id === defect.typeId)}
+            selected={defect.id === selectedDefectId}
+          />
+        ))}
+        <div className="point-cloud-x-axis" aria-hidden="true">
+          {[0, 2000, 4000, 6000, 8000, 10000, Math.round(plateLengthM * 1000)].map((tick) => (
+            <span key={tick}>{tick}</span>
+          ))}
+        </div>
+        <span className="point-cloud-axis-caption">板长方向(mm)</span>
+      </div>
+      <div className="point-cloud-height-scale" aria-label={`${surfaceLabels[surface]}高度色标`}>
+        <span>高度(mm)</span>
+        <i />
+        <b>2.00</b>
+        <b>1.00</b>
+        <b>0.00</b>
+        <b>-1.00</b>
+        <b>-2.00</b>
+      </div>
+    </div>
+  );
+}
+
+function PlatePointCloudView({
+  defects,
+  defectTypes,
+  selectedDefectId,
+  previewPositionM,
+  plateLengthM,
+  surfaceMode,
+}: {
+  defects: DefectItem[];
+  defectTypes: DefectType[];
+  selectedDefectId: string | null;
+  previewPositionM: number;
+  plateLengthM: number;
+  surfaceMode: SurfaceDisplayMode;
+}) {
+  const surfaces: Array<'top' | 'bottom'> = surfaceMode === 'all' ? ['top', 'bottom'] : [surfaceMode];
+
+  return (
+    <div
+      className={`plate-point-cloud-view rows-${surfaces.length}`}
+      data-testid="plate-point-cloud-view"
+      data-point-cloud-points={surfaces.length * 124 * 46}
+      data-point-cloud-z-range="-2.00,2.00"
+      aria-label="钢板点云高度展开图"
+    >
+      <div className="point-cloud-unfold-stack">
+        {surfaces.map((surface) => (
+          <PointCloudSurfaceStrip
+            key={surface}
+            surface={surface}
+            defects={defects}
+            defectTypes={defectTypes}
+            selectedDefectId={selectedDefectId}
+            previewPositionM={previewPositionM}
+            plateLengthM={plateLengthM}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function Plate3DScene(props: {
   defects: DefectItem[];
   defectTypes: DefectType[];
@@ -792,6 +949,15 @@ export function PlateMap({
           plateLengthM={safePlateLengthM}
           surfaceMode={surfaceMode}
           onSelectDefect={onSelectDefect}
+        />
+      ) : viewMode === 'point-cloud' ? (
+        <PlatePointCloudView
+          defects={defects}
+          defectTypes={defectTypes}
+          selectedDefectId={selectedDefectId}
+          previewPositionM={previewPositionM}
+          plateLengthM={safePlateLengthM}
+          surfaceMode={surfaceMode}
         />
       ) : showAllSurfaces ? (
         <>

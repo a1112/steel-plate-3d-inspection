@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "dev:backend": "node scripts/dev-with-backend.mjs",
     "build": "tsc && vite build",
+    "inspection:configure": "cmake -S ../backend/cpp -B ../backend/cpp/build",
+    "inspection:build": "cmake --build ../backend/cpp/build --config Debug",
     "build:standalone": "npm run capture:configure && npm run capture:build && tauri build",
     "capture:configure": "node scripts/cmake.mjs configure",
     "capture:build": "node scripts/cmake.mjs build",

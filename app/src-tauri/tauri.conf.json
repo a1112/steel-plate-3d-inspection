@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.bkgy.steel-plate-3d-inspection",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "pnpm run dev:backend",
     "devUrl": "http://localhost:1432",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "target/frontend-dist"

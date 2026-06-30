@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { X } from 'lucide-react';
-import { getAllDefects, getMockInspectionSnapshot, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
-import type { DefectItem, Severity } from './data/inspection';
+import { getAllDefects, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
+import type { DefectItem, InspectionSnapshot, Severity } from './data/inspection';
 import type { InspectionUiState } from './state/inspection-ui';
 import {
   createInitialUiState,
@@ -31,6 +31,7 @@ import type { InspectionSettings, ReportFilters, SystemAction } from './state/op
 import { emptyRecordSearchFilters, filterInspectionRecords } from './state/record-search';
 import type { RecordSearchFilters } from './state/record-search';
 import { getResponsiveProfile, getResponsiveProfileClassName } from './state/responsive-layout';
+import { fetchInspectionSnapshot } from './services/inspection-api';
 import { canStartTitlebarDrag } from './lib/titlebar-drag';
 import { getTauriWindowApi } from './lib/tauri-window';
 import { createEmptyCaptureSnapshot, readCaptureSnapshot } from './lib/capture-api';
@@ -82,7 +83,41 @@ function filterDefectsBySelectedSeverities(defects: DefectItem[], selectedSeveri
 }
 
 export default function App() {
-  const snapshot = useMemo(() => getMockInspectionSnapshot(), []);
+  const [snapshot, setSnapshot] = useState<InspectionSnapshot | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchInspectionSnapshot(controller.signal)
+      .then((nextSnapshot) => {
+        setSnapshot(nextSnapshot);
+        setLoadError(null);
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setLoadError(error instanceof Error ? error.message : '后台数据接口不可用');
+      });
+    return () => controller.abort();
+  }, []);
+
+  if (!snapshot) {
+    return (
+      <div className="app-shell theme-dark app-loading-shell">
+        <section className="app-loading-panel" role="status" aria-live="polite">
+          <span>后台数据系统</span>
+          <h1>{loadError ? '后台连接失败' : '正在连接后台数据服务'}</h1>
+          <p>{loadError ?? '正在从 C++ 检测后台获取钢板、缺陷、设备和历史记录数据...'}</p>
+        </section>
+      </div>
+    );
+  }
+
+  return <InspectionDashboard snapshot={snapshot} />;
+}
+
+function InspectionDashboard({ snapshot }: { snapshot: InspectionSnapshot }) {
   const [appMode] = useState(readAppMode);
   const [uiState, setUiState] = useState(() => createInitialUiState(snapshot));
   const [onlineFilters, setOnlineFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
