@@ -8,7 +8,7 @@ type NavKey = InspectionUiState['activeNav'];
 const navItems: Array<{ id: NavKey; label: string; icon: ElementType }> = [
   { id: 'online', label: '在线检测', icon: Gauge },
   { id: 'report', label: '缺陷报表', icon: ClipboardList },
-  { id: 'status', label: '系统状态', icon: MonitorCog },
+  { id: 'status', label: '采集管理', icon: MonitorCog },
 ];
 
 export function TopNav({

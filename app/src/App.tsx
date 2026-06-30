@@ -33,6 +33,7 @@ import type { RecordSearchFilters } from './state/record-search';
 import { getResponsiveProfile, getResponsiveProfileClassName } from './state/responsive-layout';
 import { canStartTitlebarDrag } from './lib/titlebar-drag';
 import { getTauriWindowApi } from './lib/tauri-window';
+import { createEmptyCaptureSnapshot, readCaptureSnapshot } from './lib/capture-api';
 import { BrandHeader } from './components/BrandHeader';
 import { AlarmAnalysis } from './components/AlarmAnalysis';
 import { DefectDetectionList } from './components/DefectDetectionList';
@@ -41,7 +42,7 @@ import { PlateMap } from './components/PlateMap';
 import { ReportPage } from './components/ReportPage';
 import { SettingsPage } from './components/SettingsPage';
 import { StatisticsPanel } from './components/StatisticsPanel';
-import { SystemStatusPage } from './components/SystemStatusPage';
+import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { Toast } from './components/Toast';
 import { TopNav } from './components/TopNav';
 import './styles.css';
@@ -56,6 +57,14 @@ function readViewportSize() {
     return { width: 1676, height: 945 };
   }
   return { width: window.innerWidth, height: window.innerHeight };
+}
+
+function readAppMode() {
+  if (typeof window === 'undefined') {
+    return 'terminal';
+  }
+  const params = new URLSearchParams(window.location.search);
+  return params.get('app') === 'capture' ? 'capture' : 'terminal';
 }
 
 function downloadTextFile(filename: string, content: string, mimeType = 'text/plain;charset=utf-8') {
@@ -74,6 +83,7 @@ function filterDefectsBySelectedSeverities(defects: DefectItem[], selectedSeveri
 
 export default function App() {
   const snapshot = useMemo(() => getMockInspectionSnapshot(), []);
+  const [appMode] = useState(readAppMode);
   const [uiState, setUiState] = useState(() => createInitialUiState(snapshot));
   const [onlineFilters, setOnlineFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
   const [selectedOnlineSeverities, setSelectedOnlineSeverities] = useState<Set<Severity>>(() => new Set(ALL_SEVERITY_FILTERS));
@@ -89,6 +99,7 @@ export default function App() {
   const [viewportSize, setViewportSize] = useState(readViewportSize);
   const [analysisCollapsed, setAnalysisCollapsed] = useState(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [captureSnapshot, setCaptureSnapshot] = useState(() => createEmptyCaptureSnapshot('capture service pending'));
   const windowApi = useMemo(() => getTauriWindowApi(), []);
   const responsiveClassName = getResponsiveProfileClassName(getResponsiveProfile(viewportSize));
 
@@ -111,6 +122,28 @@ export default function App() {
     document.addEventListener('keydown', closeOnEscape);
     return () => document.removeEventListener('keydown', closeOnEscape);
   }, [settingsModalOpen]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshCapture = async () => {
+      try {
+        const snapshot = await readCaptureSnapshot();
+        if (!cancelled) {
+          setCaptureSnapshot(snapshot);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setCaptureSnapshot(createEmptyCaptureSnapshot(error instanceof Error ? error.message : 'capture service offline'));
+        }
+      }
+    };
+    void refreshCapture();
+    const timer = window.setInterval(() => void refreshCapture(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const activeSnapshot = useMemo(() => getPlateInspectionSnapshot(snapshot, uiState.selectedRecordId), [snapshot, uiState.selectedRecordId]);
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
@@ -279,6 +312,23 @@ export default function App() {
     setToast(messages[action]);
   };
 
+  if (appMode === 'capture') {
+    return (
+      <div className={`app-shell theme-${uiState.theme} ${responsiveClassName} capture-standalone-shell`}>
+        <Toast message={toast} tone="success" onClear={() => setToast(null)} />
+        <main className="workspace-page capture-page capture-standalone-page">
+          <CaptureManagementApp
+            status={deviceStatus}
+            operation={operationState}
+            capture={captureSnapshot}
+            onAction={handleSystemAction}
+            className="standalone-capture-manager"
+          />
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className={`app-shell theme-${uiState.theme} ${responsiveClassName}`}>
       <BrandHeader
@@ -412,7 +462,7 @@ export default function App() {
               }}
             />
           ) : (
-            <SystemStatusPage status={deviceStatus} operation={operationState} onAction={handleSystemAction} />
+            <SystemStatusPage status={deviceStatus} operation={operationState} capture={captureSnapshot} onAction={handleSystemAction} />
           )}
         </>
       )}
