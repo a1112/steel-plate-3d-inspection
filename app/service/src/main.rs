@@ -681,11 +681,55 @@ fn build_snapshot_json() -> String {
 
 fn http_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept\r\nConnection: close\r\n\r\n{}",
         body.as_bytes().len(),
         body
     )
     .into_bytes()
+}
+
+fn capture_health_json() -> &'static str {
+    "{\"service\":\"steel-capture-simulated\",\"time\":\"2026-06-14T15:58:22Z\",\"sdkReady\":true,\"sdkCode\":0,\"sdkVersion\":\"sim-6.7.0\",\"connected\":true,\"ip\":\"192.168.10.13\",\"driverId\":\"simulated\",\"driverName\":\"Simulated 3D Camera Driver\",\"cameraCount\":8}"
+}
+
+fn capture_cameras_json() -> &'static str {
+    "{\"cameras\":[{\"ip\":\"192.168.10.13\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM2026061301\",\"driverId\":\"simulated\",\"source\":\"http-service\",\"configured\":true},{\"ip\":\"192.168.10.14\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM2026061302\",\"driverId\":\"simulated\",\"source\":\"http-service\",\"configured\":true},{\"ip\":\"192.168.10.15\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM2026061303\",\"driverId\":\"simulated\",\"source\":\"http-service\",\"configured\":true},{\"ip\":\"192.168.10.16\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM2026061304\",\"driverId\":\"simulated\",\"source\":\"http-service\",\"configured\":true},{\"ip\":\"192.168.10.17\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM2026061305\",\"driverId\":\"simulated\",\"source\":\"http-service\",\"configured\":true},{\"ip\":\"192.168.10.18\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM2026061306\",\"driverId\":\"simulated\",\"source\":\"http-service\",\"configured\":true},{\"ip\":\"192.168.10.19\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM2026061307\",\"driverId\":\"simulated\",\"source\":\"http-service\",\"configured\":true},{\"ip\":\"192.168.10.20\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM2026061308\",\"driverId\":\"simulated\",\"source\":\"http-service\",\"configured\":true}]}"
+}
+
+fn capture_status_json(ip: &str, index: usize) -> String {
+    format!(
+        "{{\"connected\":true,\"deviceId\":{},\"ip\":\"{}\",\"driverId\":\"simulated\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM20260613{:02}\",\"acquisitionState\":\"connected\",\"sdkStatus\":\"ready\",\"fps\":{:.1},\"bufferPercent\":{},\"lastFrameTime\":\"2026-06-14T15:58:{:02}Z\",\"task\":1,\"status\":0,\"linkHealth\":100,\"temperatureJ28\":{:.1},\"temperatureJ29\":{:.1},\"temperatureJ30\":{:.1},\"lostPulseCounter\":{},\"bufferOverflowCounter\":0}}",
+        index + 1,
+        ip,
+        index + 1,
+        21.5 + index as f64 * 0.7,
+        18 + index * 3,
+        12 + index,
+        38.2 + index as f64 * 0.4,
+        39.1 + index as f64 * 0.3,
+        37.6 + index as f64 * 0.5,
+        if index == 2 { 3 } else { 0 }
+    )
+}
+
+fn capture_statuses_json() -> String {
+    let ips = [
+        "192.168.10.13",
+        "192.168.10.14",
+        "192.168.10.15",
+        "192.168.10.16",
+        "192.168.10.17",
+        "192.168.10.18",
+        "192.168.10.19",
+        "192.168.10.20",
+    ];
+    let statuses = ips
+        .iter()
+        .enumerate()
+        .map(|(index, ip)| capture_status_json(ip, index))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"statuses\":[{}]}}", statuses)
 }
 
 fn handle_client(mut stream: TcpStream, snapshot_json: Arc<String>) {
@@ -708,6 +752,42 @@ fn handle_client(mut stream: TcpStream, snapshot_json: Arc<String>) {
             "200 OK",
             "application/json; charset=utf-8",
             "{\"ok\":true,\"service\":\"steel-inspection-service\",\"language\":\"rust\"}",
+        ),
+        ("GET", "/health") => {
+            http_response("200 OK", "application/json; charset=utf-8", capture_health_json())
+        }
+        ("GET", "/api/cameras") => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            capture_cameras_json(),
+        ),
+        ("GET", "/api/camera/status") => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &capture_status_json("192.168.10.13", 0),
+        ),
+        ("GET", "/api/camera/statuses") => {
+            http_response("200 OK", "application/json; charset=utf-8", &capture_statuses_json())
+        }
+        ("POST", "/api/camera/connect") => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            "{\"code\":0,\"connected\":true,\"output\":\"simulated camera connected\"}",
+        ),
+        ("POST", "/api/camera/disconnect") => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            "{\"code\":0,\"connected\":false,\"output\":\"simulated camera disconnected\"}",
+        ),
+        ("POST", "/api/param") => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            "{\"code\":0,\"output\":\"simulated parameter accepted\"}",
+        ),
+        ("POST", "/api/capture/depth-map") => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            "{\"code\":0,\"width\":2048,\"lines\":1280,\"output\":\"simulated depth map captured\"}",
         ),
         ("GET", "/api/inspection/snapshot") => {
             http_response("200 OK", "application/json; charset=utf-8", &snapshot_json)

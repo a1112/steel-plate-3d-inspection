@@ -5529,10 +5529,11 @@ button {
 }
 
 .capture-main {
+  position: relative;
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: 100px auto minmax(0, 1fr);
+  grid-template-rows: 100px minmax(0, 1fr);
   gap: 10px;
 }
 
@@ -5810,6 +5811,11 @@ button {
 }
 
 .capture-message {
+  position: absolute;
+  z-index: 6;
+  top: 110px;
+  right: 0;
+  left: 0;
   min-height: 34px;
   display: flex;
   align-items: center;
@@ -6328,6 +6334,6 @@ button {
   }
 
   .capture-main {
-    grid-template-rows: 156px auto minmax(0, 1fr);
+    grid-template-rows: 156px minmax(0, 1fr);
   }
 }

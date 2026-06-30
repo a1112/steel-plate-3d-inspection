@@ -145,7 +145,12 @@ export type CaptureCommandResult = {
   message?: string;
 };
 
-const CAPTURE_BASE_URL = 'http://127.0.0.1:4317';
+const DEFAULT_CAPTURE_SERVICE_ORIGIN = 'http://127.0.0.1:4873';
+
+function getCaptureServiceOrigin() {
+  const configuredOrigin = import.meta.env.VITE_CAPTURE_SERVICE_ORIGIN || import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN;
+  return configuredOrigin && configuredOrigin.trim().length > 0 ? configuredOrigin : DEFAULT_CAPTURE_SERVICE_ORIGIN;
+}
 
 function hasTauriRuntime() {
   return typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
@@ -159,7 +164,7 @@ async function invokeCapture<T>(command: string, args?: Record<string, unknown>)
 }
 
 async function readJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${CAPTURE_BASE_URL}${path}`);
+  const response = await fetch(`${getCaptureServiceOrigin()}${path}`);
   if (!response.ok) {
     throw new Error(`capture api ${response.status}`);
   }
@@ -167,7 +172,7 @@ async function readJson<T>(path: string): Promise<T> {
 }
 
 async function writeJson<T>(path: string, body: unknown = {}): Promise<T> {
-  const response = await fetch(`${CAPTURE_BASE_URL}${path}`, {
+  const response = await fetch(`${getCaptureServiceOrigin()}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -307,25 +312,28 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
     }
   }
 
-  const [health, camerasResult, status] = await Promise.all([
+  const [health, camerasResult, status, statusesResult] = await Promise.all([
     readJson<CaptureHealth>('/health'),
     readJson<{ cameras: CaptureCamera[] }>('/api/cameras'),
     readJson<CaptureCameraStatus>('/api/camera/status'),
+    readJson<{ statuses: CaptureCameraStatus[] }>('/api/camera/statuses').catch(() => ({ statuses: [] })),
   ]);
 
   const config = createDefaultCaptureConfig();
   const cameras = camerasResult.cameras.map((camera) => ({ ...camera, driverId: 'lvm-nvt', source: 'http-service' }));
   const discoveredByIp = new Map(cameras.map((camera) => [camera.ip, camera]));
+  const statusByIp = new Map(statusesResult.statuses.map((cameraStatus) => [cameraStatus.ip, cameraStatus]));
   const statuses = config.cameras.map((camera) => {
-    if (status.connected && status.ip === camera.ip) {
+    const backendStatus = statusByIp.get(camera.ip) ?? (status.connected && status.ip === camera.ip ? status : null);
+    if (backendStatus) {
       return {
         ...createStatusFromConfig(camera, discoveredByIp.get(camera.ip)),
-        ...status,
+        ...backendStatus,
         driverId: 'lvm-nvt',
         name: camera.name,
         role: camera.role,
         configId: camera.id,
-        acquisitionState: 'connected',
+        acquisitionState: backendStatus.connected ? 'connected' : backendStatus.acquisitionState,
         sdkStatus: health.sdkReady ? 'ready' : 'error',
       };
     }
