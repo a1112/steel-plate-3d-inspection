@@ -4,8 +4,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const clientDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const repoDir = resolve(clientDir, '..', '..');
 const serviceDir = resolve(clientDir, '..', 'service');
-const serviceBinary = resolve(serviceDir, 'target', 'debug', process.platform === 'win32' ? 'steel-inspection-service.exe' : 'steel-inspection-service');
+const cargoTargetDir = resolve(repoDir, 'target', 'cargo');
+const serviceBinary = resolve(cargoTargetDir, 'debug', process.platform === 'win32' ? 'steel-inspection-service.exe' : 'steel-inspection-service');
 const servicePort = process.env.INSPECTION_SERVICE_PORT ?? '4873';
 
 const children = new Set();
@@ -16,6 +18,7 @@ function run(command, args, options = {}) {
     stdio: 'inherit',
     env: {
       ...process.env,
+      CARGO_TARGET_DIR: cargoTargetDir,
       INSPECTION_SERVICE_PORT: servicePort,
       VITE_INSPECTION_SERVICE_ORIGIN: `http://127.0.0.1:${servicePort}`,
     },

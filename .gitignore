@@ -1,13 +1,9 @@
 node_modules/
 dist/
-src-tauri/target/
 src-tauri/gen/
 app/client/node_modules/
-app/client/src-tauri/target/
 app/client/src-tauri/gen/
-app/capture/build/
-app/capture/bin/
-app/service/target/
+target/
 .vite/
 *.log
 *.local

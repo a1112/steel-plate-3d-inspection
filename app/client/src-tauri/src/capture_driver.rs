@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::{c_char, c_float, c_int, c_void, CStr, CString},
+    fs,
+    path::PathBuf,
     ptr,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -18,6 +20,9 @@ const MALLOC_FAILED: c_int = 40009;
 const DEVICE_NET_INFO_LEN: usize = 16;
 const LVM_DRIVER_ID: &str = "lvm-nvt";
 const LVM_DRIVER_NAME: &str = "LVM/NVT 3D Camera SDK";
+const SIM_DRIVER_ID: &str = "simulated";
+const SIM_DRIVER_NAME: &str = "Simulated 3D Camera Driver";
+const SIM_CAMERA_MODEL: &str = "SIM-LVM-3D-2048";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1281,6 +1286,609 @@ impl CameraDriverBackend for LvmNvtDriver {
     }
 }
 
+#[derive(Clone)]
+struct SimulatedCameraRuntime {
+    connected: bool,
+    exposure_us: i32,
+    gain: f32,
+    depth_lines: i32,
+    frame_counter: u32,
+    last_frame_time: Option<String>,
+}
+
+struct SimulatedCameraDriver {
+    applied_config: CaptureAppliedConfig,
+    runtime: HashMap<String, SimulatedCameraRuntime>,
+    logs: Vec<CaptureLogEvent>,
+    next_log_index: u32,
+}
+
+impl SimulatedCameraDriver {
+    fn new() -> Self {
+        let applied_config = simulated_capture_config();
+        let runtime = applied_config
+            .cameras
+            .iter()
+            .filter(|camera| camera.enabled)
+            .map(|camera| {
+                (
+                    camera.ip.clone(),
+                    SimulatedCameraRuntime {
+                        connected: true,
+                        exposure_us: camera.exposure_us,
+                        gain: camera.gain,
+                        depth_lines: camera.depth_lines,
+                        frame_counter: 1,
+                        last_frame_time: Some(now_millis_string()),
+                    },
+                )
+            })
+            .collect();
+        let mut driver = Self {
+            applied_config,
+            runtime,
+            logs: Vec::new(),
+            next_log_index: 1,
+        };
+        driver.push_log("info", None, "simulated camera backend initialized");
+        driver
+    }
+
+    fn push_log(
+        &mut self,
+        level: impl Into<String>,
+        camera_ip: Option<String>,
+        message: impl Into<String>,
+    ) {
+        let event = CaptureLogEvent {
+            id: format!("SIM-{index:04}", index = self.next_log_index),
+            time: now_millis_string(),
+            level: level.into(),
+            camera_ip,
+            message: message.into(),
+        };
+        self.next_log_index += 1;
+        self.logs.insert(0, event);
+        self.logs.truncate(80);
+    }
+
+    fn driver_info(&self) -> CaptureDriverInfo {
+        CaptureDriverInfo {
+            id: SIM_DRIVER_ID.to_string(),
+            name: SIM_DRIVER_NAME.to_string(),
+            vendor: "Built-in simulator".to_string(),
+            transport: "Memory/Mock".to_string(),
+            sdk_version: "simulated-1.0".to_string(),
+            supported_models: vec![SIM_CAMERA_MODEL.to_string(), "SIM-LVM-3D-4096".to_string()],
+            features: vec![
+                "discover".to_string(),
+                "multi-connect".to_string(),
+                "parameters".to_string(),
+                "depth-map".to_string(),
+                "status-readback".to_string(),
+                "simulation".to_string(),
+            ],
+        }
+    }
+
+    fn simulated_camera_from_config(&self, config: &CaptureCameraConfig) -> CaptureCamera {
+        CaptureCamera {
+            ip: config.ip.clone(),
+            model: config.model_hint.clone(),
+            sn: format!("SIM-{}", config.id.replace("CAM-", "")),
+            driver_id: SIM_DRIVER_ID.to_string(),
+            source: "simulation".to_string(),
+            configured: true,
+        }
+    }
+
+    fn selected_ip(&self, ip: Option<&str>) -> Option<String> {
+        if let Some(ip) = ip {
+            return self
+                .runtime
+                .get(ip)
+                .filter(|runtime| runtime.connected)
+                .map(|_| ip.to_string());
+        }
+        self.runtime
+            .iter()
+            .find(|(_, runtime)| runtime.connected)
+            .map(|(ip, _)| ip.clone())
+    }
+
+    fn status_from_config(&self, config: &CaptureCameraConfig) -> CaptureCameraStatus {
+        let runtime = self.runtime.get(&config.ip);
+        let connected = config.enabled && runtime.map(|runtime| runtime.connected).unwrap_or(false);
+        let seed = simulated_seed(&config.ip);
+        let frame_counter = runtime.map(|runtime| runtime.frame_counter).unwrap_or(0);
+        let pulse_warning = connected && seed % 7 == 0;
+        let overflow_warning = connected && seed % 11 == 0;
+        let fps_base = 48.0 + (seed % 90) as f32 / 10.0;
+        let buffer_base = 34.0 + ((seed + frame_counter) % 45) as f32;
+
+        CaptureCameraStatus {
+            connected,
+            device_id: simulated_device_id(&config.ip),
+            ip: config.ip.clone(),
+            driver_id: SIM_DRIVER_ID.to_string(),
+            model: config.model_hint.clone(),
+            sn: format!("SIM-{}", config.id.replace("CAM-", "")),
+            config_id: Some(config.id.clone()),
+            name: Some(config.name.clone()),
+            role: Some(config.role.clone()),
+            enabled: config.enabled,
+            acquisition_state: if !config.enabled {
+                "disabled"
+            } else if connected {
+                "connected"
+            } else {
+                "discovered"
+            }
+            .to_string(),
+            sdk_status: "ready".to_string(),
+            fps: connected.then_some(fps_base),
+            buffer_percent: Some(if connected {
+                buffer_base.min(96.0)
+            } else {
+                0.0
+            }),
+            last_frame_time: runtime.and_then(|runtime| runtime.last_frame_time.clone()),
+            task: connected.then_some(1),
+            status: connected.then_some(0),
+            link_health: connected.then_some(if pulse_warning { 1 } else { 0 }),
+            temperature_j28: connected.then_some(36.0 + (seed % 50) as f32 / 10.0),
+            temperature_j29: connected.then_some(37.5 + (seed % 45) as f32 / 10.0),
+            temperature_j30: connected.then_some(38.0 + (seed % 40) as f32 / 10.0),
+            lost_pulse_counter: connected.then_some(if pulse_warning { seed % 5 + 1 } else { 0 }),
+            buffer_overflow_counter: connected.then_some(if overflow_warning { 1 } else { 0 }),
+            error: if config.enabled {
+                None
+            } else {
+                Some("camera disabled".to_string())
+            },
+        }
+    }
+
+    fn empty_status(&self, ip: Option<String>) -> CaptureCameraStatus {
+        CaptureCameraStatus {
+            connected: false,
+            device_id: -1,
+            ip: ip.unwrap_or_default(),
+            driver_id: SIM_DRIVER_ID.to_string(),
+            model: SIM_CAMERA_MODEL.to_string(),
+            sn: String::new(),
+            config_id: None,
+            name: None,
+            role: None,
+            enabled: false,
+            acquisition_state: "offline".to_string(),
+            sdk_status: "ready".to_string(),
+            fps: None,
+            buffer_percent: Some(0.0),
+            last_frame_time: None,
+            task: None,
+            status: None,
+            link_health: None,
+            temperature_j28: None,
+            temperature_j29: None,
+            temperature_j30: None,
+            lost_pulse_counter: None,
+            buffer_overflow_counter: None,
+            error: Some("simulated camera not found".to_string()),
+        }
+    }
+
+    fn apply_runtime_config(&mut self) {
+        for config in &self.applied_config.cameras {
+            if !config.enabled {
+                if let Some(runtime) = self.runtime.get_mut(&config.ip) {
+                    runtime.connected = false;
+                }
+                continue;
+            }
+            let runtime =
+                self.runtime
+                    .entry(config.ip.clone())
+                    .or_insert_with(|| SimulatedCameraRuntime {
+                        connected: false,
+                        exposure_us: config.exposure_us,
+                        gain: config.gain,
+                        depth_lines: config.depth_lines,
+                        frame_counter: 0,
+                        last_frame_time: None,
+                    });
+            runtime.exposure_us = config.exposure_us;
+            runtime.gain = config.gain;
+            runtime.depth_lines = config.depth_lines;
+        }
+    }
+}
+
+impl CameraDriverBackend for SimulatedCameraDriver {
+    fn health(&mut self) -> CaptureHealth {
+        let connected_ips = self
+            .runtime
+            .iter()
+            .filter(|(_, runtime)| runtime.connected)
+            .map(|(ip, _)| ip.clone())
+            .collect::<Vec<_>>();
+        CaptureHealth {
+            service: "tauri_capture_driver_simulated".to_string(),
+            time: now_millis_string(),
+            sdk_ready: true,
+            sdk_code: CORRECT,
+            sdk_version: "simulated-1.0".to_string(),
+            connected: !connected_ips.is_empty(),
+            ip: connected_ips.first().cloned().unwrap_or_default(),
+            driver_id: SIM_DRIVER_ID.to_string(),
+            driver_name: SIM_DRIVER_NAME.to_string(),
+            camera_count: connected_ips.len(),
+        }
+    }
+
+    fn cameras(&mut self) -> CaptureCameraList {
+        let cameras = self
+            .applied_config
+            .cameras
+            .iter()
+            .filter(|camera| camera.enabled)
+            .map(|camera| self.simulated_camera_from_config(camera))
+            .collect::<Vec<_>>();
+        CaptureCameraList {
+            code: CORRECT,
+            count: cameras.len(),
+            cameras,
+        }
+    }
+
+    fn statuses(&mut self) -> CaptureStatusList {
+        let statuses = self
+            .applied_config
+            .cameras
+            .iter()
+            .map(|config| self.status_from_config(config))
+            .collect::<Vec<_>>();
+        CaptureStatusList {
+            code: CORRECT,
+            count: statuses.len(),
+            statuses,
+        }
+    }
+
+    fn status(&mut self, ip: Option<String>) -> CaptureCameraStatus {
+        if let Some(ip) = ip {
+            return self
+                .applied_config
+                .cameras
+                .iter()
+                .find(|config| config.ip == ip)
+                .map(|config| self.status_from_config(config))
+                .unwrap_or_else(|| self.empty_status(Some(ip)));
+        }
+        self.statuses()
+            .statuses
+            .into_iter()
+            .find(|status| status.connected)
+            .or_else(|| self.statuses().statuses.into_iter().next())
+            .unwrap_or_else(|| self.empty_status(None))
+    }
+
+    fn connect(&mut self, ip: String, _dev_type: Option<i32>) -> CaptureCommandResult {
+        let Some(config) = self
+            .applied_config
+            .cameras
+            .iter()
+            .find(|camera| camera.ip == ip)
+            .cloned()
+        else {
+            return command_error(404, format!("simulated camera {ip} not configured"));
+        };
+        if !config.enabled {
+            return command_error(403, format!("simulated camera {ip} is disabled"));
+        }
+
+        let runtime = self
+            .runtime
+            .entry(ip.clone())
+            .or_insert_with(|| SimulatedCameraRuntime {
+                connected: false,
+                exposure_us: config.exposure_us,
+                gain: config.gain,
+                depth_lines: config.depth_lines,
+                frame_counter: 0,
+                last_frame_time: None,
+            });
+        runtime.connected = true;
+        runtime.last_frame_time = Some(now_millis_string());
+        self.push_log("info", Some(ip.clone()), "simulated camera connected");
+
+        CaptureCommandResult {
+            code: CORRECT,
+            connected: Some(true),
+            ip: Some(ip),
+            key: None,
+            output: None,
+            width: None,
+            lines: None,
+            error: None,
+            message: Some("simulated camera connected".to_string()),
+        }
+    }
+
+    fn disconnect(&mut self, ip: Option<String>) -> CaptureCommandResult {
+        let targets = ip
+            .clone()
+            .map(|ip| vec![ip])
+            .unwrap_or_else(|| self.runtime.keys().cloned().collect::<Vec<_>>());
+        for target_ip in targets {
+            if let Some(runtime) = self.runtime.get_mut(&target_ip) {
+                runtime.connected = false;
+                self.push_log("info", Some(target_ip), "simulated camera disconnected");
+            }
+        }
+        CaptureCommandResult {
+            code: CORRECT,
+            connected: Some(false),
+            ip,
+            key: None,
+            output: None,
+            width: None,
+            lines: None,
+            error: None,
+            message: Some("simulated camera disconnected".to_string()),
+        }
+    }
+
+    fn set_param(
+        &mut self,
+        ip: Option<String>,
+        key: String,
+        _type_name: String,
+        value: f64,
+    ) -> CaptureCommandResult {
+        let Some(target_ip) = self.selected_ip(ip.as_deref()) else {
+            return command_error(DEV_NOT_LINK_ERROR, "simulated camera not connected");
+        };
+        let Some(runtime) = self.runtime.get_mut(&target_ip) else {
+            return command_error(404, "simulated camera not found");
+        };
+        match key.as_str() {
+            "ExposureTime" => runtime.exposure_us = value.round().clamp(1.0, 20000.0) as i32,
+            "GainK" => runtime.gain = value.clamp(0.0, 16.0) as f32,
+            "DepthLines" => runtime.depth_lines = value.round().clamp(64.0, 8192.0) as i32,
+            _ => {
+                self.push_log(
+                    "warning",
+                    Some(target_ip.clone()),
+                    format!("unknown simulated parameter ignored: {key}"),
+                );
+            }
+        }
+        self.push_log(
+            "info",
+            Some(target_ip.clone()),
+            format!("simulated parameter {key}={value:.2} applied"),
+        );
+
+        CaptureCommandResult {
+            code: CORRECT,
+            connected: None,
+            ip: Some(target_ip),
+            key: Some(key),
+            output: None,
+            width: None,
+            lines: None,
+            error: None,
+            message: Some("simulated parameter applied".to_string()),
+        }
+    }
+
+    fn capture_depth_map(
+        &mut self,
+        ip: Option<String>,
+        lines: Option<i32>,
+        output: Option<String>,
+        _timeout_ms: Option<i32>,
+    ) -> CaptureCommandResult {
+        let Some(target_ip) = self.selected_ip(ip.as_deref()) else {
+            return command_error(DEV_NOT_LINK_ERROR, "simulated camera not connected");
+        };
+        let Some(runtime) = self.runtime.get_mut(&target_ip) else {
+            return command_error(404, "simulated camera not found");
+        };
+
+        let height = lines.unwrap_or(runtime.depth_lines).clamp(64, 2048);
+        let width = 512;
+        runtime.frame_counter = runtime.frame_counter.saturating_add(1);
+        runtime.last_frame_time = Some(now_millis_string());
+        let frame_counter = runtime.frame_counter;
+        let output = normalize_simulated_output_path(
+            output.unwrap_or_else(|| format!("captures/{}/depth.pgm", target_ip.replace('.', "-"))),
+        );
+
+        if let Err(error) =
+            write_simulated_depth_map(&output, width, height, &target_ip, frame_counter)
+        {
+            self.push_log(
+                "error",
+                Some(target_ip.clone()),
+                format!("simulated depth map failed: {error}"),
+            );
+            return command_error(500, error);
+        }
+
+        self.push_log(
+            "info",
+            Some(target_ip.clone()),
+            format!("simulated depth map captured: {output}"),
+        );
+
+        CaptureCommandResult {
+            code: CORRECT,
+            connected: None,
+            ip: Some(target_ip),
+            key: None,
+            output: Some(output),
+            width: Some(width),
+            lines: Some(height),
+            error: None,
+            message: Some("simulated depth map captured".to_string()),
+        }
+    }
+
+    fn apply_config(&mut self, mut config: CaptureAppliedConfig) -> CaptureCommandResult {
+        if config.cameras.is_empty() {
+            return command_error(400, "config has no cameras");
+        }
+        for camera in &mut config.cameras {
+            camera.driver_id = SIM_DRIVER_ID.to_string();
+            if camera.model_hint.trim().is_empty()
+                || camera.model_hint == "LVM compatible 3D camera"
+            {
+                camera.model_hint = SIM_CAMERA_MODEL.to_string();
+            }
+        }
+        config.applied = true;
+        config.updated_at = now_millis_string();
+        let name = config.name.clone();
+        self.applied_config = config;
+        self.apply_runtime_config();
+        self.push_log("info", None, format!("simulated config applied: {name}"));
+
+        CaptureCommandResult {
+            code: CORRECT,
+            connected: None,
+            ip: None,
+            key: None,
+            output: None,
+            width: None,
+            lines: None,
+            error: None,
+            message: Some("simulated config applied".to_string()),
+        }
+    }
+
+    fn capabilities(&self) -> CaptureCapabilitySet {
+        CaptureCapabilitySet {
+            driver: self.driver_info(),
+            controls: vec![
+                CaptureControlCapability {
+                    id: "connect".to_string(),
+                    label: "Connect simulated camera".to_string(),
+                    scope: "camera".to_string(),
+                    requires_connection: false,
+                },
+                CaptureControlCapability {
+                    id: "disconnect".to_string(),
+                    label: "Disconnect simulated camera".to_string(),
+                    scope: "camera".to_string(),
+                    requires_connection: true,
+                },
+                CaptureControlCapability {
+                    id: "capture_depth_map".to_string(),
+                    label: "Capture simulated depth map".to_string(),
+                    scope: "camera".to_string(),
+                    requires_connection: true,
+                },
+                CaptureControlCapability {
+                    id: "apply_config".to_string(),
+                    label: "Apply simulated configuration".to_string(),
+                    scope: "system".to_string(),
+                    requires_connection: false,
+                },
+            ],
+            parameters: vec![
+                CaptureParameterCapability {
+                    key: "ExposureTime".to_string(),
+                    label: "Exposure".to_string(),
+                    value_type: "int".to_string(),
+                    unit: "us".to_string(),
+                    min: Some(1.0),
+                    max: Some(20000.0),
+                    writable: true,
+                },
+                CaptureParameterCapability {
+                    key: "GainK".to_string(),
+                    label: "Gain".to_string(),
+                    value_type: "float".to_string(),
+                    unit: "x".to_string(),
+                    min: Some(0.0),
+                    max: Some(16.0),
+                    writable: true,
+                },
+                CaptureParameterCapability {
+                    key: "DepthLines".to_string(),
+                    label: "Depth lines".to_string(),
+                    value_type: "int".to_string(),
+                    unit: "line".to_string(),
+                    min: Some(64.0),
+                    max: Some(8192.0),
+                    writable: true,
+                },
+            ],
+            api: vec![
+                CaptureApiCapability {
+                    method: "GET".to_string(),
+                    path: "capture_driver_snapshot".to_string(),
+                    label: "Snapshot".to_string(),
+                    scope: "system".to_string(),
+                },
+                CaptureApiCapability {
+                    method: "GET".to_string(),
+                    path: "capture_driver_statuses".to_string(),
+                    label: "Simulated camera statuses".to_string(),
+                    scope: "camera".to_string(),
+                },
+                CaptureApiCapability {
+                    method: "POST".to_string(),
+                    path: "capture_driver_connect".to_string(),
+                    label: "Connect simulated camera".to_string(),
+                    scope: "camera".to_string(),
+                },
+                CaptureApiCapability {
+                    method: "POST".to_string(),
+                    path: "capture_driver_set_param".to_string(),
+                    label: "Set simulated parameter".to_string(),
+                    scope: "camera".to_string(),
+                },
+                CaptureApiCapability {
+                    method: "POST".to_string(),
+                    path: "capture_driver_capture_depth_map".to_string(),
+                    label: "Capture simulated depth map".to_string(),
+                    scope: "camera".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn logs(&self) -> Vec<CaptureLogEvent> {
+        self.logs.clone()
+    }
+
+    fn snapshot(&mut self) -> CaptureSnapshot {
+        let health = self.health();
+        let camera_list = self.cameras();
+        let status_list = self.statuses();
+        let status = status_list
+            .statuses
+            .iter()
+            .find(|status| status.connected)
+            .cloned()
+            .or_else(|| status_list.statuses.first().cloned())
+            .unwrap_or_else(|| self.empty_status(None));
+        CaptureSnapshot {
+            health,
+            driver: self.driver_info(),
+            config: self.applied_config.clone(),
+            cameras: camera_list.cameras,
+            status,
+            statuses: status_list.statuses,
+            capabilities: self.capabilities(),
+            logs: self.logs(),
+        }
+    }
+}
+
 pub struct CaptureDriver {
     backend: Mutex<Box<dyn CameraDriverBackend + Send>>,
 }
@@ -1288,7 +1896,7 @@ pub struct CaptureDriver {
 impl CaptureDriver {
     pub fn new() -> Self {
         Self {
-            backend: Mutex::new(Box::new(LvmNvtDriver::new())),
+            backend: Mutex::new(create_capture_backend()),
         }
     }
 
@@ -1329,6 +1937,110 @@ fn command_error(code: i32, error: impl Into<String>) -> CaptureCommandResult {
         error: Some(error.into()),
         message: None,
     }
+}
+
+fn create_capture_backend() -> Box<dyn CameraDriverBackend + Send> {
+    let requested = std::env::var("STEEL_CAPTURE_DRIVER")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match requested.as_str() {
+        "mock" | "sim" | "simulated" => Box::new(SimulatedCameraDriver::new()),
+        "lvm" | "lvm-nvt" | "real" => Box::new(LvmNvtDriver::new()),
+        _ => default_capture_backend(),
+    }
+}
+
+fn default_capture_backend() -> Box<dyn CameraDriverBackend + Send> {
+    #[cfg(capture_sdk)]
+    {
+        Box::new(LvmNvtDriver::new())
+    }
+    #[cfg(not(capture_sdk))]
+    {
+        Box::new(SimulatedCameraDriver::new())
+    }
+}
+
+fn simulated_capture_config() -> CaptureAppliedConfig {
+    let mut config = default_capture_config();
+    config.id = "simulated-plate-a-online".to_string();
+    config.name = "Simulated-Plate-A-Online".to_string();
+    for camera in &mut config.cameras {
+        camera.driver_id = SIM_DRIVER_ID.to_string();
+        camera.model_hint = SIM_CAMERA_MODEL.to_string();
+        camera.trigger_mode = "Software trigger".to_string();
+        camera.output_path = format!("captures/simulated/{}", camera.id);
+    }
+    config
+}
+
+fn simulated_seed(ip: &str) -> u32 {
+    ip.bytes().fold(0_u32, |seed, byte| {
+        seed.wrapping_mul(31).wrapping_add(byte as u32)
+    })
+}
+
+fn simulated_device_id(ip: &str) -> i32 {
+    1000 + (simulated_seed(ip) % 8000) as i32
+}
+
+fn normalize_simulated_output_path(output: String) -> String {
+    let mut path = PathBuf::from(output);
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("png"))
+        .unwrap_or(false)
+    {
+        path.set_extension("pgm");
+    }
+    path.to_string_lossy().into_owned()
+}
+
+fn write_simulated_depth_map(
+    output: &str,
+    width: i32,
+    height: i32,
+    ip: &str,
+    frame_index: u32,
+) -> Result<(), String> {
+    let width = width.max(64) as usize;
+    let height = height.max(64) as usize;
+    let path = PathBuf::from(output);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let seed = simulated_seed(ip).wrapping_add(frame_index);
+    let pit_x = (width as u32 / 3 + seed % (width as u32 / 4).max(1)) as i32;
+    let pit_y = (height as u32 / 2 + seed % (height as u32 / 5).max(1)) as i32;
+    let ridge_x = (width as u32 * 3 / 4).min(width as u32 - 1) as i32;
+    let mut bytes = format!("P5\n{width} {height}\n255\n").into_bytes();
+
+    for y in 0..height {
+        for x in 0..width {
+            let x_i = x as i32;
+            let y_i = y as i32;
+            let texture = ((x as u32 * 17 + y as u32 * 11 + seed) % 33) as i32 - 16;
+            let stripe = if (x as u32 + seed) % 73 < 3 { 24 } else { 0 };
+            let pit_dx = x_i - pit_x;
+            let pit_dy = y_i - pit_y;
+            let pit = if pit_dx * pit_dx + pit_dy * pit_dy < 38 * 38 {
+                -76
+            } else {
+                0
+            };
+            let ridge = if (x_i - ridge_x).abs() < 8 { 42 } else { 0 };
+            let wave = (((x as u32 / 9 + y as u32 / 13 + seed) % 9) as i32 - 4) * 3;
+            let value = (132 + texture + stripe + pit + ridge + wave).clamp(0, 255) as u8;
+            bytes.push(value);
+        }
+    }
+
+    fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
 fn default_capture_config() -> CaptureAppliedConfig {
@@ -1454,4 +2166,49 @@ pub fn capture_driver_capabilities(
 #[tauri::command]
 pub fn capture_driver_logs(driver: tauri::State<'_, CaptureDriver>) -> Vec<CaptureLogEvent> {
     driver.with_backend(|backend| backend.logs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulated_backend_serves_status_and_depth_map() {
+        let mut driver = SimulatedCameraDriver::new();
+        let snapshot = driver.snapshot();
+
+        assert_eq!(snapshot.driver.id, SIM_DRIVER_ID);
+        assert!(snapshot.health.sdk_ready);
+        assert_eq!(snapshot.cameras.len(), 8);
+
+        let ip = snapshot.cameras[0].ip.clone();
+        let disconnect = driver.disconnect(Some(ip.clone()));
+        assert_eq!(disconnect.code, CORRECT);
+        assert!(!driver.status(Some(ip.clone())).connected);
+
+        let connect = driver.connect(ip.clone(), None);
+        assert_eq!(connect.code, CORRECT);
+        assert_eq!(connect.connected, Some(true));
+
+        let requested_output = std::env::temp_dir().join(format!(
+            "steel-sim-depth-{}-{}.png",
+            std::process::id(),
+            now_millis_string()
+        ));
+        let capture = driver.capture_depth_map(
+            Some(ip),
+            Some(96),
+            Some(requested_output.to_string_lossy().into_owned()),
+            Some(100),
+        );
+
+        assert_eq!(capture.code, CORRECT);
+        assert_eq!(capture.width, Some(512));
+        assert_eq!(capture.lines, Some(96));
+        let output = capture.output.expect("simulated output path");
+        assert!(output.ends_with(".pgm"));
+        let data = fs::read(&output).expect("simulated depth map exists");
+        assert!(data.starts_with(b"P5\n512 96\n255\n"));
+        let _ = fs::remove_file(output);
+    }
 }

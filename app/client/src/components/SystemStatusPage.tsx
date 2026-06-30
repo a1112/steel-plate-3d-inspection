@@ -246,7 +246,7 @@ function ConfigTable({
                   <select value={camera.driverId} onChange={(event) => onChange(camera.id, { driverId: event.target.value })}>
                     <option value="lvm-nvt">LVM/NVT</option>
                     <option value="generic-gige">Generic GigE</option>
-                    <option value="simulated">Simulated</option>
+                    <option value="simulated">模拟相机</option>
                   </select>
                 </td>
                 <td>
@@ -572,7 +572,7 @@ export function CaptureManagementApp({
                   <select value={selectedConfig.driverId} onChange={(event) => updateCameraConfig(selectedConfig.id, { driverId: event.target.value })}>
                     <option value="lvm-nvt">LVM/NVT</option>
                     <option value="generic-gige">Generic GigE</option>
-                    <option value="simulated">Simulated</option>
+                    <option value="simulated">模拟相机</option>
                   </select>
                 </label>
                 <label>

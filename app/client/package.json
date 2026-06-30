@@ -8,11 +8,11 @@
     "dev:service": "node scripts/dev-with-service.mjs",
     "build": "tsc && vite build",
     "service:build": "cargo build --manifest-path ../service/Cargo.toml",
-    "service:start": "../service/target/debug/steel-inspection-service",
+    "service:start": "../../target/cargo/debug/steel-inspection-service",
     "build:standalone": "npm run capture:configure && npm run capture:build && tauri build",
     "capture:configure": "node scripts/cmake.mjs configure",
     "capture:build": "node scripts/cmake.mjs build",
-    "capture:start": "../capture/build/Release/steel_capture_service.exe --port 4317",
+    "capture:start": "../../target/capture/Release/steel_capture_service.exe --port 4317",
     "test": "vitest run",
     "test:watch": "vitest",
     "tauri": "tauri"

@@ -8,8 +8,8 @@ const mode = process.argv[2] ?? 'configure';
 
 const args =
   mode === 'build'
-    ? ['--build', '../capture/build', '--config', 'Release']
-    : ['-S', '../capture', '-B', '../capture/build', '-A', 'x64'];
+    ? ['--build', '../../target/capture', '--config', 'Release']
+    : ['-S', '../capture', '-B', '../../target/capture', '-A', 'x64'];
 
 const result = spawnSync(cmake, args, { stdio: 'inherit', shell: false });
 process.exit(result.status ?? 1);

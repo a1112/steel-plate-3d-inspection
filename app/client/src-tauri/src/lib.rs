@@ -55,50 +55,34 @@ fn find_capture_service_exe() -> Option<PathBuf> {
         if let Some(exe_dir) = current_exe.parent() {
             candidates.push(exe_dir.join("steel_capture_service.exe"));
             candidates.push(exe_dir.join("capture").join("steel_capture_service.exe"));
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("..")
-                    .join("..")
-                    .join("capture")
-                    .join("build")
-                    .join("Release")
-                    .join("steel_capture_service.exe"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("..")
-                    .join("..")
-                    .join("..")
-                    .join("capture")
-                    .join("build")
-                    .join("Release")
-                    .join("steel_capture_service.exe"),
-            );
+            push_capture_target_candidates(&mut candidates, exe_dir);
         }
     }
     if let Ok(current_dir) = std::env::current_dir() {
-        candidates.push(
-            current_dir
-                .join("capture")
-                .join("build")
-                .join("Release")
-                .join("steel_capture_service.exe"),
-        );
-        candidates.push(
-            current_dir
-                .join("..")
-                .join("capture")
-                .join("build")
-                .join("Release")
-                .join("steel_capture_service.exe"),
-        );
+        push_capture_target_candidates(&mut candidates, &current_dir);
     }
 
     candidates
         .into_iter()
         .find(|path| normalize_path(path).is_file())
+}
+
+fn push_capture_target_candidates(candidates: &mut Vec<PathBuf>, base: &Path) {
+    for ancestor in base.ancestors().take(8) {
+        candidates.push(
+            ancestor
+                .join("target")
+                .join("capture")
+                .join("Release")
+                .join("steel_capture_service.exe"),
+        );
+        candidates.push(
+            ancestor
+                .join("capture")
+                .join("Release")
+                .join("steel_capture_service.exe"),
+        );
+    }
 }
 
 fn normalize_path(path: &Path) -> PathBuf {

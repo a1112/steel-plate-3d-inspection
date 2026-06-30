@@ -4,6 +4,7 @@ import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  cacheDir: '../../target/client/vite-cache',
   server: {
     host: '0.0.0.0',
     port: 1432,
@@ -22,7 +23,7 @@ export default defineConfig({
     setupFiles: './src/test/setup.ts',
   },
   build: {
-    outDir: 'src-tauri/target/frontend-dist',
+    outDir: '../../target/client/frontend-dist',
     emptyOutDir: true,
     rollupOptions: {
       output: {

@@ -5,8 +5,8 @@ Local C++ service for Capture 6.7.0.4 LVM 3D camera control.
 ## Build
 
 ```powershell
-cmake -S app/capture -B app/capture/build -A x64
-cmake --build app/capture/build --config Release
+cmake -S app/capture -B target/capture -A x64
+cmake --build target/capture --config Release
 ```
 
 The build links against:
@@ -16,7 +16,7 @@ The build links against:
 ## Run
 
 ```powershell
-app/capture/build/Release/steel_capture_service.exe --port 4317
+target/capture/Release/steel_capture_service.exe --port 4317
 ```
 
 ## API
