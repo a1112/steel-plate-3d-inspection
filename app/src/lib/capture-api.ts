@@ -1,0 +1,411 @@
+import { invoke } from '@tauri-apps/api/core';
+
+export type CaptureDriverInfo = {
+  id: string;
+  name: string;
+  vendor: string;
+  transport: string;
+  sdkVersion: string;
+  supportedModels: string[];
+  features: string[];
+};
+
+export type CaptureCamera = {
+  ip: string;
+  model: string;
+  sn: string;
+  driverId?: string;
+  source?: string;
+  configured?: boolean;
+};
+
+export type CaptureHealth = {
+  service: string;
+  time: string;
+  sdkReady: boolean;
+  sdkCode: number;
+  sdkVersion?: string;
+  connected: boolean;
+  ip: string;
+  driverId?: string;
+  driverName?: string;
+  cameraCount?: number;
+};
+
+export type CaptureCameraStatus = {
+  connected: boolean;
+  deviceId: number;
+  ip: string;
+  driverId?: string;
+  model?: string;
+  sn?: string;
+  configId?: string | null;
+  name?: string | null;
+  role?: string | null;
+  enabled?: boolean;
+  acquisitionState?: 'connected' | 'discovered' | 'offline' | 'disabled' | string;
+  sdkStatus?: string;
+  fps?: number | null;
+  bufferPercent?: number | null;
+  lastFrameTime?: string | null;
+  task?: number;
+  status?: number;
+  linkHealth?: number;
+  temperatureJ28?: number;
+  temperatureJ29?: number;
+  temperatureJ30?: number;
+  lostPulseCounter?: number;
+  bufferOverflowCounter?: number;
+  error?: string | null;
+};
+
+export type CaptureCameraConfig = {
+  id: string;
+  name: string;
+  ip: string;
+  driverId: string;
+  modelHint: string;
+  role: string;
+  enabled: boolean;
+  triggerMode: string;
+  exposureUs: number;
+  gain: number;
+  depthLines: number;
+  outputPath: string;
+};
+
+export type CaptureAppliedConfig = {
+  id: string;
+  name: string;
+  applied: boolean;
+  updatedAt: string;
+  cameras: CaptureCameraConfig[];
+};
+
+export type CaptureControlCapability = {
+  id: string;
+  label: string;
+  scope: string;
+  requiresConnection: boolean;
+};
+
+export type CaptureParameterCapability = {
+  key: string;
+  label: string;
+  valueType: 'int' | 'float' | string;
+  unit: string;
+  min?: number | null;
+  max?: number | null;
+  writable: boolean;
+};
+
+export type CaptureApiCapability = {
+  method: string;
+  path: string;
+  label: string;
+  scope: string;
+};
+
+export type CaptureCapabilitySet = {
+  driver: CaptureDriverInfo;
+  controls: CaptureControlCapability[];
+  parameters: CaptureParameterCapability[];
+  api: CaptureApiCapability[];
+};
+
+export type CaptureLogEvent = {
+  id: string;
+  time: string;
+  level: 'info' | 'warning' | 'error' | string;
+  cameraIp?: string | null;
+  message: string;
+};
+
+export type CaptureSnapshot = {
+  health: CaptureHealth | null;
+  driver: CaptureDriverInfo;
+  config: CaptureAppliedConfig;
+  cameras: CaptureCamera[];
+  status: CaptureCameraStatus | null;
+  statuses: CaptureCameraStatus[];
+  capabilities: CaptureCapabilitySet;
+  logs: CaptureLogEvent[];
+  error: string | null;
+};
+
+export type CaptureCommandResult = {
+  code: number;
+  connected?: boolean;
+  ip?: string;
+  key?: string;
+  output?: string;
+  width?: number;
+  lines?: number;
+  error?: string;
+  message?: string;
+};
+
+const CAPTURE_BASE_URL = 'http://127.0.0.1:4317';
+
+function hasTauriRuntime() {
+  return typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
+}
+
+async function invokeCapture<T>(command: string, args?: Record<string, unknown>): Promise<T | null> {
+  if (!hasTauriRuntime()) {
+    return null;
+  }
+  return invoke<T>(command, args);
+}
+
+async function readJson<T>(path: string): Promise<T> {
+  const response = await fetch(`${CAPTURE_BASE_URL}${path}`);
+  if (!response.ok) {
+    throw new Error(`capture api ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+async function writeJson<T>(path: string, body: unknown = {}): Promise<T> {
+  const response = await fetch(`${CAPTURE_BASE_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`capture api ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+function timestamp() {
+  return String(Date.now());
+}
+
+export function createDefaultCaptureDriver(): CaptureDriverInfo {
+  return {
+    id: 'lvm-nvt',
+    name: 'LVM/NVT 3D Camera SDK',
+    vendor: 'Capture 6.7 SDK',
+    transport: 'GigE/Network',
+    sdkVersion: '',
+    supportedModels: ['LVM3450CA', 'LVM compatible 3D camera'],
+    features: ['discover', 'multi-connect', 'parameters', 'depth-map', 'status-readback'],
+  };
+}
+
+export function createDefaultCaptureConfig(): CaptureAppliedConfig {
+  const rows: Array<[string, string, string, string]> = [
+    ['CAM-01', '1 号入口相机', '192.168.10.13', '入口左侧'],
+    ['CAM-02', '2 号入口相机', '192.168.10.14', '入口右侧'],
+    ['CAM-03', '3 号中段相机', '192.168.10.15', '中段左侧'],
+    ['CAM-04', '4 号中段相机', '192.168.10.16', '中段右侧'],
+    ['CAM-05', '5 号出口相机', '192.168.10.17', '出口左侧'],
+    ['CAM-06', '6 号出口相机', '192.168.10.18', '出口右侧'],
+    ['CAM-07', '7 号备用相机', '192.168.10.19', '上表面备用'],
+    ['CAM-08', '8 号备用相机', '192.168.10.20', '下表面备用'],
+  ];
+
+  return {
+    id: 'plate-a-online',
+    name: 'Plate-A-Online',
+    applied: true,
+    updatedAt: timestamp(),
+    cameras: rows.map(([id, name, ip, role]) => ({
+      id,
+      name,
+      ip,
+      role,
+      driverId: 'lvm-nvt',
+      modelHint: 'LVM compatible 3D camera',
+      enabled: true,
+      triggerMode: '编码器触发',
+      exposureUs: 850,
+      gain: 1,
+      depthLines: 1280,
+      outputPath: `captures/${id}`,
+    })),
+  };
+}
+
+export function createDefaultCaptureCapabilities(driver = createDefaultCaptureDriver()): CaptureCapabilitySet {
+  return {
+    driver,
+    controls: [
+      { id: 'connect', label: '连接相机', scope: 'camera', requiresConnection: false },
+      { id: 'disconnect', label: '断开相机', scope: 'camera', requiresConnection: true },
+      { id: 'capture_depth_map', label: '采集深度图', scope: 'camera', requiresConnection: true },
+      { id: 'apply_config', label: '应用配置', scope: 'system', requiresConnection: false },
+    ],
+    parameters: [
+      { key: 'ExposureTime', label: '曝光', valueType: 'int', unit: 'us', min: 1, max: 20000, writable: true },
+      { key: 'GainK', label: '增益', valueType: 'float', unit: 'x', min: 0, max: 16, writable: true },
+      { key: 'DepthLines', label: '深度行数', valueType: 'int', unit: 'line', min: 64, max: 8192, writable: false },
+    ],
+    api: [
+      { method: 'GET', path: 'capture_driver_snapshot', label: '采集快照', scope: 'system' },
+      { method: 'GET', path: 'capture_driver_statuses', label: '相机状态', scope: 'camera' },
+      { method: 'POST', path: 'capture_driver_connect', label: '连接相机', scope: 'camera' },
+      { method: 'POST', path: 'capture_driver_set_param', label: '下发参数', scope: 'camera' },
+      { method: 'POST', path: 'capture_driver_capture_depth_map', label: '采集深度图', scope: 'camera' },
+    ],
+  };
+}
+
+function createStatusFromConfig(config: CaptureCameraConfig, discovered?: CaptureCamera): CaptureCameraStatus {
+  return {
+    connected: false,
+    deviceId: -1,
+    ip: config.ip,
+    driverId: config.driverId,
+    model: discovered?.model || config.modelHint,
+    sn: discovered?.sn || '',
+    configId: config.id,
+    name: config.name,
+    role: config.role,
+    enabled: config.enabled,
+    acquisitionState: config.enabled ? (discovered ? 'discovered' : 'offline') : 'disabled',
+    sdkStatus: 'pending',
+    fps: null,
+    bufferPercent: 0,
+    lastFrameTime: null,
+    error: config.enabled ? 'not connected' : null,
+  };
+}
+
+function hydrateSnapshot(partial: Partial<CaptureSnapshot> & { error?: string | null }): CaptureSnapshot {
+  const driver = partial.driver ?? createDefaultCaptureDriver();
+  const config = partial.config ?? createDefaultCaptureConfig();
+  const capabilities = partial.capabilities ?? createDefaultCaptureCapabilities(driver);
+  const cameras = partial.cameras ?? [];
+  const discoveredByIp = new Map(cameras.map((camera) => [camera.ip, camera]));
+  const statuses =
+    partial.statuses && partial.statuses.length > 0
+      ? partial.statuses
+      : config.cameras.map((camera) => createStatusFromConfig(camera, discoveredByIp.get(camera.ip)));
+
+  return {
+    health: partial.health ?? null,
+    driver,
+    config,
+    cameras,
+    status: partial.status ?? statuses.find((status) => status.connected) ?? statuses[0] ?? null,
+    statuses,
+    capabilities,
+    logs: partial.logs ?? [],
+    error: partial.error ?? null,
+  };
+}
+
+export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
+  if (hasTauriRuntime()) {
+    try {
+      const snapshot = await invoke<CaptureSnapshot>('capture_driver_snapshot');
+      return hydrateSnapshot(snapshot);
+    } catch (error) {
+      return createEmptyCaptureSnapshot(error instanceof Error ? error.message : 'tauri capture driver unavailable');
+    }
+  }
+
+  const [health, camerasResult, status] = await Promise.all([
+    readJson<CaptureHealth>('/health'),
+    readJson<{ cameras: CaptureCamera[] }>('/api/cameras'),
+    readJson<CaptureCameraStatus>('/api/camera/status'),
+  ]);
+
+  const config = createDefaultCaptureConfig();
+  const cameras = camerasResult.cameras.map((camera) => ({ ...camera, driverId: 'lvm-nvt', source: 'http-service' }));
+  const discoveredByIp = new Map(cameras.map((camera) => [camera.ip, camera]));
+  const statuses = config.cameras.map((camera) => {
+    if (status.connected && status.ip === camera.ip) {
+      return {
+        ...createStatusFromConfig(camera, discoveredByIp.get(camera.ip)),
+        ...status,
+        driverId: 'lvm-nvt',
+        name: camera.name,
+        role: camera.role,
+        configId: camera.id,
+        acquisitionState: 'connected',
+        sdkStatus: health.sdkReady ? 'ready' : 'error',
+      };
+    }
+    return createStatusFromConfig(camera, discoveredByIp.get(camera.ip));
+  });
+
+  return hydrateSnapshot({
+    health,
+    driver: { ...createDefaultCaptureDriver(), sdkVersion: health.sdkVersion ?? '' },
+    config,
+    cameras,
+    status,
+    statuses,
+    logs: [
+      {
+        id: 'HTTP-001',
+        time: timestamp(),
+        level: health.sdkReady ? 'info' : 'warning',
+        cameraIp: health.ip || null,
+        message: health.sdkReady ? 'HTTP capture service ready' : 'HTTP capture service waiting for SDK',
+      },
+    ],
+  });
+}
+
+export function createEmptyCaptureSnapshot(error: string | null = null): CaptureSnapshot {
+  return hydrateSnapshot({ error });
+}
+
+export async function applyCaptureConfig(config: CaptureAppliedConfig) {
+  const result = await invokeCapture<CaptureCommandResult>('capture_driver_apply_config', { config });
+  if (result) {
+    return result;
+  }
+  return {
+    code: 0,
+    message: 'config applied locally',
+  } satisfies CaptureCommandResult;
+}
+
+export async function connectCaptureCamera(ip: string, devType = -1) {
+  const result = await invokeCapture<CaptureCommandResult>('capture_driver_connect', { ip, devType });
+  if (result) {
+    return result;
+  }
+  return writeJson<CaptureCommandResult>('/api/camera/connect', { ip, devType });
+}
+
+export async function disconnectCaptureCamera(ip?: string) {
+  const result = await invokeCapture<CaptureCommandResult>('capture_driver_disconnect', { ip });
+  if (result) {
+    return result;
+  }
+  return writeJson<CaptureCommandResult>('/api/camera/disconnect', ip ? { ip } : {});
+}
+
+export async function setCaptureParam(key: string, type: 'int' | 'float', value: number, ip?: string) {
+  const result = await invokeCapture<CaptureCommandResult>('capture_driver_set_param', { ip, key, typeName: type, value });
+  if (result) {
+    return result;
+  }
+  return writeJson<CaptureCommandResult>('/api/param', { key, type, value });
+}
+
+export async function captureDepthMap(lines = 1280, output = 'capture-depth.png', ip?: string) {
+  const result = await invokeCapture<CaptureCommandResult>('capture_driver_capture_depth_map', { ip, lines, output, timeoutMs: 5000 });
+  if (result) {
+    return result;
+  }
+  return writeJson<CaptureCommandResult>('/api/capture/depth-map', { lines, output });
+}
+
+export async function openCaptureManagementWindow() {
+  const result = await invokeCapture<{ opened: boolean; label: string; error?: string | null }>('open_capture_management_window');
+  if (result) {
+    return result;
+  }
+  window.open('/?app=capture', '_blank', 'popup,width=1480,height=900');
+  return {
+    opened: true,
+    label: 'browser-capture-management',
+  };
+}

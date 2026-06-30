@@ -2,6 +2,12 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+app/node_modules/
+app/src-tauri/target/
+app/src-tauri/gen/
+app/capture/build/
+app/capture/bin/
 .vite/
 *.log
 *.local
+logFile.ini
