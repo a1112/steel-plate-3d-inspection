@@ -504,6 +504,7 @@ std::string route(const std::string& method, const std::string& path, const std:
   if (method == "POST" && path == "/api/camera/connect") return connect_json(body);
   if (method == "POST" && path == "/api/camera/disconnect") return disconnect_json();
   if (method == "GET" && path == "/api/camera/status") return status_json();
+  if (method == "GET" && path == "/api/camera/statuses") return "{\"statuses\":[" + status_json() + "]}";
   if (method == "GET" && path == "/api/param") return get_param_json(query);
   if (method == "POST" && path == "/api/param") return set_param_json(body);
   if (method == "POST" && path == "/api/capture/depth-map") return capture_depth_json(body);

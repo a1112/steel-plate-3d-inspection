@@ -31,7 +31,14 @@ import type { InspectionSettings, ReportFilters, SystemAction } from './state/op
 import { emptyRecordSearchFilters, filterInspectionRecords } from './state/record-search';
 import type { RecordSearchFilters } from './state/record-search';
 import { getResponsiveProfile, getResponsiveProfileClassName } from './state/responsive-layout';
-import { fetchInspectionSnapshot } from './services/inspection-api';
+import {
+  createDefaultConnectionConfig,
+  fetchConnectionConfig,
+  fetchInspectionSnapshot,
+  fetchInspectionSettings,
+  saveConnectionConfig,
+  type ConnectionConfig,
+} from './services/inspection-api';
 import { canStartTitlebarDrag } from './lib/titlebar-drag';
 import { getTauriWindowApi } from './lib/tauri-window';
 import { createEmptyCaptureSnapshot, readCaptureSnapshot } from './lib/capture-api';
@@ -43,6 +50,7 @@ import { PlateMap } from './components/PlateMap';
 import { ReportPage } from './components/ReportPage';
 import { SettingsPage } from './components/SettingsPage';
 import { StatisticsPanel } from './components/StatisticsPanel';
+import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { Toast } from './components/Toast';
 import { TopNav } from './components/TopNav';
@@ -65,7 +73,8 @@ function readAppMode() {
     return 'terminal';
   }
   const params = new URLSearchParams(window.location.search);
-  return params.get('app') === 'capture' ? 'capture' : 'terminal';
+  const app = params.get('app');
+  return app === 'capture' || app === 'parameters' ? app : 'terminal';
 }
 
 function downloadTextFile(filename: string, content: string, mimeType = 'text/plain;charset=utf-8') {
@@ -114,10 +123,16 @@ export default function App() {
     );
   }
 
-  return <InspectionDashboard snapshot={snapshot} />;
+  return <InspectionDashboard snapshot={snapshot} onSnapshotChange={setSnapshot} />;
 }
 
-function InspectionDashboard({ snapshot }: { snapshot: InspectionSnapshot }) {
+function InspectionDashboard({
+  snapshot,
+  onSnapshotChange,
+}: {
+  snapshot: InspectionSnapshot;
+  onSnapshotChange: (snapshot: InspectionSnapshot) => void;
+}) {
   const [appMode] = useState(readAppMode);
   const [uiState, setUiState] = useState(() => createInitialUiState(snapshot));
   const [onlineFilters, setOnlineFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
@@ -129,6 +144,8 @@ function InspectionDashboard({ snapshot }: { snapshot: InspectionSnapshot }) {
   const [savedSettings, setSavedSettings] = useState<InspectionSettings>(() => createDefaultSettings());
   const [settingsDraft, setSettingsDraft] = useState<InspectionSettings>(() => createDefaultSettings());
   const [settingsErrors, setSettingsErrors] = useState(() => validateSettings(createDefaultSettings()));
+  const [connectionDraft, setConnectionDraft] = useState<ConnectionConfig>(() => createDefaultConnectionConfig());
+  const [connectionStatus, setConnectionStatus] = useState<string | null>('读取中');
   const [operationState, setOperationState] = useState(() => createInitialOperationState());
   const [toast, setToast] = useState<string | null>(null);
   const [viewportSize, setViewportSize] = useState(readViewportSize);
@@ -143,6 +160,37 @@ function InspectionDashboard({ snapshot }: { snapshot: InspectionSnapshot }) {
     window.addEventListener('resize', handleResize);
     handleResize();
     return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchConnectionConfig(controller.signal)
+      .then((config) => {
+        setConnectionDraft(config);
+        setConnectionStatus(config.mode === 'online' ? '在线配置已加载' : '演示模式已加载');
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setConnectionStatus(error instanceof Error ? error.message : '连接配置读取失败');
+        }
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchInspectionSettings(controller.signal)
+      .then((settings) => {
+        setSavedSettings(settings);
+        setSettingsDraft(settings);
+        setSettingsErrors(validateSettings(settings));
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setToast(error instanceof Error ? error.message : '检测规则读取失败');
+        }
+      });
+    return () => controller.abort();
   }, []);
 
   useEffect(() => {
@@ -327,6 +375,28 @@ function InspectionDashboard({ snapshot }: { snapshot: InspectionSnapshot }) {
     setToast('参数已恢复默认值');
   };
 
+  const updateConnectionDraft = (patch: Partial<ConnectionConfig>) => {
+    setConnectionDraft((current) => ({
+      ...current,
+      ...patch,
+      port: patch.port === undefined ? current.port : Math.max(1, Math.min(65535, Math.round(patch.port))),
+    }));
+  };
+
+  const saveConnection = async () => {
+    try {
+      await saveConnectionConfig(connectionDraft);
+      setConnectionStatus(connectionDraft.mode === 'online' ? '在线模式已保存' : '演示模式已保存');
+      const nextSnapshot = await fetchInspectionSnapshot();
+      onSnapshotChange(nextSnapshot);
+      setUiState(createInitialUiState(nextSnapshot));
+      setToast(connectionDraft.mode === 'online' ? '已切换到服务端数据库数据' : '已切换到本地演示数据');
+    } catch (error) {
+      setConnectionStatus(error instanceof Error ? error.message : '连接设置保存失败');
+      setToast('连接设置保存失败');
+    }
+  };
+
   const handleSystemAction = (action: SystemAction) => {
     setOperationState((current) => {
       const next = runSystemAction(current, action);
@@ -360,6 +430,15 @@ function InspectionDashboard({ snapshot }: { snapshot: InspectionSnapshot }) {
             className="standalone-capture-manager"
           />
         </main>
+      </div>
+    );
+  }
+
+  if (appMode === 'parameters') {
+    return (
+      <div className={`app-shell theme-${uiState.theme} ${responsiveClassName} parameter-standalone-shell`}>
+        <Toast message={toast} tone="success" onClear={() => setToast(null)} />
+        <ParameterManagementApp />
       </div>
     );
   }
@@ -527,6 +606,8 @@ function InspectionDashboard({ snapshot }: { snapshot: InspectionSnapshot }) {
               draft={settingsDraft}
               saved={savedSettings}
               errors={settingsErrors}
+              connection={connectionDraft}
+              connectionStatus={connectionStatus}
               onThemeChange={(theme) => setState({ theme })}
               onDraftChange={(patch) => {
                 const nextDraft = { ...settingsDraft, ...patch };
@@ -535,6 +616,8 @@ function InspectionDashboard({ snapshot }: { snapshot: InspectionSnapshot }) {
                   setSettingsErrors(validateSettings(nextDraft));
                 }
               }}
+              onConnectionChange={updateConnectionDraft}
+              onConnectionSave={() => void saveConnection()}
               onSave={() => saveSettings('参数已保存')}
               onReset={resetSettings}
               onApplyToPlate={() => saveSettings('参数已应用到当前钢板')}

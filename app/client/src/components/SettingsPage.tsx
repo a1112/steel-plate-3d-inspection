@@ -1,15 +1,17 @@
-import { ClipboardCheck, Gauge, Palette, RadioTower, RotateCcw, Save, Send } from 'lucide-react';
+import { ClipboardCheck, Gauge, Palette, RadioTower, RotateCcw, Save, Send, Server } from 'lucide-react';
 import { useState, type ChangeEvent, type ElementType } from 'react';
 import type { ThemeMode } from '../data/inspection';
+import type { ConnectionConfig, ConnectionMode } from '../services/inspection-api';
 import type { InspectionSettings, SettingsErrors } from '../state/operations';
 import { Panel } from './Panel';
 
 type NumberSettingKey = 'severeDepthMm' | 'reviewDepthMm' | 'minDefectWidthMm' | 'cameraExposureUs' | 'encoderPulsePerMeter' | 'alarmVolume';
 type BooleanSettingKey = 'autoReview' | 'saveRawImages';
-type SettingsSection = 'theme' | 'grading' | 'acquisition' | 'status';
+type SettingsSection = 'theme' | 'connection' | 'grading' | 'acquisition' | 'status';
 
 const settingsSections: Array<{ id: SettingsSection; label: string; hint: string; icon: ElementType }> = [
   { id: 'theme', label: '主题外观', hint: '界面配色与显示风格', icon: Palette },
+  { id: 'connection', label: '连接设置', hint: '在线/演示与服务端地址', icon: Server },
   { id: 'grading', label: '缺陷判级', hint: '严重、复核与尺寸阈值', icon: Gauge },
   { id: 'acquisition', label: '采集联机', hint: '相机、编码器与归档', icon: RadioTower },
   { id: 'status', label: '参数状态', hint: '保存、应用与恢复', icon: ClipboardCheck },
@@ -104,8 +106,12 @@ export function SettingsPage({
   draft,
   saved,
   errors,
+  connection = { mode: 'online', host: '127.0.0.1', port: 4873 },
+  connectionStatus,
   onThemeChange,
   onDraftChange,
+  onConnectionChange = () => undefined,
+  onConnectionSave = () => undefined,
   onSave,
   onReset,
   onApplyToPlate,
@@ -115,8 +121,12 @@ export function SettingsPage({
   draft: InspectionSettings;
   saved: InspectionSettings;
   errors: SettingsErrors;
+  connection?: ConnectionConfig;
+  connectionStatus?: string | null;
   onThemeChange: (theme: ThemeMode) => void;
   onDraftChange: (patch: Partial<InspectionSettings>) => void;
+  onConnectionChange?: (patch: Partial<ConnectionConfig>) => void;
+  onConnectionSave?: () => void;
   onSave: () => void;
   onReset: () => void;
   onApplyToPlate: () => void;
@@ -125,6 +135,7 @@ export function SettingsPage({
   const [activeSection, setActiveSection] = useState<SettingsSection>('theme');
   const setNumber = (key: NumberSettingKey) => (value: number) => onDraftChange({ [key]: value });
   const setBoolean = (key: BooleanSettingKey) => (checked: boolean) => onDraftChange({ [key]: checked });
+  const setConnectionMode = (mode: ConnectionMode) => onConnectionChange({ mode });
   const handleVolume = (event: ChangeEvent<HTMLInputElement>) => onDraftChange({ alarmVolume: Number(event.target.value) });
   const currentThemeLabel = themeOptions.find((option) => option.id === theme)?.label ?? '深色工业';
 
@@ -162,6 +173,71 @@ export function SettingsPage({
           {activeSection === 'theme' ? (
             <Panel title="主题外观" className="settings-panel settings-theme-panel">
               <ThemeSelector theme={theme} onThemeChange={onThemeChange} />
+            </Panel>
+          ) : null}
+
+          {activeSection === 'connection' ? (
+            <Panel title="连接设置" className="settings-panel">
+              <div className="connection-mode-toggle" role="group" aria-label="数据模式">
+                <button type="button" className={connection.mode === 'online' ? 'active' : ''} onClick={() => setConnectionMode('online')}>
+                  在线模式
+                </button>
+                <button type="button" className={connection.mode === 'demo' ? 'active' : ''} onClick={() => setConnectionMode('demo')}>
+                  演示模式
+                </button>
+              </div>
+              <label className="setting-field">
+                <span>服务端 IP</span>
+                <input
+                  aria-label="服务端 IP"
+                  value={connection.host}
+                  disabled={connection.mode === 'demo'}
+                  onChange={(event) => onConnectionChange({ host: event.target.value })}
+                />
+              </label>
+              <label className="setting-field">
+                <span>服务端端口</span>
+                <div className="number-input">
+                  <input
+                    aria-label="服务端端口"
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={connection.port}
+                    disabled={connection.mode === 'demo'}
+                    onChange={(event) => onConnectionChange({ port: Number(event.target.value) })}
+                  />
+                  <b>port</b>
+                </div>
+              </label>
+              <div className="settings-actions">
+                <button type="button" onClick={onConnectionSave}>
+                  <Save size={16} />
+                  保存连接
+                </button>
+                <button type="button" onClick={() => window.open('/?app=parameters', '_blank', 'popup,width=1480,height=900')}>
+                  <Server size={16} />
+                  参数管理
+                </button>
+              </div>
+              <dl className="settings-summary">
+                <div>
+                  <dt>当前模式</dt>
+                  <dd>{connection.mode === 'online' ? '在线模式' : '演示模式'}</dd>
+                </div>
+                <div>
+                  <dt>数据来源</dt>
+                  <dd>{connection.mode === 'online' ? '服务端 SQLite 数据库' : '客户端内置演示数据'}</dd>
+                </div>
+                <div>
+                  <dt>服务端地址</dt>
+                  <dd>{connection.host}:{connection.port}</dd>
+                </div>
+                <div>
+                  <dt>状态</dt>
+                  <dd>{connectionStatus ?? '待保存'}</dd>
+                </div>
+              </dl>
             </Panel>
           ) : null}
 

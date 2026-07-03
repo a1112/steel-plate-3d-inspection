@@ -8,3 +8,5 @@ target/
 *.log
 *.local
 logFile.ini
+config/*.sqlite
+config/*.sqlite-*

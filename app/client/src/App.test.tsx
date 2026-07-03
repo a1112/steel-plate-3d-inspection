@@ -11,9 +11,27 @@ describe('App online severity filters', () => {
   beforeEach(() => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => getMockInspectionSnapshot(),
+      vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/inspection/settings')) {
+          return {
+            ok: true,
+            json: async () => ({
+              severeDepthMm: 0.12,
+              reviewDepthMm: 0.08,
+              minDefectWidthMm: 0.2,
+              cameraExposureUs: 850,
+              encoderPulsePerMeter: 2048,
+              autoReview: true,
+              alarmVolume: 86,
+              saveRawImages: true,
+            }),
+          };
+        }
+        return {
+          ok: true,
+          json: async () => getMockInspectionSnapshot(),
+        };
       }),
     );
   });

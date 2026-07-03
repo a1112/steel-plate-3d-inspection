@@ -133,6 +133,22 @@ export type CaptureSnapshot = {
   error: string | null;
 };
 
+type ServiceConfigResponse = {
+  service?: {
+    name?: string;
+    role?: string;
+    capturePort?: number;
+    captureOrigin?: string;
+    updatedAt?: string;
+  };
+  capture?: {
+    mode?: string;
+    driver?: string;
+    fallback?: string;
+    cameras?: CaptureCameraConfig[];
+  };
+};
+
 export type CaptureCommandResult = {
   code: number;
   connected?: boolean;
@@ -200,36 +216,27 @@ export function createDefaultCaptureDriver(): CaptureDriverInfo {
 }
 
 export function createDefaultCaptureConfig(): CaptureAppliedConfig {
-  const rows: Array<[string, string, string, string]> = [
-    ['CAM-01', '1 号入口相机', '192.168.10.13', '入口左侧'],
-    ['CAM-02', '2 号入口相机', '192.168.10.14', '入口右侧'],
-    ['CAM-03', '3 号中段相机', '192.168.10.15', '中段左侧'],
-    ['CAM-04', '4 号中段相机', '192.168.10.16', '中段右侧'],
-    ['CAM-05', '5 号出口相机', '192.168.10.17', '出口左侧'],
-    ['CAM-06', '6 号出口相机', '192.168.10.18', '出口右侧'],
-    ['CAM-07', '7 号备用相机', '192.168.10.19', '上表面备用'],
-    ['CAM-08', '8 号备用相机', '192.168.10.20', '下表面备用'],
-  ];
-
   return {
-    id: 'plate-a-online',
-    name: 'Plate-A-Online',
+    id: 'single-camera-capture',
+    name: 'Single-Camera-Capture',
     applied: true,
     updatedAt: timestamp(),
-    cameras: rows.map(([id, name, ip, role]) => ({
-      id,
-      name,
-      ip,
-      role,
-      driverId: 'lvm-nvt',
-      modelHint: 'LVM compatible 3D camera',
-      enabled: true,
-      triggerMode: '编码器触发',
-      exposureUs: 850,
-      gain: 1,
-      depthLines: 1280,
-      outputPath: `captures/${id}`,
-    })),
+    cameras: [
+      {
+        id: 'CAM-01',
+        name: '1 号采集相机',
+        ip: '192.168.10.13',
+        role: '主采集相机',
+        driverId: 'lvm-nvt',
+        modelHint: 'LVM3000 compatible 3D camera',
+        enabled: true,
+        triggerMode: '编码器触发',
+        exposureUs: 850,
+        gain: 1,
+        depthLines: 1280,
+        outputPath: 'captures/CAM-01',
+      },
+    ],
   };
 }
 
@@ -248,11 +255,11 @@ export function createDefaultCaptureCapabilities(driver = createDefaultCaptureDr
       { key: 'DepthLines', label: '深度行数', valueType: 'int', unit: 'line', min: 64, max: 8192, writable: false },
     ],
     api: [
-      { method: 'GET', path: 'capture_driver_snapshot', label: '采集快照', scope: 'system' },
-      { method: 'GET', path: 'capture_driver_statuses', label: '相机状态', scope: 'camera' },
-      { method: 'POST', path: 'capture_driver_connect', label: '连接相机', scope: 'camera' },
-      { method: 'POST', path: 'capture_driver_set_param', label: '下发参数', scope: 'camera' },
-      { method: 'POST', path: 'capture_driver_capture_depth_map', label: '采集深度图', scope: 'camera' },
+      { method: 'GET', path: '/api/config', label: '配置中心', scope: 'system' },
+      { method: 'GET', path: '/api/camera/statuses', label: '相机状态', scope: 'camera' },
+      { method: 'POST', path: '/api/camera/connect', label: '连接相机', scope: 'camera' },
+      { method: 'POST', path: '/api/param', label: '下发参数', scope: 'camera' },
+      { method: 'POST', path: '/api/capture/depth-map', label: '采集深度图', scope: 'camera' },
     ],
   };
 }
@@ -303,23 +310,18 @@ function hydrateSnapshot(partial: Partial<CaptureSnapshot> & { error?: string | 
 }
 
 export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
-  if (hasTauriRuntime()) {
-    try {
-      const snapshot = await invoke<CaptureSnapshot>('capture_driver_snapshot');
-      return hydrateSnapshot(snapshot);
-    } catch (error) {
-      return createEmptyCaptureSnapshot(error instanceof Error ? error.message : 'tauri capture driver unavailable');
-    }
-  }
-
-  const [health, camerasResult, status, statusesResult] = await Promise.all([
+  const [configResult, health, camerasResult, status, statusesResult] = await Promise.all([
+    readJson<ServiceConfigResponse>('/api/config').catch((): ServiceConfigResponse => ({})),
     readJson<CaptureHealth>('/health'),
     readJson<{ cameras: CaptureCamera[] }>('/api/cameras'),
     readJson<CaptureCameraStatus>('/api/camera/status'),
     readJson<{ statuses: CaptureCameraStatus[] }>('/api/camera/statuses').catch(() => ({ statuses: [] })),
   ]);
 
-  const config = createDefaultCaptureConfig();
+  const config = {
+    ...createDefaultCaptureConfig(),
+    cameras: configResult.capture?.cameras?.length ? configResult.capture.cameras : createDefaultCaptureConfig().cameras,
+  };
   const cameras = camerasResult.cameras.map((camera) => ({ ...camera, driverId: 'lvm-nvt', source: 'http-service' }));
   const discoveredByIp = new Map(cameras.map((camera) => [camera.ip, camera]));
   const statusByIp = new Map(statusesResult.statuses.map((cameraStatus) => [cameraStatus.ip, cameraStatus]));
@@ -364,46 +366,35 @@ export function createEmptyCaptureSnapshot(error: string | null = null): Capture
 }
 
 export async function applyCaptureConfig(config: CaptureAppliedConfig) {
-  const result = await invokeCapture<CaptureCommandResult>('capture_driver_apply_config', { config });
-  if (result) {
-    return result;
-  }
-  return {
-    code: 0,
-    message: 'config applied locally',
-  } satisfies CaptureCommandResult;
+  return writeJson<CaptureCommandResult>('/api/config/capture', {
+    service: {
+      name: 'steel-inspection-service',
+      role: 'api-config-capture-orchestrator',
+      updatedAt: timestamp(),
+    },
+    capture: {
+      mode: 'single-camera',
+      driver: 'lvm-nvt',
+      fallback: 'simulated',
+      cameras: config.cameras,
+    },
+  });
 }
 
 export async function connectCaptureCamera(ip: string, devType = -1) {
-  const result = await invokeCapture<CaptureCommandResult>('capture_driver_connect', { ip, devType });
-  if (result) {
-    return result;
-  }
   return writeJson<CaptureCommandResult>('/api/camera/connect', { ip, devType });
 }
 
 export async function disconnectCaptureCamera(ip?: string) {
-  const result = await invokeCapture<CaptureCommandResult>('capture_driver_disconnect', { ip });
-  if (result) {
-    return result;
-  }
   return writeJson<CaptureCommandResult>('/api/camera/disconnect', ip ? { ip } : {});
 }
 
 export async function setCaptureParam(key: string, type: 'int' | 'float', value: number, ip?: string) {
-  const result = await invokeCapture<CaptureCommandResult>('capture_driver_set_param', { ip, key, typeName: type, value });
-  if (result) {
-    return result;
-  }
-  return writeJson<CaptureCommandResult>('/api/param', { key, type, value });
+  return writeJson<CaptureCommandResult>('/api/param', { ip, key, type, value });
 }
 
 export async function captureDepthMap(lines = 1280, output = 'capture-depth.png', ip?: string) {
-  const result = await invokeCapture<CaptureCommandResult>('capture_driver_capture_depth_map', { ip, lines, output, timeoutMs: 5000 });
-  if (result) {
-    return result;
-  }
-  return writeJson<CaptureCommandResult>('/api/capture/depth-map', { lines, output });
+  return writeJson<CaptureCommandResult>('/api/capture/depth-map', { ip, lines, output });
 }
 
 export async function openCaptureManagementWindow() {

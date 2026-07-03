@@ -3719,6 +3719,1828 @@ button {
   height: 38px;
 }
 
+.connection-mode-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.connection-mode-toggle button {
+  height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  background: var(--panel-soft);
+  font-weight: 950;
+  cursor: pointer;
+}
+
+.connection-mode-toggle button.active {
+  border-color: var(--blue);
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.parameter-standalone-shell {
+  min-height: 100vh;
+}
+
+.parameter-page {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 12px;
+}
+
+.parameter-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.parameter-header span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.parameter-header h1 {
+  margin: 3px 0 0;
+  color: var(--text);
+  font-size: 22px;
+  line-height: 1;
+}
+
+.parameter-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.admin-session-badge {
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-size: 12px;
+  font-weight: 950;
+  white-space: nowrap;
+}
+
+.parameter-header-actions strong {
+  color: var(--blue);
+  font-size: 13px;
+}
+
+.parameter-header-actions button,
+.parameter-editor-toolbar button,
+.admin-login-form button,
+.admin-user-actions button,
+.admin-password-form button,
+.admin-role-actions button,
+.admin-service-actions button,
+.admin-camera-actions button,
+.admin-inspection-settings-actions button,
+.admin-alarm-rules-actions button,
+.admin-external-integrations-actions button,
+.admin-database-actions button,
+.admin-audit-filter button,
+.admin-record-filter button,
+.admin-record-table button,
+.admin-record-pager button {
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 12px;
+  border: 1px solid var(--blue);
+  border-radius: 7px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-weight: 950;
+  cursor: pointer;
+}
+
+.parameter-tabs {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.parameter-tabs button {
+  height: 32px;
+  min-width: 88px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+  font-weight: 950;
+  cursor: pointer;
+}
+
+.parameter-tabs button:hover,
+.parameter-tabs button.active {
+  border-color: var(--blue);
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.parameter-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(260px, 0.86fr) minmax(0, 1.28fr) minmax(280px, 0.94fr);
+  grid-template-rows: 238px minmax(0, 1fr);
+  gap: 12px;
+}
+
+.parameter-overview-grid {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.parameter-services-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+
+.parameter-login-wrap {
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+}
+
+.parameter-login-card {
+  width: min(420px, 100%);
+}
+
+.parameter-users-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.parameter-security-grid {
+  grid-template-columns: minmax(320px, 0.8fr) minmax(0, 1.2fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.parameter-config-grid {
+  grid-template-columns: minmax(320px, 0.8fr) minmax(260px, 0.7fr) minmax(0, 1fr);
+  grid-template-rows: minmax(150px, 0.5fr) minmax(220px, 0.72fr) minmax(220px, 0.86fr) minmax(220px, 0.92fr);
+}
+
+.parameter-camera-editor-card {
+  grid-row: 1 / 5;
+}
+
+.parameter-camera-list-card {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.parameter-config-revision-card {
+  grid-column: 2 / 4;
+  grid-row: 2;
+}
+
+.parameter-inspection-settings-card {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.parameter-rules-grid {
+  grid-template-columns: minmax(390px, 0.85fr) minmax(280px, 0.62fr) minmax(430px, 1.18fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.parameter-alarm-rules-card {
+  min-height: 0;
+}
+
+.parameter-alarm-summary-card {
+  min-height: 0;
+}
+
+.parameter-external-integrations-card {
+  min-height: 0;
+}
+
+.parameter-config-revision-card .panel-body {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 0.92fr) minmax(320px, 1.08fr);
+  gap: 10px;
+}
+
+.parameter-connection-editor {
+  grid-column: 2;
+  grid-row: 3 / 5;
+}
+
+.parameter-capture-editor {
+  grid-column: 3;
+  grid-row: 3 / 5;
+}
+
+.parameter-audit-grid {
+  grid-template-columns: minmax(260px, 0.72fr) minmax(0, 1.28fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.parameter-records-grid {
+  grid-template-columns: minmax(280px, 0.7fr) minmax(0, 1.3fr);
+  grid-template-rows: minmax(0, 1fr) minmax(220px, 0.72fr);
+}
+
+.parameter-record-filter-card {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.parameter-record-table-card {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.parameter-defect-type-editor-card {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.parameter-defect-type-list-card {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.parameter-card .panel-body,
+.parameter-editor-card .panel-body {
+  min-height: 0;
+}
+
+.parameter-database-card .panel-body,
+.parameter-users-card .panel-body,
+.parameter-password-card .panel-body,
+.parameter-session-card .panel-body,
+.parameter-audit-card .panel-body {
+  display: grid;
+  gap: 10px;
+}
+
+.parameter-database-card .panel-body {
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.parameter-users-card .panel-body {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.parameter-password-card .panel-body,
+.parameter-session-card .panel-body {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.parameter-audit-card .panel-body {
+  grid-template-rows: minmax(0, 1fr) auto auto;
+}
+
+.parameter-camera-editor-card .panel-body,
+.parameter-camera-list-card .panel-body,
+.parameter-config-revision-card .panel-body {
+  min-height: 0;
+  overflow: auto;
+}
+
+.parameter-facts {
+  display: grid;
+  gap: 10px;
+}
+
+.parameter-facts div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 100px minmax(0, 1fr);
+  gap: 12px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.parameter-facts dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.parameter-facts dd {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 950;
+  overflow-wrap: anywhere;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--muted);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--muted) 40%, transparent);
+}
+
+.status-dot.online {
+  background: var(--green);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--green) 58%, transparent);
+}
+
+.status-dot.warning {
+  background: var(--amber);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--amber) 58%, transparent);
+}
+
+.status-dot.offline {
+  background: var(--red);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--red) 52%, transparent);
+}
+
+.admin-table-metrics {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  overflow: auto;
+}
+
+.admin-database-actions {
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-database-buttons {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.admin-database-actions span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-database-maintenance {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.admin-database-maintenance div {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-database-maintenance span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.admin-database-maintenance strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-database-maintenance strong.ok {
+  color: var(--green);
+}
+
+.admin-database-maintenance strong.warning {
+  color: var(--yellow);
+}
+
+.admin-table-metrics div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-table-metrics span,
+.admin-user-list span,
+.admin-user-list em,
+.admin-audit-list span,
+.admin-audit-list em,
+.admin-api-summary span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-table-metrics strong {
+  color: var(--blue);
+  font-size: 18px;
+  line-height: 1;
+}
+
+@media (max-width: 980px) {
+  .admin-database-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-database-buttons {
+    justify-content: flex-start;
+  }
+
+  .admin-database-maintenance {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.admin-user-list,
+.admin-camera-list,
+.admin-defect-type-list,
+.admin-config-revision-list,
+.admin-session-list,
+.admin-audit-list {
+  min-height: 0;
+  display: grid;
+  gap: 8px;
+  overflow: auto;
+}
+
+.admin-user-list div,
+.admin-user-list button,
+.admin-camera-list button,
+.admin-defect-type-list button,
+.admin-config-revision,
+.admin-session-list div,
+.admin-audit-list div {
+  min-width: 0;
+  display: grid;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-user-list div,
+.admin-user-list button {
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+}
+
+.admin-camera-list button {
+  width: 100%;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.admin-defect-type-list button {
+  width: 100%;
+  grid-template-columns: 14px minmax(0, 1fr) auto auto;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.admin-camera-list button:hover {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.admin-defect-type-list button:hover {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.admin-defect-type-list i {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--panel) 78%, transparent);
+}
+
+.admin-defect-type-list span,
+.admin-defect-type-list em {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-camera-list em,
+.admin-camera-list b {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-camera-list em {
+  grid-column: 2 / -1;
+}
+
+.admin-camera-list b {
+  color: var(--blue);
+}
+
+.admin-config-revision {
+  grid-template-columns: 18px minmax(96px, 0.58fr) 52px minmax(0, 1fr) auto auto;
+}
+
+.admin-session-list div {
+  grid-template-columns: 18px minmax(96px, 0.42fr) minmax(180px, 0.72fr) minmax(0, 1fr) auto;
+}
+
+.admin-session-list div.current {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, var(--panel-soft));
+}
+
+.admin-session-list svg {
+  color: var(--blue);
+}
+
+.admin-session-list div.current svg {
+  color: var(--green);
+}
+
+.admin-session-list strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 950;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-session-list span,
+.admin-session-list em {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-session-list button {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--blue);
+  border-radius: 7px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-weight: 950;
+  cursor: pointer;
+}
+
+.admin-session-list button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.admin-config-revision svg {
+  color: var(--blue);
+}
+
+.admin-config-revision span {
+  justify-self: start;
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-size: 11px;
+  font-weight: 950;
+}
+
+.admin-config-revision.restore span {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 18%, transparent);
+}
+
+.admin-config-revision em {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-config-revision button {
+  height: 28px;
+  padding: 0 10px;
+}
+
+.admin-config-revision-preview {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+}
+
+.admin-config-revision-preview-head {
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-config-revision-preview-head strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 950;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-config-revision-preview-head span {
+  color: var(--amber);
+  font-size: 12px;
+  font-weight: 950;
+  white-space: nowrap;
+}
+
+.admin-empty-state {
+  min-height: 58px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed var(--line-strong);
+  border-radius: 7px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.admin-user-list button {
+  width: 100%;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.admin-user-list.interactive button:hover {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.admin-user-list svg,
+.admin-audit-list svg,
+.admin-api-summary svg {
+  color: var(--blue);
+}
+
+.admin-user-list strong,
+.admin-role-list strong,
+.admin-camera-list strong,
+.admin-defect-type-list strong,
+.admin-config-revision strong,
+.admin-audit-list strong,
+.admin-api-summary strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 950;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-user-list em,
+.admin-role-list em {
+  grid-column: 2 / -1;
+}
+
+.admin-login-form,
+.admin-user-form,
+.admin-password-form,
+.admin-role-form,
+.admin-camera-form,
+.admin-defect-type-form,
+.admin-inspection-settings-form,
+.admin-alarm-rules-form,
+.admin-external-integrations-form,
+.admin-audit-filter,
+.admin-record-filter {
+  min-height: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.admin-password-form {
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  align-items: end;
+}
+
+.parameter-password-card .admin-password-form {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+}
+
+.admin-login-form label,
+.admin-user-form label,
+.admin-password-form label,
+.admin-role-form label,
+.admin-camera-form label,
+.admin-defect-type-form label,
+.admin-inspection-settings-form label,
+.admin-alarm-rules-form label,
+.admin-external-integrations-form label,
+.admin-audit-filter label,
+.admin-record-filter label {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.admin-login-form label span,
+.admin-user-form label span,
+.admin-password-form label span,
+.admin-role-form label span,
+.admin-camera-form label span,
+.admin-defect-type-form label span,
+.admin-inspection-settings-form label span,
+.admin-alarm-rules-form label span,
+.admin-external-integrations-form label span,
+.admin-audit-filter label span,
+.admin-record-filter label span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.admin-login-form input,
+.admin-user-form input,
+.admin-user-form select,
+.admin-password-form input,
+.admin-role-form input,
+.admin-role-form select,
+.admin-camera-form input,
+.admin-camera-form select,
+.admin-defect-type-form input,
+.admin-defect-type-form select,
+.admin-inspection-settings-form input,
+.admin-alarm-rules-form input,
+.admin-external-integrations-form input,
+.admin-external-integrations-form select,
+.admin-audit-filter input,
+.admin-audit-filter select,
+.admin-record-filter input,
+.admin-record-filter select {
+  width: 100%;
+  height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 10px;
+  color: var(--text);
+  background: var(--panel-soft);
+  font: inherit;
+  font-weight: 850;
+  outline: none;
+}
+
+.admin-login-form input:focus,
+.admin-user-form input:focus,
+.admin-user-form select:focus,
+.admin-password-form input:focus,
+.admin-role-form input:focus,
+.admin-role-form select:focus,
+.admin-camera-form input:focus,
+.admin-camera-form select:focus,
+.admin-defect-type-form input:focus,
+.admin-defect-type-form select:focus,
+.admin-inspection-settings-form input:focus,
+.admin-alarm-rules-form input:focus,
+.admin-external-integrations-form input:focus,
+.admin-external-integrations-form select:focus,
+.admin-audit-filter input:focus,
+.admin-audit-filter select:focus,
+.admin-record-filter input:focus,
+.admin-record-filter select:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent);
+}
+
+.admin-user-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.admin-role-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.admin-service-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.admin-camera-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.admin-defect-type-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.admin-inspection-settings-form {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-content: start;
+}
+
+.admin-alarm-rules-form {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-content: start;
+}
+
+.admin-external-integrations-form {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  overflow: auto;
+}
+
+.admin-external-integration {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-external-integration-head {
+  grid-column: 1 / -1;
+  min-height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.admin-external-integration-head strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.admin-inspection-settings-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.admin-alarm-rules-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.admin-external-integrations-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.admin-user-actions button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-password-form button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-login-form button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-role-actions button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-camera-actions button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-defect-type-actions button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-inspection-settings-actions button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-alarm-rules-actions button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-external-integrations-actions button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-alarm-summary {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.admin-alarm-summary div {
+  min-width: 0;
+  min-height: 72px;
+  display: grid;
+  align-content: center;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-alarm-summary div.active {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 12%, var(--panel-soft));
+}
+
+.admin-alarm-summary div.muted {
+  border-color: var(--line-strong);
+  opacity: 0.72;
+}
+
+.admin-alarm-summary span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.admin-alarm-summary strong {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 950;
+}
+
+.admin-alarm-switches {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.admin-alarm-switches span {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.admin-alarm-switches span.on {
+  border-color: var(--blue);
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.admin-alarm-switches span.off {
+  opacity: 0.6;
+}
+
+.admin-user-actions button.danger,
+.admin-role-actions button.danger,
+.admin-service-actions button.danger,
+.admin-camera-actions button.danger,
+.admin-defect-type-actions button.danger {
+  border-color: var(--red);
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+
+.admin-role-list {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  gap: 8px;
+}
+
+.admin-service-paths {
+  min-height: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.admin-service-paths div {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.admin-service-paths span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.admin-service-paths strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.parameter-diagnostics-card .panel-body {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+}
+
+.admin-diagnostic-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.admin-diagnostic-overview div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-diagnostic-overview span,
+.admin-diagnostic-overview em {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-diagnostic-overview strong {
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.admin-diagnostic-overview div.normal strong {
+  color: var(--green);
+}
+
+.admin-diagnostic-overview div.warning strong {
+  color: var(--amber);
+}
+
+.admin-diagnostic-overview div.error strong {
+  color: var(--red);
+}
+
+.admin-diagnostic-list {
+  min-height: 0;
+  display: grid;
+  gap: 8px;
+  overflow: auto;
+}
+
+.admin-diagnostic-list div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 18px minmax(104px, 0.42fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-diagnostic-list div.normal {
+  border-color: color-mix(in srgb, var(--green) 46%, var(--line));
+  background: color-mix(in srgb, var(--green) 8%, var(--panel-soft));
+}
+
+.admin-diagnostic-list div.warning,
+.admin-diagnostic-list div.empty {
+  border-color: color-mix(in srgb, var(--amber) 48%, var(--line));
+  background: color-mix(in srgb, var(--amber) 9%, var(--panel-soft));
+}
+
+.admin-diagnostic-list div.error {
+  border-color: color-mix(in srgb, var(--red) 52%, var(--line));
+  background: color-mix(in srgb, var(--red) 9%, var(--panel-soft));
+}
+
+.admin-diagnostic-list svg {
+  color: var(--green);
+}
+
+.admin-diagnostic-list div.warning svg,
+.admin-diagnostic-list div.empty svg {
+  color: var(--amber);
+}
+
+.admin-diagnostic-list div.error svg {
+  color: var(--red);
+}
+
+.admin-diagnostic-list strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 950;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-diagnostic-list span {
+  justify-self: start;
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+  font-size: 11px;
+  font-weight: 950;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.admin-diagnostic-list div.warning span,
+.admin-diagnostic-list div.empty span {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 16%, transparent);
+}
+
+.admin-diagnostic-list div.error span {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+}
+
+.admin-diagnostic-list em {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 850;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.admin-role-list button {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: inherit;
+  text-align: left;
+  background: var(--panel-soft);
+  cursor: pointer;
+}
+
+.admin-role-list button:hover {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.admin-role-list span,
+.admin-role-list em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 850;
+}
+
+.admin-permission-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 8px;
+}
+
+.admin-permission-option {
+  min-height: 52px;
+  display: grid !important;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 3px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-permission-option input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  accent-color: var(--blue);
+}
+
+.admin-permission-option span {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 950;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-permission-option em {
+  grid-column: 2;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-toggle-field {
+  min-height: 38px;
+  display: flex !important;
+  grid-template-columns: none !important;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-toggle-field input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  accent-color: var(--blue);
+}
+
+.admin-audit-filter,
+.admin-record-filter {
+  align-content: start;
+}
+
+.admin-record-retention {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.admin-record-retention > div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.admin-record-retention p {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.admin-record-retention p strong {
+  color: var(--blue);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.parameter-record-table-card .panel-body {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  gap: 10px;
+}
+
+.admin-record-table-wrap {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.admin-record-table {
+  width: 100%;
+  min-width: 920px;
+  border-collapse: collapse;
+}
+
+.admin-record-table th,
+.admin-record-table td {
+  height: 38px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.admin-record-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.admin-record-actions button {
+  height: 28px;
+  padding: 0 9px;
+}
+
+.admin-record-actions button.danger {
+  border-color: var(--red);
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+}
+
+.admin-record-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: var(--muted);
+  background: var(--table-head);
+  font-weight: 950;
+}
+
+.admin-record-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.admin-record-table button {
+  height: 28px;
+  padding: 0 9px;
+}
+
+.admin-record-detail {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(96px, 1fr);
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.admin-record-detail-head {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.admin-record-detail-head strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 950;
+}
+
+.admin-record-detail-head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.admin-record-detail-head b {
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 950;
+  white-space: nowrap;
+}
+
+.admin-record-detail-table-wrap {
+  min-height: 0;
+  overflow: auto;
+}
+
+.admin-record-detail-table {
+  width: 100%;
+  min-width: 680px;
+  border-collapse: collapse;
+}
+
+.admin-record-detail-table th,
+.admin-record-detail-table td {
+  height: 30px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.admin-record-detail-table th {
+  color: var(--muted);
+  font-weight: 950;
+}
+
+.admin-record-pager {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.admin-record-pager span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.admin-record-pager div {
+  display: flex;
+  gap: 8px;
+}
+
+.admin-record-pager button:disabled {
+  opacity: 0.46;
+  cursor: not-allowed;
+}
+
+.admin-audit-list div {
+  grid-template-columns: 18px 132px minmax(0, 1fr);
+}
+
+.admin-audit-list em {
+  grid-column: 3;
+}
+
+.admin-audit-list .warning svg {
+  color: var(--amber);
+}
+
+.admin-audit-list .error svg {
+  color: var(--red);
+}
+
+.admin-api-summary {
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: 18px auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--blue-soft);
+}
+
+.parameter-editor-card .panel-body {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+}
+
+.parameter-editor-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--blue);
+}
+
+.json-code-editor {
+  --code-bg: #07192b;
+  --code-bg-soft: rgba(9, 35, 58, 0.92);
+  --code-grid: rgba(94, 173, 255, 0.09);
+  --code-gutter-bg: rgba(2, 16, 30, 0.72);
+  --code-line: rgba(108, 188, 255, 0.34);
+  --code-plain: #d8e7f6;
+  --code-key: #6dd6ff;
+  --code-string: #7ceca2;
+  --code-number: #ffd166;
+  --code-boolean: #ff9e64;
+  --code-null: #cba6ff;
+  --code-punctuation: #8eb8e6;
+  position: relative;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  border: 1px solid color-mix(in srgb, var(--blue) 58%, transparent);
+  border-radius: 8px;
+  background:
+    linear-gradient(90deg, var(--code-grid) 0 1px, transparent 1px 100%) 0 0 / 24px 24px,
+    linear-gradient(0deg, var(--code-grid) 0 1px, transparent 1px 100%) 0 0 / 24px 24px,
+    linear-gradient(180deg, rgba(15, 54, 88, 0.78), rgba(4, 18, 33, 0.96)),
+    var(--code-bg);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.04),
+    inset 42px 0 0 var(--code-gutter-bg);
+  overflow: hidden;
+}
+
+.app-shell.theme-light .json-code-editor {
+  --code-bg: #f7fbff;
+  --code-bg-soft: rgba(248, 252, 255, 0.94);
+  --code-grid: rgba(42, 120, 210, 0.12);
+  --code-gutter-bg: rgba(225, 236, 249, 0.84);
+  --code-line: rgba(47, 125, 255, 0.32);
+  --code-plain: #20304a;
+  --code-key: #006fc9;
+  --code-string: #18823f;
+  --code-number: #a15c00;
+  --code-boolean: #b55200;
+  --code-null: #7452c7;
+  --code-punctuation: #536a8a;
+  background:
+    linear-gradient(90deg, var(--code-grid) 0 1px, transparent 1px 100%) 0 0 / 24px 24px,
+    linear-gradient(0deg, var(--code-grid) 0 1px, transparent 1px 100%) 0 0 / 24px 24px,
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(240, 247, 255, 0.96)),
+    var(--code-bg);
+}
+
+.json-code-gutter {
+  position: relative;
+  z-index: 2;
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px 0;
+  border-right: 1px solid var(--code-line);
+  background: var(--code-gutter-bg);
+  color: color-mix(in srgb, var(--muted) 72%, transparent);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.69;
+  text-align: right;
+  user-select: none;
+  pointer-events: none;
+}
+
+.json-code-gutter span {
+  display: block;
+  padding: 0 9px 0 0;
+}
+
+.json-code-language {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 3;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--code-line);
+  border-radius: 6px;
+  color: var(--blue);
+  background: var(--code-bg-soft);
+  font-size: 11px;
+  font-weight: 950;
+  line-height: 18px;
+  letter-spacing: 0;
+  pointer-events: none;
+}
+
+.json-code-pane {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.json-code-highlight,
+.json-code-pane textarea {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  border: 0;
+  padding: 12px 48px 12px 12px;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.json-code-highlight {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: auto;
+  color: var(--code-plain);
+  pointer-events: none;
+}
+
+.json-code-highlight::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.json-code-pane textarea {
+  position: relative;
+  z-index: 1;
+  resize: none;
+  appearance: none;
+  overflow: auto;
+  color: transparent !important;
+  -webkit-text-fill-color: transparent !important;
+  background: transparent !important;
+  caret-color: var(--code-plain);
+  outline: none;
+}
+
+.json-code-pane textarea::selection {
+  color: transparent !important;
+  -webkit-text-fill-color: transparent !important;
+  background: rgba(47, 125, 255, 0.36);
+}
+
+.json-code-editor.readonly .json-code-pane textarea {
+  cursor: default;
+}
+
+.json-token-key {
+  color: var(--code-key);
+  font-weight: 800;
+}
+
+.json-token-string {
+  color: var(--code-string);
+}
+
+.json-token-number {
+  color: var(--code-number);
+}
+
+.json-token-boolean {
+  color: var(--code-boolean);
+  font-weight: 800;
+}
+
+.json-token-null {
+  color: var(--code-null);
+  font-weight: 800;
+}
+
+.json-token-punctuation {
+  color: var(--code-punctuation);
+  font-weight: 700;
+}
+
+.theme-light .json-token-key {
+  color: #075bbb;
+}
+
+.theme-light .json-token-string {
+  color: #147a3a;
+}
+
+.theme-light .json-token-number {
+  color: #9a5c00;
+}
+
+.theme-light .json-token-boolean {
+  color: #b84600;
+}
+
+.theme-light .json-token-null {
+  color: #6b42b7;
+}
+
+.theme-light .json-token-punctuation {
+  color: #4b6383;
+}
+
 .status-layout {
   height: 100%;
   min-height: 0;
