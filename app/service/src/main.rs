@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -62,7 +62,31 @@ struct Defect {
 }
 
 const CAPTURE_SERVICE_PORT: u16 = 4317;
-const CAPTURE_CAMERA_IP: &str = "192.168.10.13";
+const CAPTURE_CAMERA_IP: &str = "192.168.105.13";
+const CAPTURE_CAMERA_IPS: [&str; 6] = [
+    "192.168.105.13",
+    "192.168.102.100",
+    "192.168.101.100",
+    "192.168.103.100",
+    "192.168.104.100",
+    "192.168.106.100",
+];
+const CAPTURE_CAMERA_MODELS: [&str; 6] = [
+    "LVM3450CA",
+    "LVM3450CA",
+    "LVM3450BE",
+    "LVM3450RE",
+    "LVM3450BE",
+    "LVM3450RE",
+];
+const CAPTURE_CAMERA_SERIALS: [&str; 6] = [
+    "YF-0263",
+    "3G506501CA09165",
+    "3G506401BE08818",
+    "3G506401RE08993",
+    "3G506401BE08819",
+    "3G506401RE08991",
+];
 const LOGIN_MAX_FAILURES: u32 = 5;
 const LOGIN_MAX_FAILURES_MIN: u32 = 1;
 const LOGIN_MAX_FAILURES_MAX: u32 = 20;
@@ -93,6 +117,48 @@ const ADMIN_ID_MAX_LEN: usize = 64;
 const ADMIN_LABEL_MAX_LEN: usize = 128;
 const ADMIN_DESCRIPTION_MAX_LEN: usize = 256;
 const DAY_MILLIS: u128 = 24 * 60 * 60 * 1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureProvider {
+    HeadlessCpp,
+    QtTerminal,
+    ExternalApi,
+    Simulated,
+}
+
+impl CaptureProvider {
+    fn from_env_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "qt" | "qt-terminal" | "capture-qt" => Self::QtTerminal,
+            "external" | "external-api" | "api" => Self::ExternalApi,
+            "sim" | "simulated" | "simulation" => Self::Simulated,
+            _ => Self::HeadlessCpp,
+        }
+    }
+
+    fn from_env() -> Self {
+        env::var("STEEL_CAPTURE_PROVIDER")
+            .map(|value| Self::from_env_value(&value))
+            .unwrap_or(Self::HeadlessCpp)
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::HeadlessCpp => "headless-cpp",
+            Self::QtTerminal => "qt-terminal",
+            Self::ExternalApi => "external-api",
+            Self::Simulated => "simulated",
+        }
+    }
+
+    fn is_managed(&self) -> bool {
+        matches!(self, Self::HeadlessCpp)
+    }
+
+    fn uses_local_api(&self) -> bool {
+        !matches!(self, Self::Simulated)
+    }
+}
 
 struct ServiceState {
     fallback_snapshot_json: Arc<String>,
@@ -155,7 +221,10 @@ struct AdminSession {
 }
 
 struct CaptureServiceManager {
+    host: String,
     port: u16,
+    origin: String,
+    provider: CaptureProvider,
     process: Mutex<Option<Child>>,
 }
 
@@ -743,15 +812,50 @@ fn create_session_id(user_id: &str, token: &str, created_at: u128) -> String {
 }
 
 fn capture_port() -> u16 {
+    if let Ok(origin) = env::var("CAPTURE_SERVICE_ORIGIN") {
+        if let Some(port) = capture_port_from_origin(&origin) {
+            return port;
+        }
+    }
     env::var("CAPTURE_SERVICE_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(CAPTURE_SERVICE_PORT)
 }
 
-fn capture_service_listening(port: u16) -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+fn capture_origin(port: u16) -> String {
+    env::var("CAPTURE_SERVICE_ORIGIN").unwrap_or_else(|_| format!("http://127.0.0.1:{port}"))
+}
+
+fn capture_endpoint_from_origin(origin: &str) -> Option<(String, u16)> {
+    let without_scheme = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .unwrap_or(origin);
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let (host, port) = authority.rsplit_once(':')?;
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port.parse::<u16>().ok()?))
+}
+
+fn capture_host_from_origin(origin: &str) -> Option<String> {
+    capture_endpoint_from_origin(origin).map(|(host, _)| host)
+}
+
+fn capture_port_from_origin(origin: &str) -> Option<u16> {
+    capture_endpoint_from_origin(origin).map(|(_, port)| port)
+}
+
+fn capture_service_listening_at(host: &str, port: u16) -> bool {
+    let Ok(addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok())
 }
 
 fn push_capture_target_candidates(candidates: &mut Vec<PathBuf>, base: &Path) {
@@ -795,20 +899,72 @@ fn find_capture_service_exe() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
+fn default_capture_camera_value(index: usize) -> Value {
+    let camera_no = index + 1;
+    let camera_id = format!("CAM-{camera_no:02}");
+    let roles = [
+        "上表面入口相机",
+        "上表面中部相机",
+        "上表面出口相机",
+        "下表面入口相机",
+        "下表面中部相机",
+        "下表面出口相机",
+    ];
+    json!({
+        "id": camera_id,
+        "name": format!("{camera_no} 号采集相机"),
+        "ip": CAPTURE_CAMERA_IPS[index],
+        "driverId": "lvm-nvt",
+        "modelHint": CAPTURE_CAMERA_MODELS[index],
+        "role": roles[index],
+        "enabled": true,
+        "triggerMode": "软件触发",
+        "exposureUs": 850,
+        "gain": 1,
+        "depthLines": 1280,
+        "outputPath": format!("captures/{camera_id}")
+    })
+}
+
+fn default_capture_cameras_value() -> Value {
+    Value::Array((0..CAPTURE_CAMERA_IPS.len()).map(default_capture_camera_value).collect())
+}
+
 fn build_config_json(capture_port: u16) -> String {
-    format!(
-        "{{\"service\":{{\"name\":\"steel-inspection-service\",\"role\":\"api-config-capture-orchestrator\",\"capturePort\":{},\"captureOrigin\":\"http://127.0.0.1:{}\",\"updatedAt\":\"{}\"}},\"capture\":{{\"mode\":\"single-camera\",\"driver\":\"lvm-nvt\",\"fallback\":\"simulated\",\"cameras\":[{{\"id\":\"CAM-01\",\"name\":\"1 号采集相机\",\"ip\":\"{}\",\"driverId\":\"lvm-nvt\",\"modelHint\":\"LVM3000 compatible 3D camera\",\"role\":\"主采集相机\",\"enabled\":true,\"triggerMode\":\"编码器触发\",\"exposureUs\":850,\"gain\":1,\"depthLines\":1280,\"outputPath\":\"captures/CAM-01\"}}]}}}}",
-        capture_port,
-        capture_port,
-        current_time_string(),
-        CAPTURE_CAMERA_IP
-    )
+    let provider = CaptureProvider::from_env();
+    let origin = capture_origin(capture_port);
+    json!({
+        "service": {
+            "name": "steel-inspection-service",
+            "role": "api-config-capture-orchestrator",
+            "capturePort": capture_port,
+            "captureOrigin": origin,
+            "captureProvider": provider.as_str(),
+            "captureManaged": provider.is_managed(),
+            "updatedAt": current_time_string()
+        },
+        "capture": {
+            "mode": "six-camera",
+            "driver": "lvm-nvt",
+            "provider": provider.as_str(),
+            "fallback": "simulated",
+            "cameras": default_capture_cameras_value()
+        }
+    })
+    .to_string()
 }
 
 impl CaptureServiceManager {
     fn new(port: u16) -> Self {
+        let provider = CaptureProvider::from_env();
+        let origin = capture_origin(port);
+        let host = capture_host_from_origin(&origin).unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = capture_port_from_origin(&origin).unwrap_or(port);
         let manager = Self {
+            host,
             port,
+            origin,
+            provider,
             process: Mutex::new(None),
         };
         manager.ensure_started();
@@ -816,7 +972,10 @@ impl CaptureServiceManager {
     }
 
     fn ensure_started(&self) {
-        if capture_service_listening(self.port) {
+        if !self.provider.is_managed() {
+            return;
+        }
+        if self.endpoint_listening() {
             return;
         }
         if env::var("STEEL_CAPTURE_SERVICE_AUTOSTART").as_deref() == Ok("0") {
@@ -826,6 +985,9 @@ impl CaptureServiceManager {
     }
 
     fn spawn_process(&self) -> bool {
+        if !self.provider.is_managed() {
+            return false;
+        }
         let Some(exe) = find_capture_service_exe() else {
             return false;
         };
@@ -843,20 +1005,32 @@ impl CaptureServiceManager {
                 *process = Some(child);
             }
             std::thread::sleep(Duration::from_millis(250));
-            capture_service_listening(self.port)
+            self.endpoint_listening()
         } else {
             false
         }
     }
 
     fn start(&self) -> bool {
-        if capture_service_listening(self.port) {
+        if self.provider == CaptureProvider::Simulated {
+            return true;
+        }
+        if !self.provider.is_managed() {
+            return self.endpoint_listening();
+        }
+        if self.endpoint_listening() {
             return true;
         }
         self.spawn_process()
     }
 
     fn stop(&self) -> bool {
+        if self.provider == CaptureProvider::Simulated {
+            return true;
+        }
+        if !self.provider.is_managed() {
+            return !self.endpoint_listening();
+        }
         if let Ok(mut process) = self.process.lock() {
             if let Some(mut child) = process.take() {
                 let _ = child.kill();
@@ -864,10 +1038,16 @@ impl CaptureServiceManager {
             }
         }
         std::thread::sleep(Duration::from_millis(200));
-        !capture_service_listening(self.port)
+        !self.endpoint_listening()
     }
 
     fn restart(&self) -> bool {
+        if self.provider == CaptureProvider::Simulated {
+            return true;
+        }
+        if !self.provider.is_managed() {
+            return self.endpoint_listening();
+        }
         let mut killed_managed_process = false;
         if let Ok(mut process) = self.process.lock() {
             if let Some(mut child) = process.take() {
@@ -878,38 +1058,58 @@ impl CaptureServiceManager {
         }
         std::thread::sleep(Duration::from_millis(200));
         self.ensure_started();
-        killed_managed_process || capture_service_listening(self.port)
+        killed_managed_process || self.endpoint_listening()
+    }
+
+    fn endpoint_listening(&self) -> bool {
+        capture_service_listening_at(&self.host, self.port)
+    }
+
+    fn is_running(&self) -> bool {
+        self.provider == CaptureProvider::Simulated
+            || (self.provider.uses_local_api() && self.endpoint_listening())
     }
 
     fn status_json(&self) -> String {
         let exe = find_capture_service_exe()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        let running = capture_service_listening(self.port);
+        let running = self.is_running();
+        let process_available = match self.provider {
+            CaptureProvider::HeadlessCpp => !exe.is_empty(),
+            CaptureProvider::QtTerminal | CaptureProvider::ExternalApi => true,
+            CaptureProvider::Simulated => false,
+        };
         format!(
-            "{{\"name\":\"capture-service\",\"managed\":true,\"running\":{},\"port\":{},\"origin\":\"http://127.0.0.1:{}\",\"processAvailable\":{},\"executable\":\"{}\",\"fallback\":\"simulated-single-camera\"}}",
+            "{{\"name\":\"capture-service\",\"provider\":\"{}\",\"managed\":{},\"running\":{},\"port\":{},\"origin\":\"{}\",\"processAvailable\":{},\"executable\":\"{}\",\"fallback\":\"simulated-six-camera\"}}",
+            self.provider.as_str(),
+            if self.provider.is_managed() { "true" } else { "false" },
             if running { "true" } else { "false" },
             self.port,
-            self.port,
-            if exe.is_empty() { "false" } else { "true" },
+            json_escape(&self.origin),
+            if process_available { "true" } else { "false" },
             json_escape(&exe)
         )
     }
 
     fn proxy(&self, method: &str, path_with_query: &str, body: &str) -> Option<Vec<u8>> {
-        self.ensure_started();
-        if !capture_service_listening(self.port) {
+        if !self.provider.uses_local_api() {
             return None;
         }
-        let mut stream = TcpStream::connect_timeout(
-            &SocketAddr::from(([127, 0, 0, 1], self.port)),
-            Duration::from_millis(800),
-        )
-        .ok()?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        self.ensure_started();
+        if !self.endpoint_listening() {
+            return None;
+        }
+        let address = (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .ok()?
+            .find(|addr| TcpStream::connect_timeout(addr, Duration::from_millis(200)).is_ok())?;
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(1500)).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
         let request = format!(
-            "{method} {path_with_query} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "{method} {path_with_query} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            self.host,
             self.port,
             body.as_bytes().len(),
             body
@@ -1235,25 +1435,37 @@ fn http_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
 
 fn capture_health_json() -> String {
     format!(
-        "{{\"service\":\"steel-capture-simulated\",\"time\":\"{}\",\"sdkReady\":true,\"sdkCode\":0,\"sdkVersion\":\"sim-6.7.0\",\"connected\":true,\"ip\":\"{}\",\"driverId\":\"simulated\",\"driverName\":\"Simulated 3D Camera Driver\",\"cameraCount\":1}}",
+        "{{\"service\":\"steel-capture-simulated\",\"time\":\"{}\",\"sdkReady\":false,\"sdkCode\":0,\"sdkVersion\":\"sim-6.7.0\",\"connected\":false,\"ip\":\"{}\",\"driverId\":\"simulated\",\"driverName\":\"Simulated 3D Camera Driver\",\"cameraCount\":{},\"mode\":\"simulation\"}}",
         current_time_string(),
-        CAPTURE_CAMERA_IP
+        CAPTURE_CAMERA_IP,
+        CAPTURE_CAMERA_IPS.len()
     )
 }
 
 fn capture_cameras_json() -> String {
-    format!(
-        "{{\"cameras\":[{{\"ip\":\"{}\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM2026061301\",\"driverId\":\"simulated\",\"source\":\"service-fallback\",\"configured\":true}}]}}",
-        CAPTURE_CAMERA_IP
-    )
+    let cameras = CAPTURE_CAMERA_IPS
+        .iter()
+        .enumerate()
+        .map(|(index, ip)| {
+            format!(
+                "{{\"ip\":\"{}\",\"model\":\"{}\",\"sn\":\"{}\",\"driverId\":\"simulated\",\"source\":\"service-fallback\",\"configured\":true}}",
+                ip,
+                CAPTURE_CAMERA_MODELS[index],
+                CAPTURE_CAMERA_SERIALS[index]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"cameras\":[{}]}}", cameras)
 }
 
 fn capture_status_json(ip: &str, index: usize) -> String {
     format!(
-        "{{\"connected\":true,\"deviceId\":{},\"ip\":\"{}\",\"driverId\":\"simulated\",\"model\":\"SIM-LVM-3D-2048\",\"sn\":\"SIM20260613{:02}\",\"acquisitionState\":\"connected\",\"sdkStatus\":\"ready\",\"fps\":{:.1},\"bufferPercent\":{},\"lastFrameTime\":\"2026-06-14T15:58:{:02}Z\",\"task\":1,\"status\":0,\"linkHealth\":100,\"temperatureJ28\":{:.1},\"temperatureJ29\":{:.1},\"temperatureJ30\":{:.1},\"lostPulseCounter\":{},\"bufferOverflowCounter\":0}}",
+        "{{\"connected\":true,\"deviceId\":{},\"ip\":\"{}\",\"driverId\":\"simulated\",\"model\":\"{}\",\"sn\":\"{}\",\"source\":\"service-fallback\",\"acquisitionState\":\"connected\",\"sdkStatus\":\"simulation\",\"fps\":{:.1},\"bufferPercent\":{},\"lastFrameTime\":\"2026-06-14T15:58:{:02}Z\",\"task\":1,\"status\":0,\"linkHealth\":100,\"temperatureJ28\":{:.1},\"temperatureJ29\":{:.1},\"temperatureJ30\":{:.1},\"lostPulseCounter\":{},\"bufferOverflowCounter\":0}}",
         index + 1,
         ip,
-        index + 1,
+        CAPTURE_CAMERA_MODELS[index],
+        CAPTURE_CAMERA_SERIALS[index],
         21.5 + index as f64 * 0.7,
         18 + index * 3,
         12 + index,
@@ -1265,10 +1477,13 @@ fn capture_status_json(ip: &str, index: usize) -> String {
 }
 
 fn capture_statuses_json() -> String {
-    format!(
-        "{{\"statuses\":[{}]}}",
-        capture_status_json(CAPTURE_CAMERA_IP, 0)
-    )
+    let statuses = CAPTURE_CAMERA_IPS
+        .iter()
+        .enumerate()
+        .map(|(index, ip)| capture_status_json(ip, index))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"statuses\":[{}]}}", statuses)
 }
 
 fn split_path_and_query(raw_path: &str) -> (&str, &str) {
@@ -1300,22 +1515,22 @@ fn fallback_capture_response(path: &str) -> Vec<u8> {
         "/api/camera/connect" => http_response(
             "200 OK",
             "application/json; charset=utf-8",
-            "{\"code\":0,\"connected\":true,\"output\":\"simulated camera connected by service fallback\"}",
+            "{\"code\":0,\"connected\":true,\"output\":\"SIMULATION ONLY: camera connected by service fallback\"}",
         ),
         "/api/camera/disconnect" => http_response(
             "200 OK",
             "application/json; charset=utf-8",
-            "{\"code\":0,\"connected\":false,\"output\":\"simulated camera disconnected by service fallback\"}",
+            "{\"code\":0,\"connected\":false,\"output\":\"SIMULATION ONLY: camera disconnected by service fallback\"}",
         ),
         "/api/param" => http_response(
             "200 OK",
             "application/json; charset=utf-8",
-            "{\"code\":0,\"output\":\"simulated parameter accepted by service fallback\"}",
+            "{\"code\":0,\"output\":\"SIMULATION ONLY: parameter accepted by service fallback\"}",
         ),
         "/api/capture/depth-map" => http_response(
             "200 OK",
             "application/json; charset=utf-8",
-            "{\"code\":0,\"width\":2048,\"lines\":1280,\"output\":\"simulated depth map captured by service fallback\"}",
+            "{\"code\":0,\"width\":2048,\"lines\":1280,\"output\":\"SIMULATION ONLY: depth map captured by service fallback\"}",
         ),
         _ => http_response(
             "404 Not Found",
@@ -2205,7 +2420,7 @@ fn write_auth_password_response(state: &ServiceState, request: &str, body: &str)
 fn admin_services_json(state: &ServiceState) -> String {
     let service_port = env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string());
     let capture_status = serde_json::from_str::<Value>(&state.capture.status_json())
-        .unwrap_or_else(|_| json!({ "running": false, "fallback": "simulated-single-camera" }));
+        .unwrap_or_else(|_| json!({ "running": false, "fallback": "simulated-six-camera" }));
     let now = current_time_millis();
     let active_sessions = state
         .sessions
@@ -2730,7 +2945,7 @@ fn capture_service_action_response(
             "started": action == "start" && success,
             "stopped": action == "stop" && success,
             "restarted": action == "restart" && success,
-            "running": capture_service_listening(state.capture.port),
+            "running": state.capture.is_running(),
             "services": serde_json::from_str::<Value>(&admin_services_json(state)).unwrap_or_else(|_| json!({}))
         })
         .to_string(),
@@ -3046,6 +3261,21 @@ fn validate_bool_field(
         .ok_or_else(|| format!("{path}.{camel_key} 必须是布尔值"))
 }
 
+fn validate_optional_bool_field(
+    object: &serde_json::Map<String, Value>,
+    camel_key: &str,
+    snake_key: &str,
+    path: &str,
+) -> Result<(), String> {
+    let Some(value) = field_value(object, camel_key, snake_key) else {
+        return Ok(());
+    };
+    if value.as_bool().is_none() {
+        return Err(format!("{path}.{camel_key} must be a boolean"));
+    }
+    Ok(())
+}
+
 fn optional_text_field_or_default(
     object: &serde_json::Map<String, Value>,
     camel_key: &str,
@@ -3169,6 +3399,14 @@ fn validate_capture_config_value(value: &Value) -> Result<(), String> {
             "service",
             255,
         )?;
+        validate_optional_text_field(
+            service_object,
+            "captureProvider",
+            "capture_provider",
+            "service",
+            64,
+        )?;
+        validate_optional_bool_field(service_object, "captureManaged", "capture_managed", "service")?;
         validate_optional_text_field(service_object, "updatedAt", "updated_at", "service", 64)?;
         validate_optional_i64_field(
             service_object,
@@ -3183,6 +3421,7 @@ fn validate_capture_config_value(value: &Value) -> Result<(), String> {
     let capture = required_object_field(object, "capture", "config")?;
     validate_text_field(capture, "mode", "mode", "capture", 64)?;
     validate_text_field(capture, "driver", "driver", "capture", 64)?;
+    validate_optional_text_field(capture, "provider", "provider", "capture", 64)?;
     validate_text_field(capture, "fallback", "fallback", "capture", 64)?;
     let cameras = capture
         .get("cameras")
@@ -5147,7 +5386,7 @@ fn camera_config_input_from_value(payload: &Value) -> Result<db::CameraConfigInp
         "model_hint",
         "camera",
         128,
-        "LVM3000 compatible 3D camera".to_string(),
+        "LVM3450CA".to_string(),
     )?;
     let role = optional_text_field_or_default(
         object,
@@ -5164,7 +5403,7 @@ fn camera_config_input_from_value(payload: &Value) -> Result<db::CameraConfigInp
         "trigger_mode",
         "camera",
         64,
-        "编码器触发".to_string(),
+        "软件触发".to_string(),
     )?;
     let exposure_us = optional_i64_field_or_default(
         object,
@@ -6830,7 +7069,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
                 "name": "capture-service",
                 "managed": true,
                 "running": false,
-                "fallback": "simulated-single-camera"
+                "fallback": "simulated-six-camera"
             })
         });
     let service_port = env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string());
@@ -7151,6 +7390,17 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
                 fallback_capture_response(path)
             }
         }
+        ("GET", "/api/capture/file") => {
+            if let Some(body) = state.capture.proxy(method, raw_path, body) {
+                http_bytes_response_with_headers("200 OK", "image/png", &body, &[])
+            } else {
+                http_response(
+                    "404 Not Found",
+                    "application/json; charset=utf-8",
+                    "{\"error\":\"capture_file_not_found\"}",
+                )
+            }
+        }
         _ => http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -7175,6 +7425,7 @@ fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     listener.set_nonblocking(false)?;
     let capture_port = capture_port();
+    let capture_manager = Arc::new(CaptureServiceManager::new(capture_port));
     let config_json = runtime
         .block_on(db::get_config(&database.connection, "capture"))
         .ok()
@@ -7184,7 +7435,7 @@ fn main() -> std::io::Result<()> {
     let state = Arc::new(ServiceState {
         fallback_snapshot_json: Arc::new(build_snapshot_json()),
         config_json: Mutex::new(config_json),
-        capture: Arc::new(CaptureServiceManager::new(capture_port)),
+        capture: Arc::clone(&capture_manager),
         database,
         runtime,
         sessions: Mutex::new(HashMap::new()),
@@ -7192,7 +7443,11 @@ fn main() -> std::io::Result<()> {
         started_at: current_time_millis(),
     });
     println!("steel inspection service listening on http://127.0.0.1:{port}");
-    println!("capture service managed at http://127.0.0.1:{capture_port}");
+    println!(
+        "capture provider {} at {}",
+        capture_manager.provider.as_str(),
+        capture_manager.origin.as_str()
+    );
     println!("sqlite config directory {}", config_dir.display());
     for stream in listener.incoming() {
         match stream {
@@ -7783,6 +8038,43 @@ mod tests {
     }
 
     #[test]
+    fn capture_provider_parses_independent_runtime_modes() {
+        assert_eq!(
+            CaptureProvider::from_env_value("headless-cpp"),
+            CaptureProvider::HeadlessCpp
+        );
+        assert_eq!(
+            CaptureProvider::from_env_value("qt-terminal"),
+            CaptureProvider::QtTerminal
+        );
+        assert_eq!(
+            CaptureProvider::from_env_value("external-api"),
+            CaptureProvider::ExternalApi
+        );
+        assert_eq!(
+            CaptureProvider::from_env_value("simulated"),
+            CaptureProvider::Simulated
+        );
+    }
+
+    #[test]
+    fn capture_origin_port_parser_accepts_local_capture_endpoints() {
+        assert_eq!(
+            capture_port_from_origin("http://127.0.0.1:4317"),
+            Some(4317)
+        );
+        assert_eq!(
+            capture_host_from_origin("http://192.168.1.20:5317/api"),
+            Some("192.168.1.20".to_string())
+        );
+        assert_eq!(
+            capture_port_from_origin("http://127.0.0.1:5317/api"),
+            Some(5317)
+        );
+        assert_eq!(capture_port_from_origin("http://127.0.0.1"), None);
+    }
+
+    #[test]
     fn capture_config_validation_rejects_missing_cameras_and_bad_camera_fields() {
         let no_cameras = validate_capture_config_value(&json!({
             "capture": {
@@ -7803,11 +8095,11 @@ mod tests {
                 "cameras": [{
                     "id": "CAM-01",
                     "name": "1 号采集相机",
-                    "ip": "192.168.10.13",
+                    "ip": "192.168.105.13",
                     "driverId": "lvm-nvt",
                     "role": "主采集相机",
                     "enabled": true,
-                    "triggerMode": "编码器触发",
+                    "triggerMode": "软件触发",
                     "exposureUs": 0,
                     "gain": 1,
                     "depthLines": 1280,
@@ -7824,10 +8116,10 @@ mod tests {
         let valid_camera = camera_config_input_from_value(&json!({
             "id": "CAM-02",
             "name": "2 号采集相机",
-            "ip": "192.168.10.14",
+            "ip": "192.168.102.100",
             "driverId": "lvm-nvt",
             "enabled": true,
-            "triggerMode": "编码器触发",
+            "triggerMode": "软件触发",
             "exposureUs": 850,
             "gain": 1.5,
             "depthLines": 1600,
@@ -7840,7 +8132,7 @@ mod tests {
         let invalid_exposure = match camera_config_input_from_value(&json!({
             "id": "CAM-02",
             "name": "2 号采集相机",
-            "ip": "192.168.10.14",
+            "ip": "192.168.102.100",
             "exposureUs": 0,
             "gain": 1,
             "depthLines": 1600
@@ -7853,7 +8145,7 @@ mod tests {
         let invalid_gain = match camera_config_input_from_value(&json!({
             "id": "CAM-02",
             "name": "2 号采集相机",
-            "ip": "192.168.10.14",
+            "ip": "192.168.102.100",
             "exposureUs": 850,
             "gain": 101,
             "depthLines": 1600

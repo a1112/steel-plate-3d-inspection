@@ -7,7 +7,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr,
     EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
-use serde_json;
+use serde_json::{self, json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -1468,13 +1468,111 @@ async fn ensure_admin_data(connection: &DatabaseConnection) -> Result<(), DbErr>
     Ok(())
 }
 
+fn default_camera_configs() -> Vec<CameraConfigInput> {
+    let cameras = [
+        ("192.168.105.13", "LVM3450CA", "上表面入口相机"),
+        ("192.168.102.100", "LVM3450CA", "上表面中部相机"),
+        ("192.168.101.100", "LVM3450BE", "上表面出口相机"),
+        ("192.168.103.100", "LVM3450RE", "下表面入口相机"),
+        ("192.168.104.100", "LVM3450BE", "下表面中部相机"),
+        ("192.168.106.100", "LVM3450RE", "下表面出口相机"),
+    ];
+    cameras
+        .iter()
+        .enumerate()
+        .map(|(index, (ip, model, role))| {
+            let camera_no = index + 1;
+            let id = format!("CAM-{camera_no:02}");
+            CameraConfigInput {
+                id: id.clone(),
+                name: format!("{camera_no} 号采集相机"),
+                ip: (*ip).to_string(),
+                driver_id: "lvm-nvt".to_string(),
+                model_hint: (*model).to_string(),
+                role: (*role).to_string(),
+                enabled: true,
+                trigger_mode: "软件触发".to_string(),
+                exposure_us: 850,
+                gain: 1.0,
+                depth_lines: 1280,
+                output_path: format!("captures/{id}"),
+            }
+        })
+        .collect()
+}
+
+fn default_capture_config_value() -> Value {
+    let cameras = default_camera_configs()
+        .into_iter()
+        .map(|camera| {
+            json!({
+                "id": camera.id,
+                "name": camera.name,
+                "ip": camera.ip,
+                "driverId": camera.driver_id,
+                "modelHint": camera.model_hint,
+                "role": camera.role,
+                "enabled": camera.enabled,
+                "triggerMode": camera.trigger_mode,
+                "exposureUs": camera.exposure_us,
+                "gain": camera.gain,
+                "depthLines": camera.depth_lines,
+                "outputPath": camera.output_path,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "service": {
+            "name": "steel-inspection-service",
+            "role": "api-config-capture-orchestrator",
+            "updatedAt": now_millis_string()
+        },
+        "capture": {
+            "mode": "six-camera",
+            "driver": "lvm-nvt",
+            "fallback": "simulated",
+            "cameras": cameras
+        }
+    })
+}
+
+fn capture_config_matches_current_cameras(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.pointer("/capture/cameras").and_then(Value::as_array).cloned())
+        .is_some_and(|cameras| {
+            cameras.len() >= 6
+                && cameras.iter().all(|camera| {
+                    camera
+                        .get("triggerMode")
+                        .and_then(Value::as_str)
+                        .is_some_and(|mode| mode == "软件触发")
+                })
+                && cameras.iter().any(|camera| {
+                    camera
+                        .get("ip")
+                        .and_then(Value::as_str)
+                        .is_some_and(|ip| ip == "192.168.105.13")
+                })
+                && cameras.iter().any(|camera| {
+                    camera
+                        .get("ip")
+                        .and_then(Value::as_str)
+                        .is_some_and(|ip| ip == "192.168.106.100")
+                })
+        })
+}
+
 async fn ensure_default_configs(connection: &DatabaseConnection) -> Result<(), DbErr> {
     let connection_config = "{\"mode\":\"online\",\"host\":\"127.0.0.1\",\"port\":4873}";
     if get_config(connection, "connection").await?.is_none() {
         set_config(connection, "connection", connection_config).await?;
     }
-    if get_config(connection, "capture").await?.is_none() {
-        set_config(connection, "capture", &default_capture_config_json()).await?;
+    match get_config(connection, "capture").await? {
+        Some(config) if capture_config_matches_current_cameras(&config.value) => {}
+        _ => {
+            set_config(connection, "capture", &default_capture_config_json()).await?;
+        }
     }
     if get_config(connection, "security_policy").await?.is_none() {
         set_config(
@@ -1515,32 +1613,17 @@ async fn ensure_default_configs(connection: &DatabaseConnection) -> Result<(), D
         .await?;
     }
 
-    if camera_config::Entity::find().count(connection).await? == 0 {
-        camera_config::ActiveModel {
-            id: Set("CAM-01".to_string()),
-            name: Set("1 号采集相机".to_string()),
-            ip: Set("192.168.10.13".to_string()),
-            driver_id: Set("lvm-nvt".to_string()),
-            model_hint: Set("LVM3000 compatible 3D camera".to_string()),
-            role: Set("主采集相机".to_string()),
-            enabled: Set(true),
-            trigger_mode: Set("编码器触发".to_string()),
-            exposure_us: Set(850),
-            gain: Set(1.0),
-            depth_lines: Set(1280),
-            output_path: Set("captures/CAM-01".to_string()),
+    let should_refresh_default_cameras = camera_config::Entity::find().count(connection).await? < 6;
+    for camera in default_camera_configs() {
+        if should_refresh_default_cameras || find_camera_config(connection, &camera.id).await?.is_none() {
+            save_camera_config(connection, camera).await?;
         }
-        .insert(connection)
-        .await?;
     }
     Ok(())
 }
 
 fn default_capture_config_json() -> String {
-    format!(
-        "{{\"service\":{{\"name\":\"steel-inspection-service\",\"role\":\"api-config-capture-orchestrator\",\"updatedAt\":\"{}\"}},\"capture\":{{\"mode\":\"single-camera\",\"driver\":\"lvm-nvt\",\"fallback\":\"simulated\",\"cameras\":[{{\"id\":\"CAM-01\",\"name\":\"1 号采集相机\",\"ip\":\"192.168.10.13\",\"driverId\":\"lvm-nvt\",\"modelHint\":\"LVM3000 compatible 3D camera\",\"role\":\"主采集相机\",\"enabled\":true,\"triggerMode\":\"编码器触发\",\"exposureUs\":850,\"gain\":1,\"depthLines\":1280,\"outputPath\":\"captures/CAM-01\"}}]}}}}",
-        now_millis_string()
-    )
+    default_capture_config_value().to_string()
 }
 
 async fn seed_defect_types(connection: &DatabaseConnection) -> Result<(), DbErr> {

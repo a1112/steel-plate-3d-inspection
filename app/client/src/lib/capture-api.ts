@@ -155,6 +155,7 @@ export type CaptureCommandResult = {
   ip?: string;
   key?: string;
   output?: string;
+  imageUrl?: string;
   width?: number;
   lines?: number;
   error?: string;
@@ -203,6 +204,35 @@ function timestamp() {
   return String(Date.now());
 }
 
+export function createDefaultCaptureCameras(): CaptureCameraConfig[] {
+  const cameras = [
+    { ip: '192.168.105.13', model: 'LVM3450CA', role: '\u4e0a\u8868\u9762\u5165\u53e3\u76f8\u673a' },
+    { ip: '192.168.102.100', model: 'LVM3450CA', role: '\u4e0a\u8868\u9762\u4e2d\u90e8\u76f8\u673a' },
+    { ip: '192.168.101.100', model: 'LVM3450BE', role: '\u4e0a\u8868\u9762\u51fa\u53e3\u76f8\u673a' },
+    { ip: '192.168.103.100', model: 'LVM3450RE', role: '\u4e0b\u8868\u9762\u5165\u53e3\u76f8\u673a' },
+    { ip: '192.168.104.100', model: 'LVM3450BE', role: '\u4e0b\u8868\u9762\u4e2d\u90e8\u76f8\u673a' },
+    { ip: '192.168.106.100', model: 'LVM3450RE', role: '\u4e0b\u8868\u9762\u51fa\u53e3\u76f8\u673a' },
+  ];
+  return cameras.map((camera, index) => {
+    const cameraNo = index + 1;
+    const cameraId = `CAM-${String(cameraNo).padStart(2, '0')}`;
+    return {
+      id: cameraId,
+      name: `${cameraNo} \u53f7\u91c7\u96c6\u76f8\u673a`,
+      ip: camera.ip,
+      role: camera.role,
+      driverId: 'lvm-nvt',
+      modelHint: camera.model,
+      enabled: true,
+      triggerMode: '\u8f6f\u4ef6\u89e6\u53d1',
+      exposureUs: 850,
+      gain: 1,
+      depthLines: 1280,
+      outputPath: `captures/${cameraId}`,
+    };
+  });
+}
+
 export function createDefaultCaptureDriver(): CaptureDriverInfo {
   return {
     id: 'lvm-nvt',
@@ -217,26 +247,11 @@ export function createDefaultCaptureDriver(): CaptureDriverInfo {
 
 export function createDefaultCaptureConfig(): CaptureAppliedConfig {
   return {
-    id: 'single-camera-capture',
-    name: 'Single-Camera-Capture',
+    id: 'six-camera-capture',
+    name: 'Six-Camera-Capture',
     applied: true,
     updatedAt: timestamp(),
-    cameras: [
-      {
-        id: 'CAM-01',
-        name: '1 号采集相机',
-        ip: '192.168.10.13',
-        role: '主采集相机',
-        driverId: 'lvm-nvt',
-        modelHint: 'LVM3000 compatible 3D camera',
-        enabled: true,
-        triggerMode: '编码器触发',
-        exposureUs: 850,
-        gain: 1,
-        depthLines: 1280,
-        outputPath: 'captures/CAM-01',
-      },
-    ],
+    cameras: createDefaultCaptureCameras(),
   };
 }
 
@@ -312,7 +327,7 @@ function hydrateSnapshot(partial: Partial<CaptureSnapshot> & { error?: string | 
 export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
   const [configResult, health, camerasResult, status, statusesResult] = await Promise.all([
     readJson<ServiceConfigResponse>('/api/config').catch((): ServiceConfigResponse => ({})),
-    readJson<CaptureHealth>('/health'),
+    readJson<CaptureHealth>('/api/capture/health'),
     readJson<{ cameras: CaptureCamera[] }>('/api/cameras'),
     readJson<CaptureCameraStatus>('/api/camera/status'),
     readJson<{ statuses: CaptureCameraStatus[] }>('/api/camera/statuses').catch(() => ({ statuses: [] })),
@@ -322,7 +337,11 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
     ...createDefaultCaptureConfig(),
     cameras: configResult.capture?.cameras?.length ? configResult.capture.cameras : createDefaultCaptureConfig().cameras,
   };
-  const cameras = camerasResult.cameras.map((camera) => ({ ...camera, driverId: 'lvm-nvt', source: 'http-service' }));
+  const cameras = camerasResult.cameras.map((camera) => ({
+    ...camera,
+    driverId: camera.driverId ?? 'lvm-nvt',
+    source: camera.source ?? 'http-service',
+  }));
   const discoveredByIp = new Map(cameras.map((camera) => [camera.ip, camera]));
   const statusByIp = new Map(statusesResult.statuses.map((cameraStatus) => [cameraStatus.ip, cameraStatus]));
   const statuses = config.cameras.map((camera) => {
@@ -331,12 +350,12 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
       return {
         ...createStatusFromConfig(camera, discoveredByIp.get(camera.ip)),
         ...backendStatus,
-        driverId: 'lvm-nvt',
+        driverId: backendStatus.driverId ?? 'lvm-nvt',
         name: camera.name,
         role: camera.role,
         configId: camera.id,
         acquisitionState: backendStatus.connected ? 'connected' : backendStatus.acquisitionState,
-        sdkStatus: health.sdkReady ? 'ready' : 'error',
+        sdkStatus: backendStatus.sdkStatus ?? (health.sdkReady ? 'ready' : 'error'),
       };
     }
     return createStatusFromConfig(camera, discoveredByIp.get(camera.ip));
@@ -373,7 +392,7 @@ export async function applyCaptureConfig(config: CaptureAppliedConfig) {
       updatedAt: timestamp(),
     },
     capture: {
-      mode: 'single-camera',
+      mode: 'six-camera',
       driver: 'lvm-nvt',
       fallback: 'simulated',
       cameras: config.cameras,
@@ -393,8 +412,16 @@ export async function setCaptureParam(key: string, type: 'int' | 'float', value:
   return writeJson<CaptureCommandResult>('/api/param', { ip, key, type, value });
 }
 
+export async function setCaptureSoftwareTrigger(ip?: string) {
+  return writeJson<CaptureCommandResult>('/api/param', { ip, key: 'TriggerMode', type: 'int', value: 0 });
+}
+
 export async function captureDepthMap(lines = 1280, output = 'capture-depth.png', ip?: string) {
-  return writeJson<CaptureCommandResult>('/api/capture/depth-map', { ip, lines, output });
+  const result = await writeJson<CaptureCommandResult>('/api/capture/depth-map', { ip, lines, output });
+  return {
+    ...result,
+    imageUrl: result.imageUrl?.startsWith('/') ? `${getCaptureServiceOrigin()}${result.imageUrl}` : result.imageUrl,
+  };
 }
 
 export async function openCaptureManagementWindow() {

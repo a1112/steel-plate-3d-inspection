@@ -391,12 +391,12 @@ function createEmptyCameraDraft(): AdminCameraConfigInput {
   return {
     id: '',
     name: '',
-    ip: '192.168.10.13',
+    ip: '192.168.105.13',
     driverId: 'lvm-nvt',
-    modelHint: 'LVM3000 compatible 3D camera',
+    modelHint: 'LVM3450CA',
     role: '采集相机',
     enabled: true,
-    triggerMode: '编码器触发',
+    triggerMode: '软件触发',
     exposureUs: 850,
     gain: 1,
     depthLines: 1280,
@@ -2085,9 +2085,7 @@ export function ParameterManagementApp() {
             <label>
               <span>触发模式</span>
               <select value={cameraDraft.triggerMode} onChange={(event) => setCameraDraft((current) => ({ ...current, triggerMode: event.target.value }))}>
-                <option value="编码器触发">编码器触发</option>
-                <option value="软触发">软触发</option>
-                <option value="连续采集">连续采集</option>
+                <option value="软件触发">软件触发</option>
               </select>
             </label>
             <label>

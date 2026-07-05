@@ -28,7 +28,7 @@ const adminOverview = {
       managed: true,
       running: false,
       port: 4317,
-      fallback: 'simulated-single-camera',
+      fallback: 'simulated-six-camera',
     },
   },
   database: {
@@ -219,12 +219,12 @@ const adminCameras = [
   {
     id: 'CAM-01',
     name: '1 号采集相机',
-    ip: '192.168.10.13',
+    ip: '192.168.105.13',
     driverId: 'lvm-nvt',
-    modelHint: 'LVM3000 compatible 3D camera',
+    modelHint: 'LVM3450CA',
     role: '主采集相机',
     enabled: true,
-    triggerMode: '编码器触发',
+    triggerMode: '软件触发',
     exposureUs: 850,
     gain: 1,
     depthLines: 1280,
@@ -319,7 +319,7 @@ const adminServices = {
     origin: 'http://127.0.0.1:4317',
     processAvailable: true,
     executable: '/tmp/steel_capture_service.exe',
-    fallback: 'simulated-single-camera',
+      fallback: 'simulated-six-camera',
   },
   diagnostics: [
     { id: 'api', label: 'API 服务', status: 'normal', detail: '运行 125000ms，在线会话 1 个' },
@@ -1753,7 +1753,7 @@ describe('ParameterManagementApp', () => {
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
     fireEvent.change(screen.getByLabelText('相机 ID'), { target: { value: 'CAM-02' } });
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: '2 号采集相机' } });
-    fireEvent.change(screen.getByLabelText('IP 地址'), { target: { value: '192.168.10.14' } });
+    fireEvent.change(screen.getByLabelText('IP 地址'), { target: { value: '192.168.102.100' } });
     fireEvent.change(screen.getByLabelText('采集行数'), { target: { value: '1600' } });
     fireEvent.click(screen.getByRole('button', { name: /保存相机/ }));
 
@@ -1765,12 +1765,12 @@ describe('ParameterManagementApp', () => {
           body: JSON.stringify({
             id: 'CAM-02',
             name: '2 号采集相机',
-            ip: '192.168.10.14',
+            ip: '192.168.102.100',
             driverId: 'lvm-nvt',
-            modelHint: 'LVM3000 compatible 3D camera',
+            modelHint: 'LVM3450CA',
             role: '采集相机',
             enabled: true,
-            triggerMode: '编码器触发',
+            triggerMode: '软件触发',
             exposureUs: 850,
             gain: 1,
             depthLines: 1600,
@@ -1796,7 +1796,7 @@ describe('ParameterManagementApp', () => {
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
     fireEvent.change(screen.getByLabelText('相机 ID'), { target: { value: 'CAM-02' } });
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: '2 号采集相机' } });
-    fireEvent.change(screen.getByLabelText('IP 地址'), { target: { value: '192.168.10.14' } });
+    fireEvent.change(screen.getByLabelText('IP 地址'), { target: { value: '192.168.102.100' } });
     fireEvent.change(screen.getByLabelText('曝光 us'), { target: { value: '0' } });
     fireEvent.click(screen.getByRole('button', { name: /保存相机/ }));
 

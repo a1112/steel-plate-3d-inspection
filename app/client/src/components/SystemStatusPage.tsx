@@ -1,5 +1,6 @@
 import {
   Activity,
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
   CheckCircle2,
@@ -23,10 +24,12 @@ import {
   applyCaptureConfig,
   captureDepthMap,
   connectCaptureCamera,
+  createDefaultCaptureCameras,
   createDefaultCaptureConfig,
   disconnectCaptureCamera,
   openCaptureManagementWindow,
   setCaptureParam,
+  setCaptureSoftwareTrigger,
   type CaptureAppliedConfig,
   type CaptureCameraConfig,
   type CaptureCameraStatus,
@@ -115,6 +118,15 @@ function getTemperature(status: CaptureCameraStatus) {
     return '-';
   }
   return `${Math.max(...values).toFixed(1)} C`;
+}
+
+function isSimulationCapture(capture: CaptureSnapshot) {
+  return (
+    capture.health?.driverId === 'simulated' ||
+    capture.health?.service?.includes('simulated') ||
+    capture.cameras.some((camera) => camera.driverId === 'simulated' || camera.source === 'service-fallback') ||
+    capture.statuses.some((camera) => camera.driverId === 'simulated' || camera.sdkStatus === 'simulation')
+  );
 }
 
 function CameraCard({
@@ -254,9 +266,7 @@ function ConfigTable({
                 </td>
                 <td>
                   <select value={camera.triggerMode} onChange={(event) => onChange(camera.id, { triggerMode: event.target.value })}>
-                    <option value="编码器触发">编码器触发</option>
                     <option value="软件触发">软件触发</option>
-                    <option value="外部 IO">外部 IO</option>
                   </select>
                 </td>
                 <td>
@@ -315,6 +325,7 @@ export function CaptureManagementApp({
   const [configDirty, setConfigDirty] = useState(false);
   const [captureRunning, setCaptureRunning] = useState(false);
   const [captureMessage, setCaptureMessage] = useState<string | null>(null);
+  const [capturePreview, setCapturePreview] = useState<{ ip: string; url: string; output: string } | null>(null);
 
   useEffect(() => {
     if (!configDirty) {
@@ -345,11 +356,15 @@ export function CaptureManagementApp({
   const warningCount = overviewStatuses.filter((item) => getStatusTone(item) === 'warning').length;
   const offlineCount = overviewStatuses.filter((item) => getStatusTone(item) === 'offline').length;
   const recentLogs = capture.logs.length > 0 ? capture.logs : operation.events.map((event) => ({ ...event, cameraIp: null }));
+  const simulationMode = isSimulationCapture(capture);
 
   const runCaptureCommand = async (action: () => Promise<CaptureCommandResult>, success: string) => {
     try {
       const result = await action();
       setCaptureMessage(result.code === 0 ? (result.output ? `${success}: ${result.output}` : success) : `指令失败: ${result.code}`);
+      if (result.code === 0 && result.imageUrl) {
+        setCapturePreview({ ip: result.ip ?? selectedIp ?? '', url: result.imageUrl, output: result.output ?? '' });
+      }
     } catch (error) {
       setCaptureMessage(error instanceof Error ? error.message : '指令失败');
     }
@@ -372,6 +387,7 @@ export function CaptureManagementApp({
       name: `采集配置-${suffix}`,
       applied: false,
       updatedAt: String(Date.now()),
+      cameras: createDefaultCaptureCameras(),
     }));
     setConfigDirty(true);
     setActiveView('config');
@@ -406,6 +422,10 @@ export function CaptureManagementApp({
       return;
     }
     await runCaptureCommand(async () => {
+      const trigger = await setCaptureSoftwareTrigger(selectedConfig.ip);
+      if (trigger.code !== 0) {
+        return trigger;
+      }
       const exposure = await setCaptureParam('ExposureTime', 'int', selectedConfig.exposureUs, selectedConfig.ip);
       if (exposure.code !== 0) {
         return exposure;
@@ -578,9 +598,7 @@ export function CaptureManagementApp({
                 <label>
                   <span>触发模式</span>
                   <select value={selectedConfig.triggerMode} onChange={(event) => updateCameraConfig(selectedConfig.id, { triggerMode: event.target.value })}>
-                    <option value="编码器触发">编码器触发</option>
                     <option value="软件触发">软件触发</option>
-                    <option value="外部 IO">外部 IO</option>
                   </select>
                 </label>
                 <label>
@@ -651,6 +669,14 @@ export function CaptureManagementApp({
               </button>
             </div>
           </Panel>
+          {capturePreview && (!capturePreview.ip || capturePreview.ip === selectedStatus.ip) ? (
+            <Panel title="最近采集预览" className="capture-depth-preview-panel">
+              <div className="capture-depth-preview">
+                <img src={capturePreview.url} alt={`${selectedStatus.name || selectedStatus.ip} depth map`} />
+                <span>{capturePreview.output}</span>
+              </div>
+            </Panel>
+          ) : null}
           <Panel title="相机日志" className="capture-detail-log-panel">
             <div className="capture-event-list">
               {recentLogs
@@ -692,8 +718,17 @@ export function CaptureManagementApp({
             );
           })}
         </aside>
-        <section className="capture-main">
-          <header className="capture-command-header">
+        <section className={`capture-main ${simulationMode ? 'has-mode-banner' : ''}`}>
+          <header className={`capture-command-header ${simulationMode ? 'with-mode-banner' : ''}`}>
+            {simulationMode ? (
+              <div className="capture-mode-banner simulated">
+                <AlertTriangle size={18} />
+                <div>
+                  <strong>模拟模式</strong>
+                  <span>当前采集数据来自服务兜底模拟，不是相机 SDK 的真实采集结果。</span>
+                </div>
+              </div>
+            ) : null}
             <div className="capture-workflow">
               <span>选择配置</span>
               <i />
@@ -853,6 +888,7 @@ export function SystemStatusPage({
   const warningCount = overviewStatuses.filter((camera) => getStatusTone(camera) === 'warning').length;
   const offlineCount = overviewStatuses.filter((camera) => getStatusTone(camera) === 'offline').length;
   const recentLogs = capture.logs.length > 0 ? capture.logs : operation.events.map((event) => ({ ...event, cameraIp: null }));
+  const simulationMode = isSimulationCapture(capture);
 
   const openIndependentManager = async () => {
     try {
@@ -891,6 +927,15 @@ export function SystemStatusPage({
     <main className="workspace-page capture-terminal-page">
       <section className="capture-terminal-layout">
         <Panel title="采集状态概览" className="capture-terminal-overview-panel">
+          {simulationMode ? (
+            <div className="capture-mode-banner simulated compact">
+              <AlertTriangle size={18} />
+              <div>
+                <strong>模拟模式</strong>
+                <span>当前状态由服务 fallback 生成，真实相机采集服务尚未接管。</span>
+              </div>
+            </div>
+          ) : null}
           <div className="capture-terminal-summary">
             <div>
               <span>当前配置</span>

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.bkgy.steel-plate-3d-inspection",
   "build": {
-    "beforeDevCommand": "npm run dev:service",
+    "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1432",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../../../target/client/frontend-dist"
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "钢板3D表面检测系统",
+        "title": "Steel Plate 3D Inspection",
         "width": 1680,
         "height": 945,
         "minWidth": 1366,
