@@ -7,7 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 option(STEEL_CAPTURE_BUILD_SERVICE "Build the headless steel capture service executable" ON)
 
-set(CAPTURE_SDK_ROOT "C:/Program Files (x86)/Capture 6.7.0.4/LVM_NVT_SDK/LVM_C++_SDK" CACHE PATH "Capture LVM C++ SDK root")
+set(STEEL_CAPTURE_SDK_DEFAULT_ROOT "C:/Program Files (x86)/Capture 6.7.0.4/LVM_NVT_SDK/LVM_C++_SDK")
+foreach(STEEL_CAPTURE_SDK_CANDIDATE
+    "C:/Program Files (x86)/Capture 6.7.0.8/LVM_NVT_SDK/LVM_C++_SDK"
+    "C:/Program Files (x86)/Capture 6.7.0.4/LVM_NVT_SDK/LVM_C++_SDK")
+  if(EXISTS "${STEEL_CAPTURE_SDK_CANDIDATE}/x64/Include/lvm_sdk.h")
+    set(STEEL_CAPTURE_SDK_DEFAULT_ROOT "${STEEL_CAPTURE_SDK_CANDIDATE}")
+    break()
+  endif()
+endforeach()
+set(CAPTURE_SDK_ROOT "${STEEL_CAPTURE_SDK_DEFAULT_ROOT}" CACHE PATH "Capture LVM C++ SDK root")
 set(CAPTURE_SDK_ARCH "x64" CACHE STRING "Capture SDK architecture")
 
 set(CAPTURE_SDK_INCLUDE "${CAPTURE_SDK_ROOT}/${CAPTURE_SDK_ARCH}/Include")

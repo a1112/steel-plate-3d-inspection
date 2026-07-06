@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -29,6 +30,35 @@
 namespace {
 
 std::atomic<bool> g_running{true};
+
+std::string trim(std::string value);
+
+enum class DriverMode {
+  Lvm,
+  Simulated,
+};
+
+std::string driver_mode_text(DriverMode mode) {
+  return mode == DriverMode::Simulated ? "simulated" : "lvm";
+}
+
+std::string driver_id_text(DriverMode mode) {
+  return mode == DriverMode::Simulated ? "simulated" : "lvm-nvt";
+}
+
+DriverMode parse_driver_mode(std::string value, DriverMode fallback = DriverMode::Lvm) {
+  value = trim(value);
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  if (value == "sim" || value == "simulated" || value == "simulation" || value == "offline") {
+    return DriverMode::Simulated;
+  }
+  if (value == "lvm" || value == "sdk" || value == "real" || value == "hardware") {
+    return DriverMode::Lvm;
+  }
+  return fallback;
+}
 
 std::string now_iso() {
   SYSTEMTIME time{};
@@ -316,6 +346,18 @@ std::filesystem::path default_storage_root_path() {
   return absolute_normalized_path("captures");
 }
 
+std::filesystem::path default_config_root_path() {
+  const char* env_root = std::getenv("CAPTURE_CONFIG_ROOT");
+  if (env_root && *env_root) {
+    return absolute_normalized_path(env_root);
+  }
+  const char* local_app_data = std::getenv("LOCALAPPDATA");
+  if (local_app_data && *local_app_data) {
+    return (std::filesystem::path(local_app_data) / "SteelCapture" / "config").lexically_normal();
+  }
+  return (default_storage_root_path() / "config").lexically_normal();
+}
+
 std::string lower_path_text(std::filesystem::path path) {
   std::string text = path.lexically_normal().string();
   std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
@@ -392,6 +434,12 @@ class CaptureRuntime {
     return runtime;
   }
 
+  void configure(DriverMode mode) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    driver_mode_ = mode;
+    load_active_profile_settings_locked(true);
+  }
+
   RouteResult route(const std::string& method, const std::string& path, const std::string& query, const std::string& body) {
     if (method == "OPTIONS") {
       return {200, "{}", "application/json; charset=utf-8"};
@@ -407,6 +455,7 @@ class CaptureRuntime {
     if (method == "GET" && path == "/api/config/profile") return {200, config_profile_json(query)};
     if (method == "POST" && path == "/api/config/profile/save") return {200, config_profile_save_json(body)};
     if (method == "POST" && path == "/api/config/profile/apply") return {200, config_profile_apply_json(body)};
+    if (method == "POST" && path == "/api/config/profile/import") return {200, config_profile_import_json(body)};
     if (method == "POST" && path == "/api/config/camera-params/save-all") return {200, config_camera_params_save_all_json(body)};
     if (method == "POST" && path == "/api/config/camera-params/load-all") return {200, config_camera_params_load_all_json(body)};
     if (method == "GET" && path == "/api/cameras") return {200, cameras_json()};
@@ -474,12 +523,21 @@ class CaptureRuntime {
   struct CameraSession {
     lvm_dev_t* device = nullptr;
     std::string ip;
+    std::string model;
+    std::string sn;
+    bool simulated = false;
+    bool simulated_connected = false;
+    int simulated_device_id = -1;
     int dev_type = -1;
+    int exposure_time = 50;
+    float gain_k = 1.0f;
+    float time_trigger_freq = 300.0f;
+    std::map<std::string, std::string> params;
     StreamState stream;
     CalibrationState calibration;
   };
 
-  CaptureRuntime() : storage_root_(default_storage_root_path()) {}
+  CaptureRuntime() : storage_root_(default_storage_root_path()), config_root_(default_config_root_path()) {}
   CaptureRuntime(const CaptureRuntime&) = delete;
   CaptureRuntime& operator=(const CaptureRuntime&) = delete;
 
@@ -564,7 +622,7 @@ class CaptureRuntime {
       return found == sessions_.end() ? nullptr : &found->second;
     }
     for (auto& item : sessions_) {
-      if (item.second.device) {
+      if (item.second.device || item.second.simulated_connected) {
         return &item.second;
       }
     }
@@ -650,7 +708,7 @@ class CaptureRuntime {
   }
 
   std::filesystem::path config_root_locked() const {
-    return (storage_root_ / "config").lexically_normal();
+    return config_root_.lexically_normal();
   }
 
   std::filesystem::path profiles_root_locked() const {
@@ -667,6 +725,8 @@ class CaptureRuntime {
 
   void ensure_config_dirs_locked() const {
     std::error_code error;
+    std::filesystem::create_directories(config_root_locked(), error);
+    error.clear();
     std::filesystem::create_directories(profiles_root_locked(), error);
     error.clear();
     std::filesystem::create_directories(camera_params_root_locked(), error);
@@ -678,7 +738,38 @@ class CaptureRuntime {
   }
 
   std::filesystem::path profile_path_locked(const std::string& name) const {
+    return (profile_dir_locked(name) / "profile.json").lexically_normal();
+  }
+
+  std::filesystem::path profile_dir_locked(const std::string& name) const {
+    return (profiles_root_locked() / normalize_profile_name(name)).lexically_normal();
+  }
+
+  std::filesystem::path legacy_profile_path_locked(const std::string& name) const {
     return (profiles_root_locked() / (normalize_profile_name(name) + ".json")).lexically_normal();
+  }
+
+  std::filesystem::path legacy_storage_profile_path_locked(const std::string& name) const {
+    return (storage_root_ / "config" / "profiles" / (normalize_profile_name(name) + ".json")).lexically_normal();
+  }
+
+  std::filesystem::path existing_profile_path_locked(const std::string& name) const {
+    std::filesystem::path folder_path = profile_path_locked(name);
+    std::error_code error;
+    if (std::filesystem::exists(folder_path, error)) {
+      return folder_path;
+    }
+    error.clear();
+    std::filesystem::path legacy_path = legacy_profile_path_locked(name);
+    if (std::filesystem::exists(legacy_path, error)) {
+      return legacy_path;
+    }
+    error.clear();
+    std::filesystem::path old_storage_path = legacy_storage_profile_path_locked(name);
+    if (std::filesystem::exists(old_storage_path, error)) {
+      return old_storage_path;
+    }
+    return folder_path;
   }
 
   std::string active_profile_name_locked() const {
@@ -704,15 +795,27 @@ class CaptureRuntime {
       if (error) {
         break;
       }
-      if (!entry.is_regular_file()) {
-        continue;
-      }
       std::filesystem::path path = entry.path();
-      if (path.extension() == ".json") {
+      if (entry.is_directory() && std::filesystem::exists(path / "profile.json")) {
+        names.push_back(path.filename().string());
+      } else if (entry.is_regular_file() && path.extension() == ".json") {
         names.push_back(path.stem().string());
       }
     }
+    std::filesystem::path legacy_root = storage_root_ / "config" / "profiles";
+    error.clear();
+    if (std::filesystem::exists(legacy_root, error)) {
+      for (const auto& entry : std::filesystem::directory_iterator(legacy_root, error)) {
+        if (error) {
+          break;
+        }
+        if (entry.is_regular_file() && entry.path().extension() == ".json") {
+          names.push_back(entry.path().stem().string());
+        }
+      }
+    }
     std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
     return names;
   }
 
@@ -733,7 +836,7 @@ class CaptureRuntime {
   std::filesystem::path camera_param_dir_locked(const std::string& body, const std::string& profile_name) const {
     std::string dir_text = json_string_field(body, "cameraParamDir");
     if (dir_text.empty()) {
-      dir_text = "config/camera-params/" + normalize_profile_name(profile_name);
+      return (profile_dir_locked(profile_name) / "camera-params").lexically_normal();
     }
     std::filesystem::path dir = path_from_json_text(dir_text);
     if (!dir.is_absolute()) {
@@ -775,13 +878,15 @@ class CaptureRuntime {
          << json_pair("schema", "steel.capture.profile.v1") << ","
          << json_pair("name", profile_name) << ","
          << json_pair("updatedAt", now_iso()) << ","
+         << json_pair("driverMode", driver_mode_text(driver_mode_)) << ","
          << json_pair("storageRoot", storage_root_.string()) << ","
          << json_pair("configRoot", config_root_locked().string()) << ","
          << json_pair("profileRoot", profiles_root_locked().string()) << ","
-         << json_pair("cameraParamDir", "config/camera-params/" + profile_name) << ","
+         << json_pair("profileDir", profile_dir_locked(profile_name).string()) << ","
+         << json_pair("cameraParamDir", (profile_dir_locked(profile_name) / "camera-params").lexically_normal().string()) << ","
          << json_pair("startupMode", "manual") << ","
          << "\"autoConnect\":true,"
-         << "\"expectedCameras\":6,"
+         << "\"expectedCameras\":" << expected_cameras_ << ","
          << "\"devType\":-1,"
          << "\"applySoftTrigger\":true,"
          << "\"loadCameraParams\":false,"
@@ -805,8 +910,39 @@ class CaptureRuntime {
          << "\"exposureTime\":50,"
          << "\"gainK\":1.0"
          << "},"
+         << "\"simulated\":{"
+         << json_pair("imageSourceDir", simulated_image_source_dir_)
+         << "},"
          << "\"cameras\":" << cameras.str()
          << "}";
+    return json.str();
+  }
+
+  std::string profile_entries_array_json_locked() const {
+    std::vector<std::string> names = profile_names_locked();
+    std::ostringstream json;
+    json << "[";
+    for (size_t i = 0; i < names.size(); ++i) {
+      if (i > 0) {
+        json << ",";
+      }
+      std::string name = normalize_profile_name(names[i]);
+      std::filesystem::path path = existing_profile_path_locked(name);
+      std::string profile;
+      std::string mode = "-";
+      if (read_file(path.string(), profile)) {
+        mode = json_string_field(profile, "driverMode", "-");
+      }
+      json << "{"
+           << json_pair("name", name) << ","
+           << json_pair("driverMode", mode) << ","
+           << json_pair("path", path.string()) << ","
+           << json_pair("folder", profile_dir_locked(name).string()) << ","
+           << "\"active\":" << (active_profile_name_locked() == name ? "true" : "false") << ","
+           << json_pair("format", path.filename() == "profile.json" ? "folder" : "legacy-json")
+           << "}";
+    }
+    json << "]";
     return json.str();
   }
 
@@ -815,12 +951,15 @@ class CaptureRuntime {
     ensure_config_dirs_locked();
     std::ostringstream json;
     json << "{\"code\":0,"
+         << json_pair("driverMode", driver_mode_text(driver_mode_)) << ","
+         << json_pair("driverId", driver_id_text(driver_mode_)) << ","
          << json_pair("storageRoot", storage_root_.string()) << ","
          << json_pair("configRoot", config_root_locked().string()) << ","
          << json_pair("profileRoot", profiles_root_locked().string()) << ","
          << json_pair("cameraParamRoot", camera_params_root_locked().string()) << ","
          << json_pair("activeProfile", active_profile_name_locked()) << ","
-         << "\"profiles\":" << profile_names_array_json_locked()
+         << "\"profiles\":" << profile_names_array_json_locked() << ","
+         << "\"profileEntries\":" << profile_entries_array_json_locked()
          << "}";
     return json.str();
   }
@@ -837,7 +976,7 @@ class CaptureRuntime {
       name = active_profile_name_locked();
     }
     std::string profile;
-    std::filesystem::path path = profile_path_locked(name);
+    std::filesystem::path path = existing_profile_path_locked(name);
     if (!read_file(path.string(), profile)) {
       profile = default_profile_json_locked(name);
     }
@@ -859,6 +998,12 @@ class CaptureRuntime {
     ensure_config_dirs_locked();
     name = normalize_profile_name(name);
     std::filesystem::path path = profile_path_locked(name);
+    std::error_code dir_error;
+    std::filesystem::create_directories(profile_dir_locked(name) / "camera-params", dir_error);
+    dir_error.clear();
+    std::filesystem::create_directories(profile_dir_locked(name) / "sim-images", dir_error);
+    dir_error.clear();
+    std::filesystem::create_directories(profile_dir_locked(name) / "captures", dir_error);
     if (!write_text_file(path, content)) {
       return json_error(500, "profile cannot be saved");
     }
@@ -873,6 +1018,115 @@ class CaptureRuntime {
          << "\"active\":" << (active_profile_name_locked() == name ? "true" : "false")
          << "}";
     return json.str();
+  }
+
+  std::string config_profile_import_json(const std::string& body) {
+    std::string source_text = json_string_field(body, "path", json_string_field(body, "source"));
+    if (source_text.empty()) {
+      return json_error(400, "missing import path");
+    }
+    bool overwrite = json_bool_field(body, "overwrite", false);
+    bool make_active = json_bool_field(body, "makeActive", false);
+    std::filesystem::path source = absolute_normalized_path(path_from_json_text(source_text));
+    std::error_code error;
+    if (!std::filesystem::exists(source, error)) {
+      return json_error(404, "import path not found");
+    }
+
+    std::filesystem::path source_profile;
+    if (std::filesystem::is_directory(source, error)) {
+      source_profile = source / "profile.json";
+      if (!std::filesystem::exists(source_profile, error)) {
+        for (const auto& entry : std::filesystem::directory_iterator(source, error)) {
+          if (entry.is_regular_file() && entry.path().extension() == ".json") {
+            source_profile = entry.path();
+            break;
+          }
+        }
+      }
+    } else {
+      source_profile = source;
+    }
+    if (!std::filesystem::exists(source_profile, error)) {
+      return json_error(404, "profile json not found in import path");
+    }
+
+    std::string content;
+    if (!read_file(source_profile.string(), content)) {
+      return json_error(500, "profile json cannot be read");
+    }
+    std::string name = normalize_profile_name(json_string_field(body, "name", json_string_field(content, "name", source.stem().string())));
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    ensure_config_dirs_locked();
+    std::filesystem::path destination = profile_dir_locked(name);
+    if (std::filesystem::exists(destination, error) && !overwrite) {
+      return json_error(409, "profile already exists");
+    }
+    if (overwrite) {
+      std::filesystem::remove_all(destination, error);
+      error.clear();
+    }
+    std::filesystem::create_directories(destination, error);
+    if (error) {
+      return json_error(500, "profile directory cannot be created");
+    }
+
+    if (std::filesystem::is_directory(source, error)) {
+      std::filesystem::copy(source, destination,
+                            std::filesystem::copy_options::recursive |
+                                std::filesystem::copy_options::overwrite_existing,
+                            error);
+      if (error) {
+        return json_error(500, "profile directory cannot be copied");
+      }
+    }
+    if (!write_text_file(profile_path_locked(name), content)) {
+      return json_error(500, "profile json cannot be imported");
+    }
+    std::filesystem::create_directories(destination / "camera-params", error);
+    error.clear();
+    std::filesystem::create_directories(destination / "sim-images", error);
+    error.clear();
+    std::filesystem::create_directories(destination / "captures", error);
+    if (make_active) {
+      write_active_profile_locked(name);
+    }
+
+    std::ostringstream json;
+    json << "{\"code\":0,"
+         << json_pair("name", name) << ","
+         << json_pair("path", profile_path_locked(name).string()) << ","
+         << json_pair("folder", destination.string()) << ","
+         << "\"active\":" << (active_profile_name_locked() == name ? "true" : "false")
+         << "}";
+    return json.str();
+  }
+
+  void apply_profile_runtime_settings_locked(const std::string& profile, bool change_storage) {
+    driver_mode_ = parse_driver_mode(json_string_field(profile, "driverMode", driver_mode_text(driver_mode_)), driver_mode_);
+    expected_cameras_ = std::max(1, std::min(24, json_int_field(profile, "expectedCameras", expected_cameras_)));
+    simulated_image_source_dir_ = json_string_field(profile, "imageSourceDir", simulated_image_source_dir_);
+    if (change_storage) {
+      std::string next_root = json_string_field(profile, "storageRoot");
+      if (!next_root.empty()) {
+        std::error_code error;
+        std::filesystem::path next = absolute_normalized_path(path_from_json_text(next_root));
+        std::filesystem::create_directories(next, error);
+        if (!error) {
+          storage_root_ = next;
+        }
+      }
+    }
+  }
+
+  void load_active_profile_settings_locked(bool change_storage) {
+    ensure_config_dirs_locked();
+    std::string active = active_profile_name_locked();
+    std::string profile;
+    if (read_file(existing_profile_path_locked(active).string(), profile)) {
+      apply_profile_runtime_settings_locked(profile, change_storage);
+    }
   }
 
   int apply_profile_params_locked(lvm_dev_t* device, const std::string& profile) {
@@ -935,6 +1189,16 @@ class CaptureRuntime {
     std::vector<std::filesystem::path> candidates;
     candidates.push_back(dir / (safe_path_segment(session.ip) + ".nccfg"));
     candidates.push_back(dir / (safe_path_segment(session.ip) + ".xml"));
+    if (session.simulated) {
+      if (!session.model.empty()) {
+        candidates.push_back(dir / (safe_path_segment(session.model) + ".nccfg"));
+        candidates.push_back(dir / (safe_path_segment(session.model) + ".xml"));
+      }
+      if (!session.sn.empty()) {
+        candidates.push_back(dir / (safe_path_segment(session.sn) + ".nccfg"));
+        candidates.push_back(dir / (safe_path_segment(session.sn) + ".xml"));
+      }
+    }
     if (session.device && session.device->dev_info) {
       std::string model = session.device->dev_info->device_name ? session.device->dev_info->device_name : "";
       std::string sn = session.device->dev_info->sn ? session.device->dev_info->sn : "";
@@ -959,7 +1223,7 @@ class CaptureRuntime {
     std::lock_guard<std::mutex> lock(mutex_);
     ensure_config_dirs_locked();
     std::filesystem::path dir = camera_param_dir_locked(body, profile_name);
-    if (!is_path_under_base(dir.string(), storage_root_)) {
+    if (!is_path_under_base(dir.string(), storage_root_) && !is_path_under_base(dir.string(), config_root_)) {
       return json_error(403, "camera parameter directory must be under storage root");
     }
     std::error_code error;
@@ -983,10 +1247,26 @@ class CaptureRuntime {
         results << ",";
       }
       first = false;
-      int apply_ret = apply_soft_trigger ? apply_software_trigger(session.device) : CORRECT;
+      int apply_ret = session.simulated ? CORRECT : (apply_soft_trigger ? apply_software_trigger(session.device) : CORRECT);
       std::filesystem::path file = dir / (safe_path_segment(session.ip) + ".nccfg");
-      int save_file_ret = apply_ret == CORRECT ? lvm_save_dev_param(session.device, file.string().c_str()) : apply_ret;
-      int save_dev_ret = (save_file_ret == CORRECT && save_to_device) ? lvm_save_param_to_dev(session.device) : CORRECT;
+      int save_file_ret = apply_ret;
+      if (apply_ret == CORRECT) {
+        if (session.simulated) {
+          std::ostringstream body;
+          body << "{"
+               << json_pair("driverId", "simulated") << ","
+               << json_pair("ip", session.ip) << ","
+               << json_pair("savedAt", now_iso()) << ","
+               << "\"exposureTime\":" << session.exposure_time << ","
+               << "\"gainK\":" << session.gain_k << ","
+               << "\"timeTriggerFreq\":" << session.time_trigger_freq
+               << "}";
+          save_file_ret = write_text_file(file, body.str()) ? CORRECT : 500;
+        } else {
+          save_file_ret = lvm_save_dev_param(session.device, file.string().c_str());
+        }
+      }
+      int save_dev_ret = (save_file_ret == CORRECT && save_to_device && !session.simulated) ? lvm_save_param_to_dev(session.device) : CORRECT;
       int code = save_file_ret == CORRECT ? save_dev_ret : save_file_ret;
       if (code == CORRECT) {
         ++saved;
@@ -1030,7 +1310,7 @@ class CaptureRuntime {
 
     ensure_config_dirs_locked();
     std::filesystem::path dir = camera_param_dir_locked(body, profile_name);
-    if (!is_path_under_base(dir.string(), storage_root_)) {
+    if (!is_path_under_base(dir.string(), storage_root_) && !is_path_under_base(dir.string(), config_root_)) {
       return json_error(403, "camera parameter directory must be under storage root");
     }
 
@@ -1057,9 +1337,9 @@ class CaptureRuntime {
           break;
         }
       }
-      int load_ret = file.empty() ? 404 : lvm_load_dev_param(session.device, file.string().c_str());
-      int apply_ret = (load_ret == CORRECT && apply_soft_trigger) ? apply_software_trigger(session.device) : CORRECT;
-      int save_ret = (load_ret == CORRECT && apply_ret == CORRECT && save_to_device) ? lvm_save_param_to_dev(session.device) : CORRECT;
+      int load_ret = file.empty() ? 404 : (session.simulated ? CORRECT : lvm_load_dev_param(session.device, file.string().c_str()));
+      int apply_ret = (load_ret == CORRECT && apply_soft_trigger && !session.simulated) ? apply_software_trigger(session.device) : CORRECT;
+      int save_ret = (load_ret == CORRECT && apply_ret == CORRECT && save_to_device && !session.simulated) ? lvm_save_param_to_dev(session.device) : CORRECT;
       int code = load_ret == CORRECT ? (apply_ret == CORRECT ? save_ret : apply_ret) : load_ret;
       if (code == CORRECT) {
         ++loaded;
@@ -1097,7 +1377,7 @@ class CaptureRuntime {
       std::lock_guard<std::mutex> lock(mutex_);
       ensure_config_dirs_locked();
       name = normalize_profile_name(name);
-      if (profile.empty() && !read_file(profile_path_locked(name).string(), profile)) {
+      if (profile.empty() && !read_file(existing_profile_path_locked(name).string(), profile)) {
         return json_error(404, "profile not found");
       }
     }
@@ -1106,20 +1386,15 @@ class CaptureRuntime {
     bool auto_connect = json_bool_field(body, "autoConnect", json_bool_field(profile, "autoConnect", false));
     bool load_camera_params = json_bool_field(body, "loadCameraParams", json_bool_field(profile, "loadCameraParams", false));
     bool save_to_device = json_bool_field(body, "saveToDevice", json_bool_field(profile, "saveToDevice", false));
-    int expected_cameras = json_int_field(body, "expectedCameras", json_int_field(profile, "expectedCameras", 0));
+    int expected_cameras = json_int_field(body, "expectedCameras", json_int_field(profile, "expectedCameras", expected_cameras_));
     int dev_type = json_int_field(body, "devType", json_int_field(profile, "devType", -1));
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (change_storage) {
-      std::string next_root = json_string_field(profile, "storageRoot");
-      if (!next_root.empty()) {
-        std::error_code error;
-        std::filesystem::path next = absolute_normalized_path(path_from_json_text(next_root));
-        std::filesystem::create_directories(next, error);
-        if (!error) {
-          storage_root_ = next;
-        }
-      }
+    DriverMode previous_mode = driver_mode_;
+    apply_profile_runtime_settings_locked(profile, change_storage);
+    expected_cameras_ = std::max(1, std::min(24, expected_cameras));
+    if (driver_mode_ != previous_mode) {
+      clear_sessions_locked();
     }
     ensure_config_dirs_locked();
 
@@ -1159,7 +1434,7 @@ class CaptureRuntime {
         param_results << ",";
       }
       first_param = false;
-      int ret = item.second.stream.running ? 409 : apply_profile_params_locked(item.second.device, profile);
+      int ret = item.second.simulated ? CORRECT : (item.second.stream.running ? 409 : apply_profile_params_locked(item.second.device, profile));
       if (ret == CORRECT) {
         ++param_applied;
       } else {
@@ -1188,7 +1463,7 @@ class CaptureRuntime {
       }
     } else if (save_to_device) {
       for (auto& item : sessions_) {
-        int ret = lvm_save_param_to_dev(item.second.device);
+        int ret = item.second.simulated ? CORRECT : lvm_save_param_to_dev(item.second.device);
         if (ret != CORRECT && first_error == CORRECT) {
           first_error = ret;
         }
@@ -1219,6 +1494,21 @@ class CaptureRuntime {
 
   std::vector<std::string> discovered_ips_locked(int& ret, std::vector<std::string>* models = nullptr, std::vector<std::string>* sns = nullptr) {
     std::vector<std::string> ips;
+    if (driver_mode_ == DriverMode::Simulated) {
+      ret = CORRECT;
+      for (int i = 0; i < expected_cameras_; ++i) {
+        ips.push_back(simulated_ip_for_index(i));
+        if (models) {
+          models->push_back("SIM-LVM-3D");
+        }
+        if (sns) {
+          char sn_buffer[32]{};
+          snprintf(sn_buffer, sizeof(sn_buffer), "SIM-%03d", i + 1);
+          sns->push_back(sn_buffer);
+        }
+      }
+      return ips;
+    }
     int sdk_ret = ensure_sdk();
     lvm_cam_info_t* cam_info = nullptr;
     int cam_num = 0;
@@ -1242,11 +1532,33 @@ class CaptureRuntime {
     return ips;
   }
 
+  std::string simulated_ip_for_index(int index) const {
+    return "192.168.200." + std::to_string(101 + index);
+  }
+
+  int simulated_index_for_ip(const std::string& ip) const {
+    const std::string prefix = "192.168.200.";
+    if (ip.rfind(prefix, 0) != 0) {
+      return 0;
+    }
+    try {
+      return std::max(0, std::stoi(ip.substr(prefix.size())) - 101);
+    } catch (...) {
+      return 0;
+    }
+  }
+
   int connect_one_locked(const std::string& ip, int dev_type, bool* already_connected = nullptr) {
     if (already_connected) {
       *already_connected = false;
     }
     CameraSession* existing = session_for_ip_locked(ip);
+    if (existing && existing->simulated && existing->simulated_connected) {
+      if (already_connected) {
+        *already_connected = true;
+      }
+      return CORRECT;
+    }
     if (existing && existing->device && lvm_get_dev_connect_status(existing->device) == 1) {
       if (already_connected) {
         *already_connected = true;
@@ -1255,6 +1567,29 @@ class CaptureRuntime {
       return CORRECT;
     }
     destroy_session_locked(ip);
+
+    if (driver_mode_ == DriverMode::Simulated) {
+      int index = simulated_index_for_ip(ip);
+      char sn_buffer[32]{};
+      snprintf(sn_buffer, sizeof(sn_buffer), "SIM-%03d", index + 1);
+      CameraSession session{};
+      session.ip = ip.empty() ? simulated_ip_for_index(0) : ip;
+      session.model = "SIM-LVM-3D";
+      session.sn = sn_buffer;
+      session.simulated = true;
+      session.simulated_connected = true;
+      session.simulated_device_id = index + 1;
+      session.dev_type = dev_type;
+      session.params["TriggerMode"] = "0";
+      session.params["ControlMode"] = "2";
+      session.params["TriggerInputType"] = std::to_string(static_cast<int>(LVM_TRIGGER_TIME_TRIGGER));
+      session.params["DivRatio"] = "4";
+      session.params["ExposureTime"] = "50";
+      session.params["GainK"] = "1.000000";
+      session.params["TimeTriggerFreq"] = "300.000000";
+      sessions_[session.ip] = session;
+      return CORRECT;
+    }
 
     char ip_buffer[DEVICE_NET_INFO_LEN]{};
     strncpy_s(ip_buffer, ip.c_str(), _TRUNCATE);
@@ -1278,6 +1613,10 @@ class CaptureRuntime {
   }
 
   void stop_stream_locked(CameraSession& session) {
+    if (session.simulated) {
+      session.stream.running = false;
+      return;
+    }
     if (session.device) {
       if (session.stream.running) {
         lvm_trigger_en_ctrl(session.device, false);
@@ -1314,7 +1653,44 @@ class CaptureRuntime {
     sessions_.erase(found);
   }
 
+  void clear_sessions_locked() {
+    for (auto& item : sessions_) {
+      stop_stream_locked(item.second);
+      if (item.second.device) {
+        lvm_disconnect_dev(item.second.device);
+        lvm_destroy_dev(item.second.device);
+      }
+    }
+    sessions_.clear();
+  }
+
   std::string status_json_for_session(const CameraSession* session, const std::string& ip) const {
+    if (driver_mode_ == DriverMode::Simulated || (session && session->simulated)) {
+      std::string effective_ip = session ? session->ip : (ip.empty() ? simulated_ip_for_index(0) : ip);
+      int index = simulated_index_for_ip(effective_ip);
+      bool connected = session ? session->simulated_connected : false;
+      std::ostringstream json;
+      json << "{\"connected\":" << (connected ? "true" : "false")
+           << ",\"deviceId\":" << (session ? session->simulated_device_id : -1) << ","
+           << json_pair("ip", effective_ip) << ","
+           << json_pair("driverId", "simulated") << ","
+           << json_pair("model", session && !session->model.empty() ? session->model : "SIM-LVM-3D") << ","
+           << json_pair("sn", session && !session->sn.empty() ? session->sn : ("SIM-" + std::string(index + 1 < 10 ? "00" : index + 1 < 100 ? "0" : "") + std::to_string(index + 1))) << ","
+           << json_pair("source", "simulated") << ","
+           << json_pair("acquisitionState", connected ? (session && session->stream.running ? "realtime-preview" : "connected") : "discovered") << ","
+           << json_pair("sdkStatus", "simulation") << ","
+           << "\"task\":1,\"status\":0,\"linkHealth\":100,"
+           << "\"temperatureJ28\":" << (35.0 + index * 0.4) << ","
+           << "\"temperatureJ29\":" << (35.6 + index * 0.4) << ","
+           << "\"temperatureJ30\":" << (36.1 + index * 0.4) << ","
+           << "\"lostPulseCounter\":0,\"bufferOverflowCounter\":0";
+      if (session) {
+        json << ",\"streamRunning\":" << (session->stream.running ? "true" : "false")
+             << ",\"streamFrames\":" << session->stream.frame_count;
+      }
+      json << "}";
+      return json.str();
+    }
     lvm_dev_t* device = session ? session->device : nullptr;
     int connected = device ? lvm_get_dev_connect_status(device) : 0;
     int dev_id = device ? lvm_get_dev_id(device) : -1;
@@ -1349,6 +1725,35 @@ class CaptureRuntime {
 
   std::string health_json() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (driver_mode_ == DriverMode::Simulated) {
+      int connected_count = 0;
+      std::string first_ip;
+      for (const auto& item : sessions_) {
+        if (item.second.simulated_connected) {
+          ++connected_count;
+          if (first_ip.empty()) {
+            first_ip = item.first;
+          }
+        }
+      }
+      std::ostringstream json;
+      json << "{"
+           << json_pair("service", "steel_capture_service") << ","
+           << json_pair("time", now_iso()) << ","
+           << "\"sdkReady\":true,"
+           << "\"sdkCode\":0,"
+           << "\"connected\":" << (connected_count > 0 ? "true" : "false") << ","
+           << json_pair("ip", first_ip) << ","
+           << json_pair("driverMode", "simulated") << ","
+           << json_pair("driverId", "simulated") << ","
+           << json_pair("driverName", "Simulated 3D Camera Driver") << ","
+           << json_pair("storageRoot", storage_root_.string()) << ","
+           << json_pair("configRoot", config_root_locked().string()) << ","
+           << "\"cameraCount\":" << connected_count << ","
+           << "\"expectedCameras\":" << expected_cameras_
+           << "}";
+      return json.str();
+    }
     int sdk_ret = ensure_sdk();
     int connected_count = 0;
     std::string first_ip;
@@ -1368,9 +1773,11 @@ class CaptureRuntime {
          << "\"sdkCode\":" << sdk_ret << ","
          << "\"connected\":" << (connected_count > 0 ? "true" : "false") << ","
          << json_pair("ip", first_ip) << ","
+         << json_pair("driverMode", driver_mode_text(driver_mode_)) << ","
          << json_pair("driverId", "lvm-nvt") << ","
          << json_pair("driverName", "LVM/NVT 3D Camera SDK") << ","
          << json_pair("storageRoot", storage_root_.string()) << ","
+         << json_pair("configRoot", config_root_locked().string()) << ","
          << "\"cameraCount\":" << connected_count
          << "}";
     return json.str();
@@ -1378,6 +1785,24 @@ class CaptureRuntime {
 
   std::string cameras_json() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (driver_mode_ == DriverMode::Simulated) {
+      std::ostringstream json;
+      json << "{\"code\":0,\"count\":" << expected_cameras_ << ",\"driverMode\":\"simulated\",\"cameras\":[";
+      for (int i = 0; i < expected_cameras_; ++i) {
+        if (i > 0) json << ",";
+        char sn_buffer[32]{};
+        snprintf(sn_buffer, sizeof(sn_buffer), "SIM-%03d", i + 1);
+        json << "{"
+             << json_pair("ip", simulated_ip_for_index(i)) << ","
+             << json_pair("model", "SIM-LVM-3D") << ","
+             << json_pair("sn", sn_buffer) << ","
+             << json_pair("driverId", "simulated") << ","
+             << json_pair("source", "simulated")
+             << "}";
+      }
+      json << "]}";
+      return json.str();
+    }
     int sdk_ret = ensure_sdk();
     lvm_cam_info_t* cam_info = nullptr;
     int cam_num = 0;
@@ -1401,12 +1826,17 @@ class CaptureRuntime {
 
   std::string connect_json(const std::string& body) {
     std::lock_guard<std::mutex> lock(mutex_);
-    int sdk_ret = ensure_sdk();
-    if (!(sdk_ret == CORRECT || sdk_ret == SDK_REPEATED_INIT)) {
-      return "{\"code\":" + std::to_string(sdk_ret) + ",\"connected\":false}";
+    if (driver_mode_ != DriverMode::Simulated) {
+      int sdk_ret = ensure_sdk();
+      if (!(sdk_ret == CORRECT || sdk_ret == SDK_REPEATED_INIT)) {
+        return "{\"code\":" + std::to_string(sdk_ret) + ",\"connected\":false}";
+      }
     }
 
     std::string ip = json_string_field(body, "ip", "192.168.10.13");
+    if (driver_mode_ == DriverMode::Simulated && ip == "192.168.10.13") {
+      ip = simulated_ip_for_index(0);
+    }
     int dev_type = json_int_field(body, "devType", -1);
     bool already_connected = false;
     int ret = connect_one_locked(ip, dev_type, &already_connected);
@@ -1423,9 +1853,11 @@ class CaptureRuntime {
     std::vector<std::string> requested_ips = json_string_array_field(body, "ips");
 
     std::lock_guard<std::mutex> lock(mutex_);
-    int sdk_ret = ensure_sdk();
-    if (!(sdk_ret == CORRECT || sdk_ret == SDK_REPEATED_INIT)) {
-      return "{\"code\":" + std::to_string(sdk_ret) + ",\"connected\":0,\"results\":[]}";
+    if (driver_mode_ != DriverMode::Simulated) {
+      int sdk_ret = ensure_sdk();
+      if (!(sdk_ret == CORRECT || sdk_ret == SDK_REPEATED_INIT)) {
+        return "{\"code\":" + std::to_string(sdk_ret) + ",\"connected\":0,\"results\":[]}";
+      }
     }
 
     int discover_ret = CORRECT;
@@ -1481,10 +1913,12 @@ class CaptureRuntime {
     int ret = CORRECT;
     if (!ip.empty()) {
       auto found = sessions_.find(ip);
-      if (found != sessions_.end() && found->second.device) {
+      if (found != sessions_.end()) {
         stop_stream_locked(found->second);
-        ret = lvm_disconnect_dev(found->second.device);
-        lvm_destroy_dev(found->second.device);
+        if (found->second.device) {
+          ret = lvm_disconnect_dev(found->second.device);
+          lvm_destroy_dev(found->second.device);
+        }
         sessions_.erase(found);
       }
       return "{\"code\":" + std::to_string(ret) + ",\"connected\":false," + json_pair("ip", ip) + "}";
@@ -1508,6 +1942,26 @@ class CaptureRuntime {
 
   std::string statuses_json() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (driver_mode_ == DriverMode::Simulated) {
+      std::vector<std::string> statuses;
+      for (const auto& item : sessions_) {
+        statuses.push_back(status_json_for_session(&item.second, item.first));
+      }
+      for (int i = 0; i < expected_cameras_; ++i) {
+        std::string ip = simulated_ip_for_index(i);
+        if (sessions_.find(ip) == sessions_.end()) {
+          statuses.push_back(status_json_for_session(nullptr, ip));
+        }
+      }
+      std::ostringstream json;
+      json << "{\"statuses\":[";
+      for (size_t i = 0; i < statuses.size(); ++i) {
+        if (i > 0) json << ",";
+        json << statuses[i];
+      }
+      json << "]}";
+      return json.str();
+    }
     int sdk_ret = ensure_sdk();
     lvm_cam_info_t* cam_info = nullptr;
     int cam_num = 0;
@@ -1555,8 +2009,25 @@ class CaptureRuntime {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
+    }
+    if (session->simulated) {
+      std::string value;
+      if (_stricmp(key.c_str(), "ExposureTime") == 0 || _stricmp(key.c_str(), "expsure_time") == 0) {
+        value = std::to_string(session->exposure_time);
+      } else if (_stricmp(key.c_str(), "GainK") == 0 || _stricmp(key.c_str(), "gain_k") == 0) {
+        value = std::to_string(session->gain_k);
+      } else if (_stricmp(key.c_str(), "TimeTriggerFreq") == 0 || _stricmp(key.c_str(), "time_trigger_freq") == 0) {
+        value = std::to_string(session->time_trigger_freq);
+      } else {
+        auto found = session->params.find(key);
+        value = found == session->params.end() ? "0" : found->second;
+      }
+      if (type == "string") {
+        return "{\"code\":0," + json_pair("ip", session->ip) + "," + json_pair("key", key) + "," + json_pair("value", value) + "}";
+      }
+      return "{\"code\":0," + json_pair("ip", session->ip) + "," + json_pair("key", key) + ",\"value\":" + value + "}";
     }
     if ((_stricmp(key.c_str(), "TriggerMode") == 0 || _stricmp(key.c_str(), "ctrl_type") == 0) && session->device->capture_param) {
       return "{\"code\":0," + json_pair("ip", session->ip) + "," + json_pair("key", key) + ",\"value\":" +
@@ -1607,8 +2078,26 @@ class CaptureRuntime {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
+    }
+    if (session->simulated) {
+      std::string value = json_string_field(body, "value");
+      if (value.empty() && type != "string") {
+        value = type == "float" ? std::to_string(json_float_field(body, "value", 0)) : std::to_string(json_int_field(body, "value", 0));
+      }
+      if (_stricmp(key.c_str(), "ExposureTime") == 0 || _stricmp(key.c_str(), "expsure_time") == 0) {
+        session->exposure_time = json_int_field(body, "value", session->exposure_time);
+        value = std::to_string(session->exposure_time);
+      } else if (_stricmp(key.c_str(), "GainK") == 0 || _stricmp(key.c_str(), "gain_k") == 0) {
+        session->gain_k = json_float_field(body, "value", session->gain_k);
+        value = std::to_string(session->gain_k);
+      } else if (_stricmp(key.c_str(), "TimeTriggerFreq") == 0 || _stricmp(key.c_str(), "time_trigger_freq") == 0) {
+        session->time_trigger_freq = json_float_field(body, "value", session->time_trigger_freq);
+        value = std::to_string(session->time_trigger_freq);
+      }
+      session->params[key] = value;
+      return "{\"code\":0," + json_pair("ip", session->ip) + "," + json_pair("key", key) + "}";
     }
     int ret = INPUT_PARAMETER_ERROR;
     if (_stricmp(key.c_str(), "TriggerMode") == 0 || _stricmp(key.c_str(), "ctrl_type") == 0) {
@@ -1657,7 +2146,7 @@ class CaptureRuntime {
 
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
     if (session->stream.running) {
@@ -1666,7 +2155,7 @@ class CaptureRuntime {
 
     int apply_ret = CORRECT;
     if (apply_soft_trigger) {
-      apply_ret = apply_software_trigger(session->device);
+      apply_ret = session->simulated ? CORRECT : apply_software_trigger(session->device);
       if (apply_ret != CORRECT) {
         std::ostringstream failed;
         failed << "{\"code\":" << apply_ret << ","
@@ -1679,7 +2168,7 @@ class CaptureRuntime {
       }
     }
 
-    int ret = lvm_save_param_to_dev(session->device);
+    int ret = session->simulated ? CORRECT : lvm_save_param_to_dev(session->device);
     std::ostringstream json;
     json << "{\"code\":" << ret << ","
          << json_pair("ip", session->ip) << ","
@@ -1696,7 +2185,7 @@ class CaptureRuntime {
 
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
     if (session->stream.running) {
@@ -1720,7 +2209,21 @@ class CaptureRuntime {
     }
 
     std::string sdk_path = path.string();
-    int ret = lvm_save_dev_param(session->device, sdk_path.c_str());
+    int ret = CORRECT;
+    if (session->simulated) {
+      std::ostringstream body_text;
+      body_text << "{"
+                << json_pair("driverId", "simulated") << ","
+                << json_pair("ip", session->ip) << ","
+                << json_pair("savedAt", now_iso()) << ","
+                << "\"exposureTime\":" << session->exposure_time << ","
+                << "\"gainK\":" << session->gain_k << ","
+                << "\"timeTriggerFreq\":" << session->time_trigger_freq
+                << "}";
+      ret = write_text_file(path, body_text.str()) ? CORRECT : 500;
+    } else {
+      ret = lvm_save_dev_param(session->device, sdk_path.c_str());
+    }
     std::ostringstream json;
     json << "{\"code\":" << ret << ","
          << json_pair("ip", session->ip) << ","
@@ -1750,7 +2253,7 @@ class CaptureRuntime {
 
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
     if (session->stream.running) {
@@ -1758,11 +2261,13 @@ class CaptureRuntime {
     }
 
     std::string sdk_path = path.string();
-    int load_ret = lvm_load_dev_param(session->device, sdk_path.c_str());
-    int apply_ret = load_ret == CORRECT && apply_soft_trigger ? apply_software_trigger(session->device) : INPUT_PARAMETER_ERROR;
+    int load_ret = session->simulated ? CORRECT : lvm_load_dev_param(session->device, sdk_path.c_str());
+    int apply_ret = load_ret == CORRECT && apply_soft_trigger && !session->simulated ? apply_software_trigger(session->device) : CORRECT;
     int save_ret = INPUT_PARAMETER_ERROR;
-    if (load_ret == CORRECT && (!apply_soft_trigger || apply_ret == CORRECT) && save_to_device) {
+    if (load_ret == CORRECT && (!apply_soft_trigger || apply_ret == CORRECT) && save_to_device && !session->simulated) {
       save_ret = lvm_save_param_to_dev(session->device);
+    } else if (session->simulated || !save_to_device) {
+      save_ret = CORRECT;
     }
 
     int code = load_ret;
@@ -1791,20 +2296,99 @@ class CaptureRuntime {
 
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
     if (session->stream.running) {
       return json_error(409, "stream is running; stop stream before recovering parameters");
     }
 
-    int ret = lvm_recovery_param(session->device);
+    int ret = session->simulated ? CORRECT : lvm_recovery_param(session->device);
     std::ostringstream json;
     json << "{\"code\":" << ret << ","
          << json_pair("ip", session->ip) << ","
          << "\"recoveryCode\":" << ret
          << "}";
     return json.str();
+  }
+
+  int write_simulated_png_locked(CameraSession& session,
+                                 const std::string& output_path,
+                                 int width,
+                                 int lines,
+                                 const std::string& kind) {
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(output_path).parent_path(), error);
+    if (error) {
+      return 500;
+    }
+
+    std::filesystem::path source_dir = path_from_json_text(simulated_image_source_dir_);
+    if (!simulated_image_source_dir_.empty() && std::filesystem::exists(source_dir, error)) {
+      std::vector<std::filesystem::path> pngs;
+      for (const auto& entry : std::filesystem::directory_iterator(source_dir, error)) {
+        if (entry.is_regular_file()) {
+          std::string ext = entry.path().extension().string();
+          std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+          if (ext == ".png") {
+            pngs.push_back(entry.path());
+          }
+        }
+      }
+      std::sort(pngs.begin(), pngs.end());
+      if (!pngs.empty()) {
+        size_t index = static_cast<size_t>(session.stream.frame_count + simulated_index_for_ip(session.ip)) % pngs.size();
+        std::filesystem::copy_file(pngs[index], output_path, std::filesystem::copy_options::overwrite_existing, error);
+        if (!error) {
+          return CORRECT;
+        }
+      }
+    }
+
+    width = width <= 0 ? 640 : width;
+    lines = lines <= 0 ? 480 : lines;
+    std::vector<unsigned short> pixels(static_cast<size_t>(width) * static_cast<size_t>(lines));
+    int camera_offset = simulated_index_for_ip(session.ip) * 4096;
+    int frame_offset = session.stream.frame_count * 257;
+    int kind_offset = kind == "intensity" ? 8192 : 0;
+    for (int y = 0; y < lines; ++y) {
+      for (int x = 0; x < width; ++x) {
+        int wave = (x * 173 + y * 97 + camera_offset + frame_offset + kind_offset) % 65535;
+        int stripe = ((x / 24 + y / 18 + simulated_index_for_ip(session.ip)) % 2) ? 2400 : 0;
+        pixels[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)] =
+            static_cast<unsigned short>(std::min(65535, wave + stripe));
+      }
+    }
+    return lvm_save_img(output_path.c_str(), pixels.data(), width, lines, LVM_IMAGE_FORMAT_16BIT_USHORT);
+  }
+
+  int update_simulated_stream_frame_locked(CameraSession& session) {
+    if (!session.simulated || !session.stream.running) {
+      return DEV_NOT_LINK_ERROR;
+    }
+    std::filesystem::path stream_dir = (storage_root_ / "stream").lexically_normal();
+    std::string safe_ip = safe_path_segment(session.ip);
+    std::string depth_path = (stream_dir / (safe_ip + "-latest-depth.png")).lexically_normal().string();
+    std::string intensity_path = (stream_dir / (safe_ip + "-latest-intensity.png")).lexically_normal().string();
+    int ret = write_simulated_png_locked(session, depth_path, session.stream.width, session.stream.lines, "depth");
+    int intensity_ret = write_simulated_png_locked(session, intensity_path, session.stream.width, session.stream.lines, "intensity");
+    if (ret == CORRECT) {
+      session.stream.latest_depth_path = depth_path;
+    }
+    if (intensity_ret == CORRECT) {
+      session.stream.latest_intensity_path = intensity_path;
+    }
+    session.stream.code = ret;
+    session.stream.frame_count += 1;
+    session.stream.fid = session.stream.frame_count;
+    session.stream.sid = simulated_index_for_ip(session.ip) + 1;
+    session.stream.lost_lines = 0;
+    session.stream.trigger_min_interval = session.stream.fps_limit > 0 ? static_cast<unsigned int>(1000 / session.stream.fps_limit) : 0;
+    session.stream.trigger_max_interval = session.stream.trigger_min_interval;
+    session.stream.timestamp = static_cast<unsigned int>(GetTickCount());
+    session.stream.updated_at = now_iso();
+    session.stream.last_saved = std::chrono::steady_clock::now();
+    return ret;
   }
 
   std::string preview_capture_json(const std::string& body) {
@@ -1839,11 +2423,35 @@ class CaptureRuntime {
 
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
     if (session->stream.running) {
-      return json_error(409, "stream is running; stop stream before blocking capture");
+      if (!session->simulated) {
+        return json_error(409, "stream is running; stop stream before blocking capture");
+      }
+    }
+    if (session->simulated) {
+      if (width <= 0) {
+        width = 640;
+      }
+      if (lines <= 0) {
+        lines = 480;
+      }
+      std::string output_path = resolve_output_path_locked(output, "depth/capture-depth.png");
+      if (!is_output_path_allowed_locked(output_path)) {
+        return json_error(403, "output path must be under storage root");
+      }
+      int ret = write_simulated_png_locked(*session, output_path, width, lines, "depth");
+      session->calibration.validation_path = output_path;
+      session->calibration.validation_code = ret;
+      session->calibration.validation_time = now_iso();
+      std::ostringstream json;
+      json << "{\"code\":" << ret << ",\"lines\":" << lines << ",\"width\":" << width << ","
+           << json_pair("ip", session->ip) << ","
+           << json_pair("output", output_path) << ","
+           << json_pair("imageUrl", "/api/capture/file?path=" + url_encode(output_path)) << "}";
+      return json.str();
     }
     int trigger_ret = apply_software_trigger(session->device);
     if (trigger_ret != CORRECT) {
@@ -2036,11 +2644,30 @@ class CaptureRuntime {
 
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
     stop_all_streams_locked(session->ip);
     stop_stream_locked(*session);
+    if (session->simulated) {
+      if (width <= 0) {
+        width = 640;
+      }
+      if (lines <= 0) {
+        lines = 480;
+      }
+      session->stream = StreamState{};
+      session->stream.running = true;
+      session->stream.lines = lines;
+      session->stream.width = width;
+      session->stream.data_mode = data_mode;
+      session->stream.hs = hs;
+      session->stream.fps_limit = fps_limit;
+      session->stream.started_at = now_iso();
+      session->stream.updated_at = session->stream.started_at;
+      session->stream.code = update_simulated_stream_frame_locked(*session);
+      return stream_status_json_locked(*session);
+    }
     int trigger_ret = apply_software_trigger(session->device);
     if (trigger_ret != CORRECT) {
       return json_error(trigger_ret, "software trigger config failed");
@@ -2093,7 +2720,7 @@ class CaptureRuntime {
     std::string ip = json_string_field(body, "ip");
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
     stop_stream_locked(*session);
@@ -2104,8 +2731,11 @@ class CaptureRuntime {
     std::string ip = get_query_param(query, "ip");
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
+    }
+    if (session->simulated && session->stream.running) {
+      update_simulated_stream_frame_locked(*session);
     }
     return stream_status_json_locked(*session);
   }
@@ -2146,8 +2776,11 @@ class CaptureRuntime {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return {404, "", "image/png"};
+    }
+    if (session->simulated && session->stream.running) {
+      update_simulated_stream_frame_locked(*session);
     }
     std::string path = kind == "intensity" ? session->stream.latest_intensity_path : session->stream.latest_depth_path;
     if (path.empty() || !is_path_allowed_for_read(path, storage_root_)) {
@@ -2171,10 +2804,10 @@ class CaptureRuntime {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
-    int ret = lvm_load_calib_param(session->device, path.c_str());
+    int ret = session->simulated ? CORRECT : lvm_load_calib_param(session->device, path.c_str());
     session->calibration.calibration_path = path;
     session->calibration.calibration_code = ret;
     session->calibration.calibration_time = now_iso();
@@ -2192,10 +2825,10 @@ class CaptureRuntime {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
-    int ret = lvm_set_roi_param(session->device, path.c_str());
+    int ret = session->simulated ? CORRECT : lvm_set_roi_param(session->device, path.c_str());
     session->calibration.roi_path = path;
     session->calibration.roi_code = ret;
     session->calibration.roi_time = now_iso();
@@ -2206,7 +2839,7 @@ class CaptureRuntime {
     std::string ip = get_query_param(query, "ip");
     std::lock_guard<std::mutex> lock(mutex_);
     CameraSession* session = session_for_ip_locked(ip);
-    if (!session || !session->device) {
+    if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
     }
     return calibration_status_json_locked(*session);
@@ -2265,8 +2898,12 @@ class CaptureRuntime {
   }
 
   std::mutex mutex_;
+  DriverMode driver_mode_ = DriverMode::Lvm;
   bool sdk_ready_ = false;
   std::filesystem::path storage_root_;
+  std::filesystem::path config_root_;
+  int expected_cameras_ = 6;
+  std::string simulated_image_source_dir_;
   std::map<std::string, CameraSession> sessions_;
 };
 
@@ -2579,10 +3216,14 @@ int run_server(int port) {
 
 int run_capture_service_app(int argc, char** argv) {
   int port = 4317;
+  DriverMode driver_mode = parse_driver_mode(std::getenv("CAPTURE_DRIVER") ? std::getenv("CAPTURE_DRIVER") : "", DriverMode::Lvm);
   for (int i = 1; i + 1 < argc; ++i) {
     if (std::string(argv[i]) == "--port") {
       port = std::stoi(argv[i + 1]);
+    } else if (std::string(argv[i]) == "--driver" || std::string(argv[i]) == "--driver-mode") {
+      driver_mode = parse_driver_mode(argv[i + 1], driver_mode);
     }
   }
+  CaptureRuntime::instance().configure(driver_mode);
   return run_server(port);
 }

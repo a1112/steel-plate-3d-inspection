@@ -7,7 +7,9 @@ This app links the shared `steel_capture_core` library from `app/capture` and st
 ## Current Capabilities
 
 - Starts the embedded capture API on `127.0.0.1:4317` by default.
+- Can switch the embedded capture provider between the real LVM SDK driver and the offline simulated driver.
 - Provides a three-column acquisition workstation: camera list, selected-camera preview, and status/control/calibration/log tabs.
+- Provides a configuration management page for creating folder-backed profiles, importing profiles, and setting the active/default profile.
 - Lists the six expected cameras returned by `/api/cameras` and polls `/api/camera/statuses`.
 - Connects, auto-connects, disconnects, and disconnects all cameras while keeping all camera control in software trigger mode.
 - Starts and stops selected-camera realtime preview through `/api/stream/start` and `/api/stream/stop`.
@@ -28,6 +30,10 @@ scripts/build-capture-qt.ps1 -QtPrefixPath C:/Qt
 ```
 
 The local machine should use a Qt MSVC x64 kit such as `C:/Qt/6.11.1/msvc2022_64`. A MinGW kit cannot link the MSVC LVM SDK import library.
+
+## Offline Simulation
+
+Set `CAPTURE_DRIVER=simulated` before launching, or create/apply a simulated profile from the configuration management page. Simulated profiles can set the camera count, image storage root, and an optional PNG replay folder.
 
 ## Run With Rust Service
 

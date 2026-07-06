@@ -1,10 +1,13 @@
 ﻿#include <QApplication>
 #include <QAbstractItemView>
+#include <QBrush>
 #include <QBuffer>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDesktopServices>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QColor>
@@ -22,6 +25,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
+#include <QMessageBox>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -32,6 +36,7 @@
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStandardPaths>
+#include <QStackedWidget>
 #include <QStringList>
 #include <QRegularExpression>
 #include <QTableWidget>
@@ -175,6 +180,18 @@ void set_cell(QTableWidget* table, int row, int column, const QString& value) {
   item->setText(value.trimmed().isEmpty() ? "-" : value);
 }
 
+void tint_row(QTableWidget* table, int row, const QColor& background, const QColor& foreground = QColor("#edf4f6")) {
+  for (int column = 0; column < table->columnCount(); ++column) {
+    auto* item = table->item(row, column);
+    if (!item) {
+      item = new QTableWidgetItem("-");
+      table->setItem(row, column, item);
+    }
+    item->setBackground(QBrush(background));
+    item->setForeground(QBrush(foreground));
+  }
+}
+
 QString selected_ip(QTableWidget* table) {
   const int row = table->currentRow();
   if (row < 0) {
@@ -258,6 +275,20 @@ QLabel* small_label(const QString& text) {
   return label;
 }
 
+QLabel* value_label(const QString& text = "-") {
+  auto* label = new QLabel(text);
+  label->setObjectName("valueLabel");
+  label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  label->setWordWrap(true);
+  return label;
+}
+
+void set_value(QLabel* label, const QString& value) {
+  if (label) {
+    label->setText(value.trimmed().isEmpty() ? "-" : value);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -287,16 +318,72 @@ int main(int argc, char* argv[]) {
   auto* api_state = small_label(zh(u8"内置采集 API 启动中：") + origin);
   auto* provider_hint = small_label(zh(u8"Rust provider：qt-terminal"));
   provider_hint->setObjectName("muted");
+  auto* preview_page_button = new QPushButton(zh(u8"相机预览"));
+  auto* config_page_button = new QPushButton(zh(u8"配置管理"));
+  auto* stability_test_button = new QPushButton(zh(u8"采集稳定性测试"));
+  preview_page_button->setObjectName("modeButton");
+  config_page_button->setObjectName("modeButton");
   auto* open_api = new QPushButton(zh(u8"打开 API 控制台"));
   top_bar->addWidget(title, 0);
   top_bar->addSpacing(12);
   top_bar->addWidget(api_state, 1);
+  top_bar->addWidget(preview_page_button, 0);
+  top_bar->addWidget(config_page_button, 0);
+  top_bar->addWidget(stability_test_button, 0);
   top_bar->addWidget(provider_hint, 0);
   top_bar->addWidget(open_api, 0);
   root->addLayout(top_bar);
 
+  auto* main_stack = new QStackedWidget();
+  root->addWidget(main_stack, 1);
+
+  auto* preview_page = new QWidget();
+  auto* preview_page_layout = new QVBoxLayout(preview_page);
+  preview_page_layout->setContentsMargins(0, 0, 0, 0);
+  preview_page_layout->setSpacing(0);
   auto* splitter = new QSplitter(Qt::Horizontal);
-  root->addWidget(splitter, 1);
+  preview_page_layout->addWidget(splitter, 1);
+  main_stack->addWidget(preview_page);
+
+  auto* config_page = new QWidget();
+  auto* config_page_layout = new QVBoxLayout(config_page);
+  config_page_layout->setContentsMargins(0, 0, 0, 0);
+  config_page_layout->setSpacing(8);
+  auto* config_manager_group = new QGroupBox(zh(u8"配置组管理"));
+  auto* config_manager_layout = new QVBoxLayout(config_manager_group);
+  auto* active_profile_label = small_label(zh(u8"当前默认配置：-"));
+  auto* profile_manage_table = new QTableWidget(0, 4);
+  profile_manage_table->setHorizontalHeaderLabels({
+      zh(u8"配置名称"),
+      zh(u8"默认"),
+      zh(u8"模式"),
+      zh(u8"路径"),
+  });
+  profile_manage_table->horizontalHeader()->setStretchLastSection(true);
+  profile_manage_table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+  profile_manage_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+  profile_manage_table->verticalHeader()->setVisible(false);
+  profile_manage_table->setSelectionBehavior(QAbstractItemView::SelectRows);
+  profile_manage_table->setSelectionMode(QAbstractItemView::SingleSelection);
+  profile_manage_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  profile_manage_table->setAlternatingRowColors(false);
+  auto* config_manager_buttons = new QHBoxLayout();
+  auto* profile_new_wizard = new QPushButton(zh(u8"新建配置"));
+  auto* profile_import_folder = new QPushButton(zh(u8"导入配置组"));
+  auto* profile_import_json = new QPushButton(zh(u8"导入 JSON"));
+  auto* profile_apply_selected = new QPushButton(zh(u8"应用/设为默认"));
+  auto* profile_refresh_list = new QPushButton(zh(u8"刷新列表"));
+  config_manager_buttons->addWidget(profile_new_wizard);
+  config_manager_buttons->addWidget(profile_import_folder);
+  config_manager_buttons->addWidget(profile_import_json);
+  config_manager_buttons->addWidget(profile_apply_selected);
+  config_manager_buttons->addWidget(profile_refresh_list);
+  config_manager_buttons->addStretch(1);
+  config_manager_layout->addWidget(active_profile_label);
+  config_manager_layout->addWidget(profile_manage_table);
+  config_manager_layout->addLayout(config_manager_buttons);
+  config_page_layout->addWidget(config_manager_group, 0);
+  main_stack->addWidget(config_page);
 
   auto* left_panel = new QWidget();
   auto* left_layout = new QVBoxLayout(left_panel);
@@ -304,7 +391,7 @@ int main(int argc, char* argv[]) {
   left_layout->setSpacing(8);
   auto* camera_title = new QLabel(zh(u8"相机列表（目标 6 台）"));
   camera_title->setObjectName("sectionTitle");
-  auto* camera_table = new QTableWidget(0, 8);
+  auto* camera_table = new QTableWidget(0, 9);
   camera_table->setHorizontalHeaderLabels({
       zh(u8"IP 地址"),
       zh(u8"型号"),
@@ -314,14 +401,16 @@ int main(int argc, char* argv[]) {
       zh(u8"SDK"),
       zh(u8"帧数"),
       zh(u8"状态"),
+      zh(u8"选中"),
   });
-  camera_table->horizontalHeader()->setStretchLastSection(true);
+  camera_table->horizontalHeader()->setStretchLastSection(false);
   camera_table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
   camera_table->horizontalHeader()->setSectionResizeMode(7, QHeaderView::Stretch);
   camera_table->verticalHeader()->setVisible(false);
   camera_table->setSelectionBehavior(QAbstractItemView::SelectRows);
   camera_table->setSelectionMode(QAbstractItemView::SingleSelection);
   camera_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  camera_table->setAlternatingRowColors(false);
   auto* left_actions = new QGridLayout();
   auto* refresh_button = new QPushButton(zh(u8"刷新"));
   auto* connect_button = new QPushButton(zh(u8"连接选中"));
@@ -377,20 +466,48 @@ int main(int argc, char* argv[]) {
   splitter->addWidget(tabs);
   auto* camera_tabs = new QTabWidget();
   auto* config_tabs = new QTabWidget();
+  config_page_layout->addWidget(config_tabs, 1);
   tabs->addTab(camera_tabs, zh(u8"相机"));
-  tabs->addTab(config_tabs, zh(u8"配置"));
 
   auto* status_tab = new QWidget();
   auto* status_layout = new QVBoxLayout(status_tab);
-  auto* status_text = new QPlainTextEdit();
-  status_text->setReadOnly(true);
-  auto* calibration_summary = new QPlainTextEdit();
-  calibration_summary->setReadOnly(true);
-  calibration_summary->setMaximumHeight(150);
-  status_layout->addWidget(new QLabel(zh(u8"实时状态")));
-  status_layout->addWidget(status_text, 1);
-  status_layout->addWidget(new QLabel(zh(u8"标定状态")));
-  status_layout->addWidget(calibration_summary, 0);
+  auto* status_group = new QGroupBox(zh(u8"实时状态"));
+  auto* status_form = new QFormLayout(status_group);
+  auto* status_ip = value_label();
+  auto* status_connection = value_label();
+  auto* status_acquisition = value_label();
+  auto* status_stream = value_label();
+  auto* status_frames = value_label();
+  auto* status_sdk = value_label();
+  auto* status_link = value_label();
+  auto* status_temperature = value_label();
+  auto* status_errors = value_label();
+  auto* status_identity = value_label();
+  status_form->addRow(zh(u8"IP 地址"), status_ip);
+  status_form->addRow(zh(u8"连接状态"), status_connection);
+  status_form->addRow(zh(u8"采集状态"), status_acquisition);
+  status_form->addRow(zh(u8"预览状态"), status_stream);
+  status_form->addRow(zh(u8"帧数"), status_frames);
+  status_form->addRow(zh(u8"SDK 状态"), status_sdk);
+  status_form->addRow(zh(u8"链路健康"), status_link);
+  status_form->addRow(zh(u8"温度"), status_temperature);
+  status_form->addRow(zh(u8"计数器"), status_errors);
+  status_form->addRow(zh(u8"设备"), status_identity);
+  auto* calibration_status_group = new QGroupBox(zh(u8"标定状态"));
+  auto* calibration_status_form = new QFormLayout(calibration_status_group);
+  auto* calibration_code = value_label();
+  auto* calibration_path_value = value_label();
+  auto* roi_code = value_label();
+  auto* roi_path_value = value_label();
+  auto* calibration_time = value_label();
+  calibration_status_form->addRow(zh(u8"标定返回码"), calibration_code);
+  calibration_status_form->addRow(zh(u8"标定文件"), calibration_path_value);
+  calibration_status_form->addRow(zh(u8"ROI 返回码"), roi_code);
+  calibration_status_form->addRow(zh(u8"ROI 文件"), roi_path_value);
+  calibration_status_form->addRow(zh(u8"最近更新"), calibration_time);
+  status_layout->addWidget(status_group);
+  status_layout->addWidget(calibration_status_group);
+  status_layout->addStretch(1);
   camera_tabs->addTab(status_tab, zh(u8"实时状态"));
 
   auto* storage_tab = new QWidget();
@@ -400,11 +517,13 @@ int main(int argc, char* argv[]) {
   auto* storage_root = new QLineEdit("E:/steel-capture-data");
   auto* storage_browse = new QPushButton(zh(u8"选择目录"));
   auto* storage_apply = new QPushButton(zh(u8"应用存储目录"));
+  auto* storage_open = new QPushButton(zh(u8"打开位置"));
   auto* storage_refresh = new QPushButton(zh(u8"刷新状态"));
   auto* storage_row = new QHBoxLayout();
   storage_row->addWidget(storage_root, 1);
   storage_row->addWidget(storage_browse);
   storage_row->addWidget(storage_apply);
+  storage_row->addWidget(storage_open);
   storage_row->addWidget(storage_refresh);
   storage_form->addRow(zh(u8"存储根目录"), storage_row);
   auto* storage_status_text = new QPlainTextEdit();
@@ -413,6 +532,72 @@ int main(int argc, char* argv[]) {
   storage_layout->addWidget(storage_group);
   storage_layout->addWidget(storage_status_text, 1);
   config_tabs->addTab(storage_tab, zh(u8"存储配置"));
+
+  auto* camera_config_tab = new QWidget();
+  auto* camera_config_layout = new QVBoxLayout(camera_config_tab);
+  auto* profile_camera_table = new QTableWidget(0, 8);
+  profile_camera_table->setHorizontalHeaderLabels({
+      zh(u8"IP 地址"),
+      zh(u8"启用"),
+      zh(u8"型号"),
+      zh(u8"序列号"),
+      zh(u8"参数文件"),
+      zh(u8"曝光"),
+      zh(u8"增益"),
+      zh(u8"触发频率"),
+  });
+  profile_camera_table->horizontalHeader()->setStretchLastSection(false);
+  profile_camera_table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+  profile_camera_table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
+  profile_camera_table->verticalHeader()->setVisible(false);
+  profile_camera_table->setSelectionBehavior(QAbstractItemView::SelectRows);
+  profile_camera_table->setSelectionMode(QAbstractItemView::SingleSelection);
+  profile_camera_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  auto* camera_edit_group = new QGroupBox(zh(u8"单台相机配置编辑"));
+  auto* camera_edit_form = new QFormLayout(camera_edit_group);
+  auto* edit_camera_ip = new QLineEdit();
+  auto* edit_camera_enabled = new QCheckBox(zh(u8"启用此相机"));
+  edit_camera_enabled->setChecked(true);
+  auto* edit_camera_model = new QLineEdit();
+  auto* edit_camera_sn = new QLineEdit();
+  auto* edit_camera_param_file = new QLineEdit();
+  auto* edit_camera_param_browse = new QPushButton(zh(u8"选择"));
+  auto* edit_camera_param_row = new QHBoxLayout();
+  edit_camera_param_row->addWidget(edit_camera_param_file, 1);
+  edit_camera_param_row->addWidget(edit_camera_param_browse);
+  auto* edit_camera_exposure = new QSpinBox();
+  edit_camera_exposure->setRange(1, 10000000);
+  edit_camera_exposure->setValue(1000);
+  auto* edit_camera_gain = new QDoubleSpinBox();
+  edit_camera_gain->setRange(0.0, 64.0);
+  edit_camera_gain->setDecimals(3);
+  edit_camera_gain->setValue(1.0);
+  auto* edit_camera_trigger_freq = new QDoubleSpinBox();
+  edit_camera_trigger_freq->setRange(0.1, 100000.0);
+  edit_camera_trigger_freq->setDecimals(2);
+  edit_camera_trigger_freq->setValue(300.0);
+  auto* camera_config_buttons = new QHBoxLayout();
+  auto* profile_camera_sync = new QPushButton(zh(u8"从相机列表同步"));
+  auto* profile_camera_update = new QPushButton(zh(u8"添加/更新"));
+  auto* profile_camera_delete = new QPushButton(zh(u8"删除选中"));
+  auto* profile_camera_write_profile = new QPushButton(zh(u8"写入配置 JSON"));
+  camera_config_buttons->addWidget(profile_camera_sync);
+  camera_config_buttons->addWidget(profile_camera_update);
+  camera_config_buttons->addWidget(profile_camera_delete);
+  camera_config_buttons->addWidget(profile_camera_write_profile);
+  camera_config_buttons->addStretch(1);
+  camera_edit_form->addRow(zh(u8"IP 地址"), edit_camera_ip);
+  camera_edit_form->addRow(edit_camera_enabled);
+  camera_edit_form->addRow(zh(u8"型号"), edit_camera_model);
+  camera_edit_form->addRow(zh(u8"序列号"), edit_camera_sn);
+  camera_edit_form->addRow(zh(u8"参数文件"), edit_camera_param_row);
+  camera_edit_form->addRow(zh(u8"曝光"), edit_camera_exposure);
+  camera_edit_form->addRow(zh(u8"增益"), edit_camera_gain);
+  camera_edit_form->addRow(zh(u8"触发频率"), edit_camera_trigger_freq);
+  camera_edit_form->addRow(camera_config_buttons);
+  camera_config_layout->addWidget(profile_camera_table, 1);
+  camera_config_layout->addWidget(camera_edit_group, 0);
+  config_tabs->addTab(camera_config_tab, zh(u8"相机配置"));
 
   auto* control_tab = new QWidget();
   auto* control_layout = new QVBoxLayout(control_tab);
@@ -526,6 +711,9 @@ int main(int argc, char* argv[]) {
   auto* profile_group = new QGroupBox(zh(u8"全局采集配置"));
   auto* profile_form = new QFormLayout(profile_group);
   auto* profile_name = new QLineEdit("default");
+  auto* profile_driver_mode = new QComboBox();
+  profile_driver_mode->addItem(zh(u8"真实 SDK"), "lvm");
+  profile_driver_mode->addItem(zh(u8"离线模拟"), "simulated");
   auto* profile_startup_mode = new QComboBox();
   profile_startup_mode->addItem(zh(u8"手动启动"), "manual");
   profile_startup_mode->addItem(zh(u8"启动后自动连接"), "auto-connect");
@@ -563,6 +751,7 @@ int main(int argc, char* argv[]) {
   profile_result->setReadOnly(true);
   profile_result->setMinimumHeight(150);
   profile_form->addRow(zh(u8"配置名称"), profile_name);
+  profile_form->addRow(zh(u8"运行模式"), profile_driver_mode);
   profile_form->addRow(zh(u8"采集启动模式"), profile_startup_mode);
   profile_form->addRow(zh(u8"期望相机数"), profile_expected_cameras);
   profile_form->addRow(profile_auto_connect);
@@ -660,6 +849,7 @@ int main(int argc, char* argv[]) {
       "QLabel#title { font-size: 22px; font-weight: 700; color: #ffffff; }"
       "QLabel#sectionTitle { font-size: 15px; font-weight: 700; color: #ffffff; }"
       "QLabel#muted { color: #9fb2ba; }"
+      "QLabel#valueLabel { color: #e8f4f6; background: #0b1114; border: 1px solid #263840; border-radius: 4px; padding: 5px 7px; }"
       "QLabel#preview { background: #05090b; border: 1px solid #2b3f48; border-radius: 6px; color: #8ea3ac; }"
       "QTableWidget, QPlainTextEdit, QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: #0b1114; color: #edf4f6; border: 1px solid #2a3c44; border-radius: 4px; selection-background-color: #176b7b; }"
       "QHeaderView::section { background: #162229; color: #dcecef; border: 0; padding: 5px; }"
@@ -685,8 +875,6 @@ int main(int argc, char* argv[]) {
       new JsonHighlighter(edit->document());
     }
   };
-  attach_json_highlight(status_text);
-  attach_json_highlight(calibration_summary);
   attach_json_highlight(storage_status_text);
   attach_json_highlight(param_result);
   attach_json_highlight(calibration_log);
@@ -740,6 +928,105 @@ int main(int argc, char* argv[]) {
     return ip;
   };
 
+  auto camera_param_path_for_ip = [&](const QString& ip) {
+    const QString base = profile_camera_param_dir->text().trimmed().isEmpty() ? "camera-params" : profile_camera_param_dir->text().trimmed();
+    return QDir(base).filePath(safe_file_ip(ip) + ".nccfg");
+  };
+
+  auto apply_camera_row_style = [&](int row, bool connected, bool streaming, const QString& state) {
+    QColor background("#11181c");
+    if (streaming) {
+      background = QColor("#103d47");
+    } else if (connected) {
+      background = QColor("#142d20");
+    } else if (state == "discovered" || state == zh(u8"已发现")) {
+      background = QColor("#2a2416");
+    } else {
+      background = QColor("#261b1d");
+    }
+    tint_row(camera_table, row, background);
+  };
+
+  auto update_camera_selection_markers = [&]() {
+    for (int row = 0; row < camera_table->rowCount(); ++row) {
+      set_cell(camera_table, row, 8, row == camera_table->currentRow() ? zh(u8"当前") : "");
+    }
+  };
+
+  auto profile_camera_row_for_ip = [&](const QString& ip) {
+    for (int row = 0; row < profile_camera_table->rowCount(); ++row) {
+      auto* item = profile_camera_table->item(row, 0);
+      if (item && item->text().trimmed() == ip) {
+        return row;
+      }
+    }
+    const int row = profile_camera_table->rowCount();
+    profile_camera_table->insertRow(row);
+    for (int column = 0; column < profile_camera_table->columnCount(); ++column) {
+      profile_camera_table->setItem(row, column, new QTableWidgetItem("-"));
+    }
+    return row;
+  };
+
+  auto set_profile_camera_row = [&](int row, const QJsonObject& camera) {
+    const QString ip = camera.value("ip").toString();
+    const QJsonObject params = camera.value("params").toObject();
+    set_cell(profile_camera_table, row, 0, ip);
+    set_cell(profile_camera_table, row, 1, camera.value("enabled").toBool(true) ? zh(u8"是") : zh(u8"否"));
+    set_cell(profile_camera_table, row, 2, camera.value("model").toString());
+    set_cell(profile_camera_table, row, 3, camera.value("sn").toString());
+    set_cell(profile_camera_table, row, 4, camera.value("paramFile").toString(camera_param_path_for_ip(ip)));
+    set_cell(profile_camera_table, row, 5, QString::number(params.value("exposureTime").toInt(exposure->value())));
+    set_cell(profile_camera_table, row, 6, QString::number(params.value("gainK").toDouble(gain->value()), 'f', 3));
+    set_cell(profile_camera_table, row, 7, QString::number(params.value("timeTriggerFreq").toDouble(trigger_freq->value()), 'f', 2));
+  };
+
+  auto current_profile_camera_object = [&]() {
+    const QString ip = edit_camera_ip->text().trimmed();
+    if (ip.isEmpty()) {
+      return QJsonObject{};
+    }
+    return QJsonObject{
+        {"ip", ip},
+        {"enabled", edit_camera_enabled->isChecked()},
+        {"model", edit_camera_model->text().trimmed()},
+        {"sn", edit_camera_sn->text().trimmed()},
+        {"paramFile", edit_camera_param_file->text().trimmed().isEmpty() ? camera_param_path_for_ip(ip) : edit_camera_param_file->text().trimmed()},
+        {"params", QJsonObject{
+                       {"exposureTime", edit_camera_exposure->value()},
+                       {"gainK", edit_camera_gain->value()},
+                       {"timeTriggerFreq", edit_camera_trigger_freq->value()},
+                   }},
+    };
+  };
+
+  auto profile_cameras_from_table = [&]() {
+    QJsonArray cameras;
+    for (int row = 0; row < profile_camera_table->rowCount(); ++row) {
+      const QString ip = profile_camera_table->item(row, 0) ? profile_camera_table->item(row, 0)->text().trimmed() : QString();
+      if (ip.isEmpty() || ip == "-") {
+        continue;
+      }
+      const QString enabled_text = profile_camera_table->item(row, 1) ? profile_camera_table->item(row, 1)->text().trimmed() : zh(u8"是");
+      const int exposure_value = profile_camera_table->item(row, 5) ? profile_camera_table->item(row, 5)->text().toInt() : exposure->value();
+      const double gain_value = profile_camera_table->item(row, 6) ? profile_camera_table->item(row, 6)->text().toDouble() : gain->value();
+      const double trigger_value = profile_camera_table->item(row, 7) ? profile_camera_table->item(row, 7)->text().toDouble() : trigger_freq->value();
+      cameras.append(QJsonObject{
+          {"ip", ip},
+          {"enabled", enabled_text != zh(u8"否") && enabled_text != "false" && enabled_text != "0"},
+          {"model", profile_camera_table->item(row, 2) ? profile_camera_table->item(row, 2)->text() : ""},
+          {"sn", profile_camera_table->item(row, 3) ? profile_camera_table->item(row, 3)->text() : ""},
+          {"paramFile", profile_camera_table->item(row, 4) ? profile_camera_table->item(row, 4)->text() : camera_param_path_for_ip(ip)},
+          {"params", QJsonObject{
+                         {"exposureTime", exposure_value},
+                         {"gainK", gain_value},
+                         {"timeTriggerFreq", trigger_value},
+                     }},
+      });
+    }
+    return cameras;
+  };
+
   auto camera_ips_from_table = [&]() {
     QStringList ips;
     for (int row = 0; row < camera_table->rowCount(); ++row) {
@@ -763,30 +1050,33 @@ int main(int argc, char* argv[]) {
   };
 
   auto build_profile_object = [&]() {
-    QJsonArray cameras;
-    for (int row = 0; row < camera_table->rowCount(); ++row) {
-      const QString ip = camera_table->item(row, 0) ? camera_table->item(row, 0)->text().trimmed() : QString();
-      if (ip.isEmpty()) {
-        continue;
+    QJsonArray cameras = profile_cameras_from_table();
+    if (cameras.isEmpty()) {
+      for (int row = 0; row < camera_table->rowCount(); ++row) {
+        const QString ip = camera_table->item(row, 0) ? camera_table->item(row, 0)->text().trimmed() : QString();
+        if (ip.isEmpty()) {
+          continue;
+        }
+        cameras.append(QJsonObject{
+            {"ip", ip},
+            {"model", camera_table->item(row, 1) ? camera_table->item(row, 1)->text() : ""},
+            {"sn", camera_table->item(row, 2) ? camera_table->item(row, 2)->text() : ""},
+            {"enabled", true},
+            {"paramFile", camera_param_path_for_ip(ip)},
+            {"params", QJsonObject{
+                           {"exposureTime", exposure->value()},
+                           {"gainK", gain->value()},
+                           {"timeTriggerFreq", trigger_freq->value()},
+                       }},
+        });
       }
-      QString safe_ip = ip;
-      safe_ip.replace('.', '_');
-      safe_ip.replace(':', '_');
-      safe_ip.replace('/', '_');
-      safe_ip.replace('\\', '_');
-      cameras.append(QJsonObject{
-          {"ip", ip},
-          {"model", camera_table->item(row, 1) ? camera_table->item(row, 1)->text() : ""},
-          {"sn", camera_table->item(row, 2) ? camera_table->item(row, 2)->text() : ""},
-          {"enabled", true},
-          {"paramFile", profile_camera_param_dir->text().trimmed() + "/" + safe_ip + ".nccfg"},
-      });
     }
 
     QJsonObject profile{
         {"schema", "steel.capture.profile.v1"},
         {"name", profile_name->text().trimmed().isEmpty() ? "default" : profile_name->text().trimmed()},
         {"updatedAt", QDateTime::currentDateTime().toString(Qt::ISODateWithMs)},
+        {"driverMode", profile_driver_mode->currentData().toString()},
         {"storageRoot", storage_root->text().trimmed()},
         {"cameraParamDir", profile_camera_param_dir->text().trimmed()},
         {"startupMode", profile_startup_mode->currentData().toString()},
@@ -816,6 +1106,9 @@ int main(int argc, char* argv[]) {
                                {"exposureTime", exposure->value()},
                                {"gainK", gain->value()},
                            }},
+        {"simulated", QJsonObject{
+                          {"imageSourceDir", ""},
+                      }},
         {"cameras", cameras},
     };
     return profile;
@@ -825,6 +1118,15 @@ int main(int argc, char* argv[]) {
     profile_json->setPlainText(QString::fromUtf8(QJsonDocument(profile).toJson(QJsonDocument::Indented)));
     if (profile.contains("name")) {
       profile_name->setText(profile.value("name").toString("default"));
+    }
+    if (profile.contains("storageRoot")) {
+      storage_root->setText(profile.value("storageRoot").toString(storage_root->text()));
+    }
+    if (profile.contains("driverMode")) {
+      const int index = profile_driver_mode->findData(profile.value("driverMode").toString("lvm"));
+      if (index >= 0) {
+        profile_driver_mode->setCurrentIndex(index);
+      }
     }
     if (profile.contains("cameraParamDir")) {
       profile_camera_param_dir->setText(profile.value("cameraParamDir").toString("config/camera-params/default"));
@@ -841,6 +1143,42 @@ int main(int argc, char* argv[]) {
     if (profile.contains("saveToDevice")) profile_save_to_device->setChecked(profile.value("saveToDevice").toBool());
     if (profile.contains("changeStorage")) profile_change_storage->setChecked(profile.value("changeStorage").toBool());
     if (profile.contains("expectedCameras")) profile_expected_cameras->setValue(profile.value("expectedCameras").toInt(6));
+    profile_camera_table->setRowCount(0);
+    const QJsonArray cameras = profile.value("cameras").toArray();
+    for (const QJsonValue& value : cameras) {
+      const QJsonObject camera = value.toObject();
+      const QString ip = camera.value("ip").toString().trimmed();
+      if (ip.isEmpty()) {
+        continue;
+      }
+      set_profile_camera_row(profile_camera_row_for_ip(ip), camera);
+    }
+  };
+
+  auto render_profile_entries = [&](const QJsonObject& status) {
+    profile_manage_table->setRowCount(0);
+    const QJsonArray entries = status.value("profileEntries").toArray();
+    const QString active_profile = status.value("activeProfile").toString();
+    active_profile_label->setText(active_profile.isEmpty() ? zh(u8"当前默认配置：-")
+                                                           : QString(zh(u8"当前默认配置：%1")).arg(active_profile));
+    int active_row = -1;
+    for (const QJsonValue& value : entries) {
+      const QJsonObject entry = value.toObject();
+      const int row = profile_manage_table->rowCount();
+      profile_manage_table->insertRow(row);
+      profile_manage_table->setItem(row, 0, new QTableWidgetItem(entry.value("name").toString()));
+      const bool active = entry.value("active").toBool();
+      profile_manage_table->setItem(row, 1, new QTableWidgetItem(active ? zh(u8"当前默认") : zh(u8"否")));
+      profile_manage_table->setItem(row, 2, new QTableWidgetItem(entry.value("driverMode").toString("-")));
+      profile_manage_table->setItem(row, 3, new QTableWidgetItem(entry.value("path").toString()));
+      tint_row(profile_manage_table, row, active ? QColor("#173526") : QColor("#0b1114"));
+      if (active) {
+        active_row = row;
+      }
+    }
+    if (active_row >= 0) {
+      profile_manage_table->selectRow(active_row);
+    }
   };
 
   auto continuous_row_for_ip = [&](const QString& ip) {
@@ -910,7 +1248,9 @@ int main(int argc, char* argv[]) {
                          set_cell(camera_table, row, 2, camera.value("sn").toString());
                          set_cell(camera_table, row, 3, camera.value("driverId").toString());
                          set_cell(camera_table, row, 7, zh(u8"已发现"));
+                         apply_camera_row_style(row, false, false, "discovered");
                        }
+                       update_camera_selection_markers();
                        if (ips.size() < expected_camera_count->value()) {
                          continuous_log_line(QString(zh(u8"发现相机 %1 台，少于期望 %2 台。"))
                                                  .arg(ips.size())
@@ -944,13 +1284,82 @@ int main(int argc, char* argv[]) {
                               .arg(fid, size, fps, lost, temp, interval));
   };
 
+  auto render_status_panel = [&](const QJsonObject& status) {
+    if (status.isEmpty()) {
+      set_value(status_ip, "-");
+      set_value(status_connection, "-");
+      set_value(status_acquisition, "-");
+      set_value(status_stream, "-");
+      set_value(status_frames, "-");
+      set_value(status_sdk, "-");
+      set_value(status_link, "-");
+      set_value(status_temperature, "-");
+      set_value(status_errors, "-");
+      set_value(status_identity, "-");
+      return;
+    }
+    const bool connected = status.value("connected").toBool();
+    const bool streaming = status.value("streamRunning").toBool();
+    set_value(status_ip, status.value("ip").toString());
+    set_value(status_connection, connected ? zh(u8"已连接") : zh(u8"未连接"));
+    set_value(status_acquisition, status.value("acquisitionState").toString());
+    set_value(status_stream, streaming ? zh(u8"实时预览中") : zh(u8"未预览"));
+    set_value(status_frames, QString::number(status.value("streamFrames").toInt()));
+    set_value(status_sdk, status.value("sdkStatus").toString());
+    set_value(status_link, QString("%1%").arg(status.value("linkHealth").toInt()));
+    set_value(status_temperature,
+              QString("J28 %1 / J29 %2 / J30 %3")
+                  .arg(status.value("temperatureJ28").toDouble(), 0, 'f', 1)
+                  .arg(status.value("temperatureJ29").toDouble(), 0, 'f', 1)
+                  .arg(status.value("temperatureJ30").toDouble(), 0, 'f', 1));
+    set_value(status_errors,
+              QString(zh(u8"丢脉冲 %1 / 缓冲溢出 %2"))
+                  .arg(status.value("lostPulseCounter").toInt())
+                  .arg(status.value("bufferOverflowCounter").toInt()));
+    set_value(status_identity,
+              QString("%1 | %2 | %3")
+                  .arg(status.value("driverId").toString())
+                  .arg(status.value("model").toString())
+                  .arg(status.value("sn").toString()));
+  };
+
+  auto render_calibration_panel = [&](const QJsonObject& json) {
+    if (json.isEmpty()) {
+      set_value(calibration_code, "-");
+      set_value(calibration_path_value, "-");
+      set_value(roi_code, "-");
+      set_value(roi_path_value, "-");
+      set_value(calibration_time, "-");
+      return;
+    }
+    if (json.contains("error")) {
+      set_value(calibration_code, json.value("error").toString());
+      set_value(calibration_path_value, "-");
+      set_value(roi_code, "-");
+      set_value(roi_path_value, "-");
+      set_value(calibration_time, "-");
+      return;
+    }
+    set_value(calibration_code, QString::number(json.value("calibrationCode").toInt()));
+    set_value(calibration_path_value, json.value("calibrationPath").toString());
+    set_value(roi_code, QString::number(json.value("roiCode").toInt()));
+    set_value(roi_path_value, json.value("roiPath").toString());
+    const QString time_text = json.value("calibrationTime").toString();
+    const QString roi_time_text = json.value("roiTime").toString();
+    set_value(calibration_time, time_text.isEmpty() ? roi_time_text : time_text);
+  };
+
   std::function<void()> refresh_health = [&]() {
     request_json(network, "GET", origin + "/health", {}, log, [&](const QJsonObject& json) {
-      api_state->setText(QString(zh(u8"采集 API：%1 | SDK：%2（%3）| 已连接：%4"))
+      const QString driver_mode = json.value("driverMode").toString("lvm");
+      const QString driver_label = driver_mode == "simulated" ? zh(u8"离线模拟") : zh(u8"真实 SDK");
+      api_state->setText(QString(zh(u8"采集 API：%1 | 模式：%2 | SDK：%3（%4）| 已连接：%5"))
                              .arg(origin)
+                             .arg(driver_label)
                              .arg(json.value("sdkReady").toBool() ? zh(u8"就绪") : zh(u8"未就绪"))
                              .arg(json.value("sdkCode").toInt())
                              .arg(json.value("cameraCount").toInt()));
+      provider_hint->setText(QString(zh(u8"Rust provider：qt-terminal | 驱动：%1")).arg(json.value("driverId").toString()));
       if (json.contains("storageRoot") && storage_root->text().trimmed().isEmpty()) {
         storage_root->setText(json.value("storageRoot").toString());
       }
@@ -969,6 +1378,7 @@ int main(int argc, char* argv[]) {
   std::function<void()> refresh_config_status = [&]() {
     request_json(network, "GET", origin + "/api/config/status", {}, log, [&](const QJsonObject& json) {
       profile_result->setPlainText(json_to_text(json));
+      render_profile_entries(json);
       const QString active = json.value("activeProfile").toString();
       if (!active.isEmpty()) {
         profile_name->setText(active);
@@ -996,7 +1406,9 @@ int main(int argc, char* argv[]) {
         set_cell(camera_table, row, 2, camera.value("sn").toString());
         set_cell(camera_table, row, 3, camera.value("driverId").toString());
         set_cell(camera_table, row, 7, zh(u8"已发现"));
+        apply_camera_row_style(row, false, false, "discovered");
       }
+      update_camera_selection_markers();
     });
   };
 
@@ -1017,11 +1429,13 @@ int main(int argc, char* argv[]) {
         set_cell(camera_table, row, 5, status.value("sdkStatus").toString());
         set_cell(camera_table, row, 6, QString::number(status.value("streamFrames").toInt()));
         set_cell(camera_table, row, 7, status.value("streamRunning").toBool() ? zh(u8"实时预览") : status.value("acquisitionState").toString());
+        apply_camera_row_style(row, status.value("connected").toBool(), status.value("streamRunning").toBool(), status.value("acquisitionState").toString());
         if (ip == selected_ip(camera_table)) {
           selected_status = status;
-          status_text->setPlainText(json_to_text(status));
+          render_status_panel(status);
         }
       }
+      update_camera_selection_markers();
       refresh_preview_meta();
     });
   };
@@ -1057,10 +1471,10 @@ int main(int argc, char* argv[]) {
     }
     request_json(network, "GET", origin + "/api/calibration/status?ip=" + encoded(ip), {}, log, [&](const QJsonObject& json) {
       if (json.contains("error")) {
-        calibration_summary->setPlainText(json_to_text(json));
+        render_calibration_panel(json);
         return;
       }
-      calibration_summary->setPlainText(json_to_text(json));
+      render_calibration_panel(json);
       calibration_log->setPlainText(json_to_text(json));
     });
   };
@@ -1137,6 +1551,9 @@ int main(int argc, char* argv[]) {
     selected_label->setText(ip.isEmpty() ? zh(u8"未选择相机") : zh(u8"当前相机：") + ip);
     selected_status = {};
     stream_status = {};
+    render_status_panel({});
+    render_calibration_panel({});
+    update_camera_selection_markers();
     measured_fps = 0.0;
     last_frame_count = 0;
     last_fps_sample_ms = 0;
@@ -1171,6 +1588,201 @@ int main(int argc, char* argv[]) {
     QDesktopServices::openUrl(QUrl(origin + "/ui"));
   });
 
+  auto set_main_page = [&](int index) {
+    main_stack->setCurrentIndex(index);
+    preview_page_button->setEnabled(index != 0);
+    config_page_button->setEnabled(index != 1);
+  };
+  QObject::connect(preview_page_button, &QPushButton::clicked, [&]() {
+    set_main_page(0);
+  });
+  QObject::connect(config_page_button, &QPushButton::clicked, [&]() {
+    set_main_page(1);
+    refresh_config_status();
+  });
+  set_main_page(0);
+
+  auto selected_profile_name = [&]() -> QString {
+    const int row = profile_manage_table->currentRow();
+    if (row < 0 || !profile_manage_table->item(row, 0)) {
+      log_line(log, zh(u8"请先选择一个配置组。"));
+      return {};
+    }
+    return profile_manage_table->item(row, 0)->text().trimmed();
+  };
+
+  auto apply_profile_by_name = [&](const QString& name, bool auto_connect) {
+    if (name.trimmed().isEmpty()) {
+      return;
+    }
+    request_json(network, "POST", origin + "/api/config/profile/apply",
+                 QJsonObject{{"name", name.trimmed()}, {"autoConnect", auto_connect}},
+                 log,
+                 [&, name](const QJsonObject& json) {
+                   profile_result->setPlainText(json_to_text(json));
+                   log_line(log, QString(zh(u8"配置已应用/设为默认：%1，返回码 %2")).arg(name).arg(json_code(json)));
+                   refresh_all();
+                 });
+  };
+
+  QObject::connect(profile_apply_selected, &QPushButton::clicked, [&]() {
+    const QString name = selected_profile_name();
+    if (!name.isEmpty()) {
+      apply_profile_by_name(name, true);
+    }
+  });
+  QObject::connect(profile_refresh_list, &QPushButton::clicked, refresh_config_status);
+
+  QObject::connect(profile_manage_table, &QTableWidget::itemSelectionChanged, [&]() {
+    const int row = profile_manage_table->currentRow();
+    const QString name = row >= 0 && profile_manage_table->item(row, 0) ? profile_manage_table->item(row, 0)->text().trimmed() : QString();
+    if (name.isEmpty()) {
+      return;
+    }
+    request_json(network, "GET", origin + "/api/config/profile?name=" + encoded(name), {}, log,
+                 [&, name](const QJsonObject& profile) {
+                   render_profile_object(profile);
+                   log_line(log, QString(zh(u8"已选择配置：%1")).arg(name));
+                 });
+  });
+
+  auto import_profile_path = [&](const QString& path) {
+    if (path.trimmed().isEmpty()) {
+      return;
+    }
+    QFileInfo info(path);
+    const QString name = info.isDir() ? info.fileName() : info.completeBaseName();
+    QJsonObject body{{"path", path}, {"name", name}, {"makeActive", true}, {"overwrite", false}};
+    request_json(network, "POST", origin + "/api/config/profile/import", body, log,
+                 [&, path, name](const QJsonObject& json) {
+                   if (json_code(json) == 409) {
+                     if (QMessageBox::question(&window, zh(u8"覆盖配置"), zh(u8"同名配置已存在，是否覆盖导入？")) == QMessageBox::Yes) {
+                       request_json(network, "POST", origin + "/api/config/profile/import",
+                                    QJsonObject{{"path", path}, {"name", name}, {"makeActive", true}, {"overwrite", true}},
+                                    log,
+                                    [&](const QJsonObject& overwrite_json) {
+                                      profile_result->setPlainText(json_to_text(overwrite_json));
+                                      log_line(log, QString(zh(u8"配置导入完成，返回码 %1")).arg(json_code(overwrite_json)));
+                                      refresh_config_status();
+                                    });
+                     }
+                     return;
+                   }
+                   profile_result->setPlainText(json_to_text(json));
+                   log_line(log, QString(zh(u8"配置导入完成，返回码 %1")).arg(json_code(json)));
+                   refresh_config_status();
+                 });
+  };
+
+  QObject::connect(profile_import_folder, &QPushButton::clicked, [&]() {
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    const QString path = QFileDialog::getExistingDirectory(&window, zh(u8"选择配置组文件夹"), base);
+    import_profile_path(path);
+  });
+
+  QObject::connect(profile_import_json, &QPushButton::clicked, [&]() {
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    const QString path = QFileDialog::getOpenFileName(&window, zh(u8"选择配置 JSON"), base, "JSON (*.json)");
+    import_profile_path(path);
+  });
+
+  QObject::connect(profile_new_wizard, &QPushButton::clicked, [&]() {
+    QDialog dialog(&window);
+    dialog.setWindowTitle(zh(u8"新建采集配置"));
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* form = new QFormLayout();
+    auto* wizard_name = new QLineEdit("offline-sim");
+    auto* wizard_driver = new QComboBox();
+    wizard_driver->addItem(zh(u8"离线模拟"), "simulated");
+    wizard_driver->addItem(zh(u8"真实 SDK"), "lvm");
+    auto* wizard_camera_count = new QSpinBox();
+    wizard_camera_count->setRange(1, 24);
+    wizard_camera_count->setValue(profile_expected_cameras->value());
+    auto* wizard_storage = new QLineEdit(storage_root->text().trimmed().isEmpty() ? "E:/steel-capture-data" : storage_root->text().trimmed());
+    auto* wizard_storage_browse = new QPushButton(zh(u8"选择"));
+    auto* wizard_storage_row = new QHBoxLayout();
+    wizard_storage_row->addWidget(wizard_storage, 1);
+    wizard_storage_row->addWidget(wizard_storage_browse);
+    auto* wizard_sim_images = new QLineEdit();
+    auto* wizard_sim_images_browse = new QPushButton(zh(u8"选择"));
+    auto* wizard_sim_images_row = new QHBoxLayout();
+    wizard_sim_images_row->addWidget(wizard_sim_images, 1);
+    wizard_sim_images_row->addWidget(wizard_sim_images_browse);
+    auto* wizard_auto_connect = new QCheckBox(zh(u8"应用后自动连接"));
+    wizard_auto_connect->setChecked(true);
+    auto* wizard_make_default = new QCheckBox(zh(u8"设为默认加载"));
+    wizard_make_default->setChecked(true);
+    form->addRow(zh(u8"配置名称"), wizard_name);
+    form->addRow(zh(u8"运行模式"), wizard_driver);
+    form->addRow(zh(u8"相机数量"), wizard_camera_count);
+    form->addRow(zh(u8"图像保存位置"), wizard_storage_row);
+    form->addRow(zh(u8"模拟图片目录"), wizard_sim_images_row);
+    form->addRow(wizard_auto_connect);
+    form->addRow(wizard_make_default);
+    layout->addLayout(form);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons);
+    QObject::connect(wizard_storage_browse, &QPushButton::clicked, [&]() {
+      const QString path = QFileDialog::getExistingDirectory(&dialog, zh(u8"选择图像保存位置"), wizard_storage->text());
+      if (!path.isEmpty()) {
+        wizard_storage->setText(path);
+      }
+    });
+    QObject::connect(wizard_sim_images_browse, &QPushButton::clicked, [&]() {
+      const QString path = QFileDialog::getExistingDirectory(&dialog, zh(u8"选择模拟图片目录"), wizard_sim_images->text());
+      if (!path.isEmpty()) {
+        wizard_sim_images->setText(path);
+      }
+    });
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) {
+      return;
+    }
+
+    const QString name = wizard_name->text().trimmed().isEmpty() ? "default" : wizard_name->text().trimmed();
+    const QJsonObject profile{
+        {"schema", "steel.capture.profile.v1"},
+        {"name", name},
+        {"updatedAt", QDateTime::currentDateTime().toString(Qt::ISODateWithMs)},
+        {"driverMode", wizard_driver->currentData().toString()},
+        {"storageRoot", wizard_storage->text().trimmed()},
+        {"startupMode", wizard_auto_connect->isChecked() ? "auto-connect" : "manual"},
+        {"autoConnect", wizard_auto_connect->isChecked()},
+        {"expectedCameras", wizard_camera_count->value()},
+        {"changeStorage", true},
+        {"applySoftTrigger", true},
+        {"loadCameraParams", false},
+        {"saveToDevice", false},
+        {"lines", lines->value()},
+        {"width", width->value()},
+        {"timeoutMs", timeout_ms->value()},
+        {"dataMode", data_mode->currentData().toInt()},
+        {"fpsLimit", fps_limit->value()},
+        {"timeTriggerFreq", trigger_freq->value()},
+        {"exposureTime", exposure->value()},
+        {"gainK", gain->value()},
+        {"simulated", QJsonObject{{"imageSourceDir", wizard_sim_images->text().trimmed()}}},
+        {"cameras", QJsonArray{}},
+    };
+    const QJsonObject body{
+        {"name", name},
+        {"makeActive", wizard_make_default->isChecked()},
+        {"profileJson", QString::fromUtf8(QJsonDocument(profile).toJson(QJsonDocument::Compact))},
+    };
+    request_json(network, "POST", origin + "/api/config/profile/save", body, log,
+                 [&, name, profile, auto_connect = wizard_auto_connect->isChecked(), make_default = wizard_make_default->isChecked()](const QJsonObject& json) {
+                   profile_result->setPlainText(json_to_text(json));
+                   render_profile_object(profile);
+                   log_line(log, QString(zh(u8"配置向导已保存：%1，返回码 %2")).arg(name).arg(json_code(json)));
+                   if (make_default) {
+                     apply_profile_by_name(name, auto_connect);
+                   } else {
+                     refresh_config_status();
+                   }
+                 });
+  });
+
   QObject::connect(storage_browse, &QPushButton::clicked, [&]() {
     const QString path = QFileDialog::getExistingDirectory(&window, zh(u8"选择数据存储目录"), storage_root->text());
     if (!path.isEmpty()) {
@@ -1179,6 +1791,16 @@ int main(int argc, char* argv[]) {
   });
 
   QObject::connect(storage_refresh, &QPushButton::clicked, refresh_storage);
+
+  QObject::connect(storage_open, &QPushButton::clicked, [&]() {
+    const QString root_path = storage_root->text().trimmed();
+    if (root_path.isEmpty()) {
+      log_line(log, zh(u8"存储目录不能为空。"));
+      return;
+    }
+    QDir().mkpath(root_path);
+    QDesktopServices::openUrl(QUrl::fromLocalFile(root_path));
+  });
 
   QObject::connect(storage_apply, &QPushButton::clicked, [&]() {
     const QString root_path = storage_root->text().trimmed();
@@ -1202,6 +1824,90 @@ int main(int argc, char* argv[]) {
     if (!path.isEmpty()) {
       profile_camera_param_dir->setText(path);
     }
+  });
+
+  auto load_profile_camera_editor = [&]() {
+    const int row = profile_camera_table->currentRow();
+    if (row < 0) {
+      return;
+    }
+    edit_camera_ip->setText(profile_camera_table->item(row, 0) ? profile_camera_table->item(row, 0)->text() : "");
+    const QString enabled_text = profile_camera_table->item(row, 1) ? profile_camera_table->item(row, 1)->text().trimmed() : zh(u8"是");
+    edit_camera_enabled->setChecked(enabled_text != zh(u8"否") && enabled_text != "false" && enabled_text != "0");
+    edit_camera_model->setText(profile_camera_table->item(row, 2) ? profile_camera_table->item(row, 2)->text() : "");
+    edit_camera_sn->setText(profile_camera_table->item(row, 3) ? profile_camera_table->item(row, 3)->text() : "");
+    edit_camera_param_file->setText(profile_camera_table->item(row, 4) ? profile_camera_table->item(row, 4)->text() : "");
+    int camera_exposure = profile_camera_table->item(row, 5) ? profile_camera_table->item(row, 5)->text().toInt() : exposure->value();
+    if (camera_exposure < 1) {
+      camera_exposure = exposure->value();
+    }
+    edit_camera_exposure->setValue(camera_exposure);
+    edit_camera_gain->setValue(profile_camera_table->item(row, 6) ? profile_camera_table->item(row, 6)->text().toDouble() : gain->value());
+    edit_camera_trigger_freq->setValue(profile_camera_table->item(row, 7) ? profile_camera_table->item(row, 7)->text().toDouble() : trigger_freq->value());
+  };
+
+  QObject::connect(profile_camera_table, &QTableWidget::itemSelectionChanged, load_profile_camera_editor);
+
+  QObject::connect(edit_camera_param_browse, &QPushButton::clicked, [&]() {
+    const QString ip = edit_camera_ip->text().trimmed();
+    const QString base = edit_camera_param_file->text().trimmed().isEmpty() ? camera_param_path_for_ip(ip) : edit_camera_param_file->text().trimmed();
+    const QString path = QFileDialog::getSaveFileName(&window, zh(u8"选择相机参数文件"), base, "NCCFG (*.nccfg);;All Files (*.*)");
+    if (!path.isEmpty()) {
+      edit_camera_param_file->setText(path);
+    }
+  });
+
+  QObject::connect(profile_camera_sync, &QPushButton::clicked, [&]() {
+    for (int row = 0; row < camera_table->rowCount(); ++row) {
+      const QString ip = camera_table->item(row, 0) ? camera_table->item(row, 0)->text().trimmed() : QString();
+      if (ip.isEmpty()) {
+        continue;
+      }
+      set_profile_camera_row(profile_camera_row_for_ip(ip),
+                             QJsonObject{
+                                 {"ip", ip},
+                                 {"enabled", true},
+                                 {"model", camera_table->item(row, 1) ? camera_table->item(row, 1)->text() : ""},
+                                 {"sn", camera_table->item(row, 2) ? camera_table->item(row, 2)->text() : ""},
+                                 {"paramFile", camera_param_path_for_ip(ip)},
+                                 {"params", QJsonObject{
+                                                {"exposureTime", exposure->value()},
+                                                {"gainK", gain->value()},
+                                                {"timeTriggerFreq", trigger_freq->value()},
+                                            }},
+                             });
+    }
+    render_profile_object(build_profile_object());
+    log_line(log, zh(u8"已从当前相机列表同步相机配置。"));
+  });
+
+  QObject::connect(profile_camera_update, &QPushButton::clicked, [&]() {
+    const QJsonObject camera = current_profile_camera_object();
+    const QString ip = camera.value("ip").toString();
+    if (ip.isEmpty()) {
+      log_line(log, zh(u8"相机 IP 不能为空。"));
+      return;
+    }
+    set_profile_camera_row(profile_camera_row_for_ip(ip), camera);
+    render_profile_object(build_profile_object());
+    log_line(log, QString(zh(u8"相机配置已更新：%1")).arg(ip));
+  });
+
+  QObject::connect(profile_camera_delete, &QPushButton::clicked, [&]() {
+    const int row = profile_camera_table->currentRow();
+    if (row < 0) {
+      log_line(log, zh(u8"请先选择一条相机配置。"));
+      return;
+    }
+    const QString ip = profile_camera_table->item(row, 0) ? profile_camera_table->item(row, 0)->text() : "";
+    profile_camera_table->removeRow(row);
+    render_profile_object(build_profile_object());
+    log_line(log, QString(zh(u8"相机配置已删除：%1")).arg(ip));
+  });
+
+  QObject::connect(profile_camera_write_profile, &QPushButton::clicked, [&]() {
+    render_profile_object(build_profile_object());
+    profile_result->setPlainText(zh(u8"{\n  \"code\": 0,\n  \"message\": \"相机配置已写入配置 JSON，保存后生效\"\n}"));
   });
 
   QObject::connect(profile_refresh, &QPushButton::clicked, refresh_config_status);
@@ -1691,6 +2397,62 @@ int main(int argc, char* argv[]) {
     continuous_stop->setEnabled(false);
     update_continuous_summary();
     continuous_log_line(zh(u8"连续采集测试已手动停止。"));
+  });
+
+  QObject::connect(stability_test_button, &QPushButton::clicked, [&]() {
+    QDialog dialog(&window);
+    dialog.setWindowTitle(zh(u8"采集稳定性测试"));
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* form = new QFormLayout();
+    auto* dialog_scope = new QComboBox();
+    dialog_scope->addItem(zh(u8"全部已发现相机"), "all");
+    dialog_scope->addItem(zh(u8"当前选中相机"), "selected");
+    dialog_scope->setCurrentIndex(continuous_scope->currentIndex());
+    auto* dialog_rounds = new QSpinBox();
+    dialog_rounds->setRange(1, 10000);
+    dialog_rounds->setValue(continuous_rounds->value());
+    auto* dialog_interval = new QSpinBox();
+    dialog_interval->setRange(0, 600000);
+    dialog_interval->setValue(continuous_interval_ms->value());
+    dialog_interval->setSuffix(" ms");
+    auto* dialog_output = new QLineEdit(continuous_output_dir->text());
+    auto* dialog_output_browse = new QPushButton(zh(u8"选择"));
+    auto* dialog_output_row = new QHBoxLayout();
+    dialog_output_row->addWidget(dialog_output, 1);
+    dialog_output_row->addWidget(dialog_output_browse);
+    form->addRow(zh(u8"测试范围"), dialog_scope);
+    form->addRow(zh(u8"采集轮数"), dialog_rounds);
+    form->addRow(zh(u8"间隔"), dialog_interval);
+    form->addRow(zh(u8"输出目录"), dialog_output_row);
+    layout->addLayout(form);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Ok)->setText(zh(u8"开始测试"));
+    layout->addWidget(buttons);
+    QObject::connect(dialog_output_browse, &QPushButton::clicked, [&]() {
+      const QString path = QFileDialog::getExistingDirectory(&dialog, zh(u8"选择测试输出目录"), dialog_output->text());
+      if (!path.isEmpty()) {
+        dialog_output->setText(path);
+      }
+    });
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) {
+      return;
+    }
+    const int scope_index = continuous_scope->findData(dialog_scope->currentData());
+    if (scope_index >= 0) {
+      continuous_scope->setCurrentIndex(scope_index);
+    }
+    continuous_rounds->setValue(dialog_rounds->value());
+    continuous_interval_ms->setValue(dialog_interval->value());
+    continuous_output_dir->setText(dialog_output->text().trimmed().isEmpty() ? "continuous-test" : dialog_output->text().trimmed());
+    set_main_page(0);
+    camera_tabs->setCurrentWidget(continuous_tab);
+    if (continuous_running) {
+      continuous_log_line(zh(u8"已有采集稳定性测试正在运行。"));
+      return;
+    }
+    continuous_start->click();
   });
 
   QObject::connect(capture_once, &QPushButton::clicked, [&]() {

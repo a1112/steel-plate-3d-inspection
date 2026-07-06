@@ -31,9 +31,11 @@ Required fields:
 - `time`
 - `sdkReady`
 - `sdkCode`
+- `driverMode`
 - `driverId`
 - `driverName`
 - `storageRoot`
+- `configRoot`
 - `cameraCount`
 
 ## Storage
@@ -55,12 +57,14 @@ Relative capture outputs are resolved under the current storage root. Absolute o
 
 ## Global Configuration Profiles
 
-Provider-level configuration is stored under the current storage root:
+Provider-level configuration is stored under `CAPTURE_CONFIG_ROOT` when set, otherwise under `%LOCALAPPDATA%/SteelCapture/config`. Legacy profiles under the storage root remain readable:
 
 ```text
-<storageRoot>/config/profiles/<name>.json
-<storageRoot>/config/camera-params/<name>/<camera-ip>.nccfg
-<storageRoot>/config/active-profile.txt
+<configRoot>/profiles/<name>/profile.json
+<configRoot>/profiles/<name>/camera-params/<camera-ip>.nccfg
+<configRoot>/profiles/<name>/sim-images/
+<configRoot>/profiles/<name>/captures/
+<configRoot>/active-profile.txt
 ```
 
 Profiles are ordinary JSON files. They are intended to capture startup mode, storage root, expected camera count, default capture parameters, trigger settings, and the camera parameter-file directory. The Qt viewer uses these APIs, and automation scripts may call the same APIs directly.
@@ -82,7 +86,21 @@ Content-Type: application/json
 }
 ```
 
-`profileJson` is saved as the profile body. If `profileJson` is omitted, the request body itself is saved as the profile.
+`profileJson` is saved as the profile body. If `profileJson` is omitted, the request body itself is saved as the profile. New saves use the folder-backed profile layout above; legacy `<name>.json` files remain readable.
+
+```http
+POST /api/config/profile/import
+Content-Type: application/json
+
+{
+  "path": "D:/capture-configs/offline-sim",
+  "name": "offline-sim",
+  "overwrite": false,
+  "makeActive": true
+}
+```
+
+The import path may be a folder containing `profile.json` or a legacy `.json` profile file.
 
 ```http
 POST /api/config/profile/apply
@@ -105,6 +123,7 @@ Recommended profile fields:
 {
   "schema": "steel.capture.profile.v1",
   "name": "default",
+  "driverMode": "lvm",
   "storageRoot": "E:/steel-capture-data",
   "cameraParamDir": "config/camera-params/default",
   "startupMode": "manual",
@@ -124,6 +143,9 @@ Recommended profile fields:
   "timeTriggerFreq": 300,
   "exposureTime": 50,
   "gainK": 1.0,
+  "simulated": {
+    "imageSourceDir": ""
+  },
   "cameras": []
 }
 ```
