@@ -1,6 +1,6 @@
 # Capture Core And Headless Service
 
-Local C++ capture implementation for Capture 6.7.0.4 LVM 3D camera control.
+Local C++ capture implementation for Capture 6.7 LVM 3D camera control and offline simulated cameras.
 
 This project now builds:
 
@@ -15,14 +15,20 @@ The standalone Qt terminal in `app/capture-qt` links the same core so the SDK lo
 scripts/build-capture-headless.ps1
 ```
 
-The build links against:
+The build auto-detects the installed SDK under common Capture 6.7.0.8 and 6.7.0.4 paths, or uses `CAPTURE_SDK_ROOT` when passed to CMake. It links against:
 
-`C:\Program Files (x86)\Capture 6.7.0.4\LVM_NVT_SDK\LVM_C++_SDK\x64`
+`C:\Program Files (x86)\Capture <version>\LVM_NVT_SDK\LVM_C++_SDK\x64`
 
 ## Run
 
 ```powershell
 scripts/run-capture-headless.ps1 -Port 4317
+```
+
+Run without cameras:
+
+```powershell
+target/capture/Release/steel_capture_service.exe --port 4317 --driver simulated
 ```
 
 When Rust runs with `STEEL_CAPTURE_PROVIDER=headless-cpp`, it can start this executable automatically. When Rust runs with `STEEL_CAPTURE_PROVIDER=qt-terminal`, start the Qt terminal instead and do not run this headless executable at the same time.
@@ -38,6 +44,7 @@ The Tauri client no longer builds or links this project. Build this capture runt
 - `GET /api/config/profile?name=default`
 - `POST /api/config/profile/save` with `{"name":"default","profileJson":"{...}","makeActive":true}`
 - `POST /api/config/profile/apply` with `{"name":"default","autoConnect":true,"expectedCameras":6}`
+- `POST /api/config/profile/import` with `{"path":"D:/configs/offline","overwrite":false}`
 - `POST /api/config/camera-params/save-all` with `{"name":"default","cameraParamDir":"config/camera-params/default"}`
 - `POST /api/config/camera-params/load-all` with `{"name":"default","cameraParamDir":"config/camera-params/default"}`
 - `GET /api/cameras`
