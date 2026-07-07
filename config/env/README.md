@@ -8,6 +8,7 @@ Copy one of these files to a local `.env` file or pass it directly with `-EnvFil
 - `external-api.env.example`: Rust connects to an already running capture API process.
 - `qt-terminal.env.example`: Rust connects to the standalone Qt capture terminal.
 - `simulated.env.example`: Rust uses the six-camera simulation fallback.
+- `trigger-gateway.env.example`: standalone trigger gateway forwards L2/PLC/API steel events to the Rust production API.
 
 Example:
 
@@ -24,3 +25,24 @@ Example:
 ```powershell
 scripts/run-client-dev.ps1 -EnvFile config/env/client.env.example
 ```
+
+## Trigger Gateway
+
+```powershell
+scripts/run-trigger-gateway.ps1 -EnvFile config/env/trigger-gateway.env.example
+```
+
+The gateway listens on `TRIGGER_GATEWAY_PORT` and forwards:
+
+- `POST /api/trigger/steel-info`
+- `POST /api/trigger/steel-in`
+- `POST /api/trigger/steel-out`
+- `POST /api/trigger/secondary-data`
+- `POST /api/trigger/capture-summary`
+- `POST /api/trigger/capture-once`
+- `POST /api/trigger/defect`
+- `POST /api/trigger/event`
+- `POST /api/plc/steel-in`
+- `POST /api/plc/steel-out`
+- `POST /api/l2/steel-info`
+- `POST /api/l2/secondary-data`

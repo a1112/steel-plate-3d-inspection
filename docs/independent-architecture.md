@@ -1,6 +1,6 @@
 # Independent Runtime Architecture
 
-The inspection system is split into four runtime boundaries:
+The inspection system is split into five runtime boundaries:
 
 ```text
 LVM 3D cameras
@@ -8,6 +8,10 @@ LVM 3D cameras
     -> Qt capture terminal or headless capture service
       -> Rust inspection service
         -> Tauri client
+
+L2 / PLC / external trigger API
+  -> standalone trigger gateway
+    -> Rust inspection service
 ```
 
 ## Components
@@ -35,8 +39,18 @@ Standalone Qt capture terminal.
 Rust inspection backend.
 
 - Owns business APIs, configuration, admin/auth, database state, inspection records, and service monitoring.
+- Owns production database writes for material sessions, secondary data, trigger events, inspection records, capture files, and defect records.
 - Talks to the configured capture provider through the local capture API.
 - Should not call the LVM SDK directly.
+
+### `app/service/src/bin/steel_trigger_gateway.rs`
+
+Standalone trigger gateway.
+
+- Runs as its own process outside the capture provider, Rust service, Qt terminal, and Tauri client.
+- Accepts L2/PLC/API events for steel info, steel-in, steel-out, secondary data, one-shot capture, capture summary, and defect results.
+- Tags events with `TRIGGER_MODE=api` or `TRIGGER_MODE=gray`, then forwards them to the Rust production API.
+- Does not call camera SDK functions and does not write capture files directly.
 
 ### `app/client`
 
@@ -75,6 +89,7 @@ For headless mode, `CAPTURE_SERVICE_PORT` can still be used and defaults to `431
 
 - Exactly one process may own camera SDK handles.
 - The Rust service is the API gateway and business orchestrator, not a camera driver.
+- The standalone trigger gateway is the integration adapter for L2/PLC/gray-sensor events; it forwards to Rust instead of touching SDK handles.
 - The Tauri client is a UI shell and must keep using Rust APIs.
 - Qt and headless C++ modes expose the same local capture API contract.
 - If Qt mode is enabled, Rust must not autostart another headless C++ capture process.

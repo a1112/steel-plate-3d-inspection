@@ -128,6 +128,7 @@ $ServiceBuild = if ($ServiceProfile -eq "release") {
   Join-Path $RepoRoot "target\cargo\debug"
 }
 Copy-RequiredFile (Join-Path $ServiceBuild "steel-inspection-service.exe") $ServiceOut
+Copy-RequiredFile (Join-Path $ServiceBuild "steel_trigger_gateway.exe") $ServiceOut
 
 $ClientBuild = Join-Path $RepoRoot "target\client\frontend-dist"
 if (-not (Test-Path $ClientBuild -PathType Container)) {
@@ -229,11 +230,38 @@ Remove-Item Env:\CAPTURE_SERVICE_ORIGIN -ErrorAction SilentlyContinue
 exit $LASTEXITCODE
 '@
 
+Write-PackageFile "run-trigger-gateway.ps1" @'
+param(
+  [int]$Port = 4881,
+  [string]$HostAddress = "127.0.0.1",
+  [string]$InspectionServiceOrigin = "http://127.0.0.1:4873",
+  [ValidateSet("api", "gray")]
+  [string]$Mode = "api"
+)
+
+$ErrorActionPreference = "Stop"
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Exe = Join-Path $Root "service\steel_trigger_gateway.exe"
+
+if (-not (Test-Path $Exe -PathType Leaf)) {
+  throw "Missing trigger gateway executable: $Exe"
+}
+
+$env:TRIGGER_GATEWAY_PORT = [string]$Port
+$env:TRIGGER_GATEWAY_HOST = $HostAddress
+$env:INSPECTION_SERVICE_ORIGIN = $InspectionServiceOrigin
+$env:TRIGGER_MODE = $Mode
+
+& $Exe
+exit $LASTEXITCODE
+'@
+
 Write-PackageFile "stop-runtime.ps1" @'
 $ErrorActionPreference = "Stop"
 
 $ProcessNames = @(
   "steel-inspection-service",
+  "steel_trigger_gateway",
   "steel_capture_service",
   "steel_capture_qt_terminal"
 )
@@ -250,6 +278,7 @@ This package keeps runtime boundaries independent:
 
 - `capture-headless/`: C++ capture provider and camera SDK runtime DLL.
 - `service/`: Rust service API executable.
+- `service/steel_trigger_gateway.exe`: standalone L2/PLC/API trigger gateway.
 - `client/`: built frontend files.
 - `config/env/`: environment templates.
 - `docs/`: architecture and API documentation copied from the source tree.
@@ -295,6 +324,14 @@ Terminal 2:
 .\run-service-simulated.ps1 -Port 4873
 ```
 
+## Trigger Gateway
+
+```powershell
+.\run-trigger-gateway.ps1 -Port 4881 -InspectionServiceOrigin http://127.0.0.1:4873 -Mode api
+```
+
+Use `-Mode gray` when a grayscale/sensor-side signal owns the in/out steel decision and the gateway should record that source mode.
+
 ## Client Files
 
 The `client/` folder contains the built web assets. Serve it with the package-local static server:
@@ -339,6 +376,7 @@ $Manifest = [ordered]@{
   }
   service = @{
     path = "service/steel-inspection-service.exe"
+    triggerGateway = "service/steel_trigger_gateway.exe"
     profile = $ServiceProfile
   }
   client = @{
@@ -351,6 +389,7 @@ $Manifest = [ordered]@{
     captureHeadless = "run-capture-headless.ps1"
     serviceExternal = "run-service-external.ps1"
     serviceSimulated = "run-service-simulated.ps1"
+    triggerGateway = "run-trigger-gateway.ps1"
     clientStatic = "run-client-static.ps1"
     captureApiTest = "test-capture-api.ps1"
     continuousCaptureTest = "test-capture-continuous.ps1"

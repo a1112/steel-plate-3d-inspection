@@ -2432,13 +2432,18 @@ fn admin_services_json(state: &ServiceState) -> String {
                 .count()
         })
         .unwrap_or(0);
-    let database_bytes = fs::metadata(&state.database.path)
+    let database_bytes = state
+        .database
+        .file_path
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok())
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     let config_dir = state
         .database
-        .path
-        .parent()
+        .file_path
+        .as_ref()
+        .and_then(|path| path.parent())
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     let capture_running = capture_status
@@ -2452,10 +2457,11 @@ fn admin_services_json(state: &ServiceState) -> String {
         .to_string();
     let config_dir_status = if state
         .database
-        .path
-        .parent()
+        .file_path
+        .as_ref()
+        .and_then(|path| path.parent())
         .map(|path| path.is_dir())
-        .unwrap_or(false)
+        .unwrap_or_else(|| state.database.engine != "sqlite")
     {
         "normal"
     } else {
@@ -2472,8 +2478,8 @@ fn admin_services_json(state: &ServiceState) -> String {
             "uptimeMs": now.saturating_sub(state.started_at),
             "activeSessions": active_sessions,
             "database": {
-                "engine": "sqlite",
-                "path": state.database.path.display().to_string(),
+                "engine": state.database.engine,
+                "path": state.database.display_path(),
                 "bytes": database_bytes,
                 "configDir": config_dir
             }
@@ -2489,14 +2495,14 @@ fn admin_services_json(state: &ServiceState) -> String {
             {
                 "id": "database",
                 "label": "SQLite 数据库",
-                "status": if database_bytes > 0 { "normal" } else { "warning" },
-                "detail": format!("{} bytes / {}", database_bytes, state.database.path.display())
+                "status": if state.database.engine != "sqlite" || database_bytes > 0 { "normal" } else { "warning" },
+                "detail": format!("{} / {}", state.database.engine, state.database.display_path())
             },
             {
                 "id": "config",
                 "label": "配置目录",
                 "status": config_dir_status,
-                "detail": state.database.path.parent().map(|path| path.display().to_string()).unwrap_or_default()
+                "detail": config_dir
             },
             {
                 "id": "capture",
@@ -4482,23 +4488,32 @@ fn database_info_response(state: &ServiceState) -> Vec<u8> {
     http_response(
         "200 OK",
         "application/json; charset=utf-8",
-        &format!(
-            "{{\"engine\":\"sqlite\",\"orm\":\"sea-orm\",\"path\":\"{}\",\"configDir\":\"{}\"}}",
-            json_escape(&state.database.path.display().to_string()),
-            json_escape(
-                &state
-                    .database
-                    .path
-                    .parent()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default()
-            )
-        ),
+        &json!({
+            "engine": state.database.engine,
+            "orm": "sea-orm",
+            "path": state.database.display_path(),
+            "configDir": state.database.file_path.as_ref()
+                .and_then(|path| path.parent())
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        })
+        .to_string(),
     )
 }
 
 fn database_backup_response(state: &ServiceState, actor: &str) -> Vec<u8> {
-    let path = state.database.path.clone();
+    let Some(path) = state.database.file_path.clone() else {
+        return http_response(
+            "501 Not Implemented",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 501,
+                "error": "database_backup_requires_server_tool",
+                "engine": state.database.engine
+            })
+            .to_string(),
+        );
+    };
     match fs::read(&path) {
         Ok(bytes) => {
             let _ = state.runtime.block_on(db::append_audit_log(
@@ -4538,7 +4553,11 @@ fn database_backup_response(state: &ServiceState, actor: &str) -> Vec<u8> {
 }
 
 fn database_file_bytes(state: &ServiceState) -> u64 {
-    fs::metadata(&state.database.path)
+    state
+        .database
+        .file_path
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok())
         .map(|metadata| metadata.len())
         .unwrap_or(0)
 }
@@ -4691,6 +4710,730 @@ fn database_maintenance_response(state: &ServiceState, actor: &str) -> Vec<u8> {
                 &format!("{{\"error\":\"{}\"}}", json_escape(&error)),
             )
         }
+    }
+}
+
+fn value_string(payload: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| payload.get(*key))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| value.as_i64().map(|item| item.to_string()))
+                .or_else(|| value.as_u64().map(|item| item.to_string()))
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+fn value_f64(payload: &Value, keys: &[&str]) -> f64 {
+    keys.iter()
+        .find_map(|key| payload.get(*key))
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<f64>().ok()))
+        })
+        .unwrap_or(0.0)
+}
+
+fn value_i32(payload: &Value, keys: &[&str], fallback: i32) -> i32 {
+    keys.iter()
+        .find_map(|key| payload.get(*key))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_bool().map(|flag| if flag { 1 } else { 0 }))
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<i64>().ok()))
+        })
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(fallback)
+}
+
+fn material_id_from_payload(payload: &Value, fallback: &str) -> String {
+    let id = value_string(
+        payload,
+        &["materialId", "material_id", "steelId", "steel_id", "steelNo", "steel_no", "id"],
+    );
+    if id.is_empty() {
+        fallback.to_string()
+    } else {
+        id
+    }
+}
+
+fn session_id_from_payload(payload: &Value, material_id: &str) -> String {
+    let explicit = value_string(payload, &["sessionId", "session_id"]);
+    if explicit.is_empty() {
+        format!("{}-{}", material_id, current_time_millis())
+    } else {
+        explicit
+    }
+}
+
+fn provider_code_from_response(provider: &Value, fallback: i32) -> i32 {
+    provider
+        .get("code")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(fallback)
+}
+
+fn production_status_response(state: &ServiceState) -> Vec<u8> {
+    let latest = state
+        .runtime
+        .block_on(db::latest_material_session(&state.database.connection));
+    let latest_open = state
+        .runtime
+        .block_on(db::latest_open_material_session(&state.database.connection));
+    let capture_status = state
+        .capture
+        .proxy("GET", "/api/steel/status", "")
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .unwrap_or_else(|| json!({ "code": 503, "error": "capture_provider_offline" }));
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "database": {
+                "engine": state.database.engine.clone(),
+                "path": state.database.display_path()
+            },
+            "latestSession": latest.ok().flatten().map(|session| {
+                json!({
+                    "id": session.id,
+                    "materialId": session.material_id,
+                    "status": session.status,
+                    "controlMode": session.control_mode,
+                    "triggerMode": session.trigger_mode,
+                    "updatedAt": session.updated_at
+                })
+            }),
+            "activeSession": latest_open.ok().flatten().map(|session| {
+                json!({
+                    "id": session.id,
+                    "materialId": session.material_id,
+                    "status": session.status,
+                    "controlMode": session.control_mode,
+                    "triggerMode": session.trigger_mode,
+                    "updatedAt": session.updated_at
+                })
+            }),
+            "capture": capture_status
+        })
+        .to_string(),
+    )
+}
+
+fn write_secondary_data_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "code": 400, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    let latest_open = state
+        .runtime
+        .block_on(db::latest_open_material_session(&state.database.connection))
+        .ok()
+        .flatten();
+    let material_id = material_id_from_payload(
+        &payload,
+        latest_open
+            .as_ref()
+            .map(|session| session.material_id.as_str())
+            .unwrap_or("unknown-material"),
+    );
+    let session_id = value_string(&payload, &["sessionId", "session_id"]);
+    let session_id = if session_id.is_empty() {
+        latest_open
+            .as_ref()
+            .filter(|session| session.material_id == material_id)
+            .map(|session| session.id.clone())
+            .unwrap_or_else(|| session_id_from_payload(&payload, &material_id))
+    } else {
+        session_id
+    };
+    let source = value_string(&payload, &["source"]).if_empty("l2");
+    let payload_type = value_string(&payload, &["payloadType", "payload_type", "type"])
+        .if_empty("secondary");
+    let raw_payload = payload.to_string();
+    let result = state.runtime.block_on(db::append_secondary_data(
+        &state.database.connection,
+        db::SecondaryDataInput {
+            material_id: material_id.clone(),
+            session_id: session_id.clone(),
+            source: source.clone(),
+            payload_type: payload_type.clone(),
+            payload: raw_payload,
+        },
+    ));
+    match result {
+        Ok(row) => {
+            let _ = state.runtime.block_on(db::append_audit_log(
+                &state.database.connection,
+                actor,
+                "production.secondary_data",
+                &material_id,
+                &format!("secondary data from {source} for {material_id}"),
+                "info",
+            ));
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 0,
+                    "materialId": material_id,
+                    "sessionId": session_id,
+                    "secondaryDataId": row.id
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({ "code": 500, "error": error.to_string() }).to_string(),
+        ),
+    }
+}
+
+trait EmptyStringDefault {
+    fn if_empty(self, fallback: &str) -> String;
+}
+
+impl EmptyStringDefault for String {
+    fn if_empty(self, fallback: &str) -> String {
+        if self.trim().is_empty() {
+            fallback.to_string()
+        } else {
+            self
+        }
+    }
+}
+
+fn write_production_event_response(
+    state: &ServiceState,
+    body: &str,
+    default_event: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "code": 400, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    let latest_open = state
+        .runtime
+        .block_on(db::latest_open_material_session(&state.database.connection))
+        .ok()
+        .flatten();
+    let material_id = material_id_from_payload(
+        &payload,
+        latest_open
+            .as_ref()
+            .map(|session| session.material_id.as_str())
+            .unwrap_or("unknown-material"),
+    );
+    let session_id = value_string(&payload, &["sessionId", "session_id"]);
+    let session_id = if session_id.is_empty() {
+        latest_open
+            .as_ref()
+            .filter(|session| default_event == "steel-out" || session.material_id == material_id)
+            .map(|session| session.id.clone())
+            .unwrap_or_else(|| session_id_from_payload(&payload, &material_id))
+    } else {
+        session_id
+    };
+    let source = value_string(&payload, &["source"]).if_empty("api");
+    let mode = value_string(&payload, &["mode", "controlMode", "control_mode"]).if_empty("api");
+    let trigger_mode = value_string(&payload, &["triggerMode", "trigger_mode"]).if_empty(&mode);
+    let command = value_string(&payload, &["cmd", "command", "event", "type"]).if_empty(match default_event {
+        "steel-info" => "rcvSteelInfo",
+        "steel-out" => "steelIn",
+        _ => "steelIn",
+    });
+    let value = match default_event {
+        "steel-out" => 0,
+        "steel-info" => value_i32(&payload, &["value"], 0),
+        _ => value_i32(&payload, &["value", "present"], 1),
+    };
+    let status = match default_event {
+        "steel-out" => "finished",
+        "steel-info" => "info-ready",
+        _ => "active",
+    };
+    let now = current_time_string();
+    let session_input = db::MaterialSessionInput {
+        id: session_id.clone(),
+        material_id: material_id.clone(),
+        source: source.clone(),
+        status: status.to_string(),
+        control_mode: mode.clone(),
+        trigger_mode: trigger_mode.clone(),
+        steel_type: value_string(&payload, &["steelType", "steel_type", "type"]),
+        width_mm: value_f64(&payload, &["width", "widthMm", "width_mm"]),
+        length_mm: value_f64(&payload, &["length", "len", "lengthMm", "length_mm"]),
+        thickness_mm: value_f64(&payload, &["thick", "thickness", "thicknessMm", "thickness_mm"]),
+        client: value_string(&payload, &["client"]),
+        hard: value_string(&payload, &["hard"]),
+        storage_root: value_string(&payload, &["storageRoot", "storage_root"]),
+        started_at: now.clone(),
+        finished_at: if default_event == "steel-out" {
+            now.clone()
+        } else {
+            String::new()
+        },
+        raw_payload: payload.to_string(),
+    };
+    let session_result = state
+        .runtime
+        .block_on(db::upsert_material_session(&state.database.connection, session_input));
+    if let Err(error) = session_result {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({ "code": 500, "error": error.to_string() }).to_string(),
+        );
+    }
+    if default_event == "steel-out" {
+        let _ = state.runtime.block_on(db::finish_material_session(
+            &state.database.connection,
+            &session_id,
+            &now,
+        ));
+    }
+
+    let inspection_id = format!("INSP-{session_id}");
+    let _ = state.runtime.block_on(db::upsert_production_inspection(
+        &state.database.connection,
+        db::ProductionInspectionInput {
+            id: inspection_id.clone(),
+            material_id: material_id.clone(),
+            session_id: session_id.clone(),
+            status: if default_event == "steel-out" {
+                "finished".to_string()
+            } else {
+                "running".to_string()
+            },
+            storage_root: value_string(&payload, &["storageRoot", "storage_root"]),
+            summary_path: value_string(&payload, &["summaryPath", "summary_path"]),
+            started_at: now.clone(),
+            finished_at: if default_event == "steel-out" {
+                now.clone()
+            } else {
+                String::new()
+            },
+            capture_count: value_i32(&payload, &["captureCount", "capture_count"], 0),
+            defect_count: value_i32(&payload, &["defectCount", "defect_count"], 0),
+            raw_payload: payload.to_string(),
+        },
+    ));
+
+    let provider_body = json!({
+        "cmd": command.clone(),
+        "value": value,
+        "id": material_id,
+        "steelId": material_id,
+        "steelNo": material_id,
+        "steelType": value_string(&payload, &["steelType", "steel_type", "type"]),
+        "length": value_f64(&payload, &["length", "len", "lengthMm", "length_mm"]),
+        "width": value_f64(&payload, &["width", "widthMm", "width_mm"]),
+        "thick": value_f64(&payload, &["thick", "thickness", "thicknessMm", "thickness_mm"]),
+        "client": value_string(&payload, &["client"]),
+        "hard": value_string(&payload, &["hard"])
+    })
+    .to_string();
+    let provider_response = state
+        .capture
+        .proxy("POST", "/api/steel/event", &provider_body)
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .unwrap_or_else(|| json!({ "code": 503, "error": "capture_provider_offline" }));
+    let provider_code = provider_code_from_response(&provider_response, 503);
+    let trigger_result = state.runtime.block_on(db::append_trigger_event(
+        &state.database.connection,
+        db::TriggerEventInput {
+            material_id: material_id.clone(),
+            session_id: session_id.clone(),
+            source: source.clone(),
+            mode: mode.clone(),
+            event_type: default_event.to_string(),
+            command: command.clone(),
+            value,
+            payload: payload.to_string(),
+            provider_code,
+            provider_response: provider_response.to_string(),
+        },
+    ));
+    let _ = state.runtime.block_on(db::append_audit_log(
+        &state.database.connection,
+        actor,
+        "production.trigger_event",
+        &material_id,
+        &format!("{default_event} from {source} mode={mode} providerCode={provider_code}"),
+        if provider_code == 0 { "info" } else { "warning" },
+    ));
+    match trigger_result {
+        Ok(row) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": provider_code,
+                "materialId": material_id,
+                "sessionId": session_id,
+                "inspectionId": inspection_id,
+                "triggerEventId": row.id,
+                "mode": mode,
+                "triggerMode": trigger_mode,
+                "provider": provider_response
+            })
+            .to_string(),
+        ),
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({ "code": 500, "error": error.to_string(), "provider": provider_response })
+                .to_string(),
+        ),
+    }
+}
+
+fn active_session_for_payload(state: &ServiceState, payload: &Value) -> (String, String) {
+    let latest_open = state
+        .runtime
+        .block_on(db::latest_open_material_session(&state.database.connection))
+        .ok()
+        .flatten();
+    let material_id = material_id_from_payload(
+        payload,
+        latest_open
+            .as_ref()
+            .map(|session| session.material_id.as_str())
+            .unwrap_or("unknown-material"),
+    );
+    let session_id = value_string(payload, &["sessionId", "session_id"]);
+    let session_id = if session_id.is_empty() {
+        latest_open
+            .as_ref()
+            .filter(|session| session.material_id == material_id)
+            .map(|session| session.id.clone())
+            .unwrap_or_else(|| session_id_from_payload(payload, &material_id))
+    } else {
+        session_id
+    };
+    (material_id, session_id)
+}
+
+fn capture_file_rows_from_result(
+    state: &ServiceState,
+    inspection_id: &str,
+    session_id: &str,
+    material_id: &str,
+    result: &Value,
+) -> Result<usize, String> {
+    let camera_ip = value_string(result, &["ip", "cameraIp", "camera_ip"]);
+    let camera_id = value_string(result, &["cameraId", "camera_id"]).if_empty(&camera_ip);
+    let sequence_no = value_i32(result, &["attempt", "sequenceNo", "sequence_no"], 0);
+    let metadata_path = value_string(result, &["metadataOutput", "metadata_path", "metadataPath"]);
+    let outputs = [
+        ("depth", "png", value_string(result, &["depthOutput", "output"])),
+        ("intensity", "png", value_string(result, &["intensityOutput"])),
+        ("metadata", "json", metadata_path.clone()),
+        ("sdk-derived", "png", value_string(result, &["sdkOutput"])),
+        ("sdk-derived-depth", "png", value_string(result, &["sdkDepthOutput"])),
+        (
+            "sdk-derived-intensity",
+            "png",
+            value_string(result, &["sdkIntensityOutput"]),
+        ),
+    ];
+    let mut inserted = 0;
+    for (data_name, file_type, path) in outputs {
+        if path.trim().is_empty() {
+            continue;
+        }
+        state
+            .runtime
+            .block_on(db::append_capture_file(
+                &state.database.connection,
+                db::CaptureFileInput {
+                    inspection_id: inspection_id.to_string(),
+                    session_id: session_id.to_string(),
+                    material_id: material_id.to_string(),
+                    camera_id: camera_id.clone(),
+                    camera_ip: camera_ip.clone(),
+                    data_name: data_name.to_string(),
+                    sequence_no,
+                    file_type: file_type.to_string(),
+                    path,
+                    metadata_path: metadata_path.clone(),
+                },
+            ))
+            .map_err(|error| error.to_string())?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+fn write_capture_summary_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "code": 400, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    let (material_id, session_id) = active_session_for_payload(state, &payload);
+    let inspection_id =
+        value_string(&payload, &["inspectionId", "inspection_id"]).if_empty(&format!("INSP-{session_id}"));
+    let capture_count = value_i32(&payload, &["attempts", "captureCount", "capture_count"], 0);
+    let defect_count = value_i32(&payload, &["defectCount", "defect_count"], 0);
+    let status = if value_i32(&payload, &["failures"], 0) == 0 {
+        "captured"
+    } else {
+        "capture-warning"
+    };
+    let summary_path = value_string(&payload, &["summaryOutput", "summary_path", "summaryPath"]);
+    let storage_root = value_string(&payload, &["storageRoot", "storage_root"]);
+    let now = current_time_string();
+    let inspection = state.runtime.block_on(db::upsert_production_inspection(
+        &state.database.connection,
+        db::ProductionInspectionInput {
+            id: inspection_id.clone(),
+            material_id: material_id.clone(),
+            session_id: session_id.clone(),
+            status: status.to_string(),
+            storage_root,
+            summary_path,
+            started_at: value_string(&payload, &["startedAt", "started_at"]).if_empty(&now),
+            finished_at: value_string(&payload, &["finishedAt", "finished_at"]),
+            capture_count,
+            defect_count,
+            raw_payload: payload.to_string(),
+        },
+    ));
+    if let Err(error) = inspection {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({ "code": 500, "error": error.to_string() }).to_string(),
+        );
+    }
+    let mut file_rows = 0;
+    if let Some(results) = payload.get("results").and_then(Value::as_array) {
+        for result in results {
+            match capture_file_rows_from_result(
+                state,
+                &inspection_id,
+                &session_id,
+                &material_id,
+                result,
+            ) {
+                Ok(count) => file_rows += count,
+                Err(error) => {
+                    return http_response(
+                        "500 Internal Server Error",
+                        "application/json; charset=utf-8",
+                        &json!({ "code": 500, "error": error }).to_string(),
+                    );
+                }
+            }
+        }
+    }
+    let _ = state.runtime.block_on(db::append_audit_log(
+        &state.database.connection,
+        actor,
+        "production.capture_summary",
+        &material_id,
+        &format!("capture summary files={file_rows} inspection={inspection_id}"),
+        "info",
+    ));
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "materialId": material_id,
+            "sessionId": session_id,
+            "inspectionId": inspection_id,
+            "captureFileRows": file_rows
+        })
+        .to_string(),
+    )
+}
+
+fn write_production_capture_once_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "code": 400, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    let (material_id, session_id) = active_session_for_payload(state, &payload);
+    let mut capture_body = payload.as_object().cloned().unwrap_or_default();
+    capture_body
+        .entry("expectedCameras".to_string())
+        .or_insert_with(|| json!(6));
+    capture_body
+        .entry("rounds".to_string())
+        .or_insert_with(|| json!(1));
+    capture_body
+        .entry("lines".to_string())
+        .or_insert_with(|| json!(1000));
+    capture_body
+        .entry("width".to_string())
+        .or_insert_with(|| json!(0));
+    capture_body
+        .entry("timeoutMs".to_string())
+        .or_insert_with(|| json!(8000));
+    capture_body
+        .entry("intervalMs".to_string())
+        .or_insert_with(|| json!(500));
+    capture_body
+        .entry("retries".to_string())
+        .or_insert_with(|| json!(0));
+    capture_body
+        .entry("controlMode".to_string())
+        .or_insert_with(|| json!(0));
+    capture_body
+        .entry("dataMode".to_string())
+        .or_insert_with(|| json!(3));
+    capture_body
+        .entry("connectFirst".to_string())
+        .or_insert_with(|| json!(false));
+    capture_body
+        .entry("stopStreams".to_string())
+        .or_insert_with(|| json!(true));
+    capture_body.insert("materialId".to_string(), json!(material_id.clone()));
+    capture_body.insert("sessionId".to_string(), json!(session_id.clone()));
+    capture_body.insert("productionLayout".to_string(), json!(true));
+    let provider_body = Value::Object(capture_body).to_string();
+    let provider = state
+        .capture
+        .proxy("POST", "/api/capture/continuous-test", &provider_body)
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .unwrap_or_else(|| json!({ "code": 503, "error": "capture_provider_offline" }));
+    if provider.get("code").and_then(Value::as_i64).unwrap_or(503) == 503 {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({ "code": 503, "error": "capture_provider_offline", "provider": provider })
+                .to_string(),
+        );
+    }
+    let mut summary = provider.as_object().cloned().unwrap_or_default();
+    summary.insert("materialId".to_string(), json!(material_id.clone()));
+    summary.insert("sessionId".to_string(), json!(session_id.clone()));
+    let summary_json = Value::Object(summary).to_string();
+    let record_response = write_capture_summary_response(state, &summary_json, actor);
+    let record_body = String::from_utf8_lossy(
+        record_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| &record_response[index + 4..])
+            .unwrap_or(&record_response),
+    )
+    .to_string();
+    let record = serde_json::from_str::<Value>(&record_body)
+        .unwrap_or_else(|_| json!({ "code": 500, "error": "capture_summary_record_failed" }));
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": provider.get("code").and_then(Value::as_i64).unwrap_or(0),
+            "materialId": material_id,
+            "sessionId": session_id,
+            "provider": provider,
+            "record": record
+        })
+        .to_string(),
+    )
+}
+
+fn write_production_defect_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "code": 400, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    let (material_id, session_id) = active_session_for_payload(state, &payload);
+    let inspection_id =
+        value_string(&payload, &["inspectionId", "inspection_id"]).if_empty(&format!("INSP-{session_id}"));
+    let result = state.runtime.block_on(db::append_production_defect(
+        &state.database.connection,
+        db::ProductionDefectInput {
+            inspection_id: inspection_id.clone(),
+            material_id: material_id.clone(),
+            camera_id: value_string(&payload, &["cameraId", "camera_id", "cameraIp", "ip"]),
+            defect_type: value_string(&payload, &["defectType", "defect_type", "type"])
+                .if_empty("unknown"),
+            severity: value_string(&payload, &["severity"]).if_empty("review"),
+            x_mm: value_f64(&payload, &["xMm", "x_mm", "x"]),
+            y_mm: value_f64(&payload, &["yMm", "y_mm", "y"]),
+            z_mm: value_f64(&payload, &["zMm", "z_mm", "z"]),
+            width_mm: value_f64(&payload, &["widthMm", "width_mm", "width"]),
+            height_mm: value_f64(&payload, &["heightMm", "height_mm", "height"]),
+            depth_mm: value_f64(&payload, &["depthMm", "depth_mm", "depth"]),
+            confidence: value_f64(&payload, &["confidence", "score"]),
+            geometry_json: payload
+                .get("geometry")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+                .to_string(),
+        },
+    ));
+    match result {
+        Ok(row) => {
+            let _ = state.runtime.block_on(db::append_audit_log(
+                &state.database.connection,
+                actor,
+                "production.defect",
+                &material_id,
+                &format!("defect {} inspection={inspection_id}", row.id),
+                "info",
+            ));
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 0,
+                    "materialId": material_id,
+                    "sessionId": session_id,
+                    "inspectionId": inspection_id,
+                    "defectId": row.id
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({ "code": 500, "error": error.to_string() }).to_string(),
+        ),
     }
 }
 
@@ -7073,11 +7816,12 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             })
         });
     let service_port = env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string());
-    let database_path = state.database.path.display().to_string();
+    let database_path = state.database.display_path();
     let config_dir = state
         .database
-        .path
-        .parent()
+        .file_path
+        .as_ref()
+        .and_then(|path| path.parent())
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     let metrics = overview.metrics;
@@ -7092,7 +7836,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             "capture": capture_status
         },
         "database": {
-            "engine": "sqlite",
+            "engine": state.database.engine.clone(),
             "orm": "sea-orm",
             "path": database_path,
             "configDir": config_dir,
@@ -7107,6 +7851,13 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
                 { "name": "admin_user", "label": "后台账号", "rows": metrics.user_count },
                 { "name": "admin_role", "label": "角色权限", "rows": metrics.role_count },
                 { "name": "audit_log", "label": "审计日志", "rows": metrics.audit_log_count }
+                ,
+                { "name": "material_session", "label": "material session", "rows": metrics.material_session_count },
+                { "name": "secondary_data", "label": "secondary data", "rows": metrics.secondary_data_count },
+                { "name": "trigger_event", "label": "trigger event", "rows": metrics.trigger_event_count },
+                { "name": "production_inspection", "label": "production inspection", "rows": metrics.production_inspection_count },
+                { "name": "capture_file", "label": "capture file", "rows": metrics.capture_file_count },
+                { "name": "production_defect", "label": "production defect", "rows": metrics.production_defect_count }
             ]
         },
         "configs": overview.configs.iter().map(|config| {
@@ -7204,6 +7955,17 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/config/capture", "scope": "config" },
             { "method": "GET", "path": "/api/inspection/settings", "scope": "inspection" },
             { "method": "GET", "path": "/api/inspection/snapshot", "scope": "inspection" },
+            { "method": "GET", "path": "/api/production/status", "scope": "production" },
+            { "method": "POST", "path": "/api/production/steel-info", "scope": "production" },
+            { "method": "POST", "path": "/api/production/steel-in", "scope": "production" },
+            { "method": "POST", "path": "/api/production/steel-out", "scope": "production" },
+            { "method": "POST", "path": "/api/production/trigger-event", "scope": "production" },
+            { "method": "POST", "path": "/api/production/secondary-data", "scope": "production" },
+            { "method": "POST", "path": "/api/production/capture-summary", "scope": "production" },
+            { "method": "POST", "path": "/api/production/capture-once", "scope": "production" },
+            { "method": "POST", "path": "/api/production/defect", "scope": "production" },
+            { "method": "GET", "path": "/api/steel/status", "scope": "capture" },
+            { "method": "POST", "path": "/api/steel/event", "scope": "capture" },
             { "method": "GET", "path": "/api/camera/statuses", "scope": "capture" }
         ]
     });
@@ -7346,6 +8108,31 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("DELETE", "/api/admin/records") => delete_admin_record_response(&state, query, actor),
         ("GET", "/api/admin/records") => read_admin_records_response(&state, query),
+        ("GET", "/api/production/status") => production_status_response(&state),
+        ("POST", "/api/production/steel-info") => {
+            write_production_event_response(&state, body, "steel-info", actor)
+        }
+        ("POST", "/api/production/steel-in") => {
+            write_production_event_response(&state, body, "steel-in", actor)
+        }
+        ("POST", "/api/production/steel-out") => {
+            write_production_event_response(&state, body, "steel-out", actor)
+        }
+        ("POST", "/api/production/trigger-event") => {
+            write_production_event_response(&state, body, "trigger-event", actor)
+        }
+        ("POST", "/api/production/secondary-data") => {
+            write_secondary_data_response(&state, body, actor)
+        }
+        ("POST", "/api/production/capture-summary") => {
+            write_capture_summary_response(&state, body, actor)
+        }
+        ("POST", "/api/production/capture-once") => {
+            write_production_capture_once_response(&state, body, actor)
+        }
+        ("POST", "/api/production/defect") => {
+            write_production_defect_response(&state, body, actor)
+        }
         ("GET", "/api/inspection/snapshot") => {
             match state
                 .runtime
@@ -7375,9 +8162,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         | ("GET", "/api/cameras")
         | ("GET", "/api/camera/status")
         | ("GET", "/api/camera/statuses")
+        | ("GET", "/api/steel/status")
         | ("GET", "/api/param")
         | ("POST", "/api/camera/connect")
         | ("POST", "/api/camera/disconnect")
+        | ("POST", "/api/steel/event")
         | ("POST", "/api/param")
         | ("POST", "/api/capture/depth-map") => {
             if let Some(body) = state.capture.proxy(method, raw_path, body) {

@@ -125,6 +125,140 @@ pub mod inspection_record {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod material_session {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "material_session")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub material_id: String,
+        pub source: String,
+        pub status: String,
+        pub control_mode: String,
+        pub trigger_mode: String,
+        pub steel_type: String,
+        pub width_mm: f64,
+        pub length_mm: f64,
+        pub thickness_mm: f64,
+        pub client: String,
+        pub hard: String,
+        pub storage_root: String,
+        pub started_at: String,
+        pub finished_at: String,
+        pub updated_at: String,
+        pub raw_payload: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod secondary_data {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "secondary_data")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub material_id: String,
+        pub session_id: String,
+        pub source: String,
+        pub payload_type: String,
+        pub payload: String,
+        pub received_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod trigger_event {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "trigger_event")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub material_id: String,
+        pub session_id: String,
+        pub source: String,
+        pub mode: String,
+        pub event_type: String,
+        pub command: String,
+        pub value: i32,
+        pub payload: String,
+        pub provider_code: i32,
+        pub provider_response: String,
+        pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod production_inspection {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "production_inspection")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub material_id: String,
+        pub session_id: String,
+        pub status: String,
+        pub storage_root: String,
+        pub summary_path: String,
+        pub started_at: String,
+        pub finished_at: String,
+        pub capture_count: i32,
+        pub defect_count: i32,
+        pub raw_payload: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod capture_file {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "capture_file")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub inspection_id: String,
+        pub session_id: String,
+        pub material_id: String,
+        pub camera_id: String,
+        pub camera_ip: String,
+        pub data_name: String,
+        pub sequence_no: i32,
+        pub file_type: String,
+        pub path: String,
+        pub metadata_path: String,
+        pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod defect {
     use sea_orm::entity::prelude::*;
 
@@ -148,6 +282,36 @@ pub mod defect {
         pub y_offset_mm: f64,
         pub preview_x: i32,
         pub preview_y: i32,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod production_defect {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "production_defect")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub inspection_id: String,
+        pub material_id: String,
+        pub camera_id: String,
+        pub defect_type: String,
+        pub severity: String,
+        pub x_mm: f64,
+        pub y_mm: f64,
+        pub z_mm: f64,
+        pub width_mm: f64,
+        pub height_mm: f64,
+        pub depth_mm: f64,
+        pub confidence: f64,
+        pub geometry_json: String,
+        pub created_at: String,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

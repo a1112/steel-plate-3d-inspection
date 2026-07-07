@@ -9,13 +9,15 @@ use sea_orm::{
 };
 use serde_json::{self, json, Value};
 use std::collections::BTreeSet;
+use std::env;
 use std::path::PathBuf;
 
 pub mod entities;
 
 use entities::{
-    admin_role, admin_user, app_config, audit_log, camera_config, config_revision, defect,
-    defect_type, inspection_record, steel_plate,
+    admin_role, admin_user, app_config, audit_log, camera_config, capture_file, config_revision,
+    defect, defect_type, inspection_record, material_session, production_defect,
+    production_inspection, secondary_data, steel_plate, trigger_event,
 };
 
 pub const DEFAULT_ADMIN_PASSWORD: &str = "admin123";
@@ -24,6 +26,18 @@ pub const DEFAULT_ADMIN_PASSWORD: &str = "admin123";
 pub struct AppDatabase {
     pub connection: DatabaseConnection,
     pub path: PathBuf,
+    pub engine: String,
+    pub url: String,
+    pub file_path: Option<PathBuf>,
+}
+
+impl AppDatabase {
+    pub fn display_path(&self) -> String {
+        self.file_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| self.url.clone())
+    }
 }
 
 #[derive(Clone)]
@@ -51,6 +65,12 @@ pub struct AdminDatabaseMetrics {
     pub user_count: u64,
     pub role_count: u64,
     pub audit_log_count: u64,
+    pub material_session_count: u64,
+    pub secondary_data_count: u64,
+    pub trigger_event_count: u64,
+    pub production_inspection_count: u64,
+    pub capture_file_count: u64,
+    pub production_defect_count: u64,
 }
 
 #[derive(Clone)]
@@ -110,6 +130,95 @@ pub struct DefectTypeInput {
     pub label: String,
     pub color: String,
     pub shape: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct MaterialSessionInput {
+    pub id: String,
+    pub material_id: String,
+    pub source: String,
+    pub status: String,
+    pub control_mode: String,
+    pub trigger_mode: String,
+    pub steel_type: String,
+    pub width_mm: f64,
+    pub length_mm: f64,
+    pub thickness_mm: f64,
+    pub client: String,
+    pub hard: String,
+    pub storage_root: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub raw_payload: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SecondaryDataInput {
+    pub material_id: String,
+    pub session_id: String,
+    pub source: String,
+    pub payload_type: String,
+    pub payload: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TriggerEventInput {
+    pub material_id: String,
+    pub session_id: String,
+    pub source: String,
+    pub mode: String,
+    pub event_type: String,
+    pub command: String,
+    pub value: i32,
+    pub payload: String,
+    pub provider_code: i32,
+    pub provider_response: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProductionInspectionInput {
+    pub id: String,
+    pub material_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub storage_root: String,
+    pub summary_path: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub capture_count: i32,
+    pub defect_count: i32,
+    pub raw_payload: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CaptureFileInput {
+    pub inspection_id: String,
+    pub session_id: String,
+    pub material_id: String,
+    pub camera_id: String,
+    pub camera_ip: String,
+    pub data_name: String,
+    pub sequence_no: i32,
+    pub file_type: String,
+    pub path: String,
+    pub metadata_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProductionDefectInput {
+    pub inspection_id: String,
+    pub material_id: String,
+    pub camera_id: String,
+    pub defect_type: String,
+    pub severity: String,
+    pub x_mm: f64,
+    pub y_mm: f64,
+    pub z_mm: f64,
+    pub width_mm: f64,
+    pub height_mm: f64,
+    pub depth_mm: f64,
+    pub confidence: f64,
+    pub geometry_json: String,
 }
 
 #[derive(Clone, Default)]
@@ -176,11 +285,121 @@ pub struct AdminAuditLogPage {
 }
 
 pub async fn open_database(path: PathBuf) -> Result<AppDatabase, DbErr> {
+    if let Ok(url) = env::var("STEEL_DATABASE_URL") {
+        let url = normalize_database_url(url.trim());
+        if !url.is_empty() {
+            return open_database_url(url, path).await;
+        }
+    }
+    if env::var("STEEL_DATABASE_ENGINE")
+        .map(|value| value.eq_ignore_ascii_case("mysql"))
+        .unwrap_or(false)
+    {
+        let host = env::var("STEEL_MYSQL_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = env::var("STEEL_MYSQL_PORT").unwrap_or_else(|_| "3306".to_string());
+        let user = env::var("STEEL_MYSQL_USER").unwrap_or_else(|_| "root".to_string());
+        let password = env::var("STEEL_MYSQL_PASSWORD").unwrap_or_else(|_| "nercar".to_string());
+        let database =
+            env::var("STEEL_MYSQL_DATABASE").unwrap_or_else(|_| "steel_inspection".to_string());
+        let url = normalize_database_url(&format!(
+            "mysql://{user}:{password}@{host}:{port}/{database}"
+        ));
+        return open_database_url(url, path).await;
+    }
+
     let url = format!("sqlite://{}?mode=rwc", path.display());
-    let connection = Database::connect(url).await?;
+    let connection = Database::connect(url.clone()).await?;
     create_schema(&connection).await?;
     seed_database(&connection).await?;
-    Ok(AppDatabase { connection, path })
+    Ok(AppDatabase {
+        connection,
+        path: path.clone(),
+        engine: "sqlite".to_string(),
+        url,
+        file_path: Some(path),
+    })
+}
+
+fn normalize_database_url(url: &str) -> String {
+    if (url.starts_with("mysql://") || url.starts_with("mysqlx://"))
+        && !url.to_ascii_lowercase().contains("ssl-mode=")
+    {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}ssl-mode=disabled")
+    } else {
+        url.to_string()
+    }
+}
+
+pub async fn open_database_url(url: String, fallback_path: PathBuf) -> Result<AppDatabase, DbErr> {
+    if url.starts_with("mysql://") || url.starts_with("mysqlx://") {
+        ensure_mysql_database(&url).await?;
+    }
+    let connection = Database::connect(url.clone()).await?;
+    create_schema(&connection).await?;
+    seed_database(&connection).await?;
+    let engine = match connection.get_database_backend() {
+        DbBackend::MySql => "mysql",
+        DbBackend::Postgres => "postgres",
+        DbBackend::Sqlite => "sqlite",
+    }
+    .to_string();
+    let file_path = (engine == "sqlite").then_some(fallback_path.clone());
+    Ok(AppDatabase {
+        connection,
+        path: fallback_path,
+        engine,
+        url,
+        file_path,
+    })
+}
+
+async fn ensure_mysql_database(url: &str) -> Result<(), DbErr> {
+    let Some(database_name) = mysql_database_name(url) else {
+        return Ok(());
+    };
+    let Some(server_url) = mysql_server_url(url) else {
+        return Ok(());
+    };
+    let admin = Database::connect(server_url).await?;
+    let sql = format!(
+        "CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+        mysql_identifier(&database_name)?
+    );
+    admin
+        .execute(Statement::from_string(DbBackend::MySql, sql))
+        .await?;
+    Ok(())
+}
+
+fn mysql_database_name(url: &str) -> Option<String> {
+    let without_query = url.split('?').next().unwrap_or(url);
+    let name = without_query.rsplit('/').next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn mysql_server_url(url: &str) -> Option<String> {
+    let query = url.find('?').map(|index| &url[index..]).unwrap_or_default();
+    let without_query = url.split('?').next().unwrap_or(url);
+    let (server, database) = without_query.rsplit_once('/')?;
+    if database.is_empty() {
+        return None;
+    }
+    Some(format!("{server}{query}"))
+}
+
+fn mysql_identifier(value: &str) -> Result<String, DbErr> {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        Ok(value.to_string())
+    } else {
+        Err(DbErr::Custom(
+            "mysql database name must use ASCII letters, digits, or underscore".to_string(),
+        ))
+    }
 }
 
 pub async fn load_snapshot(connection: &DatabaseConnection) -> Result<DatabaseSnapshot, DbErr> {
@@ -205,6 +424,16 @@ pub async fn load_admin_overview(connection: &DatabaseConnection) -> Result<Admi
             user_count: admin_user::Entity::find().count(connection).await?,
             role_count: admin_role::Entity::find().count(connection).await?,
             audit_log_count: audit_log::Entity::find().count(connection).await?,
+            material_session_count: material_session::Entity::find().count(connection).await?,
+            secondary_data_count: secondary_data::Entity::find().count(connection).await?,
+            trigger_event_count: trigger_event::Entity::find().count(connection).await?,
+            production_inspection_count: production_inspection::Entity::find()
+                .count(connection)
+                .await?,
+            capture_file_count: capture_file::Entity::find().count(connection).await?,
+            production_defect_count: production_defect::Entity::find()
+                .count(connection)
+                .await?,
         },
         configs: app_config::Entity::find()
             .order_by_asc(app_config::Column::Key)
@@ -229,7 +458,10 @@ async fn sqlite_u64_metric(
     column: &str,
 ) -> Result<u64, DbErr> {
     let Some(row) = connection
-        .query_one(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        .query_one(Statement::from_string(
+            connection.get_database_backend(),
+            sql.to_string(),
+        ))
         .await?
     else {
         return Ok(0);
@@ -241,6 +473,13 @@ async fn sqlite_u64_metric(
 pub async fn database_maintenance_stats(
     connection: &DatabaseConnection,
 ) -> Result<DatabaseMaintenanceStats, DbErr> {
+    if connection.get_database_backend() != DbBackend::Sqlite {
+        return Ok(DatabaseMaintenanceStats {
+            page_count: 0,
+            page_size: 0,
+            freelist_count: 0,
+        });
+    }
     Ok(DatabaseMaintenanceStats {
         page_count: sqlite_u64_metric(
             connection,
@@ -266,6 +505,9 @@ pub async fn database_maintenance_stats(
 pub async fn database_integrity_messages(
     connection: &DatabaseConnection,
 ) -> Result<Vec<String>, DbErr> {
+    if connection.get_database_backend() != DbBackend::Sqlite {
+        return Ok(vec!["ok".to_string()]);
+    }
     let rows = connection
         .query_all(Statement::from_string(
             DbBackend::Sqlite,
@@ -278,6 +520,9 @@ pub async fn database_integrity_messages(
 }
 
 pub async fn run_database_maintenance(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    if connection.get_database_backend() != DbBackend::Sqlite {
+        return Ok(());
+    }
     execute(connection, "VACUUM").await?;
     execute(connection, "ANALYZE").await?;
     execute(connection, "PRAGMA optimize").await
@@ -649,7 +894,7 @@ pub async fn count_audit_logs_before(
     let cutoff = parse_millis_cutoff(cutoff_at)?;
     let Some(row) = connection
         .query_one(Statement::from_string(
-            DbBackend::Sqlite,
+            connection.get_database_backend(),
             format!("SELECT COUNT(*) AS count FROM audit_log WHERE CAST(created_at AS INTEGER) < {cutoff}"),
         ))
         .await?
@@ -667,7 +912,7 @@ pub async fn delete_audit_logs_before(
     let cutoff = parse_millis_cutoff(cutoff_at)?;
     let result = connection
         .execute(Statement::from_string(
-            DbBackend::Sqlite,
+            connection.get_database_backend(),
             format!("DELETE FROM audit_log WHERE CAST(created_at AS INTEGER) < {cutoff}"),
         ))
         .await?;
@@ -890,11 +1135,15 @@ pub async fn inspection_record_retention_cutoff(
     connection: &DatabaseConnection,
     retention_days: u64,
 ) -> Result<String, DbErr> {
+    let backend = connection.get_database_backend();
+    let sql = match backend {
+        DbBackend::MySql => format!(
+            "SELECT DATE_FORMAT(DATE_SUB(NOW(), INTERVAL {retention_days} DAY), '%Y-%m-%d %H:%i') AS cutoff_at"
+        ),
+        _ => format!("SELECT datetime('now', '-{retention_days} days') AS cutoff_at"),
+    };
     let Some(row) = connection
-        .query_one(Statement::from_string(
-            DbBackend::Sqlite,
-            format!("SELECT datetime('now', '-{retention_days} days') AS cutoff_at"),
-        ))
+        .query_one(Statement::from_string(backend, sql))
         .await?
     else {
         return Ok(String::new());
@@ -906,16 +1155,23 @@ async fn inspection_records_before(
     connection: &DatabaseConnection,
     retention_days: u64,
 ) -> Result<Vec<(String, String)>, DbErr> {
+    let backend = connection.get_database_backend();
+    let sql = match backend {
+        DbBackend::MySql => format!(
+            "SELECT r.id AS id, r.plate_no AS plate_no \
+             FROM inspection_record r \
+             LEFT JOIN steel_plate p ON p.plate_no = r.plate_no \
+             WHERE COALESCE(p.detected_at, '1970-01-01 00:00') < DATE_FORMAT(DATE_SUB(NOW(), INTERVAL {retention_days} DAY), '%Y-%m-%d %H:%i')"
+        ),
+        _ => format!(
+            "SELECT r.id AS id, r.plate_no AS plate_no \
+             FROM inspection_record r \
+             LEFT JOIN steel_plate p ON p.plate_no = r.plate_no \
+             WHERE datetime(COALESCE(p.detected_at, '1970-01-01 00:00')) < datetime('now', '-{retention_days} days')"
+        ),
+    };
     let rows = connection
-        .query_all(Statement::from_string(
-            DbBackend::Sqlite,
-            format!(
-                "SELECT r.id AS id, r.plate_no AS plate_no \
-                 FROM inspection_record r \
-                 LEFT JOIN steel_plate p ON p.plate_no = r.plate_no \
-                 WHERE datetime(COALESCE(p.detected_at, '1970-01-01 00:00')) < datetime('now', '-{retention_days} days')"
-            ),
-        ))
+        .query_all(Statement::from_string(backend, sql))
         .await?;
     rows.into_iter()
         .map(|row| {
@@ -982,6 +1238,235 @@ pub async fn delete_inspection_records_before(
         deleted_defects,
         deleted_plates,
     })
+}
+
+pub async fn find_material_session(
+    connection: &DatabaseConnection,
+    id: &str,
+) -> Result<Option<material_session::Model>, DbErr> {
+    material_session::Entity::find()
+        .filter(material_session::Column::Id.eq(id))
+        .one(connection)
+        .await
+}
+
+pub async fn latest_material_session(
+    connection: &DatabaseConnection,
+) -> Result<Option<material_session::Model>, DbErr> {
+    material_session::Entity::find()
+        .order_by_desc(material_session::Column::UpdatedAt)
+        .one(connection)
+        .await
+}
+
+pub async fn latest_open_material_session(
+    connection: &DatabaseConnection,
+) -> Result<Option<material_session::Model>, DbErr> {
+    material_session::Entity::find()
+        .filter(material_session::Column::Status.ne("finished"))
+        .order_by_desc(material_session::Column::UpdatedAt)
+        .one(connection)
+        .await
+}
+
+pub async fn upsert_material_session(
+    connection: &DatabaseConnection,
+    input: MaterialSessionInput,
+) -> Result<material_session::Model, DbErr> {
+    let now = now_millis_string();
+    let existing = material_session::Entity::find()
+        .filter(material_session::Column::Id.eq(&input.id))
+        .one(connection)
+        .await?;
+    if let Some(model) = existing {
+        let existing_started_at = model.started_at.clone();
+        let mut active: material_session::ActiveModel = model.into();
+        active.material_id = Set(input.material_id);
+        active.source = Set(input.source);
+        active.status = Set(input.status);
+        active.control_mode = Set(input.control_mode);
+        active.trigger_mode = Set(input.trigger_mode);
+        active.steel_type = Set(input.steel_type);
+        active.width_mm = Set(input.width_mm);
+        active.length_mm = Set(input.length_mm);
+        active.thickness_mm = Set(input.thickness_mm);
+        active.client = Set(input.client);
+        active.hard = Set(input.hard);
+        active.storage_root = Set(input.storage_root);
+        if existing_started_at.is_empty() && !input.started_at.is_empty() {
+            active.started_at = Set(input.started_at);
+        }
+        active.finished_at = Set(input.finished_at);
+        active.updated_at = Set(now);
+        active.raw_payload = Set(input.raw_payload);
+        active.update(connection).await
+    } else {
+        material_session::ActiveModel {
+            id: Set(input.id),
+            material_id: Set(input.material_id),
+            source: Set(input.source),
+            status: Set(input.status),
+            control_mode: Set(input.control_mode),
+            trigger_mode: Set(input.trigger_mode),
+            steel_type: Set(input.steel_type),
+            width_mm: Set(input.width_mm),
+            length_mm: Set(input.length_mm),
+            thickness_mm: Set(input.thickness_mm),
+            client: Set(input.client),
+            hard: Set(input.hard),
+            storage_root: Set(input.storage_root),
+            started_at: Set(if input.started_at.is_empty() {
+                now.clone()
+            } else {
+                input.started_at
+            }),
+            finished_at: Set(input.finished_at),
+            updated_at: Set(now),
+            raw_payload: Set(input.raw_payload),
+        }
+        .insert(connection)
+        .await
+    }
+}
+
+pub async fn finish_material_session(
+    connection: &DatabaseConnection,
+    session_id: &str,
+    finished_at: &str,
+) -> Result<Option<material_session::Model>, DbErr> {
+    let Some(model) = find_material_session(connection, session_id).await? else {
+        return Ok(None);
+    };
+    let mut active: material_session::ActiveModel = model.into();
+    active.status = Set("finished".to_string());
+    active.finished_at = Set(finished_at.to_string());
+    active.updated_at = Set(now_millis_string());
+    Ok(Some(active.update(connection).await?))
+}
+
+pub async fn append_secondary_data(
+    connection: &DatabaseConnection,
+    input: SecondaryDataInput,
+) -> Result<secondary_data::Model, DbErr> {
+    secondary_data::ActiveModel {
+        id: Set(format!("L2-{}", now_nanos_string())),
+        material_id: Set(input.material_id),
+        session_id: Set(input.session_id),
+        source: Set(input.source),
+        payload_type: Set(input.payload_type),
+        payload: Set(input.payload),
+        received_at: Set(now_millis_string()),
+    }
+    .insert(connection)
+    .await
+}
+
+pub async fn append_trigger_event(
+    connection: &DatabaseConnection,
+    input: TriggerEventInput,
+) -> Result<trigger_event::Model, DbErr> {
+    trigger_event::ActiveModel {
+        id: Set(format!("TRG-{}", now_nanos_string())),
+        material_id: Set(input.material_id),
+        session_id: Set(input.session_id),
+        source: Set(input.source),
+        mode: Set(input.mode),
+        event_type: Set(input.event_type),
+        command: Set(input.command),
+        value: Set(input.value),
+        payload: Set(input.payload),
+        provider_code: Set(input.provider_code),
+        provider_response: Set(input.provider_response),
+        created_at: Set(now_millis_string()),
+    }
+    .insert(connection)
+    .await
+}
+
+pub async fn upsert_production_inspection(
+    connection: &DatabaseConnection,
+    input: ProductionInspectionInput,
+) -> Result<production_inspection::Model, DbErr> {
+    let existing = production_inspection::Entity::find()
+        .filter(production_inspection::Column::Id.eq(&input.id))
+        .one(connection)
+        .await?;
+    if let Some(model) = existing {
+        let mut active: production_inspection::ActiveModel = model.into();
+        active.material_id = Set(input.material_id);
+        active.session_id = Set(input.session_id);
+        active.status = Set(input.status);
+        active.storage_root = Set(input.storage_root);
+        active.summary_path = Set(input.summary_path);
+        active.finished_at = Set(input.finished_at);
+        active.capture_count = Set(input.capture_count);
+        active.defect_count = Set(input.defect_count);
+        active.raw_payload = Set(input.raw_payload);
+        active.update(connection).await
+    } else {
+        production_inspection::ActiveModel {
+            id: Set(input.id),
+            material_id: Set(input.material_id),
+            session_id: Set(input.session_id),
+            status: Set(input.status),
+            storage_root: Set(input.storage_root),
+            summary_path: Set(input.summary_path),
+            started_at: Set(input.started_at),
+            finished_at: Set(input.finished_at),
+            capture_count: Set(input.capture_count),
+            defect_count: Set(input.defect_count),
+            raw_payload: Set(input.raw_payload),
+        }
+        .insert(connection)
+        .await
+    }
+}
+
+pub async fn append_capture_file(
+    connection: &DatabaseConnection,
+    input: CaptureFileInput,
+) -> Result<capture_file::Model, DbErr> {
+    capture_file::ActiveModel {
+        id: Set(format!("CAP-{}", now_nanos_string())),
+        inspection_id: Set(input.inspection_id),
+        session_id: Set(input.session_id),
+        material_id: Set(input.material_id),
+        camera_id: Set(input.camera_id),
+        camera_ip: Set(input.camera_ip),
+        data_name: Set(input.data_name),
+        sequence_no: Set(input.sequence_no),
+        file_type: Set(input.file_type),
+        path: Set(input.path),
+        metadata_path: Set(input.metadata_path),
+        created_at: Set(now_millis_string()),
+    }
+    .insert(connection)
+    .await
+}
+
+pub async fn append_production_defect(
+    connection: &DatabaseConnection,
+    input: ProductionDefectInput,
+) -> Result<production_defect::Model, DbErr> {
+    production_defect::ActiveModel {
+        id: Set(format!("PDF-{}", now_nanos_string())),
+        inspection_id: Set(input.inspection_id),
+        material_id: Set(input.material_id),
+        camera_id: Set(input.camera_id),
+        defect_type: Set(input.defect_type),
+        severity: Set(input.severity),
+        x_mm: Set(input.x_mm),
+        y_mm: Set(input.y_mm),
+        z_mm: Set(input.z_mm),
+        width_mm: Set(input.width_mm),
+        height_mm: Set(input.height_mm),
+        depth_mm: Set(input.depth_mm),
+        confidence: Set(input.confidence),
+        geometry_json: Set(input.geometry_json),
+        created_at: Set(now_millis_string()),
+    }
+    .insert(connection)
+    .await
 }
 
 pub async fn get_config(
@@ -1162,7 +1647,10 @@ fn parse_millis_cutoff(cutoff_at: &str) -> Result<i64, DbErr> {
 
 async fn execute(connection: &DatabaseConnection, sql: &str) -> Result<(), DbErr> {
     connection
-        .execute(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        .execute(Statement::from_string(
+            connection.get_database_backend(),
+            sql.to_string(),
+        ))
         .await
         .map(|_| ())
 }
@@ -1175,7 +1663,10 @@ async fn execute_compatible_migration(
         Ok(()) => Ok(()),
         Err(error) => {
             let message = error.to_string().to_ascii_lowercase();
-            if message.contains("duplicate column") || message.contains("already exists") {
+            if message.contains("duplicate column")
+                || message.contains("duplicate column name")
+                || message.contains("already exists")
+            {
                 Ok(())
             } else {
                 Err(error)
@@ -1188,85 +1679,174 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS app_config (
-            key TEXT PRIMARY KEY NOT NULL,
+            `key` VARCHAR(128) PRIMARY KEY NOT NULL,
             value TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at VARCHAR(64) NOT NULL
         )",
     )
     .await?;
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS config_revision (
-            id TEXT PRIMARY KEY NOT NULL,
-            config_key TEXT NOT NULL,
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            config_key VARCHAR(128) NOT NULL,
             value TEXT NOT NULL,
-            actor TEXT NOT NULL,
-            action TEXT NOT NULL,
+            actor VARCHAR(128) NOT NULL,
+            action VARCHAR(128) NOT NULL,
             bytes INTEGER NOT NULL,
-            created_at TEXT NOT NULL
+            created_at VARCHAR(64) NOT NULL
         )",
     )
     .await?;
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS camera_config (
-            id TEXT PRIMARY KEY NOT NULL,
-            name TEXT NOT NULL,
-            ip TEXT NOT NULL,
-            driver_id TEXT NOT NULL,
-            model_hint TEXT NOT NULL,
-            role TEXT NOT NULL,
-            enabled INTEGER NOT NULL,
-            trigger_mode TEXT NOT NULL,
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            name VARCHAR(128) NOT NULL,
+            ip VARCHAR(64) NOT NULL,
+            driver_id VARCHAR(64) NOT NULL,
+            model_hint VARCHAR(128) NOT NULL,
+            role VARCHAR(128) NOT NULL,
+            enabled BOOLEAN NOT NULL,
+            trigger_mode VARCHAR(64) NOT NULL,
             exposure_us INTEGER NOT NULL,
             gain REAL NOT NULL,
             depth_lines INTEGER NOT NULL,
-            output_path TEXT NOT NULL
+            output_path VARCHAR(512) NOT NULL
         )",
     )
     .await?;
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS steel_plate (
-            plate_no TEXT PRIMARY KEY NOT NULL,
+            plate_no VARCHAR(128) PRIMARY KEY NOT NULL,
             width_mm INTEGER NOT NULL,
             length_mm INTEGER NOT NULL,
             thickness_mm INTEGER NOT NULL,
-            steel_grade TEXT NOT NULL,
-            detected_at TEXT NOT NULL
+            steel_grade VARCHAR(128) NOT NULL,
+            detected_at VARCHAR(64) NOT NULL
         )",
     )
     .await?;
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS defect_type (
-            id TEXT PRIMARY KEY NOT NULL,
-            label TEXT NOT NULL,
-            color TEXT NOT NULL,
-            shape TEXT NOT NULL
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            label VARCHAR(128) NOT NULL,
+            color VARCHAR(32) NOT NULL,
+            shape VARCHAR(32) NOT NULL
         )",
     )
     .await?;
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS inspection_record (
-            id TEXT PRIMARY KEY NOT NULL,
-            time TEXT NOT NULL,
-            plate_no TEXT NOT NULL,
-            status TEXT NOT NULL,
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            time VARCHAR(64) NOT NULL,
+            plate_no VARCHAR(128) NOT NULL,
+            status VARCHAR(64) NOT NULL,
             defect_count INTEGER NOT NULL
         )",
     )
     .await?;
     execute(
         connection,
+        "CREATE TABLE IF NOT EXISTS material_session (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            source VARCHAR(128) NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            control_mode VARCHAR(64) NOT NULL,
+            trigger_mode VARCHAR(64) NOT NULL,
+            steel_type VARCHAR(128) NOT NULL,
+            width_mm REAL NOT NULL,
+            length_mm REAL NOT NULL,
+            thickness_mm REAL NOT NULL,
+            client VARCHAR(128) NOT NULL,
+            hard VARCHAR(128) NOT NULL,
+            storage_root VARCHAR(512) NOT NULL,
+            started_at VARCHAR(64) NOT NULL,
+            finished_at VARCHAR(64) NOT NULL,
+            updated_at VARCHAR(64) NOT NULL,
+            raw_payload TEXT NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
+        "CREATE TABLE IF NOT EXISTS secondary_data (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            source VARCHAR(128) NOT NULL,
+            payload_type VARCHAR(64) NOT NULL,
+            payload TEXT NOT NULL,
+            received_at VARCHAR(64) NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
+        "CREATE TABLE IF NOT EXISTS trigger_event (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            source VARCHAR(128) NOT NULL,
+            mode VARCHAR(64) NOT NULL,
+            event_type VARCHAR(64) NOT NULL,
+            command VARCHAR(64) NOT NULL,
+            value INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            provider_code INTEGER NOT NULL,
+            provider_response TEXT NOT NULL,
+            created_at VARCHAR(64) NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
+        "CREATE TABLE IF NOT EXISTS production_inspection (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            storage_root VARCHAR(512) NOT NULL,
+            summary_path VARCHAR(512) NOT NULL,
+            started_at VARCHAR(64) NOT NULL,
+            finished_at VARCHAR(64) NOT NULL,
+            capture_count INTEGER NOT NULL,
+            defect_count INTEGER NOT NULL,
+            raw_payload TEXT NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
+        "CREATE TABLE IF NOT EXISTS capture_file (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            inspection_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            camera_id VARCHAR(128) NOT NULL,
+            camera_ip VARCHAR(64) NOT NULL,
+            data_name VARCHAR(64) NOT NULL,
+            sequence_no INTEGER NOT NULL,
+            file_type VARCHAR(32) NOT NULL,
+            path VARCHAR(1024) NOT NULL,
+            metadata_path VARCHAR(1024) NOT NULL,
+            created_at VARCHAR(64) NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
         "CREATE TABLE IF NOT EXISTS defect (
-            id TEXT PRIMARY KEY NOT NULL,
-            plate_no TEXT NOT NULL,
-            type_id TEXT NOT NULL,
-            type_label TEXT NOT NULL,
-            surface TEXT NOT NULL,
-            severity TEXT NOT NULL,
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            plate_no VARCHAR(128) NOT NULL,
+            type_id VARCHAR(128) NOT NULL,
+            type_label VARCHAR(128) NOT NULL,
+            surface VARCHAR(32) NOT NULL,
+            severity VARCHAR(32) NOT NULL,
             distance_head_mm INTEGER NOT NULL,
             operator_side_mm INTEGER NOT NULL,
             drive_side_mm INTEGER NOT NULL,
@@ -1282,44 +1862,65 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
     .await?;
     execute(
         connection,
+        "CREATE TABLE IF NOT EXISTS production_defect (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            inspection_id VARCHAR(128) NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            camera_id VARCHAR(128) NOT NULL,
+            defect_type VARCHAR(128) NOT NULL,
+            severity VARCHAR(32) NOT NULL,
+            x_mm REAL NOT NULL,
+            y_mm REAL NOT NULL,
+            z_mm REAL NOT NULL,
+            width_mm REAL NOT NULL,
+            height_mm REAL NOT NULL,
+            depth_mm REAL NOT NULL,
+            confidence REAL NOT NULL,
+            geometry_json TEXT NOT NULL,
+            created_at VARCHAR(64) NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
         "CREATE TABLE IF NOT EXISTS admin_user (
-            id TEXT PRIMARY KEY NOT NULL,
-            display_name TEXT NOT NULL,
-            role TEXT NOT NULL,
-            status TEXT NOT NULL,
-            password_hash TEXT NOT NULL DEFAULT '',
-            last_login_at TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            display_name VARCHAR(128) NOT NULL,
+            role VARCHAR(128) NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            password_hash VARCHAR(512) NOT NULL DEFAULT '',
+            last_login_at VARCHAR(64) NOT NULL,
+            created_at VARCHAR(64) NOT NULL
         )",
     )
     .await?;
     execute_compatible_migration(
         connection,
-        "ALTER TABLE admin_user ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE admin_user ADD COLUMN password_hash VARCHAR(512) NOT NULL DEFAULT ''",
     )
     .await?;
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS admin_role (
-            id TEXT PRIMARY KEY NOT NULL,
-            label TEXT NOT NULL,
-            description TEXT NOT NULL,
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            label VARCHAR(128) NOT NULL,
+            description VARCHAR(512) NOT NULL,
             permissions TEXT NOT NULL,
-            status TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            status VARCHAR(64) NOT NULL,
+            updated_at VARCHAR(64) NOT NULL
         )",
     )
     .await?;
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS audit_log (
-            id TEXT PRIMARY KEY NOT NULL,
-            actor TEXT NOT NULL,
-            action TEXT NOT NULL,
-            target TEXT NOT NULL,
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            actor VARCHAR(128) NOT NULL,
+            action VARCHAR(128) NOT NULL,
+            target VARCHAR(256) NOT NULL,
             detail TEXT NOT NULL,
-            level TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            level VARCHAR(32) NOT NULL,
+            created_at VARCHAR(64) NOT NULL
         )",
     )
     .await

@@ -17,7 +17,9 @@ This app links the shared `steel_capture_core` library from `app/capture` and st
 - Controls exposure, gain, acquisition lines, width, timeout, high-speed mode, trigger frequency, and arbitrary SDK params.
 - Captures validation frames through `/api/capture/depth-map`.
 - Runs continuous capture tests for all discovered cameras or the selected camera, with configurable rounds, interval, and output directory.
-- Applies calibration files through `/api/calibration/load`, ROI files through `/api/roi/load`, and saves local calibration records.
+- Provides a separate automatic calibration workspace with original/corrected cross-section rendering, fit metrics, per-camera X/Z corrections, active calibration version tracking, and a confirmed global apply action.
+- Renders calibration cross-sections directly from `cross_section_points.csv`; generated PNG previews remain file artifacts but are not used as the in-app calibration preview.
+- Applies per-camera calibration files through `/api/calibration/load`, tracks array-calibration profile pointers through `/api/calibration/active`, applies global calibration versions through `/api/calibration/apply-all`, and saves current camera parameters when requested.
 - Opens `/ui` in the system browser for low-level API diagnostics.
 
 ## Build
