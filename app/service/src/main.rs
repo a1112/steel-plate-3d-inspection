@@ -757,12 +757,12 @@ fn config_dir() -> PathBuf {
                 .join("Cargo.toml")
                 .is_file()
             {
-                return ancestor.join("config");
+                return ancestor.join("target").join("config").join("service");
             }
         }
-        return current_dir.join("config");
+        return current_dir.join("target").join("config").join("service");
     }
-    PathBuf::from("config")
+    PathBuf::from("target").join("config").join("service")
 }
 
 fn current_time_string() -> String {
@@ -903,12 +903,12 @@ fn default_capture_camera_value(index: usize) -> Value {
     let camera_no = index + 1;
     let camera_id = format!("CAM-{camera_no:02}");
     let roles = [
-        "上表面入口相机",
-        "上表面中部相机",
-        "上表面出口相机",
-        "下表面入口相机",
-        "下表面中部相机",
-        "下表面出口相机",
+        "camera1 周向采集相机",
+        "camera2 周向采集相机",
+        "camera3 周向采集相机",
+        "camera4 周向采集相机",
+        "camera5 周向采集相机",
+        "camera6 周向采集相机",
     ];
     json!({
         "id": camera_id,
@@ -952,6 +952,18 @@ fn build_config_json(capture_port: u16) -> String {
         }
     })
     .to_string()
+}
+
+fn simulated_provider_string_field(payload: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| payload.get(*key))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| value.as_i64().map(|item| item.to_string()))
+        })
+        .unwrap_or_default()
 }
 
 impl CaptureServiceManager {
@@ -1092,7 +1104,206 @@ impl CaptureServiceManager {
         )
     }
 
+    fn simulated_proxy(&self, method: &str, path_with_query: &str, body: &str) -> Option<Vec<u8>> {
+        let path = path_with_query.split('?').next().unwrap_or(path_with_query);
+        match (method, path) {
+            ("GET", "/api/steel/status") => Some(
+                json!({
+                    "code": 0,
+                    "provider": "simulated",
+                    "phase": "idle",
+                    "present": false,
+                    "saveEnabled": false,
+                    "connectedCameras": CAPTURE_CAMERA_IPS.len(),
+                    "storageRoot": "simulated",
+                    "updatedAt": current_time_string()
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+            ("POST", "/api/steel/event") => {
+                let payload =
+                    serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
+                let material_id = {
+                    let id = simulated_provider_string_field(
+                        &payload,
+                        &["id", "materialId", "steelId", "steelNo"],
+                    );
+                    if id.trim().is_empty() {
+                        "simulated-material".to_string()
+                    } else {
+                        id
+                    }
+                };
+                let session_id = simulated_provider_string_field(&payload, &["sessionId"]);
+                let command = simulated_provider_string_field(&payload, &["cmd", "command"])
+                    .if_empty("steelIn");
+                let value = payload.get("value").and_then(Value::as_i64).unwrap_or(0);
+                let save_enabled = payload
+                    .get("saveEnabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(value != 0 && command != "rcvSteelInfo");
+                let phase = if command == "rcvSteelInfo" {
+                    "info-ready"
+                } else if value == 0 {
+                    "steel-out"
+                } else if save_enabled {
+                    "steel-in-saving"
+                } else {
+                    "steel-in-waiting-images"
+                };
+                Some(
+                    json!({
+                        "code": 0,
+                        "provider": "simulated",
+                        "cmd": command,
+                        "value": value,
+                        "id": material_id,
+                        "materialId": material_id,
+                        "steelId": material_id,
+                        "sessionId": session_id,
+                        "inspectionId": simulated_provider_string_field(&payload, &["inspectionId"]),
+                        "phase": phase,
+                        "present": value != 0 && command != "rcvSteelInfo",
+                        "saveEnabled": save_enabled,
+                        "saveSdkDerived": false,
+                        "discardBlackFrames": payload
+                            .get("discardBlackFrames")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                        "connectedCameras": CAPTURE_CAMERA_IPS.len(),
+                        "updatedAt": current_time_string()
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+            }
+            ("POST", "/api/capture/continuous-test") => {
+                let payload =
+                    serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
+                let material_id =
+                    simulated_provider_string_field(&payload, &["materialId", "steelId", "id"])
+                        .if_empty("simulated-material");
+                let session_id = simulated_provider_string_field(&payload, &["sessionId"]);
+                let expected_cameras = value_i32(
+                    &payload,
+                    &["expectedCameras", "expected_cameras"],
+                    CAPTURE_CAMERA_IPS.len() as i32,
+                )
+                .clamp(1, CAPTURE_CAMERA_IPS.len() as i32) as usize;
+                let rounds = value_i32(&payload, &["rounds"], 1).clamp(1, 100) as usize;
+                let lines = value_i32(&payload, &["lines", "triggerLines"], 1000).max(1);
+                let width = value_i32(&payload, &["width"], 3200).max(0);
+                let save_sdk_derived = value_bool(&payload, &["saveSdkDerived"], false);
+                let started_at = current_time_string();
+                let output_dir = format!("simulated://{material_id}");
+                let mut results = Vec::new();
+
+                for round in 1..=rounds {
+                    for (index, ip) in CAPTURE_CAMERA_IPS.iter().take(expected_cameras).enumerate()
+                    {
+                        let camera_id = format!("camera{}", index + 1);
+                        let shot = ((round - 1) * expected_cameras) + index + 1;
+                        let base = format!(
+                            "{}/{}/round-{round:03}-shot-{shot:04}",
+                            output_dir, camera_id
+                        );
+                        results.push(json!({
+                            "code": 0,
+                            "errorName": "CORRECT",
+                            "operatorHint": "simulated",
+                            "round": round,
+                            "parallelIndex": index,
+                            "attempt": shot,
+                            "ip": ip,
+                            "cameraId": camera_id,
+                            "completeFrame": true,
+                            "depthExists": true,
+                            "intensityExists": true,
+                            "metadataExists": true,
+                            "sdkExists": false,
+                            "sdkDepthExists": false,
+                            "sdkIntensityExists": false,
+                            "width": width,
+                            "lines": lines,
+                            "fid": shot,
+                            "lostLines": 0,
+                            "triggerMinInterval": 0,
+                            "triggerMaxInterval": 0,
+                            "depthOutput": format!("{base}_depthMap.png"),
+                            "intensityOutput": format!("{base}_intensity.png"),
+                            "metadataOutput": format!("{base}_metadata.json"),
+                            "sdkOutput": if save_sdk_derived {
+                                format!("{base}_sdk.png")
+                            } else {
+                                String::new()
+                            },
+                            "sdkDepthOutput": "",
+                            "sdkIntensityOutput": "",
+                        }));
+                    }
+                }
+
+                let attempts = results.len();
+                Some(
+                    json!({
+                        "schema": "steel.capture.continuous-test.summary.v1",
+                        "generatedAt": current_time_string(),
+                        "startedAt": started_at,
+                        "finishedAt": current_time_string(),
+                        "code": 0,
+                        "errorName": "CORRECT",
+                        "operatorHint": "simulated",
+                        "provider": "simulated",
+                        "materialId": material_id.clone(),
+                        "sessionId": session_id.clone(),
+                        "attempts": attempts,
+                        "successes": attempts,
+                        "failures": 0,
+                        "completeFrames": attempts,
+                        "metadataFrames": attempts,
+                        "discardedFrames": 0,
+                        "blackFrames": 0,
+                        "rounds": rounds,
+                        "retries": 0,
+                        "cameraCount": expected_cameras,
+                        "expectedCameras": expected_cameras,
+                        "expectedMet": true,
+                        "connectFirst": false,
+                        "parallel": true,
+                        "saveSdkDerived": save_sdk_derived,
+                        "workerCount": expected_cameras,
+                        "roundIntervalMs": value_i32(&payload, &["intervalMs"], 0),
+                        "elapsedMs": 1,
+                        "syncMode": "simulated-round-start-condition-variable",
+                        "storageRoot": "simulated",
+                        "outputDir": output_dir,
+                        "summaryOutput": format!("simulated://{material_id}/summary.json"),
+                        "summaryExists": true,
+                        "results": results
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+            }
+            _ => None,
+        }
+    }
+
     fn proxy(&self, method: &str, path_with_query: &str, body: &str) -> Option<Vec<u8>> {
+        self.proxy_with_read_timeout(method, path_with_query, body, Duration::from_secs(8))
+    }
+
+    fn proxy_with_read_timeout(
+        &self,
+        method: &str,
+        path_with_query: &str,
+        body: &str,
+        read_timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        if self.provider == CaptureProvider::Simulated {
+            return self.simulated_proxy(method, path_with_query, body);
+        }
         if !self.provider.uses_local_api() {
             return None;
         }
@@ -1105,7 +1316,7 @@ impl CaptureServiceManager {
             .ok()?
             .find(|addr| TcpStream::connect_timeout(addr, Duration::from_millis(200)).is_ok())?;
         let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(1500)).ok()?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
+        let _ = stream.set_read_timeout(Some(read_timeout));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
         let request = format!(
             "{method} {path_with_query} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -1484,6 +1695,228 @@ fn capture_statuses_json() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{\"statuses\":[{}]}}", statuses)
+}
+
+fn json_value_u64(value: Option<&Value>) -> u64 {
+    match value {
+        Some(Value::Number(number)) => number.as_u64().unwrap_or(0),
+        Some(Value::String(text)) => text.parse::<u64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn json_value_string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn normalize_json_array(value: Value) -> Vec<Value> {
+    match value {
+        Value::Array(items) => items,
+        Value::Null => Vec::new(),
+        item => vec![item],
+    }
+}
+
+#[derive(Clone)]
+struct NetworkInterfaceCounters {
+    received_bytes: u64,
+    transmitted_bytes: u64,
+}
+
+#[derive(Clone)]
+struct NetworkCounterSnapshot {
+    sampled_at_ms: u128,
+    interfaces: HashMap<String, NetworkInterfaceCounters>,
+}
+
+static NETWORK_COUNTER_CACHE: Mutex<Option<NetworkCounterSnapshot>> = Mutex::new(None);
+
+fn network_counter_delta_mbps(current: u64, previous: u64, elapsed_ms: u128) -> f64 {
+    if elapsed_ms == 0 || current < previous {
+        return 0.0;
+    }
+    let elapsed_seconds = elapsed_ms as f64 / 1000.0;
+    if elapsed_seconds <= 0.0 {
+        return 0.0;
+    }
+    (current.saturating_sub(previous) as f64 * 8.0) / elapsed_seconds / 1_000_000.0
+}
+
+fn read_windows_network_snapshot_json() -> Result<String, String> {
+    let script = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$statsByName = @{}
+Get-NetAdapterStatistics -ErrorAction SilentlyContinue | ForEach-Object { $statsByName[$_.Name] = $_ }
+Get-NetAdapter -ErrorAction SilentlyContinue |
+  Sort-Object Name |
+  ForEach-Object {
+    $stat = $statsByName[$_.Name]
+    $receivedBytes = 0
+    $sentBytes = 0
+    $receivedPackets = 0
+    $sentPackets = 0
+    if ($null -ne $stat) {
+      $receivedBytes = $stat.ReceivedBytes
+      $sentBytes = $stat.SentBytes
+      $receivedPackets = $stat.ReceivedUnicastPackets
+      $sentPackets = $stat.SentUnicastPackets
+    }
+    [pscustomobject]@{
+      name = [string]$_.Name
+      description = [string]$_.InterfaceDescription
+      status = [string]$_.Status
+      linkSpeed = [string]$_.LinkSpeed
+      linkSpeedBitsPerSecond = [UInt64]($_.Speed -as [UInt64])
+      receivedBytes = [UInt64]$receivedBytes
+      transmittedBytes = [UInt64]$sentBytes
+      packetsReceived = [UInt64]$receivedPackets
+      packetsTransmitted = [UInt64]$sentPackets
+    }
+  } |
+  ConvertTo-Json -Compress
+"#;
+    let output = Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn system_network_status_response() -> Vec<u8> {
+    let sampled_at_ms = current_time_millis();
+    let raw_json = match read_windows_network_snapshot_json() {
+        Ok(value) if !value.trim().is_empty() => value,
+        Ok(_) => "[]".to_string(),
+        Err(error) => {
+            return http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &format!(
+                    "{{\"code\":1,\"source\":\"windows-get-netadapter\",\"sampledAtMs\":{},\"interfaces\":[],\"totalReceivedBytes\":0,\"totalTransmittedBytes\":0,\"error\":\"{}\"}}",
+                    sampled_at_ms,
+                    json_escape(&error)
+                ),
+            );
+        }
+    };
+    let parsed = match serde_json::from_str::<Value>(&raw_json) {
+        Ok(value) => normalize_json_array(value),
+        Err(error) => {
+            return http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &format!(
+                    "{{\"code\":2,\"source\":\"windows-get-netadapter\",\"sampledAtMs\":{},\"interfaces\":[],\"totalReceivedBytes\":0,\"totalTransmittedBytes\":0,\"error\":\"{}\"}}",
+                    sampled_at_ms,
+                    json_escape(&error.to_string())
+                ),
+            );
+        }
+    };
+    let mut total_received = 0u64;
+    let mut total_transmitted = 0u64;
+    let mut total_upload_mbps = 0.0f64;
+    let mut total_download_mbps = 0.0f64;
+    let mut total_bandwidth_mbps = 0.0f64;
+    let previous_snapshot = match NETWORK_COUNTER_CACHE.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let elapsed_ms = previous_snapshot
+        .as_ref()
+        .map(|snapshot| sampled_at_ms.saturating_sub(snapshot.sampled_at_ms))
+        .unwrap_or(0);
+    let mut current_counters = HashMap::new();
+    let interfaces = parsed
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let name = json_value_string(item.get("name"));
+            let description = json_value_string(item.get("description"));
+            let status = json_value_string(item.get("status"));
+            let link_speed = json_value_string(item.get("linkSpeed"));
+            let link_speed_bits = json_value_u64(item.get("linkSpeedBitsPerSecond"));
+            let received_bytes = json_value_u64(item.get("receivedBytes"));
+            let transmitted_bytes = json_value_u64(item.get("transmittedBytes"));
+            let packets_received = json_value_u64(item.get("packetsReceived"));
+            let packets_transmitted = json_value_u64(item.get("packetsTransmitted"));
+            let previous = previous_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.interfaces.get(&name));
+            let download_mbps = previous
+                .map(|item| network_counter_delta_mbps(received_bytes, item.received_bytes, elapsed_ms))
+                .unwrap_or(0.0);
+            let upload_mbps = previous
+                .map(|item| network_counter_delta_mbps(transmitted_bytes, item.transmitted_bytes, elapsed_ms))
+                .unwrap_or(0.0);
+            let bandwidth_mbps = link_speed_bits as f64 / 1_000_000.0;
+            let online = status.eq_ignore_ascii_case("up") || link_speed_bits > 0;
+
+            total_received = total_received.saturating_add(received_bytes);
+            total_transmitted = total_transmitted.saturating_add(transmitted_bytes);
+            total_upload_mbps += upload_mbps;
+            total_download_mbps += download_mbps;
+            total_bandwidth_mbps += bandwidth_mbps;
+            current_counters.insert(
+                name.clone(),
+                NetworkInterfaceCounters {
+                    received_bytes,
+                    transmitted_bytes,
+                },
+            );
+            format!(
+                "{{\"index\":{},\"name\":\"{}\",\"description\":\"{}\",\"status\":\"{}\",\"linkSpeed\":\"{}\",\"linkSpeedBitsPerSecond\":{},\"receivedBytes\":{},\"transmittedBytes\":{},\"packetsReceived\":{},\"packetsTransmitted\":{},\"uploadMbps\":{:.6},\"downloadMbps\":{:.6},\"bandwidthMbps\":{:.6},\"online\":{}}}",
+                index + 1,
+                json_escape(&name),
+                json_escape(&description),
+                json_escape(&status),
+                json_escape(&link_speed),
+                link_speed_bits,
+                received_bytes,
+                transmitted_bytes,
+                packets_received,
+                packets_transmitted,
+                upload_mbps,
+                download_mbps,
+                bandwidth_mbps,
+                if online { "true" } else { "false" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    if let Ok(mut guard) = NETWORK_COUNTER_CACHE.lock() {
+        *guard = Some(NetworkCounterSnapshot {
+            sampled_at_ms,
+            interfaces: current_counters,
+        });
+    }
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &format!(
+            "{{\"code\":0,\"source\":\"windows-get-netadapter\",\"sampledAtMs\":{},\"interfaces\":[{}],\"totalReceivedBytes\":{},\"totalTransmittedBytes\":{},\"totalUploadMbps\":{:.6},\"totalDownloadMbps\":{:.6},\"totalBandwidthMbps\":{:.6}}}",
+            sampled_at_ms,
+            interfaces,
+            total_received,
+            total_transmitted,
+            total_upload_mbps,
+            total_download_mbps,
+            total_bandwidth_mbps
+        ),
+    )
 }
 
 fn split_path_and_query(raw_path: &str) -> (&str, &str) {
@@ -2791,7 +3224,7 @@ fn admin_diagnostics_json(state: &ServiceState) -> String {
                     "warning"
                 },
                 format!(
-                    "检测记录 {} 条，缺陷 {} 条，钢板 {} 条",
+                    "检测记录 {} 条，缺陷 {} 条，钢管 {} 条",
                     overview.metrics.record_count,
                     overview.metrics.defect_count,
                     overview.metrics.plate_count
@@ -4752,6 +5185,26 @@ fn value_i32(payload: &Value, keys: &[&str], fallback: i32) -> i32 {
         .unwrap_or(fallback)
 }
 
+fn value_bool(payload: &Value, keys: &[&str], fallback: bool) -> bool {
+    keys.iter()
+        .find_map(|key| payload.get(*key))
+        .and_then(|value| {
+            value
+                .as_bool()
+                .or_else(|| value.as_i64().map(|item| item != 0))
+                .or_else(|| {
+                    value.as_str().and_then(|text| {
+                        match text.trim().to_ascii_lowercase().as_str() {
+                            "true" | "1" | "yes" => Some(true),
+                            "false" | "0" | "no" => Some(false),
+                            _ => None,
+                        }
+                    })
+                })
+        })
+        .unwrap_or(fallback)
+}
+
 fn material_id_from_payload(payload: &Value, fallback: &str) -> String {
     let id = value_string(
         payload,
@@ -4785,9 +5238,33 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
     let latest = state
         .runtime
         .block_on(db::latest_material_session(&state.database.connection));
-    let latest_open = state
+    let latest_session = latest.ok().flatten();
+    let latest_session_json = latest_session.as_ref().map(|session| {
+        json!({
+            "id": session.id,
+            "materialId": session.material_id,
+            "status": session.status,
+            "controlMode": session.control_mode,
+            "triggerMode": session.trigger_mode,
+            "updatedAt": session.updated_at
+        })
+    });
+    let active_session_json = latest_session
+        .as_ref()
+        .filter(|session| session.status != "finished")
+        .map(|session| {
+            json!({
+                "id": session.id,
+                "materialId": session.material_id,
+                "status": session.status,
+                "controlMode": session.control_mode,
+                "triggerMode": session.trigger_mode,
+                "updatedAt": session.updated_at
+            })
+        });
+    let latest_inspection = state
         .runtime
-        .block_on(db::latest_open_material_session(&state.database.connection));
+        .block_on(db::latest_production_inspection(&state.database.connection));
     let capture_status = state
         .capture
         .proxy("GET", "/api/steel/status", "")
@@ -4802,24 +5279,27 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
                 "engine": state.database.engine.clone(),
                 "path": state.database.display_path()
             },
-            "latestSession": latest.ok().flatten().map(|session| {
+            "latestSession": latest_session_json,
+            "activeSession": active_session_json,
+            "latestInspection": latest_inspection.ok().flatten().map(|inspection| {
+                let capture_summary_path = production_session_summary_path(
+                    &inspection.storage_root,
+                    &inspection.material_id,
+                    &inspection.session_id,
+                )
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
                 json!({
-                    "id": session.id,
-                    "materialId": session.material_id,
-                    "status": session.status,
-                    "controlMode": session.control_mode,
-                    "triggerMode": session.trigger_mode,
-                    "updatedAt": session.updated_at
-                })
-            }),
-            "activeSession": latest_open.ok().flatten().map(|session| {
-                json!({
-                    "id": session.id,
-                    "materialId": session.material_id,
-                    "status": session.status,
-                    "controlMode": session.control_mode,
-                    "triggerMode": session.trigger_mode,
-                    "updatedAt": session.updated_at
+                    "id": inspection.id,
+                    "materialId": inspection.material_id,
+                    "sessionId": inspection.session_id,
+                    "status": inspection.status,
+                    "summaryPath": inspection.summary_path,
+                    "captureSummaryPath": capture_summary_path,
+                    "captureCount": inspection.capture_count,
+                    "defectCount": inspection.defect_count,
+                    "startedAt": inspection.started_at,
+                    "finishedAt": inspection.finished_at
                 })
             }),
             "capture": capture_status
@@ -5017,6 +5497,47 @@ fn write_production_event_response(
     }
 
     let inspection_id = format!("INSP-{session_id}");
+    let existing_inspection = state
+        .runtime
+        .block_on(db::find_production_inspection(
+            &state.database.connection,
+            &inspection_id,
+        ))
+        .ok()
+        .flatten();
+    let inspection_storage_root = value_string(&payload, &["storageRoot", "storage_root"]).if_empty(
+        existing_inspection
+            .as_ref()
+            .map(|inspection| inspection.storage_root.as_str())
+            .unwrap_or_default(),
+    );
+    let inspection_summary_path = value_string(&payload, &["summaryPath", "summary_path"]).if_empty(
+        existing_inspection
+            .as_ref()
+            .map(|inspection| inspection.summary_path.as_str())
+            .unwrap_or_default(),
+    );
+    let inspection_started_at = existing_inspection
+        .as_ref()
+        .map(|inspection| inspection.started_at.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| now.clone());
+    let inspection_capture_count = value_i32(
+        &payload,
+        &["captureCount", "capture_count"],
+        existing_inspection
+            .as_ref()
+            .map(|inspection| inspection.capture_count)
+            .unwrap_or(0),
+    );
+    let inspection_defect_count = value_i32(
+        &payload,
+        &["defectCount", "defect_count"],
+        existing_inspection
+            .as_ref()
+            .map(|inspection| inspection.defect_count)
+            .unwrap_or(0),
+    );
     let _ = state.runtime.block_on(db::upsert_production_inspection(
         &state.database.connection,
         db::ProductionInspectionInput {
@@ -5028,34 +5549,73 @@ fn write_production_event_response(
             } else {
                 "running".to_string()
             },
-            storage_root: value_string(&payload, &["storageRoot", "storage_root"]),
-            summary_path: value_string(&payload, &["summaryPath", "summary_path"]),
-            started_at: now.clone(),
+            storage_root: inspection_storage_root,
+            summary_path: inspection_summary_path,
+            started_at: inspection_started_at,
             finished_at: if default_event == "steel-out" {
                 now.clone()
             } else {
                 String::new()
             },
-            capture_count: value_i32(&payload, &["captureCount", "capture_count"], 0),
-            defect_count: value_i32(&payload, &["defectCount", "defect_count"], 0),
+            capture_count: inspection_capture_count,
+            defect_count: inspection_defect_count,
             raw_payload: payload.to_string(),
         },
     ));
 
-    let provider_body = json!({
+    let acquisition_mode = value_string(
+        &payload,
+        &[
+            "acquisitionMode",
+            "acquisition_mode",
+            "triggerSource",
+            "trigger_source",
+        ],
+    )
+    .if_empty(&trigger_mode);
+    let capture_save_state = match default_event {
+        "steel-in" => "save",
+        "steel-out" => "discard",
+        _ => "idle",
+    };
+    let save_enabled = default_event == "steel-in";
+    let discard_black_frames = payload
+        .get("discardBlackFrames")
+        .or_else(|| payload.get("discard_black_frames"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let mut provider_payload = json!({
         "cmd": command.clone(),
         "value": value,
         "id": material_id,
         "steelId": material_id,
         "steelNo": material_id,
+        "sessionId": session_id,
+        "inspectionId": inspection_id,
         "steelType": value_string(&payload, &["steelType", "steel_type", "type"]),
         "length": value_f64(&payload, &["length", "len", "lengthMm", "length_mm"]),
         "width": value_f64(&payload, &["width", "widthMm", "width_mm"]),
         "thick": value_f64(&payload, &["thick", "thickness", "thicknessMm", "thickness_mm"]),
         "client": value_string(&payload, &["client"]),
-        "hard": value_string(&payload, &["hard"])
-    })
-    .to_string();
+        "hard": value_string(&payload, &["hard"]),
+        "acquisitionMode": acquisition_mode,
+        "captureSaveState": capture_save_state,
+        "saveEnabled": save_enabled,
+        "saveSdkDerived": false,
+        "discardBlackFrames": discard_black_frames,
+        "algorithmPhase": "pending"
+    });
+    if let Some(auto_capture) = payload
+        .get("autoCapture")
+        .or_else(|| payload.get("auto_capture"))
+        .and_then(Value::as_bool)
+    {
+        if let Some(object) = provider_payload.as_object_mut() {
+            object.insert("autoCapture".to_string(), json!(auto_capture));
+        }
+    }
+    let provider_body = provider_payload.to_string();
     let provider_response = state
         .capture
         .proxy("POST", "/api/steel/event", &provider_body)
@@ -5085,6 +5645,17 @@ fn write_production_event_response(
         &format!("{default_event} from {source} mode={mode} providerCode={provider_code}"),
         if provider_code == 0 { "info" } else { "warning" },
     ));
+    let final_summary = if default_event == "steel-out" {
+        write_final_production_summary_file(
+            state,
+            &material_id,
+            &session_id,
+            &inspection_id,
+            &provider_response,
+        )
+    } else {
+        Value::Null
+    };
     match trigger_result {
         Ok(row) => http_response(
             "200 OK",
@@ -5097,14 +5668,22 @@ fn write_production_event_response(
                 "triggerEventId": row.id,
                 "mode": mode,
                 "triggerMode": trigger_mode,
-                "provider": provider_response
+                "flow": {
+                    "recordWrittenBeforeCapture": true,
+                    "captureSaveState": capture_save_state,
+                    "saveEnabled": save_enabled,
+                    "discardBlackFrames": discard_black_frames,
+                    "algorithmPhase": "pending"
+                },
+                "provider": provider_response,
+                "finalSummary": final_summary
             })
             .to_string(),
         ),
         Err(error) => http_response(
             "500 Internal Server Error",
             "application/json; charset=utf-8",
-            &json!({ "code": 500, "error": error.to_string(), "provider": provider_response })
+            &json!({ "code": 500, "error": error.to_string(), "provider": provider_response, "finalSummary": final_summary })
                 .to_string(),
         ),
     }
@@ -5136,6 +5715,145 @@ fn active_session_for_payload(state: &ServiceState, payload: &Value) -> (String,
     (material_id, session_id)
 }
 
+fn capture_requires_open_session(payload: &Value) -> bool {
+    value_bool(payload, &["steelStateAware", "steel_state_aware"], true)
+        && value_bool(payload, &["requireSteelPresent", "require_steel_present"], true)
+}
+
+fn validate_capture_open_session(state: &ServiceState, payload: &Value) -> Result<(), Vec<u8>> {
+    if !capture_requires_open_session(payload) {
+        return Ok(());
+    }
+
+    let requested_material = value_string(payload, &["materialId", "material_id", "steelId", "id"]);
+    let requested_session = value_string(payload, &["sessionId", "session_id"]);
+    let open_session = if requested_session.is_empty() {
+        state
+            .runtime
+            .block_on(db::latest_open_material_session(&state.database.connection))
+    } else {
+        state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                &requested_session,
+            ))
+    }
+    .map_err(|error| {
+        http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({ "code": 500, "error": error.to_string() }).to_string(),
+        )
+    })?;
+
+    let Some(session) = open_session else {
+        return Err(http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": "steel_not_present",
+                "message": "capture requires an active steel-in session before saving images",
+                "requireSteelPresent": true
+            })
+            .to_string(),
+        ));
+    };
+
+    if session.status == "finished" {
+        return Err(http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": "steel_not_present",
+                "message": "capture session is already finished",
+                "materialId": session.material_id,
+                "sessionId": session.id,
+                "requireSteelPresent": true
+            })
+            .to_string(),
+        ));
+    }
+
+    if !requested_material.is_empty() && session.material_id != requested_material {
+        return Err(http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": "steel_session_mismatch",
+                "message": "capture material does not match the active steel-in session",
+                "requestedMaterialId": requested_material,
+                "activeMaterialId": session.material_id,
+                "activeSessionId": session.id,
+                "requireSteelPresent": true
+            })
+            .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn continuous_capture_proxy_timeout(payload: &Value) -> Duration {
+    let rounds = i64::from(value_i32(payload, &["rounds"], 1)).max(1);
+    let timeout_ms = i64::from(value_i32(payload, &["timeoutMs", "timeout_ms"], 8000)).max(100);
+    let interval_ms = i64::from(value_i32(payload, &["intervalMs", "interval_ms"], 500)).max(0);
+    let retries = i64::from(value_i32(payload, &["retries"], 0)).max(0);
+    let per_round_ms = timeout_ms
+        .saturating_mul(retries.saturating_add(1))
+        .saturating_add(interval_ms);
+    let total_ms = per_round_ms
+        .saturating_mul(rounds)
+        .saturating_add(90_000)
+        .clamp(60_000, 3_600_000);
+    Duration::from_millis(total_ms as u64)
+}
+
+fn safe_storage_segment(value: &str) -> String {
+    let segment = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if segment.is_empty() {
+        "unknown".to_string()
+    } else {
+        segment
+    }
+}
+
+fn production_summary_path(summary: &Value, material_id: &str, session_id: &str) -> Option<PathBuf> {
+    let storage_root = value_string(summary, &["storageRoot", "storage_root"]);
+    production_session_summary_path(&storage_root, material_id, session_id)
+}
+
+fn production_session_summary_path(
+    storage_root: &str,
+    material_id: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if storage_root.trim().is_empty() || storage_root.contains("://") {
+        return None;
+    }
+    Some(
+        Path::new(storage_root)
+            .join("production")
+            .join(safe_storage_segment(material_id))
+            .join(safe_storage_segment(session_id))
+            .join("summary.json"),
+    )
+}
+
 fn capture_file_rows_from_result(
     state: &ServiceState,
     inspection_id: &str,
@@ -5148,20 +5866,46 @@ fn capture_file_rows_from_result(
     let sequence_no = value_i32(result, &["attempt", "sequenceNo", "sequence_no"], 0);
     let metadata_path = value_string(result, &["metadataOutput", "metadata_path", "metadataPath"]);
     let outputs = [
-        ("depth", "png", value_string(result, &["depthOutput", "output"])),
-        ("intensity", "png", value_string(result, &["intensityOutput"])),
-        ("metadata", "json", metadata_path.clone()),
-        ("sdk-derived", "png", value_string(result, &["sdkOutput"])),
-        ("sdk-derived-depth", "png", value_string(result, &["sdkDepthOutput"])),
+        (
+            "depth",
+            "png",
+            value_string(result, &["depthOutput", "output"]),
+            value_bool(result, &["depthExists"], true),
+        ),
+        (
+            "intensity",
+            "png",
+            value_string(result, &["intensityOutput"]),
+            value_bool(result, &["intensityExists"], true),
+        ),
+        (
+            "metadata",
+            "json",
+            metadata_path.clone(),
+            value_bool(result, &["metadataExists"], true),
+        ),
+        (
+            "sdk-derived",
+            "png",
+            value_string(result, &["sdkOutput"]),
+            value_bool(result, &["sdkExists"], true),
+        ),
+        (
+            "sdk-derived-depth",
+            "png",
+            value_string(result, &["sdkDepthOutput"]),
+            value_bool(result, &["sdkDepthExists"], true),
+        ),
         (
             "sdk-derived-intensity",
             "png",
             value_string(result, &["sdkIntensityOutput"]),
+            value_bool(result, &["sdkIntensityExists"], true),
         ),
     ];
     let mut inserted = 0;
-    for (data_name, file_type, path) in outputs {
-        if path.trim().is_empty() {
+    for (data_name, file_type, path, exists) in outputs {
+        if path.trim().is_empty() || !exists {
             continue;
         }
         state
@@ -5185,6 +5929,281 @@ fn capture_file_rows_from_result(
         inserted += 1;
     }
     Ok(inserted)
+}
+
+fn write_final_production_summary_file(
+    state: &ServiceState,
+    material_id: &str,
+    session_id: &str,
+    inspection_id: &str,
+    provider_response: &Value,
+) -> Value {
+    let inspection = match state.runtime.block_on(db::find_production_inspection(
+        &state.database.connection,
+        inspection_id,
+    )) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return json!({
+                "ok": false,
+                "error": "production_inspection_not_found",
+                "inspectionId": inspection_id
+            });
+        }
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": error.to_string(),
+                "inspectionId": inspection_id
+            });
+        }
+    };
+    let summary_path = inspection.summary_path.trim().to_string();
+    if summary_path.is_empty() {
+        return json!({
+            "ok": false,
+            "error": "summary_path_empty",
+            "inspectionId": inspection_id
+        });
+    }
+
+    let session = state
+        .runtime
+        .block_on(db::find_material_session(
+            &state.database.connection,
+            session_id,
+        ))
+        .ok()
+        .flatten();
+    let files = match state.runtime.block_on(db::capture_files_for_inspection(
+        &state.database.connection,
+        inspection_id,
+    )) {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": error.to_string(),
+                "inspectionId": inspection_id,
+                "path": summary_path
+            });
+        }
+    };
+    let file_items = files
+        .iter()
+        .map(|file| {
+            json!({
+                "id": file.id,
+                "cameraId": file.camera_id,
+                "cameraIp": file.camera_ip,
+                "dataName": file.data_name,
+                "sequenceNo": file.sequence_no,
+                "fileType": file.file_type,
+                "path": file.path,
+                "metadataPath": file.metadata_path,
+                "createdAt": file.created_at
+            })
+        })
+        .collect::<Vec<_>>();
+    let depth_count = files.iter().filter(|file| file.data_name == "depth").count();
+    let intensity_count = files
+        .iter()
+        .filter(|file| file.data_name == "intensity")
+        .count();
+    let metadata_count = files
+        .iter()
+        .filter(|file| file.data_name == "metadata")
+        .count();
+    let sdk_derived_count = files
+        .iter()
+        .filter(|file| file.data_name.starts_with("sdk-derived"))
+        .count();
+    let file_count = file_items.len();
+    let summary = json!({
+        "schema": "steel.production.summary.v1",
+        "writtenAt": current_time_string(),
+        "materialId": material_id,
+        "sessionId": session_id,
+        "inspectionId": inspection_id,
+        "session": session.as_ref().map(|item| {
+            json!({
+                "id": item.id,
+                "materialId": item.material_id,
+                "status": item.status,
+                "controlMode": item.control_mode,
+                "triggerMode": item.trigger_mode,
+                "steelType": item.steel_type,
+                "widthMm": item.width_mm,
+                "lengthMm": item.length_mm,
+                "thicknessMm": item.thickness_mm,
+                "startedAt": item.started_at,
+                "finishedAt": item.finished_at,
+                "updatedAt": item.updated_at
+            })
+        }),
+        "inspection": {
+            "id": inspection.id,
+            "materialId": inspection.material_id,
+            "sessionId": inspection.session_id,
+            "status": inspection.status,
+            "storageRoot": inspection.storage_root,
+            "summaryPath": inspection.summary_path,
+            "startedAt": inspection.started_at,
+            "finishedAt": inspection.finished_at,
+            "captureCount": inspection.capture_count,
+            "defectCount": inspection.defect_count
+        },
+        "captureFiles": {
+            "count": file_count,
+            "depth": depth_count,
+            "intensity": intensity_count,
+            "metadata": metadata_count,
+            "sdkDerived": sdk_derived_count,
+            "items": file_items
+        },
+        "provider": provider_response
+    });
+    let path = Path::new(&summary_path);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return json!({
+                "ok": false,
+                "error": error.to_string(),
+                "path": summary_path
+            });
+        }
+    }
+    match serde_json::to_string_pretty(&summary)
+        .map_err(|error| error.to_string())
+        .and_then(|text| fs::write(path, text).map_err(|error| error.to_string()))
+    {
+        Ok(()) => json!({
+            "ok": true,
+            "path": summary_path,
+            "fileCount": file_count,
+            "depth": depth_count,
+            "intensity": intensity_count,
+            "metadata": metadata_count,
+            "sdkDerived": sdk_derived_count
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "error": error,
+            "path": summary_path
+        }),
+    }
+}
+
+fn update_production_summary_algorithm_section(
+    storage_root: &str,
+    material_id: &str,
+    session_id: &str,
+    inspection_id: &str,
+    status: &str,
+    manifest_path: &str,
+    algorithm_payload: &Value,
+) -> Value {
+    let Some(path) = production_session_summary_path(storage_root, material_id, session_id) else {
+        return json!({
+            "ok": false,
+            "error": "capture_summary_path_unavailable",
+            "storageRoot": storage_root,
+            "materialId": material_id,
+            "sessionId": session_id
+        });
+    };
+    if !path.is_file() {
+        return json!({
+            "ok": false,
+            "error": "capture_summary_not_found",
+            "path": path.display().to_string()
+        });
+    }
+    let text = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": error.to_string(),
+                "path": path.display().to_string()
+            });
+        }
+    };
+    let mut summary = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(object)) => object,
+        Ok(_) => serde_json::Map::new(),
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": error.to_string(),
+                "path": path.display().to_string()
+            });
+        }
+    };
+    let manifest = algorithm_payload
+        .pointer("/result/manifest")
+        .or_else(|| algorithm_payload.get("manifest"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let run_id = manifest
+        .get("runId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let acceptance_status = manifest
+        .pointer("/acceptance/status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let core_available = manifest
+        .pointer("/core/available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let core_output_bytes = manifest
+        .pointer("/core/summary/outputBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    summary.insert(
+        "algorithm".to_string(),
+        json!({
+            "status": status,
+            "inspectionId": inspection_id,
+            "manifestPath": manifest_path,
+            "runId": run_id,
+            "acceptanceStatus": acceptance_status,
+            "coreAvailable": core_available,
+            "coreOutputBytes": core_output_bytes,
+            "updatedAt": current_time_string()
+        }),
+    );
+    if let Some(inspection) = summary
+        .get_mut("inspection")
+        .and_then(Value::as_object_mut)
+    {
+        inspection.insert("status".to_string(), json!(status));
+        inspection.insert("captureSummaryPath".to_string(), json!(path.display().to_string()));
+        inspection.insert("algorithmSummaryPath".to_string(), json!(manifest_path));
+    }
+    summary.insert("writtenAt".to_string(), json!(current_time_string()));
+    summary.insert("schema".to_string(), json!("steel.production.summary.v1"));
+    let output = Value::Object(summary);
+    match serde_json::to_string_pretty(&output)
+        .map_err(|error| error.to_string())
+        .and_then(|text| fs::write(&path, text).map_err(|error| error.to_string()))
+    {
+        Ok(()) => json!({
+            "ok": true,
+            "path": path.display().to_string(),
+            "status": status,
+            "manifestPath": manifest_path,
+            "acceptanceStatus": acceptance_status,
+            "coreAvailable": core_available,
+            "coreOutputBytes": core_output_bytes
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "error": error,
+            "path": path.display().to_string()
+        }),
+    }
 }
 
 fn write_capture_summary_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
@@ -5288,6 +6307,9 @@ fn write_production_capture_once_response(state: &ServiceState, body: &str, acto
             );
         }
     };
+    if let Err(response) = validate_capture_open_session(state, &payload) {
+        return response;
+    }
     let (material_id, session_id) = active_session_for_payload(state, &payload);
     let mut capture_body = payload.as_object().cloned().unwrap_or_default();
     capture_body
@@ -5323,13 +6345,32 @@ fn write_production_capture_once_response(state: &ServiceState, body: &str, acto
     capture_body
         .entry("stopStreams".to_string())
         .or_insert_with(|| json!(true));
+    capture_body
+        .entry("steelStateAware".to_string())
+        .or_insert_with(|| json!(true));
+    capture_body
+        .entry("requireSteelPresent".to_string())
+        .or_insert_with(|| json!(true));
+    capture_body
+        .entry("discardBlackFrames".to_string())
+        .or_insert_with(|| json!(true));
+    capture_body
+        .entry("saveSdkDerived".to_string())
+        .or_insert_with(|| json!(false));
     capture_body.insert("materialId".to_string(), json!(material_id.clone()));
     capture_body.insert("sessionId".to_string(), json!(session_id.clone()));
     capture_body.insert("productionLayout".to_string(), json!(true));
-    let provider_body = Value::Object(capture_body).to_string();
+    let provider_payload = Value::Object(capture_body);
+    let provider_timeout = continuous_capture_proxy_timeout(&provider_payload);
+    let provider_body = provider_payload.to_string();
     let provider = state
         .capture
-        .proxy("POST", "/api/capture/continuous-test", &provider_body)
+        .proxy_with_read_timeout(
+            "POST",
+            "/api/capture/continuous-test",
+            &provider_body,
+            provider_timeout,
+        )
         .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
         .unwrap_or_else(|| json!({ "code": 503, "error": "capture_provider_offline" }));
     if provider.get("code").and_then(Value::as_i64).unwrap_or(503) == 503 {
@@ -5343,7 +6384,22 @@ fn write_production_capture_once_response(state: &ServiceState, body: &str, acto
     let mut summary = provider.as_object().cloned().unwrap_or_default();
     summary.insert("materialId".to_string(), json!(material_id.clone()));
     summary.insert("sessionId".to_string(), json!(session_id.clone()));
-    let summary_json = Value::Object(summary).to_string();
+    let production_summary_output =
+        production_summary_path(&Value::Object(summary.clone()), &material_id, &session_id);
+    if let Some(path) = production_summary_output.as_ref() {
+        summary.insert(
+            "summaryOutput".to_string(),
+            json!(path.to_string_lossy().to_string()),
+        );
+    }
+    let provider_response = Value::Object(summary);
+    let summary_json = provider_response.to_string();
+    if let Some(path) = production_summary_output {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, &summary_json);
+    }
     let record_response = write_capture_summary_response(state, &summary_json, actor);
     let record_body = String::from_utf8_lossy(
         record_response
@@ -5359,11 +6415,309 @@ fn write_production_capture_once_response(state: &ServiceState, body: &str, acto
         "200 OK",
         "application/json; charset=utf-8",
         &json!({
-            "code": provider.get("code").and_then(Value::as_i64).unwrap_or(0),
+            "code": provider_response.get("code").and_then(Value::as_i64).unwrap_or(0),
             "materialId": material_id,
             "sessionId": session_id,
-            "provider": provider,
+            "provider": provider_response,
             "record": record
+        })
+        .to_string(),
+    )
+}
+
+fn production_algorithm_session_for_payload(
+    state: &ServiceState,
+    payload: &Value,
+) -> (String, String) {
+    let latest = state
+        .runtime
+        .block_on(db::latest_material_session(&state.database.connection))
+        .ok()
+        .flatten();
+    let material_id = material_id_from_payload(
+        payload,
+        latest
+            .as_ref()
+            .map(|session| session.material_id.as_str())
+            .unwrap_or("unknown-material"),
+    );
+    let explicit_session_id = value_string(payload, &["sessionId", "session_id"]);
+    if !explicit_session_id.is_empty() {
+        return (material_id, explicit_session_id);
+    }
+    let latest_for_material = state
+        .runtime
+        .block_on(db::latest_material_session_for_material(
+            &state.database.connection,
+            &material_id,
+        ))
+        .ok()
+        .flatten();
+    let session_id = latest_for_material
+        .map(|session| session.id)
+        .unwrap_or_else(|| session_id_from_payload(payload, &material_id));
+    (material_id, session_id)
+}
+
+fn algorithm_manifest_path_from_payload(payload: &Value) -> String {
+    payload
+        .pointer("/result/latest/manifestPath")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/result/manifest/runDir").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn upsert_algorithm_inspection_state(
+    state: &ServiceState,
+    payload: &Value,
+    material_id: &str,
+    session_id: &str,
+    inspection_id: &str,
+    status: &str,
+    summary_path: &str,
+    raw_payload: &Value,
+) -> Result<db::entities::production_inspection::Model, String> {
+    let existing = state
+        .runtime
+        .block_on(db::find_production_inspection(
+            &state.database.connection,
+            inspection_id,
+        ))
+        .map_err(|error| error.to_string())?;
+    let now = current_time_string();
+    let storage_root = value_string(payload, &["storageRoot", "storage_root"]).if_empty(
+        &value_string(payload, &["captureRoot", "capture_root"]).if_empty(
+            existing
+                .as_ref()
+                .map(|item| item.storage_root.as_str())
+                .unwrap_or_default(),
+        ),
+    );
+    let existing_summary = existing
+        .as_ref()
+        .map(|item| item.summary_path.as_str())
+        .unwrap_or_default();
+    let next_summary_path = if summary_path.trim().is_empty() {
+        value_string(payload, &["summaryPath", "summary_path"]).if_empty(existing_summary)
+    } else {
+        summary_path.to_string()
+    };
+    let started_at = existing
+        .as_ref()
+        .map(|item| item.started_at.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| now.clone());
+    let capture_count = value_i32(
+        payload,
+        &["captureCount", "capture_count"],
+        existing.as_ref().map(|item| item.capture_count).unwrap_or(0),
+    );
+    let defect_count = value_i32(
+        payload,
+        &["defectCount", "defect_count"],
+        existing.as_ref().map(|item| item.defect_count).unwrap_or(0),
+    );
+    state
+        .runtime
+        .block_on(db::upsert_production_inspection(
+            &state.database.connection,
+            db::ProductionInspectionInput {
+                id: inspection_id.to_string(),
+                material_id: material_id.to_string(),
+                session_id: session_id.to_string(),
+                status: status.to_string(),
+                storage_root,
+                summary_path: next_summary_path,
+                started_at,
+                finished_at: now,
+                capture_count,
+                defect_count,
+                raw_payload: raw_payload.to_string(),
+            },
+        ))
+        .map_err(|error| error.to_string())
+}
+
+fn write_production_algorithm_run_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "code": 400, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    let (material_id, session_id) = production_algorithm_session_for_payload(state, &payload);
+    let inspection_id =
+        value_string(&payload, &["inspectionId", "inspection_id"]).if_empty(&format!("INSP-{session_id}"));
+    let mut algorithm_request = payload.as_object().cloned().unwrap_or_default();
+    algorithm_request.insert("materialId".to_string(), json!(material_id.clone()));
+    algorithm_request
+        .entry("captureRoot".to_string())
+        .or_insert_with(|| json!(bar_surface_capture_root().display().to_string()));
+    algorithm_request
+        .entry("outputRoot".to_string())
+        .or_insert_with(|| json!(algorithm_data_root().display().to_string()));
+    algorithm_request
+        .entry("runCore".to_string())
+        .or_insert_with(|| json!(true));
+    algorithm_request
+        .entry("maxFrames".to_string())
+        .or_insert_with(|| json!(24));
+    algorithm_request
+        .entry("meshRows".to_string())
+        .or_insert_with(|| json!(144));
+    algorithm_request
+        .entry("meshColsPerCamera".to_string())
+        .or_insert_with(|| json!(72));
+    algorithm_request
+        .entry("maxFaceEdgeMm".to_string())
+        .or_insert_with(|| json!(8.0));
+
+    let running_payload = json!({
+        "request": Value::Object(algorithm_request.clone()),
+        "phase": "algorithm-running"
+    });
+    if let Err(error) = upsert_algorithm_inspection_state(
+        state,
+        &payload,
+        &material_id,
+        &session_id,
+        &inspection_id,
+        "algorithm-running",
+        "",
+        &running_payload,
+    ) {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({ "code": 500, "error": error }).to_string(),
+        );
+    }
+
+    let algorithm_payload = match run_bar_surface_algorithm(&Value::Object(algorithm_request)) {
+        Ok(value) => value,
+        Err(error) => {
+            let failed_payload = json!({
+                "request": payload,
+                "algorithm": error,
+                "phase": "algorithm-failed"
+            });
+            let failed_record = upsert_algorithm_inspection_state(
+                state,
+                &failed_payload["request"],
+                &material_id,
+                &session_id,
+                &inspection_id,
+                "algorithm-failed",
+                "",
+                &failed_payload,
+            );
+            let capture_summary = failed_record
+                .as_ref()
+                .map(|record| {
+                    update_production_summary_algorithm_section(
+                        &record.storage_root,
+                        &material_id,
+                        &session_id,
+                        &inspection_id,
+                        "algorithm-failed",
+                        "",
+                        &failed_payload["algorithm"],
+                    )
+                })
+                .unwrap_or_else(|error| {
+                    json!({
+                        "ok": false,
+                        "error": error,
+                        "status": "algorithm-failed"
+                    })
+                });
+            let _ = state.runtime.block_on(db::append_audit_log(
+                &state.database.connection,
+                actor,
+                "production.algorithm.failed",
+                &material_id,
+                &format!("bar surface algorithm failed inspection={inspection_id}"),
+                "error",
+            ));
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 500,
+                    "materialId": material_id,
+                    "sessionId": session_id,
+                    "inspectionId": inspection_id,
+                    "captureSummary": capture_summary,
+                    "algorithm": error
+                })
+                .to_string(),
+            );
+        }
+    };
+
+    let manifest_path = algorithm_manifest_path_from_payload(&algorithm_payload);
+    let record = match upsert_algorithm_inspection_state(
+        state,
+        &payload,
+        &material_id,
+        &session_id,
+        &inspection_id,
+        "algorithm-complete",
+        &manifest_path,
+        &json!({
+            "request": payload,
+            "algorithm": algorithm_payload,
+            "phase": "algorithm-complete"
+        }),
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({ "code": 500, "error": error, "algorithm": algorithm_payload }).to_string(),
+            );
+        }
+    };
+    let capture_summary = update_production_summary_algorithm_section(
+        &record.storage_root,
+        &material_id,
+        &session_id,
+        &inspection_id,
+        "algorithm-complete",
+        &manifest_path,
+        &algorithm_payload,
+    );
+    let _ = state.runtime.block_on(db::append_audit_log(
+        &state.database.connection,
+        actor,
+        "production.algorithm.complete",
+        &material_id,
+        &format!("bar surface algorithm complete inspection={inspection_id}"),
+        "info",
+    ));
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "materialId": material_id,
+            "sessionId": session_id,
+            "inspectionId": inspection_id,
+            "record": {
+                "id": record.id,
+                "status": record.status,
+                "summaryPath": record.summary_path,
+                "captureCount": record.capture_count,
+                "defectCount": record.defect_count
+            },
+            "captureSummary": capture_summary,
+            "algorithm": algorithm_payload
         })
         .to_string(),
     )
@@ -5487,6 +6841,742 @@ fn query_value(query: &str, key: &str) -> Option<String> {
     })
 }
 
+fn workspace_root() -> PathBuf {
+    if let Ok(explicit_path) = env::var("STEEL_WORKSPACE_ROOT") {
+        return PathBuf::from(explicit_path);
+    }
+    if let Ok(current_dir) = env::current_dir() {
+        for ancestor in current_dir.ancestors().take(8) {
+            if ancestor.join("scripts").join("bar_surface_reconstruct.py").is_file() {
+                return ancestor.to_path_buf();
+            }
+        }
+        return current_dir;
+    }
+    PathBuf::from(".")
+}
+
+fn algorithm_data_root() -> PathBuf {
+    env::var("STEEL_ALGORITHM_DATA_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"G:\bar-surface-algorithm"))
+}
+
+fn bar_surface_capture_root() -> PathBuf {
+    env::var("STEEL_BAR_CAPTURE_ROOT")
+        .or_else(|_| env::var("CAPTURE_CAMERA_STORAGE_ROOT"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"H:\"))
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "json" => "application/json; charset=utf-8",
+        "obj" => "text/plain; charset=utf-8",
+        "mtl" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "bsmesh" => "application/octet-stream",
+        _ => "application/octet-stream",
+    }
+}
+
+fn resolve_algorithm_file(root: &Path, value: &str) -> Result<PathBuf, String> {
+    if value.trim().is_empty() {
+        return Err("missing_path".to_string());
+    }
+    let candidate = PathBuf::from(value);
+    let candidate = if candidate.is_absolute() {
+        candidate
+    } else {
+        root.join(candidate)
+    };
+    let root_canonical = root
+        .canonicalize()
+        .map_err(|error| format!("algorithm_root_unavailable: {error}"))?;
+    let file_canonical = candidate
+        .canonicalize()
+        .map_err(|error| format!("algorithm_file_unavailable: {error}"))?;
+    if !file_canonical.starts_with(&root_canonical) {
+        return Err("algorithm_path_outside_root".to_string());
+    }
+    Ok(file_canonical)
+}
+
+fn display_algorithm_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+}
+
+fn algorithm_relative_path(root: &Path, path: &Path) -> String {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical_path
+        .strip_prefix(&canonical_root)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| display_algorithm_path(&canonical_path))
+}
+
+fn algorithm_core_summary_path(
+    root: &Path,
+    manifest_path: &Path,
+    manifest: &Value,
+) -> PathBuf {
+    if let Some(mesh_json) = manifest.pointer("/mesh/json").and_then(Value::as_str) {
+        if let Ok(mesh_path) = resolve_algorithm_file(root, mesh_json) {
+            if let Some(parent) = mesh_path.parent() {
+                return parent.join("bar_surface_core_summary.json");
+            }
+        }
+    }
+    manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("mesh")
+        .join("bar_surface_core_summary.json")
+}
+
+fn read_algorithm_core_info(root: &Path, manifest_path: &Path, manifest: &Value) -> Value {
+    let summary_path = algorithm_core_summary_path(root, manifest_path, manifest);
+    if !summary_path.is_file() {
+        return json!({"available": false});
+    }
+    let summary = fs::read_to_string(&summary_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({}));
+    let binary_path = summary
+        .get("binary")
+        .and_then(Value::as_str)
+        .and_then(|path| resolve_algorithm_file(root, path).ok());
+    json!({
+        "available": true,
+        "summaryPath": display_algorithm_path(&summary_path),
+        "summaryRelative": algorithm_relative_path(root, &summary_path),
+        "binary": binary_path.as_ref().map(|path| display_algorithm_path(path)).unwrap_or_default(),
+        "binaryRelative": binary_path.as_ref().map(|path| algorithm_relative_path(root, path)).unwrap_or_default(),
+        "summary": summary
+    })
+}
+
+fn augment_algorithm_manifest(root: &Path, manifest_path: &Path, manifest: Value) -> Value {
+    let core = read_algorithm_core_info(root, manifest_path, &manifest);
+    match manifest {
+        Value::Object(mut object) => {
+            object.insert("core".to_string(), core);
+            Value::Object(object)
+        }
+        other => other,
+    }
+}
+
+fn read_algorithm_latest_payload(root: &Path) -> Result<Value, String> {
+    let latest_path = root.join("latest.json");
+    let latest_text = fs::read_to_string(&latest_path)
+        .map_err(|error| format!("algorithm_latest_unavailable: {error}"))?;
+    let latest: Value = serde_json::from_str(&latest_text)
+        .map_err(|error| format!("algorithm_latest_invalid: {error}"))?;
+    let manifest_value = latest
+        .get("manifestPath")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "algorithm_manifest_path_missing".to_string())?;
+    let manifest_path = resolve_algorithm_file(root, manifest_value)?;
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("algorithm_manifest_unavailable: {error}"))?;
+    let manifest: Value = serde_json::from_str(&manifest_text)
+        .map_err(|error| format!("algorithm_manifest_invalid: {error}"))?;
+    let manifest = augment_algorithm_manifest(root, &manifest_path, manifest);
+    Ok(json!({
+        "code": 0,
+        "root": root.display().to_string(),
+        "latest": latest,
+        "manifest": manifest
+    }))
+}
+
+fn algorithm_latest_response() -> Vec<u8> {
+    let root = algorithm_data_root();
+    match read_algorithm_latest_payload(&root) {
+        Ok(payload) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &payload.to_string(),
+        ),
+        Err(error) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({"code": 404, "error": error, "root": root.display().to_string()}).to_string(),
+        ),
+    }
+}
+
+fn algorithm_manifest_response(query: &str) -> Vec<u8> {
+    let root = algorithm_data_root();
+    let manifest_path = match query_value(query, "path").or_else(|| query_value(query, "relative")) {
+        Some(value) => match resolve_algorithm_file(&root, &value) {
+            Ok(path) => path,
+            Err(error) => {
+                return http_response(
+                    "404 Not Found",
+                    "application/json; charset=utf-8",
+                    &json!({"code": 404, "error": error}).to_string(),
+                );
+            }
+        },
+        None => match read_algorithm_latest_payload(&root)
+            .ok()
+            .and_then(|payload| payload.get("latest").cloned())
+            .and_then(|latest| latest.get("manifestPath").and_then(Value::as_str).map(str::to_string))
+        {
+            Some(value) => match resolve_algorithm_file(&root, &value) {
+                Ok(path) => path,
+                Err(error) => {
+                    return http_response(
+                        "404 Not Found",
+                        "application/json; charset=utf-8",
+                        &json!({"code": 404, "error": error}).to_string(),
+                    );
+                }
+            },
+            None => {
+                return http_response(
+                    "404 Not Found",
+                    "application/json; charset=utf-8",
+                    "{\"code\":404,\"error\":\"algorithm_manifest_missing\"}",
+                );
+            }
+        },
+    };
+    match fs::read_to_string(&manifest_path) {
+        Ok(body) => match serde_json::from_str::<Value>(&body) {
+            Ok(manifest) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &augment_algorithm_manifest(&root, &manifest_path, manifest).to_string(),
+            ),
+            Err(error) => http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"code": 500, "error": error.to_string()}).to_string(),
+            ),
+        },
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code": 500, "error": error.to_string()}).to_string(),
+        ),
+    }
+}
+
+fn algorithm_file_response(query: &str) -> Vec<u8> {
+    let root = algorithm_data_root();
+    let Some(value) = query_value(query, "path").or_else(|| query_value(query, "relative")) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"missing_path\"}",
+        );
+    };
+    let path = match resolve_algorithm_file(&root, &value) {
+        Ok(path) => path,
+        Err(error) => {
+            return http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({"code": 404, "error": error}).to_string(),
+            );
+        }
+    };
+    match fs::read(&path) {
+        Ok(body) => http_bytes_response_with_headers(
+            "200 OK",
+            content_type_for_path(&path),
+            &body,
+            &[],
+        ),
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code": 500, "error": error.to_string()}).to_string(),
+        ),
+    }
+}
+
+fn algorithm_value_string(value: &Value, key: &str, fallback: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn algorithm_value_i64(value: &Value, key: &str, fallback: i64) -> i64 {
+    value.get(key).and_then(Value::as_i64).unwrap_or(fallback)
+}
+
+fn algorithm_value_f64(value: &Value, key: &str, fallback: f64) -> f64 {
+    value.get(key).and_then(Value::as_f64).unwrap_or(fallback)
+}
+
+fn algorithm_value_bool(value: &Value, key: &str, fallback: bool) -> bool {
+    value.get(key).and_then(Value::as_bool).unwrap_or(fallback)
+}
+
+fn algorithm_core_exe_path() -> Option<PathBuf> {
+    if let Ok(path) = env::var("STEEL_BAR_SURFACE_CORE_EXE") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let workspace = workspace_root();
+    for configuration in ["Release", "Debug"] {
+        let candidate = workspace
+            .join("target")
+            .join("algorithm-core")
+            .join(configuration)
+            .join("steel_bar_surface_core.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn run_algorithm_core_for_manifest(manifest_path: &Path) -> Value {
+    let Some(exe) = algorithm_core_exe_path() else {
+        return json!({"attempted": false, "available": false, "error": "algorithm_core_exe_missing"});
+    };
+    match Command::new(&exe)
+        .arg("--manifest")
+        .arg(manifest_path)
+        .output()
+    {
+        Ok(output) => json!({
+            "attempted": true,
+            "available": output.status.success(),
+            "exe": exe.display().to_string(),
+            "status": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+            "stderr": String::from_utf8_lossy(&output.stderr).trim()
+        }),
+        Err(error) => json!({
+            "attempted": true,
+            "available": false,
+            "exe": exe.display().to_string(),
+            "error": error.to_string()
+        }),
+    }
+}
+
+fn run_bar_surface_algorithm(request: &Value) -> Result<Value, Value> {
+    let capture_root = algorithm_value_string(request, "captureRoot", r"H:\");
+    let output_root = algorithm_value_string(
+        request,
+        "outputRoot",
+        &algorithm_data_root().display().to_string(),
+    );
+    let material_id = algorithm_value_string(request, "materialId", "latest");
+    let calibration_path = algorithm_value_string(
+        request,
+        "calibrationPath",
+        &algorithm_value_string(request, "calibration", ""),
+    );
+    let max_frames = algorithm_value_i64(request, "maxFrames", 24).clamp(1, 240).to_string();
+    let mesh_rows = algorithm_value_i64(request, "meshRows", 144).clamp(24, 512).to_string();
+    let mesh_cols = algorithm_value_i64(request, "meshColsPerCamera", 72)
+        .clamp(24, 256)
+        .to_string();
+    let max_face_edge = algorithm_value_f64(request, "maxFaceEdgeMm", 8.0)
+        .clamp(0.0, 1000.0)
+        .to_string();
+    let contour_crop = algorithm_value_bool(request, "contourCrop", true);
+    let contour_radius_tolerance = algorithm_value_f64(request, "contourRadiusToleranceMm", 0.0)
+        .clamp(0.0, 1000.0)
+        .to_string();
+    let contour_min_keep_ratio = algorithm_value_f64(request, "contourMinKeepRatio", 0.55)
+        .clamp(0.0, 1.0)
+        .to_string();
+    let contour_min_row_coverage = algorithm_value_f64(request, "contourMinRowCoverage", 0.25)
+        .clamp(0.0, 1.0)
+        .to_string();
+    let contour_auto_percentile = algorithm_value_f64(request, "contourAutoPercentile", 96.0)
+        .clamp(50.0, 99.9)
+        .to_string();
+    let run_core = algorithm_value_bool(request, "runCore", true);
+    let script = workspace_root()
+        .join("scripts")
+        .join("bar_surface_reconstruct.py");
+    if !script.is_file() {
+        return Err(json!({"code": 500, "error": "algorithm_script_missing", "script": script.display().to_string()}));
+    }
+    let python = env::var("STEEL_PYTHON").unwrap_or_else(|_| "python".to_string());
+    let mut command = Command::new(&python);
+    command
+        .arg(&script)
+        .arg("--capture-root")
+        .arg(&capture_root)
+        .arg("--output-root")
+        .arg(&output_root)
+        .arg("--material-id")
+        .arg(&material_id)
+        .arg("--max-frames")
+        .arg(&max_frames)
+        .arg("--mesh-rows")
+        .arg(&mesh_rows)
+        .arg("--mesh-cols-per-camera")
+        .arg(&mesh_cols)
+        .arg("--max-face-edge-mm")
+        .arg(&max_face_edge)
+        .arg("--contour-radius-tolerance-mm")
+        .arg(&contour_radius_tolerance)
+        .arg("--contour-min-keep-ratio")
+        .arg(&contour_min_keep_ratio)
+        .arg("--contour-min-row-coverage")
+        .arg(&contour_min_row_coverage)
+        .arg("--contour-auto-percentile")
+        .arg(&contour_auto_percentile);
+    if !contour_crop {
+        command.arg("--no-contour-crop");
+    }
+    if !calibration_path.trim().is_empty() {
+        command.arg("--calibration").arg(&calibration_path);
+    }
+    let output = command.output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let root = PathBuf::from(output_root);
+            let latest_before_core = read_algorithm_latest_payload(&root)
+                .unwrap_or_else(|error| json!({"code": 0, "warning": error}));
+            let manifest_path = latest_before_core
+                .get("latest")
+                .and_then(|latest| latest.get("manifestPath"))
+                .and_then(Value::as_str)
+                .and_then(|value| resolve_algorithm_file(&root, value).ok());
+            let core = if run_core {
+                manifest_path
+                    .as_ref()
+                    .map(|path| run_algorithm_core_for_manifest(path))
+                    .unwrap_or_else(|| json!({"attempted": false, "available": false, "error": "algorithm_manifest_missing"}))
+            } else {
+                json!({"attempted": false, "available": false, "skipped": true})
+            };
+            let latest = read_algorithm_latest_payload(&root)
+                .unwrap_or(latest_before_core);
+            Ok(json!({
+                    "code": 0,
+                    "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+                    "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+                    "core": core,
+                    "result": latest
+            }))
+        }
+        Ok(output) => Err(json!({
+                "code": 500,
+                "error": "algorithm_run_failed",
+                "status": output.status.code(),
+                "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+                "stderr": String::from_utf8_lossy(&output.stderr).trim()
+        })),
+        Err(error) => Err(json!({"code": 500, "error": error.to_string()})),
+    }
+}
+
+fn run_bar_surface_calibration_fit(request: &Value) -> Result<Value, Value> {
+    let capture_root = algorithm_value_string(request, "captureRoot", &bar_surface_capture_root().display().to_string());
+    let material_id = algorithm_value_string(request, "materialId", "latest");
+    let calibration_path = algorithm_value_string(
+        request,
+        "calibrationPath",
+        &algorithm_value_string(request, "calibration", ""),
+    );
+    let output_root = algorithm_value_string(request, "outputRoot", r"E:\steel-capture-data\analysis");
+    let rows = algorithm_value_string(request, "rows", "250,500,750");
+    let max_points = algorithm_value_i64(request, "maxPointsPerCamera", 2400)
+        .clamp(100, 20000)
+        .to_string();
+    let max_shift = algorithm_value_f64(request, "maxShiftMm", 5.0)
+        .clamp(0.1, 50.0)
+        .to_string();
+    let script = workspace_root()
+        .join("scripts")
+        .join("fit_array_calibration_cross_section.py");
+    if !script.is_file() {
+        return Err(json!({"code": 500, "error": "calibration_fit_script_missing", "script": script.display().to_string()}));
+    }
+    let python = env::var("STEEL_PYTHON").unwrap_or_else(|_| "python".to_string());
+    let mut command = Command::new(&python);
+    command
+        .arg(&script)
+        .arg("--capture-root")
+        .arg(&capture_root)
+        .arg("--material-id")
+        .arg(&material_id)
+        .arg("--rows")
+        .arg(&rows)
+        .arg("--output-root")
+        .arg(&output_root)
+        .arg("--max-points-per-camera")
+        .arg(&max_points)
+        .arg("--max-shift-mm")
+        .arg(&max_shift);
+    if !calibration_path.trim().is_empty() {
+        command.arg("--calibration").arg(&calibration_path);
+    }
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let result = serde_json::from_str::<Value>(&stdout)
+                .unwrap_or_else(|_| json!({"raw": stdout}));
+            Ok(json!({
+                "code": 0,
+                "stdout": stdout,
+                "stderr": stderr,
+                "result": result
+            }))
+        }
+        Ok(output) => Err(json!({
+            "code": 500,
+            "error": "calibration_fit_failed",
+            "status": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+            "stderr": String::from_utf8_lossy(&output.stderr).trim()
+        })),
+        Err(error) => Err(json!({"code": 500, "error": error.to_string()})),
+    }
+}
+
+fn algorithm_run_response(body: &str) -> Vec<u8> {
+    let request: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+    match run_bar_surface_algorithm(&request) {
+        Ok(payload) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &payload.to_string(),
+        ),
+        Err(payload) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &payload.to_string(),
+        ),
+    }
+}
+
+fn algorithm_calibration_fit_response(body: &str) -> Vec<u8> {
+    let request: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+    match run_bar_surface_calibration_fit(&request) {
+        Ok(payload) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &payload.to_string(),
+        ),
+        Err(payload) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &payload.to_string(),
+        ),
+    }
+}
+
+fn path_modified_millis(path: &Path) -> u64 {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn count_files_with_extension(path: &Path, extension: &str) -> usize {
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case(extension))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn algorithm_capture_materials_response(query: &str) -> Vec<u8> {
+    let root = query_value(query, "captureRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(bar_surface_capture_root);
+    let limit = query_value(query, "limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(80)
+        .clamp(1, 500);
+    let camera_names = ["camera1", "camera2", "camera3", "camera4", "camera5", "camera6"];
+    let camera_roots = camera_names
+        .iter()
+        .map(|name| root.join(name))
+        .collect::<Vec<_>>();
+    let first_root = &camera_roots[0];
+    let mut materials = fs::read_dir(first_root)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| {
+            let material_dir = entry.path();
+            if !material_dir.is_dir() {
+                return None;
+            }
+            let material_id = material_dir.file_name()?.to_string_lossy().to_string();
+            let mut cameras = Vec::new();
+            let mut complete = true;
+            let mut min_depth = usize::MAX;
+            let mut latest_modified = path_modified_millis(&material_dir);
+            for (index, camera_root) in camera_roots.iter().enumerate() {
+                let camera_dir = camera_root.join(&material_id);
+                let depth_dir = camera_dir.join("depth");
+                let intensity_dir = camera_dir.join("intensity");
+                let metadata_dir = camera_dir.join("metadata");
+                let depth_count = count_files_with_extension(&depth_dir, "png");
+                let intensity_count = count_files_with_extension(&intensity_dir, "png");
+                let metadata_count = count_files_with_extension(&metadata_dir, "json");
+                let present = depth_dir.is_dir() && intensity_dir.is_dir();
+                complete &= present && depth_count > 0 && intensity_count > 0;
+                min_depth = min_depth.min(depth_count);
+                latest_modified = latest_modified.max(path_modified_millis(&camera_dir));
+                cameras.push(json!({
+                    "name": camera_names[index],
+                    "root": camera_root.display().to_string(),
+                    "path": camera_dir.display().to_string(),
+                    "present": present,
+                    "depthCount": depth_count,
+                    "intensityCount": intensity_count,
+                    "metadataCount": metadata_count
+                }));
+            }
+            if min_depth == usize::MAX {
+                min_depth = 0;
+            }
+            Some(json!({
+                "materialId": material_id,
+                "path": material_dir.display().to_string(),
+                "complete": complete,
+                "cameraCount": cameras.iter().filter(|camera| camera.get("present").and_then(Value::as_bool).unwrap_or(false)).count(),
+                "minDepthFrames": min_depth,
+                "updatedAtMillis": latest_modified,
+                "cameras": cameras
+            }))
+        })
+        .collect::<Vec<_>>();
+    materials.sort_by(|a, b| {
+        b.get("updatedAtMillis")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .cmp(&a.get("updatedAtMillis").and_then(Value::as_u64).unwrap_or(0))
+    });
+    materials.truncate(limit);
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "captureRoot": root.display().to_string(),
+            "materials": materials
+        })
+        .to_string(),
+    )
+}
+
+fn algorithm_runs_response(query: &str) -> Vec<u8> {
+    let root = algorithm_data_root();
+    let runs_root = root.join("runs");
+    let material_filter = query_value(query, "materialId").filter(|value| !value.trim().is_empty());
+    let mut runs = Vec::new();
+    if let Ok(material_entries) = fs::read_dir(&runs_root) {
+        for material_entry in material_entries.flatten() {
+            let material_dir = material_entry.path();
+            if !material_dir.is_dir() {
+                continue;
+            }
+            let material_id = material_dir
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Some(filter) = &material_filter {
+                if &material_id != filter {
+                    continue;
+                }
+            }
+            let Ok(run_entries) = fs::read_dir(&material_dir) else {
+                continue;
+            };
+            for run_entry in run_entries.flatten() {
+                let run_dir = run_entry.path();
+                let manifest_path = run_dir.join("manifest.json");
+                if !manifest_path.is_file() {
+                    continue;
+                }
+                let manifest = fs::read_to_string(&manifest_path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .unwrap_or_else(|| json!({}));
+                let run_id = manifest
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .or_else(|| run_dir.file_name().and_then(|value| value.to_str()))
+                    .unwrap_or_default()
+                    .to_string();
+                let manifest_relative = manifest_path
+                    .strip_prefix(&root)
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| manifest_path.display().to_string());
+                let core_info = read_algorithm_core_info(&root, &manifest_path, &manifest);
+                runs.push(json!({
+                    "materialId": manifest.get("materialId").and_then(Value::as_str).unwrap_or(&material_id),
+                    "runId": run_id,
+                    "createdAt": manifest.get("createdAt").and_then(Value::as_str).unwrap_or_default(),
+                    "runDir": run_dir.display().to_string(),
+                    "manifestPath": manifest_path.display().to_string(),
+                    "manifestRelative": manifest_relative,
+                    "cameraCount": manifest.get("cameraCount").and_then(Value::as_u64).unwrap_or(0),
+                    "frameCount": manifest.pointer("/mesh/frameCount").and_then(Value::as_u64).unwrap_or(0),
+                    "vertexCount": manifest.pointer("/mesh/vertexCount").and_then(Value::as_u64).unwrap_or(0),
+                    "triangleCount": manifest.pointer("/mesh/triangleCount").and_then(Value::as_u64).unwrap_or(0),
+                    "coreAvailable": core_info.get("available").and_then(Value::as_bool).unwrap_or(false),
+                    "coreOutputBytes": core_info.pointer("/summary/outputBytes").and_then(Value::as_u64).unwrap_or(0),
+                    "coreBinaryRelative": core_info.get("binaryRelative").and_then(Value::as_str).unwrap_or_default(),
+                    "coreSummaryRelative": core_info.get("summaryRelative").and_then(Value::as_str).unwrap_or_default(),
+                    "updatedAtMillis": path_modified_millis(&manifest_path)
+                }));
+            }
+        }
+    }
+    runs.sort_by(|a, b| {
+        b.get("updatedAtMillis")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .cmp(&a.get("updatedAtMillis").and_then(Value::as_u64).unwrap_or(0))
+    });
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "root": root.display().to_string(),
+            "runs": runs
+        })
+        .to_string(),
+    )
+}
+
 fn export_filter_value(value: Option<&str>) -> String {
     value
         .map(str::trim)
@@ -5590,7 +7680,7 @@ fn record_retention_detail(
         )
     } else {
         format!(
-            "执行检测记录保留策略：保留 {retention_days} 天，截止 {cutoff_at}，清理记录 {deleted_records} / {matched} 条，缺陷 {deleted_defects} 条，钢板档案 {deleted_plates} 条"
+            "执行检测记录保留策略：保留 {retention_days} 天，截止 {cutoff_at}，清理记录 {deleted_records} / {matched} 条，缺陷 {deleted_defects} 条，钢管档案 {deleted_plates} 条"
         )
     }
 }
@@ -5972,7 +8062,7 @@ fn inspection_record_spec(row: &db::AdminInspectionRecord) -> String {
 }
 
 fn inspection_records_csv(rows: &[db::AdminInspectionRecord]) -> String {
-    let mut csv = String::from("记录号,检测时间,板号,钢种,规格,状态,缺陷总数,严重,待复核,轻微\n");
+    let mut csv = String::from("记录号,检测时间,管号,钢种,规格,状态,缺陷总数,严重,待复核,轻微\n");
     for row in rows {
         let steel_grade = row
             .plate
@@ -7746,7 +9836,7 @@ fn delete_admin_record_response(state: &ServiceState, query: &str, actor: &str) 
     )) {
         Ok(Some(result)) => {
             let detail = format!(
-                "删除检测记录 {}，板号 {}，同步删除缺陷 {} 条，钢板档案{}",
+                "删除检测记录 {}，管号 {}，同步删除缺陷 {} 条，钢管档案{}",
                 result.id,
                 result.plate_no,
                 result.defects_deleted,
@@ -7841,7 +9931,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             "path": database_path,
             "configDir": config_dir,
             "tables": [
-                { "name": "steel_plate", "label": "钢板档案", "rows": metrics.plate_count },
+                { "name": "steel_plate", "label": "钢管档案", "rows": metrics.plate_count },
                 { "name": "defect", "label": "缺陷明细", "rows": metrics.defect_count },
                 { "name": "defect_type", "label": "缺陷类型", "rows": metrics.defect_type_count },
                 { "name": "inspection_record", "label": "检测记录", "rows": metrics.record_count },
@@ -7900,6 +9990,14 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
         "apiRoutes": [
             { "method": "GET", "path": "/api/health", "scope": "service" },
             { "method": "GET", "path": "/api/services", "scope": "service" },
+            { "method": "GET", "path": "/api/system/network", "scope": "service" },
+            { "method": "GET", "path": "/api/algorithm/bar-surface/latest", "scope": "algorithm" },
+            { "method": "GET", "path": "/api/algorithm/bar-surface/manifest", "scope": "algorithm" },
+            { "method": "GET", "path": "/api/algorithm/bar-surface/file", "scope": "algorithm" },
+            { "method": "GET", "path": "/api/algorithm/bar-surface/captures", "scope": "algorithm" },
+            { "method": "GET", "path": "/api/algorithm/bar-surface/runs", "scope": "algorithm" },
+            { "method": "POST", "path": "/api/algorithm/bar-surface/run", "scope": "algorithm" },
+            { "method": "POST", "path": "/api/algorithm/bar-surface/calibration/fit", "scope": "algorithm" },
             { "method": "POST", "path": "/api/admin/auth/login", "scope": "auth" },
             { "method": "GET", "path": "/api/admin/auth/me", "scope": "auth" },
             { "method": "POST", "path": "/api/admin/auth/logout", "scope": "auth" },
@@ -7963,6 +10061,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/production/secondary-data", "scope": "production" },
             { "method": "POST", "path": "/api/production/capture-summary", "scope": "production" },
             { "method": "POST", "path": "/api/production/capture-once", "scope": "production" },
+            { "method": "POST", "path": "/api/production/algorithm/run", "scope": "production" },
             { "method": "POST", "path": "/api/production/defect", "scope": "production" },
             { "method": "GET", "path": "/api/steel/status", "scope": "capture" },
             { "method": "POST", "path": "/api/steel/event", "scope": "capture" },
@@ -8017,6 +10116,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             "application/json; charset=utf-8",
             "{\"ok\":true,\"service\":\"steel-inspection-service\",\"language\":\"rust\"}",
         ),
+        ("GET", "/api/system/network") => system_network_status_response(),
         ("GET", "/api/services") => http_response(
             "200 OK",
             "application/json; charset=utf-8",
@@ -8026,6 +10126,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
                 state.capture.status_json()
             ),
         ),
+        ("GET", "/api/algorithm/bar-surface/latest") => algorithm_latest_response(),
+        ("GET", "/api/algorithm/bar-surface/manifest") => algorithm_manifest_response(query),
+        ("GET", "/api/algorithm/bar-surface/file") => algorithm_file_response(query),
+        ("GET", "/api/algorithm/bar-surface/captures") => algorithm_capture_materials_response(query),
+        ("GET", "/api/algorithm/bar-surface/runs") => algorithm_runs_response(query),
+        ("POST", "/api/algorithm/bar-surface/run") => algorithm_run_response(body),
+        ("POST", "/api/algorithm/bar-surface/calibration/fit") => {
+            algorithm_calibration_fit_response(body)
+        }
         ("POST", "/api/admin/auth/login") => write_auth_login_response(&state, &request, body),
         ("GET", "/api/admin/auth/me") => read_auth_me_response(&state, &request),
         ("POST", "/api/admin/auth/logout") => write_auth_logout_response(&state, &request),
@@ -8129,6 +10238,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("POST", "/api/production/capture-once") => {
             write_production_capture_once_response(&state, body, actor)
+        }
+        ("POST", "/api/production/algorithm/run") => {
+            write_production_algorithm_run_response(&state, body, actor)
         }
         ("POST", "/api/production/defect") => {
             write_production_defect_response(&state, body, actor)
@@ -8654,7 +10766,7 @@ mod tests {
         );
         assert_eq!(
             record_retention_detail(365, "2025-07-02 10:00:00", 4, 4, 12, 4, false),
-            "执行检测记录保留策略：保留 365 天，截止 2025-07-02 10:00:00，清理记录 4 / 4 条，缺陷 12 条，钢板档案 4 条"
+            "执行检测记录保留策略：保留 365 天，截止 2025-07-02 10:00:00，清理记录 4 / 4 条，缺陷 12 条，钢管档案 4 条"
         );
     }
 

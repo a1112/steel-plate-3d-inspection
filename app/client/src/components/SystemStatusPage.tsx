@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
+  Box,
   CheckCircle2,
   CircleOff,
   Cpu,
@@ -18,8 +19,22 @@ import {
   SlidersHorizontal,
   StopCircle,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { DeviceStatus } from '../data/inspection';
+import {
+  captureProductionOnce,
+  fetchProductionStatus,
+  fetchTriggerGatewayStatus,
+  getTriggerGatewayOrigin,
+  setTriggerGatewayMode,
+  triggerGatewayManualSteelIn,
+  triggerGatewayManualSteelInfo,
+  triggerGatewayManualSteelOut,
+  type ProductionCommandResult,
+  type ProductionStatus,
+  type TriggerGatewayMode,
+  type TriggerGatewayStatus,
+} from '../services/inspection-api';
 import {
   applyCaptureConfig,
   captureDepthMap,
@@ -68,6 +83,46 @@ function formatTime(value?: string | null) {
 
 function formatNumber(value?: number | null, digits = 1) {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '-';
+}
+
+function pad2(value: number) {
+  return String(value).padStart(2, '0');
+}
+
+function createProductionMaterialId() {
+  const now = new Date();
+  return `BAR-${now.getFullYear()}${pad2(now.getMonth() + 1)}${pad2(now.getDate())}-${pad2(now.getHours())}${pad2(now.getMinutes())}${pad2(now.getSeconds())}`;
+}
+
+function providerValue(capture: Record<string, unknown> | null | undefined, keys: string[]) {
+  if (!capture) {
+    return '';
+  }
+  for (const key of keys) {
+    const value = capture[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+  }
+  return '';
+}
+
+function triggerGatewayModeLabel(mode?: string) {
+  switch (mode) {
+    case 'manual':
+      return '手动';
+    case 'gray':
+      return '灰度';
+    case 'secondary':
+      return '二级';
+    case 'api':
+      return 'API';
+    default:
+      return mode || '离线';
+  }
 }
 
 function getStatusTone(status: CaptureCameraStatus) {
@@ -326,12 +381,106 @@ export function CaptureManagementApp({
   const [captureRunning, setCaptureRunning] = useState(false);
   const [captureMessage, setCaptureMessage] = useState<string | null>(null);
   const [capturePreview, setCapturePreview] = useState<{ ip: string; url: string; output: string } | null>(null);
+  const [productionStatus, setProductionStatus] = useState<ProductionStatus | null>(null);
+  const [triggerGatewayStatus, setTriggerGatewayStatus] = useState<TriggerGatewayStatus | null>(null);
+  const [productionMode, setProductionMode] = useState<TriggerGatewayMode>('api');
+  const [productionBusy, setProductionBusy] = useState(false);
+  const [triggerGatewayBusy, setTriggerGatewayBusy] = useState(false);
+  const [productionMessage, setProductionMessage] = useState<string | null>(null);
+  const [triggerGatewayMessage, setTriggerGatewayMessage] = useState<string | null>(null);
+  const [productionDraftTouched, setProductionDraftTouched] = useState(false);
+  const [productionDraft, setProductionDraft] = useState(() => ({
+    materialId: createProductionMaterialId(),
+    storageRoot: 'H:/',
+    steelType: 'Q355B',
+    width: 0,
+    length: 0,
+    thick: 0,
+  }));
 
   useEffect(() => {
     if (!configDirty) {
       setLocalConfig(capture.config);
     }
   }, [capture.config, configDirty]);
+
+  const syncProductionDraftFromStatus = useCallback(
+    (nextStatus: ProductionStatus) => {
+      if (!productionDraftTouched && nextStatus.activeSession?.materialId) {
+        setProductionDraft((current) => ({
+          ...current,
+          materialId: nextStatus.activeSession?.materialId || current.materialId,
+        }));
+      }
+    },
+    [productionDraftTouched],
+  );
+
+  const refreshProductionStatus = useCallback(async () => {
+    const nextStatus = await fetchProductionStatus();
+    setProductionStatus(nextStatus);
+    syncProductionDraftFromStatus(nextStatus);
+    return nextStatus;
+  }, [syncProductionDraftFromStatus]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const nextStatus = await fetchProductionStatus();
+        if (!cancelled) {
+          setProductionStatus(nextStatus);
+          syncProductionDraftFromStatus(nextStatus);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setProductionMessage(error instanceof Error ? error.message : '生产采集状态读取失败');
+        }
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [syncProductionDraftFromStatus]);
+
+  const refreshTriggerGatewayStatus = useCallback(async () => {
+    const nextStatus = await fetchTriggerGatewayStatus();
+    setTriggerGatewayStatus(nextStatus);
+    const nextMode = nextStatus.mode;
+    if (nextMode === 'api' || nextMode === 'gray' || nextMode === 'secondary' || nextMode === 'manual') {
+      setProductionMode(nextMode);
+    }
+    return nextStatus;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const nextStatus = await fetchTriggerGatewayStatus();
+        if (!cancelled) {
+          setTriggerGatewayStatus(nextStatus);
+          const nextMode = nextStatus.mode;
+          if (nextMode === 'api' || nextMode === 'gray' || nextMode === 'secondary' || nextMode === 'manual') {
+            setProductionMode(nextMode);
+          }
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setTriggerGatewayMessage(error instanceof Error ? error.message : '触发网关未连接');
+        }
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const overviewStatuses = useMemo(() => {
     const statusesByIp = new Map(capture.statuses.map((item) => [item.ip, item]));
@@ -444,6 +593,231 @@ export function CaptureManagementApp({
     );
   };
 
+  const updateProductionDraft = (patch: Partial<typeof productionDraft>) => {
+    setProductionDraftTouched(true);
+    setProductionDraft((current) => ({ ...current, ...patch }));
+  };
+
+  const productionPayload = () => ({
+    ...productionDraft,
+    steelId: productionDraft.materialId,
+    steelNo: productionDraft.materialId,
+    source: 'capture-management-ui',
+    mode: productionMode,
+    triggerMode: productionMode,
+    discardBlackFrames: true,
+  });
+
+  const productionResultText = (result: ProductionCommandResult, success: string) => {
+    const code = result.code ?? 0;
+    const materialId = result.materialId || productionDraft.materialId;
+    const sessionId = result.sessionId ? ` / ${result.sessionId}` : '';
+    return code === 0 ? `${success}: ${materialId}${sessionId}` : `${success}返回异常: code ${code}`;
+  };
+
+  const runProductionCommand = async (action: () => Promise<ProductionCommandResult>, success: string) => {
+    setProductionBusy(true);
+    try {
+      const result = await action();
+      setProductionMessage(productionResultText(result, success));
+      await refreshProductionStatus();
+    } catch (error) {
+      setProductionMessage(error instanceof Error ? error.message : '生产采集指令失败');
+    } finally {
+      setProductionBusy(false);
+    }
+  };
+
+  const handleNewProductionMaterial = () => {
+    updateProductionDraft({ materialId: createProductionMaterialId() });
+    setProductionMessage('已生成新的钢管流水号');
+  };
+
+  const handleTriggerModeChange = async (mode: TriggerGatewayMode) => {
+    setTriggerGatewayBusy(true);
+    try {
+      const status = await setTriggerGatewayMode(mode);
+      setTriggerGatewayStatus(status);
+      setProductionMode(mode);
+      setTriggerGatewayMessage(`触发网关已切换到 ${triggerGatewayModeLabel(status.mode)}`);
+    } catch (error) {
+      setTriggerGatewayMessage(error instanceof Error ? error.message : '触发网关模式切换失败');
+    } finally {
+      setTriggerGatewayBusy(false);
+    }
+  };
+
+  const openTriggerManualPage = () => {
+    window.open(`${getTriggerGatewayOrigin()}/manual`, '_blank', 'popup,width=1080,height=760');
+  };
+
+  const handleWriteProductionRecord = () => {
+    void runProductionCommand(() => triggerGatewayManualSteelInfo(productionPayload()), '检测记录已写入');
+  };
+
+  const handleSteelIn = () => {
+    void runProductionCommand(() => triggerGatewayManualSteelIn({ ...productionPayload(), autoCapture: true }), '进钢信号已下发，采集进入保存状态');
+  };
+
+  const handleCaptureProductionOnce = () => {
+    void runProductionCommand(
+      () =>
+        captureProductionOnce({
+          ...productionPayload(),
+          rounds: 1,
+          expectedCameras: 6,
+          lines: 1000,
+          width: 0,
+          timeoutMs: 8000,
+          intervalMs: 500,
+          retries: 0,
+          connectFirst: false,
+          stopStreams: true,
+        }),
+      '生产采集一轮完成',
+    );
+  };
+
+  const handleSteelOut = () => {
+    void runProductionCommand(() => triggerGatewayManualSteelOut(productionPayload()), '出钢信号已下发，采集进入丢弃状态');
+  };
+
+  const renderProductionPanel = () => {
+    const captureState = productionStatus?.capture ?? null;
+    const activeSession = productionStatus?.activeSession;
+    const latestInspection = productionStatus?.latestInspection;
+    const providerMaterial = providerValue(captureState, ['materialId', 'steelId', 'steelNo', 'id']);
+    const providerPhase = providerValue(captureState, ['phase', 'state', 'status']);
+    const providerSaveState = providerValue(captureState, ['captureSaveState', 'saveState', 'saveEnabled']);
+    const providerRunning = providerValue(captureState, ['productionCaptureRunning', 'captureRunning', 'running']);
+    const triggerManualAllowed = Boolean(triggerGatewayStatus?.manualAllowed);
+    const triggerGatewayOnline = Boolean(triggerGatewayStatus && triggerGatewayStatus.code !== 503 && !triggerGatewayStatus.error);
+
+    return (
+      <Panel title="生产采集闭环" className="production-capture-panel">
+        <div className="production-capture-head">
+          <div>
+            <span>触发网关模式</span>
+            <div className="production-mode-toggle" role="group" aria-label="进出钢触发模式">
+              <button type="button" className={productionMode === 'api' ? 'active' : ''} onClick={() => void handleTriggerModeChange('api')} disabled={triggerGatewayBusy}>
+                API
+              </button>
+              <button type="button" className={productionMode === 'gray' ? 'active' : ''} onClick={() => void handleTriggerModeChange('gray')} disabled={triggerGatewayBusy}>
+                灰度
+              </button>
+              <button type="button" className={productionMode === 'secondary' ? 'active' : ''} onClick={() => void handleTriggerModeChange('secondary')} disabled={triggerGatewayBusy}>
+                二级
+              </button>
+              <button type="button" className={productionMode === 'manual' ? 'active' : ''} onClick={() => void handleTriggerModeChange('manual')} disabled={triggerGatewayBusy}>
+                手动
+              </button>
+            </div>
+          </div>
+          <button type="button" onClick={handleNewProductionMaterial}>
+            <RefreshCw size={15} />
+            新流水号
+          </button>
+        </div>
+        <div className="production-capture-form">
+          <label>
+            <span>钢管流水号</span>
+            <input value={productionDraft.materialId} onChange={(event) => updateProductionDraft({ materialId: event.target.value })} />
+          </label>
+          <label>
+            <span>存储根目录</span>
+            <input value={productionDraft.storageRoot} onChange={(event) => updateProductionDraft({ storageRoot: event.target.value })} />
+          </label>
+          <label>
+            <span>钢种</span>
+            <input value={productionDraft.steelType} onChange={(event) => updateProductionDraft({ steelType: event.target.value })} />
+          </label>
+          <label>
+            <span>外径/宽度 mm</span>
+            <input type="number" value={productionDraft.width} onChange={(event) => updateProductionDraft({ width: Number(event.target.value) })} />
+          </label>
+          <label>
+            <span>长度 mm</span>
+            <input type="number" value={productionDraft.length} onChange={(event) => updateProductionDraft({ length: Number(event.target.value) })} />
+          </label>
+          <label>
+            <span>壁厚 mm</span>
+            <input type="number" value={productionDraft.thick} onChange={(event) => updateProductionDraft({ thick: Number(event.target.value) })} />
+          </label>
+        </div>
+        <dl className="production-capture-facts">
+          <div>
+            <dt>活动会话</dt>
+            <dd>{activeSession ? `${activeSession.materialId} · ${activeSession.status}` : '无活动会话'}</dd>
+          </div>
+          <div>
+            <dt>最近检测</dt>
+            <dd>{latestInspection ? `${latestInspection.status} · ${latestInspection.captureCount} 轮` : '-'}</dd>
+          </div>
+          <div>
+            <dt>采集端材料</dt>
+            <dd>{providerMaterial || '-'}</dd>
+          </div>
+          <div>
+            <dt>采集端状态</dt>
+            <dd>{[providerPhase, providerSaveState, providerRunning].filter(Boolean).join(' · ') || '-'}</dd>
+          </div>
+          <div>
+            <dt>触发网关</dt>
+            <dd>{triggerGatewayOnline ? `${triggerGatewayModeLabel(triggerGatewayStatus?.mode)} · ${triggerManualAllowed ? '允许手动' : '自动/外部'}` : '离线'}</dd>
+          </div>
+          <div>
+            <dt>手动入口</dt>
+            <dd>{getTriggerGatewayOrigin()}/manual</dd>
+          </div>
+        </dl>
+        <div className="production-capture-actions">
+          <button type="button" onClick={handleWriteProductionRecord} disabled={productionBusy || !triggerManualAllowed || !productionDraft.materialId.trim()}>
+            <FileText size={16} />
+            写检测记录
+          </button>
+          <button type="button" className="primary" onClick={handleSteelIn} disabled={productionBusy || !triggerManualAllowed || !productionDraft.materialId.trim()}>
+            <Play size={16} />
+            进钢开始保存
+          </button>
+          <button type="button" onClick={handleCaptureProductionOnce} disabled={productionBusy || !productionDraft.materialId.trim()}>
+            <Gauge size={16} />
+            采集一轮
+          </button>
+          <button type="button" onClick={handleSteelOut} disabled={productionBusy || !triggerManualAllowed || !productionDraft.materialId.trim()}>
+            <StopCircle size={16} />
+            出钢结束
+          </button>
+          <button type="button" onClick={openTriggerManualPage}>
+            <ArrowRight size={16} />
+            打开触发手动界面
+          </button>
+          <button type="button" onClick={() => void refreshTriggerGatewayStatus()} disabled={triggerGatewayBusy}>
+            <RefreshCw size={16} />
+            刷新触发网关
+          </button>
+        </div>
+        {!triggerManualAllowed ? (
+          <div className="production-capture-warning">
+            <AlertTriangle size={15} />
+            <span>进钢/出钢手动控制需要先将触发网关切换到“手动”。灰度、二级和 API 模式由外部信号/API 触发。</span>
+          </div>
+        ) : null}
+        {triggerGatewayMessage ? (
+          <div className="production-capture-message trigger">
+            <Network size={15} />
+            <span>{triggerGatewayMessage}</span>
+          </div>
+        ) : null}
+        {productionMessage ? (
+          <div className="production-capture-message">
+            <CheckCircle2 size={15} />
+            <span>{productionMessage}</span>
+          </div>
+        ) : null}
+      </Panel>
+    );
+  };
+
   const renderOverview = () => (
     <section className="capture-overview-layout">
       <Panel title="相机状态总览" className="capture-overview-panel">
@@ -499,6 +873,7 @@ export function CaptureManagementApp({
           </div>
         </dl>
       </Panel>
+      {renderProductionPanel()}
       <Panel title="最新事件" className="capture-events-panel">
         <div className="capture-event-list compact">
           {recentLogs.slice(0, 5).map((event) => (
@@ -869,7 +1244,7 @@ export function SystemStatusPage({
   capture: CaptureSnapshot;
   onAction: (action: SystemAction) => void;
 }) {
-  const [embeddedManager, setEmbeddedManager] = useState(false);
+  const [embeddedManager, setEmbeddedManager] = useState(true);
   const [terminalMessage, setTerminalMessage] = useState<string | null>(null);
   const config = capture.config ?? createDefaultCaptureConfig();
   const overviewStatuses = useMemo(() => {
@@ -897,6 +1272,10 @@ export function SystemStatusPage({
     } catch (error) {
       setTerminalMessage(error instanceof Error ? error.message : '独立采集管理窗口打开失败');
     }
+  };
+
+  const openBarSurfaceWorkbench = () => {
+    window.open('/?app=bar-surface', '_blank', 'popup,width=1880,height=980');
   };
 
   if (embeddedManager) {
@@ -977,6 +1356,10 @@ export function SystemStatusPage({
             <button type="button" onClick={() => setEmbeddedManager(true)}>
               <Gauge size={16} />
               内嵌真实管理界面
+            </button>
+            <button type="button" onClick={openBarSurfaceWorkbench}>
+              <Box size={16} />
+              3D 重建工作台
             </button>
             <button type="button" onClick={() => onAction('self-check')}>
               <RefreshCw size={16} />

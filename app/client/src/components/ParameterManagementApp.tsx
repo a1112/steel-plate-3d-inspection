@@ -195,6 +195,20 @@ function JsonCodeEditor({
   );
 }
 
+function formatSteelPipeTableLabel(label: string) {
+  return label.replaceAll('钢板', '钢管').replaceAll('板号', '管号');
+}
+
+function formatCameraZoneLabel(value: string) {
+  if (value === '上表面') {
+    return '1-3号相机';
+  }
+  if (value === '下表面') {
+    return '4-6号相机';
+  }
+  return value.replaceAll('表面', '相机区');
+}
+
 async function readJsonText(path: string) {
   const response = await fetch(`${getInspectionServiceOrigin()}${path}`, {
     headers: createAdminHeaders({ Accept: 'application/json' }),
@@ -1254,7 +1268,7 @@ export function ParameterManagementApp() {
       return;
     }
     const retentionDays = Math.trunc(recordRetentionDays);
-    if (!dryRun && !window.confirm(`确认清理 ${retentionDays} 天以前的检测记录？关联缺陷和孤立钢板档案会同步清理。`)) {
+    if (!dryRun && !window.confirm(`确认清理 ${retentionDays} 天以前的检测记录？关联缺陷和孤立钢管档案会同步清理。`)) {
       return;
     }
     try {
@@ -1288,7 +1302,7 @@ export function ParameterManagementApp() {
   };
 
   const deleteRecord = async (record: AdminInspectionRecord) => {
-    if (!window.confirm(`确认删除检测记录 ${record.id}？关联缺陷和孤立钢板档案会同步清理。`)) {
+    if (!window.confirm(`确认删除检测记录 ${record.id}？关联缺陷和孤立钢管档案会同步清理。`)) {
       return;
     }
     try {
@@ -1686,7 +1700,7 @@ export function ParameterManagementApp() {
           <div className="admin-table-metrics">
             {tableRows.map((table) => (
               <div key={table.name}>
-                <span>{table.label}</span>
+                <span>{formatSteelPipeTableLabel(table.label)}</span>
                 <strong>{table.rows}</strong>
               </div>
             ))}
@@ -1830,7 +1844,7 @@ export function ParameterManagementApp() {
         <Panel title="检测记录查询" className="parameter-card parameter-record-filter-card">
           <div className="admin-record-filter">
             <label>
-              <span>板号 / 记录号</span>
+              <span>管号 / 记录号</span>
               <input value={recordKeyword} placeholder="例如 202606131900" onChange={(event) => setRecordKeyword(event.target.value)} />
             </label>
             <label>
@@ -1874,7 +1888,7 @@ export function ParameterManagementApp() {
               {recordRetentionResult ? (
                 <p>
                   <strong>{recordRetentionResult.dryRun ? recordRetentionResult.matched : recordRetentionResult.deletedRecords}</strong>
-                  <span>{recordRetentionResult.dryRun ? '条旧检测记录可清理' : `条检测记录已清理，缺陷 ${recordRetentionResult.deletedDefects} 条，钢板 ${recordRetentionResult.deletedPlates} 条`}</span>
+                  <span>{recordRetentionResult.dryRun ? '条旧检测记录可清理' : `条检测记录已清理，缺陷 ${recordRetentionResult.deletedDefects} 条，钢管 ${recordRetentionResult.deletedPlates} 条`}</span>
                 </p>
               ) : null}
             </div>
@@ -1887,7 +1901,7 @@ export function ParameterManagementApp() {
               <thead>
                 <tr>
                   <th>记录号</th>
-                  <th>板号</th>
+                  <th>管号</th>
                   <th>钢种</th>
                   <th>规格</th>
                   <th>状态</th>
@@ -1950,7 +1964,7 @@ export function ParameterManagementApp() {
                     <tr>
                       <th>缺陷号</th>
                       <th>类别</th>
-                      <th>表面</th>
+                      <th>相机区</th>
                       <th>等级</th>
                       <th>距头部</th>
                       <th>尺寸 mm</th>
@@ -1966,7 +1980,7 @@ export function ParameterManagementApp() {
                       <tr key={defect.id}>
                         <td>{defect.id}</td>
                         <td>{defect.typeLabel}</td>
-                        <td>{defect.surface}</td>
+                        <td>{formatCameraZoneLabel(defect.surface)}</td>
                         <td>{defect.severity}</td>
                         <td>{defect.distanceHeadMm}mm</td>
                         <td>{defect.widthMm.toFixed(2)} x {defect.heightMm.toFixed(2)}</td>

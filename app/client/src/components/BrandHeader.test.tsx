@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import type { DeviceStatus, SteelPlate } from '../data/inspection';
+import type { DeviceStatus } from '../data/inspection';
 import { BrandHeader } from './BrandHeader';
 
 const status: DeviceStatus = {
@@ -13,21 +13,13 @@ const status: DeviceStatus = {
   alarmCount: 1,
 };
 
-const plate: SteelPlate = {
-  plateNo: '202606131900',
-  widthMm: 3500,
-  lengthMm: 12000,
-  thicknessMm: 12,
-  steelGrade: 'Q355B',
-  detectedAt: '2026-06-13 19:00',
-};
-
 function renderHeader(overrides: Partial<ComponentProps<typeof BrandHeader>> = {}) {
   return render(
     <BrandHeader
       status={status}
-      plate={plate}
       theme="dark"
+      activeNav="online"
+      onNavChange={vi.fn()}
       onSettingsOpen={vi.fn()}
       onDragMouseDown={vi.fn()}
       {...overrides}
@@ -74,65 +66,200 @@ describe('BrandHeader', () => {
     expect(onSettingsOpen).toHaveBeenCalledTimes(1);
   });
 
-  it('shows receiver port detail information and switches detail panels', () => {
+  it('shows receiver port monitor placeholder and switches detail panels when realtime network data is pending', () => {
     const onDragMouseDown = vi.fn();
     renderHeader({ onDragMouseDown });
 
-    const receiverStatusButton = screen.getByRole('button', { name: '报级器网口，在线 7 路，异常 1 路' });
+    const receiverStatusButton = screen.getByTestId('receiver-status-button');
     fireEvent.mouseDown(receiverStatusButton);
     expect(onDragMouseDown).not.toHaveBeenCalled();
 
     fireEvent.click(receiverStatusButton);
 
-    expect(screen.getByText('报级器网口详细信息')).toBeInTheDocument();
-    expect(screen.getByLabelText('在线网口 7')).toBeInTheDocument();
-    expect(screen.getByLabelText('异常网口 1')).toBeInTheDocument();
-    expect(screen.getByText('连接异常')).toBeInTheDocument();
-    expect(screen.getByText('192.168.10.83')).toBeInTheDocument();
+    expect(document.querySelector('#receiver-detail-panel')).toBeInTheDocument();
+    expect(document.body.textContent).toContain('network monitor pending');
+    expect(document.body.textContent).toContain('0Mbps');
+    expect(document.body.textContent).not.toContain('120Mbps');
+    expect(screen.queryByRole('button', { name: /apply|limit|throttle/i })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '相机状态，在线 7 路，异常 1 路' }));
+    fireEvent.click(screen.getByTestId('camera-status-button'));
 
-    expect(screen.queryByText('报级器网口详细信息')).not.toBeInTheDocument();
-    expect(screen.getByText('相机状态详细信息')).toBeInTheDocument();
+    expect(document.querySelector('#receiver-detail-panel')).not.toBeInTheDocument();
+    expect(document.querySelector('#camera-detail-panel')).toBeInTheDocument();
+  });
+
+  it('shows real-time upload and download rates from the network monitor without limit controls', () => {
+    renderHeader({
+      network: {
+        code: 0,
+        source: 'windows-get-netadapter',
+        sampledAtMs: Date.parse('2026-07-08T12:00:00.000Z'),
+        totalUploadMbps: 64,
+        totalDownloadMbps: 512,
+        totalBandwidthMbps: 1000,
+        interfaces: [
+          {
+            index: 1,
+            name: 'Ethernet 1',
+            description: 'Intel I350 #1',
+            status: 'Up',
+            linkSpeed: '1 Gbps',
+            linkSpeedBitsPerSecond: 1_000_000_000,
+            receivedBytes: 1024,
+            transmittedBytes: 2048,
+            uploadMbps: 31.25,
+            downloadMbps: 250,
+            bandwidthMbps: 1000,
+            online: true,
+          },
+        ],
+      },
+    });
+
+    expect(screen.getByTitle('实时上传 64 Mbps / 下载 512 Mbps')).toBeInTheDocument();
+    expect(screen.getByText('实时网速')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '报级器网口，在线 1 路，异常 0 路' }));
+
+    expect(screen.getByText('Windows 网卡实时收发速率，只读监控')).toBeInTheDocument();
+    expect(screen.getAllByText('实时上传').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('实时下载').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('Ethernet 1')).toBeInTheDocument();
+    expect(screen.getByText('Intel I350 #1')).toBeInTheDocument();
+    expect(screen.getByLabelText('1 上传 31.3 Mbps')).toHaveTextContent('31.3Mbps');
+    expect(screen.getByLabelText('1 下载 250 Mbps')).toHaveTextContent('250Mbps');
+    expect(screen.getByLabelText('1 网口 利用率 25.0%')).toHaveTextContent('25.0%');
+    expect(screen.queryByRole('button', { name: /应用|限速|限制/ })).not.toBeInTheDocument();
+  });
+
+  it('does not fall back to simulated receiver speeds when the realtime network monitor is offline', () => {
+    renderHeader({
+      network: {
+        code: 1,
+        source: 'windows-get-netadapter',
+        sampledAtMs: Date.parse('2026-07-09T08:00:00.000Z'),
+        totalUploadMbps: 0,
+        totalDownloadMbps: 0,
+        totalBandwidthMbps: 0,
+        interfaces: [],
+        error: 'network monitor offline',
+      },
+    });
+
+    expect(screen.getByTitle('实时上传 0 Mbps / 下载 0 Mbps')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '报级器网口，在线 0 路，异常 1 路' }));
+
+    expect(screen.getByText('网络监控')).toBeInTheDocument();
+    expect(screen.getByText('network monitor offline')).toBeInTheDocument();
+    expect(screen.getByLabelText('1 上传 0 Mbps')).toHaveTextContent('0Mbps');
+    expect(screen.getByLabelText('1 下载 0 Mbps')).toHaveTextContent('0Mbps');
+    expect(screen.queryByLabelText('1 上传 120 Mbps')).not.toBeInTheDocument();
+  });
+
+  it('prioritizes active hardware ports over idle online ports in the receiver network monitor', () => {
+    const interfaces = [
+      ...Array.from({ length: 8 }, (_, index) => ({
+        index: index + 1,
+        name: `SLOT 4 端口 ${index + 1}`,
+        description: `Intel I350 idle #${index + 1}`,
+        status: 'Up',
+        linkSpeed: '1 Gbps',
+        linkSpeedBitsPerSecond: 1_000_000_000,
+        receivedBytes: 0,
+        transmittedBytes: 0,
+        packetsReceived: 0,
+        packetsTransmitted: 0,
+        uploadMbps: 0,
+        downloadMbps: 0,
+        bandwidthMbps: 1000,
+        online: true,
+      })),
+      {
+        index: 9,
+        name: 'SLOT 6 端口 3',
+        description: 'Intel I350 camera active',
+        status: 'Up',
+        linkSpeed: '1 Gbps',
+        linkSpeedBitsPerSecond: 1_000_000_000,
+        receivedBytes: 2_480_000_000,
+        transmittedBytes: 16_000_000,
+        packetsReceived: 1_610_000,
+        packetsTransmitted: 190_000,
+        uploadMbps: 0.5,
+        downloadMbps: 24.5,
+        bandwidthMbps: 1000,
+        online: true,
+      },
+    ];
+
+    renderHeader({
+      network: {
+        code: 0,
+        source: 'windows-get-netadapter',
+        sampledAtMs: Date.parse('2026-07-09T07:00:00.000Z'),
+        totalUploadMbps: 0.5,
+        totalDownloadMbps: 24.5,
+        totalBandwidthMbps: 9000,
+        interfaces,
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '报级器网口，在线 8 路，异常 0 路' }));
+
+    expect(screen.getByText('SLOT 6 端口 3')).toBeInTheDocument();
+    expect(screen.getByLabelText('1 下载 24.5 Mbps')).toHaveTextContent('24.5Mbps');
+    expect(screen.queryByText('SLOT 4 端口 8')).not.toBeInTheDocument();
   });
 
   it('closes open detail popovers when focus leaves, clicking outside, or pressing escape', () => {
     render(
       <>
-        <button type="button">外部按钮</button>
-        <BrandHeader status={status} plate={plate} theme="dark" onSettingsOpen={vi.fn()} onDragMouseDown={vi.fn()} />
+        <button type="button">outside</button>
+        <BrandHeader status={status} theme="dark" activeNav="online" onNavChange={vi.fn()} onSettingsOpen={vi.fn()} onDragMouseDown={vi.fn()} />
       </>,
     );
 
-    const receiverStatusButton = screen.getByRole('button', { name: '报级器网口，在线 7 路，异常 1 路' });
+    const receiverStatusButton = screen.getByTestId('receiver-status-button');
     fireEvent.click(receiverStatusButton);
-    expect(screen.getByText('报级器网口详细信息')).toBeInTheDocument();
+    expect(document.querySelector('#receiver-detail-panel')).toBeInTheDocument();
 
-    fireEvent.focusIn(screen.getByRole('button', { name: '外部按钮' }));
-    expect(screen.queryByText('报级器网口详细信息')).not.toBeInTheDocument();
+    fireEvent.focusIn(screen.getByRole('button', { name: 'outside' }));
+    expect(document.querySelector('#receiver-detail-panel')).not.toBeInTheDocument();
 
     fireEvent.click(receiverStatusButton);
-    expect(screen.getByText('报级器网口详细信息')).toBeInTheDocument();
+    expect(document.querySelector('#receiver-detail-panel')).toBeInTheDocument();
 
     fireEvent.mouseDown(document.body);
-    expect(screen.queryByText('报级器网口详细信息')).not.toBeInTheDocument();
+    expect(document.querySelector('#receiver-detail-panel')).not.toBeInTheDocument();
 
     fireEvent.click(receiverStatusButton);
-    expect(screen.getByText('报级器网口详细信息')).toBeInTheDocument();
+    expect(document.querySelector('#receiver-detail-panel')).toBeInTheDocument();
 
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(screen.queryByText('报级器网口详细信息')).not.toBeInTheDocument();
+    expect(document.querySelector('#receiver-detail-panel')).not.toBeInTheDocument();
 
     fireEvent.click(receiverStatusButton);
-    expect(screen.getByText('报级器网口详细信息')).toBeInTheDocument();
+    expect(document.querySelector('#receiver-detail-panel')).toBeInTheDocument();
 
     fireEvent.blur(window);
-    expect(screen.queryByText('报级器网口详细信息')).not.toBeInTheDocument();
+    expect(document.querySelector('#receiver-detail-panel')).not.toBeInTheDocument();
   });
 
   it('does not render the old titlebar theme toggle', () => {
     renderHeader();
 
     expect(screen.queryByRole('button', { name: '切换主题' })).not.toBeInTheDocument();
+  });
+
+  it('renders navigation beside the app title without starting titlebar drag', () => {
+    const onNavChange = vi.fn();
+    const onDragMouseDown = vi.fn();
+    renderHeader({ activeNav: 'online', onNavChange, onDragMouseDown });
+
+    const reportButton = screen.getByRole('button', { name: '缺陷报表' });
+    fireEvent.mouseDown(reportButton);
+    fireEvent.click(reportButton);
+
+    expect(onDragMouseDown).not.toHaveBeenCalled();
+    expect(onNavChange).toHaveBeenCalledWith('report');
   });
 });

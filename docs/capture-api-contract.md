@@ -53,7 +53,24 @@ Content-Type: application/json
 {"root":"E:/steel-capture-data"}
 ```
 
-Relative capture outputs are resolved under the current storage root. Absolute outputs must also stay inside the configured storage root.
+```http
+POST /api/storage/camera-roots
+Content-Type: application/json
+
+{
+  "replace": true,
+  "cameraRoots": [
+    {"ip":"192.168.101.100","root":"H:/camera1"},
+    {"ip":"192.168.102.100","root":"H:/camera2"},
+    {"ip":"192.168.103.100","root":"H:/camera3"},
+    {"ip":"192.168.104.100","root":"H:/camera4"},
+    {"ip":"192.168.105.13","root":"H:/camera5"},
+    {"ip":"192.168.106.100","root":"H:/camera6"}
+  ]
+}
+```
+
+Relative capture outputs are resolved under the current storage root. Production-layout captures without an explicit output use the configured per-camera root first, then fall back to `<storageRoot>/<camera-id>`. Absolute outputs must stay inside the configured storage root or one of the configured camera roots.
 
 ## Global Configuration Profiles
 
@@ -116,6 +133,8 @@ Content-Type: application/json
 ```
 
 Applying a profile can connect discovered cameras, apply trigger/exposure/gain defaults, optionally load camera parameter files, and set the active profile name. `changeStorage` must be true to let a profile switch the provider storage root.
+
+For the six-camera production profile `current-6-soft-trigger`, startup defaults to `loadCameraParams:false` and `changeStorage:false`. This preserves the vendor/device-side time-trigger configuration that has already been verified on the cameras. Packaged `.nccfg` files are still included for explicit operator/API loading, backup, and comparison, but default startup must not depend on `lvm_load_dev_param` succeeding.
 
 Recommended profile fields:
 
@@ -184,6 +203,8 @@ Content-Type: application/json
 ```
 
 `save-all` writes files named `<camera-ip-with-underscores>.nccfg`. `load-all` can either load explicit per-camera files through `cameraFiles[]` or fall back to the selected directory by safe IP, then model and serial number. Cameras omitted from `ips` are not touched, which lets the Qt configuration page mix "use camera built-in/current parameters" with "load this `.nccfg` file" per camera. External absolute files require `allowExternal:true`.
+
+The response includes per-camera `code`, `errorName`, `operatorHint`, `file`, and SDK sub-codes such as `loadCode`, `applyCode`, and `saveDeviceCode`. A non-zero SDK code from explicit `.nccfg` loading must be reported to the operator, but it does not change the default production strategy of using the camera's current built-in/device parameters.
 
 The per-camera low-level APIs remain available:
 
@@ -303,11 +324,20 @@ Returns the current steel phase, steel identity/specification, camera readiness 
   "steelId": "",
   "steelType": "",
   "sessionId": "",
+  "inspectionId": "",
+  "acquisitionMode": "external-trigger",
+  "captureSaveState": "discard",
+  "algorithmPhase": "pending",
+  "saveEnabled": false,
+  "discardBlackFrames": true,
+  "blackFrameThreshold": 8,
   "captureDir": "",
   "summaryOutput": "",
   "captureCount": 0,
   "captureSuccessCount": 0,
   "captureFailureCount": 0,
+  "discardFrameCount": 0,
+  "blackFrameCount": 0,
   "lastCaptureOutput": "",
   "length": 0,
   "width": 0,
@@ -334,10 +364,21 @@ Content-Type: application/json
 POST /api/steel/event
 Content-Type: application/json
 
-{"cmd":"steelIn","value":1}
+{
+  "cmd": "steelIn",
+  "value": 1,
+  "steelId": "STEEL-001",
+  "sessionId": "STEEL-001-20260707-001",
+  "inspectionId": "INSP-STEEL-001-20260707-001",
+  "acquisitionMode": "external-trigger",
+  "captureSaveState": "save",
+  "saveEnabled": true,
+  "discardBlackFrames": true,
+  "algorithmPhase": "pending"
+}
 ```
 
-`steelIn` with `value:1` means entry-steel and moves the provider state to `steel-in` / `present:true`. It also opens a production session when none is active. The session directory is:
+`steelIn` with `value:1` means entry-steel and moves the provider state to a saving state. External-trigger operation reports `steel-in-waiting-images`; internal/time-trigger operation may report `steel-in-saving`. It also opens a production session when none is active. The session directory is:
 
 ```text
 <storageRoot>/production/<safe-steel-id>/<sessionId>/
@@ -353,6 +394,7 @@ Content-Type: application/json
 ```
 
 `steelIn` with `value:0` means exit-steel and moves the provider state to `steel-out` / `present:false`.
+It also sets `saveEnabled:false` and `captureSaveState:"discard"`, so internally triggered frames can keep flowing but are not saved as production data.
 
 ```http
 POST /api/steel/event
@@ -366,18 +408,31 @@ Content-Type: application/json
 When a production session is active and `/api/capture/depth-map` is called without an explicit `output`, or `/api/capture/continuous-test` is called without an explicit `outputDir`, raw capture artifacts are stored by camera and material:
 
 ```text
-<storageRoot>/<camera-id>/<material-id>/<data-name>/<sequence>.<extension>
+<camera-root>/<material-id>/<data-name>/<sequence>.<extension>
 ```
 
-The provider uses the camera SN as `<camera-id>` when available and falls back to the camera IP. The data-name directories currently include `depth`, `intensity`, `metadata`, and `sdk-derived`. The production session summary still lives under `<storageRoot>/production/<safe-steel-id>/<sessionId>/summary.json`. Explicit `output` and `outputDir` values still take precedence unless `productionLayout:true` is sent to `/api/capture/continuous-test`.
+The provider uses per-camera roots from the active profile or `POST /api/storage/camera-roots`; the current six-camera default maps the known IPs to `H:/camera1` through `H:/camera6` when drive `H:` exists. If a camera root is not configured, it falls back to `<storageRoot>/<camera-id>`, where `<camera-id>` is the camera SN when available or the IP. The default data-name directories are `depth`, `intensity`, and `metadata`; `sdk-derived` is written only when a capture request explicitly sends `saveSdkDerived:true` or `save_sdk_derived:true`. The production session summary still lives under `<storageRoot>/production/<safe-steel-id>/<sessionId>/summary.json`. Explicit `output` and `outputDir` values still take precedence unless `productionLayout:true` is sent to `/api/capture/continuous-test`.
+
+Production capture calls may send `steelStateAware:true` or `requireSteelPresent:true`. When the provider has not received entry-steel/save state, it returns code `49000` (`CAPTURE_DISCARDED_NOT_ARMED`) and does not write frame images. When `discardBlackFrames:true`, a frame whose intensity image is below `blackFrameThreshold` returns code `49001` (`BLACK_FRAME_DISCARDED`); depth, intensity, and optional SDK-derived images are removed, while metadata records `discarded:true` and `discardReason:"black-frame"`.
 
 Example:
 
 ```text
-E:/steel-capture-data/3G506401BE08818/MAT-20260707-001/depth/000001.png
-E:/steel-capture-data/3G506401BE08818/MAT-20260707-001/intensity/000001.png
-E:/steel-capture-data/3G506401BE08818/MAT-20260707-001/metadata/000001.json
+H:/camera1/MAT-20260707-001/depth/000001.png
+H:/camera1/MAT-20260707-001/intensity/000001.png
+H:/camera1/MAT-20260707-001/metadata/000001.json
 ```
+
+Qt uses the latest-file endpoint to preview only the newest saved artifact for a selected camera:
+
+```http
+GET /api/capture/latest?ip=192.168.101.100&kind=depth
+GET /api/capture/latest?ip=192.168.101.100&kind=intensity
+GET /api/capture/latest?ip=192.168.101.100&kind=metadata
+GET /api/capture/latest?ip=192.168.101.100&kind=sdk-derived
+```
+
+Add `meta=1` to receive a JSON wrapper with the file path and `/api/capture/file` URL instead of the file body.
 
 The Rust business service adds the production database loop on top of the provider:
 
@@ -389,10 +444,29 @@ POST /api/production/steel-out
 POST /api/production/secondary-data
 POST /api/production/capture-once
 POST /api/production/capture-summary
+POST /api/production/algorithm/run
 POST /api/production/defect
 ```
 
-`/api/production/capture-once` triggers provider `/api/capture/continuous-test` with `productionLayout:true`, then records the returned depth, intensity, metadata, and SDK-derived file paths in the production database tables.
+`/api/production/steel-in` writes `material_session` and `production_inspection` before forwarding `steelIn` to the provider. `/api/production/capture-once` triggers provider `/api/capture/continuous-test` with `productionLayout:true`, `steelStateAware:true`, `requireSteelPresent:true`, and `discardBlackFrames:true`; it records only returned artifacts whose `*Exists` flag is true. The Rust service uses a production-aware provider read timeout derived from `rounds`, `timeoutMs`, `intervalMs`, and `retries`, clamped between 60 seconds and 3600 seconds, so a long production capture can keep running without being failed by the normal short HTTP proxy timeout. After the provider returns, the Rust service points `summaryOutput` and `latestInspection.summaryPath` to `<storageRoot>/production/<safe-material-id>/<sessionId>/summary.json`; after `steel-out`, it rewrites that file as `steel.production.summary.v1`, including the session, inspection, provider response, and every recorded `capture_file` row. `/api/production/algorithm/run` runs the bar-surface reconstruction for the current or specified `materialId`, writes Python prototype outputs under `G:/bar-surface-algorithm`, runs the C++ core by default, and updates `production_inspection.status` to `algorithm-complete` or `algorithm-failed`. The algorithm request accepts contour crop controls (`contourCrop`, `contourRadiusToleranceMm`, `contourMinKeepRatio`, `contourMinRowCoverage`, `contourAutoPercentile`); by default the Python prototype derives per-camera 2D crop boxes from calibrated 3D round-bar contour fitting and clips the final 3D mesh to that contour.
+
+The Rust service also exposes a review-only bar-surface calibration fit endpoint:
+
+```http
+POST /api/algorithm/bar-surface/calibration/fit
+Content-Type: application/json
+
+{
+  "materialId": "BAR-E2E-20260708-013823",
+  "captureRoot": "H:/",
+  "calibrationPath": "E:/steel-capture-data/config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-151317/ArrayCalibration.corrected.xml",
+  "rows": "250,500,750",
+  "maxPointsPerCamera": 2400,
+  "maxShiftMm": 5
+}
+```
+
+It reads the production layout `H:/camera1..camera6/<materialId>/metadata`, uses each camera's latest metadata/depth frame, runs the X/Z cross-section fitter, and returns `fitBefore`, `fitAfter`, per-camera `dx/dz`, `fit_report.json`, and `ArrayCalibration.corrected.xml`. This endpoint does not write the provider active profile and does not save parameters to camera devices; the UI can pass the returned `correctedXml` back to `/api/production/algorithm/run` as `calibrationPath` for reconstruction preview.
 
 ## Depth Capture
 
@@ -515,10 +589,9 @@ Continuous-test frame files are grouped by camera first, then by artifact type:
     depth/
     intensity/
     metadata/
-    sdk-derived/
 ```
 
-`depthOutput`, `intensityOutput`, and `metadataOutput` point to the normalized files used by downstream code. `sdkDepthOutput`, `sdkIntensityOutput`, and `sdkOutput` point to files emitted directly by `lvm_save_depth_map` when present.
+When `saveSdkDerived:true` is sent, an additional `sdk-derived/` directory is created beside these folders. `depthOutput`, `intensityOutput`, and `metadataOutput` point to the normalized files used by downstream code. `sdkDepthOutput`, `sdkIntensityOutput`, and `sdkOutput` point to files emitted directly by `lvm_save_depth_map` only when SDK-derived saving is enabled.
 
 ## Realtime Stream
 
@@ -618,6 +691,58 @@ GET /api/calibration/status?ip=192.168.105.13
 ```
 
 The Qt terminal saves operator calibration records locally after calibration load, ROI load, and validation capture. The provider does not solve calibration files from images; it applies files already accepted by the LVM SDK.
+
+## Rust Service Network Monitor
+
+The Rust service exposes a read-only Windows network monitor for the terminal header and hardware status popover:
+
+```http
+GET /api/system/network
+```
+
+The endpoint samples `Get-NetAdapter` and `Get-NetAdapterStatistics`, returns cumulative byte counters, and derives realtime upload/download Mbps from the previous service-side sample. It never sets upload, download, QoS, or bandwidth limits.
+
+Required response shape:
+
+```json
+{
+  "code": 0,
+  "source": "windows-get-netadapter",
+  "sampledAtMs": 1783543783881,
+  "interfaces": [
+    {
+      "index": 1,
+      "name": "SLOT 3 port 1",
+      "description": "Intel I350",
+      "status": "Up",
+      "linkSpeed": "1 Gbps",
+      "linkSpeedBitsPerSecond": 1000000000,
+      "receivedBytes": 123456789,
+      "transmittedBytes": 456789123,
+      "packetsReceived": 1000,
+      "packetsTransmitted": 900,
+      "uploadMbps": 0.03,
+      "downloadMbps": 0.21,
+      "bandwidthMbps": 1000,
+      "online": true
+    }
+  ],
+  "totalReceivedBytes": 123456789,
+  "totalTransmittedBytes": 456789123,
+  "totalUploadMbps": 0.03,
+  "totalDownloadMbps": 0.21,
+  "totalBandwidthMbps": 8000
+}
+```
+
+The service computes realtime upload and download Mbps from consecutive samples. The client keeps the same calculation as a compatibility fallback when connected to an older service:
+
+```text
+uploadMbps = delta(transmittedBytes) * 8 / elapsedSeconds / 1_000_000
+downloadMbps = delta(receivedBytes) * 8 / elapsedSeconds / 1_000_000
+```
+
+The UI must present upload, download, link bandwidth, and utilization as monitoring values only. No network limit or adapter configuration control belongs in this popover.
 
 ## Runtime Ownership Rule
 

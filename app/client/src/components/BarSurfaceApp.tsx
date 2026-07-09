@@ -1,0 +1,1398 @@
+import { Canvas, useLoader, useThree } from '@react-three/fiber';
+import { Box, Camera, CircleDot, ExternalLink, Image as ImageIcon, Play, RefreshCw, Rotate3d, Square, Wrench } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type PointerEvent, type WheelEvent } from 'react';
+import {
+  BufferGeometry,
+  ClampToEdgeWrapping,
+  DoubleSide,
+  Float32BufferAttribute,
+  MeshStandardMaterial,
+  TextureLoader,
+  Uint32BufferAttribute,
+} from 'three';
+import {
+  barSurfaceFileUrl,
+  captureBarSurfaceProductionOnce,
+  fitBarSurfaceCalibration,
+  fetchBarSurfaceCaptures,
+  fetchBarSurfaceLatest,
+  fetchBarSurfaceManifest,
+  fetchBarSurfaceMesh,
+  fetchBarSurfaceProductionStatus,
+  fetchBarSurfaceRuns,
+  runBarSurfaceProductionAlgorithm,
+  sendBarSurfaceProductionEvent,
+  type BarSurfaceCamera,
+  type BarSurfaceCalibrationFitReport,
+  type BarSurfaceCaptureMaterial,
+  type BarSurfaceLatestResponse,
+  type BarSurfaceManifest,
+  type BarSurfaceMesh,
+  type BarSurfaceProductionStatus,
+  type BarSurfaceRun,
+} from '../services/bar-surface-api';
+
+function numberText(value: number | undefined, fractionDigits = 0) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '-';
+  }
+  return value.toLocaleString('zh-CN', { maximumFractionDigits: fractionDigits });
+}
+
+function metricText(value: number | undefined, unit = 'mm', fractionDigits = 2) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '-';
+  }
+  return `${value.toLocaleString('zh-CN', {
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+  })}${unit}`;
+}
+
+function percentText(value: number | undefined) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '-';
+  }
+  return `${(value * 100).toLocaleString('zh-CN', {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  })}%`;
+}
+
+function byteText(value: number | undefined) {
+  if (typeof value !== 'number' || Number.isNaN(value) || value <= 0) {
+    return '-';
+  }
+  if (value >= 1024 * 1024) {
+    return `${(value / 1024 / 1024).toLocaleString('zh-CN', {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1,
+    })}MB`;
+  }
+  return `${(value / 1024).toLocaleString('zh-CN', {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  })}KB`;
+}
+
+function compactPath(value: string | undefined, keepSegments = 4) {
+  if (!value) {
+    return '-';
+  }
+  const parts = value.replaceAll('\\', '/').split('/').filter(Boolean);
+  if (parts.length <= keepSegments) {
+    return value;
+  }
+  return `.../${parts.slice(-keepSegments).join('/')}`;
+}
+
+function calibrationTone(path: string | undefined) {
+  return path?.toLowerCase().includes('corrected') ? '已使用修正标定' : '原始/未修正标定';
+}
+
+function timestampSegment(date = new Date()) {
+  const pad = (value: number) => value.toString().padStart(2, '0');
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function createMaterialId() {
+  return `BAR-${timestampSegment()}`;
+}
+
+function configNumber(camera: BarSurfaceCamera, key: string) {
+  const value = camera.captureConfig?.[key];
+  return typeof value === 'number' ? value : undefined;
+}
+
+function normalizeMeshPositions(positions: ArrayLike<number>) {
+  const normalized = new Float32Array(positions.length);
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+
+  for (let index = 0; index < positions.length; index += 3) {
+    const x = positions[index];
+    const y = positions[index + 1];
+    const z = positions[index + 2];
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    minZ = Math.min(minZ, z);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+    maxZ = Math.max(maxZ, z);
+  }
+
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  const centerZ = (minZ + maxZ) / 2;
+  const largestSpan = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 1);
+  const scale = 4.2 / largestSpan;
+  for (let index = 0; index < positions.length; index += 3) {
+    normalized[index] = (positions[index] - centerX) * scale;
+    normalized[index + 1] = (positions[index + 1] - centerY) * scale;
+    normalized[index + 2] = (positions[index + 2] - centerZ) * scale;
+  }
+  return normalized;
+}
+
+function createGeometry(mesh: BarSurfaceMesh) {
+  const geometry = new BufferGeometry();
+  geometry.setAttribute('position', new Float32BufferAttribute(normalizeMeshPositions(mesh.positions), 3));
+  geometry.setAttribute('uv', new Float32BufferAttribute(new Float32Array(mesh.uvs), 2));
+  geometry.setAttribute('color', new Float32BufferAttribute(new Float32Array(mesh.colors), 3));
+  geometry.setIndex(new Uint32BufferAttribute(new Uint32Array(mesh.indices), 1));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+type SectionCircleFit = {
+  available: boolean;
+  centerX: number;
+  centerZ: number;
+  radius: number;
+  meanAbsResidual: number;
+  maxAbsResidual: number;
+  pointCount: number;
+};
+
+type SectionPoint = {
+  x: number;
+  z: number;
+  cameraIndex: number;
+  calibrated: boolean;
+};
+
+type CircleOverlay = {
+  centerX: number;
+  centerZ: number;
+  radius: number;
+};
+
+function solve3x3(matrix: number[][], vector: number[]) {
+  const a = matrix.map((row, index) => [...row, vector[index]]);
+  for (let col = 0; col < 3; col += 1) {
+    let pivot = col;
+    for (let row = col + 1; row < 3; row += 1) {
+      if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) {
+        pivot = row;
+      }
+    }
+    if (Math.abs(a[pivot][col]) < 1e-9) {
+      return null;
+    }
+    if (pivot !== col) {
+      [a[pivot], a[col]] = [a[col], a[pivot]];
+    }
+    const divisor = a[col][col];
+    for (let item = col; item < 4; item += 1) {
+      a[col][item] /= divisor;
+    }
+    for (let row = 0; row < 3; row += 1) {
+      if (row === col) {
+        continue;
+      }
+      const factor = a[row][col];
+      for (let item = col; item < 4; item += 1) {
+        a[row][item] -= factor * a[col][item];
+      }
+    }
+  }
+  return [a[0][3], a[1][3], a[2][3]];
+}
+
+function fitSectionCircle(points: SectionPoint[]): SectionCircleFit | null {
+  if (points.length < 8) {
+    return null;
+  }
+  let sxx = 0;
+  let sxz = 0;
+  let sx = 0;
+  let szz = 0;
+  let sz = 0;
+  let sy = 0;
+  let sxy = 0;
+  let szy = 0;
+  for (const point of points) {
+    const y = point.x * point.x + point.z * point.z;
+    const ax = 2 * point.x;
+    const az = 2 * point.z;
+    sxx += ax * ax;
+    sxz += ax * az;
+    sx += ax;
+    szz += az * az;
+    sz += az;
+    sy += y;
+    sxy += ax * y;
+    szy += az * y;
+  }
+  const solved = solve3x3(
+    [
+      [sxx, sxz, sx],
+      [sxz, szz, sz],
+      [sx, sz, points.length],
+    ],
+    [sxy, szy, sy],
+  );
+  if (!solved) {
+    return null;
+  }
+  const [centerX, centerZ, c] = solved;
+  const radius = Math.sqrt(Math.max(c + centerX * centerX + centerZ * centerZ, 0));
+  if (!Number.isFinite(radius) || radius <= 0) {
+    return null;
+  }
+  let residualSum = 0;
+  let maxAbsResidual = 0;
+  for (const point of points) {
+    const residual = Math.abs(Math.hypot(point.x - centerX, point.z - centerZ) - radius);
+    residualSum += residual;
+    maxAbsResidual = Math.max(maxAbsResidual, residual);
+  }
+  return {
+    available: true,
+    centerX,
+    centerZ,
+    radius,
+    meanAbsResidual: residualSum / points.length,
+    maxAbsResidual,
+    pointCount: points.length,
+  };
+}
+
+function sectionPointsForRow(mesh: BarSurfaceMesh, row: number): SectionPoint[] {
+  const fullCols = mesh.colsPerCamera * mesh.cameraCount;
+  const safeRow = Math.max(0, Math.min(mesh.rows - 1, row));
+  const rowOffset = safeRow * fullCols;
+  const points: SectionPoint[] = [];
+  for (let col = 0; col < fullCols; col += 1) {
+    const vertexIndex = rowOffset + col;
+    if (mesh.validMask && !mesh.validMask[vertexIndex]) {
+      continue;
+    }
+    const base = vertexIndex * 3;
+    const x = Number(mesh.positions[base]);
+    const z = Number(mesh.positions[base + 2]);
+    if (!Number.isFinite(x) || !Number.isFinite(z)) {
+      continue;
+    }
+    points.push({
+      x,
+      z,
+      cameraIndex: Math.floor(col / Math.max(1, mesh.colsPerCamera)),
+      calibrated: !!mesh.calibratedMask?.[vertexIndex],
+    });
+  }
+  return points;
+}
+
+function circleFromManifest(manifest: BarSurfaceManifest): CircleOverlay | null {
+  const circle = manifest.quality?.contourCrop?.circleFit ?? manifest.mesh.contourCrop?.circleFit ?? manifest.quality?.circleFit;
+  if (!circle?.available || typeof circle.centerX !== 'number' || typeof circle.centerZ !== 'number' || typeof circle.radius !== 'number') {
+    return null;
+  }
+  return { centerX: circle.centerX, centerZ: circle.centerZ, radius: circle.radius };
+}
+
+function BarSurfaceSectionView({
+  mesh,
+  manifest,
+  row,
+}: {
+  mesh: BarSurfaceMesh;
+  manifest: BarSurfaceManifest;
+  row: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const points = useMemo(() => sectionPointsForRow(mesh, row), [mesh, row]);
+  const sectionFit = useMemo(() => fitSectionCircle(points), [points]);
+  const contourCircle = useMemo(() => circleFromManifest(manifest), [manifest]);
+  const yValue = points.length > 0 ? Number(mesh.positions[(Math.max(0, Math.min(mesh.rows - 1, row)) * mesh.colsPerCamera * mesh.cameraCount) * 3 + 1]) : undefined;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+    const draw = () => {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        return;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const width = rect.width;
+      const height = rect.height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#071825';
+      ctx.fillRect(0, 0, width, height);
+
+      const circles = [sectionFit, contourCircle].filter(Boolean) as Array<{ centerX: number; centerZ: number; radius: number }>;
+      const xs = points.map((point) => point.x);
+      const zs = points.map((point) => point.z);
+      for (const circle of circles) {
+        xs.push(circle.centerX - circle.radius, circle.centerX + circle.radius);
+        zs.push(circle.centerZ - circle.radius, circle.centerZ + circle.radius);
+      }
+      if (xs.length === 0 || zs.length === 0) {
+        ctx.fillStyle = '#9bdde9';
+        ctx.font = '14px sans-serif';
+        ctx.fillText('当前切面没有有效点', 24, 36);
+        return;
+      }
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minZ = Math.min(...zs);
+      const maxZ = Math.max(...zs);
+      const padding = 28;
+      const spanX = Math.max(1, maxX - minX);
+      const spanZ = Math.max(1, maxZ - minZ);
+      const scale = Math.min((width - padding * 2) / spanX, (height - padding * 2) / spanZ);
+      const centerX = (minX + maxX) / 2;
+      const centerZ = (minZ + maxZ) / 2;
+      const toX = (x: number) => width / 2 + (x - centerX) * scale;
+      const toY = (z: number) => height / 2 - (z - centerZ) * scale;
+      const cameraColors = ['#6ee7b7', '#7dd3fc', '#c4b5fd', '#fcd34d', '#fb7185', '#93c5fd'];
+
+      ctx.strokeStyle = 'rgba(155, 221, 233, 0.12)';
+      ctx.lineWidth = 1;
+      for (let index = 0; index <= 4; index += 1) {
+        const x = padding + ((width - padding * 2) * index) / 4;
+        const y = padding + ((height - padding * 2) * index) / 4;
+        ctx.beginPath();
+        ctx.moveTo(x, padding);
+        ctx.lineTo(x, height - padding);
+        ctx.moveTo(padding, y);
+        ctx.lineTo(width - padding, y);
+        ctx.stroke();
+      }
+
+      if (contourCircle) {
+        ctx.setLineDash([7, 5]);
+        ctx.strokeStyle = 'rgba(255, 196, 92, 0.78)';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.arc(toX(contourCircle.centerX), toY(contourCircle.centerZ), contourCircle.radius * scale, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      if (sectionFit) {
+        ctx.strokeStyle = 'rgba(134, 239, 172, 0.9)';
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.arc(toX(sectionFit.centerX), toY(sectionFit.centerZ), sectionFit.radius * scale, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      for (const point of points) {
+        ctx.fillStyle = cameraColors[point.cameraIndex % cameraColors.length];
+        ctx.globalAlpha = point.calibrated ? 0.88 : 0.46;
+        ctx.beginPath();
+        ctx.arc(toX(point.x), toY(point.z), 2.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#dff8ff';
+      ctx.font = '12px sans-serif';
+      ctx.fillText('绿色=当前切面拟合，黄色虚线=全局轮廓', padding, height - 12);
+    };
+    draw();
+    const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(draw) : null;
+    if (observer) {
+      observer.observe(canvas);
+    }
+    window.addEventListener('resize', draw);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', draw);
+    };
+  }, [contourCircle, manifest, mesh, points, row, sectionFit]);
+
+  return (
+    <div className="bar-surface-section-view">
+      <canvas ref={canvasRef} aria-label="圆钢横截面拟合预览" />
+      <div className="bar-surface-section-stats">
+        <span>切面 {row + 1}/{mesh.rows}</span>
+        <span>Y {metricText(yValue, 'mm', 1)}</span>
+        <span>点 {numberText(points.length)}</span>
+        <span>半径 {metricText(sectionFit?.radius)}</span>
+        <span>残差 {metricText(sectionFit?.meanAbsResidual)}</span>
+        <span>最大 {metricText(sectionFit?.maxAbsResidual)}</span>
+      </div>
+    </div>
+  );
+}
+
+function BarSurfaceCameraRig({ zoom }: { zoom: number }) {
+  const { camera } = useThree();
+
+  useEffect(() => {
+    camera.position.set(0, 1.1, 5.2 / zoom);
+    camera.lookAt(0, 0, 0);
+    camera.updateProjectionMatrix();
+  }, [camera, zoom]);
+
+  return null;
+}
+
+function BarSurfaceMeshView({
+  mesh,
+  textureUrl,
+  yaw,
+  pitch,
+  zoom,
+}: {
+  mesh: BarSurfaceMesh;
+  textureUrl: string;
+  yaw: number;
+  pitch: number;
+  zoom: number;
+}) {
+  const geometry = useMemo(() => createGeometry(mesh), [mesh]);
+  const texture = useLoader(TextureLoader, textureUrl, (loader) => {
+    loader.setCrossOrigin('anonymous');
+  });
+
+  useEffect(() => {
+    texture.wrapS = ClampToEdgeWrapping;
+    texture.wrapT = ClampToEdgeWrapping;
+    texture.flipY = false;
+    texture.needsUpdate = true;
+  }, [texture]);
+
+  const material = useMemo(
+    () =>
+      new MeshStandardMaterial({
+        map: texture,
+        vertexColors: true,
+        side: DoubleSide,
+        roughness: 0.82,
+        metalness: 0.04,
+      }),
+    [texture],
+  );
+
+  useEffect(
+    () => () => {
+      geometry.dispose();
+      material.dispose();
+    },
+    [geometry, material],
+  );
+
+  return (
+    <group rotation={[pitch, yaw, 0]} scale={[zoom, zoom, zoom]}>
+      <mesh geometry={geometry} material={material} />
+    </group>
+  );
+}
+
+function BarSurfaceModelPanel({
+  manifest,
+  mesh,
+  meshError,
+}: {
+  manifest: BarSurfaceManifest;
+  mesh: BarSurfaceMesh | null;
+  meshError: string | null;
+}) {
+  const [yaw, setYaw] = useState(-0.55);
+  const [pitch, setPitch] = useState(-0.18);
+  const [zoom, setZoom] = useState(1);
+  const [viewMode, setViewMode] = useState<'3d' | 'section'>('3d');
+  const [sectionRow, setSectionRow] = useState(() => Math.max(0, Math.floor((mesh?.rows ?? manifest.mesh.rows) / 2)));
+  const dragState = useRef<{ pointerId: number; x: number; y: number; yaw: number; pitch: number } | null>(null);
+  const textureUrl = barSurfaceFileUrl(manifest.relative.texture || manifest.mesh.texture);
+  const circleFit = manifest.quality?.circleFit;
+  const seamGap = manifest.quality?.seamGapMm;
+  const calibration = manifest.calibration;
+  const inputCrop = manifest.inputCrop;
+  const completeness = manifest.quality?.surfaceCompleteness;
+  const contourCrop = manifest.quality?.contourCrop ?? manifest.mesh.contourCrop;
+  const core = manifest.core;
+  const acceptance = manifest.acceptance;
+  const acceptanceStatus = acceptance?.status || (manifest.reports?.acceptanceReport ? 'ready' : '');
+  const acceptanceReportUrl = manifest.reports?.acceptanceReport
+    ? barSurfaceFileUrl(manifest.relative.acceptanceReport || manifest.reports.acceptanceReport)
+    : '';
+  const artifactIndexUrl = manifest.reports?.artifactIndex
+    ? barSurfaceFileUrl(manifest.relative.artifactIndex || manifest.reports.artifactIndex)
+    : '';
+  const modelSource =
+    mesh?.source === 'core-bsmesh'
+      ? `C++ Core ${byteText(mesh.binaryBytes)}`
+      : mesh?.source === 'json'
+        ? 'JSON 回退'
+        : core?.available
+          ? `C++ Core ${byteText(core.summary?.outputBytes)}`
+          : 'JSON';
+
+  useEffect(() => {
+    const rows = mesh?.rows ?? manifest.mesh.rows;
+    setSectionRow((current) => Math.max(0, Math.min(Math.max(0, rows - 1), current)));
+  }, [manifest.mesh.rows, mesh?.rows]);
+
+  const stopDrag = (event: PointerEvent<HTMLDivElement>) => {
+    if (dragState.current?.pointerId !== event.pointerId) {
+      return;
+    }
+    dragState.current = null;
+    if (typeof event.currentTarget.releasePointerCapture === 'function') {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const handleWheel = (event: WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const direction = event.deltaY < 0 ? 1 : -1;
+    setZoom((current) => Math.max(0.55, Math.min(2.1, Number((current + direction * 0.08).toFixed(2)))));
+  };
+
+  return (
+    <section className="bar-surface-panel bar-surface-model-panel">
+      <header className="bar-surface-panel-header">
+        <div>
+          <span>3D 重建</span>
+          <strong>六相机闭合表面 + 2D 贴图</strong>
+        </div>
+        <div className="bar-surface-icon-row">
+          <div className="bar-surface-view-switch" role="tablist" aria-label="模型显示模式">
+            <button type="button" className={viewMode === '3d' ? 'active' : ''} onClick={() => setViewMode('3d')}>
+              3D
+            </button>
+            <button type="button" className={viewMode === 'section' ? 'active' : ''} onClick={() => setViewMode('section')}>
+              切面
+            </button>
+          </div>
+          <Rotate3d size={18} />
+          <span>{numberText(manifest.mesh.vertexCount)} 顶点</span>
+          <span>{numberText(manifest.mesh.triangleCount)} 面</span>
+          {acceptanceStatus ? (
+            <span className={`bar-surface-acceptance ${acceptanceStatus === 'pass' ? 'is-pass' : 'is-attention'}`}>
+              验收 {acceptanceStatus}
+            </span>
+          ) : null}
+          {acceptanceReportUrl ? (
+            <a href={acceptanceReportUrl} target="_blank" rel="noreferrer">
+              <ExternalLink size={15} />
+              验收
+            </a>
+          ) : null}
+          {artifactIndexUrl ? (
+            <a href={artifactIndexUrl} target="_blank" rel="noreferrer">
+              <ExternalLink size={15} />
+              索引
+            </a>
+          ) : null}
+        </div>
+      </header>
+      <div
+        className={`bar-surface-canvas ${viewMode === 'section' ? 'is-section' : ''}`}
+        onWheel={viewMode === '3d' ? handleWheel : undefined}
+        onPointerDown={(event) => {
+          if (viewMode !== '3d') {
+            return;
+          }
+          if (event.button !== 0) {
+            return;
+          }
+          dragState.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, yaw, pitch };
+          if (typeof event.currentTarget.setPointerCapture === 'function') {
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }
+        }}
+        onPointerMove={(event) => {
+          if (viewMode !== '3d') {
+            return;
+          }
+          const drag = dragState.current;
+          if (!drag || drag.pointerId !== event.pointerId) {
+            return;
+          }
+          setYaw(drag.yaw + (event.clientX - drag.x) * 0.006);
+          setPitch(Math.max(-1.05, Math.min(0.9, drag.pitch + (event.clientY - drag.y) * 0.004)));
+        }}
+        onPointerUp={stopDrag}
+        onPointerCancel={stopDrag}
+      >
+        {mesh && viewMode === '3d' ? (
+          <Canvas camera={{ fov: 42, near: 0.1, far: 100 }} dpr={[1, 1.5]} gl={{ antialias: true }}>
+            <BarSurfaceCameraRig zoom={zoom} />
+            <color attach="background" args={['#071018']} />
+            <ambientLight intensity={0.78} />
+            <directionalLight position={[3, 4, 5]} intensity={1.4} />
+            <directionalLight position={[-5, -2, -3]} intensity={0.45} />
+            <BarSurfaceMeshView mesh={mesh} textureUrl={textureUrl} yaw={yaw} pitch={pitch} zoom={1} />
+          </Canvas>
+        ) : mesh && viewMode === 'section' ? (
+          <>
+            <BarSurfaceSectionView mesh={mesh} manifest={manifest} row={sectionRow} />
+            <div className="bar-surface-section-slider">
+              <span>头部</span>
+              <input
+                type="range"
+                min={0}
+                max={Math.max(0, mesh.rows - 1)}
+                value={Math.max(0, Math.min(mesh.rows - 1, sectionRow))}
+                onInput={(event) => setSectionRow(Number(event.currentTarget.value))}
+                onChange={(event) => setSectionRow(Number(event.currentTarget.value))}
+                aria-label="切面位置"
+              />
+              <span>尾部</span>
+            </div>
+          </>
+        ) : (
+          <div className="bar-surface-empty">
+            <Box size={32} />
+            <strong>{meshError ? '3D 模型加载失败' : '正在加载 3D 模型'}</strong>
+            <span>{meshError ?? '读取 G 盘 C++ bsmesh / mesh JSON 与贴图'}</span>
+          </div>
+        )}
+      </div>
+      <footer className="bar-surface-model-meta">
+        <span>帧数 {manifest.mesh.frameCount}</span>
+        <span>网格 {manifest.mesh.rows} x {manifest.mesh.colsPerCamera * manifest.cameraCount}</span>
+        <span>贴图 {manifest.mesh.textureSize.width} x {manifest.mesh.textureSize.height}</span>
+        <span>标定 {calibration ? `${calibration.matchedCameras}/${calibration.totalCameras}` : '-'}</span>
+        <span>2D裁剪 {inputCrop?.applied ? `${inputCrop.matchedCameras ?? 0}/${inputCrop.totalCameras ?? manifest.cameraCount}` : '-'}</span>
+        <span>圆残差 {metricText(circleFit?.meanAbsResidual)}</span>
+        <span>边界 gap {metricText(seamGap?.mean)}</span>
+        <span>
+          轮廓裁剪 {contourCrop?.applied ? `${percentText(contourCrop.keptPointRatio)} / ${metricText(contourCrop.radiusToleranceMm)}` : '-'}
+        </span>
+        <span>有效面 {percentText(completeness?.keptQuadRatio)}</span>
+        <span>模型 {modelSource}</span>
+        {acceptance ? <span>检查 {acceptance.passedChecks ?? 0}/{acceptance.totalChecks ?? 0}</span> : null}
+      </footer>
+    </section>
+  );
+}
+
+function BarSurfaceCameraTile({ camera }: { camera: BarSurfaceCamera }) {
+  const intensityUrl = barSurfaceFileUrl(camera.relative.intensityPreview || camera.latest.intensityPreview);
+  const depthUrl = barSurfaceFileUrl(camera.relative.depthPreview || camera.latest.depthPreview);
+  const timeFreq = configNumber(camera, 'timeTriggerFreq');
+  const maxFrameRate = configNumber(camera, 'maxFrameRate');
+  const triggerLines = configNumber(camera, 'triggerLines');
+
+  return (
+    <article className="bar-surface-camera-tile" data-testid={`bar-surface-camera-${camera.name}`}>
+      <header>
+        <div>
+          <strong>{camera.name}</strong>
+          <span>{camera.ip}</span>
+        </div>
+        <span className="bar-surface-camera-frame">#{camera.latestFrame}</span>
+      </header>
+      <div className="bar-surface-camera-images">
+        <figure>
+          <img src={intensityUrl} alt={`${camera.name} intensity`} loading="eager" decoding="async" />
+          <figcaption>亮度</figcaption>
+        </figure>
+        <figure>
+          <img src={depthUrl} alt={`${camera.name} depth`} loading="eager" decoding="async" />
+          <figcaption>深度</figcaption>
+        </figure>
+      </div>
+      <dl>
+        <div>
+          <dt>帧</dt>
+          <dd>{camera.frameCount}</dd>
+        </div>
+        <div>
+          <dt>尺寸</dt>
+          <dd>{camera.size.width} x {camera.size.height}</dd>
+        </div>
+        <div>
+          <dt>触发行</dt>
+          <dd>{numberText(triggerLines)}</dd>
+        </div>
+        <div>
+          <dt>时间触发</dt>
+          <dd>{numberText(timeFreq)} Hz</dd>
+        </div>
+        <div>
+          <dt>最快帧率</dt>
+          <dd>{numberText(maxFrameRate)} Hz</dd>
+        </div>
+        <div>
+          <dt>SN</dt>
+          <dd title={camera.sn}>{camera.sn || '-'}</dd>
+        </div>
+        <div>
+          <dt>标定</dt>
+          <dd>{camera.calibrationApplied ? '已匹配' : '未匹配'}</dd>
+        </div>
+        <div>
+          <dt>裁剪</dt>
+          <dd title={camera.cropSource || ''}>{camera.cropSource === 'calibrated-3d-contour' ? '3D轮廓' : '图像'}</dd>
+        </div>
+      </dl>
+    </article>
+  );
+}
+
+function BarSurfaceCalibrationPanel({
+  manifest,
+  fitReport,
+  busy,
+  fitRunning,
+  message,
+  onFit,
+  onRunWithCalibration,
+}: {
+  manifest: BarSurfaceManifest;
+  fitReport: BarSurfaceCalibrationFitReport | null;
+  busy: boolean;
+  fitRunning: boolean;
+  message: string;
+  onFit: () => void;
+  onRunWithCalibration: (calibrationPath: string) => void;
+}) {
+  const calibration = manifest.calibration;
+  const currentPath = calibration?.path || '';
+  const fittedPath = fitReport?.correctedXml || '';
+  const beforeResidual = fitReport?.fitBefore?.meanAbsResidual;
+  const afterResidual = fitReport?.fitAfter?.meanAbsResidual;
+  const contourCrop = manifest.quality?.contourCrop ?? manifest.mesh.contourCrop;
+  const correctedReady = Boolean(fittedPath);
+  return (
+    <section className="bar-surface-panel bar-surface-calibration-panel" data-testid="bar-surface-calibration-panel">
+      <header className="bar-surface-panel-header">
+        <div>
+          <span>标定修正</span>
+          <strong>当前阵列标定与横截面拟合</strong>
+        </div>
+        <div className="bar-surface-icon-row">
+          <Wrench size={18} />
+          <span className={currentPath.toLowerCase().includes('corrected') ? 'is-calibrated' : 'is-attention'}>
+            {calibrationTone(currentPath)}
+          </span>
+          <span>{calibration ? `${calibration.matchedCameras}/${calibration.totalCameras}` : '-'}</span>
+        </div>
+      </header>
+      <div className="bar-surface-calibration-body">
+        <dl className="bar-surface-calibration-facts">
+          <div>
+            <dt>当前 XML</dt>
+            <dd title={currentPath}>{compactPath(currentPath, 5)}</dd>
+          </div>
+          <div>
+            <dt>输入裁剪</dt>
+            <dd>{manifest.inputCrop?.source || '-'}</dd>
+          </div>
+          <div>
+            <dt>轮廓裁剪</dt>
+            <dd>{contourCrop?.applied ? `${percentText(contourCrop.keptPointRatio)} / ${metricText(contourCrop.radiusToleranceMm)}` : '-'}</dd>
+          </div>
+          <div>
+            <dt>圆残差</dt>
+            <dd>{metricText(manifest.quality?.circleFit?.meanAbsResidual)}</dd>
+          </div>
+          <div>
+            <dt>最新拟合</dt>
+            <dd>{fitReport ? `${fitReport.cameraCount ?? 0}/6，相比 ${metricText(beforeResidual)} -> ${metricText(afterResidual)}` : '未运行'}</dd>
+          </div>
+          <div>
+            <dt>修正 XML</dt>
+            <dd title={fittedPath}>{compactPath(fittedPath, 5)}</dd>
+          </div>
+        </dl>
+        <div className="bar-surface-calibration-actions">
+          <button type="button" onClick={onFit} disabled={busy}>
+            <Wrench size={16} />
+            {fitRunning ? '拟合中' : '自动标定修正'}
+          </button>
+          <button type="button" onClick={() => onRunWithCalibration(fittedPath || currentPath)} disabled={busy || (!fittedPath && !currentPath)}>
+            <Play size={16} />
+            {correctedReady ? '用新修正标定重建' : '用当前标定重建'}
+          </button>
+        </div>
+        {fitReport?.corrections?.length ? (
+          <div className="bar-surface-calibration-corrections">
+            {fitReport.corrections.slice(0, 6).map((item) => (
+              <span key={item.sn || item.ip}>
+                <b>{item.ip || item.sn}</b>
+                dx {metricText(item.dx)} / dz {metricText(item.dz)}
+              </span>
+            ))}
+          </div>
+        ) : null}
+        {message ? <p className="bar-surface-calibration-message">{message}</p> : null}
+      </div>
+    </section>
+  );
+}
+
+function BarSurfaceHeader({
+  latest,
+  manifest,
+  productionStatus,
+  captureMaterials,
+  selectedMaterialId,
+  runs,
+  selectedRunId,
+  loading,
+  running,
+  workflowBusy,
+  workflowMessage,
+  onRefresh,
+  onSteelIn,
+  onCaptureOnce,
+  onSteelOut,
+  onRun,
+  onMaterialChange,
+  onRunChange,
+}: {
+  latest: BarSurfaceLatestResponse | null;
+  manifest: BarSurfaceManifest | null;
+  productionStatus: BarSurfaceProductionStatus | null;
+  captureMaterials: BarSurfaceCaptureMaterial[];
+  selectedMaterialId: string;
+  runs: BarSurfaceRun[];
+  selectedRunId: string;
+  loading: boolean;
+  running: boolean;
+  workflowBusy: boolean;
+  workflowMessage: string;
+  onRefresh: () => void;
+  onSteelIn: () => void;
+  onCaptureOnce: () => void;
+  onSteelOut: () => void;
+  onRun: () => void;
+  onMaterialChange: (materialId: string) => void;
+  onRunChange: (runId: string) => void;
+}) {
+  const latestInspection = productionStatus?.latestInspection;
+  const productionLabel = latestInspection
+    ? `${latestInspection.status} / ${latestInspection.materialId}`
+    : productionStatus?.capture?.phaseLabel || '-';
+  return (
+    <header className="bar-surface-header" data-testid="bar-surface-header">
+      <div className="bar-surface-title">
+        <span>棒材表面检测</span>
+        <h1>3D 重建工作台</h1>
+      </div>
+      <div className="bar-surface-header-stack">
+        <div className="bar-surface-status-strip">
+          <div>
+            <span>当前流水</span>
+            <strong>{manifest?.materialId ?? (selectedMaterialId || '-')}</strong>
+          </div>
+          <div>
+            <span>相机</span>
+            <strong>{manifest ? `${manifest.cameraCount}/6` : '-'}</strong>
+          </div>
+          <div>
+            <span>算法数据</span>
+            <strong>{latest?.root ?? 'G:\\bar-surface-algorithm'}</strong>
+          </div>
+          <div>
+            <span>更新时间</span>
+            <strong>{latest?.latest.updatedAt ?? '-'}</strong>
+          </div>
+          <div>
+            <span>生产检测</span>
+            <strong>{productionLabel}</strong>
+          </div>
+        </div>
+        <div className="bar-surface-selector-row">
+          <label>
+            <span>采集流水</span>
+            <select
+              value={selectedMaterialId}
+              onChange={(event) => onMaterialChange(event.target.value)}
+              disabled={loading || running || captureMaterials.length === 0}
+            >
+              {captureMaterials.length === 0 ? <option value="">暂无采集流水</option> : null}
+              {captureMaterials.map((item) => (
+                <option key={item.materialId} value={item.materialId}>
+                  {item.materialId} · {item.cameraCount}/6 · {item.minDepthFrames} 帧
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>重建版本</span>
+            <select
+              value={selectedRunId}
+              onChange={(event) => onRunChange(event.target.value)}
+              disabled={loading || running || runs.length === 0}
+            >
+              {runs.length === 0 ? <option value="">暂无重建版本</option> : null}
+              {runs.map((run) => (
+                <option key={run.runId} value={run.runId}>
+                  {run.runId} · {run.frameCount} 帧 · {numberText(run.vertexCount)} 点
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </div>
+      <div className="bar-surface-actions">
+        <button type="button" onClick={onRefresh} disabled={loading || running || workflowBusy}>
+          <RefreshCw size={17} />
+          刷新
+        </button>
+        <button type="button" onClick={onSteelIn} disabled={loading || running || workflowBusy}>
+          <CircleDot size={17} />
+          模拟进钢
+        </button>
+        <button type="button" onClick={onCaptureOnce} disabled={loading || running || workflowBusy}>
+          <Camera size={17} />
+          采集一轮
+        </button>
+        <button type="button" onClick={onSteelOut} disabled={loading || running || workflowBusy}>
+          <Square size={17} />
+          出钢结束
+        </button>
+        <button type="button" onClick={onRun} disabled={loading || running || workflowBusy}>
+          <Play size={17} />
+          {running ? '生产重建中' : '运行生产重建'}
+        </button>
+        {workflowMessage ? (
+          <span className="bar-surface-workflow-message" aria-live="polite">
+            {workflowMessage}
+          </span>
+        ) : null}
+      </div>
+    </header>
+  );
+}
+
+export function BarSurfaceApp() {
+  const [latest, setLatest] = useState<BarSurfaceLatestResponse | null>(null);
+  const [mesh, setMesh] = useState<BarSurfaceMesh | null>(null);
+  const [captureMaterials, setCaptureMaterials] = useState<BarSurfaceCaptureMaterial[]>([]);
+  const [runs, setRuns] = useState<BarSurfaceRun[]>([]);
+  const [productionStatus, setProductionStatus] = useState<BarSurfaceProductionStatus | null>(null);
+  const [selectedMaterialId, setSelectedMaterialId] = useState('');
+  const [selectedRunId, setSelectedRunId] = useState('');
+  const [algorithmRoot, setAlgorithmRoot] = useState('G:\\bar-surface-algorithm');
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [meshError, setMeshError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [workflowBusy, setWorkflowBusy] = useState(false);
+  const [workflowMessage, setWorkflowMessage] = useState('');
+  const [calibrationFitReport, setCalibrationFitReport] = useState<BarSurfaceCalibrationFitReport | null>(null);
+  const [calibrationBusy, setCalibrationBusy] = useState(false);
+  const [calibrationMessage, setCalibrationMessage] = useState('');
+
+  const applyManifest = async (
+    manifest: BarSurfaceManifest,
+    nextLatest?: BarSurfaceLatestResponse,
+    signal?: AbortSignal,
+    run?: BarSurfaceRun,
+  ) => {
+    setLoadError(null);
+    setMesh(null);
+    setMeshError(null);
+    const root = nextLatest?.root ?? algorithmRoot;
+    setLatest(
+      nextLatest ?? {
+        code: 0,
+        root,
+        latest: {
+          schema: 'steel.bar_surface.latest.v1',
+          updatedAt: run?.createdAt || manifest.createdAt,
+          algorithmRoot: root,
+          materialId: manifest.materialId,
+          runId: manifest.runId,
+          runDir: manifest.runDir,
+          manifestPath: run?.manifestPath || '',
+        },
+        manifest,
+      },
+    );
+    setSelectedMaterialId(manifest.materialId);
+    setSelectedRunId(manifest.runId);
+    try {
+      const nextMesh = await fetchBarSurfaceMesh(manifest, signal);
+      setMesh(nextMesh);
+    } catch (error) {
+      if (!signal?.aborted) {
+        setMeshError(error instanceof Error ? error.message : '3D 模型读取失败');
+      }
+    }
+  };
+
+  const refreshLists = async (materialId?: string, signal?: AbortSignal) => {
+    const [capturesPayload, runsPayload, productionPayload] = await Promise.all([
+      fetchBarSurfaceCaptures(signal),
+      fetchBarSurfaceRuns(materialId, signal),
+      fetchBarSurfaceProductionStatus(signal),
+    ]);
+    const materials = Array.isArray(capturesPayload.materials) ? capturesPayload.materials : [];
+    const nextRuns = Array.isArray(runsPayload.runs) ? runsPayload.runs : [];
+    const nextRoot = runsPayload.root || algorithmRoot;
+    setCaptureMaterials(materials);
+    setRuns(nextRuns);
+    setAlgorithmRoot(nextRoot);
+    setProductionStatus(productionPayload);
+    return {
+      captures: materials,
+      runs: nextRuns,
+      root: nextRoot,
+      production: productionPayload,
+    };
+  };
+
+  const loadLatest = async (signal?: AbortSignal) => {
+    setLoading(true);
+    try {
+      const [payload, listState] = await Promise.all([fetchBarSurfaceLatest(signal), refreshLists(undefined, signal)]);
+      const materialId = payload.manifest.materialId || listState.captures[0]?.materialId || '';
+      if (materialId) {
+        const materialRuns = await fetchBarSurfaceRuns(materialId, signal);
+        setRuns(materialRuns.runs);
+        setAlgorithmRoot(materialRuns.root);
+      }
+      await applyManifest(payload.manifest, payload, signal);
+    } catch (error) {
+      if (signal?.aborted) {
+        return;
+      }
+      try {
+        const listState = await refreshLists(undefined, signal);
+        const firstMaterial = listState.captures[0]?.materialId ?? '';
+        setSelectedMaterialId(firstMaterial);
+      } catch {
+        // Keep the original algorithm-result error visible.
+      }
+      setLoadError(error instanceof Error ? error.message : '算法结果读取失败');
+    } finally {
+      if (!signal?.aborted) {
+        setLoading(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    const controller = new AbortController();
+    loadLatest(controller.signal);
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    document.title = '棒材表面 3D 重建工作台';
+  }, []);
+
+  const handleMaterialChange = async (materialId: string) => {
+    setSelectedMaterialId(materialId);
+    setSelectedRunId('');
+    setCalibrationFitReport(null);
+    setCalibrationMessage('');
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const runsPayload = await fetchBarSurfaceRuns(materialId);
+      setRuns(runsPayload.runs);
+      setAlgorithmRoot(runsPayload.root);
+      fetchBarSurfaceProductionStatus()
+        .then(setProductionStatus)
+        .catch(() => undefined);
+      const firstRun = runsPayload.runs[0];
+      if (firstRun) {
+        const manifest = await fetchBarSurfaceManifest(firstRun.manifestRelative || firstRun.manifestPath);
+        await applyManifest(manifest, undefined, undefined, firstRun);
+      } else {
+        setLatest(null);
+        setMesh(null);
+        setMeshError(null);
+      }
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : '重建版本读取失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRunChange = async (runId: string) => {
+    setSelectedRunId(runId);
+    setCalibrationFitReport(null);
+    setCalibrationMessage('');
+    const run = runs.find((item) => item.runId === runId);
+    if (!run) {
+      return;
+    }
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const manifest = await fetchBarSurfaceManifest(run.manifestRelative || run.manifestPath);
+      await applyManifest(manifest, undefined, undefined, run);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : '重建版本读取失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const refreshAfterWorkflow = async (materialId?: string) => {
+    const listState = await refreshLists(materialId);
+    if (materialId) {
+      setSelectedMaterialId(materialId);
+      setSelectedRunId('');
+    }
+    return listState;
+  };
+
+  const handleSteelIn = async () => {
+    setWorkflowBusy(true);
+    setLoadError(null);
+    try {
+      const materialId = createMaterialId();
+      const payload = await sendBarSurfaceProductionEvent('steel-in', {
+        materialId,
+        acquisitionMode: 'manual',
+        triggerMode: 'manual',
+        autoCapture: false,
+        steelType: 'round-bar',
+      });
+      const nextMaterialId = payload.materialId || materialId;
+      setWorkflowMessage(`已进钢建档：${nextMaterialId}，采集保存已打开，等待手动采集。`);
+      await refreshAfterWorkflow(nextMaterialId);
+    } catch (error) {
+      setWorkflowMessage('');
+      setLoadError(error instanceof Error ? error.message : '模拟进钢失败');
+    } finally {
+      setWorkflowBusy(false);
+    }
+  };
+
+  const handleCaptureOnce = async () => {
+    setWorkflowBusy(true);
+    setLoadError(null);
+    try {
+      let materialId =
+        productionStatus?.activeSession?.materialId ||
+        (productionStatus?.capture?.present ? selectedMaterialId : '') ||
+        selectedMaterialId ||
+        latest?.manifest.materialId ||
+        '';
+      if (!productionStatus?.capture?.present) {
+        materialId = materialId || createMaterialId();
+        await sendBarSurfaceProductionEvent('steel-in', {
+          materialId,
+          acquisitionMode: 'manual',
+          triggerMode: 'manual',
+          autoCapture: false,
+          steelType: 'round-bar',
+        });
+      }
+      const payload = await captureBarSurfaceProductionOnce({
+        materialId,
+        rounds: 1,
+        lines: 1000,
+        timeoutMs: 8000,
+        intervalMs: 500,
+      });
+      const provider = payload.provider;
+      const successes = provider?.successes ?? 0;
+      const attempts = provider?.attempts ?? 0;
+      const completeFrames = provider?.completeFrames ?? 0;
+      const failed = payload.code !== 0 || (provider?.code ?? payload.code) !== 0 || successes === 0;
+      setWorkflowMessage(
+        failed
+          ? `采集一轮未完全成功：${materialId}，成功 ${successes}/${attempts}，完整帧 ${completeFrames}。`
+          : `采集一轮完成：${materialId}，成功 ${successes}/${attempts}，完整帧 ${completeFrames}，未保存 SDK 派生图。`,
+      );
+      await refreshAfterWorkflow(materialId);
+    } catch (error) {
+      setWorkflowMessage('');
+      setLoadError(error instanceof Error ? error.message : '采集一轮失败');
+    } finally {
+      setWorkflowBusy(false);
+    }
+  };
+
+  const handleSteelOut = async () => {
+    setWorkflowBusy(true);
+    setLoadError(null);
+    try {
+      const materialId =
+        productionStatus?.activeSession?.materialId ||
+        selectedMaterialId ||
+        latest?.manifest.materialId ||
+        createMaterialId();
+      await sendBarSurfaceProductionEvent('steel-out', {
+        materialId,
+        acquisitionMode: 'manual',
+        triggerMode: 'manual',
+        autoCapture: false,
+      });
+      setWorkflowMessage(`已出钢结束：${materialId}，采集保存关闭。`);
+      await refreshAfterWorkflow(materialId);
+    } catch (error) {
+      setWorkflowMessage('');
+      setLoadError(error instanceof Error ? error.message : '出钢结束失败');
+    } finally {
+      setWorkflowBusy(false);
+    }
+  };
+
+  const runReconstruction = async (calibrationPath = '') => {
+    setRunning(true);
+    setLoadError(null);
+    try {
+      const materialId = selectedMaterialId || latest?.manifest.materialId || 'latest';
+      const payload = await runBarSurfaceProductionAlgorithm({
+        materialId,
+        calibrationPath: calibrationPath || undefined,
+        maxFrames: 24,
+        meshRows: 144,
+        meshColsPerCamera: 72,
+        contourCrop: true,
+        contourRadiusToleranceMm: 0,
+        contourMinKeepRatio: 0.55,
+        contourMinRowCoverage: 0.25,
+        contourAutoPercentile: 96,
+        runCore: true,
+      });
+      await applyManifest(payload.algorithm.result.manifest, payload.algorithm.result);
+      const [runsPayload, productionPayload] = await Promise.all([
+        fetchBarSurfaceRuns(payload.algorithm.result.manifest.materialId),
+        fetchBarSurfaceProductionStatus(),
+      ]);
+      setRuns(runsPayload.runs);
+      setAlgorithmRoot(runsPayload.root);
+      setProductionStatus(productionPayload);
+      if (calibrationPath) {
+        setCalibrationMessage(`已按指定标定重建：${compactPath(calibrationPath, 5)}`);
+      }
+    } catch (error) {
+      fetchBarSurfaceProductionStatus()
+        .then(setProductionStatus)
+        .catch(() => undefined);
+      setLoadError(error instanceof Error ? error.message : '生产重建失败');
+    } finally {
+      setRunning(false);
+      setLoading(false);
+    }
+  };
+
+  const handleRun = async () => {
+    await runReconstruction();
+  };
+
+  const handleRunWithCalibration = async (calibrationPath: string) => {
+    if (!calibrationPath) {
+      setCalibrationMessage('没有可用于重建的标定 XML。');
+      return;
+    }
+    await runReconstruction(calibrationPath);
+  };
+
+  const handleCalibrationFit = async () => {
+    setCalibrationBusy(true);
+    setCalibrationMessage('');
+    setLoadError(null);
+    try {
+      const materialId = selectedMaterialId || latest?.manifest.materialId || 'latest';
+      const calibrationPath = latest?.manifest.calibration?.path || '';
+      const payload = await fitBarSurfaceCalibration({
+        materialId,
+        calibrationPath,
+        captureRoot: 'H:\\',
+        rows: '250,500,750',
+        maxPointsPerCamera: 2400,
+        maxShiftMm: 5,
+      });
+      setCalibrationFitReport(payload.result);
+      const before = payload.result.fitBefore?.meanAbsResidual;
+      const after = payload.result.fitAfter?.meanAbsResidual;
+      setCalibrationMessage(
+        `自动标定完成：${payload.result.cameraCount ?? 0}/6，相比 ${metricText(before)} -> ${metricText(after)}，可用新修正 XML 重建。`,
+      );
+    } catch (error) {
+      setCalibrationMessage(error instanceof Error ? error.message : '自动标定修正失败');
+    } finally {
+      setCalibrationBusy(false);
+    }
+  };
+
+  const manifest = latest?.manifest ?? null;
+
+  return (
+    <main className="bar-surface-shell" data-testid="bar-surface-app">
+      <BarSurfaceHeader
+        latest={latest}
+        manifest={manifest}
+        productionStatus={productionStatus}
+        captureMaterials={captureMaterials}
+        selectedMaterialId={selectedMaterialId}
+        runs={runs}
+        selectedRunId={selectedRunId}
+        loading={loading}
+        running={running}
+        workflowBusy={workflowBusy}
+        workflowMessage={workflowMessage}
+        onRefresh={() => loadLatest()}
+        onSteelIn={handleSteelIn}
+        onCaptureOnce={handleCaptureOnce}
+        onSteelOut={handleSteelOut}
+        onRun={handleRun}
+        onMaterialChange={handleMaterialChange}
+        onRunChange={handleRunChange}
+      />
+      {loadError ? (
+        <section className="bar-surface-error">
+          <strong>算法结果不可用</strong>
+          <span>{loadError}</span>
+          <button type="button" onClick={handleRun} disabled={running}>
+            <Play size={16} />
+            生成当前流水重建
+          </button>
+        </section>
+      ) : null}
+      {manifest ? (
+        <>
+          <BarSurfaceCalibrationPanel
+            manifest={manifest}
+            fitReport={calibrationFitReport}
+            busy={calibrationBusy || running}
+            fitRunning={calibrationBusy}
+            message={calibrationMessage}
+            onFit={handleCalibrationFit}
+            onRunWithCalibration={handleRunWithCalibration}
+          />
+          <section className="bar-surface-main-grid">
+          <div className="bar-surface-panel bar-surface-camera-panel">
+            <header className="bar-surface-panel-header">
+              <div>
+                <span>2D 平铺</span>
+                <strong>六相机最新裁剪图</strong>
+              </div>
+              <div className="bar-surface-icon-row">
+                <ImageIcon size={18} />
+                <span>{manifest.cameraCount} 路</span>
+                <a href={barSurfaceFileUrl(manifest.relative.texture || manifest.mesh.texture)} target="_blank" rel="noreferrer">
+                  <ExternalLink size={15} />
+                  贴图
+                </a>
+              </div>
+            </header>
+            <div className="bar-surface-camera-grid" data-testid="bar-surface-camera-grid">
+              {manifest.cameras.map((camera) => (
+                <BarSurfaceCameraTile key={camera.name} camera={camera} />
+              ))}
+            </div>
+          </div>
+            <BarSurfaceModelPanel manifest={manifest} mesh={mesh} meshError={meshError} />
+          </section>
+        </>
+      ) : (
+        <section className="bar-surface-loading">
+          <RefreshCw size={28} />
+          <strong>{loading ? '正在读取 G 盘算法结果' : '暂无算法结果'}</strong>
+          <span>先选择 H 盘采集流水，再生成或查看对应的 2D 与 3D 重建结果。</span>
+        </section>
+      )}
+    </main>
+  );
+}

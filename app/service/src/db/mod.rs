@@ -1269,6 +1269,17 @@ pub async fn latest_open_material_session(
         .await
 }
 
+pub async fn latest_material_session_for_material(
+    connection: &DatabaseConnection,
+    material_id: &str,
+) -> Result<Option<material_session::Model>, DbErr> {
+    material_session::Entity::find()
+        .filter(material_session::Column::MaterialId.eq(material_id))
+        .order_by_desc(material_session::Column::UpdatedAt)
+        .one(connection)
+        .await
+}
+
 pub async fn upsert_material_session(
     connection: &DatabaseConnection,
     input: MaterialSessionInput,
@@ -1422,6 +1433,26 @@ pub async fn upsert_production_inspection(
     }
 }
 
+pub async fn latest_production_inspection(
+    connection: &DatabaseConnection,
+) -> Result<Option<production_inspection::Model>, DbErr> {
+    production_inspection::Entity::find()
+        .order_by_desc(production_inspection::Column::FinishedAt)
+        .order_by_desc(production_inspection::Column::StartedAt)
+        .one(connection)
+        .await
+}
+
+pub async fn find_production_inspection(
+    connection: &DatabaseConnection,
+    id: &str,
+) -> Result<Option<production_inspection::Model>, DbErr> {
+    production_inspection::Entity::find()
+        .filter(production_inspection::Column::Id.eq(id))
+        .one(connection)
+        .await
+}
+
 pub async fn append_capture_file(
     connection: &DatabaseConnection,
     input: CaptureFileInput,
@@ -1442,6 +1473,19 @@ pub async fn append_capture_file(
     }
     .insert(connection)
     .await
+}
+
+pub async fn capture_files_for_inspection(
+    connection: &DatabaseConnection,
+    inspection_id: &str,
+) -> Result<Vec<capture_file::Model>, DbErr> {
+    capture_file::Entity::find()
+        .filter(capture_file::Column::InspectionId.eq(inspection_id))
+        .order_by_asc(capture_file::Column::CameraId)
+        .order_by_asc(capture_file::Column::SequenceNo)
+        .order_by_asc(capture_file::Column::DataName)
+        .all(connection)
+        .await
 }
 
 pub async fn append_production_defect(
@@ -2060,7 +2104,7 @@ async fn ensure_admin_data(connection: &DatabaseConnection) -> Result<(), DbErr>
             "system",
             "data.seed",
             "inspection-demo-data",
-            "写入钢板、缺陷、记录、相机和默认配置模拟数据",
+            "写入钢管、缺陷、记录、相机和默认配置模拟数据",
             "info",
         )
         .await?;
@@ -2071,12 +2115,12 @@ async fn ensure_admin_data(connection: &DatabaseConnection) -> Result<(), DbErr>
 
 fn default_camera_configs() -> Vec<CameraConfigInput> {
     let cameras = [
-        ("192.168.105.13", "LVM3450CA", "上表面入口相机"),
-        ("192.168.102.100", "LVM3450CA", "上表面中部相机"),
-        ("192.168.101.100", "LVM3450BE", "上表面出口相机"),
-        ("192.168.103.100", "LVM3450RE", "下表面入口相机"),
-        ("192.168.104.100", "LVM3450BE", "下表面中部相机"),
-        ("192.168.106.100", "LVM3450RE", "下表面出口相机"),
+        ("192.168.105.13", "LVM3450CA", "camera1 周向采集相机"),
+        ("192.168.102.100", "LVM3450CA", "camera2 周向采集相机"),
+        ("192.168.101.100", "LVM3450BE", "camera3 周向采集相机"),
+        ("192.168.103.100", "LVM3450RE", "camera4 周向采集相机"),
+        ("192.168.104.100", "LVM3450BE", "camera5 周向采集相机"),
+        ("192.168.106.100", "LVM3450RE", "camera6 周向采集相机"),
     ];
     cameras
         .iter()

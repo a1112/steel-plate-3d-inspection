@@ -222,7 +222,7 @@ export function AlarmAnalysis({
     return (
       <Panel title="缺陷检测报警图" className={panelClassName} headerless={headerless}>
         <div className="analysis-empty">
-          <h3>当前钢板暂无缺陷</h3>
+          <h3>当前钢管暂无缺陷</h3>
           <p>切换检测记录或调整筛选条件后，将显示选中缺陷的灰度图、点云图和高度剖面。</p>
         </div>
       </Panel>

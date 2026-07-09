@@ -43,13 +43,13 @@ Rust inspection backend.
 - Talks to the configured capture provider through the local capture API.
 - Should not call the LVM SDK directly.
 
-### `app/service/src/bin/steel_trigger_gateway.rs`
+### `app/trigger`
 
 Standalone trigger gateway.
 
 - Runs as its own process outside the capture provider, Rust service, Qt terminal, and Tauri client.
 - Accepts L2/PLC/API events for steel info, steel-in, steel-out, secondary data, one-shot capture, capture summary, and defect results.
-- Tags events with `TRIGGER_MODE=api` or `TRIGGER_MODE=gray`, then forwards them to the Rust production API.
+- Tags events with `TRIGGER_MODE=api`, `gray`, `secondary`, or `manual`, then forwards them to the Rust production API. Manual steel-in/out endpoints are blocked unless the gateway mode is `manual`.
 - Does not call camera SDK functions and does not write capture files directly.
 
 ### `app/client`

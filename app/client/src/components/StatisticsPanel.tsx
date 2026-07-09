@@ -30,10 +30,10 @@ export function StatisticsPanel({
   return (
     <Panel title="缺陷统计信息" className="statistics-panel">
       <div className="stat-heading">
-        <span>钢板号</span>
+        <span>钢管号</span>
         <strong>{plate.plateNo}</strong>
         <button type="button" onClick={onOpenReport}>
-          本钢板统计
+          本钢管统计
         </button>
       </div>
       <div className="summary-layout">
@@ -64,12 +64,12 @@ export function StatisticsPanel({
       </div>
       <div className="surface-counts">
         <div>
-          <span>上表面</span>
+          <span>1-3号相机</span>
           <strong>{summary.bySurface.top}</strong>
           <i />
         </div>
         <div>
-          <span>下表面</span>
+          <span>4-6号相机</span>
           <strong>{summary.bySurface.bottom}</strong>
           <i />
         </div>

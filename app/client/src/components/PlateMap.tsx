@@ -26,8 +26,8 @@ interface PlateMapProps {
 }
 
 const surfaceModeOptions: { id: SurfaceDisplayMode; label: string }[] = [
-  { id: 'top', label: '上表' },
-  { id: 'bottom', label: '下表' },
+  { id: 'top', label: '1-3号' },
+  { id: 'bottom', label: '4-6号' },
   { id: 'all', label: '全部' },
 ];
 
@@ -46,6 +46,54 @@ const MAX_PLATE_3D_YAW = 0.5;
 const MIN_PLATE_3D_ZOOM = 0.72;
 const MAX_PLATE_3D_ZOOM = 2.2;
 const PLATE_3D_ZOOM_STEP = 0.12;
+const BAR_CAMERA_COUNT = 6;
+const BAR_CAMERA_LANES = Array.from({ length: BAR_CAMERA_COUNT }, (_, index) => ({
+  index,
+  label: `camera${index + 1}`,
+  shortLabel: `C${index + 1}`,
+}));
+
+function clampPercent(value: number, min = 0, max = 100) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function getDefectLengthPercent(defect: DefectItem, plateLengthM: number) {
+  const lengthMm = plateLengthM > 0 ? plateLengthM * 1000 : DEFAULT_PLATE_LENGTH_M * 1000;
+  const ratio = lengthMm > 0 ? defect.distanceHeadMm / lengthMm : defect.xRatio;
+  return clampPercent((Number.isFinite(ratio) ? ratio : defect.xRatio) * 100);
+}
+
+function getDefectCircumferenceRatio(defect: DefectItem) {
+  const span = defect.operatorSideMm + defect.driveSideMm;
+  if (Number.isFinite(span) && span > 0) {
+    return Math.max(0, Math.min(0.999, defect.operatorSideMm / span));
+  }
+  return Math.max(0, Math.min(0.999, (defect.yOffsetMm + 1.5) / 3));
+}
+
+function getDefectCameraIndex(defect: DefectItem) {
+  const explicitCamera = defect as DefectItem & { cameraIndex?: number; camera?: number; cameraId?: string; cameraName?: string };
+  const explicitIndex = explicitCamera.cameraIndex ?? explicitCamera.camera;
+  if (typeof explicitIndex === 'number' && Number.isFinite(explicitIndex) && explicitIndex >= 1 && explicitIndex <= BAR_CAMERA_COUNT) {
+    return Math.round(explicitIndex) - 1;
+  }
+  const parsed = String(explicitCamera.cameraId ?? explicitCamera.cameraName ?? '').match(/(?:camera|cam|相机)\s*([1-6])/i);
+  if (parsed) {
+    return Number(parsed[1]) - 1;
+  }
+  return Math.min(BAR_CAMERA_COUNT - 1, Math.floor(getDefectCircumferenceRatio(defect) * BAR_CAMERA_COUNT));
+}
+
+function getDefectCameraLabel(defect: DefectItem) {
+  return BAR_CAMERA_LANES[getDefectCameraIndex(defect)]?.label ?? 'camera1';
+}
+
+function getDefectUnfoldedTopPercent(defect: DefectItem) {
+  const cameraIndex = getDefectCameraIndex(defect);
+  const localRatio = getDefectCircumferenceRatio(defect) * BAR_CAMERA_COUNT - cameraIndex;
+  const safeLocalRatio = Math.max(0.14, Math.min(0.86, Number.isFinite(localRatio) ? localRatio : 0.5));
+  return ((cameraIndex + safeLocalRatio) / BAR_CAMERA_COUNT) * 100;
+}
 
 function yOffsetToPercentValue(offset: number) {
   return Math.max(10, Math.min(90, 50 - (offset / 1.5) * 37));
@@ -76,13 +124,13 @@ function DefectMarker({
     <button
       type="button"
       className={`defect-marker ${type.shape} ${selected ? 'selected' : ''}`}
-      aria-label={`${defect.typeLabel}，${surfaceLabels[defect.surface]}，距头${defect.distanceHeadMm}mm`}
+      aria-label={`${defect.typeLabel}，${getDefectCameraLabel(defect)}，距头${defect.distanceHeadMm}mm`}
       style={{
         left: `${defect.xRatio * 100}%`,
         top: yOffsetToPercent(defect.yOffsetMm),
         backgroundColor: type.color,
       }}
-      title={`${defect.typeLabel} ${surfaceLabels[defect.surface]} ${defect.distanceHeadMm}mm`}
+      title={`${defect.typeLabel} ${getDefectCameraLabel(defect)} ${defect.distanceHeadMm}mm`}
       onClick={onSelect}
       onMouseEnter={() => onHoverChange(defect.id)}
       onMouseLeave={() => onHoverChange(null)}
@@ -92,10 +140,22 @@ function DefectMarker({
   );
 }
 
-function DefectHoverCard({ defect, type }: { defect: DefectItem; type: DefectType }) {
-  const xPercent = defect.xRatio * 100;
-  const yPercent = yOffsetToPercentValue(defect.yOffsetMm);
-  const edgeClass = `${xPercent > 76 ? 'near-right' : xPercent < 24 ? 'near-left' : ''} ${yPercent < 44 ? 'near-top' : ''}`;
+function DefectHoverCard({
+  defect,
+  type,
+  xPercent,
+  yPercent,
+}: {
+  defect: DefectItem;
+  type: DefectType;
+  xPercent?: number;
+  yPercent?: number;
+}) {
+  const actualXPercent = xPercent ?? defect.xRatio * 100;
+  const actualYPercent = yPercent ?? yOffsetToPercentValue(defect.yOffsetMm);
+  const xPercentValue = clampPercent(actualXPercent, 0, 100);
+  const yPercentValue = clampPercent(actualYPercent, 0, 100);
+  const edgeClass = `${xPercentValue > 76 ? 'near-right' : xPercentValue < 24 ? 'near-left' : ''} ${yPercentValue < 44 ? 'near-top' : ''}`;
 
   return (
     <div
@@ -103,8 +163,8 @@ function DefectHoverCard({ defect, type }: { defect: DefectItem; type: DefectTyp
       role="tooltip"
       style={
         {
-          left: `${xPercent}%`,
-          top: `${yPercent}%`,
+          left: `${xPercentValue}%`,
+          top: `${yPercentValue}%`,
           '--defect-color': type.color,
         } as CSSProperties
       }
@@ -121,8 +181,8 @@ function DefectHoverCard({ defect, type }: { defect: DefectItem; type: DefectTyp
       ) : null}
       <dl>
         <div>
-          <dt>表面</dt>
-          <dd>{surfaceLabels[defect.surface]}</dd>
+          <dt>相机</dt>
+          <dd>{getDefectCameraLabel(defect)}</dd>
         </div>
         <div>
           <dt>等级</dt>
@@ -192,7 +252,7 @@ function SurfaceStrip({
 
   return (
     <div className="surface-row">
-      <AxisLabel label={surface === 'top' ? '上表面' : '下表面'} />
+      <AxisLabel label={surface === 'top' ? '1-3号相机' : '4-6号相机'} />
       <div className="y-axis">
         {['+1.5m', '+1.0m', '+0.5m', '0', '-0.5m', '-1.0m', '-1.5m'].map((tick) => (
           <span key={tick}>{tick}</span>
@@ -202,7 +262,7 @@ function SurfaceStrip({
         className="plate-strip"
         role="region"
         tabIndex={0}
-        aria-label={`${surface === 'top' ? '上表面' : '下表面'}缺陷显示切换`}
+        aria-label={`${surface === 'top' ? '1-3号相机' : '4-6号相机'}缺陷显示切换`}
         style={
           {
             '--preview-position': `${previewPercent}%`,
@@ -240,6 +300,101 @@ function SurfaceStrip({
             );
           })}
         {hoveredDefect && hoveredType ? <DefectHoverCard defect={hoveredDefect} type={hoveredType} /> : null}
+      </div>
+    </div>
+  );
+}
+
+function BarUnfoldedMap({
+  defects,
+  defectTypes,
+  selectedDefectId,
+  hoveredDefectId,
+  previewPositionM,
+  plateLengthM,
+  onSelectDefect,
+  onHoverDefect,
+  onDefectNavigationKeyDown,
+  onDefectNavigationWheel,
+}: {
+  defects: DefectItem[];
+  defectTypes: DefectType[];
+  selectedDefectId: string | null;
+  hoveredDefectId: string | null;
+  previewPositionM: number;
+  plateLengthM: number;
+  onSelectDefect: (defectId: string) => void;
+  onHoverDefect: (defectId: string | null) => void;
+  onDefectNavigationKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
+  onDefectNavigationWheel: (event: WheelEvent<HTMLDivElement>) => void;
+}) {
+  const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
+  const hoveredDefect = defects.find((defect) => defect.id === hoveredDefectId) ?? null;
+  const hoveredType = hoveredDefect ? defectTypes.find((type) => type.id === hoveredDefect.typeId) : null;
+  const hoveredXPercent = hoveredDefect ? getDefectLengthPercent(hoveredDefect, plateLengthM) : 0;
+  const hoveredYPercent = hoveredDefect ? getDefectUnfoldedTopPercent(hoveredDefect) : 0;
+
+  return (
+    <div className="bar-unfolded-map" data-testid="bar-unfolded-map">
+      <div className="bar-unfolded-axis" aria-hidden="true">
+        <span className="bar-unfolded-axis-title">圆周展开</span>
+        {BAR_CAMERA_LANES.map((lane) => (
+          <span key={lane.label}>{lane.label}</span>
+        ))}
+      </div>
+      <div
+        className="bar-unfolded-canvas"
+        role="region"
+        tabIndex={0}
+        aria-label="六相机圆周展开缺陷图"
+        style={{ '--preview-position': `${previewPercent}%` } as CSSProperties}
+        onKeyDown={onDefectNavigationKeyDown}
+        onWheel={onDefectNavigationWheel}
+      >
+        <div className="bar-camera-bands" aria-hidden="true">
+          {BAR_CAMERA_LANES.map((lane) => (
+            <div key={lane.label} className="bar-camera-band">
+              <span>{lane.shortLabel}</span>
+            </div>
+          ))}
+        </div>
+        <span className="bar-unfolded-note bar-unfolded-note-start">进钢</span>
+        <span className="bar-unfolded-note bar-unfolded-note-end">出钢</span>
+        <div className="bar-unfolded-centerline" aria-hidden="true" />
+        <div
+          className={`strip-preview-cursor bar-unfolded-preview-cursor ${previewPercent > 82 ? 'near-end' : ''}`}
+          data-testid="preview-cursor-unfolded"
+          aria-hidden="true"
+          style={{ left: `${previewPercent}%` }}
+        >
+          <span>{clampPreviewPositionM(previewPositionM, plateLengthM).toFixed(2)}m</span>
+        </div>
+        {defects.map((defect) => {
+          const type = defectTypes.find((item) => item.id === defect.typeId);
+          if (!type) return null;
+          return (
+            <button
+              key={defect.id}
+              type="button"
+              className={`defect-marker ${type.shape} ${defect.id === selectedDefectId ? 'selected' : ''}`}
+              aria-label={`${defect.typeLabel}，${getDefectCameraLabel(defect)}，距头${defect.distanceHeadMm}mm`}
+              style={{
+                left: `${getDefectLengthPercent(defect, plateLengthM)}%`,
+                top: `${getDefectUnfoldedTopPercent(defect)}%`,
+                backgroundColor: type.color,
+              }}
+              title={`${defect.typeLabel} ${getDefectCameraLabel(defect)} ${defect.distanceHeadMm}mm`}
+              onClick={() => onSelectDefect(defect.id)}
+              onMouseEnter={() => onHoverDefect(defect.id)}
+              onMouseLeave={() => onHoverDefect(null)}
+              onFocus={() => onHoverDefect(defect.id)}
+              onBlur={() => onHoverDefect(null)}
+            />
+          );
+        })}
+        {hoveredDefect && hoveredType ? (
+          <DefectHoverCard defect={hoveredDefect} type={hoveredType} xPercent={hoveredXPercent} yPercent={hoveredYPercent} />
+        ) : null}
       </div>
     </div>
   );
@@ -376,7 +531,7 @@ function SurfaceModeSwitch({
   onChange: (surfaceMode: SurfaceDisplayMode) => void;
 }) {
   return (
-    <div className="surface-mode-switch" role="group" aria-label="表面显示切换">
+    <div className="surface-mode-switch" role="group" aria-label="相机区显示切换">
       {surfaceModeOptions.map((option) => {
         const active = value === option.id;
         return (
@@ -419,19 +574,14 @@ function ViewModeSwitch({
 
 function PlateMapActions({
   viewMode,
-  surfaceMode,
   onViewModeChange,
-  onSurfaceModeChange,
 }: {
   viewMode: PlateMapViewMode;
-  surfaceMode: SurfaceDisplayMode;
   onViewModeChange: (viewMode: PlateMapViewMode) => void;
-  onSurfaceModeChange: (surfaceMode: SurfaceDisplayMode) => void;
 }) {
   return (
     <div className="plate-map-actions">
       <ViewModeSwitch value={viewMode} onChange={onViewModeChange} />
-      <SurfaceModeSwitch value={surfaceMode} onChange={onSurfaceModeChange} />
     </div>
   );
 }
@@ -617,7 +767,7 @@ function PointCloudSurfaceStrip({
 }) {
   const surfaceDefects = defects.filter((defect) => defect.surface === surface);
   const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
-  const title = surface === 'top' ? '上表面 Top 3D 高度展开图' : '下表面 Bottom 3D 高度展开图';
+  const title = surface === 'top' ? '1-3号相机 3D 高度展开图' : '4-6号相机 3D 高度展开图';
   const heightMapImage = surface === 'top' ? heightMapTopImage : heightMapBottomImage;
 
   return (
@@ -652,7 +802,7 @@ function PointCloudSurfaceStrip({
             <span key={tick}>{tick}</span>
           ))}
         </div>
-        <span className="point-cloud-axis-caption">板长方向(mm)</span>
+        <span className="point-cloud-axis-caption">钢管长度方向(mm)</span>
       </div>
       <div className="point-cloud-height-scale" aria-label={`${surfaceLabels[surface]}高度色标`}>
         <span>高度(mm)</span>
@@ -690,7 +840,7 @@ function PlatePointCloudView({
       data-testid="plate-point-cloud-view"
       data-point-cloud-points={surfaces.length * 124 * 46}
       data-point-cloud-z-range="-2.00,2.00"
-      aria-label="钢板点云高度展开图"
+      aria-label="钢管点云高度展开图"
     >
       <div className="point-cloud-unfold-stack">
         {surfaces.map((surface) => (
@@ -779,7 +929,7 @@ function PlateMap3DView({
       data-testid="plate-map-3d-view"
       data-view-yaw={viewYaw.toFixed(3)}
       data-view-zoom={viewZoom.toFixed(2)}
-      aria-label="3D钢板视图，左右拖拽调整视角，滚轮放大缩小"
+      aria-label="3D钢管视图，左右拖拽调整视角，滚轮放大缩小"
       onPointerDown={(event) => {
         if (event.button !== 0) {
           return;
@@ -815,7 +965,7 @@ function PlateMap3DView({
       <div className="plate-3d-overlay">
         <div>
           <span>3D显示视图</span>
-          <strong>{surfaceMode === 'all' ? '上下表面' : surfaceLabels[surfaceMode]}</strong>
+          <strong>{surfaceMode === 'all' ? '全部相机区' : surfaceLabels[surfaceMode]}</strong>
         </div>
         <div>
           <span>上表 / 下表</span>
@@ -865,8 +1015,6 @@ export function PlateMap({
 }: PlateMapProps) {
   const [viewMode, setViewMode] = useState<PlateMapViewMode>('2d');
   const [hoveredDefectId, setHoveredDefectId] = useState<string | null>(null);
-  const showAllSurfaces = surfaceMode === 'all';
-  const selectedSurface = surfaceMode === 'all' ? 'top' : surfaceMode;
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
   const selectRelativeDefect = (step: number) => {
     if (defects.length === 0) {
@@ -904,14 +1052,12 @@ export function PlateMap({
 
   return (
     <Panel
-      title="钢板缺陷长宽映射图"
+      title="棒材圆周展开缺陷图"
       className={`plate-map-panel surface-mode-${surfaceMode} view-mode-${viewMode}`}
       action={
         <PlateMapActions
           viewMode={viewMode}
-          surfaceMode={surfaceMode}
           onViewModeChange={setViewMode}
-          onSurfaceModeChange={onSurfaceModeChange}
         />
       }
     >
@@ -959,40 +1105,9 @@ export function PlateMap({
           plateLengthM={safePlateLengthM}
           surfaceMode={surfaceMode}
         />
-      ) : showAllSurfaces ? (
-        <>
-          <SurfaceStrip
-            surface="top"
-            defects={defects}
-            defectTypes={defectTypes}
-            selectedDefectId={selectedDefectId}
-            hoveredDefectId={hoveredDefectId}
-            previewPositionM={previewPositionM}
-            plateLengthM={safePlateLengthM}
-            onSelectDefect={onSelectDefect}
-            onHoverDefect={setHoveredDefectId}
-            onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
-            onDefectNavigationWheel={handleDefectNavigationWheel}
-          />
-          <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} />
-          <SurfaceStrip
-            surface="bottom"
-            defects={defects}
-            defectTypes={defectTypes}
-            selectedDefectId={selectedDefectId}
-            hoveredDefectId={hoveredDefectId}
-            previewPositionM={previewPositionM}
-            plateLengthM={safePlateLengthM}
-            onSelectDefect={onSelectDefect}
-            onHoverDefect={setHoveredDefectId}
-            onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
-            onDefectNavigationWheel={handleDefectNavigationWheel}
-          />
-        </>
       ) : (
         <>
-          <SurfaceStrip
-            surface={selectedSurface}
+          <BarUnfoldedMap
             defects={defects}
             defectTypes={defectTypes}
             selectedDefectId={selectedDefectId}

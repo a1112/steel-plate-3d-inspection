@@ -491,7 +491,7 @@ int main(int argc, char* argv[]) {
   const QSize preview_minimum = compact_1080 ? QSize(520, 360) : QSize(620, 520);
 
   QMainWindow window;
-  window.setWindowTitle(zh(u8"钢板 3D 采集工作台"));
+  window.setWindowTitle(zh(u8"钢管 3D 采集工作台"));
   window.resize(window_width, window_height);
   window.setMinimumSize(compact_1080 ? QSize(1280, 760) : QSize(1360, 820));
   window.move(available_geometry.center() - window.rect().center());
@@ -502,7 +502,7 @@ int main(int argc, char* argv[]) {
   root->setSpacing(panel_spacing);
 
   auto* top_bar = new QHBoxLayout();
-  auto* title = new QLabel(zh(u8"钢板 3D 采集工作台"));
+  auto* title = new QLabel(zh(u8"钢管 3D 采集工作台"));
   title->setObjectName("title");
   auto* api_state = small_label(zh(u8"内置采集 API 启动中：") + origin);
   auto* provider_hint = small_label(zh(u8"Rust provider：qt-terminal"));
@@ -582,7 +582,7 @@ int main(int argc, char* argv[]) {
   auto* overview_steel_in = new QPushButton(zh(u8"进钢"));
   auto* overview_steel_out = new QPushButton(zh(u8"出钢"));
   auto* overview_open_storage = new QPushButton(zh(u8"打开存储目录"));
-  auto* overview_open_steel_dir = new QPushButton(zh(u8"打开钢板目录"));
+  auto* overview_open_steel_dir = new QPushButton(zh(u8"打开钢管目录"));
   auto* overview_open_summary = new QPushButton(zh(u8"打开最新 summary"));
   overview_controls->addWidget(overview_refresh);
   overview_controls->addWidget(overview_connect_all);
@@ -780,10 +780,34 @@ int main(int argc, char* argv[]) {
   preview_actions->addWidget(save_frame);
   preview_actions->addWidget(capture_once);
   preview_actions->addStretch(1);
+  auto* latest_data_group = new QGroupBox(zh(u8"最新采集数据"));
+  auto* latest_data_layout = new QVBoxLayout(latest_data_group);
+  auto* latest_data_controls = new QHBoxLayout();
+  auto* latest_data_kind = new QComboBox();
+  latest_data_kind->addItem(zh(u8"深度图"), "depth");
+  latest_data_kind->addItem(zh(u8"亮度图"), "intensity");
+  latest_data_kind->addItem(zh(u8"元数据"), "metadata");
+  latest_data_kind->addItem(zh(u8"SDK 派生图（需手动开启）"), "sdk-derived");
+  auto* latest_data_refresh = new QPushButton(zh(u8"预览最新"));
+  auto* latest_data_open = new QPushButton(zh(u8"打开文件"));
+  auto* latest_data_path = value_label(zh(u8"尚未读取"));
+  auto* latest_data_text = new QPlainTextEdit();
+  latest_data_text->setReadOnly(true);
+  latest_data_text->setMaximumHeight(compact_1080 ? 110 : 150);
+  latest_data_text->setPlaceholderText(zh(u8"元数据 JSON 或最新文件状态"));
+  latest_data_controls->addWidget(new QLabel(zh(u8"类型")));
+  latest_data_controls->addWidget(latest_data_kind, 0);
+  latest_data_controls->addWidget(latest_data_refresh, 0);
+  latest_data_controls->addWidget(latest_data_open, 0);
+  latest_data_controls->addStretch(1);
+  latest_data_layout->addLayout(latest_data_controls);
+  latest_data_layout->addWidget(latest_data_path);
+  latest_data_layout->addWidget(latest_data_text);
   center_layout->addLayout(preview_title_row);
   center_layout->addWidget(preview, 1);
   center_layout->addWidget(preview_meta);
   center_layout->addLayout(preview_actions);
+  center_layout->addWidget(latest_data_group, 0);
   splitter->addWidget(center_panel);
 
   auto* tabs = new QTabWidget();
@@ -838,7 +862,7 @@ int main(int argc, char* argv[]) {
   auto* storage_layout = new QVBoxLayout(storage_tab);
   auto* storage_group = new QGroupBox(zh(u8"数据存储设置"));
   auto* storage_form = new QFormLayout(storage_group);
-  auto* storage_root = new QLineEdit("E:/steel-capture-data");
+  auto* storage_root = new QLineEdit("H:/");
   auto* storage_browse = new QPushButton(zh(u8"选择目录"));
   auto* storage_apply = new QPushButton(zh(u8"应用存储目录"));
   auto* storage_open = new QPushButton(zh(u8"打开位置"));
@@ -868,7 +892,7 @@ int main(int argc, char* argv[]) {
   camera_config_left_layout->setSpacing(panel_spacing);
   auto* camera_config_left_title = new QLabel(zh(u8"相机"));
   camera_config_left_title->setObjectName("sectionTitle");
-  auto* profile_camera_table = new QTableWidget(0, 10);
+  auto* profile_camera_table = new QTableWidget(0, 11);
   profile_camera_table->setHorizontalHeaderLabels({
       zh(u8"相机"),
       zh(u8"IP 地址"),
@@ -880,6 +904,7 @@ int main(int argc, char* argv[]) {
       zh(u8"曝光"),
       zh(u8"增益"),
       zh(u8"触发频率"),
+      zh(u8"保存位置"),
   });
   profile_camera_table->horizontalHeader()->setStretchLastSection(true);
   profile_camera_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
@@ -921,6 +946,11 @@ int main(int argc, char* argv[]) {
   edit_camera_param_row->addWidget(edit_camera_param_file, 1);
   edit_camera_param_row->addWidget(edit_camera_param_browse);
   edit_camera_param_row->addWidget(edit_camera_load_file);
+  auto* edit_camera_storage_root = new QLineEdit();
+  auto* edit_camera_storage_browse = new QPushButton(zh(u8"选择"));
+  auto* edit_camera_storage_row = new QHBoxLayout();
+  edit_camera_storage_row->addWidget(edit_camera_storage_root, 1);
+  edit_camera_storage_row->addWidget(edit_camera_storage_browse);
   auto* edit_camera_exposure = new QSpinBox();
   edit_camera_exposure->setRange(1, 10000000);
   edit_camera_exposure->setValue(1000);
@@ -934,10 +964,14 @@ int main(int argc, char* argv[]) {
   edit_camera_trigger_freq->setValue(300.0);
   auto* camera_config_buttons = new QHBoxLayout();
   auto* profile_camera_sync = new QPushButton(zh(u8"从相机列表同步"));
+  auto* profile_camera_h_roots = new QPushButton(zh(u8"H盘 camera1~camera6"));
+  auto* profile_camera_apply_roots = new QPushButton(zh(u8"应用保存位置"));
   auto* profile_camera_update = new QPushButton(zh(u8"添加/更新"));
   auto* profile_camera_delete = new QPushButton(zh(u8"删除选中"));
   auto* profile_camera_write_profile = new QPushButton(zh(u8"写入配置 JSON"));
   camera_config_buttons->addWidget(profile_camera_sync);
+  camera_config_buttons->addWidget(profile_camera_h_roots);
+  camera_config_buttons->addWidget(profile_camera_apply_roots);
   camera_config_buttons->addWidget(profile_camera_update);
   camera_config_buttons->addWidget(profile_camera_delete);
   camera_config_buttons->addWidget(profile_camera_write_profile);
@@ -949,6 +983,7 @@ int main(int argc, char* argv[]) {
   camera_edit_form->addRow(zh(u8"序列号"), edit_camera_sn);
   camera_edit_form->addRow(zh(u8"参数来源"), edit_camera_param_source);
   camera_edit_form->addRow(zh(u8"参数文件"), edit_camera_param_row);
+  camera_edit_form->addRow(zh(u8"保存位置"), edit_camera_storage_row);
   camera_edit_form->addRow(zh(u8"曝光"), edit_camera_exposure);
   camera_edit_form->addRow(zh(u8"增益"), edit_camera_gain);
   camera_edit_form->addRow(zh(u8"触发频率"), edit_camera_trigger_freq);
@@ -1323,7 +1358,7 @@ int main(int argc, char* argv[]) {
   auto* test_action = new QComboBox();
   test_action->addItem(zh(u8"一轮完整采集测试"), "one-round");
   test_action->addItem(zh(u8"稳定性连续采集测试"), "continuous");
-  test_action->addItem(zh(u8"模拟进钢并写入钢板信息"), "steel-in");
+  test_action->addItem(zh(u8"模拟进钢并写入钢管信息"), "steel-in");
   test_action->addItem(zh(u8"模拟出钢"), "steel-out");
   test_action->addItem(zh(u8"应用线扫预设（危险）"), "preset");
   auto* expected_camera_count = new QSpinBox();
@@ -1365,7 +1400,7 @@ int main(int argc, char* argv[]) {
   continuous_form->addRow(zh(u8"间隔"), continuous_interval_ms);
   continuous_form->addRow(zh(u8"失败重试"), continuous_retries);
   continuous_form->addRow(zh(u8"输出目录"), continuous_output_row);
-  continuous_form->addRow(zh(u8"钢板号"), test_steel_id);
+  continuous_form->addRow(zh(u8"钢管号"), test_steel_id);
   continuous_form->addRow(zh(u8"钢种"), test_steel_type);
   continuous_form->addRow(zh(u8"长度"), test_steel_length);
   continuous_form->addRow(zh(u8"宽度"), test_steel_width);
@@ -1470,6 +1505,7 @@ int main(int argc, char* argv[]) {
   attach_json_highlight(calibration_log);
   attach_json_highlight(profile_json);
   attach_json_highlight(profile_result);
+  attach_json_highlight(latest_data_text);
 
   QString active_stream_ip;
   QByteArray latest_preview_bytes;
@@ -1495,6 +1531,7 @@ int main(int argc, char* argv[]) {
   QJsonObject calibration_fit_report;
   QJsonObject calibration_active_state;
   QString overview_last_summary_path;
+  QString latest_data_current_path;
   QString calibration_fit_report_file;
   QString calibration_version_dir;
   QString calibration_corrected_xml_path;
@@ -1547,6 +1584,21 @@ int main(int argc, char* argv[]) {
     ip.replace('/', '_');
     ip.replace('\\', '_');
     return ip;
+  };
+
+  auto default_camera_storage_root = [](int index) {
+    return QString("H:/camera%1").arg(std::max(1, index + 1));
+  };
+
+  auto default_clockwise_camera_ips = []() {
+    return QStringList{
+        "192.168.101.100",
+        "192.168.102.100",
+        "192.168.103.100",
+        "192.168.104.100",
+        "192.168.105.13",
+        "192.168.106.100",
+    };
   };
 
   auto camera_param_path_for_ip = [&](const QString& ip) {
@@ -1771,6 +1823,11 @@ int main(int argc, char* argv[]) {
     set_cell(profile_camera_table, row, 7, QString::number(params.value("exposureTime").toInt(exposure->value())));
     set_cell(profile_camera_table, row, 8, QString::number(params.value("gainK").toDouble(gain->value()), 'f', 3));
     set_cell(profile_camera_table, row, 9, QString::number(params.value("timeTriggerFreq").toDouble(trigger_freq->value()), 'f', 2));
+    const QString storage = camera.value("storageRoot")
+                                .toString(camera.value("storageDir")
+                                              .toString(camera.value("captureRoot")
+                                                            .toString(default_camera_storage_root(row))));
+    set_cell(profile_camera_table, row, 10, storage);
   };
 
   auto current_profile_camera_object = [&]() {
@@ -1787,6 +1844,7 @@ int main(int argc, char* argv[]) {
         {"paramSource", edit_camera_param_source->currentData().toString()},
         {"useDeviceParams", edit_camera_param_source->currentData().toString() == "device"},
         {"paramFile", edit_camera_param_file->text().trimmed().isEmpty() ? camera_param_path_for_ip(ip) : edit_camera_param_file->text().trimmed()},
+        {"storageRoot", edit_camera_storage_root->text().trimmed().isEmpty() ? default_camera_storage_root(profile_camera_table->currentRow()) : edit_camera_storage_root->text().trimmed()},
         {"params", QJsonObject{
                        {"exposureTime", edit_camera_exposure->value()},
                        {"gainK", edit_camera_gain->value()},
@@ -1807,6 +1865,7 @@ int main(int argc, char* argv[]) {
       const int exposure_value = profile_camera_table->item(row, 7) ? profile_camera_table->item(row, 7)->text().toInt() : exposure->value();
       const double gain_value = profile_camera_table->item(row, 8) ? profile_camera_table->item(row, 8)->text().toDouble() : gain->value();
       const double trigger_value = profile_camera_table->item(row, 9) ? profile_camera_table->item(row, 9)->text().toDouble() : trigger_freq->value();
+      const QString storage_value = profile_camera_table->item(row, 10) ? profile_camera_table->item(row, 10)->text().trimmed() : default_camera_storage_root(row);
       cameras.append(QJsonObject{
           {"ip", ip},
           {"enabled", enabled_text != zh(u8"否") && enabled_text != "false" && enabled_text != "0"},
@@ -1816,6 +1875,8 @@ int main(int argc, char* argv[]) {
           {"paramSource", source_text.isEmpty() ? "device" : source_text},
           {"useDeviceParams", source_text != "file"},
           {"paramFile", profile_camera_table->item(row, 6) ? profile_camera_table->item(row, 6)->text() : camera_param_path_for_ip(ip)},
+          {"cameraIndex", row + 1},
+          {"storageRoot", storage_value.isEmpty() || storage_value == "-" ? default_camera_storage_root(row) : storage_value},
           {"params", QJsonObject{
                          {"exposureTime", exposure_value},
                          {"gainK", gain_value},
@@ -1824,6 +1885,22 @@ int main(int argc, char* argv[]) {
       });
     }
     return cameras;
+  };
+
+  auto profile_camera_roots_array = [&]() {
+    QJsonArray roots;
+    for (int row = 0; row < profile_camera_table->rowCount(); ++row) {
+      const QString ip = profile_camera_ip_at(row);
+      if (ip.isEmpty() || ip == "-") {
+        continue;
+      }
+      QString root = profile_camera_table->item(row, 10) ? profile_camera_table->item(row, 10)->text().trimmed() : QString();
+      if (root.isEmpty() || root == "-") {
+        root = default_camera_storage_root(row);
+      }
+      roots.append(QJsonObject{{"ip", ip}, {"root", root}});
+    }
+    return roots;
   };
 
   auto profile_file_camera_ips = [&]() {
@@ -1892,6 +1969,7 @@ int main(int argc, char* argv[]) {
     profile.insert("loadCameraParams", profile_load_camera_params->isChecked() && !file_ips.isEmpty());
     profile.insert("saveToDevice", profile_save_to_device->isChecked());
     profile.insert("cameras", profile_cameras_from_table());
+    profile.insert("cameraStorageRoots", profile_camera_roots_array());
     return profile;
   };
 
@@ -1914,12 +1992,25 @@ int main(int argc, char* argv[]) {
             {"paramSource", "device"},
             {"useDeviceParams", true},
             {"paramFile", camera_param_path_for_ip(ip)},
+            {"cameraIndex", cameras.size() + 1},
+            {"storageRoot", default_camera_storage_root(cameras.size())},
             {"params", QJsonObject{
                            {"exposureTime", exposure->value()},
                            {"gainK", gain->value()},
                            {"timeTriggerFreq", trigger_freq->value()},
                        }},
         });
+      }
+    }
+    QJsonArray camera_roots = profile_camera_roots_array();
+    if (camera_roots.isEmpty()) {
+      for (const QJsonValue& value : cameras) {
+        const QJsonObject camera = value.toObject();
+        const QString ip = camera.value("ip").toString();
+        const QString root = camera.value("storageRoot").toString();
+        if (!ip.isEmpty() && !root.isEmpty()) {
+          camera_roots.append(QJsonObject{{"ip", ip}, {"root", root}});
+        }
       }
     }
 
@@ -1960,6 +2051,7 @@ int main(int argc, char* argv[]) {
         {"simulated", QJsonObject{
                           {"imageSourceDir", ""},
                       }},
+        {"cameraStorageRoots", camera_roots},
         {"cameras", cameras},
     };
     return profile;
@@ -2096,12 +2188,31 @@ int main(int argc, char* argv[]) {
     if (normalized_profile.contains("expectedCameras")) profile_expected_cameras->setValue(normalized_profile.value("expectedCameras").toInt(6));
     update_profile_indicators();
     profile_camera_table->setRowCount(0);
+    std::map<QString, QString> camera_roots_by_ip;
+    auto collect_camera_roots = [&](const QJsonArray& roots) {
+      for (const QJsonValue& value : roots) {
+        const QJsonObject item = value.toObject();
+        const QString ip = item.value("ip").toString().trimmed();
+        const QString root = item.value("root").toString(item.value("storageRoot").toString()).trimmed();
+        if (!ip.isEmpty() && !root.isEmpty()) {
+          camera_roots_by_ip[ip] = root;
+        }
+      }
+    };
+    collect_camera_roots(normalized_profile.value("cameraRoots").toArray());
+    collect_camera_roots(normalized_profile.value("cameraStorageRoots").toArray());
     const QJsonArray cameras = normalized_profile.value("cameras").toArray();
     for (const QJsonValue& value : cameras) {
-      const QJsonObject camera = value.toObject();
+      QJsonObject camera = value.toObject();
       const QString ip = camera.value("ip").toString().trimmed();
       if (ip.isEmpty()) {
         continue;
+      }
+      if (!camera.contains("storageRoot")) {
+        const auto found = camera_roots_by_ip.find(ip);
+        if (found != camera_roots_by_ip.end()) {
+          camera.insert("storageRoot", found->second);
+        }
       }
       set_profile_camera_row(profile_camera_row_for_ip(ip), camera);
     }
@@ -2330,12 +2441,12 @@ int main(int argc, char* argv[]) {
     } else if (steel_phase == "steel-out") {
       steel_phase_text = zh(u8"出钢收尾");
     } else if (steel_phase == "info-ready") {
-      steel_phase_text = zh(u8"钢板信息已就绪");
+      steel_phase_text = zh(u8"钢管信息已就绪");
     }
     const QString steel_id = overview_steel_state.value("steelId").toString("-");
     const QString steel_type = overview_steel_state.value("steelType").toString("-");
     set_value(overview_steel,
-              QString(zh(u8"%1 | 钢板 %2 | 钢种 %3 | 长 %4 宽 %5 厚 %6 | 更新时间 %7"))
+              QString(zh(u8"%1 | 钢管 %2 | 钢种 %3 | 长 %4 宽 %5 厚 %6 | 更新时间 %7"))
                   .arg(steel_phase_text)
                   .arg(steel_id.isEmpty() ? "-" : steel_id)
                   .arg(steel_type.isEmpty() ? "-" : steel_type)
@@ -2887,6 +2998,9 @@ int main(int argc, char* argv[]) {
     last_frame_count = 0;
     last_fps_sample_ms = 0;
     latest_preview_bytes.clear();
+    latest_data_current_path.clear();
+    set_value(latest_data_path, zh(u8"尚未读取"));
+    latest_data_text->clear();
     preview->setText(ip.isEmpty() ? zh(u8"选择并连接一台相机后启动实时预览") : zh(u8"等待预览启动"));
     refresh_preview_meta();
   };
@@ -2912,6 +3026,59 @@ int main(int argc, char* argv[]) {
                              "t=" + QString::number(QDateTime::currentMSecsSinceEpoch()),
                   show_preview_payload);
   };
+
+  auto refresh_latest_capture_preview = [&]() {
+    const QString ip = selected_or_log();
+    if (ip.isEmpty()) {
+      return;
+    }
+    const QString kind = latest_data_kind->currentData().toString();
+    latest_data_text->setPlainText(zh(u8"正在读取最新文件..."));
+    const QString info_url = origin + "/api/capture/latest?ip=" + encoded(ip) +
+                             "&kind=" + encoded(kind) + "&meta=1&t=" +
+                             QString::number(QDateTime::currentMSecsSinceEpoch());
+    request_json(network, "GET", info_url, {}, log,
+                 [&, kind](const QJsonObject& json) {
+                   if (json_code(json) != 0) {
+                     latest_data_current_path.clear();
+                     set_value(latest_data_path, zh(u8"未找到最新文件"));
+                     latest_data_text->setPlainText(json_to_text(json));
+                     return;
+                   }
+                   latest_data_current_path = json.value("path").toString();
+                   set_value(latest_data_path, latest_data_current_path);
+                   if (kind == "metadata") {
+                     const QString url = origin + "/api/capture/latest?ip=" + encoded(json.value("ip").toString()) +
+                                         "&kind=metadata&t=" + QString::number(QDateTime::currentMSecsSinceEpoch());
+                     request_json(network, "GET", url, {}, log,
+                                  [&](const QJsonObject& metadata) {
+                                    latest_data_text->setPlainText(json_to_text(metadata));
+                                  });
+                     return;
+                   }
+                   latest_data_text->setPlainText(json_to_text(json));
+                   display_api_image(json.value("url").toString());
+                 });
+  };
+
+  QObject::connect(latest_data_refresh, &QPushButton::clicked, [&]() {
+    refresh_latest_capture_preview();
+  });
+
+  QObject::connect(latest_data_kind, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
+                   [&](int) {
+                     if (!selected_ip(camera_table).isEmpty()) {
+                       refresh_latest_capture_preview();
+                     }
+                   });
+
+  QObject::connect(latest_data_open, &QPushButton::clicked, [&]() {
+    if (latest_data_current_path.trimmed().isEmpty()) {
+      log_line(log, zh(u8"还没有最新数据文件可打开。"));
+      return;
+    }
+    QDesktopServices::openUrl(QUrl::fromLocalFile(latest_data_current_path));
+  });
 
   QObject::connect(open_api, &QPushButton::clicked, [&]() {
     QDesktopServices::openUrl(QUrl(origin + "/ui"));
@@ -3143,7 +3310,7 @@ int main(int argc, char* argv[]) {
   QObject::connect(overview_open_steel_dir, &QPushButton::clicked, [&]() {
     const QString dir = overview_steel_state.value("captureDir").toString().trimmed();
     if (dir.isEmpty()) {
-      overview_log_line(zh(u8"当前没有钢板采集目录。"));
+      overview_log_line(zh(u8"当前没有钢管采集目录。"));
       return;
     }
     QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
@@ -3433,6 +3600,7 @@ int main(int argc, char* argv[]) {
       edit_camera_param_source->setCurrentIndex(source_index);
     }
     edit_camera_param_file->setText(profile_camera_table->item(row, 6) ? profile_camera_table->item(row, 6)->text() : "");
+    edit_camera_storage_root->setText(profile_camera_table->item(row, 10) ? profile_camera_table->item(row, 10)->text() : default_camera_storage_root(row));
     int camera_exposure = profile_camera_table->item(row, 7) ? profile_camera_table->item(row, 7)->text().toInt() : exposure->value();
     if (camera_exposure < 1) {
       camera_exposure = exposure->value();
@@ -3468,6 +3636,14 @@ int main(int argc, char* argv[]) {
       if (source_index >= 0) {
         edit_camera_param_source->setCurrentIndex(source_index);
       }
+    }
+  });
+
+  QObject::connect(edit_camera_storage_browse, &QPushButton::clicked, [&]() {
+    const QString base = edit_camera_storage_root->text().trimmed().isEmpty() ? "H:/" : edit_camera_storage_root->text().trimmed();
+    const QString path = QFileDialog::getExistingDirectory(&window, zh(u8"选择单台相机保存位置"), base);
+    if (!path.isEmpty()) {
+      edit_camera_storage_root->setText(path);
     }
   });
 
@@ -3528,6 +3704,8 @@ int main(int argc, char* argv[]) {
                                  {"paramSource", "device"},
                                  {"useDeviceParams", true},
                                  {"paramFile", camera_param_path_for_ip(ip)},
+                                 {"cameraIndex", row + 1},
+                                 {"storageRoot", default_camera_storage_root(row)},
                                  {"params", QJsonObject{
                                                 {"exposureTime", exposure->value()},
                                                 {"gainK", gain->value()},
@@ -3537,6 +3715,64 @@ int main(int argc, char* argv[]) {
     }
     render_profile_object(build_profile_object());
     log_line(log, zh(u8"已从当前相机列表同步相机配置。"));
+  });
+
+  QObject::connect(profile_camera_h_roots, &QPushButton::clicked, [&]() {
+    QStringList ips;
+    for (int row = 0; row < profile_camera_table->rowCount(); ++row) {
+      const QString ip = profile_camera_ip_at(row);
+      if (!ip.isEmpty() && ip != "-" && !ips.contains(ip)) {
+        ips.append(ip);
+      }
+    }
+    if (ips.isEmpty()) {
+      ips = camera_ips_from_table();
+    }
+    if (ips.isEmpty()) {
+      ips = default_clockwise_camera_ips();
+    }
+    for (int index = 0; index < ips.size(); ++index) {
+      const QString ip = ips.at(index);
+      const int row = profile_camera_row_for_ip(ip);
+      const QString param_source = profile_camera_table->item(row, 5) ? profile_camera_table->item(row, 5)->text() : "device";
+      QJsonObject camera{
+          {"ip", ip},
+          {"enabled", true},
+          {"name", profile_camera_table->item(row, 0) && profile_camera_table->item(row, 0)->text() != "-" ? profile_camera_table->item(row, 0)->text() : QString("camera%1").arg(index + 1)},
+          {"model", profile_camera_table->item(row, 3) ? profile_camera_table->item(row, 3)->text() : ""},
+          {"sn", profile_camera_table->item(row, 4) ? profile_camera_table->item(row, 4)->text() : ""},
+          {"paramSource", param_source},
+          {"useDeviceParams", param_source != "file"},
+          {"paramFile", profile_camera_table->item(row, 6) ? profile_camera_table->item(row, 6)->text() : camera_param_path_for_ip(ip)},
+          {"cameraIndex", index + 1},
+          {"storageRoot", default_camera_storage_root(index)},
+          {"params", QJsonObject{
+                         {"exposureTime", profile_camera_table->item(row, 7) ? profile_camera_table->item(row, 7)->text().toInt() : exposure->value()},
+                         {"gainK", profile_camera_table->item(row, 8) ? profile_camera_table->item(row, 8)->text().toDouble() : gain->value()},
+                         {"timeTriggerFreq", profile_camera_table->item(row, 9) ? profile_camera_table->item(row, 9)->text().toDouble() : trigger_freq->value()},
+                     }},
+      };
+      set_profile_camera_row(row, camera);
+    }
+    render_profile_object(build_profile_object());
+    log_line(log, zh(u8"已按当前顺序写入 H:\\camera1 到 H:\\camera6。"));
+  });
+
+  QObject::connect(profile_camera_apply_roots, &QPushButton::clicked, [&]() {
+    const QJsonArray roots = profile_camera_roots_array();
+    if (roots.isEmpty()) {
+      log_line(log, zh(u8"没有可应用的相机保存位置。"));
+      return;
+    }
+    request_json(network, "POST", origin + "/api/storage/camera-roots",
+                 QJsonObject{{"replace", true}, {"cameraRoots", roots}},
+                 log,
+                 [&](const QJsonObject& json) {
+                   storage_status_text->setPlainText(json_to_text(json));
+                   profile_result->setPlainText(json_to_text(json));
+                   log_line(log, QString(zh(u8"单台相机保存位置已应用，返回码 %1")).arg(json_code(json)));
+                   refresh_storage();
+                 });
   });
 
   QObject::connect(profile_camera_update, &QPushButton::clicked, [&]() {
@@ -4221,7 +4457,7 @@ int main(int argc, char* argv[]) {
       request_json(network, "POST", origin + "/api/steel/event", info, continuous_log,
                    [&](const QJsonObject& info_json) {
                      overview_steel_state = info_json;
-                     continuous_log_line(QString(zh(u8"钢板信息已写入：返回码 %1")).arg(json_code(info_json)));
+                     continuous_log_line(QString(zh(u8"钢管信息已写入：返回码 %1")).arg(json_code(info_json)));
                      send_steel_presence_event(true, continuous_log);
                    });
       return;

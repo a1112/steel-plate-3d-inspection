@@ -1,9 +1,8 @@
-import { AlertTriangle, ClipboardList, Gauge, MonitorCog } from 'lucide-react';
+import { Box, ClipboardList, Gauge, MonitorCog } from 'lucide-react';
 import type { ElementType, MouseEvent } from 'react';
-import type { InspectionSummary } from '../data/inspection';
 import type { InspectionUiState } from '../state/inspection-ui';
 
-type NavKey = InspectionUiState['activeNav'];
+export type NavKey = InspectionUiState['activeNav'];
 
 const navItems: Array<{ id: NavKey; label: string; icon: ElementType }> = [
   { id: 'online', label: '在线检测', icon: Gauge },
@@ -13,25 +12,29 @@ const navItems: Array<{ id: NavKey; label: string; icon: ElementType }> = [
 
 export function TopNav({
   active,
-  summary,
   onChange,
   onDragMouseDown,
+  embedded = false,
 }: {
   active: NavKey;
-  summary: InspectionSummary;
   onChange: (next: NavKey) => void;
-  onDragMouseDown: (event: MouseEvent<HTMLElement>) => void;
+  onDragMouseDown?: (event: MouseEvent<HTMLElement>) => void;
+  embedded?: boolean;
 }) {
-  const hasSevereDefect = summary.bySeverity.severe > 0;
-  const hasDefect = summary.total > 0;
-  const message = hasSevereDefect
-    ? `检测到 ${summary.bySeverity.severe} 个严重缺陷`
-    : hasDefect
-      ? `当前钢板 ${summary.total} 个缺陷均未达严重等级`
-      : '当前钢板未检出缺陷';
+  const openBarSurfaceWorkbench = () => {
+    window.open('/?app=bar-surface', '_blank', 'popup,width=1880,height=980');
+  };
+
+  const handleMouseDown = (event: MouseEvent<HTMLElement>) => {
+    if (embedded) {
+      event.stopPropagation();
+      return;
+    }
+    onDragMouseDown?.(event);
+  };
 
   return (
-    <nav className="top-nav" onMouseDown={onDragMouseDown}>
+    <nav className={`top-nav ${embedded ? 'top-nav-embedded' : ''}`} data-no-drag={embedded || undefined} onMouseDown={handleMouseDown}>
       {navItems.map((item) => {
         const Icon = item.icon;
         return (
@@ -41,12 +44,15 @@ export function TopNav({
           </button>
         );
       })}
-      <div className={`top-nav-alert ${hasSevereDefect ? '' : 'stable'}`} aria-label={`${hasSevereDefect ? '严重缺陷报警' : '缺陷状态正常'}，${message}`} data-no-drag>
-        <AlertTriangle size={20} strokeWidth={1.9} />
-        <strong>{hasSevereDefect ? '严重缺陷报警' : '缺陷状态正常'}</strong>
-        <span>{message}</span>
-        <b>{hasSevereDefect ? '请立即复核' : '可继续跟踪'}</b>
-      </div>
+      <button
+        type="button"
+        className="top-nav-workbench"
+        onMouseDown={(event) => event.stopPropagation()}
+        onClick={openBarSurfaceWorkbench}
+      >
+        <Box size={18} />
+        <span>3D 重建</span>
+      </button>
     </nav>
   );
 }

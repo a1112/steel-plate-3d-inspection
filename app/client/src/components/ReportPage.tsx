@@ -1,7 +1,7 @@
 import { Download, FileText, RotateCcw, Search } from 'lucide-react';
 import type { ChangeEvent, CSSProperties } from 'react';
 import type { DefectItem, DefectType, PlateInspection, Severity } from '../data/inspection';
-import { severityLabels, surfaceLabels } from '../data/inspection';
+import { severityLabels } from '../data/inspection';
 import type { ReportFilters, ReportMetrics } from '../state/operations';
 import { Panel } from './Panel';
 
@@ -13,9 +13,9 @@ const severityOptions: Array<{ value: ReportFilters['severity']; label: string }
 ];
 
 const surfaceOptions: Array<{ value: ReportFilters['surface']; label: string }> = [
-  { value: 'all', label: '全部表面' },
-  { value: 'top', label: '上表面' },
-  { value: 'bottom', label: '下表面' },
+  { value: 'all', label: '全部相机区' },
+  { value: 'top', label: '1-3号相机' },
+  { value: 'bottom', label: '4-6号相机' },
 ];
 
 const severityColors: Record<Severity, string> = {
@@ -72,6 +72,15 @@ function createPlateReportRows(rows: DefectItem[], inspections: PlateInspection[
     .sort((a, b) => b.total - a.total || a.plateNo.localeCompare(b.plateNo));
 }
 
+function getDefectCameraLabel(defect: DefectItem) {
+  const span = defect.operatorSideMm + defect.driveSideMm;
+  if (Number.isFinite(span) && span > 0) {
+    const cameraIndex = Math.min(5, Math.max(0, Math.floor((defect.operatorSideMm / span) * 6)));
+    return `camera${cameraIndex + 1}`;
+  }
+  return defect.surface === 'top' ? 'camera1-3' : 'camera4-6';
+}
+
 function DefectRows({
   rows,
   page,
@@ -101,7 +110,7 @@ function DefectRows({
           <td>{String((page - 1) * 8 + index + 1).padStart(2, '0')}</td>
           <td>{defect.plateNo}</td>
           <td>{defect.typeLabel}</td>
-          <td>{surfaceLabels[defect.surface]}</td>
+          <td>{getDefectCameraLabel(defect)}</td>
           <td className={defect.severity}>{severityLabels[defect.severity]}</td>
           <td>{defect.distanceHeadMm}mm</td>
           <td>{defect.operatorSideMm}mm</td>
@@ -173,8 +182,8 @@ export function ReportPage({
       <section className="report-document">
         <header className="report-document-header">
           <div>
-            <span>钢板 3D 表面检测系统</span>
-            <h1>钢板表面缺陷检测报表</h1>
+            <span>钢管 3D 表面检测系统</span>
+            <h1>钢管表面缺陷检测报表</h1>
           </div>
           <div className="report-document-meta">
             <span>报表编号 RPT-20260613-1900</span>
@@ -202,7 +211,7 @@ export function ReportPage({
           <div className="report-filter-grid">
             <label>
               <span>关键字</span>
-              <input value={filters.keyword} onChange={(event) => onFilterChange({ keyword: event.target.value })} placeholder="钢板号 / 缺陷 / 距离" />
+              <input value={filters.keyword} onChange={(event) => onFilterChange({ keyword: event.target.value })} placeholder="钢管号 / 缺陷 / 距离" />
             </label>
             <label>
               <span>缺陷等级</span>
@@ -215,7 +224,7 @@ export function ReportPage({
               </select>
             </label>
             <label>
-              <span>检测表面</span>
+              <span>相机区</span>
               <select value={filters.surface} onChange={(event) => handleSelect(event, 'surface')}>
                 {surfaceOptions.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -250,7 +259,7 @@ export function ReportPage({
 
         <section className="report-metrics">
           <div>
-            <span>钢板数</span>
+            <span>钢管数</span>
             <strong>{plateRows.length}</strong>
           </div>
           <div>
@@ -266,7 +275,7 @@ export function ReportPage({
             <strong>{metrics.review}</strong>
           </div>
           <div>
-            <span>上/下表面</span>
+            <span>相机区</span>
             <strong>{metrics.top}/{metrics.bottom}</strong>
           </div>
           <div>
@@ -276,11 +285,11 @@ export function ReportPage({
         </section>
 
         <section className="report-layout">
-          <Panel title="钢板汇总" className="report-plate-panel">
+          <Panel title="钢管汇总" className="report-plate-panel">
             <table className="report-table plate-summary-table">
               <thead>
                 <tr>
-                  <th>钢板号</th>
+                  <th>钢管号</th>
                   <th>钢种</th>
                   <th>规格 mm</th>
                   <th>检测时间</th>
@@ -288,7 +297,7 @@ export function ReportPage({
                   <th>严重</th>
                   <th>待复核</th>
                   <th>轻微</th>
-                  <th>上/下表</th>
+                  <th>相机区</th>
                   <th>最大深度</th>
                   <th>距头范围</th>
                 </tr>
@@ -313,7 +322,7 @@ export function ReportPage({
                 ) : (
                   <tr>
                     <td colSpan={11} className="empty-cell">
-                      当前筛选条件下无钢板记录
+                      当前筛选条件下无钢管记录
                     </td>
                   </tr>
                 )}
@@ -335,9 +344,9 @@ export function ReportPage({
             <thead>
               <tr>
                 <th>序号</th>
-                <th>钢板号</th>
+                <th>钢管号</th>
                 <th>缺陷类别</th>
-                <th>表面</th>
+                <th>相机</th>
                 <th>等级</th>
                 <th>距头距离</th>
                 <th>操作侧</th>
@@ -392,7 +401,7 @@ export function ReportPage({
                       <dd>{selectedDefect.id}</dd>
                     </div>
                     <div>
-                      <dt>钢板号</dt>
+                      <dt>钢管号</dt>
                       <dd>{selectedDefect.plateNo}</dd>
                     </div>
                     <div>
@@ -405,7 +414,7 @@ export function ReportPage({
                     </div>
                     <div>
                       <dt>定位</dt>
-                      <dd>{`${surfaceLabels[selectedDefect.surface]} / 距头 ${selectedDefect.distanceHeadMm}mm`}</dd>
+                      <dd>{`${getDefectCameraLabel(selectedDefect)} / 距头 ${selectedDefect.distanceHeadMm}mm`}</dd>
                     </div>
                     <div>
                       <dt>边部距离</dt>

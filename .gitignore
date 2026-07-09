@@ -7,6 +7,9 @@ target/
 .vite/
 *.log
 *.local
+__pycache__/
+*.py[cod]
 logFile.ini
 config/*.sqlite
 config/*.sqlite-*
+simulated/production/

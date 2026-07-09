@@ -1,0 +1,162 @@
+{
+  "calibration": "E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger\\ArrayCalibration.xml",
+  "dataDir": "E:\\steel-capture-data\\continuous-test\\calibration-retake-20260707-142028",
+  "rows": [
+    250,
+    500,
+    750
+  ],
+  "outputDir": "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317",
+  "correctedXml": "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\ArrayCalibration.corrected.xml",
+  "beforePreview": "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\cross_section_before.png",
+  "afterPreview": "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\cross_section_corrected.png",
+  "correctionsCsv": "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\camera_corrections.csv",
+  "pointsCsv": "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\cross_section_points.csv",
+  "fitBefore": {
+    "centerX": -13.828670523956964,
+    "centerZ": -8.099650858873105,
+    "radius": 57.4842767137737,
+    "diameter": 114.9685534275474,
+    "meanAbsResidual": 0.09659776176294865,
+    "stdResidual": 0.13472612644667653,
+    "maxAbsResidual": 0.4992191885993904,
+    "pointCount": 14021,
+    "robustPointCount": 14021
+  },
+  "fitAfter": {
+    "centerX": -13.844982237564928,
+    "centerZ": -8.079610672498148,
+    "radius": 57.5105227949738,
+    "diameter": 115.0210455899476,
+    "meanAbsResidual": 0.07876434248680961,
+    "stdResidual": 0.10782861400741624,
+    "maxAbsResidual": 0.4978589137031264,
+    "pointCount": 14381,
+    "robustPointCount": 14381
+  },
+  "cameraCount": 6,
+  "maxShiftMm": 3.0,
+  "corrections": [
+    {
+      "ip": "192.168.101.100",
+      "sn": "3G506401BE08818",
+      "dx": 0.46875,
+      "dz": 0.03515625,
+      "shiftMagnitude": 0.4700665106280839,
+      "before": {
+        "meanAbsResidual": 0.2813529113314746,
+        "medianResidual": -0.04240714255945477,
+        "stdResidual": 0.3685075217608473,
+        "maxAbsResidual": 1.0837001010140312
+      },
+      "after": {
+        "meanAbsResidual": 0.10074871249259211,
+        "medianResidual": 0.01810508168053815,
+        "stdResidual": 0.1539945068888627,
+        "maxAbsResidual": 0.6510753980540258
+      },
+      "depthPath": "E:\\steel-capture-data\\continuous-test\\calibration-retake-20260707-142028\\192_168_101_100\\depth\\round-001-shot-0002_depthMap.png"
+    },
+    {
+      "ip": "192.168.102.100",
+      "sn": "3G506501CA09165",
+      "dx": 0.0,
+      "dz": -0.0234375,
+      "shiftMagnitude": 0.0234375,
+      "before": {
+        "meanAbsResidual": 0.06337257884261417,
+        "medianResidual": 0.02085107278106335,
+        "stdResidual": 0.09498467817736712,
+        "maxAbsResidual": 0.4970921942167763
+      },
+      "after": {
+        "meanAbsResidual": 0.06144691153922287,
+        "medianResidual": 0.012103922217640672,
+        "stdResidual": 0.0916334096647732,
+        "maxAbsResidual": 0.4753012158869865
+      },
+      "depthPath": "E:\\steel-capture-data\\continuous-test\\calibration-retake-20260707-142028\\192_168_102_100\\depth\\round-001-shot-0005_depthMap.png"
+    },
+    {
+      "ip": "192.168.103.100",
+      "sn": "3G506401RE08993",
+      "dx": -0.03515625,
+      "dz": -0.046875,
+      "shiftMagnitude": 0.05859375,
+      "before": {
+        "meanAbsResidual": 0.06758823724597388,
+        "medianResidual": 0.02297275085395256,
+        "stdResidual": 0.07892832458501864,
+        "maxAbsResidual": 0.524137599299273
+      },
+      "after": {
+        "meanAbsResidual": 0.05806903933277233,
+        "medianResidual": -0.0031560707456605996,
+        "stdResidual": 0.07436653356424407,
+        "maxAbsResidual": 0.580588115408446
+      },
+      "depthPath": "E:\\steel-capture-data\\continuous-test\\calibration-retake-20260707-142028\\192_168_103_100\\depth\\round-001-shot-0003_depthMap.png"
+    },
+    {
+      "ip": "192.168.104.100",
+      "sn": "3G506401BE08819",
+      "dx": -0.10546875,
+      "dz": 0.0,
+      "shiftMagnitude": 0.10546875,
+      "before": {
+        "meanAbsResidual": 0.08607957893967176,
+        "medianResidual": -0.0052562767190380555,
+        "stdResidual": 0.12101915875120169,
+        "maxAbsResidual": 0.3613596393855403
+      },
+      "after": {
+        "meanAbsResidual": 0.07035715398893015,
+        "medianResidual": 0.0027437839783424067,
+        "stdResidual": 0.08989524480377566,
+        "maxAbsResidual": 0.2796967793238281
+      },
+      "depthPath": "E:\\steel-capture-data\\continuous-test\\calibration-retake-20260707-142028\\192_168_104_100\\depth\\round-001-shot-0001_depthMap.png"
+    },
+    {
+      "ip": "192.168.105.13",
+      "sn": "YF-0263",
+      "dx": -0.05859375,
+      "dz": 0.046875,
+      "shiftMagnitude": 0.0750366121574162,
+      "before": {
+        "meanAbsResidual": 0.06329075914069132,
+        "medianResidual": -0.010766680742815282,
+        "stdResidual": 0.07708454278829306,
+        "maxAbsResidual": 0.3260169219954747
+      },
+      "after": {
+        "meanAbsResidual": 0.056034113045586455,
+        "medianResidual": 0.011192277856792998,
+        "stdResidual": 0.07255678864835498,
+        "maxAbsResidual": 0.2734466086058944
+      },
+      "depthPath": "E:\\steel-capture-data\\continuous-test\\calibration-retake-20260707-142028\\192_168_105_13\\depth\\round-001-shot-0006_depthMap.png"
+    },
+    {
+      "ip": "192.168.106.100",
+      "sn": "3G506401RE08991",
+      "dx": -0.046875,
+      "dz": -0.046875,
+      "shiftMagnitude": 0.06629126073623882,
+      "before": {
+        "meanAbsResidual": 0.12115894755338374,
+        "medianResidual": -0.021561421526058666,
+        "stdResidual": 0.14624120580498412,
+        "maxAbsResidual": 0.32485514314600294
+      },
+      "after": {
+        "meanAbsResidual": 0.118240873769407,
+        "medianResidual": -0.014250776788976793,
+        "stdResidual": 0.14166377496354507,
+        "maxAbsResidual": 0.375336656169587
+      },
+      "depthPath": "E:\\steel-capture-data\\continuous-test\\calibration-retake-20260707-142028\\192_168_106_100\\depth\\round-001-shot-0004_depthMap.png"
+    }
+  ],
+  "note": "Corrections are X/Z translations only. Review before replacing the production calibration XML."
+}

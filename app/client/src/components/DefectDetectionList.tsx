@@ -1,7 +1,7 @@
 import { ChevronLeft, ChevronRight, Filter } from 'lucide-react';
 import type { ChangeEvent } from 'react';
 import type { DefectItem } from '../data/inspection';
-import { severityLabels, surfaceLabels } from '../data/inspection';
+import { severityLabels } from '../data/inspection';
 import type { ReportFilters } from '../state/operations';
 import { Panel } from './Panel';
 
@@ -19,6 +19,13 @@ interface DefectDetectionListProps {
   onClearFilters: () => void;
 }
 
+function getDefectCameraLabel(defect: DefectItem) {
+  const span = defect.operatorSideMm + defect.driveSideMm;
+  const ratio = span > 0 ? defect.operatorSideMm / span : (defect.yOffsetMm + 1.5) / 3;
+  const cameraIndex = Math.max(0, Math.min(5, Math.floor(Math.max(0, Math.min(0.999, ratio)) * 6)));
+  return `camera${cameraIndex + 1}`;
+}
+
 export function DefectDetectionList({
   defects,
   selectedDefectId,
@@ -32,7 +39,7 @@ export function DefectDetectionList({
   onFilterChange,
   onClearFilters,
 }: DefectDetectionListProps) {
-  const handleSelect = (event: ChangeEvent<HTMLSelectElement>, key: 'severity' | 'surface') => {
+  const handleSelect = (event: ChangeEvent<HTMLSelectElement>, key: 'severity') => {
     onFilterChange({ [key]: event.target.value } as Partial<ReportFilters>);
   };
 
@@ -48,17 +55,12 @@ export function DefectDetectionList({
     >
       {filterOpen ? (
         <div className="inline-filter">
-          <input value={filters.keyword} onChange={(event) => onFilterChange({ keyword: event.target.value })} placeholder="钢板号 / 缺陷 / 距离" />
+          <input value={filters.keyword} onChange={(event) => onFilterChange({ keyword: event.target.value })} placeholder="钢管号 / 缺陷 / 距离" />
           <select value={filters.severity} onChange={(event) => handleSelect(event, 'severity')}>
             <option value="all">全部等级</option>
             <option value="severe">严重</option>
             <option value="review">待复核</option>
             <option value="minor">轻微</option>
-          </select>
-          <select value={filters.surface} onChange={(event) => handleSelect(event, 'surface')}>
-            <option value="all">全部表面</option>
-            <option value="top">上表面</option>
-            <option value="bottom">下表面</option>
           </select>
           <button type="button" onClick={onClearFilters}>
             清空
@@ -71,7 +73,7 @@ export function DefectDetectionList({
             <tr>
               <th>序号</th>
               <th>缺陷类别</th>
-              <th>表面</th>
+              <th>相机</th>
               <th>距头距离</th>
               <th>等级</th>
             </tr>
@@ -86,7 +88,7 @@ export function DefectDetectionList({
                 >
                   <td>{String((page - 1) * 10 + index + 1).padStart(2, '0')}</td>
                   <td>{defect.typeLabel}</td>
-                  <td>{surfaceLabels[defect.surface]}</td>
+                  <td>{getDefectCameraLabel(defect)}</td>
                   <td>{defect.distanceHeadMm}mm</td>
                   <td className={defect.severity}>{severityLabels[defect.severity]}</td>
                 </tr>

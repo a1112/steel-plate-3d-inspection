@@ -2,9 +2,12 @@ param(
   [int]$Port = 4881,
   [string]$HostAddress = "127.0.0.1",
   [string]$InspectionServiceOrigin = "http://127.0.0.1:4873",
-  [ValidateSet("api", "gray")]
+  [ValidateSet("api", "gray", "secondary", "manual")]
   [string]$Mode = "api",
-  [string]$EnvFile = ""
+  [string]$EnvFile = "",
+  [ValidateSet("debug", "release")]
+  [string]$Profile = "debug",
+  [switch]$ForceParameters
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,18 +16,23 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 
 Import-EnvFile $EnvFile
 
-if (-not $env:TRIGGER_GATEWAY_PORT) {
+if ($ForceParameters -or -not $env:TRIGGER_GATEWAY_PORT) {
   $env:TRIGGER_GATEWAY_PORT = [string]$Port
 }
-if (-not $env:TRIGGER_GATEWAY_HOST) {
+if ($ForceParameters -or -not $env:TRIGGER_GATEWAY_HOST) {
   $env:TRIGGER_GATEWAY_HOST = $HostAddress
 }
-if (-not $env:INSPECTION_SERVICE_ORIGIN) {
+if ($ForceParameters -or -not $env:INSPECTION_SERVICE_ORIGIN) {
   $env:INSPECTION_SERVICE_ORIGIN = $InspectionServiceOrigin
 }
-if (-not $env:TRIGGER_MODE) {
+if ($ForceParameters -or -not $env:TRIGGER_MODE) {
   $env:TRIGGER_MODE = $Mode
 }
 
-& cargo run --manifest-path (Join-Path $RepoRoot "app\service\Cargo.toml") --bin steel_trigger_gateway
+$TriggerExe = Join-Path $RepoRoot "target\trigger\$Profile\steel-trigger-gateway.exe"
+if (-not (Test-Path $TriggerExe -PathType Leaf)) {
+  throw "Missing $TriggerExe. Run scripts/build-trigger-gateway.ps1 -Profile $Profile first."
+}
+
+& $TriggerExe
 exit $LASTEXITCODE

@@ -37,7 +37,7 @@ const adminOverview = {
     path: '/tmp/steel-inspection.sqlite',
     configDir: '/tmp/config',
     tables: [
-      { name: 'steel_plate', label: '钢板档案', rows: 10 },
+      { name: 'steel_plate', label: '钢管档案', rows: 10 },
       { name: 'defect', label: '缺陷明细', rows: 12 },
       { name: 'defect_type', label: '缺陷类型', rows: 10 },
       { name: 'audit_log', label: '审计日志', rows: 2 },
@@ -121,7 +121,7 @@ const adminRecordDetail = {
       plateNo: '202606131900',
       typeId: 'pit',
       typeLabel: '凹坑',
-      surface: '上表面',
+      surface: '1-3号相机',
       severity: 'severe',
       distanceHeadMm: 8342,
       operatorSideMm: 1260,
@@ -791,7 +791,7 @@ describe('ParameterManagementApp', () => {
       if (url.includes('/api/admin/records/export')) {
         return {
           ok: true,
-          text: async () => '记录号,检测时间,板号,钢种,规格,状态,缺陷总数,严重,待复核,轻微\nR-001,19:00,202606131900,Q355B,3500 x 12000 x 12mm,检测中,12,4,3,5\n',
+          text: async () => '记录号,检测时间,管号,钢种,规格,状态,缺陷总数,严重,待复核,轻微\nR-001,19:00,202606131900,Q355B,3500 x 12000 x 12mm,检测中,12,4,3,5\n',
         };
       }
       if (url.includes('/api/admin/records/retention')) {
@@ -830,7 +830,7 @@ describe('ParameterManagementApp', () => {
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     expect(screen.getByText('工艺工程师')).toBeInTheDocument();
-    expect(screen.getByText('钢板档案')).toBeInTheDocument();
+    expect(screen.getByText('钢管档案')).toBeInTheDocument();
     expect(screen.getByText('缺陷明细')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '系统自检' })).toBeInTheDocument();
     expect(screen.getByText('总体状态')).toBeInTheDocument();
@@ -1388,7 +1388,7 @@ describe('ParameterManagementApp', () => {
     expect(screen.getByText('202606131900')).toBeInTheDocument();
     expect(screen.getByText('Q355B')).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('板号 / 记录号'), { target: { value: '202606131900' } });
+    fireEvent.change(screen.getByLabelText('管号 / 记录号'), { target: { value: '202606131900' } });
     fireEvent.change(screen.getByLabelText('状态'), { target: { value: 'detecting' } });
     fireEvent.click(screen.getByRole('button', { name: '查询' }));
 
@@ -1436,7 +1436,7 @@ describe('ParameterManagementApp', () => {
       );
     });
     expect(await screen.findByText('检测记录已清理：4 条记录')).toBeInTheDocument();
-    expect(screen.getByText('条检测记录已清理，缺陷 12 条，钢板 4 条')).toBeInTheDocument();
+    expect(screen.getByText('条检测记录已清理，缺陷 12 条，钢管 4 条')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '查看' }));
     await waitFor(() => {
@@ -1560,7 +1560,7 @@ describe('ParameterManagementApp', () => {
         }),
       );
     });
-    expect(await screen.findByText('钢板档案')).toBeInTheDocument();
+    expect(await screen.findByText('钢管档案')).toBeInTheDocument();
   });
 
   it('shows backend lockout message when login attempts are temporarily blocked', async () => {

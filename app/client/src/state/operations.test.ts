@@ -111,7 +111,7 @@ describe('operations state helpers', () => {
     const snapshot = getMockInspectionSnapshot();
     const csv = exportRowsAsCsv(snapshot.defects.slice(0, 2));
 
-    expect(csv.split('\n')[0]).toBe('序号,钢板号,缺陷类别,表面,等级,距头距离(mm),尺寸(mm),深度(mm)');
-    expect(csv).toContain('D-001,202606131900,凹坑,上表面,严重,8342,0.42 x 0.36,-0.12');
+    expect(csv.split('\n')[0]).toBe('序号,钢管号,缺陷类别,相机区,等级,距头距离(mm),尺寸(mm),深度(mm)');
+    expect(csv).toContain('D-001,202606131900,凹坑,1-3号相机,严重,8342,0.42 x 0.36,-0.12');
   });
 });

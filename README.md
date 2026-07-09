@@ -1,11 +1,12 @@
-# Steel Plate 3D Inspection
+# Bar Surface 3D Reconstruction
 
-Steel plate 3D inspection workspace with independent runtime boundaries:
+Bar surface 3D reconstruction workspace with independent runtime boundaries:
 
 ```text
 LVM/NVT cameras
   -> C++ capture provider: app/capture or app/capture-qt
   -> Rust service: app/service
+  -> standalone trigger gateway: app/trigger
   -> Tauri/React client: app/client
 ```
 
@@ -14,9 +15,11 @@ LVM/NVT cameras
 - `app/capture`: C++ SDK capture core plus headless local API executable.
 - `app/capture-qt`: standalone Qt capture terminal that links the capture core and owns camera SDK handles.
 - `app/service`: Rust backend for business APIs, configuration, records, auth, and capture provider proxying.
+- `app/trigger`: standalone trigger gateway. It talks to the Rust service by HTTP only; the service then talks to the capture provider.
 - `app/client`: Tauri/React client. It calls Rust only and does not link or ship the camera SDK.
 
 The capture API contract is documented in [docs/capture-api-contract.md](docs/capture-api-contract.md). The full architecture notes are in [docs/independent-architecture.md](docs/independent-architecture.md).
+The integrated capture-management acceptance matrix is in [docs/integrated-capture-management-acceptance.md](docs/integrated-capture-management-acceptance.md).
 
 ## Quick Start
 
@@ -32,6 +35,7 @@ Build the Rust service and client independently:
 
 ```powershell
 scripts/build-service.ps1
+scripts/build-trigger-gateway.ps1
 scripts/build-client.ps1
 ```
 

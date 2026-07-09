@@ -196,7 +196,7 @@ export function createInitialOperationState(): OperationState {
         id: 'EVT-002',
         time: '2026-06-14 15:54:09',
         level: 'info',
-        message: 'L2 上传队列为空，最近一块钢板已归档',
+        message: 'L2 上传队列为空，最近一支钢管已归档',
       },
     ],
     lastSyncTime: '2026-06-14 15:59:40',
@@ -251,7 +251,7 @@ export function getDeviceStatusWithOperation(status: DeviceStatus, operation: Pi
 }
 
 export function exportRowsAsCsv(defects: DefectItem[]): string {
-  const header = '序号,钢板号,缺陷类别,表面,等级,距头距离(mm),尺寸(mm),深度(mm)';
+  const header = '序号,钢管号,缺陷类别,相机区,等级,距头距离(mm),尺寸(mm),深度(mm)';
   const rows = defects.map((defect) =>
     [
       defect.id,

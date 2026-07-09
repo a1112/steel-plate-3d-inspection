@@ -1,10 +1,40 @@
 param(
-  [switch]$IncludeNode
+  [switch]$IncludeNode,
+  [int[]]$Ports = @(4317, 4873, 4881, 1432)
 )
 
 $ErrorActionPreference = "Stop"
 
-$Patterns = @("*steel-inspection-service*", "*steel_capture_service*", "*steel_capture_qt_terminal*")
+function Get-ListenerProcessIds {
+  param([int]$Port)
+
+  $Ids = @()
+  try {
+    $Ids = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+      Select-Object -ExpandProperty OwningProcess -Unique
+  } catch {
+    $Ids = @()
+  }
+
+  if (-not $Ids -or $Ids.Count -eq 0) {
+    $Lines = netstat -ano | Select-String ":$Port\s"
+    foreach ($Line in $Lines) {
+      if ([string]$Line -match "LISTENING\s+(\d+)") {
+        $Ids += [int]$Matches[1]
+      }
+    }
+  }
+
+  return @($Ids | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+}
+
+$Patterns = @(
+  "*steel-inspection-service*",
+  "*steel-trigger-gateway*",
+  "*steel_trigger_gateway*",
+  "*steel_capture_service*",
+  "*steel_capture_qt_terminal*"
+)
 if ($IncludeNode) {
   $Patterns += @("*node*", "*vite*")
 }
@@ -16,7 +46,23 @@ $Processes = Get-Process | Where-Object {
   }
 }
 
-if (-not $Processes) {
+$PortProcesses = @()
+foreach ($Port in $Ports) {
+  foreach ($ProcessId in (Get-ListenerProcessIds -Port $Port)) {
+    $Process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($Process) {
+      $PortProcesses += $Process
+    }
+  }
+}
+
+$Processes = @(
+  @($Processes) + @($PortProcesses) |
+    Where-Object { $_ -and $_.Id -gt 4 -and $_.Id -ne $PID } |
+    Sort-Object Id -Unique
+)
+
+if (-not $Processes -or $Processes.Count -eq 0) {
   Write-Host "No steel inspection runtime processes found."
   return
 }

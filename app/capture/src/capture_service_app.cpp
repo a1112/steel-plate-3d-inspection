@@ -9,16 +9,20 @@
 #include <condition_variable>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -33,6 +37,9 @@
 namespace {
 
 std::atomic<bool> g_running{true};
+std::atomic<unsigned long long> g_temp_file_counter{0};
+constexpr int CAPTURE_DISCARDED_NOT_ARMED = 49000;
+constexpr int BLACK_FRAME_DISCARDED = 49001;
 
 std::string trim(std::string value);
 
@@ -111,6 +118,8 @@ std::string json_error(int code, const std::string& message) {
 std::string capture_error_name(int code) {
   switch (code) {
     case CORRECT: return "CORRECT";
+    case CAPTURE_DISCARDED_NOT_ARMED: return "CAPTURE_DISCARDED_NOT_ARMED";
+    case BLACK_FRAME_DISCARDED: return "BLACK_FRAME_DISCARDED";
     case DEV_LOAD_DATA_ERROR: return "DEV_LOAD_DATA_ERROR";
     case MALLOC_FAILED: return "MALLOC_FAILED";
     case INPUT_PARAMETER_ERROR: return "INPUT_PARAMETER_ERROR";
@@ -118,6 +127,7 @@ std::string capture_error_name(int code) {
     case 40065: return "LVMS_GET_DATA_TIMEOUT";
     case 409: return "STREAM_CONFLICT";
     case 500: return "IO_ERROR";
+    case 504: return "CAPTURE_WORKER_TIMEOUT";
     default: return "SDK_ERROR_" + std::to_string(code);
   }
 }
@@ -126,6 +136,10 @@ std::string capture_error_hint(int code) {
   switch (code) {
     case CORRECT:
       return "ok";
+    case CAPTURE_DISCARDED_NOT_ARMED:
+      return "production capture is in discard state; send steel-in before saving frames";
+    case BLACK_FRAME_DISCARDED:
+      return "frame was discarded because the intensity image is below the black-frame threshold";
     case DEV_LOAD_DATA_ERROR:
     case 40065:
       return "camera accepted the configuration but no frame was returned before timeout; verify laser/array enable, trigger source is time, exposure, line count, target material, and vendor driver state";
@@ -137,6 +151,8 @@ std::string capture_error_hint(int code) {
       return "camera is not connected; run discovery/connect before capture";
     case 409:
       return "a preview stream is running; stop preview before blocking capture";
+    case 504:
+      return "capture worker exceeded the hard timeout; the SDK grab call may still be unwinding in the background";
     default:
       return "SDK returned a non-zero code; check vendor logs and the per-frame metadata file";
   }
@@ -637,6 +653,49 @@ std::map<std::string, std::string> json_profile_camera_files_field(const std::st
   return files;
 }
 
+std::map<std::string, std::string> merge_string_maps(std::map<std::string, std::string> base,
+                                                     const std::map<std::string, std::string>& overlay) {
+  for (const auto& item : overlay) {
+    if (!item.first.empty() && !item.second.empty()) {
+      base[item.first] = item.second;
+    }
+  }
+  return base;
+}
+
+std::map<std::string, std::string> json_camera_roots_array_field(const std::string& body, const std::string& key) {
+  std::map<std::string, std::string> roots;
+  for (const std::string& object : json_object_array_field(body, key)) {
+    std::string ip = json_string_field(object, "ip");
+    std::string root = json_string_field(object, "root",
+                       json_string_field(object, "storageRoot",
+                       json_string_field(object, "storageDir",
+                       json_string_field(object, "captureRoot",
+                       json_string_field(object, "path")))));
+    if (!ip.empty() && !root.empty()) {
+      roots[ip] = root;
+    }
+  }
+  return roots;
+}
+
+std::map<std::string, std::string> json_profile_camera_roots_field(const std::string& profile) {
+  std::map<std::string, std::string> roots = json_camera_roots_array_field(profile, "cameraRoots");
+  roots = merge_string_maps(roots, json_camera_roots_array_field(profile, "cameraStorageRoots"));
+  roots = merge_string_maps(roots, json_camera_roots_array_field(profile, "cameraStorageDirs"));
+  for (const std::string& object : json_object_array_field(profile, "cameras")) {
+    std::string ip = json_string_field(object, "ip");
+    std::string root = json_string_field(object, "storageRoot",
+                       json_string_field(object, "storageDir",
+                       json_string_field(object, "captureRoot",
+                       json_string_field(object, "outputRoot"))));
+    if (!ip.empty() && !root.empty()) {
+      roots[ip] = root;
+    }
+  }
+  return roots;
+}
+
 std::string safe_path_segment(std::string value) {
   for (char& ch : value) {
     unsigned char c = static_cast<unsigned char>(ch);
@@ -680,6 +739,57 @@ std::filesystem::path default_storage_root_path() {
     return std::filesystem::path("E:\\steel-capture-data").lexically_normal();
   }
   return absolute_normalized_path("captures");
+}
+
+std::filesystem::path default_camera_storage_base_path() {
+  const char* env_root = std::getenv("CAPTURE_CAMERA_STORAGE_ROOT");
+  if (env_root && *env_root) {
+    return absolute_normalized_path(env_root);
+  }
+  std::error_code error;
+  if (std::filesystem::exists("H:\\", error)) {
+    return std::filesystem::path("H:\\").lexically_normal();
+  }
+  return default_storage_root_path();
+}
+
+std::vector<std::string> default_clockwise_camera_ips() {
+  return {
+      "192.168.101.100",
+      "192.168.102.100",
+      "192.168.103.100",
+      "192.168.104.100",
+      "192.168.105.13",
+      "192.168.106.100",
+  };
+}
+
+std::map<std::string, std::string> default_camera_storage_roots() {
+  std::map<std::string, std::string> roots;
+  const std::filesystem::path base = default_camera_storage_base_path();
+  const std::vector<std::string> ips = default_clockwise_camera_ips();
+  for (size_t i = 0; i < ips.size(); ++i) {
+    roots[ips[i]] = (base / ("camera" + std::to_string(i + 1))).lexically_normal().string();
+  }
+  return roots;
+}
+
+std::string camera_storage_roots_array_json(const std::map<std::string, std::filesystem::path>& roots) {
+  std::ostringstream json;
+  json << "[";
+  bool first = true;
+  for (const auto& item : roots) {
+    if (!first) {
+      json << ",";
+    }
+    first = false;
+    json << "{"
+         << json_pair("ip", item.first) << ","
+         << json_pair("root", item.second.string())
+         << "}";
+  }
+  json << "]";
+  return json.str();
 }
 
 std::filesystem::path default_config_root_path() {
@@ -743,18 +853,51 @@ bool read_file(const std::string& path, std::string& out) {
   return true;
 }
 
+std::filesystem::path temp_output_path_for(const std::filesystem::path& target) {
+  std::ostringstream suffix;
+  suffix << ".tmp-" << GetCurrentProcessId()
+         << "-" << std::this_thread::get_id()
+         << "-" << g_temp_file_counter.fetch_add(1);
+  return target.parent_path() / (target.stem().string() + suffix.str() + target.extension().string());
+}
+
+bool replace_with_completed_file(const std::filesystem::path& temp_path, const std::filesystem::path& target_path) {
+  std::error_code error;
+  std::filesystem::create_directories(target_path.parent_path(), error);
+  if (error) {
+    std::filesystem::remove(temp_path, error);
+    return false;
+  }
+  error.clear();
+  std::filesystem::remove(target_path, error);
+  error.clear();
+  std::filesystem::rename(temp_path, target_path, error);
+  std::error_code exists_error;
+  if (!error && std::filesystem::exists(target_path, exists_error) && std::filesystem::is_regular_file(target_path, exists_error)) {
+    return true;
+  }
+  error.clear();
+  std::filesystem::copy_file(temp_path, target_path, std::filesystem::copy_options::overwrite_existing, error);
+  std::error_code remove_error;
+  std::filesystem::remove(temp_path, remove_error);
+  exists_error.clear();
+  return !error && std::filesystem::exists(target_path, exists_error) && std::filesystem::is_regular_file(target_path, exists_error);
+}
+
 bool write_text_file(const std::filesystem::path& path, const std::string& body) {
   std::error_code error;
   std::filesystem::create_directories(path.parent_path(), error);
   if (error) {
     return false;
   }
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  const std::filesystem::path temp_path = temp_output_path_for(path);
+  std::ofstream file(temp_path, std::ios::binary | std::ios::trunc);
   if (!file) {
     return false;
   }
   file << body;
-  return static_cast<bool>(file);
+  file.close();
+  return static_cast<bool>(file) && replace_with_completed_file(temp_path, path);
 }
 
 bool file_exists(const std::string& path) {
@@ -764,6 +907,20 @@ bool file_exists(const std::string& path) {
   std::error_code error;
   const std::filesystem::path candidate(path);
   return std::filesystem::exists(candidate, error) && std::filesystem::is_regular_file(candidate, error);
+}
+
+bool wait_for_file_exists(const std::string& path, int timeout_ms = 750) {
+  if (path.empty()) {
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  do {
+    if (file_exists(path)) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return file_exists(path);
 }
 
 bool copy_file_replace(const std::string& source, const std::string& target) {
@@ -780,9 +937,79 @@ bool copy_file_replace(const std::string& source, const std::string& target) {
   if (error) {
     return false;
   }
-  std::filesystem::copy_file(source_path, target_path, std::filesystem::copy_options::overwrite_existing, error);
-  return !error && file_exists(target);
+  const std::filesystem::path temp_path = temp_output_path_for(target_path);
+  std::filesystem::copy_file(source_path, temp_path, std::filesystem::copy_options::overwrite_existing, error);
+  if (error) {
+    std::filesystem::remove(temp_path, error);
+    return false;
+  }
+  return replace_with_completed_file(temp_path, target_path);
 }
+
+class StorageThreadPool {
+ public:
+  explicit StorageThreadPool(size_t thread_count = 0) {
+    if (thread_count == 0) {
+      const unsigned int hardware = std::thread::hardware_concurrency();
+      thread_count = std::max<size_t>(2, std::min<size_t>(8, hardware == 0 ? 4 : hardware / 2));
+    }
+    for (size_t index = 0; index < thread_count; ++index) {
+      workers_.emplace_back([this]() { worker_loop(); });
+    }
+  }
+
+  ~StorageThreadPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    cv_.notify_all();
+    for (auto& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+
+  std::future<int> submit(std::function<int()> task) {
+    auto promise = std::make_shared<std::promise<int>>();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      tasks_.push([task = std::move(task), promise]() mutable {
+        try {
+          promise->set_value(task());
+        } catch (...) {
+          promise->set_exception(std::current_exception());
+        }
+      });
+    }
+    cv_.notify_one();
+    return promise->get_future();
+  }
+
+ private:
+  void worker_loop() {
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&]() { return stopping_ || !tasks_.empty(); });
+        if (stopping_ && tasks_.empty()) {
+          return;
+        }
+        task = std::move(tasks_.front());
+        tasks_.pop();
+      }
+      task();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::queue<std::function<void()>> tasks_;
+  std::vector<std::thread> workers_;
+  bool stopping_ = false;
+};
 
 struct RouteResult {
   USHORT status = 200;
@@ -813,6 +1040,7 @@ class CaptureRuntime {
     if (method == "GET" && (path == "/health" || path == "/api/capture/health")) return {200, health_json()};
     if (method == "GET" && path == "/api/storage/status") return {200, storage_status_json()};
     if (method == "POST" && path == "/api/storage/config") return {200, storage_config_json(body)};
+    if (method == "POST" && path == "/api/storage/camera-roots") return {200, storage_camera_roots_config_json(body)};
     if (method == "GET" && path == "/api/config/status") return {200, config_status_json()};
     if (method == "GET" && path == "/api/config/profiles") return {200, config_profiles_json()};
     if (method == "GET" && path == "/api/config/profile") return {200, config_profile_json(query)};
@@ -838,6 +1066,7 @@ class CaptureRuntime {
     if (method == "POST" && path == "/api/capture/depth-map") return {200, capture_depth_json(body)};
     if (method == "POST" && path == "/api/capture/continuous-test") return {200, continuous_capture_test_json(body)};
     if (method == "GET" && path == "/api/capture/file") return capture_file_response(query);
+    if (method == "GET" && path == "/api/capture/latest") return capture_latest_response(query);
     if (method == "GET" && path == "/api/steel/status") return {200, steel_status_json()};
     if (method == "POST" && path == "/api/steel/event") return {200, steel_event_json(body)};
     if (method == "POST" && path == "/api/stream/start") return {200, stream_start_json(body)};
@@ -854,6 +1083,19 @@ class CaptureRuntime {
   }
 
  private:
+  struct ProductionCaptureSettings {
+    int lines = 1000;
+    int width = 0;
+    int timeout_ms = 8000;
+    int data_mode = 3;
+    int retries = 0;
+    int control_mode = 0;
+    int interval_ms = 500;
+    bool discard_black_frames = true;
+    bool save_sdk_derived = false;
+    double black_frame_threshold = 8.0;
+  };
+
   struct StreamState {
     bool running = false;
     int lines = 1280;
@@ -904,7 +1146,7 @@ class CaptureRuntime {
     std::map<std::string, std::string> params;
     StreamState stream;
     CalibrationState calibration;
-    std::shared_ptr<std::mutex> capture_mutex = std::make_shared<std::mutex>();
+    std::shared_ptr<std::timed_mutex> capture_mutex = std::make_shared<std::timed_mutex>();
   };
 
   struct SteelState {
@@ -920,6 +1162,10 @@ class CaptureRuntime {
     std::string session_id;
     std::string capture_dir;
     std::string summary_path;
+    std::string inspection_id;
+    std::string acquisition_mode = "external-trigger";
+    std::string capture_save_state = "discard";
+    std::string algorithm_phase = "pending";
     std::string session_started_at;
     std::string session_finished_at;
     std::string last_capture_at;
@@ -935,9 +1181,20 @@ class CaptureRuntime {
     int capture_count = 0;
     int capture_success_count = 0;
     int capture_failure_count = 0;
+    int discard_frame_count = 0;
+    int black_frame_count = 0;
+    bool save_enabled = false;
+    bool discard_black_frames = true;
+    double black_frame_threshold = 8.0;
   };
 
-  CaptureRuntime() : storage_root_(default_storage_root_path()), config_root_(default_config_root_path()) {}
+  CaptureRuntime()
+      : storage_root_(default_storage_root_path()),
+        config_root_(default_config_root_path()) {
+    for (const auto& item : default_camera_storage_roots()) {
+      camera_storage_roots_[item.first] = path_from_json_text(item.second).lexically_normal();
+    }
+  }
   CaptureRuntime(const CaptureRuntime&) = delete;
   CaptureRuntime& operator=(const CaptureRuntime&) = delete;
 
@@ -1094,7 +1351,15 @@ class CaptureRuntime {
   }
 
   bool is_output_path_allowed_locked(const std::string& path) const {
-    return is_path_under_base(path, storage_root_);
+    if (is_path_under_base(path, storage_root_)) {
+      return true;
+    }
+    for (const auto& item : camera_storage_roots_) {
+      if (is_path_under_base(path, item.second)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   std::string sibling_output_path(const std::string& output_path, const std::string& suffix, const std::string& extension) const {
@@ -1113,9 +1378,10 @@ class CaptureRuntime {
     std::string sdk_base_path;
     std::string sdk_depth_path;
     std::string sdk_intensity_path;
+    bool save_sdk_derived = false;
   };
 
-  CaptureOutputPaths capture_output_paths_for(const std::string& output_path) const {
+  CaptureOutputPaths capture_output_paths_for(const std::string& output_path, bool save_sdk_derived = false) const {
     std::filesystem::path requested(output_path);
     std::filesystem::path base_dir = requested.parent_path();
     const std::string parent_name = base_dir.filename().string();
@@ -1137,7 +1403,13 @@ class CaptureRuntime {
       paths.intensity_path = (base_dir / "intensity" / (stem + "_intensity.png")).lexically_normal().string();
       paths.metadata_path = (base_dir / "metadata" / (stem + "_metadata.json")).lexically_normal().string();
     }
-    paths.sdk_base_path = (base_dir / "sdk-derived" / (stem + ".png")).lexically_normal().string();
+    paths.save_sdk_derived = save_sdk_derived;
+    const std::filesystem::path sdk_dir = save_sdk_derived ? (base_dir / "sdk-derived") : (base_dir / ".sdk-scratch");
+    std::filesystem::path sdk_base = sdk_dir / (stem + ".png");
+    if (!save_sdk_derived) {
+      sdk_base = temp_output_path_for(sdk_base);
+    }
+    paths.sdk_base_path = sdk_base.lexically_normal().string();
     paths.sdk_depth_path = sibling_output_path(paths.sdk_base_path, "_depthMap", ".png");
     paths.sdk_intensity_path = sibling_output_path(paths.sdk_base_path, "_intensityMap", ".png");
     return paths;
@@ -1153,6 +1425,89 @@ class CaptureRuntime {
     if (error) return false;
     std::filesystem::create_directories(std::filesystem::path(paths.sdk_base_path).parent_path(), error);
     return !error;
+  }
+
+  void cleanup_sdk_outputs(const CaptureOutputPaths& paths) const {
+    if (paths.save_sdk_derived) {
+      return;
+    }
+    std::error_code error;
+    std::filesystem::remove(paths.sdk_base_path, error);
+    error.clear();
+    std::filesystem::remove(paths.sdk_depth_path, error);
+    error.clear();
+    std::filesystem::remove(paths.sdk_intensity_path, error);
+    error.clear();
+    std::filesystem::remove(std::filesystem::path(paths.sdk_base_path).parent_path(), error);
+  }
+
+  std::future<int> enqueue_depth_copy_storage(const CaptureOutputPaths& paths) {
+    return storage_pool_.submit([this, paths]() {
+      int result = 500;
+      if (wait_for_file_exists(paths.sdk_depth_path) && copy_file_replace(paths.sdk_depth_path, paths.depth_path)) {
+        result = CORRECT;
+      } else if (wait_for_file_exists(paths.sdk_base_path) && copy_file_replace(paths.sdk_base_path, paths.depth_path)) {
+        result = CORRECT;
+      }
+      cleanup_sdk_outputs(paths);
+      return result;
+    });
+  }
+
+  std::future<int> enqueue_intensity_storage(const std::string& intensity_path,
+                                             std::shared_ptr<std::vector<std::uint16_t>> pixels,
+                                             int width,
+                                             int height) {
+    return storage_pool_.submit([intensity_path, pixels = std::move(pixels), width, height]() {
+      if (intensity_path.empty() || !pixels || pixels->empty() || width <= 0 || height <= 0) {
+        return INPUT_PARAMETER_ERROR;
+      }
+      const std::filesystem::path target_path(intensity_path);
+      std::error_code error;
+      std::filesystem::create_directories(target_path.parent_path(), error);
+      if (error) {
+        return 500;
+      }
+      const std::filesystem::path temp_path = temp_output_path_for(target_path);
+      int ret = lvm_save_img(temp_path.string().c_str(),
+                          pixels->data(),
+                          width,
+                          height,
+                          LVM_IMAGE_FORMAT_16BIT_USHORT);
+      if (ret != CORRECT) {
+        std::filesystem::remove(temp_path, error);
+        return ret;
+      }
+      return replace_with_completed_file(temp_path, target_path) ? CORRECT : 500;
+    });
+  }
+
+  bool depth_map_is_black_frame(const lvm_depth_map_t* depth_map, double threshold) const {
+    if (!depth_map || !depth_map->intensity_img || !depth_map->intensity_img->data) {
+      return false;
+    }
+    const size_t width = static_cast<size_t>(std::max(0, static_cast<int>(depth_map->intensity_img->head.width)));
+    const size_t height = static_cast<size_t>(std::max(0, static_cast<int>(depth_map->intensity_img->head.height)));
+    const size_t pixels = width * height;
+    if (pixels == 0) {
+      return false;
+    }
+    const auto* data = reinterpret_cast<const std::uint16_t*>(depth_map->intensity_img->data);
+    const size_t step = std::max<size_t>(1, pixels / 4096);
+    double sum = 0.0;
+    std::uint16_t max_value = 0;
+    size_t samples = 0;
+    for (size_t index = 0; index < pixels; index += step) {
+      const std::uint16_t value = data[index];
+      sum += static_cast<double>(value);
+      max_value = std::max(max_value, value);
+      ++samples;
+    }
+    if (samples == 0) {
+      return false;
+    }
+    const double average = sum / static_cast<double>(samples);
+    return average <= threshold && static_cast<double>(max_value) <= threshold;
   }
 
   int write_capture_metadata_locked(const std::string& metadata_path,
@@ -1173,7 +1528,9 @@ class CaptureRuntime {
                                     unsigned int trigger_min_interval,
                                     unsigned int trigger_max_interval,
                                     unsigned int timestamp,
-                                    bool simulated) const {
+                                    bool simulated,
+                                    bool discarded = false,
+                                    const std::string& discard_reason = "") const {
     if (metadata_path.empty()) {
       return CORRECT;
     }
@@ -1211,11 +1568,56 @@ class CaptureRuntime {
          << "\"triggerMinInterval\":" << trigger_min_interval << ","
          << "\"triggerMaxInterval\":" << trigger_max_interval << ","
          << "\"timestamp\":" << timestamp << ","
+         << "\"discarded\":" << (discarded ? "true" : "false") << ","
+         << json_pair("discardReason", discard_reason) << ","
          << json_pair("depthPath", depth_path) << ","
          << json_pair("intensityPath", intensity_path) << ","
          << "\"captureConfig\":" << capture_config_json_for_session(&session)
          << "}";
-    return write_text_file(metadata_path, json.str()) ? CORRECT : 500;
+    auto metadata_future = storage_pool_.submit([metadata_path, body = json.str()]() {
+      return write_text_file(metadata_path, body) ? CORRECT : 500;
+    });
+    return metadata_future.get();
+  }
+
+  std::string camera_storage_roots_status_json_locked() const {
+    std::ostringstream roots_json;
+    roots_json << "[";
+    bool first = true;
+    for (const auto& item : camera_storage_roots_) {
+      std::error_code error;
+      bool existed_before = std::filesystem::exists(item.second, error);
+      if (!error && !existed_before) {
+        std::filesystem::create_directories(item.second, error);
+      }
+      error.clear();
+      bool exists = std::filesystem::exists(item.second, error);
+      bool writable = false;
+      if (!error && exists) {
+        std::filesystem::path probe = item.second / ".steel-capture-write-test.tmp";
+        {
+          std::ofstream file(probe, std::ios::binary);
+          if (file) {
+            file << "ok";
+            writable = true;
+          }
+        }
+        std::error_code remove_error;
+        std::filesystem::remove(probe, remove_error);
+      }
+      if (!first) {
+        roots_json << ",";
+      }
+      first = false;
+      roots_json << "{"
+                 << json_pair("ip", item.first) << ","
+                 << json_pair("root", item.second.string()) << ","
+                 << "\"exists\":" << (exists ? "true" : "false") << ","
+                 << "\"writable\":" << (writable ? "true" : "false")
+                 << "}";
+    }
+    roots_json << "]";
+    return roots_json.str();
   }
 
   std::string storage_status_json_locked(int code = CORRECT) const {
@@ -1243,7 +1645,8 @@ class CaptureRuntime {
     json << "{\"code\":" << code << ","
          << json_pair("root", storage_root_.string()) << ","
          << "\"exists\":" << (exists ? "true" : "false") << ","
-         << "\"writable\":" << (writable ? "true" : "false")
+         << "\"writable\":" << (writable ? "true" : "false") << ","
+         << "\"cameraRoots\":" << camera_storage_roots_status_json_locked()
          << "}";
     return json.str();
   }
@@ -1266,6 +1669,49 @@ class CaptureRuntime {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     storage_root_ = next_root;
+    return storage_status_json_locked();
+  }
+
+  std::filesystem::path camera_storage_root_from_text_locked(const std::string& text) const {
+    std::filesystem::path path = path_from_json_text(text).lexically_normal();
+    if (path.is_absolute()) {
+      return path;
+    }
+    return (storage_root_ / path).lexically_normal();
+  }
+
+  void apply_camera_storage_roots_locked(const std::map<std::string, std::string>& roots, bool replace) {
+    if (replace) {
+      camera_storage_roots_.clear();
+    }
+    for (const auto& item : roots) {
+      if (!item.first.empty() && !item.second.empty()) {
+        camera_storage_roots_[item.first] = camera_storage_root_from_text_locked(item.second);
+      }
+    }
+  }
+
+  std::string storage_camera_roots_config_json(const std::string& body) {
+    std::map<std::string, std::string> roots = json_camera_roots_array_field(body, "cameraRoots");
+    roots = merge_string_maps(roots, json_camera_roots_array_field(body, "cameraStorageRoots"));
+    roots = merge_string_maps(roots, json_camera_roots_array_field(body, "cameraStorageDirs"));
+    roots = merge_string_maps(roots, json_profile_camera_roots_field(body));
+    const bool reset_defaults = json_bool_field(body, "resetDefault", false) ||
+                                json_bool_field(body, "resetClockwiseH", false);
+    if (roots.empty() && !reset_defaults) {
+      return json_error(400, "missing camera roots");
+    }
+    const bool replace = json_bool_field(body, "replace", false) || reset_defaults;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (reset_defaults) {
+      camera_storage_roots_.clear();
+      for (const auto& item : default_camera_storage_roots()) {
+        camera_storage_roots_[item.first] = camera_storage_root_from_text_locked(item.second);
+      }
+    }
+    if (!roots.empty()) {
+      apply_camera_storage_roots_locked(roots, replace && !reset_defaults);
+    }
     return storage_status_json_locked();
   }
 
@@ -1429,11 +1875,52 @@ class CaptureRuntime {
     if (dir_text.empty()) {
       return (profile_dir_locked(profile_name) / "camera-params").lexically_normal();
     }
-    std::filesystem::path dir = path_from_json_text(dir_text);
-    if (!dir.is_absolute()) {
-      dir = (storage_root_ / dir).lexically_normal();
+    return config_or_storage_path_locked(dir_text);
+  }
+
+  std::filesystem::path strip_config_prefix_path(std::filesystem::path path) const {
+    auto it = path.begin();
+    if (it == path.end()) {
+      return path;
     }
-    return dir.lexically_normal();
+    std::string first = it->string();
+    std::transform(first.begin(), first.end(), first.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    if (first != "config") {
+      return path;
+    }
+    std::filesystem::path stripped;
+    ++it;
+    for (; it != path.end(); ++it) {
+      stripped /= *it;
+    }
+    return stripped;
+  }
+
+  std::filesystem::path config_or_storage_path_locked(const std::string& text) const {
+    std::filesystem::path path = path_from_json_text(text);
+    if (path.is_absolute()) {
+      return path.lexically_normal();
+    }
+
+    std::filesystem::path config_path = (config_root_ / path).lexically_normal();
+    std::filesystem::path config_stripped_path = (config_root_ / strip_config_prefix_path(path)).lexically_normal();
+    std::filesystem::path storage_path = (storage_root_ / path).lexically_normal();
+
+    std::error_code exists_error;
+    if (std::filesystem::exists(config_path, exists_error)) {
+      return config_path;
+    }
+    exists_error.clear();
+    if (std::filesystem::exists(config_stripped_path, exists_error)) {
+      return config_stripped_path;
+    }
+    exists_error.clear();
+    if (std::filesystem::exists(storage_path, exists_error)) {
+      return storage_path;
+    }
+    return config_stripped_path;
   }
 
   std::filesystem::path provider_path_locked(const std::string& text) const {
@@ -1461,6 +1948,10 @@ class CaptureRuntime {
 
   std::string default_profile_json_locked(const std::string& name) {
     const std::string profile_name = normalize_profile_name(name);
+    std::map<std::string, std::filesystem::path> default_roots;
+    for (const auto& item : default_camera_storage_roots()) {
+      default_roots[item.first] = camera_storage_root_from_text_locked(item.second);
+    }
     std::ostringstream cameras;
     cameras << "[";
     bool first = true;
@@ -1477,12 +1968,15 @@ class CaptureRuntime {
       }
       first = false;
       std::string safe_ip = safe_path_segment(ips[i]);
+      auto root_it = default_roots.find(ips[i]);
       cameras << "{"
               << json_pair("ip", ips[i]) << ","
               << json_pair("model", i < models.size() ? models[i] : "") << ","
               << json_pair("sn", i < sns.size() ? sns[i] : "") << ","
               << "\"enabled\":true,"
-              << json_pair("paramFile", "config/camera-params/" + profile_name + "/" + safe_ip + ".nccfg")
+              << json_pair("paramFile", "config/camera-params/" + profile_name + "/" + safe_ip + ".nccfg") << ","
+              << "\"cameraIndex\":" << (i + 1) << ","
+              << json_pair("storageRoot", root_it == default_roots.end() ? "" : root_it->second.string())
               << "}";
     }
     cameras << "]";
@@ -1498,6 +1992,7 @@ class CaptureRuntime {
          << json_pair("profileRoot", profiles_root_locked().string()) << ","
          << json_pair("profileDir", profile_dir_locked(profile_name).string()) << ","
          << json_pair("cameraParamDir", (profile_dir_locked(profile_name) / "camera-params").lexically_normal().string()) << ","
+         << "\"cameraStorageRoots\":" << camera_storage_roots_array_json(default_roots) << ","
          << json_pair("startupMode", "auto-connect") << ","
          << "\"autoConnect\":true,"
          << "\"expectedCameras\":" << expected_cameras_ << ","
@@ -1580,6 +2075,7 @@ class CaptureRuntime {
          << json_pair("profileRoot", profiles_root_locked().string()) << ","
          << json_pair("cameraParamRoot", camera_params_root_locked().string()) << ","
          << json_pair("activeProfile", active_profile_name_locked()) << ","
+         << "\"cameraRoots\":" << camera_storage_roots_array_json(camera_storage_roots_) << ","
          << "\"profiles\":" << profile_names_array_json_locked() << ","
          << "\"profileEntries\":" << profile_entries_array_json_locked()
          << "}";
@@ -1741,6 +2237,10 @@ class CaptureRuntime {
           storage_root_ = next;
         }
       }
+    }
+    std::map<std::string, std::string> camera_roots = json_profile_camera_roots_field(profile);
+    if (!camera_roots.empty()) {
+      apply_camera_storage_roots_locked(camera_roots, false);
     }
   }
 
@@ -1943,6 +2443,8 @@ class CaptureRuntime {
       results << "{\"code\":" << code << ","
               << json_pair("ip", session.ip) << ","
               << json_pair("file", file.string()) << ","
+              << json_pair("errorName", capture_error_name(code)) << ","
+              << json_pair("operatorHint", capture_error_hint(code)) << ","
               << "\"applyCode\":" << apply_ret << ","
               << "\"saveFileCode\":" << save_file_ret << ","
               << "\"saveDeviceCode\":" << save_dev_ret
@@ -1953,6 +2455,8 @@ class CaptureRuntime {
     std::ostringstream json;
     json << "{\"code\":" << code << ","
          << json_pair("name", profile_name) << ","
+         << json_pair("errorName", capture_error_name(code)) << ","
+         << json_pair("operatorHint", capture_error_hint(code)) << ","
          << json_pair("cameraParamDir", dir.string()) << ","
          << "\"saved\":" << saved << ","
          << "\"failed\":" << failed << ","
@@ -2001,10 +2505,7 @@ class CaptureRuntime {
       int path_ret = CORRECT;
       auto file_it = camera_files.find(session.ip);
       if (file_it != camera_files.end()) {
-        file = path_from_json_text(file_it->second);
-        if (!file.is_absolute()) {
-          file = (storage_root_ / file).lexically_normal();
-        }
+        file = config_or_storage_path_locked(file_it->second);
         const bool external_path = !is_path_under_base(file.string(), storage_root_) && !is_path_under_base(file.string(), config_root_);
         if (external_path && !allow_external) {
           path_ret = 403;
@@ -2038,6 +2539,8 @@ class CaptureRuntime {
       results << "{\"code\":" << code << ","
               << json_pair("ip", session.ip) << ","
               << json_pair("file", file.empty() ? "" : file.string()) << ","
+              << json_pair("errorName", capture_error_name(code)) << ","
+              << json_pair("operatorHint", capture_error_hint(code)) << ","
               << "\"explicitFile\":" << (file_it != camera_files.end() ? "true" : "false") << ","
               << "\"loadCode\":" << load_ret << ","
               << "\"applyCode\":" << apply_ret << ","
@@ -2049,6 +2552,8 @@ class CaptureRuntime {
     std::ostringstream json;
     json << "{\"code\":" << code << ","
          << json_pair("name", profile_name) << ","
+         << json_pair("errorName", capture_error_name(code)) << ","
+         << json_pair("operatorHint", capture_error_hint(code)) << ","
          << json_pair("cameraParamDir", dir.string()) << ","
          << "\"loaded\":" << loaded << ","
          << "\"failed\":" << failed << ","
@@ -2428,6 +2933,7 @@ class CaptureRuntime {
       if (capture) {
         int control_mode = static_cast<int>(capture->ctrl_mode);
         int trigger_source = static_cast<int>(capture->trigger_input_type);
+        float max_frame_rate = lvm_get_dev_max_frame_rate(session->device, capture->capture_data_type);
         std::string control_label = control_mode == 0 ? "continuous" : (control_mode == 2 ? "count-mode" : (control_mode == 3 ? "count-priority" : "level/common"));
         std::string trigger_label = trigger_source == static_cast<int>(LVM_TRIGGER_TIME_TRIGGER) ? "time" : ("type-" + std::to_string(trigger_source));
         json << ",\"controlMode\":" << control_mode
@@ -2437,6 +2943,7 @@ class CaptureRuntime {
              << ",\"triggerLines\":" << static_cast<int>(capture->trigger_number_per_ctrl)
              << ",\"divRatio\":" << static_cast<int>(capture->div_ratio)
              << ",\"timeTriggerFreq\":" << capture->time_trigger_freq
+             << ",\"maxFrameRate\":" << max_frame_rate
              << "," << json_pair("controlLabel", control_label)
              << "," << json_pair("triggerSourceLabel", trigger_label);
       }
@@ -3364,6 +3871,13 @@ class CaptureRuntime {
     int retries = std::max(0, std::min(10, json_int_field(body, "retries", 0)));
     int control_mode = json_int_field(body, "controlMode", 0);
     bool explicit_output = json_has_field(body, "output");
+    bool save_sdk_derived = json_bool_field(body, "saveSdkDerived", json_bool_field(body, "save_sdk_derived", false));
+    bool production_aware = json_bool_field(body, "productionLayout", false) ||
+                            json_bool_field(body, "steelStateAware", false) ||
+                            json_bool_field(body, "requireSteelPresent", false);
+    bool require_steel_present = json_bool_field(body, "requireSteelPresent", false);
+    bool discard_black_frames = json_bool_field(body, "discardBlackFrames", true);
+    double black_frame_threshold = json_float_field(body, "blackFrameThreshold", 8.0f);
     std::string output = json_string_field(body, "output", "");
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -3373,6 +3887,16 @@ class CaptureRuntime {
     CameraSession* session = session_for_ip_locked(ip);
     if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
+    }
+    if (production_aware) {
+      discard_black_frames = json_bool_field(body, "discardBlackFrames", steel_state_.discard_black_frames);
+      black_frame_threshold = json_float_field(body, "blackFrameThreshold", static_cast<float>(steel_state_.black_frame_threshold));
+      if ((require_steel_present && !steel_state_.present) || !steel_state_.save_enabled) {
+        ++steel_state_.discard_frame_count;
+        steel_state_.updated_at = now_iso();
+        write_steel_summary_locked();
+        return json_error(CAPTURE_DISCARDED_NOT_ARMED, "production capture is not armed for saving");
+      }
     }
     if (session->stream.running) {
       if (!session->simulated) {
@@ -3394,7 +3918,7 @@ class CaptureRuntime {
       if (!is_output_path_allowed_locked(output_path)) {
         return json_error(403, "output path must be under storage root");
       }
-      CaptureOutputPaths paths = capture_output_paths_for(output_path);
+      CaptureOutputPaths paths = capture_output_paths_for(output_path, save_sdk_derived);
       if (!create_capture_output_dirs(paths)) {
         return json_error(500, "output directory cannot be created");
       }
@@ -3433,6 +3957,8 @@ class CaptureRuntime {
       std::ostringstream json;
       json << "{\"code\":" << ret << ",\"lines\":" << lines << ",\"width\":" << width << ","
            << "\"attempts\":1,"
+           << "\"discarded\":false,"
+           << json_pair("discardReason", "") << ","
            << "\"depthExists\":" << (depth_exists ? "true" : "false") << ","
            << "\"intensityExists\":" << (intensity_exists ? "true" : "false") << ","
            << "\"metadataExists\":" << (metadata_exists ? "true" : "false") << ","
@@ -3469,7 +3995,7 @@ class CaptureRuntime {
     if (!is_output_path_allowed_locked(output_path)) {
       return json_error(403, "output path must be under storage root");
     }
-    CaptureOutputPaths paths = capture_output_paths_for(output_path);
+    CaptureOutputPaths paths = capture_output_paths_for(output_path, save_sdk_derived);
     if (!create_capture_output_dirs(paths)) {
       return json_error(500, "output directory cannot be created");
     }
@@ -3487,6 +4013,8 @@ class CaptureRuntime {
     unsigned int trigger_max_interval = 0;
     unsigned int frame_timestamp = 0;
     bool saved_intensity = false;
+    bool discarded = false;
+    std::string discard_reason;
     std::string depth_saved_path = paths.depth_path;
 
     lvm_trigger_en_ctrl(session->device, false);
@@ -3494,6 +4022,8 @@ class CaptureRuntime {
 
     for (int attempt = 0; attempt <= retries; ++attempt) {
       attempts = attempt + 1;
+      discarded = false;
+      discard_reason.clear();
       lvm_buf_t* buffer = lvm_alloc_depth_map_buf(session->device, data_mode, width, lines, 2);
       if (!buffer) {
         ret = MALLOC_FAILED;
@@ -3509,6 +4039,8 @@ class CaptureRuntime {
         frame = lvm_grab_frame(session->device, timeout_ms);
         ret = frame ? CORRECT : DEV_LOAD_DATA_ERROR;
       }
+      std::future<int> depth_storage_future;
+      std::future<int> intensity_storage_future;
       if (ret == CORRECT && frame) {
         auto* depth_map = static_cast<lvm_depth_map_t*>(frame);
         actual_width = static_cast<int>(depth_map->head.width);
@@ -3519,26 +4051,28 @@ class CaptureRuntime {
         trigger_min_interval = depth_map->head.trigger_min_interval;
         trigger_max_interval = depth_map->head.trigger_max_interval;
         frame_timestamp = depth_map->head.time_stamp;
-        ret = lvm_save_depth_map(session->device, paths.sdk_base_path.c_str(), depth_map);
-        if (ret == CORRECT) {
-          std::error_code exists_error;
-          if (std::filesystem::exists(paths.sdk_depth_path, exists_error) && copy_file_replace(paths.sdk_depth_path, paths.depth_path)) {
-            depth_saved_path = paths.depth_path;
-          } else if (std::filesystem::exists(paths.sdk_base_path, exists_error) && copy_file_replace(paths.sdk_base_path, paths.depth_path)) {
-            depth_saved_path = paths.depth_path;
-          } else if (std::filesystem::exists(paths.sdk_depth_path, exists_error)) {
-            depth_saved_path = paths.sdk_depth_path;
-          } else if (std::filesystem::exists(paths.sdk_base_path, exists_error)) {
-            depth_saved_path = paths.sdk_base_path;
+        if (discard_black_frames && depth_map_is_black_frame(depth_map, black_frame_threshold)) {
+          ret = BLACK_FRAME_DISCARDED;
+          discarded = true;
+          discard_reason = "black-frame";
+        } else {
+          ret = lvm_save_depth_map(session->device, paths.sdk_base_path.c_str(), depth_map);
+          if (ret == CORRECT) {
+            depth_storage_future = enqueue_depth_copy_storage(paths);
           }
-        }
-        if (ret == CORRECT && depth_map->intensity_img && depth_map->intensity_img->data) {
-          int img_ret = lvm_save_img(intensity_path.c_str(),
-                                     depth_map->intensity_img->data,
-                                     depth_map->intensity_img->head.width,
-                                     depth_map->intensity_img->head.height,
-                                     LVM_IMAGE_FORMAT_16BIT_USHORT);
-          saved_intensity = img_ret == CORRECT;
+          if (ret == CORRECT && depth_map->intensity_img && depth_map->intensity_img->data) {
+            const int intensity_width = static_cast<int>(depth_map->intensity_img->head.width);
+            const int intensity_height = static_cast<int>(depth_map->intensity_img->head.height);
+            const size_t pixel_count = intensity_width > 0 && intensity_height > 0
+                                           ? static_cast<size_t>(intensity_width) * static_cast<size_t>(intensity_height)
+                                           : 0;
+            if (pixel_count > 0) {
+              auto pixels = std::make_shared<std::vector<std::uint16_t>>();
+              const auto* source = reinterpret_cast<const std::uint16_t*>(depth_map->intensity_img->data);
+              pixels->assign(source, source + pixel_count);
+              intensity_storage_future = enqueue_intensity_storage(intensity_path, pixels, intensity_width, intensity_height);
+            }
+          }
         }
       }
       lvm_trigger_en_ctrl(session->device, false);
@@ -3546,6 +4080,18 @@ class CaptureRuntime {
       lvm_free_buf(buffer);
       if (session->device) {
         session->device->buffer = nullptr;
+      }
+      if (depth_storage_future.valid()) {
+        const int storage_ret = depth_storage_future.get();
+        if (storage_ret == CORRECT) {
+          depth_saved_path = paths.depth_path;
+        } else {
+          ret = storage_ret;
+        }
+      }
+      if (intensity_storage_future.valid()) {
+        const int img_ret = intensity_storage_future.get();
+        saved_intensity = img_ret == CORRECT;
       }
       if (ret == CORRECT) {
         break;
@@ -3555,6 +4101,20 @@ class CaptureRuntime {
       }
     }
 
+    if (discarded) {
+      std::error_code remove_error;
+      std::filesystem::remove(paths.depth_path, remove_error);
+      remove_error.clear();
+      std::filesystem::remove(paths.intensity_path, remove_error);
+      remove_error.clear();
+      std::filesystem::remove(paths.sdk_base_path, remove_error);
+      remove_error.clear();
+      std::filesystem::remove(paths.sdk_depth_path, remove_error);
+      remove_error.clear();
+      std::filesystem::remove(paths.sdk_intensity_path, remove_error);
+      depth_saved_path = paths.depth_path;
+      saved_intensity = false;
+    }
     if (!saved_intensity) {
       intensity_path.clear();
     }
@@ -3576,7 +4136,9 @@ class CaptureRuntime {
                                                      trigger_min_interval,
                                                      trigger_max_interval,
                                                      frame_timestamp,
-                                                     false);
+                                                     false,
+                                                     discarded,
+                                                     discard_reason);
 
     session->calibration.validation_path = depth_saved_path;
     session->calibration.validation_code = ret;
@@ -3592,6 +4154,8 @@ class CaptureRuntime {
          << "\"requestedWidth\":" << width << ","
          << "\"attempts\":" << attempts << ","
          << "\"retries\":" << retries << ","
+         << "\"discarded\":" << (discarded ? "true" : "false") << ","
+         << json_pair("discardReason", discard_reason) << ","
          << "\"depthExists\":" << (depth_exists ? "true" : "false") << ","
          << "\"intensityExists\":" << (intensity_exists ? "true" : "false") << ","
          << "\"metadataExists\":" << (metadata_exists ? "true" : "false") << ","
@@ -3608,9 +4172,9 @@ class CaptureRuntime {
          << json_pair("depthOutput", depth_saved_path) << ","
          << json_pair("intensityOutput", intensity_path) << ","
          << json_pair("metadataOutput", metadata_ret == CORRECT ? paths.metadata_path : "") << ","
-         << json_pair("sdkOutput", file_exists(paths.sdk_base_path) ? paths.sdk_base_path : "") << ","
-         << json_pair("sdkDepthOutput", file_exists(paths.sdk_depth_path) ? paths.sdk_depth_path : "") << ","
-         << json_pair("sdkIntensityOutput", file_exists(paths.sdk_intensity_path) ? paths.sdk_intensity_path : "") << ","
+         << json_pair("sdkOutput", paths.save_sdk_derived && file_exists(paths.sdk_base_path) ? paths.sdk_base_path : "") << ","
+         << json_pair("sdkDepthOutput", paths.save_sdk_derived && file_exists(paths.sdk_depth_path) ? paths.sdk_depth_path : "") << ","
+         << json_pair("sdkIntensityOutput", paths.save_sdk_derived && file_exists(paths.sdk_intensity_path) ? paths.sdk_intensity_path : "") << ","
          << json_pair("imageUrl", "/api/capture/file?path=" + url_encode(depth_saved_path)) << ","
          << json_pair("depthUrl", "/api/capture/file?path=" + url_encode(depth_saved_path)) << ","
          << json_pair("intensityUrl", intensity_path.empty() ? "" : "/api/capture/file?path=" + url_encode(intensity_path))
@@ -3631,6 +4195,9 @@ class CaptureRuntime {
     int data_mode = 1;
     int retries = 0;
     int control_mode = 0;
+    bool discard_black_frames = true;
+    bool save_sdk_derived = false;
+    double black_frame_threshold = 8.0;
   };
 
   struct ParallelCaptureResult {
@@ -3669,6 +4236,8 @@ class CaptureRuntime {
     bool metadata_exists = false;
     bool complete_frame = false;
     bool simulated = false;
+    bool discarded = false;
+    std::string discard_reason;
   };
 
   ParallelCaptureResult parallel_capture_error(const ParallelCaptureJob& job, int code, const std::string& message) const {
@@ -3689,6 +4258,7 @@ class CaptureRuntime {
     result.data_mode = job.data_mode;
     result.timeout_ms = job.timeout_ms;
     result.retries = job.retries;
+    result.discarded = false;
     result.error_message = message;
     return result;
   }
@@ -3718,6 +4288,7 @@ class CaptureRuntime {
          << ",\"metadataExists\":" << (result.metadata_exists ? "true" : "false")
          << ",\"completeFrame\":" << (result.complete_frame ? "true" : "false")
          << ",\"simulated\":" << (result.simulated ? "true" : "false")
+         << ",\"discarded\":" << (result.discarded ? "true" : "false")
          << "," << json_pair("ip", result.ip)
          << "," << json_pair("output", result.output)
          << "," << json_pair("depthOutput", result.depth_output.empty() ? result.output : result.depth_output)
@@ -3729,6 +4300,7 @@ class CaptureRuntime {
          << "," << json_pair("errorName", capture_error_name(result.code))
          << "," << json_pair("operatorHint", capture_error_hint(result.code))
          << "," << json_pair("error", result.error_message)
+         << "," << json_pair("discardReason", result.discard_reason)
          << "," << json_pair("roundStartedAt", result.round_started_at)
          << "," << json_pair("workerStartedAt", result.worker_started_at)
          << "," << json_pair("workerFinishedAt", result.worker_finished_at)
@@ -3754,7 +4326,7 @@ class CaptureRuntime {
     result.timeout_ms = job.timeout_ms;
     result.retries = job.retries;
 
-    std::shared_ptr<std::mutex> camera_mutex;
+    std::shared_ptr<std::timed_mutex> camera_mutex;
     std::string output_path;
     std::string intensity_path;
     std::string metadata_path;
@@ -3783,7 +4355,7 @@ class CaptureRuntime {
       if (!is_output_path_allowed_locked(output_path)) {
         return parallel_capture_error(job, 403, "output path must be under storage root");
       }
-      paths = capture_output_paths_for(output_path);
+      paths = capture_output_paths_for(output_path, job.save_sdk_derived);
       intensity_path = paths.intensity_path;
       metadata_path = paths.metadata_path;
       camera_mutex = session->capture_mutex;
@@ -3791,9 +4363,9 @@ class CaptureRuntime {
       result.depth_output = paths.depth_path;
       result.intensity_output = intensity_path;
       result.metadata_output = metadata_path;
-      result.sdk_output = paths.sdk_base_path;
-      result.sdk_depth_output = paths.sdk_depth_path;
-      result.sdk_intensity_output = paths.sdk_intensity_path;
+      result.sdk_output = paths.save_sdk_derived ? paths.sdk_base_path : "";
+      result.sdk_depth_output = paths.save_sdk_derived ? paths.sdk_depth_path : "";
+      result.sdk_intensity_output = paths.save_sdk_derived ? paths.sdk_intensity_path : "";
       result.simulated = simulated;
     }
 
@@ -3801,7 +4373,11 @@ class CaptureRuntime {
       return parallel_capture_error(job, 500, "output directory cannot be created");
     }
 
-    std::lock_guard<std::mutex> camera_lock(*camera_mutex);
+    const int camera_lock_timeout_ms = std::max(1000, std::min(60000, job.timeout_ms + 1000));
+    std::unique_lock<std::timed_mutex> camera_lock(*camera_mutex, std::defer_lock);
+    if (!camera_lock.try_lock_for(std::chrono::milliseconds(camera_lock_timeout_ms))) {
+      return parallel_capture_error(job, 409, "camera capture is busy; a previous SDK grab may still be running");
+    }
     if (simulated) {
       int ret = DEV_NOT_LINK_ERROR;
       int metadata_ret = 500;
@@ -3904,6 +4480,8 @@ class CaptureRuntime {
 
     for (int attempt = 0; attempt <= job.retries; ++attempt) {
       attempts = attempt + 1;
+      result.discarded = false;
+      result.discard_reason.clear();
       lvm_buf_t* buffer = lvm_alloc_depth_map_buf(device, job.data_mode, capture_width, job.lines, 2);
       if (!buffer) {
         ret = MALLOC_FAILED;
@@ -3919,6 +4497,8 @@ class CaptureRuntime {
         frame = lvm_grab_frame(device, job.timeout_ms);
         ret = frame ? CORRECT : DEV_LOAD_DATA_ERROR;
       }
+      std::future<int> depth_storage_future;
+      std::future<int> intensity_storage_future;
       if (ret == CORRECT && frame) {
         auto* depth_map = static_cast<lvm_depth_map_t*>(frame);
         actual_width = static_cast<int>(depth_map->head.width);
@@ -3929,26 +4509,28 @@ class CaptureRuntime {
         trigger_min_interval = depth_map->head.trigger_min_interval;
         trigger_max_interval = depth_map->head.trigger_max_interval;
         frame_timestamp = depth_map->head.time_stamp;
-        ret = lvm_save_depth_map(device, paths.sdk_base_path.c_str(), depth_map);
-        if (ret == CORRECT) {
-          std::error_code exists_error;
-          if (std::filesystem::exists(paths.sdk_depth_path, exists_error) && copy_file_replace(paths.sdk_depth_path, paths.depth_path)) {
-            depth_saved_path = paths.depth_path;
-          } else if (std::filesystem::exists(paths.sdk_base_path, exists_error) && copy_file_replace(paths.sdk_base_path, paths.depth_path)) {
-            depth_saved_path = paths.depth_path;
-          } else if (std::filesystem::exists(paths.sdk_depth_path, exists_error)) {
-            depth_saved_path = paths.sdk_depth_path;
-          } else if (std::filesystem::exists(paths.sdk_base_path, exists_error)) {
-            depth_saved_path = paths.sdk_base_path;
+        if (job.discard_black_frames && depth_map_is_black_frame(depth_map, job.black_frame_threshold)) {
+          ret = BLACK_FRAME_DISCARDED;
+          result.discarded = true;
+          result.discard_reason = "black-frame";
+        } else {
+          ret = lvm_save_depth_map(device, paths.sdk_base_path.c_str(), depth_map);
+          if (ret == CORRECT) {
+            depth_storage_future = enqueue_depth_copy_storage(paths);
           }
-        }
-        if (ret == CORRECT && depth_map->intensity_img && depth_map->intensity_img->data) {
-          int img_ret = lvm_save_img(intensity_path.c_str(),
-                                     depth_map->intensity_img->data,
-                                     depth_map->intensity_img->head.width,
-                                     depth_map->intensity_img->head.height,
-                                     LVM_IMAGE_FORMAT_16BIT_USHORT);
-          saved_intensity = img_ret == CORRECT;
+          if (ret == CORRECT && depth_map->intensity_img && depth_map->intensity_img->data) {
+            const int intensity_width = static_cast<int>(depth_map->intensity_img->head.width);
+            const int intensity_height = static_cast<int>(depth_map->intensity_img->head.height);
+            const size_t pixel_count = intensity_width > 0 && intensity_height > 0
+                                           ? static_cast<size_t>(intensity_width) * static_cast<size_t>(intensity_height)
+                                           : 0;
+            if (pixel_count > 0) {
+              auto pixels = std::make_shared<std::vector<std::uint16_t>>();
+              const auto* source = reinterpret_cast<const std::uint16_t*>(depth_map->intensity_img->data);
+              pixels->assign(source, source + pixel_count);
+              intensity_storage_future = enqueue_intensity_storage(intensity_path, pixels, intensity_width, intensity_height);
+            }
+          }
         }
       }
       lvm_trigger_en_ctrl(device, false);
@@ -3956,6 +4538,18 @@ class CaptureRuntime {
       lvm_free_buf(buffer);
       if (device) {
         device->buffer = nullptr;
+      }
+      if (depth_storage_future.valid()) {
+        const int storage_ret = depth_storage_future.get();
+        if (storage_ret == CORRECT) {
+          depth_saved_path = paths.depth_path;
+        } else {
+          ret = storage_ret;
+        }
+      }
+      if (intensity_storage_future.valid()) {
+        const int img_ret = intensity_storage_future.get();
+        saved_intensity = img_ret == CORRECT;
       }
       if (ret == CORRECT) {
         break;
@@ -3965,6 +4559,20 @@ class CaptureRuntime {
       }
     }
 
+    if (result.discarded) {
+      std::error_code remove_error;
+      std::filesystem::remove(paths.depth_path, remove_error);
+      remove_error.clear();
+      std::filesystem::remove(paths.intensity_path, remove_error);
+      remove_error.clear();
+      std::filesystem::remove(paths.sdk_base_path, remove_error);
+      remove_error.clear();
+      std::filesystem::remove(paths.sdk_depth_path, remove_error);
+      remove_error.clear();
+      std::filesystem::remove(paths.sdk_intensity_path, remove_error);
+      depth_saved_path = paths.depth_path;
+      saved_intensity = false;
+    }
     if (!saved_intensity) {
       intensity_path.clear();
       result.intensity_output.clear();
@@ -3993,7 +4601,9 @@ class CaptureRuntime {
                                                      trigger_min_interval,
                                                      trigger_max_interval,
                                                      frame_timestamp,
-                                                     false);
+                                                     false,
+                                                     result.discarded,
+                                                     result.discard_reason);
         session->calibration.validation_path = depth_saved_path;
         session->calibration.validation_code = ret;
         session->calibration.validation_time = now_iso();
@@ -4014,9 +4624,9 @@ class CaptureRuntime {
     result.output = depth_saved_path;
     result.depth_output = depth_saved_path;
     result.metadata_output = metadata_ret == CORRECT ? metadata_path : "";
-    result.sdk_output = file_exists(paths.sdk_base_path) ? paths.sdk_base_path : "";
-    result.sdk_depth_output = file_exists(paths.sdk_depth_path) ? paths.sdk_depth_path : "";
-    result.sdk_intensity_output = file_exists(paths.sdk_intensity_path) ? paths.sdk_intensity_path : "";
+    result.sdk_output = paths.save_sdk_derived && file_exists(paths.sdk_base_path) ? paths.sdk_base_path : "";
+    result.sdk_depth_output = paths.save_sdk_derived && file_exists(paths.sdk_depth_path) ? paths.sdk_depth_path : "";
+    result.sdk_intensity_output = paths.save_sdk_derived && file_exists(paths.sdk_intensity_path) ? paths.sdk_intensity_path : "";
     result.depth_exists = file_exists(depth_saved_path);
     result.intensity_exists = file_exists(intensity_path);
     result.metadata_exists = metadata_ret == CORRECT && file_exists(metadata_path);
@@ -4041,6 +4651,17 @@ class CaptureRuntime {
     std::string output_dir = json_string_field(body, "outputDir", "");
     std::string material_id = json_string_field(body, "materialId", json_string_field(body, "steelId", json_string_field(body, "steelNo")));
     bool production_layout = json_bool_field(body, "productionLayout", !explicit_output_dir || !material_id.empty());
+    bool steel_state_aware = json_bool_field(body, "steelStateAware", false) ||
+                             json_bool_field(body, "requireSteelPresent", false);
+    bool require_steel_present = json_bool_field(body, "requireSteelPresent", false);
+    bool discard_black_frames = json_bool_field(body, "discardBlackFrames", true);
+    bool save_sdk_derived = json_bool_field(body, "saveSdkDerived", json_bool_field(body, "save_sdk_derived", false));
+    double black_frame_threshold = json_float_field(body, "blackFrameThreshold", 8.0f);
+    int worker_timeout_ms = json_int_field(body, "workerTimeoutMs", json_int_field(body, "worker_timeout_ms", 0));
+    if (worker_timeout_ms <= 0) {
+      worker_timeout_ms = timeout_ms * (retries + 1) + 5000;
+    }
+    worker_timeout_ms = std::max(1000, std::min(600000, worker_timeout_ms));
     std::vector<std::string> ips = json_string_array_field(body, "ips");
 
     if (!explicit_output_dir || output_dir.empty()) {
@@ -4051,6 +4672,17 @@ class CaptureRuntime {
       output_dir = steel_state_.capture_dir.empty()
                        ? "continuous-test"
                        : steel_state_.capture_dir;
+    }
+    if (steel_state_aware) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      discard_black_frames = json_bool_field(body, "discardBlackFrames", steel_state_.discard_black_frames);
+      black_frame_threshold = json_float_field(body, "blackFrameThreshold", static_cast<float>(steel_state_.black_frame_threshold));
+      if ((require_steel_present && !steel_state_.present) || !steel_state_.save_enabled) {
+        ++steel_state_.discard_frame_count;
+        steel_state_.updated_at = now_iso();
+        write_steel_summary_locked();
+        return json_error(CAPTURE_DISCARDED_NOT_ARMED, "production capture is not armed for saving");
+      }
     }
 
     if (ips.empty()) {
@@ -4088,6 +4720,8 @@ class CaptureRuntime {
     int failures = 0;
     int complete_frames = 0;
     int metadata_frames = 0;
+    int discarded_frames = 0;
+    int black_frames = 0;
     int first_error = CORRECT;
     std::ostringstream results;
     results << "[";
@@ -4107,14 +4741,15 @@ class CaptureRuntime {
                  << ".png";
         ParallelCaptureJob job;
         job.ip = ip;
+        const int sequence_number = production_layout ? round : attempt_number;
         if (production_layout) {
           std::lock_guard<std::mutex> lock(mutex_);
-          job.output = raw_capture_output_locked(ip, material_id, attempt_number);
+          job.output = raw_capture_output_locked(ip, material_id, sequence_number);
         } else {
           job.output = (std::filesystem::path(output_dir) / safe_path_segment(ip) / filename.str()).lexically_normal().string();
         }
         job.round = round;
-        job.attempt = attempt_number;
+        job.attempt = sequence_number;
         job.parallel_index = static_cast<int>(index);
         job.lines = lines;
         job.width = width;
@@ -4122,19 +4757,35 @@ class CaptureRuntime {
         job.data_mode = data_mode;
         job.retries = retries;
         job.control_mode = control_mode;
+        job.discard_black_frames = discard_black_frames;
+        job.save_sdk_derived = save_sdk_derived;
+        job.black_frame_threshold = black_frame_threshold;
         jobs.push_back(job);
       }
 
-      std::vector<ParallelCaptureResult> round_results(jobs.size());
+      auto round_jobs = std::make_shared<std::vector<ParallelCaptureJob>>(std::move(jobs));
+      auto round_results = std::make_shared<std::vector<ParallelCaptureResult>>(round_jobs->size());
+      auto done_flags = std::make_shared<std::vector<std::shared_ptr<std::atomic_bool>>>();
+      auto abandon_flags = std::make_shared<std::vector<std::shared_ptr<std::atomic_bool>>>();
+      auto result_mutexes = std::make_shared<std::vector<std::shared_ptr<std::mutex>>>();
+      done_flags->reserve(round_jobs->size());
+      abandon_flags->reserve(round_jobs->size());
+      result_mutexes->reserve(round_jobs->size());
+      for (size_t index = 0; index < round_jobs->size(); ++index) {
+        done_flags->push_back(std::make_shared<std::atomic_bool>(false));
+        abandon_flags->push_back(std::make_shared<std::atomic_bool>(false));
+        result_mutexes->push_back(std::make_shared<std::mutex>());
+      }
       std::vector<std::thread> workers;
-      workers.reserve(jobs.size());
+      workers.reserve(round_jobs->size());
       std::mutex start_mutex;
       std::condition_variable start_cv;
       bool start_round = false;
       size_t ready_count = 0;
 
-      for (size_t index = 0; index < jobs.size(); ++index) {
-        workers.emplace_back([&, index]() {
+      for (size_t index = 0; index < round_jobs->size(); ++index) {
+        workers.emplace_back([&, round_jobs, round_results, done_flags, abandon_flags, result_mutexes, index]() {
+          ParallelCaptureResult worker_result;
           try {
             {
               std::unique_lock<std::mutex> start_lock(start_mutex);
@@ -4142,33 +4793,68 @@ class CaptureRuntime {
               start_cv.notify_one();
               start_cv.wait(start_lock, [&]() { return start_round; });
             }
-            round_results[index] = run_parallel_capture_job(jobs[index]);
+            worker_result = run_parallel_capture_job((*round_jobs)[index]);
           } catch (const std::exception& ex) {
-            round_results[index] = parallel_capture_error(jobs[index], 500, ex.what());
+            worker_result = parallel_capture_error((*round_jobs)[index], 500, ex.what());
           } catch (...) {
-            round_results[index] = parallel_capture_error(jobs[index], 500, "capture worker failed");
+            worker_result = parallel_capture_error((*round_jobs)[index], 500, "capture worker failed");
           }
+          {
+            std::lock_guard<std::mutex> result_lock(*(*result_mutexes)[index]);
+            if (!(*abandon_flags)[index]->load()) {
+              (*round_results)[index] = worker_result;
+            }
+          }
+          (*done_flags)[index]->store(true);
         });
       }
 
       {
         std::unique_lock<std::mutex> start_lock(start_mutex);
-        start_cv.wait(start_lock, [&]() { return ready_count == jobs.size(); });
+        start_cv.wait(start_lock, [&]() { return ready_count == round_jobs->size(); });
         const std::string round_started_at = now_iso();
-        for (auto& job : jobs) {
+        for (auto& job : *round_jobs) {
           job.round_started_at = round_started_at;
         }
         start_round = true;
       }
       start_cv.notify_all();
 
-      for (std::thread& worker : workers) {
-        if (worker.joinable()) {
-          worker.join();
+      const auto worker_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(worker_timeout_ms);
+      for (;;) {
+        bool all_done = true;
+        for (const auto& done : *done_flags) {
+          if (!done->load()) {
+            all_done = false;
+            break;
+          }
+        }
+        if (all_done || std::chrono::steady_clock::now() >= worker_deadline) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      }
+
+      for (size_t index = 0; index < workers.size(); ++index) {
+        if ((*done_flags)[index]->load()) {
+          if (workers[index].joinable()) {
+            workers[index].join();
+          }
+          continue;
+        }
+        (*abandon_flags)[index]->store(true);
+        {
+          std::lock_guard<std::mutex> result_lock(*(*result_mutexes)[index]);
+          (*round_results)[index] = parallel_capture_error((*round_jobs)[index],
+                                                           504,
+                                                           "capture worker exceeded hard timeout");
+        }
+        if (workers[index].joinable()) {
+          workers[index].detach();
         }
       }
 
-      for (const ParallelCaptureResult& capture : round_results) {
+      for (const ParallelCaptureResult& capture : *round_results) {
         ++attempts;
         int ret = capture.code;
         if (ret == CORRECT) {
@@ -4184,6 +4870,12 @@ class CaptureRuntime {
         }
         if (capture.metadata_exists) {
           ++metadata_frames;
+        }
+        if (capture.discarded) {
+          ++discarded_frames;
+        }
+        if (capture.discard_reason == "black-frame") {
+          ++black_frames;
         }
 
         if (result_count > 0) {
@@ -4229,6 +4921,8 @@ class CaptureRuntime {
          << ",\"failures\":" << failures
          << ",\"completeFrames\":" << complete_frames
          << ",\"metadataFrames\":" << metadata_frames
+         << ",\"discardedFrames\":" << discarded_frames
+         << ",\"blackFrames\":" << black_frames
          << ",\"rounds\":" << rounds
          << ",\"retries\":" << retries
          << ",\"cameraCount\":" << ips.size()
@@ -4236,8 +4930,10 @@ class CaptureRuntime {
          << ",\"expectedMet\":" << (expected_met ? "true" : "false")
          << ",\"connectFirst\":" << (connect_first ? "true" : "false")
          << ",\"parallel\":true"
+         << ",\"saveSdkDerived\":" << (save_sdk_derived ? "true" : "false")
          << ",\"workerCount\":" << ips.size()
          << ",\"roundIntervalMs\":" << interval_ms
+         << ",\"workerTimeoutMs\":" << worker_timeout_ms
          << ",\"elapsedMs\":" << elapsed_ms
          << "," << json_pair("syncMode", "round-start-condition-variable")
          << "," << json_pair("storageRoot", storage_root_string)
@@ -4264,11 +4960,22 @@ class CaptureRuntime {
   RouteResult capture_file_response(const std::string& query) {
     std::string path = get_query_param(query, "path");
     std::filesystem::path storage_root;
+    std::vector<std::filesystem::path> camera_roots;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       storage_root = storage_root_;
+      for (const auto& item : camera_storage_roots_) {
+        camera_roots.push_back(item.second);
+      }
     }
-    if (path.empty() || !is_path_allowed_for_read(path, storage_root)) {
+    bool allowed = !path.empty() && is_path_allowed_for_read(path, storage_root);
+    for (const auto& root : camera_roots) {
+      if (!path.empty() && is_path_under_base(path, root)) {
+        allowed = true;
+        break;
+      }
+    }
+    if (!allowed) {
       return {403, "", "image/png"};
     }
     std::string body;
@@ -4276,6 +4983,108 @@ class CaptureRuntime {
       return {404, "", "image/png"};
     }
     return {200, body, "image/png"};
+  }
+
+  struct LatestCaptureFile {
+    std::filesystem::path path;
+    std::filesystem::file_time_type write_time{};
+    bool found = false;
+  };
+
+  std::string normalize_capture_kind(std::string kind) const {
+    std::transform(kind.begin(), kind.end(), kind.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    if (kind == "brightness" || kind == "gray" || kind == "grey") {
+      return "intensity";
+    }
+    if (kind == "meta") {
+      return "metadata";
+    }
+    if (kind == "sdk" || kind == "sdk_depth" || kind == "sdk-depth") {
+      return "sdk-derived";
+    }
+    if (kind == "intensity" || kind == "metadata" || kind == "sdk-derived") {
+      return kind;
+    }
+    return "depth";
+  }
+
+  LatestCaptureFile find_latest_capture_file_locked(const std::string& ip, const std::string& kind) const {
+    LatestCaptureFile latest;
+    std::filesystem::path root = ip.empty() ? storage_root_ : camera_capture_root_locked(ip);
+    std::error_code error;
+    if (!std::filesystem::exists(root, error)) {
+      return latest;
+    }
+    const std::string data_dir = normalize_capture_kind(kind);
+    const std::string expected_extension = data_dir == "metadata" ? ".json" : ".png";
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root, std::filesystem::directory_options::skip_permission_denied, error)) {
+      if (error) {
+        error.clear();
+        continue;
+      }
+      if (!entry.is_regular_file(error)) {
+        error.clear();
+        continue;
+      }
+      const std::filesystem::path path = entry.path();
+      if (path.parent_path().filename().string() != data_dir) {
+        continue;
+      }
+      std::string extension = path.extension().string();
+      std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+      });
+      if (extension != expected_extension) {
+        continue;
+      }
+      std::filesystem::file_time_type write_time = entry.last_write_time(error);
+      if (error) {
+        error.clear();
+        continue;
+      }
+      if (!latest.found || write_time > latest.write_time) {
+        latest.path = path.lexically_normal();
+        latest.write_time = write_time;
+        latest.found = true;
+      }
+    }
+    return latest;
+  }
+
+  RouteResult capture_latest_response(const std::string& query) {
+    std::string ip = get_query_param(query, "ip");
+    std::string kind = normalize_capture_kind(get_query_param(query, "kind"));
+    const std::string meta = get_query_param(query, "meta");
+    const bool metadata_response = meta == "1" || meta == "true" || meta == "yes";
+    std::filesystem::path path;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      LatestCaptureFile latest = find_latest_capture_file_locked(ip, kind);
+      if (!latest.found) {
+        return {404, json_error(404, "latest capture file not found")};
+      }
+      path = latest.path;
+      if (!is_output_path_allowed_locked(path.string())) {
+        return {403, json_error(403, "latest capture file is outside allowed storage roots")};
+      }
+    }
+    if (metadata_response) {
+      std::ostringstream json;
+      json << "{\"code\":0,"
+           << json_pair("ip", ip) << ","
+           << json_pair("kind", kind) << ","
+           << json_pair("path", path.string()) << ","
+           << json_pair("url", "/api/capture/file?path=" + url_encode(path.string()))
+           << "}";
+      return {200, json.str()};
+    }
+    std::string body;
+    if (!read_file(path.string(), body)) {
+      return {404, "", kind == "metadata" ? "application/json; charset=utf-8" : "image/png"};
+    }
+    return {200, body, kind == "metadata" ? "application/json; charset=utf-8" : "image/png"};
   }
 
   std::string stream_start_json(const std::string& body) {
@@ -4820,6 +5629,10 @@ class CaptureRuntime {
          << json_pair("sessionId", steel_state_.session_id) << ","
          << json_pair("captureDir", steel_state_.capture_dir) << ","
          << json_pair("summaryOutput", steel_state_.summary_path) << ","
+         << json_pair("inspectionId", steel_state_.inspection_id) << ","
+         << json_pair("acquisitionMode", steel_state_.acquisition_mode) << ","
+         << json_pair("captureSaveState", steel_state_.capture_save_state) << ","
+         << json_pair("algorithmPhase", steel_state_.algorithm_phase) << ","
          << json_pair("sessionStartedAt", steel_state_.session_started_at) << ","
          << json_pair("sessionFinishedAt", steel_state_.session_finished_at) << ","
          << json_pair("lastCaptureAt", steel_state_.last_capture_at) << ","
@@ -4835,19 +5648,30 @@ class CaptureRuntime {
          << "\"captureCount\":" << steel_state_.capture_count << ","
          << "\"captureSuccessCount\":" << steel_state_.capture_success_count << ","
          << "\"captureFailureCount\":" << steel_state_.capture_failure_count << ","
+         << "\"discardFrameCount\":" << steel_state_.discard_frame_count << ","
+         << "\"blackFrameCount\":" << steel_state_.black_frame_count << ","
+         << "\"saveEnabled\":" << (steel_state_.save_enabled ? "true" : "false") << ","
+         << "\"saveSdkDerivedDefault\":false,"
+         << "\"discardBlackFrames\":" << (steel_state_.discard_black_frames ? "true" : "false") << ","
+         << "\"blackFrameThreshold\":" << steel_state_.black_frame_threshold << ","
          << "\"connectedCameras\":" << connected_count << ","
          << "\"streamingCameras\":" << streaming_count << ","
+         << "\"productionCaptureRunning\":" << (production_capture_running_ ? "true" : "false") << ","
+         << json_pair("productionCaptureStartedAt", production_capture_started_at_) << ","
+         << json_pair("productionCaptureFinishedAt", production_capture_finished_at_) << ","
          << "\"expectedCameras\":" << expected_cameras_
          << "}";
     return json.str();
   }
 
   void ensure_steel_session_locked(const std::string& now) {
-    if (!steel_state_.session_id.empty()) {
+    if (!steel_state_.session_id.empty() && !steel_state_.capture_dir.empty()) {
       return;
     }
     const std::string steel_segment = safe_path_segment(steel_state_.steel_id.empty() ? "unknown-steel" : steel_state_.steel_id);
-    steel_state_.session_id = steel_segment + "-" + timestamp_file_segment();
+    if (steel_state_.session_id.empty()) {
+      steel_state_.session_id = steel_segment + "-" + timestamp_file_segment();
+    }
     std::filesystem::path dir = (storage_root_ / "production" / steel_segment / steel_state_.session_id).lexically_normal();
     steel_state_.capture_dir = dir.string();
     steel_state_.summary_path = (dir / "summary.json").lexically_normal().string();
@@ -4867,12 +5691,19 @@ class CaptureRuntime {
   std::string raw_capture_output_locked(const std::string& ip, const std::string& material_id, int sequence_no) const {
     std::ostringstream sequence;
     sequence << std::setw(6) << std::setfill('0') << std::max(1, sequence_no);
-    std::filesystem::path output = storage_root_ /
-                                   camera_storage_segment_locked(ip) /
+    std::filesystem::path output = camera_capture_root_locked(ip) /
                                    safe_path_segment(material_id.empty() ? "unknown-material" : material_id) /
                                    "depth" /
                                    (sequence.str() + ".png");
     return output.lexically_normal().string();
+  }
+
+  std::filesystem::path camera_capture_root_locked(const std::string& ip) const {
+    auto root = camera_storage_roots_.find(ip);
+    if (root != camera_storage_roots_.end()) {
+      return root->second.lexically_normal();
+    }
+    return (storage_root_ / camera_storage_segment_locked(ip)).lexically_normal();
   }
 
   std::string material_storage_segment_locked() const {
@@ -4910,10 +5741,231 @@ class CaptureRuntime {
     ++steel_state_.capture_count;
     if (code == CORRECT) {
       ++steel_state_.capture_success_count;
+    } else if (code == BLACK_FRAME_DISCARDED) {
+      ++steel_state_.discard_frame_count;
+      ++steel_state_.black_frame_count;
+    } else if (code == CAPTURE_DISCARDED_NOT_ARMED) {
+      ++steel_state_.discard_frame_count;
     } else {
       ++steel_state_.capture_failure_count;
     }
     write_steel_summary_locked();
+  }
+
+  ProductionCaptureSettings production_capture_settings_from_body(const std::string& body) const {
+    ProductionCaptureSettings settings;
+    settings.lines = json_int_field(body, "lines", settings.lines);
+    settings.width = json_int_field(body, "width", settings.width);
+    settings.timeout_ms = json_int_field(body, "timeoutMs", json_int_field(body, "timeout_ms", settings.timeout_ms));
+    settings.data_mode = json_int_field(body, "dataMode", json_int_field(body, "data_mode", settings.data_mode));
+    settings.retries = std::max(0, std::min(10, json_int_field(body, "retries", settings.retries)));
+    settings.control_mode = json_int_field(body, "controlMode", json_int_field(body, "control_mode", settings.control_mode));
+    settings.interval_ms = std::max(0, std::min(600000, json_int_field(body, "intervalMs", json_int_field(body, "interval_ms", settings.interval_ms))));
+    settings.discard_black_frames = json_bool_field(body, "discardBlackFrames", settings.discard_black_frames);
+    settings.save_sdk_derived = json_bool_field(body, "saveSdkDerived", json_bool_field(body, "save_sdk_derived", settings.save_sdk_derived));
+    settings.black_frame_threshold = json_float_field(body, "blackFrameThreshold", static_cast<float>(settings.black_frame_threshold));
+    return settings;
+  }
+
+  bool should_auto_start_production_capture_locked(const std::string& body) const {
+    std::string mode = steel_state_.acquisition_mode;
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    const bool external_mode = mode.find("external") != std::string::npos ||
+                               mode.find("hardware") != std::string::npos ||
+                               mode.find("plc") != std::string::npos;
+    return json_bool_field(body, "autoCapture", !external_mode);
+  }
+
+  std::vector<std::string> connected_capture_ips_locked() const {
+    std::vector<std::string> ips;
+    ips.reserve(sessions_.size());
+    for (const auto& item : sessions_) {
+      const CameraSession& session = item.second;
+      if (session.device || session.simulated_connected) {
+        ips.push_back(session.ip.empty() ? item.first : session.ip);
+      }
+    }
+    std::sort(ips.begin(), ips.end());
+    return ips;
+  }
+
+  void start_production_capture_worker_locked(const std::string& body) {
+    if (production_capture_running_ || active_capture_batches_ > 0) {
+      return;
+    }
+    stop_all_streams_locked();
+    ProductionCaptureSettings settings = production_capture_settings_from_body(body);
+    production_capture_stop_.store(false);
+    const unsigned long long generation = production_capture_generation_.fetch_add(1) + 1;
+    production_capture_running_ = true;
+    production_capture_started_at_ = now_iso();
+    production_capture_finished_at_.clear();
+    ++active_capture_batches_;
+    std::thread([this, generation, settings]() {
+      production_capture_loop(generation, settings);
+    }).detach();
+  }
+
+  void request_stop_production_capture_worker_locked() {
+    production_capture_stop_.store(true);
+    production_capture_generation_.fetch_add(1);
+  }
+
+  void production_capture_loop(unsigned long long generation, ProductionCaptureSettings settings) {
+    const int worker_timeout_ms = std::max(1000, std::min(600000, settings.timeout_ms * (settings.retries + 1) + 5000));
+    while (true) {
+      std::vector<std::string> ips;
+      std::string material_id;
+      int round = 1;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (production_capture_stop_.load() ||
+            generation != production_capture_generation_.load() ||
+            !steel_state_.save_enabled ||
+            !steel_state_.present) {
+          break;
+        }
+        ips = connected_capture_ips_locked();
+        material_id = material_storage_segment_locked();
+        const int divisor = std::max(1, static_cast<int>(ips.size()));
+        round = (steel_state_.capture_count / divisor) + 1;
+      }
+
+      if (ips.empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        continue;
+      }
+
+      std::vector<ParallelCaptureJob> jobs;
+      jobs.reserve(ips.size());
+      const std::string round_started_at = now_iso();
+      for (size_t index = 0; index < ips.size(); ++index) {
+        ParallelCaptureJob job;
+        job.ip = ips[index];
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          job.output = raw_capture_output_locked(job.ip, material_id, round);
+        }
+        job.round = round;
+        job.attempt = round;
+        job.parallel_index = static_cast<int>(index);
+        job.round_started_at = round_started_at;
+        job.lines = settings.lines;
+        job.width = settings.width;
+        job.timeout_ms = settings.timeout_ms;
+        job.data_mode = settings.data_mode;
+        job.retries = settings.retries;
+        job.control_mode = settings.control_mode;
+        job.discard_black_frames = settings.discard_black_frames;
+        job.save_sdk_derived = settings.save_sdk_derived;
+        job.black_frame_threshold = settings.black_frame_threshold;
+        jobs.push_back(job);
+      }
+
+      auto round_jobs = std::make_shared<std::vector<ParallelCaptureJob>>(std::move(jobs));
+      auto round_results = std::make_shared<std::vector<ParallelCaptureResult>>(round_jobs->size());
+      auto done_flags = std::make_shared<std::vector<std::shared_ptr<std::atomic_bool>>>();
+      auto abandon_flags = std::make_shared<std::vector<std::shared_ptr<std::atomic_bool>>>();
+      auto result_mutexes = std::make_shared<std::vector<std::shared_ptr<std::mutex>>>();
+      done_flags->reserve(round_jobs->size());
+      abandon_flags->reserve(round_jobs->size());
+      result_mutexes->reserve(round_jobs->size());
+      for (size_t index = 0; index < round_jobs->size(); ++index) {
+        done_flags->push_back(std::make_shared<std::atomic_bool>(false));
+        abandon_flags->push_back(std::make_shared<std::atomic_bool>(false));
+        result_mutexes->push_back(std::make_shared<std::mutex>());
+      }
+      std::vector<std::thread> workers;
+      workers.reserve(round_jobs->size());
+      std::mutex start_mutex;
+      std::condition_variable start_cv;
+      bool start_round = false;
+      size_t ready_count = 0;
+
+      for (size_t index = 0; index < round_jobs->size(); ++index) {
+        workers.emplace_back([&, round_jobs, round_results, done_flags, abandon_flags, result_mutexes, index]() {
+          ParallelCaptureResult worker_result;
+          try {
+            {
+              std::unique_lock<std::mutex> start_lock(start_mutex);
+              ++ready_count;
+              start_cv.notify_one();
+              start_cv.wait(start_lock, [&]() { return start_round; });
+            }
+            worker_result = run_parallel_capture_job((*round_jobs)[index]);
+          } catch (const std::exception& ex) {
+            worker_result = parallel_capture_error((*round_jobs)[index], 500, ex.what());
+          } catch (...) {
+            worker_result = parallel_capture_error((*round_jobs)[index], 500, "production capture worker failed");
+          }
+          {
+            std::lock_guard<std::mutex> result_lock(*(*result_mutexes)[index]);
+            if (!(*abandon_flags)[index]->load()) {
+              (*round_results)[index] = worker_result;
+            }
+          }
+          (*done_flags)[index]->store(true);
+        });
+      }
+
+      {
+        std::unique_lock<std::mutex> start_lock(start_mutex);
+        start_cv.wait(start_lock, [&]() { return ready_count == round_jobs->size(); });
+        start_round = true;
+      }
+      start_cv.notify_all();
+
+      const auto worker_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(worker_timeout_ms);
+      for (;;) {
+        bool all_done = true;
+        for (const auto& done : *done_flags) {
+          if (!done->load()) {
+            all_done = false;
+            break;
+          }
+        }
+        if (all_done || std::chrono::steady_clock::now() >= worker_deadline) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      }
+
+      for (size_t index = 0; index < workers.size(); ++index) {
+        if ((*done_flags)[index]->load()) {
+          if (workers[index].joinable()) {
+            workers[index].join();
+          }
+          continue;
+        }
+        (*abandon_flags)[index]->store(true);
+        {
+          std::lock_guard<std::mutex> result_lock(*(*result_mutexes)[index]);
+          (*round_results)[index] = parallel_capture_error((*round_jobs)[index],
+                                                           504,
+                                                           "production capture worker exceeded hard timeout");
+        }
+        if (workers[index].joinable()) {
+          workers[index].detach();
+        }
+      }
+
+      if (settings.interval_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(settings.interval_ms));
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_capture_batches_ > 0) {
+        --active_capture_batches_;
+      }
+      production_capture_running_ = false;
+      production_capture_finished_at_ = now_iso();
+      steel_state_.updated_at = production_capture_finished_at_;
+      write_steel_summary_locked();
+    }
   }
 
   void write_steel_summary_locked() const {
@@ -4947,14 +5999,30 @@ class CaptureRuntime {
         if (!steel_state_.present || steel_state_.session_id.empty()) {
           ensure_steel_session_locked(now);
         }
+        steel_state_.inspection_id = json_string_field(body, "inspectionId", json_string_field(body, "inspection_id", steel_state_.inspection_id));
+        steel_state_.acquisition_mode = json_string_field(body, "acquisitionMode",
+                                      json_string_field(body, "acquisition_mode",
+                                      json_string_field(body, "triggerMode", steel_state_.acquisition_mode)));
+        steel_state_.capture_save_state = json_string_field(body, "captureSaveState", "save");
+        steel_state_.save_enabled = json_bool_field(body, "saveEnabled", true);
+        steel_state_.discard_black_frames = json_bool_field(body, "discardBlackFrames", steel_state_.discard_black_frames);
+        steel_state_.black_frame_threshold = json_float_field(body, "blackFrameThreshold", static_cast<float>(steel_state_.black_frame_threshold));
+        steel_state_.algorithm_phase = json_string_field(body, "algorithmPhase", "pending");
         steel_state_.present = true;
-        steel_state_.phase = "steel-in";
+        const bool auto_capture = should_auto_start_production_capture_locked(body);
+        steel_state_.phase = auto_capture ? "steel-in-saving" : "steel-in-waiting-images";
         steel_state_.in_time = now;
         steel_state_.updated_at = now;
         ++steel_state_.in_count;
+        if (auto_capture) {
+          start_production_capture_worker_locked(body);
+        }
       } else {
+        request_stop_production_capture_worker_locked();
         steel_state_.present = false;
         steel_state_.phase = "steel-out";
+        steel_state_.capture_save_state = json_string_field(body, "captureSaveState", "discard");
+        steel_state_.save_enabled = false;
         steel_state_.out_time = now;
         steel_state_.session_finished_at = now;
         steel_state_.updated_at = now;
@@ -4966,6 +6034,7 @@ class CaptureRuntime {
         steel_state_.phase = "info-ready";
       }
     } else if (cmd == "reset" || cmd == "clear") {
+      request_stop_production_capture_worker_locked();
       steel_state_ = SteelState{};
       steel_state_.updated_at = now;
     } else {
@@ -4986,6 +6055,8 @@ class CaptureRuntime {
 
   static std::string steel_phase_label(const std::string& phase) {
     if (phase == "steel-in") return "steel-in-capturing";
+    if (phase == "steel-in-waiting-images") return "steel-in-waiting-images";
+    if (phase == "steel-in-saving") return "steel-in-saving";
     if (phase == "steel-out") return "steel-out-finishing";
     if (phase == "info-ready") return "steel-info-ready";
     return "idle";
@@ -5007,6 +6078,17 @@ class CaptureRuntime {
     std::string hard = json_string_field(body, "hard");
     if (!hard.empty()) {
       steel_state_.hard = hard;
+    }
+    std::string session_id = json_string_field(body, "sessionId", json_string_field(body, "session_id"));
+    if (!session_id.empty()) {
+      session_id = safe_path_segment(session_id);
+      if (steel_state_.session_id != session_id) {
+        steel_state_.session_id = session_id;
+        steel_state_.capture_dir.clear();
+        steel_state_.summary_path.clear();
+        steel_state_.session_started_at.clear();
+        steel_state_.session_finished_at.clear();
+      }
     }
     steel_state_.length = json_float_field(body, "length", json_float_field(body, "len", static_cast<float>(steel_state_.length)));
     steel_state_.width = json_float_field(body, "width", static_cast<float>(steel_state_.width));
@@ -5060,11 +6142,18 @@ class CaptureRuntime {
   bool sdk_ready_ = false;
   std::filesystem::path storage_root_;
   std::filesystem::path config_root_;
+  std::map<std::string, std::filesystem::path> camera_storage_roots_;
   int expected_cameras_ = 6;
   std::string simulated_image_source_dir_;
   SteelState steel_state_;
   std::map<std::string, CameraSession> sessions_;
+  mutable StorageThreadPool storage_pool_;
   int active_capture_batches_ = 0;
+  std::atomic<unsigned long long> production_capture_generation_{0};
+  std::atomic<bool> production_capture_stop_{false};
+  bool production_capture_running_ = false;
+  std::string production_capture_started_at_;
+  std::string production_capture_finished_at_;
 };
 
 std::string receive_body(HANDLE queue, PHTTP_REQUEST request) {

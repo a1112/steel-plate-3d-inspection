@@ -88,9 +88,9 @@ describe('PlateMap', () => {
     expect(onToggleType).toHaveBeenCalledWith('roll');
   });
 
-  it('switches between all, top and bottom surface display modes', () => {
+  it('renders a single six-camera unfolded map instead of top and bottom surfaces', () => {
     const onSurfaceModeChange = vi.fn();
-    const { rerender } = render(
+    render(
       <PlateMap
         defectTypes={defectTypes}
         defects={defects}
@@ -107,33 +107,15 @@ describe('PlateMap', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: '显示全部' })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByText('上表面')).toBeInTheDocument();
-    expect(screen.getByText('下表面')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '显示上表' }));
-    expect(onSurfaceModeChange).toHaveBeenCalledWith('top');
-
-    rerender(
-      <PlateMap
-        defectTypes={defectTypes}
-        defects={defects.filter((defect) => defect.surface === 'top')}
-        defectTypeCounts={{ pit: 1, roll: 0 }}
-        hiddenTypeIds={new Set()}
-        selectedDefectId={null}
-        surfaceMode="top"
-        previewPositionM={6}
-        plateLengthM={12}
-        onToggleType={vi.fn()}
-        onSurfaceModeChange={onSurfaceModeChange}
-        onPreviewPositionChange={vi.fn()}
-        onSelectDefect={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByRole('button', { name: '显示上表' })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByText('上表面')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '棒材圆周展开缺陷图' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: '六相机圆周展开缺陷图' })).toBeInTheDocument();
+    expect(screen.getByTestId('bar-unfolded-map')).toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: '相机区显示切换' })).not.toBeInTheDocument();
+    expect(screen.queryByText('上表面')).not.toBeInTheDocument();
     expect(screen.queryByText('下表面')).not.toBeInTheDocument();
+    expect(screen.getByText('camera1')).toBeInTheDocument();
+    expect(screen.getByText('camera6')).toBeInTheDocument();
+    expect(onSurfaceModeChange).not.toHaveBeenCalled();
   });
 
   it('keeps the existing map as 2D and can switch to the 3D plate view', () => {
@@ -174,7 +156,7 @@ describe('PlateMap', () => {
     expect(screen.getByRole('slider', { name: '预览位置' })).toBeInTheDocument();
   });
 
-  it('renders point-cloud mode as top and bottom height unfolded maps', () => {
+  it('renders point-cloud mode as camera-zone height unfolded maps', () => {
     render(
       <PlateMap
         defectTypes={defectTypes}
@@ -196,12 +178,12 @@ describe('PlateMap', () => {
     const view = screen.getByTestId('plate-point-cloud-view');
 
     expect(Number(view.getAttribute('data-point-cloud-points'))).toBeGreaterThan(5000);
-    expect(screen.getByText('上表面 Top 3D 高度展开图')).toBeInTheDocument();
-    expect(screen.getByText('下表面 Bottom 3D 高度展开图')).toBeInTheDocument();
-    expect(screen.getByLabelText('上表面高度色标')).toBeInTheDocument();
-    expect(screen.getByLabelText('下表面高度色标')).toBeInTheDocument();
-    expect(screen.getByLabelText('凹坑点云标注，上表面，距头1000mm')).toBeInTheDocument();
-    expect(screen.getByLabelText('辊印点云标注，下表面，距头2000mm')).toBeInTheDocument();
+    expect(screen.getByText('1-3号相机 3D 高度展开图')).toBeInTheDocument();
+    expect(screen.getByText('4-6号相机 3D 高度展开图')).toBeInTheDocument();
+    expect(screen.getByLabelText('1-3号相机高度色标')).toBeInTheDocument();
+    expect(screen.getByLabelText('4-6号相机高度色标')).toBeInTheDocument();
+    expect(screen.getByLabelText('凹坑点云标注，1-3号相机，距头1000mm')).toBeInTheDocument();
+    expect(screen.getByLabelText('辊印点云标注，4-6号相机，距头2000mm')).toBeInTheDocument();
   });
 
   it('limits 3D view control to horizontal dragging', () => {
@@ -306,7 +288,7 @@ describe('PlateMap', () => {
       />,
     );
 
-    const marker = screen.getByRole('button', { name: '凹坑，上表面，距头1000mm' });
+    const marker = screen.getByRole('button', { name: '凹坑，camera3，距头1000mm' });
     fireEvent.mouseEnter(marker);
 
     expect(screen.getByRole('tooltip')).toBeInTheDocument();
@@ -341,8 +323,8 @@ describe('PlateMap', () => {
       />,
     );
 
-    const topStrip = screen.getByRole('region', { name: '上表面缺陷显示切换' });
-    fireEvent.keyDown(topStrip, { key: 'ArrowRight' });
+    const unfoldedMap = screen.getByRole('region', { name: '六相机圆周展开缺陷图' });
+    fireEvent.keyDown(unfoldedMap, { key: 'ArrowRight' });
     expect(onSelectDefect).toHaveBeenLastCalledWith('D-BOTTOM');
 
     rerender(
@@ -362,11 +344,11 @@ describe('PlateMap', () => {
       />,
     );
 
-    const bottomStrip = screen.getByRole('region', { name: '下表面缺陷显示切换' });
-    fireEvent.wheel(bottomStrip, { deltaY: -120 });
+    const rerenderedMap = screen.getByRole('region', { name: '六相机圆周展开缺陷图' });
+    fireEvent.wheel(rerenderedMap, { deltaY: -120 });
     expect(onSelectDefect).toHaveBeenLastCalledWith('D-TOP');
 
-    fireEvent.keyDown(bottomStrip, { key: 'End' });
+    fireEvent.keyDown(rerenderedMap, { key: 'End' });
     expect(onSelectDefect).toHaveBeenLastCalledWith('D-BOTTOM');
   });
 
@@ -433,7 +415,7 @@ describe('PlateMap', () => {
     expect(onPreviewPositionChange).toHaveBeenLastCalledWith(5.9);
   });
 
-  it('renders synchronized preview cursors on top and bottom surface strips', () => {
+  it('renders the preview cursor on the unfolded six-camera map', () => {
     render(
       <PlateMap
         defectTypes={defectTypes}
@@ -451,8 +433,7 @@ describe('PlateMap', () => {
       />,
     );
 
-    expect(screen.getByTestId('preview-cursor-top')).toHaveStyle({ left: '25%' });
-    expect(screen.getByTestId('preview-cursor-bottom')).toHaveStyle({ left: '25%' });
+    expect(screen.getByTestId('preview-cursor-unfolded')).toHaveStyle({ left: '25%' });
     expect(screen.getByRole('slider', { name: '预览位置' })).toHaveAttribute('aria-valuenow', '3');
   });
 });

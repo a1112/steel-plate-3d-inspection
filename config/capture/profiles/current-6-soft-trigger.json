@@ -1,0 +1,240 @@
+﻿{
+    "schema":  "steel.capture.profile.v1",
+    "name":  "current-6-soft-trigger",
+    "updatedAt":  "2026-07-06T17:08:09.2382419+08:00",
+    "storageRoot":  "H:/",
+    "cameraParamDir":  "config/camera-params/current-6-soft-trigger",
+    "startupMode":  "auto-connect",
+    "autoConnect":  true,
+    "expectedCameras":  6,
+    "devType":  -1,
+    "changeStorage":  false,
+    "applySoftTrigger":  false,
+    "loadCameraParams":  false,
+    "saveToDevice":  false,
+    "lines":  1000,
+    "width":  0,
+    "timeoutMs":  8000,
+    "dataMode":  3,
+    "fpsLimit":  5,
+    "controlMode":  0,
+    "triggerInputType":  4,
+    "divRatio":  4,
+    "timeTriggerFreq":  300,
+    "exposureTime":  50,
+    "gainK":  1,
+    "cameraDefaults":  {
+                           "controlMode":  0,
+                           "triggerInputType":  4,
+                           "divRatio":  4,
+                           "timeTriggerFreq":  300,
+                           "exposureTime":  50,
+                           "gainK":  1,
+                           "laserEnable":  false,
+                           "arrayEnable":  true,
+                           "laserPower":  100
+                       },
+    "cameras":  [
+                    {
+                        "ip":  "192.168.101.100",
+                        "model":  "LVM3450BE",
+                        "sn":  "3G506401BE08818",
+                        "driverId":  "lvm-nvt",
+                        "enabled":  true,
+                        "paramFile":  "config/camera-params/current-6-soft-trigger/192_168_101_100.nccfg",
+                        "role":  "BE-left"
+                    },
+                    {
+                        "ip":  "192.168.102.100",
+                        "model":  "LVM3450CA",
+                        "sn":  "3G506501CA09165",
+                        "driverId":  "lvm-nvt",
+                        "enabled":  true,
+                        "paramFile":  "config/camera-params/current-6-soft-trigger/192_168_102_100.nccfg",
+                        "role":  "CA-left"
+                    },
+                    {
+                        "ip":  "192.168.103.100",
+                        "model":  "LVM3450RE",
+                        "sn":  "3G506401RE08993",
+                        "driverId":  "lvm-nvt",
+                        "enabled":  true,
+                        "paramFile":  "config/camera-params/current-6-soft-trigger/192_168_103_100.nccfg",
+                        "role":  "RE-left"
+                    },
+                    {
+                        "ip":  "192.168.104.100",
+                        "model":  "LVM3450BE",
+                        "sn":  "3G506401BE08819",
+                        "driverId":  "lvm-nvt",
+                        "enabled":  true,
+                        "paramFile":  "config/camera-params/current-6-soft-trigger/192_168_104_100.nccfg",
+                        "role":  "BE-right"
+                    },
+                    {
+                        "ip":  "192.168.105.13",
+                        "model":  "LVM3450CA",
+                        "sn":  "YF-0263",
+                        "driverId":  "lvm-nvt",
+                        "enabled":  true,
+                        "paramFile":  "config/camera-params/current-6-soft-trigger/192_168_105_13.nccfg",
+                        "role":  "CA-right"
+                    },
+                    {
+                        "ip":  "192.168.106.100",
+                        "model":  "LVM3450RE",
+                        "sn":  "3G506401RE08991",
+                        "driverId":  "lvm-nvt",
+                        "enabled":  true,
+                        "paramFile":  "config/camera-params/current-6-soft-trigger/192_168_106_100.nccfg",
+                        "role":  "RE-right"
+                    }
+                ],
+    "captureDataType":  3,
+    "laserEnable":  false,
+    "arrayEnable":  true,
+    "laserPower":  100,
+    "laserLineSelect":  0,
+    "arrayCalibrationFile":  "config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-151317/ArrayCalibration.corrected.xml",
+    "activeCalibration":  {
+                              "version":  "array-calibration-fit-20260707-151317",
+                              "appliedAt":  "2026-07-07T15:14:21.457",
+                              "appliedBy":  "codex-renderable-calibration-apply",
+                              "sourceCalibration":  "E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger\\ArrayCalibration.xml",
+                              "correctedCalibration":  "config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-151317/ArrayCalibration.corrected.xml",
+                              "fitReport":  "config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-151317/fit_report.json",
+                              "beforePreview":  "config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-151317/cross_section_before.png",
+                              "afterPreview":  "config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-151317/cross_section_corrected.png",
+                              "fitBefore":  {
+                                                "centerX":  -13.828670523956964,
+                                                "centerZ":  -8.099650858873105,
+                                                "radius":  57.4842767137737,
+                                                "diameter":  114.9685534275474,
+                                                "meanAbsResidual":  0.09659776176294865,
+                                                "stdResidual":  0.13472612644667653,
+                                                "maxAbsResidual":  0.4992191885993904,
+                                                "pointCount":  14021,
+                                                "robustPointCount":  14021
+                                            },
+                              "fitAfter":  {
+                                               "centerX":  -13.844982237564928,
+                                               "centerZ":  -8.079610672498148,
+                                               "radius":  57.5105227949738,
+                                               "diameter":  115.0210455899476,
+                                               "meanAbsResidual":  0.07876434248680961,
+                                               "stdResidual":  0.10782861400741624,
+                                               "maxAbsResidual":  0.4978589137031264,
+                                               "pointCount":  14381,
+                                               "robustPointCount":  14381
+                                           },
+                              "saveToDevice":  true,
+                              "cameraParamDir":  "config/camera-params/current-6-soft-trigger",
+                              "calibrationResults":  [
+                                                         {
+                                                             "code":  40092,
+                                                             "ip":  "192.168.101.100",
+                                                             "calibrationPath":  "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\ArrayCalibration.corrected.xml",
+                                                             "calibrationCode":  40092,
+                                                             "errorName":  "SDK_ERROR_40092",
+                                                             "message":  "SDK calibration load returned non-zero; ArrayCalibration XML may be a stitching/profile file rather than a per-camera SDK calibration file"
+                                                         },
+                                                         {
+                                                             "code":  40092,
+                                                             "ip":  "192.168.102.100",
+                                                             "calibrationPath":  "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\ArrayCalibration.corrected.xml",
+                                                             "calibrationCode":  40092,
+                                                             "errorName":  "SDK_ERROR_40092",
+                                                             "message":  "SDK calibration load returned non-zero; ArrayCalibration XML may be a stitching/profile file rather than a per-camera SDK calibration file"
+                                                         },
+                                                         {
+                                                             "code":  40092,
+                                                             "ip":  "192.168.103.100",
+                                                             "calibrationPath":  "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\ArrayCalibration.corrected.xml",
+                                                             "calibrationCode":  40092,
+                                                             "errorName":  "SDK_ERROR_40092",
+                                                             "message":  "SDK calibration load returned non-zero; ArrayCalibration XML may be a stitching/profile file rather than a per-camera SDK calibration file"
+                                                         },
+                                                         {
+                                                             "code":  40092,
+                                                             "ip":  "192.168.104.100",
+                                                             "calibrationPath":  "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\ArrayCalibration.corrected.xml",
+                                                             "calibrationCode":  40092,
+                                                             "errorName":  "SDK_ERROR_40092",
+                                                             "message":  "SDK calibration load returned non-zero; ArrayCalibration XML may be a stitching/profile file rather than a per-camera SDK calibration file"
+                                                         },
+                                                         {
+                                                             "code":  40092,
+                                                             "ip":  "192.168.105.13",
+                                                             "calibrationPath":  "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\ArrayCalibration.corrected.xml",
+                                                             "calibrationCode":  40092,
+                                                             "errorName":  "SDK_ERROR_40092",
+                                                             "message":  "SDK calibration load returned non-zero; ArrayCalibration XML may be a stitching/profile file rather than a per-camera SDK calibration file"
+                                                         },
+                                                         {
+                                                             "code":  40092,
+                                                             "ip":  "192.168.106.100",
+                                                             "calibrationPath":  "E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger\\array-calibration-fit-20260707-151317\\ArrayCalibration.corrected.xml",
+                                                             "calibrationCode":  40092,
+                                                             "errorName":  "SDK_ERROR_40092",
+                                                             "message":  "SDK calibration load returned non-zero; ArrayCalibration XML may be a stitching/profile file rather than a per-camera SDK calibration file"
+                                                         }
+                                                     ],
+                              "saveResult":  {
+                                                 "code":  0,
+                                                 "name":  "current-6-soft-trigger",
+                                                 "cameraParamDir":  "E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger",
+                                                 "saved":  6,
+                                                 "failed":  0,
+                                                 "results":  [
+                                                                 {
+                                                                     "code":  0,
+                                                                     "ip":  "192.168.101.100",
+                                                                     "file":  "E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger\\192_168_101_100.nccfg",
+                                                                     "applyCode":  0,
+                                                                     "saveFileCode":  0,
+                                                                     "saveDeviceCode":  0
+                                                                 },
+                                                                 {
+                                                                     "code":  0,
+                                                                     "ip":  "192.168.102.100",
+                                                                     "file":  "E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger\\192_168_102_100.nccfg",
+                                                                     "applyCode":  0,
+                                                                     "saveFileCode":  0,
+                                                                     "saveDeviceCode":  0
+                                                                 },
+                                                                 {
+                                                                     "code":  0,
+                                                                     "ip":  "192.168.103.100",
+                                                                     "file":  "E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger\\192_168_103_100.nccfg",
+                                                                     "applyCode":  0,
+                                                                     "saveFileCode":  0,
+                                                                     "saveDeviceCode":  0
+                                                                 },
+                                                                 {
+                                                                     "code":  0,
+                                                                     "ip":  "192.168.104.100",
+                                                                     "file":  "E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger\\192_168_104_100.nccfg",
+                                                                     "applyCode":  0,
+                                                                     "saveFileCode":  0,
+                                                                     "saveDeviceCode":  0
+                                                                 },
+                                                                 {
+                                                                     "code":  0,
+                                                                     "ip":  "192.168.105.13",
+                                                                     "file":  "E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger\\192_168_105_13.nccfg",
+                                                                     "applyCode":  0,
+                                                                     "saveFileCode":  0,
+                                                                     "saveDeviceCode":  0
+                                                                 },
+                                                                 {
+                                                                     "code":  0,
+                                                                     "ip":  "192.168.106.100",
+                                                                     "file":  "E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger\\192_168_106_100.nccfg",
+                                                                     "applyCode":  0,
+                                                                     "saveFileCode":  0,
+                                                                     "saveDeviceCode":  0
+                                                                 }
+                                                             ]
+                                             }
+                          }
+}

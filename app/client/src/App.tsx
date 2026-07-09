@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import { getAllDefects, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
 import type { DefectItem, InspectionSnapshot, Severity } from './data/inspection';
@@ -41,7 +41,13 @@ import {
 } from './services/inspection-api';
 import { canStartTitlebarDrag } from './lib/titlebar-drag';
 import { getTauriWindowApi } from './lib/tauri-window';
-import { createEmptyCaptureSnapshot, readCaptureSnapshot } from './lib/capture-api';
+import {
+  calculateSystemNetworkRates,
+  createEmptyCaptureSnapshot,
+  readCaptureSnapshot,
+  readSystemNetworkSnapshot,
+  type SystemNetworkSnapshot,
+} from './lib/capture-api';
 import { BrandHeader } from './components/BrandHeader';
 import { AlarmAnalysis } from './components/AlarmAnalysis';
 import { DefectDetectionList } from './components/DefectDetectionList';
@@ -52,8 +58,8 @@ import { SettingsPage } from './components/SettingsPage';
 import { StatisticsPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
+import { BarSurfaceApp } from './components/BarSurfaceApp';
 import { Toast } from './components/Toast';
-import { TopNav } from './components/TopNav';
 import './styles.css';
 
 const DEFECT_PAGE_SIZE = 10;
@@ -74,7 +80,13 @@ function readAppMode() {
   }
   const params = new URLSearchParams(window.location.search);
   const app = params.get('app');
-  return app === 'capture' || app === 'parameters' ? app : 'terminal';
+  if (app === 'capture' || app === 'parameters' || app === 'bar-surface' || app === 'bar') {
+    return app === 'bar' ? 'bar-surface' : app;
+  }
+  if (app === 'terminal' || app === 'inspection' || app === 'dashboard') {
+    return 'terminal';
+  }
+  return 'terminal';
 }
 
 function downloadTextFile(filename: string, content: string, mimeType = 'text/plain;charset=utf-8') {
@@ -92,6 +104,11 @@ function filterDefectsBySelectedSeverities(defects: DefectItem[], selectedSeveri
 }
 
 export default function App() {
+  const appMode = readAppMode();
+  if (appMode === 'bar-surface') {
+    return <BarSurfaceApp />;
+  }
+
   const [snapshot, setSnapshot] = useState<InspectionSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -117,7 +134,7 @@ export default function App() {
         <section className="app-loading-panel" role="status" aria-live="polite">
           <span>后台数据系统</span>
           <h1>{loadError ? '后台连接失败' : '正在连接后台数据服务'}</h1>
-          <p>{loadError ?? '正在从 Rust 数据服务获取钢板、缺陷、设备和历史记录数据...'}</p>
+          <p>{loadError ?? '正在从 Rust 数据服务获取钢管、缺陷、设备和历史记录数据...'}</p>
         </section>
       </div>
     );
@@ -152,6 +169,15 @@ function InspectionDashboard({
   const [analysisCollapsed, setAnalysisCollapsed] = useState(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [captureSnapshot, setCaptureSnapshot] = useState(() => createEmptyCaptureSnapshot('capture service pending'));
+  const [networkSnapshot, setNetworkSnapshot] = useState(() => calculateSystemNetworkRates({
+    code: 1,
+    sampledAtMs: Date.now(),
+    interfaces: [],
+    totalReceivedBytes: 0,
+    totalTransmittedBytes: 0,
+    error: 'network monitor pending',
+  }, null));
+  const previousNetworkSnapshotRef = useRef<SystemNetworkSnapshot | null>(null);
   const windowApi = useMemo(() => getTauriWindowApi(), []);
   const responsiveClassName = getResponsiveProfileClassName(getResponsiveProfile(viewportSize));
 
@@ -222,6 +248,45 @@ function InspectionDashboard({
     };
     void refreshCapture();
     const timer = window.setInterval(() => void refreshCapture(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let requestInFlight = false;
+    const refreshNetwork = async () => {
+      if (requestInFlight) {
+        return;
+      }
+      requestInFlight = true;
+      try {
+        const snapshot = await readSystemNetworkSnapshot();
+        const rates = calculateSystemNetworkRates(snapshot, previousNetworkSnapshotRef.current);
+        previousNetworkSnapshotRef.current = snapshot;
+        if (!cancelled) {
+          setNetworkSnapshot(rates);
+        }
+      } catch (error) {
+        previousNetworkSnapshotRef.current = null;
+        if (!cancelled) {
+          setNetworkSnapshot(calculateSystemNetworkRates({
+            code: 1,
+            sampledAtMs: Date.now(),
+            interfaces: [],
+            totalReceivedBytes: 0,
+            totalTransmittedBytes: 0,
+            error: error instanceof Error ? error.message : 'network monitor offline',
+          }, null));
+        }
+      } finally {
+        requestInFlight = false;
+      }
+    };
+    void refreshNetwork();
+    const timer = window.setInterval(() => void refreshNetwork(), 1000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -353,7 +418,7 @@ function InspectionDashboard({
     setReportFilters({ ...createDefaultReportFilters(), keyword: activeSnapshot.currentPlate.plateNo });
     setReportPage(1);
     setState({ activeNav: 'report', selectedRecordId: activeSnapshot.currentPlate.plateNo });
-    setToast('已切换到当前钢板报表');
+    setToast('已切换到当前钢管报表');
   };
 
   const saveSettings = (message: string) => {
@@ -447,8 +512,11 @@ function InspectionDashboard({
     <div className={`app-shell theme-${uiState.theme} ${responsiveClassName}`}>
       <BrandHeader
         status={deviceStatus}
-        plate={activeSnapshot.currentPlate}
         theme={uiState.theme}
+        capture={captureSnapshot}
+        network={networkSnapshot}
+        activeNav={uiState.activeNav}
+        onNavChange={(activeNav) => setState({ activeNav })}
         onSettingsOpen={() => setSettingsModalOpen(true)}
         onDragMouseDown={(event) => void handleTitlebarMouseDown(event)}
       />
@@ -458,6 +526,7 @@ function InspectionDashboard({
         <div className="online-workspace">
           <LeftSidebar
             plate={activeSnapshot.currentPlate}
+            summary={activeSummary}
             records={pageRecords}
             selectedRecordId={uiState.selectedRecordId}
             page={uiState.recordPage}
@@ -471,12 +540,6 @@ function InspectionDashboard({
             onSearchReset={resetRecordSearchFilters}
           />
           <section className="online-main">
-            <TopNav
-              active={uiState.activeNav}
-              summary={activeSummary}
-              onChange={(activeNav) => setState({ activeNav })}
-              onDragMouseDown={(event) => void handleTitlebarMouseDown(event)}
-            />
             <main className="dashboard-grid online-dashboard-grid">
               <section className={`center-column ${analysisCollapsed ? 'analysis-collapsed' : ''}`}>
                 <PlateMap
@@ -536,12 +599,6 @@ function InspectionDashboard({
         </div>
       ) : (
         <>
-          <TopNav
-            active={uiState.activeNav}
-            summary={activeSummary}
-            onChange={(activeNav) => setState({ activeNav })}
-            onDragMouseDown={(event) => void handleTitlebarMouseDown(event)}
-          />
           {uiState.activeNav === 'report' ? (
             <ReportPage
               defectTypes={snapshot.defectTypes}
@@ -620,7 +677,7 @@ function InspectionDashboard({
               onConnectionSave={() => void saveConnection()}
               onSave={() => saveSettings('参数已保存')}
               onReset={resetSettings}
-              onApplyToPlate={() => saveSettings('参数已应用到当前钢板')}
+              onApplyToPlate={() => saveSettings('参数已应用到当前钢管')}
             />
           </section>
         </div>

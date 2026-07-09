@@ -99,8 +99,8 @@ export const severityLabels: Record<Severity, string> = {
 };
 
 export const surfaceLabels: Record<Surface, string> = {
-  top: '上表面',
-  bottom: '下表面',
+  top: '1-3号相机',
+  bottom: '4-6号相机',
 };
 
 const defectTypes: DefectType[] = [

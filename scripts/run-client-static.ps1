@@ -41,18 +41,150 @@ function Get-ContentType {
   }
 }
 
+function Resolve-HostAddress {
+  param([string]$Name)
+
+  if ([string]::IsNullOrWhiteSpace($Name) -or $Name -eq "localhost") {
+    return [System.Net.IPAddress]::Parse("127.0.0.1")
+  }
+
+  $Address = $null
+  if ([System.Net.IPAddress]::TryParse($Name, [ref]$Address)) {
+    return $Address
+  }
+
+  $Addresses = [System.Net.Dns]::GetHostAddresses($Name)
+  $Loopback = $Addresses | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } | Select-Object -First 1
+  if ($Loopback) {
+    return $Loopback
+  }
+
+  throw "Could not resolve host address: $Name"
+}
+
+function Write-HttpResponse {
+  param(
+    [System.Net.Sockets.NetworkStream]$Stream,
+    [int]$StatusCode,
+    [string]$Reason,
+    [string]$ContentType,
+    [byte[]]$Body,
+    [switch]$HeadOnly
+  )
+
+  $Headers = @(
+    "HTTP/1.1 $StatusCode $Reason",
+    "Content-Type: $ContentType",
+    "Content-Length: $($Body.Length)",
+    "Connection: close",
+    "Cache-Control: no-cache",
+    "Access-Control-Allow-Origin: *",
+    "",
+    ""
+  ) -join "`r`n"
+
+  $HeaderBytes = [System.Text.Encoding]::ASCII.GetBytes($Headers)
+  $Stream.Write($HeaderBytes, 0, $HeaderBytes.Length)
+  if (-not $HeadOnly -and $Body.Length -gt 0) {
+    $Stream.Write($Body, 0, $Body.Length)
+  }
+}
+
 function Send-Text {
   param(
-    [System.Net.HttpListenerResponse]$Response,
+    [System.Net.Sockets.NetworkStream]$Stream,
     [int]$StatusCode,
-    [string]$Text
+    [string]$Reason,
+    [string]$Text,
+    [switch]$HeadOnly
   )
 
   $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
-  $Response.StatusCode = $StatusCode
-  $Response.ContentType = "text/plain; charset=utf-8"
-  $Response.ContentLength64 = $Bytes.Length
-  $Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
+  Write-HttpResponse -Stream $Stream -StatusCode $StatusCode -Reason $Reason -ContentType "text/plain; charset=utf-8" -Body $Bytes -HeadOnly:$HeadOnly
+}
+
+function Resolve-RequestedFile {
+  param(
+    [string]$Root,
+    [string]$IndexPath,
+    [string]$RequestTarget
+  )
+
+  $PathOnly = ($RequestTarget -split "\?", 2)[0]
+  $RequestPath = [System.Uri]::UnescapeDataString($PathOnly.TrimStart("/"))
+  $RequestPath = $RequestPath -replace "/", "\"
+  if ([string]::IsNullOrWhiteSpace($RequestPath)) {
+    $RequestPath = "index.html"
+  }
+
+  $Candidate = Join-Path $Root $RequestPath
+  if (Test-Path $Candidate -PathType Container) {
+    $Candidate = Join-Path $Candidate "index.html"
+  }
+
+  if (-not (Test-Path $Candidate -PathType Leaf)) {
+    if ([System.IO.Path]::HasExtension($RequestPath)) {
+      return @{ Status = 404; Path = $null }
+    }
+    $Candidate = $IndexPath
+  }
+
+  $ResolvedCandidate = (Resolve-Path $Candidate).Path
+  $RootWithSeparator = $Root.TrimEnd("\") + "\"
+  if ($ResolvedCandidate -ne $Root -and -not $ResolvedCandidate.StartsWith($RootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase)) {
+    return @{ Status = 403; Path = $null }
+  }
+
+  return @{ Status = 200; Path = $ResolvedCandidate }
+}
+
+function Handle-Client {
+  param(
+    [System.Net.Sockets.TcpClient]$Client,
+    [string]$Root,
+    [string]$IndexPath
+  )
+
+  try {
+    $Stream = $Client.GetStream()
+    $Stream.ReadTimeout = 5000
+    $Reader = [System.IO.StreamReader]::new($Stream, [System.Text.Encoding]::ASCII, $false, 1024, $true)
+    $RequestLine = $Reader.ReadLine()
+    if ([string]::IsNullOrWhiteSpace($RequestLine)) {
+      return
+    }
+
+    do {
+      $HeaderLine = $Reader.ReadLine()
+    } while ($null -ne $HeaderLine -and $HeaderLine.Length -gt 0)
+
+    $Parts = $RequestLine.Split(" ")
+    if ($Parts.Length -lt 2) {
+      Send-Text -Stream $Stream -StatusCode 400 -Reason "Bad Request" -Text "Bad request"
+      return
+    }
+
+    $Method = $Parts[0].ToUpperInvariant()
+    if ($Method -ne "GET" -and $Method -ne "HEAD") {
+      Send-Text -Stream $Stream -StatusCode 405 -Reason "Method Not Allowed" -Text "Method not allowed"
+      return
+    }
+
+    $Resolved = Resolve-RequestedFile -Root $Root -IndexPath $IndexPath -RequestTarget $Parts[1]
+    if ($Resolved.Status -eq 403) {
+      Send-Text -Stream $Stream -StatusCode 403 -Reason "Forbidden" -Text "Forbidden" -HeadOnly:($Method -eq "HEAD")
+      return
+    }
+    if ($Resolved.Status -eq 404) {
+      Send-Text -Stream $Stream -StatusCode 404 -Reason "Not Found" -Text "Not found" -HeadOnly:($Method -eq "HEAD")
+      return
+    }
+
+    $Bytes = [System.IO.File]::ReadAllBytes([string]$Resolved.Path)
+    Write-HttpResponse -Stream $Stream -StatusCode 200 -Reason "OK" -ContentType (Get-ContentType ([string]$Resolved.Path)) -Body $Bytes -HeadOnly:($Method -eq "HEAD")
+  } finally {
+    $Client.Dispose()
+  }
 }
 
 if ([string]::IsNullOrWhiteSpace($ClientRoot)) {
@@ -69,59 +201,24 @@ if (-not (Test-Path $IndexPath -PathType Leaf)) {
   throw "Missing client index.html: $IndexPath"
 }
 
-$Prefix = "http://${HostName}:${Port}/"
-$Listener = [System.Net.HttpListener]::new()
-$Listener.Prefixes.Add($Prefix)
+$Address = Resolve-HostAddress $HostName
+$Listener = [System.Net.Sockets.TcpListener]::new($Address, $Port)
 $Listener.Start()
+$ClientUrl = "http://${HostName}:${Port}/"
 
 Write-Host "Serving client from $Root"
-Write-Host "Client URL: $Prefix"
+Write-Host "Client URL: $ClientUrl"
 Write-Host "Press Ctrl+C to stop."
 
 if ($OpenBrowser) {
-  Start-Process $Prefix | Out-Null
+  Start-Process $ClientUrl | Out-Null
 }
 
 try {
-  while ($Listener.IsListening) {
-    $Context = $Listener.GetContext()
-    $RequestPath = [System.Uri]::UnescapeDataString($Context.Request.Url.AbsolutePath.TrimStart("/"))
-    $RequestPath = $RequestPath -replace "/", "\"
-    if ([string]::IsNullOrWhiteSpace($RequestPath)) {
-      $RequestPath = "index.html"
-    }
-
-    $Candidate = Join-Path $Root $RequestPath
-    if (Test-Path $Candidate -PathType Container) {
-      $Candidate = Join-Path $Candidate "index.html"
-    }
-
-    if (-not (Test-Path $Candidate -PathType Leaf)) {
-      if ([System.IO.Path]::HasExtension($RequestPath)) {
-        Send-Text $Context.Response 404 "Not found"
-        $Context.Response.Close()
-        continue
-      }
-      $Candidate = $IndexPath
-    }
-
-    $ResolvedCandidate = (Resolve-Path $Candidate).Path
-    if (-not $ResolvedCandidate.StartsWith($Root, [System.StringComparison]::OrdinalIgnoreCase)) {
-      Send-Text $Context.Response 403 "Forbidden"
-      $Context.Response.Close()
-      continue
-    }
-
-    $Bytes = [System.IO.File]::ReadAllBytes($ResolvedCandidate)
-    $Context.Response.StatusCode = 200
-    $Context.Response.ContentType = Get-ContentType $ResolvedCandidate
-    $Context.Response.ContentLength64 = $Bytes.Length
-    $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
-    $Context.Response.Close()
+  while ($true) {
+    $Client = $Listener.AcceptTcpClient()
+    Handle-Client -Client $Client -Root $Root -IndexPath $IndexPath
   }
 } finally {
-  if ($Listener.IsListening) {
-    $Listener.Stop()
-  }
-  $Listener.Close()
+  $Listener.Stop()
 }

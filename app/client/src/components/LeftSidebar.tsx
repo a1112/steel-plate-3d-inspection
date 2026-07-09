@@ -1,6 +1,6 @@
-import { ChevronLeft, ChevronRight, RotateCcw, Search } from 'lucide-react';
+import { AlertTriangle, ChevronLeft, ChevronRight, RotateCcw, Search } from 'lucide-react';
 import { useState, type ChangeEvent, type FormEvent } from 'react';
-import type { InspectionRecord, SteelPlate } from '../data/inspection';
+import type { InspectionRecord, InspectionSummary, SteelPlate } from '../data/inspection';
 import { emptyRecordSearchFilters, type RecordSearchFilters } from '../state/record-search';
 import { Panel } from './Panel';
 
@@ -8,7 +8,7 @@ type RecordSearchField = keyof RecordSearchFilters;
 
 const recordSearchOptions: Array<{ field: RecordSearchField; label: string; placeholder: string; inputLabel: string }> = [
   { field: 'serialNo', label: '流水号', placeholder: 'R-001', inputLabel: '流水号查询' },
-  { field: 'plateNo', label: '钢板号', placeholder: '202606131900', inputLabel: '钢板号查询' },
+  { field: 'plateNo', label: '钢管号', placeholder: '202606131900', inputLabel: '钢管号查询' },
   { field: 'time', label: '时间', placeholder: '2026-06-13 / 19:00', inputLabel: '时间查询' },
 ];
 
@@ -21,6 +21,7 @@ function createSingleRecordSearchPatch(field: RecordSearchField, value: string):
 
 interface LeftSidebarProps {
   plate: SteelPlate;
+  summary: InspectionSummary;
   records: InspectionRecord[];
   selectedRecordId: string;
   page: number;
@@ -34,8 +35,33 @@ interface LeftSidebarProps {
   onSearchReset: () => void;
 }
 
+function SidebarAlertCard({ summary }: { summary: InspectionSummary }) {
+  const hasSevereDefect = summary.bySeverity.severe > 0;
+  const hasDefect = summary.total > 0;
+  const message = hasSevereDefect
+    ? `检测到 ${summary.bySeverity.severe} 个严重缺陷`
+    : hasDefect
+      ? `当前钢管 ${summary.total} 个缺陷均未达严重等级`
+      : '当前钢管未检出缺陷';
+
+  return (
+    <section
+      className={`sidebar-alert-card ${hasSevereDefect ? '' : 'stable'}`}
+      aria-label={`${hasSevereDefect ? '严重缺陷报警' : '缺陷状态正常'}，${message}`}
+    >
+      <AlertTriangle size={18} strokeWidth={1.9} />
+      <div>
+        <strong>{hasSevereDefect ? '严重缺陷报警' : '缺陷状态正常'}</strong>
+        <span>{message}</span>
+      </div>
+      <b>{hasSevereDefect ? '立即复核' : '跟踪'}</b>
+    </section>
+  );
+}
+
 export function LeftSidebar({
   plate,
+  summary,
   records,
   selectedRecordId,
   page,
@@ -73,22 +99,24 @@ export function LeftSidebar({
 
   return (
     <aside className="left-column">
-      <Panel title="钢板信息" className="plate-info-panel">
+      <SidebarAlertCard summary={summary} />
+
+      <Panel title="钢管信息" className="plate-info-panel">
         <dl className="plate-info-list">
           <div>
-            <dt>钢板号:</dt>
+            <dt>钢管号:</dt>
             <dd>{plate.plateNo}</dd>
           </div>
           <div>
-            <dt>钢板宽度:</dt>
+            <dt>外径/宽度:</dt>
             <dd>{plate.widthMm} mm</dd>
           </div>
           <div>
-            <dt>钢板长度:</dt>
+            <dt>钢管长度:</dt>
             <dd>{plate.lengthMm} mm</dd>
           </div>
           <div>
-            <dt>钢板厚度:</dt>
+            <dt>壁厚:</dt>
             <dd>{plate.thicknessMm} mm</dd>
           </div>
           <div>
@@ -154,7 +182,7 @@ export function LeftSidebar({
             <thead>
               <tr>
                 <th>时间</th>
-                <th>钢板号</th>
+                <th>钢管号</th>
                 <th>状态</th>
                 <th>缺陷数</th>
               </tr>

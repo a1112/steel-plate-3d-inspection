@@ -27,6 +27,8 @@ from PIL import Image, ImageDraw
 
 DEFAULT_CALIBRATION = Path(r"E:\steel-capture-data\config\camera-params\current-6-soft-trigger\ArrayCalibration.xml")
 DEFAULT_STORAGE = Path(r"E:\steel-capture-data")
+DEFAULT_CAPTURE_ROOT = Path(r"H:\\")
+DEFAULT_CAMERA_NAMES = ["camera1", "camera2", "camera3", "camera4", "camera5", "camera6"]
 
 
 def parse_rows(value: str) -> list[int]:
@@ -47,6 +49,22 @@ def latest_capture_dir(storage_root: Path) -> Path:
     if not candidates:
         raise FileNotFoundError(f"No summary.json found under {storage_root}")
     return max(candidates, key=lambda path: path.stat().st_mtime).parent
+
+
+def latest_production_material_id(capture_root: Path) -> str:
+    first_camera = capture_root / DEFAULT_CAMERA_NAMES[0]
+    if not first_camera.is_dir():
+        raise FileNotFoundError(f"No production camera folder found: {first_camera}")
+    candidates = sorted(
+        (path for path in first_camera.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates:
+        material_id = candidate.name
+        if all((capture_root / camera / material_id / "metadata").is_dir() for camera in DEFAULT_CAMERA_NAMES):
+            return material_id
+    raise FileNotFoundError(f"No six-camera production material found under {capture_root}")
 
 
 def load_calibration(path: Path) -> tuple[ET.ElementTree, dict[str, dict]]:
@@ -81,8 +99,19 @@ def load_calibration(path: Path) -> tuple[ET.ElementTree, dict[str, dict]]:
     return tree, calibration
 
 
-def load_metadata(data_dir: Path) -> list[dict]:
-    paths = sorted(data_dir.glob("*\\metadata\\*_metadata.json"))
+def load_metadata(data_dir: Path, material_id: str = "") -> list[dict]:
+    paths: list[Path] = []
+    if material_id:
+        for camera_name in DEFAULT_CAMERA_NAMES:
+            metadata_dir = data_dir / camera_name / material_id / "metadata"
+            if metadata_dir.is_dir():
+                metadata_files = sorted(metadata_dir.glob("*.json"))
+                if metadata_files:
+                    paths.append(metadata_files[-1])
+    if not paths:
+        paths = sorted(data_dir.glob("*\\metadata\\*_metadata.json"))
+    if not paths:
+        paths = sorted(data_dir.glob("*\\metadata\\*.json"))
     if not paths:
         paths = sorted(data_dir.glob("*\\*_metadata.json"))
     metadata = []
@@ -294,20 +323,30 @@ def main() -> int:
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
     parser.add_argument("--data-dir", type=Path, default=None)
     parser.add_argument("--storage-root", type=Path, default=DEFAULT_STORAGE)
+    parser.add_argument("--capture-root", type=Path, default=DEFAULT_CAPTURE_ROOT)
+    parser.add_argument("--material-id", default="", help="Production material folder under camera1..camera6, or latest")
     parser.add_argument("--rows", default="500", help="Comma-separated source rows, for example 250,500,750")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_STORAGE / "analysis")
     parser.add_argument("--max-points-per-camera", type=int, default=2400)
     parser.add_argument("--max-shift-mm", type=float, default=5.0)
     args = parser.parse_args()
 
-    data_dir = args.data_dir or latest_capture_dir(args.storage_root)
+    material_id = args.material_id.strip()
+    if material_id.lower() == "latest":
+        material_id = latest_production_material_id(args.capture_root)
+    if args.data_dir is not None:
+        data_dir = args.data_dir
+    elif material_id:
+        data_dir = args.capture_root
+    else:
+        data_dir = latest_capture_dir(args.storage_root)
     rows = parse_rows(args.rows)
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = args.output_root / f"array-calibration-fit-{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tree, calibration = load_calibration(args.calibration)
-    metadata = load_metadata(data_dir)
+    metadata = load_metadata(data_dir, material_id)
 
     chunks: list[dict] = []
     all_points: list[np.ndarray] = []
@@ -421,6 +460,8 @@ def main() -> int:
     report = {
         "calibration": str(args.calibration),
         "dataDir": str(data_dir),
+        "captureRoot": str(args.capture_root),
+        "materialId": material_id,
         "rows": rows,
         "outputDir": str(output_dir),
         "correctedXml": str(corrected_xml),

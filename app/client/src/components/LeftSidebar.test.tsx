@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { useState } from 'react';
 import { describe, expect, it } from 'vitest';
-import type { InspectionRecord, SteelPlate } from '../data/inspection';
+import type { InspectionRecord, InspectionSummary, SteelPlate } from '../data/inspection';
 import { emptyRecordSearchFilters, type RecordSearchFilters } from '../state/record-search';
 import { LeftSidebar } from './LeftSidebar';
 
@@ -18,6 +18,12 @@ const records: InspectionRecord[] = [
   { id: 'R-001', time: '19:00', plateNo: '202606131900', status: 'detecting', defectCount: 12 },
   { id: 'R-002', time: '18:42', plateNo: '202606131858', status: 'completed', defectCount: 8 },
 ];
+
+const summary: InspectionSummary = {
+  total: 12,
+  bySeverity: { severe: 4, review: 3, minor: 5 },
+  bySurface: { top: 5, bottom: 7 },
+};
 
 function SidebarHarness() {
   const [filters, setFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
@@ -37,6 +43,7 @@ function SidebarHarness() {
   return (
     <LeftSidebar
       plate={plate}
+      summary={summary}
       records={filteredRecords}
       selectedRecordId={plate.plateNo}
       page={1}
@@ -57,7 +64,7 @@ describe('LeftSidebar', () => {
     render(<SidebarHarness />);
 
     fireEvent.change(screen.getByLabelText('查询条件'), { target: { value: 'plateNo' } });
-    const input = screen.getByLabelText('钢板号查询');
+    const input = screen.getByLabelText('钢管号查询');
     fireEvent.change(input, { target: { value: '1858' } });
 
     expect(screen.getByDisplayValue('1858')).toBeInTheDocument();

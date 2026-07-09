@@ -1,8 +1,9 @@
 param(
   [int]$Port = 4317,
   [string]$Configuration = "Release",
-  [string]$StorageRoot = "E:\steel-capture-data",
-  [string]$ConfigRoot = "E:\steel-capture-data\config",
+  [string]$StorageRoot = "H:\",
+  [string]$CameraStorageRoot = "H:\",
+  [string]$ConfigRoot = "",
   [string]$Profile = "current-6-soft-trigger",
   [int]$ExpectedCameras = 6,
   [int]$Lines = 1000,
@@ -50,11 +51,55 @@ function Wait-CaptureHealth {
   throw "Capture provider did not become healthy on port $Port within ${TimeoutSec}s."
 }
 
+function Normalize-PathText {
+  param([string]$Path)
+
+  if ([string]::IsNullOrWhiteSpace($Path)) {
+    return ""
+  }
+  try {
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/').ToLowerInvariant()
+  } catch {
+    return $Path.TrimEnd('\', '/').ToLowerInvariant()
+  }
+}
+
+function Assert-CaptureProviderMatches {
+  param(
+    [object]$Health,
+    [string]$ExpectedStorageRoot,
+    [string]$ExpectedConfigRoot
+  )
+
+  $ActualStorage = Normalize-PathText ([string]$Health.storageRoot)
+  $ExpectedStorage = Normalize-PathText $ExpectedStorageRoot
+  if ($ActualStorage -ne $ExpectedStorage) {
+    throw "Capture provider on port $Port uses storageRoot '$($Health.storageRoot)', expected '$ExpectedStorageRoot'. Stop it first or rerun with -StopExisting to avoid writing frames to the wrong root."
+  }
+
+  $ActualConfig = Normalize-PathText ([string]$Health.configRoot)
+  $ExpectedConfig = Normalize-PathText $ExpectedConfigRoot
+  if ($ActualConfig -ne $ExpectedConfig) {
+    throw "Capture provider on port $Port uses configRoot '$($Health.configRoot)', expected '$ExpectedConfigRoot'. Stop it first or rerun with -StopExisting to avoid loading the wrong profile."
+  }
+}
+
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+if ($ConfigRoot.Trim().Length -eq 0) {
+  $ConfigRoot = Join-Path $RepoRoot "target\config\capture"
+}
 $CaptureExe = Join-Path $RepoRoot "target\capture\$Configuration\steel_capture_service.exe"
 $QtExe = Join-Path $RepoRoot "target\capture-qt\$Configuration\steel_capture_qt_terminal.exe"
-$LogDir = Join-Path $StorageRoot "logs"
+$LogDir = Join-Path $RepoRoot "target\logs\capture"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+New-Item -ItemType Directory -Force -Path $ConfigRoot | Out-Null
+
+$SeedConfigRoot = Join-Path $RepoRoot "config\capture"
+$ExpectedProfilePath = Join-Path $ConfigRoot "profiles\$Profile\profile.json"
+if (-not (Test-Path $ExpectedProfilePath -PathType Leaf) -and (Test-Path $SeedConfigRoot -PathType Container)) {
+  Get-ChildItem -LiteralPath $SeedConfigRoot -Force | Copy-Item -Destination $ConfigRoot -Recurse -Force
+  Write-Host "Seeded capture config from $SeedConfigRoot to $ConfigRoot."
+}
 
 if (-not (Test-Path $CaptureExe -PathType Leaf)) {
   throw "Missing $CaptureExe. Run scripts/build-capture-headless.ps1 first."
@@ -76,10 +121,13 @@ try {
 
 if ($ExistingHealth) {
   Write-Host "Using existing capture provider on port $Port."
+  Assert-CaptureProviderMatches -Health $ExistingHealth -ExpectedStorageRoot $StorageRoot -ExpectedConfigRoot $ConfigRoot
 } else {
   $OldStorageRoot = $env:CAPTURE_STORAGE_ROOT
+  $OldCameraStorageRoot = $env:CAPTURE_CAMERA_STORAGE_ROOT
   $OldConfigRoot = $env:CAPTURE_CONFIG_ROOT
   $env:CAPTURE_STORAGE_ROOT = $StorageRoot
+  $env:CAPTURE_CAMERA_STORAGE_ROOT = $CameraStorageRoot
   $env:CAPTURE_CONFIG_ROOT = $ConfigRoot
   $Process = Start-Process -FilePath $CaptureExe `
     -ArgumentList @("--port", [string]$Port) `
@@ -89,11 +137,13 @@ if ($ExistingHealth) {
     -RedirectStandardError (Join-Path $LogDir "capture-service.err.log") `
     -PassThru
   $env:CAPTURE_STORAGE_ROOT = $OldStorageRoot
+  $env:CAPTURE_CAMERA_STORAGE_ROOT = $OldCameraStorageRoot
   $env:CAPTURE_CONFIG_ROOT = $OldConfigRoot
   Write-Host "Started capture provider PID $($Process.Id) on port $Port."
 }
 
 $Health = Wait-CaptureHealth
+Assert-CaptureProviderMatches -Health $Health -ExpectedStorageRoot $StorageRoot -ExpectedConfigRoot $ConfigRoot
 Write-Host "Provider health: sdkReady=$($Health.sdkReady), cameraCount=$($Health.cameraCount), storageRoot=$($Health.storageRoot)"
 
 $Apply = Invoke-CaptureJson -Method POST -Path "/api/config/profile/apply" -TimeoutSec 60 -Body @{

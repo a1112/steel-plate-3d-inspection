@@ -1,27 +1,37 @@
 import { Activity, Bell, Camera, Cpu, Server, Settings } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent } from 'react';
 import ustbLogoDark from '../assets/USTB-dark.png';
 import ustbLogo from '../assets/USTB.png';
-import type { DeviceStatus, SteelPlate, ThemeMode } from '../data/inspection';
+import type { DeviceStatus, ThemeMode } from '../data/inspection';
+import type { CaptureCameraStatus, CaptureSnapshot, SystemNetworkRateInterface, SystemNetworkRateSnapshot } from '../lib/capture-api';
+import { TopNav, type NavKey } from './TopNav';
 import { WindowControls } from './WindowControls';
 
 interface BrandHeaderProps {
   status: DeviceStatus;
-  plate: SteelPlate;
   theme: ThemeMode;
+  capture?: CaptureSnapshot;
+  network?: SystemNetworkRateSnapshot | null;
+  activeNav: NavKey;
+  onNavChange: (next: NavKey) => void;
   onSettingsOpen: () => void;
   onDragMouseDown: (event: MouseEvent<HTMLElement>) => void;
 }
 
-type Port = { index: number; ok: boolean };
+type Port = { index: number; ok: boolean; title?: string };
 
 interface CameraDetail {
   index: number;
   station: string;
   ip: string;
+  model: string;
+  sn: string;
   status: string;
   frameRate: string;
   temperature: string;
+  sdkStatus: string;
+  buffer: string;
+  lastFrame: string;
 }
 
 interface ReceiverDetail {
@@ -31,20 +41,106 @@ interface ReceiverDetail {
   throughput: string;
   latency: string;
   status: string;
+  uploadMbps: number;
+  downloadMbps: number;
+  bandwidthMbps: number;
+  realtime?: boolean;
 }
 
-const cameraStations = ['上表面-操作侧', '上表面-中部', '上表面-传动侧', '上表面-边部', '下表面-操作侧', '下表面-中部', '下表面-传动侧', '下表面-边部'];
-const receiverChannels = ['一级判定', '二级判定', '严重报警', '待复核队列', '上表结果', '下表结果', 'L2 推送', '备用链路'];
+type ReceiverNetworkTotals = {
+  upload: number;
+  download: number;
+  bandwidth: number;
+};
 
-function createReceiverDetails(ports: Port[]): ReceiverDetail[] {
-  return ports.map((port, index) => ({
-    index: port.index,
-    channel: receiverChannels[index] ?? `报级通道 ${port.index}`,
-    ip: `192.168.10.${80 + port.index}`,
-    throughput: port.ok ? `${(118 + index * 6).toFixed(0)} Mbps` : '--',
-    latency: port.ok ? `${(2.4 + (index % 4) * 0.3).toFixed(1)} ms` : '--',
-    status: port.ok ? '已连接' : '连接异常',
-  }));
+const cameraStations = ['1号采集相机', '2号采集相机', '3号采集相机', '4号采集相机', '5号采集相机', '6号采集相机'];
+const REAL_CAMERA_LIMIT = 6;
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function formatTime(value?: string | null) {
+  if (!value) {
+    return '--';
+  }
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toLocaleTimeString('zh-CN', { hour12: false });
+  }
+  return value.includes('T') ? value.slice(11, 19) : value;
+}
+
+function formatFrameRate(value?: number | null) {
+  if (!isFiniteNumber(value) || value <= 0) {
+    return '--';
+  }
+  return `${value.toLocaleString('zh-CN', { maximumFractionDigits: 1 })} Hz`;
+}
+
+function formatMbps(value?: number | null) {
+  if (!isFiniteNumber(value) || value <= 0) {
+    return '0';
+  }
+  if (value >= 100) {
+    return value.toLocaleString('zh-CN', { maximumFractionDigits: 0, useGrouping: false });
+  }
+  if (value >= 10) {
+    return value.toLocaleString('zh-CN', { maximumFractionDigits: 1, useGrouping: false });
+  }
+  return value.toLocaleString('zh-CN', { maximumFractionDigits: 2, useGrouping: false });
+}
+
+function formatNetworkSampleTime(value?: number | null) {
+  if (!isFiniteNumber(value) || value <= 0) {
+    return '--';
+  }
+  return new Date(value).toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function formatPercent(value?: number | null) {
+  if (!isFiniteNumber(value)) {
+    return '--';
+  }
+  return `${value.toFixed(0)}%`;
+}
+
+function formatCameraTemperature(camera: CaptureCameraStatus) {
+  const values = [camera.temperatureJ28, camera.temperatureJ29, camera.temperatureJ30].filter(isFiniteNumber);
+  if (!values.length) {
+    return '--';
+  }
+  return `${Math.max(...values).toFixed(1)} C`;
+}
+
+function cameraFrameRate(camera: CaptureCameraStatus) {
+  return formatFrameRate(camera.fps ?? camera.captureConfig?.maxFrameRate);
+}
+
+function cameraStation(camera: CaptureCameraStatus, index: number) {
+  return camera.name || camera.role || camera.configId || cameraStations[index] || `相机 ${index + 1}`;
+}
+
+function cameraStatusText(camera: CaptureCameraStatus) {
+  if (camera.enabled === false) {
+    return '停用';
+  }
+  if (camera.connected) {
+    return camera.error ? '异常' : '在线';
+  }
+  if (camera.acquisitionState === 'discovered') {
+    return '已发现';
+  }
+  return '离线';
+}
+
+function isCameraHealthy(camera: CaptureCameraStatus) {
+  const sdkStatus = (camera.sdkStatus ?? '').toLowerCase();
+  return cameraStatusText(camera) === '在线' && !sdkStatus.includes('error') && !sdkStatus.includes('fail') && !sdkStatus.includes('offline');
+}
+
+function isReceiverDetailOk(detail: ReceiverDetail) {
+  return detail.status === '已连接' || detail.status === '运行中' || detail.status === '正常' || detail.status === '在线';
 }
 
 function createCameraDetails(ports: Port[]): CameraDetail[] {
@@ -52,9 +148,169 @@ function createCameraDetails(ports: Port[]): CameraDetail[] {
     index: port.index,
     station: cameraStations[index] ?? `相机 ${port.index}`,
     ip: `192.168.20.${100 + port.index}`,
+    model: '模拟链路',
+    sn: '--',
     status: port.ok ? '在线' : '链路异常',
     frameRate: port.ok ? `${(24.6 + (index % 3) * 0.2).toFixed(1)} kHz` : '--',
     temperature: port.ok ? `${38 + index} C` : '--',
+    sdkStatus: port.ok ? 'ready' : 'error',
+    buffer: '--',
+    lastFrame: '--',
+  }));
+}
+
+function receiverNetworkScore(item: SystemNetworkRateInterface) {
+  const text = `${item.name} ${item.description ?? ''}`.toLowerCase();
+  const trafficBytes = Math.max(0, item.receivedBytes) + Math.max(0, item.transmittedBytes);
+  const packets = Math.max(0, item.packetsReceived ?? 0) + Math.max(0, item.packetsTransmitted ?? 0);
+  const realtimeMbps = Math.max(0, item.uploadMbps) + Math.max(0, item.downloadMbps);
+  let score = 0;
+  if (item.online) score += 100;
+  if (text.includes('slot') || text.includes('端口') || text.includes('i350') || text.includes('ethernet')) score += 30;
+  if (text.includes('wlan') || text.includes('wifi') || text.includes('wireless')) score -= 40;
+  if (item.bandwidthMbps > 0) score += 10;
+  if (trafficBytes > 0) score += 20;
+  if (packets > 0) score += 10;
+  if (realtimeMbps > 0) score += Math.min(30, realtimeMbps);
+  return score;
+}
+
+function selectReceiverNetworkInterfaces(network?: SystemNetworkRateSnapshot | null) {
+  if (!network?.interfaces.length) {
+    return [];
+  }
+  return [...network.interfaces]
+    .sort((left, right) => {
+      const scoreDelta = receiverNetworkScore(right) - receiverNetworkScore(left);
+      if (scoreDelta !== 0) {
+        return scoreDelta;
+      }
+      return left.name.localeCompare(right.name, 'zh-CN', { numeric: true });
+    })
+    .slice(0, 8);
+}
+
+function createReceiverDetailsFromNetwork(network?: SystemNetworkRateSnapshot | null): ReceiverDetail[] {
+  const interfaces = selectReceiverNetworkInterfaces(network);
+  if (!interfaces.length) {
+    return [];
+  }
+  return interfaces.map((item, index) => ({
+    index: index + 1,
+    channel: item.name || `网口 ${index + 1}`,
+    ip: item.description || '本机网卡',
+    throughput: `↑ ${formatMbps(item.uploadMbps)} / ↓ ${formatMbps(item.downloadMbps)} Mbps`,
+    latency: formatNetworkSampleTime(network?.sampledAtMs),
+    status: item.online ? '在线' : '离线',
+    uploadMbps: item.uploadMbps,
+    downloadMbps: item.downloadMbps,
+    bandwidthMbps: item.bandwidthMbps > 0 ? item.bandwidthMbps : Math.max(1000, item.uploadMbps + item.downloadMbps),
+    realtime: true,
+  }));
+}
+
+function createNetworkMonitorPlaceholder(network: SystemNetworkRateSnapshot): ReceiverDetail[] {
+  const message = network.error?.trim() || (network.code === 0 ? '未发现网卡' : '/api/system/network 离线');
+  return [
+    {
+      index: 1,
+      channel: '网络监控',
+      ip: message,
+      throughput: '--',
+      latency: formatNetworkSampleTime(network.sampledAtMs),
+      status: '离线',
+      uploadMbps: 0,
+      downloadMbps: 0,
+      bandwidthMbps: 0,
+      realtime: true,
+    },
+  ];
+}
+
+function createReceiverDetailsFromCapture(
+  capture: CaptureSnapshot | undefined,
+  network?: SystemNetworkRateSnapshot | null,
+): ReceiverDetail[] {
+  const realtimeDetails = createReceiverDetailsFromNetwork(network);
+  if (realtimeDetails.length) {
+    return realtimeDetails;
+  }
+  if (network) {
+    return createNetworkMonitorPlaceholder(network);
+  }
+
+  if (!capture || (!capture.health && !capture.statuses.length && !capture.error)) {
+    return createNetworkMonitorPlaceholder({
+      code: 1,
+      source: 'ui-network-monitor',
+      sampledAtMs: Date.now(),
+      interfaces: [],
+      totalUploadMbps: 0,
+      totalDownloadMbps: 0,
+      totalBandwidthMbps: 0,
+      error: 'network monitor pending',
+    });
+  }
+
+  const health = capture.health;
+  const apiOk = Boolean(health) && !capture.error;
+  const sdkOk = Boolean(health?.sdkReady);
+  const cameraLinks = capture.statuses.slice(0, REAL_CAMERA_LIMIT).map((camera, index): ReceiverDetail => ({
+    index: index + 3,
+    channel: `${camera.name || `camera${index + 1}`} 链路`,
+    ip: camera.ip || '--',
+    throughput: cameraFrameRate(camera),
+    latency: formatTime(camera.lastFrameTime),
+    status: isCameraHealthy(camera) ? '已连接' : cameraStatusText(camera),
+    uploadMbps: 0,
+    downloadMbps: 0,
+    bandwidthMbps: 0,
+  }));
+
+  return [
+    {
+      index: 1,
+      channel: '采集 API',
+      ip: '127.0.0.1',
+      throughput: apiOk ? 'HTTP 在线' : '--',
+      latency: formatTime(health?.time),
+      status: apiOk ? '运行中' : '离线',
+      uploadMbps: 0,
+      downloadMbps: 0,
+      bandwidthMbps: 0,
+    },
+    {
+      index: 2,
+      channel: 'LVM SDK',
+      ip: health?.driverId || capture.driver.id,
+      throughput: health?.sdkVersion || capture.driver.sdkVersion || '--',
+      latency: health ? `code ${health.sdkCode}` : '--',
+      status: sdkOk ? '正常' : '异常',
+      uploadMbps: 0,
+      downloadMbps: 0,
+      bandwidthMbps: 0,
+    },
+    ...cameraLinks,
+  ].slice(0, 8);
+}
+
+function createCameraDetailsFromCapture(capture: CaptureSnapshot | undefined, fallbackPorts: Port[]): CameraDetail[] {
+  if (!capture?.statuses.length) {
+    return createCameraDetails(fallbackPorts);
+  }
+
+  return capture.statuses.slice(0, REAL_CAMERA_LIMIT).map((camera, index) => ({
+    index: index + 1,
+    station: cameraStation(camera, index),
+    ip: camera.ip || '--',
+    model: camera.model || '--',
+    sn: camera.sn || '--',
+    status: cameraStatusText(camera),
+    frameRate: cameraFrameRate(camera),
+    temperature: formatCameraTemperature(camera),
+    sdkStatus: camera.sdkStatus || camera.acquisitionState || '--',
+    buffer: formatPercent(camera.bufferPercent),
+    lastFrame: formatTime(camera.lastFrameTime),
   }));
 }
 
@@ -64,7 +320,7 @@ function PortContent({ title, ports }: { title: string; ports: Port[] }) {
       <span>{title}</span>
       <div className="port-list">
         {ports.map((port) => (
-          <i key={port.index} className={port.ok ? 'ok' : 'bad'}>
+          <i key={port.index} className={port.ok ? 'ok' : 'bad'} title={port.title}>
             {port.index}
           </i>
         ))}
@@ -73,16 +329,101 @@ function PortContent({ title, ports }: { title: string; ports: Port[] }) {
   );
 }
 
-function ReceiverStatusPanel({ details }: { details: ReceiverDetail[] }) {
-  const onlineCount = details.filter((item) => item.status === '已连接').length;
+function PortSpeedSummary({ upload, download, realtime }: { upload: number; download: number; realtime: boolean }) {
+  const uploadText = formatMbps(upload);
+  const downloadText = formatMbps(download);
+  return (
+    <span
+      className={`port-speed-summary ${realtime ? 'realtime' : ''}`}
+      title={`${realtime ? '实时' : '估算'}上传 ${uploadText} Mbps / 下载 ${downloadText} Mbps`}
+      aria-label={`${realtime ? '实时' : '估算'}上传 ${uploadText} Mbps，下载 ${downloadText} Mbps`}
+    >
+      <span className="port-speed-title">{realtime ? '实时网速' : '网速无数据'}</span>
+      <span className="port-speed-value">
+        <em>上</em>
+        <b>{uploadText}</b>
+      </span>
+      <span className="port-speed-value">
+        <em>下</em>
+        <b>{downloadText}</b>
+      </span>
+    </span>
+  );
+}
+
+function networkUsagePercent(value: number, bandwidth: number) {
+  if (!Number.isFinite(value) || !Number.isFinite(bandwidth) || bandwidth <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, (value / bandwidth) * 100));
+}
+
+function networkPeakUsagePercent(upload: number, download: number, bandwidth: number) {
+  return networkUsagePercent(Math.max(upload, download), bandwidth);
+}
+
+function ReceiverNetworkMeter({
+  value,
+  bandwidth,
+  label,
+  full = false,
+}: {
+  value: number;
+  bandwidth: number;
+  label: string;
+  full?: boolean;
+}) {
+  const ratio = full ? 100 : networkUsagePercent(value, bandwidth);
+  const displayValue = formatMbps(value);
+  return (
+    <span
+      className={`receiver-network-meter ${full ? 'capacity' : ''}`}
+      style={{ '--receiver-network-ratio': `${ratio}%` } as CSSProperties}
+      aria-label={`${label} ${displayValue} Mbps`}
+    >
+      <i aria-hidden="true" />
+      <b>{displayValue}</b>
+      <em>Mbps</em>
+    </span>
+  );
+}
+
+function ReceiverNetworkUsage({ upload, download, bandwidth, label }: { upload: number; download: number; bandwidth: number; label: string }) {
+  const ratio = networkPeakUsagePercent(upload, download, bandwidth);
+  return (
+    <span
+      className="receiver-network-meter receiver-network-usage"
+      style={{ '--receiver-network-ratio': `${ratio}%` } as CSSProperties}
+      aria-label={`${label} 利用率 ${ratio.toFixed(1)}%`}
+    >
+      <i aria-hidden="true" />
+      <b>{ratio.toFixed(1)}</b>
+      <em>%</em>
+    </span>
+  );
+}
+
+function ReceiverStatusPanel({ details, realtime, totals }: { details: ReceiverDetail[]; realtime: boolean; totals?: ReceiverNetworkTotals }) {
+  const onlineCount = details.filter(isReceiverDetailOk).length;
   const offlineCount = details.length - onlineCount;
+  const detailTotals = details.reduce(
+    (totals, detail) => {
+      totals.upload += detail.uploadMbps;
+      totals.download += detail.downloadMbps;
+      totals.bandwidth += detail.bandwidthMbps;
+      return totals;
+    },
+    { upload: 0, download: 0, bandwidth: 0 },
+  );
+  const networkTotals = totals ?? detailTotals;
+  const peakUsage = networkPeakUsagePercent(networkTotals.upload, networkTotals.download, networkTotals.bandwidth);
 
   return (
     <div className="camera-detail-popover receiver-detail-popover" id="receiver-detail-panel" role="dialog" aria-label="报级器网口详细信息" data-no-drag>
       <div className="camera-detail-head">
         <div>
           <strong>报级器网口详细信息</strong>
-          <span>8 路缺陷判级与结果上传链路</span>
+          <span>{realtime ? 'Windows 网卡实时收发速率，只读监控' : '未连接到实时网络监控，上传/下载速率不显示估算值'}</span>
         </div>
         <div className="camera-detail-metrics">
           <span aria-label={`在线网口 ${onlineCount}`}>
@@ -93,30 +434,70 @@ function ReceiverStatusPanel({ details }: { details: ReceiverDetail[] }) {
           </span>
         </div>
       </div>
-      <table className="camera-detail-table">
-        <thead>
-          <tr>
-            <th>编号</th>
-            <th>通道</th>
-            <th>IP</th>
-            <th>吞吐</th>
-            <th>延迟</th>
-            <th>状态</th>
-          </tr>
-        </thead>
-        <tbody>
-          {details.map((port) => (
-            <tr key={port.index} className={port.status === '已连接' ? 'ok' : 'bad'}>
-              <td>{port.index}</td>
-              <td>{port.channel}</td>
-              <td>{port.ip}</td>
-              <td>{port.throughput}</td>
-              <td>{port.latency}</td>
-              <td>{port.status}</td>
+      <section className="receiver-network-summary" aria-label="网口带宽监控汇总">
+        <div>
+          <span>{realtime ? '实时上传' : '上传监控'}</span>
+          <strong>{formatMbps(networkTotals.upload)}</strong>
+          <em>Mbps</em>
+        </div>
+        <div>
+          <span>{realtime ? '实时下载' : '下载监控'}</span>
+          <strong>{formatMbps(networkTotals.download)}</strong>
+          <em>Mbps</em>
+        </div>
+        <div>
+          <span>带宽监控</span>
+          <strong>{formatMbps(networkTotals.bandwidth)}</strong>
+          <em>Mbps</em>
+        </div>
+        <div>
+          <span>峰值利用率</span>
+          <strong>{peakUsage.toFixed(1)}</strong>
+          <em>%</em>
+        </div>
+      </section>
+      <div className="receiver-network-table-wrap">
+        <table className="camera-detail-table">
+          <thead>
+            <tr>
+              <th>编号</th>
+              <th>网口</th>
+              <th>描述</th>
+              <th>状态值</th>
+              <th>时间/返回</th>
+              <th>实时上传</th>
+              <th>实时下载</th>
+              <th>网口带宽</th>
+              <th>利用率</th>
+              <th>状态</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {details.map((port) => (
+              <tr key={port.index} className={isReceiverDetailOk(port) ? 'ok' : 'bad'}>
+                <td>{port.index}</td>
+                <td>{port.channel}</td>
+                <td>{port.ip}</td>
+                <td>{port.throughput}</td>
+                <td>{port.latency}</td>
+                <td>
+                  <ReceiverNetworkMeter value={port.uploadMbps} bandwidth={port.bandwidthMbps} label={`${port.index} 上传`} />
+                </td>
+                <td>
+                  <ReceiverNetworkMeter value={port.downloadMbps} bandwidth={port.bandwidthMbps} label={`${port.index} 下载`} />
+                </td>
+                <td>
+                  <ReceiverNetworkMeter value={port.bandwidthMbps} bandwidth={port.bandwidthMbps} label={`${port.index} 带宽`} full />
+                </td>
+                <td>
+                  <ReceiverNetworkUsage upload={port.uploadMbps} download={port.downloadMbps} bandwidth={port.bandwidthMbps} label={`${port.index} 网口`} />
+                </td>
+                <td>{port.status}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -126,11 +507,11 @@ function CameraStatusPanel({ details }: { details: CameraDetail[] }) {
   const offlineCount = details.length - onlineCount;
 
   return (
-    <div className="camera-detail-popover" id="camera-detail-panel" role="dialog" aria-label="相机状态详细信息" data-no-drag>
+    <div className="camera-detail-popover camera-detail-popover-wide" id="camera-detail-panel" role="dialog" aria-label="相机状态详细信息" data-no-drag>
       <div className="camera-detail-head">
         <div>
           <strong>相机状态详细信息</strong>
-          <span>8 路 3D 线扫相机</span>
+          <span>{details.length} 路 3D 线扫相机实时状态</span>
         </div>
         <div className="camera-detail-metrics">
           <span aria-label={`在线相机 ${onlineCount}`}>
@@ -147,8 +528,10 @@ function CameraStatusPanel({ details }: { details: CameraDetail[] }) {
             <th>编号</th>
             <th>站位</th>
             <th>IP</th>
+            <th>型号 / SN</th>
             <th>帧率</th>
             <th>温度</th>
+            <th>SDK / 缓冲</th>
             <th>状态</th>
           </tr>
         </thead>
@@ -158,8 +541,16 @@ function CameraStatusPanel({ details }: { details: CameraDetail[] }) {
               <td>{camera.index}</td>
               <td>{camera.station}</td>
               <td>{camera.ip}</td>
+              <td>
+                {camera.model}
+                <small>{camera.sn}</small>
+              </td>
               <td>{camera.frameRate}</td>
               <td>{camera.temperature}</td>
+              <td>
+                {camera.sdkStatus}
+                <small>{camera.buffer} / {camera.lastFrame}</small>
+              </td>
               <td>{camera.status}</td>
             </tr>
           ))}
@@ -178,40 +569,54 @@ function StatusBlock({ label, value, tone = 'ok' }: { label: string; value: stri
   );
 }
 
-function ProductionMeta({ plate }: { plate: SteelPlate }) {
-  const items = [
-    ['产线', '2250mm热轧'],
-    ['钢板号', plate.plateNo],
-    ['钢种', plate.steelGrade],
-    ['规格', `${plate.thicknessMm.toFixed(1)} x ${plate.widthMm} mm`],
-    ['板长', `${(plate.lengthMm / 1000).toFixed(3)} m`],
-    ['板宽', `${(plate.widthMm / 1000).toFixed(3)} m`],
-    ['检测时间', plate.detectedAt],
-    ['线速', '2.35 m/s'],
-    ['温度', '36.5 C'],
-  ];
-
-  return (
-    <div className="production-meta" aria-label="当前钢板生产参数">
-      {items.map(([label, value]) => (
-        <span key={label}>
-          <b>{label}:</b>
-          {value}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-export function BrandHeader({ status, plate, theme, onSettingsOpen, onDragMouseDown }: BrandHeaderProps) {
+export function BrandHeader({ status, theme, capture, network, activeNav, onNavChange, onSettingsOpen, onDragMouseDown }: BrandHeaderProps) {
   const logoSrc = theme === 'light' ? ustbLogo : ustbLogoDark;
   const [activeDetail, setActiveDetail] = useState<'receiver' | 'camera' | null>(null);
   const receiverWrapRef = useRef<HTMLDivElement>(null);
   const cameraWrapRef = useRef<HTMLDivElement>(null);
-  const receiverDetails = useMemo(() => createReceiverDetails(status.receiverPorts), [status.receiverPorts]);
-  const cameraDetails = useMemo(() => createCameraDetails(status.cameraPorts), [status.cameraPorts]);
-  const onlineReceiverCount = receiverDetails.filter((port) => port.status === '已连接').length;
+  const receiverDetails = useMemo(() => createReceiverDetailsFromCapture(capture, network), [capture, network]);
+  const receiverRealtime = receiverDetails.some((detail) => detail.realtime);
+  const receiverPorts = useMemo(
+    () =>
+      receiverDetails.map((detail) => ({
+        index: detail.index,
+        ok: isReceiverDetailOk(detail),
+        title: `${detail.channel} ${detail.ip} ${detail.status}`,
+      })),
+    [receiverDetails],
+  );
+  const cameraDetails = useMemo(() => createCameraDetailsFromCapture(capture, status.cameraPorts), [capture, status.cameraPorts]);
+  const cameraPorts = useMemo(
+    () =>
+      cameraDetails.map((camera) => ({
+        index: camera.index,
+        ok: camera.status === '在线',
+        title: `${camera.station} ${camera.ip} ${camera.status}`,
+      })),
+    [cameraDetails],
+  );
+  const onlineReceiverCount = receiverDetails.filter(isReceiverDetailOk).length;
   const offlineReceiverCount = receiverDetails.length - onlineReceiverCount;
+  const receiverSpeedTotals = useMemo(
+    () => {
+      if (receiverRealtime && network) {
+        return {
+          upload: network.totalUploadMbps,
+          download: network.totalDownloadMbps,
+          bandwidth: network.totalBandwidthMbps,
+        };
+      }
+      return receiverDetails.reduce(
+        (totals, detail) => ({
+          upload: totals.upload + detail.uploadMbps,
+          download: totals.download + detail.downloadMbps,
+          bandwidth: totals.bandwidth + detail.bandwidthMbps,
+        }),
+        { upload: 0, download: 0, bandwidth: 0 },
+      );
+    },
+    [network, receiverDetails, receiverRealtime],
+  );
   const onlineCameraCount = cameraDetails.filter((camera) => camera.status === '在线').length;
   const offlineCameraCount = cameraDetails.length - onlineCameraCount;
 
@@ -259,35 +664,44 @@ export function BrandHeader({ status, plate, theme, onSettingsOpen, onDragMouseD
       </div>
 
       <div className="title-meta-group">
-        <div className="system-title">钢板3D表面检测系统</div>
-        <ProductionMeta plate={plate} />
+        <div className="system-title">钢管3D表面检测系统</div>
+        <TopNav active={activeNav} onChange={onNavChange} embedded />
       </div>
 
       <div className="brand-status">
-        <div className="port-status-stack">
+        <div className="port-status-stack" data-testid="hardware-status-stack">
           <div ref={receiverWrapRef} className="camera-status-wrap receiver-status-wrap" data-no-drag onMouseDown={(event) => event.stopPropagation()}>
             <button
               className={`port-group port-group-button ${activeDetail === 'receiver' ? 'active' : ''}`}
               type="button"
+              data-testid="receiver-status-button"
               aria-expanded={activeDetail === 'receiver'}
               aria-controls="receiver-detail-panel"
               aria-label={`报级器网口，在线 ${onlineReceiverCount} 路，异常 ${offlineReceiverCount} 路`}
-              onClick={() => setActiveDetail((current) => (current === 'receiver' ? null : 'receiver'))}
+              onClick={(event) => {
+                event.stopPropagation();
+                setActiveDetail((current) => (current === 'receiver' ? null : 'receiver'));
+              }}
             >
-              <PortContent title="报级器网口" ports={status.receiverPorts} />
+              <PortContent title="报级器网口" ports={receiverPorts} />
+              <PortSpeedSummary upload={receiverSpeedTotals.upload} download={receiverSpeedTotals.download} realtime={receiverRealtime} />
             </button>
-            {activeDetail === 'receiver' ? <ReceiverStatusPanel details={receiverDetails} /> : null}
+            {activeDetail === 'receiver' ? <ReceiverStatusPanel details={receiverDetails} realtime={receiverRealtime} totals={receiverSpeedTotals} /> : null}
           </div>
           <div ref={cameraWrapRef} className="camera-status-wrap" data-no-drag onMouseDown={(event) => event.stopPropagation()}>
             <button
               className={`port-group port-group-button ${activeDetail === 'camera' ? 'active' : ''}`}
               type="button"
+              data-testid="camera-status-button"
               aria-expanded={activeDetail === 'camera'}
               aria-controls="camera-detail-panel"
               aria-label={`相机状态，在线 ${onlineCameraCount} 路，异常 ${offlineCameraCount} 路`}
-              onClick={() => setActiveDetail((current) => (current === 'camera' ? null : 'camera'))}
+              onClick={(event) => {
+                event.stopPropagation();
+                setActiveDetail((current) => (current === 'camera' ? null : 'camera'));
+              }}
             >
-              <PortContent title="相机状态" ports={status.cameraPorts} />
+              <PortContent title="相机状态" ports={cameraPorts} />
             </button>
             {activeDetail === 'camera' ? <CameraStatusPanel details={cameraDetails} /> : null}
           </div>

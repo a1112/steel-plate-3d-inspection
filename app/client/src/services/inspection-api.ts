@@ -5,6 +5,7 @@ import { getMockInspectionSnapshot } from '../data/inspection';
 import type { DefectItem, InspectionSnapshot } from '../data/inspection';
 
 const DEFAULT_SERVICE_ORIGIN = 'http://127.0.0.1:4873';
+const DEFAULT_TRIGGER_GATEWAY_ORIGIN = 'http://127.0.0.1:4881';
 const CONNECTION_CONFIG_KEY = 'steel-inspection-connection-config';
 const ADMIN_SESSION_KEY = 'steel-inspection-admin-session';
 const ADMIN_ERROR_MESSAGES: Record<string, string> = {
@@ -487,6 +488,100 @@ export type AdminRecordFilter = {
   offset?: number;
 };
 
+export type ProductionMaterialSession = {
+  id: string;
+  materialId: string;
+  status: string;
+  controlMode: string;
+  triggerMode: string;
+  updatedAt: string;
+};
+
+export type ProductionInspection = {
+  id: string;
+  materialId: string;
+  sessionId: string;
+  status: string;
+  summaryPath: string;
+  captureCount: number;
+  defectCount: number;
+  startedAt: string;
+  finishedAt: string;
+};
+
+export type ProductionStatus = {
+  code: number;
+  database?: {
+    engine: string;
+    path: string;
+  };
+  latestSession?: ProductionMaterialSession | null;
+  activeSession?: ProductionMaterialSession | null;
+  latestInspection?: ProductionInspection | null;
+  capture?: Record<string, unknown>;
+};
+
+export type ProductionEventInput = {
+  materialId: string;
+  sessionId?: string;
+  source?: string;
+  mode?: string;
+  triggerMode?: string;
+  storageRoot?: string;
+  steelType?: string;
+  width?: number;
+  length?: number;
+  thick?: number;
+  autoCapture?: boolean;
+  discardBlackFrames?: boolean;
+};
+
+export type ProductionCommandResult = {
+  code: number;
+  materialId?: string;
+  sessionId?: string;
+  inspectionId?: string;
+  triggerEventId?: number;
+  mode?: string;
+  triggerMode?: string;
+  flow?: {
+    recordWrittenBeforeCapture?: boolean;
+    captureSaveState?: string;
+    saveEnabled?: boolean;
+    discardBlackFrames?: boolean;
+    algorithmPhase?: string;
+  };
+  provider?: unknown;
+  record?: unknown;
+  error?: string;
+  message?: string;
+};
+
+export type TriggerGatewayMode = 'api' | 'gray' | 'secondary' | 'manual';
+
+export type TriggerGatewayStatus = {
+  code: number;
+  service?: string;
+  mode: TriggerGatewayMode | string;
+  modeLabel?: string;
+  manualAllowed: boolean;
+  allowedModes?: TriggerGatewayMode[];
+  inspectionServiceOrigin?: string;
+  production?: ProductionStatus;
+  error?: string;
+  message?: string;
+};
+
+export type TriggerGatewayCommandResult = {
+  code: number;
+  gateway?: string;
+  mode?: string;
+  target?: string;
+  service?: ProductionCommandResult;
+  error?: string;
+  message?: string;
+};
+
 const defectPreviewImages: Record<string, string> = {
   pit: defectPitImage,
   bubble: defectPitImage,
@@ -583,6 +678,11 @@ export function getInspectionServiceOrigin(config = getStoredConnectionConfig())
     return configuredOrigin;
   }
   return config.host && config.port ? `http://${config.host}:${config.port}` : DEFAULT_SERVICE_ORIGIN;
+}
+
+export function getTriggerGatewayOrigin() {
+  const configuredOrigin = import.meta.env.VITE_TRIGGER_GATEWAY_ORIGIN;
+  return configuredOrigin && configuredOrigin.trim().length > 0 ? configuredOrigin : DEFAULT_TRIGGER_GATEWAY_ORIGIN;
 }
 
 export async function readAdminErrorMessage(response: Response, fallback: string) {
@@ -726,6 +826,129 @@ export async function fetchInspectionSnapshot(signal?: AbortSignal): Promise<Ins
     throw new Error(await readAdminErrorMessage(response, '后台数据接口异常'));
   }
   return normalizeInspectionSnapshot((await response.json()) as InspectionSnapshot);
+}
+
+export async function fetchProductionStatus(signal?: AbortSignal): Promise<ProductionStatus> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/production/status`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '生产采集状态接口异常'));
+  }
+  return response.json() as Promise<ProductionStatus>;
+}
+
+async function postProductionCommand(path: string, body: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}${path}`, {
+    method: 'POST',
+    headers: createAdminHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '生产采集指令失败'));
+  }
+  return response.json() as Promise<ProductionCommandResult>;
+}
+
+export async function writeProductionSteelInfo(input: ProductionEventInput): Promise<ProductionCommandResult> {
+  return postProductionCommand('/api/production/steel-info', input);
+}
+
+export async function startProductionSteelIn(input: ProductionEventInput): Promise<ProductionCommandResult> {
+  return postProductionCommand('/api/production/steel-in', {
+    ...input,
+    autoCapture: input.autoCapture ?? true,
+    discardBlackFrames: input.discardBlackFrames ?? true,
+  });
+}
+
+export async function stopProductionSteelOut(input: ProductionEventInput): Promise<ProductionCommandResult> {
+  return postProductionCommand('/api/production/steel-out', input);
+}
+
+export async function captureProductionOnce(input: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
+  return postProductionCommand('/api/production/capture-once', {
+    ...input,
+    autoCapture: input.autoCapture ?? false,
+    discardBlackFrames: input.discardBlackFrames ?? true,
+  });
+}
+
+export async function fetchTriggerGatewayStatus(signal?: AbortSignal): Promise<TriggerGatewayStatus> {
+  const response = await fetch(`${getTriggerGatewayOrigin()}/api/trigger/status`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '触发网关状态接口异常'));
+  }
+  return response.json() as Promise<TriggerGatewayStatus>;
+}
+
+export async function setTriggerGatewayMode(mode: TriggerGatewayMode): Promise<TriggerGatewayStatus> {
+  const response = await fetch(`${getTriggerGatewayOrigin()}/api/trigger/mode`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ mode }),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '触发网关模式切换失败'));
+  }
+  return response.json() as Promise<TriggerGatewayStatus>;
+}
+
+function mergeTriggerGatewayResult(payload: TriggerGatewayCommandResult): ProductionCommandResult {
+  const service = payload.service;
+  return {
+    ...(service ?? {}),
+    code: payload.code ?? service?.code ?? 503,
+    provider: {
+      gateway: payload.gateway ?? 'steel-trigger-gateway',
+      mode: payload.mode,
+      target: payload.target,
+      service: service ?? null,
+    },
+    error: payload.error ?? service?.error,
+    message: payload.message ?? service?.message,
+  };
+}
+
+async function postTriggerGatewayManualCommand(path: string, body: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
+  const response = await fetch(`${getTriggerGatewayOrigin()}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '触发网关手动指令失败'));
+  }
+  const payload = (await response.json()) as TriggerGatewayCommandResult;
+  return mergeTriggerGatewayResult(payload);
+}
+
+export async function triggerGatewayManualSteelInfo(input: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
+  return postTriggerGatewayManualCommand('/api/trigger/manual/steel-info', input);
+}
+
+export async function triggerGatewayManualSteelIn(input: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
+  return postTriggerGatewayManualCommand('/api/trigger/manual/steel-in', {
+    ...input,
+    present: true,
+    value: 1,
+    autoCapture: input.autoCapture ?? true,
+    discardBlackFrames: input.discardBlackFrames ?? true,
+  });
+}
+
+export async function triggerGatewayManualSteelOut(input: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
+  return postTriggerGatewayManualCommand('/api/trigger/manual/steel-out', {
+    ...input,
+    present: false,
+    value: 0,
+  });
 }
 
 export async function fetchConnectionConfig(signal?: AbortSignal): Promise<ConnectionConfig> {
