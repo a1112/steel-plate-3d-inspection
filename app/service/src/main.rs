@@ -1512,6 +1512,312 @@ fn database_defects_json(defects: &[db::entities::defect::Model]) -> String {
     )
 }
 
+fn url_encode_component(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (*byte as char).to_string()
+            }
+            _ => format!("%{:02X}", byte),
+        })
+        .collect()
+}
+
+fn production_file_url(path: &str) -> String {
+    if path.trim().is_empty() {
+        String::new()
+    } else {
+        format!("/api/production/file?path={}", url_encode_component(path))
+    }
+}
+
+fn production_time_label(started_at: &str, material_id: &str) -> String {
+    material_id
+        .split('-')
+        .find(|part| part.len() == 6 && part.chars().all(|ch| ch.is_ascii_digit()))
+        .map(|part| format!("{}:{}", &part[0..2], &part[2..4]))
+        .unwrap_or_else(|| {
+            if started_at.len() >= 4 {
+                let end = started_at.len();
+                format!("{}:{}", &started_at[end - 4..end - 2], &started_at[end - 2..end])
+            } else {
+                "--:--".to_string()
+            }
+        })
+}
+
+fn production_record_status(status: &str) -> &'static str {
+    match status {
+        "algorithm-complete" | "completed" | "finished" => "completed",
+        _ => "detecting",
+    }
+}
+
+fn production_plate_value(
+    inspection: &db::entities::production_inspection::Model,
+    session: Option<&db::entities::material_session::Model>,
+) -> Value {
+    json!({
+        "plateNo": inspection.material_id,
+        "widthMm": session.map(|item| item.width_mm).unwrap_or(0.0),
+        "lengthMm": session.map(|item| item.length_mm).unwrap_or(0.0),
+        "thicknessMm": session.map(|item| item.thickness_mm).unwrap_or(0.0),
+        "steelGrade": session.map(|item| item.hard.clone()).filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "实际生产".to_string()),
+        "detectedAt": session.map(|item| item.started_at.clone()).unwrap_or_else(|| inspection.started_at.clone())
+    })
+}
+
+fn production_defect_label(type_id: &str) -> String {
+    match type_id {
+        "pit" => "凹坑",
+        "scratch" => "划伤",
+        "roll" => "辊印",
+        "foreign" => "异物压入",
+        "burnt" => "烂钢",
+        "edge" => "边裂",
+        "bubble" => "气泡",
+        "inclusion" => "夹杂",
+        "longitudinal" => "纵裂",
+        value if value.trim().is_empty() => "未知缺陷",
+        value => value,
+    }
+    .to_string()
+}
+
+fn production_defect_severity(severity: &str) -> &'static str {
+    match severity {
+        "severe" => "severe",
+        "minor" => "minor",
+        "review" => "review",
+        _ => "review",
+    }
+}
+
+fn production_defect_surface(camera_id: &str) -> &'static str {
+    if camera_id.contains("101") || camera_id.contains("102") || camera_id.contains("103") {
+        "top"
+    } else {
+        "bottom"
+    }
+}
+
+fn production_defect_value(
+    defect: &db::entities::production_defect::Model,
+    inspection: &db::entities::production_inspection::Model,
+    plate: &Value,
+) -> Value {
+    let width = plate.get("widthMm").and_then(Value::as_f64).unwrap_or(0.0);
+    let length = plate.get("lengthMm").and_then(Value::as_f64).unwrap_or(0.0);
+    let x_ratio = if length > 0.0 {
+        (defect.x_mm / length).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let y_offset = if width > 0.0 {
+        ((defect.y_mm / width) - 0.5).clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    json!({
+        "id": defect.id,
+        "plateNo": inspection.material_id,
+        "typeId": defect.defect_type,
+        "typeLabel": production_defect_label(&defect.defect_type),
+        "surface": production_defect_surface(&defect.camera_id),
+        "severity": production_defect_severity(&defect.severity),
+        "distanceHeadMm": defect.x_mm.round() as i64,
+        "operatorSideMm": defect.y_mm.round() as i64,
+        "driveSideMm": if width > 0.0 { (width - defect.y_mm).round() as i64 } else { 0 },
+        "widthMm": defect.width_mm,
+        "heightMm": defect.height_mm,
+        "depthMm": defect.depth_mm,
+        "xRatio": x_ratio,
+        "yOffsetMm": y_offset,
+        "previewX": (x_ratio * 100.0).round() as i64,
+        "previewY": ((0.5 - y_offset / 2.0) * 100.0).round() as i64,
+        "previewImageUrl": ""
+    })
+}
+
+fn production_capture_image_value(file: &db::entities::capture_file::Model) -> Value {
+    json!({
+        "id": file.id,
+        "cameraId": file.camera_id,
+        "cameraIp": file.camera_ip,
+        "dataName": file.data_name,
+        "sequenceNo": file.sequence_no,
+        "fileType": file.file_type,
+        "path": file.path,
+        "metadataPath": file.metadata_path,
+        "url": production_file_url(&file.path),
+        "metadataUrl": production_file_url(&file.metadata_path),
+        "createdAt": file.created_at
+    })
+}
+
+fn summarize_defect_values(defects: &[Value]) -> Value {
+    let mut severe = 0;
+    let mut review = 0;
+    let mut minor = 0;
+    let mut top = 0;
+    let mut bottom = 0;
+    for defect in defects {
+        match defect.get("severity").and_then(Value::as_str).unwrap_or("review") {
+            "severe" => severe += 1,
+            "minor" => minor += 1,
+            _ => review += 1,
+        }
+        match defect.get("surface").and_then(Value::as_str).unwrap_or("top") {
+            "bottom" => bottom += 1,
+            _ => top += 1,
+        }
+    }
+    json!({
+        "total": defects.len(),
+        "bySeverity": { "severe": severe, "review": review, "minor": minor },
+        "bySurface": { "top": top, "bottom": bottom }
+    })
+}
+
+fn production_defect_types_value() -> Value {
+    json!([
+        { "id": "pit", "label": "凹坑", "color": "#4f8cff", "shape": "circle" },
+        { "id": "scratch", "label": "划伤", "color": "#46d36f", "shape": "rect" },
+        { "id": "roll", "label": "辊印", "color": "#ff9d3b", "shape": "square" },
+        { "id": "foreign", "label": "异物压入", "color": "#ff4d6d", "shape": "diamond" },
+        { "id": "burnt", "label": "烂钢", "color": "#9b6bff", "shape": "star" },
+        { "id": "edge", "label": "边裂", "color": "#ffd166", "shape": "diamond" },
+        { "id": "bubble", "label": "气泡", "color": "#ff69b4", "shape": "circle" },
+        { "id": "inclusion", "label": "夹杂", "color": "#8a96a3", "shape": "rect" }
+    ])
+}
+
+fn production_device_status_value(state: &ServiceState) -> Value {
+    let statuses = state
+        .capture
+        .proxy("GET", "/api/camera/statuses", "")
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
+    let connected = statuses
+        .as_ref()
+        .and_then(|value| value.get("statuses"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| item.get("connected").and_then(Value::as_bool).unwrap_or(false))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let camera_ports = (0..6)
+        .map(|index| json!({ "index": index + 1, "ok": connected.get(index).copied().unwrap_or(false) }))
+        .collect::<Vec<_>>();
+    json!({
+        "receiverPorts": (0..8).map(|index| json!({ "index": index + 1, "ok": true })).collect::<Vec<_>>(),
+        "cameraPorts": camera_ports,
+        "encoder": "sync",
+        "plc": "normal",
+        "l2": "normal",
+        "alarmCount": 0
+    })
+}
+
+fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>, String> {
+    let inspections = state
+        .runtime
+        .block_on(db::list_recent_production_inspections(
+            &state.database.connection,
+            20,
+        ))
+        .map_err(|error| error.to_string())?;
+    if inspections.is_empty() {
+        return Ok(None);
+    }
+
+    let mut records = Vec::new();
+    let mut plate_inspections = Vec::new();
+    let mut current_plate = json!({
+        "plateNo": "",
+        "widthMm": 0,
+        "lengthMm": 0,
+        "thicknessMm": 0,
+        "steelGrade": "实际生产",
+        "detectedAt": ""
+    });
+    let mut current_defects = Vec::new();
+    let mut current_capture_images = Vec::new();
+
+    for (index, inspection) in inspections.iter().enumerate() {
+        let session = state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                &inspection.session_id,
+            ))
+            .map_err(|error| error.to_string())?;
+        let files = state
+            .runtime
+            .block_on(db::capture_files_for_inspection(
+                &state.database.connection,
+                &inspection.id,
+            ))
+            .map_err(|error| error.to_string())?;
+        let production_defects = state
+            .runtime
+            .block_on(db::production_defects_for_inspection(
+                &state.database.connection,
+                &inspection.id,
+            ))
+            .map_err(|error| error.to_string())?;
+        let plate = production_plate_value(inspection, session.as_ref());
+        let defects = production_defects
+            .iter()
+            .map(|defect| production_defect_value(defect, inspection, &plate))
+            .collect::<Vec<_>>();
+        let capture_images = files
+            .iter()
+            .map(production_capture_image_value)
+            .collect::<Vec<_>>();
+        if index == 0 {
+            current_plate = plate.clone();
+            current_defects = defects.clone();
+            current_capture_images = capture_images.clone();
+        }
+        records.push(json!({
+            "id": inspection.session_id,
+            "time": production_time_label(&inspection.started_at, &inspection.material_id),
+            "plateNo": inspection.material_id,
+            "status": production_record_status(&inspection.status),
+            "defectCount": defects.len()
+        }));
+        plate_inspections.push(json!({
+            "plate": plate,
+            "defects": defects,
+            "heightProfile": [],
+            "captureImages": capture_images,
+            "inspectionId": inspection.id,
+            "source": "production"
+        }));
+    }
+
+    Ok(Some(
+        json!({
+            "currentPlate": current_plate,
+            "defectTypes": production_defect_types_value(),
+            "defects": current_defects,
+            "records": records,
+            "status": production_device_status_value(state),
+            "summary": summarize_defect_values(&current_defects),
+            "heightProfile": [],
+            "inspections": plate_inspections,
+            "captureImages": current_capture_images,
+            "source": "production-sqlite"
+        })
+        .to_string(),
+    ))
+}
+
 fn build_database_snapshot_json(snapshot: db::DatabaseSnapshot) -> String {
     let current_plate =
         snapshot
@@ -6888,6 +7194,44 @@ fn content_type_for_path(path: &Path) -> &'static str {
     }
 }
 
+fn path_stays_under(path: &Path, root: &Path) -> bool {
+    let Ok(canonical_path) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(canonical_root) = root.canonicalize() else {
+        return false;
+    };
+    canonical_path.starts_with(canonical_root)
+}
+
+fn production_file_response(query: &str) -> Vec<u8> {
+    let Some(path_value) = query_value(query, "path") else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"error\":\"path_required\"}",
+        );
+    };
+    let path = PathBuf::from(path_value);
+    let allowed = path_stays_under(&path, &bar_surface_capture_root())
+        || path_stays_under(&path, &algorithm_data_root());
+    if !allowed {
+        return http_response(
+            "403 Forbidden",
+            "application/json; charset=utf-8",
+            "{\"error\":\"path_not_allowed\"}",
+        );
+    }
+    match fs::read(&path) {
+        Ok(body) => http_bytes_response_with_headers("200 OK", content_type_for_path(&path), &body, &[]),
+        Err(error) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
+        ),
+    }
+}
+
 fn resolve_algorithm_file(root: &Path, value: &str) -> Result<PathBuf, String> {
     if value.trim().is_empty() {
         return Err("missing_path".to_string());
@@ -10063,6 +10407,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/production/capture-once", "scope": "production" },
             { "method": "POST", "path": "/api/production/algorithm/run", "scope": "production" },
             { "method": "POST", "path": "/api/production/defect", "scope": "production" },
+            { "method": "GET", "path": "/api/production/file", "scope": "production" },
             { "method": "GET", "path": "/api/steel/status", "scope": "capture" },
             { "method": "POST", "path": "/api/steel/event", "scope": "capture" },
             { "method": "GET", "path": "/api/camera/statuses", "scope": "capture" }
@@ -10245,16 +10590,33 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("POST", "/api/production/defect") => {
             write_production_defect_response(&state, body, actor)
         }
+        ("GET", "/api/production/file") => production_file_response(query),
         ("GET", "/api/inspection/snapshot") => {
-            match state
-                .runtime
-                .block_on(db::load_snapshot(&state.database.connection))
-            {
-                Ok(snapshot) => http_response(
+            match build_production_snapshot_json(&state) {
+                Ok(Some(payload)) => http_response(
                     "200 OK",
                     "application/json; charset=utf-8",
-                    &build_database_snapshot_json(snapshot),
+                    &payload,
                 ),
+                Ok(None) => match state
+                    .runtime
+                    .block_on(db::load_snapshot(&state.database.connection))
+                {
+                    Ok(snapshot) => http_response(
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        &build_database_snapshot_json(snapshot),
+                    ),
+                    Err(error) => http_response(
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        &format!(
+                            "{{\"error\":\"database_snapshot_unavailable\",\"detail\":\"{}\",\"fallback\":{}}}",
+                            json_escape(&error.to_string()),
+                            build_snapshot_json()
+                        ),
+                    ),
+                },
                 Err(error) => http_response(
                     "200 OK",
                     "application/json; charset=utf-8",

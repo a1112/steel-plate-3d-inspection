@@ -2,7 +2,7 @@ import defectInclusionImage from '../assets/mock-defects/defect-inclusion.png';
 import defectPitImage from '../assets/mock-defects/defect-pit.png';
 import defectScratchImage from '../assets/mock-defects/defect-scratch.png';
 import { getMockInspectionSnapshot } from '../data/inspection';
-import type { DefectItem, InspectionSnapshot } from '../data/inspection';
+import type { CaptureImageItem, DefectItem, InspectionSnapshot } from '../data/inspection';
 
 const DEFAULT_SERVICE_ORIGIN = 'http://127.0.0.1:4873';
 const DEFAULT_TRIGGER_GATEWAY_ORIGIN = 'http://127.0.0.1:4881';
@@ -793,21 +793,43 @@ export async function revokeAdminLoginSession(id: string): Promise<void> {
   }
 }
 
-function withPreviewImage(defect: DefectItem): DefectItem {
+function normalizeServiceUrl(value: string | undefined, origin: string) {
+  if (!value) {
+    return '';
+  }
+  if (/^https?:\/\//i.test(value) || value.startsWith('data:') || value.startsWith('blob:')) {
+    return value;
+  }
+  return value.startsWith('/') ? `${origin}${value}` : value;
+}
+
+function normalizeCaptureImage(image: CaptureImageItem, origin: string): CaptureImageItem {
   return {
-    ...defect,
-    previewImageUrl: defectPreviewImages[defect.typeId] ?? defectPitImage,
+    ...image,
+    url: normalizeServiceUrl(image.url, origin),
+    metadataUrl: normalizeServiceUrl(image.metadataUrl, origin),
   };
 }
 
-function normalizeInspectionSnapshot(snapshot: InspectionSnapshot): InspectionSnapshot {
+function withPreviewImage(defect: DefectItem, allowMockFallback: boolean, origin: string): DefectItem {
+  const previewImageUrl = normalizeServiceUrl(defect.previewImageUrl, origin);
+  return {
+    ...defect,
+    previewImageUrl: previewImageUrl || (allowMockFallback ? defectPreviewImages[defect.typeId] ?? defectPitImage : ''),
+  };
+}
+
+function normalizeInspectionSnapshot(snapshot: InspectionSnapshot, origin: string): InspectionSnapshot {
+  const allowMockFallback = snapshot.source !== 'production-sqlite' && snapshot.source !== 'production';
   const inspections = snapshot.inspections.map((inspection) => ({
     ...inspection,
-    defects: inspection.defects.map(withPreviewImage),
+    defects: inspection.defects.map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
+    captureImages: inspection.captureImages?.map((image) => normalizeCaptureImage(image, origin)),
   }));
   return {
     ...snapshot,
-    defects: snapshot.defects.map(withPreviewImage),
+    defects: snapshot.defects.map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
+    captureImages: snapshot.captureImages?.map((image) => normalizeCaptureImage(image, origin)),
     inspections,
   };
 }
@@ -818,14 +840,15 @@ export async function fetchInspectionSnapshot(signal?: AbortSignal): Promise<Ins
     return getMockInspectionSnapshot();
   }
 
-  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/inspection/snapshot`, {
+  const origin = getInspectionServiceOrigin(config);
+  const response = await fetch(`${origin}/api/inspection/snapshot`, {
     headers: { Accept: 'application/json' },
     signal,
   });
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '后台数据接口异常'));
   }
-  return normalizeInspectionSnapshot((await response.json()) as InspectionSnapshot);
+  return normalizeInspectionSnapshot((await response.json()) as InspectionSnapshot, origin);
 }
 
 export async function fetchProductionStatus(signal?: AbortSignal): Promise<ProductionStatus> {

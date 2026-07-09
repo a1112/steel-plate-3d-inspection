@@ -22,7 +22,7 @@ export function TopNav({
   embedded?: boolean;
 }) {
   const openBarSurfaceWorkbench = () => {
-    window.open('/?app=bar-surface', '_blank', 'popup,width=1880,height=980');
+    window.location.assign('/?app=bar-surface');
   };
 
   const handleMouseDown = (event: MouseEvent<HTMLElement>) => {

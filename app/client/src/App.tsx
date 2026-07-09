@@ -80,8 +80,8 @@ function readAppMode() {
   }
   const params = new URLSearchParams(window.location.search);
   const app = params.get('app');
-  if (app === 'capture' || app === 'parameters' || app === 'bar-surface' || app === 'bar') {
-    return app === 'bar' ? 'bar-surface' : app;
+  if (app === 'capture' || app === 'parameters' || app === 'bar-surface' || app === 'bar' || app === '3d' || app === 'reconstruction') {
+    return app === 'bar' || app === '3d' || app === 'reconstruction' ? 'bar-surface' : app;
   }
   if (app === 'terminal' || app === 'inspection' || app === 'dashboard') {
     return 'terminal';
@@ -564,6 +564,7 @@ function InspectionDashboard({
                 <AlarmAnalysis
                   selectedDefect={selectedOnlineDefect}
                   heightProfile={activeSnapshot.heightProfile}
+                  captureImages={activeSnapshot.captureImages}
                   headerless
                   collapsed={analysisCollapsed}
                   onCollapsedChange={setAnalysisCollapsed}

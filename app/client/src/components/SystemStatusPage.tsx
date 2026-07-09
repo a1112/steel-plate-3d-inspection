@@ -1275,7 +1275,7 @@ export function SystemStatusPage({
   };
 
   const openBarSurfaceWorkbench = () => {
-    window.open('/?app=bar-surface', '_blank', 'popup,width=1880,height=980');
+    window.location.assign('/?app=bar-surface');
   };
 
   if (embeddedManager) {

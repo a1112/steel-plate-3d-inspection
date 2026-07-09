@@ -1443,6 +1443,18 @@ pub async fn latest_production_inspection(
         .await
 }
 
+pub async fn list_recent_production_inspections(
+    connection: &DatabaseConnection,
+    limit: u64,
+) -> Result<Vec<production_inspection::Model>, DbErr> {
+    production_inspection::Entity::find()
+        .order_by_desc(production_inspection::Column::FinishedAt)
+        .order_by_desc(production_inspection::Column::StartedAt)
+        .limit(limit)
+        .all(connection)
+        .await
+}
+
 pub async fn find_production_inspection(
     connection: &DatabaseConnection,
     id: &str,
@@ -1484,6 +1496,17 @@ pub async fn capture_files_for_inspection(
         .order_by_asc(capture_file::Column::CameraId)
         .order_by_asc(capture_file::Column::SequenceNo)
         .order_by_asc(capture_file::Column::DataName)
+        .all(connection)
+        .await
+}
+
+pub async fn production_defects_for_inspection(
+    connection: &DatabaseConnection,
+    inspection_id: &str,
+) -> Result<Vec<production_defect::Model>, DbErr> {
+    production_defect::Entity::find()
+        .filter(production_defect::Column::InspectionId.eq(inspection_id))
+        .order_by_asc(production_defect::Column::CreatedAt)
         .all(connection)
         .await
 }

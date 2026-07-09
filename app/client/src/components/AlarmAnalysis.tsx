@@ -3,7 +3,7 @@ import { ChevronDown, ChevronUp } from 'lucide-react';
 import { Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { BufferGeometry, Float32BufferAttribute } from 'three';
 import { useMemo, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react';
-import type { ChartPoint, DefectItem } from '../data/inspection';
+import type { CaptureImageItem, ChartPoint, DefectItem } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import { createPointCloudGeometryArrays } from '../lib/point-cloud-simulator';
 import { createSectionProfiles } from '../lib/section-profiles';
@@ -42,6 +42,35 @@ function DefectPreview({ defect }: { defect: DefectItem }) {
         <span>{`${defect.typeLabel} ${defect.widthMm.toFixed(2)}x${defect.heightMm.toFixed(2)}x${Math.abs(defect.depthMm).toFixed(2)}mm`}</span>
       </div>
       <span className="scale-mark">2 mm</span>
+    </div>
+  );
+}
+
+function CaptureImagePreview({ captureImages }: { captureImages: CaptureImageItem[] }) {
+  const visibleImages = captureImages
+    .filter((image) => image.url && (image.dataName === 'depth' || image.dataName === 'intensity'))
+    .slice(0, 12);
+
+  if (visibleImages.length === 0) {
+    return (
+      <div className="analysis-empty">
+        <h3>当前钢管暂无缺陷</h3>
+        <p>真实检测记录已加载，当前流水还没有可显示的缺陷图像或采集图像。</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="capture-image-preview-grid">
+      {visibleImages.map((image) => (
+        <figure key={`${image.id}-${image.dataName}`} className="capture-image-preview-card">
+          <img src={image.url} alt={`${image.cameraId} ${image.dataName}`} loading="lazy" />
+          <figcaption>
+            <strong>{image.cameraId || image.cameraIp}</strong>
+            <span>{image.dataName === 'depth' ? '深度' : '亮度'} #{image.sequenceNo}</span>
+          </figcaption>
+        </figure>
+      ))}
     </div>
   );
 }
@@ -203,12 +232,14 @@ function HeightProfile({ points, defect }: { points: ChartPoint[]; defect: Defec
 export function AlarmAnalysis({
   selectedDefect,
   heightProfile,
+  captureImages = [],
   headerless = false,
   collapsed,
   onCollapsedChange,
 }: {
   selectedDefect: DefectItem | null;
   heightProfile: ChartPoint[];
+  captureImages?: CaptureImageItem[];
   headerless?: boolean;
   collapsed?: boolean;
   onCollapsedChange?: (collapsed: boolean) => void;
@@ -217,6 +248,14 @@ export function AlarmAnalysis({
   const isCollapsed = selectedDefect ? (collapsed ?? internalCollapsed) : false;
   const setCollapsed = onCollapsedChange ?? setInternalCollapsed;
   const panelClassName = `alarm-analysis-panel ${isCollapsed ? 'is-collapsed' : ''}`;
+
+  if (!selectedDefect && captureImages.length > 0) {
+    return (
+      <Panel title="缺陷检测报警图" className={panelClassName} headerless={headerless}>
+        <CaptureImagePreview captureImages={captureImages} />
+      </Panel>
+    );
+  }
 
   if (!selectedDefect) {
     return (

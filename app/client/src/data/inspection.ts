@@ -42,6 +42,20 @@ export interface DefectItem {
   previewImageUrl: string;
 }
 
+export interface CaptureImageItem {
+  id: string;
+  cameraId: string;
+  cameraIp: string;
+  dataName: 'depth' | 'intensity' | 'metadata' | string;
+  sequenceNo: number;
+  fileType: string;
+  path: string;
+  metadataPath?: string;
+  url: string;
+  metadataUrl?: string;
+  createdAt: string;
+}
+
 export interface InspectionRecord {
   id: string;
   time: string;
@@ -84,12 +98,17 @@ export interface InspectionSnapshot {
   summary: InspectionSummary;
   heightProfile: ChartPoint[];
   inspections: PlateInspection[];
+  captureImages?: CaptureImageItem[];
+  source?: string;
 }
 
 export interface PlateInspection {
   plate: SteelPlate;
   defects: DefectItem[];
   heightProfile: ChartPoint[];
+  captureImages?: CaptureImageItem[];
+  inspectionId?: string;
+  source?: string;
 }
 
 export const severityLabels: Record<Severity, string> = {
@@ -567,6 +586,7 @@ export function getPlateInspectionSnapshot(snapshot: InspectionSnapshot, plateNo
     defects: inspection.defects,
     summary: summarizeDefects(inspection.defects),
     heightProfile: inspection.heightProfile,
+    captureImages: inspection.captureImages,
   };
 }
 
