@@ -108,6 +108,8 @@ export interface PlateInspection {
   heightProfile: ChartPoint[];
   captureImages?: CaptureImageItem[];
   inspectionId?: string;
+  summaryPath?: string;
+  captureSummaryPath?: string;
   source?: string;
 }
 
@@ -533,6 +535,7 @@ function createPlateInspections(): PlateInspection[] {
         record.plateNo === '202606131900'
           ? heightProfile
           : createHistoricalHeightProfile(inspectionDefects[0]?.depthMm ?? -0.02, 28 + ((index * 7) % 22)),
+      source: 'demo',
     };
   });
 }
@@ -572,6 +575,7 @@ export function getMockInspectionSnapshot(): InspectionSnapshot {
     summary: summarizeDefects(currentInspection.defects),
     heightProfile: currentInspection.heightProfile,
     inspections,
+    source: 'demo',
   };
 }
 

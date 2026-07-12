@@ -24,7 +24,6 @@ import {
   getDeviceStatusWithOperation,
   getReportMetrics,
   runSystemAction,
-  saveSettingsDraft,
   validateSettings,
 } from './state/operations';
 import type { InspectionSettings, ReportFilters, SystemAction } from './state/operations';
@@ -34,10 +33,16 @@ import { getResponsiveProfile, getResponsiveProfileClassName } from './state/res
 import {
   createDefaultConnectionConfig,
   fetchConnectionConfig,
+  fetchServiceHealthDetails,
+  fetchTriggerGatewayStatus,
   fetchInspectionSnapshot,
   fetchInspectionSettings,
+  fetchProductionStatus,
+  saveAdminInspectionSettings,
   saveConnectionConfig,
   type ConnectionConfig,
+  getInspectionServiceOrigin,
+  getTriggerGatewayOrigin,
 } from './services/inspection-api';
 import { canStartTitlebarDrag } from './lib/titlebar-drag';
 import { getTauriWindowApi } from './lib/tauri-window';
@@ -50,6 +55,7 @@ import {
 } from './lib/capture-api';
 import { BrandHeader } from './components/BrandHeader';
 import { AlarmAnalysis } from './components/AlarmAnalysis';
+import { AlarmCenter } from './components/AlarmCenter';
 import { DefectDetectionList } from './components/DefectDetectionList';
 import { LeftSidebar } from './components/LeftSidebar';
 import { PlateMap } from './components/PlateMap';
@@ -59,6 +65,11 @@ import { StatisticsPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { BarSurfaceApp } from './components/BarSurfaceApp';
+import {
+  fetchBarSurfaceManifest,
+  fetchBarSurfaceMesh,
+  type BarSurfaceMesh,
+} from './services/bar-surface-api';
 import { Toast } from './components/Toast';
 import './styles.css';
 
@@ -66,6 +77,38 @@ const DEFECT_PAGE_SIZE = 10;
 const RECORD_PAGE_SIZE = 10;
 const REPORT_PAGE_SIZE = 8;
 const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
+const UNKNOWN_SERVICE_ENDPOINT = 'unknown';
+
+type ServiceConnectionState = 'online' | 'warning' | 'offline';
+
+type ServiceStatusPanelItem = {
+  name: string;
+  state: ServiceConnectionState;
+  detail: string;
+  endpoint: string;
+};
+
+type ServiceStatusPanel = {
+  inspectionService: ServiceStatusPanelItem;
+  captureService: ServiceStatusPanelItem;
+  triggerGateway: ServiceStatusPanelItem;
+};
+
+type RecordBoundSurfaceArtifact = {
+  inspectionId: string;
+  loading: boolean;
+  mesh: BarSurfaceMesh | null;
+  status: string;
+};
+
+function buildUnknownService(name: string, endpoint: string): ServiceStatusPanelItem {
+  return {
+    name,
+    state: 'warning',
+    detail: '未检查',
+    endpoint,
+  };
+}
 
 function readViewportSize() {
   if (typeof window === 'undefined') {
@@ -168,7 +211,20 @@ function InspectionDashboard({
   const [viewportSize, setViewportSize] = useState(readViewportSize);
   const [analysisCollapsed, setAnalysisCollapsed] = useState(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>('latest');
+  const [snapshotSyncState, setSnapshotSyncState] = useState('等待实时同步');
   const [captureSnapshot, setCaptureSnapshot] = useState(() => createEmptyCaptureSnapshot('capture service pending'));
+  const [recordBoundSurface, setRecordBoundSurface] = useState<RecordBoundSurfaceArtifact>({
+    inspectionId: '',
+    loading: false,
+    mesh: null,
+    status: '尚未选择生产检测记录',
+  });
+  const [serviceStatus, setServiceStatus] = useState<ServiceStatusPanel>(() => ({
+    inspectionService: buildUnknownService('Rust服务', getInspectionServiceOrigin()),
+    captureService: buildUnknownService('采集服务', UNKNOWN_SERVICE_ENDPOINT),
+    triggerGateway: buildUnknownService('触发网关', getTriggerGatewayOrigin()),
+  }));
   const [networkSnapshot, setNetworkSnapshot] = useState(() => calculateSystemNetworkRates({
     code: 1,
     sampledAtMs: Date.now(),
@@ -256,6 +312,41 @@ function InspectionDashboard({
 
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
+    const refreshSnapshot = async () => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
+      try {
+        const nextSnapshot = await fetchInspectionSnapshot();
+        if (cancelled) {
+          return;
+        }
+        onSnapshotChange(nextSnapshot);
+        setSnapshotSyncState(`已同步 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`);
+        if (snapshotTracking === 'latest') {
+          const latestPlateNo = nextSnapshot.records[0]?.plateNo ?? nextSnapshot.currentPlate.plateNo;
+          setUiState((current) => selectRecord(current, nextSnapshot, latestPlateNo));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSnapshotSyncState(error instanceof Error ? `同步失败：${error.message}` : '实时同步失败');
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const timer = window.setInterval(() => void refreshSnapshot(), 8000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [onSnapshotChange, snapshotTracking]);
+
+  useEffect(() => {
+    let cancelled = false;
     let requestInFlight = false;
     const refreshNetwork = async () => {
       if (requestInFlight) {
@@ -293,7 +384,257 @@ function InspectionDashboard({
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+
+    const refreshServices = async () => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
+
+      try {
+        const apiOrigin = getInspectionServiceOrigin();
+        const [response, health] = await Promise.all([
+          fetch(`${apiOrigin}/api/services`),
+          fetchServiceHealthDetails(),
+        ]);
+        if (cancelled) {
+          return;
+        }
+        if (!response.ok) {
+          setServiceStatus((current) => ({
+            ...current,
+            inspectionService: {
+              ...current.inspectionService,
+              state: 'offline',
+              detail: `检测服务不可达 HTTP ${response.status}`,
+            },
+          }));
+        } else {
+          const payload = (await response.json()) as {
+            api?: { name?: string; running?: boolean; origin?: string };
+            capture?: { name?: string; running?: boolean; origin?: string };
+          };
+          const checks = health.checks ?? {};
+          const blockingChecks = Object.entries(checks).filter(([, check]) =>
+            check && check.ok !== true && check.readyContribution !== true,
+          );
+          const blockingCheckDetail = blockingChecks.map(([name, check]) => {
+            if (name === 'calibrationReconciliation') {
+              const operationIds = check?.unresolvedOperations
+                ?.map((operation) => operation.operationId)
+                .filter(Boolean)
+                .join('、');
+              return `标定协调围栏(${check?.unresolvedCount ?? '?'} 项${operationIds ? `：${operationIds}` : ''})`;
+            }
+            return `${name}${check?.reason ? `(${check.reason})` : ''}`;
+          });
+          const healthDetail = health.ok
+            ? '检测服务已就绪'
+            : `检测服务降级：${blockingCheckDetail.join('、') || health.status}`;
+          const captureHealthy = checks.capture?.ok === true && checks.storage?.ok === true;
+          const captureReachable = checks.capture?.apiReachable === true || checks.capture?.status === 'simulated';
+          setServiceStatus((current) => ({
+            ...current,
+            inspectionService: {
+              name: payload.api?.name || current.inspectionService.name || 'steel-inspection-service',
+              state: payload.api?.running === true ? (health.ok ? 'online' : 'warning') : 'offline',
+              detail: payload.api?.running === true ? healthDetail : '检测服务离线',
+              endpoint: payload.api?.origin || apiOrigin,
+            },
+            captureService: {
+              ...current.captureService,
+              name: payload.capture?.name || current.captureService.name || 'steel-capture-service',
+              state:
+                payload.capture?.running === false
+                  ? 'offline'
+                  : captureHealthy
+                    ? 'online'
+                    : captureReachable
+                      ? 'warning'
+                      : 'offline',
+              detail:
+                captureHealthy
+                  ? '采集 API、SDK 与存储均就绪'
+                  : captureReachable
+                    ? `采集服务降级：${checks.capture?.reason || checks.storage?.reason || '依赖未就绪'}`
+                  : payload.capture?.running === false
+                    ? '采集服务离线'
+                    : '采集服务不可达',
+              endpoint: payload.capture?.origin || current.captureService.endpoint,
+            },
+          }));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setServiceStatus((current) => ({
+            ...current,
+            inspectionService: {
+              ...current.inspectionService,
+              state: 'offline',
+              detail: error instanceof Error ? error.message : '检测服务连接失败',
+            },
+          }));
+        }
+      }
+
+      try {
+        const triggerStatus = await fetchTriggerGatewayStatus();
+        if (cancelled) {
+          return;
+        }
+        setServiceStatus((current) => ({
+          ...current,
+          triggerGateway: {
+            name: 'trigger-gateway',
+            state: triggerStatus.code === 0 && !triggerStatus.error ? 'online' : 'offline',
+            detail: triggerStatus.modeLabel ? `模式 ${triggerStatus.modeLabel}` : triggerStatus.mode || '未知',
+            endpoint: getTriggerGatewayOrigin(),
+          },
+        }));
+      } catch (error) {
+        if (!cancelled) {
+          setServiceStatus((current) => ({
+            ...current,
+            triggerGateway: {
+              ...current.triggerGateway,
+              state: 'offline',
+              detail: error instanceof Error ? error.message : '触发网关连接失败',
+            },
+          }));
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void refreshServices();
+    const timer = window.setInterval(() => {
+      void refreshServices();
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const activeSnapshot = useMemo(() => getPlateInspectionSnapshot(snapshot, uiState.selectedRecordId), [snapshot, uiState.selectedRecordId]);
+  const activeInspection = useMemo(
+    () => snapshot.inspections.find((inspection) => inspection.plate.plateNo === activeSnapshot.currentPlate.plateNo) ?? null,
+    [activeSnapshot.currentPlate.plateNo, snapshot.inspections],
+  );
+  const artifactMode: 'production' | 'demo' = snapshot.source === 'demo' || snapshot.source === 'test' ? 'demo' : 'production';
+
+  useEffect(() => {
+    const inspectionId = activeInspection?.inspectionId?.trim() || '';
+    const materialId = activeSnapshot.currentPlate.plateNo;
+    const recordSummaryPath = activeInspection?.summaryPath?.trim() || '';
+    if (artifactMode === 'demo') {
+      setRecordBoundSurface({
+        inspectionId,
+        loading: false,
+        mesh: null,
+        status: '演示/测试模式使用显式 demo 产物',
+      });
+      return;
+    }
+    if (!inspectionId) {
+      setRecordBoundSurface({
+        inspectionId: '',
+        loading: false,
+        mesh: null,
+        status: '当前数据未绑定 production inspection，禁止使用全局最新或模拟点云',
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    setRecordBoundSurface({
+      inspectionId,
+      loading: true,
+      mesh: null,
+      status: '正在核对检测记录绑定的算法产物…',
+    });
+    let inFlight = false;
+    let artifactLoaded = false;
+    const loadRecordArtifact = async () => {
+      if (inFlight || artifactLoaded || controller.signal.aborted) {
+        return;
+      }
+      inFlight = true;
+      try {
+        let summaryPath = recordSummaryPath;
+        if (!summaryPath) {
+          const production = await fetchProductionStatus(controller.signal);
+          if (controller.signal.aborted) {
+            return;
+          }
+          const latest = production.latestInspection;
+          if (!latest || latest.id !== inspectionId || latest.materialId !== materialId) {
+            setRecordBoundSurface({
+              inspectionId,
+              loading: false,
+              mesh: null,
+              status: '所选记录未提供算法产物路径，且不是 production/status 的最新检测；未使用全局 latest 以避免串记录',
+            });
+            return;
+          }
+          summaryPath = latest.summaryPath?.trim() || '';
+          if (!summaryPath) {
+            setRecordBoundSurface({
+              inspectionId,
+              loading: false,
+              mesh: null,
+              status: `生产状态 ${latest.status || 'unknown'}，暂无记录绑定的三维产物`,
+            });
+            return;
+          }
+        }
+        const manifest = await fetchBarSurfaceManifest(summaryPath, controller.signal);
+        if (controller.signal.aborted) {
+          return;
+        }
+        if (manifest.materialId !== materialId) {
+          throw new Error('算法 manifest 与当前检测材料号不一致，已拒绝展示');
+        }
+        const mesh = await fetchBarSurfaceMesh(manifest, controller.signal);
+        if (controller.signal.aborted) {
+          return;
+        }
+        if (mesh.positions.length < 3) {
+          throw new Error('记录绑定的算法 mesh 没有有效点数据');
+        }
+        setRecordBoundSurface({
+          inspectionId,
+          loading: false,
+          mesh,
+          status: `已绑定 ${manifest.runId} · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点`,
+        });
+        artifactLoaded = true;
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setRecordBoundSurface({
+            inspectionId,
+            loading: false,
+            mesh: null,
+            status: error instanceof Error ? `生产产物不可用：${error.message}` : '生产产物不可用',
+          });
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    void loadRecordArtifact();
+    const timer = window.setInterval(() => void loadRecordArtifact(), 8000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeSnapshot.currentPlate.plateNo, artifactMode]);
+
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
   const currentPlateDefects = useMemo(
     () => applyInspectionSettingsToDefects(activeSnapshot.defects, savedSettings),
@@ -304,7 +645,17 @@ function InspectionDashboard({
     [snapshot, savedSettings],
   );
   const activeSummary = useMemo(() => summarizeDefects(currentPlateDefects), [currentPlateDefects]);
-  const deviceStatus = useMemo(() => getDeviceStatusWithOperation(activeSnapshot.status, operationState), [activeSnapshot.status, operationState]);
+  const baseDeviceStatus = useMemo(() => getDeviceStatusWithOperation(activeSnapshot.status, operationState), [activeSnapshot.status, operationState]);
+  const serviceAlarmCount = useMemo(() => {
+    return Object.values(serviceStatus).reduce((count, service) => count + (service.state === 'offline' || service.state === 'warning' ? 1 : 0), 0);
+  }, [serviceStatus]);
+  const deviceStatus = useMemo(
+    () => ({
+      ...baseDeviceStatus,
+      alarmCount: baseDeviceStatus.alarmCount + serviceAlarmCount,
+    }),
+    [baseDeviceStatus, serviceAlarmCount],
+  );
   const categoryVisibleDefects = useMemo(() => getVisibleDefects(currentPlateDefects, uiState), [currentPlateDefects, uiState]);
   const legendCountDefects = useMemo(
     () =>
@@ -370,11 +721,24 @@ function InspectionDashboard({
   };
 
   const selectDefectById = (defectId: string) => {
+    const defect = allDefects.find((item) => item.id === defectId);
+    const latestPlateNo = snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo;
+    if (defect) {
+      setSnapshotTracking(defect.plateNo === latestPlateNo ? 'latest' : 'history');
+    }
     setUiState((current) => selectDefect(current, allDefects, defectId));
   };
 
   const selectRecordByPlateNo = (plateNo: string) => {
+    const latestPlateNo = snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo;
+    setSnapshotTracking(plateNo === latestPlateNo ? 'latest' : 'history');
     setUiState((current) => selectRecord(current, snapshot, plateNo));
+  };
+
+  const followLatestSnapshot = () => {
+    const latestPlateNo = snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo;
+    setSnapshotTracking('latest');
+    setUiState((current) => selectRecord(current, snapshot, latestPlateNo));
   };
 
   const updateOnlineFilters = (patch: Partial<ReportFilters>) => {
@@ -421,23 +785,29 @@ function InspectionDashboard({
     setToast('已切换到当前钢管报表');
   };
 
-  const saveSettings = (message: string) => {
+  const saveSettings = async (message: string) => {
     const errors = validateSettings(settingsDraft);
     setSettingsErrors(errors);
     if (Object.keys(errors).length > 0) {
       setToast('参数校验未通过，请修正红色提示');
       return;
     }
-    setSavedSettings((current) => saveSettingsDraft(current, settingsDraft));
-    setToast(message);
+    try {
+      const saved = await saveAdminInspectionSettings(settingsDraft);
+      setSavedSettings(saved);
+      setSettingsDraft(saved);
+      setSettingsErrors({});
+      setToast(message);
+    } catch (error) {
+      setToast(error instanceof Error ? `参数保存失败：${error.message}` : '参数保存失败');
+    }
   };
 
   const resetSettings = () => {
     const defaults = createDefaultSettings();
     setSettingsDraft(defaults);
-    setSavedSettings(defaults);
     setSettingsErrors({});
-    setToast('参数已恢复默认值');
+    setToast('默认参数已填入，保存后生效');
   };
 
   const updateConnectionDraft = (patch: Partial<ConnectionConfig>) => {
@@ -462,7 +832,29 @@ function InspectionDashboard({
     }
   };
 
-  const handleSystemAction = (action: SystemAction) => {
+  const handleSystemAction = async (action: SystemAction) => {
+    if (action === 'self-check') {
+      setToast('系统自检中');
+      const [inspectionResult, captureResult, triggerResult] = await Promise.allSettled([
+        fetchInspectionSnapshot(),
+        readCaptureSnapshot(),
+        fetchTriggerGatewayStatus(),
+      ]);
+      if (inspectionResult.status === 'fulfilled') {
+        onSnapshotChange(inspectionResult.value);
+      }
+      if (captureResult.status === 'fulfilled') {
+        setCaptureSnapshot(captureResult.value);
+      }
+      const failures = [inspectionResult, captureResult, triggerResult].filter((result) => result.status === 'rejected').length;
+      if (failures > 0) {
+        setToast(`系统自检发现 ${failures} 项服务不可用，请查看顶部服务状态`);
+        return;
+      }
+      setOperationState((current) => runSystemAction(current, action));
+      setToast('系统自检已完成，Rust、采集和触发服务均可达');
+      return;
+    }
     setOperationState((current) => {
       const next = runSystemAction(current, action);
       if (action === 'export-log') {
@@ -475,7 +867,7 @@ function InspectionDashboard({
     });
     const messages: Record<SystemAction, string> = {
       'self-check': '系统自检已完成',
-      'clear-alarm': '报警计数已清零',
+      'clear-alarm': '本地临时报警已清零，服务端报警保持不变',
       'sync-time': '系统时间已同步',
       'export-log': '事件日志已导出',
     };
@@ -515,6 +907,7 @@ function InspectionDashboard({
         theme={uiState.theme}
         capture={captureSnapshot}
         network={networkSnapshot}
+        services={serviceStatus}
         activeNav={uiState.activeNav}
         onNavChange={(activeNav) => setState({ activeNav })}
         onSettingsOpen={() => setSettingsModalOpen(true)}
@@ -540,6 +933,21 @@ function InspectionDashboard({
             onSearchReset={resetRecordSearchFilters}
           />
           <section className="online-main">
+            <div className="snapshot-follow-bar" role="status" aria-label="检测数据实时跟随状态">
+              <div>
+                <i className={snapshotTracking === 'latest' ? 'live' : 'history'} />
+                <strong>{snapshotTracking === 'latest' ? '实时跟随最新检测' : `固定查看 ${activeSnapshot.currentPlate.plateNo}`}</strong>
+                <span>{snapshotSyncState} · 每 8 秒刷新</span>
+              </div>
+              <div role="group" aria-label="检测记录跟随模式">
+                <button type="button" className={snapshotTracking === 'latest' ? 'active' : ''} onClick={followLatestSnapshot}>
+                  跟随最新
+                </button>
+                <button type="button" className={snapshotTracking === 'history' ? 'active' : ''} onClick={() => setSnapshotTracking('history')}>
+                  固定当前
+                </button>
+              </div>
+            </div>
             <main className="dashboard-grid online-dashboard-grid">
               <section className={`center-column ${analysisCollapsed ? 'analysis-collapsed' : ''}`}>
                 <PlateMap
@@ -551,6 +959,11 @@ function InspectionDashboard({
                   surfaceMode={uiState.surfaceDisplayMode}
                   previewPositionM={uiState.previewPositionM}
                   plateLengthM={activePlateLengthM}
+                  artifactMode={artifactMode}
+                  inspectionId={activeInspection?.inspectionId}
+                  captureImages={activeSnapshot.captureImages ?? []}
+                  surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
+                  artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
                   onToggleType={(typeId) =>
                     setUiState((current) => ({
                       ...toggleDefectType(current, typeId),
@@ -565,6 +978,10 @@ function InspectionDashboard({
                   selectedDefect={selectedOnlineDefect}
                   heightProfile={activeSnapshot.heightProfile}
                   captureImages={activeSnapshot.captureImages}
+                  artifactMode={artifactMode}
+                  inspectionId={activeInspection?.inspectionId}
+                  surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
+                  artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
                   headerless
                   collapsed={analysisCollapsed}
                   onCollapsedChange={setAnalysisCollapsed}
@@ -633,6 +1050,8 @@ function InspectionDashboard({
                 setToast('缺陷报表 JSON 已导出');
               }}
             />
+          ) : uiState.activeNav === 'alarms' ? (
+            <AlarmCenter />
           ) : (
             <SystemStatusPage status={deviceStatus} operation={operationState} capture={captureSnapshot} onAction={handleSystemAction} />
           )}

@@ -232,6 +232,74 @@ pub mod production_inspection {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod production_task {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "production_task")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub idempotency_key: String,
+        pub kind: String,
+        pub material_id: String,
+        pub session_id: String,
+        pub status: String,
+        pub phase: String,
+        pub payload: String,
+        pub result: String,
+        pub error: String,
+        pub actor: String,
+        pub progress: i32,
+        pub attempts: i32,
+        pub max_attempts: i32,
+        pub cancel_requested: bool,
+        pub created_at: String,
+        pub started_at: String,
+        pub finished_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod calibration_operation {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "calibration_operation")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub kind: String,
+        pub request_hash: String,
+        pub request_json: String,
+        pub status: String,
+        pub provider_http_status: i32,
+        pub provider_response_body: String,
+        pub error: String,
+        pub actor: String,
+        pub parent_operation_id: String,
+        pub reconciliation_outcome: String,
+        pub reconciliation_id: String,
+        pub resolved_by: String,
+        pub resolved_at: String,
+        pub row_version: i32,
+        pub created_at: String,
+        pub dispatch_started_at: String,
+        pub finished_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod capture_file {
     use sea_orm::entity::prelude::*;
 
@@ -312,6 +380,39 @@ pub mod production_defect {
         pub confidence: f64,
         pub geometry_json: String,
         pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod production_alarm {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "production_alarm")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub source: String,
+        pub alarm_type: String,
+        pub severity: String,
+        pub material_id: String,
+        pub session_id: String,
+        pub inspection_id: String,
+        pub camera_id: String,
+        pub message: String,
+        pub details: String,
+        pub status: String,
+        pub created_at: String,
+        pub acknowledged_at: String,
+        pub resolved_at: String,
+        pub acknowledged_by: String,
+        pub acknowledge_note: String,
+        pub resolved_by: String,
+        pub resolve_note: String,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -6,7 +6,7 @@ export const DEFAULT_PLATE_LENGTH_M = 12;
 
 export interface InspectionUiState {
   theme: ThemeMode;
-  activeNav: 'online' | 'report' | 'settings' | 'status';
+  activeNav: 'online' | 'report' | 'alarms' | 'settings' | 'status';
   selectedRecordId: string;
   selectedDefectId: string | null;
   hiddenDefectTypeIds: Set<string>;

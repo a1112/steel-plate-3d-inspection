@@ -136,12 +136,16 @@ function Test-PackagedRuntimeContract {
     "scripts.integrated" = $Manifest.scripts.integrated
     "scripts.integratedFullAcceptanceTest" = $Manifest.scripts.integratedFullAcceptanceTest
     "scripts.integratedAcceptanceAuditTest" = $Manifest.scripts.integratedAcceptanceAuditTest
+    "scripts.migrationArchitectureTest" = $Manifest.scripts.migrationArchitectureTest
     "scripts.integratedSmokeTest" = $Manifest.scripts.integratedSmokeTest
     "scripts.integratedReadyTest" = $Manifest.scripts.integratedReadyTest
     "scripts.runtimeAcceptanceTest" = $Manifest.scripts.runtimeAcceptanceTest
     "scripts.runtimeLayoutTest" = $Manifest.scripts.runtimeLayoutTest
     "scripts.runtimeUiSmokeTest" = $Manifest.scripts.runtimeUiSmokeTest
     "scripts.realHardwareAcceptanceTest" = $Manifest.scripts.realHardwareAcceptanceTest
+    "scripts.realCalibrationAcceptanceTest" = $Manifest.scripts.realCalibrationAcceptanceTest
+    "scripts.realCalibrationCrashRecoveryTest" = $Manifest.scripts.realCalibrationCrashRecoveryTest
+    "scripts.realCalibrationIntegrityGenerationTest" = $Manifest.scripts.realCalibrationIntegrityGenerationTest
     "scripts.productionStabilityTest" = $Manifest.scripts.productionStabilityTest
     "scripts.barSurfaceE2ETest" = $Manifest.scripts.barSurfaceE2ETest
     "scripts.clientStatic" = $Manifest.scripts.clientStatic
@@ -155,6 +159,13 @@ function Test-PackagedRuntimeContract {
     }
     $ExpectedPath = Resolve-PackagePath $PackageDir ([string]$Entry.Value)
     Assert-PathExists $ExpectedPath "Runtime manifest points to missing file for $($Entry.Key): $ExpectedPath" "Leaf"
+  }
+
+  $MigrationArchitectureTest = Resolve-PackagePath $PackageDir $Manifest.scripts.migrationArchitectureTest
+  $MigrationArchitectureReportText = (& $MigrationArchitectureTest -ManifestPath $ManifestPath | Out-String)
+  $MigrationArchitectureReport = $MigrationArchitectureReportText | ConvertFrom-Json
+  if ($MigrationArchitectureReport.code -ne 0) {
+    throw "Packaged runtime failed the architecture migration contract."
   }
 
   if ($ExpectQt) {
@@ -177,10 +188,14 @@ function Test-PackagedRuntimeContract {
     "run-integrated-capture-management.ps1",
     "test-integrated-capture-management-full.ps1",
     "test-integrated-acceptance-audit.ps1",
+    "test-architecture-migration-contract.ps1",
     "test-integrated-management-smoke.ps1",
     "test-integrated-runtime-ready.ps1",
     "test-runtime-acceptance.ps1",
     "test-real-hardware-acceptance.ps1",
+    "test-real-calibration-acceptance.ps1",
+    "test-real-calibration-crash-recovery.ps1",
+    "test-real-calibration-integrity-generation.ps1",
     "test-production-stability.ps1",
     "test-runtime-ui-smoke.ps1",
     "scripts\test-bar-surface-e2e.ps1",
@@ -257,7 +272,7 @@ function Test-PackagedRuntimeContract {
 
   $ReadyScript = Join-Path $PackageDir "test-integrated-runtime-ready.ps1"
   $ReadyText = Get-Content $ReadyScript -Raw
-  foreach ($RequiredText in @("/health", "/api/production/status", "/api/system/network", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "bandwidthMbps", "/api/trigger/status", "?app=terminal")) {
+  foreach ($RequiredText in @("/health", "/api/health/details", "/api/production/status", "/api/system/network", "database", "taskWorker", "capture", "calibrationReconciliation", "storage", "trigger", "trigger.required", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "bandwidthMbps", "/api/trigger/status", "?app=terminal")) {
     if ($ReadyText -notmatch [regex]::Escape($RequiredText)) {
       throw "Integrated ready test must verify $RequiredText"
     }
@@ -270,10 +285,18 @@ function Test-PackagedRuntimeContract {
     "test-runtime-layout.ps1",
     "test-integrated-runtime-ready.ps1",
     "test-real-hardware-acceptance.ps1",
+    "test-real-calibration-acceptance.ps1",
+    "test-real-calibration-crash-recovery.ps1",
+    "test-real-calibration-integrity-generation.ps1",
     "test-runtime-ui-smoke.ps1",
     "test-bar-surface-e2e.ps1",
     "test-production-stability.ps1",
     "RunCapture",
+    "RunCalibrationApplyRollback",
+    "CalibrationSafetyConfirmation",
+    "ApplyCrashRecoveryReportPath",
+    "RollbackCrashRecoveryReportPath",
+    "CalibrationIntegrityGenerationReportPath",
     "RunBarSurface",
     "RunShortStability",
     "StabilityDurationSec",
@@ -287,6 +310,9 @@ function Test-PackagedRuntimeContract {
     "required =",
     "uncovered",
     "trigger-gateway-route",
+    "real-calibration-apply-rollback",
+    "real-calibration-crash-recovery",
+    "real-calibration-integrity-generation",
     "bar-surface-e2e",
     "integrated-capture-management",
     "reportPath"
@@ -301,7 +327,9 @@ function Test-PackagedRuntimeContract {
   foreach ($RequiredText in @(
     "steel.integrated-capture-management.acceptance-audit.v1",
     "ICM-01",
-    "ICM-18",
+    "ICM-23",
+    'RequiredCount = 23',
+    "test-architecture-migration-contract.ps1",
     "integratedReportPath",
     "tenMinuteReportPath",
     "acceptance-audit",
@@ -327,7 +355,9 @@ function Test-PackagedRuntimeContract {
     "coverage.covered",
     "coverage.required",
     "ICM-01",
-    "ICM-18",
+    "ICM-23",
+    "summary.passed=23",
+    "test-architecture-migration-contract.ps1",
     "H:\camera1",
     "integrated-capture-management-20260709-121522-831.json",
     "BAR-STABILITY-20260709-121618-010",
@@ -380,6 +410,30 @@ function Test-PackagedRuntimeContract {
   foreach ($RequiredText in @("/api/production/capture-once", "/api/system/network", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "H:\camera", "saveSdkDerived", "productionLayout", "steel.production.summary.v1", "captureFiles")) {
     if ($RealHardwareText -notmatch [regex]::Escape($RequiredText)) {
       throw "Real hardware acceptance test must verify $RequiredText"
+    }
+  }
+
+  $RealCalibrationScript = Join-Path $PackageDir "test-real-calibration-acceptance.ps1"
+  $RealCalibrationText = Get-Content $RealCalibrationScript -Raw
+  foreach ($RequiredText in @("steel.real-calibration.acceptance.v1", "/api/calibration/apply-all", "/api/calibration/rollback", "/api/calibration/operations/detail", "SafetyConfirmation", "/api/capture/continuous-test", "calibrationReconciliation")) {
+    if ($RealCalibrationText -notmatch [regex]::Escape($RequiredText)) {
+      throw "Real calibration acceptance test must verify $RequiredText"
+    }
+  }
+
+  $RealCalibrationCrashScript = Join-Path $PackageDir "test-real-calibration-crash-recovery.ps1"
+  $RealCalibrationCrashText = Get-Content $RealCalibrationCrashScript -Raw
+  foreach ($RequiredText in @("steel.real-calibration.crash-recovery.v1", "ApplyCrash", "RollbackCrash", "calibrationCrashFailpointArmed", "expectedApplyOperationId", "parentOperationId", "reconciled")) {
+    if ($RealCalibrationCrashText -notmatch [regex]::Escape($RequiredText)) {
+      throw "Real calibration crash-recovery test must verify $RequiredText"
+    }
+  }
+
+  $RealCalibrationIntegrityScript = Join-Path $PackageDir "test-real-calibration-integrity-generation.ps1"
+  $RealCalibrationIntegrityText = Get-Content $RealCalibrationIntegrityScript -Raw
+  foreach ($RequiredText in @("steel.real-calibration.integrity-generation.v1", "sideEffects", "zeroWriteEvidence", "staleGeneration", "stagedTamper")) {
+    if ($RealCalibrationIntegrityText -notmatch [regex]::Escape($RequiredText)) {
+      throw "Real calibration integrity/generation test must verify $RequiredText"
     }
   }
 
@@ -480,12 +534,22 @@ Assert-NoMatches "dev-with-service|scripts/cmake" $ClientDir "Client must not ke
 Assert-PathExists (Join-Path $RepoRoot "app\trigger\Cargo.toml") "Standalone trigger gateway project must live under app/trigger." "Leaf"
 Assert-PathExists (Join-Path $RepoRoot "scripts\build-trigger-gateway.ps1") "Missing trigger gateway build script." "Leaf"
 Assert-PathExists (Join-Path $RepoRoot "scripts\start-integrated-capture-management.ps1") "Missing source integrated capture-management startup script." "Leaf"
+$MigrationArchitectureTest = Join-Path $RepoRoot "scripts\test-architecture-migration-contract.ps1"
+Assert-PowerShellScriptParses $MigrationArchitectureTest
+$MigrationArchitectureReportText = (& $MigrationArchitectureTest -RepoRoot ([string]$RepoRoot) | Out-String)
+$MigrationArchitectureReport = $MigrationArchitectureReportText | ConvertFrom-Json
+if ($MigrationArchitectureReport.code -ne 0) {
+  throw "Source tree failed the architecture migration contract."
+}
 Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\start-integrated-capture-management.ps1")
 Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-integrated-capture-management-full.ps1")
 Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-integrated-management-smoke.ps1")
 Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-integrated-runtime-ready.ps1")
 Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-runtime-acceptance.ps1")
 Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-real-hardware-acceptance.ps1")
+Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-real-calibration-acceptance.ps1")
+Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-real-calibration-crash-recovery.ps1")
+Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-real-calibration-integrity-generation.ps1")
 Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-production-stability.ps1")
 Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-bar-surface-e2e.ps1")
 Assert-PowerShellScriptParses (Join-Path $RepoRoot "scripts\test-runtime-layout.ps1")

@@ -57,7 +57,60 @@ function Resolve-RuntimePath {
 Assert-PathExists $ManifestPath "Missing runtime manifest: $ManifestPath" "Leaf"
 $Manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
 
+if ([string]$Manifest.formalCapture -ne "headless-cpp") {
+  throw "Runtime manifest must declare headless-cpp as the formal capture provider."
+}
+
+$CalibrationOperations = $Manifest.migrationArchitecture.calibrationOperations
+$CalibrationMutationRoutes = @($CalibrationOperations.mutationRoutes)
+if (
+  $null -eq $CalibrationOperations -or
+  $CalibrationOperations.persistent -ne $true -or
+  $CalibrationMutationRoutes.Count -ne 2 -or
+  $CalibrationMutationRoutes -notcontains "POST /api/calibration/apply-all" -or
+  $CalibrationMutationRoutes -notcontains "POST /api/calibration/rollback" -or
+  [string]$CalibrationOperations.detailRoute -ne "GET /api/calibration/operations/detail" -or
+  [string]$CalibrationOperations.idempotencyKey -ne "operationId" -or
+  [string]$CalibrationOperations.interruptedStatus -ne "needs-reconciliation" -or
+  [string]$CalibrationOperations.reconciledStatus -ne "reconciled" -or
+  $CalibrationOperations.automaticReplay -ne $false -or
+  $CalibrationOperations.dryRunPersisted -ne $false -or
+  $CalibrationOperations.persistentMutationFence -ne $true -or
+  [string]$CalibrationOperations.recoveryParentField -ne "parentOperationId" -or
+  [string]$CalibrationOperations.recoveryOutcome -ne "restored-to-staged-baseline" -or
+  @($CalibrationOperations.rollbackEvidence).Count -ne 2 -or
+  @($CalibrationOperations.rollbackEvidence) -notcontains "complete" -or
+  @($CalibrationOperations.rollbackEvidence) -notcontains "applyOperationId" -or
+  [string]$CalibrationOperations.providerRollbackTokenDurability -ne "cross-restart-file-only" -or
+  [string]$CalibrationOperations.providerRollbackFileFingerprint -ne "sha256+size" -or
+  [string]$CalibrationOperations.providerRollbackManifest -ne "atomic-write-ahead-v1" -or
+  $CalibrationOperations.providerStagedPreviousFiles -ne $true -or
+  $CalibrationOperations.providerRecoveryFence -ne $true -or
+  [string]$CalibrationOperations.realHardwareAcceptanceScript -ne "test-real-calibration-acceptance.ps1" -or
+  $CalibrationOperations.realHardwareApplyRollbackRequiredForFullCoverage -ne $true -or
+  [string]$CalibrationOperations.realHardwareCrashRecoveryScript -ne "test-real-calibration-crash-recovery.ps1" -or
+  $CalibrationOperations.realHardwareCrashRecoveryRequiredForFullCoverage -ne $true -or
+  [string]$CalibrationOperations.providerCrashFailpoint -ne "explicit-env-operation-phase-camera-bound-v1" -or
+  [string]$CalibrationOperations.realHardwareIntegrityGenerationScript -ne "test-real-calibration-integrity-generation.ps1" -or
+  $CalibrationOperations.realHardwareIntegrityGenerationRequiredForFullCoverage -ne $true -or
+  (@($CalibrationOperations.decisiveRollbackPreflightEvidence | Sort-Object) -join ",") -ne "attempted,sideEffects" -or
+  $CalibrationOperations.processCrashFaultInjectionSeparate -ne $true -or
+  [int]$CalibrationOperations.requiredCameraCount -ne 6 -or
+  $CalibrationOperations.uniqueCameraIps -ne $true -or
+  $CalibrationOperations.uniqueExpectedSerials -ne $true -or
+  $CalibrationOperations.uniqueSdkCalibrationPaths -ne $true -or
+  $CalibrationOperations.arrayArtifactAsSdkCalibrationAllowed -ne $false
+) {
+  throw "Runtime manifest is missing the persistent calibration ledger or six-camera calibration safety contract."
+}
+
 $IsTargetRuntimeManifest = -not [string]::IsNullOrWhiteSpace([string]$Manifest.captureHeadless)
+$QtDeclared = if ($IsTargetRuntimeManifest) {
+  -not [string]::IsNullOrWhiteSpace([string]$Manifest.captureQt)
+} else {
+  $null -ne $Manifest.captureQt -and
+    -not [string]::IsNullOrWhiteSpace([string]$Manifest.captureQt.path)
+}
 
 if ($IsTargetRuntimeManifest) {
   $RequiredFiles = [ordered]@{
@@ -69,12 +122,16 @@ if ($IsTargetRuntimeManifest) {
     integrated = $Manifest.integrated
     integratedFullAcceptanceTest = $Manifest.integratedFullAcceptanceTest
     integratedAcceptanceAuditTest = $Manifest.integratedAcceptanceAuditTest
+    migrationArchitectureTest = $Manifest.migrationArchitectureTest
     integratedSmokeTest = $Manifest.integratedSmokeTest
     integratedReadyTest = $Manifest.integratedReadyTest
     runtimeAcceptanceTest = $Manifest.runtimeAcceptanceTest
     runtimeLayoutTest = $Manifest.runtimeLayoutTest
     runtimeUiSmokeTest = $Manifest.runtimeUiSmokeTest
     realHardwareAcceptanceTest = $Manifest.realHardwareAcceptanceTest
+    realCalibrationAcceptanceTest = $Manifest.realCalibrationAcceptanceTest
+    realCalibrationCrashRecoveryTest = $Manifest.realCalibrationCrashRecoveryTest
+    realCalibrationIntegrityGenerationTest = $Manifest.realCalibrationIntegrityGenerationTest
     productionStabilityTest = $Manifest.productionStabilityTest
     barSurfaceE2ETest = $Manifest.barSurfaceE2ETest
     algorithmCore = $Manifest.algorithmCore
@@ -100,12 +157,16 @@ if ($IsTargetRuntimeManifest) {
     integrated = $Manifest.scripts.integrated
     integratedFullAcceptanceTest = $Manifest.scripts.integratedFullAcceptanceTest
     integratedAcceptanceAuditTest = $Manifest.scripts.integratedAcceptanceAuditTest
+    migrationArchitectureTest = $Manifest.scripts.migrationArchitectureTest
     integratedSmokeTest = $Manifest.scripts.integratedSmokeTest
     integratedReadyTest = $Manifest.scripts.integratedReadyTest
     runtimeAcceptanceTest = $Manifest.scripts.runtimeAcceptanceTest
     runtimeLayoutTest = $Manifest.scripts.runtimeLayoutTest
     runtimeUiSmokeTest = $Manifest.scripts.runtimeUiSmokeTest
     realHardwareAcceptanceTest = $Manifest.scripts.realHardwareAcceptanceTest
+    realCalibrationAcceptanceTest = $Manifest.scripts.realCalibrationAcceptanceTest
+    realCalibrationCrashRecoveryTest = $Manifest.scripts.realCalibrationCrashRecoveryTest
+    realCalibrationIntegrityGenerationTest = $Manifest.scripts.realCalibrationIntegrityGenerationTest
     productionStabilityTest = $Manifest.scripts.productionStabilityTest
     barSurfaceE2ETest = $Manifest.scripts.barSurfaceE2ETest
     stop = $Manifest.scripts.stop
@@ -128,11 +189,17 @@ foreach ($Entry in $RequiredFiles.GetEnumerator()) {
   Assert-PathExists (Resolve-RuntimePath ([string]$Entry.Value)) "Runtime manifest points to missing $($Entry.Key): $($Entry.Value)" "Leaf"
 }
 
+$MigrationArchitectureTestPath = Resolve-RuntimePath ([string]$RequiredFiles.migrationArchitectureTest)
+$MigrationArchitectureReportText = (& $MigrationArchitectureTestPath -ManifestPath $ManifestPath | Out-String)
+$MigrationArchitectureReport = $MigrationArchitectureReportText | ConvertFrom-Json
+if ($MigrationArchitectureReport.code -ne 0) {
+  throw "Runtime manifest failed the architecture migration contract."
+}
+
 $ScriptNames = if ($IsTargetRuntimeManifest) {
   @(
     "run-capture-headless.ps1",
     "run-service-headless.ps1",
-    "run-service-qt.ps1",
     "run-service-simulated.ps1",
     "run-trigger-gateway.ps1",
     "run-integrated-capture-management.ps1",
@@ -142,8 +209,12 @@ $ScriptNames = if ($IsTargetRuntimeManifest) {
     "test-integrated-runtime-ready.ps1",
     "test-integrated-capture-management-full.ps1",
     "test-integrated-acceptance-audit.ps1",
+    "test-architecture-migration-contract.ps1",
     "test-runtime-acceptance.ps1",
     "test-real-hardware-acceptance.ps1",
+    "test-real-calibration-acceptance.ps1",
+    "test-real-calibration-crash-recovery.ps1",
+    "test-real-calibration-integrity-generation.ps1",
     "test-production-stability.ps1",
     "test-runtime-ui-smoke.ps1",
     "scripts\test-bar-surface-e2e.ps1",
@@ -162,15 +233,19 @@ $ScriptNames = if ($IsTargetRuntimeManifest) {
     "test-integrated-runtime-ready.ps1",
     "test-integrated-capture-management-full.ps1",
     "test-integrated-acceptance-audit.ps1",
+    "test-architecture-migration-contract.ps1",
     "test-runtime-acceptance.ps1",
     "test-real-hardware-acceptance.ps1",
+    "test-real-calibration-acceptance.ps1",
+    "test-real-calibration-crash-recovery.ps1",
+    "test-real-calibration-integrity-generation.ps1",
     "test-production-stability.ps1",
     "test-runtime-ui-smoke.ps1",
     "scripts\test-bar-surface-e2e.ps1",
     "test-runtime-layout.ps1"
   )
 }
-if (-not $AllowMissingQt) {
+if (-not $AllowMissingQt -and $QtDeclared) {
   $ScriptNames += "run-capture-qt.ps1"
 }
 
@@ -179,6 +254,8 @@ foreach ($ScriptName in $ScriptNames) {
 }
 
 $CaptureConfigRoot = Join-Path $RuntimeRoot "config\capture"
+$CalibrationAcceptancePlanExample = Join-Path $CaptureConfigRoot "calibration-acceptance-plan.example.json"
+Assert-PathExists $CalibrationAcceptancePlanExample "Runtime is missing the reviewed six-camera calibration acceptance plan template." "Leaf"
 $CaptureProfileName = "current-6-soft-trigger"
 $CaptureProfilePath = Join-Path $CaptureConfigRoot "profiles\$CaptureProfileName\profile.json"
 $CaptureActiveProfilePath = Join-Path $CaptureConfigRoot "active-profile.txt"
@@ -251,7 +328,7 @@ foreach ($CaptureScriptName in @("run-capture-headless.ps1", "run-capture-qt.ps1
 }
 
 $SmokeText = Get-Content (Join-Path $RuntimeRoot "test-integrated-management-smoke.ps1") -Raw
-foreach ($RequiredText in @("/api/production/steel-info", "/api/trigger/manual/steel-in", "recordWrittenBeforeCapture", "/api/system/network", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "rateFields", "/api/production/capture-once", "captureGuard", "captureOnce", "captureFileRows", "RunId", 'runs\$RunId\config\service', "-ConfigRoot", "Write-SmokeReport", "reportPath")) {
+foreach ($RequiredText in @("/api/production/tasks/steel-info", "/api/production/tasks/steel-in", "/api/production/tasks/steel-out", "/api/production/tasks", "/api/production/tasks/detail", "/api/trigger/manual/steel-in", "recordWrittenBeforeCapture", "/api/system/network", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "rateFields", "/api/production/capture-once", "captureGuard", "captureOnce", "captureFileRows", "durableTasks", "requestId", "RunId", 'runs\$RunId\config\service', "-ConfigRoot", "Write-SmokeReport", "reportPath")) {
   if ($SmokeText -notmatch [regex]::Escape($RequiredText)) {
     throw "test-integrated-management-smoke.ps1 must verify $RequiredText"
   }
@@ -276,7 +353,7 @@ foreach ($ServiceScriptName in @("run-service-simulated.ps1", "run-service-exter
 }
 
 $ReadyText = Get-Content (Join-Path $RuntimeRoot "test-integrated-runtime-ready.ps1") -Raw
-foreach ($RequiredText in @("/health", "/api/production/status", "/api/system/network", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "bandwidthMbps", "/api/trigger/status", "?app=terminal")) {
+foreach ($RequiredText in @("/health", "/api/health/details", "/api/production/status", "/api/system/network", "database", "taskWorker", "capture", "calibrationReconciliation", "storage", "trigger", "trigger.required", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "bandwidthMbps", "/api/trigger/status", "?app=terminal")) {
   if ($ReadyText -notmatch [regex]::Escape($RequiredText)) {
     throw "test-integrated-runtime-ready.ps1 must verify $RequiredText"
   }
@@ -288,10 +365,16 @@ foreach ($RequiredText in @(
   "test-runtime-layout.ps1",
   "test-integrated-runtime-ready.ps1",
   "test-real-hardware-acceptance.ps1",
+  "test-real-calibration-acceptance.ps1",
   "test-runtime-ui-smoke.ps1",
   "test-bar-surface-e2e.ps1",
   "test-production-stability.ps1",
   "RunCapture",
+  "RunCalibrationApplyRollback",
+  "CalibrationSafetyConfirmation",
+  "ApplyCrashRecoveryReportPath",
+  "RollbackCrashRecoveryReportPath",
+  "CalibrationIntegrityGenerationReportPath",
   "RunBarSurface",
   "RunShortStability",
   "StabilityDurationSec",
@@ -305,6 +388,9 @@ foreach ($RequiredText in @(
   "required =",
   "uncovered",
   "trigger-gateway-route",
+  "real-calibration-apply-rollback",
+  "real-calibration-crash-recovery",
+  "real-calibration-integrity-generation",
   "bar-surface-e2e",
   "integrated-capture-management",
   "reportPath"
@@ -318,7 +404,9 @@ $IntegratedAuditText = Get-Content (Join-Path $RuntimeRoot "test-integrated-acce
 foreach ($RequiredText in @(
   "steel.integrated-capture-management.acceptance-audit.v1",
   "ICM-01",
-  "ICM-18",
+  "ICM-23",
+  'RequiredCount = 23',
+  "test-architecture-migration-contract.ps1",
   "integratedReportPath",
   "tenMinuteReportPath",
   "acceptance-audit",
@@ -328,6 +416,9 @@ foreach ($RequiredText in @(
   "sdkDerived",
   "trigger-gateway-route",
   "verify-independent-architecture.ps1"
+  "steel.real-calibration.acceptance.v1"
+  "steel.real-calibration.crash-recovery.v1"
+  "steel.real-calibration.integrity-generation.v1"
 )) {
   if ($IntegratedAuditText -notmatch [regex]::Escape($RequiredText)) {
     throw "test-integrated-acceptance-audit.ps1 must verify $RequiredText"
@@ -344,7 +435,9 @@ foreach ($RequiredText in @(
   "coverage.covered",
   "coverage.required",
   "ICM-01",
-  "ICM-18",
+  "ICM-23",
+  "summary.passed=23",
+  "test-architecture-migration-contract.ps1",
   "H:\camera1",
   "integrated-capture-management-20260709-121522-831.json",
   "BAR-STABILITY-20260709-121618-010",
@@ -397,6 +490,27 @@ foreach ($RequiredText in @("/api/production/capture-once", "/api/system/network
   }
 }
 
+$RealCalibrationText = Get-Content (Join-Path $RuntimeRoot "test-real-calibration-acceptance.ps1") -Raw
+foreach ($RequiredText in @("steel.real-calibration.acceptance.v1", "/api/calibration/apply-all", "/api/calibration/rollback", "/api/calibration/operations/detail", "APPLY CAMERA CALIBRATION SET", "ROLLBACK CAMERA CALIBRATION", "PERSIST CAMERA PARAMETERS", "/api/capture/continuous-test", "calibrationReconciliation", "does not prove a process crash")) {
+  if ($RealCalibrationText -notmatch [regex]::Escape($RequiredText)) {
+    throw "test-real-calibration-acceptance.ps1 must verify $RequiredText"
+  }
+}
+
+$RealCalibrationCrashText = Get-Content (Join-Path $RuntimeRoot "test-real-calibration-crash-recovery.ps1") -Raw
+foreach ($RequiredText in @("steel.real-calibration.crash-recovery.v1", "ApplyCrash", "RollbackCrash", "calibrationCrashFailpointArmed", "needs-reconciliation", "expectedApplyOperationId", "parentOperationId", "reconciled", "/api/capture/continuous-test")) {
+  if ($RealCalibrationCrashText -notmatch [regex]::Escape($RequiredText)) {
+    throw "test-real-calibration-crash-recovery.ps1 must verify $RequiredText"
+  }
+}
+
+$RealCalibrationIntegrityText = Get-Content (Join-Path $RuntimeRoot "test-real-calibration-integrity-generation.ps1") -Raw
+foreach ($RequiredText in @("steel.real-calibration.integrity-generation.v1", "sideEffects", "zeroWriteEvidence", "staleGeneration", "stagedTamper", "recovery", "/api/capture/continuous-test")) {
+  if ($RealCalibrationIntegrityText -notmatch [regex]::Escape($RequiredText)) {
+    throw "test-real-calibration-integrity-generation.ps1 must verify $RequiredText"
+  }
+}
+
 $ProductionStabilityText = Get-Content (Join-Path $RuntimeRoot "test-production-stability.ps1") -Raw
 foreach ($RequiredText in @("/api/production/steel-in", "/api/production/capture-once", "/api/production/steel-out", "/api/production/algorithm/run", "/api/system/network", "/api/trigger/manual/steel-in", "/api/trigger/capture-once", "UseTriggerGateway", "triggerRoute", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "steel.production.stability.v1", "steel.production.summary.v1", "H:\", "RunAlgorithmEvery", "activeSession", "sdkDerived")) {
   if ($ProductionStabilityText -notmatch [regex]::Escape($RequiredText)) {
@@ -433,7 +547,7 @@ $Summary = [ordered]@{
   manifest = $ManifestPath
   requiredFiles = $RequiredFiles.Count
   scripts = $ScriptNames.Count
-  hasQt = [bool]($Manifest.captureQt -or $Manifest.captureQt.path)
+  hasQt = [bool]$QtDeclared
   client = Resolve-RuntimePath ([string]$RequiredFiles.client)
 }
 

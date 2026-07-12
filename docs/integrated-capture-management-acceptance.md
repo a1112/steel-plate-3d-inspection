@@ -6,10 +6,11 @@ This matrix defines what must be true before the integrated capture-management g
 
 The accepted system is the integrated runtime made of:
 
-- C++ capture provider, either headless or Qt-hosted, as the only process owning LVM/NVT SDK handles.
+- Headless C++ capture provider as the only formal process owning LVM/NVT SDK handles.
 - Rust inspection service as the production API, database, provider proxy, and orchestration layer.
 - Standalone trigger gateway as the API/gray/secondary/manual trigger adapter.
 - Tauri/React client as the operator UI for terminal, capture management, configuration, and 3D reconstruction.
+- Optional Qt diagnostic viewer, when explicitly included, as an HTTP client with its embedded API disabled.
 - H-drive production storage under `H:\camera1` through `H:\camera6`.
 - Bar-surface 3D reconstruction using the corrected calibration and calibrated 3D contour crop.
 
@@ -35,7 +36,26 @@ After the full coverage report exists, run the itemized audit:
 scripts/test-integrated-acceptance-audit.ps1
 ```
 
-The audit report is accepted only when `code=0` and `summary.passed=18`.
+Before packaging or synchronizing a runtime, the source-only migration contract can be checked without starting any service:
+
+```powershell
+scripts/test-architecture-migration-contract.ps1
+```
+
+The source-only contract is accepted at `6/6`. Its checks are:
+
+1. six-kind durable production tasks;
+2. trigger/Tauri durable dispatch with caller idempotency;
+3. layered readiness, including the persistent calibration-reconciliation fence;
+4. persistent alarm lifecycle;
+5. former Qt operation coverage through the formal Tauri -> Rust -> headless C++ chain, including parameterized realtime preview, merged real logs, per-camera disconnect evidence, capture-before-fit automatic calibration, four latest artifact kinds, safe six-camera calibration/rollback, maintenance JSONL, and a non-formal Qt runtime role;
+6. persistent calibration-operation single-flight/idempotency, 423/readiness fencing, parent-bound reconciliation without replay, Tauri resolution evidence, and C++ staged cross-restart rollback.
+
+The fifth and sixth checks read only explicitly named source and runtime-configuration files. They do not scan `target`, packaged/minified frontend output, object files, or executables.
+
+Packaging records the verified contract in `manifest.json`; `test-runtime-layout.ps1` validates that structured contract again without scanning minified JavaScript or compiled executable strings.
+
+The audit report is accepted only when `code=0` and `summary.passed=23`.
 
 The report is accepted only when:
 
@@ -49,8 +69,8 @@ The report is accepted only when:
 
 | ID | Requirement | Required evidence |
 | --- | --- | --- |
-| ICM-01 | Runtime package contains capture provider, Qt viewer, Rust service, trigger gateway, frontend client, config, launch scripts, and acceptance scripts. | `test-runtime-layout.ps1` passes in `target/runtime` and `target/packages/steel-inspection-runtime`. |
-| ICM-02 | Runtime boundaries remain independent: client calls Rust only, trigger gateway forwards to Rust only, Rust does not link camera SDK, and exactly one capture provider owns SDK handles. | `verify-independent-architecture.ps1 -CheckQt` passes. |
+| ICM-01 | Runtime package contains the headless C++ capture provider, Rust service, trigger gateway, frontend client, config, launch scripts, and acceptance scripts. | `test-runtime-layout.ps1` passes in `target/runtime` and `target/packages/steel-inspection-runtime`. |
+| ICM-02 | Runtime boundaries remain independent: client calls Rust only, trigger gateway forwards to Rust only, Rust does not link camera SDK, and exactly one headless capture provider owns SDK handles. | `verify-independent-architecture.ps1` passes; add `-CheckQt` only when validating an included diagnostic viewer. |
 | ICM-03 | Live stack is reachable: capture provider, Rust production API, trigger gateway, network monitor, and terminal client. | `test-integrated-runtime-ready.ps1` passes inside the full coverage report. |
 | ICM-04 | Six real cameras are discovered/connected through the LVM/NVT provider and H-drive camera roots are mapped and writable. | `test-real-hardware-acceptance.ps1` passes inside the full coverage report. |
 | ICM-05 | Current camera configuration is read back from hardware without silently overwriting the operator's device configuration. | Real-hardware acceptance confirms camera config readback and current profile state. |
@@ -65,10 +85,37 @@ The report is accepted only when:
 | ICM-14 | Latest six-camera production capture can be consumed by the bar-surface reconstruction API. | `test-bar-surface-e2e.ps1 -SkipCapture -MaterialId <latest>` passes inside the full coverage report. |
 | ICM-15 | 3D reconstruction outputs mesh, texture, artifact index, acceptance report, and C++ core binary output. | Bar-surface e2e report includes manifest, artifact index, acceptance report, and nonzero core bytes. |
 | ICM-16 | 3D contour crop is applied from calibrated 3D data, not a static image-only preview. | Bar-surface e2e manifest reports `contourCrop.applied=true` and `contourCrop.source=calibrated-3d`. |
-| ICM-17 | Qt capture viewer builds and packages with the required Qt DLLs and SDK DLL. | `build-capture-qt.ps1 -QtPrefixPath C:\Qt`, `package-runtime.ps1 -IncludeQt`, and package layout pass. |
+| ICM-17 | The headless C++ provider is declared as the formal SDK owner; Qt is absent by default or packaged only as a non-owning diagnostic viewer, and former Qt operations are reachable through Tauri -> Rust -> C++. | The package manifest declares `formalCapture=headless-cpp` and `capture.role=formal-sdk-owner`; optional Qt metadata declares `diagnostic-only`, `ownsApi=false`, and `formalRuntime=false`. The fifth source migration check verifies four latest artifact kinds, safe six-camera calibration/rollback, maintenance JSONL, and the formal chain. |
 | ICM-18 | The full coverage acceptance command is shipped in the package and cannot silently lose coverage checks. | `test-runtime-layout.ps1` and `verify-independent-architecture.ps1` require `RequireFullCoverage`, `coverage`, and `trigger-gateway-route` text in packaged scripts. |
+| ICM-19 | Rust exposes a persistent FIFO production task worker for `capture-once`, `algorithm-run`, `steel-info`, `steel-in`, `steel-out`, and `trigger-event`. | `test-architecture-migration-contract.ps1` verifies the SeaORM task table, six canonical kinds, durable route dispatch, FIFO claim, restart recovery, and focused Rust tests; the runtime manifest records the exact kind and route sets. |
+| ICM-20 | Trigger gateway and Tauri dispatch production commands to durable Rust task routes while preserving a stable caller `requestId` for idempotency. | The migration contract verifies the four trigger mappings, Tauri durable task routes, caller-ID preservation, Rust idempotency lookup/conflict behavior, and focused Trigger/Tauri tests. |
+| ICM-21 | Layered Rust readiness gates on database, task worker, capture, persistent calibration reconciliation, storage, and required-by-default trigger health. | The migration contract verifies `/api/health/details`, `/api/storage/status`, `/api/trigger/status`, bounded health tests, the database-backed reconciliation fence, and the default-required trigger policy; `test-integrated-runtime-ready.ps1` requires all six components to be healthy. |
+| ICM-22 | Persistent alarms expose open/history queries and an audited `active -> acknowledged -> resolved` state machine through the Tauri alarm center. | The migration contract verifies the SeaORM alarm table, transactional defect/alarm ingest, list/acknowledge/resolve APIs, server-owned actor/audit notes, frontend `AlarmCenter` entry, and focused Rust/Tauri tests. |
+| ICM-23 | Real six-camera calibration apply/rollback uses a persistent caller-correlated ledger, a readiness/device-write fence, nested parent-bound recovery, and staged cross-restart rollback without automatically replaying an interrupted SDK mutation. | The live audit requires real apply/rollback, successful `ApplyCrash` and `RollbackCrash` Resume reports, and `test-real-calibration-integrity-generation.ps1`. Evidence must prove the unresolved Rust row, original `applyOperationId`, exact reconciliation parent, staged rollback, stale-generation and staged-hash rejection with `attempted:false/sideEffects:false`, unchanged camera/maintenance evidence, reopened readiness, and six validation frames. |
 
 ## Current Evidence Snapshot
+
+Latest Qt-free post-migration simulated evidence (Release, 2026-07-12):
+
+```text
+D:\project\steel-plate-3d-inspection\target\packages\steel-inspection-runtime\logs\integrated-smoke\reports\integrated-smoke-20260712-060652-437.json
+D:\project\steel-plate-3d-inspection\target\runtime\logs\integrated-smoke\reports\integrated-smoke-20260712-060810-551.json
+D:\project\steel-plate-3d-inspection\target\runtime\logs\ui-smoke\20260712-060933-011\ui-smoke-report.json
+```
+
+Observed result:
+
+- source migration contract: `6/6`, including `qt-capability-formal-chain` and `persistent-calibration-operation-ledger`
+- frontend: `24` files and `156/156` tests pass; production build passes
+- Rust service: `99/99` tests pass; trigger gateway: `6/6` tests pass
+- C++ headless provider: `5/5` CTest suites pass
+- package and `target/runtime` layouts both report `hasQt:false`
+- package and runtime smoke both complete the durable steel-info -> steel-in -> six-camera capture -> steel-out chain
+- each smoke capture reports `workerCount:6`, `parallel:true`, `completeFrames:6`, `metadataFrames:6`, and `captureFileRows:18`
+- browser UI smoke passes the terminal, capture-management, and 3D-reconstruction pages on the formal `1432/4873` ports
+- calibration apply/rollback now uses a database-backed `operationId` ledger plus staged C++ rollback manifests; tests prove same-ID single-flight, rejection of a distinct queued operation, duplicate-key-safe dry-run routing, terminal replay, conflict rejection, 423/readiness fencing, nested interrupted-rollback reconciliation, provider restart recovery, an actual operation/phase/camera-bound provider process exit, hash/SN/generation validation, and fail-closed invalid manifests
+
+These results certify the Qt-free software/runtime boundary with the simulated driver. They do not supersede the real-camera evidence or close the post-writer/post-calibration hardware gate below.
 
 Latest full coverage report:
 
@@ -87,7 +134,8 @@ Observed result:
 - short stability cycles: `10/10`, failures `0`
 - short capture frames: `60`
 - short metadata frames: `60`
-- itemized audit: `18/18` requirements pass
+- historical itemized audit: `18/18` requirements passed before ICM-19 through ICM-23 and the real-calibration live check were added
+- current source migration-contract audit: `6/6` static architecture checks pass; the fifth is `qt-capability-formal-chain` and the sixth is `persistent-calibration-operation-ledger`
 - latest source audit report: `D:\project\steel-plate-3d-inspection\target\logs\integrated-capture-management\acceptance-audit-20260709-125503-276.json`
 - latest runtime audit report: `D:\project\steel-plate-3d-inspection\target\runtime\logs\integrated-capture-management\acceptance-audit-20260709-125850-744.json`
 - latest package audit report: `D:\project\steel-plate-3d-inspection\target\packages\steel-inspection-runtime\logs\integrated-capture-management\acceptance-audit-20260709-130111-474.json`
@@ -147,6 +195,7 @@ Each camera folder contains one `depth`, one `intensity`, and one `metadata` fil
 
 ## Remaining Acceptance Notes
 
+- `target/runtime` and `target/packages/steel-inspection-runtime` have been regenerated from the current Release outputs and passed Qt-free simulated acceptance. Rerun the full live-stack/itemized audit on the current six-camera hardware with the real calibration plan and explicit apply/rollback authorization to produce a new `23/23` report; historical real-camera and ten-minute evidence does not by itself certify the final writer, lifecycle, and calibration changes.
 - The ten-minute stability run above is the current endurance evidence. Longer production soaks can reuse the same command with a larger `-StabilityDurationSec`.
 - The current goal excludes downstream defect algorithm implementation beyond bar-surface reconstruction acceptance.
 - Qt deployment warnings about `dxcompiler.dll`, `dxil.dll`, or `VCINSTALLDIR` are acceptable for the current Qt Widgets viewer unless Direct3D 12-specific features are introduced.

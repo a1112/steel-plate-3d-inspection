@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -8,11 +8,14 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
 mod db;
+mod calibration_operations;
+mod production_tasks;
 
 #[derive(Clone)]
 struct DefectType {
@@ -113,6 +116,11 @@ const ALARM_RULES_CONFIG_KEY: &str = "alarm_rules";
 const EXTERNAL_INTEGRATIONS_CONFIG_KEY: &str = "external_integrations";
 const CONFIG_JSON_MAX_BYTES: usize = 128 * 1024;
 const CAPTURE_CAMERA_MAX_COUNT: usize = 16;
+const TASK_WORKER_IDLE_HEARTBEAT_MAX_AGE_MS: u128 = 5_000;
+const DEFAULT_TRIGGER_GATEWAY_ORIGIN: &str = "http://127.0.0.1:4881";
+const TRIGGER_HEALTH_TIMEOUT_MS: u64 = 1_200;
+const STORAGE_HEALTH_TIMEOUT_MS: u64 = 1_500;
+const HEALTH_HTTP_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const ADMIN_ID_MAX_LEN: usize = 64;
 const ADMIN_LABEL_MAX_LEN: usize = 128;
 const ADMIN_DESCRIPTION_MAX_LEN: usize = 256;
@@ -166,6 +174,15 @@ struct ServiceState {
     capture: Arc<CaptureServiceManager>,
     database: db::AppDatabase,
     runtime: Runtime,
+    production_command_lock: Mutex<()>,
+    calibration_operation_lock: Mutex<()>,
+    production_task_admin_lock: Mutex<()>,
+    production_task_wakeup: Condvar,
+    production_task_wakeup_generation: Mutex<u64>,
+    production_task_worker_status: Mutex<ProductionTaskWorkerStatus>,
+    production_task_sequence: AtomicU64,
+    trigger_gateway_origin: String,
+    trigger_health_required: bool,
     sessions: Mutex<HashMap<String, AdminSession>>,
     login_failures: Mutex<HashMap<String, LoginFailureState>>,
     started_at: u128,
@@ -226,6 +243,35 @@ struct CaptureServiceManager {
     origin: String,
     provider: CaptureProvider,
     process: Mutex<Option<Child>>,
+}
+
+#[derive(Clone, Default)]
+struct ProductionTaskWorkerStatus {
+    running: bool,
+    current_task_id: String,
+    last_heartbeat_at: u128,
+    last_error: String,
+    recovered_tasks: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HealthEndpoint {
+    Compatibility,
+    Live,
+    Ready,
+    Details,
+}
+
+struct ServiceHealthSnapshot {
+    ready: bool,
+    body: Value,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureProxyResponse {
+    status_code: u16,
+    content_type: String,
+    body: Vec<u8>,
 }
 
 impl Drop for CaptureServiceManager {
@@ -827,6 +873,25 @@ fn capture_origin(port: u16) -> String {
     env::var("CAPTURE_SERVICE_ORIGIN").unwrap_or_else(|_| format!("http://127.0.0.1:{port}"))
 }
 
+fn trigger_gateway_origin() -> String {
+    env::var("TRIGGER_GATEWAY_ORIGIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_TRIGGER_GATEWAY_ORIGIN.to_string())
+}
+
+fn trigger_health_required_from_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "no" | "off" | "disabled")
+    )
+}
+
+fn trigger_health_required() -> bool {
+    trigger_health_required_from_value(env::var("STEEL_TRIGGER_HEALTH_REQUIRED").ok().as_deref())
+}
+
 fn capture_endpoint_from_origin(origin: &str) -> Option<(String, u16)> {
     let without_scheme = origin
         .strip_prefix("http://")
@@ -1301,8 +1366,40 @@ impl CaptureServiceManager {
         body: &str,
         read_timeout: Duration,
     ) -> Option<Vec<u8>> {
+        self.proxy_response_with_read_timeout(method, path_with_query, body, read_timeout)
+            .filter(|response| (200..300).contains(&response.status_code))
+            .map(|response| response.body)
+    }
+
+    fn proxy_response(
+        &self,
+        method: &str,
+        path_with_query: &str,
+        body: &str,
+    ) -> Option<CaptureProxyResponse> {
+        self.proxy_response_with_read_timeout(
+            method,
+            path_with_query,
+            body,
+            Duration::from_secs(8),
+        )
+    }
+
+    fn proxy_response_with_read_timeout(
+        &self,
+        method: &str,
+        path_with_query: &str,
+        body: &str,
+        read_timeout: Duration,
+    ) -> Option<CaptureProxyResponse> {
         if self.provider == CaptureProvider::Simulated {
-            return self.simulated_proxy(method, path_with_query, body);
+            return self
+                .simulated_proxy(method, path_with_query, body)
+                .map(|body| CaptureProxyResponse {
+                    status_code: 200,
+                    content_type: "application/json; charset=utf-8".to_string(),
+                    body,
+                });
         }
         if !self.provider.uses_local_api() {
             return None;
@@ -1311,11 +1408,33 @@ impl CaptureServiceManager {
         if !self.endpoint_listening() {
             return None;
         }
-        let address = (self.host.as_str(), self.port)
+        self.request_response_with_read_timeout(method, path_with_query, body, read_timeout)
+    }
+
+    fn probe_response(
+        &self,
+        path_with_query: &str,
+        read_timeout: Duration,
+    ) -> Option<CaptureProxyResponse> {
+        if self.provider == CaptureProvider::Simulated || !self.provider.uses_local_api() {
+            return None;
+        }
+        self.request_response_with_read_timeout("GET", path_with_query, "", read_timeout)
+    }
+
+    fn request_response_with_read_timeout(
+        &self,
+        method: &str,
+        path_with_query: &str,
+        body: &str,
+        read_timeout: Duration,
+    ) -> Option<CaptureProxyResponse> {
+        let mut addresses = (self.host.as_str(), self.port)
             .to_socket_addrs()
-            .ok()?
-            .find(|addr| TcpStream::connect_timeout(addr, Duration::from_millis(200)).is_ok())?;
-        let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(1500)).ok()?;
+            .ok()?;
+        let mut stream = addresses.find_map(|address| {
+            TcpStream::connect_timeout(&address, Duration::from_millis(1500)).ok()
+        })?;
         let _ = stream.set_read_timeout(Some(read_timeout));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
         let request = format!(
@@ -1328,22 +1447,37 @@ impl CaptureServiceManager {
         stream.write_all(request.as_bytes()).ok()?;
         let mut response = Vec::new();
         stream.read_to_end(&mut response).ok()?;
-        let header_text = String::from_utf8_lossy(&response);
-        let status_code = header_text
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse::<u16>().ok())?;
-        if !(200..300).contains(&status_code) {
-            return None;
-        }
-        let marker = b"\r\n\r\n";
-        let body_start = response
-            .windows(marker.len())
-            .position(|window| window == marker)
-            .map(|index| index + marker.len())?;
-        Some(response[body_start..].to_vec())
+        parse_capture_http_response(response)
     }
+}
+
+fn parse_capture_http_response(response: Vec<u8>) -> Option<CaptureProxyResponse> {
+    let marker = b"\r\n\r\n";
+    let header_end = response
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    let body_start = header_end + marker.len();
+    let header_text = String::from_utf8_lossy(&response[..header_end]);
+    let status_code = header_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())?;
+    let content_type = header_text
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_else(|| "application/json; charset=utf-8".to_string());
+    Some(CaptureProxyResponse {
+        status_code,
+        content_type,
+        body: response[body_start..].to_vec(),
+    })
 }
 
 fn plate_json(plate: &Plate) -> String {
@@ -1713,13 +1847,18 @@ fn production_device_status_value(state: &ServiceState) -> Value {
     let camera_ports = (0..6)
         .map(|index| json!({ "index": index + 1, "ok": connected.get(index).copied().unwrap_or(false) }))
         .collect::<Vec<_>>();
+    let alarm_count = state
+        .runtime
+        .block_on(db::production_alarm_counts(&state.database.connection))
+        .map(|counts| counts.active.saturating_add(counts.acknowledged))
+        .unwrap_or(0);
     json!({
         "receiverPorts": (0..8).map(|index| json!({ "index": index + 1, "ok": true })).collect::<Vec<_>>(),
         "cameraPorts": camera_ports,
         "encoder": "sync",
         "plc": "normal",
         "l2": "normal",
-        "alarmCount": 0
+        "alarmCount": alarm_count
     })
 }
 
@@ -1779,6 +1918,13 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             .iter()
             .map(production_capture_image_value)
             .collect::<Vec<_>>();
+        let capture_summary_path = production_session_summary_path(
+            &inspection.storage_root,
+            &inspection.material_id,
+            &inspection.session_id,
+        )
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
         if index == 0 {
             current_plate = plate.clone();
             current_defects = defects.clone();
@@ -1797,6 +1943,8 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             "heightProfile": [],
             "captureImages": capture_images,
             "inspectionId": inspection.id,
+            "summaryPath": inspection.summary_path,
+            "captureSummaryPath": capture_summary_path,
             "source": "production"
         }));
     }
@@ -1819,6 +1967,43 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
 }
 
 fn build_database_snapshot_json(snapshot: db::DatabaseSnapshot) -> String {
+    if snapshot.records.is_empty() && snapshot.plates.is_empty() {
+        return json!({
+            "currentPlate": {
+                "plateNo": "暂无生产记录",
+                "widthMm": 0,
+                "lengthMm": 0,
+                "thicknessMm": 0,
+                "steelGrade": "-",
+                "detectedAt": ""
+            },
+            "defectTypes": snapshot.defect_types.iter().map(|item| json!({
+                "id": item.id,
+                "label": item.label,
+                "color": item.color,
+                "shape": item.shape
+            })).collect::<Vec<_>>(),
+            "defects": [],
+            "records": [],
+            "status": {
+                "receiverPorts": [],
+                "cameraPorts": [],
+                "encoder": "offline",
+                "plc": "error",
+                "l2": "error",
+                "alarmCount": 0
+            },
+            "summary": {
+                "total": 0,
+                "bySeverity": { "severe": 0, "review": 0, "minor": 0 },
+                "bySurface": { "top": 0, "bottom": 0 }
+            },
+            "heightProfile": [],
+            "inspections": [],
+            "source": "empty-production-sqlite"
+        })
+        .to_string();
+    }
     let current_plate =
         snapshot
             .plates
@@ -1920,7 +2105,7 @@ fn http_response_with_headers(
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect::<String>();
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Authorization\r\n{extra_header_lines}Connection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Authorization, Idempotency-Key\r\n{extra_header_lines}Connection: close\r\n\r\n{}",
         body.as_bytes().len(),
         body
     )
@@ -1938,7 +2123,7 @@ fn http_bytes_response_with_headers(
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect::<String>();
     let mut response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Authorization\r\n{extra_header_lines}Connection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Authorization, Idempotency-Key\r\n{extra_header_lines}Connection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -1948,6 +2133,651 @@ fn http_bytes_response_with_headers(
 
 fn http_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
     http_response_with_headers(status, content_type, body, &[])
+}
+
+fn health_endpoint_for_route(method: &str, path: &str) -> Option<HealthEndpoint> {
+    if method != "GET" {
+        return None;
+    }
+    match path {
+        "/api/health" => Some(HealthEndpoint::Compatibility),
+        "/api/health/live" => Some(HealthEndpoint::Live),
+        "/api/health/ready" => Some(HealthEndpoint::Ready),
+        "/api/health/details" | "/api/health/ready/details" => Some(HealthEndpoint::Details),
+        _ => None,
+    }
+}
+
+fn health_latency_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HealthHttpProbeError {
+    InvalidOrigin,
+    Unreachable,
+    Timeout,
+    InvalidResponse,
+}
+
+impl HealthHttpProbeError {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidOrigin => "invalid_origin",
+            Self::Unreachable => "unreachable",
+            Self::Timeout => "timeout",
+            Self::InvalidResponse => "invalid_response",
+        }
+    }
+}
+
+fn health_http_origin_endpoint(origin: &str) -> Result<(String, u16), HealthHttpProbeError> {
+    let origin = origin.trim();
+    let without_scheme = origin
+        .strip_prefix("http://")
+        .ok_or(HealthHttpProbeError::InvalidOrigin)?;
+    let authority = without_scheme.split('/').next().unwrap_or_default().trim();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(HealthHttpProbeError::InvalidOrigin);
+    }
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| HealthHttpProbeError::InvalidOrigin)?;
+        if host.is_empty() || port == 0 {
+            return Err(HealthHttpProbeError::InvalidOrigin);
+        }
+        Ok((host.to_string(), port))
+    } else {
+        Ok((authority.to_string(), 80))
+    }
+}
+
+fn health_http_io_error(error: &std::io::Error) -> HealthHttpProbeError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        HealthHttpProbeError::Timeout
+    } else {
+        HealthHttpProbeError::Unreachable
+    }
+}
+
+fn bounded_local_http_request(
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    timeout: Duration,
+) -> Result<CaptureProxyResponse, HealthHttpProbeError> {
+    if !matches!(method, "GET" | "POST") {
+        return Err(HealthHttpProbeError::InvalidResponse);
+    }
+    let (host, port) = health_http_origin_endpoint(origin)?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(HealthHttpProbeError::Timeout)?;
+    let addresses = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|_| HealthHttpProbeError::Unreachable)?;
+    let mut stream = None;
+    for address in addresses {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(HealthHttpProbeError::Timeout)?;
+        if remaining.is_zero() {
+            return Err(HealthHttpProbeError::Timeout);
+        }
+        if let Ok(candidate) = TcpStream::connect_timeout(&address, remaining) {
+            stream = Some(candidate);
+            break;
+        }
+    }
+    let mut stream = stream.ok_or(HealthHttpProbeError::Unreachable)?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(HealthHttpProbeError::Timeout)?;
+    stream
+        .set_write_timeout(Some(remaining))
+        .map_err(|error| health_http_io_error(&error))?;
+    stream
+        .set_read_timeout(Some(remaining))
+        .map_err(|error| health_http_io_error(&error))?;
+    let path = if path.starts_with('/') { path } else { "/" };
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.as_bytes().len(),
+        body
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| health_http_io_error(&error))?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(HealthHttpProbeError::Timeout)?;
+        if remaining.is_zero() {
+            return Err(HealthHttpProbeError::Timeout);
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| health_http_io_error(&error))?;
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&buffer[..count]);
+                if response.len() > HEALTH_HTTP_MAX_RESPONSE_BYTES {
+                    return Err(HealthHttpProbeError::InvalidResponse);
+                }
+            }
+            Err(error) => return Err(health_http_io_error(&error)),
+        }
+    }
+    parse_capture_http_response(response).ok_or(HealthHttpProbeError::InvalidResponse)
+}
+
+fn bounded_health_http_get(
+    origin: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<CaptureProxyResponse, HealthHttpProbeError> {
+    bounded_local_http_request(origin, "GET", path, "", timeout)
+}
+
+fn database_health_component(state: &ServiceState) -> (bool, Value) {
+    let started = Instant::now();
+    let ok = state
+        .runtime
+        .block_on(state.database.connection.ping())
+        .is_ok();
+    (
+        ok,
+        json!({
+            "ok": ok,
+            "status": if ok { "up" } else { "unavailable" },
+            "engine": state.database.engine.clone(),
+            "latencyMs": health_latency_ms(started),
+            "reason": if ok { Value::Null } else { json!("database_ping_failed") }
+        }),
+    )
+}
+
+fn task_worker_health_component(state: &ServiceState) -> (bool, Value) {
+    let status = match state.production_task_worker_status.lock() {
+        Ok(status) => status.clone(),
+        Err(_) => {
+            return (
+                false,
+                json!({
+                    "ok": false,
+                    "status": "unavailable",
+                    "running": false,
+                    "busy": false,
+                    "heartbeatFresh": false,
+                    "heartbeatAgeMs": Value::Null,
+                    "heartbeatPausedAtProviderBoundary": false,
+                    "reason": "task_worker_status_lock_poisoned"
+                }),
+            );
+        }
+    };
+    let now = current_time_millis();
+    let heartbeat_age = status
+        .last_heartbeat_at
+        .checked_sub(0)
+        .filter(|value| *value > 0)
+        .map(|_| now.saturating_sub(status.last_heartbeat_at));
+    let heartbeat_fresh = heartbeat_age
+        .map(|age| age <= TASK_WORKER_IDLE_HEARTBEAT_MAX_AGE_MS)
+        .unwrap_or(false);
+    let busy = !status.current_task_id.is_empty();
+
+    // Task execution currently crosses a synchronous provider boundary. While a task is active,
+    // the worker cannot refresh its own heartbeat, so running+busy is reported honestly as busy
+    // instead of being treated as a stale idle worker.
+    let ok = status.running && (busy || heartbeat_fresh);
+    let reason = if !status.running {
+        Some("task_worker_not_running")
+    } else if !busy && !heartbeat_fresh {
+        Some("task_worker_heartbeat_stale")
+    } else {
+        None
+    };
+    (
+        ok,
+        json!({
+            "ok": ok,
+            "status": if ok && busy { "busy" } else if ok { "idle" } else { "unavailable" },
+            "running": status.running,
+            "busy": busy,
+            "heartbeatFresh": heartbeat_fresh,
+            "heartbeatAgeMs": heartbeat_age,
+            "heartbeatPausedAtProviderBoundary": busy,
+            "recoveredTasks": status.recovered_tasks,
+            "reason": reason
+        }),
+    )
+}
+
+fn capture_health_component(state: &ServiceState) -> (bool, Value) {
+    if state.capture.provider == CaptureProvider::Simulated {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "status": "simulated",
+                "provider": state.capture.provider.as_str(),
+                "managed": false,
+                "apiReachable": true,
+                "sdkRequired": false,
+                "sdkReady": Value::Null,
+                "httpStatus": Value::Null,
+                "latencyMs": 0,
+                "reason": Value::Null
+            }),
+        );
+    }
+
+    let started = Instant::now();
+    let response = state
+        .capture
+        .probe_response("/health", Duration::from_millis(1_500));
+    let latency_ms = health_latency_ms(started);
+    let Some(response) = response else {
+        return (
+            false,
+            json!({
+                "ok": false,
+                "status": "unavailable",
+                "provider": state.capture.provider.as_str(),
+                "managed": state.capture.provider.is_managed(),
+                "apiReachable": false,
+                "sdkRequired": true,
+                "sdkReady": Value::Null,
+                "httpStatus": Value::Null,
+                "latencyMs": latency_ms,
+                "reason": "capture_provider_unreachable"
+            }),
+        );
+    };
+
+    let api_reachable = true;
+    let status_ok = (200..300).contains(&response.status_code);
+    let payload = serde_json::from_slice::<Value>(&response.body).ok();
+    let sdk_ready = payload
+        .as_ref()
+        .and_then(|value| value.get("sdkReady"))
+        .and_then(Value::as_bool);
+    let recovery_required = payload
+        .as_ref()
+        .and_then(|value| value.get("recoveryRequired"))
+        .and_then(Value::as_bool);
+    let invalid_manifest = payload
+        .as_ref()
+        .and_then(|value| value.get("invalidManifest"))
+        .and_then(Value::as_bool);
+    let pending_recovery_count = payload
+        .as_ref()
+        .and_then(|value| value.get("pendingRecoveryCount"))
+        .and_then(Value::as_u64);
+    let contract_valid = sdk_ready.is_some();
+    let ok = status_ok && sdk_ready == Some(true) && recovery_required != Some(true);
+    let reason = if !status_ok {
+        Some("capture_health_http_error")
+    } else if !contract_valid {
+        Some("capture_health_contract_invalid")
+    } else if recovery_required == Some(true) {
+        Some("capture_calibration_recovery_required")
+    } else if sdk_ready != Some(true) {
+        Some("capture_sdk_not_ready")
+    } else {
+        None
+    };
+    (
+        ok,
+        json!({
+            "ok": ok,
+            "status": if ok { "up" } else { "unavailable" },
+            "provider": state.capture.provider.as_str(),
+            "managed": state.capture.provider.is_managed(),
+            "apiReachable": api_reachable,
+            "sdkRequired": true,
+            "sdkReady": sdk_ready,
+            "recoveryRequired": recovery_required,
+            "invalidManifest": invalid_manifest,
+            "pendingRecoveryCount": pending_recovery_count,
+            "httpStatus": response.status_code,
+            "latencyMs": latency_ms,
+            "reason": reason
+        }),
+    )
+}
+
+fn calibration_reconciliation_health_component(state: &ServiceState) -> (bool, Value) {
+    match state
+        .runtime
+        .block_on(db::list_unresolved_calibration_operations(
+            &state.database.connection,
+        )) {
+        Ok(unresolved) => {
+            let ok = unresolved.is_empty();
+            (
+                ok,
+                json!({
+                    "ok": ok,
+                    "status": if ok { "clear" } else { "reconciliation-required" },
+                    "unresolvedCount": unresolved.len(),
+                    "unresolvedOperations": unresolved.iter().map(|operation| json!({
+                        "operationId": &operation.id,
+                        "kind": &operation.kind,
+                        "status": &operation.status,
+                        "error": &operation.error,
+                        "updatedAt": &operation.updated_at
+                    })).collect::<Vec<_>>(),
+                    "reason": if ok { Value::Null } else { json!("calibration_reconciliation_required") }
+                }),
+            )
+        }
+        Err(_) => (
+            false,
+            json!({
+                "ok": false,
+                "status": "unavailable",
+                "unresolvedCount": Value::Null,
+                "unresolvedOperations": [],
+                "reason": "calibration_reconciliation_lookup_failed"
+            }),
+        ),
+    }
+}
+
+fn storage_health_component_with_timeout(
+    state: &ServiceState,
+    timeout: Duration,
+) -> (bool, Value) {
+    if state.capture.provider == CaptureProvider::Simulated {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "status": "simulated",
+                "provider": state.capture.provider.as_str(),
+                "simulated": true,
+                "apiReachable": true,
+                "rootExists": Value::Null,
+                "rootWritable": Value::Null,
+                "queueAccepting": Value::Null,
+                "queueRequired": false,
+                "httpStatus": Value::Null,
+                "latencyMs": 0,
+                "reason": Value::Null
+            }),
+        );
+    }
+
+    let started = Instant::now();
+    let response = bounded_health_http_get(&state.capture.origin, "/api/storage/status", timeout);
+    let latency_ms = health_latency_ms(started);
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                false,
+                json!({
+                    "ok": false,
+                    "status": "unavailable",
+                    "provider": state.capture.provider.as_str(),
+                    "simulated": false,
+                    "apiReachable": false,
+                    "rootExists": Value::Null,
+                    "rootWritable": Value::Null,
+                    "queueAccepting": Value::Null,
+                    "queueRequired": true,
+                    "httpStatus": Value::Null,
+                    "latencyMs": latency_ms,
+                    "reason": format!("storage_{}", error.as_str())
+                }),
+            );
+        }
+    };
+    let status_ok = (200..300).contains(&response.status_code);
+    let payload = serde_json::from_slice::<Value>(&response.body).ok();
+    let code = payload
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_i64);
+    let root_exists = payload
+        .as_ref()
+        .and_then(|value| value.get("exists"))
+        .and_then(Value::as_bool);
+    let root_writable = payload
+        .as_ref()
+        .and_then(|value| value.get("writable"))
+        .and_then(Value::as_bool);
+    let queue = payload.as_ref().and_then(|value| value.get("queue"));
+    let queue_accepting = queue
+        .and_then(|value| value.get("accepting"))
+        .and_then(Value::as_bool);
+    let pending_items = queue
+        .and_then(|value| value.get("pendingItems"))
+        .and_then(Value::as_u64);
+    let capacity_items = queue
+        .and_then(|value| value.get("capacityItems"))
+        .and_then(Value::as_u64);
+    let camera_root_count = payload
+        .as_ref()
+        .and_then(|value| value.get("cameraRoots"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let contract_valid = code.is_some()
+        && root_exists.is_some()
+        && root_writable.is_some()
+        && queue_accepting.is_some();
+    let ok = status_ok
+        && code == Some(0)
+        && root_exists == Some(true)
+        && root_writable == Some(true)
+        && queue_accepting == Some(true);
+    let reason = if !status_ok {
+        Some("storage_status_http_error")
+    } else if !contract_valid {
+        Some("storage_status_contract_invalid")
+    } else if code != Some(0) {
+        Some("storage_status_provider_error")
+    } else if root_exists != Some(true) {
+        Some("storage_root_missing")
+    } else if root_writable != Some(true) {
+        Some("storage_root_not_writable")
+    } else if queue_accepting != Some(true) {
+        Some("storage_queue_not_accepting")
+    } else {
+        None
+    };
+    (
+        ok,
+        json!({
+            "ok": ok,
+            "status": if ok { "up" } else { "unavailable" },
+            "provider": state.capture.provider.as_str(),
+            "simulated": false,
+            "apiReachable": true,
+            "rootExists": root_exists,
+            "rootWritable": root_writable,
+            "queueAccepting": queue_accepting,
+            "queueRequired": true,
+            "queuePendingItems": pending_items,
+            "queueCapacityItems": capacity_items,
+            "cameraRootCount": camera_root_count,
+            "httpStatus": response.status_code,
+            "latencyMs": latency_ms,
+            "reason": reason
+        }),
+    )
+}
+
+fn storage_health_component(state: &ServiceState) -> (bool, Value) {
+    storage_health_component_with_timeout(
+        state,
+        Duration::from_millis(STORAGE_HEALTH_TIMEOUT_MS),
+    )
+}
+
+fn trigger_health_component_with_timeout(
+    origin: &str,
+    required: bool,
+    timeout: Duration,
+) -> (bool, Value) {
+    let started = Instant::now();
+    let response = bounded_health_http_get(origin, "/api/trigger/status", timeout);
+    let latency_ms = health_latency_ms(started);
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let ready_contribution = !required;
+            return (
+                ready_contribution,
+                json!({
+                    "ok": false,
+                    "readyContribution": ready_contribution,
+                    "status": if required { "unavailable" } else { "optional-unavailable" },
+                    "required": required,
+                    "apiReachable": false,
+                    "mode": Value::Null,
+                    "httpStatus": Value::Null,
+                    "latencyMs": latency_ms,
+                    "reason": format!("trigger_gateway_{}", error.as_str())
+                }),
+            );
+        }
+    };
+    let status_ok = (200..300).contains(&response.status_code);
+    let payload = serde_json::from_slice::<Value>(&response.body).ok();
+    let code = payload
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_i64);
+    let service = payload
+        .as_ref()
+        .and_then(|value| value.get("service"))
+        .and_then(Value::as_str);
+    let mode = payload
+        .as_ref()
+        .and_then(|value| value.get("mode"))
+        .and_then(Value::as_str);
+    let contract_valid = code.is_some() && service == Some("steel-trigger-gateway");
+    let healthy = status_ok && code == Some(0) && contract_valid;
+    let ready_contribution = healthy || !required;
+    let reason = if !status_ok {
+        Some("trigger_gateway_http_error")
+    } else if !contract_valid {
+        Some("trigger_gateway_contract_invalid")
+    } else if code != Some(0) {
+        Some("trigger_gateway_reported_error")
+    } else {
+        None
+    };
+    (
+        ready_contribution,
+        json!({
+            "ok": healthy,
+            "readyContribution": ready_contribution,
+            "status": if healthy { "up" } else if required { "unavailable" } else { "optional-unavailable" },
+            "required": required,
+            "apiReachable": true,
+            "mode": mode,
+            "httpStatus": response.status_code,
+            "latencyMs": latency_ms,
+            "reason": reason
+        }),
+    )
+}
+
+fn trigger_health_component(state: &ServiceState) -> (bool, Value) {
+    trigger_health_component_with_timeout(
+        &state.trigger_gateway_origin,
+        state.trigger_health_required,
+        Duration::from_millis(TRIGGER_HEALTH_TIMEOUT_MS),
+    )
+}
+
+fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
+    let (database_ok, database) = database_health_component(state);
+    let (worker_ok, task_worker) = task_worker_health_component(state);
+    let (capture_ok, capture) = capture_health_component(state);
+    let (calibration_ok, calibration_reconciliation) =
+        calibration_reconciliation_health_component(state);
+    let (storage_ok, storage) = storage_health_component(state);
+    let (trigger_ok, trigger) = trigger_health_component(state);
+    let ready = database_ok
+        && worker_ok
+        && capture_ok
+        && calibration_ok
+        && storage_ok
+        && trigger_ok;
+    ServiceHealthSnapshot {
+        ready,
+        body: json!({
+            "ok": ready,
+            "status": if ready { "ready" } else { "not-ready" },
+            "service": "steel-inspection-service",
+            "language": "rust",
+            "uptimeMs": current_time_millis().saturating_sub(state.started_at),
+            "checks": {
+                "database": database,
+                "taskWorker": task_worker,
+                "capture": capture,
+                "calibrationReconciliation": calibration_reconciliation,
+                "storage": storage,
+                "trigger": trigger
+            }
+        }),
+    }
+}
+
+fn service_health_response(state: &ServiceState, endpoint: HealthEndpoint) -> Vec<u8> {
+    if endpoint == HealthEndpoint::Live {
+        return http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "ok": true,
+                "status": "live",
+                "service": "steel-inspection-service",
+                "language": "rust",
+                "uptimeMs": current_time_millis().saturating_sub(state.started_at)
+            })
+            .to_string(),
+        );
+    }
+
+    let snapshot = service_health_snapshot(state);
+    let mut body = snapshot.body;
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "endpoint".to_string(),
+            json!(match endpoint {
+                HealthEndpoint::Compatibility => "compatibility",
+                HealthEndpoint::Ready => "ready",
+                HealthEndpoint::Details => "details",
+                HealthEndpoint::Live => "live",
+            }),
+        );
+    }
+    http_response(
+        if snapshot.ready {
+            "200 OK"
+        } else {
+            "503 Service Unavailable"
+        },
+        "application/json; charset=utf-8",
+        &body.to_string(),
+    )
 }
 
 fn capture_health_json() -> String {
@@ -2233,6 +3063,350 @@ fn split_path_and_query(raw_path: &str) -> (&str, &str) {
     }
 }
 
+fn is_production_mutation_route(method: &str, path: &str) -> bool {
+    method == "POST"
+        && path.starts_with("/api/production/")
+        && !path.starts_with("/api/production/tasks")
+}
+
+const LINE_CONTINUOUS_PRESET_CONFIRMATION: &str = "APPLY LINE CONTINUOUS PRESET";
+const LINE_CONTINUOUS_DEVICE_PERSIST_CONFIRMATION: &str =
+    "PERSIST LINE PRESET TO CAMERA DEVICES";
+const CAMERA_DEVICE_PERSIST_CONFIRMATION: &str = "PERSIST CAMERA PARAMETERS";
+const SDK_PARAMETER_WRITE_CONFIRMATION: &str = "WRITE SDK PARAMETER";
+const CAMERA_CALIBRATION_CONFIRMATION: &str = "APPLY CAMERA CALIBRATION";
+const CAMERA_CALIBRATION_SET_CONFIRMATION: &str = "APPLY CAMERA CALIBRATION SET";
+const CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION: &str = "ROLLBACK CAMERA CALIBRATION";
+const CAMERA_ROI_CONFIRMATION: &str = "APPLY CAMERA ROI";
+const CALIBRATION_SET_CAMERA_COUNT: usize = 6;
+
+fn validate_calibration_set_safety(
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), &'static str> {
+    if object.get("atomic").and_then(Value::as_bool) != Some(true)
+        || object.get("rollbackOnFailure").and_then(Value::as_bool) != Some(true)
+        || object.get("requireAllMapped").and_then(Value::as_bool) != Some(true)
+        || object.get("stopStreams").and_then(Value::as_bool) != Some(true)
+    {
+        return Err("calibration_set_safe_mode_required");
+    }
+    if object
+        .get("expectedCameras")
+        .and_then(Value::as_u64)
+        != Some(CALIBRATION_SET_CAMERA_COUNT as u64)
+    {
+        return Err("calibration_set_requires_six_cameras");
+    }
+    if object
+        .get("allowBestEffortDeviceRollback")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || object.get("saveCameraParams").and_then(Value::as_bool) == Some(true)
+    {
+        return Err("calibration_set_unsafe_option_rejected");
+    }
+    if object.get("persistActive").and_then(Value::as_bool) == Some(true)
+        && object
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        return Err("calibration_set_array_path_required");
+    }
+
+    let mappings = object
+        .get("cameraCalibrations")
+        .and_then(Value::as_array)
+        .ok_or("calibration_set_mapping_required")?;
+    if mappings.len() != CALIBRATION_SET_CAMERA_COUNT {
+        return Err("calibration_set_requires_six_cameras");
+    }
+    let mut mapping_ips = std::collections::BTreeSet::new();
+    let mut mapping_serials = std::collections::BTreeSet::new();
+    let mut mapping_paths = std::collections::BTreeSet::new();
+    for mapping in mappings {
+        let mapping = mapping
+            .as_object()
+            .ok_or("calibration_set_mapping_invalid")?;
+        let required_text = |name: &str| {
+            mapping
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let ip = required_text("ip").ok_or("calibration_set_mapping_invalid")?;
+        let path = required_text("path").ok_or("calibration_set_mapping_invalid")?;
+        let expected_sn =
+            required_text("expectedSn").ok_or("calibration_set_serial_required")?;
+        required_text("rollbackPath")
+            .ok_or("calibration_set_durable_rollback_path_required")?;
+        if !mapping_ips.insert(ip.to_string()) {
+            return Err("calibration_set_duplicate_camera");
+        }
+        if !mapping_serials.insert(expected_sn.to_ascii_lowercase()) {
+            return Err("calibration_set_duplicate_serial");
+        }
+        let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+        if !mapping_paths.insert(normalized_path) {
+            return Err("calibration_set_duplicate_artifact");
+        }
+    }
+
+    let requested_ips = object
+        .get("ips")
+        .and_then(Value::as_array)
+        .ok_or("calibration_set_target_list_required")?;
+    if requested_ips.len() != CALIBRATION_SET_CAMERA_COUNT {
+        return Err("calibration_set_requires_six_cameras");
+    }
+    let requested_ips = requested_ips
+        .iter()
+        .map(|value| value.as_str().map(str::trim).unwrap_or_default())
+        .collect::<std::collections::BTreeSet<_>>();
+    if requested_ips.len() != CALIBRATION_SET_CAMERA_COUNT
+        || requested_ips
+            .iter()
+            .any(|ip| !mapping_ips.contains(*ip))
+    {
+        return Err("calibration_set_target_mapping_mismatch");
+    }
+    Ok(())
+}
+
+fn validate_line_continuous_preset_request(body: &str) -> Result<(), &'static str> {
+    let payload = serde_json::from_str::<Value>(body.trim())
+        .map_err(|_| "invalid_json")?;
+    let object = payload.as_object().ok_or("json_object_required")?;
+
+    if object.get("confirmation").and_then(Value::as_str)
+        != Some(LINE_CONTINUOUS_PRESET_CONFIRMATION)
+    {
+        return Err("line_preset_confirmation_required");
+    }
+
+    let integer_in_range = |name: &str, minimum: i64, maximum: i64| {
+        object
+            .get(name)
+            .map(|value| {
+                value
+                    .as_i64()
+                    .filter(|number| *number >= minimum && *number <= maximum)
+                    .is_some()
+            })
+            .unwrap_or(true)
+    };
+    if !integer_in_range("lines", 1, 100_000)
+        || !integer_in_range("laserPower", 0, 100)
+        || !integer_in_range("laserLineSelect", 0, 2)
+        || !integer_in_range("controlMode", 0, 1)
+    {
+        return Err("line_preset_parameter_out_of_range");
+    }
+    if let Some(frequency) = object.get("timeTriggerFreq") {
+        let valid = frequency
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.1 && *value <= 100_000.0)
+            .is_some();
+        if !valid {
+            return Err("line_preset_parameter_out_of_range");
+        }
+    }
+    if object.get("saveToDevice").and_then(Value::as_bool) == Some(true)
+        && object.get("deviceConfirmation").and_then(Value::as_str)
+            != Some(LINE_CONTINUOUS_DEVICE_PERSIST_CONFIRMATION)
+    {
+        return Err("line_preset_device_confirmation_required");
+    }
+    Ok(())
+}
+
+fn validate_capture_device_mutation_request(
+    path: &str,
+    body: &str,
+) -> Result<(), &'static str> {
+    let payload = serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
+    let object = payload.as_object().ok_or("json_object_required")?;
+
+    if path == "/api/calibration/load"
+        && object.get("dryRun").and_then(Value::as_bool) != Some(true)
+        && object.get("confirmation").and_then(Value::as_str)
+            != Some(CAMERA_CALIBRATION_CONFIRMATION)
+    {
+        return Err("camera_calibration_confirmation_required");
+    }
+    if path == "/api/calibration/apply-all" {
+        validate_calibration_set_safety(object)?;
+    }
+    if path == "/api/calibration/apply-all"
+        && object.get("dryRun").and_then(Value::as_bool) != Some(true)
+        && object.get("confirmation").and_then(Value::as_str)
+            != Some(CAMERA_CALIBRATION_SET_CONFIRMATION)
+    {
+        return Err("camera_calibration_set_confirmation_required");
+    }
+    if path == "/api/calibration/rollback"
+        && object.get("confirmation").and_then(Value::as_str)
+            != Some(CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION)
+    {
+        return Err("camera_calibration_rollback_confirmation_required");
+    }
+    if path == "/api/calibration/rollback"
+        && object
+            .get("applyOperationId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        return Err("calibration_rollback_apply_operation_id_required");
+    }
+    if path == "/api/roi/load"
+        && object.get("confirmation").and_then(Value::as_str) != Some(CAMERA_ROI_CONFIRMATION)
+    {
+        return Err("camera_roi_confirmation_required");
+    }
+
+    if path == "/api/param" {
+        let key = object
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let operator_keys = [
+            "exposuretime",
+            "expsure_time",
+            "gaink",
+            "gain_k",
+            "timetriggerfreq",
+            "time_trigger_freq",
+            "triggermode",
+            "trigger_mode",
+        ];
+        if !operator_keys.contains(&key.as_str())
+            && object.get("confirmation").and_then(Value::as_str)
+                != Some(SDK_PARAMETER_WRITE_CONFIRMATION)
+        {
+            return Err("sdk_parameter_write_confirmation_required");
+        }
+    }
+
+    if path == "/api/param/recovery"
+        && object.get("confirmation").and_then(Value::as_str)
+            != Some(SDK_PARAMETER_WRITE_CONFIRMATION)
+    {
+        return Err("sdk_parameter_write_confirmation_required");
+    }
+
+    let explicit_device_save = matches!(
+        path,
+        "/api/param/save-device" | "/api/param/save-to-device"
+    );
+    let requested_device_save = object.get("saveToDevice").and_then(Value::as_bool) == Some(true);
+    if (explicit_device_save || requested_device_save)
+        && object.get("deviceConfirmation").and_then(Value::as_str)
+            != Some(CAMERA_DEVICE_PERSIST_CONFIRMATION)
+    {
+        return Err("camera_device_persist_confirmation_required");
+    }
+
+    Ok(())
+}
+
+const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/health"),
+    ("GET", "/api/capture/health"),
+    ("GET", "/api/storage/status"),
+    ("GET", "/api/config/status"),
+    ("GET", "/api/config/profiles"),
+    ("GET", "/api/config/profile"),
+    ("GET", "/api/cameras"),
+    ("GET", "/api/camera/status"),
+    ("GET", "/api/camera/statuses"),
+    ("GET", "/api/steel/status"),
+    ("GET", "/api/param"),
+    ("GET", "/api/capture/latest"),
+    ("GET", "/api/stream/status"),
+    ("GET", "/api/calibration/active"),
+    ("GET", "/api/calibration/status"),
+    ("POST", "/api/storage/config"),
+    ("POST", "/api/storage/camera-roots"),
+    ("POST", "/api/config/profile/save"),
+    ("POST", "/api/config/profile/apply"),
+    ("POST", "/api/config/profile/import"),
+    ("POST", "/api/config/camera-params/save-all"),
+    ("POST", "/api/config/camera-params/load-all"),
+    ("POST", "/api/camera/connect"),
+    ("POST", "/api/camera/connect-all"),
+    ("POST", "/api/cameras/connect-all"),
+    ("POST", "/api/camera/disconnect"),
+    ("POST", "/api/steel/event"),
+    ("POST", "/api/param"),
+    ("POST", "/api/param/save-device"),
+    ("POST", "/api/param/save-to-device"),
+    ("POST", "/api/param/save-file"),
+    ("POST", "/api/param/load-file"),
+    ("POST", "/api/param/recovery"),
+    ("POST", "/api/preview/capture"),
+    ("POST", "/api/capture/preview"),
+    ("POST", "/api/capture/depth-map"),
+    ("POST", "/api/capture/continuous-test"),
+    ("POST", "/api/capture/preset/line-continuous"),
+    ("POST", "/api/stream/start"),
+    ("POST", "/api/stream/stop"),
+    ("POST", "/api/calibration/load"),
+    ("POST", "/api/calibration/apply-all"),
+    ("POST", "/api/calibration/rollback"),
+    ("POST", "/api/calibration/active"),
+    ("POST", "/api/roi/load"),
+];
+
+const CAPTURE_BINARY_PROXY_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/api/capture/file"),
+    ("GET", "/api/stream/latest"),
+];
+
+fn is_capture_json_proxy_route(method: &str, path: &str) -> bool {
+    CAPTURE_JSON_PROXY_ROUTES.contains(&(method, path))
+}
+
+fn is_capture_binary_proxy_route(method: &str, path: &str) -> bool {
+    CAPTURE_BINARY_PROXY_ROUTES.contains(&(method, path))
+}
+
+fn append_capture_proxy_manifest_routes(routes: &mut Vec<Value>) {
+    for (method, path) in CAPTURE_JSON_PROXY_ROUTES
+        .iter()
+        .chain(CAPTURE_BINARY_PROXY_ROUTES.iter())
+    {
+        let already_present = routes.iter().any(|route| {
+            route.get("method").and_then(Value::as_str) == Some(*method)
+                && route.get("path").and_then(Value::as_str) == Some(*path)
+        });
+        if !already_present {
+            routes.push(json!({
+                "method": method,
+                "path": path,
+                "scope": "capture"
+            }));
+        }
+    }
+}
+
+fn is_trigger_gateway_proxy_route(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("GET", "/api/trigger/status")
+            | ("GET", "/api/trigger/mode")
+            | ("POST", "/api/trigger/mode")
+            | ("POST", "/api/trigger/manual/steel-info")
+            | ("POST", "/api/trigger/manual/steel-in")
+            | ("POST", "/api/trigger/manual/steel-out")
+    )
+}
+
 fn fallback_capture_response(path: &str) -> Vec<u8> {
     match path {
         "/health" | "/api/capture/health" => {
@@ -2392,8 +3566,40 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         ("POST", "/api/admin/database/maintenance") => Some("admin.services"),
         ("GET", "/api/config")
         | ("GET", "/api/config/capture")
+        | ("GET", "/api/config/status")
+        | ("GET", "/api/config/profiles")
+        | ("GET", "/api/config/profile")
+        | ("GET", "/api/storage/status")
+        | ("GET", "/api/param")
+        | ("GET", "/api/calibration/active")
+        | ("GET", "/api/calibration/status")
+        | ("GET", "/api/calibration/operations/detail")
         | ("POST", "/api/config/capture")
         | ("POST", "/api/config/connection")
+        | ("POST", "/api/storage/config")
+        | ("POST", "/api/storage/camera-roots")
+        | ("POST", "/api/config/profile/save")
+        | ("POST", "/api/config/profile/apply")
+        | ("POST", "/api/config/profile/import")
+        | ("POST", "/api/config/camera-params/save-all")
+        | ("POST", "/api/config/camera-params/load-all")
+        | ("POST", "/api/cameras/connect-all")
+        | ("POST", "/api/camera/connect-all")
+        | ("POST", "/api/camera/connect")
+        | ("POST", "/api/camera/disconnect")
+        | ("POST", "/api/param/save-device")
+        | ("POST", "/api/param/save-to-device")
+        | ("POST", "/api/param/save-file")
+        | ("POST", "/api/param/load-file")
+        | ("POST", "/api/param/recovery")
+        | ("POST", "/api/param")
+        | ("POST", "/api/capture/continuous-test")
+        | ("POST", "/api/capture/preset/line-continuous")
+        | ("POST", "/api/calibration/load")
+        | ("POST", "/api/calibration/apply-all")
+        | ("POST", "/api/calibration/rollback")
+        | ("POST", "/api/calibration/active")
+        | ("POST", "/api/roi/load")
         | ("GET", "/api/admin/inspection-settings")
         | ("POST", "/api/admin/inspection-settings")
         | ("GET", "/api/admin/alarm-rules")
@@ -2433,6 +3639,9 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("GET", "/api/admin/records/export")
         | ("POST", "/api/admin/records/retention")
         | ("DELETE", "/api/admin/records") => Some("admin.records"),
+        ("POST", "/api/alarms/acknowledge") | ("POST", "/api/alarms/resolve") => {
+            Some("admin.records")
+        }
         ("POST", "/api/admin/auth/password")
         | ("GET", "/api/admin/auth/sessions")
         | ("DELETE", "/api/admin/auth/sessions") => Some("admin.self"),
@@ -5452,6 +6661,158 @@ fn database_maintenance_response(state: &ServiceState, actor: &str) -> Vec<u8> {
     }
 }
 
+fn capture_proxy_status(status_code: u16) -> String {
+    let reason = match status_code {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Capture Provider Response",
+    };
+    format!("{status_code} {reason}")
+}
+
+fn capture_provider_unavailable_response(capture: &CaptureServiceManager) -> Vec<u8> {
+    http_response(
+        "503 Service Unavailable",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 503,
+            "error": "capture_provider_unavailable",
+            "provider": capture.provider.as_str(),
+            "simulated": false,
+            "retryable": true
+        })
+        .to_string(),
+    )
+}
+
+fn capture_proxy_http_response(
+    capture: &CaptureServiceManager,
+    method: &str,
+    raw_path: &str,
+    path: &str,
+    body: &str,
+) -> Vec<u8> {
+    if method == "POST" && path == "/api/capture/preset/line-continuous" {
+        if let Err(error) = validate_line_continuous_preset_request(body) {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 400,
+                    "error": error,
+                    "requiredConfirmation": LINE_CONTINUOUS_PRESET_CONFIRMATION,
+                    "requiredDeviceConfirmation": LINE_CONTINUOUS_DEVICE_PERSIST_CONFIRMATION,
+                })
+                .to_string(),
+            );
+        }
+    } else if method == "POST" {
+        if let Err(error) = validate_capture_device_mutation_request(path, body) {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 400,
+                    "error": error,
+                    "requiredDeviceConfirmation": CAMERA_DEVICE_PERSIST_CONFIRMATION,
+                    "requiredParameterConfirmation": SDK_PARAMETER_WRITE_CONFIRMATION,
+                    "requiredCalibrationConfirmation": CAMERA_CALIBRATION_CONFIRMATION,
+                    "requiredCalibrationSetConfirmation": CAMERA_CALIBRATION_SET_CONFIRMATION,
+                    "requiredCalibrationRollbackConfirmation": CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION,
+                    "requiredRoiConfirmation": CAMERA_ROI_CONFIRMATION,
+                })
+                .to_string(),
+            );
+        }
+    }
+    let proxy_response = if method == "POST" && path == "/api/capture/continuous-test" {
+        let payload = serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
+        capture.proxy_response_with_read_timeout(
+            method,
+            raw_path,
+            body,
+            continuous_capture_proxy_timeout(&payload),
+        )
+    } else if method == "POST"
+        && matches!(
+            path,
+            "/api/config/profile/apply"
+                | "/api/config/camera-params/save-all"
+                | "/api/config/camera-params/load-all"
+                | "/api/capture/preset/line-continuous"
+                | "/api/calibration/apply-all"
+                | "/api/calibration/rollback"
+        )
+    {
+        capture.proxy_response_with_read_timeout(
+            method,
+            raw_path,
+            body,
+            Duration::from_secs(120),
+        )
+    } else {
+        capture.proxy_response(method, raw_path, body)
+    };
+    if let Some(response) = proxy_response {
+        return http_bytes_response_with_headers(
+            &capture_proxy_status(response.status_code),
+            &response.content_type,
+            &response.body,
+            &[],
+        );
+    }
+    if capture.provider == CaptureProvider::Simulated {
+        return fallback_capture_response(path);
+    }
+    capture_provider_unavailable_response(capture)
+}
+
+fn trigger_gateway_proxy_http_response(
+    state: &ServiceState,
+    method: &str,
+    raw_path: &str,
+    body: &str,
+) -> Vec<u8> {
+    match bounded_local_http_request(
+        &state.trigger_gateway_origin,
+        method,
+        raw_path,
+        body,
+        Duration::from_secs(8),
+    ) {
+        Ok(response) => http_bytes_response_with_headers(
+            &capture_proxy_status(response.status_code),
+            &response.content_type,
+            &response.body,
+            &[],
+        ),
+        Err(HealthHttpProbeError::Timeout) => http_response(
+            "504 Gateway Timeout",
+            "application/json; charset=utf-8",
+            &json!({ "code": 504, "error": "trigger_gateway_timeout" }).to_string(),
+        ),
+        Err(_) => http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({ "code": 503, "error": "trigger_gateway_unavailable" }).to_string(),
+        ),
+    }
+}
+
 fn value_string(payload: &Value, keys: &[&str]) -> String {
     keys.iter()
         .find_map(|key| payload.get(*key))
@@ -5468,6 +6829,10 @@ fn value_string(payload: &Value, keys: &[&str]) -> String {
 }
 
 fn value_f64(payload: &Value, keys: &[&str]) -> f64 {
+    value_f64_or(payload, keys, 0.0)
+}
+
+fn value_f64_or(payload: &Value, keys: &[&str], fallback: f64) -> f64 {
     keys.iter()
         .find_map(|key| payload.get(*key))
         .and_then(|value| {
@@ -5475,7 +6840,7 @@ fn value_f64(payload: &Value, keys: &[&str]) -> f64 {
                 .as_f64()
                 .or_else(|| value.as_str().and_then(|text| text.trim().parse::<f64>().ok()))
         })
-        .unwrap_or(0.0)
+        .unwrap_or(fallback)
 }
 
 fn value_i32(payload: &Value, keys: &[&str], fallback: i32) -> i32 {
@@ -5532,6 +6897,122 @@ fn session_id_from_payload(payload: &Value, material_id: &str) -> String {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ProductionEventTarget {
+    material_id: String,
+    session_id: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProductionTransitionConflict {
+    ActiveSessionRequired,
+    ActiveSessionMismatch {
+        active_material_id: String,
+        active_session_id: String,
+        requested_material_id: String,
+        requested_session_id: String,
+    },
+}
+
+fn resolve_production_event_target(
+    payload: &Value,
+    event: &str,
+    active_session: Option<(&str, &str)>,
+    generated_at: u128,
+) -> Result<ProductionEventTarget, ProductionTransitionConflict> {
+    let requested_material_id = material_id_from_payload(payload, "");
+    let requested_session_id = value_string(payload, &["sessionId", "session_id"]);
+
+    if event == "steel-out" && active_session.is_none() {
+        return Err(ProductionTransitionConflict::ActiveSessionRequired);
+    }
+
+    if matches!(event, "steel-in" | "steel-out") {
+        if let Some((active_material_id, active_session_id)) = active_session {
+            let material_mismatch = !requested_material_id.is_empty()
+                && requested_material_id != active_material_id;
+            let session_mismatch = !requested_session_id.is_empty()
+                && requested_session_id != active_session_id;
+            if material_mismatch || session_mismatch {
+                return Err(ProductionTransitionConflict::ActiveSessionMismatch {
+                    active_material_id: active_material_id.to_string(),
+                    active_session_id: active_session_id.to_string(),
+                    requested_material_id,
+                    requested_session_id,
+                });
+            }
+        }
+    }
+
+    let material_id = if requested_material_id.is_empty() {
+        active_session
+            .map(|(material_id, _)| material_id.to_string())
+            .unwrap_or_else(|| "unknown-material".to_string())
+    } else {
+        requested_material_id
+    };
+    let session_id = if requested_session_id.is_empty() {
+        active_session
+            .filter(|(active_material_id, _)| {
+                event == "steel-out" || *active_material_id == material_id
+            })
+            .map(|(_, session_id)| session_id.to_string())
+            .unwrap_or_else(|| format!("{material_id}-{generated_at}"))
+    } else {
+        requested_session_id
+    };
+
+    Ok(ProductionEventTarget {
+        material_id,
+        session_id,
+    })
+}
+
+fn production_transition_conflict_response(
+    conflict: ProductionTransitionConflict,
+) -> Vec<u8> {
+    let body = match conflict {
+        ProductionTransitionConflict::ActiveSessionRequired => json!({
+            "code": 409,
+            "error": "active_session_required",
+            "message": "steel-out requires an active steel-in session"
+        }),
+        ProductionTransitionConflict::ActiveSessionMismatch {
+            active_material_id,
+            active_session_id,
+            requested_material_id,
+            requested_session_id,
+        } => json!({
+            "code": 409,
+            "error": "active_session_conflict",
+            "message": "the requested production session does not match the active session",
+            "activeMaterialId": active_material_id,
+            "activeSessionId": active_session_id,
+            "requestedMaterialId": requested_material_id,
+            "requestedSessionId": requested_session_id
+        }),
+    };
+    http_response(
+        "409 Conflict",
+        "application/json; charset=utf-8",
+        &body.to_string(),
+    )
+}
+
+fn production_database_error_response(operation: &str, error: &str) -> Vec<u8> {
+    http_response(
+        "500 Internal Server Error",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 500,
+            "error": "production_state_persistence_failed",
+            "operation": operation,
+            "detail": error
+        })
+        .to_string(),
+    )
+}
+
 fn provider_code_from_response(provider: &Value, fallback: i32) -> i32 {
     provider
         .get("code")
@@ -5541,10 +7022,24 @@ fn provider_code_from_response(provider: &Value, fallback: i32) -> i32 {
 }
 
 fn production_status_response(state: &ServiceState) -> Vec<u8> {
-    let latest = state
+    let latest_session = match state
         .runtime
-        .block_on(db::latest_material_session(&state.database.connection));
-    let latest_session = latest.ok().flatten();
+        .block_on(db::latest_material_session(&state.database.connection))
+    {
+        Ok(session) => session,
+        Err(error) => {
+            return production_database_error_response("load_latest_session", &error.to_string());
+        }
+    };
+    let active_session = match state
+        .runtime
+        .block_on(db::latest_open_material_session(&state.database.connection))
+    {
+        Ok(session) => session,
+        Err(error) => {
+            return production_database_error_response("load_active_session", &error.to_string());
+        }
+    };
     let latest_session_json = latest_session.as_ref().map(|session| {
         json!({
             "id": session.id,
@@ -5555,9 +7050,8 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
             "updatedAt": session.updated_at
         })
     });
-    let active_session_json = latest_session
+    let active_session_json = active_session
         .as_ref()
-        .filter(|session| session.status != "finished")
         .map(|session| {
             json!({
                 "id": session.id,
@@ -5568,9 +7062,18 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
                 "updatedAt": session.updated_at
             })
         });
-    let latest_inspection = state
+    let latest_inspection = match state
         .runtime
-        .block_on(db::latest_production_inspection(&state.database.connection));
+        .block_on(db::latest_production_inspection(&state.database.connection))
+    {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            return production_database_error_response(
+                "load_latest_production_inspection",
+                &error.to_string(),
+            );
+        }
+    };
     let capture_status = state
         .capture
         .proxy("GET", "/api/steel/status", "")
@@ -5587,7 +7090,7 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
             },
             "latestSession": latest_session_json,
             "activeSession": active_session_json,
-            "latestInspection": latest_inspection.ok().flatten().map(|inspection| {
+            "latestInspection": latest_inspection.map(|inspection| {
                 let capture_summary_path = production_session_summary_path(
                     &inspection.storage_root,
                     &inspection.material_id,
@@ -5608,6 +7111,7 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
                     "finishedAt": inspection.finished_at
                 })
             }),
+            "tasks": production_tasks::status_json(state),
             "capture": capture_status
         })
         .to_string(),
@@ -5721,31 +7225,92 @@ fn write_production_event_response(
             );
         }
     };
-    let latest_open = state
+    if !production_tasks::worker_execution_scope_active() {
+        let open_tasks = match state
+            .runtime
+            .block_on(db::count_open_production_tasks(&state.database.connection))
+        {
+            Ok(count) => count,
+            Err(error) => {
+                return production_database_error_response(
+                    "count_open_production_tasks",
+                    &error.to_string(),
+                );
+            }
+        };
+        if open_tasks > 0 {
+            return http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 409,
+                    "error": "production_tasks_in_progress",
+                    "queueDepth": open_tasks,
+                    "retryable": true
+                })
+                .to_string(),
+            );
+        }
+    }
+    let latest_open = match state
         .runtime
         .block_on(db::latest_open_material_session(&state.database.connection))
-        .ok()
-        .flatten();
-    let material_id = material_id_from_payload(
-        &payload,
-        latest_open
-            .as_ref()
-            .map(|session| session.material_id.as_str())
-            .unwrap_or("unknown-material"),
-    );
-    let session_id = value_string(&payload, &["sessionId", "session_id"]);
-    let session_id = if session_id.is_empty() {
-        latest_open
-            .as_ref()
-            .filter(|session| default_event == "steel-out" || session.material_id == material_id)
-            .map(|session| session.id.clone())
-            .unwrap_or_else(|| session_id_from_payload(&payload, &material_id))
-    } else {
-        session_id
+    {
+        Ok(session) => session,
+        Err(error) => {
+            return production_database_error_response("load_active_session", &error.to_string());
+        }
     };
-    let source = value_string(&payload, &["source"]).if_empty("api");
-    let mode = value_string(&payload, &["mode", "controlMode", "control_mode"]).if_empty("api");
-    let trigger_mode = value_string(&payload, &["triggerMode", "trigger_mode"]).if_empty(&mode);
+    if default_event == "steel-out" {
+        if let Some(session) = latest_open.as_ref() {
+            if !matches!(session.status.as_str(), "active" | "finishing" | "exit-failed") {
+                return http_response(
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "code": 409,
+                        "error": "production_session_not_exit_ready",
+                        "materialId": session.material_id,
+                        "sessionId": session.id,
+                        "status": session.status,
+                        "allowedStatuses": ["active", "finishing", "exit-failed"]
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    }
+    let target = match resolve_production_event_target(
+        &payload,
+        default_event,
+        latest_open
+            .as_ref()
+            .map(|session| (session.material_id.as_str(), session.id.as_str())),
+        current_time_millis(),
+    ) {
+        Ok(target) => target,
+        Err(conflict) => return production_transition_conflict_response(conflict),
+    };
+    let material_id = target.material_id;
+    let session_id = target.session_id;
+    let previous_session = latest_open.as_ref().filter(|session| {
+        session.id == session_id && session.material_id == material_id
+    });
+    let source = value_string(&payload, &["source"]).if_empty(
+        previous_session
+            .map(|session| session.source.as_str())
+            .unwrap_or("api"),
+    );
+    let mode = value_string(&payload, &["mode", "controlMode", "control_mode"]).if_empty(
+        previous_session
+            .map(|session| session.control_mode.as_str())
+            .unwrap_or("api"),
+    );
+    let trigger_mode = value_string(&payload, &["triggerMode", "trigger_mode"]).if_empty(
+        previous_session
+            .map(|session| session.trigger_mode.as_str())
+            .unwrap_or(&mode),
+    );
     let command = value_string(&payload, &["cmd", "command", "event", "type"]).if_empty(match default_event {
         "steel-info" => "rcvSteelInfo",
         "steel-out" => "steelIn",
@@ -5757,11 +7322,53 @@ fn write_production_event_response(
         _ => value_i32(&payload, &["value", "present"], 1),
     };
     let status = match default_event {
-        "steel-out" => "finished",
-        "steel-info" => "info-ready",
+        "steel-out" => "finishing",
+        "steel-info" => "info-pending",
+        "steel-in" => "starting",
         _ => "active",
     };
     let now = current_time_string();
+    let steel_type = value_string(&payload, &["steelType", "steel_type", "type"]).if_empty(
+        previous_session
+            .map(|session| session.steel_type.as_str())
+            .unwrap_or_default(),
+    );
+    let width_mm = value_f64_or(
+        &payload,
+        &["width", "widthMm", "width_mm"],
+        previous_session.map(|session| session.width_mm).unwrap_or(0.0),
+    );
+    let length_mm = value_f64_or(
+        &payload,
+        &["length", "len", "lengthMm", "length_mm"],
+        previous_session.map(|session| session.length_mm).unwrap_or(0.0),
+    );
+    let thickness_mm = value_f64_or(
+        &payload,
+        &["thick", "thickness", "thicknessMm", "thickness_mm"],
+        previous_session
+            .map(|session| session.thickness_mm)
+            .unwrap_or(0.0),
+    );
+    let client = value_string(&payload, &["client"]).if_empty(
+        previous_session
+            .map(|session| session.client.as_str())
+            .unwrap_or_default(),
+    );
+    let hard = value_string(&payload, &["hard"]).if_empty(
+        previous_session
+            .map(|session| session.hard.as_str())
+            .unwrap_or_default(),
+    );
+    let storage_root = value_string(&payload, &["storageRoot", "storage_root"]).if_empty(
+        previous_session
+            .map(|session| session.storage_root.as_str())
+            .unwrap_or_default(),
+    );
+    let started_at = previous_session
+        .map(|session| session.started_at.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| now.clone());
     let session_input = db::MaterialSessionInput {
         id: session_id.clone(),
         material_id: material_id.clone(),
@@ -5769,48 +7376,45 @@ fn write_production_event_response(
         status: status.to_string(),
         control_mode: mode.clone(),
         trigger_mode: trigger_mode.clone(),
-        steel_type: value_string(&payload, &["steelType", "steel_type", "type"]),
-        width_mm: value_f64(&payload, &["width", "widthMm", "width_mm"]),
-        length_mm: value_f64(&payload, &["length", "len", "lengthMm", "length_mm"]),
-        thickness_mm: value_f64(&payload, &["thick", "thickness", "thicknessMm", "thickness_mm"]),
-        client: value_string(&payload, &["client"]),
-        hard: value_string(&payload, &["hard"]),
-        storage_root: value_string(&payload, &["storageRoot", "storage_root"]),
-        started_at: now.clone(),
-        finished_at: if default_event == "steel-out" {
-            now.clone()
-        } else {
-            String::new()
-        },
+        steel_type: steel_type.clone(),
+        width_mm,
+        length_mm,
+        thickness_mm,
+        client: client.clone(),
+        hard: hard.clone(),
+        storage_root: storage_root.clone(),
+        started_at,
+        finished_at: String::new(),
         raw_payload: payload.to_string(),
     };
     let session_result = state
         .runtime
         .block_on(db::upsert_material_session(&state.database.connection, session_input));
-    if let Err(error) = session_result {
-        return http_response(
-            "500 Internal Server Error",
-            "application/json; charset=utf-8",
-            &json!({ "code": 500, "error": error.to_string() }).to_string(),
-        );
-    }
-    if default_event == "steel-out" {
-        let _ = state.runtime.block_on(db::finish_material_session(
-            &state.database.connection,
-            &session_id,
-            &now,
-        ));
-    }
-
+    let session = match session_result {
+        Ok(session) => session,
+        Err(error) => {
+            return production_database_error_response(
+                "upsert_material_session",
+                &error.to_string(),
+            );
+        }
+    };
     let inspection_id = format!("INSP-{session_id}");
-    let existing_inspection = state
+    let existing_inspection = match state
         .runtime
         .block_on(db::find_production_inspection(
             &state.database.connection,
             &inspection_id,
         ))
-        .ok()
-        .flatten();
+    {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            return production_database_error_response(
+                "load_production_inspection",
+                &error.to_string(),
+            );
+        }
+    };
     let inspection_storage_root = value_string(&payload, &["storageRoot", "storage_root"]).if_empty(
         existing_inspection
             .as_ref()
@@ -5844,30 +7448,31 @@ fn write_production_event_response(
             .map(|inspection| inspection.defect_count)
             .unwrap_or(0),
     );
-    let _ = state.runtime.block_on(db::upsert_production_inspection(
+    let inspection_result = state.runtime.block_on(db::upsert_production_inspection(
         &state.database.connection,
         db::ProductionInspectionInput {
             id: inspection_id.clone(),
             material_id: material_id.clone(),
             session_id: session_id.clone(),
-            status: if default_event == "steel-out" {
-                "finished".to_string()
-            } else {
-                "running".to_string()
-            },
+            status: status.to_string(),
             storage_root: inspection_storage_root,
             summary_path: inspection_summary_path,
             started_at: inspection_started_at,
-            finished_at: if default_event == "steel-out" {
-                now.clone()
-            } else {
-                String::new()
-            },
+            finished_at: String::new(),
             capture_count: inspection_capture_count,
             defect_count: inspection_defect_count,
             raw_payload: payload.to_string(),
         },
     ));
+    let inspection = match inspection_result {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            return production_database_error_response(
+                "upsert_production_inspection",
+                &error.to_string(),
+            );
+        }
+    };
 
     let acquisition_mode = value_string(
         &payload,
@@ -5899,12 +7504,12 @@ fn write_production_event_response(
         "steelNo": material_id,
         "sessionId": session_id,
         "inspectionId": inspection_id,
-        "steelType": value_string(&payload, &["steelType", "steel_type", "type"]),
-        "length": value_f64(&payload, &["length", "len", "lengthMm", "length_mm"]),
-        "width": value_f64(&payload, &["width", "widthMm", "width_mm"]),
-        "thick": value_f64(&payload, &["thick", "thickness", "thicknessMm", "thickness_mm"]),
-        "client": value_string(&payload, &["client"]),
-        "hard": value_string(&payload, &["hard"]),
+        "steelType": steel_type,
+        "length": length_mm,
+        "width": width_mm,
+        "thick": thickness_mm,
+        "client": client,
+        "hard": hard,
         "acquisitionMode": acquisition_mode,
         "captureSaveState": capture_save_state,
         "saveEnabled": save_enabled,
@@ -5943,6 +7548,76 @@ fn write_production_event_response(
             provider_response: provider_response.to_string(),
         },
     ));
+    let provider_succeeded = provider_code == 0;
+    let final_session_status = match (default_event, provider_succeeded) {
+        ("steel-in", true) => "active",
+        ("steel-in", false) => "start-failed",
+        ("steel-out", true) => "finished",
+        ("steel-out", false) => "exit-failed",
+        ("steel-info", true) => "info-ready",
+        ("steel-info", false) => "info-failed",
+        (_, true) => "active",
+        (_, false) => "event-failed",
+    };
+    let final_inspection_status = match (default_event, provider_succeeded) {
+        ("steel-in", true) => "running",
+        ("steel-in", false) => "start-failed",
+        ("steel-out", true) => "finished",
+        ("steel-out", false) => "exit-failed",
+        ("steel-info", true) => "info-ready",
+        ("steel-info", false) => "info-failed",
+        (_, true) => "running",
+        (_, false) => "event-failed",
+    };
+    let finished_at = if default_event == "steel-out" && provider_succeeded {
+        now.clone()
+    } else {
+        String::new()
+    };
+    if let Err(error) = state.runtime.block_on(db::upsert_material_session(
+        &state.database.connection,
+        db::MaterialSessionInput {
+            id: session.id.clone(),
+            material_id: session.material_id.clone(),
+            source: session.source.clone(),
+            status: final_session_status.to_string(),
+            control_mode: session.control_mode.clone(),
+            trigger_mode: session.trigger_mode.clone(),
+            steel_type: session.steel_type.clone(),
+            width_mm: session.width_mm,
+            length_mm: session.length_mm,
+            thickness_mm: session.thickness_mm,
+            client: session.client.clone(),
+            hard: session.hard.clone(),
+            storage_root: session.storage_root.clone(),
+            started_at: session.started_at.clone(),
+            finished_at: finished_at.clone(),
+            raw_payload: payload.to_string(),
+        },
+    )) {
+        return production_database_error_response("finalize_material_session", &error.to_string());
+    }
+    if let Err(error) = state.runtime.block_on(db::upsert_production_inspection(
+        &state.database.connection,
+        db::ProductionInspectionInput {
+            id: inspection.id.clone(),
+            material_id: inspection.material_id.clone(),
+            session_id: inspection.session_id.clone(),
+            status: final_inspection_status.to_string(),
+            storage_root: inspection.storage_root.clone(),
+            summary_path: inspection.summary_path.clone(),
+            started_at: inspection.started_at.clone(),
+            finished_at,
+            capture_count: inspection.capture_count,
+            defect_count: inspection.defect_count,
+            raw_payload: payload.to_string(),
+        },
+    )) {
+        return production_database_error_response(
+            "finalize_production_inspection",
+            &error.to_string(),
+        );
+    }
     let _ = state.runtime.block_on(db::append_audit_log(
         &state.database.connection,
         actor,
@@ -5951,7 +7626,7 @@ fn write_production_event_response(
         &format!("{default_event} from {source} mode={mode} providerCode={provider_code}"),
         if provider_code == 0 { "info" } else { "warning" },
     ));
-    let final_summary = if default_event == "steel-out" {
+    let final_summary = if default_event == "steel-out" && provider_succeeded {
         write_final_production_summary_file(
             state,
             &material_id,
@@ -6067,16 +7742,17 @@ fn validate_capture_open_session(state: &ServiceState, payload: &Value) -> Resul
         ));
     };
 
-    if session.status == "finished" {
+    if session.status != "active" {
         return Err(http_response(
             "409 Conflict",
             "application/json; charset=utf-8",
             &json!({
                 "code": 409,
-                "error": "steel_not_present",
-                "message": "capture session is already finished",
+                "error": "production_session_not_capture_ready",
+                "message": "capture requires a production session whose steel-in command completed successfully",
                 "materialId": session.material_id,
                 "sessionId": session.id,
+                "sessionStatus": session.status,
                 "requireSteelPresent": true
             })
             .to_string(),
@@ -7029,6 +8705,80 @@ fn write_production_algorithm_run_response(state: &ServiceState, body: &str, act
     )
 }
 
+fn stable_alarm_hash(value: &str) -> u64 {
+    value.as_bytes().iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn production_defect_alarm_input(
+    payload: &Value,
+    material_id: &str,
+    session_id: &str,
+    defect: &db::ProductionDefectInput,
+) -> Option<db::ProductionAlarmInput> {
+    if !matches!(defect.severity.as_str(), "severe" | "review") {
+        return None;
+    }
+    let client_key = value_string(
+        payload,
+        &[
+            "alarmKey",
+            "alarm_key",
+            "defectId",
+            "defect_id",
+            "idempotencyKey",
+            "idempotency_key",
+            "id",
+        ],
+    );
+    let fingerprint = json!({
+        "source": "production-defect",
+        "clientKey": client_key,
+        "materialId": material_id,
+        "sessionId": session_id,
+        "inspectionId": defect.inspection_id,
+        "cameraId": defect.camera_id,
+        "type": defect.defect_type,
+        "severity": defect.severity,
+        "xMm": defect.x_mm,
+        "yMm": defect.y_mm,
+        "zMm": defect.z_mm,
+        "widthMm": defect.width_mm,
+        "heightMm": defect.height_mm,
+        "depthMm": defect.depth_mm,
+        "confidence": defect.confidence,
+        "geometry": defect.geometry_json
+    })
+    .to_string();
+    let id = format!("ALARM-DEFECT-{:016x}", stable_alarm_hash(&fingerprint));
+    let camera_label = if defect.camera_id.trim().is_empty() {
+        "unknown-camera"
+    } else {
+        defect.camera_id.as_str()
+    };
+    Some(db::ProductionAlarmInput {
+        id,
+        source: "production-defect".to_string(),
+        alarm_type: defect.defect_type.clone(),
+        severity: defect.severity.clone(),
+        material_id: material_id.to_string(),
+        session_id: session_id.to_string(),
+        inspection_id: defect.inspection_id.clone(),
+        camera_id: defect.camera_id.clone(),
+        message: format!(
+            "{} defect {} detected on {}",
+            defect.severity, defect.defect_type, camera_label
+        ),
+        details: json!({
+            "schema": "steel.production.alarm.defect.v1",
+            "fingerprint": fingerprint,
+            "payload": payload
+        })
+        .to_string(),
+    })
+}
+
 fn write_production_defect_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let payload = match serde_json::from_str::<Value>(body.trim()) {
         Ok(value) => value,
@@ -7043,31 +8793,36 @@ fn write_production_defect_response(state: &ServiceState, body: &str, actor: &st
     let (material_id, session_id) = active_session_for_payload(state, &payload);
     let inspection_id =
         value_string(&payload, &["inspectionId", "inspection_id"]).if_empty(&format!("INSP-{session_id}"));
-    let result = state.runtime.block_on(db::append_production_defect(
+    let defect = db::ProductionDefectInput {
+        inspection_id: inspection_id.clone(),
+        material_id: material_id.clone(),
+        camera_id: value_string(&payload, &["cameraId", "camera_id", "cameraIp", "ip"]),
+        defect_type: value_string(&payload, &["defectType", "defect_type", "type"])
+            .if_empty("unknown"),
+        severity: value_string(&payload, &["severity"])
+            .if_empty("review")
+            .to_ascii_lowercase(),
+        x_mm: value_f64(&payload, &["xMm", "x_mm", "x"]),
+        y_mm: value_f64(&payload, &["yMm", "y_mm", "y"]),
+        z_mm: value_f64(&payload, &["zMm", "z_mm", "z"]),
+        width_mm: value_f64(&payload, &["widthMm", "width_mm", "width"]),
+        height_mm: value_f64(&payload, &["heightMm", "height_mm", "height"]),
+        depth_mm: value_f64(&payload, &["depthMm", "depth_mm", "depth"]),
+        confidence: value_f64(&payload, &["confidence", "score"]),
+        geometry_json: payload
+            .get("geometry")
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+            .to_string(),
+    };
+    let alarm = production_defect_alarm_input(&payload, &material_id, &session_id, &defect);
+    let result = state.runtime.block_on(db::append_production_defect_with_alarm(
         &state.database.connection,
-        db::ProductionDefectInput {
-            inspection_id: inspection_id.clone(),
-            material_id: material_id.clone(),
-            camera_id: value_string(&payload, &["cameraId", "camera_id", "cameraIp", "ip"]),
-            defect_type: value_string(&payload, &["defectType", "defect_type", "type"])
-                .if_empty("unknown"),
-            severity: value_string(&payload, &["severity"]).if_empty("review"),
-            x_mm: value_f64(&payload, &["xMm", "x_mm", "x"]),
-            y_mm: value_f64(&payload, &["yMm", "y_mm", "y"]),
-            z_mm: value_f64(&payload, &["zMm", "z_mm", "z"]),
-            width_mm: value_f64(&payload, &["widthMm", "width_mm", "width"]),
-            height_mm: value_f64(&payload, &["heightMm", "height_mm", "height"]),
-            depth_mm: value_f64(&payload, &["depthMm", "depth_mm", "depth"]),
-            confidence: value_f64(&payload, &["confidence", "score"]),
-            geometry_json: payload
-                .get("geometry")
-                .cloned()
-                .unwrap_or_else(|| json!({}))
-                .to_string(),
-        },
+        defect,
+        alarm,
     ));
     match result {
-        Ok(row) => {
+        Ok((row, alarm_result)) => {
             let _ = state.runtime.block_on(db::append_audit_log(
                 &state.database.connection,
                 actor,
@@ -7076,6 +8831,34 @@ fn write_production_defect_response(state: &ServiceState, body: &str, actor: &st
                 &format!("defect {} inspection={inspection_id}", row.id),
                 "info",
             ));
+            if let Some((alarm, true)) = alarm_result.as_ref() {
+                let _ = state.runtime.block_on(db::append_audit_log(
+                    &state.database.connection,
+                    actor,
+                    "production.alarm.created",
+                    &alarm.id,
+                    &format!(
+                        "{} {} alarm material={} inspection={} camera={}",
+                        alarm.severity,
+                        alarm.alarm_type,
+                        alarm.material_id,
+                        alarm.inspection_id,
+                        alarm.camera_id
+                    ),
+                    if alarm.severity == "severe" {
+                        "error"
+                    } else {
+                        "warning"
+                    },
+                ));
+            }
+            let alarm_json = alarm_result.as_ref().map(|(alarm, created)| {
+                json!({
+                    "id": alarm.id,
+                    "status": alarm.status,
+                    "created": created
+                })
+            });
             http_response(
                 "200 OK",
                 "application/json; charset=utf-8",
@@ -7084,7 +8867,8 @@ fn write_production_defect_response(state: &ServiceState, body: &str, actor: &st
                     "materialId": material_id,
                     "sessionId": session_id,
                     "inspectionId": inspection_id,
-                    "defectId": row.id
+                    "defectId": row.id,
+                    "alarm": alarm_json
                 })
                 .to_string(),
             )
@@ -7093,6 +8877,230 @@ fn write_production_defect_response(state: &ServiceState, body: &str, actor: &st
             "500 Internal Server Error",
             "application/json; charset=utf-8",
             &json!({ "code": 500, "error": error.to_string() }).to_string(),
+        ),
+    }
+}
+
+fn production_alarm_json(alarm: &db::entities::production_alarm::Model) -> Value {
+    let details = serde_json::from_str::<Value>(&alarm.details)
+        .unwrap_or_else(|_| json!(alarm.details));
+    json!({
+        "id": alarm.id,
+        "source": alarm.source,
+        "type": alarm.alarm_type,
+        "severity": alarm.severity,
+        "materialId": alarm.material_id,
+        "sessionId": alarm.session_id,
+        "inspectionId": alarm.inspection_id,
+        "cameraId": alarm.camera_id,
+        "message": alarm.message,
+        "details": details,
+        "status": alarm.status,
+        "createdAt": alarm.created_at,
+        "acknowledgedAt": alarm.acknowledged_at,
+        "resolvedAt": alarm.resolved_at,
+        "acknowledgedBy": alarm.acknowledged_by,
+        "acknowledgeNote": alarm.acknowledge_note,
+        "resolvedBy": alarm.resolved_by,
+        "resolveNote": alarm.resolve_note
+    })
+}
+
+fn read_production_alarms_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let status = query_value(query, "status").unwrap_or_else(|| "open".to_string());
+    if !matches!(
+        status.as_str(),
+        "open" | "active" | "acknowledged" | "resolved" | "history" | "all"
+    ) {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 400,
+                "error": "invalid_alarm_status",
+                "supportedStatuses": ["open", "active", "acknowledged", "resolved", "history", "all"]
+            })
+            .to_string(),
+        );
+    }
+    let filter = db::ProductionAlarmFilter {
+        status: Some(status),
+        severity: query_value(query, "severity"),
+        source: query_value(query, "source"),
+        keyword: query_value(query, "keyword"),
+        limit: query_value(query, "limit").and_then(|value| value.parse::<u64>().ok()),
+        offset: Some(
+            query_value(query, "offset")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0),
+        ),
+    };
+    let page = match state.runtime.block_on(db::list_production_alarms(
+        &state.database.connection,
+        filter,
+    )) {
+        Ok(page) => page,
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({ "code": 500, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    let counts = match state
+        .runtime
+        .block_on(db::production_alarm_counts(&state.database.connection))
+    {
+        Ok(counts) => counts,
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({ "code": 500, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "total": page.total,
+            "limit": page.limit,
+            "offset": page.offset,
+            "alarms": page.alarms.iter().map(production_alarm_json).collect::<Vec<_>>(),
+            "counts": {
+                "active": counts.active,
+                "acknowledged": counts.acknowledged,
+                "resolved": counts.resolved
+            }
+        })
+        .to_string(),
+    )
+}
+
+#[derive(Copy, Clone)]
+enum ProductionAlarmAction {
+    Acknowledge,
+    Resolve,
+}
+
+fn write_production_alarm_action_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+    action: ProductionAlarmAction,
+) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "code": 400, "error": "invalid_alarm_action_json" }).to_string(),
+            );
+        }
+    };
+    let alarm_id = value_string(&payload, &["alarmId", "alarm_id", "id"]);
+    if alarm_id.trim().is_empty() {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "code": 400, "error": "alarm_id_required" }).to_string(),
+        );
+    }
+    let note = value_string(&payload, &["note"]);
+    if note.is_empty() {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "code": 400, "error": "alarm_note_required" }).to_string(),
+        );
+    }
+    if note.chars().count() > 1000 {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "code": 400, "error": "alarm_note_too_long" }).to_string(),
+        );
+    }
+    let result = match action {
+        ProductionAlarmAction::Acknowledge => state.runtime.block_on(
+            db::acknowledge_production_alarm(
+                &state.database.connection,
+                &alarm_id,
+                actor,
+                &note,
+            ),
+        ),
+        ProductionAlarmAction::Resolve => state.runtime.block_on(db::resolve_production_alarm(
+            &state.database.connection,
+            &alarm_id,
+            actor,
+            &note,
+        )),
+    };
+    let transition = match result {
+        Ok(transition) => transition,
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({ "code": 500, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    match transition {
+        db::ProductionAlarmTransition::Changed(alarm) => {
+            let (audit_action, audit_level) = match action {
+                ProductionAlarmAction::Acknowledge => ("alarm.acknowledge", "warning"),
+                ProductionAlarmAction::Resolve => ("alarm.resolve", "info"),
+            };
+            let _ = state.runtime.block_on(db::append_audit_log(
+                &state.database.connection,
+                actor,
+                audit_action,
+                &alarm.id,
+                &format!("actor={actor} note={note}"),
+                audit_level,
+            ));
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({ "code": 0, "changed": true, "alarm": production_alarm_json(&alarm) })
+                    .to_string(),
+            )
+        }
+        db::ProductionAlarmTransition::Unchanged(alarm) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({ "code": 0, "changed": false, "alarm": production_alarm_json(&alarm) })
+                .to_string(),
+        ),
+        db::ProductionAlarmTransition::Conflict(alarm) => {
+            let error = match action {
+                ProductionAlarmAction::Acknowledge => "alarm_not_active",
+                ProductionAlarmAction::Resolve if alarm.status == "active" => {
+                    "alarm_acknowledgement_required"
+                }
+                ProductionAlarmAction::Resolve => "alarm_not_acknowledged",
+            };
+            http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 409,
+                    "error": error,
+                    "alarm": production_alarm_json(&alarm)
+                })
+                .to_string(),
+            )
+        }
+        db::ProductionAlarmTransition::NotFound => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({ "code": 404, "error": "alarm_not_found" }).to_string(),
         ),
     }
 }
@@ -7650,6 +9658,7 @@ fn run_bar_surface_calibration_fit(request: &Value) -> Result<Value, Value> {
     let max_shift = algorithm_value_f64(request, "maxShiftMm", 5.0)
         .clamp(0.1, 50.0)
         .to_string();
+    let data_dir = algorithm_value_string(request, "dataDir", "");
     let script = workspace_root()
         .join("scripts")
         .join("fit_array_calibration_cross_section.py");
@@ -7658,12 +9667,17 @@ fn run_bar_surface_calibration_fit(request: &Value) -> Result<Value, Value> {
     }
     let python = env::var("STEEL_PYTHON").unwrap_or_else(|_| "python".to_string());
     let mut command = Command::new(&python);
+    command.arg(&script);
+    if data_dir.trim().is_empty() {
+        command
+            .arg("--capture-root")
+            .arg(&capture_root)
+            .arg("--material-id")
+            .arg(&material_id);
+    } else {
+        command.arg("--data-dir").arg(&data_dir);
+    }
     command
-        .arg(&script)
-        .arg("--capture-root")
-        .arg(&capture_root)
-        .arg("--material-id")
-        .arg(&material_id)
         .arg("--rows")
         .arg(&rows)
         .arg("--output-root")
@@ -7696,6 +9710,240 @@ fn run_bar_surface_calibration_fit(request: &Value) -> Result<Value, Value> {
             "stderr": String::from_utf8_lossy(&output.stderr).trim()
         })),
         Err(error) => Err(json!({"code": 500, "error": error.to_string()})),
+    }
+}
+
+fn calibration_capture_data_dir(summary: &Value, expected_cameras: i64) -> Result<PathBuf, Value> {
+    let code = summary.get("code").and_then(Value::as_i64).unwrap_or(503);
+    let successes = summary
+        .get("successes")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let failures = summary
+        .get("failures")
+        .and_then(Value::as_i64)
+        .unwrap_or(expected_cameras);
+    let complete_frames = summary
+        .get("completeFrames")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let metadata_frames = summary
+        .get("metadataFrames")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let results = summary
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut camera_ips = std::collections::BTreeSet::new();
+    let per_camera_complete = results.iter().all(|result| {
+        let result_code = result.get("code").and_then(Value::as_i64).unwrap_or(500);
+        let complete = result
+            .get("completeFrame")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let metadata = result
+            .get("metadataOutput")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some(ip) = result.get("ip").and_then(Value::as_str) {
+            if !ip.trim().is_empty() {
+                camera_ips.insert(ip.trim().to_string());
+            }
+        }
+        result_code == 0 && complete && !metadata.trim().is_empty()
+    });
+    if code != 0
+        || failures != 0
+        || successes != expected_cameras
+        || complete_frames != expected_cameras
+        || metadata_frames != expected_cameras
+        || results.len() != expected_cameras as usize
+        || camera_ips.len() != expected_cameras as usize
+        || !per_camera_complete
+    {
+        return Err(json!({
+            "code": 422,
+            "error": "calibration_capture_incomplete",
+            "expectedCameras": expected_cameras,
+            "successes": successes,
+            "failures": failures,
+            "completeFrames": complete_frames,
+            "metadataFrames": metadata_frames,
+            "resultCount": results.len(),
+            "uniqueCameraCount": camera_ips.len()
+        }));
+    }
+    let summary_path = summary
+        .get("summaryOutput")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if summary_path.is_empty() || summary_path.starts_with("simulated://") {
+        return Err(json!({
+            "code": 422,
+            "error": "calibration_capture_artifacts_unavailable",
+            "summaryOutput": summary_path
+        }));
+    }
+    let summary_path = PathBuf::from(summary_path);
+    if !summary_path.is_file() {
+        return Err(json!({
+            "code": 422,
+            "error": "calibration_capture_summary_missing",
+            "summaryOutput": summary_path.display().to_string()
+        }));
+    }
+    summary_path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        json!({
+            "code": 422,
+            "error": "calibration_capture_directory_missing",
+            "summaryOutput": summary_path.display().to_string()
+        })
+    })
+}
+
+fn run_bar_surface_calibration_capture_fit(
+    state: &ServiceState,
+    request: &Value,
+    actor: &str,
+) -> Result<Value, Value> {
+    let expected_cameras = algorithm_value_i64(request, "expectedCameras", 6);
+    if expected_cameras != 6 {
+        return Err(json!({
+            "code": 400,
+            "error": "calibration_capture_requires_six_cameras",
+            "expectedCameras": expected_cameras
+        }));
+    }
+    let material_id = algorithm_value_string(
+        request,
+        "materialId",
+        &format!("CALIBRATION-{}", current_time_millis()),
+    );
+    let output_dir = algorithm_value_string(
+        request,
+        "captureOutputDir",
+        &format!("continuous-test/auto-calibration-{}", current_time_millis()),
+    );
+    let mut capture_body = serde_json::Map::new();
+    capture_body.insert("expectedCameras".to_string(), json!(6));
+    capture_body.insert("rounds".to_string(), json!(1));
+    capture_body.insert(
+        "lines".to_string(),
+        json!(algorithm_value_i64(request, "lines", 1000).clamp(1, 20000)),
+    );
+    capture_body.insert(
+        "width".to_string(),
+        json!(algorithm_value_i64(request, "width", 0).clamp(0, 20000)),
+    );
+    capture_body.insert(
+        "timeoutMs".to_string(),
+        json!(algorithm_value_i64(request, "timeoutMs", 8000).clamp(1000, 120000)),
+    );
+    capture_body.insert("intervalMs".to_string(), json!(500));
+    capture_body.insert("retries".to_string(), json!(0));
+    capture_body.insert("controlMode".to_string(), json!(0));
+    capture_body.insert(
+        "dataMode".to_string(),
+        json!(algorithm_value_i64(request, "dataMode", 3).clamp(0, 3)),
+    );
+    capture_body.insert("outputDir".to_string(), json!(output_dir));
+    capture_body.insert("materialId".to_string(), json!(material_id));
+    capture_body.insert("connectFirst".to_string(), json!(true));
+    capture_body.insert("stopStreams".to_string(), json!(true));
+    capture_body.insert("steelStateAware".to_string(), json!(false));
+    capture_body.insert("requireSteelPresent".to_string(), json!(false));
+    if let Some(ips) = request.get("ips").and_then(Value::as_array) {
+        capture_body.insert("ips".to_string(), Value::Array(ips.clone()));
+    }
+    let capture_request = Value::Object(capture_body);
+    let capture_response = state.capture.proxy_response_with_read_timeout(
+        "POST",
+        "/api/capture/continuous-test",
+        &capture_request.to_string(),
+        continuous_capture_proxy_timeout(&capture_request),
+    );
+    let Some(capture_response) = capture_response else {
+        return Err(json!({ "code": 503, "error": "capture_provider_offline" }));
+    };
+    let capture = serde_json::from_slice::<Value>(&capture_response.body).map_err(|error| {
+        json!({
+            "code": 502,
+            "error": "calibration_capture_response_invalid",
+            "detail": error.to_string()
+        })
+    })?;
+    if !(200..300).contains(&capture_response.status_code) {
+        return Err(json!({
+            "code": capture_response.status_code,
+            "error": "calibration_capture_provider_rejected",
+            "capture": capture
+        }));
+    }
+    let data_dir = calibration_capture_data_dir(&capture, expected_cameras)?;
+    let mut fit_request = request.as_object().cloned().unwrap_or_default();
+    fit_request.insert(
+        "dataDir".to_string(),
+        json!(data_dir.display().to_string()),
+    );
+    fit_request.insert("materialId".to_string(), json!(material_id));
+    let fit = run_bar_surface_calibration_fit(&Value::Object(fit_request))?;
+    let result = fit.get("result").cloned().unwrap_or_else(|| json!({}));
+    let _ = state.runtime.block_on(db::append_audit_log(
+        &state.database.connection,
+        actor,
+        "calibration.capture_fit",
+        result
+            .get("correctedXml")
+            .and_then(Value::as_str)
+            .unwrap_or("calibration-fit"),
+        &format!(
+            "six-camera calibration capture and fit completed from {}",
+            data_dir.display()
+        ),
+        "warning",
+    ));
+    Ok(json!({
+        "code": 0,
+        "capture": capture,
+        "fit": fit,
+        "result": result
+    }))
+}
+
+fn write_production_calibration_capture_fit_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let request = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value @ Value::Object(_)) => value,
+        _ => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "code": 400, "error": "invalid_calibration_capture_fit_json" })
+                    .to_string(),
+            );
+        }
+    };
+    match run_bar_surface_calibration_capture_fit(state, &request, actor) {
+        Ok(payload) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &payload.to_string(),
+        ),
+        Err(payload) => http_response(
+            if payload.get("code").and_then(Value::as_i64) == Some(400) {
+                "400 Bad Request"
+            } else {
+                "422 Unprocessable Entity"
+            },
+            "application/json; charset=utf-8",
+            &payload.to_string(),
+        ),
     }
 }
 
@@ -8015,7 +10263,7 @@ fn record_retention_detail(
     matched: u64,
     deleted_records: u64,
     deleted_defects: u64,
-    deleted_plates: u64,
+    deleted_capture_files: u64,
     dry_run: bool,
 ) -> String {
     if dry_run {
@@ -8024,7 +10272,7 @@ fn record_retention_detail(
         )
     } else {
         format!(
-            "执行检测记录保留策略：保留 {retention_days} 天，截止 {cutoff_at}，清理记录 {deleted_records} / {matched} 条，缺陷 {deleted_defects} 条，钢管档案 {deleted_plates} 条"
+            "执行检测记录保留策略：保留 {retention_days} 天，截止 {cutoff_at}，清理生产记录 {deleted_records} / {matched} 条，缺陷 {deleted_defects} 条，采集文件索引 {deleted_capture_files} 条"
         )
     }
 }
@@ -8386,20 +10634,20 @@ fn audit_logs_csv(logs: &[db::entities::audit_log::Model]) -> String {
 }
 
 fn inspection_record_status_label(status: &str) -> &str {
-    match status {
+    match production_record_status(status) {
         "detecting" => "检测中",
         "completed" => "已完成",
-        _ => status,
+        _ => "检测中",
     }
 }
 
 fn inspection_record_spec(row: &db::AdminInspectionRecord) -> String {
-    row.plate
+    row.session
         .as_ref()
-        .map(|plate| {
+        .map(|session| {
             format!(
-                "{} x {} x {}mm",
-                plate.width_mm, plate.length_mm, plate.thickness_mm
+                "{:.0} x {:.0} x {:.1}mm",
+                session.width_mm, session.length_mm, session.thickness_mm
             )
         })
         .unwrap_or_else(|| "-".to_string())
@@ -8409,18 +10657,19 @@ fn inspection_records_csv(rows: &[db::AdminInspectionRecord]) -> String {
     let mut csv = String::from("记录号,检测时间,管号,钢种,规格,状态,缺陷总数,严重,待复核,轻微\n");
     for row in rows {
         let steel_grade = row
-            .plate
+            .session
             .as_ref()
-            .map(|plate| plate.steel_grade.as_str())
+            .map(|session| session.hard.as_str())
             .unwrap_or("-");
+        let defect_count = row.severe_count + row.review_count + row.minor_count;
         let fields = [
-            csv_escape(&row.record.id),
-            csv_escape(&row.record.time),
-            csv_escape(&row.record.plate_no),
+            csv_escape(&row.inspection.id),
+            csv_escape(&row.inspection.started_at),
+            csv_escape(&row.inspection.material_id),
             csv_escape(steel_grade),
             csv_escape(&inspection_record_spec(row)),
-            csv_escape(inspection_record_status_label(&row.record.status)),
-            row.record.defect_count.to_string(),
+            csv_escape(inspection_record_status_label(&row.inspection.status)),
+            defect_count.to_string(),
             row.severe_count.to_string(),
             row.review_count.to_string(),
             row.minor_count.to_string(),
@@ -8448,23 +10697,22 @@ fn config_revisions_json(revisions: Vec<db::entities::config_revision::Model>) -
 }
 
 fn inspection_record_json(row: &db::AdminInspectionRecord) -> Value {
-    let plate = row.plate.as_ref();
+    let plate = production_plate_value(&row.inspection, row.session.as_ref());
+    let defect_count = row.severe_count + row.review_count + row.minor_count;
     json!({
-        "id": &row.record.id,
-        "time": &row.record.time,
-        "plateNo": &row.record.plate_no,
-        "status": &row.record.status,
-        "defectCount": row.record.defect_count,
-        "plate": plate.map(|item| {
-            json!({
-                "plateNo": &item.plate_no,
-                "widthMm": item.width_mm,
-                "lengthMm": item.length_mm,
-                "thicknessMm": item.thickness_mm,
-                "steelGrade": &item.steel_grade,
-                "detectedAt": &item.detected_at
-            })
-        }),
+        "id": &row.inspection.id,
+        "time": &row.inspection.started_at,
+        "plateNo": &row.inspection.material_id,
+        "materialId": &row.inspection.material_id,
+        "sessionId": &row.inspection.session_id,
+        "status": production_record_status(&row.inspection.status),
+        "productionStatus": &row.inspection.status,
+        "defectCount": defect_count,
+        "startedAt": &row.inspection.started_at,
+        "finishedAt": &row.inspection.finished_at,
+        "summaryPath": &row.inspection.summary_path,
+        "source": "production",
+        "plate": plate,
         "severity": {
             "severe": row.severe_count,
             "review": row.review_count,
@@ -8475,6 +10723,10 @@ fn inspection_record_json(row: &db::AdminInspectionRecord) -> Value {
 
 fn inspection_record_detail_json(detail: db::AdminInspectionRecordDetail) -> String {
     let mut record = inspection_record_json(&detail.record);
+    let plate = production_plate_value(
+        &detail.record.inspection,
+        detail.record.session.as_ref(),
+    );
     if let Some(object) = record.as_object_mut() {
         object.insert(
             "defects".to_string(),
@@ -8482,7 +10734,19 @@ fn inspection_record_detail_json(detail: db::AdminInspectionRecordDetail) -> Str
                 detail
                     .defects
                     .iter()
-                    .map(|defect| config_value_json(&database_defect_json(defect)))
+                    .map(|defect| {
+                        production_defect_value(defect, &detail.record.inspection, &plate)
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        object.insert(
+            "captureFiles".to_string(),
+            Value::Array(
+                detail
+                    .capture_files
+                    .iter()
+                    .map(production_capture_image_value)
                     .collect::<Vec<_>>(),
             ),
         );
@@ -10095,7 +12359,7 @@ fn apply_record_retention_response(state: &ServiceState, body: &str, actor: &str
                 matched,
                 deleted_records: 0,
                 deleted_defects: 0,
-                deleted_plates: 0,
+                deleted_capture_files: 0,
             },
             Err(error) => {
                 return http_response(
@@ -10129,14 +12393,14 @@ fn apply_record_retention_response(state: &ServiceState, body: &str, actor: &str
         } else {
             "record.retention.purge"
         },
-        "inspection_record",
+        "production_inspection",
         &record_retention_detail(
             retention_days,
             &cutoff_at,
             result.matched,
             result.deleted_records,
             result.deleted_defects,
-            result.deleted_plates,
+            result.deleted_capture_files,
             dry_run,
         ),
         if dry_run { "info" } else { "warning" },
@@ -10152,7 +12416,8 @@ fn apply_record_retention_response(state: &ServiceState, body: &str, actor: &str
             "matched": result.matched,
             "deletedRecords": result.deleted_records,
             "deletedDefects": result.deleted_defects,
-            "deletedPlates": result.deleted_plates,
+            "deletedCaptureFiles": result.deleted_capture_files,
+            "deletedPlates": 0,
             "dryRun": dry_run
         })
         .to_string(),
@@ -10180,15 +12445,11 @@ fn delete_admin_record_response(state: &ServiceState, query: &str, actor: &str) 
     )) {
         Ok(Some(result)) => {
             let detail = format!(
-                "删除检测记录 {}，管号 {}，同步删除缺陷 {} 条，钢管档案{}",
+                "删除生产检测记录 {}，材料 {}，同步删除缺陷 {} 条、采集文件索引 {} 条；流程会话保留",
                 result.id,
-                result.plate_no,
+                result.material_id,
                 result.defects_deleted,
-                if result.plate_deleted {
-                    "已删除"
-                } else {
-                    "保留"
-                }
+                result.capture_files_deleted
             );
             let _ = state.runtime.block_on(db::append_audit_log(
                 &state.database.connection,
@@ -10205,9 +12466,11 @@ fn delete_admin_record_response(state: &ServiceState, query: &str, actor: &str) 
                     "code": 0,
                     "deleted": true,
                     "recordId": result.id,
-                    "plateNo": result.plate_no,
+                    "plateNo": result.material_id,
+                    "materialId": result.material_id,
                     "defectsDeleted": result.defects_deleted,
-                    "plateDeleted": result.plate_deleted
+                    "captureFilesDeleted": result.capture_files_deleted,
+                    "plateDeleted": false
                 })
                 .to_string(),
             )
@@ -10259,7 +12522,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     let metrics = overview.metrics;
-    let body = json!({
+    let mut body = json!({
         "updatedAt": current_time_string(),
         "service": {
             "name": "steel-inspection-service",
@@ -10275,10 +12538,10 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             "path": database_path,
             "configDir": config_dir,
             "tables": [
-                { "name": "steel_plate", "label": "钢管档案", "rows": metrics.plate_count },
-                { "name": "defect", "label": "缺陷明细", "rows": metrics.defect_count },
+                { "name": "steel_plate", "label": "旧版材料档案（只读）", "rows": metrics.plate_count },
+                { "name": "defect", "label": "旧版缺陷（只读）", "rows": metrics.defect_count },
                 { "name": "defect_type", "label": "缺陷类型", "rows": metrics.defect_type_count },
-                { "name": "inspection_record", "label": "检测记录", "rows": metrics.record_count },
+                { "name": "inspection_record", "label": "旧版检测记录（只读）", "rows": metrics.record_count },
                 { "name": "camera_config", "label": "相机配置", "rows": metrics.camera_count },
                 { "name": "app_config", "label": "系统配置", "rows": metrics.config_count },
                 { "name": "config_revision", "label": "配置版本", "rows": metrics.config_revision_count },
@@ -10286,12 +12549,15 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
                 { "name": "admin_role", "label": "角色权限", "rows": metrics.role_count },
                 { "name": "audit_log", "label": "审计日志", "rows": metrics.audit_log_count }
                 ,
-                { "name": "material_session", "label": "material session", "rows": metrics.material_session_count },
-                { "name": "secondary_data", "label": "secondary data", "rows": metrics.secondary_data_count },
-                { "name": "trigger_event", "label": "trigger event", "rows": metrics.trigger_event_count },
-                { "name": "production_inspection", "label": "production inspection", "rows": metrics.production_inspection_count },
-                { "name": "capture_file", "label": "capture file", "rows": metrics.capture_file_count },
-                { "name": "production_defect", "label": "production defect", "rows": metrics.production_defect_count }
+                { "name": "material_session", "label": "生产材料会话", "rows": metrics.material_session_count },
+                { "name": "secondary_data", "label": "二级数据", "rows": metrics.secondary_data_count },
+                { "name": "trigger_event", "label": "生产触发事件", "rows": metrics.trigger_event_count },
+                { "name": "production_inspection", "label": "正式检测记录", "rows": metrics.production_inspection_count },
+                { "name": "production_task", "label": "持久生产任务", "rows": metrics.production_task_count },
+                { "name": "calibration_operation", "label": "持久标定操作", "rows": metrics.calibration_operation_count },
+                { "name": "capture_file", "label": "采集文件索引", "rows": metrics.capture_file_count },
+                { "name": "production_defect", "label": "正式缺陷", "rows": metrics.production_defect_count },
+                { "name": "production_alarm", "label": "生产报警", "rows": metrics.production_alarm_count }
             ]
         },
         "configs": overview.configs.iter().map(|config| {
@@ -10333,8 +12599,18 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
         }).collect::<Vec<_>>(),
         "apiRoutes": [
             { "method": "GET", "path": "/api/health", "scope": "service" },
+            { "method": "GET", "path": "/api/health/live", "scope": "service" },
+            { "method": "GET", "path": "/api/health/ready", "scope": "service" },
+            { "method": "GET", "path": "/api/health/ready/details", "scope": "service" },
+            { "method": "GET", "path": "/api/health/details", "scope": "service" },
             { "method": "GET", "path": "/api/services", "scope": "service" },
             { "method": "GET", "path": "/api/system/network", "scope": "service" },
+            { "method": "GET", "path": "/api/trigger/status", "scope": "trigger-proxy" },
+            { "method": "GET", "path": "/api/trigger/mode", "scope": "trigger-proxy" },
+            { "method": "POST", "path": "/api/trigger/mode", "scope": "trigger-proxy" },
+            { "method": "POST", "path": "/api/trigger/manual/steel-info", "scope": "trigger-proxy" },
+            { "method": "POST", "path": "/api/trigger/manual/steel-in", "scope": "trigger-proxy" },
+            { "method": "POST", "path": "/api/trigger/manual/steel-out", "scope": "trigger-proxy" },
             { "method": "GET", "path": "/api/algorithm/bar-surface/latest", "scope": "algorithm" },
             { "method": "GET", "path": "/api/algorithm/bar-surface/manifest", "scope": "algorithm" },
             { "method": "GET", "path": "/api/algorithm/bar-surface/file", "scope": "algorithm" },
@@ -10397,7 +12673,19 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/config/capture", "scope": "config" },
             { "method": "GET", "path": "/api/inspection/settings", "scope": "inspection" },
             { "method": "GET", "path": "/api/inspection/snapshot", "scope": "inspection" },
+            { "method": "GET", "path": "/api/alarms", "scope": "alarm" },
+            { "method": "POST", "path": "/api/alarms/acknowledge", "scope": "admin.records" },
+            { "method": "POST", "path": "/api/alarms/resolve", "scope": "admin.records" },
             { "method": "GET", "path": "/api/production/status", "scope": "production" },
+            { "method": "POST", "path": "/api/production/tasks", "scope": "production" },
+            { "method": "GET", "path": "/api/production/tasks", "scope": "production" },
+            { "method": "GET", "path": "/api/production/tasks/detail", "scope": "production" },
+            { "method": "POST", "path": "/api/production/tasks/cancel", "scope": "production" },
+            { "method": "POST", "path": "/api/production/tasks/retry", "scope": "production" },
+            { "method": "POST", "path": "/api/production/tasks/steel-info", "scope": "production" },
+            { "method": "POST", "path": "/api/production/tasks/steel-in", "scope": "production" },
+            { "method": "POST", "path": "/api/production/tasks/steel-out", "scope": "production" },
+            { "method": "POST", "path": "/api/production/tasks/trigger-event", "scope": "production" },
             { "method": "POST", "path": "/api/production/steel-info", "scope": "production" },
             { "method": "POST", "path": "/api/production/steel-in", "scope": "production" },
             { "method": "POST", "path": "/api/production/steel-out", "scope": "production" },
@@ -10410,9 +12698,32 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "GET", "path": "/api/production/file", "scope": "production" },
             { "method": "GET", "path": "/api/steel/status", "scope": "capture" },
             { "method": "POST", "path": "/api/steel/event", "scope": "capture" },
-            { "method": "GET", "path": "/api/camera/statuses", "scope": "capture" }
+            { "method": "GET", "path": "/api/camera/statuses", "scope": "capture" },
+            { "method": "GET", "path": "/api/capture/latest", "scope": "capture" },
+            { "method": "GET", "path": "/api/storage/status", "scope": "capture" },
+            { "method": "POST", "path": "/api/storage/config", "scope": "capture" },
+            { "method": "GET", "path": "/api/config/profiles", "scope": "capture" },
+            { "method": "POST", "path": "/api/config/profile/apply", "scope": "capture" },
+            { "method": "POST", "path": "/api/config/camera-params/save-all", "scope": "capture" },
+            { "method": "POST", "path": "/api/config/camera-params/load-all", "scope": "capture" },
+            { "method": "POST", "path": "/api/stream/start", "scope": "capture" },
+            { "method": "POST", "path": "/api/stream/stop", "scope": "capture" },
+            { "method": "GET", "path": "/api/stream/status", "scope": "capture" },
+            { "method": "GET", "path": "/api/stream/latest", "scope": "capture" },
+            { "method": "POST", "path": "/api/capture/continuous-test", "scope": "capture" },
+            { "method": "POST", "path": "/api/capture/preset/line-continuous", "scope": "capture" },
+            { "method": "GET", "path": "/api/calibration/active", "scope": "capture" },
+            { "method": "POST", "path": "/api/calibration/active", "scope": "capture" },
+            { "method": "POST", "path": "/api/calibration/apply-all", "scope": "capture" },
+            { "method": "POST", "path": "/api/calibration/rollback", "scope": "capture" },
+            { "method": "GET", "path": "/api/calibration/status", "scope": "capture" },
+            { "method": "GET", "path": "/api/calibration/operations/detail", "scope": "capture-ledger" }
         ]
     });
+
+    if let Some(routes) = body.get_mut("apiRoutes").and_then(Value::as_array_mut) {
+        append_capture_proxy_manifest_routes(routes);
+    }
 
     http_response(
         "200 OK",
@@ -10454,13 +12765,27 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         .as_ref()
         .map(|session| session.user_id.as_str())
         .unwrap_or("admin");
+    if calibration_operations::mutation_requires_reconciliation_fence(method, path) {
+        if let Some(response) = calibration_operations::reconciliation_fence_response(
+            &state,
+            path,
+        ) {
+            let _ = stream.write_all(&response);
+            return;
+        }
+    }
+    let _production_command_guard = if is_production_mutation_route(method, path) {
+        state.production_command_lock.lock().ok()
+    } else {
+        None
+    };
+    let health_endpoint = health_endpoint_for_route(method, path);
+    let queued_production_kind = production_tasks::queued_kind_for_route(method, path);
     let response = match (method, path) {
         ("OPTIONS", _) => http_response("204 No Content", "application/json; charset=utf-8", ""),
-        ("GET", "/api/health") => http_response(
-            "200 OK",
-            "application/json; charset=utf-8",
-            "{\"ok\":true,\"service\":\"steel-inspection-service\",\"language\":\"rust\"}",
-        ),
+        _ if health_endpoint.is_some() => {
+            service_health_response(&state, health_endpoint.expect("health endpoint guard"))
+        }
         ("GET", "/api/system/network") => system_network_status_response(),
         ("GET", "/api/services") => http_response(
             "200 OK",
@@ -10562,7 +12887,39 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("DELETE", "/api/admin/records") => delete_admin_record_response(&state, query, actor),
         ("GET", "/api/admin/records") => read_admin_records_response(&state, query),
+        ("GET", "/api/alarms") => read_production_alarms_response(&state, query),
+        ("POST", "/api/alarms/acknowledge") => write_production_alarm_action_response(
+            &state,
+            body,
+            actor,
+            ProductionAlarmAction::Acknowledge,
+        ),
+        ("POST", "/api/alarms/resolve") => write_production_alarm_action_response(
+            &state,
+            body,
+            actor,
+            ProductionAlarmAction::Resolve,
+        ),
         ("GET", "/api/production/status") => production_status_response(&state),
+        ("POST", "/api/production/tasks") => {
+            production_tasks::enqueue_response(&state, body, actor)
+        }
+        ("GET", "/api/production/tasks") => production_tasks::list_response(&state, query),
+        ("GET", "/api/production/tasks/detail") => {
+            production_tasks::detail_response(&state, query)
+        }
+        ("POST", "/api/production/tasks/cancel") => {
+            production_tasks::cancel_response(&state, body, actor)
+        }
+        ("POST", "/api/production/tasks/retry") => {
+            production_tasks::retry_response(&state, body, actor)
+        }
+        _ if queued_production_kind.is_some() => production_tasks::enqueue_kind_response(
+            &state,
+            queued_production_kind.expect("queued production kind guard"),
+            body,
+            actor,
+        ),
         ("POST", "/api/production/steel-info") => {
             write_production_event_response(&state, body, "steel-info", actor)
         }
@@ -10591,6 +12948,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             write_production_defect_response(&state, body, actor)
         }
         ("GET", "/api/production/file") => production_file_response(query),
+        ("GET", "/api/calibration/operations/detail") => {
+            calibration_operations::detail_response(&state, query)
+        }
+        ("POST", "/api/calibration/apply-all") => {
+            calibration_operations::apply_response(&state, body, actor)
+        }
+        ("POST", "/api/calibration/rollback") => {
+            calibration_operations::mutation_response(&state, path, body, actor)
+        }
         ("GET", "/api/inspection/snapshot") => {
             match build_production_snapshot_json(&state) {
                 Ok(Some(payload)) => http_response(
@@ -10631,38 +12997,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
                 ),
             }
         }
-        ("GET", "/health")
-        | ("GET", "/api/capture/health")
-        | ("GET", "/api/cameras")
-        | ("GET", "/api/camera/status")
-        | ("GET", "/api/camera/statuses")
-        | ("GET", "/api/steel/status")
-        | ("GET", "/api/param")
-        | ("POST", "/api/camera/connect")
-        | ("POST", "/api/camera/disconnect")
-        | ("POST", "/api/steel/event")
-        | ("POST", "/api/param")
-        | ("POST", "/api/capture/depth-map") => {
-            if let Some(body) = state.capture.proxy(method, raw_path, body) {
-                http_response(
-                    "200 OK",
-                    "application/json; charset=utf-8",
-                    &String::from_utf8_lossy(&body),
-                )
-            } else {
-                fallback_capture_response(path)
-            }
+        _ if is_trigger_gateway_proxy_route(method, path) => {
+            trigger_gateway_proxy_http_response(&state, method, raw_path, body)
         }
-        ("GET", "/api/capture/file") => {
-            if let Some(body) = state.capture.proxy(method, raw_path, body) {
-                http_bytes_response_with_headers("200 OK", "image/png", &body, &[])
-            } else {
-                http_response(
-                    "404 Not Found",
-                    "application/json; charset=utf-8",
-                    "{\"error\":\"capture_file_not_found\"}",
-                )
-            }
+        _ if is_capture_json_proxy_route(method, path) => {
+            capture_proxy_http_response(&state.capture, method, raw_path, path, body)
+        }
+        _ if is_capture_binary_proxy_route(method, path) => {
+            capture_proxy_http_response(&state.capture, method, raw_path, path, body)
         }
         _ => http_response(
             "404 Not Found",
@@ -10680,13 +13022,23 @@ fn main() -> std::io::Result<()> {
         .unwrap_or(4873);
     let config_dir = config_dir();
     std::fs::create_dir_all(&config_dir)?;
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    listener.set_nonblocking(false)?;
     let database_path = config_dir.join("steel-inspection.sqlite");
     let runtime = Runtime::new()?;
     let database = runtime
         .block_on(db::open_database(database_path))
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
-    listener.set_nonblocking(false)?;
+    let recovered_calibration_operations = runtime
+        .block_on(db::recover_dispatching_calibration_operations(
+            &database.connection,
+        ))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+    if recovered_calibration_operations > 0 {
+        eprintln!(
+            "marked {recovered_calibration_operations} interrupted calibration operation(s) as needs-reconciliation; no operation was replayed"
+        );
+    }
     let capture_port = capture_port();
     let capture_manager = Arc::new(CaptureServiceManager::new(capture_port));
     let config_json = runtime
@@ -10701,10 +13053,20 @@ fn main() -> std::io::Result<()> {
         capture: Arc::clone(&capture_manager),
         database,
         runtime,
+        production_command_lock: Mutex::new(()),
+        calibration_operation_lock: Mutex::new(()),
+        production_task_admin_lock: Mutex::new(()),
+        production_task_wakeup: Condvar::new(),
+        production_task_wakeup_generation: Mutex::new(0),
+        production_task_worker_status: Mutex::new(ProductionTaskWorkerStatus::default()),
+        production_task_sequence: AtomicU64::new(0),
+        trigger_gateway_origin: trigger_gateway_origin(),
+        trigger_health_required: trigger_health_required(),
         sessions: Mutex::new(HashMap::new()),
         login_failures: Mutex::new(HashMap::new()),
         started_at: current_time_millis(),
     });
+    production_tasks::start_worker(Arc::clone(&state));
     println!("steel inspection service listening on http://127.0.0.1:{port}");
     println!(
         "capture provider {} at {}",
@@ -10717,7 +13079,12 @@ fn main() -> std::io::Result<()> {
             Ok(stream) => {
                 let state = Arc::clone(&state);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                handle_client(stream, state);
+                if let Err(error) = std::thread::Builder::new()
+                    .name("inspection-http-request".to_string())
+                    .spawn(move || handle_client(stream, state))
+                {
+                    eprintln!("failed to start request worker: {error}");
+                }
             }
             Err(error) => eprintln!("failed to accept connection: {error}"),
         }
@@ -10728,21 +13095,601 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, Set, Statement};
+
+    fn production_test_state() -> ServiceState {
+        production_test_state_with_provider(CaptureProvider::Simulated, "simulated://capture")
+    }
+
+    fn production_test_state_with_provider(
+        provider: CaptureProvider,
+        origin: &str,
+    ) -> ServiceState {
+        let runtime = Runtime::new().expect("test runtime");
+        let database = runtime
+            .block_on(db::open_database_url(
+                "sqlite::memory:".to_string(),
+                PathBuf::from(":memory:"),
+            ))
+            .expect("in-memory production database");
+        ServiceState {
+            fallback_snapshot_json: Arc::new(build_snapshot_json()),
+            config_json: Mutex::new(String::new()),
+            capture: Arc::new(CaptureServiceManager {
+                host: capture_host_from_origin(origin)
+                    .unwrap_or_else(|| "127.0.0.1".to_string()),
+                port: capture_port_from_origin(origin).unwrap_or(0),
+                origin: origin.to_string(),
+                provider,
+                process: Mutex::new(None),
+            }),
+            database,
+            runtime,
+            production_command_lock: Mutex::new(()),
+            calibration_operation_lock: Mutex::new(()),
+            production_task_admin_lock: Mutex::new(()),
+            production_task_wakeup: Condvar::new(),
+            production_task_wakeup_generation: Mutex::new(0),
+            production_task_worker_status: Mutex::new(ProductionTaskWorkerStatus::default()),
+            production_task_sequence: AtomicU64::new(0),
+            trigger_gateway_origin: "disabled".to_string(),
+            trigger_health_required: false,
+            sessions: Mutex::new(HashMap::new()),
+            login_failures: Mutex::new(HashMap::new()),
+            started_at: current_time_millis(),
+        }
+    }
+
+    fn response_text(response: Vec<u8>) -> String {
+        String::from_utf8(response).expect("HTTP response should be UTF-8")
+    }
+
+    fn response_json(response: Vec<u8>) -> Value {
+        let response = response_text(response);
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("HTTP response should contain a body");
+        serde_json::from_str(body).expect("HTTP response body should be JSON")
+    }
+
+    fn calibration_apply_operation_body(operation_id: &str) -> String {
+        let mappings = (1..=CALIBRATION_SET_CAMERA_COUNT)
+            .map(|index| {
+                json!({
+                    "ip": format!("192.0.2.{index}"),
+                    "path": format!("camera-{index}.xml"),
+                    "rollbackPath": format!("known-good-camera-{index}.xml"),
+                    "expectedSn": format!("SN-{index}"),
+                    "artifactType": "camera-sdk"
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "operationId": operation_id,
+            "dryRun": false,
+            "atomic": true,
+            "rollbackOnFailure": true,
+            "requireAllMapped": true,
+            "stopStreams": true,
+            "expectedCameras": CALIBRATION_SET_CAMERA_COUNT,
+            "ips": mappings
+                .iter()
+                .filter_map(|mapping| mapping.get("ip").cloned())
+                .collect::<Vec<_>>(),
+            "cameraCalibrations": mappings,
+            "persistActive": false,
+            "saveCameraParams": false,
+            "saveToDevice": false,
+            "confirmation": CAMERA_CALIBRATION_SET_CONFIRMATION
+        })
+        .to_string()
+    }
+
+    fn mark_task_worker_healthy(state: &ServiceState) {
+        let mut status = state
+            .production_task_worker_status
+            .lock()
+            .expect("task worker status lock");
+        status.running = true;
+        status.current_task_id.clear();
+        status.last_heartbeat_at = current_time_millis();
+        status.last_error.clear();
+    }
+
+    fn spawn_health_http_server(
+        status: &'static str,
+        body: String,
+        delay: Duration,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("health test listener");
+        let address = listener.local_addr().expect("health test address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health probe connection");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.as_bytes().len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn unused_local_http_origin() -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("unused port listener");
+        let address = listener.local_addr().expect("unused port address");
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    #[test]
+    fn layered_health_routes_are_explicit_and_get_only() {
+        assert_eq!(
+            health_endpoint_for_route("GET", "/api/health"),
+            Some(HealthEndpoint::Compatibility)
+        );
+        assert_eq!(
+            health_endpoint_for_route("GET", "/api/health/live"),
+            Some(HealthEndpoint::Live)
+        );
+        assert_eq!(
+            health_endpoint_for_route("GET", "/api/health/ready"),
+            Some(HealthEndpoint::Ready)
+        );
+        assert_eq!(
+            health_endpoint_for_route("GET", "/api/health/details"),
+            Some(HealthEndpoint::Details)
+        );
+        assert_eq!(
+            health_endpoint_for_route("GET", "/api/health/ready/details"),
+            Some(HealthEndpoint::Details)
+        );
+        assert_eq!(health_endpoint_for_route("POST", "/api/health/ready"), None);
+        assert_eq!(health_endpoint_for_route("GET", "/health"), None);
+    }
+
+    #[test]
+    fn live_health_does_not_depend_on_database_worker_or_capture() {
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:0/private-capture-origin",
+        );
+        state
+            .runtime
+            .block_on(state.database.connection.close_by_ref())
+            .expect("test database should close");
+
+        let response = response_text(service_health_response(&state, HealthEndpoint::Live));
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("\"status\":\"live\""));
+        assert!(!response.contains("checks"));
+        assert!(!response.contains("private-capture-origin"));
+    }
+
+    #[test]
+    fn readiness_accepts_explicit_simulation_with_database_and_worker_ready() {
+        let state = production_test_state();
+        mark_task_worker_healthy(&state);
+
+        let snapshot = service_health_snapshot(&state);
+        assert!(snapshot.ready);
+        assert_eq!(snapshot.body["checks"]["database"]["ok"], json!(true));
+        assert_eq!(snapshot.body["checks"]["taskWorker"]["status"], json!("idle"));
+        assert_eq!(snapshot.body["checks"]["capture"]["status"], json!("simulated"));
+
+        let response = response_text(service_health_response(&state, HealthEndpoint::Ready));
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(!response.contains("simulated://capture"));
+        assert!(!response.contains("lastError"));
+        assert!(!response.contains("executable"));
+    }
+
+    #[test]
+    fn readiness_rejects_a_stale_idle_worker_but_allows_a_busy_worker_boundary() {
+        let state = production_test_state();
+        {
+            let mut status = state
+                .production_task_worker_status
+                .lock()
+                .expect("task worker status lock");
+            status.running = true;
+            status.last_heartbeat_at = current_time_millis()
+                .saturating_sub(TASK_WORKER_IDLE_HEARTBEAT_MAX_AGE_MS + 1);
+        }
+
+        let stale = service_health_snapshot(&state);
+        assert!(!stale.ready);
+        assert_eq!(
+            stale.body["checks"]["taskWorker"]["reason"],
+            json!("task_worker_heartbeat_stale")
+        );
+        assert!(response_text(service_health_response(&state, HealthEndpoint::Ready))
+            .starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+
+        {
+            let mut status = state
+                .production_task_worker_status
+                .lock()
+                .expect("task worker status lock");
+            status.current_task_id = "TASK-LONG-PROVIDER-CALL".to_string();
+        }
+        let busy = service_health_snapshot(&state);
+        assert!(busy.ready);
+        assert_eq!(busy.body["checks"]["taskWorker"]["status"], json!("busy"));
+        assert_eq!(
+            busy.body["checks"]["taskWorker"]["heartbeatPausedAtProviderBoundary"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_unreachable_non_simulated_capture_without_leaking_origin() {
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:0/private-capture-origin",
+        );
+        mark_task_worker_healthy(&state);
+
+        let snapshot = service_health_snapshot(&state);
+        assert!(!snapshot.ready);
+        assert_eq!(
+            snapshot.body["checks"]["capture"]["reason"],
+            json!("capture_provider_unreachable")
+        );
+        let response = response_text(service_health_response(&state, HealthEndpoint::Details));
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(!response.contains("127.0.0.1"));
+        assert!(!response.contains("private-capture-origin"));
+    }
+
+    #[test]
+    fn capture_health_surfaces_provider_calibration_recovery_without_leaking_artifacts() {
+        let body = json!({
+            "service": "steel_capture_service",
+            "sdkReady": false,
+            "sdkCode": 423,
+            "recoveryRequired": true,
+            "invalidManifest": false,
+            "pendingRecoveryCount": 1,
+            "manifestPath": "C:\\classified\\calibration-rollbacks\\manifest.json"
+        })
+        .to_string();
+        let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
+        let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+        let (ok, detail) = capture_health_component(&state);
+        server.join().expect("capture recovery health server");
+        assert!(!ok);
+        assert_eq!(detail["reason"], json!("capture_calibration_recovery_required"));
+        assert_eq!(detail["recoveryRequired"], json!(true));
+        assert_eq!(detail["invalidManifest"], json!(false));
+        assert_eq!(detail["pendingRecoveryCount"], json!(1));
+        assert!(!detail.to_string().contains("classified"));
+        assert!(!detail.to_string().contains("manifest.json"));
+    }
+
+    #[test]
+    fn compatibility_health_rejects_a_database_that_cannot_be_queried() {
+        let state = production_test_state();
+        mark_task_worker_healthy(&state);
+        state
+            .runtime
+            .block_on(state.database.connection.close_by_ref())
+            .expect("test database should close");
+
+        let response = service_health_response(&state, HealthEndpoint::Compatibility);
+        let response_text = response_text(response.clone());
+        assert!(response_text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        let body = response_json(response);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["endpoint"], json!("compatibility"));
+        assert_eq!(body["checks"]["database"]["reason"], json!("database_ping_failed"));
+    }
+
+    #[test]
+    fn storage_health_is_simulated_explicitly_or_validates_root_and_queue_without_path_leaks() {
+        let simulated = production_test_state();
+        let (simulated_ok, simulated_detail) = storage_health_component(&simulated);
+        assert!(simulated_ok);
+        assert_eq!(simulated_detail["status"], json!("simulated"));
+        assert_eq!(simulated_detail["simulated"], json!(true));
+        assert_eq!(simulated_detail["queueRequired"], json!(false));
+
+        let provider_body = json!({
+            "code": 0,
+            "root": "C:\\classified-storage-root",
+            "exists": true,
+            "writable": true,
+            "cameraRoots": [
+                { "ip": "192.168.1.10", "root": "C:\\classified-camera-root", "exists": true, "writable": true }
+            ],
+            "queue": {
+                "accepting": true,
+                "pendingItems": 2,
+                "capacityItems": 64
+            }
+        })
+        .to_string();
+        let (origin, server) =
+            spawn_health_http_server("200 OK", provider_body, Duration::ZERO);
+        let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+        let (ok, detail) =
+            storage_health_component_with_timeout(&state, Duration::from_millis(500));
+        server.join().expect("storage health server");
+        assert!(ok);
+        assert_eq!(detail["rootExists"], json!(true));
+        assert_eq!(detail["rootWritable"], json!(true));
+        assert_eq!(detail["queueAccepting"], json!(true));
+        assert_eq!(detail["queuePendingItems"], json!(2));
+        assert_eq!(detail["cameraRootCount"], json!(1));
+        let detail_text = detail.to_string();
+        assert!(!detail_text.contains("classified-storage-root"));
+        assert!(!detail_text.contains("classified-camera-root"));
+        assert!(!detail_text.contains("192.168.1.10"));
+    }
+
+    #[test]
+    fn storage_health_rejects_missing_unwritable_or_non_accepting_storage_and_times_out() {
+        for (exists, writable, accepting, expected_reason) in [
+            (false, false, true, "storage_root_missing"),
+            (true, false, true, "storage_root_not_writable"),
+            (true, true, false, "storage_queue_not_accepting"),
+        ] {
+            let body = json!({
+                "code": 0,
+                "root": "D:\\must-not-leak",
+                "exists": exists,
+                "writable": writable,
+                "cameraRoots": [],
+                "queue": { "accepting": accepting, "pendingItems": 0, "capacityItems": 8 }
+            })
+            .to_string();
+            let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
+            let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+            let (ok, detail) =
+                storage_health_component_with_timeout(&state, Duration::from_millis(500));
+            server.join().expect("storage health server");
+            assert!(!ok);
+            assert_eq!(detail["reason"], json!(expected_reason));
+            assert!(!detail.to_string().contains("must-not-leak"));
+        }
+
+        let body = json!({
+            "code": 0,
+            "root": "E:\\slow-secret-root",
+            "exists": true,
+            "writable": true,
+            "queue": { "accepting": true }
+        })
+        .to_string();
+        let (origin, server) =
+            spawn_health_http_server("200 OK", body, Duration::from_millis(150));
+        let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+        let started = Instant::now();
+        let (ok, detail) =
+            storage_health_component_with_timeout(&state, Duration::from_millis(30));
+        assert!(!ok);
+        assert!(started.elapsed() < Duration::from_millis(120));
+        assert_eq!(detail["reason"], json!("storage_timeout"));
+        assert!(!detail.to_string().contains("slow-secret-root"));
+        server.join().expect("slow storage health server");
+    }
+
+    #[test]
+    fn trigger_health_defaults_required_supports_explicit_optional_and_never_leaks_origin() {
+        assert!(trigger_health_required_from_value(None));
+        assert!(trigger_health_required_from_value(Some("1")));
+        assert!(!trigger_health_required_from_value(Some("0")));
+        assert!(!trigger_health_required_from_value(Some("false")));
+
+        let body = json!({
+            "code": 0,
+            "service": "steel-trigger-gateway",
+            "mode": "api",
+            "inspectionServiceOrigin": "http://classified-inspection-origin:4873",
+            "production": { "private": "must-not-be-forwarded" }
+        })
+        .to_string();
+        let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
+        let (required_ready, detail) = trigger_health_component_with_timeout(
+            &origin,
+            true,
+            Duration::from_millis(500),
+        );
+        server.join().expect("trigger health server");
+        assert!(required_ready);
+        assert_eq!(detail["ok"], json!(true));
+        assert_eq!(detail["required"], json!(true));
+        assert_eq!(detail["mode"], json!("api"));
+        let detail_text = detail.to_string();
+        assert!(!detail_text.contains("classified-inspection-origin"));
+        assert!(!detail_text.contains("must-not-be-forwarded"));
+        assert!(!detail_text.contains(&origin));
+
+        let unreachable = unused_local_http_origin();
+        let (required_ready, required_detail) = trigger_health_component_with_timeout(
+            &unreachable,
+            true,
+            Duration::from_millis(100),
+        );
+        assert!(!required_ready);
+        assert_eq!(required_detail["required"], json!(true));
+        assert_eq!(required_detail["readyContribution"], json!(false));
+        assert!(!required_detail.to_string().contains(&unreachable));
+
+        let (optional_ready, optional_detail) = trigger_health_component_with_timeout(
+            &unreachable,
+            false,
+            Duration::from_millis(100),
+        );
+        assert!(optional_ready);
+        assert_eq!(optional_detail["ok"], json!(false));
+        assert_eq!(optional_detail["status"], json!("optional-unavailable"));
+        assert_eq!(optional_detail["readyContribution"], json!(true));
+    }
+
+    #[test]
+    fn trigger_health_timeout_is_bounded_and_required_trigger_gates_service_readiness() {
+        let body = json!({
+            "code": 0,
+            "service": "steel-trigger-gateway",
+            "mode": "api"
+        })
+        .to_string();
+        let (slow_origin, slow_server) =
+            spawn_health_http_server("200 OK", body, Duration::from_millis(150));
+        let started = Instant::now();
+        let (ready, detail) = trigger_health_component_with_timeout(
+            &slow_origin,
+            true,
+            Duration::from_millis(30),
+        );
+        assert!(!ready);
+        assert!(started.elapsed() < Duration::from_millis(120));
+        assert_eq!(detail["reason"], json!("trigger_gateway_timeout"));
+        assert!(!detail.to_string().contains(&slow_origin));
+        slow_server.join().expect("slow trigger health server");
+
+        let mut unavailable_state = production_test_state();
+        mark_task_worker_healthy(&unavailable_state);
+        unavailable_state.trigger_health_required = true;
+        unavailable_state.trigger_gateway_origin = unused_local_http_origin();
+        let unavailable = service_health_snapshot(&unavailable_state);
+        assert!(!unavailable.ready);
+        assert_eq!(unavailable.body["checks"]["storage"]["status"], json!("simulated"));
+        assert_eq!(unavailable.body["checks"]["trigger"]["required"], json!(true));
+
+        let body = json!({
+            "code": 0,
+            "service": "steel-trigger-gateway",
+            "mode": "manual"
+        })
+        .to_string();
+        let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
+        let mut available_state = production_test_state();
+        mark_task_worker_healthy(&available_state);
+        available_state.trigger_health_required = true;
+        available_state.trigger_gateway_origin = origin;
+        let available = service_health_snapshot(&available_state);
+        server.join().expect("required trigger health server");
+        assert!(available.ready);
+        assert_eq!(available.body["checks"]["trigger"]["status"], json!("up"));
+    }
+
+    fn install_failing_insert_trigger(state: &ServiceState, table: &str) {
+        let sql = format!(
+            "CREATE TRIGGER fail_{table}_insert BEFORE INSERT ON {table} \
+             BEGIN SELECT RAISE(FAIL, 'forced {table} persistence failure'); END"
+        );
+        state
+            .runtime
+            .block_on(state.database.connection.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                sql,
+            )))
+            .expect("failing insert trigger should install");
+    }
+
+    fn insert_production_record(
+        state: &ServiceState,
+        inspection_id: &str,
+        material_id: &str,
+        session_id: &str,
+        session_status: &str,
+        inspection_status: &str,
+        finished_at: &str,
+    ) {
+        state
+            .runtime
+            .block_on(db::upsert_material_session(
+                &state.database.connection,
+                db::MaterialSessionInput {
+                    id: session_id.to_string(),
+                    material_id: material_id.to_string(),
+                    source: "test".to_string(),
+                    status: session_status.to_string(),
+                    control_mode: "manual".to_string(),
+                    trigger_mode: "manual".to_string(),
+                    steel_type: "round-bar".to_string(),
+                    width_mm: 120.0,
+                    length_mm: 6000.0,
+                    thickness_mm: 12.0,
+                    client: "test".to_string(),
+                    hard: "Q355".to_string(),
+                    storage_root: "H:\\".to_string(),
+                    started_at: "1".to_string(),
+                    finished_at: finished_at.to_string(),
+                    raw_payload: "{}".to_string(),
+                },
+            ))
+            .expect("material session insert");
+        state
+            .runtime
+            .block_on(db::upsert_production_inspection(
+                &state.database.connection,
+                db::ProductionInspectionInput {
+                    id: inspection_id.to_string(),
+                    material_id: material_id.to_string(),
+                    session_id: session_id.to_string(),
+                    status: inspection_status.to_string(),
+                    storage_root: "H:\\".to_string(),
+                    summary_path: format!("H:\\production\\{inspection_id}.json"),
+                    started_at: "1".to_string(),
+                    finished_at: finished_at.to_string(),
+                    capture_count: 6,
+                    defect_count: 0,
+                    raw_payload: "{}".to_string(),
+                },
+            ))
+            .expect("production inspection insert");
+    }
 
     #[test]
     fn capture_config_reads_require_admin_config_permission() {
-        assert_eq!(
-            permission_for_route("GET", "/api/config"),
-            Some("admin.config")
-        );
-        assert_eq!(
-            permission_for_route("GET", "/api/config/capture"),
-            Some("admin.config")
-        );
-        assert_eq!(
-            permission_for_route("POST", "/api/config/capture"),
-            Some("admin.config")
-        );
+        for (method, path) in [
+            ("GET", "/api/config"),
+            ("GET", "/api/config/capture"),
+            ("GET", "/api/config/status"),
+            ("GET", "/api/config/profiles"),
+            ("GET", "/api/config/profile"),
+            ("GET", "/api/storage/status"),
+            ("GET", "/api/param"),
+            ("GET", "/api/calibration/active"),
+            ("GET", "/api/calibration/status"),
+            ("GET", "/api/calibration/operations/detail"),
+            ("POST", "/api/config/capture"),
+            ("POST", "/api/storage/config"),
+            ("POST", "/api/storage/camera-roots"),
+            ("POST", "/api/config/profile/save"),
+            ("POST", "/api/config/profile/apply"),
+            ("POST", "/api/config/profile/import"),
+            ("POST", "/api/config/camera-params/save-all"),
+            ("POST", "/api/config/camera-params/load-all"),
+            ("POST", "/api/cameras/connect-all"),
+            ("POST", "/api/camera/connect"),
+            ("POST", "/api/camera/disconnect"),
+            ("POST", "/api/param/load-file"),
+            ("POST", "/api/param/recovery"),
+            ("POST", "/api/param"),
+            ("POST", "/api/capture/continuous-test"),
+            ("POST", "/api/capture/preset/line-continuous"),
+            ("POST", "/api/calibration/active"),
+            ("POST", "/api/calibration/apply-all"),
+            ("POST", "/api/calibration/rollback"),
+            ("POST", "/api/roi/load"),
+        ] {
+            assert_eq!(
+                permission_for_route(method, path),
+                Some("admin.config"),
+                "capture configuration route must be protected: {method} {path}"
+            );
+        }
     }
 
     #[test]
@@ -11128,7 +14075,7 @@ mod tests {
         );
         assert_eq!(
             record_retention_detail(365, "2025-07-02 10:00:00", 4, 4, 12, 4, false),
-            "执行检测记录保留策略：保留 365 天，截止 2025-07-02 10:00:00，清理记录 4 / 4 条，缺陷 12 条，钢管档案 4 条"
+            "执行检测记录保留策略：保留 365 天，截止 2025-07-02 10:00:00，清理生产记录 4 / 4 条，缺陷 12 条，采集文件索引 4 条"
         );
     }
 
@@ -11321,6 +14268,2043 @@ mod tests {
     }
 
     #[test]
+    fn latest_capture_metadata_is_read_through_the_rust_proxy() {
+        assert!(is_capture_json_proxy_route(
+            "GET",
+            "/api/capture/latest"
+        ));
+        assert!(!is_capture_json_proxy_route(
+            "POST",
+            "/api/capture/latest"
+        ));
+        assert!(!is_capture_json_proxy_route(
+            "GET",
+            "/api/capture/file"
+        ));
+        assert!(is_capture_json_proxy_route("POST", "/api/stream/start"));
+        assert!(is_capture_json_proxy_route("GET", "/api/stream/status"));
+        assert!(is_capture_binary_proxy_route(
+            "GET",
+            "/api/stream/latest"
+        ));
+        assert!(is_capture_json_proxy_route(
+            "POST",
+            "/api/capture/preset/line-continuous"
+        ));
+    }
+
+    #[test]
+    fn dangerous_line_preset_requires_exact_confirmations_and_bounded_values() {
+        assert_eq!(
+            validate_line_continuous_preset_request(
+                r#"{"lines":1000,"timeTriggerFreq":300,"laserPower":100}"#
+            ),
+            Err("line_preset_confirmation_required")
+        );
+        assert_eq!(
+            validate_line_continuous_preset_request(&format!(
+                r#"{{"confirmation":"{}","lines":0}}"#,
+                LINE_CONTINUOUS_PRESET_CONFIRMATION
+            )),
+            Err("line_preset_parameter_out_of_range")
+        );
+        assert_eq!(
+            validate_line_continuous_preset_request(&format!(
+                r#"{{"confirmation":"{}","saveToDevice":true}}"#,
+                LINE_CONTINUOUS_PRESET_CONFIRMATION
+            )),
+            Err("line_preset_device_confirmation_required")
+        );
+        assert!(validate_line_continuous_preset_request(&format!(
+            r#"{{"confirmation":"{}","deviceConfirmation":"{}","lines":1000,"timeTriggerFreq":300,"laserPower":100,"laserLineSelect":0,"controlMode":0,"saveToDevice":true}}"#,
+            LINE_CONTINUOUS_PRESET_CONFIRMATION,
+            LINE_CONTINUOUS_DEVICE_PERSIST_CONFIRMATION
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn capture_device_mutations_enforce_server_side_typed_confirmations() {
+        assert!(validate_capture_device_mutation_request(
+            "/api/param",
+            r#"{"ip":"192.0.2.1","key":"ExposureTime","value":100}"#
+        )
+        .is_ok());
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/param",
+                r#"{"ip":"192.0.2.1","key":"UndocumentedVendorKey","value":1}"#
+            ),
+            Err("sdk_parameter_write_confirmation_required")
+        );
+        assert!(validate_capture_device_mutation_request(
+            "/api/param",
+            &format!(
+                r#"{{"ip":"192.0.2.1","key":"UndocumentedVendorKey","value":1,"confirmation":"{}"}}"#,
+                SDK_PARAMETER_WRITE_CONFIRMATION
+            )
+        )
+        .is_ok());
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/load",
+                r#"{"ip":"192.0.2.1","path":"camera.xml"}"#
+            ),
+            Err("camera_calibration_confirmation_required")
+        );
+        assert!(validate_capture_device_mutation_request(
+            "/api/calibration/load",
+            r#"{"ip":"192.0.2.1","path":"camera.xml","dryRun":true}"#
+        )
+        .is_ok());
+        let mappings = (1..=CALIBRATION_SET_CAMERA_COUNT)
+            .map(|index| {
+                json!({
+                    "ip": format!("192.0.2.{index}"),
+                    "path": format!("camera-{index}.xml"),
+                    "rollbackPath": format!("known-good-camera-{index}.xml"),
+                    "expectedSn": format!("SN-{index}"),
+                    "artifactType": "camera-sdk"
+                })
+            })
+            .collect::<Vec<_>>();
+        let safe_preflight = json!({
+            "dryRun": true,
+            "atomic": true,
+            "rollbackOnFailure": true,
+            "requireAllMapped": true,
+            "stopStreams": true,
+            "expectedCameras": CALIBRATION_SET_CAMERA_COUNT,
+            "ips": mappings.iter().filter_map(|item| item.get("ip").cloned()).collect::<Vec<_>>(),
+            "cameraCalibrations": mappings,
+            "persistActive": false,
+            "saveCameraParams": false,
+            "saveToDevice": false
+        });
+        assert!(validate_capture_device_mutation_request(
+            "/api/calibration/apply-all",
+            &safe_preflight.to_string()
+        )
+        .is_ok());
+        let mut unsafe_partial = safe_preflight.clone();
+        unsafe_partial["atomic"] = json!(false);
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/apply-all",
+                &unsafe_partial.to_string()
+            ),
+            Err("calibration_set_safe_mode_required")
+        );
+        let mut missing_serial = safe_preflight.clone();
+        missing_serial["cameraCalibrations"][0]["expectedSn"] = json!("");
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/apply-all",
+                &missing_serial.to_string()
+            ),
+            Err("calibration_set_serial_required")
+        );
+        let mut missing_rollback = safe_preflight.clone();
+        missing_rollback["cameraCalibrations"][0]["rollbackPath"] = json!("");
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/apply-all",
+                &missing_rollback.to_string()
+            ),
+            Err("calibration_set_durable_rollback_path_required")
+        );
+        let mut duplicate_serial = safe_preflight.clone();
+        let first_serial = duplicate_serial["cameraCalibrations"][0]["expectedSn"].clone();
+        duplicate_serial["cameraCalibrations"][1]["expectedSn"] = first_serial;
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/apply-all",
+                &duplicate_serial.to_string()
+            ),
+            Err("calibration_set_duplicate_serial")
+        );
+        let mut duplicate_artifact = safe_preflight.clone();
+        let first_path = duplicate_artifact["cameraCalibrations"][0]["path"].clone();
+        duplicate_artifact["cameraCalibrations"][1]["path"] = first_path;
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/apply-all",
+                &duplicate_artifact.to_string()
+            ),
+            Err("calibration_set_duplicate_artifact")
+        );
+        let mut real_apply = safe_preflight.clone();
+        real_apply["dryRun"] = json!(false);
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/apply-all",
+                &real_apply.to_string()
+            ),
+            Err("camera_calibration_set_confirmation_required")
+        );
+        real_apply["confirmation"] = json!(CAMERA_CALIBRATION_SET_CONFIRMATION);
+        assert!(validate_capture_device_mutation_request(
+            "/api/calibration/apply-all",
+            &real_apply.to_string()
+        )
+        .is_ok());
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/rollback",
+                r#"{"rollbackToken":"calrb-test"}"#
+            ),
+            Err("camera_calibration_rollback_confirmation_required")
+        );
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/rollback",
+                &json!({
+                    "operationId": "rollback-test",
+                    "rollbackToken": "calrb-test",
+                    "confirmation": CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION
+                })
+                .to_string()
+            ),
+            Err("calibration_rollback_apply_operation_id_required")
+        );
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/roi/load",
+                r#"{"ip":"192.0.2.1","path":"camera.roi"}"#
+            ),
+            Err("camera_roi_confirmation_required")
+        );
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/config/camera-params/save-all",
+                r#"{"saveToDevice":true}"#
+            ),
+            Err("camera_device_persist_confirmation_required")
+        );
+        assert!(validate_capture_device_mutation_request(
+            "/api/config/camera-params/save-all",
+            &format!(
+                r#"{{"saveToDevice":true,"deviceConfirmation":"{}"}}"#,
+                CAMERA_DEVICE_PERSIST_CONFIRMATION
+            )
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn qt_operator_workflows_have_explicit_rust_proxy_routes() {
+        let json_routes = [
+            ("GET", "/api/storage/status"),
+            ("POST", "/api/storage/config"),
+            ("GET", "/api/config/profiles"),
+            ("POST", "/api/config/profile/apply"),
+            ("POST", "/api/config/camera-params/save-all"),
+            ("POST", "/api/config/camera-params/load-all"),
+            ("POST", "/api/cameras/connect-all"),
+            ("POST", "/api/param/load-file"),
+            ("POST", "/api/param/save-file"),
+            ("POST", "/api/param/recovery"),
+            ("POST", "/api/capture/continuous-test"),
+            ("POST", "/api/capture/preset/line-continuous"),
+            ("POST", "/api/stream/start"),
+            ("POST", "/api/stream/stop"),
+            ("GET", "/api/stream/status"),
+            ("GET", "/api/calibration/active"),
+            ("POST", "/api/calibration/active"),
+            ("POST", "/api/calibration/apply-all"),
+            ("POST", "/api/calibration/rollback"),
+            ("GET", "/api/calibration/status"),
+            ("POST", "/api/roi/load"),
+        ];
+        for (method, path) in json_routes {
+            assert!(
+                is_capture_json_proxy_route(method, path),
+                "missing capture proxy route {method} {path}"
+            );
+        }
+        assert!(is_capture_binary_proxy_route(
+            "GET",
+            "/api/stream/latest"
+        ));
+    }
+
+    #[test]
+    fn capture_proxy_allowlist_is_fully_reflected_in_the_api_manifest() {
+        let mut routes = Vec::new();
+        append_capture_proxy_manifest_routes(&mut routes);
+        assert_eq!(
+            routes.len(),
+            CAPTURE_JSON_PROXY_ROUTES.len() + CAPTURE_BINARY_PROXY_ROUTES.len()
+        );
+        for (method, path) in CAPTURE_JSON_PROXY_ROUTES
+            .iter()
+            .chain(CAPTURE_BINARY_PROXY_ROUTES.iter())
+        {
+            assert!(routes.iter().any(|route| {
+                route.get("method").and_then(Value::as_str) == Some(*method)
+                    && route.get("path").and_then(Value::as_str) == Some(*path)
+                    && route.get("scope").and_then(Value::as_str) == Some("capture")
+            }), "capture proxy route missing from manifest: {method} {path}");
+        }
+    }
+
+    #[test]
+    fn calibration_operation_ledger_replays_terminal_response_and_rejects_conflicts() {
+        let state = production_test_state();
+        let body = calibration_apply_operation_body("cal-op-idempotent-001");
+        let dispatches = std::sync::atomic::AtomicUsize::new(0);
+        let provider_body = br#"{"code":0,"applied":6,"failed":0}"#.to_vec();
+
+        let first = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &body,
+            "admin-a",
+            |_| {
+                dispatches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(CaptureProxyResponse {
+                    status_code: 200,
+                    content_type: "application/json; charset=utf-8".to_string(),
+                    body: provider_body.clone(),
+                })
+            },
+        );
+        assert!(response_text(first).starts_with("HTTP/1.1 200 OK"));
+
+        let stored = state
+            .runtime
+            .block_on(db::find_calibration_operation(
+                &state.database.connection,
+                "cal-op-idempotent-001",
+            ))
+            .expect("operation lookup")
+            .expect("stored operation");
+        assert_eq!(stored.status, "succeeded");
+        assert_eq!(stored.actor, "admin-a");
+        assert!(!stored.request_hash.is_empty());
+        assert_eq!(stored.provider_http_status, 200);
+
+        let replay = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &body,
+            "admin-b",
+            |_| panic!("a completed operation must not be dispatched again"),
+        );
+        assert_eq!(
+            response_json(replay),
+            serde_json::from_slice::<Value>(&provider_body).expect("provider JSON")
+        );
+
+        let mut conflicting = serde_json::from_str::<Value>(&body).expect("request JSON");
+        conflicting["version"] = json!("different-request");
+        let conflict = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &conflicting.to_string(),
+            "admin-b",
+            |_| panic!("an operationId conflict must not be dispatched"),
+        );
+        let conflict = response_json(conflict);
+        assert_eq!(conflict["code"], 409);
+        assert_eq!(conflict["error"], "calibration_operation_id_conflict");
+        assert_eq!(
+            dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn calibration_operation_same_id_is_single_flight_while_dispatching() {
+        let state = Arc::new(production_test_state());
+        let body = calibration_apply_operation_body("cal-op-concurrent-001");
+        let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+
+        let first_state = Arc::clone(&state);
+        let first_body = body.clone();
+        let first_dispatches = Arc::clone(&dispatches);
+        let first = std::thread::spawn(move || {
+            calibration_operations::mutation_response_with_dispatch(
+                &first_state,
+                "/api/calibration/apply-all",
+                &first_body,
+                "admin-a",
+                |_| {
+                    first_dispatches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    started_sender.send(()).expect("signal dispatch start");
+                    release_receiver
+                        .recv_timeout(Duration::from_secs(3))
+                        .expect("release first dispatch");
+                    Some(CaptureProxyResponse {
+                        status_code: 200,
+                        content_type: "application/json".to_string(),
+                        body: br#"{"code":0,"applied":6}"#.to_vec(),
+                    })
+                },
+            )
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first operation should enter dispatch");
+
+        let current = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &body,
+            "admin-b",
+            |_| {
+                dispatches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+        );
+        let current_text = response_text(current.clone());
+        assert!(current_text.starts_with("HTTP/1.1 202 Accepted"));
+        let current = response_json(current);
+        assert_eq!(current["status"], "dispatching");
+        assert_eq!(current["replayed"], true);
+        assert_eq!(current["needsReconciliation"], false);
+        assert_eq!(
+            dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        release_sender.send(()).expect("release first operation");
+        let first = first.join().expect("first operation thread");
+        assert!(response_text(first).starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn calibration_operation_rejects_a_different_id_instead_of_queueing() {
+        let state = Arc::new(production_test_state());
+        let first_body = calibration_apply_operation_body("cal-op-fence-001");
+        let second_body = calibration_apply_operation_body("cal-op-fence-002");
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+
+        let first_state = Arc::clone(&state);
+        let first = std::thread::spawn(move || {
+            calibration_operations::mutation_response_with_dispatch(
+                &first_state,
+                "/api/calibration/apply-all",
+                &first_body,
+                "admin-a",
+                |_| {
+                    started_sender.send(()).expect("signal dispatch start");
+                    release_receiver
+                        .recv_timeout(Duration::from_secs(3))
+                        .expect("release first dispatch");
+                    Some(CaptureProxyResponse {
+                        status_code: 200,
+                        content_type: "application/json".to_string(),
+                        body: br#"{"code":0,"applied":6}"#.to_vec(),
+                    })
+                },
+            )
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first operation should enter dispatch");
+
+        let second = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &second_body,
+            "admin-b",
+            |_| panic!("a distinct operation must not queue behind an active SDK mutation"),
+        );
+        let second_text = response_text(second.clone());
+        assert!(second_text.starts_with("HTTP/1.1 409 Conflict"));
+        let second = response_json(second);
+        assert_eq!(second["error"], "calibration_operation_in_progress");
+        assert_eq!(second["operationId"], "cal-op-fence-002");
+        assert_eq!(second["retryable"], true);
+        assert!(state
+            .runtime
+            .block_on(db::find_calibration_operation(
+                &state.database.connection,
+                "cal-op-fence-002",
+            ))
+            .expect("second operation lookup")
+            .is_none());
+
+        release_sender.send(()).expect("release first operation");
+        let first = first.join().expect("first operation thread");
+        assert!(response_text(first).starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn calibration_apply_rejects_duplicate_json_keys_before_provider_dispatch() {
+        let state = production_test_state();
+        let response = calibration_operations::apply_response(
+            &state,
+            r#"{"dryRun":false,"dryRun":true}"#,
+            "admin-a",
+        );
+        let response_text_value = response_text(response.clone());
+        assert!(response_text_value.starts_with("HTTP/1.1 400 Bad Request"));
+        assert_eq!(
+            response_json(response)["error"],
+            "invalid_or_duplicate_calibration_operation_json"
+        );
+    }
+
+    #[test]
+    fn calibration_operation_unavailable_provider_is_persisted_for_reconciliation() {
+        let state = production_test_state();
+        let body = calibration_apply_operation_body("cal-op-unknown-001");
+        let response = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &body,
+            "admin-reconciler",
+            |_| None,
+        );
+        let response_text_value = response_text(response.clone());
+        assert!(response_text_value.starts_with("HTTP/1.1 409 Conflict"));
+        let response = response_json(response);
+        assert_eq!(response["status"], "needs-reconciliation");
+        assert_eq!(response["needsReconciliation"], true);
+        assert_eq!(
+            response["error"],
+            "capture_provider_timeout_or_unavailable"
+        );
+
+        let replay = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &body,
+            "admin-other",
+            |_| panic!("an uncertain operation must never be replayed automatically"),
+        );
+        let replay = response_json(replay);
+        assert_eq!(replay["status"], "needs-reconciliation");
+        assert_eq!(replay["replayed"], true);
+
+        let detail = calibration_operations::detail_response(
+            &state,
+            "id=cal-op-unknown-001",
+        );
+        let detail = response_json(detail);
+        assert_eq!(detail["operationId"], "cal-op-unknown-001");
+        assert_eq!(detail["actor"], "admin-reconciler");
+        assert_eq!(detail["needsReconciliation"], true);
+    }
+
+    #[test]
+    fn unresolved_calibration_operation_fences_device_writes_until_parent_bound_rollback() {
+        let state = production_test_state();
+        let parent_id = "cal-op-parent-unknown-001";
+        let parent_body = calibration_apply_operation_body(parent_id);
+        let uncertain = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &parent_body,
+            "admin-original",
+            |_| None,
+        );
+        assert_eq!(response_json(uncertain)["status"], "needs-reconciliation");
+
+        let blocked_id = "cal-op-blocked-apply-001";
+        let blocked = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &calibration_apply_operation_body(blocked_id),
+            "admin-blocked",
+            |_| panic!("a fenced calibration apply must not reach the provider"),
+        );
+        let blocked_text = response_text(blocked.clone());
+        assert!(blocked_text.starts_with("HTTP/1.1 423 Locked"));
+        let blocked = response_json(blocked);
+        assert_eq!(blocked["error"], "calibration_reconciliation_required");
+        assert_eq!(blocked["operationId"], blocked_id);
+        assert_eq!(blocked["unresolvedOperations"][0]["operationId"], parent_id);
+
+        for path in [
+            "/api/calibration/load",
+            "/api/roi/load",
+            "/api/calibration/active",
+            "/api/config/profile/save",
+            "/api/config/profile/import",
+            "/api/config/profile/apply",
+            "/api/config/camera-params/save-all",
+            "/api/config/camera-params/load-all",
+            "/api/param",
+            "/api/param/save-device",
+            "/api/param/save-to-device",
+            "/api/param/load-file",
+            "/api/param/recovery",
+            "/api/capture/preset/line-continuous",
+        ] {
+            assert!(
+                calibration_operations::mutation_requires_reconciliation_fence("POST", path),
+                "device mutation must be fenced: {path}"
+            );
+        }
+        let generic_fence = calibration_operations::reconciliation_fence_response(
+            &state,
+            "/api/param",
+        )
+        .expect("unresolved operation must fence generic device mutations");
+        let generic_fence_text = response_text(generic_fence.clone());
+        assert!(generic_fence_text.starts_with("HTTP/1.1 423 Locked"));
+        let generic_fence = response_json(generic_fence);
+        assert_eq!(generic_fence["requestTarget"], "/api/param");
+        assert!(generic_fence.get("operationId").is_none());
+
+        let rollback_id = "cal-op-parent-rollback-001";
+        let rollback_body = json!({
+            "operationId": rollback_id,
+            "parentOperationId": parent_id,
+            "applyOperationId": parent_id,
+            "rollbackToken": "calrb-parent-001",
+            "confirmation": CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION
+        })
+        .to_string();
+        let rollback = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/rollback",
+            &rollback_body,
+            "admin-reconciler",
+            |_| {
+                Some(CaptureProxyResponse {
+                    status_code: 200,
+                    content_type: "application/json; charset=utf-8".to_string(),
+                    body: json!({
+                        "code": 0,
+                        "complete": true,
+                        "applyOperationId": parent_id,
+                        "rolledBack": 6,
+                        "failed": 0
+                    })
+                    .to_string()
+                    .into_bytes(),
+                })
+            },
+        );
+        assert!(response_text(rollback).starts_with("HTTP/1.1 200 OK"));
+
+        let parent = state
+            .runtime
+            .block_on(db::find_calibration_operation(
+                &state.database.connection,
+                parent_id,
+            ))
+            .expect("parent operation lookup")
+            .expect("parent operation");
+        assert_eq!(parent.status, "reconciled");
+        assert_eq!(parent.reconciliation_outcome, "restored-to-staged-baseline");
+        assert_eq!(parent.reconciliation_id, rollback_id);
+        assert_eq!(parent.resolved_by, "admin-reconciler");
+        assert!(!parent.resolved_at.is_empty());
+        assert_eq!(parent.row_version, 3);
+        assert!(calibration_operations::reconciliation_fence_response(
+            &state,
+            "/api/param"
+        )
+        .is_none());
+
+        let after_reconciliation = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &calibration_apply_operation_body("cal-op-after-reconcile-001"),
+            "admin-next",
+            |_| {
+                Some(CaptureProxyResponse {
+                    status_code: 200,
+                    content_type: "application/json".to_string(),
+                    body: br#"{"code":0,"applied":6,"failed":0}"#.to_vec(),
+                })
+            },
+        );
+        assert!(response_text(after_reconciliation).starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn rollback_parent_mismatch_keeps_reconciliation_fence_closed() {
+        let state = production_test_state();
+        let parent_id = "cal-op-parent-mismatch-001";
+        let uncertain = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &calibration_apply_operation_body(parent_id),
+            "admin-original",
+            |_| None,
+        );
+        assert_eq!(response_json(uncertain)["status"], "needs-reconciliation");
+
+        let rollback = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/rollback",
+            &json!({
+                "operationId": "cal-op-mismatch-rollback-001",
+                "parentOperationId": parent_id,
+                "applyOperationId": parent_id,
+                "rollbackToken": "calrb-parent-mismatch-001",
+                "confirmation": CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION
+            })
+            .to_string(),
+            "admin-reconciler",
+            |_| {
+                Some(CaptureProxyResponse {
+                    status_code: 200,
+                    content_type: "application/json".to_string(),
+                    body: br#"{"code":0,"complete":true,"applyOperationId":"different-parent"}"#
+                        .to_vec(),
+                })
+            },
+        );
+        let rollback_text = response_text(rollback.clone());
+        assert!(rollback_text.starts_with("HTTP/1.1 409 Conflict"));
+        assert_eq!(
+            response_json(rollback)["error"],
+            "calibration_reconciliation_parent_mismatch"
+        );
+        let parent = state
+            .runtime
+            .block_on(db::find_calibration_operation(
+                &state.database.connection,
+                parent_id,
+            ))
+            .expect("parent lookup")
+            .expect("parent operation");
+        assert_eq!(parent.status, "needs-reconciliation");
+        assert!(calibration_operations::reconciliation_fence_response(
+            &state,
+            "/api/param"
+        )
+        .is_some());
+        let (ready, reconciliation) = calibration_reconciliation_health_component(&state);
+        assert!(!ready);
+        assert_eq!(reconciliation["status"], "reconciliation-required");
+        assert_eq!(reconciliation["unresolvedCount"], 1);
+        assert_eq!(
+            reconciliation["unresolvedOperations"][0]["operationId"],
+            parent_id
+        );
+    }
+
+    #[test]
+    fn interrupted_rollback_reconciles_against_its_original_apply_operation() {
+        let state = production_test_state();
+        let apply_id = "cal-op-before-interrupted-rollback-001";
+        let apply = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/apply-all",
+            &calibration_apply_operation_body(apply_id),
+            "admin-apply",
+            |_| {
+                Some(CaptureProxyResponse {
+                    status_code: 200,
+                    content_type: "application/json".to_string(),
+                    body: json!({
+                        "code": 0,
+                        "operationId": apply_id,
+                        "applied": 6,
+                        "failed": 0,
+                        "rollbackToken": "calrb-interrupted-rollback-001"
+                    })
+                    .to_string()
+                    .into_bytes(),
+                })
+            },
+        );
+        assert!(response_text(apply).starts_with("HTTP/1.1 200 OK"));
+
+        let interrupted_rollback_id = "cal-op-interrupted-rollback-001";
+        let interrupted = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/rollback",
+            &json!({
+                "operationId": interrupted_rollback_id,
+                "applyOperationId": apply_id,
+                "rollbackToken": "calrb-interrupted-rollback-001",
+                "confirmation": CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION
+            })
+            .to_string(),
+            "admin-first-rollback",
+            |_| None,
+        );
+        assert_eq!(response_json(interrupted)["status"], "needs-reconciliation");
+
+        let fenced = calibration_operations::reconciliation_fence_response(
+            &state,
+            "/api/param",
+        )
+        .expect("interrupted rollback must close the fence");
+        let fenced = response_json(fenced);
+        assert_eq!(
+            fenced["unresolvedOperations"][0]["operationId"],
+            interrupted_rollback_id
+        );
+        assert_eq!(
+            fenced["unresolvedOperations"][0]["expectedApplyOperationId"],
+            apply_id
+        );
+
+        let recovery_id = "cal-op-interrupted-rollback-recovery-001";
+        let recovery = calibration_operations::mutation_response_with_dispatch(
+            &state,
+            "/api/calibration/rollback",
+            &json!({
+                "operationId": recovery_id,
+                "parentOperationId": interrupted_rollback_id,
+                "applyOperationId": apply_id,
+                "rollbackToken": "calrb-interrupted-rollback-001",
+                "confirmation": CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION
+            })
+            .to_string(),
+            "admin-recovery",
+            |_| {
+                Some(CaptureProxyResponse {
+                    status_code: 200,
+                    content_type: "application/json".to_string(),
+                    body: json!({
+                        "code": 0,
+                        "complete": true,
+                        "applyOperationId": apply_id,
+                        "rolledBack": 6,
+                        "failed": 0
+                    })
+                    .to_string()
+                    .into_bytes(),
+                })
+            },
+        );
+        assert!(response_text(recovery).starts_with("HTTP/1.1 200 OK"));
+        let interrupted = state
+            .runtime
+            .block_on(db::find_calibration_operation(
+                &state.database.connection,
+                interrupted_rollback_id,
+            ))
+            .expect("interrupted rollback lookup")
+            .expect("interrupted rollback row");
+        assert_eq!(interrupted.status, "reconciled");
+        assert_eq!(interrupted.reconciliation_id, recovery_id);
+        assert!(calibration_operations::reconciliation_fence_response(
+            &state,
+            "/api/param"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn startup_recovery_marks_dispatching_calibration_operations_without_replay() {
+        let state = production_test_state();
+        state
+            .runtime
+            .block_on(db::insert_calibration_operation(
+                &state.database.connection,
+                db::CalibrationOperationInput {
+                    id: "cal-op-interrupted-001".to_string(),
+                    kind: "apply-all".to_string(),
+                    request_hash: "fnv1a64-test".to_string(),
+                    request_json: r#"{"operationId":"cal-op-interrupted-001"}"#.to_string(),
+                    actor: "admin-a".to_string(),
+                    parent_operation_id: String::new(),
+                },
+            ))
+            .expect("insert interrupted operation");
+
+        let recovered = state
+            .runtime
+            .block_on(db::recover_dispatching_calibration_operations(
+                &state.database.connection,
+            ))
+            .expect("recover interrupted operations");
+        assert_eq!(recovered, 1);
+        let operation = state
+            .runtime
+            .block_on(db::find_calibration_operation(
+                &state.database.connection,
+                "cal-op-interrupted-001",
+            ))
+            .expect("operation lookup")
+            .expect("recovered operation");
+        assert_eq!(operation.status, "needs-reconciliation");
+        assert_eq!(operation.error, "service_restart_while_dispatching");
+        assert_eq!(
+            state
+                .runtime
+                .block_on(db::recover_dispatching_calibration_operations(
+                    &state.database.connection,
+                ))
+                .expect("second recovery"),
+            0
+        );
+    }
+
+    #[test]
+    fn capture_proxy_preserves_provider_error_status_and_body() {
+        let response = parse_capture_http_response(
+            b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 37\r\n\r\n{\"code\":422,\"error\":\"bad_parameter\"}"
+                .to_vec(),
+        )
+        .expect("provider response should parse");
+
+        assert_eq!(response.status_code, 422);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+        assert_eq!(
+            String::from_utf8(response.body).expect("json body"),
+            "{\"code\":422,\"error\":\"bad_parameter\"}"
+        );
+        assert_eq!(capture_proxy_status(422), "422 Unprocessable Entity");
+    }
+
+    #[test]
+    fn capture_provider_unavailable_response_never_leaks_the_private_origin() {
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:4317",
+        );
+        let response = response_text(capture_provider_unavailable_response(&state.capture));
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(response.contains("capture_provider_unavailable"));
+        assert!(!response.contains("127.0.0.1"));
+        assert!(!response.contains("4317"));
+        assert!(!response.contains("\"origin\""));
+    }
+
+    #[test]
+    fn trigger_gateway_operator_routes_are_explicit_and_proxied_without_origin_leaks() {
+        for (method, path) in [
+            ("GET", "/api/trigger/status"),
+            ("GET", "/api/trigger/mode"),
+            ("POST", "/api/trigger/mode"),
+            ("POST", "/api/trigger/manual/steel-info"),
+            ("POST", "/api/trigger/manual/steel-in"),
+            ("POST", "/api/trigger/manual/steel-out"),
+        ] {
+            assert!(
+                is_trigger_gateway_proxy_route(method, path),
+                "missing trigger gateway proxy route {method} {path}"
+            );
+        }
+        assert!(!is_trigger_gateway_proxy_route(
+            "POST",
+            "/api/trigger/defect"
+        ));
+
+        let body = json!({
+            "code": 0,
+            "service": "steel-trigger-gateway",
+            "mode": "manual",
+            "manualAllowed": true
+        })
+        .to_string();
+        let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
+        let mut state = production_test_state();
+        state.trigger_gateway_origin = origin;
+        let response = response_text(trigger_gateway_proxy_http_response(
+            &state,
+            "GET",
+            "/api/trigger/status",
+            "",
+        ));
+        server.join().expect("trigger proxy test server");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("\"service\":\"steel-trigger-gateway\""));
+        assert!(response.contains("\"mode\":\"manual\""));
+
+        let mut unavailable = production_test_state();
+        unavailable.trigger_gateway_origin = unused_local_http_origin();
+        let private_origin = unavailable.trigger_gateway_origin.clone();
+        let response = response_text(trigger_gateway_proxy_http_response(
+            &unavailable,
+            "GET",
+            "/api/trigger/status",
+            "",
+        ));
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(response.contains("trigger_gateway_unavailable"));
+        assert!(!response.contains(&private_origin));
+    }
+
+    #[test]
+    fn production_mutations_share_one_serial_command_lane() {
+        assert!(is_production_mutation_route(
+            "POST",
+            "/api/production/capture-once"
+        ));
+        assert!(is_production_mutation_route(
+            "POST",
+            "/api/production/steel-out"
+        ));
+        assert!(!is_production_mutation_route(
+            "GET",
+            "/api/production/status"
+        ));
+        assert!(!is_production_mutation_route("POST", "/api/param"));
+    }
+
+    #[test]
+    fn steel_out_requires_an_active_session() {
+        let conflict = resolve_production_event_target(
+            &json!({ "materialId": "MAT-A", "sessionId": "SESSION-A" }),
+            "steel-out",
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            conflict,
+            ProductionTransitionConflict::ActiveSessionRequired
+        );
+
+        let state = production_test_state();
+        let response = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+            "steel-out",
+            "test",
+        ));
+        assert!(response.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(response.contains("active_session_required"));
+        assert!(state
+            .runtime
+            .block_on(db::latest_material_session(&state.database.connection))
+            .expect("session query")
+            .is_none());
+    }
+
+    #[test]
+    fn steel_out_mismatch_does_not_finish_the_active_session() {
+        let state = production_test_state();
+        let started = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+            "steel-in",
+            "test",
+        ));
+        assert!(started.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        for mismatched_body in [
+            r#"{"materialId":"MAT-B","sessionId":"SESSION-A"}"#,
+            r#"{"materialId":"MAT-A","sessionId":"SESSION-B"}"#,
+        ] {
+            let response = response_text(write_production_event_response(
+                &state,
+                mismatched_body,
+                "steel-out",
+                "test",
+            ));
+            assert!(response.starts_with("HTTP/1.1 409 Conflict\r\n"));
+            assert!(response.contains("active_session_conflict"));
+
+            let active = state
+                .runtime
+                .block_on(db::find_material_session(
+                    &state.database.connection,
+                    "SESSION-A",
+                ))
+                .expect("active session query")
+                .expect("active session should remain");
+            assert_eq!(active.material_id, "MAT-A");
+            assert_eq!(active.status, "active");
+            assert!(active.finished_at.is_empty());
+        }
+        assert!(state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                "SESSION-B",
+            ))
+            .expect("mismatched session query")
+            .is_none());
+    }
+
+    #[test]
+    fn production_status_uses_the_latest_open_session_independently() {
+        let state = production_test_state();
+        insert_production_record(
+            &state,
+            "INSP-SESSION-A",
+            "MAT-OPEN",
+            "SESSION-A",
+            "active",
+            "running",
+            "",
+        );
+        insert_production_record(
+            &state,
+            "INSP-SESSION-Z",
+            "MAT-FINISHED",
+            "SESSION-Z",
+            "finished",
+            "finished",
+            "2",
+        );
+
+        let body = response_json(production_status_response(&state));
+        assert_eq!(body["latestSession"]["id"], json!("SESSION-Z"));
+        assert_eq!(body["activeSession"]["id"], json!("SESSION-A"));
+        assert_eq!(body["activeSession"]["status"], json!("active"));
+    }
+
+    #[test]
+    fn steel_in_rejects_a_second_session_but_allows_same_session_retry() {
+        let target = resolve_production_event_target(
+            &json!({ "materialId": "MAT-A" }),
+            "steel-in",
+            Some(("MAT-A", "SESSION-A")),
+            1,
+        )
+        .expect("same material retry should resolve to the active session");
+        assert_eq!(target.session_id, "SESSION-A");
+
+        let state = production_test_state();
+        let started = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+            "steel-in",
+            "test",
+        ));
+        assert!(started.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let conflict = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-B","sessionId":"SESSION-B"}"#,
+            "steel-in",
+            "test",
+        ));
+        assert!(conflict.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                "SESSION-B",
+            ))
+            .expect("second session query")
+            .is_none());
+
+        let retry = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+            "steel-in",
+            "test",
+        ));
+        assert!(retry.starts_with("HTTP/1.1 200 OK\r\n"));
+        let active = state
+            .runtime
+            .block_on(db::latest_open_material_session(
+                &state.database.connection,
+            ))
+            .expect("active session query")
+            .expect("active session should exist");
+        assert_eq!(active.id, "SESSION-A");
+        assert_eq!(active.material_id, "MAT-A");
+    }
+
+    #[test]
+    fn steel_out_provider_failure_remains_retryable_and_never_marks_session_finished() {
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:0",
+        );
+        insert_production_record(
+            &state,
+            "INSP-SESSION-A",
+            "MAT-A",
+            "SESSION-A",
+            "active",
+            "running",
+            "",
+        );
+        let first = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+            "steel-out",
+            "test",
+        ));
+        assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(first.contains("\"code\":503"));
+        let failed = state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                "SESSION-A",
+            ))
+            .expect("failed session query")
+            .expect("failed session");
+        assert_eq!(failed.status, "exit-failed");
+        assert!(failed.finished_at.is_empty());
+
+        let retry = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+            "steel-out",
+            "test",
+        ));
+        assert!(retry.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(retry.contains("\"code\":503"));
+        assert!(!retry.contains("active_session_required"));
+    }
+
+    #[test]
+    fn steel_out_preserves_existing_material_spec_when_payload_is_minimal() {
+        let state = production_test_state();
+        insert_production_record(
+            &state,
+            "INSP-SESSION-A",
+            "MAT-A",
+            "SESSION-A",
+            "active",
+            "running",
+            "",
+        );
+
+        let response = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+            "steel-out",
+            "test",
+        ));
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("\"code\":0"));
+
+        let finished = state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                "SESSION-A",
+            ))
+            .expect("finished session query")
+            .expect("finished session");
+        assert_eq!(finished.status, "finished");
+        assert_eq!(finished.source, "test");
+        assert_eq!(finished.control_mode, "manual");
+        assert_eq!(finished.trigger_mode, "manual");
+        assert_eq!(finished.steel_type, "round-bar");
+        assert_eq!(finished.width_mm, 120.0);
+        assert_eq!(finished.length_mm, 6000.0);
+        assert_eq!(finished.thickness_mm, 12.0);
+        assert_eq!(finished.client, "test");
+        assert_eq!(finished.hard, "Q355");
+        assert_eq!(finished.storage_root, "H:\\");
+        assert_eq!(finished.started_at, "1");
+        assert!(!finished.finished_at.is_empty());
+    }
+
+    #[test]
+    fn steel_in_provider_failure_does_not_arm_capture() {
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:0",
+        );
+        let response = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-FAILED","sessionId":"SESSION-FAILED"}"#,
+            "steel-in",
+            "test",
+        ));
+        assert!(response.contains("\"code\":503"));
+        let session = state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                "SESSION-FAILED",
+            ))
+            .expect("failed steel-in query")
+            .expect("failed steel-in session");
+        assert_eq!(session.status, "start-failed");
+        let capture_guard = response_text(
+            validate_capture_open_session(
+                &state,
+                &json!({
+                    "materialId": "MAT-FAILED",
+                    "sessionId": "SESSION-FAILED",
+                    "requireSteelPresent": true
+                }),
+            )
+            .expect_err("failed steel-in must not allow capture"),
+        );
+        assert!(capture_guard.contains("production_session_not_capture_ready"));
+        assert!(capture_guard.contains("start-failed"));
+
+        let steel_out = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-FAILED","sessionId":"SESSION-FAILED"}"#,
+            "steel-out",
+            "test",
+        ));
+        assert!(steel_out.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(steel_out.contains("production_session_not_exit_ready"));
+        assert!(steel_out.contains("start-failed"));
+    }
+
+    #[test]
+    fn pre_capture_session_persistence_failure_is_reported_for_info_and_in() {
+        for event in ["steel-info", "steel-in"] {
+            let state = production_test_state();
+            install_failing_insert_trigger(&state, "material_session");
+            let response = response_text(write_production_event_response(
+                &state,
+                r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+                event,
+                "test",
+            ));
+            assert!(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+            assert!(response.contains("production_state_persistence_failed"));
+            assert!(!response.contains("recordWrittenBeforeCapture"));
+        }
+    }
+
+    #[test]
+    fn pre_capture_inspection_persistence_failure_is_reported_for_info_and_in() {
+        for event in ["steel-info", "steel-in"] {
+            let state = production_test_state();
+            install_failing_insert_trigger(&state, "production_inspection");
+            let response = response_text(write_production_event_response(
+                &state,
+                r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+                event,
+                "test",
+            ));
+            assert!(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+            assert!(response.contains("upsert_production_inspection"));
+            assert!(!response.contains("recordWrittenBeforeCapture"));
+        }
+    }
+
+    #[test]
+    fn production_task_enqueue_is_idempotent_and_rejects_payload_conflicts() {
+        let state = production_test_state();
+        let first = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"algorithm-run","idempotencyKey":"RUN-001","payload":{"materialId":"MAT-A","maxFrames":6}}"#,
+            "tester",
+        ));
+        assert!(first.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        assert!(first.contains("\"duplicate\":false"));
+
+        let duplicate = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"algorithm-run","idempotencyKey":"RUN-001","payload":{"materialId":"MAT-A","maxFrames":6}}"#,
+            "tester",
+        ));
+        assert!(duplicate.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(duplicate.contains("\"duplicate\":true"));
+
+        let conflict = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"algorithm-run","idempotencyKey":"RUN-001","payload":{"materialId":"MAT-B","maxFrames":6}}"#,
+            "tester",
+        ));
+        assert!(conflict.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(conflict.contains("idempotency_conflict"));
+
+        let page = state
+            .runtime
+            .block_on(db::list_production_tasks(
+                &state.database.connection,
+                db::ProductionTaskFilter::default(),
+            ))
+            .expect("task page");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.tasks[0].status, "queued");
+    }
+
+    #[test]
+    fn queued_production_event_routes_are_explicit_and_do_not_take_the_sync_lane() {
+        for (path, kind) in [
+            ("/api/production/tasks/steel-info", "steel-info"),
+            ("/api/production/tasks/steel-in", "steel-in"),
+            ("/api/production/tasks/steel-out", "steel-out"),
+            ("/api/production/tasks/trigger-event", "trigger-event"),
+        ] {
+            assert_eq!(
+                production_tasks::queued_kind_for_route("POST", path),
+                Some(kind)
+            );
+            assert!(!is_production_mutation_route("POST", path));
+            assert_eq!(production_tasks::queued_kind_for_route("GET", path), None);
+        }
+        assert_eq!(
+            production_tasks::queued_kind_for_route("POST", "/api/production/steel-in"),
+            None
+        );
+        assert!(is_production_mutation_route(
+            "POST",
+            "/api/production/steel-in"
+        ));
+
+        let state = production_test_state();
+        let request =
+            r#"{"materialId":"MAT-IDEMPOTENT","sessionId":"SESSION-IDEMPOTENT","requestId":"STEEL-IN-001","autoCapture":false}"#;
+        let first = response_text(production_tasks::enqueue_kind_response(
+            &state, "steel-in", request, "tester",
+        ));
+        let duplicate = response_text(production_tasks::enqueue_kind_response(
+            &state, "steel-in", request, "tester",
+        ));
+        assert!(first.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        assert!(duplicate.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(duplicate.contains("\"duplicate\":true"));
+        assert_eq!(
+            state
+                .runtime
+                .block_on(db::count_open_production_tasks(&state.database.connection))
+                .expect("open task count"),
+            1
+        );
+    }
+
+    #[test]
+    fn queued_production_chain_reuses_session_and_claims_fifo_through_steel_out() {
+        let state = production_test_state();
+        let steel_in = response_json(production_tasks::enqueue_kind_response(
+            &state,
+            "steel-in",
+            r#"{"materialId":"MAT-FIFO","requestId":"FIFO-IN","autoCapture":false}"#,
+            "tester",
+        ));
+        let capture = response_json(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"capture-once","idempotencyKey":"FIFO-CAPTURE","payload":{"materialId":"MAT-FIFO","requireSteelPresent":true}}"#,
+            "tester",
+        ));
+        let algorithm = response_json(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"algorithm-run","idempotencyKey":"FIFO-ALGORITHM","payload":{"materialId":"MAT-FIFO","runCore":false}}"#,
+            "tester",
+        ));
+        let steel_out = response_json(production_tasks::enqueue_kind_response(
+            &state,
+            "steel-out",
+            r#"{"materialId":"MAT-FIFO","requestId":"FIFO-OUT"}"#,
+            "tester",
+        ));
+
+        let session_id = steel_in["task"]["sessionId"]
+            .as_str()
+            .expect("steel-in task session")
+            .to_string();
+        assert!(!session_id.is_empty());
+        for task in [&capture, &algorithm, &steel_out] {
+            assert_eq!(task["task"]["sessionId"], json!(session_id.clone()));
+        }
+
+        let mut claimed_kinds = Vec::new();
+        for _ in 0..4 {
+            let task = state
+                .runtime
+                .block_on(db::claim_next_production_task(&state.database.connection))
+                .expect("claim query")
+                .expect("queued task");
+            claimed_kinds.push(task.kind.clone());
+            let checkpoint = state
+                .runtime
+                .block_on(db::update_production_task_progress(
+                    &state.database.connection,
+                    &task.id,
+                    "dispatching-test-operation",
+                    42,
+                ))
+                .expect("checkpoint update")
+                .expect("running task checkpoint");
+            assert_eq!(checkpoint.status, "running");
+            assert_eq!(checkpoint.phase, "dispatching-test-operation");
+            assert_eq!(checkpoint.progress, 42);
+            state
+                .runtime
+                .block_on(db::finish_production_task(
+                    &state.database.connection,
+                    &task.id,
+                    "succeeded",
+                    100,
+                    "{}".to_string(),
+                    String::new(),
+                ))
+                .expect("finish task");
+        }
+        assert_eq!(
+            claimed_kinds,
+            ["steel-in", "capture-once", "algorithm-run", "steel-out"]
+        );
+    }
+
+    #[test]
+    fn worker_execution_scope_bypasses_only_its_own_open_task_fence() {
+        let state = production_test_state();
+        let queued = response_text(production_tasks::enqueue_kind_response(
+            &state,
+            "steel-in",
+            r#"{"materialId":"MAT-WORKER","sessionId":"SESSION-WORKER","requestId":"WORKER-IN","autoCapture":false}"#,
+            "tester",
+        ));
+        assert!(queued.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        let task = state
+            .runtime
+            .block_on(db::claim_next_production_task(&state.database.connection))
+            .expect("claim query")
+            .expect("steel-in task");
+        assert_eq!(task.kind, "steel-in");
+        assert_eq!(
+            state
+                .runtime
+                .block_on(db::count_open_production_tasks(&state.database.connection))
+                .expect("open task count"),
+            1
+        );
+        assert!(!production_tasks::worker_execution_scope_active());
+
+        let response = response_text(production_tasks::execute_task(&state, &task));
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("\"code\":0"));
+        assert!(!response.contains("production_tasks_in_progress"));
+        assert!(!production_tasks::worker_execution_scope_active());
+
+        let session = state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                "SESSION-WORKER",
+            ))
+            .expect("session query")
+            .expect("worker-created session");
+        assert_eq!(session.status, "active");
+
+        let sync_response = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-WORKER","sessionId":"SESSION-WORKER"}"#,
+            "steel-out",
+            "tester",
+        ));
+        assert!(sync_response.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(sync_response.contains("production_tasks_in_progress"));
+    }
+
+    #[test]
+    fn queued_event_validates_state_in_worker_and_provider_failure_is_explicitly_retryable() {
+        let invalid_state = production_test_state();
+        let queued = response_text(production_tasks::enqueue_kind_response(
+            &invalid_state,
+            "steel-out",
+            r#"{"materialId":"MAT-NONE","sessionId":"SESSION-NONE","requestId":"OUT-NO-SESSION"}"#,
+            "tester",
+        ));
+        assert!(queued.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        let invalid_task = invalid_state
+            .runtime
+            .block_on(db::claim_next_production_task(
+                &invalid_state.database.connection,
+            ))
+            .expect("claim query")
+            .expect("steel-out task");
+        let invalid_response = response_text(production_tasks::execute_task(
+            &invalid_state,
+            &invalid_task,
+        ));
+        assert!(invalid_response.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(invalid_response.contains("active_session_required"));
+
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:0",
+        );
+        let queued = response_text(production_tasks::enqueue_kind_response(
+            &state,
+            "steel-in",
+            r#"{"materialId":"MAT-RETRY","sessionId":"SESSION-RETRY","requestId":"RETRY-IN","autoCapture":false}"#,
+            "tester",
+        ));
+        assert!(queued.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        let task = state
+            .runtime
+            .block_on(db::claim_next_production_task(&state.database.connection))
+            .expect("claim query")
+            .expect("steel-in task");
+        let response = production_tasks::execute_task(&state, &task);
+        let body = production_tasks::response_body(&response);
+        assert!(body.contains("\"code\":503"));
+        let (status, progress, error) =
+            production_tasks::provider_terminal_outcome(&response, &body);
+        assert_eq!(status, "failed");
+        state
+            .runtime
+            .block_on(db::finish_production_task(
+                &state.database.connection,
+                &task.id,
+                status,
+                progress,
+                body,
+                error,
+            ))
+            .expect("finish failed task");
+        let failed = state
+            .runtime
+            .block_on(db::find_production_task(
+                &state.database.connection,
+                &task.id,
+            ))
+            .expect("task query")
+            .expect("failed task");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.attempts, 1);
+
+        let retried = response_text(production_tasks::retry_response(
+            &state,
+            &json!({ "taskId": task.id }).to_string(),
+            "tester",
+        ));
+        assert!(retried.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        let queued_again = state
+            .runtime
+            .block_on(db::find_production_task(
+                &state.database.connection,
+                &task.id,
+            ))
+            .expect("task query")
+            .expect("retried task");
+        assert_eq!(queued_again.status, "queued");
+        assert_eq!(queued_again.attempts, 1);
+    }
+
+    #[test]
+    fn production_task_idempotent_replay_precedes_changed_session_validation() {
+        let state = production_test_state();
+        insert_production_record(
+            &state,
+            "INSP-SESSION-A",
+            "MAT-A",
+            "SESSION-A",
+            "active",
+            "running",
+            "",
+        );
+        let request = r#"{"kind":"capture-once","idempotencyKey":"CAPTURE-001","payload":{"materialId":"MAT-A","sessionId":"SESSION-A","requireSteelPresent":true}}"#;
+        let first = response_text(production_tasks::enqueue_response(
+            &state, request, "tester",
+        ));
+        assert!(first.starts_with("HTTP/1.1 202 Accepted\r\n"));
+
+        insert_production_record(
+            &state,
+            "INSP-SESSION-A",
+            "MAT-A",
+            "SESSION-A",
+            "finished",
+            "finished",
+            "2",
+        );
+        let duplicate = response_text(production_tasks::enqueue_response(
+            &state, request, "tester",
+        ));
+        assert!(duplicate.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(duplicate.contains("\"duplicate\":true"));
+        assert!(!duplicate.contains("production_session_not_capture_ready"));
+    }
+
+    #[test]
+    fn queued_production_task_prevents_steel_out_from_overtaking_it() {
+        let state = production_test_state();
+        insert_production_record(
+            &state,
+            "INSP-SESSION-A",
+            "MAT-A",
+            "SESSION-A",
+            "active",
+            "running",
+            "",
+        );
+        let queued = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"capture-once","idempotencyKey":"CAPTURE-FENCE","payload":{"materialId":"MAT-A","sessionId":"SESSION-A","requireSteelPresent":true}}"#,
+            "tester",
+        ));
+        assert!(queued.starts_with("HTTP/1.1 202 Accepted\r\n"));
+
+        let steel_out = response_text(write_production_event_response(
+            &state,
+            r#"{"materialId":"MAT-A","sessionId":"SESSION-A"}"#,
+            "steel-out",
+            "tester",
+        ));
+        assert!(steel_out.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(steel_out.contains("production_tasks_in_progress"));
+        let session = state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                "SESSION-A",
+            ))
+            .expect("session query")
+            .expect("session should remain");
+        assert_eq!(session.status, "active");
+        assert!(session.finished_at.is_empty());
+    }
+
+    #[test]
+    fn queued_production_task_can_be_cancelled_and_explicitly_retried() {
+        let state = production_test_state();
+        let queued = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"algorithm-run","idempotencyKey":"RUN-CANCEL","payload":{"materialId":"MAT-A"}}"#,
+            "tester",
+        ));
+        assert!(queued.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        let page = state
+            .runtime
+            .block_on(db::list_production_tasks(
+                &state.database.connection,
+                db::ProductionTaskFilter::default(),
+            ))
+            .expect("task page");
+        let task_id = page.tasks[0].id.clone();
+
+        let cancelled = response_text(production_tasks::cancel_response(
+            &state,
+            &json!({ "taskId": task_id }).to_string(),
+            "tester",
+        ));
+        assert!(cancelled.starts_with("HTTP/1.1 200 OK\r\n"));
+        let cancelled_task = state
+            .runtime
+            .block_on(db::find_production_task(
+                &state.database.connection,
+                &page.tasks[0].id,
+            ))
+            .expect("cancel query")
+            .expect("cancelled task");
+        assert_eq!(cancelled_task.status, "cancelled");
+        assert!(cancelled_task.cancel_requested);
+
+        let retried = response_text(production_tasks::retry_response(
+            &state,
+            &json!({ "taskId": cancelled_task.id }).to_string(),
+            "tester",
+        ));
+        assert!(retried.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        let retried_task = state
+            .runtime
+            .block_on(db::find_production_task(
+                &state.database.connection,
+                &page.tasks[0].id,
+            ))
+            .expect("retry query")
+            .expect("retried task");
+        assert_eq!(retried_task.status, "queued");
+        assert!(!retried_task.cancel_requested);
+    }
+
+    #[test]
+    fn service_restart_marks_inflight_task_interrupted_without_replaying_it() {
+        let state = production_test_state();
+        state
+            .runtime
+            .block_on(db::insert_production_task(
+                &state.database.connection,
+                db::ProductionTaskInput {
+                    id: "TASK-RECOVERY".to_string(),
+                    idempotency_key: "algorithm-run:RECOVERY".to_string(),
+                    kind: "algorithm-run".to_string(),
+                    material_id: "MAT-A".to_string(),
+                    session_id: "SESSION-A".to_string(),
+                    payload: r#"{"materialId":"MAT-A"}"#.to_string(),
+                    actor: "tester".to_string(),
+                    max_attempts: 3,
+                },
+            ))
+            .expect("insert recovery task");
+        let claimed = state
+            .runtime
+            .block_on(db::claim_next_production_task(&state.database.connection))
+            .expect("claim task")
+            .expect("claimed task");
+        assert_eq!(claimed.status, "running");
+
+        let recovered = state
+            .runtime
+            .block_on(db::recover_incomplete_production_tasks(
+                &state.database.connection,
+            ))
+            .expect("recover tasks");
+        assert_eq!(recovered, 1);
+        let task = state
+            .runtime
+            .block_on(db::find_production_task(
+                &state.database.connection,
+                "TASK-RECOVERY",
+            ))
+            .expect("recovered task query")
+            .expect("recovered task");
+        assert_eq!(task.status, "interrupted");
+        assert!(task.error.contains("explicit retry required"));
+    }
+
+    #[test]
+    fn admin_records_use_production_tables_and_ignore_legacy_rows() {
+        let state = production_test_state();
+        state
+            .runtime
+            .block_on(
+                db::entities::inspection_record::ActiveModel {
+                    id: Set("R-LEGACY".to_string()),
+                    time: Set("2026-01-01 00:00".to_string()),
+                    plate_no: Set("LEGACY-MAT".to_string()),
+                    status: Set("completed".to_string()),
+                    defect_count: Set(99),
+                }
+                .insert(&state.database.connection),
+            )
+            .expect("legacy row insert");
+        insert_production_record(
+            &state,
+            "INSP-PROD-1",
+            "MAT-PROD-1",
+            "SESSION-PROD-1",
+            "finished",
+            "algorithm-complete",
+            &current_time_string(),
+        );
+        state
+            .runtime
+            .block_on(db::append_production_defect(
+                &state.database.connection,
+                db::ProductionDefectInput {
+                    inspection_id: "INSP-PROD-1".to_string(),
+                    material_id: "MAT-PROD-1".to_string(),
+                    camera_id: "CAM-01".to_string(),
+                    defect_type: "pit".to_string(),
+                    severity: "severe".to_string(),
+                    x_mm: 10.0,
+                    y_mm: 20.0,
+                    z_mm: -1.0,
+                    width_mm: 3.0,
+                    height_mm: 2.0,
+                    depth_mm: 1.0,
+                    confidence: 0.99,
+                    geometry_json: "{}".to_string(),
+                },
+            ))
+            .expect("production defect insert");
+        state
+            .runtime
+            .block_on(db::append_capture_file(
+                &state.database.connection,
+                db::CaptureFileInput {
+                    inspection_id: "INSP-PROD-1".to_string(),
+                    session_id: "SESSION-PROD-1".to_string(),
+                    material_id: "MAT-PROD-1".to_string(),
+                    camera_id: "CAM-01".to_string(),
+                    camera_ip: "192.168.101.100".to_string(),
+                    data_name: "depth".to_string(),
+                    sequence_no: 1,
+                    file_type: "png".to_string(),
+                    path: "H:\\camera1\\MAT-PROD-1\\depth\\1.png".to_string(),
+                    metadata_path: String::new(),
+                },
+            ))
+            .expect("capture file insert");
+        state
+            .runtime
+            .block_on(db::append_capture_file(
+                &state.database.connection,
+                db::CaptureFileInput {
+                    inspection_id: "INSP-PROD-1".to_string(),
+                    session_id: "SESSION-PROD-1".to_string(),
+                    material_id: "MAT-PROD-1".to_string(),
+                    camera_id: "CAM-01".to_string(),
+                    camera_ip: "192.168.101.100".to_string(),
+                    data_name: "depth".to_string(),
+                    sequence_no: 1,
+                    file_type: "png".to_string(),
+                    path: "H:\\camera1\\MAT-PROD-1\\depth\\1-replayed.png".to_string(),
+                    metadata_path: String::new(),
+                },
+            ))
+            .expect("capture file replay upsert");
+
+        let page = state
+            .runtime
+            .block_on(db::list_inspection_records(
+                &state.database.connection,
+                db::InspectionRecordFilter::default(),
+            ))
+            .expect("admin production records");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.records[0].inspection.id, "INSP-PROD-1");
+        assert_eq!(page.records[0].severe_count, 1);
+        let detail = state
+            .runtime
+            .block_on(db::find_inspection_record_detail(
+                &state.database.connection,
+                "INSP-PROD-1",
+            ))
+            .expect("record detail query")
+            .expect("production record detail");
+        assert_eq!(detail.defects.len(), 1);
+        assert_eq!(detail.capture_files.len(), 1);
+        assert!(detail.capture_files[0].path.ends_with("1-replayed.png"));
+        let response = response_text(read_admin_records_response(&state, ""));
+        assert!(response.contains("INSP-PROD-1"));
+        assert!(response.contains("\"source\":\"production\""));
+        assert!(!response.contains("R-LEGACY"));
+
+        let snapshot: Value = serde_json::from_str(
+            &build_production_snapshot_json(&state)
+                .expect("production snapshot query")
+                .expect("production snapshot"),
+        )
+        .expect("production snapshot json");
+        assert_eq!(snapshot["inspections"][0]["inspectionId"], "INSP-PROD-1");
+        assert_eq!(
+            snapshot["inspections"][0]["summaryPath"],
+            "H:\\production\\INSP-PROD-1.json"
+        );
+        assert!(snapshot["inspections"][0]["captureSummaryPath"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty()));
+        assert_eq!(snapshot["inspections"][0]["captureImages"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn deleting_production_record_removes_children_but_retains_session() {
+        let state = production_test_state();
+        insert_production_record(
+            &state,
+            "INSP-DELETE",
+            "MAT-DELETE",
+            "SESSION-DELETE",
+            "finished",
+            "algorithm-complete",
+            "1",
+        );
+        state
+            .runtime
+            .block_on(db::append_production_defect(
+                &state.database.connection,
+                db::ProductionDefectInput {
+                    inspection_id: "INSP-DELETE".to_string(),
+                    material_id: "MAT-DELETE".to_string(),
+                    camera_id: "CAM-01".to_string(),
+                    defect_type: "scratch".to_string(),
+                    severity: "review".to_string(),
+                    x_mm: 1.0,
+                    y_mm: 2.0,
+                    z_mm: 0.0,
+                    width_mm: 1.0,
+                    height_mm: 1.0,
+                    depth_mm: 0.1,
+                    confidence: 0.8,
+                    geometry_json: "{}".to_string(),
+                },
+            ))
+            .expect("defect insert");
+        state
+            .runtime
+            .block_on(db::append_capture_file(
+                &state.database.connection,
+                db::CaptureFileInput {
+                    inspection_id: "INSP-DELETE".to_string(),
+                    session_id: "SESSION-DELETE".to_string(),
+                    material_id: "MAT-DELETE".to_string(),
+                    camera_id: "CAM-01".to_string(),
+                    camera_ip: "192.168.101.100".to_string(),
+                    data_name: "depth".to_string(),
+                    sequence_no: 1,
+                    file_type: "png".to_string(),
+                    path: "depth.png".to_string(),
+                    metadata_path: String::new(),
+                },
+            ))
+            .expect("capture file insert");
+        let deleted = state
+            .runtime
+            .block_on(db::delete_inspection_record(
+                &state.database.connection,
+                "INSP-DELETE",
+            ))
+            .expect("delete record")
+            .expect("deleted record");
+        assert_eq!(deleted.defects_deleted, 1);
+        assert_eq!(deleted.capture_files_deleted, 1);
+        assert!(state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                "SESSION-DELETE",
+            ))
+            .expect("session query")
+            .is_some());
+        assert!(state
+            .runtime
+            .block_on(db::find_production_inspection(
+                &state.database.connection,
+                "INSP-DELETE",
+            ))
+            .expect("inspection query")
+            .is_none());
+    }
+
+    #[test]
+    fn production_record_retention_excludes_active_and_recent_records() {
+        let state = production_test_state();
+        insert_production_record(
+            &state,
+            "INSP-OLD",
+            "MAT-OLD",
+            "SESSION-OLD",
+            "finished",
+            "algorithm-complete",
+            "1",
+        );
+        insert_production_record(
+            &state,
+            "INSP-RECENT",
+            "MAT-RECENT",
+            "SESSION-RECENT",
+            "finished",
+            "algorithm-complete",
+            &current_time_string(),
+        );
+        insert_production_record(
+            &state,
+            "INSP-ACTIVE",
+            "MAT-ACTIVE",
+            "SESSION-ACTIVE",
+            "active",
+            "algorithm-complete",
+            "1",
+        );
+        let matched = state
+            .runtime
+            .block_on(db::count_inspection_records_before(
+                &state.database.connection,
+                1,
+            ))
+            .expect("retention preview");
+        assert_eq!(matched, 1);
+        let result = state
+            .runtime
+            .block_on(db::delete_inspection_records_before(
+                &state.database.connection,
+                1,
+            ))
+            .expect("retention purge");
+        assert_eq!(result.matched, 1);
+        assert_eq!(result.deleted_records, 1);
+        assert!(state
+            .runtime
+            .block_on(db::find_production_inspection(
+                &state.database.connection,
+                "INSP-RECENT",
+            ))
+            .expect("recent query")
+            .is_some());
+        assert!(state
+            .runtime
+            .block_on(db::find_production_inspection(
+                &state.database.connection,
+                "INSP-ACTIVE",
+            ))
+            .expect("active query")
+            .is_some());
+    }
+
+    #[test]
     fn capture_origin_port_parser_accepts_local_capture_endpoints() {
         assert_eq!(
             capture_port_from_origin("http://127.0.0.1:4317"),
@@ -11481,6 +16465,243 @@ mod tests {
         }))
         .unwrap_err();
         assert!(invalid_item.contains("非空字符串"));
+    }
+
+    #[test]
+    fn alarm_reads_are_public_but_state_changes_require_records_permission() {
+        assert_eq!(permission_for_route("GET", "/api/alarms"), None);
+        assert_eq!(
+            permission_for_route("POST", "/api/alarms/acknowledge"),
+            Some("admin.records")
+        );
+        assert_eq!(
+            permission_for_route("POST", "/api/alarms/resolve"),
+            Some("admin.records")
+        );
+    }
+
+    #[test]
+    fn severe_and_review_defect_ingest_create_one_idempotent_alarm() {
+        let state = production_test_state();
+        let severe = r#"{
+            "materialId":"MAT-ALARM",
+            "sessionId":"SESSION-ALARM",
+            "inspectionId":"INSP-ALARM",
+            "defectId":"SOURCE-DEFECT-001",
+            "cameraId":"CAM-01",
+            "defectType":"pit",
+            "severity":"severe",
+            "xMm":12.5,
+            "yMm":6.25,
+            "depthMm":0.21,
+            "confidence":0.98
+        }"#;
+        let first = response_text(write_production_defect_response(
+            &state, severe, "detector",
+        ));
+        let duplicate = response_text(write_production_defect_response(
+            &state, severe, "detector",
+        ));
+        assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(first.contains("\"created\":true"));
+        assert!(duplicate.contains("\"created\":false"));
+
+        let page = state
+            .runtime
+            .block_on(db::list_production_alarms(
+                &state.database.connection,
+                db::ProductionAlarmFilter {
+                    status: Some("open".to_string()),
+                    ..db::ProductionAlarmFilter::default()
+                },
+            ))
+            .expect("alarm page");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.alarms[0].severity, "severe");
+        assert_eq!(page.alarms[0].status, "active");
+        let list_response = response_text(read_production_alarms_response(
+            &state,
+            "status=open&severity=severe&keyword=MAT-ALARM&limit=10&offset=0",
+        ));
+        assert!(list_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(list_response.contains("\"total\":1"));
+        assert!(list_response.contains("\"alarms\":[{"));
+
+        let review = severe
+            .replace("SOURCE-DEFECT-001", "SOURCE-DEFECT-002")
+            .replace("\"severity\":\"severe\"", "\"severity\":\"review\"");
+        let review_response = response_text(write_production_defect_response(
+            &state, &review, "detector",
+        ));
+        assert!(review_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(review_response.contains("\"created\":true"));
+
+        let minor = severe
+            .replace("SOURCE-DEFECT-001", "SOURCE-DEFECT-003")
+            .replace("\"severity\":\"severe\"", "\"severity\":\"minor\"");
+        let minor_response = response_text(write_production_defect_response(
+            &state, &minor, "detector",
+        ));
+        assert!(minor_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(minor_response.contains("\"alarm\":null"));
+        let counts = state
+            .runtime
+            .block_on(db::production_alarm_counts(&state.database.connection))
+            .expect("alarm counts");
+        assert_eq!(counts.active, 2);
+        assert_eq!(counts.acknowledged, 0);
+        assert_eq!(counts.resolved, 0);
+    }
+
+    #[test]
+    fn alarm_transition_requires_acknowledgement_and_preserves_confirming_actor() {
+        let state = production_test_state();
+        let (alarm, created) = state
+            .runtime
+            .block_on(db::ensure_production_alarm(
+                &state.database.connection,
+                db::ProductionAlarmInput {
+                    id: "ALARM-TRANSITION".to_string(),
+                    source: "test".to_string(),
+                    alarm_type: "camera-offline".to_string(),
+                    severity: "review".to_string(),
+                    material_id: "MAT-A".to_string(),
+                    session_id: "SESSION-A".to_string(),
+                    inspection_id: "INSP-A".to_string(),
+                    camera_id: "CAM-01".to_string(),
+                    message: "camera offline".to_string(),
+                    details: "{}".to_string(),
+                },
+            ))
+            .expect("insert alarm");
+        assert!(created);
+        assert_eq!(alarm.status, "active");
+
+        let missing_note = response_text(write_production_alarm_action_response(
+            &state,
+            r#"{"alarmId":"ALARM-TRANSITION","note":""}"#,
+            "operator-a",
+            ProductionAlarmAction::Acknowledge,
+        ));
+        assert!(missing_note.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(missing_note.contains("alarm_note_required"));
+
+        let premature = response_text(write_production_alarm_action_response(
+            &state,
+            r#"{"alarmId":"ALARM-TRANSITION","note":"fixed"}"#,
+            "operator-b",
+            ProductionAlarmAction::Resolve,
+        ));
+        assert!(premature.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(premature.contains("alarm_acknowledgement_required"));
+
+        let acknowledged = response_text(write_production_alarm_action_response(
+            &state,
+            r#"{"alarmId":"ALARM-TRANSITION","note":"checked on line"}"#,
+            "operator-a",
+            ProductionAlarmAction::Acknowledge,
+        ));
+        assert!(acknowledged.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(acknowledged.contains("\"changed\":true"));
+        assert!(acknowledged.contains("\"acknowledgedBy\":\"operator-a\""));
+
+        let repeated = response_text(write_production_alarm_action_response(
+            &state,
+            r#"{"alarmId":"ALARM-TRANSITION","note":"overwrite attempt"}"#,
+            "operator-b",
+            ProductionAlarmAction::Acknowledge,
+        ));
+        assert!(repeated.contains("\"changed\":false"));
+        assert!(repeated.contains("\"acknowledgedBy\":\"operator-a\""));
+        assert!(!repeated.contains("overwrite attempt"));
+
+        let resolved = response_text(write_production_alarm_action_response(
+            &state,
+            r#"{"alarmId":"ALARM-TRANSITION","note":"root cause removed"}"#,
+            "operator-b",
+            ProductionAlarmAction::Resolve,
+        ));
+        assert!(resolved.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resolved.contains("\"status\":\"resolved\""));
+        assert!(resolved.contains("\"resolvedBy\":\"operator-b\""));
+
+        let history = state
+            .runtime
+            .block_on(db::list_production_alarms(
+                &state.database.connection,
+                db::ProductionAlarmFilter {
+                    status: Some("history".to_string()),
+                    keyword: Some("ALARM-TRANSITION".to_string()),
+                    ..db::ProductionAlarmFilter::default()
+                },
+            ))
+            .expect("alarm history");
+        assert_eq!(history.total, 1);
+        assert_eq!(history.alarms[0].acknowledged_by, "operator-a");
+        assert_eq!(history.alarms[0].resolved_by, "operator-b");
+    }
+
+    #[test]
+    fn calibration_capture_fit_requires_one_complete_frame_from_each_of_six_cameras() {
+        let root = std::env::temp_dir().join(format!(
+            "steel-calibration-capture-summary-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        fs::create_dir_all(&root).expect("create calibration capture test directory");
+        let summary_path = root.join("summary.json");
+        fs::write(&summary_path, "{}").expect("write calibration capture summary");
+        let results = (1..=6)
+            .map(|index| {
+                json!({
+                    "code": 0,
+                    "ip": format!("192.168.200.{index}"),
+                    "completeFrame": true,
+                    "metadataOutput": root.join(format!("camera-{index}.json")).display().to_string()
+                })
+            })
+            .collect::<Vec<_>>();
+        let complete = json!({
+            "code": 0,
+            "successes": 6,
+            "failures": 0,
+            "completeFrames": 6,
+            "metadataFrames": 6,
+            "summaryOutput": summary_path.display().to_string(),
+            "results": results
+        });
+        assert_eq!(
+            calibration_capture_data_dir(&complete, 6).expect("complete capture"),
+            root
+        );
+
+        let mut incomplete = complete;
+        incomplete["metadataFrames"] = json!(5);
+        let error = calibration_capture_data_dir(&incomplete, 6)
+            .expect_err("incomplete calibration capture must fail");
+        assert_eq!(error["error"], "calibration_capture_incomplete");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn calibration_capture_fit_rejects_service_only_simulated_artifacts() {
+        let simulated = json!({
+            "code": 0,
+            "successes": 6,
+            "failures": 0,
+            "completeFrames": 6,
+            "metadataFrames": 6,
+            "summaryOutput": "simulated://calibration/summary.json",
+            "results": (1..=6).map(|index| json!({
+                "code": 0,
+                "ip": format!("192.168.200.{index}"),
+                "completeFrame": true,
+                "metadataOutput": format!("simulated://camera-{index}.json")
+            })).collect::<Vec<_>>()
+        });
+        let error = calibration_capture_data_dir(&simulated, 6)
+            .expect_err("non-file simulated capture must not enter fitter");
+        assert_eq!(error["error"], "calibration_capture_artifacts_unavailable");
     }
 
     #[test]

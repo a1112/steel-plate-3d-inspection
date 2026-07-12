@@ -108,6 +108,44 @@ function Get-NetworkRateSummary {
   }
 }
 
+function Get-LayeredReadinessSummary {
+  param([object]$HealthJson)
+
+  if ($HealthJson.ok -ne $true -or [string]$HealthJson.status -ne "ready") {
+    throw "Rust layered readiness did not report ready."
+  }
+  if (-not (Test-JsonProperty $HealthJson "checks")) {
+    throw "Rust layered readiness is missing checks."
+  }
+
+  $Summary = [ordered]@{}
+  foreach ($Component in @("database", "taskWorker", "capture", "calibrationReconciliation", "storage", "trigger")) {
+    if (-not (Test-JsonProperty $HealthJson.checks $Component)) {
+      throw "Rust layered readiness is missing $Component."
+    }
+    $Check = $HealthJson.checks.$Component
+    if ($Check.ok -ne $true) {
+      throw "Rust layered readiness component $Component is not healthy: $($Check.reason)"
+    }
+    $Summary[$Component] = [ordered]@{
+      ok = $true
+      status = $Check.status
+      reason = $Check.reason
+    }
+  }
+
+  if ($HealthJson.checks.trigger.required -ne $true) {
+    throw "Formal runtime readiness must require the trigger gateway; STEEL_TRIGGER_HEALTH_REQUIRED=0 is development-only."
+  }
+  $Summary["trigger"]["required"] = $true
+
+  return [ordered]@{
+    ok = $true
+    status = [string]$HealthJson.status
+    components = $Summary
+  }
+}
+
 $Checks = [ordered]@{}
 
 try {
@@ -130,6 +168,23 @@ try {
     database = $ProductionStatus.json.database
     activeSession = $ProductionStatus.json.activeSession.materialId
     latestSession = $ProductionStatus.json.latestSession.materialId
+  }
+
+  if (-not $SkipTrigger) {
+    $LayeredHealth = Read-JsonEndpoint -Name "Rust layered readiness" -Uri (Join-OriginPath $ServiceOrigin "/api/health/details")
+    $LayeredSummary = Get-LayeredReadinessSummary -HealthJson $LayeredHealth.json
+    $Checks.readiness = [ordered]@{
+      ok = $LayeredSummary.ok
+      uri = $LayeredHealth.uri
+      status = $LayeredSummary.status
+      components = $LayeredSummary.components
+    }
+  } else {
+    $Checks.readiness = [ordered]@{
+      ok = $true
+      skipped = $true
+      reason = "trigger check explicitly skipped"
+    }
   }
 
   $NetworkStatus = Read-JsonEndpoint -Name "Rust network monitor" -Uri (Join-OriginPath $ServiceOrigin "/api/system/network")

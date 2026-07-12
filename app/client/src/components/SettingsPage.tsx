@@ -295,7 +295,7 @@ export function SettingsPage({
                 </button>
                 <button type="button" onClick={onApplyToPlate}>
                   <Send size={16} />
-                  应用到当前板
+                  应用到当前材料
                 </button>
                 <button type="button" onClick={onReset}>
                   <RotateCcw size={16} />

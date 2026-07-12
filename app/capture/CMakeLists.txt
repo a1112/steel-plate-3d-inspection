@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.12)
 
 project(steel_capture_service LANGUAGES CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -25,13 +27,17 @@ set(CAPTURE_SDK_DLL "${CAPTURE_SDK_ROOT}/${CAPTURE_SDK_ARCH}/dll/nvt_lvm_sdk.dll
 
 add_library(steel_capture_core STATIC
   src/capture_service_app.cpp
+  src/calibration_contract.h
+  src/capture_path_policy.h
+  src/owned_worker_registry.h
+  src/storage_thread_pool.h
 )
 
 target_include_directories(steel_capture_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CAPTURE_SDK_INCLUDE}"
 )
-target_link_libraries(steel_capture_core PUBLIC "${CAPTURE_SDK_LIB}" httpapi.lib ws2_32.lib)
+target_link_libraries(steel_capture_core PUBLIC "${CAPTURE_SDK_LIB}" httpapi.lib ws2_32.lib bcrypt.lib)
 
 target_compile_definitions(steel_capture_core PUBLIC
   _WIN32_WINNT=0x0A00
@@ -51,4 +57,63 @@ if(STEEL_CAPTURE_BUILD_SERVICE)
       "${CAPTURE_SDK_DLL}"
       "$<TARGET_FILE_DIR:steel_capture_service>/nvt_lvm_sdk.dll"
   )
+endif()
+
+if(BUILD_TESTING)
+  add_executable(steel_capture_storage_thread_pool_test
+    tests/storage_thread_pool_test.cpp
+  )
+  target_include_directories(steel_capture_storage_thread_pool_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  add_test(
+    NAME steel_capture_storage_thread_pool_test
+    COMMAND steel_capture_storage_thread_pool_test
+  )
+
+  add_executable(steel_capture_owned_worker_registry_test
+    tests/owned_worker_registry_test.cpp
+  )
+  target_include_directories(steel_capture_owned_worker_registry_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  add_test(
+    NAME steel_capture_owned_worker_registry_test
+    COMMAND steel_capture_owned_worker_registry_test
+  )
+
+  add_executable(steel_capture_path_policy_test
+    tests/capture_path_policy_test.cpp
+  )
+  target_include_directories(steel_capture_path_policy_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  add_test(
+    NAME steel_capture_path_policy_test
+    COMMAND steel_capture_path_policy_test
+  )
+
+  add_executable(steel_capture_calibration_contract_test
+    tests/calibration_contract_test.cpp
+  )
+  target_include_directories(steel_capture_calibration_contract_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  add_test(
+    NAME steel_capture_calibration_contract_test
+    COMMAND steel_capture_calibration_contract_test
+  )
+
+  if(WIN32 AND STEEL_CAPTURE_BUILD_SERVICE)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      add_test(
+        NAME steel_capture_frame_pipeline_test
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/frame_pipeline_test.py"
+                --exe "$<TARGET_FILE:steel_capture_service>"
+      )
+      set_tests_properties(steel_capture_frame_pipeline_test PROPERTIES TIMEOUT 60)
+    endif()
+  endif()
 endif()

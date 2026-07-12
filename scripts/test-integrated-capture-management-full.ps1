@@ -12,6 +12,14 @@ param(
   [switch]$SkipUiSmoke,
   [switch]$SkipClient,
   [switch]$RunCapture,
+  [string]$CalibrationPlanPath = "",
+  [string]$AdminToken = $env:STEEL_ADMIN_TOKEN,
+  [switch]$RunCalibrationApplyRollback,
+  [switch]$SaveCalibrationToDevice,
+  [string]$CalibrationSafetyConfirmation = "",
+  [string]$ApplyCrashRecoveryReportPath = "",
+  [string]$RollbackCrashRecoveryReportPath = "",
+  [string]$CalibrationIntegrityGenerationReportPath = "",
   [switch]$RunBarSurface,
   [switch]$BarSurfaceCapture,
   [string]$BarSurfaceMaterialId = "",
@@ -339,6 +347,78 @@ try {
   }
   $null = Add-CheckResult -Checks $Checks -Id "real-hardware" -ScriptPath $HardwareScript -Arguments $HardwareArgs -Skipped:$SkipRealHardware
 
+  if (-not [string]::IsNullOrWhiteSpace($CalibrationPlanPath)) {
+    $CalibrationScript = if ($SourceMode) {
+      Resolve-RepoScript "scripts\test-real-calibration-acceptance.ps1"
+    } else {
+      Resolve-RuntimeScript "test-real-calibration-acceptance.ps1"
+    }
+    $CalibrationArgs = @(
+      "-ServiceOrigin", $ServiceOrigin,
+      "-PlanPath", $CalibrationPlanPath,
+      "-ExpectedCameras", [string]$ExpectedCameras
+    )
+    if (-not [string]::IsNullOrWhiteSpace($AdminToken)) {
+      $CalibrationArgs += @("-AdminToken", $AdminToken)
+    }
+    if ($RunCalibrationApplyRollback) {
+      $CalibrationArgs += @("-RunApplyRollback", "-SafetyConfirmation", $CalibrationSafetyConfirmation)
+    }
+    if ($SaveCalibrationToDevice) {
+      $CalibrationArgs += "-SaveToDevice"
+    }
+    $null = Add-CheckResult -Checks $Checks -Id "real-calibration" -ScriptPath $CalibrationScript -Arguments $CalibrationArgs
+  } else {
+    $Checks.Add([ordered]@{ id = "real-calibration"; ok = $true; skipped = $true })
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($ApplyCrashRecoveryReportPath) -and
+      -not [string]::IsNullOrWhiteSpace($RollbackCrashRecoveryReportPath)) {
+    try {
+      $ApplyCrashReport = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ApplyCrashRecoveryReportPath).Path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+      $RollbackCrashReport = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $RollbackCrashRecoveryReportPath).Path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+      $CrashReportsOk = @(@($ApplyCrashReport, $RollbackCrashReport) | Where-Object {
+        [string]$_.schema -eq "steel.real-calibration.crash-recovery.v1" -and
+        [string]$_.mode -eq "Resume" -and
+        [int]$_.code -eq 0 -and
+        $_.evidence.recovery.complete -eq $true -and
+        [string]$_.evidence.reconciledParent.status -eq "reconciled" -and
+        [int]$_.evidence.validationCapture.completeFrames -eq $ExpectedCameras
+      }).Count -eq 2 -and
+        [string]$ApplyCrashReport.scenario -eq "ApplyCrash" -and
+        [string]$RollbackCrashReport.scenario -eq "RollbackCrash"
+      $Checks.Add([ordered]@{
+        id = "real-calibration-crash-recovery"
+        ok = $CrashReportsOk
+        skipped = $false
+        summary = [ordered]@{ applyCrash = $ApplyCrashReport; rollbackCrash = $RollbackCrashReport }
+      })
+    } catch {
+      $Checks.Add([ordered]@{ id = "real-calibration-crash-recovery"; ok = $false; skipped = $false; error = $_.Exception.Message })
+    }
+  } else {
+    $Checks.Add([ordered]@{ id = "real-calibration-crash-recovery"; ok = $true; skipped = $true })
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($CalibrationIntegrityGenerationReportPath)) {
+    try {
+      $IntegrityReport = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CalibrationIntegrityGenerationReportPath).Path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+      $IntegrityReportOk =
+        [string]$IntegrityReport.schema -eq "steel.real-calibration.integrity-generation.v1" -and
+        [int]$IntegrityReport.code -eq 0 -and
+        $IntegrityReport.evidence.staleGeneration.zeroWriteEvidence -eq $true -and
+        $IntegrityReport.evidence.stagedTamper.zeroWriteEvidence -eq $true -and
+        $IntegrityReport.evidence.recovery.complete -eq $true -and
+        [int]$IntegrityReport.evidence.validationCapture.completeFrames -eq $ExpectedCameras -and
+        [int]$IntegrityReport.evidence.validationCapture.metadataFrames -eq $ExpectedCameras
+      $Checks.Add([ordered]@{ id = "real-calibration-integrity-generation"; ok = $IntegrityReportOk; skipped = $false; summary = $IntegrityReport })
+    } catch {
+      $Checks.Add([ordered]@{ id = "real-calibration-integrity-generation"; ok = $false; skipped = $false; error = $_.Exception.Message })
+    }
+  } else {
+    $Checks.Add([ordered]@{ id = "real-calibration-integrity-generation"; ok = $true; skipped = $true })
+  }
+
   $UiScript = if ($SourceMode) {
     Resolve-RepoScript "scripts\test-runtime-ui-smoke.ps1"
   } else {
@@ -411,6 +491,9 @@ try {
 $RuntimeCheck = Get-CheckById -Checks $Checks -Id "runtime-layout"
 $ReadyCheck = Get-CheckById -Checks $Checks -Id "live-ready"
 $HardwareCheck = Get-CheckById -Checks $Checks -Id "real-hardware"
+$CalibrationCheck = Get-CheckById -Checks $Checks -Id "real-calibration"
+$CalibrationCrashRecoveryCheck = Get-CheckById -Checks $Checks -Id "real-calibration-crash-recovery"
+$CalibrationIntegrityGenerationCheck = Get-CheckById -Checks $Checks -Id "real-calibration-integrity-generation"
 $UiCheck = Get-CheckById -Checks $Checks -Id "ui-smoke"
 $BarSurfaceCheck = Get-CheckById -Checks $Checks -Id "bar-surface-e2e"
 $StabilityCheck = Get-CheckById -Checks $Checks -Id "short-stability"
@@ -418,7 +501,7 @@ $StabilityCheck = Get-CheckById -Checks $Checks -Id "short-stability"
 $CoverageItems = @(
   (New-CoverageItem `
       -Id "runtime-package" `
-      -Label "target runtime/package layout includes service, trigger, capture provider, Qt viewer, client, scripts and config" `
+      -Label "target runtime/package layout includes the headless capture provider, Rust service, trigger gateway, Tauri client, scripts and config without a formal Qt dependency" `
       -Check $RuntimeCheck `
       -Evidence "test-runtime-layout.ps1"),
   (New-CoverageItem `
@@ -431,6 +514,27 @@ $CoverageItems = @(
       -Label "real SDK provider sees six cameras, H-drive storage roots, and current camera configuration" `
       -Check $HardwareCheck `
       -Evidence "test-real-hardware-acceptance.ps1"),
+  (New-CoverageItem `
+      -Id "real-calibration-apply-rollback" `
+      -Label "real six-camera SDK calibration passes local file/SN preflight, Rust dry-run, apply ledger, explicit rollback, readiness reopening and a validation capture" `
+      -Check $CalibrationCheck `
+      -Evidence "test-real-calibration-acceptance.ps1 -RunApplyRollback" `
+      -ExtraCondition (-not [string]::IsNullOrWhiteSpace($CalibrationPlanPath) -and [bool]$RunCalibrationApplyRollback) `
+      -SkipReason $(if ([string]::IsNullOrWhiteSpace($CalibrationPlanPath)) { "calibration plan was not provided" } elseif (-not $RunCalibrationApplyRollback) { "real calibration apply/rollback was not requested" } else { "" })),
+  (New-CoverageItem `
+      -Id "real-calibration-crash-recovery" `
+      -Label "controlled process crashes during apply and rollback both persist an unresolved Rust row, close readiness, recover from staged files, reconcile the exact parent, and finish with six validation frames" `
+      -Check $CalibrationCrashRecoveryCheck `
+      -Evidence "test-real-calibration-crash-recovery.ps1 Prepare/Resume for ApplyCrash and RollbackCrash" `
+      -ExtraCondition (-not [string]::IsNullOrWhiteSpace($ApplyCrashRecoveryReportPath) -and -not [string]::IsNullOrWhiteSpace($RollbackCrashRecoveryReportPath)) `
+      -SkipReason $(if ([string]::IsNullOrWhiteSpace($ApplyCrashRecoveryReportPath) -or [string]::IsNullOrWhiteSpace($RollbackCrashRecoveryReportPath)) { "both apply-crash and rollback-crash Resume reports are required" } else { "" })),
+  (New-CoverageItem `
+      -Id "real-calibration-integrity-generation" `
+      -Label "real cameras reject a stale generation and a tampered staged previous file with decisive zero-write evidence, then recover after exact staged bytes are restored" `
+      -Check $CalibrationIntegrityGenerationCheck `
+      -Evidence "test-real-calibration-integrity-generation.ps1" `
+      -ExtraCondition (-not [string]::IsNullOrWhiteSpace($CalibrationIntegrityGenerationReportPath)) `
+      -SkipReason $(if ([string]::IsNullOrWhiteSpace($CalibrationIntegrityGenerationReportPath)) { "integrity/generation report was not provided" } else { "" })),
   (New-CoverageItem `
       -Id "ui-workspaces" `
       -Label "terminal, capture management and 3D reconstruction workspaces render and expose key controls" `
@@ -487,6 +591,12 @@ $Report = [ordered]@{
   requested = [ordered]@{
     expectedCameras = $ExpectedCameras
     runCapture = [bool]$RunCapture
+    calibrationPlanPath = $CalibrationPlanPath
+    runCalibrationApplyRollback = [bool]$RunCalibrationApplyRollback
+    saveCalibrationToDevice = [bool]$SaveCalibrationToDevice
+    applyCrashRecoveryReportPath = $ApplyCrashRecoveryReportPath
+    rollbackCrashRecoveryReportPath = $RollbackCrashRecoveryReportPath
+    calibrationIntegrityGenerationReportPath = $CalibrationIntegrityGenerationReportPath
     runBarSurface = [bool]$RunBarSurface
     barSurfaceCapture = [bool]$BarSurfaceCapture
     runShortStability = [bool]$RunShortStability

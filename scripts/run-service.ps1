@@ -2,6 +2,7 @@ param(
   [ValidateSet("headless-cpp", "qt-terminal", "external-api", "simulated")]
   [string]$Provider = "headless-cpp",
   [string]$CaptureOrigin = "",
+  [string]$TriggerOrigin = "",
   [int]$Port = 4873,
   [switch]$NoCaptureAutostart,
   [string]$EnvFile = "",
@@ -31,6 +32,9 @@ if ($ForceParameters -or -not $env:STEEL_CAPTURE_PROVIDER) {
 
 if ($CaptureOrigin.Trim().Length -gt 0) {
   $env:CAPTURE_SERVICE_ORIGIN = $CaptureOrigin
+}
+if ($TriggerOrigin.Trim().Length -gt 0) {
+  $env:TRIGGER_GATEWAY_ORIGIN = $TriggerOrigin
 }
 
 if ($NoCaptureAutostart) {

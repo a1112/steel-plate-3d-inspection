@@ -1,7 +1,15 @@
 import { fireEvent, render, screen } from '@testing-library/react';
+import type { ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType } from '../data/inspection';
-import { PlateMap } from './PlateMap';
+import type { BarSurfaceMesh } from '../services/bar-surface-api';
+import { PlateMap as ProductionPlateMap } from './PlateMap';
+
+// These legacy interaction cases intentionally exercise the bundled demo/test
+// visualization. Production behavior is covered separately below.
+function PlateMap(props: ComponentProps<typeof ProductionPlateMap>) {
+  return <ProductionPlateMap artifactMode="demo" {...props} />;
+}
 
 const defectTypes: DefectType[] = [
   { id: 'pit', label: '凹坑', color: '#2f6bff', shape: 'circle' },
@@ -54,6 +62,29 @@ const defectTypeCounts = {
   roll: 1,
 };
 
+const productionMesh: BarSurfaceMesh = {
+  schema: 'steel.bar-surface.mesh.v1',
+  coordinateUnit: 'mm',
+  cameraCount: 1,
+  frameStems: ['frame-001'],
+  rows: 2,
+  colsPerCamera: 2,
+  positions: new Float32Array([
+    0, 0, 0,
+    1, 0, 0.1,
+    0, 1, 0.2,
+    1, 1, 0.3,
+  ]),
+  uvs: new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]),
+  colors: new Float32Array([
+    0.1, 0.5, 0.9,
+    0.2, 0.6, 0.8,
+    0.3, 0.7, 0.7,
+    0.4, 0.8, 0.6,
+  ]),
+  indices: new Uint32Array([0, 1, 2, 1, 3, 2]),
+};
+
 describe('PlateMap', () => {
   it('shows clear selected and cancelled states for defect legend toggles', () => {
     const onToggleType = vi.fn();
@@ -67,6 +98,7 @@ describe('PlateMap', () => {
         surfaceMode="all"
         previewPositionM={6}
         plateLengthM={12}
+        artifactMode="demo"
         onToggleType={onToggleType}
         onSurfaceModeChange={vi.fn()}
         onPreviewPositionChange={vi.fn()}
@@ -435,5 +467,67 @@ describe('PlateMap', () => {
 
     expect(screen.getByTestId('preview-cursor-unfolded')).toHaveStyle({ left: '25%' });
     expect(screen.getByRole('slider', { name: '预览位置' })).toHaveAttribute('aria-valuenow', '3');
+  });
+
+  it('fails closed in production when the selected record has no 3D or point-cloud artifact', () => {
+    render(
+      <ProductionPlateMap
+        defectTypes={defectTypes}
+        defects={defects}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId="D-TOP"
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        inspectionId="INS-PROD-1"
+        artifactStatus="记录尚未生成算法产物"
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('note')).toHaveTextContent('生产记录 INS-PROD-1');
+    expect(screen.queryByText(/演示\/测试数据/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '3D' }));
+    expect(screen.getByTestId('plate-production-surface-empty')).toHaveTextContent('暂无生产三维表面产物');
+    expect(screen.queryByTestId('plate-map-3d-view')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '点云' }));
+    expect(screen.getByTestId('plate-production-point-cloud-empty')).toHaveTextContent('暂无生产点云产物');
+    expect(screen.queryByTestId('plate-point-cloud-view')).not.toBeInTheDocument();
+  });
+
+  it('renders only the record-bound production mesh in 3D and point-cloud modes', () => {
+    render(
+      <ProductionPlateMap
+        defectTypes={defectTypes}
+        defects={defects}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId="D-TOP"
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        inspectionId="INS-PROD-2"
+        surfaceMesh={productionMesh}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '3D' }));
+    expect(screen.getByTestId('plate-production-surface')).toHaveAttribute('data-artifact-source', 'production-record');
+    expect(screen.getByTestId('plate-production-surface')).toHaveAttribute('data-artifact-points', '4');
+    expect(screen.getByTestId('plate-production-surface')).toHaveAttribute('data-artifact-triangles', '2');
+
+    fireEvent.click(screen.getByRole('button', { name: '点云' }));
+    expect(screen.getByTestId('plate-production-point-cloud')).toHaveAttribute('data-artifact-source', 'production-record');
+    expect(screen.queryByTestId('plate-point-cloud-view')).not.toBeInTheDocument();
   });
 });

@@ -1,5 +1,5 @@
 import { Canvas, useLoader, useThree } from '@react-three/fiber';
-import { Box, Camera, CircleDot, ExternalLink, Image as ImageIcon, Play, RefreshCw, Rotate3d, Square, Wrench } from 'lucide-react';
+import { Box, Camera, CircleDot, ExternalLink, FileJson, FolderOpen, Image as ImageIcon, Play, RefreshCw, Rotate3d, Square, Wrench } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type PointerEvent, type WheelEvent } from 'react';
 import {
   BufferGeometry,
@@ -12,6 +12,7 @@ import {
 } from 'three';
 import {
   barSurfaceFileUrl,
+  cancelBarSurfaceProductionTask,
   captureBarSurfaceProductionOnce,
   fitBarSurfaceCalibration,
   fetchBarSurfaceCaptures,
@@ -29,8 +30,17 @@ import {
   type BarSurfaceManifest,
   type BarSurfaceMesh,
   type BarSurfaceProductionStatus,
+  type BarSurfaceProductionTask,
   type BarSurfaceRun,
 } from '../services/bar-surface-api';
+import {
+  activateCaptureCalibration,
+  chooseCaptureLocalFile,
+  openCaptureLocalPath,
+  readActiveCaptureCalibration,
+  readCaptureLocalTextFile,
+  type ActiveCaptureCalibration,
+} from '../lib/capture-api';
 
 function numberText(value: number | undefined, fractionDigits = 0) {
   if (typeof value !== 'number' || Number.isNaN(value)) {
@@ -740,18 +750,30 @@ function BarSurfaceCameraTile({ camera }: { camera: BarSurfaceCamera }) {
 function BarSurfaceCalibrationPanel({
   manifest,
   fitReport,
+  activeCalibration,
   busy,
   fitRunning,
+  activationBusy,
   message,
   onFit,
+  onActivate,
+  onImportFitReport,
+  onRefreshActive,
+  onOpenVersionDirectory,
   onRunWithCalibration,
 }: {
   manifest: BarSurfaceManifest;
   fitReport: BarSurfaceCalibrationFitReport | null;
+  activeCalibration: ActiveCaptureCalibration | null;
   busy: boolean;
   fitRunning: boolean;
+  activationBusy: boolean;
   message: string;
   onFit: () => void;
+  onActivate: () => void;
+  onImportFitReport: () => void;
+  onRefreshActive: () => void;
+  onOpenVersionDirectory: () => void;
   onRunWithCalibration: (calibrationPath: string) => void;
 }) {
   const calibration = manifest.calibration;
@@ -802,8 +824,26 @@ function BarSurfaceCalibrationPanel({
             <dt>修正 XML</dt>
             <dd title={fittedPath}>{compactPath(fittedPath, 5)}</dd>
           </div>
+          <div>
+            <dt>采集端当前版本</dt>
+            <dd title={activeCalibration?.calibrationPath || ''}>
+              {activeCalibration?.activeCalibration?.version || compactPath(activeCalibration?.calibrationFile || '', 4) || '未读取'}
+            </dd>
+          </div>
         </dl>
         <div className="bar-surface-calibration-actions">
+          <button type="button" onClick={onImportFitReport} disabled={busy}>
+            <FileJson size={16} />
+            导入 fit_report
+          </button>
+          <button type="button" onClick={onRefreshActive} disabled={busy}>
+            <RefreshCw size={16} />
+            刷新当前版本
+          </button>
+          <button type="button" onClick={onOpenVersionDirectory} disabled={busy || (!fitReport?.outputDir && !activeCalibration?.versionRoot)}>
+            <FolderOpen size={16} />
+            打开版本目录
+          </button>
           <button type="button" onClick={onFit} disabled={busy}>
             <Wrench size={16} />
             {fitRunning ? '拟合中' : '自动标定修正'}
@@ -812,17 +852,52 @@ function BarSurfaceCalibrationPanel({
             <Play size={16} />
             {correctedReady ? '用新修正标定重建' : '用当前标定重建'}
           </button>
+          <button type="button" onClick={onActivate} disabled={busy || !fittedPath}>
+            <Square size={16} />
+            {activationBusy ? '激活中' : '复核通过并激活版本'}
+          </button>
         </div>
-        {fitReport?.corrections?.length ? (
-          <div className="bar-surface-calibration-corrections">
-            {fitReport.corrections.slice(0, 6).map((item) => (
-              <span key={item.sn || item.ip}>
-                <b>{item.ip || item.sn}</b>
-                dx {metricText(item.dx)} / dz {metricText(item.dz)}
-              </span>
-            ))}
+        {fitReport?.beforePreview || fitReport?.afterPreview ? (
+          <div className="bar-surface-calibration-previews">
+            {fitReport.beforePreview ? (
+              <figure>
+                <img src={barSurfaceFileUrl(fitReport.beforePreview)} alt="阵列标定修正前横截面" />
+                <figcaption>修正前 · 平均残差 {metricText(beforeResidual)}</figcaption>
+              </figure>
+            ) : null}
+            {fitReport.afterPreview ? (
+              <figure>
+                <img src={barSurfaceFileUrl(fitReport.afterPreview)} alt="阵列标定修正后横截面" />
+                <figcaption>修正后 · 平均残差 {metricText(afterResidual)}</figcaption>
+              </figure>
+            ) : null}
           </div>
         ) : null}
+        {fitReport?.corrections?.length ? (
+          <div className="bar-surface-calibration-comparison-wrap">
+            <table className="bar-surface-calibration-comparison">
+              <thead>
+                <tr><th>相机</th><th>SN</th><th>dx</th><th>dz</th><th>位移</th><th>修正前均值</th><th>修正前最大</th><th>修正后均值</th><th>修正后最大</th></tr>
+              </thead>
+              <tbody>
+                {fitReport.corrections.map((item, index) => (
+                  <tr key={`${item.ip || item.sn || 'camera'}-${index}`}>
+                    <td>{item.ip || '-'}</td><td>{item.sn || '-'}</td>
+                    <td>{metricText(item.dx)}</td><td>{metricText(item.dz)}</td>
+                    <td>{metricText(item.shiftMagnitude)}</td>
+                    <td>{metricText(item.before?.meanAbsResidual)}</td>
+                    <td>{metricText(item.before?.maxAbsResidual)}</td>
+                    <td>{metricText(item.after?.meanAbsResidual)}</td>
+                    <td>{metricText(item.after?.maxAbsResidual)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+        <p className="bar-surface-calibration-safety">
+          阵列 XML 仅用于重建；逐相机 SDK 文件下发位于“采集配置 → 受控开发诊断”，必须先预检、支持回滚，且默认不持久化到设备。
+        </p>
         {message ? <p className="bar-surface-calibration-message">{message}</p> : null}
       </div>
     </section>
@@ -841,11 +916,13 @@ function BarSurfaceHeader({
   running,
   workflowBusy,
   workflowMessage,
+  activeTask,
   onRefresh,
   onSteelIn,
   onCaptureOnce,
   onSteelOut,
   onRun,
+  onCancelTask,
   onMaterialChange,
   onRunChange,
 }: {
@@ -860,11 +937,13 @@ function BarSurfaceHeader({
   running: boolean;
   workflowBusy: boolean;
   workflowMessage: string;
+  activeTask: BarSurfaceProductionTask<unknown> | null;
   onRefresh: () => void;
   onSteelIn: () => void;
   onCaptureOnce: () => void;
   onSteelOut: () => void;
   onRun: () => void;
+  onCancelTask: () => void;
   onMaterialChange: (materialId: string) => void;
   onRunChange: (runId: string) => void;
 }) {
@@ -899,6 +978,16 @@ function BarSurfaceHeader({
           <div>
             <span>生产检测</span>
             <strong>{productionLabel}</strong>
+          </div>
+          <div>
+            <span>持久任务</span>
+            <strong>
+              {activeTask
+                ? `${activeTask.kind} / ${activeTask.phase || activeTask.status} / ${activeTask.progress}%`
+                : productionStatus?.tasks?.worker?.running
+                  ? `空闲 / 队列 ${productionStatus.tasks.queueDepth ?? 0}`
+                  : 'worker 离线'}
+            </strong>
           </div>
         </div>
         <div className="bar-surface-selector-row">
@@ -955,6 +1044,12 @@ function BarSurfaceHeader({
           <Play size={17} />
           {running ? '生产重建中' : '运行生产重建'}
         </button>
+        {activeTask && ['queued', 'running'].includes(activeTask.status) ? (
+          <button type="button" onClick={onCancelTask}>
+            <Square size={17} />
+            取消任务
+          </button>
+        ) : null}
         {workflowMessage ? (
           <span className="bar-surface-workflow-message" aria-live="polite">
             {workflowMessage}
@@ -980,9 +1075,66 @@ export function BarSurfaceApp() {
   const [running, setRunning] = useState(false);
   const [workflowBusy, setWorkflowBusy] = useState(false);
   const [workflowMessage, setWorkflowMessage] = useState('');
+  const [activeTask, setActiveTask] = useState<BarSurfaceProductionTask<unknown> | null>(null);
   const [calibrationFitReport, setCalibrationFitReport] = useState<BarSurfaceCalibrationFitReport | null>(null);
   const [calibrationBusy, setCalibrationBusy] = useState(false);
+  const [calibrationActivationBusy, setCalibrationActivationBusy] = useState(false);
+  const [activeCalibration, setActiveCalibration] = useState<ActiveCaptureCalibration | null>(null);
   const [calibrationMessage, setCalibrationMessage] = useState('');
+
+  const refreshActiveCalibration = async () => {
+    try {
+      const status = await readActiveCaptureCalibration();
+      setActiveCalibration(status);
+      setCalibrationMessage(`采集端当前标定已刷新：${status.activeCalibration?.version || compactPath(status.calibrationFile, 4)}`);
+      return status;
+    } catch (error) {
+      setCalibrationMessage(error instanceof Error ? `采集端当前标定读取失败：${error.message}` : '采集端当前标定读取失败');
+      return null;
+    }
+  };
+
+  const handleImportCalibrationFitReport = async () => {
+    try {
+      const selected = await chooseCaptureLocalFile('导入阵列标定 fit_report', ['json']);
+      if (!selected) {
+        setCalibrationMessage('浏览器模式不能读取本地 fit_report；请使用 Tauri 桌面端。');
+        return;
+      }
+      if (!selected.selected || !selected.path) {
+        setCalibrationMessage('已取消导入 fit_report。');
+        return;
+      }
+      const file = await readCaptureLocalTextFile(selected.path);
+      if (!file) {
+        setCalibrationMessage('浏览器模式不能读取本地 fit_report。');
+        return;
+      }
+      const parsed = JSON.parse(file.text) as BarSurfaceCalibrationFitReport | { result?: BarSurfaceCalibrationFitReport };
+      const report = 'result' in parsed && parsed.result ? parsed.result : parsed as BarSurfaceCalibrationFitReport;
+      if (!report || typeof report !== 'object' || (!report.correctedXml && !report.outputDir)) {
+        throw new Error('fit_report 缺少 correctedXml/outputDir');
+      }
+      setCalibrationFitReport(report);
+      setCalibrationMessage(`已导入 fit_report：${file.path}（${file.bytes} bytes）`);
+    } catch (error) {
+      setCalibrationMessage(error instanceof Error ? `fit_report 导入失败：${error.message}` : 'fit_report 导入失败');
+    }
+  };
+
+  const handleOpenCalibrationVersionDirectory = async () => {
+    const path = calibrationFitReport?.outputDir || activeCalibration?.versionRoot || '';
+    if (!path) {
+      setCalibrationMessage('没有可打开的标定版本目录。');
+      return;
+    }
+    try {
+      const opened = await openCaptureLocalPath(path);
+      setCalibrationMessage(opened ? `已打开标定版本目录：${path}` : '浏览器模式不能打开本地目录');
+    } catch (error) {
+      setCalibrationMessage(error instanceof Error ? error.message : '标定版本目录打开失败');
+    }
+  };
 
   const applyManifest = async (
     manifest: BarSurfaceManifest,
@@ -1077,6 +1229,24 @@ export function BarSurfaceApp() {
     const controller = new AbortController();
     loadLatest(controller.signal);
     return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    readActiveCaptureCalibration()
+      .then((status) => {
+        if (!cancelled) {
+          setActiveCalibration(status);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setCalibrationMessage(error instanceof Error ? `采集端当前标定读取失败：${error.message}` : '采集端当前标定读取失败');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -1191,6 +1361,7 @@ export function BarSurfaceApp() {
         lines: 1000,
         timeoutMs: 8000,
         intervalMs: 500,
+        onTaskStatus: (task) => setActiveTask(task),
       });
       const provider = payload.provider;
       const successes = provider?.successes ?? 0;
@@ -1208,6 +1379,23 @@ export function BarSurfaceApp() {
       setLoadError(error instanceof Error ? error.message : '采集一轮失败');
     } finally {
       setWorkflowBusy(false);
+    }
+  };
+
+  const handleCancelTask = async () => {
+    if (!activeTask || !['queued', 'running'].includes(activeTask.status)) {
+      return;
+    }
+    try {
+      const task = await cancelBarSurfaceProductionTask(activeTask.taskId);
+      setActiveTask(task);
+      setWorkflowMessage(
+        task.status === 'cancelled'
+          ? `任务已取消：${task.taskId}`
+          : `已请求取消，等待当前采集边界：${task.taskId}`,
+      );
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : '取消生产任务失败');
     }
   };
 
@@ -1253,6 +1441,7 @@ export function BarSurfaceApp() {
         contourMinRowCoverage: 0.25,
         contourAutoPercentile: 96,
         runCore: true,
+        onTaskStatus: (task) => setActiveTask(task),
       });
       await applyManifest(payload.algorithm.result.manifest, payload.algorithm.result);
       const [runsPayload, productionPayload] = await Promise.all([
@@ -1290,29 +1479,69 @@ export function BarSurfaceApp() {
 
   const handleCalibrationFit = async () => {
     setCalibrationBusy(true);
-    setCalibrationMessage('');
+    setCalibrationMessage('正在采集六相机标定帧，完整性校验通过后自动拟合…');
     setLoadError(null);
     try {
-      const materialId = selectedMaterialId || latest?.manifest.materialId || 'latest';
       const calibrationPath = latest?.manifest.calibration?.path || '';
       const payload = await fitBarSurfaceCalibration({
-        materialId,
         calibrationPath,
-        captureRoot: 'H:\\',
         rows: '250,500,750',
         maxPointsPerCamera: 2400,
         maxShiftMm: 5,
+        expectedCameras: 6,
+        onTaskStatus: (task) => setActiveTask(task),
       });
       setCalibrationFitReport(payload.result);
       const before = payload.result.fitBefore?.meanAbsResidual;
       const after = payload.result.fitAfter?.meanAbsResidual;
       setCalibrationMessage(
-        `自动标定完成：${payload.result.cameraCount ?? 0}/6，相比 ${metricText(before)} -> ${metricText(after)}，可用新修正 XML 重建。`,
+        `六相机标定采集与拟合完成：${payload.result.cameraCount ?? 0}/6，相差 ${metricText(before)} -> ${metricText(after)}，可用新修正 XML 重建。`,
       );
     } catch (error) {
       setCalibrationMessage(error instanceof Error ? error.message : '自动标定修正失败');
     } finally {
       setCalibrationBusy(false);
+    }
+  };
+
+  const handleActivateCalibration = async () => {
+    const report = calibrationFitReport;
+    const correctedXml = report?.correctedXml || '';
+    if (!report || !correctedXml) {
+      setCalibrationMessage('请先完成自动标定拟合并复核修正结果。');
+      return;
+    }
+    setCalibrationActivationBusy(true);
+    setCalibrationMessage('正在激活已复核的阵列标定版本...');
+    try {
+      const outputDir = report.outputDir || correctedXml.split(/[\\/]/).slice(0, -1).join('\\');
+      const version = outputDir.split(/[\\/]/).filter(Boolean).at(-1) || 'tauri-reviewed-calibration';
+      const separator = outputDir.includes('\\') ? '\\' : '/';
+      const fitReportPath = outputDir ? `${outputDir.replace(/[\\/]$/, '')}${separator}fit_report.json` : '';
+      const status = await activateCaptureCalibration({
+        name: 'current-6-soft-trigger',
+        path: correctedXml,
+        version,
+        fitReport: fitReportPath,
+        beforePreview: report.beforePreview,
+        afterPreview: report.afterPreview,
+        sourceCalibration: report.calibration,
+        fitBefore: report.fitBefore,
+        fitAfter: report.fitAfter,
+        cameraParamDir: 'config/camera-params/current-6-soft-trigger',
+        allowExternal: true,
+        saveToDevice: false,
+        appliedBy: 'tauri-calibration-review',
+      });
+      if (status.code !== 0 || !status.exists) {
+        throw new Error(`采集端未接受标定版本（code ${status.code}）`);
+      }
+      setActiveCalibration(status);
+      setCalibrationMessage(`阵列标定版本已激活：${status.activeCalibration?.version || version}；未写入相机设备。`);
+    } catch (error) {
+      setCalibrationMessage(error instanceof Error ? `标定版本激活失败：${error.message}` : '标定版本激活失败');
+    } finally {
+      setCalibrationActivationBusy(false);
     }
   };
 
@@ -1332,11 +1561,13 @@ export function BarSurfaceApp() {
         running={running}
         workflowBusy={workflowBusy}
         workflowMessage={workflowMessage}
+        activeTask={activeTask}
         onRefresh={() => loadLatest()}
         onSteelIn={handleSteelIn}
         onCaptureOnce={handleCaptureOnce}
         onSteelOut={handleSteelOut}
         onRun={handleRun}
+        onCancelTask={handleCancelTask}
         onMaterialChange={handleMaterialChange}
         onRunChange={handleRunChange}
       />
@@ -1355,10 +1586,16 @@ export function BarSurfaceApp() {
           <BarSurfaceCalibrationPanel
             manifest={manifest}
             fitReport={calibrationFitReport}
-            busy={calibrationBusy || running}
+            activeCalibration={activeCalibration}
+            busy={calibrationBusy || calibrationActivationBusy || running}
             fitRunning={calibrationBusy}
+            activationBusy={calibrationActivationBusy}
             message={calibrationMessage}
             onFit={handleCalibrationFit}
+            onActivate={handleActivateCalibration}
+            onImportFitReport={handleImportCalibrationFitReport}
+            onRefreshActive={() => void refreshActiveCalibration()}
+            onOpenVersionDirectory={() => void handleOpenCalibrationVersionDirectory()}
             onRunWithCalibration={handleRunWithCalibration}
           />
           <section className="bar-surface-main-grid">

@@ -5,6 +5,8 @@ describe('getMockInspectionSnapshot', () => {
   it('returns the accepted design plate, defects, status groups, and summaries', () => {
     const snapshot = getMockInspectionSnapshot();
 
+    expect(snapshot.source).toBe('demo');
+    expect(snapshot.inspections.every((inspection) => inspection.source === 'demo')).toBe(true);
     expect(snapshot.currentPlate.plateNo).toBe('202606131900');
     expect(snapshot.currentPlate.widthMm).toBe(3500);
     expect(snapshot.currentPlate.lengthMm).toBe(12000);
@@ -74,10 +76,12 @@ describe('getMockInspectionSnapshot', () => {
     expect(selected.defects.every((defect) => defect.plateNo === '202606131858')).toBe(true);
   });
 
-  it('attaches generated mock defect images to current and historical defects', () => {
+  it('attaches generated mock defect images only to the explicit demo fixture', () => {
     const snapshot = getMockInspectionSnapshot();
     const historical = getPlateInspectionSnapshot(snapshot, '202606131858');
 
+    expect(snapshot.source).toBe('demo');
+    expect(historical.source).toBe('demo');
     expect(snapshot.defects.every((defect) => defect.previewImageUrl)).toBe(true);
     expect(snapshot.defects.find((defect) => defect.typeId === 'pit')?.previewImageUrl).toContain('defect-pit');
     expect(snapshot.defects.find((defect) => defect.typeId === 'scratch')?.previewImageUrl).toContain('defect-scratch');

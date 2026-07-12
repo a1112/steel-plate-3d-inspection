@@ -23,21 +23,27 @@ Equivalent env-file mode:
 scripts/run-service.ps1 -EnvFile config/env/external-api.env.example
 ```
 
-## Qt Capture Provider
+## Six-Camera Headless Stack
 
-```powershell
-scripts/list-qt-kits.ps1 -QtRoot C:/Qt
-scripts/build-capture-qt.ps1 -QtPrefixPath C:/Qt
-target/capture-qt/Release/steel_capture_qt_terminal.exe
-```
-
-For the current six-camera hardware setup, use the stack starter to launch the headless provider, apply the active `current-6-soft-trigger` profile, preserve the vendor/device-side time-trigger parameters, and open the Qt viewer:
+For the current six-camera hardware setup, use the stack starter to launch the headless provider, apply the active `current-6-soft-trigger` profile, and preserve the vendor/device-side time-trigger parameters:
 
 ```powershell
 scripts/start-capture-stack.ps1 -StopExisting
 ```
 
-It defaults to `E:\steel-capture-data`, `E:\steel-capture-data\config`, port `4317`, and six expected cameras. Pass `-NoQt` when only the API provider should be started. By default it preserves the saved device/profile parameters, including the vendor-side time-trigger setup; pass `-ApplyPreset` only when you intentionally want to force the generic 1000-line preset from the API.
+Headless mode is the default. `-NoQt` is retained only as a deprecated compatibility switch. The stack defaults to `H:\`, a target-local configuration root, port `4317`, and six expected cameras. It preserves saved device/profile parameters, including the vendor-side time-trigger setup; pass `-ApplyPreset` only when you intentionally want to force the generic 1000-line preset from the API.
+
+## Optional Qt Diagnostic Viewer
+
+```powershell
+scripts/list-qt-kits.ps1 -QtRoot C:/Qt
+scripts/build-capture-qt.ps1 -QtPrefixPath C:/Qt
+scripts/start-capture-stack.ps1 -WithQtViewer
+```
+
+`-WithQtViewer` adds the local diagnostic viewer to the headless stack. The script sets `CAPTURE_QT_API_AUTOSTART=0`, so Qt consumes the existing headless API and does not become a second SDK/API owner.
+
+The `qt-terminal` Rust provider mode and its environment template remain for legacy development compatibility only; neither is used by the formal runtime or package:
 
 In another terminal:
 
@@ -83,6 +89,33 @@ POST /api/production/capture-once
 POST /api/production/capture-summary
 POST /api/production/algorithm/run
 POST /api/production/defect
+POST /api/production/tasks
+POST /api/production/tasks/steel-info
+POST /api/production/tasks/steel-in
+POST /api/production/tasks/steel-out
+POST /api/production/tasks/trigger-event
+GET  /api/production/tasks
+GET  /api/production/tasks/detail?id=TASK-ID
+POST /api/production/tasks/cancel
+POST /api/production/tasks/retry
+GET  /api/alarms?status=open
+POST /api/alarms/acknowledge
+POST /api/alarms/resolve
+```
+
+The formal Tauri and trigger-gateway steel-info/in/out/event paths use the durable task endpoints. PLC/L2 callers should retain one stable `requestId` when retrying the same command. The original synchronous steel routes remain compatibility paths. `capture-once` and `algorithm-run` use the generic task endpoint. Clients poll task detail until a persisted terminal state; accepted work is not tied to the lifetime of the enqueue request. Persistent alarm state is `active -> acknowledged -> resolved`; state changes require an authenticated `admin.records` session and a non-empty operator note.
+
+Real six-camera calibration apply/rollback has a separate Rust `calibration_operation` ledger. Tauri supplies a stable `operationId`, and `GET /api/calibration/operations/detail?id=...` exposes `dispatching/succeeded/failed/needs-reconciliation`. Never generate a new ID merely because an HTTP response was lost: refresh the stored operation first. Rust startup marks interrupted dispatch for reconciliation and never automatically repeats the C++ SDK mutation.
+
+Formal operator trigger controls are exposed by Rust, not by a browser-side gateway origin:
+
+```text
+GET  /api/trigger/status
+GET  /api/trigger/mode
+POST /api/trigger/mode
+POST /api/trigger/manual/steel-info
+POST /api/trigger/manual/steel-in
+POST /api/trigger/manual/steel-out
 ```
 
 The standalone trigger gateway is a separate executable for L2/PLC/API integration:
@@ -91,7 +124,7 @@ The standalone trigger gateway is a separate executable for L2/PLC/API integrati
 scripts/run-trigger-gateway.ps1 -EnvFile config/env/trigger-gateway.env.example
 ```
 
-The source project lives in `app/trigger` and communicates with the Rust service only through HTTP APIs. It forwards `/api/trigger/*`, `/api/plc/*`, and `/api/l2/*` requests to the Rust production API. Use `-Mode api` for direct API-controlled in/out steel, `-Mode gray` when an external grayscale/sensor-side trigger owns the in/out decision, `-Mode secondary` for L2/二级 tagging, and `-Mode manual` to enable the local manual steel-in/out page at `http://127.0.0.1:4881/manual`.
+The source project lives in `app/trigger` and communicates with the Rust service only through HTTP APIs. PLC/L2/gray/manual events accepted by the gateway are forwarded to Rust's durable production-task APIs. In the other direction, Tauri requests trigger status, mode, and manual actions only from Rust's explicit `/api/trigger/*` proxy allowlist; the browser never targets port `4881`. Use `-Mode api` for API-controlled in/out steel, `-Mode gray` when an external grayscale/sensor-side trigger owns the in/out decision, `-Mode secondary` for L2/secondary-level tagging, and `-Mode manual` to enable the gateway's local diagnostic page at `http://127.0.0.1:4881/manual`.
 
 For a local integrated run that starts the capture provider, Rust service, trigger gateway, and static client from existing `target` build outputs:
 
@@ -99,7 +132,7 @@ For a local integrated run that starts the capture provider, Rust service, trigg
 scripts/start-integrated-capture-management.ps1 -TriggerMode manual -OpenBrowser
 ```
 
-This waits for `http://127.0.0.1:4317/health`, `http://127.0.0.1:4873/api/production/status`, `http://127.0.0.1:4881/api/trigger/status`, and the built client page at `http://127.0.0.1:1432/?app=terminal`. Use `-NoQt` to skip the Qt viewer or `-StopExisting` to first stop known project executables and listeners on the selected ports.
+This waits for `http://127.0.0.1:4317/health`, `http://127.0.0.1:4873/api/production/status`, `http://127.0.0.1:4881/api/trigger/status`, and the built client page at `http://127.0.0.1:1432/?app=terminal`. The direct gateway URL here is an orchestration readiness probe, not a client route. Rust readiness additionally gates database, durable-task worker, capture, storage/writer queue, and the required trigger gateway. Headless C++ capture is the default; use `-WithQtViewer` only for local diagnostics, or `-StopExisting` to first stop known project executables and listeners on the selected ports.
 
 To verify the integrated management flow without cameras, run the simulated smoke test:
 
@@ -107,7 +140,7 @@ To verify the integrated management flow without cameras, run the simulated smok
 scripts/test-integrated-management-smoke.ps1
 ```
 
-It starts the Rust service in simulated provider mode, starts the standalone trigger gateway, serves the built terminal client, checks the service-side network monitor API, checks that manual steel-in is rejected outside manual mode, then verifies steel-info, steel-in, record-before-capture, steel-out, and final session status.
+It starts the Rust service in simulated provider mode, starts the standalone trigger gateway, serves the built terminal client, checks the service-side network monitor API, and checks that manual steel-in is rejected outside manual mode. It then enqueues and polls persisted `steel-info -> steel-in -> capture-once -> steel-out` tasks, verifies their FIFO material/session identity, checks record-before-capture behavior, and confirms the final session status. This Qt-free simulated runtime acceptance has passed; it does not replace the six-camera hardware regression below.
 
 To verify only the generated runtime folder layout without starting services:
 
@@ -133,6 +166,8 @@ For real six-camera hardware acceptance, start the capture provider, Rust servic
 scripts/test-real-hardware-acceptance.ps1
 ```
 
+The post-migration six-camera regression is still outstanding. In addition to the scripted API checks, production sign-off must validate the asynchronous frame-transaction writer on real SDK frames: `owned-offline-format0`, same-frame online/offline depth equivalence, pending-byte backpressure, any format-2 fallback, and CTRL_BREAK drain while accepted frames are pending.
+
 For a single combined live-stack report that runs runtime layout, live readiness, real-hardware read-only checks, and UI smoke:
 
 ```powershell
@@ -154,6 +189,41 @@ scripts/test-real-hardware-acceptance.ps1 -RunCapture
 ```
 
 The capture mode also checks that provider capture is parallel, that the Rust service writes the production summary to `H:\production\<material>\<session>\summary.json`, that `summaryOutput` and `latestInspection.summaryPath` both point to that production summary, that the final `steel.production.summary.v1` file lists depth/intensity/metadata files for all six cameras with `sdk-derived` disabled, and that `activeSession` is cleared after steel-out.
+
+Real six-camera calibration has a separate, authenticated acceptance script. Its default mode performs local SHA-256/file/SN/mapping validation plus the Rust/C++ dry-run and does not call the SDK mutation path:
+
+Copy and review `config/capture/calibration-acceptance-plan.example.json`; replace every target and known-good rollback path with provider-local regular files. `AdminToken` may be passed explicitly or supplied through `STEEL_ADMIN_TOKEN`.
+
+```powershell
+scripts/test-real-calibration-acceptance.ps1 `
+  -PlanPath C:\maintenance\six-camera-calibration-plan.json `
+  -AdminToken $adminToken
+```
+
+The mutating apply -> ledger -> explicit rollback -> validation-capture path requires an additional switch and exact safety phrase:
+
+```powershell
+scripts/test-real-calibration-acceptance.ps1 `
+  -PlanPath C:\maintenance\six-camera-calibration-plan.json `
+  -AdminToken $adminToken `
+  -RunApplyRollback `
+  -SafetyConfirmation "RUN REAL SIX CAMERA CALIBRATION APPLY AND ROLLBACK"
+```
+
+Add `-SaveToDevice` only for the separately approved device-flash test. The script intentionally reports that apply/rollback process-crash injection, staged-file tamper rejection, and generation rejection remain a separate controlled maintenance drill.
+
+The process-crash drill is a two-phase command and must be completed once for `ApplyCrash` and once for `RollbackCrash`. Start the provider with the four exact `CAPTURE_CALIBRATION_CRASH_*` bindings shown in `docs/capture-api-contract.md`, verify `/health` reports the intended operation/phase/camera binding, then run `Prepare`. After the controlled exit, clear every crash variable, restart the provider, and run `Resume` with the generated state file. Resume verifies provider and Rust fences, reconnects all cameras, performs the parent-bound staged rollback, checks nested rollback correlation, and captures six validation frames.
+
+```powershell
+scripts/test-real-calibration-crash-recovery.ps1 -Mode Prepare -Scenario ApplyCrash -PlanPath C:\maintenance\six-camera-calibration-plan.json -AdminToken $adminToken -SafetyConfirmation "RUN CONTROLLED CALIBRATION PROCESS CRASH RECOVERY"
+scripts/test-real-calibration-crash-recovery.ps1 -Mode Resume -StatePath target\logs\real-calibration-crash-recovery\active-calibration-crash-drill.json -AdminToken $adminToken -SafetyConfirmation "RUN CONTROLLED CALIBRATION PROCESS CRASH RECOVERY"
+```
+
+Run the separately confirmed integrity/generation drill after the crash scenarios. It uses `persistActive:false` and `saveToDevice:false`, creates two runtime generations, rejects the stale token, temporarily modifies one staged copy, proves both rejections are zero-write using status and maintenance evidence, restores the exact bytes in a `finally` block, rolls back, and captures six validation frames:
+
+```powershell
+scripts/test-real-calibration-integrity-generation.ps1 -PlanPath C:\maintenance\six-camera-calibration-plan.json -AdminToken $adminToken -SafetyConfirmation "RUN REAL CALIBRATION INTEGRITY AND GENERATION DRILL"
+```
 
 For repeated in/out steel stability checks, use:
 
@@ -201,7 +271,7 @@ python scripts/fit_array_calibration_cross_section.py `
   --rows 250,500,750
 ```
 
-The fitter writes `ArrayCalibration.corrected.xml`, before/after cross-section previews, `fit_report.json`, `camera_corrections.csv`, and `cross_section_points.csv` under `E:\steel-capture-data\analysis\array-calibration-fit-*`. Qt uses the point CSV to render the cross-section directly in the calibration workspace instead of displaying a static preview image. The fitter never overwrites the production calibration file.
+The fitter writes `ArrayCalibration.corrected.xml`, before/after cross-section previews, `fit_report.json`, `camera_corrections.csv`, and `cross_section_points.csv` under `E:\steel-capture-data\analysis\array-calibration-fit-*`. The formal Tauri calibration workflow presents the fit for review and reconstruction-version activation through Rust without writing camera devices. The optional Qt diagnostic workspace may still render the point CSV directly. The fitter never overwrites the production calibration file.
 
 ## Rust Service Only
 
@@ -300,7 +370,7 @@ Tauri dev starts only the Vite frontend through `app/client/src-tauri/tauri.conf
 scripts/verify-independent-architecture.ps1
 ```
 
-Use `-CheckQt` after installing a Qt MSVC x64 kit.
+Use `-CheckQt` only when the optional diagnostic viewer is included and a Qt MSVC x64 kit is installed.
 
 To verify only the Rust-to-external-capture-provider boundary:
 
@@ -314,14 +384,14 @@ scripts/verify-external-provider.ps1
 scripts/package-runtime.ps1
 ```
 
-This creates independent deployable folders under `target/packages/steel-inspection-runtime`.
-Add `-IncludeQt` after building/installing the Qt MSVC kit to package the Qt capture terminal with its Qt runtime DLLs:
+This creates independent deployable folders under `target/packages/steel-inspection-runtime`. The formal package uses the headless C++ capture provider and does not require Qt.
+Add `-IncludeQt` only when a development diagnostic viewer is wanted after building/installing the Qt MSVC kit:
 
 ```powershell
 scripts/package-runtime.ps1 -IncludeQt -QtPrefixPath C:/Qt
 ```
 
-The package includes root-level launch scripts:
+The package includes root-level launch scripts; `run-capture-qt.ps1` exists only in packages generated with `-IncludeQt`:
 
 ```powershell
 target/packages/steel-inspection-runtime/run-capture-headless.ps1
@@ -334,19 +404,26 @@ target/packages/steel-inspection-runtime/test-integrated-runtime-ready.ps1
 target/packages/steel-inspection-runtime/test-integrated-capture-management-full.ps1
 target/packages/steel-inspection-runtime/test-runtime-acceptance.ps1
 target/packages/steel-inspection-runtime/test-real-hardware-acceptance.ps1
+target/packages/steel-inspection-runtime/test-real-calibration-acceptance.ps1
 target/packages/steel-inspection-runtime/test-runtime-layout.ps1
 target/packages/steel-inspection-runtime/stop-runtime.ps1
 ```
 
 ## Target-Local Runtime
 
-For local hardware acceptance, synchronize all compiled executables and DLLs into `target/runtime`:
+For the formal Qt-free local hardware runtime, synchronize the compiled executables and DLLs into `target/runtime`:
 
 ```powershell
 scripts/build-capture-headless.ps1
-scripts/build-capture-qt.ps1 -QtPrefixPath C:\Qt
 scripts/build-service.ps1
 scripts/build-trigger-gateway.ps1
+scripts/sync-target-runtime.ps1
+```
+
+Add the diagnostic viewer only to an explicitly diagnostic runtime:
+
+```powershell
+scripts/build-capture-qt.ps1 -QtPrefixPath C:\Qt
 scripts/sync-target-runtime.ps1 -IncludeQt
 ```
 
@@ -354,22 +431,24 @@ This creates:
 
 ```text
 target/runtime/capture-headless/
-target/runtime/capture-qt/
 target/runtime/service/
 target/runtime/trigger/
 target/runtime/client/
 target/runtime/config/
 ```
 
+`target/runtime/capture-qt/` and `run-capture-qt.ps1` exist only when `-IncludeQt` is requested.
+
 The generated run scripts keep temporary runtime config under `target/runtime/config`.
-The service SQLite database is `target/runtime/config/service/steel-inspection.sqlite`, and the Qt/capture provider config root is `target/runtime/config/capture`.
+The service SQLite database is `target/runtime/config/service/steel-inspection.sqlite`, and the capture-provider configuration root is `target/runtime/config/capture`. An optional Qt diagnostic viewer consumes that same headless-provider configuration through the API.
 The target runtime also includes `test-integrated-management-smoke.ps1`, which can be run from inside `target/runtime` to validate the simulated service + trigger gateway + static client flow without touching cameras.
 Use `test-runtime-layout.ps1` from inside `target/runtime` for a static folder-layout check.
 Use `test-runtime-acceptance.ps1` from inside `target/runtime` for a one-command folder acceptance check. It uses temporary ports `4973`, `4981`, and `1494` by default and only cleans listeners on those ports.
 Use `test-integrated-runtime-ready.ps1` from inside `target/runtime` after starting the real stack to check capture, service, trigger gateway, network monitor, and client page readiness.
-Use `test-integrated-capture-management-full.ps1` from inside `target/runtime` after starting the real stack for a combined layout/live-ready/hardware/UI acceptance report; add `-RunCapture`, `-RunBarSurface`, or `-RunShortStability` for deeper live acceptance. Use `-RequireFullCoverage` with `-RunShortStability -StabilityUseTriggerGateway -RunBarSurface` when skipped coverage must fail the report, and use `-StabilityDurationSec 600` when the integrated report should include a ten-minute stability soak.
+Use `test-integrated-capture-management-full.ps1` from inside `target/runtime` after starting the real stack for a combined layout/live-ready/hardware/UI acceptance report. Full coverage also requires the real calibration apply/rollback arguments, both crash Resume report paths, and `-CalibrationIntegrityGenerationReportPath`. Use `-StabilityDurationSec 600` for a ten-minute soak.
 Use `test-runtime-ui-smoke.ps1` from inside `target/runtime` after starting the real stack and client to screenshot-check terminal/capture/3D pages and the receiver network popover's realtime upload/download monitor.
 Use `test-real-hardware-acceptance.ps1` from inside `target/runtime` for read-only six-camera hardware checks, or add `-RunCapture` to run one real production capture round and verify the H-drive production layout.
+Use `test-real-calibration-acceptance.ps1` for the separately authorized calibration dry-run or real apply/rollback acceptance described above.
 
 ## Stop Runtime Processes
 

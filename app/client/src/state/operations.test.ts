@@ -99,12 +99,12 @@ describe('operations state helpers', () => {
     expect(cleared.events[1].message).toBe('系统自检完成，核心服务正常');
   });
 
-  it('projects operation alarm state into the device status used by the header', () => {
+  it('keeps backend alarms and adds only real local transient alarms', () => {
     const snapshot = getMockInspectionSnapshot();
-    const cleared = runSystemAction(createInitialOperationState(), 'clear-alarm');
+    const localState = { ...createInitialOperationState(), alarmCount: 2 };
 
     expect(snapshot.status.alarmCount).toBe(1);
-    expect(getDeviceStatusWithOperation(snapshot.status, cleared).alarmCount).toBe(0);
+    expect(getDeviceStatusWithOperation(snapshot.status, localState).alarmCount).toBe(3);
   });
 
   it('exports visible report rows as csv text', () => {

@@ -351,7 +351,102 @@ export type BarSurfaceProductionStatus = {
     productionCaptureFinishedAt?: string;
     algorithmPhase?: string;
   };
+  tasks?: {
+    queueDepth?: number;
+    capacity?: number;
+    worker?: {
+      running?: boolean;
+      activeTaskId?: string | null;
+      heartbeatAgeMs?: number;
+      lastError?: string;
+    };
+  };
 };
+
+export type BarSurfaceProductionTask<T = unknown> = {
+  id: string;
+  taskId: string;
+  kind: 'capture-once' | 'algorithm-run' | string;
+  materialId: string;
+  sessionId: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | string;
+  phase: string;
+  progress: number;
+  attempts: number;
+  maxAttempts: number;
+  cancelRequested: boolean;
+  result: T | null;
+  error: string;
+  createdAt: string;
+  startedAt: string;
+  finishedAt: string;
+  updatedAt: string;
+};
+
+type ProductionTaskEnvelope<T> = {
+  code: number;
+  duplicate?: boolean;
+  task: BarSurfaceProductionTask<T>;
+};
+
+function productionTaskRequestId(kind: string) {
+  const randomId = globalThis.crypto?.randomUUID?.();
+  return randomId || `${kind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function waitForProductionTask<T>(
+  kind: 'capture-once' | 'algorithm-run',
+  payload: Record<string, unknown>,
+  onTaskStatus?: (task: BarSurfaceProductionTask<T>) => void,
+): Promise<T> {
+  const response = await fetch(`${origin()}/api/production/tasks`, {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      kind,
+      idempotencyKey: productionTaskRequestId(kind),
+      maxAttempts: 1,
+      payload,
+    }),
+  });
+  let envelope = await readJsonResponse<ProductionTaskEnvelope<T>>(response, 'production task enqueue failed');
+  onTaskStatus?.(envelope.task);
+  const deadline = Date.now() + 60 * 60 * 1000;
+  while (!['succeeded', 'failed', 'cancelled', 'interrupted'].includes(envelope.task.status)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`production task ${envelope.task.taskId} did not finish within one hour`);
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 400));
+    const detailResponse = await fetch(
+      `${origin()}/api/production/tasks/detail?id=${encodeURIComponent(envelope.task.taskId)}`,
+      { headers: { Accept: 'application/json' } },
+    );
+    envelope = await readJsonResponse<ProductionTaskEnvelope<T>>(
+      detailResponse,
+      'production task status failed',
+    );
+    onTaskStatus?.(envelope.task);
+  }
+  if (envelope.task.status !== 'succeeded' || !envelope.task.result) {
+    throw new Error(
+      envelope.task.error || `production task ${envelope.task.taskId} ended as ${envelope.task.status}`,
+    );
+  }
+  return envelope.task.result;
+}
+
+export async function cancelBarSurfaceProductionTask<T = unknown>(taskId: string) {
+  const response = await fetch(`${origin()}/api/production/tasks/cancel`, {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ taskId }),
+  });
+  const payload = await readJsonResponse<ProductionTaskEnvelope<T>>(
+    response,
+    'production task cancellation failed',
+  );
+  return payload.task;
+}
 
 export type BarSurfaceProductionRunResponse = {
   code: number;
@@ -472,6 +567,19 @@ export type BarSurfaceCalibrationFitResponse = {
   code: number;
   stdout?: string;
   stderr?: string;
+  capture?: {
+    code?: number;
+    successes?: number;
+    failures?: number;
+    completeFrames?: number;
+    metadataFrames?: number;
+    summaryOutput?: string;
+  };
+  fit?: {
+    code?: number;
+    stdout?: string;
+    stderr?: string;
+  };
   result: BarSurfaceCalibrationFitReport;
 };
 
@@ -724,6 +832,7 @@ export async function captureBarSurfaceProductionOnce(options: {
   lines?: number;
   timeoutMs?: number;
   intervalMs?: number;
+  onTaskStatus?: (task: BarSurfaceProductionTask<BarSurfaceProductionCaptureResponse>) => void;
 } = {}): Promise<BarSurfaceProductionCaptureResponse> {
   const body: Record<string, unknown> = {
     materialId: options.materialId || 'latest',
@@ -747,12 +856,11 @@ export async function captureBarSurfaceProductionOnce(options: {
   if (options.sessionId) {
     body.sessionId = options.sessionId;
   }
-  const response = await fetch(`${origin()}/api/production/capture-once`, {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return readJsonResponse<BarSurfaceProductionCaptureResponse>(response, 'production capture once failed');
+  return waitForProductionTask<BarSurfaceProductionCaptureResponse>(
+    'capture-once',
+    body,
+    options.onTaskStatus,
+  );
 }
 
 export async function runBarSurfacePrototype(options: {
@@ -812,6 +920,7 @@ export async function runBarSurfaceProductionAlgorithm(options: {
   contourMinRowCoverage?: number;
   contourAutoPercentile?: number;
   runCore?: boolean;
+  onTaskStatus?: (task: BarSurfaceProductionTask<BarSurfaceProductionRunResponse>) => void;
 } = {}): Promise<BarSurfaceProductionRunResponse> {
   const body: Record<string, unknown> = {
     materialId: options.materialId || 'latest',
@@ -835,12 +944,11 @@ export async function runBarSurfaceProductionAlgorithm(options: {
   if (options.calibrationPath) {
     body.calibrationPath = options.calibrationPath;
   }
-  const response = await fetch(`${origin()}/api/production/algorithm/run`, {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return readJsonResponse<BarSurfaceProductionRunResponse>(response, 'production algorithm run failed');
+  return waitForProductionTask<BarSurfaceProductionRunResponse>(
+    'algorithm-run',
+    body,
+    options.onTaskStatus,
+  );
 }
 
 export async function fitBarSurfaceCalibration(options: {
@@ -851,24 +959,45 @@ export async function fitBarSurfaceCalibration(options: {
   outputRoot?: string;
   maxPointsPerCamera?: number;
   maxShiftMm?: number;
+  expectedCameras?: number;
+  lines?: number;
+  width?: number;
+  timeoutMs?: number;
+  dataMode?: number;
+  captureOutputDir?: string;
+  ips?: string[];
+  onTaskStatus?: (task: BarSurfaceProductionTask<BarSurfaceCalibrationFitResponse>) => void;
 } = {}): Promise<BarSurfaceCalibrationFitResponse> {
   const body: Record<string, unknown> = {
-    materialId: options.materialId || 'latest',
+    operation: 'calibration-capture-fit',
     captureRoot: options.captureRoot || 'H:\\',
     rows: options.rows || '250,500,750',
     maxPointsPerCamera: options.maxPointsPerCamera ?? 2400,
     maxShiftMm: options.maxShiftMm ?? 5,
+    expectedCameras: options.expectedCameras ?? 6,
+    lines: options.lines ?? 1000,
+    width: options.width ?? 0,
+    timeoutMs: options.timeoutMs ?? 8000,
+    dataMode: options.dataMode ?? 3,
   };
+  if (options.materialId) {
+    body.materialId = options.materialId;
+  }
   if (options.calibrationPath) {
     body.calibrationPath = options.calibrationPath;
   }
   if (options.outputRoot) {
     body.outputRoot = options.outputRoot;
   }
-  const response = await fetch(`${origin()}/api/algorithm/bar-surface/calibration/fit`, {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return readJsonResponse<BarSurfaceCalibrationFitResponse>(response, 'bar surface calibration fit failed');
+  if (options.captureOutputDir) {
+    body.captureOutputDir = options.captureOutputDir;
+  }
+  if (options.ips?.length) {
+    body.ips = options.ips;
+  }
+  return waitForProductionTask<BarSurfaceCalibrationFitResponse>(
+    'algorithm-run',
+    body,
+    options.onTaskStatus,
+  );
 }

@@ -5,13 +5,14 @@ import { getMockInspectionSnapshot } from '../data/inspection';
 import type { CaptureImageItem, DefectItem, InspectionSnapshot } from '../data/inspection';
 
 const DEFAULT_SERVICE_ORIGIN = 'http://127.0.0.1:4873';
-const DEFAULT_TRIGGER_GATEWAY_ORIGIN = 'http://127.0.0.1:4881';
 const CONNECTION_CONFIG_KEY = 'steel-inspection-connection-config';
 const ADMIN_SESSION_KEY = 'steel-inspection-admin-session';
 const ADMIN_ERROR_MESSAGES: Record<string, string> = {
   auth_required: '请先登录后台管理',
   permission_denied: '当前账号没有该操作权限',
   origin_not_allowed: '请求来源不受信任，请从本机客户端操作',
+  trigger_gateway_unavailable: '触发网关不可达',
+  trigger_gateway_timeout: '触发网关响应超时',
   invalid_credentials: '账号或密码错误',
   login_locked: '登录失败次数过多，请稍后再试',
   role_disabled: '当前账号角色已停用',
@@ -503,6 +504,7 @@ export type ProductionInspection = {
   sessionId: string;
   status: string;
   summaryPath: string;
+  captureSummaryPath?: string;
   captureCount: number;
   defectCount: number;
   startedAt: string;
@@ -518,12 +520,23 @@ export type ProductionStatus = {
   latestSession?: ProductionMaterialSession | null;
   activeSession?: ProductionMaterialSession | null;
   latestInspection?: ProductionInspection | null;
+  tasks?: {
+    queueDepth: number;
+    capacity: number;
+    worker?: {
+      running: boolean;
+      activeTaskId?: string | null;
+      heartbeatAgeMs?: number;
+      recoveredTasks?: number;
+    };
+  };
   capture?: Record<string, unknown>;
 };
 
 export type ProductionEventInput = {
   materialId: string;
   sessionId?: string;
+  requestId?: string;
   source?: string;
   mode?: string;
   triggerMode?: string;
@@ -536,8 +549,23 @@ export type ProductionEventInput = {
   discardBlackFrames?: boolean;
 };
 
+export type ProductionTaskSummary = {
+  id?: string;
+  taskId: string;
+  kind: string;
+  materialId: string;
+  sessionId: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | string;
+  phase?: string;
+  progress?: number;
+  cancelRequested?: boolean;
+  error?: string;
+};
+
 export type ProductionCommandResult = {
   code: number;
+  duplicate?: boolean;
+  task?: ProductionTaskSummary;
   materialId?: string;
   sessionId?: string;
   inspectionId?: string;
@@ -570,6 +598,42 @@ export type TriggerGatewayStatus = {
   production?: ProductionStatus;
   error?: string;
   message?: string;
+};
+
+export type ServiceHealthCheck = {
+  ok: boolean;
+  status: string;
+  reason?: string | null;
+  required?: boolean;
+  readyContribution?: boolean;
+  apiReachable?: boolean;
+  sdkReady?: boolean | null;
+  writable?: boolean;
+  accepting?: boolean;
+  unresolvedCount?: number | null;
+  unresolvedOperations?: Array<{
+    operationId: string;
+    kind?: string;
+    status?: string;
+    error?: string | null;
+    updatedAt?: string;
+  }>;
+};
+
+export type ServiceHealthDetails = {
+  ok: boolean;
+  status: string;
+  service: string;
+  uptimeMs: number;
+  endpoint?: string;
+  checks: {
+    database?: ServiceHealthCheck;
+    taskWorker?: ServiceHealthCheck;
+    capture?: ServiceHealthCheck;
+    calibrationReconciliation?: ServiceHealthCheck;
+    storage?: ServiceHealthCheck;
+    trigger?: ServiceHealthCheck;
+  };
 };
 
 export type TriggerGatewayCommandResult = {
@@ -681,8 +745,7 @@ export function getInspectionServiceOrigin(config = getStoredConnectionConfig())
 }
 
 export function getTriggerGatewayOrigin() {
-  const configuredOrigin = import.meta.env.VITE_TRIGGER_GATEWAY_ORIGIN;
-  return configuredOrigin && configuredOrigin.trim().length > 0 ? configuredOrigin : DEFAULT_TRIGGER_GATEWAY_ORIGIN;
+  return getInspectionServiceOrigin();
 }
 
 export async function readAdminErrorMessage(response: Response, fallback: string) {
@@ -820,7 +883,10 @@ function withPreviewImage(defect: DefectItem, allowMockFallback: boolean, origin
 }
 
 function normalizeInspectionSnapshot(snapshot: InspectionSnapshot, origin: string): InspectionSnapshot {
-  const allowMockFallback = snapshot.source !== 'production-sqlite' && snapshot.source !== 'production';
+  // Static fixtures are allowed only for an explicitly identified demo/test
+  // snapshot. Unknown and database-backed sources must fail closed so the
+  // online page never presents bundled mock images as production evidence.
+  const allowMockFallback = snapshot.source === 'demo' || snapshot.source === 'test';
   const inspections = snapshot.inspections.map((inspection) => ({
     ...inspection,
     defects: inspection.defects.map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
@@ -863,7 +929,19 @@ export async function fetchProductionStatus(signal?: AbortSignal): Promise<Produ
   return response.json() as Promise<ProductionStatus>;
 }
 
-async function postProductionCommand(path: string, body: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
+export async function fetchServiceHealthDetails(signal?: AbortSignal): Promise<ServiceHealthDetails> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/health/details`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  if (response.status !== 503 && !response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '服务健康检查异常'));
+  }
+  return response.json() as Promise<ServiceHealthDetails>;
+}
+
+async function postProductionCommand(path: string, body: Record<string, unknown>): Promise<ProductionCommandResult> {
   const config = getStoredConnectionConfig();
   const response = await fetch(`${getInspectionServiceOrigin(config)}${path}`, {
     method: 'POST',
@@ -876,32 +954,57 @@ async function postProductionCommand(path: string, body: ProductionEventInput & 
   return response.json() as Promise<ProductionCommandResult>;
 }
 
+function productionRequestId(kind: string, input: ProductionEventInput & Record<string, unknown>) {
+  const provided = typeof input.requestId === 'string' ? input.requestId.trim() : '';
+  if (provided) {
+    return provided;
+  }
+  const random = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${kind}-${input.materialId || 'unknown'}-${random}`;
+}
+
 export async function writeProductionSteelInfo(input: ProductionEventInput): Promise<ProductionCommandResult> {
-  return postProductionCommand('/api/production/steel-info', input);
+  return postProductionCommand('/api/production/tasks/steel-info', {
+    ...input,
+    requestId: productionRequestId('steel-info', input),
+  });
 }
 
 export async function startProductionSteelIn(input: ProductionEventInput): Promise<ProductionCommandResult> {
-  return postProductionCommand('/api/production/steel-in', {
+  return postProductionCommand('/api/production/tasks/steel-in', {
     ...input,
+    requestId: productionRequestId('steel-in', input),
     autoCapture: input.autoCapture ?? true,
     discardBlackFrames: input.discardBlackFrames ?? true,
   });
 }
 
 export async function stopProductionSteelOut(input: ProductionEventInput): Promise<ProductionCommandResult> {
-  return postProductionCommand('/api/production/steel-out', input);
+  return postProductionCommand('/api/production/tasks/steel-out', {
+    ...input,
+    requestId: productionRequestId('steel-out', input),
+  });
 }
 
 export async function captureProductionOnce(input: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
-  return postProductionCommand('/api/production/capture-once', {
-    ...input,
-    autoCapture: input.autoCapture ?? false,
-    discardBlackFrames: input.discardBlackFrames ?? true,
+  const requestId = productionRequestId('capture-once', input);
+  return postProductionCommand('/api/production/tasks', {
+    kind: 'capture-once',
+    idempotencyKey: requestId,
+    maxAttempts: 1,
+    payload: {
+      ...input,
+      requestId,
+      autoCapture: input.autoCapture ?? false,
+      discardBlackFrames: input.discardBlackFrames ?? true,
+    },
   });
 }
 
 export async function fetchTriggerGatewayStatus(signal?: AbortSignal): Promise<TriggerGatewayStatus> {
-  const response = await fetch(`${getTriggerGatewayOrigin()}/api/trigger/status`, {
+  const response = await fetch(`${getInspectionServiceOrigin()}/api/trigger/status`, {
     headers: { Accept: 'application/json' },
     signal,
   });
@@ -912,7 +1015,7 @@ export async function fetchTriggerGatewayStatus(signal?: AbortSignal): Promise<T
 }
 
 export async function setTriggerGatewayMode(mode: TriggerGatewayMode): Promise<TriggerGatewayStatus> {
-  const response = await fetch(`${getTriggerGatewayOrigin()}/api/trigger/mode`, {
+  const response = await fetch(`${getInspectionServiceOrigin()}/api/trigger/mode`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({ mode }),
@@ -925,9 +1028,12 @@ export async function setTriggerGatewayMode(mode: TriggerGatewayMode): Promise<T
 
 function mergeTriggerGatewayResult(payload: TriggerGatewayCommandResult): ProductionCommandResult {
   const service = payload.service;
+  const task = service?.task;
   return {
     ...(service ?? {}),
     code: payload.code ?? service?.code ?? 503,
+    materialId: service?.materialId ?? task?.materialId,
+    sessionId: service?.sessionId ?? task?.sessionId,
     provider: {
       gateway: payload.gateway ?? 'steel-trigger-gateway',
       mode: payload.mode,
@@ -940,7 +1046,7 @@ function mergeTriggerGatewayResult(payload: TriggerGatewayCommandResult): Produc
 }
 
 async function postTriggerGatewayManualCommand(path: string, body: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
-  const response = await fetch(`${getTriggerGatewayOrigin()}${path}`, {
+  const response = await fetch(`${getInspectionServiceOrigin()}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body),
@@ -953,12 +1059,16 @@ async function postTriggerGatewayManualCommand(path: string, body: ProductionEve
 }
 
 export async function triggerGatewayManualSteelInfo(input: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
-  return postTriggerGatewayManualCommand('/api/trigger/manual/steel-info', input);
+  return postTriggerGatewayManualCommand('/api/trigger/manual/steel-info', {
+    ...input,
+    requestId: productionRequestId('steel-info', input),
+  });
 }
 
 export async function triggerGatewayManualSteelIn(input: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
   return postTriggerGatewayManualCommand('/api/trigger/manual/steel-in', {
     ...input,
+    requestId: productionRequestId('steel-in', input),
     present: true,
     value: 1,
     autoCapture: input.autoCapture ?? true,
@@ -969,6 +1079,7 @@ export async function triggerGatewayManualSteelIn(input: ProductionEventInput & 
 export async function triggerGatewayManualSteelOut(input: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
   return postTriggerGatewayManualCommand('/api/trigger/manual/steel-out', {
     ...input,
+    requestId: productionRequestId('steel-out', input),
     present: false,
     value: 0,
   });
