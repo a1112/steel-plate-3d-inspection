@@ -1,12 +1,12 @@
 # Qt Capture Terminal
 
-Standalone operator-facing capture terminal for the steel plate 3D inspection system.
+Optional development diagnostic viewer for the steel inspection capture API. Tauri is the formal operator UI.
 
-This app links the shared `steel_capture_core` library from `app/capture` and starts the same local capture API inside the Qt process. The Rust service should connect to it as an external provider instead of starting another headless capture process.
+The current compatibility binary still links `steel_capture_core`, but the formal runtime starts `steel_capture_service.exe` first and launches Qt with `CAPTURE_QT_API_AUTOSTART=0`. In that mode Qt is an HTTP client and must not start a second capture API or SDK session.
 
 ## Current Capabilities
 
-- Starts the embedded capture API on `127.0.0.1:4317` by default.
+- Can start the embedded capture API on `127.0.0.1:4317` only for legacy isolated diagnostics; formal startup disables it.
 - Can switch the embedded capture provider between the real LVM SDK driver and the offline simulated driver.
 - Provides a three-column acquisition workstation: camera list, selected-camera preview, and status/control/calibration/log tabs.
 - Provides a configuration management page for creating folder-backed profiles, importing profiles, and setting the active/default profile.
@@ -37,12 +37,12 @@ The local machine should use a Qt MSVC x64 kit such as `C:/Qt/6.11.1/msvc2022_64
 
 Set `CAPTURE_DRIVER=simulated` before launching, or create/apply a simulated profile from the configuration management page. Simulated profiles can set the camera count, image storage root, and an optional PNG replay folder.
 
-## Run With Rust Service
+## Run as an Optional Diagnostic Viewer
 
-Start the Qt terminal first, then run the Rust service with:
+Start the formal headless stack and request the viewer explicitly:
 
 ```powershell
-scripts/run-service.ps1 -Provider qt-terminal -CaptureOrigin http://127.0.0.1:4317
+scripts/start-capture-stack.ps1 -WithQtViewer
 ```
 
-Only the Qt terminal owns the camera SDK handles in this mode.
+The script sets `CAPTURE_QT_API_AUTOSTART=0`; the headless C++ process remains the only formal camera SDK/API owner. The legacy `qt-terminal` provider mode is compatibility-only and is not part of production startup.

@@ -1,4 +1,4 @@
-import { Box, ClipboardList, Gauge, MonitorCog } from 'lucide-react';
+import { BellRing, Box, ClipboardList, Gauge, MonitorCog } from 'lucide-react';
 import type { ElementType, MouseEvent } from 'react';
 import type { InspectionUiState } from '../state/inspection-ui';
 
@@ -7,6 +7,7 @@ export type NavKey = InspectionUiState['activeNav'];
 const navItems: Array<{ id: NavKey; label: string; icon: ElementType }> = [
   { id: 'online', label: '在线检测', icon: Gauge },
   { id: 'report', label: '缺陷报表', icon: ClipboardList },
+  { id: 'alarms', label: '报警中心', icon: BellRing },
   { id: 'status', label: '采集管理', icon: MonitorCog },
 ];
 

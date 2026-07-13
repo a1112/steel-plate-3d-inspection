@@ -4,11 +4,12 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type Keyboard
 import { DoubleSide, type Mesh, type PerspectiveCamera } from 'three';
 import heightMapBottomImage from '../assets/plate-surfaces/height-map-bottom.png';
 import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
-import steelPlateSurfaceImage from '../assets/plate-surfaces/steel-plate-surface.png';
-import type { DefectItem, DefectType } from '../data/inspection';
+import type { CaptureImageItem, DefectItem, DefectType } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
+import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { clampPreviewPositionM, DEFAULT_PLATE_LENGTH_M, type SurfaceDisplayMode } from '../state/inspection-ui';
 import { Panel } from './Panel';
+import { ProductionArtifactView } from './ProductionArtifactView';
 
 interface PlateMapProps {
   defectTypes: DefectType[];
@@ -19,6 +20,11 @@ interface PlateMapProps {
   surfaceMode: SurfaceDisplayMode;
   previewPositionM: number;
   plateLengthM?: number;
+  artifactMode?: 'production' | 'demo';
+  inspectionId?: string;
+  captureImages?: CaptureImageItem[];
+  surfaceMesh?: BarSurfaceMesh | null;
+  artifactStatus?: string;
   onToggleType: (typeId: string) => void;
   onSurfaceModeChange: (surfaceMode: SurfaceDisplayMode) => void;
   onPreviewPositionChange: (positionM: number) => void;
@@ -209,98 +215,6 @@ function DefectHoverCard({
           <dd>{getDefectSizeText(defect)}</dd>
         </div>
       </dl>
-    </div>
-  );
-}
-
-function AxisLabel({ label }: { label: string }) {
-  return (
-    <div className="axis-label">
-      <span>{label}</span>
-    </div>
-  );
-}
-
-function SurfaceStrip({
-  surface,
-  defects,
-  defectTypes,
-  selectedDefectId,
-  hoveredDefectId,
-  previewPositionM,
-  plateLengthM,
-  onSelectDefect,
-  onHoverDefect,
-  onDefectNavigationKeyDown,
-  onDefectNavigationWheel,
-}: {
-  surface: 'top' | 'bottom';
-  defects: DefectItem[];
-  defectTypes: DefectType[];
-  selectedDefectId: string | null;
-  hoveredDefectId: string | null;
-  previewPositionM: number;
-  plateLengthM: number;
-  onSelectDefect: (defectId: string) => void;
-  onHoverDefect: (defectId: string | null) => void;
-  onDefectNavigationKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
-  onDefectNavigationWheel: (event: WheelEvent<HTMLDivElement>) => void;
-}) {
-  const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
-  const hoveredDefect = defects.find((defect) => defect.id === hoveredDefectId && defect.surface === surface) ?? null;
-  const hoveredType = hoveredDefect ? defectTypes.find((type) => type.id === hoveredDefect.typeId) : null;
-
-  return (
-    <div className="surface-row">
-      <AxisLabel label={surface === 'top' ? '1-3号相机' : '4-6号相机'} />
-      <div className="y-axis">
-        {['+1.5m', '+1.0m', '+0.5m', '0', '-0.5m', '-1.0m', '-1.5m'].map((tick) => (
-          <span key={tick}>{tick}</span>
-        ))}
-      </div>
-      <div
-        className="plate-strip"
-        role="region"
-        tabIndex={0}
-        aria-label={`${surface === 'top' ? '1-3号相机' : '4-6号相机'}缺陷显示切换`}
-        style={
-          {
-            '--preview-position': `${previewPercent}%`,
-            '--plate-surface-image': `url(${steelPlateSurfaceImage})`,
-          } as CSSProperties
-        }
-        onKeyDown={onDefectNavigationKeyDown}
-        onWheel={onDefectNavigationWheel}
-      >
-        <span className="side-note operator">操作侧</span>
-        <span className="side-note drive">传动侧</span>
-        <div className="center-line" />
-        <div
-          className={`strip-preview-cursor ${previewPercent > 82 ? 'near-end' : ''}`}
-          data-testid={`preview-cursor-${surface}`}
-          aria-hidden="true"
-          style={{ left: `${previewPercent}%` }}
-        >
-          <span>{clampPreviewPositionM(previewPositionM, plateLengthM).toFixed(2)}m</span>
-        </div>
-        {defects
-          .filter((defect) => defect.surface === surface)
-          .map((defect) => {
-            const type = defectTypes.find((item) => item.id === defect.typeId);
-            if (!type) return null;
-            return (
-              <DefectMarker
-                key={defect.id}
-                defect={defect}
-                type={type}
-                selected={defect.id === selectedDefectId}
-                onSelect={() => onSelectDefect(defect.id)}
-                onHoverChange={onHoverDefect}
-              />
-            );
-          })}
-        {hoveredDefect && hoveredType ? <DefectHoverCard defect={hoveredDefect} type={hoveredType} /> : null}
-      </div>
     </div>
   );
 }
@@ -824,6 +738,9 @@ function PlatePointCloudView({
   previewPositionM,
   plateLengthM,
   surfaceMode,
+  artifactMode,
+  surfaceMesh,
+  artifactStatus,
 }: {
   defects: DefectItem[];
   defectTypes: DefectType[];
@@ -831,7 +748,26 @@ function PlatePointCloudView({
   previewPositionM: number;
   plateLengthM: number;
   surfaceMode: SurfaceDisplayMode;
+  artifactMode: 'production' | 'demo';
+  surfaceMesh?: BarSurfaceMesh | null;
+  artifactStatus?: string;
 }) {
+  if (artifactMode === 'production') {
+    return surfaceMesh && surfaceMesh.positions.length >= 3 ? (
+      <ProductionArtifactView
+        mesh={surfaceMesh}
+        mode="points"
+        testId="plate-production-point-cloud"
+        ariaLabel="当前检测记录真实点云"
+        className="plate-production-artifact"
+      />
+    ) : (
+      <div className="production-artifact-empty" role="status" data-testid="plate-production-point-cloud-empty">
+        <strong>暂无生产点云产物</strong>
+        <span>{artifactStatus || '当前检测记录尚未绑定算法点云，请等待算法任务完成。'}</span>
+      </div>
+    );
+  }
   const surfaces: Array<'top' | 'bottom'> = surfaceMode === 'all' ? ['top', 'bottom'] : [surfaceMode];
 
   return (
@@ -840,8 +776,10 @@ function PlatePointCloudView({
       data-testid="plate-point-cloud-view"
       data-point-cloud-points={surfaces.length * 124 * 46}
       data-point-cloud-z-range="-2.00,2.00"
+      data-artifact-source="demo"
       aria-label="钢管点云高度展开图"
     >
+      <span className="demo-artifact-badge">演示点云 · 非生产产物</span>
       <div className="point-cloud-unfold-stack">
         {surfaces.map((surface) => (
           <PointCloudSurfaceStrip
@@ -1008,6 +946,11 @@ export function PlateMap({
   surfaceMode,
   previewPositionM,
   plateLengthM = DEFAULT_PLATE_LENGTH_M,
+  artifactMode = 'production',
+  inspectionId,
+  captureImages = [],
+  surfaceMesh,
+  artifactStatus,
   onToggleType,
   onSurfaceModeChange,
   onPreviewPositionChange,
@@ -1086,16 +1029,39 @@ export function PlateMap({
         })}
       </div>
 
+      <div className={`record-artifact-provenance ${artifactMode}`} role="note">
+        {artifactMode === 'demo'
+          ? '演示/测试数据：允许使用内置表面与模拟点云，不代表当前生产结果。'
+          : `生产记录 ${inspectionId || '未绑定'}：二维图仅显示数据库缺陷坐标（非表面图像产物）；记录采集产物 ${captureImages.length} 件。`}
+      </div>
+
       {viewMode === '3d' ? (
-        <PlateMap3DView
-          defects={defects}
-          defectTypes={defectTypes}
-          selectedDefectId={selectedDefectId}
-          previewPositionM={previewPositionM}
-          plateLengthM={safePlateLengthM}
-          surfaceMode={surfaceMode}
-          onSelectDefect={onSelectDefect}
-        />
+        artifactMode === 'production' ? (
+          surfaceMesh && surfaceMesh.positions.length >= 3 && surfaceMesh.indices.length >= 3 ? (
+            <ProductionArtifactView
+              mesh={surfaceMesh}
+              mode="surface"
+              testId="plate-production-surface"
+              ariaLabel="当前检测记录真实三维表面"
+              className="plate-production-artifact"
+            />
+          ) : (
+            <div className="production-artifact-empty" role="status" data-testid="plate-production-surface-empty">
+              <strong>暂无生产三维表面产物</strong>
+              <span>{artifactStatus || '当前检测记录尚未绑定三维重建结果，请等待算法任务完成。'}</span>
+            </div>
+          )
+        ) : (
+          <PlateMap3DView
+            defects={defects}
+            defectTypes={defectTypes}
+            selectedDefectId={selectedDefectId}
+            previewPositionM={previewPositionM}
+            plateLengthM={safePlateLengthM}
+            surfaceMode={surfaceMode}
+            onSelectDefect={onSelectDefect}
+          />
+        )
       ) : viewMode === 'point-cloud' ? (
         <PlatePointCloudView
           defects={defects}
@@ -1104,6 +1070,9 @@ export function PlateMap({
           previewPositionM={previewPositionM}
           plateLengthM={safePlateLengthM}
           surfaceMode={surfaceMode}
+          artifactMode={artifactMode}
+          surfaceMesh={surfaceMesh}
+          artifactStatus={artifactStatus}
         />
       ) : (
         <>

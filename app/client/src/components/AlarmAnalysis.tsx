@@ -7,7 +7,9 @@ import type { CaptureImageItem, ChartPoint, DefectItem } from '../data/inspectio
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import { createPointCloudGeometryArrays } from '../lib/point-cloud-simulator';
 import { createSectionProfiles } from '../lib/section-profiles';
+import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { Panel } from './Panel';
+import { ProductionArtifactView } from './ProductionArtifactView';
 
 const POINT_CLOUD_INITIAL_YAW = -0.32;
 const POINT_CLOUD_PITCH = 0.24;
@@ -31,17 +33,49 @@ function clampChartAxisZoom(zoom: number) {
   return Math.max(CHART_AXIS_MIN_ZOOM, Math.min(CHART_AXIS_MAX_ZOOM, zoom));
 }
 
-function DefectPreview({ defect }: { defect: DefectItem }) {
+function DefectPreview({
+  defect,
+  captureImages,
+  artifactMode,
+}: {
+  defect: DefectItem;
+  captureImages: CaptureImageItem[];
+  artifactMode: 'production' | 'demo';
+}) {
+  const recordImage = captureImages.find((image) => image.dataName === 'intensity' && image.url)
+    ?? captureImages.find((image) => image.dataName === 'depth' && image.url);
+  if (artifactMode === 'production' && !defect.previewImageUrl) {
+    if (!recordImage) {
+      return (
+        <div className="production-artifact-empty compact" role="status">
+          <strong>暂无生产缺陷图像产物</strong>
+          <span>当前缺陷没有绑定 ROI/灰度裁剪图，检测记录也没有可显示的采集原图。</span>
+        </div>
+      );
+    }
+    return (
+      <figure className="record-bound-defect-image" data-artifact-source="production-record">
+        <img src={recordImage.url} alt={`检测记录采集原图 ${recordImage.cameraId || recordImage.cameraIp}`} loading="lazy" />
+        <figcaption>
+          <strong>检测记录采集原图</strong>
+          <span>{recordImage.cameraId || recordImage.cameraIp} · {recordImage.dataName} #{recordImage.sequenceNo}；非缺陷 ROI 裁剪</span>
+        </figcaption>
+      </figure>
+    );
+  }
   const previewStyle = {
     '--defect-preview-image': `url(${defect.previewImageUrl})`,
   } as CSSProperties;
 
   return (
-    <div className="defect-preview" style={previewStyle}>
+    <div className="defect-preview" style={previewStyle} data-artifact-source={artifactMode === 'demo' ? 'demo' : 'production-record'}>
       <div className="defect-bbox" style={{ left: `${defect.previewX}%`, top: `${defect.previewY}%` }}>
         <span>{`${defect.typeLabel} ${defect.widthMm.toFixed(2)}x${defect.heightMm.toFixed(2)}x${Math.abs(defect.depthMm).toFixed(2)}mm`}</span>
       </div>
       <span className="scale-mark">2 mm</span>
+      {artifactMode === 'demo'
+        ? <span className="demo-artifact-badge">演示缺陷图</span>
+        : <span className="production-artifact-tag">生产记录缺陷图</span>}
     </div>
   );
 }
@@ -61,7 +95,7 @@ function CaptureImagePreview({ captureImages }: { captureImages: CaptureImageIte
   }
 
   return (
-    <div className="capture-image-preview-grid">
+    <div className="capture-image-preview-grid" data-artifact-source="production-record">
       {visibleImages.map((image) => (
         <figure key={`${image.id}-${image.dataName}`} className="capture-image-preview-card">
           <img src={image.url} alt={`${image.cameraId} ${image.dataName}`} loading="lazy" />
@@ -79,7 +113,7 @@ function getDefectSizeLabel(defect: DefectItem) {
   return `${defect.widthMm.toFixed(2)} × ${defect.heightMm.toFixed(2)} × ${Math.abs(defect.depthMm).toFixed(2)}mm`;
 }
 
-function SurfacePointCloud() {
+function DemoSurfacePointCloud() {
   const [yaw, setYaw] = useState(POINT_CLOUD_INITIAL_YAW);
   const [zoom, setZoom] = useState(1);
   const [dragging, setDragging] = useState(false);
@@ -117,6 +151,7 @@ function SurfacePointCloud() {
       data-point-cloud-zoom={zoom.toFixed(2)}
       data-point-cloud-points={pointCloud.pointCount}
       data-point-cloud-memory-bytes={pointCloud.memoryBytes}
+      data-artifact-source="demo"
       aria-label="点云图，左右拖拽调整视角，滚轮放大缩小"
       onPointerDown={(event) => {
         if (event.button !== 0) {
@@ -153,6 +188,7 @@ function SurfacePointCloud() {
         </group>
       </Canvas>
       <span className="point-cloud-zoom-tag">缩放 {zoom.toFixed(2)}x</span>
+      <span className="demo-artifact-badge">演示点云 · 非生产产物</span>
     </div>
   );
 }
@@ -233,6 +269,10 @@ export function AlarmAnalysis({
   selectedDefect,
   heightProfile,
   captureImages = [],
+  artifactMode = 'production',
+  surfaceMesh,
+  artifactStatus,
+  inspectionId,
   headerless = false,
   collapsed,
   onCollapsedChange,
@@ -240,6 +280,10 @@ export function AlarmAnalysis({
   selectedDefect: DefectItem | null;
   heightProfile: ChartPoint[];
   captureImages?: CaptureImageItem[];
+  artifactMode?: 'production' | 'demo';
+  surfaceMesh?: BarSurfaceMesh | null;
+  artifactStatus?: string;
+  inspectionId?: string;
   headerless?: boolean;
   collapsed?: boolean;
   onCollapsedChange?: (collapsed: boolean) => void;
@@ -285,17 +329,41 @@ export function AlarmAnalysis({
         <div className="analysis-grid">
           <div className="analysis-cell">
             <h3>灰度图</h3>
-            <DefectPreview defect={selectedDefect} />
+            <DefectPreview defect={selectedDefect} captureImages={captureImages} artifactMode={artifactMode} />
           </div>
           <div className="analysis-cell point-cloud">
             <h3>点云图</h3>
-            <span className="base-plane">基准面 0mm</span>
-            <SurfacePointCloud />
-            <span className="depth-tag">凹坑深度 {selectedDefect.depthMm.toFixed(2)}mm</span>
+            {artifactMode === 'demo' ? (
+              <>
+                <span className="base-plane">基准面 0mm</span>
+                <DemoSurfacePointCloud />
+                <span className="depth-tag">凹坑深度 {selectedDefect.depthMm.toFixed(2)}mm</span>
+              </>
+            ) : surfaceMesh && surfaceMesh.positions.length >= 3 ? (
+              <ProductionArtifactView
+                mesh={surfaceMesh}
+                mode="points"
+                testId="analysis-production-point-cloud"
+                ariaLabel="当前检测记录真实点云"
+                className="analysis-production-point-cloud"
+              />
+            ) : (
+              <div className="production-artifact-empty compact" role="status">
+                <strong>暂无生产点云产物</strong>
+                <span>{artifactStatus || '当前检测记录尚未绑定算法点云。'}</span>
+              </div>
+            )}
           </div>
           <div className="analysis-cell">
             <h3>缺陷高度剖面图</h3>
-            <HeightProfile points={heightProfile} defect={selectedDefect} />
+            {artifactMode === 'demo' || heightProfile.length >= 2 ? (
+              <HeightProfile points={heightProfile} defect={selectedDefect} />
+            ) : (
+              <div className="production-artifact-empty compact" role="status">
+                <strong>暂无生产高度剖面产物</strong>
+                <span>检测记录 {inspectionId || '未绑定'} 未提供缺陷局部剖面点。</span>
+              </div>
+            )}
           </div>
         </div>
       )}

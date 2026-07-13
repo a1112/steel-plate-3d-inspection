@@ -4,20 +4,22 @@ use argon2::{
 };
 use rand_core::OsRng;
 use sea_orm::{
+    sea_query::Expr,
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr,
     EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use serde_json::{self, json, Value};
-use std::collections::BTreeSet;
 use std::env;
 use std::path::PathBuf;
 
 pub mod entities;
 
 use entities::{
-    admin_role, admin_user, app_config, audit_log, camera_config, capture_file, config_revision,
-    defect, defect_type, inspection_record, material_session, production_defect,
-    production_inspection, secondary_data, steel_plate, trigger_event,
+    admin_role, admin_user, app_config, audit_log, calibration_operation, camera_config,
+    capture_file, config_revision, defect, defect_type, inspection_record, material_session, production_alarm,
+    production_defect, production_inspection, production_task, secondary_data, steel_plate,
+    trigger_event,
 };
 
 pub const DEFAULT_ADMIN_PASSWORD: &str = "admin123";
@@ -69,8 +71,11 @@ pub struct AdminDatabaseMetrics {
     pub secondary_data_count: u64,
     pub trigger_event_count: u64,
     pub production_inspection_count: u64,
+    pub production_task_count: u64,
+    pub calibration_operation_count: u64,
     pub capture_file_count: u64,
     pub production_defect_count: u64,
+    pub production_alarm_count: u64,
 }
 
 #[derive(Clone)]
@@ -191,6 +196,44 @@ pub struct ProductionInspectionInput {
 }
 
 #[derive(Clone, Debug)]
+pub struct ProductionTaskInput {
+    pub id: String,
+    pub idempotency_key: String,
+    pub kind: String,
+    pub material_id: String,
+    pub session_id: String,
+    pub payload: String,
+    pub actor: String,
+    pub max_attempts: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct CalibrationOperationInput {
+    pub id: String,
+    pub kind: String,
+    pub request_hash: String,
+    pub request_json: String,
+    pub actor: String,
+    pub parent_operation_id: String,
+}
+
+#[derive(Clone, Default)]
+pub struct ProductionTaskFilter {
+    pub status: Option<String>,
+    pub kind: Option<String>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct ProductionTaskPage {
+    pub tasks: Vec<production_task::Model>,
+    pub total: u64,
+    pub limit: u64,
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct CaptureFileInput {
     pub inspection_id: String,
     pub session_id: String,
@@ -221,6 +264,53 @@ pub struct ProductionDefectInput {
     pub geometry_json: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct ProductionAlarmInput {
+    pub id: String,
+    pub source: String,
+    pub alarm_type: String,
+    pub severity: String,
+    pub material_id: String,
+    pub session_id: String,
+    pub inspection_id: String,
+    pub camera_id: String,
+    pub message: String,
+    pub details: String,
+}
+
+#[derive(Clone, Default)]
+pub struct ProductionAlarmFilter {
+    pub status: Option<String>,
+    pub severity: Option<String>,
+    pub source: Option<String>,
+    pub keyword: Option<String>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct ProductionAlarmPage {
+    pub alarms: Vec<production_alarm::Model>,
+    pub total: u64,
+    pub limit: u64,
+    pub offset: u64,
+}
+
+#[derive(Clone, Default)]
+pub struct ProductionAlarmCounts {
+    pub active: u64,
+    pub acknowledged: u64,
+    pub resolved: u64,
+}
+
+#[derive(Clone)]
+pub enum ProductionAlarmTransition {
+    Changed(production_alarm::Model),
+    Unchanged(production_alarm::Model),
+    Conflict(production_alarm::Model),
+    NotFound,
+}
+
 #[derive(Clone, Default)]
 pub struct AuditLogFilter {
     pub keyword: Option<String>,
@@ -239,8 +329,8 @@ pub struct InspectionRecordFilter {
 
 #[derive(Clone)]
 pub struct AdminInspectionRecord {
-    pub record: inspection_record::Model,
-    pub plate: Option<steel_plate::Model>,
+    pub inspection: production_inspection::Model,
+    pub session: Option<material_session::Model>,
     pub severe_count: u64,
     pub review_count: u64,
     pub minor_count: u64,
@@ -257,15 +347,16 @@ pub struct AdminInspectionRecordPage {
 #[derive(Clone)]
 pub struct AdminInspectionRecordDetail {
     pub record: AdminInspectionRecord,
-    pub defects: Vec<defect::Model>,
+    pub defects: Vec<production_defect::Model>,
+    pub capture_files: Vec<capture_file::Model>,
 }
 
 #[derive(Clone)]
 pub struct DeleteInspectionRecordResult {
     pub id: String,
-    pub plate_no: String,
+    pub material_id: String,
     pub defects_deleted: u64,
-    pub plate_deleted: bool,
+    pub capture_files_deleted: u64,
 }
 
 #[derive(Clone)]
@@ -273,7 +364,7 @@ pub struct InspectionRecordRetentionResult {
     pub matched: u64,
     pub deleted_records: u64,
     pub deleted_defects: u64,
-    pub deleted_plates: u64,
+    pub deleted_capture_files: u64,
 }
 
 #[derive(Clone)]
@@ -430,8 +521,15 @@ pub async fn load_admin_overview(connection: &DatabaseConnection) -> Result<Admi
             production_inspection_count: production_inspection::Entity::find()
                 .count(connection)
                 .await?,
+            production_task_count: production_task::Entity::find().count(connection).await?,
+            calibration_operation_count: calibration_operation::Entity::find()
+                .count(connection)
+                .await?,
             capture_file_count: capture_file::Entity::find().count(connection).await?,
             production_defect_count: production_defect::Entity::find()
+                .count(connection)
+                .await?,
+            production_alarm_count: production_alarm::Entity::find()
                 .count(connection)
                 .await?,
         },
@@ -919,65 +1017,87 @@ pub async fn delete_audit_logs_before(
     Ok(result.rows_affected())
 }
 
+fn filtered_production_inspections(
+    filter: &InspectionRecordFilter,
+) -> sea_orm::Select<production_inspection::Entity> {
+    let mut query = production_inspection::Entity::find()
+        .order_by_desc(production_inspection::Column::StartedAt)
+        .order_by_desc(production_inspection::Column::Id);
+    if let Some(status) = filter
+        .status
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "all")
+    {
+        query = match status {
+            "completed" => query.filter(production_inspection::Column::Status.is_in([
+                "algorithm-complete",
+                "completed",
+                "finished",
+            ])),
+            "detecting" => query.filter(production_inspection::Column::Status.is_not_in([
+                "algorithm-complete",
+                "completed",
+                "finished",
+            ])),
+            _ => query.filter(production_inspection::Column::Status.eq(status)),
+        };
+    }
+    if let Some(keyword) = filter.keyword.as_deref().filter(|value| !value.is_empty()) {
+        query = query.filter(
+            production_inspection::Column::MaterialId
+                .contains(keyword)
+                .or(production_inspection::Column::Id.contains(keyword))
+                .or(production_inspection::Column::SessionId.contains(keyword)),
+        );
+    }
+    query
+}
+
+async fn admin_production_record(
+    connection: &DatabaseConnection,
+    inspection: production_inspection::Model,
+) -> Result<AdminInspectionRecord, DbErr> {
+    let session = material_session::Entity::find()
+        .filter(material_session::Column::Id.eq(&inspection.session_id))
+        .one(connection)
+        .await?;
+    let defects = production_defect::Entity::find()
+        .filter(production_defect::Column::InspectionId.eq(&inspection.id))
+        .all(connection)
+        .await?;
+    Ok(AdminInspectionRecord {
+        inspection,
+        session,
+        severe_count: defects
+            .iter()
+            .filter(|item| item.severity == "severe")
+            .count() as u64,
+        review_count: defects
+            .iter()
+            .filter(|item| item.severity == "review")
+            .count() as u64,
+        minor_count: defects
+            .iter()
+            .filter(|item| item.severity == "minor")
+            .count() as u64,
+    })
+}
+
 pub async fn list_inspection_records(
     connection: &DatabaseConnection,
     filter: InspectionRecordFilter,
 ) -> Result<AdminInspectionRecordPage, DbErr> {
     let limit = filter.limit.unwrap_or(20).clamp(1, 100);
     let offset = filter.offset.unwrap_or(0);
-    let mut query = inspection_record::Entity::find().order_by_desc(inspection_record::Column::Id);
-
-    if let Some(status) = filter
-        .status
-        .as_deref()
-        .filter(|value| !value.is_empty() && *value != "all")
-    {
-        query = query.filter(inspection_record::Column::Status.eq(status));
-    }
-    if let Some(keyword) = filter.keyword.as_deref().filter(|value| !value.is_empty()) {
-        query = query.filter(
-            inspection_record::Column::PlateNo
-                .contains(keyword)
-                .or(inspection_record::Column::Id.contains(keyword)),
-        );
-    }
-
+    let query = filtered_production_inspections(&filter);
     let total = query.clone().count(connection).await?;
-    let records = query.limit(limit).offset(offset).all(connection).await?;
-    let mut rows = Vec::with_capacity(records.len());
-
-    for record in records {
-        let plate = steel_plate::Entity::find()
-            .filter(steel_plate::Column::PlateNo.eq(&record.plate_no))
-            .one(connection)
-            .await?;
-        let defects = defect::Entity::find()
-            .filter(defect::Column::PlateNo.eq(&record.plate_no))
-            .all(connection)
-            .await?;
-        let severe_count = defects
-            .iter()
-            .filter(|item| item.severity == "severe")
-            .count() as u64;
-        let review_count = defects
-            .iter()
-            .filter(|item| item.severity == "review")
-            .count() as u64;
-        let minor_count = defects
-            .iter()
-            .filter(|item| item.severity == "minor")
-            .count() as u64;
-        rows.push(AdminInspectionRecord {
-            record,
-            plate,
-            severe_count,
-            review_count,
-            minor_count,
-        });
+    let inspections = query.limit(limit).offset(offset).all(connection).await?;
+    let mut records = Vec::with_capacity(inspections.len());
+    for inspection in inspections {
+        records.push(admin_production_record(connection, inspection).await?);
     }
-
     Ok(AdminInspectionRecordPage {
-        records: rows,
+        records,
         total,
         limit,
         offset,
@@ -990,98 +1110,45 @@ pub async fn export_inspection_records(
     max_rows: u64,
 ) -> Result<Vec<AdminInspectionRecord>, DbErr> {
     let limit = max_rows.clamp(1, 5000);
-    let mut query = inspection_record::Entity::find().order_by_desc(inspection_record::Column::Id);
-
-    if let Some(status) = filter
-        .status
-        .as_deref()
-        .filter(|value| !value.is_empty() && *value != "all")
-    {
-        query = query.filter(inspection_record::Column::Status.eq(status));
+    let inspections = filtered_production_inspections(&filter)
+        .limit(limit)
+        .all(connection)
+        .await?;
+    let mut records = Vec::with_capacity(inspections.len());
+    for inspection in inspections {
+        records.push(admin_production_record(connection, inspection).await?);
     }
-    if let Some(keyword) = filter.keyword.as_deref().filter(|value| !value.is_empty()) {
-        query = query.filter(
-            inspection_record::Column::PlateNo
-                .contains(keyword)
-                .or(inspection_record::Column::Id.contains(keyword)),
-        );
-    }
-
-    let records = query.limit(limit).all(connection).await?;
-    let mut rows = Vec::with_capacity(records.len());
-    for record in records {
-        let plate = steel_plate::Entity::find()
-            .filter(steel_plate::Column::PlateNo.eq(&record.plate_no))
-            .one(connection)
-            .await?;
-        let defects = defect::Entity::find()
-            .filter(defect::Column::PlateNo.eq(&record.plate_no))
-            .all(connection)
-            .await?;
-        let severe_count = defects
-            .iter()
-            .filter(|item| item.severity == "severe")
-            .count() as u64;
-        let review_count = defects
-            .iter()
-            .filter(|item| item.severity == "review")
-            .count() as u64;
-        let minor_count = defects
-            .iter()
-            .filter(|item| item.severity == "minor")
-            .count() as u64;
-        rows.push(AdminInspectionRecord {
-            record,
-            plate,
-            severe_count,
-            review_count,
-            minor_count,
-        });
-    }
-    Ok(rows)
+    Ok(records)
 }
 
 pub async fn find_inspection_record_detail(
     connection: &DatabaseConnection,
     id: &str,
 ) -> Result<Option<AdminInspectionRecordDetail>, DbErr> {
-    let Some(record) = inspection_record::Entity::find()
-        .filter(inspection_record::Column::Id.eq(id))
+    let Some(inspection) = production_inspection::Entity::find()
+        .filter(production_inspection::Column::Id.eq(id))
         .one(connection)
         .await?
     else {
         return Ok(None);
     };
-    let plate = steel_plate::Entity::find()
-        .filter(steel_plate::Column::PlateNo.eq(&record.plate_no))
-        .one(connection)
-        .await?;
-    let defects = defect::Entity::find()
-        .filter(defect::Column::PlateNo.eq(&record.plate_no))
-        .order_by_asc(defect::Column::DistanceHeadMm)
+    let defects = production_defect::Entity::find()
+        .filter(production_defect::Column::InspectionId.eq(id))
+        .order_by_asc(production_defect::Column::CameraId)
+        .order_by_asc(production_defect::Column::YMm)
         .all(connection)
         .await?;
-    let severe_count = defects
-        .iter()
-        .filter(|item| item.severity == "severe")
-        .count() as u64;
-    let review_count = defects
-        .iter()
-        .filter(|item| item.severity == "review")
-        .count() as u64;
-    let minor_count = defects
-        .iter()
-        .filter(|item| item.severity == "minor")
-        .count() as u64;
+    let capture_files = capture_file::Entity::find()
+        .filter(capture_file::Column::InspectionId.eq(id))
+        .order_by_asc(capture_file::Column::CameraId)
+        .order_by_asc(capture_file::Column::SequenceNo)
+        .all(connection)
+        .await?;
+    let record = admin_production_record(connection, inspection).await?;
     Ok(Some(AdminInspectionRecordDetail {
-        record: AdminInspectionRecord {
-            record,
-            plate,
-            severe_count,
-            review_count,
-            minor_count,
-        },
+        record,
         defects,
+        capture_files,
     }))
 }
 
@@ -1089,97 +1156,87 @@ pub async fn delete_inspection_record(
     connection: &DatabaseConnection,
     id: &str,
 ) -> Result<Option<DeleteInspectionRecordResult>, DbErr> {
-    let Some(record) = inspection_record::Entity::find()
-        .filter(inspection_record::Column::Id.eq(id))
+    let Some(inspection) = production_inspection::Entity::find()
+        .filter(production_inspection::Column::Id.eq(id))
         .one(connection)
         .await?
     else {
         return Ok(None);
     };
-    let plate_no = record.plate_no.clone();
-    let delete_result = inspection_record::Entity::delete_many()
-        .filter(inspection_record::Column::Id.eq(id))
-        .exec(connection)
-        .await?;
-    if delete_result.rows_affected == 0 {
+    let material_id = inspection.material_id.clone();
+    let transaction = connection.begin().await?;
+    let defects_deleted = production_defect::Entity::delete_many()
+        .filter(production_defect::Column::InspectionId.eq(id))
+        .exec(&transaction)
+        .await?
+        .rows_affected;
+    let capture_files_deleted = capture_file::Entity::delete_many()
+        .filter(capture_file::Column::InspectionId.eq(id))
+        .exec(&transaction)
+        .await?
+        .rows_affected;
+    let deleted = production_inspection::Entity::delete_many()
+        .filter(production_inspection::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?
+        .rows_affected;
+    if deleted == 0 {
+        transaction.rollback().await?;
         return Ok(None);
     }
-    let remaining_records_for_plate = inspection_record::Entity::find()
-        .filter(inspection_record::Column::PlateNo.eq(&plate_no))
-        .count(connection)
-        .await?;
-    let mut defects_deleted = 0;
-    let mut plate_deleted = false;
-    if remaining_records_for_plate == 0 {
-        defects_deleted = defect::Entity::delete_many()
-            .filter(defect::Column::PlateNo.eq(&plate_no))
-            .exec(connection)
-            .await?
-            .rows_affected;
-        plate_deleted = steel_plate::Entity::delete_many()
-            .filter(steel_plate::Column::PlateNo.eq(&plate_no))
-            .exec(connection)
-            .await?
-            .rows_affected
-            > 0;
-    }
+    transaction.commit().await?;
     Ok(Some(DeleteInspectionRecordResult {
-        id: record.id,
-        plate_no,
+        id: inspection.id,
+        material_id,
         defects_deleted,
-        plate_deleted,
+        capture_files_deleted,
     }))
 }
 
 pub async fn inspection_record_retention_cutoff(
-    connection: &DatabaseConnection,
+    _connection: &DatabaseConnection,
     retention_days: u64,
 ) -> Result<String, DbErr> {
-    let backend = connection.get_database_backend();
-    let sql = match backend {
-        DbBackend::MySql => format!(
-            "SELECT DATE_FORMAT(DATE_SUB(NOW(), INTERVAL {retention_days} DAY), '%Y-%m-%d %H:%i') AS cutoff_at"
-        ),
-        _ => format!("SELECT datetime('now', '-{retention_days} days') AS cutoff_at"),
-    };
-    let Some(row) = connection
-        .query_one(Statement::from_string(backend, sql))
-        .await?
-    else {
-        return Ok(String::new());
-    };
-    row.try_get("", "cutoff_at")
+    let now = now_millis_string().parse::<u128>().unwrap_or(0);
+    let retention_ms = (retention_days as u128).saturating_mul(24 * 60 * 60 * 1000);
+    Ok(now.saturating_sub(retention_ms).to_string())
 }
 
 async fn inspection_records_before(
     connection: &DatabaseConnection,
     retention_days: u64,
-) -> Result<Vec<(String, String)>, DbErr> {
-    let backend = connection.get_database_backend();
-    let sql = match backend {
-        DbBackend::MySql => format!(
-            "SELECT r.id AS id, r.plate_no AS plate_no \
-             FROM inspection_record r \
-             LEFT JOIN steel_plate p ON p.plate_no = r.plate_no \
-             WHERE COALESCE(p.detected_at, '1970-01-01 00:00') < DATE_FORMAT(DATE_SUB(NOW(), INTERVAL {retention_days} DAY), '%Y-%m-%d %H:%i')"
-        ),
-        _ => format!(
-            "SELECT r.id AS id, r.plate_no AS plate_no \
-             FROM inspection_record r \
-             LEFT JOIN steel_plate p ON p.plate_no = r.plate_no \
-             WHERE datetime(COALESCE(p.detected_at, '1970-01-01 00:00')) < datetime('now', '-{retention_days} days')"
-        ),
-    };
-    let rows = connection
-        .query_all(Statement::from_string(backend, sql))
+) -> Result<Vec<String>, DbErr> {
+    let cutoff = inspection_record_retention_cutoff(connection, retention_days)
+        .await?
+        .parse::<u128>()
+        .unwrap_or(0);
+    let inspections = production_inspection::Entity::find()
+        .filter(production_inspection::Column::Status.is_in([
+            "algorithm-complete",
+            "completed",
+            "finished",
+        ]))
+        .all(connection)
         .await?;
-    rows.into_iter()
-        .map(|row| {
-            let id: String = row.try_get("", "id")?;
-            let plate_no: String = row.try_get("", "plate_no")?;
-            Ok((id, plate_no))
-        })
-        .collect()
+    let mut candidates = Vec::new();
+    for inspection in inspections {
+        let finished_at = inspection.finished_at.parse::<u128>().unwrap_or(u128::MAX);
+        if inspection.finished_at.is_empty() || finished_at >= cutoff {
+            continue;
+        }
+        let session = material_session::Entity::find()
+            .filter(material_session::Column::Id.eq(&inspection.session_id))
+            .one(connection)
+            .await?;
+        if session
+            .as_ref()
+            .map(|item| item.status == "finished")
+            .unwrap_or(true)
+        {
+            candidates.push(inspection.id);
+        }
+    }
+    Ok(candidates)
 }
 
 pub async fn count_inspection_records_before(
@@ -1197,38 +1254,14 @@ pub async fn delete_inspection_records_before(
 ) -> Result<InspectionRecordRetentionResult, DbErr> {
     let candidates = inspection_records_before(connection, retention_days).await?;
     let matched = candidates.len() as u64;
-    let plate_nos = candidates
-        .iter()
-        .map(|(_, plate_no)| plate_no.clone())
-        .collect::<BTreeSet<_>>();
-
     let mut deleted_records = 0;
-    for (id, _) in &candidates {
-        deleted_records += inspection_record::Entity::delete_many()
-            .filter(inspection_record::Column::Id.eq(id))
-            .exec(connection)
-            .await?
-            .rows_affected;
-    }
-
     let mut deleted_defects = 0;
-    let mut deleted_plates = 0;
-    for plate_no in plate_nos {
-        let remaining_records_for_plate = inspection_record::Entity::find()
-            .filter(inspection_record::Column::PlateNo.eq(&plate_no))
-            .count(connection)
-            .await?;
-        if remaining_records_for_plate == 0 {
-            deleted_defects += defect::Entity::delete_many()
-                .filter(defect::Column::PlateNo.eq(&plate_no))
-                .exec(connection)
-                .await?
-                .rows_affected;
-            deleted_plates += steel_plate::Entity::delete_many()
-                .filter(steel_plate::Column::PlateNo.eq(&plate_no))
-                .exec(connection)
-                .await?
-                .rows_affected;
+    let mut deleted_capture_files = 0;
+    for id in candidates {
+        if let Some(result) = delete_inspection_record(connection, &id).await? {
+            deleted_records += 1;
+            deleted_defects += result.defects_deleted;
+            deleted_capture_files += result.capture_files_deleted;
         }
     }
 
@@ -1236,7 +1269,7 @@ pub async fn delete_inspection_records_before(
         matched,
         deleted_records,
         deleted_defects,
-        deleted_plates,
+        deleted_capture_files,
     })
 }
 
@@ -1255,6 +1288,7 @@ pub async fn latest_material_session(
 ) -> Result<Option<material_session::Model>, DbErr> {
     material_session::Entity::find()
         .order_by_desc(material_session::Column::UpdatedAt)
+        .order_by_desc(material_session::Column::Id)
         .one(connection)
         .await
 }
@@ -1265,6 +1299,7 @@ pub async fn latest_open_material_session(
     material_session::Entity::find()
         .filter(material_session::Column::Status.ne("finished"))
         .order_by_desc(material_session::Column::UpdatedAt)
+        .order_by_desc(material_session::Column::Id)
         .one(connection)
         .await
 }
@@ -1276,6 +1311,7 @@ pub async fn latest_material_session_for_material(
     material_session::Entity::find()
         .filter(material_session::Column::MaterialId.eq(material_id))
         .order_by_desc(material_session::Column::UpdatedAt)
+        .order_by_desc(material_session::Column::Id)
         .one(connection)
         .await
 }
@@ -1338,21 +1374,6 @@ pub async fn upsert_material_session(
         .insert(connection)
         .await
     }
-}
-
-pub async fn finish_material_session(
-    connection: &DatabaseConnection,
-    session_id: &str,
-    finished_at: &str,
-) -> Result<Option<material_session::Model>, DbErr> {
-    let Some(model) = find_material_session(connection, session_id).await? else {
-        return Ok(None);
-    };
-    let mut active: material_session::ActiveModel = model.into();
-    active.status = Set("finished".to_string());
-    active.finished_at = Set(finished_at.to_string());
-    active.updated_at = Set(now_millis_string());
-    Ok(Some(active.update(connection).await?))
 }
 
 pub async fn append_secondary_data(
@@ -1465,10 +1486,503 @@ pub async fn find_production_inspection(
         .await
 }
 
+pub async fn insert_calibration_operation(
+    connection: &DatabaseConnection,
+    input: CalibrationOperationInput,
+) -> Result<calibration_operation::Model, DbErr> {
+    let now = now_millis_string();
+    calibration_operation::ActiveModel {
+        id: Set(input.id),
+        kind: Set(input.kind),
+        request_hash: Set(input.request_hash),
+        request_json: Set(input.request_json),
+        status: Set("dispatching".to_string()),
+        provider_http_status: Set(0),
+        provider_response_body: Set(String::new()),
+        error: Set(String::new()),
+        actor: Set(input.actor),
+        parent_operation_id: Set(input.parent_operation_id),
+        reconciliation_outcome: Set(String::new()),
+        reconciliation_id: Set(String::new()),
+        resolved_by: Set(String::new()),
+        resolved_at: Set(String::new()),
+        row_version: Set(1),
+        created_at: Set(now.clone()),
+        dispatch_started_at: Set(now.clone()),
+        finished_at: Set(String::new()),
+        updated_at: Set(now),
+    }
+    .insert(connection)
+    .await
+}
+
+pub async fn find_calibration_operation(
+    connection: &DatabaseConnection,
+    id: &str,
+) -> Result<Option<calibration_operation::Model>, DbErr> {
+    calibration_operation::Entity::find()
+        .filter(calibration_operation::Column::Id.eq(id))
+        .one(connection)
+        .await
+}
+
+pub async fn list_unresolved_calibration_operations(
+    connection: &DatabaseConnection,
+) -> Result<Vec<calibration_operation::Model>, DbErr> {
+    calibration_operation::Entity::find()
+        .filter(
+            calibration_operation::Column::Status
+                .is_in(["dispatching", "needs-reconciliation"]),
+        )
+        .order_by_asc(calibration_operation::Column::CreatedAt)
+        .all(connection)
+        .await
+}
+
+pub async fn reconcile_calibration_operation(
+    connection: &DatabaseConnection,
+    operation_id: &str,
+    reconciliation_id: &str,
+    outcome: &str,
+    actor: &str,
+) -> Result<Option<calibration_operation::Model>, DbErr> {
+    let Some(existing) = find_calibration_operation(connection, operation_id).await? else {
+        return Ok(None);
+    };
+    if existing.status != "needs-reconciliation" {
+        return Ok(Some(existing));
+    }
+    let now = now_millis_string();
+    calibration_operation::Entity::update_many()
+        .col_expr(
+            calibration_operation::Column::Status,
+            Expr::value("reconciled"),
+        )
+        .col_expr(
+            calibration_operation::Column::ReconciliationOutcome,
+            Expr::value(outcome.to_string()),
+        )
+        .col_expr(
+            calibration_operation::Column::ReconciliationId,
+            Expr::value(reconciliation_id.to_string()),
+        )
+        .col_expr(
+            calibration_operation::Column::ResolvedBy,
+            Expr::value(actor.to_string()),
+        )
+        .col_expr(
+            calibration_operation::Column::ResolvedAt,
+            Expr::value(now.clone()),
+        )
+        .col_expr(
+            calibration_operation::Column::RowVersion,
+            Expr::value(existing.row_version.saturating_add(1)),
+        )
+        .col_expr(
+            calibration_operation::Column::UpdatedAt,
+            Expr::value(now),
+        )
+        .filter(calibration_operation::Column::Id.eq(operation_id))
+        .filter(calibration_operation::Column::Status.eq("needs-reconciliation"))
+        .filter(calibration_operation::Column::RowVersion.eq(existing.row_version))
+        .exec(connection)
+        .await?;
+    find_calibration_operation(connection, operation_id).await
+}
+
+pub async fn finish_calibration_operation(
+    connection: &DatabaseConnection,
+    id: &str,
+    status: &str,
+    provider_http_status: i32,
+    provider_response_body: String,
+    error: String,
+) -> Result<Option<calibration_operation::Model>, DbErr> {
+    let Some(existing) = find_calibration_operation(connection, id).await? else {
+        return Ok(None);
+    };
+    if existing.status != "dispatching" {
+        return Ok(Some(existing));
+    }
+    let now = now_millis_string();
+    let update = calibration_operation::Entity::update_many()
+        .col_expr(
+            calibration_operation::Column::Status,
+            Expr::value(status.to_string()),
+        )
+        .col_expr(
+            calibration_operation::Column::ProviderHttpStatus,
+            Expr::value(provider_http_status),
+        )
+        .col_expr(
+            calibration_operation::Column::ProviderResponseBody,
+            Expr::value(provider_response_body),
+        )
+        .col_expr(
+            calibration_operation::Column::Error,
+            Expr::value(error),
+        )
+        .col_expr(
+            calibration_operation::Column::FinishedAt,
+            Expr::value(now.clone()),
+        )
+        .col_expr(
+            calibration_operation::Column::UpdatedAt,
+            Expr::value(now),
+        )
+        .col_expr(
+            calibration_operation::Column::RowVersion,
+            Expr::value(existing.row_version.saturating_add(1)),
+        )
+        .filter(calibration_operation::Column::Id.eq(id))
+        .filter(calibration_operation::Column::Status.eq("dispatching"))
+        .filter(calibration_operation::Column::RowVersion.eq(existing.row_version))
+        .exec(connection)
+        .await?;
+    if update.rows_affected == 0 {
+        return find_calibration_operation(connection, id).await;
+    }
+    find_calibration_operation(connection, id).await
+}
+
+pub async fn recover_dispatching_calibration_operations(
+    connection: &DatabaseConnection,
+) -> Result<u64, DbErr> {
+    let interrupted = calibration_operation::Entity::find()
+        .filter(calibration_operation::Column::Status.eq("dispatching"))
+        .all(connection)
+        .await?;
+    let mut recovered = 0_u64;
+    for existing in interrupted {
+        let now = now_millis_string();
+        let update = calibration_operation::Entity::update_many()
+            .col_expr(
+                calibration_operation::Column::Status,
+                Expr::value("needs-reconciliation"),
+            )
+            .col_expr(
+                calibration_operation::Column::Error,
+                Expr::value("service_restart_while_dispatching"),
+            )
+            .col_expr(
+                calibration_operation::Column::FinishedAt,
+                Expr::value(now.clone()),
+            )
+            .col_expr(
+                calibration_operation::Column::UpdatedAt,
+                Expr::value(now),
+            )
+            .col_expr(
+                calibration_operation::Column::RowVersion,
+                Expr::value(existing.row_version.saturating_add(1)),
+            )
+            .filter(calibration_operation::Column::Id.eq(&existing.id))
+            .filter(calibration_operation::Column::Status.eq("dispatching"))
+            .filter(calibration_operation::Column::RowVersion.eq(existing.row_version))
+            .exec(connection)
+            .await?;
+        recovered = recovered.saturating_add(update.rows_affected);
+    }
+    Ok(recovered)
+}
+
+pub async fn insert_production_task(
+    connection: &DatabaseConnection,
+    input: ProductionTaskInput,
+) -> Result<production_task::Model, DbErr> {
+    let now = now_millis_string();
+    production_task::ActiveModel {
+        id: Set(input.id),
+        idempotency_key: Set(input.idempotency_key),
+        kind: Set(input.kind),
+        material_id: Set(input.material_id),
+        session_id: Set(input.session_id),
+        status: Set("queued".to_string()),
+        phase: Set("queued".to_string()),
+        payload: Set(input.payload),
+        result: Set(String::new()),
+        error: Set(String::new()),
+        actor: Set(input.actor),
+        progress: Set(0),
+        attempts: Set(0),
+        max_attempts: Set(input.max_attempts.clamp(1, 10)),
+        cancel_requested: Set(false),
+        created_at: Set(now.clone()),
+        started_at: Set(String::new()),
+        finished_at: Set(String::new()),
+        updated_at: Set(now),
+    }
+    .insert(connection)
+    .await
+}
+
+pub async fn find_production_task(
+    connection: &DatabaseConnection,
+    id: &str,
+) -> Result<Option<production_task::Model>, DbErr> {
+    production_task::Entity::find()
+        .filter(production_task::Column::Id.eq(id))
+        .one(connection)
+        .await
+}
+
+pub async fn find_production_task_by_idempotency_key(
+    connection: &DatabaseConnection,
+    idempotency_key: &str,
+) -> Result<Option<production_task::Model>, DbErr> {
+    if idempotency_key.trim().is_empty() {
+        return Ok(None);
+    }
+    production_task::Entity::find()
+        .filter(production_task::Column::IdempotencyKey.eq(idempotency_key))
+        .order_by_desc(production_task::Column::CreatedAt)
+        .one(connection)
+        .await
+}
+
+pub async fn count_open_production_tasks(
+    connection: &DatabaseConnection,
+) -> Result<u64, DbErr> {
+    production_task::Entity::find()
+        .filter(production_task::Column::Status.is_in(["queued", "running"]))
+        .count(connection)
+        .await
+}
+
+pub async fn latest_open_production_task(
+    connection: &DatabaseConnection,
+    material_id: Option<&str>,
+) -> Result<Option<production_task::Model>, DbErr> {
+    let mut query = production_task::Entity::find()
+        .filter(production_task::Column::Status.is_in(["queued", "running"]))
+        .order_by_desc(production_task::Column::CreatedAt)
+        .order_by_desc(production_task::Column::Id);
+    if let Some(material_id) = material_id.filter(|value| !value.trim().is_empty()) {
+        query = query.filter(production_task::Column::MaterialId.eq(material_id));
+    }
+    query.one(connection).await
+}
+
+pub async fn list_production_tasks(
+    connection: &DatabaseConnection,
+    filter: ProductionTaskFilter,
+) -> Result<ProductionTaskPage, DbErr> {
+    let limit = filter.limit.unwrap_or(50).clamp(1, 200);
+    let offset = filter.offset.unwrap_or(0);
+    let mut query = production_task::Entity::find()
+        .order_by_desc(production_task::Column::CreatedAt)
+        .order_by_desc(production_task::Column::Id);
+    if let Some(status) = filter.status.as_deref().filter(|value| !value.is_empty()) {
+        query = query.filter(production_task::Column::Status.eq(status));
+    }
+    if let Some(kind) = filter.kind.as_deref().filter(|value| !value.is_empty()) {
+        query = query.filter(production_task::Column::Kind.eq(kind));
+    }
+    let total = query.clone().count(connection).await?;
+    let tasks = query.limit(limit).offset(offset).all(connection).await?;
+    Ok(ProductionTaskPage {
+        tasks,
+        total,
+        limit,
+        offset,
+    })
+}
+
+pub async fn claim_next_production_task(
+    connection: &DatabaseConnection,
+) -> Result<Option<production_task::Model>, DbErr> {
+    loop {
+        let Some(model) = production_task::Entity::find()
+            .filter(production_task::Column::Status.eq("queued"))
+            .filter(production_task::Column::CancelRequested.eq(false))
+            .order_by_asc(production_task::Column::CreatedAt)
+            .order_by_asc(production_task::Column::Id)
+            .one(connection)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let now = now_millis_string();
+        let update = production_task::Entity::update_many()
+            .col_expr(production_task::Column::Status, Expr::value("running"))
+            .col_expr(production_task::Column::Phase, Expr::value("executing"))
+            .col_expr(production_task::Column::Progress, Expr::value(5))
+            .col_expr(
+                production_task::Column::Attempts,
+                Expr::value(model.attempts + 1),
+            )
+            .col_expr(
+                production_task::Column::StartedAt,
+                Expr::value(now.clone()),
+            )
+            .col_expr(production_task::Column::FinishedAt, Expr::value(""))
+            .col_expr(production_task::Column::UpdatedAt, Expr::value(now))
+            .filter(production_task::Column::Id.eq(&model.id))
+            .filter(production_task::Column::Status.eq("queued"))
+            .filter(production_task::Column::CancelRequested.eq(false))
+            .exec(connection)
+            .await?;
+        if update.rows_affected == 1 {
+            return find_production_task(connection, &model.id).await;
+        }
+    }
+}
+
+pub async fn update_production_task_progress(
+    connection: &DatabaseConnection,
+    id: &str,
+    phase: &str,
+    progress: i32,
+) -> Result<Option<production_task::Model>, DbErr> {
+    let now = now_millis_string();
+    let update = production_task::Entity::update_many()
+        .col_expr(
+            production_task::Column::Phase,
+            Expr::value(phase.trim().to_string()),
+        )
+        .col_expr(
+            production_task::Column::Progress,
+            Expr::value(progress.clamp(0, 99)),
+        )
+        .col_expr(production_task::Column::UpdatedAt, Expr::value(now))
+        .filter(production_task::Column::Id.eq(id))
+        .filter(production_task::Column::Status.eq("running"))
+        .exec(connection)
+        .await?;
+    if update.rows_affected == 0 {
+        return Ok(None);
+    }
+    find_production_task(connection, id).await
+}
+
+pub async fn finish_production_task(
+    connection: &DatabaseConnection,
+    id: &str,
+    status: &str,
+    progress: i32,
+    result: String,
+    error: String,
+) -> Result<Option<production_task::Model>, DbErr> {
+    let Some(model) = find_production_task(connection, id).await? else {
+        return Ok(None);
+    };
+    let terminal = matches!(status, "succeeded" | "failed" | "cancelled" | "interrupted");
+    let now = now_millis_string();
+    let mut active: production_task::ActiveModel = model.into();
+    active.status = Set(status.to_string());
+    active.phase = Set(status.to_string());
+    active.progress = Set(progress.clamp(0, 100));
+    active.result = Set(result);
+    active.error = Set(error);
+    active.finished_at = Set(if terminal { now.clone() } else { String::new() });
+    active.updated_at = Set(now);
+    active.update(connection).await.map(Some)
+}
+
+pub async fn request_cancel_production_task(
+    connection: &DatabaseConnection,
+    id: &str,
+) -> Result<Option<production_task::Model>, DbErr> {
+    let Some(model) = find_production_task(connection, id).await? else {
+        return Ok(None);
+    };
+    if matches!(
+        model.status.as_str(),
+        "succeeded" | "failed" | "cancelled" | "interrupted"
+    ) {
+        return Ok(Some(model));
+    }
+    let now = now_millis_string();
+    let queued = model.status == "queued";
+    let mut active: production_task::ActiveModel = model.into();
+    active.cancel_requested = Set(true);
+    active.updated_at = Set(now.clone());
+    if queued {
+        active.status = Set("cancelled".to_string());
+        active.phase = Set("cancelled".to_string());
+        active.error = Set("cancelled before execution".to_string());
+        active.finished_at = Set(now);
+    }
+    active.update(connection).await.map(Some)
+}
+
+pub async fn retry_production_task(
+    connection: &DatabaseConnection,
+    id: &str,
+) -> Result<Option<production_task::Model>, DbErr> {
+    let Some(model) = find_production_task(connection, id).await? else {
+        return Ok(None);
+    };
+    if !matches!(model.status.as_str(), "failed" | "cancelled" | "interrupted") {
+        return Ok(Some(model));
+    }
+    let now = now_millis_string();
+    let next_max_attempts = model.max_attempts.max(model.attempts + 1).min(10);
+    let mut active: production_task::ActiveModel = model.into();
+    active.status = Set("queued".to_string());
+    active.phase = Set("queued".to_string());
+    active.progress = Set(0);
+    active.max_attempts = Set(next_max_attempts);
+    active.cancel_requested = Set(false);
+    active.result = Set(String::new());
+    active.error = Set(String::new());
+    active.started_at = Set(String::new());
+    active.finished_at = Set(String::new());
+    active.updated_at = Set(now);
+    active.update(connection).await.map(Some)
+}
+
+pub async fn recover_incomplete_production_tasks(
+    connection: &DatabaseConnection,
+) -> Result<u64, DbErr> {
+    let tasks = production_task::Entity::find()
+        .filter(production_task::Column::Status.eq("running"))
+        .all(connection)
+        .await?;
+    let mut recovered = 0;
+    for model in tasks {
+        let now = now_millis_string();
+        let cancelled = model.cancel_requested;
+        let mut active: production_task::ActiveModel = model.into();
+        active.status = Set(if cancelled { "cancelled" } else { "interrupted" }.to_string());
+        active.phase = Set(if cancelled { "cancelled" } else { "interrupted" }.to_string());
+        active.progress = Set(0);
+        active.error = Set(if cancelled {
+            "cancelled during service restart".to_string()
+        } else {
+            "execution interrupted by service restart; explicit retry required".to_string()
+        });
+        active.started_at = Set(String::new());
+        active.finished_at = Set(now.clone());
+        active.updated_at = Set(now);
+        active.update(connection).await?;
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
 pub async fn append_capture_file(
     connection: &DatabaseConnection,
     input: CaptureFileInput,
 ) -> Result<capture_file::Model, DbErr> {
+    let existing = capture_file::Entity::find()
+        .filter(capture_file::Column::InspectionId.eq(&input.inspection_id))
+        .filter(capture_file::Column::CameraId.eq(&input.camera_id))
+        .filter(capture_file::Column::SequenceNo.eq(input.sequence_no))
+        .filter(capture_file::Column::DataName.eq(&input.data_name))
+        .one(connection)
+        .await?;
+    if let Some(model) = existing {
+        let mut active: capture_file::ActiveModel = model.into();
+        active.session_id = Set(input.session_id);
+        active.material_id = Set(input.material_id);
+        active.camera_ip = Set(input.camera_ip);
+        active.file_type = Set(input.file_type);
+        active.path = Set(input.path);
+        active.metadata_path = Set(input.metadata_path);
+        active.created_at = Set(now_millis_string());
+        return active.update(connection).await;
+    }
     capture_file::ActiveModel {
         id: Set(format!("CAP-{}", now_nanos_string())),
         inspection_id: Set(input.inspection_id),
@@ -1511,10 +2025,13 @@ pub async fn production_defects_for_inspection(
         .await
 }
 
-pub async fn append_production_defect(
-    connection: &DatabaseConnection,
+async fn insert_production_defect<C>(
+    connection: &C,
     input: ProductionDefectInput,
-) -> Result<production_defect::Model, DbErr> {
+) -> Result<production_defect::Model, DbErr>
+where
+    C: ConnectionTrait,
+{
     production_defect::ActiveModel {
         id: Set(format!("PDF-{}", now_nanos_string())),
         inspection_id: Set(input.inspection_id),
@@ -1534,6 +2051,266 @@ pub async fn append_production_defect(
     }
     .insert(connection)
     .await
+}
+
+#[cfg(test)]
+pub async fn append_production_defect(
+    connection: &DatabaseConnection,
+    input: ProductionDefectInput,
+) -> Result<production_defect::Model, DbErr> {
+    insert_production_defect(connection, input).await
+}
+
+async fn ensure_production_alarm_on<C>(
+    connection: &C,
+    input: ProductionAlarmInput,
+) -> Result<(production_alarm::Model, bool), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if let Some(existing) = production_alarm::Entity::find()
+        .filter(production_alarm::Column::Id.eq(&input.id))
+        .one(connection)
+        .await?
+    {
+        return Ok((existing, false));
+    }
+    let model = production_alarm::ActiveModel {
+        id: Set(input.id),
+        source: Set(input.source),
+        alarm_type: Set(input.alarm_type),
+        severity: Set(input.severity),
+        material_id: Set(input.material_id),
+        session_id: Set(input.session_id),
+        inspection_id: Set(input.inspection_id),
+        camera_id: Set(input.camera_id),
+        message: Set(input.message),
+        details: Set(input.details),
+        status: Set("active".to_string()),
+        created_at: Set(now_millis_string()),
+        acknowledged_at: Set(String::new()),
+        resolved_at: Set(String::new()),
+        acknowledged_by: Set(String::new()),
+        acknowledge_note: Set(String::new()),
+        resolved_by: Set(String::new()),
+        resolve_note: Set(String::new()),
+    }
+    .insert(connection)
+    .await?;
+    Ok((model, true))
+}
+
+#[cfg(test)]
+pub async fn ensure_production_alarm(
+    connection: &DatabaseConnection,
+    input: ProductionAlarmInput,
+) -> Result<(production_alarm::Model, bool), DbErr> {
+    ensure_production_alarm_on(connection, input).await
+}
+
+pub async fn append_production_defect_with_alarm(
+    connection: &DatabaseConnection,
+    defect: ProductionDefectInput,
+    alarm: Option<ProductionAlarmInput>,
+) -> Result<
+    (
+        production_defect::Model,
+        Option<(production_alarm::Model, bool)>,
+    ),
+    DbErr,
+> {
+    let transaction = connection.begin().await?;
+    let defect = insert_production_defect(&transaction, defect).await?;
+    let alarm = match alarm {
+        Some(input) => Some(ensure_production_alarm_on(&transaction, input).await?),
+        None => None,
+    };
+    transaction.commit().await?;
+    Ok((defect, alarm))
+}
+
+fn filtered_production_alarms(
+    filter: &ProductionAlarmFilter,
+) -> sea_orm::Select<production_alarm::Entity> {
+    let mut query = production_alarm::Entity::find()
+        .order_by_desc(production_alarm::Column::CreatedAt)
+        .order_by_desc(production_alarm::Column::Id);
+    if let Some(status) = filter.status.as_deref().filter(|value| !value.is_empty()) {
+        query = match status {
+            "open" => query.filter(
+                production_alarm::Column::Status.is_in(["active", "acknowledged"]),
+            ),
+            "history" => query.filter(production_alarm::Column::Status.eq("resolved")),
+            "all" => query,
+            _ => query.filter(production_alarm::Column::Status.eq(status)),
+        };
+    }
+    if let Some(severity) = filter
+        .severity
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "all")
+    {
+        query = query.filter(production_alarm::Column::Severity.eq(severity));
+    }
+    if let Some(source) = filter
+        .source
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "all")
+    {
+        query = query.filter(production_alarm::Column::Source.eq(source));
+    }
+    if let Some(keyword) = filter.keyword.as_deref().filter(|value| !value.is_empty()) {
+        query = query.filter(
+            production_alarm::Column::Id
+                .contains(keyword)
+                .or(production_alarm::Column::AlarmType.contains(keyword))
+                .or(production_alarm::Column::Message.contains(keyword))
+                .or(production_alarm::Column::MaterialId.contains(keyword))
+                .or(production_alarm::Column::InspectionId.contains(keyword))
+                .or(production_alarm::Column::CameraId.contains(keyword)),
+        );
+    }
+    query
+}
+
+pub async fn list_production_alarms(
+    connection: &DatabaseConnection,
+    filter: ProductionAlarmFilter,
+) -> Result<ProductionAlarmPage, DbErr> {
+    let limit = filter.limit.unwrap_or(50).clamp(1, 200);
+    let offset = filter.offset.unwrap_or(0);
+    let query = filtered_production_alarms(&filter);
+    let total = query.clone().count(connection).await?;
+    let alarms = query.limit(limit).offset(offset).all(connection).await?;
+    Ok(ProductionAlarmPage {
+        alarms,
+        total,
+        limit,
+        offset,
+    })
+}
+
+pub async fn production_alarm_counts(
+    connection: &DatabaseConnection,
+) -> Result<ProductionAlarmCounts, DbErr> {
+    Ok(ProductionAlarmCounts {
+        active: production_alarm::Entity::find()
+            .filter(production_alarm::Column::Status.eq("active"))
+            .count(connection)
+            .await?,
+        acknowledged: production_alarm::Entity::find()
+            .filter(production_alarm::Column::Status.eq("acknowledged"))
+            .count(connection)
+            .await?,
+        resolved: production_alarm::Entity::find()
+            .filter(production_alarm::Column::Status.eq("resolved"))
+            .count(connection)
+            .await?,
+    })
+}
+
+pub async fn acknowledge_production_alarm(
+    connection: &DatabaseConnection,
+    id: &str,
+    actor: &str,
+    note: &str,
+) -> Result<ProductionAlarmTransition, DbErr> {
+    let Some(existing) = production_alarm::Entity::find()
+        .filter(production_alarm::Column::Id.eq(id))
+        .one(connection)
+        .await?
+    else {
+        return Ok(ProductionAlarmTransition::NotFound);
+    };
+    if existing.status == "acknowledged" {
+        return Ok(ProductionAlarmTransition::Unchanged(existing));
+    }
+    if existing.status != "active" {
+        return Ok(ProductionAlarmTransition::Conflict(existing));
+    }
+    let now = now_millis_string();
+    let update = production_alarm::Entity::update_many()
+        .col_expr(
+            production_alarm::Column::Status,
+            Expr::value("acknowledged"),
+        )
+        .col_expr(
+            production_alarm::Column::AcknowledgedAt,
+            Expr::value(now),
+        )
+        .col_expr(
+            production_alarm::Column::AcknowledgedBy,
+            Expr::value(actor.to_string()),
+        )
+        .col_expr(
+            production_alarm::Column::AcknowledgeNote,
+            Expr::value(note.to_string()),
+        )
+        .filter(production_alarm::Column::Id.eq(id))
+        .filter(production_alarm::Column::Status.eq("active"))
+        .exec(connection)
+        .await?;
+    let current = production_alarm::Entity::find()
+        .filter(production_alarm::Column::Id.eq(id))
+        .one(connection)
+        .await?
+        .ok_or_else(|| DbErr::Custom("alarm disappeared during acknowledge".to_string()))?;
+    if update.rows_affected == 1 {
+        Ok(ProductionAlarmTransition::Changed(current))
+    } else if current.status == "acknowledged" {
+        Ok(ProductionAlarmTransition::Unchanged(current))
+    } else {
+        Ok(ProductionAlarmTransition::Conflict(current))
+    }
+}
+
+pub async fn resolve_production_alarm(
+    connection: &DatabaseConnection,
+    id: &str,
+    actor: &str,
+    note: &str,
+) -> Result<ProductionAlarmTransition, DbErr> {
+    let Some(existing) = production_alarm::Entity::find()
+        .filter(production_alarm::Column::Id.eq(id))
+        .one(connection)
+        .await?
+    else {
+        return Ok(ProductionAlarmTransition::NotFound);
+    };
+    if existing.status == "resolved" {
+        return Ok(ProductionAlarmTransition::Unchanged(existing));
+    }
+    if existing.status != "acknowledged" {
+        return Ok(ProductionAlarmTransition::Conflict(existing));
+    }
+    let now = now_millis_string();
+    let update = production_alarm::Entity::update_many()
+        .col_expr(production_alarm::Column::Status, Expr::value("resolved"))
+        .col_expr(production_alarm::Column::ResolvedAt, Expr::value(now))
+        .col_expr(
+            production_alarm::Column::ResolvedBy,
+            Expr::value(actor.to_string()),
+        )
+        .col_expr(
+            production_alarm::Column::ResolveNote,
+            Expr::value(note.to_string()),
+        )
+        .filter(production_alarm::Column::Id.eq(id))
+        .filter(production_alarm::Column::Status.eq("acknowledged"))
+        .exec(connection)
+        .await?;
+    let current = production_alarm::Entity::find()
+        .filter(production_alarm::Column::Id.eq(id))
+        .one(connection)
+        .await?
+        .ok_or_else(|| DbErr::Custom("alarm disappeared during resolve".to_string()))?;
+    if update.rows_affected == 1 {
+        Ok(ProductionAlarmTransition::Changed(current))
+    } else if current.status == "resolved" {
+        Ok(ProductionAlarmTransition::Unchanged(current))
+    } else {
+        Ok(ProductionAlarmTransition::Conflict(current))
+    }
 }
 
 pub async fn get_config(
@@ -1732,6 +2509,7 @@ async fn execute_compatible_migration(
             let message = error.to_string().to_ascii_lowercase();
             if message.contains("duplicate column")
                 || message.contains("duplicate column name")
+                || message.contains("duplicate key name")
                 || message.contains("already exists")
             {
                 Ok(())
@@ -1889,6 +2667,66 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
     .await?;
     execute(
         connection,
+        "CREATE TABLE IF NOT EXISTS production_task (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            idempotency_key VARCHAR(256) NOT NULL,
+            kind VARCHAR(64) NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            phase VARCHAR(64) NOT NULL,
+            payload TEXT NOT NULL,
+            result TEXT NOT NULL,
+            error TEXT NOT NULL,
+            actor VARCHAR(128) NOT NULL,
+            progress INTEGER NOT NULL,
+            attempts INTEGER NOT NULL,
+            max_attempts INTEGER NOT NULL,
+            cancel_requested BOOLEAN NOT NULL,
+            created_at VARCHAR(64) NOT NULL,
+            started_at VARCHAR(64) NOT NULL,
+            finished_at VARCHAR(64) NOT NULL,
+            updated_at VARCHAR(64) NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
+        "CREATE TABLE IF NOT EXISTS calibration_operation (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            kind VARCHAR(64) NOT NULL,
+            request_hash VARCHAR(64) NOT NULL,
+            request_json TEXT NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            provider_http_status INTEGER NOT NULL,
+            provider_response_body TEXT NOT NULL,
+            error TEXT NOT NULL,
+            actor VARCHAR(128) NOT NULL,
+            parent_operation_id VARCHAR(128) NOT NULL DEFAULT '',
+            reconciliation_outcome VARCHAR(64) NOT NULL DEFAULT '',
+            reconciliation_id VARCHAR(128) NOT NULL DEFAULT '',
+            resolved_by VARCHAR(128) NOT NULL DEFAULT '',
+            resolved_at VARCHAR(64) NOT NULL DEFAULT '',
+            row_version INTEGER NOT NULL DEFAULT 1,
+            created_at VARCHAR(64) NOT NULL,
+            dispatch_started_at VARCHAR(64) NOT NULL,
+            finished_at VARCHAR(64) NOT NULL,
+            updated_at VARCHAR(64) NOT NULL
+        )",
+    )
+    .await?;
+    for migration in [
+        "ALTER TABLE calibration_operation ADD COLUMN parent_operation_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE calibration_operation ADD COLUMN reconciliation_outcome VARCHAR(64) NOT NULL DEFAULT ''",
+        "ALTER TABLE calibration_operation ADD COLUMN reconciliation_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE calibration_operation ADD COLUMN resolved_by VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE calibration_operation ADD COLUMN resolved_at VARCHAR(64) NOT NULL DEFAULT ''",
+        "ALTER TABLE calibration_operation ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1",
+    ] {
+        execute_compatible_migration(connection, migration).await?;
+    }
+    execute(
+        connection,
         "CREATE TABLE IF NOT EXISTS capture_file (
             id VARCHAR(128) PRIMARY KEY NOT NULL,
             inspection_id VARCHAR(128) NOT NULL,
@@ -1950,6 +2788,30 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
     .await?;
     execute(
         connection,
+        "CREATE TABLE IF NOT EXISTS production_alarm (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            source VARCHAR(64) NOT NULL,
+            alarm_type VARCHAR(128) NOT NULL,
+            severity VARCHAR(32) NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            inspection_id VARCHAR(128) NOT NULL,
+            camera_id VARCHAR(128) NOT NULL,
+            message VARCHAR(1024) NOT NULL,
+            details TEXT NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            created_at VARCHAR(64) NOT NULL,
+            acknowledged_at VARCHAR(64) NOT NULL,
+            resolved_at VARCHAR(64) NOT NULL,
+            acknowledged_by VARCHAR(128) NOT NULL,
+            acknowledge_note VARCHAR(1024) NOT NULL,
+            resolved_by VARCHAR(128) NOT NULL,
+            resolve_note VARCHAR(1024) NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
         "CREATE TABLE IF NOT EXISTS admin_user (
             id VARCHAR(128) PRIMARY KEY NOT NULL,
             display_name VARCHAR(128) NOT NULL,
@@ -1990,18 +2852,39 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             created_at VARCHAR(64) NOT NULL
         )",
     )
-    .await
+    .await?;
+    for index in [
+        "CREATE UNIQUE INDEX idx_production_task_idempotency ON production_task(idempotency_key)",
+        "CREATE INDEX idx_production_task_due ON production_task(status, created_at)",
+        "CREATE INDEX idx_production_task_session ON production_task(session_id, created_at)",
+        "CREATE INDEX idx_calibration_operation_status_updated ON calibration_operation(status, updated_at)",
+        "CREATE INDEX idx_production_inspection_status_started ON production_inspection(status, started_at)",
+        "CREATE INDEX idx_production_inspection_material ON production_inspection(material_id)",
+        "CREATE INDEX idx_production_inspection_session ON production_inspection(session_id)",
+        "CREATE INDEX idx_production_defect_inspection ON production_defect(inspection_id)",
+        "CREATE INDEX idx_production_alarm_status_created ON production_alarm(status, created_at)",
+        "CREATE INDEX idx_production_alarm_severity_created ON production_alarm(severity, created_at)",
+        "CREATE INDEX idx_production_alarm_inspection ON production_alarm(inspection_id)",
+        "CREATE INDEX idx_capture_file_inspection ON capture_file(inspection_id)",
+        "CREATE INDEX idx_capture_file_frame_data ON capture_file(inspection_id, camera_id, sequence_no, data_name)",
+    ] {
+        execute_compatible_migration(connection, index).await?;
+    }
+    Ok(())
 }
 
 async fn seed_database(connection: &DatabaseConnection) -> Result<(), DbErr> {
     ensure_default_configs(connection).await?;
     ensure_admin_data(connection).await?;
-
-    if steel_plate::Entity::find().count(connection).await? > 0 {
+    if defect_type::Entity::find().count(connection).await? == 0 {
+        seed_defect_types(connection).await?;
+    }
+    let seed_demo = env::var("STEEL_SEED_DEMO_DATA")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !seed_demo || steel_plate::Entity::find().count(connection).await? > 0 {
         return Ok(());
     }
-
-    seed_defect_types(connection).await?;
     seed_inspection_data(connection).await
 }
 
@@ -2125,9 +3008,9 @@ async fn ensure_admin_data(connection: &DatabaseConnection) -> Result<(), DbErr>
         append_audit_log(
             connection,
             "system",
-            "data.seed",
-            "inspection-demo-data",
-            "写入钢管、缺陷、记录、相机和默认配置模拟数据",
+            "data.bootstrap",
+            "system-defaults",
+            "写入默认配置、权限和管理账号；生产检测记录不注入演示数据",
             "info",
         )
         .await?;

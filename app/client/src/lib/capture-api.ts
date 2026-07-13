@@ -1,4 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import {
+  createAdminHeaders,
+  getInspectionServiceOrigin,
+  readAdminErrorMessage,
+} from "../services/inspection-api";
 
 export type CaptureDriverInfo = {
   id: string;
@@ -59,26 +64,28 @@ export type CaptureCameraStatus = {
   bufferOverflowCounter?: number;
   streamRunning?: boolean;
   streamFrames?: number;
-  captureConfig?: {
-    available?: boolean;
-    controlMode?: number;
-    ctrlType?: number;
-    triggerInputType?: number;
-    captureDataType?: number;
-    triggerLines?: number;
-    divRatio?: number;
-    timeTriggerFreq?: number;
-    maxFrameRate?: number;
-    controlLabel?: string;
-    triggerSourceLabel?: string;
-    exposureTime?: number;
-    gainK?: number;
-    laserEnable?: number;
-    arrayEnable?: number;
-    laserPower?: number;
-    laserLineSelect?: number;
-  };
+  captureConfig?: CaptureSdkReadback;
   error?: string | null;
+};
+
+export type CaptureSdkReadback = {
+  available?: boolean;
+  controlMode?: number;
+  ctrlType?: number;
+  triggerInputType?: number;
+  captureDataType?: number;
+  triggerLines?: number;
+  divRatio?: number;
+  timeTriggerFreq?: number;
+  maxFrameRate?: number;
+  controlLabel?: string;
+  triggerSourceLabel?: string;
+  exposureTime?: number;
+  gainK?: number;
+  laserEnable?: number;
+  arrayEnable?: number;
+  laserPower?: number;
+  laserLineSelect?: number;
 };
 
 export type CaptureCameraConfig = {
@@ -139,6 +146,7 @@ export type CaptureLogEvent = {
   id: string;
   time: string;
   level: "info" | "warning" | "error" | string;
+  source?: "provider-snapshot" | "client-operation" | "system-operation";
   cameraIp?: string | null;
   message: string;
 };
@@ -229,18 +237,508 @@ export type CaptureCommandResult = {
   width?: number;
   lines?: number;
   error?: string;
+  errorName?: string;
+  operatorHint?: string;
   message?: string;
+  value?: string | number;
+  type?: string;
+  calibrationCode?: number;
+  calibrationPath?: string;
+  roiCode?: number;
+  roiPath?: string;
+  path?: string;
+  loadCode?: number;
+  saveCode?: number;
+  external?: boolean;
+  saveToDevice?: boolean;
+};
+
+export type CaptureImageKind = "depth" | "intensity" | "metadata" | "sdk-derived";
+
+export type LatestCaptureFile = {
+  code: number;
+  ip: string;
+  kind: CaptureImageKind;
+  path: string;
+  url: string;
+  imageUrl: string;
+  content?: string;
+};
+
+export type CaptureStreamStatus = CaptureCommandResult & {
+  running: boolean;
+  lines?: number;
+  width?: number;
+  dataMode?: number;
+  fpsLimit?: number;
+  hs?: boolean;
+  frameCount?: number;
+  latestDepthUrl?: string;
+  latestIntensityUrl?: string;
+};
+
+export type CaptureStreamStartOptions = {
+  ip: string;
+  lines?: number;
+  width?: number;
+  dataMode?: number;
+  fpsLimit?: number;
+  hs?: boolean;
+  controlMode?: number;
+};
+
+export type CaptureProfileEntry = {
+  name: string;
+  path?: string;
+  folder?: string;
+  format?: string;
+  active?: boolean;
+  driverMode?: string;
+  expectedCameras?: number;
+  autoConnect?: boolean;
+  loadCameraParams?: boolean;
+  saveToDevice?: boolean;
+  changeStorage?: boolean;
+};
+
+export type CaptureProfilesStatus = CaptureCommandResult & {
+  activeProfile: string;
+  profiles: string[];
+  profileEntries?: CaptureProfileEntry[];
+  configRoot?: string;
+  profileRoot?: string;
+  cameraParamRoot?: string;
+  storageRoot?: string;
+};
+
+export type CaptureCameraStorageRoot = {
+  ip: string;
+  root: string;
+};
+
+export type CaptureCameraStorageRootStatus = CaptureCameraStorageRoot & {
+  exists?: boolean;
+  writable?: boolean;
+};
+
+export type CaptureProfileCamera = Record<string, unknown> & {
+  ip: string;
+  name?: string;
+  enabled?: boolean;
+  model?: string;
+  sn?: string;
+  paramSource?: "device" | "file" | string;
+  useDeviceParams?: boolean;
+  paramFile?: string;
+  cameraIndex?: number;
+  storageRoot?: string;
+  params?: Record<string, unknown> & {
+    exposureTime?: number;
+    gainK?: number;
+    timeTriggerFreq?: number;
+  };
+};
+
+export type CaptureProfileDocument = Record<string, unknown> & {
+  schema?: string;
+  name: string;
+  updatedAt?: string;
+  driverMode?: string;
+  storageRoot?: string;
+  cameraParamDir?: string;
+  startupMode?: string;
+  autoConnect?: boolean;
+  expectedCameras?: number;
+  changeStorage?: boolean;
+  applySoftTrigger?: boolean;
+  loadCameraParams?: boolean;
+  saveToDevice?: boolean;
+  cameraStorageRoots?: CaptureCameraStorageRoot[];
+  cameras?: CaptureProfileCamera[];
+};
+
+export type CaptureParamType = "int" | "float" | "string";
+
+export const SDK_PARAMETER_WRITE_CONFIRMATION = "WRITE SDK PARAMETER";
+export const CAMERA_CALIBRATION_CONFIRMATION = "APPLY CAMERA CALIBRATION";
+export const CAMERA_CALIBRATION_SET_CONFIRMATION = "APPLY CAMERA CALIBRATION SET";
+export const CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION = "ROLLBACK CAMERA CALIBRATION";
+export const CAMERA_ROI_CONFIRMATION = "APPLY CAMERA ROI";
+export const CAMERA_DEVICE_PERSIST_CONFIRMATION = "PERSIST CAMERA PARAMETERS";
+
+export type CaptureCalibrationStatus = CaptureCommandResult & {
+  ip?: string;
+  operationId?: string;
+  rollbackToken?: string;
+  rollbackMode?: string;
+  rollbackCode?: number;
+  rollbackTime?: string;
+  calibrationTime?: string;
+  roiTime?: string;
+  validationCode?: number;
+  validationPath?: string;
+  validationTime?: string;
+  maintenanceRecordPath?: string;
+};
+
+export type CaptureProfileMutationResult = CaptureCommandResult & {
+  name?: string;
+  path?: string;
+  folder?: string;
+  active?: boolean;
+};
+
+export type CaptureBatchOperationItem = {
+  code: number;
+  operationId?: string;
+  ip?: string;
+  file?: string;
+  path?: string;
+  calibrationPath?: string;
+  artifactKind?: string;
+  preflightCode?: number;
+  applyCode?: number;
+  persistCode?: number;
+  rollbackCode?: number;
+  rollbackMode?: string;
+  loadCode?: number;
+  saveCode?: number;
+  saveDeviceCode?: number;
+  attempted?: boolean;
+  applied?: boolean;
+  rolledBack?: boolean;
+  skipped?: boolean;
+  message?: string;
+  connected?: boolean;
+  disconnected?: boolean;
+  alreadyConnected?: boolean;
+  errorName?: string;
+  operatorHint?: string;
+  recoveryCode?: number;
+};
+
+export type CaptureBatchOperationResult = CaptureCommandResult & {
+  name?: string;
+  active?: boolean;
+  expectedCameras?: number;
+  expectedMet?: boolean;
+  discovered?: number;
+  connected?: number;
+  requested?: number;
+  disconnected?: number;
+  saved?: number;
+  loaded?: number;
+  failed?: number;
+  connectFailed?: number;
+  paramApplied?: number;
+  paramFailed?: number;
+  applied?: number;
+  skipped?: number;
+  rolledBack?: number;
+  rollbackToken?: string;
+  rollbackPerformed?: boolean;
+  rollbackComplete?: boolean;
+  operationId?: string;
+  applyOperationId?: string;
+  status?: string;
+  needsReconciliation?: boolean;
+  complete?: boolean;
+  dryRun?: boolean;
+  cameraParamDir?: string;
+  storageRoot?: string;
+  results?: CaptureBatchOperationItem[];
+};
+
+export type CaptureCalibrationMapping = {
+  ip: string;
+  path: string;
+  artifactType?: "camera-sdk" | "per-camera-sdk" | "sdk-camera-calibration";
+  expectedSn?: string;
+  rollbackPath?: string;
+};
+
+export type CaptureCalibrationSetInput = {
+  name: string;
+  path?: string;
+  cameraCalibrations: CaptureCalibrationMapping[];
+  ips?: string[];
+  expectedCameras?: number;
+  dryRun: boolean;
+  stopStreams?: boolean;
+  atomic?: boolean;
+  rollbackOnFailure?: boolean;
+  requireAllMapped?: boolean;
+  persistActive?: boolean;
+  saveCameraParams?: boolean;
+  saveToDevice?: boolean;
+  allowExternal?: boolean;
+  operationId?: string;
+  confirmation?: string;
+  deviceConfirmation?: string;
+};
+
+export type CaptureCalibrationOperationRecord = {
+  operationId?: string;
+  id?: string;
+  kind?: string;
+  status?: string;
+  needsReconciliation?: boolean;
+  parentOperationId?: string | null;
+  reconciliationOutcome?: string | null;
+  reconciliationId?: string | null;
+  resolvedBy?: string | null;
+  resolvedAt?: string | null;
+  rowVersion?: number;
+  requestHash?: string;
+  request?: unknown;
+  providerHttpStatus?: number;
+  providerResponse?: unknown;
+  rollbackToken?: string;
+  actor?: string;
+  createdAt?: string;
+  dispatchStartedAt?: string;
+  finishedAt?: string;
+  updatedAt?: string;
+  completedAt?: string;
+  replayed?: boolean;
+  error?: string | null;
+  response?: CaptureBatchOperationResult | null;
+};
+
+export type CaptureCalibrationOperationDetail = CaptureCommandResult &
+  CaptureCalibrationOperationRecord & {
+    operation?: CaptureCalibrationOperationRecord | null;
+  };
+
+export type CaptureReconciliationFenceOperation = {
+  operationId: string;
+  kind?: string;
+  status?: string;
+  error?: string | null;
+  expectedApplyOperationId?: string;
+  updatedAt?: string;
+};
+
+export type CaptureReconciliationFencePayload = {
+  code: 423;
+  error: "calibration_reconciliation_required" | string;
+  requestTarget?: string;
+  operationId?: string;
+  unresolvedOperations?: CaptureReconciliationFenceOperation[];
+};
+
+export class CaptureAdminApiError extends Error {
+  readonly status: number;
+  readonly payload?: unknown;
+
+  constructor(message: string, status: number, payload?: unknown) {
+    super(message);
+    this.name = "CaptureAdminApiError";
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
+export type LocalPathResult = {
+  selected: boolean;
+  path?: string | null;
+};
+
+export type LocalFileWriteResult = {
+  saved: boolean;
+  path?: string | null;
+  bytes: number;
+};
+
+export type LocalTextFileResult = {
+  path: string;
+  text: string;
+  bytes: number;
+};
+
+export type CaptureStorageQueueStatus = {
+  workerCount: number;
+  capacityItems: number;
+  capacityBytes: number;
+  pendingItems: number;
+  pendingBytes: number;
+  queued: number;
+  queuedBytes: number;
+  active: number;
+  activeBytes: number;
+  highWaterItems: number;
+  highWaterBytes: number;
+  completed: number;
+  failed: number;
+  rejected: number;
+  enqueueTimeoutMs: number;
+  accepting: boolean;
+};
+
+export type CaptureStorageStatus = CaptureCommandResult & {
+  root: string;
+  exists: boolean;
+  writable: boolean;
+  cameraRoots?: CaptureCameraStorageRootStatus[];
+  queue?: CaptureStorageQueueStatus;
+};
+
+export type CaptureContinuousTestInput = {
+  expectedCameras: number;
+  rounds: number;
+  lines: number;
+  width?: number;
+  timeoutMs: number;
+  workerTimeoutMs?: number;
+  intervalMs: number;
+  retries: number;
+  controlMode?: number;
+  dataMode: number;
+  outputDir: string;
+  connectFirst: boolean;
+  stopStreams: boolean;
+  ips: string[];
+  discardBlackFrames?: boolean;
+  blackFrameThreshold?: number;
+};
+
+export type CaptureContinuousTestResult = {
+  round: number;
+  attempt: number;
+  parallelIndex?: number;
+  code: number;
+  attemptsUsed?: number;
+  requestedWidth?: number;
+  requestedLines?: number;
+  width?: number;
+  lines?: number;
+  dataMode?: number;
+  depthDataFormat?: number;
+  depthPersistenceMode?: string;
+  timeoutMs?: number;
+  retries?: number;
+  fid?: number;
+  sid?: number;
+  lostLines?: number;
+  triggerMinInterval?: number;
+  triggerMaxInterval?: number;
+  timestamp?: number;
+  depthExists?: boolean;
+  intensityExists?: boolean;
+  metadataExists?: boolean;
+  completeFrame?: boolean;
+  storageAsync?: boolean;
+  storageTicketId?: number;
+  captureFinishedTickMs?: number;
+  storageQueuedTickMs?: number;
+  storageStartedTickMs?: number;
+  storageFinishedTickMs?: number;
+  simulated?: boolean;
+  discarded?: boolean;
+  ip: string;
+  output?: string;
+  depthOutput?: string;
+  intensityOutput?: string;
+  metadataOutput?: string;
+  sdkOutput?: string;
+  sdkDepthOutput?: string;
+  sdkIntensityOutput?: string;
+  errorName?: string;
+  operatorHint?: string;
+  error?: string;
+  discardReason?: string;
+  roundStartedAt?: string;
+  workerStartedAt?: string;
+  captureFinishedAt?: string;
+  storageQueuedAt?: string;
+  storageStartedAt?: string;
+  storageFinishedAt?: string;
+  workerFinishedAt?: string;
+};
+
+export type CaptureContinuousTestSummary = CaptureCommandResult & {
+  schema: "steel.capture.continuous-test.summary.v1" | string;
+  generatedAt?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  errorName?: string;
+  operatorHint?: string;
+  attempts: number;
+  successes: number;
+  failures: number;
+  completeFrames: number;
+  metadataFrames: number;
+  discardedFrames?: number;
+  blackFrames?: number;
+  rounds: number;
+  retries: number;
+  cameraCount: number;
+  expectedCameras: number;
+  expectedMet: boolean;
+  connectFirst?: boolean;
+  parallel?: boolean;
+  saveSdkDerived?: boolean;
+  workerCount?: number;
+  roundIntervalMs?: number;
+  workerTimeoutMs?: number;
+  storageAsyncFrames?: number;
+  storagePendingTicketLimit?: number;
+  captureStorageOverlappedRounds?: number;
+  frameTransaction?: boolean;
+  metadataCommitLast?: boolean;
+  elapsedMs?: number;
+  syncMode?: string;
+  storageRoot?: string;
+  outputDir?: string;
+  summaryOutput?: string;
+  summaryExists?: boolean;
+  results: CaptureContinuousTestResult[];
+};
+
+export type ActiveCaptureCalibration = {
+  code: number;
+  profile: string;
+  profilePath?: string;
+  calibrationFile: string;
+  calibrationPath: string;
+  exists: boolean;
+  versionRoot?: string;
+  activeCalibration?: {
+    version?: string;
+    appliedAt?: string;
+    appliedBy?: string;
+    sourceCalibration?: string;
+    correctedCalibration?: string;
+    fitReport?: string;
+    beforePreview?: string;
+    afterPreview?: string;
+    saveToDevice?: boolean;
+  };
+};
+
+export type ActivateCaptureCalibrationInput = {
+  name: string;
+  path: string;
+  version?: string;
+  fitReport?: string;
+  beforePreview?: string;
+  afterPreview?: string;
+  sourceCalibration?: string;
+  fitBefore?: unknown;
+  fitAfter?: unknown;
+  cameraParamDir?: string;
+  allowExternal?: boolean;
+  saveToDevice: false;
+  appliedBy: string;
 };
 
 const DEFAULT_CAPTURE_SERVICE_ORIGIN = "http://127.0.0.1:4873";
 
 function getCaptureServiceOrigin() {
-  const configuredOrigin =
-    import.meta.env.VITE_CAPTURE_SERVICE_ORIGIN ||
-    import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN;
-  return configuredOrigin && configuredOrigin.trim().length > 0
-    ? configuredOrigin
-    : DEFAULT_CAPTURE_SERVICE_ORIGIN;
+  // The desktop UI is never a capture-provider client. Every request, including
+  // image reads, must traverse the Rust service so its auth, audit and provider
+  // policy remain authoritative.
+  return getInspectionServiceOrigin() || DEFAULT_CAPTURE_SERVICE_ORIGIN;
 }
 
 function hasTauriRuntime() {
@@ -260,6 +758,69 @@ async function invokeCapture<T>(
   return invoke<T>(command, args);
 }
 
+export async function chooseCaptureLocalFile(
+  title: string,
+  extensions: string[] = [],
+): Promise<LocalPathResult | null> {
+  return invokeCapture<LocalPathResult>("choose_local_file", {
+    title,
+    extensions,
+  });
+}
+
+export async function chooseCaptureLocalDirectory(
+  title: string,
+): Promise<LocalPathResult | null> {
+  return invokeCapture<LocalPathResult>("choose_local_directory", { title });
+}
+
+export async function openCaptureLocalPath(
+  path: string,
+): Promise<LocalPathResult | null> {
+  const normalized = path.trim();
+  if (!normalized) {
+    throw new Error("本地路径不能为空");
+  }
+  return invokeCapture<LocalPathResult>("open_local_path", { path: normalized });
+}
+
+export async function readCaptureLocalTextFile(
+  path: string,
+): Promise<LocalTextFileResult | null> {
+  const normalized = path.trim();
+  if (!normalized) {
+    throw new Error("本地文本路径不能为空");
+  }
+  return invokeCapture<LocalTextFileResult>("read_local_text_file", {
+    path: normalized,
+  });
+}
+
+export async function saveCapturePreviewBytes(
+  suggestedName: string,
+  bytes: Uint8Array | number[],
+): Promise<LocalFileWriteResult | null> {
+  return invokeCapture<LocalFileWriteResult>("save_binary_file_with_dialog", {
+    suggestedName,
+    bytes: Array.from(bytes),
+  });
+}
+
+export async function saveCapturePreviewFromUrl(
+  imageUrl: string,
+  suggestedName = "capture-preview.png",
+): Promise<LocalFileWriteResult | null> {
+  if (!hasTauriRuntime()) {
+    return null;
+  }
+  const response = await fetch(imageUrl);
+  if (!response.ok) {
+    throw new Error(`预览图读取失败（HTTP ${response.status}）`);
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  return saveCapturePreviewBytes(suggestedName, bytes);
+}
+
 async function readJson<T>(path: string): Promise<T> {
   const response = await fetch(`${getCaptureServiceOrigin()}${path}`);
   if (!response.ok) {
@@ -276,6 +837,44 @@ async function writeJson<T>(path: string, body: unknown = {}): Promise<T> {
   });
   if (!response.ok) {
     throw new Error(`capture api ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+async function readAdminJson<T>(path: string): Promise<T> {
+  const response = await fetch(`${getCaptureServiceOrigin()}${path}`, {
+    headers: createAdminHeaders({ Accept: "application/json" }),
+  });
+  if (!response.ok) {
+    const payload = await response.clone().json().catch(() => undefined);
+    throw new CaptureAdminApiError(
+      await readAdminErrorMessage(response, `capture api ${response.status}`),
+      response.status,
+      payload,
+    );
+  }
+  return response.json() as Promise<T>;
+}
+
+async function writeAdminJson<T>(
+  path: string,
+  body: unknown = {},
+): Promise<T> {
+  const response = await fetch(`${getCaptureServiceOrigin()}${path}`, {
+    method: "POST",
+    headers: createAdminHeaders({
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const payload = await response.clone().json().catch(() => undefined);
+    throw new CaptureAdminApiError(
+      await readAdminErrorMessage(response, `capture api ${response.status}`),
+      response.status,
+      payload,
+    );
   }
   return response.json() as Promise<T>;
 }
@@ -500,7 +1099,7 @@ function hydrateSnapshot(
 export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
   const [configResult, health, camerasResult, status, statusesResult] =
     await Promise.all([
-      readJson<ServiceConfigResponse>("/api/config").catch(
+      readAdminJson<ServiceConfigResponse>("/api/config").catch(
         (): ServiceConfigResponse => ({}),
       ),
       readJson<CaptureHealth>("/api/capture/health"),
@@ -573,6 +1172,7 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
         id: "HTTP-001",
         time: timestamp(),
         level: health.sdkReady ? "info" : "warning",
+        source: "provider-snapshot",
         cameraIp: health.ip || null,
         message: health.sdkReady
           ? "HTTP capture service ready"
@@ -708,7 +1308,7 @@ export function createEmptyCaptureSnapshot(
 }
 
 export async function applyCaptureConfig(config: CaptureAppliedConfig) {
-  return writeJson<CaptureCommandResult>("/api/config/capture", {
+  return writeAdminJson<CaptureCommandResult>("/api/config/capture", {
     service: {
       name: "steel-inspection-service",
       role: "api-config-capture-orchestrator",
@@ -723,15 +1323,260 @@ export async function applyCaptureConfig(config: CaptureAppliedConfig) {
   });
 }
 
+export async function readCaptureProfiles(): Promise<CaptureProfilesStatus> {
+  return readAdminJson<CaptureProfilesStatus>("/api/config/profiles");
+}
+
+export async function readCaptureProfile(
+  name: string,
+): Promise<CaptureProfileDocument> {
+  const query = new URLSearchParams({ name: name.trim() });
+  return readAdminJson<CaptureProfileDocument>(
+    `/api/config/profile?${query.toString()}`,
+  );
+}
+
+export async function saveCaptureProfile(input: {
+  name: string;
+  profile: CaptureProfileDocument;
+  makeActive?: boolean;
+}): Promise<CaptureProfileMutationResult> {
+  const name = input.name.trim();
+  if (!name) {
+    throw new Error("配置名称不能为空");
+  }
+  const profile: CaptureProfileDocument = {
+    ...input.profile,
+    name,
+    updatedAt: new Date().toISOString(),
+    // A profile created in Tauri must never make a later apply persist to the
+    // camera merely because an imported JSON happened to contain this flag.
+    saveToDevice: false,
+  };
+  return writeAdminJson<CaptureProfileMutationResult>(
+    "/api/config/profile/save",
+    {
+      name,
+      makeActive: input.makeActive ?? false,
+      profileJson: JSON.stringify(profile),
+    },
+  );
+}
+
+export async function importCaptureProfileFromProviderPath(input: {
+  path: string;
+  name?: string;
+  overwrite?: boolean;
+  makeActive?: boolean;
+}): Promise<CaptureProfileMutationResult> {
+  const path = input.path.trim();
+  if (!path) {
+    throw new Error("采集主机上的配置路径不能为空");
+  }
+  return writeAdminJson<CaptureProfileMutationResult>(
+    "/api/config/profile/import",
+    {
+      path,
+      name: input.name?.trim() || undefined,
+      overwrite: input.overwrite ?? false,
+      makeActive: input.makeActive ?? false,
+    },
+  );
+}
+
+export async function applyCaptureProfile(input: {
+  name: string;
+  expectedCameras?: number;
+  autoConnect?: boolean;
+  loadCameraParams?: boolean;
+  saveToDevice?: false;
+  changeStorage?: boolean;
+}): Promise<CaptureBatchOperationResult> {
+  return writeAdminJson<CaptureBatchOperationResult>(
+    "/api/config/profile/apply",
+    { ...input, saveToDevice: false },
+  );
+}
+
+export async function connectAllCaptureCameras(input: {
+  ips?: string[];
+  expectedCameras?: number;
+  devType?: number;
+} = {}): Promise<CaptureBatchOperationResult> {
+  return writeAdminJson<CaptureBatchOperationResult>(
+    "/api/cameras/connect-all",
+    input,
+  );
+}
+
+export async function saveAllCaptureCameraParams(input: {
+  name: string;
+  ips?: string[];
+  cameraParamDir?: string;
+  applySoftTrigger?: boolean;
+  saveToDevice?: false;
+}): Promise<CaptureBatchOperationResult> {
+  return writeAdminJson<CaptureBatchOperationResult>(
+    "/api/config/camera-params/save-all",
+    { ...input, saveToDevice: false },
+  );
+}
+
+export async function persistAllCaptureCameraParams(input: {
+  name: string;
+  ips?: string[];
+  cameraParamDir?: string;
+  applySoftTrigger?: boolean;
+}): Promise<CaptureBatchOperationResult> {
+  return writeAdminJson<CaptureBatchOperationResult>(
+    "/api/config/camera-params/save-all",
+    {
+      ...input,
+      saveToDevice: true,
+      deviceConfirmation: CAMERA_DEVICE_PERSIST_CONFIRMATION,
+    },
+  );
+}
+
+export async function loadAllCaptureCameraParams(input: {
+  name: string;
+  ips?: string[];
+  cameraParamDir?: string;
+  applySoftTrigger?: boolean;
+  saveToDevice?: false;
+  allowExternal?: boolean;
+}): Promise<CaptureBatchOperationResult> {
+  return writeAdminJson<CaptureBatchOperationResult>(
+    "/api/config/camera-params/load-all",
+    { ...input, saveToDevice: false },
+  );
+}
+
+export async function recoverCaptureCameraParams(
+  ip: string,
+): Promise<CaptureBatchOperationResult> {
+  return writeAdminJson<CaptureBatchOperationResult>("/api/param/recovery", {
+    ip,
+    confirmation: SDK_PARAMETER_WRITE_CONFIRMATION,
+  });
+}
+
+export async function loadCaptureParamFile(input: {
+  ip: string;
+  path: string;
+  allowExternal?: boolean;
+  saveToDevice?: boolean;
+}): Promise<CaptureCommandResult> {
+  const saveToDevice = input.saveToDevice === true;
+  return writeAdminJson<CaptureCommandResult>("/api/param/load-file", {
+    ip: input.ip.trim(),
+    path: input.path.trim(),
+    allowExternal: input.allowExternal ?? false,
+    applySoftTrigger: false,
+    saveToDevice,
+    deviceConfirmation: saveToDevice
+      ? CAMERA_DEVICE_PERSIST_CONFIRMATION
+      : undefined,
+  });
+}
+
+export async function saveCaptureParamFile(input: {
+  ip: string;
+  path: string;
+}): Promise<CaptureCommandResult> {
+  return writeAdminJson<CaptureCommandResult>("/api/param/save-file", {
+    ip: input.ip.trim(),
+    path: input.path.trim(),
+  });
+}
+
+export async function persistCaptureParamsToDevice(
+  ip: string,
+): Promise<CaptureCommandResult> {
+  return writeAdminJson<CaptureCommandResult>("/api/param/save-device", {
+    ip: ip.trim(),
+    applySoftTrigger: false,
+    deviceConfirmation: CAMERA_DEVICE_PERSIST_CONFIRMATION,
+  });
+}
+
+export async function readCaptureStorageStatus(): Promise<CaptureStorageStatus> {
+  return readAdminJson<CaptureStorageStatus>("/api/storage/status");
+}
+
+export async function applyCaptureStorageRoot(
+  root: string,
+): Promise<CaptureStorageStatus> {
+  return writeAdminJson<CaptureStorageStatus>("/api/storage/config", {
+    root,
+  });
+}
+
+export async function applyCaptureCameraStorageRoots(input: {
+  cameraRoots: CaptureCameraStorageRoot[];
+  replace?: boolean;
+}): Promise<CaptureStorageStatus> {
+  const cameraRoots = input.cameraRoots
+    .map((item) => ({ ip: item.ip.trim(), root: item.root.trim() }))
+    .filter((item) => item.ip && item.root);
+  if (cameraRoots.length === 0) {
+    throw new Error("至少需要一个有效的相机落盘目录");
+  }
+  return writeAdminJson<CaptureStorageStatus>(
+    "/api/storage/camera-roots",
+    {
+      replace: input.replace ?? true,
+      cameraRoots,
+    },
+  );
+}
+
+export async function runCaptureContinuousTest(
+  input: CaptureContinuousTestInput,
+): Promise<CaptureContinuousTestSummary> {
+  return writeAdminJson<CaptureContinuousTestSummary>(
+    "/api/capture/continuous-test",
+    {
+      ...input,
+      controlMode: input.controlMode ?? 0,
+      discardBlackFrames: input.discardBlackFrames ?? true,
+      // SDK-derived files are intentionally opt-in at provider level and are
+      // not part of this operational regression workflow.
+      saveSdkDerived: false,
+    },
+  );
+}
+
+export async function applyCaptureLineContinuousPreset(input: {
+  lines: number;
+  timeTriggerFreq: number;
+  laserPower: number;
+  laserLineSelect: number;
+  controlMode: number;
+  connectFirst?: boolean;
+  saveToDevice?: boolean;
+  confirmation: string;
+  deviceConfirmation?: string;
+}): Promise<CaptureBatchOperationResult> {
+  return writeAdminJson<CaptureBatchOperationResult>(
+    "/api/capture/preset/line-continuous",
+    {
+      ...input,
+      connectFirst: input.connectFirst ?? false,
+      saveToDevice: input.saveToDevice ?? false,
+    },
+  );
+}
+
 export async function connectCaptureCamera(ip: string, devType = -1) {
-  return writeJson<CaptureCommandResult>("/api/camera/connect", {
+  return writeAdminJson<CaptureCommandResult>("/api/camera/connect", {
     ip,
     devType,
   });
 }
 
 export async function disconnectCaptureCamera(ip?: string) {
-  return writeJson<CaptureCommandResult>(
+  return writeAdminJson<CaptureBatchOperationResult>(
     "/api/camera/disconnect",
     ip ? { ip } : {},
   );
@@ -743,7 +1588,7 @@ export async function setCaptureParam(
   value: number,
   ip?: string,
 ) {
-  return writeJson<CaptureCommandResult>("/api/param", {
+  return writeAdminJson<CaptureCommandResult>("/api/param", {
     ip,
     key,
     type,
@@ -752,11 +1597,34 @@ export async function setCaptureParam(
 }
 
 export async function setCaptureSoftwareTrigger(ip?: string) {
-  return writeJson<CaptureCommandResult>("/api/param", {
+  return writeAdminJson<CaptureCommandResult>("/api/param", {
     ip,
     key: "TriggerMode",
     type: "int",
     value: 0,
+  });
+}
+
+export async function readCaptureParam(
+  ip: string,
+  key: string,
+  type: CaptureParamType,
+): Promise<CaptureCommandResult> {
+  const query = new URLSearchParams({ ip: ip.trim(), key: key.trim(), type });
+  return readAdminJson<CaptureCommandResult>(`/api/param?${query.toString()}`);
+}
+
+export async function writeCaptureParam(input: {
+  ip: string;
+  key: string;
+  type: CaptureParamType;
+  value: string | number;
+}): Promise<CaptureCommandResult> {
+  return writeAdminJson<CaptureCommandResult>("/api/param", {
+    ...input,
+    ip: input.ip.trim(),
+    key: input.key.trim(),
+    confirmation: SDK_PARAMETER_WRITE_CONFIRMATION,
   });
 }
 
@@ -768,6 +1636,308 @@ export async function captureDepthMap(
   const result = await writeJson<CaptureCommandResult>(
     "/api/capture/depth-map",
     { ip, lines, output },
+  );
+  return {
+    ...result,
+    imageUrl: result.imageUrl?.startsWith("/")
+      ? `${getCaptureServiceOrigin()}${result.imageUrl}`
+      : result.imageUrl,
+  };
+}
+
+export async function readLatestCaptureFile(
+  ip: string,
+  kind: CaptureImageKind = "depth",
+): Promise<LatestCaptureFile> {
+  const query = new URLSearchParams({ ip, kind, meta: "1" });
+  const result = await readJson<Omit<LatestCaptureFile, "imageUrl">>(
+    `/api/capture/latest?${query.toString()}`,
+  );
+  const resolvedUrl = result.url.startsWith("/")
+    ? `${getCaptureServiceOrigin()}${result.url}`
+    : result.url;
+  const separator = resolvedUrl.includes("?") ? "&" : "?";
+  const content = kind === "metadata"
+    ? await fetch(resolvedUrl).then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`capture metadata ${response.status}`);
+      }
+      return response.text();
+    })
+    : undefined;
+  return {
+    ...result,
+    ip: result.ip || ip,
+    kind: result.kind || kind,
+    imageUrl: `${resolvedUrl}${separator}v=${Date.now()}`,
+    content,
+  };
+}
+
+export function validateCaptureStreamStartOptions(
+  options: CaptureStreamStartOptions,
+): string | null {
+  if (!options.ip.trim()) {
+    return "实时预览必须选择相机 IP";
+  }
+  if (options.lines !== undefined
+    && (!Number.isInteger(options.lines) || options.lines < 1 || options.lines > 100000)) {
+    return "实时预览行数必须是 1 到 100000 的整数";
+  }
+  if (options.width !== undefined
+    && (!Number.isInteger(options.width) || options.width < 0 || options.width > 32768)) {
+    return "实时预览宽度必须是 0 到 32768 的整数";
+  }
+  if (options.dataMode !== undefined && options.dataMode !== 1 && options.dataMode !== 3) {
+    return "实时预览数据模式只允许 1（深度）或 3（深度 + 亮度）";
+  }
+  if (options.fpsLimit !== undefined
+    && (!Number.isInteger(options.fpsLimit) || options.fpsLimit < 1 || options.fpsLimit > 30)) {
+    return "实时预览 FPS 限制必须是 1 到 30 的整数";
+  }
+  if (options.hs !== undefined && typeof options.hs !== "boolean") {
+    return "实时预览高速模式必须是布尔值";
+  }
+  return null;
+}
+
+export async function startCaptureStream(
+  options: CaptureStreamStartOptions,
+): Promise<CaptureStreamStatus> {
+  const request: CaptureStreamStartOptions = {
+    lines: 1280,
+    width: 0,
+    dataMode: 3,
+    fpsLimit: 5,
+    hs: false,
+    controlMode: 0,
+    ...options,
+    ip: options.ip.trim(),
+  };
+  const validationError = validateCaptureStreamStartOptions(request);
+  if (validationError) {
+    throw new Error(validationError);
+  }
+  return writeJson<CaptureStreamStatus>("/api/stream/start", request);
+}
+
+export async function stopCaptureStream(ip: string): Promise<CaptureStreamStatus> {
+  return writeJson<CaptureStreamStatus>("/api/stream/stop", { ip });
+}
+
+export function captureStreamImageUrl(
+  ip: string,
+  kind: "depth" | "intensity" = "depth",
+) {
+  const query = new URLSearchParams({ ip, kind, v: String(Date.now()) });
+  return `${getCaptureServiceOrigin()}/api/stream/latest?${query.toString()}`;
+}
+
+export async function readActiveCaptureCalibration(
+  profile = "current-6-soft-trigger",
+): Promise<ActiveCaptureCalibration> {
+  const query = new URLSearchParams({ profile });
+  return readAdminJson<ActiveCaptureCalibration>(
+    `/api/calibration/active?${query.toString()}`,
+  );
+}
+
+export async function activateCaptureCalibration(
+  input: ActivateCaptureCalibrationInput,
+): Promise<ActiveCaptureCalibration> {
+  return writeAdminJson<ActiveCaptureCalibration>("/api/calibration/active", {
+    ...input,
+    saveToDevice: false,
+  });
+}
+
+export async function readCaptureCalibrationStatus(
+  ip: string,
+): Promise<CaptureCalibrationStatus> {
+  const query = new URLSearchParams({ ip: ip.trim() });
+  return readAdminJson<CaptureCalibrationStatus>(
+    `/api/calibration/status?${query.toString()}`,
+  );
+}
+
+export async function loadCaptureCalibration(input: {
+  ip: string;
+  path: string;
+  allowExternal?: boolean;
+  confirmation: string;
+}): Promise<CaptureCalibrationStatus> {
+  if (input.confirmation !== CAMERA_CALIBRATION_CONFIRMATION) {
+    throw new Error(`应用相机标定必须输入 ${CAMERA_CALIBRATION_CONFIRMATION}`);
+  }
+  return writeAdminJson<CaptureCalibrationStatus>("/api/calibration/load", {
+    ip: input.ip.trim(),
+    path: input.path.trim(),
+    allowExternal: input.allowExternal ?? false,
+    confirmation: input.confirmation,
+  });
+}
+
+export async function applyCaptureCalibrationSet(
+  input: CaptureCalibrationSetInput,
+): Promise<CaptureBatchOperationResult> {
+  const cameraCalibrations = input.cameraCalibrations
+    .map((item) => ({
+      ...item,
+      ip: item.ip.trim(),
+      path: item.path.trim(),
+      artifactType: item.artifactType || "camera-sdk",
+      expectedSn: item.expectedSn?.trim() || undefined,
+      rollbackPath: item.rollbackPath?.trim() || undefined,
+    }))
+    .filter((item) => item.ip && item.path);
+  const saveToDevice = input.saveToDevice === true;
+  const uniqueIps = new Set(cameraCalibrations.map((item) => item.ip));
+  if (cameraCalibrations.length !== 6 || uniqueIps.size !== 6) {
+    throw new Error("整组标定必须包含 6 台唯一相机");
+  }
+  const uniqueCalibrationPaths = new Set(
+    cameraCalibrations.map((item) => item.path.replaceAll("\\", "/").toUpperCase()),
+  );
+  if (uniqueCalibrationPaths.size !== cameraCalibrations.length) {
+    throw new Error("整组标定必须为每台相机使用独立 SDK 标定文件");
+  }
+  if (cameraCalibrations.some((item) => !item.expectedSn)) {
+    throw new Error("整组标定必须为每台相机填写期望 SN");
+  }
+  const uniqueExpectedSns = new Set(
+    cameraCalibrations.map((item) => item.expectedSn?.toUpperCase()),
+  );
+  if (uniqueExpectedSns.size !== cameraCalibrations.length) {
+    throw new Error("整组标定的期望 SN 必须逐相机唯一");
+  }
+  if (cameraCalibrations.some((item) => !item.rollbackPath)) {
+    throw new Error("整组标定预检和应用必须为每台相机填写可跨重启恢复的回滚文件");
+  }
+  if (!input.dryRun && input.confirmation !== CAMERA_CALIBRATION_SET_CONFIRMATION) {
+    throw new Error(`真实应用必须输入 ${CAMERA_CALIBRATION_SET_CONFIRMATION}`);
+  }
+  const operationId = input.operationId?.trim() || "";
+  if (!input.dryRun && !operationId) {
+    throw new Error("真实应用必须携带稳定 operationId");
+  }
+  if (saveToDevice && input.deviceConfirmation !== CAMERA_DEVICE_PERSIST_CONFIRMATION) {
+    throw new Error(`设备持久化必须输入 ${CAMERA_DEVICE_PERSIST_CONFIRMATION}`);
+  }
+  return writeAdminJson<CaptureBatchOperationResult>(
+    "/api/calibration/apply-all",
+    {
+      ...input,
+      name: input.name.trim(),
+      path: input.path?.trim() || undefined,
+      cameraCalibrations,
+      ips: cameraCalibrations.map((item) => item.ip),
+      expectedCameras: 6,
+      stopStreams: true,
+      atomic: true,
+      rollbackOnFailure: true,
+      requireAllMapped: true,
+      persistActive: input.persistActive ?? false,
+      saveCameraParams: false,
+      saveToDevice,
+      allowBestEffortDeviceRollback: false,
+      operationId: input.dryRun ? undefined : operationId,
+      confirmation: input.dryRun ? undefined : input.confirmation,
+      deviceConfirmation: saveToDevice ? input.deviceConfirmation : undefined,
+    },
+  );
+}
+
+export async function rollbackCaptureCalibrationSet(input: {
+  rollbackToken: string;
+  operationId: string;
+  applyOperationId: string;
+  parentOperationId?: string;
+  confirmation: string;
+}): Promise<CaptureBatchOperationResult> {
+  if (input.confirmation !== CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION) {
+    throw new Error(`整组标定回滚必须输入 ${CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION}`);
+  }
+  const operationId = input.operationId.trim();
+  if (!operationId) {
+    throw new Error("整组标定回滚必须携带稳定 operationId");
+  }
+  const applyOperationId = input.applyOperationId.trim();
+  if (!applyOperationId) {
+    throw new Error("整组标定回滚必须携带原始 applyOperationId");
+  }
+  const parentOperationId = input.parentOperationId?.trim();
+  if (input.parentOperationId !== undefined && !parentOperationId) {
+    throw new Error("受控恢复回滚必须携带待协调 apply 的 parentOperationId");
+  }
+  return writeAdminJson<CaptureBatchOperationResult>(
+    "/api/calibration/rollback",
+    {
+      rollbackToken: input.rollbackToken.trim(),
+      operationId,
+      applyOperationId,
+      parentOperationId,
+      stopStreams: true,
+      confirmation: input.confirmation,
+    },
+  );
+}
+
+export async function readCaptureCalibrationOperationDetail(
+  operationId: string,
+): Promise<CaptureCalibrationOperationDetail> {
+  const id = operationId.trim();
+  if (!id) {
+    throw new Error("标定 operationId 不能为空");
+  }
+  const query = new URLSearchParams({ id });
+  const detail = await readAdminJson<CaptureCalibrationOperationDetail>(
+    `/api/calibration/operations/detail?${query.toString()}`,
+  );
+  const record = detail.operation || detail;
+  const needsReconciliation = record.needsReconciliation
+    ?? record.status === "needs-reconciliation";
+  return detail.operation
+    ? {
+      ...detail,
+      needsReconciliation,
+      operation: { ...detail.operation, needsReconciliation },
+    }
+    : { ...detail, needsReconciliation };
+}
+
+export async function loadCaptureRoi(input: {
+  ip: string;
+  path: string;
+  allowExternal?: boolean;
+  confirmation: string;
+}): Promise<CaptureCalibrationStatus> {
+  if (input.confirmation !== CAMERA_ROI_CONFIRMATION) {
+    throw new Error(`应用相机 ROI 必须输入 ${CAMERA_ROI_CONFIRMATION}`);
+  }
+  return writeAdminJson<CaptureCalibrationStatus>("/api/roi/load", {
+    ip: input.ip.trim(),
+    path: input.path.trim(),
+    allowExternal: input.allowExternal ?? false,
+    confirmation: input.confirmation,
+  });
+}
+
+export async function captureValidationFrame(input: {
+  ip: string;
+  output: string;
+  lines?: number;
+  width?: number;
+  dataMode?: number;
+  timeoutMs?: number;
+}): Promise<CaptureCommandResult> {
+  const result = await writeAdminJson<CaptureCommandResult>(
+    "/api/capture/depth-map",
+    {
+      ...input,
+      ip: input.ip.trim(),
+      output: input.output.trim(),
+      calibrationMaintenanceRecord: true,
+    },
   );
   return {
     ...result,

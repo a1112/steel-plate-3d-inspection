@@ -159,16 +159,24 @@ fn gateway_source(path: &str) -> &'static str {
 
 fn service_path_for(path: &str) -> Option<&'static str> {
     match path {
-        "/api/trigger/steel-info" | "/api/l2/steel-info" => Some("/api/production/steel-info"),
-        "/api/trigger/steel-in" | "/api/plc/steel-in" => Some("/api/production/steel-in"),
-        "/api/trigger/steel-out" | "/api/plc/steel-out" => Some("/api/production/steel-out"),
+        "/api/trigger/steel-info" | "/api/l2/steel-info" => {
+            Some("/api/production/tasks/steel-info")
+        }
+        "/api/trigger/steel-in" | "/api/plc/steel-in" => {
+            Some("/api/production/tasks/steel-in")
+        }
+        "/api/trigger/steel-out" | "/api/plc/steel-out" => {
+            Some("/api/production/tasks/steel-out")
+        }
         "/api/trigger/secondary-data" | "/api/l2/secondary-data" => {
             Some("/api/production/secondary-data")
         }
         "/api/trigger/capture-summary" => Some("/api/production/capture-summary"),
         "/api/trigger/capture-once" => Some("/api/production/capture-once"),
         "/api/trigger/defect" => Some("/api/production/defect"),
-        "/api/trigger/event" | "/api/plc/event" => Some("/api/production/trigger-event"),
+        "/api/trigger/event" | "/api/plc/event" => {
+            Some("/api/production/tasks/trigger-event")
+        }
         _ => None,
     }
 }
@@ -176,13 +184,13 @@ fn service_path_for(path: &str) -> Option<&'static str> {
 fn manual_service_path_for(path: &str) -> Option<&'static str> {
     match path {
         "/api/trigger/manual/steel-info" | "/api/manual/steel-info" => {
-            Some("/api/production/steel-info")
+            Some("/api/production/tasks/steel-info")
         }
         "/api/trigger/manual/steel-in" | "/api/manual/steel-in" => {
-            Some("/api/production/steel-in")
+            Some("/api/production/tasks/steel-in")
         }
         "/api/trigger/manual/steel-out" | "/api/manual/steel-out" => {
-            Some("/api/production/steel-out")
+            Some("/api/production/tasks/steel-out")
         }
         _ => None,
     }
@@ -554,11 +562,11 @@ mod tests {
     fn routes_trigger_and_manual_paths_to_production_api() {
         assert_eq!(
             service_path_for("/api/trigger/steel-info"),
-            Some("/api/production/steel-info")
+            Some("/api/production/tasks/steel-info")
         );
         assert_eq!(
             service_path_for("/api/plc/steel-in"),
-            Some("/api/production/steel-in")
+            Some("/api/production/tasks/steel-in")
         );
         assert_eq!(
             service_path_for("/api/l2/secondary-data"),
@@ -566,7 +574,7 @@ mod tests {
         );
         assert_eq!(
             manual_service_path_for("/api/trigger/manual/steel-out"),
-            Some("/api/production/steel-out")
+            Some("/api/production/tasks/steel-out")
         );
         assert_eq!(manual_service_path_for("/api/trigger/steel-out"), None);
     }

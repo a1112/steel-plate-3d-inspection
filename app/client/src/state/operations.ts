@@ -55,7 +55,9 @@ export interface OperationState {
   lastSyncTime: string;
 }
 
-const defaultTimestamp = '2026-06-14 16:00:00';
+function operationTimestamp() {
+  return new Date().toLocaleString('zh-CN', { hour12: false });
+}
 const defaultInspectionSettings: InspectionSettings = {
   severeDepthMm: 0.12,
   reviewDepthMm: 0.08,
@@ -178,28 +180,15 @@ export function saveSettingsDraft(current: InspectionSettings, draft: Inspection
 
 export function createInitialOperationState(): OperationState {
   return {
-    alarmCount: 1,
+    alarmCount: 0,
     serviceHealth: {
       inspectionEngine: 'warning',
       cameraAcquisition: 'warning',
       plcBridge: 'normal',
       l2Uploader: 'normal',
     },
-    events: [
-      {
-        id: 'EVT-001',
-        time: '2026-06-14 15:58:22',
-        level: 'warning',
-        message: '相机 3 号链路存在丢包，已自动切换重采样',
-      },
-      {
-        id: 'EVT-002',
-        time: '2026-06-14 15:54:09',
-        level: 'info',
-        message: 'L2 上传队列为空，最近一支钢管已归档',
-      },
-    ],
-    lastSyncTime: '2026-06-14 15:59:40',
+    events: [],
+    lastSyncTime: '',
   };
 }
 
@@ -210,7 +199,7 @@ function prependEvent(state: OperationState, message: string, level: SystemEvent
     events: [
       {
         id: `EVT-${String(nextIndex).padStart(3, '0')}`,
-        time: defaultTimestamp,
+        time: operationTimestamp(),
         level,
         message,
       },
@@ -238,7 +227,7 @@ export function runSystemAction(state: OperationState, action: SystemAction): Op
     return prependEvent({ ...state, alarmCount: 0 }, '已清除当前报警计数');
   }
   if (action === 'sync-time') {
-    return prependEvent({ ...state, lastSyncTime: defaultTimestamp }, '系统时间已同步到工控主站');
+    return prependEvent({ ...state, lastSyncTime: operationTimestamp() }, '系统时间已同步到工控主站');
   }
   return prependEvent(state, '已生成运行日志导出文件');
 }
@@ -246,7 +235,7 @@ export function runSystemAction(state: OperationState, action: SystemAction): Op
 export function getDeviceStatusWithOperation(status: DeviceStatus, operation: Pick<OperationState, 'alarmCount'>): DeviceStatus {
   return {
     ...status,
-    alarmCount: operation.alarmCount,
+    alarmCount: status.alarmCount + operation.alarmCount,
   };
 }
 

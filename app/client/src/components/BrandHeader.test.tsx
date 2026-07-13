@@ -250,6 +250,45 @@ describe('BrandHeader', () => {
     expect(screen.queryByRole('button', { name: '切换主题' })).not.toBeInTheDocument();
   });
 
+  it('renders service connection blocks when service status is provided', () => {
+    renderHeader({
+      services: {
+        inspectionService: {
+          name: 'Rust服务',
+          state: 'warning',
+          detail: 'SDK 未就绪',
+          endpoint: 'http://127.0.0.1:8080',
+        },
+        captureService: {
+          name: '采集服务',
+          state: 'online',
+          detail: '采集服务在线',
+          endpoint: 'http://127.0.0.1:4873',
+        },
+        triggerGateway: {
+          name: '触发网关',
+          state: 'offline',
+          detail: '网关离线',
+          endpoint: 'http://127.0.0.1:18888',
+        },
+      },
+    });
+
+    expect(screen.getByText('Rust服务')).toBeInTheDocument();
+    expect(screen.getByText('采集服务')).toBeInTheDocument();
+    expect(screen.getByText('触发网关')).toBeInTheDocument();
+    expect(screen.getByText('异常')).toBeInTheDocument();
+    expect(screen.getByText('离线')).toBeInTheDocument();
+    expect(screen.getAllByText('在线')[0]).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '系统报警 1 项，服务异常 2 项' }));
+    expect(screen.getByRole('dialog', { name: '服务连接状态详情' })).toBeInTheDocument();
+    expect(screen.getByText('2 项服务异常')).toBeInTheDocument();
+    expect(screen.getByText('SDK 未就绪')).toBeInTheDocument();
+    expect(screen.getByText('网关离线')).toBeInTheDocument();
+    expect(screen.getByText('http://127.0.0.1:18888')).toBeInTheDocument();
+  });
+
   it('renders navigation beside the app title without starting titlebar drag', () => {
     const onNavChange = vi.fn();
     const onDragMouseDown = vi.fn();

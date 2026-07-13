@@ -13,6 +13,7 @@ param(
   [int]$ControlMode = 0,
   [switch]$ApplyPreset,
   [switch]$StopExisting,
+  [switch]$WithQtViewer,
   [switch]$NoQt
 )
 
@@ -104,8 +105,8 @@ if (-not (Test-Path $ExpectedProfilePath -PathType Leaf) -and (Test-Path $SeedCo
 if (-not (Test-Path $CaptureExe -PathType Leaf)) {
   throw "Missing $CaptureExe. Run scripts/build-capture-headless.ps1 first."
 }
-if (-not $NoQt -and -not (Test-Path $QtExe -PathType Leaf)) {
-  throw "Missing $QtExe. Run scripts/build-capture-qt.ps1 -QtPrefixPath C:\Qt first, or pass -NoQt."
+if ($WithQtViewer -and -not (Test-Path $QtExe -PathType Leaf)) {
+  throw "Missing $QtExe. Run scripts/build-capture-qt.ps1 -QtPrefixPath C:\Qt first, or omit -WithQtViewer."
 }
 
 if ($StopExisting) {
@@ -191,7 +192,7 @@ $StatusRows = @($Statuses.statuses | Sort-Object ip | ForEach-Object {
 })
 $StatusRows | Format-Table -AutoSize
 
-if (-not $NoQt) {
+if ($WithQtViewer -and -not $NoQt) {
   $QtRunning = Get-Process steel_capture_qt_terminal -ErrorAction SilentlyContinue
   if ($QtRunning) {
     Write-Host "Qt capture viewer is already running: $($QtRunning.Id -join ', ')."
@@ -212,4 +213,7 @@ if (-not $NoQt) {
   }
 }
 
-Write-Host "Capture stack ready at http://127.0.0.1:$Port"
+Write-Host "Headless capture stack ready at http://127.0.0.1:$Port"
+if ($NoQt) {
+  Write-Warning "-NoQt is deprecated because headless mode is now the default. Use -WithQtViewer only for local diagnostics."
+}

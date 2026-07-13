@@ -48,7 +48,9 @@ $Capture = $null
 $Service = $null
 
 try {
-  $Capture = Start-Process -FilePath $CaptureExe -ArgumentList "--port", $CapturePort -WorkingDirectory (Split-Path $CaptureExe) -WindowStyle Hidden -PassThru
+  # This is an architecture-boundary test, not a hardware-discovery test. Keep
+  # it deterministic and independent from whichever real cameras are attached.
+  $Capture = Start-Process -FilePath $CaptureExe -ArgumentList "--port", $CapturePort, "--driver", "simulated" -WorkingDirectory (Split-Path $CaptureExe) -WindowStyle Hidden -PassThru
   Start-Sleep -Milliseconds 800
 
   $ServiceStart = New-Object System.Diagnostics.ProcessStartInfo

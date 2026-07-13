@@ -10,6 +10,8 @@ Copy one of these files to a local `.env` file or pass it directly with `-EnvFil
 - `simulated.env.example`: Rust uses the six-camera simulation fallback.
 - `trigger-gateway.env.example`: standalone trigger gateway from `app/trigger` forwards L2/PLC/API steel events to the Rust production API.
 
+Formal readiness requires the gateway at `TRIGGER_GATEWAY_ORIGIN` by default. Set `STEEL_TRIGGER_HEALTH_REQUIRED=0` only for an explicit development/service-only run.
+
 Example:
 
 ```powershell
@@ -54,3 +56,5 @@ When `TRIGGER_MODE=manual`, the local operator page is available at `http://127.
 - `POST /api/trigger/manual/steel-out`
 
 These manual endpoints return `409 manual_mode_required` unless the gateway mode is `manual`.
+
+Steel-info, steel-in, steel-out, and generic trigger events are forwarded to Rust's durable production-task endpoints. Upstream PLC/L2 clients should provide a stable `requestId` when retrying the same command so Rust can return the existing idempotent task.

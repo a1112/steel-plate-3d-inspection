@@ -62,5 +62,11 @@ describe('App online severity filters', () => {
     expect(restoredRows.some((row) => row.endsWith('严重'))).toBe(true);
     expect(restoredRows.some((row) => row.endsWith('轻微'))).toBe(true);
     expect(restoredRows.some((row) => row.endsWith('待复核'))).toBe(true);
+
+    const followLatest = screen.getByRole('button', { name: '跟随最新' });
+    const holdHistory = screen.getByRole('button', { name: '固定当前' });
+    expect(followLatest).toHaveClass('active');
+    fireEvent.click(holdHistory);
+    expect(holdHistory).toHaveClass('active');
   });
 });

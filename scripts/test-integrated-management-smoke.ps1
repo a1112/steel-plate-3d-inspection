@@ -248,6 +248,28 @@ function Wait-HttpJson {
   throw "$Name did not become ready at $Uri within ${TimeoutSec}s."
 }
 
+function Wait-ProductionTask {
+  param(
+    [string]$TaskId,
+    [string]$ExpectedKind
+  )
+
+  Assert-Condition (-not [string]::IsNullOrWhiteSpace($TaskId)) "Missing persisted task ID for $ExpectedKind."
+  $Deadline = (Get-Date).AddSeconds($TimeoutSec)
+  do {
+    $Response = Invoke-HttpJson -Method GET -Uri "$ServiceOrigin/api/production/tasks/detail?id=$([uri]::EscapeDataString($TaskId))"
+    $Task = $Response.Json.task
+    if ($Task.status -in @("succeeded", "failed", "cancelled", "interrupted")) {
+      Assert-Condition ($Task.kind -eq $ExpectedKind) "Task $TaskId kind mismatch: $($Task.kind)"
+      Assert-Condition ($Task.status -eq "succeeded") "Task $TaskId ($ExpectedKind) ended as $($Task.status): $($Task.error)"
+      return $Response
+    }
+    Start-Sleep -Milliseconds 100
+  } while ((Get-Date) -lt $Deadline)
+
+  throw "Production task $TaskId ($ExpectedKind) did not reach a terminal state within ${TimeoutSec}s."
+}
+
 function Test-StaticClient {
   param([string]$Uri)
 
@@ -375,50 +397,73 @@ try {
   Assert-Condition ($CaptureGuard.StatusCode -eq 409) "Production capture-once did not reject capture before steel-in."
   Assert-Condition ($CaptureGuard.Json.error -eq "steel_not_present" -or $CaptureGuard.Json.error -eq "steel_session_mismatch") "Production capture-once returned an unexpected guard error: $($CaptureGuard.Content)"
 
-  $SteelInfo = Invoke-HttpJson -Method POST -Uri "$TriggerOrigin/api/trigger/manual/steel-info" -Body $EventBody
+  $SteelInfoBody = $EventBody.Clone()
+  $SteelInfoBody.requestId = "smoke-steel-info-$RunId"
+  $SteelInfo = Invoke-HttpJson -Method POST -Uri "$TriggerOrigin/api/trigger/manual/steel-info" -Body $SteelInfoBody
   Assert-Condition ($SteelInfo.Json.code -eq 0) "Manual steel-info failed: $($SteelInfo.Content)"
-  Assert-Condition ($SteelInfo.Json.target -eq "/api/production/steel-info") "Manual steel-info did not route to production API."
+  Assert-Condition ($SteelInfo.Json.target -eq "/api/production/tasks/steel-info") "Manual steel-info did not route to the durable production API."
+  $SteelInfoTask = Wait-ProductionTask -TaskId ([string]$SteelInfo.Json.service.task.taskId) -ExpectedKind "steel-info"
 
-  $SteelIn = Invoke-HttpJson -Method POST -Uri "$TriggerOrigin/api/trigger/manual/steel-in" -Body $EventBody
+  $SteelInBody = $EventBody.Clone()
+  $SteelInBody.requestId = "smoke-steel-in-$RunId"
+  $SteelIn = Invoke-HttpJson -Method POST -Uri "$TriggerOrigin/api/trigger/manual/steel-in" -Body $SteelInBody
   Assert-Condition ($SteelIn.Json.code -eq 0) "Manual steel-in failed: $($SteelIn.Content)"
-  Assert-Condition ($SteelIn.Json.target -eq "/api/production/steel-in") "Manual steel-in did not route to production API."
-  Assert-Condition ($SteelIn.Json.service.flow.recordWrittenBeforeCapture -eq $true) "Steel-in did not report record-before-capture."
-  Assert-Condition ([string]::IsNullOrWhiteSpace([string]$SteelIn.Json.service.sessionId) -eq $false) "Steel-in did not create a session."
+  Assert-Condition ($SteelIn.Json.target -eq "/api/production/tasks/steel-in") "Manual steel-in did not route to the durable production API."
+  $SteelInTask = Wait-ProductionTask -TaskId ([string]$SteelIn.Json.service.task.taskId) -ExpectedKind "steel-in"
+  $SteelInResult = $SteelInTask.Json.task.result
+  Assert-Condition ($SteelInResult.flow.recordWrittenBeforeCapture -eq $true) "Steel-in did not report record-before-capture."
+  Assert-Condition ([string]::IsNullOrWhiteSpace([string]$SteelInTask.Json.task.sessionId) -eq $false) "Steel-in did not create a persisted session."
 
   $StatusDuring = Invoke-HttpJson -Method GET -Uri "$ServiceOrigin/api/production/status"
   Assert-Condition ($StatusDuring.Json.activeSession.materialId -eq $MaterialId) "Active production session mismatch after steel-in."
 
-  $CaptureOnce = Invoke-HttpJson -Method POST -Uri "$ServiceOrigin/api/production/capture-once" -Body @{
-    materialId = $MaterialId
-    expectedCameras = 6
-    rounds = 1
-    lines = 1000
-    width = 0
-    timeoutMs = 8000
-    intervalMs = 0
-    retries = 0
-    controlMode = 0
-    dataMode = 3
-    connectFirst = $false
-    stopStreams = $true
-    steelStateAware = $true
-    requireSteelPresent = $true
-    productionLayout = $true
-    saveSdkDerived = $false
-    discardBlackFrames = $true
-  }
-  Assert-Condition ($CaptureOnce.Json.code -eq 0) "Production capture-once failed: $($CaptureOnce.Content)"
-  Assert-Condition ($CaptureOnce.Json.provider.parallel -eq $true) "Production capture-once did not report parallel provider capture."
-  Assert-Condition ($CaptureOnce.Json.provider.workerCount -ge 6) "Production capture-once worker count was below six cameras."
-  Assert-Condition ($CaptureOnce.Json.provider.failures -eq 0) "Production capture-once provider reported failures."
-  Assert-Condition ($CaptureOnce.Json.provider.completeFrames -ge 6) "Production capture-once did not produce six complete frames."
-  Assert-Condition ($CaptureOnce.Json.provider.metadataFrames -ge 6) "Production capture-once did not produce six metadata frames."
-  Assert-Condition ($CaptureOnce.Json.provider.saveSdkDerived -eq $false) "Production capture-once should keep sdk-derived disabled by default."
-  Assert-Condition ($CaptureOnce.Json.record.captureFileRows -ge 18) "Production capture summary did not record depth/intensity/metadata files for six cameras."
+  $CaptureEnqueue = Invoke-HttpJson -Method POST -Uri "$ServiceOrigin/api/production/tasks" -Body @{
+    kind = "capture-once"
+    idempotencyKey = "smoke-capture-$RunId"
+    maxAttempts = 1
+    payload = @{
+      requestId = "smoke-capture-$RunId"
+      materialId = $MaterialId
+      expectedCameras = 6
+      rounds = 1
+      lines = 1000
+      width = 0
+      timeoutMs = 8000
+      intervalMs = 0
+      retries = 0
+      controlMode = 0
+      dataMode = 3
+      connectFirst = $false
+      stopStreams = $true
+      steelStateAware = $true
+      requireSteelPresent = $true
+      productionLayout = $true
+      saveSdkDerived = $false
+      discardBlackFrames = $true
+    }
+  } -AllowedStatusCodes @(202)
+  $CaptureTask = Wait-ProductionTask -TaskId ([string]$CaptureEnqueue.Json.task.taskId) -ExpectedKind "capture-once"
+  $CaptureOnce = $CaptureTask.Json.task.result
+  Assert-Condition ($CaptureOnce.code -eq 0) "Persistent production capture-once failed."
+  Assert-Condition ($CaptureOnce.provider.parallel -eq $true) "Production capture-once did not report parallel provider capture."
+  Assert-Condition ($CaptureOnce.provider.workerCount -ge 6) "Production capture-once worker count was below six cameras."
+  Assert-Condition ($CaptureOnce.provider.failures -eq 0) "Production capture-once provider reported failures."
+  Assert-Condition ($CaptureOnce.provider.completeFrames -ge 6) "Production capture-once did not produce six complete frames."
+  Assert-Condition ($CaptureOnce.provider.metadataFrames -ge 6) "Production capture-once did not produce six metadata frames."
+  Assert-Condition ($CaptureOnce.provider.saveSdkDerived -eq $false) "Production capture-once should keep sdk-derived disabled by default."
+  Assert-Condition ($CaptureOnce.record.captureFileRows -ge 18) "Production capture summary did not record depth/intensity/metadata files for six cameras."
 
-  $SteelOut = Invoke-HttpJson -Method POST -Uri "$TriggerOrigin/api/trigger/manual/steel-out" -Body $EventBody
+  $SteelOutBody = $EventBody.Clone()
+  $SteelOutBody.requestId = "smoke-steel-out-$RunId"
+  $SteelOut = Invoke-HttpJson -Method POST -Uri "$TriggerOrigin/api/trigger/manual/steel-out" -Body $SteelOutBody
   Assert-Condition ($SteelOut.Json.code -eq 0) "Manual steel-out failed: $($SteelOut.Content)"
-  Assert-Condition ($SteelOut.Json.target -eq "/api/production/steel-out") "Manual steel-out did not route to production API."
+  Assert-Condition ($SteelOut.Json.target -eq "/api/production/tasks/steel-out") "Manual steel-out did not route to the durable production API."
+  $SteelOutTask = Wait-ProductionTask -TaskId ([string]$SteelOut.Json.service.task.taskId) -ExpectedKind "steel-out"
+  $PersistedSessionId = [string]$SteelInTask.Json.task.sessionId
+  foreach ($PersistedTask in @($SteelInfoTask.Json.task, $SteelInTask.Json.task, $CaptureTask.Json.task, $SteelOutTask.Json.task)) {
+    Assert-Condition ($PersistedTask.materialId -eq $MaterialId) "Durable task $($PersistedTask.kind) changed material identity."
+    Assert-Condition ([string]$PersistedTask.sessionId -eq $PersistedSessionId) "Durable task $($PersistedTask.kind) changed session identity."
+  }
 
   $StatusAfter = Invoke-HttpJson -Method GET -Uri "$ServiceOrigin/api/production/status"
   Assert-Condition ($StatusAfter.Json.latestSession.materialId -eq $MaterialId) "Latest production session mismatch after steel-out."
@@ -446,23 +491,29 @@ try {
       checked = -not $SkipClient
     }
     production = @{
-      sessionId = $SteelIn.Json.service.sessionId
-      inspectionId = $SteelIn.Json.service.inspectionId
+      sessionId = $SteelInTask.Json.task.sessionId
+      inspectionId = $SteelInResult.inspectionId
       latestStatus = $StatusAfter.Json.latestSession.status
-      recordWrittenBeforeCapture = $SteelIn.Json.service.flow.recordWrittenBeforeCapture
+      recordWrittenBeforeCapture = $SteelInResult.flow.recordWrittenBeforeCapture
+      durableTasks = @{
+        steelInfo = $SteelInfoTask.Json.task.taskId
+        steelIn = $SteelInTask.Json.task.taskId
+        captureOnce = $CaptureTask.Json.task.taskId
+        steelOut = $SteelOutTask.Json.task.taskId
+      }
       captureGuard = @{
         statusCode = $CaptureGuard.StatusCode
         error = $CaptureGuard.Json.error
       }
       captureOnce = @{
-        code = $CaptureOnce.Json.code
-        provider = $CaptureOnce.Json.provider.provider
-        parallel = $CaptureOnce.Json.provider.parallel
-        workerCount = $CaptureOnce.Json.provider.workerCount
-        completeFrames = $CaptureOnce.Json.provider.completeFrames
-        metadataFrames = $CaptureOnce.Json.provider.metadataFrames
-        captureFileRows = $CaptureOnce.Json.record.captureFileRows
-        saveSdkDerived = $CaptureOnce.Json.provider.saveSdkDerived
+        code = $CaptureOnce.code
+        provider = $CaptureOnce.provider.provider
+        parallel = $CaptureOnce.provider.parallel
+        workerCount = $CaptureOnce.provider.workerCount
+        completeFrames = $CaptureOnce.provider.completeFrames
+        metadataFrames = $CaptureOnce.provider.metadataFrames
+        captureFileRows = $CaptureOnce.record.captureFileRows
+        saveSdkDerived = $CaptureOnce.provider.saveSdkDerived
       }
     }
     logs = $LogDir

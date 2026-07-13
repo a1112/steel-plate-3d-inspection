@@ -8,6 +8,7 @@ import {
   CircleOff,
   Cpu,
   FileText,
+  FolderOpen,
   Gauge,
   ListChecks,
   Network,
@@ -19,13 +20,12 @@ import {
   SlidersHorizontal,
   StopCircle,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DeviceStatus } from '../data/inspection';
 import {
   captureProductionOnce,
   fetchProductionStatus,
   fetchTriggerGatewayStatus,
-  getTriggerGatewayOrigin,
   setTriggerGatewayMode,
   triggerGatewayManualSteelIn,
   triggerGatewayManualSteelInfo,
@@ -37,21 +37,32 @@ import {
 } from '../services/inspection-api';
 import {
   applyCaptureConfig,
+  captureStreamImageUrl,
   captureDepthMap,
   connectCaptureCamera,
   createDefaultCaptureCameras,
   createDefaultCaptureConfig,
   disconnectCaptureCamera,
   openCaptureManagementWindow,
+  openCaptureLocalPath,
+  readLatestCaptureFile,
   setCaptureParam,
   setCaptureSoftwareTrigger,
+  saveCapturePreviewFromUrl,
+  startCaptureStream,
+  stopCaptureStream,
+  validateCaptureStreamStartOptions,
   type CaptureAppliedConfig,
   type CaptureCameraConfig,
   type CaptureCameraStatus,
   type CaptureCommandResult,
+  type CaptureImageKind,
+  type CaptureLogEvent,
   type CaptureSnapshot,
+  type CaptureStreamStartOptions,
 } from '../lib/capture-api';
 import type { OperationState, SystemAction } from '../state/operations';
+import { CaptureOperationsPanel } from './CaptureOperationsPanel';
 import { Panel } from './Panel';
 
 type CaptureView = 'overview' | 'config' | 'logs' | 'api';
@@ -83,6 +94,62 @@ function formatTime(value?: string | null) {
 
 function formatNumber(value?: number | null, digits = 1) {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '-';
+}
+
+function captureKindLabel(kind: CaptureImageKind) {
+  switch (kind) {
+    case 'intensity': return '亮度图';
+    case 'metadata': return '元数据';
+    case 'sdk-derived': return 'SDK 派生图';
+    default: return '深度图';
+  }
+}
+
+const CAPTURE_CLIENT_LOG_LIMIT = 80;
+const CAPTURE_VISIBLE_LOG_LIMIT = 100;
+
+export function prependBoundedCaptureLog(
+  logs: CaptureLogEvent[],
+  event: CaptureLogEvent,
+  limit = CAPTURE_CLIENT_LOG_LIMIT,
+) {
+  return [event, ...logs].slice(0, Math.max(1, limit));
+}
+
+export function mergeCaptureLogEvents(
+  providerLogs: CaptureLogEvent[],
+  systemEvents: OperationState['events'],
+  clientLogs: CaptureLogEvent[] = [],
+) {
+  const candidates: CaptureLogEvent[] = [
+    ...clientLogs.slice(0, CAPTURE_CLIENT_LOG_LIMIT),
+    ...systemEvents.slice(0, 15).map((event) => ({
+      ...event,
+      source: 'system-operation' as const,
+      cameraIp: null,
+    })),
+    ...providerLogs.slice(0, 5).map((event) => ({
+      ...event,
+      source: event.source ?? 'provider-snapshot',
+    })),
+  ];
+  const seen = new Set<string>();
+  return candidates.filter((event) => {
+    const key = `${event.source || 'unknown'}:${event.id}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  }).slice(0, CAPTURE_VISIBLE_LOG_LIMIT);
+}
+
+function captureLogSourceLabel(source?: CaptureLogEvent['source']) {
+  switch (source) {
+    case 'client-operation': return '前端操作';
+    case 'system-operation': return '系统操作';
+    default: return 'Provider 快照';
+  }
 }
 
 function pad2(value: number) {
@@ -181,6 +248,50 @@ function isSimulationCapture(capture: CaptureSnapshot) {
     capture.health?.service?.includes('simulated') ||
     capture.cameras.some((camera) => camera.driverId === 'simulated' || camera.source === 'service-fallback') ||
     capture.statuses.some((camera) => camera.driverId === 'simulated' || camera.sdkStatus === 'simulation')
+  );
+}
+
+function sdkValue(value: number | string | undefined, unit = '') {
+  if (value === undefined || value === '') {
+    return '-';
+  }
+  return `${value}${unit}`;
+}
+
+function sdkSwitch(value?: number) {
+  if (value === undefined) {
+    return '-';
+  }
+  return `${value === 0 ? '关闭' : '开启'} (${value})`;
+}
+
+function CaptureSdkReadback({ status }: { status: CaptureCameraStatus }) {
+  const config = status.captureConfig;
+  return (
+    <section className="capture-sdk-readback" aria-label="SDK 参数读回">
+      <header>
+        <strong>SDK 参数读回</strong>
+        <span>{config?.available ? '设备当前生效值' : 'SDK 暂无可用参数块'}</span>
+      </header>
+      <dl>
+        <div><dt>available</dt><dd>{config?.available ? '是' : '否'}</dd></div>
+        <div><dt>controlMode</dt><dd>{config?.controlMode === undefined ? '-' : `${config.controlLabel || '-'} (${config.controlMode})`}</dd></div>
+        <div><dt>ctrlType</dt><dd>{sdkValue(config?.ctrlType)}</dd></div>
+        <div><dt>triggerInputType</dt><dd>{config?.triggerInputType === undefined ? '-' : `${config.triggerSourceLabel || '-'} (${config.triggerInputType})`}</dd></div>
+        <div><dt>captureDataType</dt><dd>{sdkValue(config?.captureDataType)}</dd></div>
+        <div><dt>triggerLines</dt><dd>{sdkValue(config?.triggerLines, ' line')}</dd></div>
+        <div><dt>divRatio</dt><dd>{sdkValue(config?.divRatio)}</dd></div>
+        <div><dt>timeTriggerFreq</dt><dd>{sdkValue(config?.timeTriggerFreq, ' Hz')}</dd></div>
+        <div><dt>maxFrameRate</dt><dd>{sdkValue(config?.maxFrameRate, ' fps')}</dd></div>
+        <div><dt>exposureTime</dt><dd>{sdkValue(config?.exposureTime, ' us')}</dd></div>
+        <div><dt>gainK</dt><dd>{sdkValue(config?.gainK)}</dd></div>
+        <div><dt>laserEnable</dt><dd>{sdkSwitch(config?.laserEnable)}</dd></div>
+        <div><dt>laserPower</dt><dd>{sdkValue(config?.laserPower, '%')}</dd></div>
+        <div><dt>laserLineSelect</dt><dd>{sdkValue(config?.laserLineSelect)}</dd></div>
+        <div><dt>arrayEnable</dt><dd>{sdkSwitch(config?.arrayEnable)}</dd></div>
+      </dl>
+      <p>只读值来自 C++ 独占 SDK 会话；arrayEnable 是运行开关，不代表已执行阵列标定下发。</p>
+    </section>
   );
 }
 
@@ -378,9 +489,27 @@ export function CaptureManagementApp({
   const [selectedIp, setSelectedIp] = useState<string | null>(null);
   const [localConfig, setLocalConfig] = useState<CaptureAppliedConfig>(() => capture.config ?? createDefaultCaptureConfig());
   const [configDirty, setConfigDirty] = useState(false);
-  const [captureRunning, setCaptureRunning] = useState(false);
   const [captureMessage, setCaptureMessage] = useState<string | null>(null);
-  const [capturePreview, setCapturePreview] = useState<{ ip: string; url: string; output: string } | null>(null);
+  const [capturePreview, setCapturePreview] = useState<{
+    ip: string;
+    kind: CaptureImageKind;
+    url: string;
+    output: string;
+    content?: string;
+  } | null>(null);
+  const [previewKind, setPreviewKind] = useState<CaptureImageKind>('depth');
+  const [previewMode, setPreviewMode] = useState<'latest' | 'stream'>('latest');
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewRefreshToken, setPreviewRefreshToken] = useState(0);
+  const [previewStreamOptions, setPreviewStreamOptions] = useState({
+    width: 0,
+    dataMode: 3,
+    fpsLimit: 5,
+    hs: false,
+  });
+  const [clientOperationLogs, setClientOperationLogs] = useState<CaptureLogEvent[]>([]);
+  const clientLogSequence = useRef(0);
   const [productionStatus, setProductionStatus] = useState<ProductionStatus | null>(null);
   const [triggerGatewayStatus, setTriggerGatewayStatus] = useState<TriggerGatewayStatus | null>(null);
   const [productionMode, setProductionMode] = useState<TriggerGatewayMode>('api');
@@ -504,18 +633,135 @@ export function CaptureManagementApp({
   const enabledCount = localConfig.cameras.filter((camera) => camera.enabled).length;
   const warningCount = overviewStatuses.filter((item) => getStatusTone(item) === 'warning').length;
   const offlineCount = overviewStatuses.filter((item) => getStatusTone(item) === 'offline').length;
-  const recentLogs = capture.logs.length > 0 ? capture.logs : operation.events.map((event) => ({ ...event, cameraIp: null }));
+  const captureRunning = overviewStatuses.some((item) => item.streamRunning);
+  const previewStreamRequest = useMemo<CaptureStreamStartOptions>(() => ({
+    ip: selectedStatus?.ip || '',
+    lines: selectedConfig?.depthLines ?? 1280,
+    ...previewStreamOptions,
+  }), [previewStreamOptions, selectedConfig?.depthLines, selectedStatus?.ip]);
+  const previewStreamValidation = selectedStatus
+    ? validateCaptureStreamStartOptions(previewStreamRequest)
+    : null;
+  const recentLogs = useMemo(
+    () => mergeCaptureLogEvents(capture.logs, operation.events, clientOperationLogs),
+    [capture.logs, clientOperationLogs, operation.events],
+  );
   const simulationMode = isSimulationCapture(capture);
 
-  const runCaptureCommand = async (action: () => Promise<CaptureCommandResult>, success: string) => {
+  const appendClientOperationLog = useCallback((
+    level: CaptureLogEvent['level'],
+    message: string,
+    cameraIp?: string | null,
+  ) => {
+    clientLogSequence.current += 1;
+    const event: CaptureLogEvent = {
+      id: `CLIENT-${Date.now()}-${clientLogSequence.current}`,
+      time: new Date().toISOString(),
+      level,
+      source: 'client-operation',
+      cameraIp: cameraIp || null,
+      message,
+    };
+    setClientOperationLogs((current) => prependBoundedCaptureLog(current, event));
+  }, []);
+
+  useEffect(() => {
+    if (!selectedIp || previewMode !== 'latest') {
+      setPreviewLoading(false);
+      setPreviewError(null);
+      return;
+    }
+
+    let cancelled = false;
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
+      if (!cancelled) {
+        setPreviewLoading(true);
+      }
+      try {
+        const latest = await readLatestCaptureFile(selectedIp, previewKind);
+        if (!cancelled) {
+          setCapturePreview({
+            ip: latest.ip || selectedIp,
+            kind: latest.kind,
+            url: latest.imageUrl,
+            output: latest.path,
+            content: latest.content,
+          });
+          setPreviewError(null);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setCapturePreview((current) =>
+            current?.ip === selectedIp && current.kind === previewKind ? null : current,
+          );
+          setPreviewError(
+            error instanceof Error && !error.message.includes('404')
+              ? error.message
+              : `暂无${captureKindLabel(previewKind)}`,
+          );
+        }
+      } finally {
+        inFlight = false;
+        if (!cancelled) {
+          setPreviewLoading(false);
+        }
+      }
+    };
+
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedIp, previewKind, previewMode, previewRefreshToken]);
+
+  useEffect(() => {
+    if (!selectedIp || previewMode !== 'stream' || (previewKind !== 'depth' && previewKind !== 'intensity')) {
+      return;
+    }
+    const refresh = () => {
+      setCapturePreview({
+        ip: selectedIp,
+        kind: previewKind,
+        url: captureStreamImageUrl(selectedIp, previewKind),
+        output: `${selectedIp} · ${captureKindLabel(previewKind)}实时流`,
+      });
+      setPreviewError(null);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 400);
+    return () => window.clearInterval(timer);
+  }, [selectedIp, previewKind, previewMode]);
+
+  const runCaptureCommand = async (
+    action: () => Promise<CaptureCommandResult>,
+    success: string,
+    cameraIp?: string | null,
+  ) => {
     try {
       const result = await action();
-      setCaptureMessage(result.code === 0 ? (result.output ? `${success}: ${result.output}` : success) : `指令失败: ${result.code}`);
+      const message = result.code === 0
+        ? (result.output ? `${success}: ${result.output}` : success)
+        : `指令失败: ${result.code}${result.error ? ` · ${result.error}` : ''}`;
+      setCaptureMessage(message);
+      appendClientOperationLog(result.code === 0 ? 'info' : 'error', message, cameraIp ?? selectedIp);
       if (result.code === 0 && result.imageUrl) {
-        setCapturePreview({ ip: result.ip ?? selectedIp ?? '', url: result.imageUrl, output: result.output ?? '' });
+        setPreviewKind('depth');
+        setCapturePreview({ ip: result.ip ?? selectedIp ?? '', kind: 'depth', url: result.imageUrl, output: result.output ?? '' });
+        setPreviewError(null);
       }
+      return result;
     } catch (error) {
-      setCaptureMessage(error instanceof Error ? error.message : '指令失败');
+      const message = error instanceof Error ? error.message : '指令失败';
+      setCaptureMessage(message);
+      appendClientOperationLog('error', message, cameraIp ?? selectedIp);
+      return null;
     }
   };
 
@@ -559,11 +805,33 @@ export function CaptureManagementApp({
     const cameras = localConfig.cameras.filter((camera) => camera.enabled);
     const results = await Promise.allSettled(cameras.map((camera) => connectCaptureCamera(camera.ip)));
     const successCount = results.filter((result) => result.status === 'fulfilled' && result.value.code === 0).length;
-    setCaptureMessage(`已下发连接: ${successCount}/${cameras.length}`);
+    const message = `已下发连接: ${successCount}/${cameras.length}`;
+    setCaptureMessage(message);
+    appendClientOperationLog(successCount === cameras.length ? 'info' : 'warning', message);
   };
 
   const handleDisconnectAll = async () => {
-    await runCaptureCommand(() => disconnectCaptureCamera(), '全部相机已断开');
+    try {
+      const result = await disconnectCaptureCamera();
+      const results = result.results ?? [];
+      const requested = result.requested ?? results.length;
+      const disconnected = result.disconnected
+        ?? results.filter((item) => item.code === 0 && item.disconnected !== false).length;
+      const failed = result.failed ?? Math.max(0, requested - disconnected);
+      const failedEvidence = results
+        .filter((item) => item.code !== 0 || item.disconnected === false)
+        .map((item) => `${item.ip || '未知相机'}: ${item.errorName || item.code}${item.operatorHint ? `（${item.operatorHint}）` : ''}`)
+        .join('；');
+      const message = failed === 0 && result.code === 0
+        ? `全部相机已断开：${disconnected}/${requested}`
+        : `相机批量断开完成：${disconnected}/${requested}，失败 ${failed}${failedEvidence ? `；${failedEvidence}` : ''}`;
+      setCaptureMessage(message);
+      appendClientOperationLog(failed === 0 && result.code === 0 ? 'info' : 'warning', message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '相机批量断开失败';
+      setCaptureMessage(message);
+      appendClientOperationLog('error', message);
+    }
   };
 
   const handleApplySelectedParams = async () => {
@@ -593,6 +861,87 @@ export function CaptureManagementApp({
     );
   };
 
+  const handleStartPreview = async (ip: string, config?: CaptureCameraConfig | null) => {
+    setPreviewError(null);
+    const request: CaptureStreamStartOptions = {
+      ...previewStreamOptions,
+      ip,
+      lines: config?.depthLines ?? 1280,
+    };
+    const validationError = validateCaptureStreamStartOptions(request);
+    if (validationError) {
+      setPreviewError(validationError);
+      setCaptureMessage(validationError);
+      appendClientOperationLog('warning', validationError, ip);
+      return;
+    }
+    const result = await runCaptureCommand(
+      () => startCaptureStream(request),
+      '实时预览已启动',
+      ip,
+    );
+    setPreviewMode(result?.code === 0 ? 'stream' : 'latest');
+  };
+
+  const handleStopPreview = async (ip: string) => {
+    await runCaptureCommand(() => stopCaptureStream(ip), '实时预览已停止', ip);
+    setPreviewMode('latest');
+  };
+
+  const handleStopAllPreviews = async () => {
+    const targets = overviewStatuses.filter((item) => item.streamRunning);
+    if (targets.length === 0) {
+      const message = '当前没有运行中的实时预览';
+      setCaptureMessage(message);
+      appendClientOperationLog('info', message);
+      return;
+    }
+    let stopped = 0;
+    for (const target of targets) {
+      try {
+        const result = await stopCaptureStream(target.ip);
+        if (result.code === 0) {
+          stopped += 1;
+        }
+      } catch {
+        // Continue so one unreachable camera cannot leave the remaining
+        // streams running without an attempted stop.
+      }
+    }
+    setPreviewMode('latest');
+    const message = `已停止实时预览 ${stopped}/${targets.length}`;
+    setCaptureMessage(message);
+    appendClientOperationLog(stopped === targets.length ? 'info' : 'warning', message);
+  };
+
+  const handleOpenLocalPath = async (path: string) => {
+    try {
+      const opened = await openCaptureLocalPath(path);
+      setCaptureMessage(opened ? `已打开：${path}` : '浏览器模式不能打开本地路径');
+    } catch (error) {
+      setCaptureMessage(error instanceof Error ? error.message : '本地路径打开失败');
+    }
+  };
+
+  const handleSaveCurrentPreview = async () => {
+    if (!capturePreview) {
+      return;
+    }
+    try {
+      const safeIp = (capturePreview.ip || selectedIp || 'camera').replace(/[^0-9A-Za-z_-]+/g, '_');
+      const extension = capturePreview.kind === 'metadata' ? 'json' : 'png';
+      const saved = await saveCapturePreviewFromUrl(
+        capturePreview.url,
+        `${safeIp}-${capturePreview.kind || previewKind}-preview.${extension}`,
+      );
+      setCaptureMessage(saved
+        ? (saved.saved ? `当前预览已保存：${saved.path || ''}` : '已取消保存当前预览')
+        : '浏览器模式不能调用系统另存对话框');
+    } catch (error) {
+      setCaptureMessage(error instanceof Error ? error.message : '当前预览保存失败');
+    }
+  };
+
   const updateProductionDraft = (patch: Partial<typeof productionDraft>) => {
     setProductionDraftTouched(true);
     setProductionDraft((current) => ({ ...current, ...patch }));
@@ -612,6 +961,9 @@ export function CaptureManagementApp({
     const code = result.code ?? 0;
     const materialId = result.materialId || productionDraft.materialId;
     const sessionId = result.sessionId ? ` / ${result.sessionId}` : '';
+    if (code === 0 && result.task?.taskId) {
+      return `${success}已入队：${materialId}${sessionId} / ${result.task.taskId} / ${result.task.status}`;
+    }
     return code === 0 ? `${success}: ${materialId}${sessionId}` : `${success}返回异常: code ${code}`;
   };
 
@@ -645,10 +997,6 @@ export function CaptureManagementApp({
     } finally {
       setTriggerGatewayBusy(false);
     }
-  };
-
-  const openTriggerManualPage = () => {
-    window.open(`${getTriggerGatewayOrigin()}/manual`, '_blank', 'popup,width=1080,height=760');
   };
 
   const handleWriteProductionRecord = () => {
@@ -690,6 +1038,8 @@ export function CaptureManagementApp({
     const providerPhase = providerValue(captureState, ['phase', 'state', 'status']);
     const providerSaveState = providerValue(captureState, ['captureSaveState', 'saveState', 'saveEnabled']);
     const providerRunning = providerValue(captureState, ['productionCaptureRunning', 'captureRunning', 'running']);
+    const providerSteelPath = providerValue(captureState, ['steelDir', 'materialDir', 'captureDir', 'storagePath', 'outputDir']);
+    const taskState = productionStatus?.tasks;
     const triggerManualAllowed = Boolean(triggerGatewayStatus?.manualAllowed);
     const triggerGatewayOnline = Boolean(triggerGatewayStatus && triggerGatewayStatus.code !== 503 && !triggerGatewayStatus.error);
 
@@ -766,8 +1116,16 @@ export function CaptureManagementApp({
             <dd>{triggerGatewayOnline ? `${triggerGatewayModeLabel(triggerGatewayStatus?.mode)} · ${triggerManualAllowed ? '允许手动' : '自动/外部'}` : '离线'}</dd>
           </div>
           <div>
+            <dt>持久任务队列</dt>
+            <dd>
+              {taskState
+                ? `${taskState.queueDepth}/${taskState.capacity}${taskState.worker?.activeTaskId ? ` · ${taskState.worker.activeTaskId}` : ''}`
+                : '-'}
+            </dd>
+          </div>
+          <div>
             <dt>手动入口</dt>
-            <dd>{getTriggerGatewayOrigin()}/manual</dd>
+            <dd>由 Tauri 经 Rust /api/trigger/* 受控代理</dd>
           </div>
         </dl>
         <div className="production-capture-actions">
@@ -787,13 +1145,18 @@ export function CaptureManagementApp({
             <StopCircle size={16} />
             出钢结束
           </button>
-          <button type="button" onClick={openTriggerManualPage}>
-            <ArrowRight size={16} />
-            打开触发手动界面
-          </button>
           <button type="button" onClick={() => void refreshTriggerGatewayStatus()} disabled={triggerGatewayBusy}>
             <RefreshCw size={16} />
             刷新触发网关
+          </button>
+          <button type="button" onClick={() => void handleOpenLocalPath(productionDraft.storageRoot)} disabled={!productionDraft.storageRoot.trim()}>
+            <FolderOpen size={16} />打开存储根目录
+          </button>
+          <button type="button" onClick={() => void handleOpenLocalPath(providerSteelPath)} disabled={!providerSteelPath}>
+            <FolderOpen size={16} />打开当前钢材目录
+          </button>
+          <button type="button" onClick={() => void handleOpenLocalPath(latestInspection?.summaryPath || '')} disabled={!latestInspection?.summaryPath}>
+            <FolderOpen size={16} />打开最近 summary
           </button>
         </div>
         {!triggerManualAllowed ? (
@@ -837,13 +1200,28 @@ export function CaptureManagementApp({
             <CircleOff size={16} />
             全部断开
           </button>
-          <button type="button" onClick={() => setCaptureRunning(true)}>
+          <button
+            type="button"
+            onClick={() => {
+              const target = overviewStatuses.find((item) => item.connected);
+              if (!target) {
+                setCaptureMessage('请先连接一台相机，再启动实时预览');
+                return;
+              }
+              const targetConfig = localConfig.cameras.find((item) => item.ip === target.ip);
+              setSelectedIp(target.ip);
+              void handleStartPreview(target.ip, targetConfig);
+            }}
+          >
             <Play size={16} />
-            开始采集
+            启动实时预览
           </button>
-          <button type="button" onClick={() => setCaptureRunning(false)}>
+          <button
+            type="button"
+            onClick={() => void handleStopAllPreviews()}
+          >
             <StopCircle size={16} />
-            停止采集
+            停止全部预览
           </button>
           <button type="button" onClick={() => onAction('self-check')}>
             <RefreshCw size={16} />
@@ -877,9 +1255,10 @@ export function CaptureManagementApp({
       <Panel title="最新事件" className="capture-events-panel">
         <div className="capture-event-list compact">
           {recentLogs.slice(0, 5).map((event) => (
-            <div key={event.id} className={event.level}>
+            <div key={`${event.source || 'unknown'}-${event.id}`} className={event.level}>
               <Activity size={15} />
               <span>{formatTime(event.time)}</span>
+              <em>{captureLogSourceLabel(event.source)}</em>
               <strong>{event.cameraIp ? `${event.cameraIp} · ${event.message}` : event.message}</strong>
             </div>
           ))}
@@ -950,6 +1329,7 @@ export function CaptureManagementApp({
                 <dd>{selectedStatus.bufferOverflowCounter ?? 0}</dd>
               </div>
             </dl>
+            <CaptureSdkReadback status={selectedStatus} />
           </Panel>
           <Panel title="配置参数" className="capture-detail-config-panel">
             {selectedConfig ? (
@@ -1017,6 +1397,51 @@ export function CaptureManagementApp({
             )}
           </Panel>
           <Panel title="单相机控制" className="capture-detail-control-panel">
+            <section className="capture-stream-settings" aria-label="实时预览参数">
+              <label>
+                <span>宽度（0=SDK）</span>
+                <input
+                  aria-label="实时预览宽度"
+                  type="number"
+                  min={0}
+                  max={32768}
+                  value={previewStreamOptions.width}
+                  onChange={(event) => setPreviewStreamOptions((current) => ({ ...current, width: Number(event.target.value) }))}
+                />
+              </label>
+              <label>
+                <span>数据模式</span>
+                <select
+                  aria-label="实时预览数据模式"
+                  value={previewStreamOptions.dataMode}
+                  onChange={(event) => setPreviewStreamOptions((current) => ({ ...current, dataMode: Number(event.target.value) }))}
+                >
+                  <option value={1}>深度</option>
+                  <option value={3}>深度 + 亮度</option>
+                </select>
+              </label>
+              <label>
+                <span>FPS 限制</span>
+                <input
+                  aria-label="实时预览 FPS 限制"
+                  type="number"
+                  min={1}
+                  max={30}
+                  value={previewStreamOptions.fpsLimit}
+                  onChange={(event) => setPreviewStreamOptions((current) => ({ ...current, fpsLimit: Number(event.target.value) }))}
+                />
+              </label>
+              <label className="capture-stream-hs-toggle">
+                <input
+                  aria-label="实时预览高速模式"
+                  type="checkbox"
+                  checked={previewStreamOptions.hs}
+                  onChange={(event) => setPreviewStreamOptions((current) => ({ ...current, hs: event.target.checked }))}
+                />
+                高速模式
+              </label>
+            </section>
+            {previewStreamValidation ? <p className="capture-stream-validation" role="alert">{previewStreamValidation}</p> : null}
             <div className="capture-control-grid single">
               <button type="button" onClick={() => void runCaptureCommand(() => connectCaptureCamera(selectedStatus.ip), '相机已连接')}>
                 <Power size={16} />
@@ -1038,29 +1463,103 @@ export function CaptureManagementApp({
                 <Save size={16} />
                 应用配置
               </button>
-              <button type="button" onClick={() => setCaptureMessage('设备复位指令已记录')}>
-                <RefreshCw size={16} />
-                复位设备
-              </button>
+              {selectedStatus.streamRunning ? (
+                <button type="button" onClick={() => void handleStopPreview(selectedStatus.ip)}>
+                  <StopCircle size={16} />
+                  停止实时预览
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void handleStartPreview(selectedStatus.ip, selectedConfig)}
+                  disabled={!selectedStatus.connected || Boolean(previewStreamValidation) || (previewKind !== 'depth' && previewKind !== 'intensity')}
+                >
+                  <Play size={16} />
+                  启动实时预览
+                </button>
+              )}
             </div>
           </Panel>
-          {capturePreview && (!capturePreview.ip || capturePreview.ip === selectedStatus.ip) ? (
-            <Panel title="最近采集预览" className="capture-depth-preview-panel">
-              <div className="capture-depth-preview">
-                <img src={capturePreview.url} alt={`${selectedStatus.name || selectedStatus.ip} depth map`} />
-                <span>{capturePreview.output}</span>
+          <Panel title="最新图像预览" className="capture-depth-preview-panel">
+            <div className="capture-preview-toolbar">
+              <div role="group" aria-label="图像预览模式">
+                <button type="button" className={previewMode === 'latest' ? 'active' : ''} onClick={() => setPreviewMode('latest')}>
+                  最新落盘
+                </button>
+                <button
+                  type="button"
+                  className={previewMode === 'stream' ? 'active' : ''}
+                  onClick={() => {
+                    if (selectedStatus.streamRunning) {
+                      setPreviewMode('stream');
+                    } else {
+                      void handleStartPreview(selectedStatus.ip, selectedConfig);
+                    }
+                  }}
+                  disabled={!selectedStatus.connected}
+                >
+                  实时流
+                </button>
+                <button type="button" className={previewKind === 'depth' ? 'active' : ''} onClick={() => setPreviewKind('depth')}>
+                  深度图
+                </button>
+                <button type="button" className={previewKind === 'intensity' ? 'active' : ''} onClick={() => setPreviewKind('intensity')}>
+                  亮度图
+                </button>
+                <button type="button" className={previewKind === 'metadata' ? 'active' : ''} onClick={() => { setPreviewMode('latest'); setPreviewKind('metadata'); }}>
+                  元数据
+                </button>
+                <button type="button" className={previewKind === 'sdk-derived' ? 'active' : ''} onClick={() => { setPreviewMode('latest'); setPreviewKind('sdk-derived'); }}>
+                  SDK 派生图
+                </button>
               </div>
-            </Panel>
-          ) : null}
+              <button
+                type="button"
+                onClick={() => setPreviewRefreshToken((value) => value + 1)}
+                disabled={previewLoading || previewMode === 'stream'}
+              >
+                <RefreshCw size={14} className={previewLoading ? 'spin' : ''} />
+                {previewMode === 'stream' ? '实时刷新中' : previewLoading ? '读取中' : '刷新最新'}
+              </button>
+              <button type="button" disabled={!capturePreview} onClick={() => void handleSaveCurrentPreview()}>
+                <Save size={14} />保存当前帧
+              </button>
+              <button type="button" disabled={!capturePreview || previewMode !== 'latest'} onClick={() => void handleOpenLocalPath(capturePreview?.output || '')}>
+                <FolderOpen size={14} />打开落盘文件
+              </button>
+            </div>
+            {capturePreview && (!capturePreview.ip || capturePreview.ip === selectedStatus.ip) && capturePreview.kind === previewKind ? (
+              <div className="capture-depth-preview">
+                {previewKind === 'metadata' ? (
+                  <pre className="capture-metadata-preview" aria-label="最新采集元数据">
+                    {capturePreview.content || '元数据文件为空'}
+                  </pre>
+                ) : (
+                  <img
+                    src={capturePreview.url}
+                    alt={`${selectedStatus.name || selectedStatus.ip} ${previewKind === 'depth' ? 'depth map' : previewKind === 'intensity' ? 'intensity map' : 'SDK 派生图'}`}
+                  />
+                )}
+                <span title={capturePreview.output}>{capturePreview.output}</span>
+              </div>
+            ) : (
+              <div className="capture-preview-empty" role="status">
+                <Gauge size={28} />
+                <strong>{previewLoading ? '正在读取最新图像' : previewError || '等待最新采集图像'}</strong>
+                <span>{previewMode === 'stream' ? '前端每 400 毫秒经 Rust 服务读取实时帧' : '前端每 3 秒经 Rust 服务读取一次采集端最新文件'}</span>
+              </div>
+            )}
+          </Panel>
           <Panel title="相机日志" className="capture-detail-log-panel">
             <div className="capture-event-list">
               {recentLogs
                 .filter((event) => !event.cameraIp || event.cameraIp === selectedStatus.ip)
                 .slice(0, 8)
                 .map((event) => (
-                  <div key={event.id} className={event.level}>
+                  <div key={`${event.source || 'unknown'}-${event.id}`} className={event.level}>
                     <Activity size={15} />
                     <span>{formatTime(event.time)}</span>
+                    <em>{captureLogSourceLabel(event.source)}</em>
                     <strong>{event.message}</strong>
                   </div>
                 ))}
@@ -1155,21 +1654,28 @@ export function CaptureManagementApp({
           ) : activeView === 'overview' ? (
             renderOverview()
           ) : activeView === 'config' ? (
-            <ConfigTable
-              config={localConfig}
-              dirty={configDirty}
-              onCreate={handleCreateConfig}
-              onChange={updateCameraConfig}
-              onApply={() => void handleApplyConfig()}
-              onReset={handleResetConfig}
-            />
+            <section className="capture-config-workspace">
+              <ConfigTable
+                config={localConfig}
+                dirty={configDirty}
+                onCreate={handleCreateConfig}
+                onChange={updateCameraConfig}
+                onApply={() => void handleApplyConfig()}
+                onReset={handleResetConfig}
+              />
+              <CaptureOperationsPanel
+                cameraIps={localConfig.cameras.filter((camera) => camera.enabled).map((camera) => camera.ip)}
+                cameraStatuses={overviewStatuses}
+              />
+            </section>
           ) : activeView === 'logs' ? (
             <Panel title="采集日志" className="capture-log-panel">
               <div className="capture-event-list">
                 {recentLogs.map((event) => (
-                  <div key={event.id} className={event.level}>
+                  <div key={`${event.source || 'unknown'}-${event.id}`} className={event.level}>
                     <Activity size={15} />
                     <span>{formatTime(event.time)}</span>
+                    <em>{captureLogSourceLabel(event.source)}</em>
                     <strong>{event.cameraIp ? `${event.cameraIp} · ${event.message}` : event.message}</strong>
                   </div>
                 ))}
@@ -1262,7 +1768,10 @@ export function SystemStatusPage({
   const connectedCount = overviewStatuses.filter((camera) => camera.connected).length;
   const warningCount = overviewStatuses.filter((camera) => getStatusTone(camera) === 'warning').length;
   const offlineCount = overviewStatuses.filter((camera) => getStatusTone(camera) === 'offline').length;
-  const recentLogs = capture.logs.length > 0 ? capture.logs : operation.events.map((event) => ({ ...event, cameraIp: null }));
+  const recentLogs = useMemo(
+    () => mergeCaptureLogEvents(capture.logs, operation.events),
+    [capture.logs, operation.events],
+  );
   const simulationMode = isSimulationCapture(capture);
 
   const openIndependentManager = async () => {
@@ -1386,9 +1895,10 @@ export function SystemStatusPage({
         <Panel title="最近采集事件" className="capture-terminal-log-panel">
           <div className="capture-event-list compact">
             {recentLogs.slice(0, 6).map((event) => (
-              <div key={event.id} className={event.level}>
+              <div key={`${event.source || 'unknown'}-${event.id}`} className={event.level}>
                 <Activity size={15} />
                 <span>{formatTime(event.time)}</span>
+                <em>{captureLogSourceLabel(event.source)}</em>
                 <strong>{event.cameraIp ? `${event.cameraIp} · ${event.message}` : event.message}</strong>
               </div>
             ))}

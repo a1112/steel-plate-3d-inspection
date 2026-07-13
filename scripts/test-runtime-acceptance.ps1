@@ -207,6 +207,11 @@ function Assert-SmokeResult {
   if ($Smoke.production.captureOnce.saveSdkDerived -ne $false) {
     throw "Smoke capture-once should keep sdk-derived disabled."
   }
+  foreach ($TaskName in @("steelInfo", "steelIn", "captureOnce", "steelOut")) {
+    if ([string]::IsNullOrWhiteSpace([string]$Smoke.production.durableTasks.$TaskName)) {
+      throw "Smoke did not report persisted task identity for $TaskName."
+    }
+  }
 }
 
 $StartedAt = Get-Date
@@ -255,6 +260,7 @@ try {
         clientPort = if ($SkipSmoke -or $SkipClient) { $null } else { $ClientPort }
         reportPath = if ($SkipSmoke -or $null -eq $SmokeSummary) { $null } else { $SmokeSummary.reportPath }
         network = if ($SkipSmoke -or $null -eq $SmokeSummary) { $null } else { $SmokeSummary.service.network }
+        durableTasks = if ($SkipSmoke -or $null -eq $SmokeSummary) { $null } else { $SmokeSummary.production.durableTasks }
         captureGuard = if ($SkipSmoke -or $null -eq $SmokeSummary) { $null } else { $SmokeSummary.production.captureGuard }
         captureOnce = if ($SkipSmoke -or $null -eq $SmokeSummary) { $null } else { $SmokeSummary.production.captureOnce }
         outputTail = Get-OutputTail $SmokeOutput

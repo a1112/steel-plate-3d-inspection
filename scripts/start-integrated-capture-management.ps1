@@ -11,6 +11,7 @@ param(
   [string]$CaptureProfile = "current-6-soft-trigger",
   [ValidateSet("api", "gray", "secondary", "manual")]
   [string]$TriggerMode = "manual",
+  [switch]$WithQtViewer,
   [switch]$NoQt,
   [switch]$StopExisting,
   [switch]$OpenBrowser
@@ -132,7 +133,7 @@ if (-not (Test-Path $ServiceScript -PathType Leaf)) { throw "Missing $ServiceScr
 if (-not (Test-Path $TriggerScript -PathType Leaf)) { throw "Missing $TriggerScript" }
 if (-not (Test-Path $ClientScript -PathType Leaf)) { throw "Missing $ClientScript" }
 
-Write-Host "Starting capture provider and Qt viewer..."
+Write-Host "Starting headless capture provider..."
 $CaptureStartArgs = @{
   Port = $CapturePort
   Configuration = $Configuration
@@ -140,8 +141,8 @@ $CaptureStartArgs = @{
   CameraStorageRoot = $CameraStorageRoot
   Profile = $CaptureProfile
 }
-if ($NoQt) {
-  $CaptureStartArgs.NoQt = $true
+if ($WithQtViewer -and -not $NoQt) {
+  $CaptureStartArgs.WithQtViewer = $true
 }
 if ($StopExisting) {
   $CaptureStartArgs.StopExisting = $true
@@ -154,6 +155,7 @@ if (-not (Test-LocalTcpPort -Port $ServicePort)) {
   Start-LongRunningScript -Name "service" -ScriptPath $ServiceScript -Arguments @(
     "-Provider", "external-api",
     "-CaptureOrigin", "http://127.0.0.1:$CapturePort",
+    "-TriggerOrigin", "http://127.0.0.1:$TriggerPort",
     "-Port", [string]$ServicePort,
     "-Profile", $ServiceProfile,
     "-NoCaptureAutostart",
@@ -204,3 +206,6 @@ Write-Host "  Rust service    http://127.0.0.1:$ServicePort"
 Write-Host "  Trigger gateway http://127.0.0.1:$TriggerPort/manual"
 Write-Host "  Client          $ClientUrl"
 Write-Host "  Logs            $LogDir"
+if ($NoQt) {
+  Write-Warning "-NoQt is deprecated because Qt is no longer part of the formal runtime. Use -WithQtViewer only for local diagnostics."
+}
