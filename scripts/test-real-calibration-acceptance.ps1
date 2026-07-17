@@ -3,7 +3,7 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$PlanPath,
   [string]$AdminToken = $env:STEEL_ADMIN_TOKEN,
-  [int]$ExpectedCameras = 6,
+  [int]$ExpectedCameras = 8,
   [string]$ReportDir = "",
   [switch]$RunApplyRollback,
   [switch]$SaveToDevice,
@@ -15,7 +15,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$MutationConfirmation = "RUN REAL SIX CAMERA CALIBRATION APPLY AND ROLLBACK"
+if ($ExpectedCameras -ne 8) {
+  throw "Formal calibration acceptance requires exactly eight cameras."
+}
+$MutationConfirmation = "RUN REAL EIGHT CAMERA CALIBRATION APPLY AND ROLLBACK"
 $StartedAt = Get-Date
 $Failures = [System.Collections.Generic.List[string]]::new()
 
@@ -160,10 +163,10 @@ try {
 if ($null -ne $Plan) {
   $Mappings = @($Plan.cameraCalibrations)
   $Ips = @($Plan.ips | ForEach-Object { [string]$_ })
-  Test-Condition ($ExpectedCameras -eq 6) "Formal calibration acceptance requires ExpectedCameras=6."
+  Test-Condition ($ExpectedCameras -eq 8) "Formal calibration acceptance requires ExpectedCameras=8."
   Test-Condition ($Mappings.Count -eq $ExpectedCameras) "Plan contains $($Mappings.Count) camera calibration mapping(s), expected $ExpectedCameras."
   Test-Condition ($Ips.Count -eq $ExpectedCameras) "Plan contains $($Ips.Count) IP(s), expected $ExpectedCameras."
-  Test-Condition (@($Ips | Select-Object -Unique).Count -eq $ExpectedCameras) "Plan IPs are not six unique values."
+  Test-Condition (@($Ips | Select-Object -Unique).Count -eq $ExpectedCameras) "Plan IPs are not eight unique values."
   Test-Condition (-not [string]::IsNullOrWhiteSpace([string]$Plan.name)) "Plan name is required."
   Test-Condition (-not [string]::IsNullOrWhiteSpace([string]$Plan.path)) "Plan array calibration path is required for active-profile correlation."
   $ArrayCalibrationEvidence = Get-CanonicalFileEvidence -Path ([string]$Plan.path) -Label "Array reconstruction calibration"
@@ -196,9 +199,9 @@ if ($null -ne $Plan) {
       targetDiffersFromRollback = $TargetEvidence.sha256 -ne $RollbackEvidence.sha256
     }
   }
-  Test-Condition (@($Serials | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique).Count -eq $ExpectedCameras) "Plan expectedSn values are not six non-empty unique values."
-  Test-Condition (@($TargetPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique).Count -eq $ExpectedCameras) "Plan target SDK calibration paths are not six non-empty unique values."
-  Test-Condition (@($RollbackPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique).Count -eq $ExpectedCameras) "Plan rollback SDK calibration paths are not six non-empty unique values."
+  Test-Condition (@($Serials | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique).Count -eq $ExpectedCameras) "Plan expectedSn values are not eight non-empty unique values."
+  Test-Condition (@($TargetPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique).Count -eq $ExpectedCameras) "Plan target SDK calibration paths are not eight non-empty unique values."
+  Test-Condition (@($RollbackPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique).Count -eq $ExpectedCameras) "Plan rollback SDK calibration paths are not eight non-empty unique values."
   if ($null -ne $ArrayCalibrationEvidence -and $ArrayCalibrationEvidence.exists) {
     Test-Condition ($TargetHashes -notcontains $ArrayCalibrationEvidence.sha256) "Array reconstruction XML must not be reused as a per-camera SDK calibration artifact."
   }
@@ -321,7 +324,7 @@ if ($RunApplyRollback) {
         Test-Condition ($Validation.json.code -eq 0 -and [int]$Validation.json.failures -eq 0) "Post-rollback validation capture reported failures."
         Test-Condition ([int]$Validation.json.completeFrames -eq $ExpectedCameras) "Validation capture did not commit exactly $ExpectedCameras complete frames."
         Test-Condition ([int]$Validation.json.metadataFrames -eq $ExpectedCameras) "Validation capture did not commit exactly $ExpectedCameras metadata frames."
-        Test-Condition (@($Validation.json.results | ForEach-Object { [string]$_.ip } | Select-Object -Unique).Count -eq $ExpectedCameras) "Validation capture did not return six unique camera IPs."
+        Test-Condition (@($Validation.json.results | ForEach-Object { [string]$_.ip } | Select-Object -Unique).Count -eq $ExpectedCameras) "Validation capture did not return eight unique camera IPs."
       }
 
       $HealthAfterRollback = Invoke-ServiceJson -Method GET -Path "/api/health/details"

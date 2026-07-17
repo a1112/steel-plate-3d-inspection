@@ -405,7 +405,7 @@ function createEmptyCameraDraft(): AdminCameraConfigInput {
   return {
     id: '',
     name: '',
-    ip: '192.168.105.13',
+    ip: '192.168.101.100',
     driverId: 'lvm-nvt',
     modelHint: 'LVM3450CA',
     role: '采集相机',
@@ -654,7 +654,9 @@ export function ParameterManagementApp() {
         }
         setAuthSession(session);
         setAuthChecked(true);
-        if (session) {
+        if (session?.user.mustChangePassword) {
+          setMessage('首次登录必须修改初始密码');
+        } else if (session) {
           refresh().catch((error: unknown) => setMessage(error instanceof Error ? error.message : '参数读取失败'));
         } else {
           setMessage('请登录后台管理');
@@ -677,6 +679,11 @@ export function ParameterManagementApp() {
     try {
       const session = await loginAdmin(loginDraft.userId.trim(), loginDraft.password);
       setAuthSession(session);
+      if (session.user.mustChangePassword) {
+        setPasswordDraft((current) => ({ ...current, currentPassword: loginDraft.password }));
+        setMessage('首次登录必须修改初始密码');
+        return;
+      }
       await refresh();
       setMessage('后台登录成功');
     } catch (error) {
@@ -910,6 +917,11 @@ export function ParameterManagementApp() {
         passwordDraft.confirmPassword,
       );
       setPasswordDraft({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      setAuthSession((current) => current ? {
+        ...current,
+        user: { ...current.user, mustChangePassword: false },
+      } : current);
+      await refresh();
       await loadAuditLogs(0);
       setMessage('当前账号密码已修改');
     } catch (error) {
@@ -1268,7 +1280,7 @@ export function ParameterManagementApp() {
       return;
     }
     const retentionDays = Math.trunc(recordRetentionDays);
-    if (!dryRun && !window.confirm(`确认清理 ${retentionDays} 天以前的检测记录？关联缺陷和孤立钢管档案会同步清理。`)) {
+    if (!dryRun && !window.confirm(`确认清理 ${retentionDays} 天以前的检测记录？受控目录内的采集与重建文件会先校验并删除，随后清理数据库索引；生产会话档案保留。`)) {
       return;
     }
     try {
@@ -1284,8 +1296,8 @@ export function ParameterManagementApp() {
         await loadAuditLogs(0);
       }
       setMessage(dryRun
-        ? `检测记录清理预览：${result.matched} 条将被清理`
-        : `检测记录已清理：${result.deletedRecords} 条记录`);
+        ? `检测记录清理预览：${result.matched} 条，计划清理 ${result.filesPlanned} 个文件`
+        : `检测记录清理完成：${result.deletedRecords}/${result.matched} 条记录，物理文件 ${result.filesDeleted} 个，失败 ${result.failures.length} 条`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '检测记录保留策略执行失败');
     }
@@ -1302,11 +1314,11 @@ export function ParameterManagementApp() {
   };
 
   const deleteRecord = async (record: AdminInspectionRecord) => {
-    if (!window.confirm(`确认删除检测记录 ${record.id}？关联缺陷和孤立钢管档案会同步清理。`)) {
+    if (!window.confirm(`确认删除检测记录 ${record.id}？受控目录内的物理文件会先校验并删除，随后清理记录索引；生产会话档案保留。`)) {
       return;
     }
     try {
-      await deleteAdminRecord(record.id);
+      const result = await deleteAdminRecord(record.id);
       const nextOffset = recordRows.length <= 1 ? Math.max(0, recordOffset - RECORD_PAGE_SIZE) : recordOffset;
       await loadRecords(nextOffset);
       if (selectedRecordDetail?.id === record.id) {
@@ -1316,7 +1328,7 @@ export function ParameterManagementApp() {
       if (authSession?.user.permissions.includes('admin.audit')) {
         await loadAuditLogs(0);
       }
-      setMessage('检测记录已删除');
+      setMessage(`检测记录已删除：物理文件 ${result.filesDeleted}/${result.filesPlanned} 个，缺失 ${result.filesMissing} 个`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '检测记录删除失败');
     }
@@ -1513,7 +1525,7 @@ export function ParameterManagementApp() {
                 <input
                   aria-label="登录密码"
                   type="password"
-                  placeholder="默认 admin123"
+                  placeholder="请输入账号密码"
                   value={loginDraft.password}
                   onChange={(event) => setLoginDraft((current) => ({ ...current, password: event.target.value }))}
                 />
@@ -1523,6 +1535,48 @@ export function ParameterManagementApp() {
                 登录
               </button>
             </form>
+          </Panel>
+        </section>
+      </main>
+    );
+  }
+
+  if (authSession.user.mustChangePassword) {
+    return (
+      <main className="workspace-page parameter-page">
+        <header className="parameter-header">
+          <div>
+            <span>生产安全初始化</span>
+            <h1>首次登录必须修改密码</h1>
+          </div>
+          <div className="parameter-header-actions">
+            <strong>{message}</strong>
+            <button type="button" onClick={() => void logout()}>
+              <LogOut size={16} />
+              退出
+            </button>
+          </div>
+        </header>
+        <section className="parameter-login-wrap">
+          <Panel title="设置管理员新密码" className="parameter-card parameter-password-card">
+            <div className="admin-password-form">
+              <label>
+                <span>当前初始密码</span>
+                <input type="password" value={passwordDraft.currentPassword} onChange={(event) => setPasswordDraft((current) => ({ ...current, currentPassword: event.target.value }))} />
+              </label>
+              <label>
+                <span>新密码</span>
+                <input type="password" value={passwordDraft.newPassword} onChange={(event) => setPasswordDraft((current) => ({ ...current, newPassword: event.target.value }))} />
+              </label>
+              <label>
+                <span>确认新密码</span>
+                <input type="password" value={passwordDraft.confirmPassword} onChange={(event) => setPasswordDraft((current) => ({ ...current, confirmPassword: event.target.value }))} />
+              </label>
+              <button type="button" className="primary" onClick={() => void changePassword()}>
+                <ShieldCheck size={16} />
+                完成安全初始化
+              </button>
+            </div>
           </Panel>
         </section>
       </main>
@@ -1888,7 +1942,11 @@ export function ParameterManagementApp() {
               {recordRetentionResult ? (
                 <p>
                   <strong>{recordRetentionResult.dryRun ? recordRetentionResult.matched : recordRetentionResult.deletedRecords}</strong>
-                  <span>{recordRetentionResult.dryRun ? '条旧检测记录可清理' : `条检测记录已清理，缺陷 ${recordRetentionResult.deletedDefects} 条，钢管 ${recordRetentionResult.deletedPlates} 条`}</span>
+                  <span>
+                    {recordRetentionResult.dryRun
+                      ? `条旧检测记录可清理，计划物理文件 ${recordRetentionResult.filesPlanned} 个`
+                      : `条检测记录已清理，物理文件 ${recordRetentionResult.filesDeleted}/${recordRetentionResult.filesPlanned} 个，缺失 ${recordRetentionResult.filesMissing} 个，失败 ${recordRetentionResult.failures.length} 条；生产会话保留`}
+                  </span>
                 </p>
               ) : null}
             </div>
@@ -1958,6 +2016,16 @@ export function ParameterManagementApp() {
                 <span>{selectedRecordDetail.plate?.steelGrade ?? '-'} / {selectedRecordDetail.plate ? `${selectedRecordDetail.plate.widthMm} x ${selectedRecordDetail.plate.lengthMm} x ${selectedRecordDetail.plate.thicknessMm}mm` : '-'}</span>
                 <b>{selectedRecordDetail.defects.length} 条缺陷</b>
               </div>
+              {selectedRecordDetail.algorithmTrace ? (
+                <div className="admin-record-algorithm-trace">
+                  <span>Algorithm {selectedRecordDetail.algorithmTrace.algorithmVersion ?? '-'}</span>
+                  <span>Config {selectedRecordDetail.algorithmTrace.configRevision ?? '-'}</span>
+                  <span>Release {selectedRecordDetail.algorithmTrace.releaseCommit?.slice(0, 12) ?? '-'}</span>
+                  <span>Input {selectedRecordDetail.algorithmTrace.inputSummarySha256?.slice(0, 12) ?? '-'}</span>
+                  <span>Qualification {selectedRecordDetail.algorithmTrace.acceptanceReportSha256?.slice(0, 12) ?? '-'}</span>
+                  <span>Gate {selectedRecordDetail.algorithmTrace.qualityGate?.passed ? 'PASS' : 'FAIL'}</span>
+                </div>
+              ) : null}
               <div className="admin-record-detail-table-wrap">
                 <table className="admin-record-detail-table">
                   <thead>

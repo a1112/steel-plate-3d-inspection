@@ -5,7 +5,7 @@ param(
   [string]$ClientOrigin = "http://127.0.0.1:1432/?app=terminal",
   [string]$RuntimeRoot = "",
   [string]$ReportDir = "",
-  [int]$ExpectedCameras = 6,
+  [int]$ExpectedCameras = 8,
   [switch]$SkipRuntimeLayout,
   [switch]$SkipReady,
   [switch]$SkipRealHardware,
@@ -35,6 +35,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($ExpectedCameras -ne 8) {
+  throw "Formal integrated capture-management acceptance requires exactly eight cameras."
+}
 $ScriptRoot = (Resolve-Path $PSScriptRoot).Path
 $SourceMode = Test-Path (Join-Path $ScriptRoot "package-runtime.ps1") -PathType Leaf
 $RepoRoot = if ($SourceMode) {
@@ -282,10 +286,10 @@ function Invoke-ServiceJson {
 function Get-LatestBarSurfaceMaterialId {
   $Captures = Invoke-ServiceJson -Method GET -Path "/api/algorithm/bar-surface/captures" -TimeoutSec 30
   $Candidate = @($Captures.materials |
-      Where-Object { [int]$_.cameraCount -ge $ExpectedCameras -and [int]$_.minDepthFrames -ge 1 } |
+      Where-Object { [int]$_.cameraCount -eq $ExpectedCameras -and [int]$_.minDepthFrames -ge 1 } |
       Select-Object -First 1)[0]
   if ($null -eq $Candidate -or [string]::IsNullOrWhiteSpace([string]$Candidate.materialId)) {
-    throw "No existing six-camera bar-surface capture is available. Rerun with -BarSurfaceCapture to capture a fresh material."
+    throw "No existing eight-camera bar-surface capture is available. Rerun with -BarSurfaceCapture to capture a fresh material."
   }
   return [string]$Candidate.materialId
 }
@@ -300,6 +304,23 @@ try {
 } catch {
   $ResolvedRuntimeRoot = $RuntimeRoot
 }
+$ReleaseManifestPath = Join-Path $ResolvedRuntimeRoot "manifest.json"
+if (-not (Test-Path -LiteralPath $ReleaseManifestPath -PathType Leaf)) {
+  throw "Integrated acceptance requires the exact runtime package manifest: $ReleaseManifestPath"
+}
+$ReleaseManifest = Get-Content -LiteralPath $ReleaseManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ([string]$ReleaseManifest.schema -ne "steel.runtime-package.v1" -or
+    [string]::IsNullOrWhiteSpace([string]$ReleaseManifest.releaseVersion) -or
+    [string]$ReleaseManifest.source.gitCommit -notmatch "^[0-9a-f]{40,64}$") {
+  throw "Runtime package manifest does not expose a valid release version and commit."
+}
+$ReleaseIdentity = [ordered]@{
+  version = [string]$ReleaseManifest.releaseVersion
+  commit = [string]$ReleaseManifest.source.gitCommit
+  packageClass = [string]$ReleaseManifest.packageClass
+  manifestPath = $ReleaseManifestPath
+  manifestSha256 = (Get-FileHash -LiteralPath $ReleaseManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
 
 try {
   $LayoutScript = if ($SourceMode) {
@@ -309,6 +330,21 @@ try {
   }
   $LayoutArgs = @("-RuntimeRoot", $ResolvedRuntimeRoot)
   $null = Add-CheckResult -Checks $Checks -Id "runtime-layout" -ScriptPath $LayoutScript -Arguments $LayoutArgs -Skipped:$SkipRuntimeLayout
+
+  $TriggerSecurityScript = if ($SourceMode) {
+    Resolve-RepoScript "scripts\test-trigger-gateway-security.ps1"
+  } else {
+    Resolve-RuntimeScript "test-trigger-gateway-security.ps1"
+  }
+  $PackagedGatewayExe = @(
+    (Join-Path $ResolvedRuntimeRoot "service\steel-trigger-gateway.exe"),
+    (Join-Path $ResolvedRuntimeRoot "trigger\steel-trigger-gateway.exe")
+  ) | Where-Object { Test-Path $_ -PathType Leaf } | Select-Object -First 1
+  $TriggerSecurityArgs = @("-LogRoot", (Join-Path $ReportDir "trigger-security"))
+  if (-not [string]::IsNullOrWhiteSpace($PackagedGatewayExe)) {
+    $TriggerSecurityArgs += @("-GatewayExe", $PackagedGatewayExe)
+  }
+  $null = Add-CheckResult -Checks $Checks -Id "trigger-security" -ScriptPath $TriggerSecurityScript -Arguments $TriggerSecurityArgs
 
   $ReadyScript = if ($SourceMode) {
     Resolve-RepoScript "scripts\test-integrated-runtime-ready.ps1"
@@ -440,6 +476,7 @@ try {
       "-ClientOrigin", $ClientOrigin,
       "-CaptureRoot", $CaptureRoot,
       "-AlgorithmRoot", $AlgorithmRoot,
+      "-ReleaseManifestPath", $ReleaseManifestPath,
       "-ExpectedCameras", [string]$ExpectedCameras,
       "-DurationSec", [string]$StabilityDurationSec,
       "-IntervalSec", [string]$StabilityIntervalSec,
@@ -452,7 +489,10 @@ try {
       $StabilityArgs += "-SkipClient"
     }
     if ($StabilityUseTriggerGateway) {
-      $StabilityArgs += "-UseTriggerGateway"
+      if ([string]::IsNullOrWhiteSpace($AdminToken)) {
+        throw "StabilityUseTriggerGateway requires -AdminToken or STEEL_ADMIN_TOKEN for audited trigger mutations."
+      }
+      $StabilityArgs += @("-UseTriggerGateway", "-AdminToken", $AdminToken)
     }
     $null = Add-CheckResult -Checks $Checks -Id "short-stability" -ScriptPath $StabilityScript -Arguments $StabilityArgs
   } else {
@@ -489,6 +529,7 @@ try {
 }
 
 $RuntimeCheck = Get-CheckById -Checks $Checks -Id "runtime-layout"
+$TriggerSecurityCheck = Get-CheckById -Checks $Checks -Id "trigger-security"
 $ReadyCheck = Get-CheckById -Checks $Checks -Id "live-ready"
 $HardwareCheck = Get-CheckById -Checks $Checks -Id "real-hardware"
 $CalibrationCheck = Get-CheckById -Checks $Checks -Id "real-calibration"
@@ -505,25 +546,30 @@ $CoverageItems = @(
       -Check $RuntimeCheck `
       -Evidence "test-runtime-layout.ps1"),
   (New-CoverageItem `
+      -Id "production-trigger-security" `
+      -Label "production HTTP/TCP/UDP trigger ingress requires HMAC-SHA256, rejects replays, enforces source policy, locks mode mutation, redacts status, and emits no wildcard CORS" `
+      -Check $TriggerSecurityCheck `
+      -Evidence "test-trigger-gateway-security.ps1"),
+  (New-CoverageItem `
       -Id "live-stack" `
       -Label "capture provider, Rust service, trigger gateway, network monitor and terminal client are reachable" `
       -Check $ReadyCheck `
       -Evidence "test-integrated-runtime-ready.ps1"),
   (New-CoverageItem `
-      -Id "real-hardware-six-camera" `
-      -Label "real SDK provider sees six cameras, H-drive storage roots, and current camera configuration" `
+      -Id "real-hardware-eight-camera" `
+      -Label "real SDK provider sees eight cameras, H-drive storage roots, and current camera configuration" `
       -Check $HardwareCheck `
       -Evidence "test-real-hardware-acceptance.ps1"),
   (New-CoverageItem `
       -Id "real-calibration-apply-rollback" `
-      -Label "real six-camera SDK calibration passes local file/SN preflight, Rust dry-run, apply ledger, explicit rollback, readiness reopening and a validation capture" `
+      -Label "real eight-camera SDK calibration passes local file/SN preflight, Rust dry-run, apply ledger, explicit rollback, readiness reopening and a validation capture" `
       -Check $CalibrationCheck `
       -Evidence "test-real-calibration-acceptance.ps1 -RunApplyRollback" `
       -ExtraCondition (-not [string]::IsNullOrWhiteSpace($CalibrationPlanPath) -and [bool]$RunCalibrationApplyRollback) `
       -SkipReason $(if ([string]::IsNullOrWhiteSpace($CalibrationPlanPath)) { "calibration plan was not provided" } elseif (-not $RunCalibrationApplyRollback) { "real calibration apply/rollback was not requested" } else { "" })),
   (New-CoverageItem `
       -Id "real-calibration-crash-recovery" `
-      -Label "controlled process crashes during apply and rollback both persist an unresolved Rust row, close readiness, recover from staged files, reconcile the exact parent, and finish with six validation frames" `
+      -Label "controlled process crashes during apply and rollback both persist an unresolved Rust row, close readiness, recover from staged files, reconcile the exact parent, and finish with eight validation frames" `
       -Check $CalibrationCrashRecoveryCheck `
       -Evidence "test-real-calibration-crash-recovery.ps1 Prepare/Resume for ApplyCrash and RollbackCrash" `
       -ExtraCondition (-not [string]::IsNullOrWhiteSpace($ApplyCrashRecoveryReportPath) -and -not [string]::IsNullOrWhiteSpace($RollbackCrashRecoveryReportPath)) `
@@ -542,7 +588,7 @@ $CoverageItems = @(
       -Evidence "test-runtime-ui-smoke.ps1"),
   (New-CoverageItem `
       -Id "production-trigger-storage" `
-      -Label "production steel-in/capture/steel-out flow stores depth, intensity and metadata under H:\camera1..camera6 with sdk-derived disabled" `
+      -Label "production steel-in/capture/steel-out flow stores depth, intensity and metadata under H:\camera1..camera8 with sdk-derived disabled" `
       -Check $StabilityCheck `
       -Evidence "test-production-stability.ps1" `
       -ExtraCondition ([bool]$RunShortStability)),
@@ -555,7 +601,7 @@ $CoverageItems = @(
       -SkipReason $(if (-not $RunShortStability) { "short stability was not run" } elseif (-not $StabilityUseTriggerGateway) { "trigger gateway route was not requested" } else { "" })),
   (New-CoverageItem `
       -Id "bar-surface-e2e" `
-      -Label "latest six-camera capture can run calibrated 3D reconstruction, artifact indexing and acceptance checks" `
+      -Label "latest eight-camera capture can run calibrated 3D reconstruction, artifact indexing and acceptance checks" `
       -Check $BarSurfaceCheck `
       -Evidence "test-bar-surface-e2e.ps1" `
       -ExtraCondition ([bool]$RunBarSurface))
@@ -576,6 +622,7 @@ if ($RequireFullCoverage -and $UncoveredItems.Count -gt 0) {
 
 $Report = [ordered]@{
   schema = "steel.integrated-capture-management.acceptance.v1"
+  release = $ReleaseIdentity
   code = if ($Failures.Count -eq 0 -and @($Checks | Where-Object { $_.ok -eq $false }).Count -eq 0) { 0 } else { 1 }
   runId = $RunId
   checkedAt = (Get-Date).ToString("o")

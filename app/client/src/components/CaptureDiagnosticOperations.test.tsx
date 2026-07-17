@@ -38,7 +38,7 @@ vi.mock('../lib/capture-api', async (importOriginal) => ({
   ...api,
 }));
 
-const cameraIps = Array.from({ length: 6 }, (_, index) => `192.168.${101 + index}.100`);
+const cameraIps = Array.from({ length: 8 }, (_, index) => `192.168.${101 + index}.100`);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -58,7 +58,7 @@ beforeEach(() => {
         message: 'preflight passed; no SDK call made',
       }],
     }
-    : { code: 0, dryRun: false, applied: 6, failed: 0, rollbackToken: 'rollback-1', results: [] });
+    : { code: 0, dryRun: false, applied: 8, failed: 0, rollbackToken: 'rollback-1', results: [] });
   api.applyCaptureLineContinuousPreset.mockResolvedValue({ code: 0, applied: 2, failed: 0 });
   api.captureValidationFrame.mockResolvedValue({ code: 0, output: 'validation.png', imageUrl: '/validation.png' });
   api.loadCaptureCalibration.mockResolvedValue({ code: 0, calibrationCode: 0 });

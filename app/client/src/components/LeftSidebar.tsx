@@ -1,6 +1,7 @@
 import { AlertTriangle, ChevronLeft, ChevronRight, RotateCcw, Search } from 'lucide-react';
 import { useState, type ChangeEvent, type FormEvent } from 'react';
-import type { InspectionRecord, InspectionSummary, SteelPlate } from '../data/inspection';
+import { createPortal } from 'react-dom';
+import type { InspectionRecord, InspectionSummary, PlateInspection, SteelPlate } from '../data/inspection';
 import { emptyRecordSearchFilters, type RecordSearchFilters } from '../state/record-search';
 import { Panel } from './Panel';
 
@@ -23,6 +24,7 @@ interface LeftSidebarProps {
   plate: SteelPlate;
   summary: InspectionSummary;
   records: InspectionRecord[];
+  inspections?: PlateInspection[];
   selectedRecordId: string;
   page: number;
   pageCount: number;
@@ -63,6 +65,7 @@ export function LeftSidebar({
   plate,
   summary,
   records,
+  inspections = [],
   selectedRecordId,
   page,
   pageCount,
@@ -75,8 +78,14 @@ export function LeftSidebar({
   onSearchReset,
 }: LeftSidebarProps) {
   const [activeSearchField, setActiveSearchField] = useState<RecordSearchField>('serialNo');
+  const [hoveredRecord, setHoveredRecord] = useState<{ record: InspectionRecord; left: number; top: number } | null>(null);
   const activeSearchOption = recordSearchOptions.find((option) => option.field === activeSearchField) ?? recordSearchOptions[0];
   const activeSearchValue = searchFilters[activeSearchField];
+  const hoveredInspection = hoveredRecord
+    ? inspections.find((inspection) => inspection.inspectionId === hoveredRecord.record.id)
+      ?? inspections.find((inspection) => inspection.plate.plateNo === hoveredRecord.record.plateNo)
+      ?? null
+    : null;
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -95,6 +104,15 @@ export function LeftSidebar({
   const handleSearchReset = () => {
     setActiveSearchField('serialNo');
     onSearchReset();
+  };
+
+  const showRecordDetail = (record: InspectionRecord, element: HTMLElement) => {
+    const rect = element.getBoundingClientRect();
+    setHoveredRecord({
+      record,
+      left: Math.min(rect.right + 10, window.innerWidth - 354),
+      top: Math.max(56, Math.min(rect.top - 18, window.innerHeight - 390)),
+    });
   };
 
   return (
@@ -192,8 +210,15 @@ export function LeftSidebar({
                 records.map((record) => (
                   <tr
                     key={record.id}
+                    tabIndex={0}
                     className={record.plateNo === selectedRecordId ? 'selected' : ''}
                     onClick={() => onRecordSelect(record.plateNo)}
+                    onMouseEnter={(event) => showRecordDetail(record, event.currentTarget)}
+                    onPointerEnter={(event) => showRecordDetail(record, event.currentTarget)}
+                    onMouseLeave={() => setHoveredRecord(null)}
+                    onPointerLeave={() => setHoveredRecord(null)}
+                    onFocus={(event) => showRecordDetail(record, event.currentTarget)}
+                    onBlur={() => setHoveredRecord(null)}
                   >
                     <td>{record.time}</td>
                     <td>{record.plateNo}</td>
@@ -223,6 +248,39 @@ export function LeftSidebar({
           </button>
         </div>
       </Panel>
+      {hoveredRecord && typeof document !== 'undefined' ? createPortal(
+        <aside
+          className="record-hover-detail"
+          style={{ left: hoveredRecord.left, top: hoveredRecord.top }}
+          role="tooltip"
+          aria-label={`${hoveredRecord.record.plateNo} 检测记录详情`}
+        >
+          <header>
+            <span>检测记录详情</span>
+            <strong>{hoveredRecord.record.plateNo}</strong>
+          </header>
+          <dl>
+            <div><dt>检测时间</dt><dd>{hoveredRecord.record.time}</dd></div>
+            <div><dt>记录状态</dt><dd className={hoveredRecord.record.status}>{hoveredRecord.record.status === 'detecting' ? '检测中' : '已完成'}</dd></div>
+            <div><dt>缺陷总数</dt><dd>{hoveredRecord.record.defectCount}</dd></div>
+            <div><dt>采集产物</dt><dd>{hoveredInspection?.captureImages?.length ?? 0} 件</dd></div>
+            <div><dt>规格/钢种</dt><dd>{hoveredInspection?.plate.steelGrade || '—'}</dd></div>
+            <div><dt>外径/宽度</dt><dd>{hoveredInspection?.plate.widthMm ?? 0} mm</dd></div>
+            <div><dt>长度</dt><dd>{hoveredInspection?.plate.lengthMm ?? 0} mm</dd></div>
+            <div><dt>壁厚</dt><dd>{hoveredInspection?.plate.thicknessMm ?? 0} mm</dd></div>
+          </dl>
+          <section>
+            <strong>缺陷分布</strong>
+            <div className="record-hover-severity">
+              <span>严重 <b>{hoveredInspection?.defects.filter((defect) => defect.severity === 'severe').length ?? 0}</b></span>
+              <span>待复核 <b>{hoveredInspection?.defects.filter((defect) => defect.severity === 'review').length ?? 0}</b></span>
+              <span>轻微 <b>{hoveredInspection?.defects.filter((defect) => defect.severity === 'minor').length ?? 0}</b></span>
+            </div>
+          </section>
+          <footer>{hoveredInspection?.inspectionId || hoveredRecord.record.id}</footer>
+        </aside>,
+        document.body,
+      ) : null}
     </aside>
   );
 }

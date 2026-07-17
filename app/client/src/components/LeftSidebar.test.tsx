@@ -60,6 +60,19 @@ function SidebarHarness() {
 }
 
 describe('LeftSidebar', () => {
+  it('shows record details beside the table while a row is hovered', () => {
+    render(<SidebarHarness />);
+
+    const row = screen.getByText('202606131858').closest('tr');
+    expect(row).not.toBeNull();
+    fireEvent.mouseEnter(row!);
+
+    expect(screen.getByRole('tooltip')).toHaveTextContent('202606131858');
+    expect(screen.getByRole('tooltip')).toHaveTextContent('8');
+    fireEvent.mouseLeave(row!);
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+  });
+
   it('uses a right-side dropdown to switch record search condition', () => {
     render(<SidebarHarness />);
 

@@ -3,7 +3,7 @@ import type { ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType } from '../data/inspection';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
-import { PlateMap as ProductionPlateMap } from './PlateMap';
+import { cameraBandRotationRadians, PlateMap as ProductionPlateMap } from './PlateMap';
 
 // These legacy interaction cases intentionally exercise the bundled demo/test
 // visualization. Production behavior is covered separately below.
@@ -15,6 +15,13 @@ const defectTypes: DefectType[] = [
   { id: 'pit', label: '凹坑', color: '#2f6bff', shape: 'circle' },
   { id: 'roll', label: '辊印', color: '#ff7f1f', shape: 'square' },
 ];
+
+describe('line-scan image orientation', () => {
+  it('keeps acquisition rows vertical and rotates them toward the right in horizontal mode', () => {
+    expect(cameraBandRotationRadians('vertical')).toBe(0);
+    expect(cameraBandRotationRadians('horizontal')).toBe(-Math.PI / 2);
+  });
+});
 
 const defects: DefectItem[] = [
   {
@@ -120,7 +127,7 @@ describe('PlateMap', () => {
     expect(onToggleType).toHaveBeenCalledWith('roll');
   });
 
-  it('renders a single six-camera unfolded map instead of top and bottom surfaces', () => {
+  it('renders a single eight-camera unfolded map instead of top and bottom surfaces', () => {
     const onSurfaceModeChange = vi.fn();
     render(
       <PlateMap
@@ -140,14 +147,38 @@ describe('PlateMap', () => {
     );
 
     expect(screen.getByRole('heading', { name: '棒材圆周展开缺陷图' })).toBeInTheDocument();
-    expect(screen.getByRole('region', { name: '六相机圆周展开缺陷图' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: '8 相机圆周展开缺陷图' })).toBeInTheDocument();
     expect(screen.getByTestId('bar-unfolded-map')).toBeInTheDocument();
     expect(screen.queryByRole('group', { name: '相机区显示切换' })).not.toBeInTheDocument();
     expect(screen.queryByText('上表面')).not.toBeInTheDocument();
     expect(screen.queryByText('下表面')).not.toBeInTheDocument();
     expect(screen.getByText('camera1')).toBeInTheDocument();
-    expect(screen.getByText('camera6')).toBeInTheDocument();
+    expect(screen.getByText('camera8')).toBeInTheDocument();
     expect(onSurfaceModeChange).not.toHaveBeenCalled();
+  });
+
+  it('expands one camera on double click and restores the eight-camera view', () => {
+    render(
+      <PlateMap
+        defectTypes={defectTypes}
+        defects={[]}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId={null}
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'camera1 采集图像，双击展开' }));
+    expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-expanded-camera', 'camera1');
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'camera1 采集图像，已展开，双击恢复' }));
+    expect(screen.getByTestId('bar-unfolded-map')).not.toHaveAttribute('data-expanded-camera');
   });
 
   it('keeps the existing map as 2D and can switch to the 3D plate view', () => {
@@ -355,7 +386,7 @@ describe('PlateMap', () => {
       />,
     );
 
-    const unfoldedMap = screen.getByRole('region', { name: '六相机圆周展开缺陷图' });
+    const unfoldedMap = screen.getByRole('region', { name: '8 相机圆周展开缺陷图' });
     fireEvent.keyDown(unfoldedMap, { key: 'ArrowRight' });
     expect(onSelectDefect).toHaveBeenLastCalledWith('D-BOTTOM');
 
@@ -376,7 +407,7 @@ describe('PlateMap', () => {
       />,
     );
 
-    const rerenderedMap = screen.getByRole('region', { name: '六相机圆周展开缺陷图' });
+    const rerenderedMap = screen.getByRole('region', { name: '8 相机圆周展开缺陷图' });
     fireEvent.wheel(rerenderedMap, { deltaY: -120 });
     expect(onSelectDefect).toHaveBeenLastCalledWith('D-TOP');
 
@@ -447,7 +478,7 @@ describe('PlateMap', () => {
     expect(onPreviewPositionChange).toHaveBeenLastCalledWith(5.9);
   });
 
-  it('renders the preview cursor on the unfolded six-camera map', () => {
+  it('renders the preview cursor on the unfolded eight-camera map', () => {
     render(
       <PlateMap
         defectTypes={defectTypes}

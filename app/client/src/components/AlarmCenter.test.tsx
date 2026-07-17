@@ -176,4 +176,39 @@ describe('AlarmCenter', () => {
     expect(screen.getByLabelText('确认说明 ALARM-ACTIVE')).toHaveValue('准备确认');
     expect(screen.getByRole('button', { name: '提交确认' })).toBeEnabled();
   });
+
+  it('renders an automatically recovered system-health episode as immutable history', async () => {
+    const recovered = makeAlarm('resolved', {
+      id: 'ALARM-HEALTH-001',
+      source: 'system-health',
+      type: 'storage-capacity-warning',
+      severity: 'warning',
+      materialId: '',
+      sessionId: '',
+      inspectionId: '',
+      cameraId: '',
+      message: '存储容量接近生产水位，请安排归档或清理。',
+      details: {
+        schema: 'steel.system-health.alarm.v1',
+        check: 'storage',
+        freePercent: 12,
+      },
+      acknowledgedBy: 'system-health-monitor',
+      acknowledgeNote: '系统检测到运行条件已恢复，自动确认并关闭告警。',
+      resolvedBy: 'system-health-monitor',
+      resolveNote: '系统健康监视器确认运行条件已恢复。',
+    });
+    alarmApiMocks.fetchAlarmPage.mockImplementation(async (filter: { status?: string }) => (
+      makePage(filter.status === 'history' ? [recovered] : [])
+    ));
+
+    render(<AlarmCenter pollIntervalMs={0} />);
+    expect(await screen.findByText('当前没有符合条件的活动报警')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: '历史报警' }));
+
+    expect(await screen.findByText(recovered.message)).toBeInTheDocument();
+    expect(screen.getByText('system-health')).toBeInTheDocument();
+    expect(screen.getAllByText('system-health-monitor')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: /报警 ALARM-HEALTH-001/ })).not.toBeInTheDocument();
+  });
 });

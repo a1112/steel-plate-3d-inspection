@@ -34,6 +34,8 @@
 
 #include "capture_service_app.h"
 #include "calibration_contract.h"
+#include "capture_concurrency_policy.h"
+#include "capture_health_policy.h"
 #include "capture_path_policy.h"
 #include "owned_worker_registry.h"
 #include "storage_thread_pool.h"
@@ -131,7 +133,7 @@ class CaptureSdkOwnerMutex {
       return true;
     }
     if (wait_result == WAIT_TIMEOUT) {
-      error_ = "another steel_capture_service or Qt embedded capture API already owns the camera SDK";
+      error_ = "another steel_capture_service process already owns the camera SDK";
     } else {
       const DWORD error = GetLastError();
       error_ = "cannot acquire SDK owner mutex (Win32 " + std::to_string(error) +
@@ -1036,8 +1038,10 @@ std::vector<std::string> default_clockwise_camera_ips() {
       "192.168.102.100",
       "192.168.103.100",
       "192.168.104.100",
-      "192.168.105.13",
+      "192.168.105.100",
       "192.168.106.100",
+      "192.168.107.100",
+      "192.168.108.100",
   };
 }
 
@@ -1567,10 +1571,12 @@ bool route_allowed_when_sdk_capture_poisoned(const std::string& method,
                                              const std::string& path) {
   if (method == "GET") {
     return path == "/" || path == "/ui" || path == "/health" ||
-           path == "/api/capture/health" || path == "/api/storage/status" ||
+           path == "/api/capture/health" || path == "/api/capture/logs" ||
+           path == "/api/storage/status" ||
            path == "/api/config/status" || path == "/api/config/profiles" ||
            path == "/api/config/profile" || path == "/api/capture/file" ||
            path == "/api/capture/latest" || path == "/api/steel/status" ||
+           path == "/api/capture/continuous-settings" ||
            path == "/api/stream/status" || path == "/api/stream/latest" ||
            path == "/api/calibration/active" || path == "/api/calibration/status";
   }
@@ -1580,6 +1586,7 @@ bool route_allowed_when_sdk_capture_poisoned(const std::string& method,
            path == "/api/config/profile/save" ||
            path == "/api/config/profile/import" ||
            path == "/api/calibration/active" ||
+           path == "/api/steel/capture-mode" ||
            path == "/api/steel/event";
   }
   return method == "OPTIONS";
@@ -1615,6 +1622,7 @@ class CaptureRuntime {
     std::lock_guard<std::mutex> lock(mutex_);
     shutting_down_.store(false, std::memory_order_release);
     driver_mode_ = mode;
+    capture_logs_.push_front({now_iso(), "info", "", "Capture provider configured"});
     load_active_profile_settings_locked(true);
     // run_capture_service_app acquires the global SDK owner mutex before
     // configure(), so persisted generation state cannot be raced by another
@@ -1623,6 +1631,7 @@ class CaptureRuntime {
     if (force_driver_mode) {
       driver_mode_ = mode;
     }
+    auto_connect_active_profile_locked();
   }
 
   RouteResult route(const std::string& method, const std::string& path, const std::string& query, const std::string& body) {
@@ -1636,6 +1645,13 @@ class CaptureRuntime {
     }
     if (method == "GET" && (path == "/" || path == "/ui")) {
       return {200, ui_html(), "text/html; charset=utf-8"};
+    }
+    if (method == "GET" && path == "/api/capture/logs") {
+      return {200, capture_logs_json()};
+    }
+    if (method == "POST") {
+      record_capture_log("info", json_string_field(body, "ip"),
+                         "Provider received " + method + " " + path);
     }
     bool recovery_required = false;
     bool invalid_manifest = false;
@@ -1695,12 +1711,15 @@ class CaptureRuntime {
     if (method == "POST" && path == "/api/param/load-file") return {200, param_load_file_json(body)};
     if (method == "POST" && path == "/api/param/recovery") return {200, param_recovery_json(body)};
     if (method == "POST" && path == "/api/capture/preset/line-continuous") return {200, capture_line_continuous_preset_json(body)};
+    if (method == "GET" && path == "/api/capture/continuous-settings") return {200, continuous_settings_json()};
+    if (method == "POST" && path == "/api/capture/continuous-settings") return {200, continuous_settings_json(body)};
     if (method == "POST" && (path == "/api/preview/capture" || path == "/api/capture/preview")) return {200, preview_capture_json(body)};
     if (method == "POST" && path == "/api/capture/depth-map") return {200, capture_depth_json(body)};
     if (method == "POST" && path == "/api/capture/continuous-test") return {200, continuous_capture_test_json(body)};
     if (method == "GET" && path == "/api/capture/file") return capture_file_response(query);
     if (method == "GET" && path == "/api/capture/latest") return capture_latest_response(query);
     if (method == "GET" && path == "/api/steel/status") return {200, steel_status_json()};
+    if (method == "POST" && path == "/api/steel/capture-mode") return {200, steel_capture_mode_json(body)};
     if (method == "POST" && path == "/api/steel/event") return {200, steel_event_json(body)};
     if (method == "POST" && path == "/api/stream/start") return {200, stream_start_json(body)};
     if (method == "POST" && path == "/api/stream/stop") return {200, stream_stop_json(body)};
@@ -1726,21 +1745,26 @@ class CaptureRuntime {
       return false;
     }
 
-    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     int active_batches = 0;
     for (;;) {
       {
         std::lock_guard<std::mutex> lock(mutex_);
         active_batches = active_capture_batches_;
       }
-      if (active_batches == 0 &&
+      bool production_running = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        production_running = production_capture_running_;
+      }
+      if (active_batches == 0 && !production_running &&
           g_inflight_routes.load(std::memory_order_acquire) == 0 &&
           g_socket_clients.load(std::memory_order_acquire) == 0) {
         break;
       }
       if (std::chrono::steady_clock::now() >= drain_deadline) {
         std::cerr << "Capture shutdown timed out with " << active_batches
-                  << " capture batch(es), "
+                  << " capture batch(es), production running=" << production_running << ", "
                   << g_inflight_routes.load(std::memory_order_acquire)
                   << " route(s), and "
                   << g_socket_clients.load(std::memory_order_acquire)
@@ -1811,13 +1835,13 @@ class CaptureRuntime {
 
  private:
   struct ProductionCaptureSettings {
-    int lines = 1000;
+    int lines = 1280;
     int width = 0;
     int timeout_ms = 8000;
     int data_mode = 3;
     int retries = 0;
     int control_mode = 0;
-    int interval_ms = 500;
+    int interval_ms = 0;
     bool discard_black_frames = true;
     bool save_sdk_derived = false;
     double black_frame_threshold = 8.0;
@@ -1842,6 +1866,8 @@ class CaptureRuntime {
     std::string updated_at;
     std::string latest_depth_path;
     std::string latest_intensity_path;
+    unsigned long long last_frame_tick_ms = 0;
+    std::deque<unsigned long long> frame_ticks;
     lvm_buf_t* buffer = nullptr;
     std::chrono::steady_clock::time_point last_saved = std::chrono::steady_clock::time_point::min();
   };
@@ -1932,6 +1958,19 @@ class CaptureRuntime {
     std::string message;
   };
 
+  // Production acquisition has a different lifetime from the asynchronous
+  // preview stream.  Keep its telemetry on the camera session so a stopped
+  // preview cannot erase the cadence observed by the continuous worker.
+  struct ContinuousCaptureState {
+    unsigned long long finalized_count = 0;
+    unsigned long long frame_count = 0;
+    unsigned long long successful_frame_count = 0;
+    int last_result_code = 0;
+    unsigned long long last_frame_tick_ms = 0;
+    std::string last_frame_at;
+    std::deque<unsigned long long> frame_ticks;
+  };
+
   struct CameraSession {
     lvm_dev_t* device = nullptr;
     std::string ip;
@@ -1947,6 +1986,7 @@ class CaptureRuntime {
     int simulated_capture_sequence = 0;
     std::map<std::string, std::string> params;
     StreamState stream;
+    ContinuousCaptureState continuous;
     CalibrationState calibration;
     std::shared_ptr<std::timed_mutex> capture_mutex = std::make_shared<std::timed_mutex>();
   };
@@ -1965,7 +2005,11 @@ class CaptureRuntime {
     std::string capture_dir;
     std::string summary_path;
     std::string inspection_id;
-    std::string acquisition_mode = "external-trigger";
+    std::string acquisition_mode = "software-trigger-continuous";
+    // This is deliberately independent of acquisition_mode. The latter
+    // describes where the steel-in/out signal came from, while capture_mode
+    // controls whether the provider keeps requesting camera frames.
+    std::string capture_mode = "continuous";
     std::string capture_save_state = "discard";
     std::string algorithm_phase = "pending";
     std::string session_started_at;
@@ -2122,9 +2166,13 @@ class CaptureRuntime {
     std::filesystem::create_directories(stream_dir);
     std::string safe_ip = safe_path_segment(session->ip);
     std::string depth_path = (stream_dir / (safe_ip + "-latest-depth.png")).lexically_normal().string();
+    // The LVM online saver appends `_depthMap` to the supplied PNG stem.
+    // Publish that real output path; keeping `depth_path` here causes the
+    // stream endpoint to return 404 even though frames are being acquired.
+    std::string sdk_depth_path = sibling_output_path(depth_path, "_depthMap", ".png");
     int ret = lvm_save_depth_map(dev, depth_path.c_str(), depth_map);
     if (ret == CORRECT) {
-      session->stream.latest_depth_path = depth_path;
+      session->stream.latest_depth_path = sdk_depth_path;
     }
     if (depth_map->intensity_img && depth_map->intensity_img->data) {
       std::string intensity_path = (stream_dir / (safe_ip + "-latest-intensity.png")).lexically_normal().string();
@@ -2139,6 +2187,7 @@ class CaptureRuntime {
     }
     session->stream.code = ret;
     session->stream.frame_count += 1;
+    record_stream_frame_tick_locked(session->stream);
     session->stream.fid = depth_map->head.fid;
     session->stream.sid = depth_map->head.sid;
     session->stream.width = static_cast<int>(depth_map->head.width);
@@ -2881,6 +2930,14 @@ class CaptureRuntime {
         std::error_code remove_error;
         std::filesystem::remove(probe, remove_error);
       }
+      error.clear();
+      const std::filesystem::space_info capacity = std::filesystem::space(item.second, error);
+      const bool capacity_available = !error && capacity.capacity > 0;
+      const std::uintmax_t capacity_bytes = capacity_available ? capacity.capacity : 0;
+      const std::uintmax_t free_bytes = capacity_available ? capacity.available : 0;
+      const double free_percent = capacity_available
+          ? (static_cast<double>(free_bytes) * 100.0 / static_cast<double>(capacity_bytes))
+          : 0.0;
       if (!first) {
         roots_json << ",";
       }
@@ -2889,7 +2946,11 @@ class CaptureRuntime {
                  << json_pair("ip", item.first) << ","
                  << json_pair("root", item.second.string()) << ","
                  << "\"exists\":" << (exists ? "true" : "false") << ","
-                 << "\"writable\":" << (writable ? "true" : "false")
+                 << "\"writable\":" << (writable ? "true" : "false") << ","
+                 << "\"capacityAvailable\":" << (capacity_available ? "true" : "false") << ","
+                 << "\"capacityBytes\":" << capacity_bytes << ","
+                 << "\"freeBytes\":" << free_bytes << ","
+                 << "\"freePercent\":" << std::fixed << std::setprecision(3) << free_percent
                  << "}";
     }
     roots_json << "]";
@@ -2912,6 +2973,11 @@ class CaptureRuntime {
          << "\"highWaterItems\":" << stats.high_water_items << ","
          << "\"highWaterBytes\":" << stats.high_water_bytes << ","
          << "\"completed\":" << stats.completed << ","
+         << "\"completedBytes\":" << stats.completed_bytes << ","
+         << "\"recentCompletedBytes\":" << stats.recent_completed_bytes << ","
+         << "\"recentWindowSeconds\":" << stats.recent_window_seconds << ","
+         << "\"recentWriteBytesPerSecond\":" << std::fixed << std::setprecision(3)
+         << stats.recent_write_bytes_per_second << ","
          << "\"failed\":" << stats.failed << ","
          << "\"rejected\":" << stats.rejected << ","
          << "\"enqueueTimeoutMs\":" << storage_enqueue_timeout_ms_ << ","
@@ -2943,11 +3009,23 @@ class CaptureRuntime {
       std::error_code remove_error;
       std::filesystem::remove(probe, remove_error);
     }
+    error.clear();
+    const std::filesystem::space_info capacity = std::filesystem::space(storage_root_, error);
+    const bool capacity_available = !error && capacity.capacity > 0;
+    const std::uintmax_t capacity_bytes = capacity_available ? capacity.capacity : 0;
+    const std::uintmax_t free_bytes = capacity_available ? capacity.available : 0;
+    const double free_percent = capacity_available
+        ? (static_cast<double>(free_bytes) * 100.0 / static_cast<double>(capacity_bytes))
+        : 0.0;
     std::ostringstream json;
     json << "{\"code\":" << code << ","
          << json_pair("root", storage_root_.string()) << ","
          << "\"exists\":" << (exists ? "true" : "false") << ","
          << "\"writable\":" << (writable ? "true" : "false") << ","
+         << "\"capacityAvailable\":" << (capacity_available ? "true" : "false") << ","
+         << "\"capacityBytes\":" << capacity_bytes << ","
+         << "\"freeBytes\":" << free_bytes << ","
+         << "\"freePercent\":" << std::fixed << std::setprecision(3) << free_percent << ","
          << "\"cameraRoots\":" << camera_storage_roots_status_json_locked() << ","
          << "\"queue\":" << storage_queue_status_json()
          << "}";
@@ -3556,6 +3634,63 @@ class CaptureRuntime {
     }
   }
 
+  void auto_connect_active_profile_locked() {
+    const std::string active = active_profile_name_locked();
+    std::string profile;
+    if (!read_file(existing_profile_path_locked(active).string(), profile) ||
+        !json_bool_field(profile, "autoConnect", false)) {
+      return;
+    }
+
+    const int dev_type = json_int_field(profile, "devType", -1);
+    int discover_ret = CORRECT;
+    const std::vector<std::string> ips = discovered_ips_locked(discover_ret);
+    int connected = 0;
+    int failed = 0;
+    int first_error = discover_ret;
+    if (discover_ret == CORRECT) {
+      for (const std::string& ip : ips) {
+        bool already_connected = false;
+        const int ret = connect_one_locked(ip, dev_type, &already_connected);
+        if (ret == CORRECT) {
+          ++connected;
+        } else {
+          ++failed;
+          if (first_error == CORRECT) {
+            first_error = ret;
+          }
+        }
+      }
+    }
+
+    const bool expected_met = connected == expected_cameras_ &&
+                              static_cast<int>(ips.size()) == expected_cameras_ &&
+                              failed == 0;
+    if (expected_met && continuous_capture_enabled_locked() &&
+        calibration_rollback_manifest_set_valid_ &&
+        pending_calibration_recovery_count_locked() == 0 &&
+        (driver_mode_ == DriverMode::Simulated ||
+         !sdk_capture_restart_required())) {
+      start_production_capture_worker_locked("{}");
+    }
+    capture_logs_.push_front(
+        {now_iso(),
+         expected_met ? "info" : "error",
+         "",
+         "Active profile startup auto-connect " +
+             std::string(expected_met ? "completed" : "failed") +
+             ": profile=" + active +
+             ", discovered=" + std::to_string(ips.size()) +
+             ", connected=" + std::to_string(connected) +
+             ", failed=" + std::to_string(failed) +
+             ", expected=" + std::to_string(expected_cameras_) +
+             ", code=" + std::to_string(first_error)});
+    constexpr std::size_t kCaptureLogLimit = 200;
+    while (capture_logs_.size() > kCaptureLogLimit) {
+      capture_logs_.pop_back();
+    }
+  }
+
   int apply_profile_params_locked(lvm_dev_t* device, const std::string& profile) {
     if (!device) {
       return DEV_NOT_LINK_ERROR;
@@ -3882,6 +4017,7 @@ class CaptureRuntime {
     bool load_camera_params = json_bool_field(body, "loadCameraParams", json_bool_field(profile, "loadCameraParams", false));
     bool save_to_device = json_bool_field(body, "saveToDevice", json_bool_field(profile, "saveToDevice", false));
     bool allow_external = json_bool_field(body, "allowExternal", false);
+    bool apply_camera_params = json_bool_field(body, "applyCameraParams", json_bool_field(profile, "applyCameraParams", false));
     int expected_cameras = json_int_field(body, "expectedCameras", json_int_field(profile, "expectedCameras", expected_cameras_));
     int dev_type = json_int_field(body, "devType", json_int_field(profile, "devType", -1));
     std::vector<std::string> load_ips = json_string_array_field(body, "ips");
@@ -3890,9 +4026,18 @@ class CaptureRuntime {
       camera_files = json_profile_camera_files_field(profile);
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (active_capture_batches_ > 0) {
       return json_error(409, "capture batch is running");
+    }
+    if (production_capture_running_) {
+      request_stop_production_capture_worker_locked();
+      if (!production_capture_cv_.wait_for(
+              lock,
+              std::chrono::seconds(15),
+              [this]() { return !production_capture_running_; })) {
+        return json_error(409, "continuous acquisition did not stop before profile apply");
+      }
     }
     DriverMode previous_mode = driver_mode_;
     apply_profile_runtime_settings_locked(profile, change_storage);
@@ -3933,21 +4078,23 @@ class CaptureRuntime {
     std::ostringstream param_results;
     param_results << "[";
     bool first_param = true;
-    for (auto& item : sessions_) {
-      if (!first_param) {
-        param_results << ",";
-      }
-      first_param = false;
-      int ret = item.second.simulated ? CORRECT : (item.second.stream.running ? 409 : apply_profile_params_locked(item.second.device, profile));
-      if (ret == CORRECT) {
-        ++param_applied;
-      } else {
-        ++param_failed;
-        if (first_error == CORRECT) {
-          first_error = ret;
+    if (apply_camera_params) {
+      for (auto& item : sessions_) {
+        if (!first_param) {
+          param_results << ",";
         }
+        first_param = false;
+        int ret = item.second.simulated ? CORRECT : (item.second.stream.running ? 409 : apply_profile_params_locked(item.second.device, profile));
+        if (ret == CORRECT) {
+          ++param_applied;
+        } else {
+          ++param_failed;
+          if (first_error == CORRECT) {
+            first_error = ret;
+          }
+        }
+        param_results << "{\"code\":" << ret << "," << json_pair("ip", item.second.ip) << "}";
       }
-      param_results << "{\"code\":" << ret << "," << json_pair("ip", item.second.ip) << "}";
     }
     param_results << "]";
 
@@ -4009,11 +4156,16 @@ class CaptureRuntime {
     write_active_profile_locked(name);
     bool expected_met = expected_cameras <= 0 || connected >= expected_cameras || !auto_connect;
     int code = (first_error == CORRECT && expected_met) ? CORRECT : (first_error == CORRECT ? 206 : first_error);
+    if (auto_connect && connected > 0 && code == CORRECT &&
+        continuous_capture_enabled_locked()) {
+      start_production_capture_worker_locked("{}");
+    }
     std::ostringstream json;
     json << "{\"code\":" << code << ","
          << json_pair("name", name) << ","
          << "\"active\":true,"
          << "\"autoConnect\":" << (auto_connect ? "true" : "false") << ","
+         << "\"applyCameraParams\":" << (apply_camera_params ? "true" : "false") << ","
          << "\"expectedCameras\":" << expected_cameras << ","
          << "\"expectedMet\":" << (expected_met ? "true" : "false") << ","
          << "\"connected\":" << connected << ","
@@ -4137,9 +4289,6 @@ class CaptureRuntime {
     strncpy_s(ip_buffer, ip.c_str(), _TRUNCATE);
     lvm_dev_t* device = lvm_create_dev(ip_buffer, dev_type);
     int ret = device ? lvm_connect_dev(device) : DEV_INIT_FAILED;
-    if (ret == CORRECT) {
-      ret = apply_software_trigger(device);
-    }
     if (ret == CORRECT) {
       CameraSession session{};
       session.device = device;
@@ -4270,11 +4419,155 @@ class CaptureRuntime {
     return json.str();
   }
 
+  bool continuous_acquiring_for_session_locked(const CameraSession* session,
+                                               bool connected) const {
+    return session && connected && production_capture_running_ &&
+           continuous_capture_enabled_locked();
+  }
+
+  double continuous_fps_for_session_locked(const CameraSession* session) const {
+    // A depth-map is the unit of work for the production worker.  The line
+    // trigger rate remains a configuration value; it is not this FPS.
+    constexpr unsigned long long kFpsStaleAfterMs = 10000;
+    if (!session || session->continuous.frame_ticks.size() < 2 ||
+        session->continuous.last_frame_tick_ms == 0) {
+      return 0.0;
+    }
+    const unsigned long long now = GetTickCount64();
+    if (now < session->continuous.last_frame_tick_ms ||
+        now - session->continuous.last_frame_tick_ms > kFpsStaleAfterMs) {
+      return 0.0;
+    }
+    const unsigned long long first_tick = session->continuous.frame_ticks.front();
+    const unsigned long long last_tick = session->continuous.frame_ticks.back();
+    if (last_tick <= first_tick) {
+      return 0.0;
+    }
+    const double intervals =
+        static_cast<double>(session->continuous.frame_ticks.size() - 1);
+    return intervals * 1000.0 / static_cast<double>(last_tick - first_tick);
+  }
+
+  void record_stream_frame_tick_locked(StreamState& stream) {
+    constexpr std::size_t kStreamFpsWindow = 16;
+    const unsigned long long tick = GetTickCount64();
+    stream.frame_ticks.push_back(
+        stream.frame_ticks.empty() || tick >= stream.frame_ticks.back()
+            ? tick
+            : stream.frame_ticks.back());
+    while (stream.frame_ticks.size() > kStreamFpsWindow) {
+      stream.frame_ticks.pop_front();
+    }
+    stream.last_frame_tick_ms = stream.frame_ticks.back();
+  }
+
+  double stream_fps_for_session_locked(const CameraSession* session) const {
+    constexpr unsigned long long kFpsStaleAfterMs = 10000;
+    if (!session || !session->stream.running ||
+        session->stream.frame_ticks.size() < 2 ||
+        session->stream.last_frame_tick_ms == 0) {
+      return 0.0;
+    }
+    const unsigned long long now = GetTickCount64();
+    if (now < session->stream.last_frame_tick_ms ||
+        now - session->stream.last_frame_tick_ms > kFpsStaleAfterMs) {
+      return 0.0;
+    }
+    const unsigned long long first_tick = session->stream.frame_ticks.front();
+    const unsigned long long last_tick = session->stream.frame_ticks.back();
+    if (last_tick <= first_tick) {
+      return 0.0;
+    }
+    return static_cast<double>(session->stream.frame_ticks.size() - 1) * 1000.0 /
+           static_cast<double>(last_tick - first_tick);
+  }
+
+  float time_trigger_frequency_for_session_locked(
+      const CameraSession& session) const {
+    if (session.simulated) {
+      return session.time_trigger_freq;
+    }
+    if (session.device && session.device->capture_param) {
+      return session.device->capture_param->time_trigger_freq;
+    }
+    return 0.0f;
+  }
+
+  float sdk_max_acquisition_frame_rate_for_session_locked(
+      const CameraSession& session) const {
+    // The SDK describes this as the maximum *acquisition frame rate*.  It is
+    // not documented as a time-trigger line-frequency limit, so it is
+    // returned as diagnostics only and must never be used to certify a line
+    // rate as safe.
+    if (session.simulated) {
+      return 100000.0f;
+    }
+    if (session.device && session.device->capture_param) {
+      const float maximum = lvm_get_dev_max_frame_rate(
+          session.device, session.device->capture_param->capture_data_type);
+      return std::isfinite(maximum) && maximum > 0.0f ? maximum : 0.0f;
+    }
+    return 0.0f;
+  }
+
+  std::string continuous_settings_status_json_locked() const {
+    int connected = 0;
+    int configured = 0;
+    float first_rate = 0.0f;
+    float lowest_max_rate = 0.0f;
+    bool mixed_rates = false;
+    for (const auto& item : sessions_) {
+      const CameraSession& session = item.second;
+      const bool session_connected = session.simulated
+          ? session.simulated_connected
+          : (session.device && lvm_get_dev_connect_status(session.device) == 1);
+      if (!session_connected) {
+        continue;
+      }
+      ++connected;
+      const float rate = time_trigger_frequency_for_session_locked(session);
+      const float max_rate =
+          sdk_max_acquisition_frame_rate_for_session_locked(session);
+      if (max_rate > 0.0f &&
+          (lowest_max_rate <= 0.0f || max_rate < lowest_max_rate)) {
+        lowest_max_rate = max_rate;
+      }
+      if (rate <= 0.0f) {
+        continue;
+      }
+      if (configured == 0) {
+        first_rate = rate;
+      } else if (std::fabs(rate - first_rate) > 0.001f) {
+        mixed_rates = true;
+      }
+      ++configured;
+    }
+    std::ostringstream json;
+    json << "{\"supported\":true,"
+         << json_pair("route", "/api/capture/continuous-settings") << ","
+         << "\"connectedCameras\":" << connected << ","
+         << "\"configuredCameras\":" << configured << ","
+         << "\"timeTriggerFreq\":" << (mixed_rates ? 0.0f : first_rate) << ","
+         << "\"lineTriggerFrequency\":" << (mixed_rates ? 0.0f : first_rate) << ","
+         << "\"sdkMaxAcquisitionFrameRate\":" << lowest_max_rate << ","
+         << "\"lineTriggerRateMaximumKnown\":false,"
+         << "\"mixedLineTriggerFrequency\":" << (mixed_rates ? "true" : "false") << ","
+         << "\"requiresApplyToDevice\":true,"
+         << "\"runtimeOnly\":true,"
+         << "\"devicePersistent\":false,"
+         << json_pair("readbackSource", "sdk-memory")
+         << "}";
+    return json.str();
+  }
+
   std::string status_json_for_session(const CameraSession* session, const std::string& ip) const {
     if (driver_mode_ == DriverMode::Simulated || (session && session->simulated)) {
       std::string effective_ip = session ? session->ip : (ip.empty() ? simulated_ip_for_index(0) : ip);
       int index = simulated_index_for_ip(effective_ip);
       bool connected = session ? session->simulated_connected : false;
+      const bool continuous_acquiring =
+          continuous_acquiring_for_session_locked(session, connected);
+      const ContinuousCaptureState* continuous = session ? &session->continuous : nullptr;
       std::ostringstream json;
       json << "{\"connected\":" << (connected ? "true" : "false")
            << ",\"deviceId\":" << (session ? session->simulated_device_id : -1) << ","
@@ -4289,10 +4582,27 @@ class CaptureRuntime {
            << "\"temperatureJ28\":" << (35.0 + index * 0.4) << ","
            << "\"temperatureJ29\":" << (35.6 + index * 0.4) << ","
            << "\"temperatureJ30\":" << (36.1 + index * 0.4) << ","
-           << "\"lostPulseCounter\":0,\"bufferOverflowCounter\":0";
+           << "\"lostPulseCounter\":0,\"bufferOverflowCounter\":0,"
+           << "\"continuousAcquiring\":"
+           << (continuous_acquiring ? "true" : "false") << ","
+           << json_pair("continuousTelemetryStage", "sdk-capture-complete-before-storage") << ","
+           << json_pair("continuousFpsUnit", "completed-depth-maps-per-second") << ","
+           << "\"continuousFps\":" << continuous_fps_for_session_locked(session) << ","
+           << "\"continuousFrameCount\":"
+           << (continuous ? continuous->frame_count : 0) << ","
+           << "\"continuousFinalizedCount\":"
+           << (continuous ? continuous->finalized_count : 0) << ","
+           << "\"continuousSuccessfulFrameCount\":"
+           << (continuous ? continuous->successful_frame_count : 0) << ","
+           << "\"continuousLastResultCode\":"
+           << (continuous ? continuous->last_result_code : 0) << ","
+           << json_pair("lastContinuousFrameAt",
+                        continuous ? continuous->last_frame_at : "");
       if (session) {
         json << ",\"streamRunning\":" << (session->stream.running ? "true" : "false")
-             << ",\"streamFrames\":" << session->stream.frame_count;
+             << ",\"streamFrames\":" << session->stream.frame_count
+             << ",\"streamFps\":" << stream_fps_for_session_locked(session)
+             << "," << json_pair("streamLastFrameAt", session->stream.updated_at);
       }
       json << ",\"captureConfig\":" << capture_config_json_for_session(session);
       json << "}";
@@ -4300,6 +4610,9 @@ class CaptureRuntime {
     }
     lvm_dev_t* device = session ? session->device : nullptr;
     int connected = device ? lvm_get_dev_connect_status(device) : 0;
+    const bool continuous_acquiring =
+        continuous_acquiring_for_session_locked(session, connected == 1);
+    const ContinuousCaptureState* continuous = session ? &session->continuous : nullptr;
     int dev_id = device ? lvm_get_dev_id(device) : -1;
     std::ostringstream json;
     json << "{\"connected\":" << (connected == 1 ? "true" : "false")
@@ -4307,7 +4620,22 @@ class CaptureRuntime {
          << json_pair("ip", session ? session->ip : ip) << ","
          << json_pair("driverId", "lvm-nvt") << ","
          << json_pair("acquisitionState", connected == 1 ? "connected" : "discovered") << ","
-         << json_pair("sdkStatus", sdk_ready_ ? "ready" : "not-ready");
+         << json_pair("sdkStatus", sdk_ready_ ? "ready" : "not-ready") << ","
+         << "\"continuousAcquiring\":"
+         << (continuous_acquiring ? "true" : "false") << ","
+         << json_pair("continuousTelemetryStage", "sdk-capture-complete-before-storage") << ","
+         << json_pair("continuousFpsUnit", "completed-depth-maps-per-second") << ","
+         << "\"continuousFps\":" << continuous_fps_for_session_locked(session) << ","
+         << "\"continuousFrameCount\":"
+         << (continuous ? continuous->frame_count : 0) << ","
+         << "\"continuousFinalizedCount\":"
+         << (continuous ? continuous->finalized_count : 0) << ","
+         << "\"continuousSuccessfulFrameCount\":"
+         << (continuous ? continuous->successful_frame_count : 0) << ","
+         << "\"continuousLastResultCode\":"
+         << (continuous ? continuous->last_result_code : 0) << ","
+         << json_pair("lastContinuousFrameAt",
+                      continuous ? continuous->last_frame_at : "");
     if (device && device->dev_info) {
       json << "," << json_pair("model", device->dev_info->device_name)
            << "," << json_pair("sn", device->dev_info->sn);
@@ -4325,6 +4653,8 @@ class CaptureRuntime {
     if (session) {
       json << ",\"streamRunning\":" << (session->stream.running ? "true" : "false")
            << ",\"streamFrames\":" << session->stream.frame_count
+           << ",\"streamFps\":" << stream_fps_for_session_locked(session)
+           << "," << json_pair("streamLastFrameAt", session->stream.updated_at)
            << ",\"captureConfig\":" << capture_config_json_for_session(session);
     }
     json << "}";
@@ -4384,7 +4714,8 @@ class CaptureRuntime {
     }
     const bool restart_required = sdk_capture_restart_required();
     int sdk_ret = restart_required ? SDK_CAPTURE_RESTART_REQUIRED : ensure_sdk();
-    const bool effective_sdk_ready = sdk_ready_ && !recovery_required;
+    const bool effective_sdk_ready = steel_capture::sdk_health_ready(
+        sdk_ready_, recovery_required, restart_required);
     int connected_count = 0;
     std::string first_ip;
     for (const auto& item : sessions_) {
@@ -4396,11 +4727,15 @@ class CaptureRuntime {
         }
       }
     }
+    const bool camera_set_ready = steel_capture::camera_set_ready(
+        connected_count, expected_cameras_);
+    const bool effective_ready = steel_capture::provider_health_ready(
+        effective_sdk_ready, connected_count, expected_cameras_);
     std::ostringstream json;
     json << "{"
          << json_pair("service", "steel_capture_service") << ","
          << json_pair("time", now_iso()) << ","
-         << "\"ready\":" << (effective_sdk_ready ? "true" : "false") << ","
+         << "\"ready\":" << (effective_ready ? "true" : "false") << ","
          << "\"sdkReady\":" << (effective_sdk_ready ? "true" : "false") << ","
          << "\"sdkCode\":"
          << (recovery_required ? CALIBRATION_RECOVERY_REQUIRED : sdk_ret) << ","
@@ -4424,6 +4759,8 @@ class CaptureRuntime {
          << json_pair("storageRoot", storage_root_.string()) << ","
          << json_pair("configRoot", config_root_locked().string()) << ","
          << "\"cameraCount\":" << connected_count << ","
+         << "\"expectedCameras\":" << expected_cameras_ << ","
+         << "\"cameraSetReady\":" << (camera_set_ready ? "true" : "false") << ","
          << "\"sdkCaptureState\":" << sdk_capture_state_json() << ","
          << "\"storageQueue\":" << storage_queue_status_json()
          << "}";
@@ -4487,6 +4824,11 @@ class CaptureRuntime {
     int dev_type = json_int_field(body, "devType", -1);
     bool already_connected = false;
     int ret = connect_one_locked(ip, dev_type, &already_connected);
+    if (ret == CORRECT && !production_capture_running_ &&
+        continuous_capture_enabled_locked() &&
+        static_cast<int>(connected_capture_ips_locked().size()) == expected_cameras_) {
+      start_production_capture_worker_locked("{}");
+    }
 
     std::ostringstream json;
     json << "{\"code\":" << ret << ",\"connected\":" << (ret == CORRECT ? "true" : "false") << ","
@@ -4540,14 +4882,21 @@ class CaptureRuntime {
     }
     results << "]";
 
-    bool expected_met = expected_cameras <= 0 || static_cast<int>(ips.size()) >= expected_cameras;
+    const int effective_expected = expected_cameras > 0 ? expected_cameras : expected_cameras_;
+    bool expected_met = static_cast<int>(ips.size()) == effective_expected &&
+                        connected == effective_expected && failed == 0;
     int code = (failed == 0 && expected_met) ? CORRECT : (first_error == CORRECT ? 206 : first_error);
+    if (code == CORRECT && connected == expected_cameras_ &&
+        static_cast<int>(ips.size()) == expected_cameras_ &&
+        !production_capture_running_ && continuous_capture_enabled_locked()) {
+      start_production_capture_worker_locked("{}");
+    }
     std::ostringstream json;
     json << "{\"code\":" << code
          << ",\"discovered\":" << ips.size()
          << ",\"connected\":" << connected
          << ",\"failed\":" << failed
-         << ",\"expectedCameras\":" << expected_cameras
+         << ",\"expectedCameras\":" << effective_expected
          << ",\"expectedMet\":" << (expected_met ? "true" : "false")
          << ",\"results\":" << results.str()
          << "}";
@@ -4555,9 +4904,18 @@ class CaptureRuntime {
   }
 
   std::string disconnect_json(const std::string& body) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (active_capture_batches_ > 0) {
       return json_error(409, "capture batch is running");
+    }
+    if (production_capture_running_) {
+      request_stop_production_capture_worker_locked();
+      if (!production_capture_cv_.wait_for(
+              lock,
+              std::chrono::seconds(15),
+              [this]() { return !production_capture_running_; })) {
+        return json_error(409, "continuous acquisition did not stop before disconnect");
+      }
     }
     std::string ip = json_string_field(body, "ip");
     int ret = CORRECT;
@@ -4798,7 +5156,28 @@ class CaptureRuntime {
     if (key.empty()) {
       return json_error(400, "missing key");
     }
+    const bool capture_timing_parameter =
+        _stricmp(key.c_str(), "TimeTriggerFreq") == 0 ||
+        _stricmp(key.c_str(), "time_trigger_freq") == 0 ||
+        _stricmp(key.c_str(), "TriggerMode") == 0 ||
+        _stricmp(key.c_str(), "ctrl_type") == 0 ||
+        _stricmp(key.c_str(), "ControlMode") == 0 ||
+        _stricmp(key.c_str(), "ctrl_mode") == 0 ||
+        _stricmp(key.c_str(), "TriggerInputType") == 0 ||
+        _stricmp(key.c_str(), "trigger_input_type") == 0 ||
+        _stricmp(key.c_str(), "DivRatio") == 0 ||
+        _stricmp(key.c_str(), "div_ratio") == 0 ||
+        _stricmp(key.c_str(), "CaptureDataType") == 0 ||
+        _stricmp(key.c_str(), "capture_data_type") == 0 ||
+        _stricmp(key.c_str(), "TriggerLines") == 0 ||
+        _stricmp(key.c_str(), "ControlLineNum") == 0 ||
+        _stricmp(key.c_str(), "trigger_number_per_ctrl") == 0;
     std::lock_guard<std::mutex> lock(mutex_);
+    if (capture_timing_parameter && production_capture_running_) {
+      return json_error(
+          409,
+          "continuous acquisition is active; use /api/capture/continuous-settings for a safe line-rate change");
+    }
     CameraSession* session = session_for_ip_locked(ip);
     if (!session || (!session->device && !session->simulated)) {
       return json_error(DEV_NOT_LINK_ERROR, "camera not connected");
@@ -4893,6 +5272,287 @@ class CaptureRuntime {
     return "{\"code\":" + std::to_string(ret) + "," + json_pair("ip", session->ip) + "," + json_pair("key", key) + "}";
   }
 
+  std::string continuous_settings_json() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::ostringstream json;
+    json << "{\"code\":0,\"settings\":"
+         << continuous_settings_status_json_locked() << "}";
+    return json.str();
+  }
+
+  std::string continuous_settings_json(const std::string& body) {
+    const bool has_time_trigger_frequency =
+        json_has_field(body, "timeTriggerFreq") ||
+        json_has_field(body, "lineTriggerFrequency");
+    if (!has_time_trigger_frequency) {
+      return json_error(
+          400,
+          "timeTriggerFreq or lineTriggerFrequency is required for continuous settings");
+    }
+    const float requested_rate = json_has_field(body, "timeTriggerFreq")
+        ? json_float_field(body, "timeTriggerFreq", 0.0f)
+        : json_float_field(body, "lineTriggerFrequency", 0.0f);
+    if (!std::isfinite(requested_rate) || requested_rate < 0.1f ||
+        requested_rate > 100000.0f) {
+      return json_error(
+          400,
+          "timeTriggerFreq must be a finite value between 0.1 and 100000 Hz");
+    }
+    if (json_bool_field(body, "saveToDevice", false) ||
+        json_bool_field(body, "persistToDevice", false)) {
+      return json_error(
+          400,
+          "continuous settings are runtime-only; use the guarded maintenance preset to persist device parameters");
+    }
+
+    const bool apply_to_device = json_bool_field(
+        body, "applyToDevice", json_bool_field(body, "apply", false));
+    const bool restart_continuous =
+        json_bool_field(body, "restartContinuous", true);
+    std::vector<std::string> requested_ips = json_string_array_field(body, "ips");
+    const std::string requested_ip = json_string_field(body, "ip");
+    if (!requested_ip.empty() &&
+        std::find(requested_ips.begin(), requested_ips.end(), requested_ip) ==
+            requested_ips.end()) {
+      requested_ips.push_back(requested_ip);
+    }
+
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (active_capture_batches_ > 0) {
+      return json_error(409, "capture batch is running");
+    }
+    if (driver_mode_ != DriverMode::Simulated &&
+        sdk_capture_restart_required()) {
+      return sdk_capture_restart_error_json();
+    }
+    if (requested_ips.empty()) {
+      requested_ips = connected_capture_ips_locked();
+    }
+    if (requested_ips.empty()) {
+      return json_error(DEV_NOT_LINK_ERROR, "no connected cameras for continuous settings");
+    }
+    std::sort(requested_ips.begin(), requested_ips.end());
+    requested_ips.erase(
+        std::unique(requested_ips.begin(), requested_ips.end()), requested_ips.end());
+
+    auto validate_targets = [&]() -> std::string {
+      for (const auto& ip : requested_ips) {
+        CameraSession* session = session_for_ip_locked(ip);
+        if (!session || (!session->device && !session->simulated_connected)) {
+          return json_error(DEV_NOT_LINK_ERROR, "requested camera is not connected: " + ip);
+        }
+        if (session->stream.running) {
+          return json_error(
+              409,
+              "realtime preview is running; stop preview before changing continuous settings: " + ip);
+        }
+        if (!session->simulated && !session->device->capture_param) {
+          return json_error(
+              INPUT_PARAMETER_ERROR,
+              "camera has no capture parameters: " + ip);
+        }
+      }
+      return "";
+    };
+
+    if (const std::string validation_error = validate_targets();
+        !validation_error.empty()) {
+      return validation_error;
+    }
+
+    const bool production_was_running = production_capture_running_;
+    bool production_restarted = false;
+    auto restart_production_if_requested = [&]() {
+      if (!apply_to_device || !production_was_running ||
+          !restart_continuous || !continuous_capture_enabled_locked() ||
+          production_capture_running_ || connected_capture_ips_locked().empty() ||
+          (driver_mode_ != DriverMode::Simulated &&
+           sdk_capture_restart_required())) {
+        return;
+      }
+      start_production_capture_worker_locked("{}");
+      production_restarted = production_capture_running_;
+    };
+    if (apply_to_device && production_was_running) {
+      request_stop_production_capture_worker_locked();
+      if (!production_capture_cv_.wait_for(
+              lock,
+              std::chrono::seconds(15),
+              [this]() { return !production_capture_running_; })) {
+        return json_error(
+            409,
+            "continuous acquisition did not stop before line-rate setting change");
+      }
+      if (const std::string validation_error = validate_targets();
+          !validation_error.empty()) {
+        restart_production_if_requested();
+        return validation_error;
+      }
+    }
+
+    struct ContinuousSettingsTarget {
+      CameraSession* session = nullptr;
+      std::string ip;
+      float previous_rate = 0.0f;
+      float max_rate = 0.0f;
+      int apply_code = CORRECT;
+      int rollback_code = CORRECT;
+      bool attempted = false;
+      bool applied = false;
+      bool rollback_attempted = false;
+      bool rolled_back = false;
+    };
+    std::vector<ContinuousSettingsTarget> targets;
+    targets.reserve(requested_ips.size());
+    for (const auto& ip : requested_ips) {
+      CameraSession* session = session_for_ip_locked(ip);
+      targets.push_back({
+          session,
+          ip,
+          session ? time_trigger_frequency_for_session_locked(*session) : 0.0f,
+          session ? sdk_max_acquisition_frame_rate_for_session_locked(*session) : 0.0f});
+    }
+
+    auto write_runtime_rate = [](CameraSession& session, float rate) {
+      if (session.simulated) {
+        session.time_trigger_freq = rate;
+        session.params["TimeTriggerFreq"] = std::to_string(rate);
+        return CORRECT;
+      }
+      if (!session.device || !session.device->capture_param) {
+        return INPUT_PARAMETER_ERROR;
+      }
+      session.device->capture_param->time_trigger_freq = rate;
+      return lvm_set_param(session.device, LVM_CAPTURE_PARAM);
+    };
+
+    int attempted = 0;
+    int applied_before_rollback = 0;
+    int failed = 0;
+    int first_error = CORRECT;
+    bool transaction_failed = false;
+    if (apply_to_device) {
+      for (auto& target : targets) {
+        target.attempted = true;
+        ++attempted;
+        target.apply_code = target.session
+            ? write_runtime_rate(*target.session, requested_rate)
+            : DEV_NOT_LINK_ERROR;
+        target.applied = target.apply_code == CORRECT;
+        if (target.applied) {
+          ++applied_before_rollback;
+          continue;
+        }
+        transaction_failed = true;
+        ++failed;
+        first_error = target.apply_code;
+        break;
+      }
+      if (transaction_failed) {
+        // Roll every target we touched, including the target whose SDK call
+        // returned an error: a device may have accepted a partial update even
+        // when the SDK reports failure.  Do not restart acquisition after an
+        // incomplete transaction; an operator must inspect the result first.
+        for (auto& target : targets) {
+          if (!target.attempted || !target.session) {
+            continue;
+          }
+          target.rollback_attempted = true;
+          target.rollback_code =
+              write_runtime_rate(*target.session, target.previous_rate);
+          target.rolled_back = target.rollback_code == CORRECT;
+        }
+      }
+    }
+    int rolled_back = 0;
+    int rollback_failed = 0;
+    for (const auto& target : targets) {
+      if (!target.rollback_attempted) {
+        continue;
+      }
+      if (target.rolled_back) {
+        ++rolled_back;
+      } else {
+        ++rollback_failed;
+      }
+    }
+
+    std::ostringstream results;
+    results << "[";
+    for (size_t index = 0; index < targets.size(); ++index) {
+      if (index > 0) {
+        results << ",";
+      }
+      const ContinuousSettingsTarget& target = targets[index];
+      const float current_rate = target.session
+          ? time_trigger_frequency_for_session_locked(*target.session)
+          : target.previous_rate;
+      const bool committed = apply_to_device && !transaction_failed &&
+          target.applied;
+      results << "{\"code\":" << target.apply_code << ","
+              << "\"runtimeApplyCode\":" << target.apply_code << ","
+              << json_pair("ip", target.ip) << ","
+              << "\"attempted\":" << (target.attempted ? "true" : "false") << ","
+              << "\"applied\":" << (committed ? "true" : "false") << ","
+              << "\"appliedBeforeRollback\":"
+              << (target.applied ? "true" : "false") << ","
+              << "\"previousTimeTriggerFreq\":" << target.previous_rate << ","
+              << "\"timeTriggerFreq\":" << current_rate << ","
+              << "\"lineTriggerFrequency\":" << current_rate << ","
+              << "\"sdkMaxAcquisitionFrameRate\":" << target.max_rate << ","
+              << "\"lineTriggerRateMaximumKnown\":false,"
+              << "\"rollbackAttempted\":"
+              << (target.rollback_attempted ? "true" : "false") << ","
+              << "\"rollbackCode\":" << target.rollback_code << ","
+              << "\"rolledBack\":" << (target.rolled_back ? "true" : "false") << ","
+              << "\"deviceReadbackVerified\":false"
+              << "}";
+    }
+    results << "]";
+
+    if (apply_to_device) {
+      steel_state_.updated_at = now_iso();
+      write_steel_summary_locked();
+    }
+    if (!transaction_failed) {
+      restart_production_if_requested();
+    }
+
+    const int code = failed == 0 ? CORRECT : first_error;
+    std::ostringstream json;
+    json << "{\"code\":" << code << ","
+         << "\"applyToDevice\":" << (apply_to_device ? "true" : "false") << ","
+         << "\"dryRun\":" << (apply_to_device ? "false" : "true") << ","
+         << "\"runtimeOnly\":true,"
+         << "\"devicePersistent\":false,"
+         << "\"deviceReadbackVerified\":false,"
+         << json_pair("readbackSource", "sdk-memory") << ","
+         << "\"restartContinuous\":" << (restart_continuous ? "true" : "false") << ","
+         << "\"productionCaptureWasRunning\":"
+         << (production_was_running ? "true" : "false") << ","
+         << "\"productionCaptureRestarted\":"
+         << (production_restarted ? "true" : "false") << ","
+         << "\"timeTriggerFreq\":" << requested_rate << ","
+         << "\"lineTriggerFrequency\":" << requested_rate << ","
+         << "\"atomic\":true,"
+         << "\"transactionCommitted\":"
+         << (apply_to_device && !transaction_failed ? "true" : "false") << ","
+         << "\"validatedOnly\":" << (!apply_to_device ? "true" : "false") << ","
+         << "\"attempted\":" << attempted << ","
+         << "\"appliedBeforeRollback\":" << applied_before_rollback << ","
+         << "\"applied\":"
+         << (transaction_failed ? 0 : applied_before_rollback) << ","
+         << "\"failed\":" << failed << ","
+         << "\"rolledBack\":" << rolled_back << ","
+         << "\"rollbackFailed\":" << rollback_failed << ","
+         << "\"requiresOperatorRestart\":"
+         << (transaction_failed && production_was_running ? "true" : "false") << ","
+         << "\"results\":" << results.str() << ","
+         << "\"settings\":" << continuous_settings_status_json_locked()
+         << "}";
+    return json.str();
+  }
+
   std::string capture_line_continuous_preset_json(const std::string& body) {
     int lines = std::max(1, json_int_field(body, "lines", 1000));
     float time_trigger_freq = json_float_field(body, "timeTriggerFreq", 300.0f);
@@ -4907,7 +5567,49 @@ class CaptureRuntime {
       connect_all_json(body);
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (!std::isfinite(time_trigger_freq) || time_trigger_freq < 0.1f ||
+        time_trigger_freq > 100000.0f) {
+      return json_error(400, "timeTriggerFreq must be a finite value between 0.1 and 100000 Hz");
+    }
+
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (active_capture_batches_ > 0) {
+      return json_error(409, "capture batch is running");
+    }
+    if (driver_mode_ != DriverMode::Simulated &&
+        sdk_capture_restart_required()) {
+      return sdk_capture_restart_error_json();
+    }
+    const bool production_was_running = production_capture_running_;
+    bool production_restarted = false;
+    auto restart_production_if_needed = [&]() {
+      if (!production_was_running || !continuous_capture_enabled_locked() ||
+          production_capture_running_ || connected_capture_ips_locked().empty() ||
+          (driver_mode_ != DriverMode::Simulated && sdk_capture_restart_required())) {
+        return;
+      }
+      start_production_capture_worker_locked("{}");
+      production_restarted = production_capture_running_;
+    };
+    if (production_was_running) {
+      request_stop_production_capture_worker_locked();
+      if (!production_capture_cv_.wait_for(
+              lock,
+              std::chrono::seconds(15),
+              [this]() { return !production_capture_running_; })) {
+        return json_error(409, "continuous acquisition did not stop before line preset apply");
+      }
+    }
+    for (const auto& item : sessions_) {
+      const CameraSession& session = item.second;
+      if (!ips.empty() && std::find(ips.begin(), ips.end(), session.ip) == ips.end()) {
+        continue;
+      }
+      if ((session.device || session.simulated) && session.stream.running) {
+        restart_production_if_needed();
+        return json_error(409, "stream is running; stop stream before applying line preset");
+      }
+    }
     int applied = 0;
     int failed = 0;
     int first_error = CORRECT;
@@ -4926,7 +5628,23 @@ class CaptureRuntime {
         results << ",";
       }
       first = false;
-      int ret = session.simulated ? CORRECT : apply_line_continuous_preset(session.device, lines, time_trigger_freq, laser_power, laser_line_select, control_mode);
+      int ret = CORRECT;
+      if (session.simulated) {
+        session.time_trigger_freq = time_trigger_freq;
+        session.params["TimeTriggerFreq"] = std::to_string(time_trigger_freq);
+        session.params["TriggerLines"] = std::to_string(lines);
+        session.params["ControlMode"] = std::to_string(control_mode);
+        session.params["TriggerInputType"] =
+            std::to_string(static_cast<int>(LVM_TRIGGER_TIME_TRIGGER));
+      } else {
+        ret = apply_line_continuous_preset(
+            session.device,
+            lines,
+            time_trigger_freq,
+            laser_power,
+            laser_line_select,
+            control_mode);
+      }
       int save_ret = (ret == CORRECT && save_to_device && !session.simulated) ? lvm_save_param_to_dev(session.device) : CORRECT;
       int code = ret == CORRECT ? save_ret : ret;
       if (code == CORRECT) {
@@ -4949,6 +5667,7 @@ class CaptureRuntime {
               << "}";
     }
     results << "]";
+    restart_production_if_needed();
     int code = failed == 0 ? CORRECT : first_error;
     std::ostringstream json;
     json << "{\"code\":" << code
@@ -4958,6 +5677,10 @@ class CaptureRuntime {
          << ",\"controlMode\":" << control_mode
          << ",\"timeTriggerFreq\":" << time_trigger_freq
          << ",\"laserPower\":" << std::max(0, std::min(100, laser_power))
+         << ",\"productionCaptureWasRunning\":"
+         << (production_was_running ? "true" : "false")
+         << ",\"productionCaptureRestarted\":"
+         << (production_restarted ? "true" : "false")
          << ",\"results\":" << results.str()
          << "}";
     return json.str();
@@ -5281,6 +6004,7 @@ class CaptureRuntime {
     }
     session.stream.code = ret;
     session.stream.frame_count += 1;
+    record_stream_frame_tick_locked(session.stream);
     session.stream.fid = session.stream.frame_count;
     session.stream.sid = simulated_index_for_ip(session.ip) + 1;
     session.stream.lost_lines = 0;
@@ -5337,6 +6061,13 @@ class CaptureRuntime {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_capture_batches_ > 0) {
       return json_error(409, "capture batch is running");
+    }
+    if (!steel_capture::blocking_capture_allowed(
+            driver_mode_ == DriverMode::Simulated,
+            production_capture_running_)) {
+      return json_error(
+          409,
+          "continuous production acquisition is running; switch capture mode to on-demand before blocking capture");
     }
     CameraSession* session = session_for_ip_locked(ip);
     if (!session || (!session->device && !session->simulated)) {
@@ -5713,6 +6444,9 @@ class CaptureRuntime {
     int control_mode = 0;
     bool discard_black_frames = true;
     bool save_sdk_derived = false;
+    bool persist_frame = true;
+    bool production_continuous = false;
+    unsigned long long production_save_generation = 0;
     double black_frame_threshold = 8.0;
   };
 
@@ -5780,6 +6514,8 @@ class CaptureRuntime {
     StorageTicket storage;
     bool has_storage = false;
     bool record_capture = false;
+    bool track_continuous_acquisition = false;
+    unsigned long long production_save_generation = 0;
 
     PendingParallelCapture() = default;
     PendingParallelCapture(ParallelCaptureResult value) : result(std::move(value)) {}
@@ -5919,26 +6655,34 @@ class CaptureRuntime {
           result.lines = 480;
         }
       }
-      output_path = resolve_output_path_locked(job.output, "continuous-test/capture-depth.png");
-      if (!is_output_path_allowed_locked(output_path)) {
-        return parallel_capture_error(job, 403, "output path must be under storage root");
+      if (job.persist_frame) {
+        output_path = resolve_output_path_locked(job.output, "continuous-test/capture-depth.png");
+        if (!is_output_path_allowed_locked(output_path)) {
+          return parallel_capture_error(job, 403, "output path must be under storage root");
+        }
+        paths = capture_output_paths_for(output_path, job.save_sdk_derived);
+        intensity_path = paths.intensity_path;
+        metadata_path = paths.metadata_path;
+        result.output = paths.depth_path;
+        result.depth_output = paths.depth_path;
+        result.intensity_output = intensity_path;
+        result.sdk_output = paths.save_sdk_derived ? paths.sdk_base_path : "";
+        result.sdk_depth_output = paths.save_sdk_derived ? paths.sdk_depth_path : "";
+        result.sdk_intensity_output = paths.save_sdk_derived ? paths.sdk_intensity_path : "";
+      } else {
+        result.output.clear();
+        result.depth_output.clear();
+        result.intensity_output.clear();
       }
-      paths = capture_output_paths_for(output_path, job.save_sdk_derived);
-      intensity_path = paths.intensity_path;
-      metadata_path = paths.metadata_path;
       camera_mutex = session->capture_mutex;
-      result.output = paths.depth_path;
-      result.depth_output = paths.depth_path;
-      result.intensity_output = intensity_path;
       result.metadata_output.clear();
-      result.sdk_output = paths.save_sdk_derived ? paths.sdk_base_path : "";
-      result.sdk_depth_output = paths.save_sdk_derived ? paths.sdk_depth_path : "";
-      result.sdk_intensity_output = paths.save_sdk_derived ? paths.sdk_intensity_path : "";
       result.simulated = simulated;
-      pending.record_capture = true;
+      pending.record_capture = job.persist_frame;
+      pending.track_continuous_acquisition = job.production_continuous;
+      pending.production_save_generation = job.production_save_generation;
     }
 
-    if (!create_capture_output_dirs(paths)) {
+    if (job.persist_frame && !create_capture_output_dirs(paths)) {
       return parallel_capture_error(job, 500, "output directory cannot be created");
     }
 
@@ -5948,6 +6692,24 @@ class CaptureRuntime {
       return parallel_capture_error(job, 409, "camera capture is busy; a previous SDK grab may still be running");
     }
     if (simulated) {
+      if (!job.persist_frame) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        CameraSession* session = session_for_ip_locked(job.ip);
+        if (!session || !session->simulated) {
+          return parallel_capture_error(job, DEV_NOT_LINK_ERROR, "camera not connected");
+        }
+        ++session->simulated_capture_sequence;
+        result.code = CORRECT;
+        result.attempts_used = 1;
+        result.depth_data_format = 0;
+        result.depth_persistence_mode = "discarded-live-frame";
+        result.discarded = true;
+        result.discard_reason = "save-disabled";
+        result.capture_finished_at = now_iso();
+        result.capture_finished_tick_ms = GetTickCount64();
+        result.worker_finished_at = result.capture_finished_at;
+        return pending;
+      }
       FrameWriteRequest request;
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -6089,7 +6851,12 @@ class CaptureRuntime {
         trigger_max_interval = depth_map->head.trigger_max_interval;
         frame_timestamp = depth_map->head.time_stamp;
         depth_data_format = depth_map->param ? depth_map->param->data_format : -1;
-        if (job.discard_black_frames && depth_map_is_black_frame(depth_map, job.black_frame_threshold)) {
+        if (!job.persist_frame) {
+          ret = CORRECT;
+          result.discarded = true;
+          result.discard_reason = "save-disabled";
+          depth_persistence_mode = "discarded-live-frame";
+        } else if (job.discard_black_frames && depth_map_is_black_frame(depth_map, job.black_frame_threshold)) {
           ret = BLACK_FRAME_DISCARDED;
           result.discarded = true;
           result.discard_reason = "black-frame";
@@ -6132,10 +6899,10 @@ class CaptureRuntime {
       if (device) {
         device->buffer = nullptr;
       }
-      if (ret == CORRECT && !intensity_source.available()) {
+      if (job.persist_frame && ret == CORRECT && !intensity_source.available()) {
         ret = CAPTURE_INTENSITY_MISSING;
       }
-      saved_intensity = ret == CORRECT && intensity_source.available();
+      saved_intensity = job.persist_frame && ret == CORRECT && intensity_source.available();
       if (ret == CORRECT) {
         break;
       }
@@ -6180,7 +6947,29 @@ class CaptureRuntime {
     result.capture_finished_at = now_iso();
     result.capture_finished_tick_ms = GetTickCount64();
 
-    if (ret == CORRECT && depth_source.available() && intensity_source.available()) {
+    if (job.production_continuous && job.persist_frame && ret == CORRECT) {
+      bool still_armed_for_save = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        still_armed_for_save =
+            steel_state_.save_enabled &&
+            steel_state_.present &&
+            job.production_save_generation == production_save_generation_;
+      }
+      if (!still_armed_for_save) {
+        pending.record_capture = false;
+        result.discarded = true;
+        result.discard_reason = "save-disabled-before-storage";
+        result.depth_persistence_mode = "discarded-live-frame";
+        result.output.clear();
+        result.depth_output.clear();
+        result.intensity_output.clear();
+        depth_source = OwnedImageSource{};
+        intensity_source = OwnedImageSource{};
+      }
+    }
+
+    if (job.persist_frame && ret == CORRECT && depth_source.available() && intensity_source.available()) {
       FrameWriteRequest request;
       request.paths = paths;
       request.depth = std::move(depth_source);
@@ -6224,9 +7013,11 @@ class CaptureRuntime {
       }
     }
 
-    if (!pending.has_storage) {
+    if (!pending.has_storage && job.persist_frame) {
       cleanup_sdk_outputs(paths);
-      result.code = ret;
+    }
+    result.code = ret;
+    if (!pending.has_storage) {
       result.worker_finished_at = now_iso();
     }
     return pending;
@@ -6234,6 +7025,45 @@ class CaptureRuntime {
 
   bool pending_capture_ready(const PendingParallelCapture& pending) const {
     return !pending.has_storage || pending.storage.ready();
+  }
+
+  void record_continuous_capture_completion_locked(
+      CameraSession& session, const ParallelCaptureResult& result) {
+    constexpr size_t kContinuousFpsWindow = 20;
+    ContinuousCaptureState& state = session.continuous;
+    ++state.finalized_count;
+    state.last_result_code = result.code;
+
+    // A frame must have reached the SDK result path before it contributes to
+    // the per-camera depth-map cadence.  This runs before the storage ticket
+    // is finalized, so a slow disk cannot make the live acquisition FPS look
+    // stalled.  Storage outcomes remain visible through the regular capture
+    // result and production counters.
+    const bool received_frame = result.capture_finished_tick_ms != 0 &&
+        (result.simulated || result.discarded || result.depth_data_format >= 0);
+    if (!received_frame) {
+      return;
+    }
+
+    ++state.frame_count;
+    if (result.code == CORRECT) {
+      ++state.successful_frame_count;
+    }
+    const unsigned long long tick = result.capture_finished_tick_ms;
+    if (state.frame_ticks.empty() || tick >= state.frame_ticks.back()) {
+      state.frame_ticks.push_back(tick);
+    } else {
+      // A storage completion can be delayed.  Preserve a monotonic window so
+      // the reported rolling FPS never becomes negative or nonsensical.
+      state.frame_ticks.push_back(state.frame_ticks.back());
+    }
+    while (state.frame_ticks.size() > kContinuousFpsWindow) {
+      state.frame_ticks.pop_front();
+    }
+    state.last_frame_tick_ms = state.frame_ticks.back();
+    state.last_frame_at = result.capture_finished_at.empty()
+        ? result.worker_finished_at
+        : result.capture_finished_at;
   }
 
   ParallelCaptureResult finalize_pending_capture(PendingParallelCapture&& pending) {
@@ -6260,6 +7090,49 @@ class CaptureRuntime {
       result.metadata_output = write_result.metadata_exists ? write_result.metadata_path : "";
       if (result.code != CORRECT && result.error_message.empty()) {
         result.error_message = "frame storage transaction failed";
+      }
+    }
+
+    if (pending.record_capture && pending.track_continuous_acquisition) {
+      bool still_armed_for_save = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        still_armed_for_save =
+            steel_state_.save_enabled &&
+            steel_state_.present &&
+            pending.production_save_generation == production_save_generation_;
+        if (!still_armed_for_save) {
+          ++continuous_discarded_frame_count_;
+        }
+      }
+      if (!still_armed_for_save) {
+        for (const std::string* path : {
+                 &result.depth_output,
+                 &result.intensity_output,
+                 &result.metadata_output,
+                 &result.sdk_output,
+                 &result.sdk_depth_output,
+                 &result.sdk_intensity_output}) {
+          if (!path->empty()) {
+            std::error_code remove_error;
+            std::filesystem::remove(*path, remove_error);
+          }
+        }
+        pending.record_capture = false;
+        result.discarded = true;
+        result.discard_reason = "save-disabled-before-finalize";
+        result.depth_persistence_mode = "discarded-live-frame";
+        result.output.clear();
+        result.depth_output.clear();
+        result.intensity_output.clear();
+        result.metadata_output.clear();
+        result.sdk_output.clear();
+        result.sdk_depth_output.clear();
+        result.sdk_intensity_output.clear();
+        result.depth_exists = false;
+        result.intensity_exists = false;
+        result.metadata_exists = false;
+        result.complete_frame = false;
       }
     }
 
@@ -6346,6 +7219,23 @@ class CaptureRuntime {
         } catch (...) {
           worker_result = PendingParallelCapture(
               parallel_capture_error((*round_jobs)[index], 500, "capture worker failed"));
+        }
+        if (worker_result.track_continuous_acquisition) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          ++continuous_acquisition_frame_count_;
+          if (worker_result.result.discarded) {
+            ++continuous_discarded_frame_count_;
+          }
+          last_continuous_acquisition_at_ =
+              worker_result.result.capture_finished_at.empty()
+                  ? worker_result.result.worker_finished_at
+                  : worker_result.result.capture_finished_at;
+          CameraSession* session =
+              session_for_ip_locked(worker_result.result.ip);
+          if (session) {
+            record_continuous_capture_completion_locked(
+                *session, worker_result.result);
+          }
         }
         {
           std::lock_guard<std::mutex> result_lock(*(*result_mutexes)[index]);
@@ -6977,6 +7867,7 @@ class CaptureRuntime {
          << "\"hs\":" << (stream.hs ? "true" : "false") << ","
          << "\"fpsLimit\":" << stream.fps_limit << ","
          << "\"frameCount\":" << stream.frame_count << ","
+         << "\"fps\":" << stream_fps_for_session_locked(&session) << ","
          << "\"fid\":" << stream.fid << ","
          << "\"sid\":" << stream.sid << ","
          << "\"lostLines\":" << stream.lost_lines << ","
@@ -7039,7 +7930,7 @@ class CaptureRuntime {
       result.message = "missing calibration path";
       return result;
     }
-    const std::filesystem::path candidate = provider_path_locked(path_text);
+    const std::filesystem::path candidate = config_or_storage_path_locked(path_text);
     std::filesystem::path resolved;
     if (allow_external) {
       std::error_code error;
@@ -7674,7 +8565,9 @@ class CaptureRuntime {
     }
 
     std::string calibration_file = json_string_field(profile, "arrayCalibrationFile");
-    std::filesystem::path calibration_path = calibration_file.empty() ? std::filesystem::path() : provider_path_locked(calibration_file);
+    std::filesystem::path calibration_path = calibration_file.empty()
+                                                ? std::filesystem::path()
+                                                : config_or_storage_path_locked(calibration_file);
     bool exists = !calibration_file.empty() && std::filesystem::exists(calibration_path);
     const auto artifact_kind = calibration_path.empty()
                                    ? steel_capture::CalibrationArtifactKind::Missing
@@ -7687,7 +8580,7 @@ class CaptureRuntime {
     std::string fit_report = json_string_field(active_raw, "fitReport");
     std::string fit_summary = "{}";
     if (!fit_report.empty()) {
-      std::filesystem::path report_path = provider_path_locked(fit_report);
+      std::filesystem::path report_path = config_or_storage_path_locked(fit_report);
       std::string report;
       if (is_config_or_storage_path_locked(report_path) && read_file(report_path.string(), report)) {
         std::string before = json_raw_field(report, "fitBefore", "{}");
@@ -7754,7 +8647,7 @@ class CaptureRuntime {
       std::string fit_before = json_raw_field(body, "fitBefore", "{}");
       std::string fit_after = json_raw_field(body, "fitAfter", "{}");
       if ((!fit_report.empty()) && (fit_before == "{}" || fit_after == "{}")) {
-        std::filesystem::path report_path = provider_path_locked(fit_report);
+        std::filesystem::path report_path = config_or_storage_path_locked(fit_report);
         std::string report;
         if (is_config_or_storage_path_locked(report_path) && read_file(report_path.string(), report)) {
           fit_before = json_raw_field(report, "fitBefore", fit_before);
@@ -8815,6 +9708,9 @@ class CaptureRuntime {
          << json_pair("summaryOutput", steel_state_.summary_path) << ","
          << json_pair("inspectionId", steel_state_.inspection_id) << ","
          << json_pair("acquisitionMode", steel_state_.acquisition_mode) << ","
+         << json_pair("captureMode", steel_state_.capture_mode) << ","
+         << "\"automaticCaptureEnabled\":"
+         << (continuous_capture_enabled_locked() ? "true" : "false") << ","
          << json_pair("captureSaveState", steel_state_.capture_save_state) << ","
          << json_pair("algorithmPhase", steel_state_.algorithm_phase) << ","
          << json_pair("sessionStartedAt", steel_state_.session_started_at) << ","
@@ -8844,6 +9740,10 @@ class CaptureRuntime {
          << "\"productionCaptureRunning\":" << (production_capture_running_ ? "true" : "false") << ","
          << json_pair("productionCaptureStartedAt", production_capture_started_at_) << ","
          << json_pair("productionCaptureFinishedAt", production_capture_finished_at_) << ","
+         << "\"continuousAcquisitionFrameCount\":" << continuous_acquisition_frame_count_ << ","
+         << "\"continuousDiscardedFrameCount\":" << continuous_discarded_frame_count_ << ","
+         << json_pair("lastContinuousAcquisitionAt", last_continuous_acquisition_at_) << ","
+         << "\"continuousSettings\":" << continuous_settings_status_json_locked() << ","
          << "\"expectedCameras\":" << expected_cameras_ << ","
          << "\"sdkCaptureState\":" << sdk_capture_state_json()
          << "}";
@@ -8960,7 +9860,96 @@ class CaptureRuntime {
     return settings;
   }
 
+  static std::string normalize_capture_mode(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    if (value == "continuous" || value == "auto" || value == "automatic") {
+      return "continuous";
+    }
+    if (value == "on-demand" || value == "on_demand" || value == "ondemand" ||
+        value == "manual") {
+      return "on-demand";
+    }
+    if (value == "disabled" || value == "off" || value == "stop") {
+      return "disabled";
+    }
+    return "";
+  }
+
+  static std::string capture_mode_from_body(const std::string& body) {
+    return json_string_field(body, "captureMode", json_string_field(body, "capture_mode"));
+  }
+
+  bool continuous_capture_enabled_locked() const {
+    return steel_state_.capture_mode == "continuous";
+  }
+
+  bool apply_capture_mode_from_body_locked(const std::string& body) {
+    const std::string requested = capture_mode_from_body(body);
+    if (requested.empty()) {
+      return true;
+    }
+    const std::string capture_mode = normalize_capture_mode(requested);
+    if (capture_mode.empty()) {
+      return false;
+    }
+    if (steel_state_.capture_mode != capture_mode) {
+      steel_state_.capture_mode = capture_mode;
+      if (!continuous_capture_enabled_locked() && production_capture_running_) {
+        request_stop_production_capture_worker_locked();
+      }
+    }
+    return true;
+  }
+
+  std::string steel_capture_mode_json(const std::string& body) {
+    const std::string requested = capture_mode_from_body(body);
+    const std::string capture_mode = normalize_capture_mode(requested);
+    if (requested.empty() || capture_mode.empty()) {
+      return json_error(400, "captureMode must be continuous, on-demand, or disabled");
+    }
+
+    std::unique_lock<std::mutex> lock(mutex_);
+    const bool changed = steel_state_.capture_mode != capture_mode;
+    steel_state_.capture_mode = capture_mode;
+    if (!continuous_capture_enabled_locked()) {
+      if (production_capture_running_) {
+        request_stop_production_capture_worker_locked();
+        if (!production_capture_cv_.wait_for(
+                lock,
+                std::chrono::seconds(15),
+                [this]() { return !production_capture_running_; })) {
+          return json_error(409, "continuous acquisition did not stop before capture mode change");
+        }
+      }
+      if (steel_state_.present &&
+          !(driver_mode_ != DriverMode::Simulated && sdk_capture_restart_required())) {
+        steel_state_.phase = "steel-in-waiting-images";
+      }
+    } else if (!production_capture_running_ && !connected_capture_ips_locked().empty() &&
+               (driver_mode_ == DriverMode::Simulated || !sdk_capture_restart_required())) {
+      start_production_capture_worker_locked("{}");
+      if (steel_state_.present && steel_state_.save_enabled) {
+        steel_state_.phase = "steel-in-saving";
+      }
+    }
+    steel_state_.updated_at = now_iso();
+    write_steel_summary_locked();
+
+    std::string status = steel_status_json_locked();
+    status.pop_back();
+    status += ",";
+    status += "\"captureModeChanged\":";
+    status += changed ? "true" : "false";
+    status += "}";
+    return status;
+  }
+
   bool should_auto_start_production_capture_locked(const std::string& body) const {
+    if (!continuous_capture_enabled_locked()) {
+      return false;
+    }
     std::string mode = steel_state_.acquisition_mode;
     std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char ch) {
       return static_cast<char>(std::tolower(ch));
@@ -8985,7 +9974,7 @@ class CaptureRuntime {
   }
 
   void start_production_capture_worker_locked(const std::string& body) {
-    if (production_capture_running_ || active_capture_batches_ > 0) {
+    if (production_capture_running_) {
       return;
     }
     if (driver_mode_ != DriverMode::Simulated &&
@@ -8999,7 +9988,6 @@ class CaptureRuntime {
     production_capture_running_ = true;
     production_capture_started_at_ = now_iso();
     production_capture_finished_at_.clear();
-    ++active_capture_batches_;
     std::thread([this, generation, settings]() {
       production_capture_loop(generation, settings);
     }).detach();
@@ -9027,27 +10015,38 @@ class CaptureRuntime {
       std::vector<std::string> ips;
       std::string material_id;
       int round = 0;
+      bool persist_frame = false;
+      unsigned long long production_save_generation = 0;
+      bool paused_for_maintenance = false;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         if (production_capture_stop_.load() ||
             generation != production_capture_generation_.load() ||
             (driver_mode_ != DriverMode::Simulated &&
-             sdk_capture_restart_required()) ||
-            !steel_state_.save_enabled ||
-            !steel_state_.present) {
+             sdk_capture_restart_required())) {
           break;
         }
-        ips = connected_capture_ips_locked();
-        material_id = material_storage_segment_locked();
+        paused_for_maintenance = active_capture_batches_ > 0;
+        if (!paused_for_maintenance) {
+          ips = connected_capture_ips_locked();
+          persist_frame = steel_state_.save_enabled && steel_state_.present;
+          if (persist_frame) {
+            material_id = material_storage_segment_locked();
+            round = reserve_production_sequence_locked();
+            production_save_generation = production_save_generation_;
+          } else {
+            round = ++continuous_acquisition_round_;
+          }
+        }
       }
 
+      if (paused_for_maintenance) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
+      }
       if (ips.empty()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         continue;
-      }
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        round = reserve_production_sequence_locked();
       }
 
       std::vector<ParallelCaptureJob> jobs;
@@ -9056,7 +10055,7 @@ class CaptureRuntime {
       for (size_t index = 0; index < ips.size(); ++index) {
         ParallelCaptureJob job;
         job.ip = ips[index];
-        {
+        if (persist_frame) {
           std::lock_guard<std::mutex> lock(mutex_);
           job.output = raw_capture_output_locked(job.ip, material_id, round);
         }
@@ -9072,6 +10071,9 @@ class CaptureRuntime {
         job.control_mode = settings.control_mode;
         job.discard_black_frames = settings.discard_black_frames;
         job.save_sdk_derived = settings.save_sdk_derived;
+        job.persist_frame = persist_frame;
+        job.production_continuous = true;
+        job.production_save_generation = production_save_generation;
         job.black_frame_threshold = settings.black_frame_threshold;
         jobs.push_back(job);
       }
@@ -9107,9 +10109,6 @@ class CaptureRuntime {
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (active_capture_batches_ > 0) {
-        --active_capture_batches_;
-      }
       production_capture_running_ = false;
       production_capture_finished_at_ = now_iso();
       if (driver_mode_ != DriverMode::Simulated &&
@@ -9119,6 +10118,7 @@ class CaptureRuntime {
       steel_state_.updated_at = production_capture_finished_at_;
       write_steel_summary_locked();
     }
+    production_capture_cv_.notify_all();
   }
 
   void write_steel_summary_locked() const {
@@ -9144,12 +10144,16 @@ class CaptureRuntime {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     const std::string now = now_iso();
+    if (!apply_capture_mode_from_body_locked(body)) {
+      return json_error(400, "captureMode must be continuous, on-demand, or disabled");
+    }
 
     if (cmd == "steelIn" || cmd == "steel_in" || cmd == "in") {
       const int value = json_int_field(body, "value", json_bool_field(body, "present", true) ? 1 : 0);
       update_steel_info_locked(body, now);
       if (value != 0) {
         if (!steel_state_.present || steel_state_.session_id.empty()) {
+          ++production_save_generation_;
           ensure_steel_session_locked(now);
         }
         steel_state_.inspection_id = json_string_field(body, "inspectionId", json_string_field(body, "inspection_id", steel_state_.inspection_id));
@@ -9177,7 +10181,7 @@ class CaptureRuntime {
           start_production_capture_worker_locked(body);
         }
       } else {
-        request_stop_production_capture_worker_locked();
+        ++production_save_generation_;
         steel_state_.present = false;
         steel_state_.phase = "steel-out";
         steel_state_.capture_save_state = json_string_field(body, "captureSaveState", "discard");
@@ -9192,9 +10196,15 @@ class CaptureRuntime {
       if (steel_state_.phase == "idle") {
         steel_state_.phase = "info-ready";
       }
+      if (continuous_capture_enabled_locked() && !production_capture_running_ &&
+          (driver_mode_ == DriverMode::Simulated || !sdk_capture_restart_required())) {
+        start_production_capture_worker_locked(body);
+      }
     } else if (cmd == "reset" || cmd == "clear") {
       request_stop_production_capture_worker_locked();
+      const std::string capture_mode = steel_state_.capture_mode;
       steel_state_ = SteelState{};
+      steel_state_.capture_mode = capture_mode;
       steel_state_.updated_at = now;
     } else {
       return json_error(400, "unknown steel event cmd");
@@ -9298,7 +10308,43 @@ class CaptureRuntime {
 </html>)STEEL";
   }
 
+  void record_capture_log(const std::string& level,
+                          const std::string& camera_ip,
+                          const std::string& message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    capture_logs_.push_front({now_iso(), level, camera_ip, message});
+    constexpr std::size_t kCaptureLogLimit = 200;
+    while (capture_logs_.size() > kCaptureLogLimit) {
+      capture_logs_.pop_back();
+    }
+  }
+
+  std::string capture_logs_json() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::ostringstream json;
+    json << "{\"events\":[";
+    for (std::size_t index = 0; index < capture_logs_.size(); ++index) {
+      const CaptureLogEntry& event = capture_logs_[index];
+      if (index != 0) json << ",";
+      json << "{" << json_pair("id", "provider-" + std::to_string(index + 1)) << ","
+           << json_pair("time", event.time) << ","
+           << json_pair("level", event.level) << ","
+           << json_pair("source", "provider-log") << ","
+           << json_pair("cameraIp", event.camera_ip) << ","
+           << json_pair("message", event.message) << "}";
+    }
+    json << "]}";
+    return json.str();
+  }
+
   std::mutex mutex_;
+  struct CaptureLogEntry {
+    std::string time;
+    std::string level;
+    std::string camera_ip;
+    std::string message;
+  };
+  std::deque<CaptureLogEntry> capture_logs_;
   DriverMode driver_mode_ = DriverMode::Lvm;
   bool sdk_ready_ = false;
   bool sdk_initialized_here_ = false;
@@ -9328,10 +10374,16 @@ class CaptureRuntime {
   std::atomic<unsigned long long> frame_write_ticket_counter_{0};
   int active_capture_batches_ = 0;
   std::atomic<unsigned long long> production_capture_generation_{0};
+  unsigned long long production_save_generation_ = 0;
   std::atomic<bool> production_capture_stop_{false};
   bool production_capture_running_ = false;
+  std::condition_variable production_capture_cv_;
   std::string production_capture_started_at_;
   std::string production_capture_finished_at_;
+  int continuous_acquisition_round_ = 0;
+  unsigned long long continuous_acquisition_frame_count_ = 0;
+  unsigned long long continuous_discarded_frame_count_ = 0;
+  std::string last_continuous_acquisition_at_;
 };
 
 std::string receive_body(HANDLE queue, PHTTP_REQUEST request) {
@@ -9761,7 +10813,11 @@ int run_capture_service_app(int argc, char** argv) {
   }
 
   CaptureSdkOwnerMutex sdk_owner;
-  if (!sdk_owner.try_acquire()) {
+  // The simulated driver never loads or calls the vendor SDK. Keeping it out
+  // of the global SDK-owner mutex lets isolated regression fixtures run while
+  // the real production provider remains online, without weakening ownership
+  // for either real SDK mode.
+  if (driver_mode != DriverMode::Simulated && !sdk_owner.try_acquire()) {
     std::cerr << "steel_capture_service cannot start: " << sdk_owner.error() << ".\n"
               << "SDK owner mutex: Global\\SteelPlate3DInspection.CaptureSdkOwner.v1\n";
     return 2;

@@ -6,7 +6,7 @@ param(
   [string]$CaptureRoot = "H:\",
   [string]$AlgorithmRoot = "G:\bar-surface-algorithm",
   [string]$MaterialPrefix = "BAR-STABILITY",
-  [int]$ExpectedCameras = 6,
+  [int]$ExpectedCameras = 8,
   [int]$DurationSec = 600,
   [int]$MaxCycles = 0,
   [int]$IntervalSec = 2,
@@ -23,7 +23,10 @@ param(
   [int]$MeshRows = 72,
   [int]$MeshColsPerCamera = 48,
   [double]$MaxFaceEdgeMm = 8.0,
+  [string]$ReleaseManifestPath = "",
   [string]$ReportDir = "",
+  [string]$WorkRoot = "",
+  [string]$AdminToken = $env:STEEL_ADMIN_TOKEN,
   [switch]$SkipTrigger,
   [switch]$SkipClient,
   [switch]$UseTriggerGateway,
@@ -32,6 +35,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($ExpectedCameras -ne 8) {
+  throw "Formal production stability acceptance requires exactly eight cameras."
+}
 
 function Join-OriginPath {
   param([string]$Origin, [string]$Path)
@@ -53,15 +60,16 @@ function Invoke-HttpJson {
     [string]$Uri,
     [object]$Body = $null,
     [int[]]$AllowedStatusCodes = @(200),
-    [int]$TimeoutSec = 30
+    [int]$TimeoutSec = 30,
+    [hashtable]$Headers = @{}
   )
 
   $JsonBody = if ($null -eq $Body) { "{}" } else { $Body | ConvertTo-Json -Compress -Depth 30 }
   try {
     if ($Method -eq "GET") {
-      $Response = Invoke-WebRequest -Method Get -Uri $Uri -UseBasicParsing -TimeoutSec $TimeoutSec
+      $Response = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -UseBasicParsing -TimeoutSec $TimeoutSec
     } else {
-      $Response = Invoke-WebRequest -Method Post -Uri $Uri -UseBasicParsing -ContentType "application/json; charset=utf-8" -Body $JsonBody -TimeoutSec $TimeoutSec
+      $Response = Invoke-WebRequest -Method Post -Uri $Uri -Headers $Headers -UseBasicParsing -ContentType "application/json; charset=utf-8" -Body $JsonBody -TimeoutSec $TimeoutSec
     }
     $StatusCode = [int]$Response.StatusCode
     $Content = [string]$Response.Content
@@ -90,6 +98,23 @@ function Invoke-HttpJson {
   }
 }
 
+function Wait-DurableProductionTask {
+  param([string]$TaskId, [int]$TimeoutSec)
+  $Deadline = (Get-Date).AddSeconds($TimeoutSec)
+  do {
+    $Detail = Invoke-HttpJson -Method GET -Uri (Join-OriginPath $ServiceOrigin "/api/production/tasks/detail?id=$([uri]::EscapeDataString($TaskId))") -TimeoutSec 10
+    $Task = $Detail.json.task
+    if ($Task.status -eq "succeeded") {
+      return $Task
+    }
+    if ($Task.status -in @("failed", "cancelled", "interrupted", "blocked")) {
+      throw "Durable production task $TaskId ended as $($Task.status): $($Task.error)"
+    }
+    Start-Sleep -Milliseconds 250
+  } while ((Get-Date) -lt $Deadline)
+  throw "Durable production task $TaskId did not finish within ${TimeoutSec}s."
+}
+
 function Invoke-ProductionPost {
   param(
     [string]$ProductionPath,
@@ -102,8 +127,25 @@ function Invoke-ProductionPost {
     if ($SkipTrigger) {
       throw "UseTriggerGateway requires trigger gateway checks; remove -SkipTrigger."
     }
-    $Response = Invoke-HttpJson -Method POST -Uri (Join-OriginPath $TriggerOrigin $TriggerPath) -Body $Body -TimeoutSec $TimeoutSec
+    if ([string]::IsNullOrWhiteSpace($AdminToken)) {
+      throw "UseTriggerGateway requires -AdminToken or STEEL_ADMIN_TOKEN for audited admin.services proxy mutations."
+    }
+    $Response = Invoke-HttpJson -Method POST -Uri (Join-OriginPath $ServiceOrigin $TriggerPath) -Body $Body -TimeoutSec $TimeoutSec -Headers @{ Authorization = "Bearer $AdminToken" }
     $ServiceJson = if (Test-JsonProperty $Response.json "service") { $Response.json.service } else { $Response.json }
+    if ($ServiceJson.task -and -not [string]::IsNullOrWhiteSpace([string]$ServiceJson.task.taskId) -and $ServiceJson.task.status -ne "succeeded") {
+      $CompletedTask = Wait-DurableProductionTask -TaskId ([string]$ServiceJson.task.taskId) -TimeoutSec $TimeoutSec
+      $ServiceJson = [pscustomobject]@{
+        code = 0
+        materialId = $CompletedTask.materialId
+        sessionId = $CompletedTask.sessionId
+        task = $CompletedTask
+      }
+      if ($CompletedTask.result) {
+        foreach ($Property in $CompletedTask.result.PSObject.Properties) {
+          $ServiceJson | Add-Member -NotePropertyName $Property.Name -NotePropertyValue $Property.Value -Force
+        }
+      }
+    }
     return [pscustomobject]@{
       statusCode = $Response.statusCode
       json = $ServiceJson
@@ -193,12 +235,33 @@ function Get-ProductionSummaryPath {
   return Join-Path (Join-Path (Join-Path $CaptureRoot "production") (ConvertTo-SafeStorageSegment $Material)) (Join-Path (ConvertTo-SafeStorageSegment $Session) "summary.json")
 }
 
+function Resolve-ProductionSummaryPath {
+  param(
+    [string]$Material,
+    [string]$Session,
+    [string]$ProviderSummaryOutput
+  )
+
+  if (-not [string]::IsNullOrWhiteSpace($ProviderSummaryOutput)) {
+    if ([System.IO.Path]::IsPathRooted($ProviderSummaryOutput)) {
+      return [System.IO.Path]::GetFullPath($ProviderSummaryOutput)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($WorkRoot)) {
+      return [System.IO.Path]::GetFullPath((Join-Path $WorkRoot $ProviderSummaryOutput))
+    }
+  }
+  return Get-ProductionSummaryPath -Material $Material -Session $Session
+}
+
 function Get-ReportRoot {
   if (-not [string]::IsNullOrWhiteSpace($ReportDir)) {
     return [System.IO.Path]::GetFullPath($ReportDir)
   }
+  if (-not [string]::IsNullOrWhiteSpace($WorkRoot)) {
+    return Join-Path ([System.IO.Path]::GetFullPath($WorkRoot)) "reports\production-stability"
+  }
   if (Test-Path (Join-Path $PSScriptRoot "manifest.json") -PathType Leaf) {
-    return Join-Path $PSScriptRoot "logs\production-stability"
+    return Join-Path ([System.IO.Path]::GetTempPath()) "steel-runtime-package-stability\reports\production-stability"
   }
   $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
   return Join-Path $RepoRoot "target\logs\production-stability"
@@ -220,6 +283,106 @@ function Assert-CycleCondition {
   )
   if (-not $Condition) {
     Add-Failure -Failures $Failures -Message $Message
+  }
+}
+
+function Get-ReleaseIdentity {
+  if ([string]::IsNullOrWhiteSpace($ReleaseManifestPath)) {
+    $PackagedManifest = Join-Path $PSScriptRoot "manifest.json"
+    if (Test-Path $PackagedManifest -PathType Leaf) {
+      $script:ReleaseManifestPath = $PackagedManifest
+    } else {
+      $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+      $script:ReleaseManifestPath = Join-Path $RepoRoot "target\packages\steel-inspection-runtime\manifest.json"
+    }
+  }
+  if (-not (Test-Path -LiteralPath $ReleaseManifestPath -PathType Leaf)) {
+    throw "Release manifest is required for stability evidence: $ReleaseManifestPath"
+  }
+  $Resolved = (Resolve-Path -LiteralPath $ReleaseManifestPath).Path
+  $Manifest = Get-Content -LiteralPath $Resolved -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ([string]$Manifest.schema -ne "steel.runtime-package.v1" -or
+      [string]::IsNullOrWhiteSpace([string]$Manifest.releaseVersion) -or
+      [string]$Manifest.source.gitCommit -notmatch "^[0-9a-f]{40,64}$") {
+    throw "Release manifest does not expose a valid runtime-package version and commit: $Resolved"
+  }
+  return [ordered]@{
+    version = [string]$Manifest.releaseVersion
+    commit = [string]$Manifest.source.gitCommit
+    packageClass = [string]$Manifest.packageClass
+    manifestPath = $Resolved
+    manifestSha256 = (Get-FileHash -LiteralPath $Resolved -Algorithm SHA256).Hash.ToLowerInvariant()
+  }
+}
+
+function Get-ProductionConvergenceFailures {
+  param([object]$StatusJson)
+
+  $Failures = [System.Collections.Generic.List[string]]::new()
+  if ($null -eq $StatusJson) {
+    $Failures.Add("production status response was empty")
+    return @($Failures)
+  }
+  if ($null -ne $StatusJson.activeSession) {
+    $Failures.Add("activeSession was not cleared")
+  }
+  if ($null -eq $StatusJson.tasks) {
+    $Failures.Add("production status did not expose tasks convergence state")
+  } else {
+    if ($StatusJson.tasks.queueDepthAvailable -ne $true) {
+      $Failures.Add("tasks.queueDepthAvailable was not true")
+    }
+    if ($null -eq $StatusJson.tasks.queueDepth -or [int]$StatusJson.tasks.queueDepth -ne 0) {
+      $Failures.Add("tasks.queueDepth was not zero")
+    }
+    if ($null -eq $StatusJson.tasks.worker) {
+      $Failures.Add("production status did not expose tasks.worker state")
+    } else {
+      if ($StatusJson.tasks.worker.running -ne $true) {
+        $Failures.Add("tasks.worker.running was not true")
+      }
+      if (-not [string]::IsNullOrWhiteSpace([string]$StatusJson.tasks.worker.activeTaskId)) {
+        $Failures.Add("tasks.worker.activeTaskId was not cleared")
+      }
+    }
+  }
+  if ($null -eq $StatusJson.admission) {
+    $Failures.Add("production status did not expose admission convergence state")
+  } elseif ($null -eq $StatusJson.admission.inFlight -or [int]$StatusJson.admission.inFlight -ne 0) {
+    $Failures.Add("admission.inFlight was not zero")
+  }
+  return @($Failures)
+}
+
+function Wait-ProductionConvergence {
+  param([int]$TimeoutSec = 30)
+
+  $Started = Get-Date
+  $Attempts = 0
+  $StatusResponse = $null
+  $Failures = @("production convergence was not evaluated")
+  do {
+    $Attempts += 1
+    try {
+      $StatusResponse = Invoke-HttpJson -Method GET -Uri (Join-OriginPath $ServiceOrigin "/api/production/status") -TimeoutSec 15
+      $Failures = @(Get-ProductionConvergenceFailures -StatusJson $StatusResponse.json)
+      if ($Failures.Count -eq 0) {
+        break
+      }
+    } catch {
+      $Failures = @("production status request failed: $($_.Exception.Message)")
+    }
+    if (((Get-Date) - $Started).TotalSeconds -lt $TimeoutSec) {
+      Start-Sleep -Milliseconds 250
+    }
+  } while (((Get-Date) - $Started).TotalSeconds -lt $TimeoutSec)
+
+  return [ordered]@{
+    converged = $Failures.Count -eq 0
+    attempts = $Attempts
+    elapsedSeconds = [math]::Round(((Get-Date) - $Started).TotalSeconds, 3)
+    failures = $Failures
+    status = if ($null -eq $StatusResponse) { $null } else { $StatusResponse.json }
   }
 }
 
@@ -275,6 +438,7 @@ function Invoke-ProductionCycle {
   $CaptureResult = $null
   $SteelOutResult = $null
   $PostStatus = $null
+  $PostConvergence = $null
   $TriggerRoute = [ordered]@{
     enabled = [bool]$UseTriggerGateway
     steelInfoTarget = $null
@@ -302,16 +466,20 @@ function Invoke-ProductionCycle {
     if ($UseTriggerGateway) {
       $TriggerRoute.steelInfoTarget = [string]$SteelInfo.gateway.target
       $TriggerRoute.mode = [string]$SteelInfo.gateway.mode
-      Assert-CycleCondition -Failures $CycleFailures -Condition ($SteelInfo.gateway.target -eq "/api/production/steel-info") -Message "trigger steel-info routed to $($SteelInfo.gateway.target)."
+      Assert-CycleCondition -Failures $CycleFailures -Condition ($SteelInfo.gateway.target -eq "/api/production/tasks/steel-info") -Message "trigger steel-info routed to $($SteelInfo.gateway.target)."
     }
     $SteelIn = Invoke-ProductionPost -ProductionPath "/api/production/steel-in" -TriggerPath "/api/trigger/manual/steel-in" -Body $EventBody -TimeoutSec 15
     $SteelInOk = $true
     $SessionId = [string]$SteelIn.json.sessionId
     $InspectionId = [string]$SteelIn.json.inspectionId
+    Assert-CycleCondition -Failures $CycleFailures -Condition (-not [string]::IsNullOrWhiteSpace($SessionId)) -Message "steel-in did not return a sessionId."
+    Assert-CycleCondition -Failures $CycleFailures -Condition (-not [string]::IsNullOrWhiteSpace($InspectionId)) -Message "steel-in did not return an inspectionId."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ($SessionId.StartsWith("$MaterialId-", [System.StringComparison]::Ordinal)) -Message "sessionId was not bound to the current materialId."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ($InspectionId -ceq "INSP-$SessionId") -Message "inspectionId was not bound to the current sessionId."
     if ($UseTriggerGateway) {
       $TriggerRoute.steelInTarget = [string]$SteelIn.gateway.target
       $TriggerRoute.mode = [string]$SteelIn.gateway.mode
-      Assert-CycleCondition -Failures $CycleFailures -Condition ($SteelIn.gateway.target -eq "/api/production/steel-in") -Message "trigger steel-in routed to $($SteelIn.gateway.target)."
+      Assert-CycleCondition -Failures $CycleFailures -Condition ($SteelIn.gateway.target -eq "/api/production/tasks/steel-in") -Message "trigger steel-in routed to $($SteelIn.gateway.target)."
       Assert-CycleCondition -Failures $CycleFailures -Condition ($SteelIn.gateway.mode -eq "manual") -Message "trigger gateway mode was $($SteelIn.gateway.mode), expected manual."
     }
     Assert-CycleCondition -Failures $CycleFailures -Condition ($SteelIn.json.code -eq 0) -Message "steel-in returned code $($SteelIn.json.code)."
@@ -347,11 +515,13 @@ function Invoke-ProductionCycle {
     $ProviderRows = @($Provider.results)
     Assert-CycleCondition -Failures $CycleFailures -Condition ($CaptureResult.json.code -eq 0) -Message "capture-once returned code $($CaptureResult.json.code)."
     Assert-CycleCondition -Failures $CycleFailures -Condition ($Provider.parallel -eq $true) -Message "provider did not report parallel capture."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ($Provider.workerCount -ge $ExpectedCameras) -Message "provider workerCount $($Provider.workerCount) below $ExpectedCameras."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ($Provider.workerCount -eq $ExpectedCameras) -Message "provider workerCount $($Provider.workerCount) does not equal $ExpectedCameras."
     Assert-CycleCondition -Failures $CycleFailures -Condition ($Provider.failures -eq 0) -Message "provider failures $($Provider.failures)."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ($Provider.completeFrames -ge ($ExpectedCameras * $RoundsPerCycle)) -Message "provider completeFrames $($Provider.completeFrames) below expected."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ($Provider.metadataFrames -ge ($ExpectedCameras * $RoundsPerCycle)) -Message "provider metadataFrames $($Provider.metadataFrames) below expected."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$CaptureResult.json.record.captureFileRows -ge ($ExpectedCameras * $RoundsPerCycle * 3)) -Message "captureFileRows below expected: $($CaptureResult.json.record.captureFileRows)."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ($Provider.successes -eq ($ExpectedCameras * $RoundsPerCycle)) -Message "provider successes $($Provider.successes) does not equal expected."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ($Provider.completeFrames -eq ($ExpectedCameras * $RoundsPerCycle)) -Message "provider completeFrames $($Provider.completeFrames) does not equal expected."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ($Provider.metadataFrames -eq ($ExpectedCameras * $RoundsPerCycle)) -Message "provider metadataFrames $($Provider.metadataFrames) does not equal expected."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ($ProviderRows.Count -eq ($ExpectedCameras * $RoundsPerCycle)) -Message "provider result rows $($ProviderRows.Count) does not equal expected."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$CaptureResult.json.record.captureFileRows -eq ($ExpectedCameras * $RoundsPerCycle * 3)) -Message "captureFileRows does not equal expected: $($CaptureResult.json.record.captureFileRows)."
     foreach ($Row in $ProviderRows) {
       Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$Row.code -eq 0) -Message "camera $($Row.ip) round $($Row.round) returned code $($Row.code), error $($Row.errorName)."
       Assert-CycleCondition -Failures $CycleFailures -Condition ([bool]$Row.completeFrame) -Message "camera $($Row.ip) round $($Row.round) incomplete frame."
@@ -365,6 +535,7 @@ function Invoke-ProductionCycle {
         $SteelOutResult = Invoke-ProductionPost -ProductionPath "/api/production/steel-out" -TriggerPath "/api/trigger/manual/steel-out" -Body $EventBody -TimeoutSec 15
         if ($UseTriggerGateway) {
           $TriggerRoute.steelOutTarget = [string]$SteelOutResult.gateway.target
+          Assert-CycleCondition -Failures $CycleFailures -Condition ($SteelOutResult.gateway.target -eq "/api/production/tasks/steel-out") -Message "trigger steel-out routed to $($SteelOutResult.gateway.target)."
         }
       } catch {
         Add-Failure -Failures $CycleFailures -Message "steel-out failed: $($_.Exception.Message)"
@@ -373,31 +544,60 @@ function Invoke-ProductionCycle {
   }
 
   try {
-    $PostStatus = Invoke-HttpJson -Method GET -Uri (Join-OriginPath $ServiceOrigin "/api/production/status") -TimeoutSec 15
-    Assert-CycleCondition -Failures $CycleFailures -Condition ($null -eq $PostStatus.json.activeSession) -Message "activeSession was not cleared after cycle."
+    $PostConvergence = Wait-ProductionConvergence -TimeoutSec 30
+    $PostStatus = $PostConvergence.status
+    foreach ($Failure in @($PostConvergence.failures)) {
+      Add-Failure -Failures $CycleFailures -Message "production did not converge after cycle: $Failure."
+    }
   } catch {
     Add-Failure -Failures $CycleFailures -Message "post status failed: $($_.Exception.Message)"
   }
 
   $LayoutRows = Test-CameraMaterialLayout -Material $MaterialId
-  foreach ($Layout in $LayoutRows) {
-    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$Layout.depth -ge $RoundsPerCycle) -Message "$($Layout.camera) depth count $($Layout.depth) below $RoundsPerCycle."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$Layout.intensity -ge $RoundsPerCycle) -Message "$($Layout.camera) intensity count $($Layout.intensity) below $RoundsPerCycle."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$Layout.metadata -ge $RoundsPerCycle) -Message "$($Layout.camera) metadata count $($Layout.metadata) below $RoundsPerCycle."
-    Assert-CycleCondition -Failures $CycleFailures -Condition (-not [bool]$Layout.sdkDerivedExists) -Message "$($Layout.camera) wrote sdk-derived while disabled."
+  if ($HardwareCaptureConfigurationRequired) {
+    foreach ($Layout in $LayoutRows) {
+      Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$Layout.depth -eq $RoundsPerCycle) -Message "$($Layout.camera) depth count $($Layout.depth) does not equal $RoundsPerCycle."
+      Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$Layout.intensity -eq $RoundsPerCycle) -Message "$($Layout.camera) intensity count $($Layout.intensity) does not equal $RoundsPerCycle."
+      Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$Layout.metadata -eq $RoundsPerCycle) -Message "$($Layout.camera) metadata count $($Layout.metadata) does not equal $RoundsPerCycle."
+      Assert-CycleCondition -Failures $CycleFailures -Condition (-not [bool]$Layout.sdkDerivedExists) -Message "$($Layout.camera) wrote sdk-derived while disabled."
+    }
   }
 
-  $SummaryPath = if ($SessionId) { Get-ProductionSummaryPath -Material $MaterialId -Session $SessionId } else { "" }
+  $ProviderSummaryOutput = if ($null -ne $CaptureResult) {
+    [string]$CaptureResult.json.provider.summaryOutput
+  } else {
+    ""
+  }
+  $SummaryPath = if ($SessionId) {
+    Resolve-ProductionSummaryPath `
+      -Material $MaterialId `
+      -Session $SessionId `
+      -ProviderSummaryOutput $ProviderSummaryOutput
+  } else {
+    ""
+  }
   $SummaryJson = if ($SummaryPath) { Read-ProductionSummary -Path $SummaryPath } else { $null }
   if ($null -eq $SummaryJson) {
     Add-Failure -Failures $CycleFailures -Message "production summary missing: $SummaryPath"
   } else {
     Assert-CycleCondition -Failures $CycleFailures -Condition ($SummaryJson.schema -eq "steel.production.summary.v1") -Message "summary schema mismatch: $($SummaryJson.schema)."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$SummaryJson.captureFiles.count -ge ($ExpectedCameras * $RoundsPerCycle * 3)) -Message "summary file count below expected: $($SummaryJson.captureFiles.count)."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$SummaryJson.captureFiles.depth -ge ($ExpectedCameras * $RoundsPerCycle)) -Message "summary depth count below expected."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$SummaryJson.captureFiles.intensity -ge ($ExpectedCameras * $RoundsPerCycle)) -Message "summary intensity count below expected."
-    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$SummaryJson.captureFiles.metadata -ge ($ExpectedCameras * $RoundsPerCycle)) -Message "summary metadata count below expected."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([string]$SummaryJson.materialId -ceq $MaterialId) -Message "summary materialId did not match the cycle."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([string]$SummaryJson.sessionId -ceq $SessionId) -Message "summary sessionId did not match the cycle."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([string]$SummaryJson.inspectionId -ceq $InspectionId) -Message "summary inspectionId did not match the cycle."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([string]$SummaryJson.session.id -ceq $SessionId -and [string]$SummaryJson.session.materialId -ceq $MaterialId) -Message "summary session record crossed the cycle identity boundary."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([string]$SummaryJson.inspection.id -ceq $InspectionId -and [string]$SummaryJson.inspection.sessionId -ceq $SessionId -and [string]$SummaryJson.inspection.materialId -ceq $MaterialId) -Message "summary inspection record crossed the cycle identity boundary."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$SummaryJson.captureFiles.count -eq ($ExpectedCameras * $RoundsPerCycle * 3)) -Message "summary file count does not equal expected: $($SummaryJson.captureFiles.count)."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$SummaryJson.captureFiles.depth -eq ($ExpectedCameras * $RoundsPerCycle)) -Message "summary depth count does not equal expected."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$SummaryJson.captureFiles.intensity -eq ($ExpectedCameras * $RoundsPerCycle)) -Message "summary intensity count does not equal expected."
+    Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$SummaryJson.captureFiles.metadata -eq ($ExpectedCameras * $RoundsPerCycle)) -Message "summary metadata count does not equal expected."
     Assert-CycleCondition -Failures $CycleFailures -Condition ([int]$SummaryJson.captureFiles.sdkDerived -eq 0) -Message "summary sdkDerived should be 0."
+    if (-not $HardwareCaptureConfigurationRequired) {
+      $SimulatedItems = @($SummaryJson.captureFiles.items)
+      Assert-CycleCondition -Failures $CycleFailures -Condition ($SimulatedItems.Count -eq ($ExpectedCameras * $RoundsPerCycle * 3)) -Message "simulated summary item count does not equal expected."
+      foreach ($Item in $SimulatedItems) {
+        Assert-CycleCondition -Failures $CycleFailures -Condition ([string]$Item.path -like "simulated://$MaterialId/*") -Message "simulated capture item escaped the material URI namespace: $($Item.path)."
+      }
+    }
   }
 
   $ShouldRunAlgorithm = $RunAlgorithmEvery -gt 0 -and ($CycleIndex % $RunAlgorithmEvery -eq 0) -and $CycleFailures.Count -eq 0
@@ -430,6 +630,14 @@ function Invoke-ProductionCycle {
     materialId = $MaterialId
     sessionId = $SessionId
     inspectionId = $InspectionId
+    identityBinding = [ordered]@{
+      sessionMatchesMaterial = -not [string]::IsNullOrWhiteSpace($SessionId) -and $SessionId.StartsWith("$MaterialId-", [System.StringComparison]::Ordinal)
+      inspectionMatchesSession = -not [string]::IsNullOrWhiteSpace($InspectionId) -and $InspectionId -ceq "INSP-$SessionId"
+      summaryMatchesCycle = $null -ne $SummaryJson -and
+        [string]$SummaryJson.materialId -ceq $MaterialId -and
+        [string]$SummaryJson.sessionId -ceq $SessionId -and
+        [string]$SummaryJson.inspectionId -ceq $InspectionId
+    }
     startedAt = $StartedAt.ToString("o")
     elapsedSeconds = [math]::Round(((Get-Date) - $StartedAt).TotalSeconds, 3)
     ok = $CycleFailures.Count -eq 0
@@ -447,7 +655,13 @@ function Invoke-ProductionCycle {
       }
     }
     triggerRoute = $TriggerRoute
-    layout = $LayoutRows
+    layout = if ($HardwareCaptureConfigurationRequired) { $LayoutRows } else {
+      [ordered]@{
+        mode = "simulated-uri-ledger"
+        physicalFilesRequired = $false
+        reason = "simulated provider records deterministic URI artifacts instead of physical camera files"
+      }
+    }
     summary = if ($null -eq $SummaryJson) { $null } else {
       [ordered]@{
         path = $SummaryPath
@@ -472,9 +686,16 @@ function Invoke-ProductionCycle {
     }
     postStatus = if ($null -eq $PostStatus) { $null } else {
       [ordered]@{
-        activeSession = $PostStatus.json.activeSession
-        latestInspectionStatus = $PostStatus.json.latestInspection.status
-        captureCount = $PostStatus.json.latestInspection.captureCount
+        activeSession = $PostStatus.activeSession
+        latestInspectionStatus = $PostStatus.latestInspection.status
+        captureCount = $PostStatus.latestInspection.captureCount
+        queueDepth = $PostStatus.tasks.queueDepth
+        activeTaskId = $PostStatus.tasks.worker.activeTaskId
+        workerRunning = $PostStatus.tasks.worker.running
+        admissionInFlight = $PostStatus.admission.inFlight
+        converged = $PostConvergence.converged
+        convergenceAttempts = $PostConvergence.attempts
+        convergenceElapsedSeconds = $PostConvergence.elapsedSeconds
       }
     }
   }
@@ -483,12 +704,9 @@ function Invoke-ProductionCycle {
 if ($DurationSec -lt 1 -and $MaxCycles -lt 1) {
   throw "Set DurationSec >= 1 or MaxCycles >= 1."
 }
-if ($ExpectedCameras -lt 1) {
-  throw "ExpectedCameras must be positive."
-}
-
 $ReportRoot = Get-ReportRoot
 New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
+$ReleaseIdentity = Get-ReleaseIdentity
 $StartedAt = Get-Date
 $GlobalFailures = [System.Collections.Generic.List[string]]::new()
 
@@ -508,10 +726,7 @@ if ($UseTriggerGateway) {
     throw "UseTriggerGateway requires a reachable trigger gateway."
   }
   if ($Trigger.json.mode -ne "manual" -or $Trigger.json.manualAllowed -ne $true) {
-    $Trigger = Invoke-HttpJson -Method POST -Uri (Join-OriginPath $TriggerOrigin "/api/trigger/mode") -Body @{ mode = "manual" } -TimeoutSec 10
-  }
-  if ($Trigger.json.mode -ne "manual" -or $Trigger.json.manualAllowed -ne $true) {
-    throw "Trigger gateway did not enter manual mode for stability run."
+    throw "Production trigger gateway must be started in manual mode; the stability gate will not bypass the locked runtime-mode boundary."
   }
 }
 
@@ -528,18 +743,22 @@ if ($null -ne $ProductionStatus.json.activeSession) {
 
 $Connected = @($CameraStatuses.json.statuses | Where-Object { $_.connected })
 $NetworkSummary = Get-NetworkRateSummary -NetworkJson $Network.json
-if ($Connected.Count -lt $ExpectedCameras) {
-  throw "Connected camera count $($Connected.Count) below expected $ExpectedCameras."
+$CaptureProvider = [string]$Services.json.capture.provider
+$HardwareCaptureConfigurationRequired = $CaptureProvider -ne "simulated"
+if ($Connected.Count -ne $ExpectedCameras) {
+  throw "Connected camera count $($Connected.Count) does not equal expected $ExpectedCameras."
 }
-foreach ($Camera in @($Connected | Select-Object -First $ExpectedCameras)) {
-  if ([int]$Camera.captureConfig.controlMode -ne $ControlMode) {
-    Add-Failure -Failures $GlobalFailures -Message "Camera $($Camera.ip) controlMode $($Camera.captureConfig.controlMode), expected $ControlMode."
-  }
-  if ([int]$Camera.captureConfig.triggerInputType -ne 4) {
-    Add-Failure -Failures $GlobalFailures -Message "Camera $($Camera.ip) triggerInputType $($Camera.captureConfig.triggerInputType), expected 4."
-  }
-  if ([int]$Camera.captureConfig.triggerLines -ne $Lines) {
-    Add-Failure -Failures $GlobalFailures -Message "Camera $($Camera.ip) triggerLines $($Camera.captureConfig.triggerLines), expected $Lines."
+if ($HardwareCaptureConfigurationRequired) {
+  foreach ($Camera in @($Connected | Select-Object -First $ExpectedCameras)) {
+    if ([int]$Camera.captureConfig.controlMode -ne $ControlMode) {
+      Add-Failure -Failures $GlobalFailures -Message "Camera $($Camera.ip) controlMode $($Camera.captureConfig.controlMode), expected $ControlMode."
+    }
+    if ([int]$Camera.captureConfig.triggerInputType -ne 4) {
+      Add-Failure -Failures $GlobalFailures -Message "Camera $($Camera.ip) triggerInputType $($Camera.captureConfig.triggerInputType), expected 4."
+    }
+    if ([int]$Camera.captureConfig.triggerLines -ne $Lines) {
+      Add-Failure -Failures $GlobalFailures -Message "Camera $($Camera.ip) triggerLines $($Camera.captureConfig.triggerLines), expected $Lines."
+    }
   }
 }
 if ($Network.json.code -ne 0 -or @($Network.json.interfaces).Count -lt 1) {
@@ -585,8 +804,32 @@ while ($GlobalFailures.Count -eq 0) {
   }
 }
 
+$MaterialIds = @($Cycles | ForEach-Object { [string]$_.materialId })
+$SessionIds = @($Cycles | ForEach-Object { [string]$_.sessionId })
+$InspectionIds = @($Cycles | ForEach-Object { [string]$_.inspectionId })
+foreach ($Identity in @(
+  [ordered]@{ name = "materialId"; values = $MaterialIds },
+  [ordered]@{ name = "sessionId"; values = $SessionIds },
+  [ordered]@{ name = "inspectionId"; values = $InspectionIds }
+)) {
+  $Missing = @($Identity.values | Where-Object { [string]::IsNullOrWhiteSpace([string]$_) })
+  $Distinct = @($Identity.values | Sort-Object -Unique)
+  if ($Missing.Count -gt 0) {
+    Add-Failure -Failures $GlobalFailures -Message "$($Identity.name) was missing from one or more cycles."
+  }
+  if ($Distinct.Count -ne $Identity.values.Count) {
+    Add-Failure -Failures $GlobalFailures -Message "$($Identity.name) was reused across production cycles."
+  }
+}
+
+$FinalConvergence = Wait-ProductionConvergence -TimeoutSec 30
+foreach ($Failure in @($FinalConvergence.failures)) {
+  Add-Failure -Failures $GlobalFailures -Message "final production convergence failed: $Failure."
+}
+
 $Report = [ordered]@{
   schema = "steel.production.stability.v1"
+  release = $ReleaseIdentity
   code = if ($GlobalFailures.Count -eq 0) { 0 } else { 1 }
   startedAt = $StartedAt.ToString("o")
   finishedAt = (Get-Date).ToString("o")
@@ -601,6 +844,8 @@ $Report = [ordered]@{
     dataMode = $DataMode
     runAlgorithmEvery = $RunAlgorithmEvery
     useTriggerGateway = [bool]$UseTriggerGateway
+    workRoot = if ([string]::IsNullOrWhiteSpace($WorkRoot)) { $null } else { [System.IO.Path]::GetFullPath($WorkRoot) }
+    reportRoot = $ReportRoot
   }
   origins = [ordered]@{
     capture = $CaptureOrigin
@@ -610,13 +855,27 @@ $Report = [ordered]@{
   }
   preflight = [ordered]@{
     services = $Services.json
+    captureProvider = $CaptureProvider
     connectedCameras = $Connected.Count
+    hardwareCaptureConfiguration = [ordered]@{
+      required = $HardwareCaptureConfigurationRequired
+      status = if ($HardwareCaptureConfigurationRequired) { "validated" } else { "not-applicable-simulated-provider" }
+    }
     network = $NetworkSummary
     networkInterfaces = $NetworkSummary.interfaces
     trigger = if ($null -eq $Trigger) { $null } else { $Trigger.json }
     client = $Client
   }
   cycles = $Cycles
+  identityIsolation = [ordered]@{
+    materialIds = $MaterialIds
+    sessionIds = $SessionIds
+    inspectionIds = $InspectionIds
+    uniqueMaterialIds = @($MaterialIds | Sort-Object -Unique).Count
+    uniqueSessionIds = @($SessionIds | Sort-Object -Unique).Count
+    uniqueInspectionIds = @($InspectionIds | Sort-Object -Unique).Count
+  }
+  finalConvergence = $FinalConvergence
   totals = [ordered]@{
     cycles = $Cycles.Count
     okCycles = @($Cycles | Where-Object { $_.ok }).Count

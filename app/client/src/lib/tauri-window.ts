@@ -6,7 +6,9 @@ type UnlistenFn = () => void;
 export type TauriWindowApi = {
   isAvailable: boolean;
   close: () => Promise<void>;
+  isFullscreen: () => Promise<boolean>;
   minimize: () => Promise<void>;
+  setFullscreen: (fullscreen: boolean) => Promise<void>;
   startDragging: () => Promise<void>;
   toggleMaximize: () => Promise<void>;
   isMaximized: () => Promise<boolean>;
@@ -16,7 +18,9 @@ export type TauriWindowApi = {
 const unavailableWindowApi: TauriWindowApi = {
   isAvailable: false,
   close: async () => {},
+  isFullscreen: async () => false,
   minimize: async () => {},
+  setFullscreen: async () => {},
   startDragging: async () => {},
   toggleMaximize: async () => {},
   isMaximized: async () => false,
@@ -33,7 +37,9 @@ export function getTauriWindowApi(): TauriWindowApi {
   return {
     isAvailable: true,
     close: () => appWindow.close(),
+    isFullscreen: () => appWindow.isFullscreen(),
     minimize: () => appWindow.minimize(),
+    setFullscreen: (fullscreen) => appWindow.setFullscreen(fullscreen),
     startDragging: () => appWindow.startDragging(),
     toggleMaximize: () => appWindow.toggleMaximize(),
     isMaximized: () => appWindow.isMaximized(),

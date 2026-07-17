@@ -32,8 +32,7 @@ $Patterns = @(
   "*steel-inspection-service*",
   "*steel-trigger-gateway*",
   "*steel_trigger_gateway*",
-  "*steel_capture_service*",
-  "*steel_capture_qt_terminal*"
+  "*steel_capture_service*"
 )
 if ($IncludeNode) {
   $Patterns += @("*node*", "*vite*")

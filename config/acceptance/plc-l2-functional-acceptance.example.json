@@ -1,0 +1,30 @@
+{
+  "schema": "steel.plc-l2-functional-acceptance.v1",
+  "releaseVersion": "REPLACE-WITH-APPROVED-VERSION",
+  "releaseCommit": "REPLACE-WITH-40-TO-64-LOWERCASE-HEX-COMMIT",
+  "target": {
+    "line": "REPLACE-WITH-LINE",
+    "plc": "REPLACE-WITH-PLC",
+    "l2": "REPLACE-WITH-L2"
+  },
+  "startedAt": "REPLACE-WITH-ISO-8601",
+  "finishedAt": "REPLACE-WITH-ISO-8601",
+  "scenarios": [
+    { "id": "steel-info", "passed": false, "evidence": [{ "path": "evidence\\steel-info.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "steel-in", "passed": false, "evidence": [{ "path": "evidence\\steel-in.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "capture", "passed": false, "evidence": [{ "path": "evidence\\capture.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "algorithm", "passed": false, "evidence": [{ "path": "evidence\\algorithm.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "result-report", "passed": false, "evidence": [{ "path": "evidence\\result-report.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "steel-out", "passed": false, "evidence": [{ "path": "evidence\\steel-out.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "duplicate-retry", "passed": false, "evidence": [{ "path": "evidence\\duplicate-retry.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "wrong-order", "passed": false, "evidence": [{ "path": "evidence\\wrong-order.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "disconnect-reconnect", "passed": false, "evidence": [{ "path": "evidence\\disconnect-reconnect.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "service-restart", "passed": false, "evidence": [{ "path": "evidence\\service-restart.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "back-to-back-materials", "passed": false, "evidence": [{ "path": "evidence\\back-to-back-materials.json", "sha256": "REPLACE-WITH-SHA256" }] }
+  ],
+  "approvals": {
+    "automationOwner": "",
+    "productionOwner": "",
+    "approvedAt": ""
+  }
+}

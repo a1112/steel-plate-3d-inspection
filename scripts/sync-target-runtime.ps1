@@ -1,15 +1,13 @@
 param(
   [string]$Configuration = "Release",
   [ValidateSet("debug", "release")]
-  [string]$ServiceProfile = "debug",
-  [switch]$IncludeQt
+  [string]$ServiceProfile = "release"
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $RuntimeRoot = Join-Path $RepoRoot "target\runtime"
 $CaptureOut = Join-Path $RuntimeRoot "capture-headless"
-$CaptureQtOut = Join-Path $RuntimeRoot "capture-qt"
 $ServiceOut = Join-Path $RuntimeRoot "service"
 $TriggerOut = Join-Path $RuntimeRoot "trigger"
 $ClientOut = Join-Path $RuntimeRoot "client"
@@ -18,6 +16,7 @@ $LogsOut = Join-Path $RuntimeRoot "logs"
 $ScriptsOut = Join-Path $RuntimeRoot "scripts"
 $DocsOut = Join-Path $RuntimeRoot "docs"
 $AlgorithmCoreOut = Join-Path $RuntimeRoot "algorithm-core"
+$DatabaseOut = Join-Path $RuntimeRoot "database"
 
 function Copy-RequiredFile {
   param(
@@ -52,6 +51,28 @@ if ($MigrationArchitectureReport.code -ne 0) {
 }
 $MigrationArchitecture = $MigrationArchitectureReport.contract
 
+$DatabaseContractVerifier = Join-Path $RepoRoot "scripts\verify-database-migration-contract.ps1"
+$DatabaseContractTest = Join-Path $RepoRoot "scripts\test-database-migration-contract.ps1"
+$DatabaseContractSource = Join-Path $RepoRoot "config\release\database\contract.json"
+$DatabaseMigrationIndexSource = Join-Path $RepoRoot "config\release\database\migrations\index.json"
+$DatabaseContractReportText = (& $DatabaseContractVerifier `
+  -ContractPath $DatabaseContractSource `
+  -IndexPath $DatabaseMigrationIndexSource | Out-String)
+$DatabaseContractReport = $DatabaseContractReportText | ConvertFrom-Json
+if ($DatabaseContractReport.code -ne 0) {
+  throw "Database contract validation failed before runtime synchronization."
+}
+$DatabaseContract = Get-Content -LiteralPath $DatabaseContractSource -Raw -Encoding UTF8 | ConvertFrom-Json
+$ServiceDatabaseSource = Get-Content -LiteralPath (Join-Path $RepoRoot "app\service\src\db\mod.rs") -Raw -Encoding UTF8
+$ServiceSchemaVersionMatches = [regex]::Matches(
+  $ServiceDatabaseSource,
+  '(?m)^pub const DATABASE_SCHEMA_VERSION: i64 = ([1-9][0-9]*);$'
+)
+if ($ServiceSchemaVersionMatches.Count -ne 1 -or
+    [long]$DatabaseContract.schemaVersion -ne [long]$ServiceSchemaVersionMatches[0].Groups[1].Value) {
+  throw "Database target-runtime contract must match the Rust DATABASE_SCHEMA_VERSION."
+}
+
 if (Test-Path $RuntimeRoot) {
   $ResolvedRuntime = Resolve-Path $RuntimeRoot
   $ResolvedTarget = Resolve-Path (Join-Path $RepoRoot "target")
@@ -61,26 +82,30 @@ if (Test-Path $RuntimeRoot) {
   Remove-Item -LiteralPath $ResolvedRuntime.Path -Recurse -Force
 }
 
-New-Item -ItemType Directory -Force -Path $CaptureOut, $ServiceOut, $TriggerOut, $ClientOut, $ConfigOut, $LogsOut, $ScriptsOut, $DocsOut, $AlgorithmCoreOut | Out-Null
+New-Item -ItemType Directory -Force -Path $CaptureOut, $ServiceOut, $TriggerOut, $ClientOut, $ConfigOut, $LogsOut, $ScriptsOut, $DocsOut, $AlgorithmCoreOut, $DatabaseOut | Out-Null
+
+Copy-Item -LiteralPath $DatabaseContractSource -Destination (Join-Path $DatabaseOut "contract.json") -Force
+Copy-Item -LiteralPath (Split-Path -Parent $DatabaseMigrationIndexSource) -Destination $DatabaseOut -Recurse -Force
+$PackagedDatabaseContractPath = Join-Path $DatabaseOut "contract.json"
+$PackagedDatabaseMigrationIndexPath = Join-Path $DatabaseOut "migrations\index.json"
+$PackagedDatabaseContractHash = (Get-FileHash -LiteralPath $PackagedDatabaseContractPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$PackagedDatabaseMigrationIndexHash = (Get-FileHash -LiteralPath $PackagedDatabaseMigrationIndexPath -Algorithm SHA256).Hash.ToLowerInvariant()
+[void](& $DatabaseContractVerifier `
+  -ContractPath $PackagedDatabaseContractPath `
+  -IndexPath $PackagedDatabaseMigrationIndexPath | Out-String)
 
 $CaptureBuild = Join-Path $RepoRoot "target\capture\$Configuration"
 Copy-RequiredFile (Join-Path $CaptureBuild "steel_capture_service.exe") $CaptureOut
 Copy-RequiredFile (Join-Path $CaptureBuild "nvt_lvm_sdk.dll") $CaptureOut
-
-if ($IncludeQt) {
-  $CaptureQtBuild = Join-Path $RepoRoot "target\capture-qt\$Configuration"
-  if (-not (Test-Path (Join-Path $CaptureQtBuild "steel_capture_qt_terminal.exe") -PathType Leaf)) {
-    throw "Missing Qt executable under $CaptureQtBuild. Run scripts/build-capture-qt.ps1 first."
-  }
-  New-Item -ItemType Directory -Force -Path $CaptureQtOut | Out-Null
-  Get-ChildItem -LiteralPath $CaptureQtBuild -Force | Copy-Item -Destination $CaptureQtOut -Recurse -Force
-}
+Copy-RequiredFile (Join-Path $CaptureBuild "steel_runtime_supervisor.exe") $ServiceOut
+Rename-Item -LiteralPath (Join-Path $ServiceOut "steel_runtime_supervisor.exe") -NewName "steel-runtime-supervisor.exe"
 
 $ServiceBuild = Join-Path $RepoRoot "target\cargo\$ServiceProfile"
 Copy-RequiredFile (Join-Path $ServiceBuild "steel-inspection-service.exe") $ServiceOut
 
 $TriggerBuild = Join-Path $RepoRoot "target\trigger\$ServiceProfile"
 Copy-RequiredFile (Join-Path $TriggerBuild "steel-trigger-gateway.exe") $TriggerOut
+Copy-RequiredFile (Join-Path $TriggerBuild "steel-trigger-gateway.exe") $ServiceOut
 
 $AlgorithmCoreBuild = Join-Path $RepoRoot "target\algorithm-core\$Configuration"
 Copy-RequiredFile (Join-Path $AlgorithmCoreBuild "steel_bar_surface_core.exe") $AlgorithmCoreOut
@@ -97,20 +122,46 @@ if (Test-Path (Join-Path $RepoRoot "config\env") -PathType Container) {
 if (Test-Path (Join-Path $RepoRoot "config\capture") -PathType Container) {
   Copy-Item -LiteralPath (Join-Path $RepoRoot "config\capture") -Destination $ConfigOut -Recurse -Force
 }
+if (Test-Path (Join-Path $RepoRoot "config\algorithm") -PathType Container) {
+  Copy-Item -LiteralPath (Join-Path $RepoRoot "config\algorithm") -Destination $ConfigOut -Recurse -Force
+}
+if (Test-Path (Join-Path $RepoRoot "config\acceptance") -PathType Container) {
+  Copy-Item -LiteralPath (Join-Path $RepoRoot "config\acceptance") -Destination $ConfigOut -Recurse -Force
+}
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\run-client-static.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-integrated-management-smoke.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-trigger-gateway-security.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-integrated-runtime-ready.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-integrated-capture-management-full.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-integrated-acceptance-audit.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-architecture-migration-contract.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-runtime-acceptance.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-runtime-layout.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-runtime-supervisor.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-algorithm-acceptance-report.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-functional-go-live-readiness.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\new-functional-scenario-evidence.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\new-functional-acceptance-workspace.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-functional-acceptance-workspace-contract.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\add-functional-scenario-evidence.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-functional-scenario-attachment-contract.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test_algorithm_traceability.py") $ScriptsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\install-runtime-service.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\uninstall-runtime-service.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-runtime-ui-smoke.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-hardware-acceptance.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-calibration-acceptance.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-calibration-crash-recovery.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-calibration-integrity-generation.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-production-stability.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-production-stability-workroot-contract.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\backup-database.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\restore-database.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\manage-report-archives.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-report-archive-recovery.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\database-recovery-common.ps1") $RuntimeRoot
+Copy-RequiredFile $DatabaseContractVerifier $RuntimeRoot
+Copy-RequiredFile $DatabaseContractTest $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\bar_surface_reconstruct.py") $ScriptsOut
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\fit_array_calibration_cross_section.py") $ScriptsOut
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-bar-surface-e2e.ps1") $ScriptsOut
@@ -119,6 +170,10 @@ Copy-RequiredFile (Join-Path $RepoRoot "docs\independent-architecture.md") $Docs
 Copy-RequiredFile (Join-Path $RepoRoot "docs\capture-api-contract.md") $DocsOut
 Copy-RequiredFile (Join-Path $RepoRoot "docs\integrated-capture-management-acceptance.md") $DocsOut
 Copy-RequiredFile (Join-Path $RepoRoot "docs\qt-to-tauri-migration.md") $DocsOut
+Copy-RequiredFile (Join-Path $RepoRoot "docs\release-deployment-and-operations.md") $DocsOut
+Copy-RequiredFile (Join-Path $RepoRoot "docs\production-readiness-gap-and-closure-design.md") $DocsOut
+Copy-RequiredFile (Join-Path $RepoRoot "docs\atomic-upgrade-and-database-migration-design.md") $DocsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\README.md") $ScriptsOut
 
 Write-RuntimeFile "run-capture-headless.ps1" @'
 param(
@@ -149,40 +204,13 @@ try {
 }
 '@
 
-if ($IncludeQt) {
-  Write-RuntimeFile "run-capture-qt.ps1" @'
-param(
-  [int]$Port = 4317,
-  [string]$StorageRoot = "H:\",
-  [string]$CameraStorageRoot = "H:\"
-)
-
-$ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Exe = Join-Path $Root "capture-qt\steel_capture_qt_terminal.exe"
-
-if (-not (Test-Path $Exe -PathType Leaf)) {
-  throw "Missing Qt capture executable: $Exe"
-}
-
-$env:PATH = "$(Split-Path -Parent $Exe);$env:PATH"
-$env:CAPTURE_QT_API_AUTOSTART = "0"
-$env:CAPTURE_SERVICE_PORT = [string]$Port
-$env:CAPTURE_STORAGE_ROOT = $StorageRoot
-$env:CAPTURE_CONFIG_ROOT = Join-Path $Root "config\capture"
-$env:CAPTURE_CAMERA_STORAGE_ROOT = $CameraStorageRoot
-New-Item -ItemType Directory -Force -Path $env:CAPTURE_CONFIG_ROOT | Out-Null
-
-& $Exe
-exit $LASTEXITCODE
-'@
-}
-
 Write-RuntimeFile "run-service-headless.ps1" @'
 param(
   [int]$Port = 4873,
   [string]$CaptureOrigin = "http://127.0.0.1:4317",
-  [string]$TriggerOrigin = "http://127.0.0.1:4881"
+  [string]$TriggerOrigin = "http://127.0.0.1:4881",
+  [Parameter(Mandatory = $true)]
+  [string]$ArtifactAllowedRoots
 )
 
 $ErrorActionPreference = "Stop"
@@ -199,6 +227,13 @@ $env:STEEL_CAPTURE_PROVIDER = "external-api"
 $env:CAPTURE_SERVICE_ORIGIN = $CaptureOrigin
 $env:TRIGGER_GATEWAY_ORIGIN = $TriggerOrigin
 $env:STEEL_CAPTURE_SERVICE_AUTOSTART = "0"
+$env:STEEL_RUNTIME_PROFILE = "production"
+$env:STEEL_ALGORITHM_MODE = "production"
+$env:BAR_SURFACE_MOCK_DEFECT_COUNT = "0"
+$env:STEEL_TRIGGER_HEALTH_REQUIRED = "1"
+$env:STEEL_STORAGE_MIN_FREE_BYTES = "21474836480"
+$env:STEEL_STORAGE_MIN_FREE_PERCENT = "10"
+$env:STEEL_ARTIFACT_ALLOWED_ROOTS = $ArtifactAllowedRoots
 $env:STEEL_WORKSPACE_ROOT = $Root
 $env:STEEL_BAR_SURFACE_CORE_EXE = Join-Path $Root "algorithm-core\steel_bar_surface_core.exe"
 $env:STEEL_SERVICE_CONFIG_DIR = Join-Path $Root "config\service"
@@ -245,9 +280,14 @@ exit $LASTEXITCODE
 Write-RuntimeFile "run-trigger-gateway.ps1" @'
 param(
   [int]$Port = 4881,
+  [string]$HostAddress = "127.0.0.1",
   [string]$InspectionServiceOrigin = "http://127.0.0.1:4873",
-  [ValidateSet("api", "gray", "secondary", "manual")]
-  [string]$Mode = "manual"
+  [ValidateSet("api", "tcp", "udp", "gray", "secondary", "manual")]
+  [string]$Mode = "manual",
+  [ValidateSet("development", "acceptance", "production")]
+  [string]$RuntimeProfile = "production",
+  [string]$SourceAllowlist = "",
+  [switch]$AllowModeMutation
 )
 
 $ErrorActionPreference = "Stop"
@@ -259,9 +299,12 @@ if (-not (Test-Path $Exe -PathType Leaf)) {
 }
 
 $env:TRIGGER_GATEWAY_PORT = [string]$Port
-$env:TRIGGER_GATEWAY_HOST = "127.0.0.1"
+$env:TRIGGER_GATEWAY_HOST = $HostAddress
 $env:INSPECTION_SERVICE_ORIGIN = $InspectionServiceOrigin
 $env:TRIGGER_MODE = $Mode
+$env:STEEL_RUNTIME_PROFILE = $RuntimeProfile
+$env:TRIGGER_SOURCE_ALLOWLIST = $SourceAllowlist
+$env:TRIGGER_ALLOW_MODE_MUTATION = if ($AllowModeMutation) { "1" } else { "0" }
 
 & $Exe
 exit $LASTEXITCODE
@@ -275,9 +318,10 @@ param(
   [int]$ClientPort = 1432,
   [string]$StorageRoot = "H:\",
   [string]$CameraStorageRoot = "H:\",
-  [ValidateSet("api", "gray", "secondary", "manual")]
+  [Parameter(Mandatory = $true)]
+  [string]$ArtifactAllowedRoots,
+  [ValidateSet("api", "tcp", "udp", "gray", "secondary", "manual")]
   [string]$TriggerMode = "manual",
-  [switch]$WithQtDiagnostic,
   [switch]$StopExisting,
   [switch]$OpenBrowser
 )
@@ -396,16 +440,8 @@ $ExpectedCaptureConfigRoot = Join-Path $Root "config\capture"
 Assert-CaptureProviderMatches -Health $CaptureHealth -ExpectedStorageRoot $StorageRoot -ExpectedConfigRoot $ExpectedCaptureConfigRoot
 Write-Host ("Capture ready: sdkReady={0}, cameraCount={1}" -f $CaptureHealth.sdkReady, $CaptureHealth.cameraCount)
 
-if ($WithQtDiagnostic) {
-  $QtDiagnosticScript = Join-Path $Root "run-capture-qt.ps1"
-  if (-not (Test-Path $QtDiagnosticScript -PathType Leaf)) {
-    throw "Qt diagnostic viewer is not included in this runtime. Sync with -IncludeQt or omit -WithQtDiagnostic."
-  }
-  Start-RuntimeScript -Name "capture-qt-diagnostic" -ScriptPath $QtDiagnosticScript -Arguments @("-Port", [string]$CapturePort, "-StorageRoot", $StorageRoot, "-CameraStorageRoot", $CameraStorageRoot)
-}
-
 if (-not (Test-LocalTcpPort -Port $ServicePort)) {
-  Start-RuntimeScript -Name "service" -ScriptPath $ServiceScript -Arguments @("-Port", [string]$ServicePort, "-CaptureOrigin", "http://127.0.0.1:$CapturePort", "-TriggerOrigin", "http://127.0.0.1:$TriggerPort")
+  Start-RuntimeScript -Name "service" -ScriptPath $ServiceScript -Arguments @("-Port", [string]$ServicePort, "-CaptureOrigin", "http://127.0.0.1:$CapturePort", "-TriggerOrigin", "http://127.0.0.1:$TriggerPort", "-ArtifactAllowedRoots", $ArtifactAllowedRoots)
 } else {
   Write-Host "Rust service already listening on port $ServicePort."
 }
@@ -475,8 +511,7 @@ $ProcessNames = @(
   "steel-inspection-service",
   "steel-trigger-gateway",
   "steel_trigger_gateway",
-  "steel_capture_service",
-  "steel_capture_qt_terminal"
+  "steel_capture_service"
 )
 
 $Processes = @()
@@ -509,7 +544,6 @@ Write-RuntimeFile "README.md" @'
 This folder is generated by `scripts/sync-target-runtime.ps1`.
 
 - `capture-headless/`: headless C++ provider plus `nvt_lvm_sdk.dll`.
-- `capture-qt/`: optional diagnostic viewer plus Qt runtime DLLs and plugins when generated with `-IncludeQt`.
 - `service/`: Rust service executable.
 - `trigger/`: standalone trigger gateway executable.
 - `client/`: built frontend files.
@@ -517,6 +551,8 @@ This folder is generated by `scripts/sync-target-runtime.ps1`.
 - `logs/`: runtime logs.
 
 Recommended start order:
+
+The target trigger gateway defaults to `STEEL_RUNTIME_PROFILE=production`. Inject different values for `TRIGGER_SHARED_SECRET` and `TRIGGER_OPERATOR_TOKEN`, each with at least 32 random bytes, through the service manager before starting it; non-loopback binding also requires `TRIGGER_SOURCE_ALLOWLIST`. The shared secret authenticates PLC/L2 traffic, while the operator token is only for the loopback Rust-to-gateway hop. Runtime mode mutation remains locked unless an approved maintenance run explicitly passes `-AllowModeMutation`.
 
 ```powershell
 .\run-capture-headless.ps1
@@ -527,18 +563,10 @@ Recommended start order:
 One-command integrated startup:
 
 ```powershell
-.\run-integrated-capture-management.ps1 -TriggerMode manual -OpenBrowser
+.\run-integrated-capture-management.ps1 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction" -TriggerMode manual -OpenBrowser
 ```
 
 Use `-StopExisting` when restarting the stack on the same ports.
-
-Optional Qt diagnostic viewer after the headless provider is running:
-
-```powershell
-.\run-capture-qt.ps1
-```
-
-The Qt script sets `CAPTURE_QT_API_AUTOSTART=0`; it does not own the API or camera SDK session in the formal runtime.
 
 The integrated script waits for capture, service, trigger health endpoints, and the built client page at `http://127.0.0.1:1432/?app=terminal` when `run-client-static.ps1` is present.
 
@@ -555,6 +583,14 @@ Integrated smoke test without cameras:
 ```
 
 The smoke test starts the simulated Rust service, trigger gateway, and static client on temporary ports, then verifies manual guard, steel-info, steel-in, record-before-capture, steel-out, and terminal page availability.
+
+Production trigger security gate:
+
+```powershell
+.\test-trigger-gateway-security.ps1
+```
+
+This isolated gate verifies fail-closed secret validation, HMAC-SHA256 and replay protection for HTTP/TCP/UDP, source policy, mode locking, status redaction, and absence of wildcard CORS.
 
 Static runtime layout check without starting services:
 
@@ -606,21 +642,21 @@ Real hardware read-only checks, with optional `-RunCapture` for one production c
 Authenticated calibration dry-run and separately authorized apply/rollback:
 
 ```powershell
-.\test-real-calibration-acceptance.ps1 -PlanPath C:\maintenance\six-camera-calibration-plan.json -AdminToken $adminToken
-.\test-real-calibration-acceptance.ps1 -PlanPath C:\maintenance\six-camera-calibration-plan.json -AdminToken $adminToken -RunApplyRollback -SafetyConfirmation "RUN REAL SIX CAMERA CALIBRATION APPLY AND ROLLBACK"
+.\test-real-calibration-acceptance.ps1 -PlanPath C:\maintenance\eight-camera-calibration-plan.json -AdminToken $adminToken
+.\test-real-calibration-acceptance.ps1 -PlanPath C:\maintenance\eight-camera-calibration-plan.json -AdminToken $adminToken -RunApplyRollback -SafetyConfirmation "RUN REAL EIGHT CAMERA CALIBRATION APPLY AND ROLLBACK"
 ```
 
 Controlled crash recovery (run once for ApplyCrash and once for RollbackCrash):
 
 ```powershell
-.\test-real-calibration-crash-recovery.ps1 -Mode Prepare -Scenario ApplyCrash -PlanPath C:\maintenance\six-camera-calibration-plan.json -AdminToken $adminToken -SafetyConfirmation "RUN CONTROLLED CALIBRATION PROCESS CRASH RECOVERY"
+.\test-real-calibration-crash-recovery.ps1 -Mode Prepare -Scenario ApplyCrash -PlanPath C:\maintenance\eight-camera-calibration-plan.json -AdminToken $adminToken -SafetyConfirmation "RUN CONTROLLED CALIBRATION PROCESS CRASH RECOVERY"
 .\test-real-calibration-crash-recovery.ps1 -Mode Resume -StatePath .\logs\real-calibration-crash-recovery\active-calibration-crash-drill.json -AdminToken $adminToken -SafetyConfirmation "RUN CONTROLLED CALIBRATION PROCESS CRASH RECOVERY"
 ```
 
 Real stale-generation and staged-hash zero-write drill:
 
 ```powershell
-.\test-real-calibration-integrity-generation.ps1 -PlanPath C:\maintenance\six-camera-calibration-plan.json -AdminToken $adminToken -SafetyConfirmation "RUN REAL CALIBRATION INTEGRITY AND GENERATION DRILL"
+.\test-real-calibration-integrity-generation.ps1 -PlanPath C:\maintenance\eight-camera-calibration-plan.json -AdminToken $adminToken -SafetyConfirmation "RUN REAL CALIBRATION INTEGRITY AND GENERATION DRILL"
 ```
 '@
 
@@ -630,37 +666,76 @@ $Manifest = [ordered]@{
   root = "target/runtime"
   configRoot = "target/runtime/config"
   captureHeadless = "capture-headless/steel_capture_service.exe"
-  captureQt = if ($IncludeQt) { "capture-qt/steel_capture_qt_terminal.exe" } else { $null }
-  captureQtRole = if ($IncludeQt) { "diagnostic-only" } else { $null }
-  captureQtOwnsApi = if ($IncludeQt) { $false } else { $null }
-  captureQtFormalRuntime = if ($IncludeQt) { $false } else { $null }
   formalCapture = "headless-cpp"
   captureRole = "formal-sdk-owner"
   service = "service/steel-inspection-service.exe"
   triggerGateway = "trigger/steel-trigger-gateway.exe"
+  serviceTriggerGateway = "service/steel-trigger-gateway.exe"
+  supervisor = "service/steel-runtime-supervisor.exe"
+  windowsServiceName = "SteelInspectionRuntime"
   client = "client/index.html"
   algorithmCore = "algorithm-core/steel_bar_surface_core.exe"
+  algorithmConfig = "config/algorithm/bar-surface-production.json"
+  algorithmAcceptanceTemplate = "config/algorithm/acceptance-report.example.json"
+  functionalGoLivePlanTemplate = "config/acceptance/functional-go-live-plan.example.json"
+  plcL2FunctionalAcceptanceTemplate = "config/acceptance/plc-l2-functional-acceptance.example.json"
+  targetMachineFunctionalAcceptanceTemplate = "config/acceptance/target-machine-functional-acceptance.example.json"
+  functionalScenarioEvidenceTemplate = "config/acceptance/functional-scenario-evidence.example.json"
   algorithmScripts = "scripts"
   clientStatic = "run-client-static.ps1"
   integrated = "run-integrated-capture-management.ps1"
   integratedSmokeTest = "test-integrated-management-smoke.ps1"
+  triggerSecurityTest = "test-trigger-gateway-security.ps1"
   integratedReadyTest = "test-integrated-runtime-ready.ps1"
   integratedFullAcceptanceTest = "test-integrated-capture-management-full.ps1"
   integratedAcceptanceAuditTest = "test-integrated-acceptance-audit.ps1"
   migrationArchitectureTest = "test-architecture-migration-contract.ps1"
   runtimeAcceptanceTest = "test-runtime-acceptance.ps1"
   runtimeLayoutTest = "test-runtime-layout.ps1"
+  runtimeSupervisorTest = "test-runtime-supervisor.ps1"
+  algorithmAcceptanceTest = "test-algorithm-acceptance-report.ps1"
+  functionalGoLiveReadinessTest = "test-functional-go-live-readiness.ps1"
+  functionalScenarioEvidenceGenerator = "new-functional-scenario-evidence.ps1"
+  functionalAcceptanceWorkspaceInitializer = "new-functional-acceptance-workspace.ps1"
+  functionalAcceptanceWorkspaceContractTest = "test-functional-acceptance-workspace-contract.ps1"
+  functionalScenarioEvidenceAttacher = "add-functional-scenario-evidence.ps1"
+  functionalScenarioAttachmentContractTest = "test-functional-scenario-attachment-contract.ps1"
+  algorithmTraceabilityTest = "scripts/test_algorithm_traceability.py"
+  installRuntimeService = "install-runtime-service.ps1"
+  uninstallRuntimeService = "uninstall-runtime-service.ps1"
   runtimeUiSmokeTest = "test-runtime-ui-smoke.ps1"
   realHardwareAcceptanceTest = "test-real-hardware-acceptance.ps1"
   realCalibrationAcceptanceTest = "test-real-calibration-acceptance.ps1"
   realCalibrationCrashRecoveryTest = "test-real-calibration-crash-recovery.ps1"
   realCalibrationIntegrityGenerationTest = "test-real-calibration-integrity-generation.ps1"
   productionStabilityTest = "test-production-stability.ps1"
+  productionStabilityWorkRootContractTest = "test-production-stability-workroot-contract.ps1"
+  databaseBackup = "backup-database.ps1"
+  databaseRestore = "restore-database.ps1"
+  reportArchiveRecovery = "manage-report-archives.ps1"
+  reportArchiveRecoveryTest = "test-report-archive-recovery.ps1"
+  databaseRecoveryCommon = "database-recovery-common.ps1"
+  databaseContractVerify = "verify-database-migration-contract.ps1"
+  databaseContractTest = "test-database-migration-contract.ps1"
   barSurfaceE2ETest = "scripts/test-bar-surface-e2e.ps1"
+  database = [ordered]@{
+    contractPath = "database/contract.json"
+    contractSha256 = $PackagedDatabaseContractHash
+    contractSchema = [string]$DatabaseContract.contractSchema
+    schemaVersion = [int]$DatabaseContract.schemaVersion
+    minUpgradeableSchemaVersion = [int]$DatabaseContract.minUpgradeableSchemaVersion
+    maxUpgradeableSchemaVersion = [int]$DatabaseContract.maxUpgradeableSchemaVersion
+    minReadableSchemaVersion = [int]$DatabaseContract.minReadableSchemaVersion
+    maxReadableSchemaVersion = [int]$DatabaseContract.maxReadableSchemaVersion
+    rollbackReadableThrough = [int]$DatabaseContract.rollbackReadableThrough
+    engines = @($DatabaseContract.engines)
+    migrationIndex = [string]$DatabaseContract.migrationIndex
+    migrationIndexSha256 = $PackagedDatabaseMigrationIndexHash
+    stateLayoutVersion = [int]$DatabaseContract.stateLayoutVersion
+  }
   migrationArchitecture = $MigrationArchitecture
   dlls = @{
     captureSdk = "capture-headless/nvt_lvm_sdk.dll"
-    qtSdk = if ($IncludeQt) { "capture-qt/nvt_lvm_sdk.dll" } else { $null }
   }
 }
 $Manifest | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $RuntimeRoot "manifest.json") -Encoding UTF8

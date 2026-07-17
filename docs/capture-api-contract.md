@@ -1,6 +1,6 @@
 # Capture API Contract
 
-The headless C++ capture service is the formal camera-SDK owner and exposes this HTTP API. The legacy Qt compatibility mode can expose the same API, but formal startup uses Qt only as an optional diagnostic client with `CAPTURE_QT_API_AUTOSTART=0`.
+The headless C++ capture service is the sole camera-SDK owner and exposes this HTTP API. Tauri calls it only through the Rust service; the removed Qt compatibility runtime is not supported.
 
 Default origin:
 
@@ -23,7 +23,43 @@ GET /health
 GET /api/capture/health
 ```
 
-Returns SDK status and provider identity.
+Returns SDK status and provider identity. `ready` and `sdkReady` are operational
+readiness fields, not process-liveness fields. When a real SDK worker exceeds its
+hard timeout, `sdkCaptureState.restartRequired` becomes `true`, `sdkCode` becomes
+`49007`, and both readiness fields become `false` until the provider process is
+restarted. Rust also reads the nested restart flag so an older provider that
+incorrectly leaves `sdkReady:true` is still rejected by layered readiness.
+
+For a real provider, `ready` additionally requires `cameraSetReady:true` and an
+exact match between `cameraCount` and `expectedCameras`. More cameras are not
+treated as a valid configured set. At startup the provider reads the active
+profile; when `autoConnect` is enabled it discovers and connects that profile,
+starts continuous acquisition only after the exact set is present, and otherwise
+stays live but not ready. Connecting or disconnecting a single camera recomputes
+this gate.
+
+The production recovery sequence is: stop admitting new steel, preserve the
+failed material/session evidence, restart the capture provider through the
+managed service, reconnect exactly eight cameras, verify parameter readback,
+then run a fresh 8/8 capture round. This restart path must not be used to bypass
+`recoveryRequired:true` calibration reconciliation or an invalid rollback
+manifest; those states follow their explicit reconciliation workflow.
+
+The Windows runtime supervisor polls the provider while the child group is
+running. It requests a managed whole-group restart only after two consecutive
+successful health responses containing `restartRequired:true`, `sdkCode:49007`,
+`recoveryRequired:false`, and `invalidManifest:false`. A healthy observation
+resets confirmation. Restart attempts consume the existing supervisor restart
+budget; calibration recovery and invalid-manifest states remain fail-closed and
+must be reconciled explicitly.
+
+## Provider Capture Logs
+
+```http
+GET /api/capture/logs
+```
+
+Returns the bounded, newest-first event stream from the capture provider. Entries are produced by the provider when it receives real capture-management operations (connection, acquisition, parameter, storage, and calibration routes). The Rust service proxies this endpoint so the UI never reads provider logs directly.
 
 Required fields:
 
@@ -41,6 +77,9 @@ Required fields:
 - `storageRoot`
 - `configRoot`
 - `cameraCount`
+- `sdkCaptureState.poisoned`
+- `sdkCaptureState.restartRequired`
+- `sdkCaptureState.reason`
 
 ## Storage
 
@@ -76,7 +115,7 @@ Content-Type: application/json
     {"ip":"192.168.102.100","root":"H:/camera2"},
     {"ip":"192.168.103.100","root":"H:/camera3"},
     {"ip":"192.168.104.100","root":"H:/camera4"},
-    {"ip":"192.168.105.13","root":"H:/camera5"},
+    {"ip":"192.168.105.100","root":"H:/camera5"},
     {"ip":"192.168.106.100","root":"H:/camera6"}
   ]
 }
@@ -96,7 +135,7 @@ Provider-level configuration is stored under `CAPTURE_CONFIG_ROOT` when set, oth
 <configRoot>/active-profile.txt
 ```
 
-Profiles are ordinary JSON files. They are intended to capture startup mode, storage root, expected camera count, default capture parameters, trigger settings, and the camera parameter-file directory. The formal Tauri workflow reaches these operations through Rust's authenticated operator facade; automation and the optional Qt diagnostic viewer may use the provider API directly only in their explicit diagnostic/integration scope.
+Profiles are ordinary JSON files. They capture startup mode, storage root, expected camera count, default capture parameters, trigger settings, and the camera parameter-file directory. Tauri reaches these operations through Rust's authenticated operator facade; provider-level automation is limited to explicit diagnostic/integration scope.
 
 ```http
 GET /api/config/status
@@ -140,13 +179,13 @@ Content-Type: application/json
   "autoConnect": true,
   "loadCameraParams": false,
   "saveToDevice": false,
-  "expectedCameras": 6
+  "expectedCameras": 8
 }
 ```
 
 Applying a profile can connect discovered cameras, apply trigger/exposure/gain defaults, optionally load camera parameter files, and set the active profile name. `changeStorage` must be true to let a profile switch the provider storage root.
 
-For the six-camera production profile `current-6-soft-trigger`, startup defaults to `loadCameraParams:false` and `changeStorage:false`. This preserves the vendor/device-side time-trigger configuration that has already been verified on the cameras. Packaged `.nccfg` files are still included for explicit operator/API loading, backup, and comparison, but default startup must not depend on `lvm_load_dev_param` succeeding.
+For the eight-camera production profile `current-8-time-trigger`, startup defaults to `loadCameraParams:false` and `changeStorage:false`. This preserves the vendor/device-side time-trigger configuration already verified on the cameras. Parameter files remain available for explicit operator/API maintenance, but default startup does not depend on `lvm_load_dev_param` succeeding.
 
 Recommended profile fields:
 
@@ -159,7 +198,7 @@ Recommended profile fields:
   "cameraParamDir": "config/camera-params/default",
   "startupMode": "auto-connect",
   "autoConnect": true,
-  "expectedCameras": 6,
+  "expectedCameras": 8,
   "applySoftTrigger": true,
   "loadCameraParams": false,
   "saveToDevice": false,
@@ -214,7 +253,7 @@ Content-Type: application/json
 }
 ```
 
-`save-all` writes files named `<camera-ip-with-underscores>.nccfg`. `load-all` can either load explicit per-camera files through `cameraFiles[]` or fall back to the selected directory by safe IP, then model and serial number. Cameras omitted from `ips` are not touched, which lets the Qt configuration page mix "use camera built-in/current parameters" with "load this `.nccfg` file" per camera. External absolute files require `allowExternal:true`.
+`save-all` writes files named `<camera-ip-with-underscores>.nccfg`. `load-all` can either load explicit per-camera files through `cameraFiles[]` or fall back to the selected directory by safe IP, then model and serial number. Cameras omitted from `ips` are not touched, which lets the Tauri configuration page mix "use camera built-in/current parameters" with "load this `.nccfg` file" per camera. External absolute files require `allowExternal:true`.
 
 The response includes per-camera `code`, `errorName`, `operatorHint`, `file`, and SDK sub-codes such as `loadCode`, `applyCode`, and `saveDeviceCode`. A non-zero SDK code from explicit `.nccfg` loading must be reported to the operator, but it does not change the default production strategy of using the camera's current built-in/device parameters.
 
@@ -241,7 +280,7 @@ Returns:
 {
   "cameras": [
     {
-      "ip": "192.168.105.13",
+      "ip": "192.168.101.100",
       "model": "LVM3450CA",
       "sn": "YF-0263",
       "driverId": "lvm-nvt"
@@ -256,14 +295,14 @@ Returns:
 POST /api/camera/connect
 Content-Type: application/json
 
-{"ip":"192.168.105.13","devType":-1}
+{"ip":"192.168.101.100","devType":-1}
 ```
 
 ```http
 POST /api/cameras/connect-all
 Content-Type: application/json
 
-{"expectedCameras":6,"devType":-1}
+{"expectedCameras":8,"devType":-1}
 ```
 
 `/api/camera/connect-all` is accepted as an alias. The provider discovers cameras, connects them sequentially, and keeps software trigger mode enabled.
@@ -272,7 +311,7 @@ Content-Type: application/json
 POST /api/camera/disconnect
 Content-Type: application/json
 
-{"ip":"192.168.105.13"}
+{"ip":"192.168.101.100"}
 ```
 
 The provider should force software trigger mode during connect.
@@ -280,7 +319,7 @@ The provider should force software trigger mode during connect.
 ## Camera Status
 
 ```http
-GET /api/camera/status?ip=192.168.105.13
+GET /api/camera/status?ip=192.168.101.100
 GET /api/camera/statuses
 ```
 
@@ -305,21 +344,21 @@ Recommended fields:
 ## Parameters
 
 ```http
-GET /api/param?ip=192.168.105.13&key=TriggerMode&type=int
+GET /api/param?ip=192.168.101.100&key=TriggerMode&type=int
 ```
 
 ```http
 POST /api/param
 Content-Type: application/json
 
-{"ip":"192.168.105.13","key":"ExposureTime","type":"int","value":850}
+{"ip":"192.168.101.100","key":"ExposureTime","type":"int","value":850}
 ```
 
 Trigger mode must remain software-triggered for this deployment.
 
 ## Production Steel State
 
-The provider keeps a lightweight production state model so API-only callers and the Qt overview can use the same entry/exit-steel state. This state does not directly open SDK streams; it records the business phase that should drive higher-level line logic.
+The provider keeps a lightweight production state model so API-only callers and the Tauri overview can use the same entry/exit-steel state. This state does not directly open SDK streams; it records the business phase that should drive higher-level line logic.
 
 ```http
 GET /api/steel/status
@@ -357,9 +396,9 @@ Returns the current steel phase, steel identity/specification, camera readiness 
   "inTime": "",
   "outTime": "",
   "updatedAt": "2026-07-06T17:00:00.000",
-  "connectedCameras": 6,
+  "connectedCameras": 8,
   "streamingCameras": 0,
-  "expectedCameras": 6
+  "expectedCameras": 8
 }
 ```
 
@@ -423,7 +462,7 @@ When a production session is active and `/api/capture/depth-map` is called witho
 <camera-root>/<material-id>/<data-name>/<sequence>.<extension>
 ```
 
-The provider uses per-camera roots from the active profile or `POST /api/storage/camera-roots`; the current six-camera default maps the known IPs to `H:/camera1` through `H:/camera6` when drive `H:` exists. If a camera root is not configured, it falls back to `<storageRoot>/<camera-id>`, where `<camera-id>` is the camera SN when available or the IP. The default data-name directories are `depth`, `intensity`, and `metadata`; `sdk-derived` is written only when a capture request explicitly sends `saveSdkDerived:true` or `save_sdk_derived:true`. The production session summary still lives under `<storageRoot>/production/<safe-steel-id>/<sessionId>/summary.json`. Explicit `output` and `outputDir` values still take precedence unless `productionLayout:true` is sent to `/api/capture/continuous-test`.
+The provider uses per-camera roots from the active profile or `POST /api/storage/camera-roots`; the current eight-camera default maps the known IPs to `H:/camera1` through `H:/camera8` when drive `H:` exists. If a camera root is not configured, it falls back to `<storageRoot>/<camera-id>`, where `<camera-id>` is the camera SN when available or the IP. The default data-name directories are `depth`, `intensity`, and `metadata`; `sdk-derived` is written only when a capture request explicitly sends `saveSdkDerived:true` or `save_sdk_derived:true`. The production session summary still lives under `<storageRoot>/production/<safe-steel-id>/<sessionId>/summary.json`. Explicit `output` and `outputDir` values still take precedence unless `productionLayout:true` is sent to `/api/capture/continuous-test`.
 
 Production capture calls may send `steelStateAware:true` or `requireSteelPresent:true`. When the provider has not received entry-steel/save state, it returns code `49000` (`CAPTURE_DISCARDED_NOT_ARMED`) and does not write frame images. When `discardBlackFrames:true`, a frame whose intensity image is below `blackFrameThreshold` returns code `49001` (`BLACK_FRAME_DISCARDED`); depth, intensity, and optional SDK-derived images are removed, while metadata records `discarded:true` and `discardReason:"black-frame"`.
 
@@ -477,7 +516,69 @@ POST /api/production/tasks/retry
 
 Tauri and the standalone trigger gateway use the task API for durable production commands instead of holding the original command request open. The persistent worker supports `steel-info`, `steel-in`, `capture-once`, `algorithm-run`, `steel-out`, and `trigger-event`. The four steel/event kinds have the explicit enqueue routes listed above; capture and algorithm use the generic task endpoint. Secondary-data, capture-summary, and defect ingest remain synchronous record-ingest routes.
 
+Every persisted task exposes `chainId`, `dependsOnTaskId`, `dependencyPolicy`, and `blockedReason`. If callers omit dependency metadata, Rust reuses the session's stable chain and links the new task to the latest task in that chain. A material/session cannot fork into a different chain. `require-success` tasks wait until their direct predecessor succeeds; a failed, cancelled, interrupted, missing, or blocked predecessor recursively moves queued descendants to terminal `blocked` without calling the provider or algorithm. Retrying the failed parent requeues its blocked descendants. Safety-critical kinds reject `always-run`; only an explicitly safe `trigger-event` cleanup may use it.
+
 Tauri does not call the gateway origin directly. Rust exposes an explicit operator proxy allowlist for `GET /api/trigger/status`, `GET|POST /api/trigger/mode`, and `POST /api/trigger/manual/steel-info|steel-in|steel-out`. Proxy status, content type, and body are preserved; an unreachable gateway returns a bounded 503 and a timeout returns 504 without exposing the configured gateway origin. The gateway forwards manual steel commands back to the event-specific durable Rust routes.
+
+### HTTP API, TCP, and UDP trigger transports
+
+The standalone trigger gateway listens on HTTP `4881`, TCP `4882`, and UDP
+`4883` by default. Set `TRIGGER_TCP_PORT=0` or `TRIGGER_UDP_PORT=0` to disable a
+network listener. The active trigger mode accepts `api`, `tcp`, `udp`, `gray`,
+`secondary`, or `manual`; the status response includes the configured listener
+addresses.
+
+TCP is newline-delimited UTF-8 JSON (one request and one response per line).
+UDP is one UTF-8 JSON object per datagram, with one response datagram returned
+to the sender. Development loopback may explicitly disable authentication. Production always requires HMAC-SHA256 authentication and refuses to start without `TRIGGER_SHARED_SECRET` containing at least 32 bytes. A non-loopback production bind also requires `TRIGGER_SOURCE_ALLOWLIST` containing exact IP and/or CIDR rules.
+
+The canonical signature input is the UTF-8 byte sequence below, with LF separators and no trailing newline:
+
+```text
+steel-trigger-v1
+<unix timestamp seconds>
+<unique nonce>
+<transport: http|tcp|udp>
+<body>
+```
+
+For HTTP, `<body>` is the exact request body and clients send its lowercase hexadecimal HMAC-SHA256 in `X-Trigger-Signature`, alongside `X-Trigger-Timestamp` and `X-Trigger-Nonce`. For TCP/UDP, `<body>` is the compact, key-sorted JSON serialization of `payload`, and both transports use this envelope:
+
+```json
+{
+  "auth": {
+    "timestamp": "1784116800",
+    "nonce": "plc-a-cycle-1042-in",
+    "signature": "lowercase-hex-hmac-sha256"
+  },
+  "payload": {
+    "event": "steel-in",
+    "requestId": "plc-cycle-1042-in",
+    "materialId": "BAR-20260714-001",
+    "present": true,
+    "value": 1
+  }
+}
+```
+
+The default acceptance window is 30 seconds (`TRIGGER_AUTH_WINDOW_SECONDS`, allowed range 5–300). Nonces are 16–128 ASCII letters, digits, `-`, `_`, `.`, or `:` and are single-use across every transport during the replay window. Invalid signatures/timestamps return 401, a reused nonce returns 409 `trigger_replay_detected`, and a disallowed source returns 403 `trigger_source_forbidden`. Gateway status exposes only boolean listener/security state, never internal origins, hosts, ports, secrets, signatures, or nonces. Responses do not emit wildcard CORS.
+
+Operator mutations use a separate trust boundary. Production also requires `TRIGGER_OPERATOR_TOKEN` with at least 32 bytes, different from the upstream HMAC secret. Tauri sends its administrator session only to Rust; Rust requires `admin.services`, writes an audit record, and forwards `X-Trigger-Operator-Token` over the local Rust-to-gateway hop. The gateway accepts that token only from loopback and compares it without data-dependent early exit. Direct production manual requests without the token return 401 `trigger_operator_auth_required`; the local HTML manual page is disabled in production. `POST /api/trigger/capture-once` is included in this authenticated operator proxy so formal stability tests do not bypass the Rust authorization boundary.
+
+`event` may be `steel-info`, `steel-in`, `steel-out`, `secondary-data`,
+`capture-once`, `capture-summary`, `defect`, or `event`. `type` and `action` are
+accepted as aliases for `event`; underscore event names are normalized to
+hyphens. Every response contains `code`, `transport`, `mode`, `target`, and the
+inspection service response. PLC/L2 clients should reuse a stable `requestId`
+when retrying the same command.
+
+Run the English standard-library demo for a complete info/in/wait/out cycle:
+
+```powershell
+python scripts/trigger_demo.py --transport api
+python scripts/trigger_demo.py --transport tcp --hold-seconds 10
+python scripts/trigger_demo.py --transport udp --material-id BAR-DEMO-001
+```
 
 The original synchronous steel routes remain compatibility APIs. They cannot overtake accepted durable work: while a production task is queued or running, a synchronous steel event returns HTTP 409 `production_tasks_in_progress`. The formal Tauri and trigger-gateway paths enqueue instead.
 
@@ -488,6 +589,9 @@ Content-Type: application/json
 {
   "kind": "capture-once",
   "idempotencyKey": "operator-request-20260711-001",
+  "chainId": "SESSION-001",
+  "dependsOnTaskId": "TASK-STEEL-IN-001",
+  "dependencyPolicy": "require-success",
   "maxAttempts": 1,
   "payload": {
     "materialId": "MAT-001",
@@ -499,6 +603,8 @@ Content-Type: application/json
   }
 }
 ```
+
+`chainId`, `dependsOnTaskId`, and `dependencyPolicy` may be omitted for the normal sequential flow; the service derives the stable chain and direct predecessor. Clients must treat `blocked` as terminal and display the persisted `error`/`blockedReason`. A retry is accepted only after the dependency is ready.
 
 The first accepted enqueue returns HTTP 202 with `duplicate:false`. The task is stored before the worker is notified. `idempotencyKey` (or `requestId` on the event-specific routes) is scoped by normalized task kind: the same key and byte-equivalent normalized JSON payload returns the existing task with HTTP 200 and `duplicate:true`; different work under the same compound key returns HTTP 409 `idempotency_conflict`. When no key is supplied, Rust generates a task-specific stored key, but PLC/L2 retrying the same command must supply a stable request ID.
 
@@ -540,7 +646,19 @@ Only `failed`, `cancelled`, and `interrupted` tasks can be explicitly requeued. 
 
 Administrator record list, detail, CSV export, delete, and retention APIs use the same production tables as the operator snapshot: `production_inspection` is the record, `material_session` supplies material dimensions, `production_defect` supplies defect detail/severity counts, and `capture_file` supplies captured artifacts. The legacy `inspection_record`, `steel_plate`, and `defect` demo tables are not the administrator read model.
 
-Single-record delete removes the selected `production_inspection` plus its `production_defect` and `capture_file` database rows in a transaction. It retains `material_session`, trigger/secondary-data history, and files on disk. Retention selects only terminal production inspections older than the cutoff and excludes a record whose material session is still open.
+Single-record delete and retention use a persistent mark-clean-confirm lifecycle. `record_cleanup` freezes a `steel.record-artifact-cleanup.v1` manifest containing canonical paths, sizes, and SHA-256 values. `STEEL_ARTIFACT_ALLOWED_ROOTS` must enumerate narrow production capture, summary, and reconstruction roots. Execution revalidates the root, regular-file type, size, and hash before each delete and records per-file progress. Only after all artifacts are deleted or verifiably missing does one database transaction delete the selected `production_inspection` plus its `production_defect` and `capture_file` rows and mark the cleanup completed. It retains `material_session` and trigger/secondary-data history. Active sessions and records with unresolved production tasks are excluded; a hash/path/delete failure preserves database indexes and returns a retryable cleanup ID.
+
+```http
+GET  /api/admin/records/cleanup?id=CLEANUP-ID
+POST /api/admin/records/cleanup/retry
+Content-Type: application/json
+
+{"cleanupId":"CLEANUP-ID"}
+```
+
+Both routes require `admin.records`. Batch retention returns planned/deleted/missing file and byte totals. A partial batch returns HTTP 207 with per-record `recordId`, optional `cleanupId`, and error; successful records remain committed and failed records remain retryable.
+
+SQLite `GET /api/admin/database/backup` creates an online consistent snapshot with `VACUUM INTO`; it never copies the live database file. MySQL returns a server-side-job requirement and is backed up with `scripts/backup-database.ps1`, which uses a single-transaction `mysqldump` and emits a SHA-256 manifest. `scripts/restore-database.ps1` verifies that manifest and requires an exact confirmation phrase before an offline SQLite or controlled MySQL restore.
 
 Demo inspection data is disabled by default. Set `STEEL_SEED_DEMO_DATA=1` (also accepts `true`, `yes`, or `on`) only for an explicit development fixture; defect-type defaults remain available without enabling demo records.
 
@@ -556,7 +674,7 @@ POST /api/alarms/resolve
 
 List status accepts `open`, `active`, `acknowledged`, `resolved`, `history`, or `all` and returns global active/acknowledged/resolved counts. State changes require `admin.records`; the actor is derived from the authenticated Bearer session and is never trusted from the request body. Both actions require a non-empty note of at most 1000 characters. The only valid transition is `active -> acknowledged -> resolved`; same-state retry returns HTTP 200 with `changed:false`, an invalid transition returns HTTP 409, and the first actor/note is retained. Creation and both transitions are written to the audit log.
 
-The task queue makes Rust command ownership durable, and the C++ service has a bounded item/byte writer queue with backpressure, metrics, failure propagation, and shutdown drain. Current task cancellation must not be described as immediate SDK cancellation. The final cross-round/frame-transaction behavior and the real-SDK format-specific storage boundary are described in the storage section and still require a fresh six-camera hardware regression after writer changes.
+The task queue makes Rust command ownership durable, and the C++ service has a bounded item/byte writer queue with backpressure, metrics, failure propagation, and shutdown drain. Current task cancellation must not be described as immediate SDK cancellation. The final cross-round/frame-transaction behavior and the real-SDK format-specific storage boundary are described in the storage section and still require a fresh eight-camera hardware regression after writer changes.
 
 ### Rust service health
 
@@ -574,6 +692,8 @@ GET /api/health
 
 `/details` and `/ready/details` return the same readiness decision plus bounded database, worker, capture, `calibrationReconciliation`, storage, trigger, latency, and uptime fields. The reconciliation check exposes only the unresolved count plus operation ID/kind/status/error/time needed by Tauri; it does not expose request bodies or artifact paths. These endpoints do not include the database URL/path, capture or trigger origin, executable path, IP address, raw provider response, or raw worker errors. The legacy `/api/health` path remains available but now follows the readiness result instead of returning unconditional success. Each HTTP probe has a bounded deadline and a one-MiB response cap.
 
+In production runtime profile Rust also evaluates the same bounded checks every ten seconds after a five-second startup grace period. Storage warning/critical, capture unavailability or restart requirements, task-worker failure, unresolved calibration operations, required trigger failure, missing algorithm qualification, invalid production policy, Supervisor restart-budget exhaustion, and an invalid Supervisor status contract become persistent `source=system-health` alarms. Supervisor state is read from the atomic `StateRoot/service/supervisor-status.json` contract; an exhausted budget remains visible across Supervisor exit and is cleared only after a stable runtime recovery. A continuing condition refreshes the original open alarm instead of inserting duplicates. Recovery automatically records server-owned acknowledgement/resolution fields; a later recurrence creates a new alarm ID, preserving incident history. Development runtime profiles do not start this background monitor. A simulated provider under the production profile is intentionally monitored and produces algorithm/policy alarms because that combination is not production-qualified.
+
 The Rust service also exposes a review-only bar-surface calibration fit endpoint:
 
 ```http
@@ -583,16 +703,16 @@ Content-Type: application/json
 {
   "materialId": "BAR-E2E-20260708-013823",
   "captureRoot": "H:/",
-  "calibrationPath": "E:/steel-capture-data/config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-151317/ArrayCalibration.corrected.xml",
+  "calibrationPath": "config/capture/calibrations/current-8-time-trigger/ArrayCalibration.xml",
   "rows": "250,500,750",
   "maxPointsPerCamera": 2400,
   "maxShiftMm": 5
 }
 ```
 
-For direct review calls, it can read the production layout `H:/camera1..camera6/<materialId>/metadata`; it also accepts `dataDir` to fit one provider-returned continuous-test directory. It runs the X/Z cross-section fitter and returns `fitBefore`, `fitAfter`, per-camera `dx/dz`, `fit_report.json`, and `ArrayCalibration.corrected.xml`. This endpoint does not write the provider active profile and does not save parameters to camera devices.
+For direct review calls, it can read the production layout `H:/camera1..camera8/<materialId>/metadata`; it also accepts `dataDir` to fit one provider-returned continuous-test directory. It runs the X/Z cross-section fitter and returns target-detection evidence, `fitBefore`, `fitAfter`, per-camera `dx/dz`, `fit_report.json`, and—only after the gates pass—`ArrayCalibration.corrected.xml`. The capture-fit route may activate the corrected reconstruction pointer automatically, but it never saves parameters to camera devices.
 
-The formal Tauri automatic-calibration button does not fit an arbitrary old material. It enqueues a durable `algorithm-run` task with `operation:"calibration-capture-fit"`. Rust first requests one `/api/capture/continuous-test` round, requires exactly six unique successful camera results, six complete frames, six metadata commits, a real on-disk summary, and no simulated URI, then passes the returned summary directory as `dataDir` to the fitter. Capture or completeness failure ends the task before fitting. The reviewed `correctedXml` may later be passed to reconstruction or explicitly activated as the array pointer; neither step writes per-camera devices.
+The Tauri automatic-calibration button does not fit arbitrary old material. It enqueues a durable `algorithm-run` task with `operation:"calibration-capture-fit"`. Rust captures one round and requires exactly eight unique successful results, eight complete frames, eight metadata commits, a real on-disk summary, and no simulated URI. The fitter then requires an actual round target to pass point-count, diameter, angular-coverage, robust-inlier, and residual gates. A corrected XML is generated and automatically activated only when the correction-quality gate passes; no step writes per-camera devices.
 
 ## Depth Capture
 
@@ -601,7 +721,7 @@ POST /api/capture/depth-map
 Content-Type: application/json
 
 {
-  "ip": "192.168.105.13",
+  "ip": "192.168.101.100",
   "lines": 1280,
   "width": 4096,
   "timeoutMs": 8000,
@@ -615,7 +735,7 @@ Returns:
 ```json
 {
   "code": 0,
-  "ip": "192.168.105.13",
+  "ip": "192.168.101.100",
   "width": 4096,
   "lines": 1280,
   "output": "E:\\steel-capture-data\\CAM-01\\depth_depthMap.png",
@@ -635,6 +755,13 @@ Returns:
 
 `intensityOutput` is empty when the SDK frame does not include an intensity image. `depthExists`, `intensityExists`, `metadataExists`, and `completeFrame` are computed from the files actually present on disk after the SDK call. `metadataOutput` records camera identity, requested and actual dimensions, frame counters, trigger intervals, return code, `errorName`, `operatorHint`, `captureConfig`, and saved file paths. For example, `DEV_LOAD_DATA_ERROR` means the SDK accepted the camera configuration but did not return a frame before timeout.
 
+On a real provider, this blocking endpoint and the preview alias return `409`
+while continuous production acquisition is running. They must never call the
+vendor SDK concurrently with the background worker for the same camera. Switch
+capture mode to `on-demand` (which performs the bounded continuous-worker stop)
+before a maintenance/diagnostic blocking capture, then explicitly restore the
+desired mode. Simulated fixtures remain able to exercise both paths together.
+
 ## Preview Capture
 
 ```http
@@ -643,7 +770,7 @@ POST /api/capture/preview
 Content-Type: application/json
 
 {
-  "ip": "192.168.105.13",
+  "ip": "192.168.101.100",
   "lines": 1280,
   "width": 0,
   "timeoutMs": 5000,
@@ -665,7 +792,7 @@ Returns a PNG image when the output file exists and is inside the provider's all
 
 ## Auto-Connect And Continuous Capture Test
 
-Auto-connect and continuous capture are available as provider APIs and are also used by the Qt terminal and `scripts/test-capture-continuous.ps1`; they do not require additional Rust service business logic.
+Auto-connect and continuous capture are available as provider APIs and are used by the Tauri capture page and `scripts/test-capture-continuous.ps1`; they do not require additional Rust service business logic.
 
 The provider writes detailed `summary.json` into the selected output directory. The PowerShell script preserves that provider summary and writes its own camera-level rollup as `script-summary.json` and `script-summary.csv`. The summary records `completeFrames` per camera; a frame is complete only when depth PNG, intensity PNG, and metadata JSON all exist on disk. Failed cameras still write metadata when possible, so `metadataFrames` may be higher than `completeFrames`.
 
@@ -686,7 +813,7 @@ POST /api/capture/continuous-test
 Content-Type: application/json
 
 {
-  "expectedCameras": 6,
+  "expectedCameras": 8,
   "rounds": 3,
   "lines": 1280,
   "width": 0,
@@ -707,7 +834,7 @@ The provider response includes `parallel: true`, `syncMode: "round-start-conditi
 
 The provider also writes its response-shaped summary to `<storageRoot>/<outputDir>/summary.json` and returns `summaryOutput` plus `summaryExists`. This gives API-only callers the same durable audit trail that the PowerShell script creates.
 
-For the current six-camera line configuration, `controlMode: 0` is the default continuous capture mode, matching the vendor demo's "连续采集" setting. The provider still enforces software control with the time trigger source (`triggerInputType: 4`). The SDK value for depth + intensity capture is `captureDataType: 3` (`LVM_BT_DEPTH_INTENSITY`).
+For the current eight-camera line configuration, `controlMode: 0` is the default continuous capture mode, matching the vendor demo's "连续采集" setting. The provider still enforces software control with the time trigger source (`triggerInputType: 4`). The SDK value for depth + intensity capture is `captureDataType: 3` (`LVM_BT_DEPTH_INTENSITY`).
 
 Continuous-test frame files are grouped by camera first, then by artifact type:
 
@@ -730,7 +857,7 @@ POST /api/stream/start
 Content-Type: application/json
 
 {
-  "ip": "192.168.105.13",
+  "ip": "192.168.101.100",
   "lines": 1280,
   "width": 4096,
   "dataMode": 3,
@@ -749,13 +876,13 @@ lvm_alloc_depth_map_buf -> lvm_bind_buf -> lvm_enable_async_mode -> lvm_trigger_
 POST /api/stream/stop
 Content-Type: application/json
 
-{"ip":"192.168.105.13"}
+{"ip":"192.168.101.100"}
 ```
 
 ```http
-GET /api/stream/status?ip=192.168.105.13
-GET /api/stream/latest?ip=192.168.105.13&kind=depth
-GET /api/stream/latest?ip=192.168.105.13&kind=intensity
+GET /api/stream/status?ip=192.168.101.100
+GET /api/stream/latest?ip=192.168.101.100&kind=depth
+GET /api/stream/latest?ip=192.168.101.100&kind=intensity
 ```
 
 `/api/stream/latest` returns the latest PNG frame when one has been saved.
@@ -769,7 +896,7 @@ POST /api/calibration/load
 Content-Type: application/json
 
 {
-  "ip": "192.168.105.13",
+  "ip": "192.168.101.100",
   "path": "config/calibrations/reviewed/camera-105.xml",
   "expectedSn": "YF-0263",
   "dryRun": false,
@@ -781,7 +908,7 @@ Content-Type: application/json
 `dryRun:true` performs the single-camera static preflight without calling the SDK and does not require the apply phrase. A real single-camera maintenance apply requires the exact phrase `APPLY CAMERA CALIBRATION`; it enters the same snapshot/rollback-token workflow used by the set operation.
 
 ```http
-GET /api/calibration/active?profile=current-6-soft-trigger
+GET /api/calibration/active?profile=current-8-time-trigger
 ```
 
 Returns the active array-calibration pointer recorded by the profile, the absolute path if it can be resolved, and the latest `activeCalibration` metadata. This is the stitching/profile calibration file used by the operator workflow, not necessarily a file accepted by the vendor per-camera SDK loader.
@@ -792,9 +919,9 @@ Content-Type: application/json
 
 {
   "operationId": "calibration-apply-20260712-001",
-  "name": "current-6-soft-trigger",
-  "path": "config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-142746/ArrayCalibration.corrected.xml",
-  "fitReport": "config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-142746/fit_report.json"
+  "name": "current-8-time-trigger",
+  "path": "config/calibrations/current-8-time-trigger/array-calibration-fit-20260713-140000/ArrayCalibration.corrected.xml",
+  "fitReport": "config/calibrations/current-8-time-trigger/array-calibration-fit-20260713-140000/fit_report.json"
 }
 ```
 
@@ -802,66 +929,82 @@ Updates only the current profile pointer and `activeCalibration` metadata. It do
 
 The Tauri automatic-calibration review flow uses this endpoint with `saveToDevice:false`. It may activate a trusted local fitter output with `allowExternal:true`, but it must clearly report that only the array reconstruction pointer changed.
 
-### Formal six-camera apply
+### Formal eight-camera apply
 
 ```http
 POST /api/calibration/apply-all
 Content-Type: application/json
 
 {
-  "name": "current-6-soft-trigger",
-  "path": "config/calibrations/current-6-soft-trigger/array-calibration-fit-20260707-142746/ArrayCalibration.corrected.xml",
+  "name": "current-8-time-trigger",
+  "path": "config/calibrations/current-8-time-trigger/array-calibration-fit-20260713-140000/ArrayCalibration.corrected.xml",
   "ips": [
     "192.168.101.100",
     "192.168.102.100",
     "192.168.103.100",
     "192.168.104.100",
-    "192.168.105.13",
-    "192.168.106.100"
+    "192.168.105.100",
+    "192.168.106.100",
+    "192.168.107.100",
+    "192.168.108.100"
   ],
-  "expectedCameras": 6,
+  "expectedCameras": 8,
   "cameraCalibrations": [
     {
       "ip": "192.168.101.100",
-      "expectedSn": "3G506401BE08818",
+      "expectedSn": "3G506601BE09220",
       "artifactType": "camera-sdk",
       "path": "config/calibrations/reviewed/camera-101.xml",
       "rollbackPath": "config/calibrations/known-good/camera-101.xml"
     },
     {
       "ip": "192.168.102.100",
-      "expectedSn": "3G506501CA09165",
+      "expectedSn": "3G506501CA09164",
       "artifactType": "camera-sdk",
       "path": "config/calibrations/reviewed/camera-102.xml",
       "rollbackPath": "config/calibrations/known-good/camera-102.xml"
     },
     {
       "ip": "192.168.103.100",
-      "expectedSn": "3G506401RE08993",
+      "expectedSn": "3G506401RE08999",
       "artifactType": "camera-sdk",
       "path": "config/calibrations/reviewed/camera-103.xml",
       "rollbackPath": "config/calibrations/known-good/camera-103.xml"
     },
     {
       "ip": "192.168.104.100",
-      "expectedSn": "3G506401BE08819",
+      "expectedSn": "YF-0270",
       "artifactType": "camera-sdk",
       "path": "config/calibrations/reviewed/camera-104.xml",
       "rollbackPath": "config/calibrations/known-good/camera-104.xml"
     },
     {
-      "ip": "192.168.105.13",
-      "expectedSn": "YF-0263",
+      "ip": "192.168.105.100",
+      "expectedSn": "3G506601BE09221",
       "artifactType": "camera-sdk",
       "path": "config/calibrations/reviewed/camera-105.xml",
       "rollbackPath": "config/calibrations/known-good/camera-105.xml"
     },
     {
       "ip": "192.168.106.100",
-      "expectedSn": "3G506401RE08991",
+      "expectedSn": "3G506501CA09163",
       "artifactType": "camera-sdk",
       "path": "config/calibrations/reviewed/camera-106.xml",
       "rollbackPath": "config/calibrations/known-good/camera-106.xml"
+    },
+    {
+      "ip": "192.168.107.100",
+      "expectedSn": "3G506401RE08995",
+      "artifactType": "camera-sdk",
+      "path": "config/calibrations/reviewed/camera-107.xml",
+      "rollbackPath": "config/calibrations/known-good/camera-107.xml"
+    },
+    {
+      "ip": "192.168.108.100",
+      "expectedSn": "YF-0269",
+      "artifactType": "camera-sdk",
+      "path": "config/calibrations/reviewed/camera-108.xml",
+      "rollbackPath": "config/calibrations/known-good/camera-108.xml"
     }
   ],
   "dryRun": false,
@@ -879,9 +1022,9 @@ Content-Type: application/json
 
 The formal Rust proxy requires all of the following before forwarding either dry-run or real apply:
 
-- exactly six unique `ips` and six matching `cameraCalibrations`;
+- exactly eight unique `ips` and eight matching `cameraCalibrations`;
 - a non-empty, set-unique `expectedSn` and a distinct normalized SDK `path` for every camera; formal clients send `artifactType:"camera-sdk"` explicitly;
-- `expectedCameras:6`, `stopStreams:true`, `atomic:true`, `rollbackOnFailure:true`, and `requireAllMapped:true`;
+- `expectedCameras:8`, `stopStreams:true`, `atomic:true`, `rollbackOnFailure:true`, and `requireAllMapped:true`;
 - `saveCameraParams:false` and `allowBestEffortDeviceRollback:false`.
 - for a real apply, a caller-owned `operationId` of at most 128 ASCII letters/digits or `-_.:` characters; dry-run does not enter the mutation ledger.
 
@@ -933,7 +1076,7 @@ GET /api/calibration/operations/detail?id=calibration-apply-20260712-001
 
 It requires `admin.config` and returns `operationId`, kind, request hash/body, status, `needsReconciliation`, provider result, actor, `parentOperationId`, `reconciliationOutcome`, `reconciliationId`, `resolvedBy`, `resolvedAt`, `rowVersion`, and timestamps.
 
-Every formal six-camera mapping must include a known-good `rollbackPath`, even when `saveToDevice:false`. Before the first SDK write, C++ copies those files below `<CAPTURE_CONFIG_ROOT>/calibration-rollbacks/<token>/<safe-operationId>/previous`, verifies SHA-256+size, marks the staged copies read-only, and flushes an atomic `steel.capture.calibration-rollback-manifest.v1`. The manifest carries token/operation/profile state, camera IP/SN, target and staged previous paths, fingerprints, attempted flags, save mode, phase, and consumed state. Original rollback files may be moved or changed after apply without changing the staged recovery bytes.
+Every formal eight-camera mapping must include a known-good `rollbackPath`, even when `saveToDevice:false`. Before the first SDK write, C++ copies those files below `<CAPTURE_CONFIG_ROOT>/calibration-rollbacks/<token>/<safe-operationId>/previous`, verifies SHA-256+size, marks the staged copies read-only, and flushes an atomic `steel.capture.calibration-rollback-manifest.v1`. The manifest carries token/operation/profile state, camera IP/SN, target and staged previous paths, fingerprints, attempted flags, save mode, phase, and consumed state. Original rollback files may be moved or changed after apply without changing the staged recovery bytes.
 
 Clean restart reloads durable manifests and binds only the newest token for each IP/SN generation. `applied` is an ordinary unconsumed rollback asset; `prepared`, `applying`, `rolling-back`, and `rollback-failed` require explicit recovery. Such phases—or any corrupt/unreadable manifest—make provider `/health` report `ready:false`, `sdkReady:false`, `recoveryRequired:true`, `invalidManifest`, and `pendingRecoveryCount`; all new provider writes return HTTP 423 except camera connect/disconnect, stream stop, and explicit rollback. A successful staged rollback persists `rolled-back/consumed` and reopens readiness. A corrupt manifest has no override and remains fail-closed. Exact `lvm_calib_param_t` runtime snapshots are still process-local and are never serialized; cross-restart recovery uses only the staged SDK files.
 
@@ -946,7 +1089,7 @@ POST /api/roi/load
 Content-Type: application/json
 
 {
-  "ip": "192.168.105.13",
+  "ip": "192.168.101.100",
   "path": "config/calibrations/reviewed/CAM-01-roi.xml",
   "allowExternal": false,
   "confirmation": "APPLY CAMERA ROI"
@@ -956,7 +1099,7 @@ Content-Type: application/json
 The exact phrase `APPLY CAMERA ROI` is mandatory. With the default `allowExternal:false`, the canonical target must be an existing regular file below the provider storage root or config root. Relative paths are provider-local; traversal, symlink/junction escape, directories, and other external paths are rejected. `allowExternal:true` is an explicit admin maintenance opt-in and still requires a canonical regular file.
 
 ```http
-GET /api/calibration/status?ip=192.168.105.13
+GET /api/calibration/status?ip=192.168.101.100
 ```
 
 Calibration apply, rollback, and ROI apply append best-effort JSON Lines records to the path below. Validation capture appends a record when `calibrationMaintenanceRecord:true`; the Tauri validation helper sets this flag.
@@ -1028,6 +1171,11 @@ The UI must present upload, download, link bandwidth, and utilization as monitor
 Only one provider process may own the LVM SDK camera handles:
 
 - `headless-cpp`: Rust may start `steel_capture_service.exe`.
-- `qt-terminal`: legacy compatibility mode in which the Qt terminal owns the SDK and Rust only proxies to it. Formal Qt diagnostics never use this ownership mode.
 - `external-api`: another compatible process owns the SDK and Rust only proxies to it.
 - `simulated`: Rust does not call a provider.
+
+## Storage capacity contract
+
+`GET /api/storage/status` reports capacity for the global storage root and every configured camera root. Each root includes `capacityAvailable`, `capacityBytes`, `freeBytes`, and `freePercent` in addition to existence and writability. Rust does not expose root paths through readiness; it publishes the minimum capacity/free values across all roots.
+
+For a non-simulated provider, Rust derives a warning watermark at twice `STEEL_STORAGE_MIN_FREE_BYTES` and five percentage points above `STEEL_STORAGE_MIN_FREE_PERCENT`. Crossing either warning watermark returns `ok=true`, `status=warning`, `level=warning`, and `warningReason=storage_capacity_near_watermark`; readiness remains open and the Tauri header displays the minimum free GiB, free percentage, and estimated remaining hours. Crossing either hard watermark returns `ok=false`, `status=unavailable`, `level=critical`, and `reason=storage_capacity_below_watermark`; it closes readiness and blocks only new `steel-info`/`steel-in` admission while allowing retries and `steel-out` for the current session. Defaults are hard values of 20 GiB and 10%; deployments set both explicitly from the production retention/capacity calculation. Missing capacity fields are a contract failure, not an assumed healthy state. The writer queue also reports successful bytes completed in the last 60 seconds; Rust publishes `recentWriteBytesPerSecond` and derives `estimatedRemainingSeconds` when the rate is nonzero. Failed writes never increase that rate.

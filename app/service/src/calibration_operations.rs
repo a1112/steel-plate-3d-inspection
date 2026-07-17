@@ -165,7 +165,10 @@ fn normalized_request(body: &str) -> Result<(String, String), &'static str> {
         return Err("calibration_operation_id_invalid");
     }
     let operation_id = operation_id.to_string();
-    object.insert("operationId".to_string(), Value::String(operation_id.clone()));
+    object.insert(
+        "operationId".to_string(),
+        Value::String(operation_id.clone()),
+    );
     let request_json = serde_json::to_string(&canonicalize(&value))
         .map_err(|_| "calibration_operation_normalization_failed")?;
     Ok((operation_id, request_json))
@@ -179,11 +182,7 @@ fn valid_operation_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
-pub(super) fn apply_response(
-    state: &ServiceState,
-    body: &str,
-    actor: &str,
-) -> Vec<u8> {
+pub(super) fn apply_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let value = match parse_unique_json(body) {
         Ok(value) => value,
         Err(error) => return validation_error_response(error),
@@ -283,9 +282,7 @@ fn replay_response(operation: &calibration_operation::Model) -> Vec<u8> {
             )
         }
         "needs-reconciliation" => operation_http_response("409 Conflict", operation, true),
-        "succeeded" | "failed" | "reconciled" => {
-            operation_http_response("200 OK", operation, true)
-        }
+        "succeeded" | "failed" | "reconciled" => operation_http_response("200 OK", operation, true),
         _ => operation_http_response("500 Internal Server Error", operation, true),
     }
 }
@@ -390,9 +387,11 @@ pub(super) fn reconciliation_fence_response(
     state: &ServiceState,
     operation_id: &str,
 ) -> Option<Vec<u8>> {
-    match state.runtime.block_on(db::list_unresolved_calibration_operations(
-        &state.database.connection,
-    )) {
+    match state
+        .runtime
+        .block_on(db::list_unresolved_calibration_operations(
+            &state.database.connection,
+        )) {
         Ok(unresolved) if unresolved.is_empty() => None,
         Ok(unresolved) => Some(reconciliation_required_response(operation_id, &unresolved)),
         Err(_) => Some(database_error_response(
@@ -433,7 +432,10 @@ fn provider_terminal_status(
     response: &CaptureProxyResponse,
 ) -> (&'static str, &'static str) {
     let Some(body) = serde_json::from_slice::<Value>(&response.body).ok() else {
-        return ("needs-reconciliation", "capture_provider_response_not_decisive");
+        return (
+            "needs-reconciliation",
+            "capture_provider_response_not_decisive",
+        );
     };
     if kind == "apply-all"
         && body.get("rollbackPerformed").and_then(Value::as_bool) == Some(true)
@@ -457,13 +459,19 @@ fn provider_terminal_status(
         );
     }
     if matches!(response.status_code, 408 | 502 | 503 | 504) {
-        return ("needs-reconciliation", "capture_provider_timeout_or_unavailable");
+        return (
+            "needs-reconciliation",
+            "capture_provider_timeout_or_unavailable",
+        );
     }
     if !(200..300).contains(&response.status_code) {
         return ("failed", "capture_provider_rejected_operation");
     }
     let Some(code) = body.get("code").and_then(Value::as_i64) else {
-        return ("needs-reconciliation", "capture_provider_response_not_decisive");
+        return (
+            "needs-reconciliation",
+            "capture_provider_response_not_decisive",
+        );
     };
     if code == 0 {
         ("succeeded", "")
@@ -518,12 +526,10 @@ where
         return validation_error_response("calibration_apply_operation_id_invalid");
     }
 
-    match state
-        .runtime
-        .block_on(db::find_calibration_operation(
-            &state.database.connection,
-            &operation_id,
-        )) {
+    match state.runtime.block_on(db::find_calibration_operation(
+        &state.database.connection,
+        &operation_id,
+    )) {
         Ok(Some(existing)) => {
             if !matches_request(&existing, kind, &hash, &request_json) {
                 return conflict_response(&operation_id);
@@ -557,8 +563,7 @@ where
         if !recovery_parent_matches {
             return reconciliation_required_response(&operation_id, &unresolved);
         }
-        reconciliation_expected_apply_operation_id =
-            expected_apply_operation_id(&unresolved[0]);
+        reconciliation_expected_apply_operation_id = expected_apply_operation_id(&unresolved[0]);
         if reconciliation_expected_apply_operation_id.is_empty()
             || requested_apply_operation_id != reconciliation_expected_apply_operation_id
         {
@@ -674,17 +679,16 @@ where
         return operation_http_response("409 Conflict", &operation, false);
     }
     if status == "succeeded" && kind == "rollback" && !parent_operation_id.is_empty() {
-        let provider_apply_operation_id = serde_json::from_str::<Value>(
-            &operation.provider_response_body,
-        )
-        .ok()
-        .and_then(|value| {
-            value
-                .get("applyOperationId")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
+        let provider_apply_operation_id =
+            serde_json::from_str::<Value>(&operation.provider_response_body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("applyOperationId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
         if provider_apply_operation_id != reconciliation_expected_apply_operation_id {
             return http_response(
                 "409 Conflict",
@@ -715,9 +719,7 @@ where
                     actor,
                     "calibration.reconciled",
                     &parent_operation_id,
-                    &format!(
-                        "restored to staged baseline by rollback operation {operation_id}"
-                    ),
+                    &format!("restored to staged baseline by rollback operation {operation_id}"),
                     "warning",
                 ));
             }
@@ -784,7 +786,10 @@ mod tests {
         )
         .expect("second request");
         assert_eq!(first, second);
-        assert_eq!(request_hash("apply-all", &first), request_hash("apply-all", &second));
+        assert_eq!(
+            request_hash("apply-all", &first),
+            request_hash("apply-all", &second)
+        );
     }
 
     #[test]
@@ -820,8 +825,7 @@ mod tests {
         let automatic = CaptureProxyResponse {
             status_code: 200,
             content_type: "application/json".to_string(),
-            body: br#"{"code":9001,"rollbackPerformed":true,"rollbackComplete":false}"#
-                .to_vec(),
+            body: br#"{"code":9001,"rollbackPerformed":true,"rollbackComplete":false}"#.to_vec(),
         };
         assert_eq!(
             provider_terminal_status("apply-all", &automatic),

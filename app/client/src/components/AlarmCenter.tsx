@@ -378,7 +378,7 @@ export function AlarmCenter({ pollIntervalMs = 10_000 }: { pollIntervalMs?: numb
           </label>
           <label>
             <span>来源</span>
-            <input aria-label="报警来源" value={filterDraft.source} placeholder="production-defect / camera / service" onChange={(event) => setFilterDraft((current) => ({ ...current, source: event.target.value }))} />
+            <input aria-label="报警来源" value={filterDraft.source} placeholder="production-defect / system-health" onChange={(event) => setFilterDraft((current) => ({ ...current, source: event.target.value }))} />
           </label>
           <label className="keyword">
             <span>关键词</span>

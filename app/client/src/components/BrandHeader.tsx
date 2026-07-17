@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEve
 import ustbLogoDark from '../assets/USTB-dark.png';
 import ustbLogo from '../assets/USTB.png';
 import type { DeviceStatus, ThemeMode } from '../data/inspection';
+import type { TriggerGatewayStatus } from '../services/inspection-api';
 import type { CaptureCameraStatus, CaptureSnapshot, SystemNetworkRateInterface, SystemNetworkRateSnapshot } from '../lib/capture-api';
 import { TopNav, type NavKey } from './TopNav';
 import { WindowControls } from './WindowControls';
@@ -12,6 +13,7 @@ interface BrandHeaderProps {
   theme: ThemeMode;
   capture?: CaptureSnapshot;
   network?: SystemNetworkRateSnapshot | null;
+  trigger?: TriggerGatewayStatus | null;
   services?: ServiceStatusPanel;
   activeNav: NavKey;
   onNavChange: (next: NavKey) => void;
@@ -167,7 +169,9 @@ function formatCameraTemperature(camera: CaptureCameraStatus) {
 }
 
 function cameraFrameRate(camera: CaptureCameraStatus) {
-  return formatFrameRate(camera.fps ?? camera.captureConfig?.maxFrameRate);
+  // The capture dashboard reports completed production depth-map FPS.  Preview
+  // stream telemetry and the SDK's maximum frame-rate are different metrics.
+  return formatFrameRate(camera.continuousFps);
 }
 
 function cameraStation(camera: CaptureCameraStatus, index: number) {
@@ -313,7 +317,7 @@ function createReceiverDetailsFromCapture(
     channel: `${camera.name || `camera${index + 1}`} 链路`,
     ip: camera.ip || '--',
     throughput: cameraFrameRate(camera),
-    latency: formatTime(camera.lastFrameTime),
+    latency: formatTime(camera.lastContinuousFrameAt ?? camera.lastFrameTime),
     status: isCameraHealthy(camera) ? '已连接' : cameraStatusText(camera),
     uploadMbps: 0,
     downloadMbps: 0,
@@ -368,16 +372,13 @@ function createCameraDetailsFromCapture(capture: CaptureSnapshot | undefined, fa
 }
 
 function PortContent({ title, ports }: { title: string; ports: Port[] }) {
+  const onlineCount = ports.filter((port) => port.ok).length;
   return (
     <>
       <span>{title}</span>
-      <div className="port-list">
-        {ports.map((port) => (
-          <i key={port.index} className={port.ok ? 'ok' : 'bad'} title={port.title}>
-            {port.index}
-          </i>
-        ))}
-      </div>
+      <strong className={`port-count-summary ${onlineCount === ports.length ? 'ok' : 'warning'}`}>
+        {onlineCount}/{ports.length}
+      </strong>
     </>
   );
 }
@@ -618,18 +619,51 @@ function StatusBlock({
   value,
   tone = 'ok',
   title,
+  className,
 }: {
   label: string;
   value: string;
   tone?: 'ok' | 'warning' | 'error' | 'alarm';
   title?: string;
+  className?: string;
 }) {
   return (
-    <div className="status-block">
+    <div className={`status-block ${className ?? ''}`}>
       <span>{label}</span>
       <strong className={tone} title={title}>
         {value}
       </strong>
+    </div>
+  );
+}
+
+function SystemStatusDetailPanel({ status }: { status: DeviceStatus }) {
+  const entries = [
+    { label: '编码器', value: status.encoder === 'sync' ? '同步正常' : '离线', ok: status.encoder === 'sync' },
+    { label: 'PLC', value: status.plc === 'normal' ? '正常' : '异常', ok: status.plc === 'normal' },
+    { label: 'L2', value: status.l2 === 'normal' ? '正常' : '异常', ok: status.l2 === 'normal' },
+  ];
+
+  return (
+    <div className="service-status-popover system-status-popover" id="system-status-detail-panel" role="dialog" aria-label="控制系统状态详情" data-no-drag>
+      <header>
+        <div>
+          <strong>控制系统状态</strong>
+          <span>编码器、PLC 与 L2 连接详情</span>
+        </div>
+      </header>
+      <div className="service-status-detail-list system-status-detail-list">
+        {entries.map((entry) => (
+          <section key={entry.label} className={entry.ok ? 'online' : 'offline'}>
+            <i aria-hidden="true" />
+            <div>
+              <strong>{entry.label}</strong>
+              <span>{entry.value}</span>
+            </div>
+            <em>{entry.ok ? '正常' : '异常'}</em>
+          </section>
+        ))}
+      </div>
     </div>
   );
 }
@@ -668,6 +702,7 @@ export function BrandHeader({
   theme,
   capture,
   network,
+  trigger,
   services,
   activeNav,
   onNavChange,
@@ -680,9 +715,10 @@ export function BrandHeader({
     triggerGateway: makeUnknownService('触发网关'),
   };
   const logoSrc = theme === 'light' ? ustbLogo : ustbLogoDark;
-  const [activeDetail, setActiveDetail] = useState<'receiver' | 'camera' | 'service' | null>(null);
+  const [activeDetail, setActiveDetail] = useState<'receiver' | 'camera' | 'system' | 'service' | null>(null);
   const receiverWrapRef = useRef<HTMLDivElement>(null);
   const cameraWrapRef = useRef<HTMLDivElement>(null);
+  const systemWrapRef = useRef<HTMLDivElement>(null);
   const serviceWrapRef = useRef<HTMLDivElement>(null);
   const receiverDetails = useMemo(() => createReceiverDetailsFromCapture(capture, network), [capture, network]);
   const receiverRealtime = receiverDetails.some((detail) => detail.realtime);
@@ -729,7 +765,17 @@ export function BrandHeader({
   );
   const onlineCameraCount = cameraDetails.filter((camera) => camera.status === '在线').length;
   const offlineCameraCount = cameraDetails.length - onlineCameraCount;
+  const systemIssueCount = Number(status.encoder !== 'sync') + Number(status.plc !== 'normal') + Number(status.l2 !== 'normal');
   const serviceIssueCount = Object.values(serviceStatus).filter((service) => service.state !== 'online').length;
+  const triggerHealthy = trigger?.inspectionServiceHealthy !== false;
+  const triggerValue = !trigger
+    ? '未知'
+    : triggerHealthy
+      ? '就绪'
+      : '服务异常';
+  const triggerTitle = trigger
+    ? `模式 ${trigger.modeLabel || trigger.mode} · 检测服务${triggerHealthy ? '可达' : '不可达'}`
+    : '触发网关状态不可用';
 
   useEffect(() => {
     if (!activeDetail) {
@@ -740,7 +786,7 @@ export function BrandHeader({
       if (!(target instanceof Node)) {
         return false;
       }
-      return [receiverWrapRef.current, cameraWrapRef.current, serviceWrapRef.current].some((element) => element?.contains(target));
+      return [receiverWrapRef.current, cameraWrapRef.current, systemWrapRef.current, serviceWrapRef.current].some((element) => element?.contains(target));
     };
 
     const closeWhenOutside = (event: Event) => {
@@ -780,6 +826,7 @@ export function BrandHeader({
       </div>
 
       <div className="brand-status">
+        <StatusBlock className="trigger-header-status" label="触发状态" value={triggerValue} tone={trigger ? (triggerHealthy ? 'ok' : 'warning') : 'warning'} title={triggerTitle} />
         <div className="port-status-stack" data-testid="hardware-status-stack">
           <div ref={receiverWrapRef} className="camera-status-wrap receiver-status-wrap" data-no-drag onMouseDown={(event) => event.stopPropagation()}>
             <button
@@ -838,6 +885,20 @@ export function BrandHeader({
           tone={serviceStatusTone(serviceStatus.triggerGateway.state)}
           title={`${serviceStatus.triggerGateway.endpoint} ${serviceStatus.triggerGateway.detail}`}
         />
+        <div ref={systemWrapRef} className="system-status-wrap" data-no-drag onMouseDown={(event) => event.stopPropagation()}>
+          <button
+            className={`header-summary-button ${systemIssueCount > 0 ? 'warning' : ''} ${activeDetail === 'system' ? 'active' : ''}`}
+            type="button"
+            aria-label={`控制系统，正常 ${3 - systemIssueCount} 项，异常 ${systemIssueCount} 项`}
+            aria-expanded={activeDetail === 'system'}
+            aria-controls="system-status-detail-panel"
+            onClick={() => setActiveDetail((current) => (current === 'system' ? null : 'system'))}
+          >
+            <span>控制</span>
+            <strong>{3 - systemIssueCount}/3</strong>
+          </button>
+          {activeDetail === 'system' ? <SystemStatusDetailPanel status={status} /> : null}
+        </div>
         <div
           className={`run-indicator ${serviceIssueCount > 0 ? 'warning' : ''}`}
           aria-label={serviceIssueCount > 0 ? `系统服务异常 ${serviceIssueCount} 项` : '系统运行状态正常'}

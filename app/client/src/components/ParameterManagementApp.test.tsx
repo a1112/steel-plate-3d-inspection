@@ -28,7 +28,7 @@ const adminOverview = {
       managed: true,
       running: false,
       port: 4317,
-      fallback: 'simulated-six-camera',
+      fallback: 'simulated-eight-camera',
     },
   },
   database: {
@@ -145,7 +145,15 @@ const adminRecordRetentionPreview = {
   matched: 4,
   deletedRecords: 0,
   deletedDefects: 0,
+  deletedCaptureFiles: 0,
   deletedPlates: 0,
+  filesPlanned: 8,
+  filesDeleted: 0,
+  filesMissing: 0,
+  bytesPlanned: 4096,
+  bytesDeleted: 0,
+  cleanupIds: [],
+  failures: [],
   dryRun: true,
 };
 
@@ -156,7 +164,15 @@ const adminRecordRetentionPurge = {
   matched: 4,
   deletedRecords: 4,
   deletedDefects: 12,
-  deletedPlates: 4,
+  deletedCaptureFiles: 8,
+  deletedPlates: 0,
+  filesPlanned: 8,
+  filesDeleted: 8,
+  filesMissing: 0,
+  bytesPlanned: 4096,
+  bytesDeleted: 4096,
+  cleanupIds: ['CLEAN-1', 'CLEAN-2', 'CLEAN-3', 'CLEAN-4'],
+  failures: [],
   dryRun: false,
 };
 
@@ -219,7 +235,7 @@ const adminCameras = [
   {
     id: 'CAM-01',
     name: '1 号采集相机',
-    ip: '192.168.105.13',
+    ip: '192.168.101.100',
     driverId: 'lvm-nvt',
     modelHint: 'LVM3450CA',
     role: '主采集相机',
@@ -319,7 +335,7 @@ const adminServices = {
     origin: 'http://127.0.0.1:4317',
     processAvailable: true,
     executable: '/tmp/steel_capture_service.exe',
-      fallback: 'simulated-six-camera',
+      fallback: 'simulated-eight-camera',
   },
   diagnostics: [
     { id: 'api', label: 'API 服务', status: 'normal', detail: '运行 125000ms，在线会话 1 个' },
@@ -466,6 +482,7 @@ describe('ParameterManagementApp', () => {
   const storage = new Map<string, string>();
   let failLoginSessions = false;
   let failDiagnostics = false;
+  let forcePasswordChangeLogin = false;
   let loginFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
   let saveUserFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
   let deleteUserFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
@@ -479,6 +496,7 @@ describe('ParameterManagementApp', () => {
     vi.restoreAllMocks();
     failLoginSessions = false;
     failDiagnostics = false;
+    forcePasswordChangeLogin = false;
     loginFailureResponse = null;
     saveUserFailureResponse = null;
     deleteUserFailureResponse = null;
@@ -511,7 +529,12 @@ describe('ParameterManagementApp', () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes('/api/admin/auth/me')) {
-        return { ok: true, json: async () => adminSession };
+        return {
+          ok: true,
+          json: async () => forcePasswordChangeLogin
+            ? { ...adminSession, user: { ...adminSession.user, mustChangePassword: true } }
+            : adminSession,
+        };
       }
       if (url.includes('/api/admin/auth/login')) {
         if (loginFailureResponse) {
@@ -521,7 +544,12 @@ describe('ParameterManagementApp', () => {
             json: async () => loginFailureResponse?.payload ?? {},
           };
         }
-        return { ok: true, json: async () => adminSession };
+        return {
+          ok: true,
+          json: async () => forcePasswordChangeLogin
+            ? { ...adminSession, user: { ...adminSession.user, mustChangePassword: true } }
+            : adminSession,
+        };
       }
       if (url.includes('/api/admin/auth/logout')) {
         return { ok: true, json: async () => ({ code: 0 }) };
@@ -805,7 +833,21 @@ describe('ParameterManagementApp', () => {
         return { ok: true, json: async () => ({ record: adminRecordDetail }) };
       }
       if (url.includes('/api/admin/records') && init?.method === 'DELETE') {
-        return { ok: true, json: async () => ({ code: 0, deleted: true, recordId: 'R-001', plateNo: '202606131900', defectsDeleted: 12, plateDeleted: true }) };
+        return { ok: true, json: async () => ({
+          code: 0,
+          deleted: true,
+          cleanupId: 'CLEAN-1',
+          recordId: 'R-001',
+          materialId: '202606131900',
+          filesPlanned: 4,
+          filesDeleted: 4,
+          filesMissing: 0,
+          bytesPlanned: 4096,
+          bytesDeleted: 4096,
+          defectsDeleted: 12,
+          captureFilesDeleted: 2,
+          plateDeleted: false,
+        }) };
       }
       if (url.includes('/api/admin/records')) {
         return { ok: true, json: async () => adminRecordPage };
@@ -1422,8 +1464,8 @@ describe('ParameterManagementApp', () => {
         }),
       );
     });
-    expect(await screen.findByText('检测记录清理预览：4 条将被清理')).toBeInTheDocument();
-    expect(screen.getByText('条旧检测记录可清理')).toBeInTheDocument();
+    expect(await screen.findByText('检测记录清理预览：4 条，计划清理 8 个文件')).toBeInTheDocument();
+    expect(screen.getByText('条旧检测记录可清理，计划物理文件 8 个')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /执行清理/ }));
     await waitFor(() => {
@@ -1435,8 +1477,8 @@ describe('ParameterManagementApp', () => {
         }),
       );
     });
-    expect(await screen.findByText('检测记录已清理：4 条记录')).toBeInTheDocument();
-    expect(screen.getByText('条检测记录已清理，缺陷 12 条，钢管 4 条')).toBeInTheDocument();
+    expect(await screen.findByText('检测记录清理完成：4/4 条记录，物理文件 8 个，失败 0 条')).toBeInTheDocument();
+    expect(screen.getByText('条检测记录已清理，物理文件 8/8 个，缺失 0 个，失败 0 条；生产会话保留')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '查看' }));
     await waitFor(() => {
@@ -1457,7 +1499,7 @@ describe('ParameterManagementApp', () => {
         expect.objectContaining({ method: 'DELETE' }),
       );
     });
-    expect(await screen.findByText('检测记录已删除')).toBeInTheDocument();
+    expect(await screen.findByText('检测记录已删除：物理文件 4/4 个，缺失 0 个')).toBeInTheDocument();
   });
 
   it('manages defect type catalog from the backend data tab', async () => {
@@ -1581,6 +1623,40 @@ describe('ParameterManagementApp', () => {
     fireEvent.click(screen.getByRole('button', { name: /登录/ }));
 
     expect(await screen.findByText('后台登录失败：登录失败次数过多，请稍后再试')).toBeInTheDocument();
+  });
+
+  it('forces a bootstrap admin to change the initial password before loading management data', async () => {
+    storage.clear();
+    forcePasswordChangeLogin = true;
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('后台登录')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('登录账号'), { target: { value: 'admin' } });
+    fireEvent.change(screen.getByLabelText('登录密码'), { target: { value: 'Bootstrap1!' } });
+    fireEvent.click(screen.getByRole('button', { name: /登录/ }));
+
+    expect(await screen.findByText('首次登录必须修改密码')).toBeInTheDocument();
+    expect(screen.queryByText('钢管档案')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('当前初始密码')).toHaveValue('Bootstrap1!');
+    fireEvent.change(screen.getByLabelText('新密码'), { target: { value: 'secure456' } });
+    fireEvent.change(screen.getByLabelText('确认新密码'), { target: { value: 'secure456' } });
+    fireEvent.click(screen.getByRole('button', { name: /完成安全初始化/ }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://127.0.0.1:4873/api/admin/auth/password',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            currentPassword: 'Bootstrap1!',
+            newPassword: 'secure456',
+            confirmPassword: 'secure456',
+          }),
+        }),
+      );
+    });
+    expect(await screen.findByText('当前账号密码已修改')).toBeInTheDocument();
+    expect(await screen.findByText('钢管档案')).toBeInTheDocument();
   });
 
   it('changes the current admin password through the authenticated API', async () => {

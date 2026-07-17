@@ -20,9 +20,23 @@ fn normalize_kind(value: &str) -> Option<&'static str> {
         "steel-info" | "steel_info" | "steelinfo" | "info" => Some("steel-info"),
         "steel-in" | "steel_in" | "steelin" | "in" => Some("steel-in"),
         "steel-out" | "steel_out" | "steelout" | "out" => Some("steel-out"),
-        "trigger-event" | "trigger_event" | "triggerevent" | "event" => {
-            Some("trigger-event")
-        }
+        "trigger-event" | "trigger_event" | "triggerevent" | "event" => Some("trigger-event"),
+        _ => None,
+    }
+}
+
+fn valid_task_chain_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+}
+
+fn normalize_dependency_policy(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "require-success" | "require_success" => Some("require-success"),
+        "always-run" | "always_run" => Some("always-run"),
         _ => None,
     }
 }
@@ -76,6 +90,10 @@ fn task_json(task: &production_task::Model) -> Value {
         "kind": task.kind,
         "materialId": task.material_id,
         "sessionId": task.session_id,
+        "chainId": task.chain_id,
+        "dependsOnTaskId": if task.depends_on_task_id.is_empty() { Value::Null } else { json!(task.depends_on_task_id) },
+        "dependencyPolicy": task.dependency_policy,
+        "blockedReason": task.blocked_reason,
         "status": task.status,
         "phase": task.phase,
         "progress": task.progress,
@@ -93,11 +111,20 @@ fn task_json(task: &production_task::Model) -> Value {
 }
 
 fn worker_json(state: &ServiceState) -> Value {
-    let status = state
-        .production_task_worker_status
-        .lock()
-        .map(|value| value.clone())
-        .unwrap_or_default();
+    let status = match state.production_task_worker_status.lock() {
+        Ok(value) => value.clone(),
+        Err(_) => {
+            return json!({
+                "running": false,
+                "activeTaskId": "worker_status_unavailable",
+                "lastHeartbeatAt": Value::Null,
+                "heartbeatAgeMs": Value::Null,
+                "lastError": "worker_status_unavailable",
+                "recoveredTasks": Value::Null,
+                "capacity": queue_capacity()
+            });
+        }
+    };
     let now = current_time_millis();
     json!({
         "running": status.running,
@@ -114,10 +141,12 @@ pub(super) fn status_json(state: &ServiceState) -> Value {
     let queue_depth = state
         .runtime
         .block_on(db::count_open_production_tasks(&state.database.connection))
-        .unwrap_or(0);
+        .ok();
+    let queue_depth_available = queue_depth.is_some();
     json!({
         "worker": worker_json(state),
         "queueDepth": queue_depth,
+        "queueDepthAvailable": queue_depth_available,
         "capacity": queue_capacity()
     })
 }
@@ -138,7 +167,7 @@ fn task_target(state: &ServiceState, payload: &Value) -> (String, String) {
     let requested_material_id = material_id_from_payload(payload, "");
     let latest_task = state
         .runtime
-        .block_on(db::latest_open_production_task(
+        .block_on(db::latest_unresolved_production_task(
             &state.database.connection,
             (!requested_material_id.is_empty()).then_some(requested_material_id.as_str()),
         ))
@@ -220,9 +249,52 @@ pub(super) fn enqueue_response(state: &ServiceState, body: &str, actor: &str) ->
             &json!({ "code": 400, "error": "production_task_payload_must_be_object" }).to_string(),
         );
     }
+    let requested_chain_id = value_string(&request, &["chainId", "chain_id"]);
+    let requested_dependency_id = value_string(
+        &request,
+        &["dependsOnTaskId", "depends_on_task_id", "dependsOn"],
+    );
+    if requested_dependency_id.len() > 128 {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "code": 400, "error": "dependency_task_id_too_long" }).to_string(),
+        );
+    }
+    let dependency_policy_value =
+        value_string(&request, &["dependencyPolicy", "dependency_policy"]);
+    let Some(dependency_policy) = normalize_dependency_policy(&dependency_policy_value) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 400,
+                "error": "invalid_dependency_policy",
+                "supportedPolicies": ["require-success", "always-run"]
+            })
+            .to_string(),
+        );
+    };
+    if dependency_policy == "always-run" && kind != "trigger-event" {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 400,
+                "error": "always_run_not_allowed_for_safety_critical_task",
+                "kind": kind
+            })
+            .to_string(),
+        );
+    }
     let raw_key = value_string(
         &request,
-        &["idempotencyKey", "idempotency_key", "requestId", "request_id"],
+        &[
+            "idempotencyKey",
+            "idempotency_key",
+            "requestId",
+            "request_id",
+        ],
     );
     if raw_key.len() > 160 {
         return http_response(
@@ -242,12 +314,21 @@ pub(super) fn enqueue_response(state: &ServiceState, body: &str, actor: &str) ->
         format!("{kind}:{}", raw_key.trim())
     };
     if !compound_key.is_empty() {
-        match state.runtime.block_on(db::find_production_task_by_idempotency_key(
-            &state.database.connection,
-            &compound_key,
-        )) {
+        match state
+            .runtime
+            .block_on(db::find_production_task_by_idempotency_key(
+                &state.database.connection,
+                &compound_key,
+            )) {
             Ok(Some(existing)) => {
-                if existing.kind != kind || existing.payload != payload_text {
+                if existing.kind != kind
+                    || existing.payload != payload_text
+                    || (!requested_chain_id.is_empty() && existing.chain_id != requested_chain_id)
+                    || (!requested_dependency_id.is_empty()
+                        && existing.depends_on_task_id != requested_dependency_id)
+                    || (!dependency_policy_value.is_empty()
+                        && existing.dependency_policy != dependency_policy)
+                {
                     return http_response(
                         "409 Conflict",
                         "application/json; charset=utf-8",
@@ -275,6 +356,19 @@ pub(super) fn enqueue_response(state: &ServiceState, body: &str, actor: &str) ->
                 );
             }
         }
+    }
+    if runtime_is_draining(state) && kind != "steel-out" {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 503,
+                "error": "runtime_draining",
+                "kind": kind,
+                "admission": runtime_drain_status_json(state)
+            })
+            .to_string(),
+        );
     }
     // Replays must return the persisted task even if the surrounding production session has
     // since advanced. Production state is deliberately validated by the FIFO worker at execution
@@ -315,6 +409,115 @@ pub(super) fn enqueue_response(state: &ServiceState, body: &str, actor: &str) ->
         compound_key
     };
     let (material_id, session_id) = task_target(state, &payload);
+    if !requested_chain_id.is_empty() && !valid_task_chain_id(&requested_chain_id) {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "code": 400, "error": "invalid_production_chain_id" }).to_string(),
+        );
+    }
+    let latest_session_task = match state
+        .runtime
+        .block_on(db::latest_production_task_for_session(
+            &state.database.connection,
+            &session_id,
+        )) {
+        Ok(task) => task,
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({ "code": 500, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    let chain_id = if requested_chain_id.is_empty() {
+        latest_session_task
+            .as_ref()
+            .map(|task| task.chain_id.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| session_id.clone())
+    } else {
+        requested_chain_id.clone()
+    };
+    if latest_session_task
+        .as_ref()
+        .is_some_and(|task| !task.chain_id.is_empty() && task.chain_id != chain_id)
+    {
+        return http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": "production_session_chain_mismatch",
+                "existingChainId": latest_session_task.as_ref().map(|task| task.chain_id.clone()),
+                "requestedChainId": chain_id
+            })
+            .to_string(),
+        );
+    }
+    let depends_on_task_id = if !requested_dependency_id.is_empty() {
+        requested_dependency_id.clone()
+    } else if kind == "trigger-event" {
+        String::new()
+    } else {
+        match state.runtime.block_on(db::latest_production_task_in_chain(
+            &state.database.connection,
+            &chain_id,
+        )) {
+            Ok(Some(task)) => task.id,
+            Ok(None) => String::new(),
+            Err(error) => {
+                return http_response(
+                    "500 Internal Server Error",
+                    "application/json; charset=utf-8",
+                    &json!({ "code": 500, "error": error.to_string() }).to_string(),
+                );
+            }
+        }
+    };
+    if !depends_on_task_id.is_empty() {
+        let dependency = match state.runtime.block_on(db::find_production_task(
+            &state.database.connection,
+            &depends_on_task_id,
+        )) {
+            Ok(Some(task)) => task,
+            Ok(None) => {
+                return http_response(
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "code": 409,
+                        "error": "production_task_dependency_not_found",
+                        "dependsOnTaskId": depends_on_task_id
+                    })
+                    .to_string(),
+                );
+            }
+            Err(error) => {
+                return http_response(
+                    "500 Internal Server Error",
+                    "application/json; charset=utf-8",
+                    &json!({ "code": 500, "error": error.to_string() }).to_string(),
+                );
+            }
+        };
+        if dependency.chain_id != chain_id
+            || dependency.session_id != session_id
+            || dependency.material_id != material_id
+        {
+            return http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 409,
+                    "error": "production_task_dependency_chain_mismatch",
+                    "dependsOnTaskId": dependency.id
+                })
+                .to_string(),
+            );
+        }
+    }
     let max_attempts = request
         .get("maxAttempts")
         .or_else(|| request.get("max_attempts"))
@@ -329,6 +532,9 @@ pub(super) fn enqueue_response(state: &ServiceState, body: &str, actor: &str) ->
             kind: kind.to_string(),
             material_id,
             session_id,
+            chain_id,
+            depends_on_task_id,
+            dependency_policy: dependency_policy.to_string(),
             payload: payload_text,
             actor: actor.to_string(),
             max_attempts,
@@ -377,7 +583,12 @@ pub(super) fn enqueue_kind_response(
     };
     let idempotency_key = value_string(
         &payload,
-        &["idempotencyKey", "idempotency_key", "requestId", "request_id"],
+        &[
+            "idempotencyKey",
+            "idempotency_key",
+            "requestId",
+            "request_id",
+        ],
     );
     let max_attempts = payload
         .get("maxAttempts")
@@ -385,12 +596,21 @@ pub(super) fn enqueue_kind_response(
         .and_then(Value::as_i64)
         .unwrap_or(1)
         .clamp(1, 10);
+    let chain_id = value_string(&payload, &["chainId", "chain_id"]);
+    let depends_on_task_id = value_string(
+        &payload,
+        &["dependsOnTaskId", "depends_on_task_id", "dependsOn"],
+    );
+    let dependency_policy = value_string(&payload, &["dependencyPolicy", "dependency_policy"]);
     enqueue_response(
         state,
         &json!({
             "kind": kind,
             "idempotencyKey": idempotency_key,
             "maxAttempts": max_attempts,
+            "chainId": chain_id,
+            "dependsOnTaskId": depends_on_task_id,
+            "dependencyPolicy": dependency_policy,
             "payload": payload
         })
         .to_string(),
@@ -442,10 +662,10 @@ pub(super) fn detail_response(state: &ServiceState, query: &str) -> Vec<u8> {
             &json!({ "code": 400, "error": "production_task_id_required" }).to_string(),
         );
     }
-    match state
-        .runtime
-        .block_on(db::find_production_task(&state.database.connection, id.trim()))
-    {
+    match state.runtime.block_on(db::find_production_task(
+        &state.database.connection,
+        id.trim(),
+    )) {
         Ok(Some(task)) => http_response(
             "200 OK",
             "application/json; charset=utf-8",
@@ -515,7 +735,7 @@ pub(super) fn cancel_response(state: &ServiceState, body: &str, actor: &str) -> 
     };
     if matches!(
         existing.status.as_str(),
-        "succeeded" | "failed" | "cancelled" | "interrupted"
+        "succeeded" | "failed" | "cancelled" | "interrupted" | "blocked"
     ) {
         return http_response(
             "409 Conflict",
@@ -543,7 +763,11 @@ pub(super) fn cancel_response(state: &ServiceState, body: &str, actor: &str) -> 
             ));
             notify_worker(state);
             http_response(
-                if task.status == "running" { "202 Accepted" } else { "200 OK" },
+                if task.status == "running" {
+                    "202 Accepted"
+                } else {
+                    "200 OK"
+                },
                 "application/json; charset=utf-8",
                 &json!({ "code": 0, "task": task_json(&task) }).to_string(),
             )
@@ -590,7 +814,10 @@ pub(super) fn retry_response(state: &ServiceState, body: &str, actor: &str) -> V
             );
         }
     };
-    if !matches!(existing.status.as_str(), "failed" | "cancelled" | "interrupted") {
+    if !matches!(
+        existing.status.as_str(),
+        "failed" | "cancelled" | "interrupted" | "blocked"
+    ) {
         return http_response(
             "409 Conflict",
             "application/json; charset=utf-8",
@@ -607,6 +834,18 @@ pub(super) fn retry_response(state: &ServiceState, body: &str, actor: &str) -> V
         .block_on(db::retry_production_task(&state.database.connection, &id))
     {
         Ok(Some(task)) => {
+            if task.status == "blocked" {
+                return http_response(
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "code": 409,
+                        "error": "production_task_dependency_unresolved",
+                        "task": task_json(&task)
+                    })
+                    .to_string(),
+                );
+            }
             let _ = state.runtime.block_on(db::append_audit_log(
                 &state.database.connection,
                 actor,
@@ -680,6 +919,23 @@ fn response_error(response: &[u8], body: &str) -> String {
         })
 }
 
+fn response_cooperatively_cancelled(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .map(|value| {
+            value
+                .get("cooperativeCancellation")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || value
+                    .get("algorithm")
+                    .and_then(|algorithm| algorithm.get("cooperativeCancellation"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 fn production_event_payload(task: &production_task::Model) -> String {
     let mut payload = serde_json::from_str::<Value>(&task.payload).unwrap_or_else(|_| json!({}));
     let missing_material_id = material_id_from_payload(&payload, "").is_empty();
@@ -698,20 +954,39 @@ fn production_event_payload(task: &production_task::Model) -> String {
 
 pub(super) fn execute_task(state: &ServiceState, task: &production_task::Model) -> Vec<u8> {
     let _execution_scope = WorkerExecutionScope::enter();
+    let cancellation_requested = || {
+        runtime_is_draining(state)
+            || state
+                .runtime
+                .block_on(db::find_production_task(
+                    &state.database.connection,
+                    &task.id,
+                ))
+                .ok()
+                .flatten()
+                .map(|item| item.cancel_requested)
+                .unwrap_or(false)
+    };
     match task.kind.as_str() {
         "capture-once" => write_production_capture_once_response(state, &task.payload, &task.actor),
         "algorithm-run" => {
-            let payload = serde_json::from_str::<Value>(&task.payload).unwrap_or_else(|_| json!({}));
-            if value_string(&payload, &["operation", "operationType"])
-                == "calibration-capture-fit"
+            let payload =
+                serde_json::from_str::<Value>(&task.payload).unwrap_or_else(|_| json!({}));
+            if value_string(&payload, &["operation", "operationType"]) == "calibration-capture-fit"
             {
                 write_production_calibration_capture_fit_response(
                     state,
                     &task.payload,
                     &task.actor,
+                    Some(&cancellation_requested),
                 )
             } else {
-                write_production_algorithm_run_response(state, &task.payload, &task.actor)
+                write_production_algorithm_run_response(
+                    state,
+                    &task.payload,
+                    &task.actor,
+                    Some(&cancellation_requested),
+                )
             }
         }
         "steel-info" | "steel-in" | "steel-out" | "trigger-event" => {
@@ -788,11 +1063,11 @@ fn set_worker_status(
 fn wait_for_work(state: &ServiceState) {
     if let Ok(generation) = state.production_task_wakeup_generation.lock() {
         let observed = *generation;
-        let _ = state
-            .production_task_wakeup
-            .wait_timeout_while(generation, Duration::from_millis(500), |value| {
-                *value == observed
-            });
+        let _ = state.production_task_wakeup.wait_timeout_while(
+            generation,
+            Duration::from_millis(500),
+            |value| *value == observed,
+        );
     } else {
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -821,10 +1096,17 @@ fn worker_loop(state: Arc<ServiceState>) {
         persist_task_checkpoint(&state, &task, "waiting-command-lane", 10);
         let latest = state
             .runtime
-            .block_on(db::find_production_task(&state.database.connection, &task.id))
+            .block_on(db::find_production_task(
+                &state.database.connection,
+                &task.id,
+            ))
             .ok()
             .flatten();
-        if latest.as_ref().map(|item| item.cancel_requested).unwrap_or(false) {
+        if latest
+            .as_ref()
+            .map(|item| item.cancel_requested)
+            .unwrap_or(false)
+        {
             let _ = state.runtime.block_on(db::finish_production_task(
                 &state.database.connection,
                 &task.id,
@@ -839,7 +1121,10 @@ fn worker_loop(state: Arc<ServiceState>) {
             Ok(_command_guard) => {
                 let cancelled = state
                     .runtime
-                    .block_on(db::find_production_task(&state.database.connection, &task.id))
+                    .block_on(db::find_production_task(
+                        &state.database.connection,
+                        &task.id,
+                    ))
                     .ok()
                     .flatten()
                     .map(|item| item.cancel_requested)
@@ -872,7 +1157,10 @@ fn worker_loop(state: Arc<ServiceState>) {
         let body = response_body(&response);
         let cancellation_requested = state
             .runtime
-            .block_on(db::find_production_task(&state.database.connection, &task.id))
+            .block_on(db::find_production_task(
+                &state.database.connection,
+                &task.id,
+            ))
             .ok()
             .flatten()
             .map(|item| item.cancel_requested)
@@ -880,8 +1168,22 @@ fn worker_loop(state: Arc<ServiceState>) {
         // A running provider call cannot currently be interrupted. Once dispatch has crossed that
         // boundary, its real result remains authoritative; cancel_requested records the late intent
         // instead of falsely claiming that a completed camera side effect was cancelled.
-        let (status, progress, error) = provider_terminal_outcome(&response, &body);
-        if cancellation_requested {
+        let cooperative_cancellation = response_cooperatively_cancelled(&body);
+        let (status, progress, error) = if cooperative_cancellation {
+            (
+                "cancelled",
+                100,
+                if runtime_is_draining(&state) && !cancellation_requested {
+                    "cancelled during runtime drain at interruptible algorithm computation"
+                        .to_string()
+                } else {
+                    "cancelled during interruptible algorithm computation".to_string()
+                },
+            )
+        } else {
+            provider_terminal_outcome(&response, &body)
+        };
+        if cancellation_requested && !cooperative_cancellation {
             let _ = state.runtime.block_on(db::append_audit_log(
                 &state.database.connection,
                 &task.actor,
@@ -910,7 +1212,10 @@ mod tests {
 
     #[test]
     fn durable_task_dispatch_phases_are_operation_specific() {
-        assert_eq!(dispatch_phase("capture-once"), "dispatching-capture-provider");
+        assert_eq!(
+            dispatch_phase("capture-once"),
+            "dispatching-capture-provider"
+        );
         assert_eq!(dispatch_phase("algorithm-run"), "dispatching-algorithm");
         assert_eq!(dispatch_phase("steel-info"), "dispatching-steel-info");
         assert_eq!(dispatch_phase("steel-in"), "dispatching-steel-in");
@@ -920,11 +1225,7 @@ mod tests {
 
     #[test]
     fn provider_result_is_authoritative_after_dispatch_boundary() {
-        let success = http_response(
-            "200 OK",
-            "application/json; charset=utf-8",
-            r#"{"code":0}"#,
-        );
+        let success = http_response("200 OK", "application/json; charset=utf-8", r#"{"code":0}"#);
         let success_body = response_body(&success);
         assert_eq!(
             provider_terminal_outcome(&success, &success_body),
@@ -940,6 +1241,19 @@ mod tests {
         let outcome = provider_terminal_outcome(&failure, &failure_body);
         assert_eq!(outcome.0, "failed");
         assert!(outcome.2.contains("capture_provider_offline"));
+    }
+
+    #[test]
+    fn cooperative_algorithm_cancellation_is_explicitly_distinguishable() {
+        assert!(response_cooperatively_cancelled(
+            r#"{"code":499,"cooperativeCancellation":true}"#
+        ));
+        assert!(response_cooperatively_cancelled(
+            r#"{"algorithm":{"cooperativeCancellation":true}}"#
+        ));
+        assert!(!response_cooperatively_cancelled(
+            r#"{"code":500,"error":"provider_failed"}"#
+        ));
     }
 }
 

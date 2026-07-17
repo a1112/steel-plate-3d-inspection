@@ -1,0 +1,26 @@
+{
+  "schema": "steel.target-machine-functional-acceptance.v1",
+  "releaseVersion": "REPLACE-WITH-APPROVED-VERSION",
+  "releaseCommit": "REPLACE-WITH-40-TO-64-LOWERCASE-HEX-COMMIT",
+  "machine": {
+    "name": "REPLACE-WITH-TARGET-MACHINE",
+    "line": "REPLACE-WITH-LINE"
+  },
+  "startedAt": "REPLACE-WITH-ISO-8601",
+  "finishedAt": "REPLACE-WITH-ISO-8601",
+  "scenarios": [
+    { "id": "clean-install", "passed": false, "evidence": [{ "path": "evidence\\clean-install.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "configuration-readback", "passed": false, "evidence": [{ "path": "evidence\\configuration-readback.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "service-start", "passed": false, "evidence": [{ "path": "evidence\\service-start.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "reboot-auto-start", "passed": false, "evidence": [{ "path": "evidence\\reboot-auto-start.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "complete-production-cycle", "passed": false, "evidence": [{ "path": "evidence\\complete-production-cycle.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "upgrade", "passed": false, "evidence": [{ "path": "evidence\\upgrade.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "rollback", "passed": false, "evidence": [{ "path": "evidence\\rollback.json", "sha256": "REPLACE-WITH-SHA256" }] },
+    { "id": "uninstall-preserves-production-data", "passed": false, "evidence": [{ "path": "evidence\\uninstall-preserves-production-data.json", "sha256": "REPLACE-WITH-SHA256" }] }
+  ],
+  "approvals": {
+    "implementationOwner": "",
+    "operationsOwner": "",
+    "approvedAt": ""
+  }
+}

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyCaptureCameraStorageRoots,
   applyCaptureCalibrationSet,
+  applyCaptureContinuousSettings,
   applyCaptureLineContinuousPreset,
   applyCaptureProfile,
   activateCaptureCalibration,
@@ -25,6 +26,7 @@ import {
   readCaptureProfile,
   readCaptureProfiles,
   readCaptureCalibrationOperationDetail,
+  readCaptureContinuousSettings,
   readCaptureParam,
   readCaptureLocalTextFile,
   readActiveCaptureCalibration,
@@ -40,6 +42,7 @@ import {
   setCaptureSoftwareTrigger,
   startCaptureStream,
   stopCaptureStream,
+  validateCaptureContinuousSettings,
   writeCaptureParam,
   type SystemNetworkSnapshot,
 } from "./capture-api";
@@ -244,6 +247,66 @@ describe("readLatestCaptureFile", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("reads and applies continuous acquisition settings through Rust without persisting camera parameters", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/api/capture/continuous-settings') && init?.method === 'POST') {
+        return new Response(JSON.stringify({
+          code: 0,
+          applyToDevice: true,
+          dryRun: false,
+          restartContinuous: true,
+          productionCaptureRestarted: true,
+          timeTriggerFreq: 360.5,
+          lineTriggerFrequency: 360.5,
+          applied: 2,
+          failed: 0,
+          results: [
+            { code: 0, ip: '192.168.101.100', applied: true, timeTriggerFreq: 360.5 },
+            { code: 0, ip: '192.168.102.100', applied: true, timeTriggerFreq: 360.5 },
+          ],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        code: 0,
+        settings: {
+          supported: true,
+          connectedCameras: 8,
+          configuredCameras: 8,
+          timeTriggerFreq: 300,
+          lineTriggerFrequency: 300,
+          requiresApplyToDevice: true,
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const current = await readCaptureContinuousSettings();
+    const applied = await applyCaptureContinuousSettings({
+      timeTriggerFreq: 360.5,
+      ips: [' 192.168.101.100 ', '192.168.102.100'],
+      applyToDevice: true,
+      restartContinuous: true,
+    });
+
+    expect(current.settings?.lineTriggerFrequency).toBe(300);
+    expect(applied.lineTriggerFrequency).toBe(360.5);
+    expect(fetchMock.mock.calls[0][0]).toBe('http://127.0.0.1:4873/api/capture/continuous-settings');
+    expect(fetchMock.mock.calls[1][0]).toBe('http://127.0.0.1:4873/api/capture/continuous-settings');
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      timeTriggerFreq: 360.5,
+      ips: ['192.168.101.100', '192.168.102.100'],
+      applyToDevice: true,
+      restartContinuous: true,
+    });
+  });
+
+  it("validates the production line trigger rate before calling the capture service", async () => {
+    expect(validateCaptureContinuousSettings({ timeTriggerFreq: 0.09 })).toContain('0.1 到 100000 Hz');
+    expect(validateCaptureContinuousSettings({ timeTriggerFreq: 100000.1 })).toContain('0.1 到 100000 Hz');
+    expect(validateCaptureContinuousSettings({ timeTriggerFreq: 300, ips: [''] })).toContain('空相机 IP');
+  });
+
   it("reads and activates reviewed array calibration without writing camera devices", async () => {
     window.localStorage.setItem(
       "steel-inspection-admin-session",
@@ -253,7 +316,7 @@ describe("readLatestCaptureFile", () => {
       new Response(
         JSON.stringify({
           code: 0,
-          profile: "current-6-soft-trigger",
+          profile: "current-8-time-trigger",
           calibrationFile: "config/calibrations/reviewed/ArrayCalibration.corrected.xml",
           calibrationPath: "E:/steel-capture-data/config/calibrations/reviewed/ArrayCalibration.corrected.xml",
           exists: true,
@@ -266,7 +329,7 @@ describe("readLatestCaptureFile", () => {
 
     await readActiveCaptureCalibration();
     await activateCaptureCalibration({
-      name: "current-6-soft-trigger",
+      name: "current-8-time-trigger",
       path: "E:/steel-capture-data/analysis/reviewed/ArrayCalibration.corrected.xml",
       allowExternal: true,
       saveToDevice: false,
@@ -274,7 +337,7 @@ describe("readLatestCaptureFile", () => {
     });
 
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "http://127.0.0.1:4873/api/calibration/active?profile=current-6-soft-trigger",
+      "http://127.0.0.1:4873/api/calibration/active?profile=current-8-time-trigger",
     );
     expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({
       Authorization: "Bearer calibration-admin-token",
@@ -623,20 +686,20 @@ describe("capture operations migrated from Qt", () => {
       allowExternal: true,
       confirmation: CAMERA_ROI_CONFIRMATION,
     });
-    const calibrationMappings = Array.from({ length: 6 }, (_, index) => ({
+    const calibrationMappings = Array.from({ length: 8 }, (_, index) => ({
       ip: `192.168.${101 + index}.100`,
       path: `D:/cal/cam${index + 1}.xml`,
       expectedSn: `SN-${index + 1}`,
       rollbackPath: `D:/cal/known-good-cam${index + 1}.xml`,
     }));
     await applyCaptureCalibrationSet({
-      name: "current-6-soft-trigger",
+      name: "current-8-time-trigger",
       cameraCalibrations: calibrationMappings,
       dryRun: true,
       saveToDevice: false,
     });
     await applyCaptureCalibrationSet({
-      name: "current-6-soft-trigger",
+      name: "current-8-time-trigger",
       cameraCalibrations: calibrationMappings,
       dryRun: false,
       saveToDevice: true,
@@ -831,10 +894,10 @@ describe("capture operations migrated from Qt", () => {
       confirmation: CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION,
     })).rejects.toThrow("parentOperationId");
 
-    const mappings = Array.from({ length: 6 }, (_, index) => ({
+    const mappings = Array.from({ length: 8 }, (_, index) => ({
       ip: `192.168.${101 + index}.100`,
       path: `D:/cal/cam${index + 1}.xml`,
-      expectedSn: index === 5 ? " sn-1 " : `SN-${index + 1}`,
+      expectedSn: index === 7 ? " sn-1 " : `SN-${index + 1}`,
       rollbackPath: `D:/cal/known-good-cam${index + 1}.xml`,
     }));
     await expect(applyCaptureCalibrationSet({
@@ -842,9 +905,9 @@ describe("capture operations migrated from Qt", () => {
       cameraCalibrations: mappings,
       dryRun: true,
     })).rejects.toThrow("期望 SN 必须逐相机唯一");
-    const duplicatePaths = Array.from({ length: 6 }, (_, index) => ({
+    const duplicatePaths = Array.from({ length: 8 }, (_, index) => ({
       ip: `192.168.${101 + index}.100`,
-      path: index === 5 ? "d:\\CAL\\cam1.xml" : `D:/cal/cam${index + 1}.xml`,
+      path: index === 7 ? "d:\\CAL\\cam1.xml" : `D:/cal/cam${index + 1}.xml`,
       expectedSn: `UNIQUE-SN-${index + 1}`,
       rollbackPath: `D:/cal/known-good-cam${index + 1}.xml`,
     }));

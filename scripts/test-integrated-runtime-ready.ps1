@@ -4,6 +4,7 @@ param(
   [string]$TriggerOrigin = "http://127.0.0.1:4881",
   [string]$ClientOrigin = "http://127.0.0.1:1432/?app=terminal",
   [int]$TimeoutSec = 10,
+  [int]$ExpectedCameras = 8,
   [switch]$SkipCapture,
   [switch]$SkipTrigger,
   [switch]$SkipClient
@@ -119,7 +120,7 @@ function Get-LayeredReadinessSummary {
   }
 
   $Summary = [ordered]@{}
-  foreach ($Component in @("database", "taskWorker", "capture", "calibrationReconciliation", "storage", "trigger")) {
+  foreach ($Component in @("database", "taskWorker", "capture", "calibrationReconciliation", "storage", "trigger", "algorithm", "productionPolicy")) {
     if (-not (Test-JsonProperty $HealthJson.checks $Component)) {
       throw "Rust layered readiness is missing $Component."
     }
@@ -151,10 +152,23 @@ $Checks = [ordered]@{}
 try {
   if (-not $SkipCapture) {
     $CaptureHealth = Read-JsonEndpoint -Name "Capture provider" -Uri (Join-OriginPath $CaptureOrigin "/health")
+    $RestartRequired = $CaptureHealth.json.restartRequired -eq $true -or
+      $CaptureHealth.json.sdkCaptureState.restartRequired -eq $true
+    if ($CaptureHealth.json.ready -ne $true -or $CaptureHealth.json.sdkReady -ne $true) {
+      throw "Capture provider is reachable but not ready (sdkCode=$($CaptureHealth.json.sdkCode))."
+    }
+    if ($RestartRequired) {
+      throw "Capture provider requires a process restart after an SDK capture timeout."
+    }
+    if ([int]$CaptureHealth.json.cameraCount -ne $ExpectedCameras) {
+      throw "Capture provider has $($CaptureHealth.json.cameraCount) connected camera(s), expected $ExpectedCameras."
+    }
     $Checks.capture = [ordered]@{
       ok = $true
       uri = $CaptureHealth.uri
+      ready = $CaptureHealth.json.ready
       sdkReady = $CaptureHealth.json.sdkReady
+      restartRequired = $RestartRequired
       cameraCount = $CaptureHealth.json.cameraCount
       provider = $CaptureHealth.json.provider
     }

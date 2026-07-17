@@ -1,6 +1,6 @@
 param(
   [string]$Origin = "http://127.0.0.1:4317",
-  [int]$ExpectedCameras = 6,
+  [int]$ExpectedCameras = 8,
   [int]$Rounds = 3,
   [int]$Lines = 1280,
   [int]$Width = 0,

@@ -1,5 +1,5 @@
 {
-  "name": "current-6-soft-trigger",
+  "name": "current-8-time-trigger",
   "version": "REPLACE-WITH-REVIEWED-VERSION",
   "path": "C:\\maintenance\\array-calibration\\ArrayCalibration.corrected.xml",
   "ips": [
@@ -7,51 +7,67 @@
     "192.168.102.100",
     "192.168.103.100",
     "192.168.104.100",
-    "192.168.105.13",
-    "192.168.106.100"
+    "192.168.105.100",
+    "192.168.106.100",
+    "192.168.107.100",
+    "192.168.108.100"
   ],
   "cameraCalibrations": [
     {
       "ip": "192.168.101.100",
-      "expectedSn": "3G506401BE08818",
+      "expectedSn": "3G506601BE09220",
       "artifactType": "camera-sdk",
       "path": "C:\\maintenance\\camera-sdk\\target\\camera-101.xml",
       "rollbackPath": "C:\\maintenance\\camera-sdk\\known-good\\camera-101.xml"
     },
     {
       "ip": "192.168.102.100",
-      "expectedSn": "3G506501CA09165",
+      "expectedSn": "3G506501CA09164",
       "artifactType": "camera-sdk",
       "path": "C:\\maintenance\\camera-sdk\\target\\camera-102.xml",
       "rollbackPath": "C:\\maintenance\\camera-sdk\\known-good\\camera-102.xml"
     },
     {
       "ip": "192.168.103.100",
-      "expectedSn": "3G506401RE08993",
+      "expectedSn": "3G506401RE08999",
       "artifactType": "camera-sdk",
       "path": "C:\\maintenance\\camera-sdk\\target\\camera-103.xml",
       "rollbackPath": "C:\\maintenance\\camera-sdk\\known-good\\camera-103.xml"
     },
     {
       "ip": "192.168.104.100",
-      "expectedSn": "3G506401BE08819",
+      "expectedSn": "YF-0270",
       "artifactType": "camera-sdk",
       "path": "C:\\maintenance\\camera-sdk\\target\\camera-104.xml",
       "rollbackPath": "C:\\maintenance\\camera-sdk\\known-good\\camera-104.xml"
     },
     {
-      "ip": "192.168.105.13",
-      "expectedSn": "YF-0263",
+      "ip": "192.168.105.100",
+      "expectedSn": "3G506601BE09221",
       "artifactType": "camera-sdk",
       "path": "C:\\maintenance\\camera-sdk\\target\\camera-105.xml",
       "rollbackPath": "C:\\maintenance\\camera-sdk\\known-good\\camera-105.xml"
     },
     {
       "ip": "192.168.106.100",
-      "expectedSn": "3G506401RE08991",
+      "expectedSn": "3G506501CA09163",
       "artifactType": "camera-sdk",
       "path": "C:\\maintenance\\camera-sdk\\target\\camera-106.xml",
       "rollbackPath": "C:\\maintenance\\camera-sdk\\known-good\\camera-106.xml"
+    },
+    {
+      "ip": "192.168.107.100",
+      "expectedSn": "3G506401RE08995",
+      "artifactType": "camera-sdk",
+      "path": "C:\\maintenance\\camera-sdk\\target\\camera-107.xml",
+      "rollbackPath": "C:\\maintenance\\camera-sdk\\known-good\\camera-107.xml"
+    },
+    {
+      "ip": "192.168.108.100",
+      "expectedSn": "YF-0269",
+      "artifactType": "camera-sdk",
+      "path": "C:\\maintenance\\camera-sdk\\target\\camera-108.xml",
+      "rollbackPath": "C:\\maintenance\\camera-sdk\\known-good\\camera-108.xml"
     }
   ]
 }

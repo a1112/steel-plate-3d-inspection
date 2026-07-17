@@ -1,0 +1,22 @@
+{
+  "schema": "steel.functional-scenario-evidence.v1",
+  "releaseVersion": "REPLACE-WITH-APPROVED-VERSION",
+  "releaseCommit": "REPLACE-WITH-40-TO-64-LOWERCASE-HEX-COMMIT",
+  "releaseManifestSha256": "REPLACE-WITH-SHA256",
+  "scenarioId": "REPLACE-WITH-EXACT-SCENARIO-ID",
+  "observedAt": "REPLACE-WITH-ISO-8601-WITH-TIMEZONE",
+  "result": "pass",
+  "source": {
+    "system": "REPLACE-WITH-PLC-L2-OR-TARGET-MACHINE",
+    "command": "REPLACE-WITH-EXECUTED-COMMAND-OR-PROCEDURE",
+    "rawLogPath": "REPLACE-WITH-RAW-LOG-PATH",
+    "rawLogSha256": "REPLACE-WITH-SHA256"
+  },
+  "observations": {
+    "requestId": "",
+    "materialId": "",
+    "sessionId": "",
+    "inspectionId": "",
+    "notes": ""
+  }
+}

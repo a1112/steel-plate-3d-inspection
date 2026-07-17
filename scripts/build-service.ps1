@@ -1,6 +1,7 @@
 param(
   [ValidateSet("debug", "release")]
-  [string]$Profile = "debug"
+  [string]$Profile = "debug",
+  [switch]$Locked
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,6 +10,9 @@ $Args = @("build", "--manifest-path", (Join-Path $RepoRoot "app\service\Cargo.to
 
 if ($Profile -eq "release") {
   $Args += "--release"
+}
+if ($Locked) {
+  $Args += "--locked"
 }
 
 & cargo @Args

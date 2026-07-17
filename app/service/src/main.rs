@@ -1,11 +1,13 @@
 #![recursion_limit = "512"]
 
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,8 +15,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
-mod db;
+mod artifact_cleanup;
 mod calibration_operations;
+mod controlled_process;
+mod db;
 mod production_tasks;
 
 #[derive(Clone)]
@@ -65,30 +69,36 @@ struct Defect {
 }
 
 const CAPTURE_SERVICE_PORT: u16 = 4317;
-const CAPTURE_CAMERA_IP: &str = "192.168.105.13";
-const CAPTURE_CAMERA_IPS: [&str; 6] = [
-    "192.168.105.13",
-    "192.168.102.100",
+const CAPTURE_CAMERA_IP: &str = "192.168.101.100";
+const CAPTURE_CAMERA_IPS: [&str; 8] = [
     "192.168.101.100",
+    "192.168.102.100",
     "192.168.103.100",
     "192.168.104.100",
+    "192.168.105.100",
     "192.168.106.100",
+    "192.168.107.100",
+    "192.168.108.100",
 ];
-const CAPTURE_CAMERA_MODELS: [&str; 6] = [
-    "LVM3450CA",
-    "LVM3450CA",
+const CAPTURE_CAMERA_MODELS: [&str; 8] = [
     "LVM3450BE",
+    "LVM3450CA",
     "LVM3450RE",
+    "LVM3450GE(520)",
     "LVM3450BE",
+    "LVM3450CA",
     "LVM3450RE",
+    "LVM3450GE(520)",
 ];
-const CAPTURE_CAMERA_SERIALS: [&str; 6] = [
-    "YF-0263",
-    "3G506501CA09165",
-    "3G506401BE08818",
-    "3G506401RE08993",
-    "3G506401BE08819",
-    "3G506401RE08991",
+const CAPTURE_CAMERA_SERIALS: [&str; 8] = [
+    "3G506601BE09220",
+    "3G506501CA09164",
+    "3G506401RE08999",
+    "YF-0270",
+    "3G506601BE09221",
+    "3G506501CA09163",
+    "3G506401RE08995",
+    "YF-0269",
 ];
 const LOGIN_MAX_FAILURES: u32 = 5;
 const LOGIN_MAX_FAILURES_MIN: u32 = 1;
@@ -120,16 +130,34 @@ const TASK_WORKER_IDLE_HEARTBEAT_MAX_AGE_MS: u128 = 5_000;
 const DEFAULT_TRIGGER_GATEWAY_ORIGIN: &str = "http://127.0.0.1:4881";
 const TRIGGER_HEALTH_TIMEOUT_MS: u64 = 1_200;
 const STORAGE_HEALTH_TIMEOUT_MS: u64 = 1_500;
+const STORAGE_MIN_FREE_BYTES_DEFAULT: u64 = 20 * 1024 * 1024 * 1024;
+const STORAGE_MIN_FREE_PERCENT_DEFAULT: f64 = 10.0;
+const SYSTEM_HEALTH_ALARM_INITIAL_DELAY_SECS: u64 = 5;
+const SYSTEM_HEALTH_ALARM_INTERVAL_SECS: u64 = 10;
+const SYSTEM_HEALTH_ALARM_SOURCE: &str = "system-health";
+const SYSTEM_HEALTH_ALARM_ACTOR: &str = "system-health-monitor";
+const SYSTEM_HEALTH_ALARM_TYPES: [&str; 10] = [
+    "supervisor-restart-budget-exhausted",
+    "supervisor-status-invalid",
+    "storage-capacity-warning",
+    "storage-critical",
+    "capture-unavailable",
+    "task-worker-unavailable",
+    "calibration-reconciliation-required",
+    "trigger-unavailable",
+    "algorithm-not-qualified",
+    "production-policy-invalid",
+];
 const HEALTH_HTTP_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const ADMIN_ID_MAX_LEN: usize = 64;
 const ADMIN_LABEL_MAX_LEN: usize = 128;
 const ADMIN_DESCRIPTION_MAX_LEN: usize = 256;
 const DAY_MILLIS: u128 = 24 * 60 * 60 * 1000;
+static SYSTEM_HEALTH_ALARM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureProvider {
     HeadlessCpp,
-    QtTerminal,
     ExternalApi,
     Simulated,
 }
@@ -137,7 +165,6 @@ enum CaptureProvider {
 impl CaptureProvider {
     fn from_env_value(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
-            "qt" | "qt-terminal" | "capture-qt" => Self::QtTerminal,
             "external" | "external-api" | "api" => Self::ExternalApi,
             "sim" | "simulated" | "simulation" => Self::Simulated,
             _ => Self::HeadlessCpp,
@@ -153,7 +180,6 @@ impl CaptureProvider {
     fn as_str(&self) -> &'static str {
         match self {
             Self::HeadlessCpp => "headless-cpp",
-            Self::QtTerminal => "qt-terminal",
             Self::ExternalApi => "external-api",
             Self::Simulated => "simulated",
         }
@@ -165,6 +191,15 @@ impl CaptureProvider {
 
     fn uses_local_api(&self) -> bool {
         !matches!(self, Self::Simulated)
+    }
+}
+
+fn normalize_capture_output_mode(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "continuous" | "auto" | "automatic" => Some("continuous"),
+        "on-demand" | "on_demand" | "ondemand" | "manual" => Some("on-demand"),
+        "disabled" | "off" | "stop" => Some("disabled"),
+        _ => None,
     }
 }
 
@@ -181,11 +216,43 @@ struct ServiceState {
     production_task_wakeup_generation: Mutex<u64>,
     production_task_worker_status: Mutex<ProductionTaskWorkerStatus>,
     production_task_sequence: AtomicU64,
+    runtime_admission: Mutex<RuntimeAdmissionState>,
+    runtime_drain_token: Vec<u8>,
     trigger_gateway_origin: String,
     trigger_health_required: bool,
+    runtime_profile: String,
+    algorithm_mode: String,
+    algorithm_mock_defect_count: String,
     sessions: Mutex<HashMap<String, AdminSession>>,
     login_failures: Mutex<HashMap<String, LoginFailureState>>,
     started_at: u128,
+}
+
+#[derive(Debug)]
+struct RuntimeAdmissionState {
+    accepting: bool,
+    in_flight: u64,
+}
+
+impl Default for RuntimeAdmissionState {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            in_flight: 0,
+        }
+    }
+}
+
+struct RuntimeAdmissionGuard<'a> {
+    state: &'a ServiceState,
+}
+
+impl Drop for RuntimeAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.state.runtime_admission.lock() {
+            admission.in_flight = admission.in_flight.saturating_sub(1);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -232,6 +299,7 @@ struct AdminSession {
     display_name: String,
     role: String,
     permissions: Vec<String>,
+    must_change_password: bool,
     user_agent: String,
     created_at: u128,
     expires_at: u128,
@@ -243,6 +311,8 @@ struct CaptureServiceManager {
     origin: String,
     provider: CaptureProvider,
     process: Mutex<Option<Child>>,
+    simulated_capture_mode: Mutex<String>,
+    simulated_continuous_line_rate: Mutex<f64>,
 }
 
 #[derive(Clone, Default)]
@@ -974,6 +1044,8 @@ fn default_capture_camera_value(index: usize) -> Value {
         "camera4 周向采集相机",
         "camera5 周向采集相机",
         "camera6 周向采集相机",
+        "camera7 周向采集相机",
+        "camera8 周向采集相机",
     ];
     json!({
         "id": camera_id,
@@ -981,7 +1053,7 @@ fn default_capture_camera_value(index: usize) -> Value {
         "ip": CAPTURE_CAMERA_IPS[index],
         "driverId": "lvm-nvt",
         "modelHint": CAPTURE_CAMERA_MODELS[index],
-        "role": roles[index],
+        "role": roles.get(index).copied().unwrap_or("array camera"),
         "enabled": true,
         "triggerMode": "软件触发",
         "exposureUs": 850,
@@ -992,7 +1064,11 @@ fn default_capture_camera_value(index: usize) -> Value {
 }
 
 fn default_capture_cameras_value() -> Value {
-    Value::Array((0..CAPTURE_CAMERA_IPS.len()).map(default_capture_camera_value).collect())
+    Value::Array(
+        (0..CAPTURE_CAMERA_IPS.len())
+            .map(default_capture_camera_value)
+            .collect(),
+    )
 }
 
 fn build_config_json(capture_port: u16) -> String {
@@ -1009,7 +1085,7 @@ fn build_config_json(capture_port: u16) -> String {
             "updatedAt": current_time_string()
         },
         "capture": {
-            "mode": "six-camera",
+            "mode": "eight-camera",
             "driver": "lvm-nvt",
             "provider": provider.as_str(),
             "fallback": "simulated",
@@ -1043,6 +1119,8 @@ impl CaptureServiceManager {
             origin,
             provider,
             process: Mutex::new(None),
+            simulated_capture_mode: Mutex::new("continuous".to_string()),
+            simulated_continuous_line_rate: Mutex::new(300.0),
         };
         manager.ensure_started();
         manager
@@ -1154,11 +1232,11 @@ impl CaptureServiceManager {
         let running = self.is_running();
         let process_available = match self.provider {
             CaptureProvider::HeadlessCpp => !exe.is_empty(),
-            CaptureProvider::QtTerminal | CaptureProvider::ExternalApi => true,
+            CaptureProvider::ExternalApi => true,
             CaptureProvider::Simulated => false,
         };
         format!(
-            "{{\"name\":\"capture-service\",\"provider\":\"{}\",\"managed\":{},\"running\":{},\"port\":{},\"origin\":\"{}\",\"processAvailable\":{},\"executable\":\"{}\",\"fallback\":\"simulated-six-camera\"}}",
+            "{{\"name\":\"capture-service\",\"provider\":\"{}\",\"managed\":{},\"running\":{},\"port\":{},\"origin\":\"{}\",\"processAvailable\":{},\"executable\":\"{}\",\"fallback\":\"simulated-eight-camera\"}}",
             self.provider.as_str(),
             if self.provider.is_managed() { "true" } else { "false" },
             if running { "true" } else { "false" },
@@ -1172,23 +1250,181 @@ impl CaptureServiceManager {
     fn simulated_proxy(&self, method: &str, path_with_query: &str, body: &str) -> Option<Vec<u8>> {
         let path = path_with_query.split('?').next().unwrap_or(path_with_query);
         match (method, path) {
-            ("GET", "/api/steel/status") => Some(
-                json!({
-                    "code": 0,
-                    "provider": "simulated",
-                    "phase": "idle",
-                    "present": false,
-                    "saveEnabled": false,
-                    "connectedCameras": CAPTURE_CAMERA_IPS.len(),
-                    "storageRoot": "simulated",
-                    "updatedAt": current_time_string()
-                })
-                .to_string()
-                .into_bytes(),
-            ),
+            ("GET", "/api/steel/status") => {
+                let capture_mode = self
+                    .simulated_capture_mode
+                    .lock()
+                    .map(|mode| mode.clone())
+                    .unwrap_or_else(|_| "continuous".to_string());
+                let time_trigger_freq = self
+                    .simulated_continuous_line_rate
+                    .lock()
+                    .map(|rate| *rate)
+                    .unwrap_or(300.0);
+                Some(
+                    json!({
+                        "code": 0,
+                        "provider": "simulated",
+                        "phase": "idle",
+                        "present": false,
+                        "saveEnabled": false,
+                        "captureMode": capture_mode,
+                        "automaticCaptureEnabled": capture_mode == "continuous",
+                        "productionCaptureRunning": false,
+                        "connectedCameras": CAPTURE_CAMERA_IPS.len(),
+                        "continuousSettings": {
+                            "timeTriggerFreq": time_trigger_freq,
+                            "applyToDevice": false,
+                            "runtimeOnly": true,
+                            "restartContinuous": true
+                        },
+                        "storageRoot": "simulated",
+                        "updatedAt": current_time_string()
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+            }
+            ("GET", "/api/capture/continuous-settings") => {
+                let capture_mode = self
+                    .simulated_capture_mode
+                    .lock()
+                    .map(|mode| mode.clone())
+                    .unwrap_or_else(|_| "continuous".to_string());
+                let time_trigger_freq = self
+                    .simulated_continuous_line_rate
+                    .lock()
+                    .map(|rate| *rate)
+                    .unwrap_or(300.0);
+                Some(
+                    json!({
+                        "code": 0,
+                        "provider": "simulated",
+                        "supported": true,
+                        "timeTriggerFreq": time_trigger_freq,
+                        "lineTriggerFrequency": time_trigger_freq,
+                        "connectedCameras": CAPTURE_CAMERA_IPS.len(),
+                        "configuredCameras": CAPTURE_CAMERA_IPS.len(),
+                        "captureMode": capture_mode,
+                        "requiresApplyToDevice": true,
+                        "runtimeOnly": true
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+            }
+            ("POST", "/api/steel/capture-mode") => {
+                let payload =
+                    serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
+                let requested =
+                    simulated_provider_string_field(&payload, &["captureMode", "capture_mode"]);
+                let Some(capture_mode) = normalize_capture_output_mode(&requested) else {
+                    return Some(
+                        json!({
+                            "code": 400,
+                            "error": "captureMode must be continuous, on-demand, or disabled"
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    );
+                };
+                if let Ok(mut current) = self.simulated_capture_mode.lock() {
+                    *current = capture_mode.to_string();
+                }
+                Some(
+                    json!({
+                        "code": 0,
+                        "provider": "simulated",
+                        "captureMode": capture_mode,
+                        "automaticCaptureEnabled": capture_mode == "continuous",
+                        "productionCaptureRunning": false,
+                        "updatedAt": current_time_string()
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+            }
+            ("POST", "/api/capture/continuous-settings") => {
+                let payload =
+                    serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
+                let Some(time_trigger_freq) = payload
+                    .get("timeTriggerFreq")
+                    .or_else(|| payload.get("time_trigger_freq"))
+                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_finite() && *value >= 0.1 && *value <= 100_000.0)
+                else {
+                    return Some(
+                        json!({
+                            "code": 400,
+                            "error": "timeTriggerFreq must be between 0.1 and 100000"
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    );
+                };
+                let apply_to_device = payload
+                    .get("applyToDevice")
+                    .or_else(|| payload.get("apply_to_device"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let restart_continuous = payload
+                    .get("restartContinuous")
+                    .or_else(|| payload.get("restart_continuous"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if apply_to_device {
+                    if let Ok(mut current) = self.simulated_continuous_line_rate.lock() {
+                        *current = time_trigger_freq;
+                    }
+                }
+                let current_time_trigger_freq = self
+                    .simulated_continuous_line_rate
+                    .lock()
+                    .map(|rate| *rate)
+                    .unwrap_or(300.0);
+                Some(
+                    json!({
+                        "code": 0,
+                        "provider": "simulated",
+                        "timeTriggerFreq": current_time_trigger_freq,
+                        "requestedTimeTriggerFreq": time_trigger_freq,
+                        "applyToDevice": apply_to_device,
+                        "runtimeOnly": true,
+                        "restartContinuous": restart_continuous,
+                        "applied": if apply_to_device { CAPTURE_CAMERA_IPS.len() } else { 0 },
+                        "failed": 0,
+                        "updatedAt": current_time_string()
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+            }
             ("POST", "/api/steel/event") => {
                 let payload =
                     serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
+                let requested_capture_mode =
+                    simulated_provider_string_field(&payload, &["captureMode", "capture_mode"]);
+                if !requested_capture_mode.is_empty() {
+                    let Some(capture_mode) = normalize_capture_output_mode(&requested_capture_mode)
+                    else {
+                        return Some(
+                            json!({
+                                "code": 400,
+                                "error": "captureMode must be continuous, on-demand, or disabled"
+                            })
+                            .to_string()
+                            .into_bytes(),
+                        );
+                    };
+                    if let Ok(mut current) = self.simulated_capture_mode.lock() {
+                        *current = capture_mode.to_string();
+                    }
+                }
+                let capture_mode = self
+                    .simulated_capture_mode
+                    .lock()
+                    .map(|mode| mode.clone())
+                    .unwrap_or_else(|_| "continuous".to_string());
                 let material_id = {
                     let id = simulated_provider_string_field(
                         &payload,
@@ -1208,11 +1444,16 @@ impl CaptureServiceManager {
                     .get("saveEnabled")
                     .and_then(Value::as_bool)
                     .unwrap_or(value != 0 && command != "rcvSteelInfo");
+                let automatic_capture = capture_mode == "continuous"
+                    && payload
+                        .get("autoCapture")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
                 let phase = if command == "rcvSteelInfo" {
                     "info-ready"
                 } else if value == 0 {
                     "steel-out"
-                } else if save_enabled {
+                } else if save_enabled && automatic_capture {
                     "steel-in-saving"
                 } else {
                     "steel-in-waiting-images"
@@ -1231,6 +1472,11 @@ impl CaptureServiceManager {
                         "phase": phase,
                         "present": value != 0 && command != "rcvSteelInfo",
                         "saveEnabled": save_enabled,
+                        "captureMode": capture_mode,
+                        "automaticCaptureEnabled": capture_mode == "continuous",
+                        "productionCaptureRunning": automatic_capture
+                            && value != 0
+                            && command != "rcvSteelInfo",
                         "saveSdkDerived": false,
                         "discardBlackFrames": payload
                             .get("discardBlackFrames")
@@ -1255,7 +1501,8 @@ impl CaptureServiceManager {
                     &["expectedCameras", "expected_cameras"],
                     CAPTURE_CAMERA_IPS.len() as i32,
                 )
-                .clamp(1, CAPTURE_CAMERA_IPS.len() as i32) as usize;
+                .clamp(1, CAPTURE_CAMERA_IPS.len() as i32)
+                    as usize;
                 let rounds = value_i32(&payload, &["rounds"], 1).clamp(1, 100) as usize;
                 let lines = value_i32(&payload, &["lines", "triggerLines"], 1000).max(1);
                 let width = value_i32(&payload, &["width"], 3200).max(0);
@@ -1377,12 +1624,7 @@ impl CaptureServiceManager {
         path_with_query: &str,
         body: &str,
     ) -> Option<CaptureProxyResponse> {
-        self.proxy_response_with_read_timeout(
-            method,
-            path_with_query,
-            body,
-            Duration::from_secs(8),
-        )
+        self.proxy_response_with_read_timeout(method, path_with_query, body, Duration::from_secs(8))
     }
 
     fn proxy_response_with_read_timeout(
@@ -1429,9 +1671,7 @@ impl CaptureServiceManager {
         body: &str,
         read_timeout: Duration,
     ) -> Option<CaptureProxyResponse> {
-        let mut addresses = (self.host.as_str(), self.port)
-            .to_socket_addrs()
-            .ok()?;
+        let mut addresses = (self.host.as_str(), self.port).to_socket_addrs().ok()?;
         let mut stream = addresses.find_map(|address| {
             TcpStream::connect_timeout(&address, Duration::from_millis(1500)).ok()
         })?;
@@ -1675,7 +1915,11 @@ fn production_time_label(started_at: &str, material_id: &str) -> String {
         .unwrap_or_else(|| {
             if started_at.len() >= 4 {
                 let end = started_at.len();
-                format!("{}:{}", &started_at[end - 4..end - 2], &started_at[end - 2..end])
+                format!(
+                    "{}:{}",
+                    &started_at[end - 4..end - 2],
+                    &started_at[end - 2..end]
+                )
             } else {
                 "--:--".to_string()
             }
@@ -1703,7 +1947,15 @@ fn production_plate_value(
     })
 }
 
-fn production_defect_label(type_id: &str) -> String {
+fn production_defect_label(type_id: &str, geometry: &Value) -> String {
+    if geometry.get("classificationState").and_then(Value::as_str) == Some("candidate-only") {
+        return match geometry.get("candidatePolarity").and_then(Value::as_str) {
+            Some("depression") => "凹陷候选",
+            Some("protrusion") => "凸起候选",
+            _ => "几何异常候选",
+        }
+        .to_string();
+    }
     match type_id {
         "pit" => "凹坑",
         "scratch" => "划伤",
@@ -1744,7 +1996,18 @@ fn production_defect_value(
 ) -> Value {
     let width = plate.get("widthMm").and_then(Value::as_f64).unwrap_or(0.0);
     let length = plate.get("lengthMm").and_then(Value::as_f64).unwrap_or(0.0);
-    let x_ratio = if length > 0.0 {
+    let geometry =
+        serde_json::from_str::<Value>(&defect.geometry_json).unwrap_or_else(|_| json!({}));
+    let geometry_length_ratio = geometry.get("lengthRatio").and_then(Value::as_f64);
+    let geometry_circumference_ratio = geometry.get("circumferenceRatio").and_then(Value::as_f64);
+    let geometry_camera_index = geometry.get("cameraIndex").and_then(Value::as_i64);
+    let defect_artifacts = geometry
+        .get("artifacts")
+        .filter(|value| value.is_object())
+        .cloned();
+    let x_ratio = if let Some(ratio) = geometry_length_ratio {
+        ratio.clamp(0.0, 1.0)
+    } else if length > 0.0 {
         (defect.x_mm / length).clamp(0.0, 1.0)
     } else {
         0.0
@@ -1757,8 +2020,14 @@ fn production_defect_value(
     json!({
         "id": defect.id,
         "plateNo": inspection.material_id,
+        "cameraId": defect.camera_id,
+        "cameraIndex": geometry_camera_index,
         "typeId": defect.defect_type,
-        "typeLabel": production_defect_label(&defect.defect_type),
+        "typeLabel": production_defect_label(&defect.defect_type, &geometry),
+        "classificationState": geometry.get("classificationState").cloned().unwrap_or(Value::Null),
+        "classificationVersion": geometry.get("classificationVersion").cloned().unwrap_or(Value::Null),
+        "candidatePolarity": geometry.get("candidatePolarity").cloned().unwrap_or(Value::Null),
+        "classificationConfidence": geometry.get("classificationConfidence").cloned().unwrap_or(Value::Null),
         "surface": production_defect_surface(&defect.camera_id),
         "severity": production_defect_severity(&defect.severity),
         "distanceHeadMm": defect.x_mm.round() as i64,
@@ -1769,8 +2038,13 @@ fn production_defect_value(
         "depthMm": defect.depth_mm,
         "xRatio": x_ratio,
         "yOffsetMm": y_offset,
+        "circumferenceRatio": geometry_circumference_ratio,
+        "confidence": defect.confidence,
+        "detectionConfidence": defect.confidence,
+        "synthetic": geometry.get("synthetic").and_then(Value::as_bool).unwrap_or(false),
+        "artifacts": defect_artifacts,
         "previewX": (x_ratio * 100.0).round() as i64,
-        "previewY": ((0.5 - y_offset / 2.0) * 100.0).round() as i64,
+        "previewY": (geometry_circumference_ratio.unwrap_or(0.5 - y_offset / 2.0).clamp(0.0, 1.0) * 100.0).round() as i64,
         "previewImageUrl": ""
     })
 }
@@ -1798,12 +2072,20 @@ fn summarize_defect_values(defects: &[Value]) -> Value {
     let mut top = 0;
     let mut bottom = 0;
     for defect in defects {
-        match defect.get("severity").and_then(Value::as_str).unwrap_or("review") {
+        match defect
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("review")
+        {
             "severe" => severe += 1,
             "minor" => minor += 1,
             _ => review += 1,
         }
-        match defect.get("surface").and_then(Value::as_str).unwrap_or("top") {
+        match defect
+            .get("surface")
+            .and_then(Value::as_str)
+            .unwrap_or("top")
+        {
             "bottom" => bottom += 1,
             _ => top += 1,
         }
@@ -1817,10 +2099,10 @@ fn summarize_defect_values(defects: &[Value]) -> Value {
 
 fn production_defect_types_value() -> Value {
     json!([
-        { "id": "pit", "label": "凹坑", "color": "#4f8cff", "shape": "circle" },
+        { "id": "pit", "label": "凹陷候选", "color": "#4f8cff", "shape": "circle" },
         { "id": "scratch", "label": "划伤", "color": "#46d36f", "shape": "rect" },
         { "id": "roll", "label": "辊印", "color": "#ff9d3b", "shape": "square" },
-        { "id": "foreign", "label": "异物压入", "color": "#ff4d6d", "shape": "diamond" },
+        { "id": "foreign", "label": "凸起候选", "color": "#ff4d6d", "shape": "diamond" },
         { "id": "burnt", "label": "烂钢", "color": "#9b6bff", "shape": "star" },
         { "id": "edge", "label": "边裂", "color": "#ffd166", "shape": "diamond" },
         { "id": "bubble", "label": "气泡", "color": "#ff69b4", "shape": "circle" },
@@ -1840,11 +2122,15 @@ fn production_device_status_value(state: &ServiceState) -> Value {
         .map(|items| {
             items
                 .iter()
-                .map(|item| item.get("connected").and_then(Value::as_bool).unwrap_or(false))
+                .map(|item| {
+                    item.get("connected")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let camera_ports = (0..6)
+    let camera_ports = (0..CAPTURE_CAMERA_IPS.len())
         .map(|index| json!({ "index": index + 1, "ok": connected.get(index).copied().unwrap_or(false) }))
         .collect::<Vec<_>>();
     let alarm_count = state
@@ -2211,6 +2497,7 @@ fn bounded_local_http_request(
     path: &str,
     body: &str,
     timeout: Duration,
+    headers: &[(&str, &str)],
 ) -> Result<CaptureProxyResponse, HealthHttpProbeError> {
     if !matches!(method, "GET" | "POST") {
         return Err(HealthHttpProbeError::InvalidResponse);
@@ -2246,8 +2533,23 @@ fn bounded_local_http_request(
         .set_read_timeout(Some(remaining))
         .map_err(|error| health_http_io_error(&error))?;
     let path = if path.starts_with('/') { path } else { "/" };
+    let mut extra_headers = String::new();
+    for (name, value) in headers {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || value.contains(['\r', '\n'])
+        {
+            return Err(HealthHttpProbeError::InvalidResponse);
+        }
+        extra_headers.push_str(name);
+        extra_headers.push_str(": ");
+        extra_headers.push_str(value);
+        extra_headers.push_str("\r\n");
+    }
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\n\r\n{}",
         body.as_bytes().len(),
         body
     );
@@ -2286,7 +2588,7 @@ fn bounded_health_http_get(
     path: &str,
     timeout: Duration,
 ) -> Result<CaptureProxyResponse, HealthHttpProbeError> {
-    bounded_local_http_request(origin, "GET", path, "", timeout)
+    bounded_local_http_request(origin, "GET", path, "", timeout, &[])
 }
 
 fn database_health_component(state: &ServiceState) -> (bool, Value) {
@@ -2301,6 +2603,7 @@ fn database_health_component(state: &ServiceState) -> (bool, Value) {
             "ok": ok,
             "status": if ok { "up" } else { "unavailable" },
             "engine": state.database.engine.clone(),
+            "schemaVersion": state.database.schema_version,
             "latencyMs": health_latency_ms(started),
             "reason": if ok { Value::Null } else { json!("database_ping_failed") }
         }),
@@ -2413,6 +2716,21 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
         .as_ref()
         .and_then(|value| value.get("sdkReady"))
         .and_then(Value::as_bool);
+    let provider_ready = payload
+        .as_ref()
+        .and_then(|value| value.get("ready"))
+        .and_then(Value::as_bool);
+    let restart_required = payload.as_ref().and_then(|value| {
+        value
+            .get("restartRequired")
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                value
+                    .get("sdkCaptureState")
+                    .and_then(|state| state.get("restartRequired"))
+                    .and_then(Value::as_bool)
+            })
+    });
     let recovery_required = payload
         .as_ref()
         .and_then(|value| value.get("recoveryRequired"))
@@ -2426,13 +2744,21 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
         .and_then(|value| value.get("pendingRecoveryCount"))
         .and_then(Value::as_u64);
     let contract_valid = sdk_ready.is_some();
-    let ok = status_ok && sdk_ready == Some(true) && recovery_required != Some(true);
+    let ok = status_ok
+        && sdk_ready == Some(true)
+        && provider_ready != Some(false)
+        && recovery_required != Some(true)
+        && restart_required != Some(true);
     let reason = if !status_ok {
         Some("capture_health_http_error")
     } else if !contract_valid {
         Some("capture_health_contract_invalid")
     } else if recovery_required == Some(true) {
         Some("capture_calibration_recovery_required")
+    } else if restart_required == Some(true) {
+        Some("capture_sdk_restart_required")
+    } else if provider_ready == Some(false) {
+        Some("capture_provider_not_ready")
     } else if sdk_ready != Some(true) {
         Some("capture_sdk_not_ready")
     } else {
@@ -2448,6 +2774,8 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
             "apiReachable": api_reachable,
             "sdkRequired": true,
             "sdkReady": sdk_ready,
+            "providerReady": provider_ready,
+            "restartRequired": restart_required,
             "recoveryRequired": recovery_required,
             "invalidManifest": invalid_manifest,
             "pendingRecoveryCount": pending_recovery_count,
@@ -2496,10 +2824,7 @@ fn calibration_reconciliation_health_component(state: &ServiceState) -> (bool, V
     }
 }
 
-fn storage_health_component_with_timeout(
-    state: &ServiceState,
-    timeout: Duration,
-) -> (bool, Value) {
+fn storage_health_component_with_timeout(state: &ServiceState, timeout: Duration) -> (bool, Value) {
     if state.capture.provider == CaptureProvider::Simulated {
         return (
             true,
@@ -2511,6 +2836,12 @@ fn storage_health_component_with_timeout(
                 "apiReachable": true,
                 "rootExists": Value::Null,
                 "rootWritable": Value::Null,
+                "capacityAvailable": Value::Null,
+                "capacityBytes": Value::Null,
+                "freeBytes": Value::Null,
+                "freePercent": Value::Null,
+                "level": "simulated",
+                "warningReason": Value::Null,
                 "queueAccepting": Value::Null,
                 "queueRequired": false,
                 "httpStatus": Value::Null,
@@ -2536,6 +2867,10 @@ fn storage_health_component_with_timeout(
                     "apiReachable": false,
                     "rootExists": Value::Null,
                     "rootWritable": Value::Null,
+                    "capacityAvailable": Value::Null,
+                    "capacityBytes": Value::Null,
+                    "freeBytes": Value::Null,
+                    "freePercent": Value::Null,
                     "queueAccepting": Value::Null,
                     "queueRequired": true,
                     "httpStatus": Value::Null,
@@ -2559,6 +2894,22 @@ fn storage_health_component_with_timeout(
         .as_ref()
         .and_then(|value| value.get("writable"))
         .and_then(Value::as_bool);
+    let root_capacity_available = payload
+        .as_ref()
+        .and_then(|value| value.get("capacityAvailable"))
+        .and_then(Value::as_bool);
+    let root_capacity_bytes = payload
+        .as_ref()
+        .and_then(|value| value.get("capacityBytes"))
+        .and_then(Value::as_u64);
+    let root_free_bytes = payload
+        .as_ref()
+        .and_then(|value| value.get("freeBytes"))
+        .and_then(Value::as_u64);
+    let root_free_percent = payload
+        .as_ref()
+        .and_then(|value| value.get("freePercent"))
+        .and_then(Value::as_f64);
     let queue = payload.as_ref().and_then(|value| value.get("queue"));
     let queue_accepting = queue
         .and_then(|value| value.get("accepting"))
@@ -2569,21 +2920,92 @@ fn storage_health_component_with_timeout(
     let capacity_items = queue
         .and_then(|value| value.get("capacityItems"))
         .and_then(Value::as_u64);
+    let recent_write_bytes_per_second = queue
+        .and_then(|value| value.get("recentWriteBytesPerSecond"))
+        .and_then(Value::as_f64);
     let camera_root_count = payload
         .as_ref()
         .and_then(|value| value.get("cameraRoots"))
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
+    let camera_roots = payload
+        .as_ref()
+        .and_then(|value| value.get("cameraRoots"))
+        .and_then(Value::as_array);
+    let camera_capacity_contract_valid = camera_roots
+        .map(|roots| {
+            roots.iter().all(|root| {
+                root.get("capacityAvailable").and_then(Value::as_bool) == Some(true)
+                    && root.get("capacityBytes").and_then(Value::as_u64).is_some()
+                    && root.get("freeBytes").and_then(Value::as_u64).is_some()
+                    && root.get("freePercent").and_then(Value::as_f64).is_some()
+            })
+        })
+        .unwrap_or(false);
+    let minimum_free_bytes = camera_roots
+        .into_iter()
+        .flat_map(|roots| roots.iter())
+        .filter_map(|root| root.get("freeBytes").and_then(Value::as_u64))
+        .chain(root_free_bytes)
+        .min();
+    let minimum_free_percent = camera_roots
+        .into_iter()
+        .flat_map(|roots| roots.iter())
+        .filter_map(|root| root.get("freePercent").and_then(Value::as_f64))
+        .chain(root_free_percent)
+        .reduce(f64::min);
+    let minimum_capacity_bytes = camera_roots
+        .into_iter()
+        .flat_map(|roots| roots.iter())
+        .filter_map(|root| root.get("capacityBytes").and_then(Value::as_u64))
+        .chain(root_capacity_bytes)
+        .min();
+    let estimated_remaining_seconds = match (minimum_free_bytes, recent_write_bytes_per_second) {
+        (Some(free), Some(rate)) if rate.is_finite() && rate > 0.0 => {
+            Some((free as f64 / rate).floor() as u64)
+        }
+        _ => None,
+    };
+    let min_free_bytes = env::var("STEEL_STORAGE_MIN_FREE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(STORAGE_MIN_FREE_BYTES_DEFAULT);
+    let min_free_percent = env::var("STEEL_STORAGE_MIN_FREE_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+        .unwrap_or(STORAGE_MIN_FREE_PERCENT_DEFAULT);
+    let warning_free_bytes = min_free_bytes.saturating_mul(2);
+    let warning_free_percent = (min_free_percent + 5.0).min(100.0);
     let contract_valid = code.is_some()
         && root_exists.is_some()
         && root_writable.is_some()
+        && root_capacity_available == Some(true)
+        && root_capacity_bytes.is_some()
+        && root_free_bytes.is_some()
+        && root_free_percent.is_some()
+        && camera_capacity_contract_valid
         && queue_accepting.is_some();
+    let capacity_healthy = minimum_free_bytes
+        .map(|value| value >= min_free_bytes)
+        .unwrap_or(false)
+        && minimum_free_percent
+            .map(|value| value >= min_free_percent)
+            .unwrap_or(false);
     let ok = status_ok
         && code == Some(0)
         && root_exists == Some(true)
         && root_writable == Some(true)
+        && capacity_healthy
         && queue_accepting == Some(true);
+    let capacity_warning = capacity_healthy
+        && (minimum_free_bytes
+            .map(|value| value < warning_free_bytes)
+            .unwrap_or(false)
+            || minimum_free_percent
+                .map(|value| value < warning_free_percent)
+                .unwrap_or(false));
     let reason = if !status_ok {
         Some("storage_status_http_error")
     } else if !contract_valid {
@@ -2594,6 +3016,8 @@ fn storage_health_component_with_timeout(
         Some("storage_root_missing")
     } else if root_writable != Some(true) {
         Some("storage_root_not_writable")
+    } else if !capacity_healthy {
+        Some("storage_capacity_below_watermark")
     } else if queue_accepting != Some(true) {
         Some("storage_queue_not_accepting")
     } else {
@@ -2603,12 +3027,24 @@ fn storage_health_component_with_timeout(
         ok,
         json!({
             "ok": ok,
-            "status": if ok { "up" } else { "unavailable" },
+            "status": if !ok { "unavailable" } else if capacity_warning { "warning" } else { "up" },
+            "level": if !ok { "critical" } else if capacity_warning { "warning" } else { "ok" },
             "provider": state.capture.provider.as_str(),
             "simulated": false,
             "apiReachable": true,
             "rootExists": root_exists,
             "rootWritable": root_writable,
+            "capacityAvailable": root_capacity_available,
+            "capacityBytes": minimum_capacity_bytes,
+            "freeBytes": minimum_free_bytes,
+            "freePercent": minimum_free_percent,
+            "minimumFreeBytes": min_free_bytes,
+            "minimumFreePercent": min_free_percent,
+            "warningFreeBytes": warning_free_bytes,
+            "warningFreePercent": warning_free_percent,
+            "warningReason": if capacity_warning { json!("storage_capacity_near_watermark") } else { Value::Null },
+            "recentWriteBytesPerSecond": recent_write_bytes_per_second,
+            "estimatedRemainingSeconds": estimated_remaining_seconds,
             "queueAccepting": queue_accepting,
             "queueRequired": true,
             "queuePendingItems": pending_items,
@@ -2622,10 +3058,7 @@ fn storage_health_component_with_timeout(
 }
 
 fn storage_health_component(state: &ServiceState) -> (bool, Value) {
-    storage_health_component_with_timeout(
-        state,
-        Duration::from_millis(STORAGE_HEALTH_TIMEOUT_MS),
-    )
+    storage_health_component_with_timeout(state, Duration::from_millis(STORAGE_HEALTH_TIMEOUT_MS))
 }
 
 fn trigger_health_component_with_timeout(
@@ -2706,6 +3139,432 @@ fn trigger_health_component(state: &ServiceState) -> (bool, Value) {
     )
 }
 
+fn sha256_file_hex(path: &Path) -> Option<String> {
+    let mut stream = fs::File::open(path).ok()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = stream.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
+fn algorithm_config_path() -> PathBuf {
+    env::var("STEEL_ALGORITHM_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            workspace_root()
+                .join("config")
+                .join("algorithm")
+                .join("bar-surface-production.json")
+        })
+}
+
+fn algorithm_config_health() -> (bool, Value, Option<Value>) {
+    let path = algorithm_config_path();
+    let Some(hash) = sha256_file_hex(&path) else {
+        return (
+            false,
+            json!({
+                "ok": false,
+                "status": "invalid",
+                "reason": "algorithm_config_unavailable"
+            }),
+            None,
+        );
+    };
+    let config = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let Some(config) = config else {
+        return (
+            false,
+            json!({
+                "ok": false,
+                "status": "invalid",
+                "reason": "algorithm_config_invalid_json",
+                "configSha256": hash
+            }),
+            None,
+        );
+    };
+    let thresholds = config.get("thresholds").and_then(Value::as_object);
+    let required_thresholds = [
+        "contourEnabled",
+        "maxFrames",
+        "meshRows",
+        "meshColsPerCamera",
+        "radiusMm",
+        "radialScaleMm",
+        "maxFaceEdgeMm",
+        "contourRadiusToleranceMm",
+        "contourMinKeepRatio",
+        "contourMinRowCoverage",
+        "contourAutoPercentile",
+        "contourMinimumToleranceMm",
+        "contourMadMultiplier",
+        "contourFallbackPercentile",
+        "meshLongitudinalStepMm",
+        "defectMinDepthMm",
+        "defectMinAreaPoints",
+        "defectMadMultiplier",
+        "defectLongitudinalSpanFloorMm",
+        "severitySevereAbsoluteMm",
+        "severitySevereThresholdMultiplier",
+        "severityReviewAbsoluteMm",
+        "severityReviewThresholdMultiplier",
+        "confidenceBase",
+        "confidenceMagnitudeWeight",
+        "confidenceAreaWeight",
+        "confidenceAreaNormalizationPoints",
+        "confidenceMaximum",
+    ];
+    let numeric_thresholds_valid = [
+        ("maxFrames", 1.0, 240.0),
+        ("meshRows", 24.0, 512.0),
+        ("meshColsPerCamera", 24.0, 256.0),
+        ("radiusMm", 0.001, 1_000_000.0),
+        ("radialScaleMm", 0.0, 1_000_000.0),
+        ("maxFaceEdgeMm", 0.0, 1_000_000.0),
+        ("contourRadiusToleranceMm", 0.0, 1_000_000.0),
+        ("contourMinKeepRatio", 0.0, 1.0),
+        ("contourMinRowCoverage", 0.0, 1.0),
+        ("contourAutoPercentile", 50.0, 99.9),
+        ("contourMinimumToleranceMm", 0.0, 1_000_000.0),
+        ("contourMadMultiplier", 0.001, 1_000_000.0),
+        ("contourFallbackPercentile", 50.0, 100.0),
+        ("meshLongitudinalStepMm", 0.000001, 1_000_000.0),
+        ("defectMinDepthMm", 0.000001, 1_000_000.0),
+        ("defectMinAreaPoints", 1.0, 1_000_000.0),
+        ("defectMadMultiplier", 0.001, 1_000_000.0),
+        ("defectLongitudinalSpanFloorMm", 0.0, 1_000_000.0),
+        ("severitySevereAbsoluteMm", 0.0, 1_000_000.0),
+        ("severitySevereThresholdMultiplier", 0.0, 1_000_000.0),
+        ("severityReviewAbsoluteMm", 0.0, 1_000_000.0),
+        ("severityReviewThresholdMultiplier", 0.0, 1_000_000.0),
+        ("confidenceBase", 0.0, 1.0),
+        ("confidenceMagnitudeWeight", 0.0, 1.0),
+        ("confidenceAreaWeight", 0.0, 1.0),
+        ("confidenceAreaNormalizationPoints", 0.000001, 1_000_000.0),
+        ("confidenceMaximum", 0.0, 1.0),
+    ]
+    .iter()
+    .all(|(key, minimum, maximum)| {
+        thresholds
+            .and_then(|values| values.get(*key))
+            .and_then(Value::as_f64)
+            .is_some_and(|value| value.is_finite() && value >= *minimum && value <= *maximum)
+    });
+    let valid = config.get("schema").and_then(Value::as_str) == Some("steel.algorithm-config.v1")
+        && ["algorithmName", "algorithmVersion", "configRevision"]
+            .iter()
+            .all(|key| {
+                config
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+        && required_thresholds
+            .iter()
+            .all(|key| thresholds.is_some_and(|values| values.contains_key(*key)))
+        && thresholds
+            .and_then(|values| values.get("contourEnabled"))
+            .and_then(Value::as_bool)
+            .is_some()
+        && numeric_thresholds_valid
+        && config
+            .pointer("/qualityGate/requiredCameraCount")
+            .and_then(Value::as_u64)
+            == Some(8)
+        && config
+            .pointer("/qualityGate/maximumSyntheticDefectCount")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && config
+            .pointer("/qualityGate/requireCalibrationForEveryCamera")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && config
+            .pointer("/qualityGate/requireReconstructionAcceptance")
+            .and_then(Value::as_bool)
+            == Some(true);
+    let detail = json!({
+        "ok": valid,
+        "status": if valid { "locked" } else { "invalid" },
+        "reason": if valid { Value::Null } else { json!("algorithm_config_contract_invalid") },
+        "algorithmName": config.get("algorithmName"),
+        "algorithmVersion": config.get("algorithmVersion"),
+        "configRevision": config.get("configRevision"),
+        "configSha256": hash
+    });
+    (valid, detail, valid.then_some(config))
+}
+
+fn algorithm_acceptance_report_valid(report: &Value, config: &Value, config_hash: &str) -> bool {
+    let text_present = |pointer: &str| {
+        report
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    let hash_present = |pointer: &str| {
+        report
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    };
+    let metric_pairs = [
+        (
+            "/metrics/detectionRecall",
+            "/acceptanceCriteria/minimumDetectionRecall",
+            true,
+        ),
+        (
+            "/metrics/falsePositiveRate",
+            "/acceptanceCriteria/maximumFalsePositiveRate",
+            false,
+        ),
+        (
+            "/metrics/missRate",
+            "/acceptanceCriteria/maximumMissRate",
+            false,
+        ),
+        (
+            "/metrics/localizationErrorMmP95",
+            "/acceptanceCriteria/maximumLocalizationErrorMmP95",
+            false,
+        ),
+        (
+            "/metrics/sizeErrorMmP95",
+            "/acceptanceCriteria/maximumSizeErrorMmP95",
+            false,
+        ),
+        (
+            "/metrics/endToEndLatencyMsP95",
+            "/acceptanceCriteria/maximumEndToEndLatencyMsP95",
+            false,
+        ),
+    ];
+    report.get("schema").and_then(Value::as_str) == Some("steel.algorithm-acceptance.v1")
+        && report.get("status").and_then(Value::as_str) == Some("pass")
+        && report.get("algorithmName") == config.get("algorithmName")
+        && report.get("algorithmVersion") == config.get("algorithmVersion")
+        && report.get("configRevision") == config.get("configRevision")
+        && report.get("configSha256").and_then(Value::as_str) == Some(config_hash)
+        && text_present("/datasetRevision")
+        && hash_present("/datasetSha256")
+        && text_present("/evaluatorRevision")
+        && hash_present("/evaluatorSha256")
+        && text_present("/calibrationRevision")
+        && hash_present("/calibrationSha256")
+        && hash_present("/scriptSha256")
+        && hash_present("/coreSha256")
+        && report
+            .get("releaseCommit")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                (40..=64).contains(&value.len())
+                    && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        && text_present("/approvals/algorithmOwner")
+        && text_present("/approvals/qualityOwner")
+        && text_present("/approvals/approvedAt")
+        && metric_pairs.iter().all(|(metric, criterion, minimum)| {
+            let Some(actual) = report.pointer(metric).and_then(Value::as_f64) else {
+                return false;
+            };
+            let Some(limit) = report.pointer(criterion).and_then(Value::as_f64) else {
+                return false;
+            };
+            if *minimum {
+                actual >= limit
+            } else {
+                actual <= limit
+            }
+        })
+}
+
+fn configured_algorithm_acceptance_report() -> Option<(PathBuf, Value, String)> {
+    let path = env::var("STEEL_ALGORITHM_ACCEPTANCE_REPORT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)?;
+    let text = fs::read_to_string(&path).ok()?;
+    let report = serde_json::from_str::<Value>(&text).ok()?;
+    let hash = sha256_file_hex(&path)?;
+    Some((path, report, hash))
+}
+
+fn current_algorithm_implementation_identity() -> Option<Value> {
+    let script = workspace_root()
+        .join("scripts")
+        .join("bar_surface_reconstruct.py");
+    let core = env::var("STEEL_BAR_SURFACE_CORE_EXE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)?;
+    let release_commit = env::var("STEEL_RELEASE_COMMIT")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase();
+    if !script.is_file()
+        || !core.is_file()
+        || !(40..=64).contains(&release_commit.len())
+        || !release_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(json!({
+        "scriptSha256": sha256_file_hex(&script)?,
+        "coreSha256": sha256_file_hex(&core)?,
+        "releaseCommit": release_commit,
+        "script": script.display().to_string(),
+        "core": core.display().to_string()
+    }))
+}
+
+fn algorithm_implementation_binding_valid(report: &Value, implementation: &Value) -> bool {
+    ["scriptSha256", "coreSha256", "releaseCommit"]
+        .iter()
+        .all(|key| {
+            report
+                .get(*key)
+                .and_then(Value::as_str)
+                .zip(implementation.get(*key).and_then(Value::as_str))
+                .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+        })
+}
+
+fn current_algorithm_calibration_identity() -> Option<Value> {
+    let path = algorithm_calibration_path()?;
+    let sha256 = sha256_file_hex(&path)?;
+    let revision = env::var("STEEL_CALIBRATION_REVISION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("sha256:{}", &sha256[..16]));
+    Some(json!({
+        "path": path.display().to_string(),
+        "revision": revision,
+        "sha256": sha256
+    }))
+}
+
+fn algorithm_calibration_binding_valid(report: &Value, calibration: &Value) -> bool {
+    report
+        .get("calibrationRevision")
+        .and_then(Value::as_str)
+        .zip(calibration.get("revision").and_then(Value::as_str))
+        .is_some_and(|(expected, actual)| expected == actual)
+        && report
+            .get("calibrationSha256")
+            .and_then(Value::as_str)
+            .zip(calibration.get("sha256").and_then(Value::as_str))
+            .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+}
+
+fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
+    if state.capture.provider == CaptureProvider::Simulated {
+        let allowed =
+            synthetic_algorithm_fixtures_allowed(&state.runtime_profile, &state.algorithm_mode);
+        return (
+            allowed,
+            json!({
+                "ok": allowed,
+                "readyContribution": allowed,
+                "status": if allowed { "simulation-not-required" } else { "production-simulation-forbidden" },
+                "required": !allowed,
+                "reason": if allowed { Value::Null } else { json!("production_simulated_algorithm_forbidden") }
+            }),
+        );
+    }
+    let (config_ok, config_detail, config) = algorithm_config_health();
+    let (paths_ok, paths) = algorithm_runtime_paths_health();
+    let acceptance_bundle = configured_algorithm_acceptance_report();
+    let acceptance_path = acceptance_bundle.as_ref().map(|(path, _, _)| path);
+    let acceptance = acceptance_bundle.as_ref().map(|(_, report, _)| report);
+    let config_hash = config_detail
+        .get("configSha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let acceptance_ok = acceptance
+        .zip(config.as_ref())
+        .is_some_and(|(report, config)| {
+            algorithm_acceptance_report_valid(report, config, config_hash)
+        });
+    let implementation = current_algorithm_implementation_identity();
+    let implementation_ok = acceptance
+        .zip(implementation.as_ref())
+        .is_some_and(|(report, identity)| algorithm_implementation_binding_valid(report, identity));
+    let calibration = current_algorithm_calibration_identity();
+    let calibration_ok = acceptance
+        .zip(calibration.as_ref())
+        .is_some_and(|(report, identity)| algorithm_calibration_binding_valid(report, identity));
+    let ready = config_ok && paths_ok && acceptance_ok && implementation_ok && calibration_ok;
+    (
+        ready,
+        json!({
+            "ok": ready,
+            "readyContribution": ready,
+            "status": if ready { "qualified" } else { "not-qualified" },
+            "required": true,
+            "config": config_detail,
+            "paths": paths,
+            "acceptanceReportConfigured": acceptance_path.is_some(),
+            "acceptanceReportValid": acceptance_ok,
+            "acceptanceReportSha256": acceptance_bundle.as_ref().map(|(_, _, hash)| hash),
+            "implementation": implementation,
+            "implementationBindingValid": implementation_ok,
+            "calibration": calibration,
+            "calibrationBindingValid": calibration_ok,
+            "datasetRevision": acceptance.and_then(|value| value.get("datasetRevision")),
+            "calibrationRevision": acceptance.and_then(|value| value.get("calibrationRevision")),
+            "reason": if !config_ok { json!("algorithm_config_invalid") } else if !paths_ok { json!("algorithm_runtime_paths_invalid") } else if !acceptance_ok { json!("algorithm_acceptance_missing_or_invalid") } else if !implementation_ok { json!("algorithm_implementation_not_approved") } else if !calibration_ok { json!("algorithm_calibration_not_approved") } else { Value::Null }
+        }),
+    )
+}
+
+fn production_policy_health_component(state: &ServiceState) -> (bool, Value) {
+    if state.capture.provider == CaptureProvider::Simulated {
+        let allowed =
+            synthetic_algorithm_fixtures_allowed(&state.runtime_profile, &state.algorithm_mode);
+        return (
+            allowed,
+            json!({
+                "ok": allowed,
+                "readyContribution": allowed,
+                "status": if allowed { "development-simulation" } else { "production-simulation-forbidden" },
+                "required": !allowed,
+                "syntheticFixturesAllowed": allowed,
+                "reason": if allowed { Value::Null } else { json!("production_simulated_provider_forbidden") }
+            }),
+        );
+    }
+    let mock_count = state.algorithm_mock_defect_count.parse::<u64>().ok();
+    let ready = state.runtime_profile.eq_ignore_ascii_case("production")
+        && state.algorithm_mode.eq_ignore_ascii_case("production")
+        && mock_count == Some(0);
+    (
+        ready,
+        json!({
+            "ok": ready,
+            "readyContribution": ready,
+            "status": if ready { "enforced" } else { "invalid" },
+            "required": true,
+            "runtimeProfile": state.runtime_profile,
+            "algorithmMode": state.algorithm_mode,
+            "syntheticFixturesAllowed": false,
+            "mockDefectCount": mock_count,
+            "reason": if ready { Value::Null } else { json!("production_algorithm_policy_invalid") }
+        }),
+    )
+}
+
 fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
     let (database_ok, database) = database_health_component(state);
     let (worker_ok, task_worker) = task_worker_health_component(state);
@@ -2714,12 +3573,16 @@ fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
         calibration_reconciliation_health_component(state);
     let (storage_ok, storage) = storage_health_component(state);
     let (trigger_ok, trigger) = trigger_health_component(state);
+    let (algorithm_ok, algorithm) = algorithm_health_component(state);
+    let (production_policy_ok, production_policy) = production_policy_health_component(state);
     let ready = database_ok
         && worker_ok
         && capture_ok
         && calibration_ok
         && storage_ok
-        && trigger_ok;
+        && trigger_ok
+        && algorithm_ok
+        && production_policy_ok;
     ServiceHealthSnapshot {
         ready,
         body: json!({
@@ -2734,9 +3597,407 @@ fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
                 "capture": capture,
                 "calibrationReconciliation": calibration_reconciliation,
                 "storage": storage,
-                "trigger": trigger
+                "trigger": trigger,
+                "algorithm": algorithm,
+                "productionPolicy": production_policy
             }
         }),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SystemHealthAlarmSpec {
+    alarm_type: &'static str,
+    severity: &'static str,
+    message: String,
+    details: Value,
+}
+
+fn health_snapshot_check<'a>(snapshot: &'a Value, name: &str) -> Option<&'a Value> {
+    snapshot.get("checks").and_then(|checks| checks.get(name))
+}
+
+fn health_check_is_ok(check: &Value) -> bool {
+    check.get("ok").and_then(Value::as_bool) == Some(true)
+}
+
+fn health_check_reason(check: &Value) -> &str {
+    check
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("health_check_failed")
+}
+
+fn supervisor_runtime_status_from_root(state_root: Option<&Path>) -> Result<Option<Value>, String> {
+    let Some(state_root) = state_root else {
+        return Ok(None);
+    };
+    let path = state_root.join("service").join("supervisor-status.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text =
+        fs::read_to_string(&path).map_err(|_| "supervisor_status_read_failed".to_string())?;
+    let status = serde_json::from_str::<Value>(&text)
+        .map_err(|_| "supervisor_status_invalid_json".to_string())?;
+    if status.get("schema").and_then(Value::as_str) != Some("steel.runtime-supervisor.status.v1")
+        || status.get("status").and_then(Value::as_str).is_none()
+        || status
+            .get("restartBudgetExhausted")
+            .and_then(Value::as_bool)
+            .is_none()
+        || status
+            .get("restartCountWindow")
+            .and_then(Value::as_u64)
+            .is_none()
+        || status
+            .get("restartBudgetMaximum")
+            .and_then(Value::as_u64)
+            .is_none()
+        || status
+            .get("restartBudgetWindowSeconds")
+            .and_then(Value::as_u64)
+            .is_none()
+        || status.get("updatedAt").and_then(Value::as_str).is_none()
+    {
+        return Err("supervisor_status_contract_invalid".to_string());
+    }
+    Ok(Some(status))
+}
+
+fn supervisor_runtime_status() -> Result<Option<Value>, String> {
+    let state_root = env::var("STEEL_RUNTIME_STATE_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    supervisor_runtime_status_from_root(state_root.as_deref())
+}
+
+fn system_health_alarm_specs_with_supervisor(
+    snapshot: &Value,
+    supervisor_status: Result<Option<Value>, String>,
+) -> Vec<SystemHealthAlarmSpec> {
+    let mut alarms = Vec::new();
+
+    match supervisor_status {
+        Ok(Some(status))
+            if status
+                .get("restartBudgetExhausted")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "supervisor-restart-budget-exhausted",
+                severity: "critical",
+                message: "统一运行宿主重启预算已耗尽，自动重启已停止。".to_string(),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "runtimeSupervisor",
+                    "status": status.get("status"),
+                    "reason": status.get("reason"),
+                    "restartCountWindow": status.get("restartCountWindow"),
+                    "restartBudgetMaximum": status.get("restartBudgetMaximum"),
+                    "restartBudgetWindowSeconds": status.get("restartBudgetWindowSeconds"),
+                    "recoveryStableSeconds": status.get("recoveryStableSeconds"),
+                    "updatedAt": status.get("updatedAt")
+                }),
+            });
+        }
+        Err(reason) => {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "supervisor-status-invalid",
+                severity: "severe",
+                message: format!("统一运行宿主状态不可校验：{reason}。"),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "runtimeSupervisor",
+                    "reason": reason
+                }),
+            });
+        }
+        Ok(_) => {}
+    }
+
+    if let Some(storage) = health_snapshot_check(snapshot, "storage") {
+        let level = storage.get("level").and_then(Value::as_str);
+        if level == Some("warning") {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "storage-capacity-warning",
+                severity: "warning",
+                message: "存储容量接近生产水位，请安排归档或清理。".to_string(),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "storage",
+                    "status": storage.get("status"),
+                    "level": level,
+                    "reason": storage.get("warningReason"),
+                    "freeBytes": storage.get("freeBytes"),
+                    "freePercent": storage.get("freePercent"),
+                    "estimatedRemainingSeconds": storage.get("estimatedRemainingSeconds"),
+                    "warningFreeBytes": storage.get("warningFreeBytes"),
+                    "warningFreePercent": storage.get("warningFreePercent"),
+                    "queuePendingItems": storage.get("queuePendingItems"),
+                    "queueCapacityItems": storage.get("queueCapacityItems")
+                }),
+            });
+        } else if !health_check_is_ok(storage) {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "storage-critical",
+                severity: "critical",
+                message: format!("存储不可用于新生产会话：{}。", health_check_reason(storage)),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "storage",
+                    "status": storage.get("status"),
+                    "level": level,
+                    "reason": storage.get("reason"),
+                    "freeBytes": storage.get("freeBytes"),
+                    "freePercent": storage.get("freePercent"),
+                    "minimumFreeBytes": storage.get("minimumFreeBytes"),
+                    "minimumFreePercent": storage.get("minimumFreePercent"),
+                    "estimatedRemainingSeconds": storage.get("estimatedRemainingSeconds"),
+                    "queueAccepting": storage.get("queueAccepting"),
+                    "queuePendingItems": storage.get("queuePendingItems"),
+                    "queueCapacityItems": storage.get("queueCapacityItems")
+                }),
+            });
+        }
+    }
+
+    if let Some(capture) = health_snapshot_check(snapshot, "capture") {
+        if !health_check_is_ok(capture) {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "capture-unavailable",
+                severity: if capture.get("restartRequired").and_then(Value::as_bool) == Some(true)
+                    || capture.get("recoveryRequired").and_then(Value::as_bool) == Some(true)
+                {
+                    "critical"
+                } else {
+                    "severe"
+                },
+                message: format!("采集服务不可用：{}。", health_check_reason(capture)),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "capture",
+                    "status": capture.get("status"),
+                    "reason": capture.get("reason"),
+                    "apiReachable": capture.get("apiReachable"),
+                    "sdkReady": capture.get("sdkReady"),
+                    "providerReady": capture.get("providerReady"),
+                    "restartRequired": capture.get("restartRequired"),
+                    "recoveryRequired": capture.get("recoveryRequired"),
+                    "invalidManifest": capture.get("invalidManifest"),
+                    "pendingRecoveryCount": capture.get("pendingRecoveryCount")
+                }),
+            });
+        }
+    }
+
+    if let Some(worker) = health_snapshot_check(snapshot, "taskWorker") {
+        if !health_check_is_ok(worker) {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "task-worker-unavailable",
+                severity: "severe",
+                message: format!("生产任务执行器不可用：{}。", health_check_reason(worker)),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "taskWorker",
+                    "status": worker.get("status"),
+                    "reason": worker.get("reason"),
+                    "running": worker.get("running"),
+                    "busy": worker.get("busy"),
+                    "heartbeatFresh": worker.get("heartbeatFresh"),
+                    "heartbeatAgeMs": worker.get("heartbeatAgeMs"),
+                    "recoveredTasks": worker.get("recoveredTasks")
+                }),
+            });
+        }
+    }
+
+    if let Some(calibration) = health_snapshot_check(snapshot, "calibrationReconciliation") {
+        if !health_check_is_ok(calibration) {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "calibration-reconciliation-required",
+                severity: "critical",
+                message: "标定操作需要人工协调恢复，设备写入已被围栏阻止。".to_string(),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "calibrationReconciliation",
+                    "status": calibration.get("status"),
+                    "reason": calibration.get("reason"),
+                    "unresolvedCount": calibration.get("unresolvedCount"),
+                    "unresolvedOperations": calibration.get("unresolvedOperations")
+                }),
+            });
+        }
+    }
+
+    if let Some(trigger) = health_snapshot_check(snapshot, "trigger") {
+        let required = trigger.get("required").and_then(Value::as_bool) == Some(true);
+        if required && !health_check_is_ok(trigger) {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "trigger-unavailable",
+                severity: "severe",
+                message: format!("生产触发网关不可用：{}。", health_check_reason(trigger)),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "trigger",
+                    "status": trigger.get("status"),
+                    "reason": trigger.get("reason"),
+                    "required": required,
+                    "apiReachable": trigger.get("apiReachable"),
+                    "mode": trigger.get("mode")
+                }),
+            });
+        }
+    }
+
+    if let Some(algorithm) = health_snapshot_check(snapshot, "algorithm") {
+        if !health_check_is_ok(algorithm) {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "algorithm-not-qualified",
+                severity: "severe",
+                message: format!(
+                    "生产算法未取得运行资格：{}。",
+                    health_check_reason(algorithm)
+                ),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "algorithm",
+                    "status": algorithm.get("status"),
+                    "reason": algorithm.get("reason"),
+                    "acceptanceReportConfigured": algorithm.get("acceptanceReportConfigured"),
+                    "acceptanceReportValid": algorithm.get("acceptanceReportValid"),
+                    "implementationBindingValid": algorithm.get("implementationBindingValid"),
+                    "calibrationBindingValid": algorithm.get("calibrationBindingValid"),
+                    "config": algorithm.get("config").map(|config| json!({
+                        "algorithmName": config.get("algorithmName"),
+                        "algorithmVersion": config.get("algorithmVersion"),
+                        "configRevision": config.get("configRevision"),
+                        "configSha256": config.get("configSha256")
+                    }))
+                }),
+            });
+        }
+    }
+
+    if let Some(policy) = health_snapshot_check(snapshot, "productionPolicy") {
+        if !health_check_is_ok(policy) {
+            alarms.push(SystemHealthAlarmSpec {
+                alarm_type: "production-policy-invalid",
+                severity: "severe",
+                message: format!("生产运行策略无效：{}。", health_check_reason(policy)),
+                details: json!({
+                    "schema": "steel.system-health.alarm.v1",
+                    "check": "productionPolicy",
+                    "status": policy.get("status"),
+                    "reason": policy.get("reason"),
+                    "runtimeProfile": policy.get("runtimeProfile"),
+                    "algorithmMode": policy.get("algorithmMode"),
+                    "mockDefectCount": policy.get("mockDefectCount"),
+                    "syntheticFixturesAllowed": policy.get("syntheticFixturesAllowed")
+                }),
+            });
+        }
+    }
+
+    alarms
+}
+
+fn system_health_alarm_specs(snapshot: &Value) -> Vec<SystemHealthAlarmSpec> {
+    system_health_alarm_specs_with_supervisor(snapshot, supervisor_runtime_status())
+}
+
+fn next_system_health_alarm_id(alarm_type: &str) -> String {
+    let sequence = SYSTEM_HEALTH_ALARM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let fingerprint = format!("{alarm_type}:{}:{sequence}", current_time_millis());
+    format!("ALARM-HEALTH-{:016x}", stable_alarm_hash(&fingerprint))
+}
+
+fn reconcile_system_health_alarms(
+    state: &ServiceState,
+    snapshot: &Value,
+) -> Result<Vec<String>, String> {
+    let active = system_health_alarm_specs(snapshot);
+    let mut events = Vec::new();
+    for alarm_type in SYSTEM_HEALTH_ALARM_TYPES {
+        let spec = active.iter().find(|item| item.alarm_type == alarm_type);
+        let input = spec.map(|item| db::ProductionAlarmInput {
+            id: next_system_health_alarm_id(item.alarm_type),
+            source: SYSTEM_HEALTH_ALARM_SOURCE.to_string(),
+            alarm_type: item.alarm_type.to_string(),
+            severity: item.severity.to_string(),
+            material_id: String::new(),
+            session_id: String::new(),
+            inspection_id: String::new(),
+            camera_id: String::new(),
+            message: item.message.clone(),
+            details: item.details.to_string(),
+        });
+        let outcome = state
+            .runtime
+            .block_on(db::reconcile_managed_alarm(
+                &state.database.connection,
+                SYSTEM_HEALTH_ALARM_SOURCE,
+                alarm_type,
+                input,
+                SYSTEM_HEALTH_ALARM_ACTOR,
+            ))
+            .map_err(|error| error.to_string())?;
+        match outcome {
+            db::ManagedAlarmReconcile::Created(alarm) => {
+                events.push(format!("created:{}", alarm.id));
+                let _ = state.runtime.block_on(db::append_audit_log(
+                    &state.database.connection,
+                    SYSTEM_HEALTH_ALARM_ACTOR,
+                    "system.health.alarm.created",
+                    &alarm.id,
+                    &format!("{} {}", alarm.alarm_type, alarm.message),
+                    if alarm.severity == "critical" {
+                        "error"
+                    } else {
+                        "warning"
+                    },
+                ));
+            }
+            db::ManagedAlarmReconcile::Resolved(alarm) => {
+                events.push(format!("resolved:{}", alarm.id));
+                let _ = state.runtime.block_on(db::append_audit_log(
+                    &state.database.connection,
+                    SYSTEM_HEALTH_ALARM_ACTOR,
+                    "system.health.alarm.resolved",
+                    &alarm.id,
+                    &format!("{} recovered", alarm.alarm_type),
+                    "info",
+                ));
+            }
+            db::ManagedAlarmReconcile::Updated(alarm) => {
+                events.push(format!("updated:{}", alarm.id));
+            }
+            db::ManagedAlarmReconcile::Unchanged | db::ManagedAlarmReconcile::Absent => {}
+        }
+    }
+    Ok(events)
+}
+
+fn start_system_health_alarm_monitor(state: Arc<ServiceState>) {
+    if !state.runtime_profile.eq_ignore_ascii_case("production") {
+        return;
+    }
+    if let Err(error) = std::thread::Builder::new()
+        .name("system-health-alarm-monitor".to_string())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(SYSTEM_HEALTH_ALARM_INITIAL_DELAY_SECS));
+            loop {
+                let snapshot = service_health_snapshot(&state);
+                if let Err(error) = reconcile_system_health_alarms(&state, &snapshot.body) {
+                    eprintln!("system health alarm reconciliation failed: {error}");
+                }
+                std::thread::sleep(Duration::from_secs(SYSTEM_HEALTH_ALARM_INTERVAL_SECS));
+            }
+        })
+    {
+        eprintln!("failed to start system health alarm monitor: {error}");
     }
 }
 
@@ -3070,15 +4331,14 @@ fn is_production_mutation_route(method: &str, path: &str) -> bool {
 }
 
 const LINE_CONTINUOUS_PRESET_CONFIRMATION: &str = "APPLY LINE CONTINUOUS PRESET";
-const LINE_CONTINUOUS_DEVICE_PERSIST_CONFIRMATION: &str =
-    "PERSIST LINE PRESET TO CAMERA DEVICES";
+const LINE_CONTINUOUS_DEVICE_PERSIST_CONFIRMATION: &str = "PERSIST LINE PRESET TO CAMERA DEVICES";
 const CAMERA_DEVICE_PERSIST_CONFIRMATION: &str = "PERSIST CAMERA PARAMETERS";
 const SDK_PARAMETER_WRITE_CONFIRMATION: &str = "WRITE SDK PARAMETER";
 const CAMERA_CALIBRATION_CONFIRMATION: &str = "APPLY CAMERA CALIBRATION";
 const CAMERA_CALIBRATION_SET_CONFIRMATION: &str = "APPLY CAMERA CALIBRATION SET";
 const CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION: &str = "ROLLBACK CAMERA CALIBRATION";
 const CAMERA_ROI_CONFIRMATION: &str = "APPLY CAMERA ROI";
-const CALIBRATION_SET_CAMERA_COUNT: usize = 6;
+const CALIBRATION_SET_CAMERA_COUNT: usize = 8;
 
 fn validate_calibration_set_safety(
     object: &serde_json::Map<String, Value>,
@@ -3090,12 +4350,10 @@ fn validate_calibration_set_safety(
     {
         return Err("calibration_set_safe_mode_required");
     }
-    if object
-        .get("expectedCameras")
-        .and_then(Value::as_u64)
+    if object.get("expectedCameras").and_then(Value::as_u64)
         != Some(CALIBRATION_SET_CAMERA_COUNT as u64)
     {
-        return Err("calibration_set_requires_six_cameras");
+        return Err("calibration_set_requires_eight_cameras");
     }
     if object
         .get("allowBestEffortDeviceRollback")
@@ -3121,7 +4379,7 @@ fn validate_calibration_set_safety(
         .and_then(Value::as_array)
         .ok_or("calibration_set_mapping_required")?;
     if mappings.len() != CALIBRATION_SET_CAMERA_COUNT {
-        return Err("calibration_set_requires_six_cameras");
+        return Err("calibration_set_requires_eight_cameras");
     }
     let mut mapping_ips = std::collections::BTreeSet::new();
     let mut mapping_serials = std::collections::BTreeSet::new();
@@ -3139,10 +4397,8 @@ fn validate_calibration_set_safety(
         };
         let ip = required_text("ip").ok_or("calibration_set_mapping_invalid")?;
         let path = required_text("path").ok_or("calibration_set_mapping_invalid")?;
-        let expected_sn =
-            required_text("expectedSn").ok_or("calibration_set_serial_required")?;
-        required_text("rollbackPath")
-            .ok_or("calibration_set_durable_rollback_path_required")?;
+        let expected_sn = required_text("expectedSn").ok_or("calibration_set_serial_required")?;
+        required_text("rollbackPath").ok_or("calibration_set_durable_rollback_path_required")?;
         if !mapping_ips.insert(ip.to_string()) {
             return Err("calibration_set_duplicate_camera");
         }
@@ -3160,16 +4416,14 @@ fn validate_calibration_set_safety(
         .and_then(Value::as_array)
         .ok_or("calibration_set_target_list_required")?;
     if requested_ips.len() != CALIBRATION_SET_CAMERA_COUNT {
-        return Err("calibration_set_requires_six_cameras");
+        return Err("calibration_set_requires_eight_cameras");
     }
     let requested_ips = requested_ips
         .iter()
         .map(|value| value.as_str().map(str::trim).unwrap_or_default())
         .collect::<std::collections::BTreeSet<_>>();
     if requested_ips.len() != CALIBRATION_SET_CAMERA_COUNT
-        || requested_ips
-            .iter()
-            .any(|ip| !mapping_ips.contains(*ip))
+        || requested_ips.iter().any(|ip| !mapping_ips.contains(*ip))
     {
         return Err("calibration_set_target_mapping_mismatch");
     }
@@ -3177,8 +4431,7 @@ fn validate_calibration_set_safety(
 }
 
 fn validate_line_continuous_preset_request(body: &str) -> Result<(), &'static str> {
-    let payload = serde_json::from_str::<Value>(body.trim())
-        .map_err(|_| "invalid_json")?;
+    let payload = serde_json::from_str::<Value>(body.trim()).map_err(|_| "invalid_json")?;
     let object = payload.as_object().ok_or("json_object_required")?;
 
     if object.get("confirmation").and_then(Value::as_str)
@@ -3223,10 +4476,7 @@ fn validate_line_continuous_preset_request(body: &str) -> Result<(), &'static st
     Ok(())
 }
 
-fn validate_capture_device_mutation_request(
-    path: &str,
-    body: &str,
-) -> Result<(), &'static str> {
+fn validate_capture_device_mutation_request(path: &str, body: &str) -> Result<(), &'static str> {
     let payload = serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
     let object = payload.as_object().ok_or("json_object_required")?;
 
@@ -3269,6 +4519,18 @@ fn validate_capture_device_mutation_request(
         return Err("camera_roi_confirmation_required");
     }
 
+    if path == "/api/capture/continuous-settings" {
+        let valid = object
+            .get("timeTriggerFreq")
+            .or_else(|| object.get("time_trigger_freq"))
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.1 && *value <= 100_000.0)
+            .is_some();
+        if !valid {
+            return Err("continuous_line_rate_out_of_range");
+        }
+    }
+
     if path == "/api/param" {
         let key = object
             .get("key")
@@ -3300,10 +4562,8 @@ fn validate_capture_device_mutation_request(
         return Err("sdk_parameter_write_confirmation_required");
     }
 
-    let explicit_device_save = matches!(
-        path,
-        "/api/param/save-device" | "/api/param/save-to-device"
-    );
+    let explicit_device_save =
+        matches!(path, "/api/param/save-device" | "/api/param/save-to-device");
     let requested_device_save = object.get("saveToDevice").and_then(Value::as_bool) == Some(true);
     if (explicit_device_save || requested_device_save)
         && object.get("deviceConfirmation").and_then(Value::as_str)
@@ -3318,6 +4578,7 @@ fn validate_capture_device_mutation_request(
 const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("GET", "/health"),
     ("GET", "/api/capture/health"),
+    ("GET", "/api/capture/logs"),
     ("GET", "/api/storage/status"),
     ("GET", "/api/config/status"),
     ("GET", "/api/config/profiles"),
@@ -3328,6 +4589,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/steel/status"),
     ("GET", "/api/param"),
     ("GET", "/api/capture/latest"),
+    ("GET", "/api/capture/continuous-settings"),
     ("GET", "/api/stream/status"),
     ("GET", "/api/calibration/active"),
     ("GET", "/api/calibration/status"),
@@ -3342,6 +4604,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/camera/connect-all"),
     ("POST", "/api/cameras/connect-all"),
     ("POST", "/api/camera/disconnect"),
+    ("POST", "/api/steel/capture-mode"),
     ("POST", "/api/steel/event"),
     ("POST", "/api/param"),
     ("POST", "/api/param/save-device"),
@@ -3353,6 +4616,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/capture/preview"),
     ("POST", "/api/capture/depth-map"),
     ("POST", "/api/capture/continuous-test"),
+    ("POST", "/api/capture/continuous-settings"),
     ("POST", "/api/capture/preset/line-continuous"),
     ("POST", "/api/stream/start"),
     ("POST", "/api/stream/stop"),
@@ -3363,10 +4627,8 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/roi/load"),
 ];
 
-const CAPTURE_BINARY_PROXY_ROUTES: &[(&str, &str)] = &[
-    ("GET", "/api/capture/file"),
-    ("GET", "/api/stream/latest"),
-];
+const CAPTURE_BINARY_PROXY_ROUTES: &[(&str, &str)] =
+    &[("GET", "/api/capture/file"), ("GET", "/api/stream/latest")];
 
 fn is_capture_json_proxy_route(method: &str, path: &str) -> bool {
     CAPTURE_JSON_PROXY_ROUTES.contains(&(method, path))
@@ -3404,6 +4666,7 @@ fn is_trigger_gateway_proxy_route(method: &str, path: &str) -> bool {
             | ("POST", "/api/trigger/manual/steel-info")
             | ("POST", "/api/trigger/manual/steel-in")
             | ("POST", "/api/trigger/manual/steel-out")
+            | ("POST", "/api/trigger/capture-once")
     )
 }
 
@@ -3412,6 +4675,11 @@ fn fallback_capture_response(path: &str) -> Vec<u8> {
         "/health" | "/api/capture/health" => {
             http_response("200 OK", "application/json; charset=utf-8", &capture_health_json())
         }
+        "/api/capture/logs" => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            "{\"events\":[]}",
+        ),
         "/api/cameras" => http_response(
             "200 OK",
             "application/json; charset=utf-8",
@@ -3466,6 +4734,147 @@ fn request_header(request: &str, name: &str) -> Option<String> {
                 None
             }
         })
+}
+
+fn constant_time_runtime_token_matches(expected: &[u8], supplied: &[u8]) -> bool {
+    let expected_hash = Sha256::digest(expected);
+    let supplied_hash = Sha256::digest(supplied);
+    let mut difference = expected.len() ^ supplied.len();
+    for (left, right) in expected_hash.iter().zip(supplied_hash.iter()) {
+        difference |= (*left ^ *right) as usize;
+    }
+    difference == 0
+}
+
+fn runtime_drain_status_json(state: &ServiceState) -> Value {
+    match state.runtime_admission.lock() {
+        Ok(admission) => json!({
+            "draining": !admission.accepting,
+            "accepting": admission.accepting,
+            "acceptingNewProduction": admission.accepting,
+            "inFlight": admission.in_flight
+        }),
+        Err(_) => json!({
+            "draining": true,
+            "accepting": false,
+            "acceptingNewProduction": false,
+            "inFlight": 1,
+            "error": "runtime_admission_state_unavailable"
+        }),
+    }
+}
+
+fn runtime_is_draining(state: &ServiceState) -> bool {
+    state
+        .runtime_admission
+        .lock()
+        .map(|admission| !admission.accepting)
+        .unwrap_or(true)
+}
+
+fn runtime_draining_http_response(state: &ServiceState, path: &str) -> Vec<u8> {
+    http_response(
+        "503 Service Unavailable",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 503,
+            "error": "runtime_draining",
+            "path": path,
+            "admission": runtime_drain_status_json(state)
+        })
+        .to_string(),
+    )
+}
+
+fn runtime_completion_route(method: &str, path: &str) -> bool {
+    method == "POST"
+        && matches!(
+            path,
+            "/api/production/steel-out"
+                | "/api/production/tasks/steel-out"
+                | "/api/production/tasks/cancel"
+                | "/api/production/tasks"
+        )
+}
+
+fn enter_runtime_admission<'a>(
+    state: &'a ServiceState,
+    method: &str,
+    path: &str,
+) -> Result<Option<RuntimeAdmissionGuard<'a>>, Vec<u8>> {
+    if !matches!(method, "POST" | "DELETE") || path == "/api/runtime/drain" {
+        return Ok(None);
+    }
+    let mut admission = state.runtime_admission.lock().map_err(|_| {
+        http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({ "code": 503, "error": "runtime_admission_state_unavailable" }).to_string(),
+        )
+    })?;
+    if !admission.accepting && !runtime_completion_route(method, path) {
+        drop(admission);
+        return Err(runtime_draining_http_response(state, path));
+    }
+    admission.in_flight = admission.in_flight.saturating_add(1);
+    drop(admission);
+    Ok(Some(RuntimeAdmissionGuard { state }))
+}
+
+fn runtime_drain_response(
+    state: &ServiceState,
+    request: &str,
+    peer: Option<SocketAddr>,
+) -> Vec<u8> {
+    if !peer.is_some_and(|address| address.ip().is_loopback()) {
+        return http_response(
+            "403 Forbidden",
+            "application/json; charset=utf-8",
+            &json!({ "code": 403, "error": "runtime_drain_loopback_only" }).to_string(),
+        );
+    }
+    let supplied = request_header(request, "X-Trigger-Operator-Token").unwrap_or_default();
+    if state.runtime_drain_token.len() < 32
+        || supplied.is_empty()
+        || !constant_time_runtime_token_matches(&state.runtime_drain_token, supplied.as_bytes())
+    {
+        return http_response(
+            "401 Unauthorized",
+            "application/json; charset=utf-8",
+            &json!({ "code": 401, "error": "runtime_drain_auth_required" }).to_string(),
+        );
+    }
+    let mut admission = match state.runtime_admission.lock() {
+        Ok(admission) => admission,
+        Err(_) => {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({ "code": 503, "error": "runtime_admission_state_unavailable" }).to_string(),
+            )
+        }
+    };
+    admission.accepting = false;
+    drop(admission);
+    // Publish the drain state before waiting at the production-command boundary. Interruptible
+    // algorithm subprocesses poll this state and can now terminate cooperatively. Camera and
+    // device calls remain non-interruptible; taking this barrier waits for their authoritative
+    // result without pretending that an external side effect was cancelled.
+    let _production_barrier = match state.production_command_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({ "code": 503, "error": "production_command_lock_poisoned" }).to_string(),
+            )
+        }
+    };
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({ "code": 0, "admission": runtime_drain_status_json(state) }).to_string(),
+    )
 }
 
 fn content_length_from_headers(request: &str) -> usize {
@@ -3534,12 +4943,15 @@ fn session_from_request(state: &ServiceState, request: &str) -> Option<AdminSess
     None
 }
 
-fn invalidate_user_sessions_except(state: &ServiceState, user_id: &str, keep_token: &str) {
+fn complete_password_change_sessions(state: &ServiceState, user_id: &str, keep_token: &str) {
     let now = current_time_millis();
     if let Ok(mut sessions) = state.sessions.lock() {
         sessions.retain(|token, session| {
             session.expires_at > now && (session.user_id != user_id || token == keep_token)
         });
+        if let Some(session) = sessions.get_mut(keep_token) {
+            session.must_change_password = false;
+        }
     }
 }
 
@@ -3612,7 +5024,12 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         ("GET", "/api/admin/services")
         | ("POST", "/api/admin/services/capture/start")
         | ("POST", "/api/admin/services/capture/stop")
-        | ("POST", "/api/admin/services/capture/restart") => Some("admin.services"),
+        | ("POST", "/api/admin/services/capture/restart")
+        | ("POST", "/api/trigger/mode")
+        | ("POST", "/api/trigger/manual/steel-info")
+        | ("POST", "/api/trigger/manual/steel-in")
+        | ("POST", "/api/trigger/manual/steel-out")
+        | ("POST", "/api/trigger/capture-once") => Some("admin.services"),
         ("GET", "/api/admin/overview") => Some("admin.overview"),
         ("GET", "/api/admin/users")
         | ("POST", "/api/admin/users")
@@ -3636,8 +5053,13 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         }
         ("GET", "/api/admin/records")
         | ("GET", "/api/admin/records/detail")
+        | ("GET", "/api/admin/records/reports")
+        | ("GET", "/api/admin/records/reports/detail")
+        | ("POST", "/api/admin/records/reports")
+        | ("GET", "/api/admin/records/cleanup")
         | ("GET", "/api/admin/records/export")
         | ("POST", "/api/admin/records/retention")
+        | ("POST", "/api/admin/records/cleanup/retry")
         | ("DELETE", "/api/admin/records") => Some("admin.records"),
         ("POST", "/api/alarms/acknowledge") | ("POST", "/api/alarms/resolve") => {
             Some("admin.records")
@@ -3941,10 +5363,28 @@ fn authorize_request(
     method: &str,
     path: &str,
 ) -> Result<Option<AdminSession>, Vec<u8>> {
-    let Some(required_permission) = permission_for_route(method, path) else {
-        return Ok(session_from_request(state, request));
+    let required_permission = permission_for_route(method, path);
+    let session = session_from_request(state, request);
+    if session
+        .as_ref()
+        .is_some_and(|session| session.must_change_password)
+        && !matches!(
+            (method, path),
+            ("GET", "/api/admin/auth/me")
+                | ("POST", "/api/admin/auth/password")
+                | ("POST", "/api/admin/auth/logout")
+        )
+    {
+        return Err(auth_failure(
+            "403 Forbidden",
+            403,
+            "password_change_required",
+        ));
+    }
+    let Some(required_permission) = required_permission else {
+        return Ok(session);
     };
-    let Some(session) = session_from_request(state, request) else {
+    let Some(session) = session else {
         append_authorization_audit(
             state,
             "anonymous",
@@ -4114,6 +5554,7 @@ fn write_auth_login_response(state: &ServiceState, request: &str, body: &str) ->
         display_name: user.display_name.clone(),
         role: user.role.clone(),
         permissions: role_permissions_vec(&role.permissions),
+        must_change_password: user.must_change_password,
         user_agent: request_header(request, "User-Agent").unwrap_or_else(|| "unknown".to_string()),
         created_at: now,
         expires_at: now + security_policy.session_ttl_ms(),
@@ -4349,7 +5790,7 @@ fn write_auth_password_response(state: &ServiceState, request: &str, body: &str)
             &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
         );
     }
-    invalidate_user_sessions_except(state, &session.user_id, &token);
+    complete_password_change_sessions(state, &session.user_id, &token);
     let _ = state.runtime.block_on(db::append_audit_log(
         &state.database.connection,
         &session.user_id,
@@ -4368,7 +5809,7 @@ fn write_auth_password_response(state: &ServiceState, request: &str, body: &str)
 fn admin_services_json(state: &ServiceState) -> String {
     let service_port = env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string());
     let capture_status = serde_json::from_str::<Value>(&state.capture.status_json())
-        .unwrap_or_else(|_| json!({ "running": false, "fallback": "simulated-six-camera" }));
+        .unwrap_or_else(|_| json!({ "running": false, "fallback": "simulated-eight-camera" }));
     let now = current_time_millis();
     let active_sessions = state
         .sessions
@@ -5360,7 +6801,12 @@ fn validate_capture_config_value(value: &Value) -> Result<(), String> {
             "service",
             64,
         )?;
-        validate_optional_bool_field(service_object, "captureManaged", "capture_managed", "service")?;
+        validate_optional_bool_field(
+            service_object,
+            "captureManaged",
+            "capture_managed",
+            "service",
+        )?;
         validate_optional_text_field(service_object, "updatedAt", "updated_at", "service", 64)?;
         validate_optional_i64_field(
             service_object,
@@ -6452,24 +7898,67 @@ fn database_info_response(state: &ServiceState) -> Vec<u8> {
 fn database_backup_response(state: &ServiceState, actor: &str) -> Vec<u8> {
     let Some(path) = state.database.file_path.clone() else {
         return http_response(
-            "501 Not Implemented",
+            "409 Conflict",
             "application/json; charset=utf-8",
             &json!({
-                "code": 501,
-                "error": "database_backup_requires_server_tool",
-                "engine": state.database.engine
+                "code": 409,
+                "error": "database_backup_requires_server_side_job",
+                "engine": state.database.engine,
+                "tool": "scripts/backup-database.ps1"
             })
             .to_string(),
         );
     };
-    match fs::read(&path) {
+    let Some(parent) = path.parent() else {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            "{\"error\":\"database path has no parent\"}",
+        );
+    };
+    let snapshot_path = parent.join(format!(
+        ".steel-inspection-backup-{}-{}.sqlite",
+        std::process::id(),
+        current_time_millis()
+    ));
+    let snapshot_sql_path = snapshot_path
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .replace('\'', "''");
+    let snapshot_result =
+        state
+            .runtime
+            .block_on(state.database.connection.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("VACUUM INTO '{snapshot_sql_path}'"),
+            )));
+    if let Err(error) = snapshot_result {
+        let _ = fs::remove_file(&snapshot_path);
+        let _ = state.runtime.block_on(db::append_audit_log(
+            &state.database.connection,
+            actor,
+            "database.backup.failed",
+            "steel-inspection.sqlite",
+            &format!("SQLite 在线一致性快照失败：{error}"),
+            "error",
+        ));
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({ "error": "sqlite_online_backup_failed" }).to_string(),
+        );
+    }
+    let read_result = fs::read(&snapshot_path);
+    let _ = fs::remove_file(&snapshot_path);
+    match read_result {
         Ok(bytes) => {
             let _ = state.runtime.block_on(db::append_audit_log(
                 &state.database.connection,
                 actor,
                 "database.backup",
                 "steel-inspection.sqlite",
-                &format!("下载数据库备份 {}（{} bytes）", path.display(), bytes.len()),
+                &format!("下载 SQLite 在线一致性备份（{} bytes）", bytes.len()),
                 "info",
             ));
             http_bytes_response_with_headers(
@@ -6488,7 +7977,7 @@ fn database_backup_response(state: &ServiceState, actor: &str) -> Vec<u8> {
                 actor,
                 "database.backup.failed",
                 "steel-inspection.sqlite",
-                &format!("数据库备份读取失败 {}：{}", path.display(), error),
+                &format!("SQLite 在线备份读取失败：{error}"),
                 "error",
             ));
             http_response(
@@ -6753,17 +8242,14 @@ fn capture_proxy_http_response(
             "/api/config/profile/apply"
                 | "/api/config/camera-params/save-all"
                 | "/api/config/camera-params/load-all"
+                | "/api/capture/continuous-settings"
                 | "/api/capture/preset/line-continuous"
+                | "/api/steel/capture-mode"
                 | "/api/calibration/apply-all"
                 | "/api/calibration/rollback"
         )
     {
-        capture.proxy_response_with_read_timeout(
-            method,
-            raw_path,
-            body,
-            Duration::from_secs(120),
-        )
+        capture.proxy_response_with_read_timeout(method, raw_path, body, Duration::from_secs(120))
     } else {
         capture.proxy_response(method, raw_path, body)
     };
@@ -6786,20 +8272,45 @@ fn trigger_gateway_proxy_http_response(
     method: &str,
     raw_path: &str,
     body: &str,
+    actor: &str,
 ) -> Vec<u8> {
+    let operator_token = env::var("TRIGGER_OPERATOR_TOKEN").unwrap_or_default();
+    let operator_headers = if method == "POST" && !operator_token.is_empty() {
+        vec![("X-Trigger-Operator-Token", operator_token.as_str())]
+    } else {
+        Vec::new()
+    };
     match bounded_local_http_request(
         &state.trigger_gateway_origin,
         method,
         raw_path,
         body,
         Duration::from_secs(8),
+        &operator_headers,
     ) {
-        Ok(response) => http_bytes_response_with_headers(
-            &capture_proxy_status(response.status_code),
-            &response.content_type,
-            &response.body,
-            &[],
-        ),
+        Ok(response) => {
+            if method == "POST" {
+                let path = split_path_and_query(raw_path).0;
+                let _ = state.runtime.block_on(db::append_audit_log(
+                    &state.database.connection,
+                    actor,
+                    "trigger.operator.forwarded",
+                    path,
+                    &format!("触发网关操作已转发，HTTP 状态 {}", response.status_code),
+                    if response.status_code < 400 {
+                        "info"
+                    } else {
+                        "warning"
+                    },
+                ));
+            }
+            http_bytes_response_with_headers(
+                &capture_proxy_status(response.status_code),
+                &response.content_type,
+                &response.body,
+                &[],
+            )
+        }
         Err(HealthHttpProbeError::Timeout) => http_response(
             "504 Gateway Timeout",
             "application/json; charset=utf-8",
@@ -6836,9 +8347,11 @@ fn value_f64_or(payload: &Value, keys: &[&str], fallback: f64) -> f64 {
     keys.iter()
         .find_map(|key| payload.get(*key))
         .and_then(|value| {
-            value
-                .as_f64()
-                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<f64>().ok()))
+            value.as_f64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<f64>().ok())
+            })
         })
         .unwrap_or(fallback)
 }
@@ -6850,7 +8363,11 @@ fn value_i32(payload: &Value, keys: &[&str], fallback: i32) -> i32 {
             value
                 .as_i64()
                 .or_else(|| value.as_bool().map(|flag| if flag { 1 } else { 0 }))
-                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<i64>().ok()))
+                .or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|text| text.trim().parse::<i64>().ok())
+                })
         })
         .and_then(|value| i32::try_from(value).ok())
         .unwrap_or(fallback)
@@ -6879,7 +8396,15 @@ fn value_bool(payload: &Value, keys: &[&str], fallback: bool) -> bool {
 fn material_id_from_payload(payload: &Value, fallback: &str) -> String {
     let id = value_string(
         payload,
-        &["materialId", "material_id", "steelId", "steel_id", "steelNo", "steel_no", "id"],
+        &[
+            "materialId",
+            "material_id",
+            "steelId",
+            "steel_id",
+            "steelNo",
+            "steel_no",
+            "id",
+        ],
     );
     if id.is_empty() {
         fallback.to_string()
@@ -6929,10 +8454,10 @@ fn resolve_production_event_target(
 
     if matches!(event, "steel-in" | "steel-out") {
         if let Some((active_material_id, active_session_id)) = active_session {
-            let material_mismatch = !requested_material_id.is_empty()
-                && requested_material_id != active_material_id;
-            let session_mismatch = !requested_session_id.is_empty()
-                && requested_session_id != active_session_id;
+            let material_mismatch =
+                !requested_material_id.is_empty() && requested_material_id != active_material_id;
+            let session_mismatch =
+                !requested_session_id.is_empty() && requested_session_id != active_session_id;
             if material_mismatch || session_mismatch {
                 return Err(ProductionTransitionConflict::ActiveSessionMismatch {
                     active_material_id: active_material_id.to_string(),
@@ -6968,9 +8493,7 @@ fn resolve_production_event_target(
     })
 }
 
-fn production_transition_conflict_response(
-    conflict: ProductionTransitionConflict,
-) -> Vec<u8> {
+fn production_transition_conflict_response(conflict: ProductionTransitionConflict) -> Vec<u8> {
     let body = match conflict {
         ProductionTransitionConflict::ActiveSessionRequired => json!({
             "code": 409,
@@ -7050,18 +8573,16 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
             "updatedAt": session.updated_at
         })
     });
-    let active_session_json = active_session
-        .as_ref()
-        .map(|session| {
-            json!({
-                "id": session.id,
-                "materialId": session.material_id,
-                "status": session.status,
-                "controlMode": session.control_mode,
-                "triggerMode": session.trigger_mode,
-                "updatedAt": session.updated_at
-            })
-        });
+    let active_session_json = active_session.as_ref().map(|session| {
+        json!({
+            "id": session.id,
+            "materialId": session.material_id,
+            "status": session.status,
+            "controlMode": session.control_mode,
+            "triggerMode": session.trigger_mode,
+            "updatedAt": session.updated_at
+        })
+    });
     let latest_inspection = match state
         .runtime
         .block_on(db::latest_production_inspection(&state.database.connection))
@@ -7086,10 +8607,12 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
             "code": 0,
             "database": {
                 "engine": state.database.engine.clone(),
-                "path": state.database.display_path()
+                "path": state.database.display_path(),
+                "schemaVersion": state.database.schema_version
             },
             "latestSession": latest_session_json,
             "activeSession": active_session_json,
+            "admission": runtime_drain_status_json(state),
             "latestInspection": latest_inspection.map(|inspection| {
                 let capture_summary_path = production_session_summary_path(
                     &inspection.storage_root,
@@ -7152,8 +8675,8 @@ fn write_secondary_data_response(state: &ServiceState, body: &str, actor: &str) 
         session_id
     };
     let source = value_string(&payload, &["source"]).if_empty("l2");
-    let payload_type = value_string(&payload, &["payloadType", "payload_type", "type"])
-        .if_empty("secondary");
+    let payload_type =
+        value_string(&payload, &["payloadType", "payload_type", "type"]).if_empty("secondary");
     let raw_payload = payload.to_string();
     let result = state.runtime.block_on(db::append_secondary_data(
         &state.database.connection,
@@ -7207,6 +8730,28 @@ impl EmptyStringDefault for String {
             self
         }
     }
+}
+
+fn new_session_storage_admission_response(
+    event: &str,
+    existing_session: bool,
+    storage_ok: bool,
+    storage: &Value,
+) -> Option<Vec<u8>> {
+    if existing_session || !matches!(event, "steel-info" | "steel-in") || storage_ok {
+        return None;
+    }
+    Some(http_response(
+        "503 Service Unavailable",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 503,
+            "error": "storage_not_ready_for_new_session",
+            "storageReason": storage.get("reason").cloned().unwrap_or(Value::Null),
+            "retryable": true
+        })
+        .to_string(),
+    ))
 }
 
 fn write_production_event_response(
@@ -7263,7 +8808,10 @@ fn write_production_event_response(
     };
     if default_event == "steel-out" {
         if let Some(session) = latest_open.as_ref() {
-            if !matches!(session.status.as_str(), "active" | "finishing" | "exit-failed") {
+            if !matches!(
+                session.status.as_str(),
+                "active" | "finishing" | "exit-failed"
+            ) {
                 return http_response(
                     "409 Conflict",
                     "application/json; charset=utf-8",
@@ -7293,9 +8841,29 @@ fn write_production_event_response(
     };
     let material_id = target.material_id;
     let session_id = target.session_id;
-    let previous_session = latest_open.as_ref().filter(|session| {
-        session.id == session_id && session.material_id == material_id
-    });
+    let previous_session = latest_open
+        .as_ref()
+        .filter(|session| session.id == session_id && session.material_id == material_id);
+    if matches!(default_event, "steel-info" | "steel-in") && previous_session.is_none() {
+        let (storage_ok, storage) = storage_health_component(state);
+        if let Some(response) =
+            new_session_storage_admission_response(default_event, false, storage_ok, &storage)
+        {
+            let reason = storage
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("storage_unavailable");
+            let _ = state.runtime.block_on(db::append_audit_log(
+                &state.database.connection,
+                actor,
+                "production.session.rejected.storage",
+                &material_id,
+                &format!("new {default_event} session rejected: {reason}"),
+                "warning",
+            ));
+            return response;
+        }
+    }
     let source = value_string(&payload, &["source"]).if_empty(
         previous_session
             .map(|session| session.source.as_str())
@@ -7311,11 +8879,33 @@ fn write_production_event_response(
             .map(|session| session.trigger_mode.as_str())
             .unwrap_or(&mode),
     );
-    let command = value_string(&payload, &["cmd", "command", "event", "type"]).if_empty(match default_event {
-        "steel-info" => "rcvSteelInfo",
-        "steel-out" => "steelIn",
-        _ => "steelIn",
-    });
+    let requested_capture_mode = value_string(&payload, &["captureMode", "capture_mode"]);
+    let capture_mode = if requested_capture_mode.is_empty() {
+        None
+    } else {
+        match normalize_capture_output_mode(&requested_capture_mode) {
+            Some(mode) => Some(mode),
+            None => {
+                return http_response(
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "code": 400,
+                        "error": "invalid_capture_mode",
+                        "message": "captureMode must be continuous, on-demand, or disabled"
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    };
+    let command = value_string(&payload, &["cmd", "command", "event", "type"]).if_empty(
+        match default_event {
+            "steel-info" => "rcvSteelInfo",
+            "steel-out" => "steelIn",
+            _ => "steelIn",
+        },
+    );
     let value = match default_event {
         "steel-out" => 0,
         "steel-info" => value_i32(&payload, &["value"], 0),
@@ -7336,12 +8926,16 @@ fn write_production_event_response(
     let width_mm = value_f64_or(
         &payload,
         &["width", "widthMm", "width_mm"],
-        previous_session.map(|session| session.width_mm).unwrap_or(0.0),
+        previous_session
+            .map(|session| session.width_mm)
+            .unwrap_or(0.0),
     );
     let length_mm = value_f64_or(
         &payload,
         &["length", "len", "lengthMm", "length_mm"],
-        previous_session.map(|session| session.length_mm).unwrap_or(0.0),
+        previous_session
+            .map(|session| session.length_mm)
+            .unwrap_or(0.0),
     );
     let thickness_mm = value_f64_or(
         &payload,
@@ -7387,9 +8981,10 @@ fn write_production_event_response(
         finished_at: String::new(),
         raw_payload: payload.to_string(),
     };
-    let session_result = state
-        .runtime
-        .block_on(db::upsert_material_session(&state.database.connection, session_input));
+    let session_result = state.runtime.block_on(db::upsert_material_session(
+        &state.database.connection,
+        session_input,
+    ));
     let session = match session_result {
         Ok(session) => session,
         Err(error) => {
@@ -7400,13 +8995,10 @@ fn write_production_event_response(
         }
     };
     let inspection_id = format!("INSP-{session_id}");
-    let existing_inspection = match state
-        .runtime
-        .block_on(db::find_production_inspection(
-            &state.database.connection,
-            &inspection_id,
-        ))
-    {
+    let existing_inspection = match state.runtime.block_on(db::find_production_inspection(
+        &state.database.connection,
+        &inspection_id,
+    )) {
         Ok(inspection) => inspection,
         Err(error) => {
             return production_database_error_response(
@@ -7415,18 +9007,20 @@ fn write_production_event_response(
             );
         }
     };
-    let inspection_storage_root = value_string(&payload, &["storageRoot", "storage_root"]).if_empty(
-        existing_inspection
-            .as_ref()
-            .map(|inspection| inspection.storage_root.as_str())
-            .unwrap_or_default(),
-    );
-    let inspection_summary_path = value_string(&payload, &["summaryPath", "summary_path"]).if_empty(
-        existing_inspection
-            .as_ref()
-            .map(|inspection| inspection.summary_path.as_str())
-            .unwrap_or_default(),
-    );
+    let inspection_storage_root = value_string(&payload, &["storageRoot", "storage_root"])
+        .if_empty(
+            existing_inspection
+                .as_ref()
+                .map(|inspection| inspection.storage_root.as_str())
+                .unwrap_or_default(),
+        );
+    let inspection_summary_path = value_string(&payload, &["summaryPath", "summary_path"])
+        .if_empty(
+            existing_inspection
+                .as_ref()
+                .map(|inspection| inspection.summary_path.as_str())
+                .unwrap_or_default(),
+        );
     let inspection_started_at = existing_inspection
         .as_ref()
         .map(|inspection| inspection.started_at.clone())
@@ -7515,6 +9109,8 @@ fn write_production_event_response(
         "saveEnabled": save_enabled,
         "saveSdkDerived": false,
         "discardBlackFrames": discard_black_frames,
+        "lines": value_i32(&payload, &["lines", "depthLines", "depth_lines"], 1280).clamp(1, 100_000),
+        "intervalMs": value_i32(&payload, &["intervalMs", "interval_ms"], 0).clamp(0, 600_000),
         "algorithmPhase": "pending"
     });
     if let Some(auto_capture) = payload
@@ -7524,6 +9120,11 @@ fn write_production_event_response(
     {
         if let Some(object) = provider_payload.as_object_mut() {
             object.insert("autoCapture".to_string(), json!(auto_capture));
+        }
+    }
+    if let Some(capture_mode) = capture_mode {
+        if let Some(object) = provider_payload.as_object_mut() {
+            object.insert("captureMode".to_string(), json!(capture_mode));
         }
     }
     let provider_body = provider_payload.to_string();
@@ -7624,7 +9225,11 @@ fn write_production_event_response(
         "production.trigger_event",
         &material_id,
         &format!("{default_event} from {source} mode={mode} providerCode={provider_code}"),
-        if provider_code == 0 { "info" } else { "warning" },
+        if provider_code == 0 {
+            "info"
+        } else {
+            "warning"
+        },
     ));
     let final_summary = if default_event == "steel-out" && provider_succeeded {
         write_final_production_summary_file(
@@ -7698,7 +9303,11 @@ fn active_session_for_payload(state: &ServiceState, payload: &Value) -> (String,
 
 fn capture_requires_open_session(payload: &Value) -> bool {
     value_bool(payload, &["steelStateAware", "steel_state_aware"], true)
-        && value_bool(payload, &["requireSteelPresent", "require_steel_present"], true)
+        && value_bool(
+            payload,
+            &["requireSteelPresent", "require_steel_present"],
+            true,
+        )
 }
 
 fn validate_capture_open_session(state: &ServiceState, payload: &Value) -> Result<(), Vec<u8>> {
@@ -7713,12 +9322,10 @@ fn validate_capture_open_session(state: &ServiceState, payload: &Value) -> Resul
             .runtime
             .block_on(db::latest_open_material_session(&state.database.connection))
     } else {
-        state
-            .runtime
-            .block_on(db::find_material_session(
-                &state.database.connection,
-                &requested_session,
-            ))
+        state.runtime.block_on(db::find_material_session(
+            &state.database.connection,
+            &requested_session,
+        ))
     }
     .map_err(|error| {
         http_response(
@@ -7814,7 +9421,11 @@ fn safe_storage_segment(value: &str) -> String {
     }
 }
 
-fn production_summary_path(summary: &Value, material_id: &str, session_id: &str) -> Option<PathBuf> {
+fn production_summary_path(
+    summary: &Value,
+    material_id: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
     let storage_root = value_string(summary, &["storageRoot", "storage_root"]);
     production_session_summary_path(&storage_root, material_id, session_id)
 }
@@ -7987,7 +9598,10 @@ fn write_final_production_summary_file(
             })
         })
         .collect::<Vec<_>>();
-    let depth_count = files.iter().filter(|file| file.data_name == "depth").count();
+    let depth_count = files
+        .iter()
+        .filter(|file| file.data_name == "depth")
+        .count();
     let intensity_count = files
         .iter()
         .filter(|file| file.data_name == "intensity")
@@ -8143,6 +9757,7 @@ fn update_production_summary_algorithm_section(
         .pointer("/core/summary/outputBytes")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let traceability = algorithm_traceability_summary(&manifest);
     summary.insert(
         "algorithm".to_string(),
         json!({
@@ -8153,15 +9768,16 @@ fn update_production_summary_algorithm_section(
             "acceptanceStatus": acceptance_status,
             "coreAvailable": core_available,
             "coreOutputBytes": core_output_bytes,
+            "traceability": traceability,
             "updatedAt": current_time_string()
         }),
     );
-    if let Some(inspection) = summary
-        .get_mut("inspection")
-        .and_then(Value::as_object_mut)
-    {
+    if let Some(inspection) = summary.get_mut("inspection").and_then(Value::as_object_mut) {
         inspection.insert("status".to_string(), json!(status));
-        inspection.insert("captureSummaryPath".to_string(), json!(path.display().to_string()));
+        inspection.insert(
+            "captureSummaryPath".to_string(),
+            json!(path.display().to_string()),
+        );
         inspection.insert("algorithmSummaryPath".to_string(), json!(manifest_path));
     }
     summary.insert("writtenAt".to_string(), json!(current_time_string()));
@@ -8178,7 +9794,8 @@ fn update_production_summary_algorithm_section(
             "manifestPath": manifest_path,
             "acceptanceStatus": acceptance_status,
             "coreAvailable": core_available,
-            "coreOutputBytes": core_output_bytes
+            "coreOutputBytes": core_output_bytes,
+            "traceability": algorithm_traceability_summary(&manifest)
         }),
         Err(error) => json!({
             "ok": false,
@@ -8186,6 +9803,34 @@ fn update_production_summary_algorithm_section(
             "path": path.display().to_string()
         }),
     }
+}
+
+fn algorithm_traceability_summary(manifest: &Value) -> Value {
+    json!({
+        "schema": "steel.algorithm-traceability.v1",
+        "algorithmName": manifest.get("algorithmName"),
+        "algorithmVersion": manifest.get("algorithmVersion"),
+        "configRevision": manifest.get("configRevision"),
+        "configSha256": manifest.get("configSha256"),
+        "scriptSha256": manifest.get("scriptSha256"),
+        "coreSha256": manifest.get("coreSha256"),
+        "releaseCommit": manifest.get("releaseCommit"),
+        "acceptanceReportSha256": manifest.get("acceptanceReportSha256"),
+        "datasetRevision": manifest.get("datasetRevision"),
+        "datasetSha256": manifest.get("datasetSha256"),
+        "evaluatorRevision": manifest.get("evaluatorRevision"),
+        "evaluatorSha256": manifest.get("evaluatorSha256"),
+        "calibrationRevision": manifest.get("calibrationRevision"),
+        "calibrationSha256": manifest.get("calibrationSha256"),
+        "inputSummarySha256": manifest.get("inputSummarySha256"),
+        "inputFrameIds": manifest.get("inputFrameIds"),
+        "inputArtifactCount": manifest.get("inputArtifactCount"),
+        "inputArtifacts": manifest.get("inputArtifacts"),
+        "thresholds": manifest.get("thresholds"),
+        "qualityGate": manifest.get("qualityGate"),
+        "realDefectCount": manifest.get("realDefectCount"),
+        "syntheticDefectCount": manifest.get("syntheticDefectCount")
+    })
 }
 
 fn write_capture_summary_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
@@ -8200,8 +9845,8 @@ fn write_capture_summary_response(state: &ServiceState, body: &str, actor: &str)
         }
     };
     let (material_id, session_id) = active_session_for_payload(state, &payload);
-    let inspection_id =
-        value_string(&payload, &["inspectionId", "inspection_id"]).if_empty(&format!("INSP-{session_id}"));
+    let inspection_id = value_string(&payload, &["inspectionId", "inspection_id"])
+        .if_empty(&format!("INSP-{session_id}"));
     let capture_count = value_i32(&payload, &["attempts", "captureCount", "capture_count"], 0);
     let defect_count = value_i32(&payload, &["defectCount", "defect_count"], 0);
     let status = if value_i32(&payload, &["failures"], 0) == 0 {
@@ -8278,7 +9923,11 @@ fn write_capture_summary_response(state: &ServiceState, body: &str, actor: &str)
     )
 }
 
-fn write_production_capture_once_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+fn write_production_capture_once_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
     let payload = match serde_json::from_str::<Value>(body.trim()) {
         Ok(value) => value,
         Err(error) => {
@@ -8296,7 +9945,7 @@ fn write_production_capture_once_response(state: &ServiceState, body: &str, acto
     let mut capture_body = payload.as_object().cloned().unwrap_or_default();
     capture_body
         .entry("expectedCameras".to_string())
-        .or_insert_with(|| json!(6));
+        .or_insert_with(|| json!(8));
     capture_body
         .entry("rounds".to_string())
         .or_insert_with(|| json!(1));
@@ -8445,7 +10094,11 @@ fn algorithm_manifest_path_from_payload(payload: &Value) -> String {
     payload
         .pointer("/result/latest/manifestPath")
         .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/result/manifest/runDir").and_then(Value::as_str))
+        .or_else(|| {
+            payload
+                .pointer("/result/manifest/runDir")
+                .and_then(Value::as_str)
+        })
         .unwrap_or_default()
         .to_string()
 }
@@ -8493,7 +10146,10 @@ fn upsert_algorithm_inspection_state(
     let capture_count = value_i32(
         payload,
         &["captureCount", "capture_count"],
-        existing.as_ref().map(|item| item.capture_count).unwrap_or(0),
+        existing
+            .as_ref()
+            .map(|item| item.capture_count)
+            .unwrap_or(0),
     );
     let defect_count = value_i32(
         payload,
@@ -8521,7 +10177,12 @@ fn upsert_algorithm_inspection_state(
         .map_err(|error| error.to_string())
 }
 
-fn write_production_algorithm_run_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+fn write_production_algorithm_run_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+    cancellation_requested: Option<&dyn Fn() -> bool>,
+) -> Vec<u8> {
     let payload = match serde_json::from_str::<Value>(body.trim()) {
         Ok(value) => value,
         Err(error) => {
@@ -8533,8 +10194,8 @@ fn write_production_algorithm_run_response(state: &ServiceState, body: &str, act
         }
     };
     let (material_id, session_id) = production_algorithm_session_for_payload(state, &payload);
-    let inspection_id =
-        value_string(&payload, &["inspectionId", "inspection_id"]).if_empty(&format!("INSP-{session_id}"));
+    let inspection_id = value_string(&payload, &["inspectionId", "inspection_id"])
+        .if_empty(&format!("INSP-{session_id}"));
     let mut algorithm_request = payload.as_object().cloned().unwrap_or_default();
     algorithm_request.insert("materialId".to_string(), json!(material_id.clone()));
     algorithm_request
@@ -8546,18 +10207,20 @@ fn write_production_algorithm_run_response(state: &ServiceState, body: &str, act
     algorithm_request
         .entry("runCore".to_string())
         .or_insert_with(|| json!(true));
-    algorithm_request
-        .entry("maxFrames".to_string())
-        .or_insert_with(|| json!(24));
-    algorithm_request
-        .entry("meshRows".to_string())
-        .or_insert_with(|| json!(144));
-    algorithm_request
-        .entry("meshColsPerCamera".to_string())
-        .or_insert_with(|| json!(72));
-    algorithm_request
-        .entry("maxFaceEdgeMm".to_string())
-        .or_insert_with(|| json!(8.0));
+    if !production_algorithm_policy_enabled() {
+        algorithm_request
+            .entry("maxFrames".to_string())
+            .or_insert_with(|| json!(24));
+        algorithm_request
+            .entry("meshRows".to_string())
+            .or_insert_with(|| json!(144));
+        algorithm_request
+            .entry("meshColsPerCamera".to_string())
+            .or_insert_with(|| json!(72));
+        algorithm_request
+            .entry("maxFaceEdgeMm".to_string())
+            .or_insert_with(|| json!(8.0));
+    }
 
     let running_payload = json!({
         "request": Value::Object(algorithm_request.clone()),
@@ -8580,13 +10243,25 @@ fn write_production_algorithm_run_response(state: &ServiceState, body: &str, act
         );
     }
 
-    let algorithm_payload = match run_bar_surface_algorithm(&Value::Object(algorithm_request)) {
+    let algorithm_payload = match run_bar_surface_algorithm(
+        &Value::Object(algorithm_request),
+        cancellation_requested,
+    ) {
         Ok(value) => value,
         Err(error) => {
+            let cooperatively_cancelled = error
+                .get("cooperativeCancellation")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let terminal_status = if cooperatively_cancelled {
+                "algorithm-cancelled"
+            } else {
+                "algorithm-failed"
+            };
             let failed_payload = json!({
                 "request": payload,
                 "algorithm": error,
-                "phase": "algorithm-failed"
+                "phase": terminal_status
             });
             let failed_record = upsert_algorithm_inspection_state(
                 state,
@@ -8594,7 +10269,7 @@ fn write_production_algorithm_run_response(state: &ServiceState, body: &str, act
                 &material_id,
                 &session_id,
                 &inspection_id,
-                "algorithm-failed",
+                terminal_status,
                 "",
                 &failed_payload,
             );
@@ -8606,7 +10281,7 @@ fn write_production_algorithm_run_response(state: &ServiceState, body: &str, act
                         &material_id,
                         &session_id,
                         &inspection_id,
-                        "algorithm-failed",
+                        terminal_status,
                         "",
                         &failed_payload["algorithm"],
                     )
@@ -8615,22 +10290,35 @@ fn write_production_algorithm_run_response(state: &ServiceState, body: &str, act
                     json!({
                         "ok": false,
                         "error": error,
-                        "status": "algorithm-failed"
+                        "status": terminal_status
                     })
                 });
             let _ = state.runtime.block_on(db::append_audit_log(
                 &state.database.connection,
                 actor,
-                "production.algorithm.failed",
+                if cooperatively_cancelled {
+                    "production.algorithm.cancelled"
+                } else {
+                    "production.algorithm.failed"
+                },
                 &material_id,
-                &format!("bar surface algorithm failed inspection={inspection_id}"),
-                "error",
+                &format!("bar surface algorithm {terminal_status} inspection={inspection_id}"),
+                if cooperatively_cancelled {
+                    "warning"
+                } else {
+                    "error"
+                },
             ));
             return http_response(
-                "500 Internal Server Error",
+                if cooperatively_cancelled {
+                    "409 Conflict"
+                } else {
+                    "500 Internal Server Error"
+                },
                 "application/json; charset=utf-8",
                 &json!({
-                    "code": 500,
+                    "code": if cooperatively_cancelled { 499 } else { 500 },
+                    "cooperativeCancellation": cooperatively_cancelled,
                     "materialId": material_id,
                     "sessionId": session_id,
                     "inspectionId": inspection_id,
@@ -8643,17 +10331,35 @@ fn write_production_algorithm_run_response(state: &ServiceState, body: &str, act
     };
 
     let manifest_path = algorithm_manifest_path_from_payload(&algorithm_payload);
+    let detection_ingest = ingest_algorithm_detected_defects(
+        state,
+        &algorithm_payload,
+        &material_id,
+        &session_id,
+        &inspection_id,
+    );
+    let mut completion_payload = payload.clone();
+    if let Some(object) = completion_payload.as_object_mut() {
+        object.insert(
+            "defectCount".to_string(),
+            json!(detection_ingest
+                .get("total")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)),
+        );
+    }
     let record = match upsert_algorithm_inspection_state(
         state,
-        &payload,
+        &completion_payload,
         &material_id,
         &session_id,
         &inspection_id,
         "algorithm-complete",
         &manifest_path,
         &json!({
-            "request": payload,
+            "request": completion_payload,
             "algorithm": algorithm_payload,
+            "detectionIngest": detection_ingest,
             "phase": "algorithm-complete"
         }),
     ) {
@@ -8699,16 +10405,20 @@ fn write_production_algorithm_run_response(state: &ServiceState, body: &str, act
                 "defectCount": record.defect_count
             },
             "captureSummary": capture_summary,
-            "algorithm": algorithm_payload
+            "algorithm": algorithm_payload,
+            "detectionIngest": detection_ingest
         })
         .to_string(),
     )
 }
 
 fn stable_alarm_hash(value: &str) -> u64 {
-    value.as_bytes().iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    })
+    value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
 }
 
 fn production_defect_alarm_input(
@@ -8791,8 +10501,8 @@ fn write_production_defect_response(state: &ServiceState, body: &str, actor: &st
         }
     };
     let (material_id, session_id) = active_session_for_payload(state, &payload);
-    let inspection_id =
-        value_string(&payload, &["inspectionId", "inspection_id"]).if_empty(&format!("INSP-{session_id}"));
+    let inspection_id = value_string(&payload, &["inspectionId", "inspection_id"])
+        .if_empty(&format!("INSP-{session_id}"));
     let defect = db::ProductionDefectInput {
         inspection_id: inspection_id.clone(),
         material_id: material_id.clone(),
@@ -8816,11 +10526,13 @@ fn write_production_defect_response(state: &ServiceState, body: &str, actor: &st
             .to_string(),
     };
     let alarm = production_defect_alarm_input(&payload, &material_id, &session_id, &defect);
-    let result = state.runtime.block_on(db::append_production_defect_with_alarm(
-        &state.database.connection,
-        defect,
-        alarm,
-    ));
+    let result = state
+        .runtime
+        .block_on(db::append_production_defect_with_alarm(
+            &state.database.connection,
+            defect,
+            alarm,
+        ));
     match result {
         Ok((row, alarm_result)) => {
             let _ = state.runtime.block_on(db::append_audit_log(
@@ -8882,8 +10594,8 @@ fn write_production_defect_response(state: &ServiceState, body: &str, actor: &st
 }
 
 fn production_alarm_json(alarm: &db::entities::production_alarm::Model) -> Value {
-    let details = serde_json::from_str::<Value>(&alarm.details)
-        .unwrap_or_else(|_| json!(alarm.details));
+    let details =
+        serde_json::from_str::<Value>(&alarm.details).unwrap_or_else(|_| json!(alarm.details));
     json!({
         "id": alarm.id,
         "source": alarm.source,
@@ -9027,12 +10739,7 @@ fn write_production_alarm_action_response(
     }
     let result = match action {
         ProductionAlarmAction::Acknowledge => state.runtime.block_on(
-            db::acknowledge_production_alarm(
-                &state.database.connection,
-                &alarm_id,
-                actor,
-                &note,
-            ),
+            db::acknowledge_production_alarm(&state.database.connection, &alarm_id, actor, &note),
         ),
         ProductionAlarmAction::Resolve => state.runtime.block_on(db::resolve_production_alarm(
             &state.database.connection,
@@ -9161,7 +10868,11 @@ fn workspace_root() -> PathBuf {
     }
     if let Ok(current_dir) = env::current_dir() {
         for ancestor in current_dir.ancestors().take(8) {
-            if ancestor.join("scripts").join("bar_surface_reconstruct.py").is_file() {
+            if ancestor
+                .join("scripts")
+                .join("bar_surface_reconstruct.py")
+                .is_file()
+            {
                 return ancestor.to_path_buf();
             }
         }
@@ -9181,6 +10892,403 @@ fn bar_surface_capture_root() -> PathBuf {
         .or_else(|_| env::var("CAPTURE_CAMERA_STORAGE_ROOT"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(r"H:\"))
+}
+
+fn algorithm_calibration_path() -> Option<PathBuf> {
+    env::var("STEEL_ALGORITHM_CALIBRATION_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn runtime_path_readback(path: &Path, kind: &str) -> Value {
+    let absolute = path.is_absolute();
+    let exists = path.exists();
+    let expected_type = match kind {
+        "file" => path.is_file(),
+        _ => path.is_dir(),
+    };
+    json!({
+        "path": path.display().to_string(),
+        "absolute": absolute,
+        "exists": exists,
+        "kind": kind,
+        "typeValid": expected_type,
+        "ready": absolute && exists && expected_type
+    })
+}
+
+fn algorithm_runtime_paths_health() -> (bool, Value) {
+    let capture = runtime_path_readback(&bar_surface_capture_root(), "directory");
+    let output = runtime_path_readback(&algorithm_data_root(), "directory");
+    let config = runtime_path_readback(&algorithm_config_path(), "file");
+    let calibration = algorithm_calibration_path()
+        .map(|path| runtime_path_readback(&path, "file"))
+        .unwrap_or_else(|| {
+            json!({
+                "path": "",
+                "absolute": false,
+                "exists": false,
+                "kind": "file",
+                "typeValid": false,
+                "ready": false,
+                "reason": "algorithm_calibration_not_configured"
+            })
+        });
+    let ready = [&capture, &output, &config, &calibration]
+        .iter()
+        .all(|item| item.get("ready").and_then(Value::as_bool) == Some(true));
+    (
+        ready,
+        json!({
+            "ok": ready,
+            "status": if ready { "ready" } else { "invalid" },
+            "captureRoot": capture,
+            "algorithmRoot": output,
+            "algorithmConfig": config,
+            "algorithmCalibration": calibration
+        }),
+    )
+}
+
+fn configured_paths_equal(requested: &str, configured: &Path) -> bool {
+    let requested = PathBuf::from(requested.trim());
+    let requested = requested.canonicalize().unwrap_or(requested);
+    let configured = configured
+        .canonicalize()
+        .unwrap_or_else(|_| configured.to_path_buf());
+    let requested = requested.to_string_lossy();
+    let configured = configured.to_string_lossy();
+    if cfg!(windows) {
+        requested.eq_ignore_ascii_case(&configured)
+    } else {
+        requested == configured
+    }
+}
+
+fn algorithm_runtime_configuration() -> Value {
+    let algorithm_root = algorithm_data_root();
+    let capture_root = bar_surface_capture_root();
+    let config_path = algorithm_config_path();
+    let calibration_path = algorithm_calibration_path();
+    let calibration_path_text = calibration_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let (config_ok, config_health, config) = algorithm_config_health();
+    let (paths_ok, paths) = algorithm_runtime_paths_health();
+    json!({
+        "schema": "steel.algorithm-runtime-config.v1",
+        "desired": {
+            "captureRoot": capture_root.display().to_string(),
+            "algorithmRoot": algorithm_root.display().to_string(),
+            "algorithmConfig": config_path.display().to_string(),
+            "algorithmCalibration": calibration_path_text.clone()
+        },
+        "active": {
+            "captureRoot": capture_root.display().to_string(),
+            "algorithmRoot": algorithm_root.display().to_string(),
+            "algorithmConfig": config_path.display().to_string(),
+            "algorithmCalibration": calibration_path_text,
+            "algorithmName": config.as_ref().and_then(|value| value.get("algorithmName")),
+            "algorithmVersion": config.as_ref().and_then(|value| value.get("algorithmVersion")),
+            "configRevision": config.as_ref().and_then(|value| value.get("configRevision")),
+            "configSha256": config_health.get("configSha256"),
+            "thresholds": config.as_ref().and_then(|value| value.get("thresholds"))
+        },
+        "readback": {
+            "ready": config_ok && paths_ok,
+            "configValid": config_ok,
+            "algorithmRootExists": algorithm_root.is_dir(),
+            "captureRootExists": capture_root.is_dir(),
+            "config": config_health,
+            "paths": paths
+        }
+    })
+}
+
+fn synthetic_algorithm_fixtures_allowed(runtime_profile: &str, algorithm_mode: &str) -> bool {
+    matches!(
+        runtime_profile.trim().to_ascii_lowercase().as_str(),
+        "development" | "dev" | "test"
+    ) && matches!(algorithm_mode.trim().to_ascii_lowercase().as_str(), "demo")
+}
+
+fn production_algorithm_policy_enabled() -> bool {
+    let runtime_profile =
+        env::var("STEEL_RUNTIME_PROFILE").unwrap_or_else(|_| "production".to_string());
+    let algorithm_mode =
+        env::var("STEEL_ALGORITHM_MODE").unwrap_or_else(|_| "production".to_string());
+    !synthetic_algorithm_fixtures_allowed(&runtime_profile, &algorithm_mode)
+}
+
+fn algorithm_mock_defect_count(request: &Value, production_policy: bool) -> Result<i64, Value> {
+    let count = match request.get("mockDefectCount") {
+        None => 0,
+        Some(value) => value.as_i64().ok_or_else(|| {
+            json!({
+                "code": 400,
+                "error": "invalid_synthetic_defect_count",
+                "field": "mockDefectCount",
+                "requiredType": "integer"
+            })
+        })?,
+    };
+    if !(0..=64).contains(&count) {
+        return Err(json!({
+            "code": 400,
+            "error": "invalid_synthetic_defect_count",
+            "field": "mockDefectCount",
+            "minimum": 0,
+            "maximum": 64
+        }));
+    }
+    if production_policy && count != 0 {
+        return Err(json!({
+            "code": 400,
+            "error": "synthetic_defects_forbidden_in_production",
+            "field": "mockDefectCount",
+            "required": 0
+        }));
+    }
+    Ok(count)
+}
+
+fn algorithm_synthetic_defect_count(payload: &Value) -> u64 {
+    let declared = payload
+        .pointer("/result/manifest/detection/syntheticDefectCount")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            payload
+                .pointer("/result/manifest/syntheticDefectCount")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    let observed = payload
+        .pointer("/result/manifest/detection/defects")
+        .and_then(Value::as_array)
+        .map(|defects| {
+            defects
+                .iter()
+                .filter(|defect| {
+                    defect
+                        .pointer("/geometry/synthetic")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .count() as u64
+        })
+        .unwrap_or(0);
+    declared.max(observed)
+}
+
+fn sha256_text_is_valid(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn canonical_value_sha256(value: &Value) -> Option<String> {
+    let bytes = serde_json::to_vec(value).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    Some(format!("{:x}", digest.finalize()))
+}
+
+fn algorithm_traceability_structure_error(manifest: &Value) -> Option<String> {
+    for key in [
+        "algorithmName",
+        "algorithmVersion",
+        "configRevision",
+        "calibrationRevision",
+        "datasetRevision",
+        "evaluatorRevision",
+    ] {
+        if manifest
+            .get(key)
+            .and_then(Value::as_str)
+            .map_or(true, |value| value.trim().is_empty())
+        {
+            return Some("algorithm_traceability_identity_missing".to_string());
+        }
+    }
+    for key in [
+        "configSha256",
+        "calibrationSha256",
+        "inputSummarySha256",
+        "scriptSha256",
+        "coreSha256",
+        "acceptanceReportSha256",
+        "datasetSha256",
+        "evaluatorSha256",
+    ] {
+        if !sha256_text_is_valid(manifest.get(key)) {
+            return Some("algorithm_traceability_sha256_missing".to_string());
+        }
+    }
+    if manifest
+        .get("releaseCommit")
+        .and_then(Value::as_str)
+        .is_none_or(|value| {
+            !(40..=64).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Some("algorithm_traceability_release_commit_missing".to_string());
+    }
+    let artifacts = manifest.get("inputArtifacts").and_then(Value::as_array);
+    if manifest
+        .get("inputFrameIds")
+        .and_then(Value::as_array)
+        .map_or(true, Vec::is_empty)
+        || artifacts.map_or(true, Vec::is_empty)
+    {
+        return Some("algorithm_traceability_inputs_missing".to_string());
+    }
+    let artifacts = artifacts.expect("checked above");
+    if manifest.get("inputArtifactCount").and_then(Value::as_u64) != Some(artifacts.len() as u64)
+        || artifacts.iter().any(|artifact| {
+            ["camera", "frameId", "kind", "path"].iter().any(|key| {
+                artifact
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            }) || artifact.get("bytes").and_then(Value::as_u64).is_none()
+                || !sha256_text_is_valid(artifact.get("sha256"))
+        })
+    {
+        return Some("algorithm_traceability_input_artifacts_invalid".to_string());
+    }
+    if canonical_value_sha256(&Value::Array(artifacts.clone())).as_deref()
+        != manifest.get("inputSummarySha256").and_then(Value::as_str)
+    {
+        return Some("algorithm_traceability_input_summary_mismatch".to_string());
+    }
+    if manifest
+        .get("thresholds")
+        .and_then(Value::as_object)
+        .is_none_or(|thresholds| thresholds.is_empty())
+    {
+        return Some("algorithm_traceability_thresholds_missing".to_string());
+    }
+    if manifest
+        .pointer("/qualityGate/passed")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Some("algorithm_quality_gate_failed".to_string());
+    }
+    if manifest.pointer("/core/available").and_then(Value::as_bool) != Some(true)
+        || manifest
+            .pointer("/core/summary/outputBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0
+    {
+        return Some("algorithm_core_output_gate_failed".to_string());
+    }
+    if manifest
+        .get("realDefectCount")
+        .and_then(Value::as_u64)
+        .is_none()
+        || manifest
+            .get("syntheticDefectCount")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Some("algorithm_traceability_defect_counts_missing".to_string());
+    }
+    None
+}
+
+fn production_algorithm_traceability_error(payload: &Value) -> Option<String> {
+    let Some(manifest) = payload.pointer("/result/manifest") else {
+        return Some("algorithm_traceability_manifest_missing".to_string());
+    };
+    if let Some(error) = algorithm_traceability_structure_error(manifest) {
+        return Some(error);
+    }
+    let (config_ok, config_detail, config) = algorithm_config_health();
+    let Some(config) = config.filter(|_| config_ok) else {
+        return Some("algorithm_traceability_current_config_invalid".to_string());
+    };
+    let Some((_, report, report_hash)) = configured_algorithm_acceptance_report() else {
+        return Some("algorithm_traceability_acceptance_report_missing".to_string());
+    };
+    let config_hash = config_detail
+        .get("configSha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !algorithm_acceptance_report_valid(&report, &config, config_hash) {
+        return Some("algorithm_traceability_acceptance_report_invalid".to_string());
+    }
+    let Some(implementation) = current_algorithm_implementation_identity() else {
+        return Some("algorithm_traceability_implementation_missing".to_string());
+    };
+    if !algorithm_implementation_binding_valid(&report, &implementation) {
+        return Some("algorithm_traceability_implementation_not_approved".to_string());
+    }
+    let Some(current_calibration) = current_algorithm_calibration_identity() else {
+        return Some("algorithm_traceability_calibration_missing".to_string());
+    };
+    if !algorithm_calibration_binding_valid(&report, &current_calibration) {
+        return Some("algorithm_traceability_calibration_not_approved".to_string());
+    }
+    for key in ["algorithmName", "algorithmVersion", "configRevision"] {
+        if manifest.get(key) != config.get(key) {
+            return Some("algorithm_traceability_config_binding_mismatch".to_string());
+        }
+    }
+    if !manifest
+        .get("configSha256")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(config_hash))
+    {
+        return Some("algorithm_traceability_config_binding_mismatch".to_string());
+    }
+    if manifest.get("thresholds") != config.get("thresholds") {
+        return Some("algorithm_traceability_threshold_binding_mismatch".to_string());
+    }
+    for key in [
+        "scriptSha256",
+        "coreSha256",
+        "releaseCommit",
+        "datasetRevision",
+        "datasetSha256",
+        "evaluatorRevision",
+        "evaluatorSha256",
+    ] {
+        let expected = if matches!(key, "scriptSha256" | "coreSha256" | "releaseCommit") {
+            implementation.get(key)
+        } else {
+            report.get(key)
+        };
+        let matches = manifest
+            .get(key)
+            .and_then(Value::as_str)
+            .zip(expected.and_then(Value::as_str))
+            .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected));
+        if !matches {
+            return Some("algorithm_traceability_release_binding_mismatch".to_string());
+        }
+    }
+    for key in ["calibrationRevision", "calibrationSha256"] {
+        let matches = manifest
+            .get(key)
+            .and_then(Value::as_str)
+            .zip(report.get(key).and_then(Value::as_str))
+            .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected));
+        if !matches {
+            return Some("algorithm_traceability_calibration_binding_mismatch".to_string());
+        }
+    }
+    if !manifest
+        .get("acceptanceReportSha256")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(&report_hash))
+    {
+        return Some("algorithm_traceability_acceptance_report_hash_mismatch".to_string());
+    }
+    None
 }
 
 fn content_type_for_path(path: &Path) -> &'static str {
@@ -9231,7 +11339,9 @@ fn production_file_response(query: &str) -> Vec<u8> {
         );
     }
     match fs::read(&path) {
-        Ok(body) => http_bytes_response_with_headers("200 OK", content_type_for_path(&path), &body, &[]),
+        Ok(body) => {
+            http_bytes_response_with_headers("200 OK", content_type_for_path(&path), &body, &[])
+        }
         Err(error) => http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -9276,11 +11386,7 @@ fn algorithm_relative_path(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| display_algorithm_path(&canonical_path))
 }
 
-fn algorithm_core_summary_path(
-    root: &Path,
-    manifest_path: &Path,
-    manifest: &Value,
-) -> PathBuf {
+fn algorithm_core_summary_path(root: &Path, manifest_path: &Path, manifest: &Value) -> PathBuf {
     if let Some(mesh_json) = manifest.pointer("/mesh/json").and_then(Value::as_str) {
         if let Ok(mesh_path) = resolve_algorithm_file(root, mesh_json) {
             if let Some(parent) = mesh_path.parent() {
@@ -9353,6 +11459,18 @@ fn read_algorithm_latest_payload(root: &Path) -> Result<Value, String> {
     }))
 }
 
+fn restore_algorithm_latest(root: &Path, previous: Option<&[u8]>) {
+    let latest_path = root.join("latest.json");
+    match previous {
+        Some(bytes) => {
+            let _ = fs::write(latest_path, bytes);
+        }
+        None => {
+            let _ = fs::remove_file(latest_path);
+        }
+    }
+}
+
 fn algorithm_latest_response() -> Vec<u8> {
     let root = algorithm_data_root();
     match read_algorithm_latest_payload(&root) {
@@ -9371,7 +11489,8 @@ fn algorithm_latest_response() -> Vec<u8> {
 
 fn algorithm_manifest_response(query: &str) -> Vec<u8> {
     let root = algorithm_data_root();
-    let manifest_path = match query_value(query, "path").or_else(|| query_value(query, "relative")) {
+    let manifest_path = match query_value(query, "path").or_else(|| query_value(query, "relative"))
+    {
         Some(value) => match resolve_algorithm_file(&root, &value) {
             Ok(path) => path,
             Err(error) => {
@@ -9385,8 +11504,12 @@ fn algorithm_manifest_response(query: &str) -> Vec<u8> {
         None => match read_algorithm_latest_payload(&root)
             .ok()
             .and_then(|payload| payload.get("latest").cloned())
-            .and_then(|latest| latest.get("manifestPath").and_then(Value::as_str).map(str::to_string))
-        {
+            .and_then(|latest| {
+                latest
+                    .get("manifestPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }) {
             Some(value) => match resolve_algorithm_file(&root, &value) {
                 Ok(path) => path,
                 Err(error) => {
@@ -9447,12 +11570,9 @@ fn algorithm_file_response(query: &str) -> Vec<u8> {
         }
     };
     match fs::read(&path) {
-        Ok(body) => http_bytes_response_with_headers(
-            "200 OK",
-            content_type_for_path(&path),
-            &body,
-            &[],
-        ),
+        Ok(body) => {
+            http_bytes_response_with_headers("200 OK", content_type_for_path(&path), &body, &[])
+        }
         Err(error) => http_response(
             "500 Internal Server Error",
             "application/json; charset=utf-8",
@@ -9482,6 +11602,75 @@ fn algorithm_value_bool(value: &Value, key: &str, fallback: bool) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(fallback)
 }
 
+fn production_algorithm_request_config_error(request: &Value) -> Option<&'static str> {
+    let (config_ok, _, config) = algorithm_config_health();
+    let Some(config) = config.filter(|_| config_ok) else {
+        return Some("production_algorithm_config_invalid");
+    };
+    let Some(thresholds) = config.get("thresholds") else {
+        return Some("production_algorithm_config_invalid");
+    };
+    for (request_key, configured) in [
+        ("captureRoot", bar_surface_capture_root()),
+        ("outputRoot", algorithm_data_root()),
+    ] {
+        if request
+            .get(request_key)
+            .and_then(Value::as_str)
+            .is_some_and(|requested| !configured_paths_equal(requested, &configured))
+        {
+            return Some("production_algorithm_path_override_forbidden");
+        }
+    }
+    if let Some(requested) = request
+        .get("calibrationPath")
+        .or_else(|| request.get("calibration"))
+        .and_then(Value::as_str)
+    {
+        let configured = env::var("STEEL_ALGORITHM_CALIBRATION_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+        if configured
+            .as_ref()
+            .is_none_or(|configured| !configured_paths_equal(requested, configured))
+        {
+            return Some("production_algorithm_calibration_override_forbidden");
+        }
+    }
+    for (request_key, config_key) in [
+        ("maxFrames", "maxFrames"),
+        ("meshRows", "meshRows"),
+        ("meshColsPerCamera", "meshColsPerCamera"),
+        ("radiusMm", "radiusMm"),
+        ("radialScaleMm", "radialScaleMm"),
+        ("maxFaceEdgeMm", "maxFaceEdgeMm"),
+        ("contourCrop", "contourEnabled"),
+        ("contourRadiusToleranceMm", "contourRadiusToleranceMm"),
+        ("contourMinKeepRatio", "contourMinKeepRatio"),
+        ("contourMinRowCoverage", "contourMinRowCoverage"),
+        ("contourAutoPercentile", "contourAutoPercentile"),
+        ("defectMinDepthMm", "defectMinDepthMm"),
+        ("defectMinAreaPoints", "defectMinAreaPoints"),
+    ] {
+        let Some(requested) = request.get(request_key) else {
+            continue;
+        };
+        let Some(configured) = thresholds.get(config_key) else {
+            return Some("production_algorithm_config_invalid");
+        };
+        let equal = if requested.is_number() && configured.is_number() {
+            requested.as_f64() == configured.as_f64()
+        } else {
+            requested == configured
+        };
+        if !equal {
+            return Some("production_algorithm_parameter_override_forbidden");
+        }
+    }
+    None
+}
+
 fn algorithm_core_exe_path() -> Option<PathBuf> {
     if let Ok(path) = env::var("STEEL_BAR_SURFACE_CORE_EXE") {
         let path = PathBuf::from(path);
@@ -9503,34 +11692,126 @@ fn algorithm_core_exe_path() -> Option<PathBuf> {
     None
 }
 
-fn run_algorithm_core_for_manifest(manifest_path: &Path) -> Value {
+fn algorithm_process_timeout() -> Duration {
+    let seconds = env::var("STEEL_ALGORITHM_PROCESS_TIMEOUT_SEC")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1_800)
+        .clamp(10, 7_200);
+    Duration::from_secs(seconds)
+}
+
+fn controlled_process_error(
+    error: controlled_process::ControlledProcessError,
+    operation: &str,
+) -> Value {
+    match error {
+        controlled_process::ControlledProcessError::Cancelled => json!({
+            "code": 499,
+            "error": format!("{operation}_cancelled"),
+            "cooperativeCancellation": true
+        }),
+        controlled_process::ControlledProcessError::TimedOut => json!({
+            "code": 504,
+            "error": format!("{operation}_timeout"),
+            "timeoutSec": algorithm_process_timeout().as_secs()
+        }),
+        controlled_process::ControlledProcessError::Spawn(detail) => json!({
+            "code": 500,
+            "error": format!("{operation}_spawn_failed"),
+            "detail": detail
+        }),
+        controlled_process::ControlledProcessError::Containment(detail) => json!({
+            "code": 500,
+            "error": format!("{operation}_process_tree_containment_failed"),
+            "detail": detail
+        }),
+        controlled_process::ControlledProcessError::Wait(detail) => json!({
+            "code": 500,
+            "error": format!("{operation}_wait_failed"),
+            "detail": detail
+        }),
+    }
+}
+
+fn controlled_process_output_summary(
+    output: &controlled_process::ControlledProcessOutput,
+) -> Value {
+    json!({
+        "retainedByteLimitPerStream": controlled_process::OUTPUT_RETAINED_BYTES,
+        "stdoutTotalBytes": output.stdout_total_bytes,
+        "stderrTotalBytes": output.stderr_total_bytes,
+        "stdoutRetainedBytes": output.stdout.len(),
+        "stderrRetainedBytes": output.stderr.len(),
+        "stdoutTruncated": output.stdout_truncated,
+        "stderrTruncated": output.stderr_truncated
+    })
+}
+
+fn run_algorithm_core_for_manifest(
+    manifest_path: &Path,
+    cancellation_requested: Option<&dyn Fn() -> bool>,
+) -> Result<Value, Value> {
     let Some(exe) = algorithm_core_exe_path() else {
-        return json!({"attempted": false, "available": false, "error": "algorithm_core_exe_missing"});
+        return Ok(
+            json!({"attempted": false, "available": false, "error": "algorithm_core_exe_missing"}),
+        );
     };
-    match Command::new(&exe)
-        .arg("--manifest")
-        .arg(manifest_path)
-        .output()
-    {
-        Ok(output) => json!({
+    let mut command = Command::new(&exe);
+    command.arg("--manifest").arg(manifest_path);
+    match controlled_process::run(
+        &mut command,
+        algorithm_process_timeout(),
+        cancellation_requested,
+    ) {
+        Ok(output) => Ok(json!({
             "attempted": true,
             "available": output.status.success(),
             "exe": exe.display().to_string(),
             "status": output.status.code(),
             "stdout": String::from_utf8_lossy(&output.stdout).trim(),
-            "stderr": String::from_utf8_lossy(&output.stderr).trim()
-        }),
-        Err(error) => json!({
-            "attempted": true,
-            "available": false,
-            "exe": exe.display().to_string(),
-            "error": error.to_string()
-        }),
+            "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+            "processOutput": controlled_process_output_summary(&output)
+        })),
+        Err(error) => Err(controlled_process_error(error, "algorithm_core")),
     }
 }
 
-fn run_bar_surface_algorithm(request: &Value) -> Result<Value, Value> {
-    let capture_root = algorithm_value_string(request, "captureRoot", r"H:\");
+fn run_bar_surface_algorithm(
+    request: &Value,
+    cancellation_requested: Option<&dyn Fn() -> bool>,
+) -> Result<Value, Value> {
+    let production_policy = production_algorithm_policy_enabled();
+    if production_policy {
+        if let Some(error) = production_algorithm_request_config_error(request) {
+            return Err(json!({
+                "code": 400,
+                "error": error,
+                "source": "versioned_algorithm_config"
+            }));
+        }
+        let (paths_ok, paths) = algorithm_runtime_paths_health();
+        if !paths_ok {
+            return Err(json!({
+                "code": 503,
+                "error": "production_algorithm_runtime_paths_invalid",
+                "readback": paths
+            }));
+        }
+        if request.get("runCore").and_then(Value::as_bool) == Some(false) {
+            return Err(json!({
+                "code": 400,
+                "error": "production_algorithm_core_required",
+                "field": "runCore",
+                "required": true
+            }));
+        }
+    }
+    let capture_root = algorithm_value_string(
+        request,
+        "captureRoot",
+        &bar_surface_capture_root().display().to_string(),
+    );
     let output_root = algorithm_value_string(
         request,
         "outputRoot",
@@ -9540,10 +11821,18 @@ fn run_bar_surface_algorithm(request: &Value) -> Result<Value, Value> {
     let calibration_path = algorithm_value_string(
         request,
         "calibrationPath",
-        &algorithm_value_string(request, "calibration", ""),
+        &algorithm_value_string(
+            request,
+            "calibration",
+            &env::var("STEEL_ALGORITHM_CALIBRATION_PATH").unwrap_or_default(),
+        ),
     );
-    let max_frames = algorithm_value_i64(request, "maxFrames", 24).clamp(1, 240).to_string();
-    let mesh_rows = algorithm_value_i64(request, "meshRows", 144).clamp(24, 512).to_string();
+    let max_frames = algorithm_value_i64(request, "maxFrames", 24)
+        .clamp(1, 240)
+        .to_string();
+    let mesh_rows = algorithm_value_i64(request, "meshRows", 144)
+        .clamp(24, 512)
+        .to_string();
     let mesh_cols = algorithm_value_i64(request, "meshColsPerCamera", 72)
         .clamp(24, 256)
         .to_string();
@@ -9563,14 +11852,19 @@ fn run_bar_surface_algorithm(request: &Value) -> Result<Value, Value> {
     let contour_auto_percentile = algorithm_value_f64(request, "contourAutoPercentile", 96.0)
         .clamp(50.0, 99.9)
         .to_string();
+    let mock_defect_count = algorithm_mock_defect_count(request, production_policy)?.to_string();
     let run_core = algorithm_value_bool(request, "runCore", true);
     let script = workspace_root()
         .join("scripts")
         .join("bar_surface_reconstruct.py");
     if !script.is_file() {
-        return Err(json!({"code": 500, "error": "algorithm_script_missing", "script": script.display().to_string()}));
+        return Err(
+            json!({"code": 500, "error": "algorithm_script_missing", "script": script.display().to_string()}),
+        );
     }
     let python = env::var("STEEL_PYTHON").unwrap_or_else(|_| "python".to_string());
+    let algorithm_root = PathBuf::from(&output_root);
+    let previous_latest = fs::read(algorithm_root.join("latest.json")).ok();
     let mut command = Command::new(&python);
     command
         .arg(&script)
@@ -9580,29 +11874,38 @@ fn run_bar_surface_algorithm(request: &Value) -> Result<Value, Value> {
         .arg(&output_root)
         .arg("--material-id")
         .arg(&material_id)
-        .arg("--max-frames")
-        .arg(&max_frames)
-        .arg("--mesh-rows")
-        .arg(&mesh_rows)
-        .arg("--mesh-cols-per-camera")
-        .arg(&mesh_cols)
-        .arg("--max-face-edge-mm")
-        .arg(&max_face_edge)
-        .arg("--contour-radius-tolerance-mm")
-        .arg(&contour_radius_tolerance)
-        .arg("--contour-min-keep-ratio")
-        .arg(&contour_min_keep_ratio)
-        .arg("--contour-min-row-coverage")
-        .arg(&contour_min_row_coverage)
-        .arg("--contour-auto-percentile")
-        .arg(&contour_auto_percentile);
-    if !contour_crop {
-        command.arg("--no-contour-crop");
+        .arg("--mock-defect-count")
+        .arg(&mock_defect_count);
+    if !production_policy {
+        command
+            .arg("--max-frames")
+            .arg(&max_frames)
+            .arg("--mesh-rows")
+            .arg(&mesh_rows)
+            .arg("--mesh-cols-per-camera")
+            .arg(&mesh_cols)
+            .arg("--max-face-edge-mm")
+            .arg(&max_face_edge)
+            .arg("--contour-radius-tolerance-mm")
+            .arg(&contour_radius_tolerance)
+            .arg("--contour-min-keep-ratio")
+            .arg(&contour_min_keep_ratio)
+            .arg("--contour-min-row-coverage")
+            .arg(&contour_min_row_coverage)
+            .arg("--contour-auto-percentile")
+            .arg(&contour_auto_percentile);
+        if !contour_crop {
+            command.arg("--no-contour-crop");
+        }
     }
     if !calibration_path.trim().is_empty() {
         command.arg("--calibration").arg(&calibration_path);
     }
-    let output = command.output();
+    let output = controlled_process::run(
+        &mut command,
+        algorithm_process_timeout(),
+        cancellation_requested,
+    );
     match output {
         Ok(output) if output.status.success() => {
             let root = PathBuf::from(output_root);
@@ -9614,43 +11917,96 @@ fn run_bar_surface_algorithm(request: &Value) -> Result<Value, Value> {
                 .and_then(Value::as_str)
                 .and_then(|value| resolve_algorithm_file(&root, value).ok());
             let core = if run_core {
-                manifest_path
-                    .as_ref()
-                    .map(|path| run_algorithm_core_for_manifest(path))
-                    .unwrap_or_else(|| json!({"attempted": false, "available": false, "error": "algorithm_manifest_missing"}))
+                match manifest_path.as_ref() {
+                    Some(path) => {
+                        match run_algorithm_core_for_manifest(path, cancellation_requested) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                restore_algorithm_latest(
+                                    &algorithm_root,
+                                    previous_latest.as_deref(),
+                                );
+                                return Err(error);
+                            }
+                        }
+                    }
+                    None => {
+                        json!({"attempted": false, "available": false, "error": "algorithm_manifest_missing"})
+                    }
+                }
             } else {
                 json!({"attempted": false, "available": false, "skipped": true})
             };
-            let latest = read_algorithm_latest_payload(&root)
-                .unwrap_or(latest_before_core);
-            Ok(json!({
-                    "code": 0,
-                    "stdout": String::from_utf8_lossy(&output.stdout).trim(),
-                    "stderr": String::from_utf8_lossy(&output.stderr).trim(),
-                    "core": core,
-                    "result": latest
-            }))
+            let latest = read_algorithm_latest_payload(&root).unwrap_or(latest_before_core);
+            let result = json!({
+                "code": 0,
+                "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+                "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+                "processOutput": controlled_process_output_summary(&output),
+                "core": core,
+                "result": latest
+            });
+            let synthetic_defect_count = algorithm_synthetic_defect_count(&result);
+            if production_policy && synthetic_defect_count != 0 {
+                restore_algorithm_latest(&algorithm_root, previous_latest.as_deref());
+                return Err(json!({
+                    "code": 422,
+                    "error": "synthetic_algorithm_output_rejected",
+                    "syntheticDefectCount": synthetic_defect_count
+                }));
+            }
+            if production_policy {
+                if let Some(error) = production_algorithm_traceability_error(&result) {
+                    restore_algorithm_latest(&algorithm_root, previous_latest.as_deref());
+                    return Err(json!({
+                        "code": 422,
+                        "error": error
+                    }));
+                }
+            }
+            Ok(result)
         }
-        Ok(output) => Err(json!({
+        Ok(output) => {
+            if production_policy {
+                restore_algorithm_latest(&algorithm_root, previous_latest.as_deref());
+            }
+            Err(json!({
                 "code": 500,
                 "error": "algorithm_run_failed",
                 "status": output.status.code(),
                 "stdout": String::from_utf8_lossy(&output.stdout).trim(),
-                "stderr": String::from_utf8_lossy(&output.stderr).trim()
-        })),
-        Err(error) => Err(json!({"code": 500, "error": error.to_string()})),
+                "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+                "processOutput": controlled_process_output_summary(&output)
+            }))
+        }
+        Err(error) => {
+            restore_algorithm_latest(&algorithm_root, previous_latest.as_deref());
+            Err(controlled_process_error(error, "algorithm_run"))
+        }
     }
 }
 
-fn run_bar_surface_calibration_fit(request: &Value) -> Result<Value, Value> {
-    let capture_root = algorithm_value_string(request, "captureRoot", &bar_surface_capture_root().display().to_string());
+fn run_bar_surface_calibration_fit(
+    request: &Value,
+    cancellation_requested: Option<&dyn Fn() -> bool>,
+) -> Result<Value, Value> {
+    let capture_root = algorithm_value_string(
+        request,
+        "captureRoot",
+        &bar_surface_capture_root().display().to_string(),
+    );
     let material_id = algorithm_value_string(request, "materialId", "latest");
     let calibration_path = algorithm_value_string(
         request,
         "calibrationPath",
         &algorithm_value_string(request, "calibration", ""),
     );
-    let output_root = algorithm_value_string(request, "outputRoot", r"E:\steel-capture-data\analysis");
+    let default_output_root = bar_surface_capture_root().join("analysis");
+    let output_root = algorithm_value_string(
+        request,
+        "outputRoot",
+        &default_output_root.display().to_string(),
+    );
     let rows = algorithm_value_string(request, "rows", "250,500,750");
     let max_points = algorithm_value_i64(request, "maxPointsPerCamera", 2400)
         .clamp(100, 20000)
@@ -9658,12 +12014,38 @@ fn run_bar_surface_calibration_fit(request: &Value) -> Result<Value, Value> {
     let max_shift = algorithm_value_f64(request, "maxShiftMm", 5.0)
         .clamp(0.1, 50.0)
         .to_string();
+    let expected_cameras = algorithm_value_i64(request, "expectedCameras", 8)
+        .clamp(1, 24)
+        .to_string();
+    let min_points_per_camera = algorithm_value_i64(request, "minPointsPerCamera", 100)
+        .clamp(20, 20000)
+        .to_string();
+    let min_diameter = algorithm_value_f64(request, "minDiameterMm", 20.0)
+        .clamp(1.0, 10000.0)
+        .to_string();
+    let max_diameter = algorithm_value_f64(request, "maxDiameterMm", 1000.0)
+        .clamp(1.0, 20000.0)
+        .to_string();
+    let min_angular_coverage = algorithm_value_f64(request, "minAngularCoverageDeg", 220.0)
+        .clamp(30.0, 359.0)
+        .to_string();
+    let max_fit_residual = algorithm_value_f64(request, "maxFitResidualMm", 8.0)
+        .clamp(0.05, 1000.0)
+        .to_string();
+    let max_relative_residual = algorithm_value_f64(request, "maxRelativeResidual", 0.08)
+        .clamp(0.001, 1.0)
+        .to_string();
+    let min_improvement_ratio = algorithm_value_f64(request, "minImprovementRatio", 0.03)
+        .clamp(0.0, 1.0)
+        .to_string();
     let data_dir = algorithm_value_string(request, "dataDir", "");
     let script = workspace_root()
         .join("scripts")
         .join("fit_array_calibration_cross_section.py");
     if !script.is_file() {
-        return Err(json!({"code": 500, "error": "calibration_fit_script_missing", "script": script.display().to_string()}));
+        return Err(
+            json!({"code": 500, "error": "calibration_fit_script_missing", "script": script.display().to_string()}),
+        );
     }
     let python = env::var("STEEL_PYTHON").unwrap_or_else(|_| "python".to_string());
     let mut command = Command::new(&python);
@@ -9685,20 +12067,58 @@ fn run_bar_surface_calibration_fit(request: &Value) -> Result<Value, Value> {
         .arg("--max-points-per-camera")
         .arg(&max_points)
         .arg("--max-shift-mm")
-        .arg(&max_shift);
+        .arg(&max_shift)
+        .arg("--expected-cameras")
+        .arg(&expected_cameras)
+        .arg("--min-points-per-camera")
+        .arg(&min_points_per_camera)
+        .arg("--min-diameter-mm")
+        .arg(&min_diameter)
+        .arg("--max-diameter-mm")
+        .arg(&max_diameter)
+        .arg("--min-angular-coverage-deg")
+        .arg(&min_angular_coverage)
+        .arg("--max-fit-residual-mm")
+        .arg(&max_fit_residual)
+        .arg("--max-relative-residual")
+        .arg(&max_relative_residual)
+        .arg("--min-improvement-ratio")
+        .arg(&min_improvement_ratio);
     if !calibration_path.trim().is_empty() {
         command.arg("--calibration").arg(&calibration_path);
     }
-    match command.output() {
+    match controlled_process::run(
+        &mut command,
+        algorithm_process_timeout(),
+        cancellation_requested,
+    ) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let result = serde_json::from_str::<Value>(&stdout)
-                .unwrap_or_else(|_| json!({"raw": stdout}));
+            if output.stdout_truncated {
+                return Err(json!({
+                    "code": 500,
+                    "error": "calibration_fit_output_exceeded_limit",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "processOutput": controlled_process_output_summary(&output)
+                }));
+            }
+            let result = serde_json::from_str::<Value>(&stdout).map_err(|error| {
+                json!({
+                    "code": 500,
+                    "error": "calibration_fit_output_invalid",
+                    "detail": error.to_string(),
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "processOutput": controlled_process_output_summary(&output)
+                })
+            })?;
             Ok(json!({
                 "code": 0,
                 "stdout": stdout,
                 "stderr": stderr,
+                "processOutput": controlled_process_output_summary(&output),
                 "result": result
             }))
         }
@@ -9707,9 +12127,10 @@ fn run_bar_surface_calibration_fit(request: &Value) -> Result<Value, Value> {
             "error": "calibration_fit_failed",
             "status": output.status.code(),
             "stdout": String::from_utf8_lossy(&output.stdout).trim(),
-            "stderr": String::from_utf8_lossy(&output.stderr).trim()
+            "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+            "processOutput": controlled_process_output_summary(&output)
         })),
-        Err(error) => Err(json!({"code": 500, "error": error.to_string()})),
+        Err(error) => Err(controlled_process_error(error, "calibration_fit")),
     }
 }
 
@@ -9804,16 +12225,148 @@ fn calibration_capture_data_dir(summary: &Value, expected_cameras: i64) -> Resul
     })
 }
 
+fn ingest_algorithm_detected_defects(
+    state: &ServiceState,
+    algorithm_payload: &Value,
+    material_id: &str,
+    session_id: &str,
+    inspection_id: &str,
+) -> Value {
+    let defects = algorithm_payload
+        .pointer("/result/manifest/detection/defects")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let existing = state
+        .runtime
+        .block_on(db::production_defects_for_inspection(
+            &state.database.connection,
+            inspection_id,
+        ))
+        .unwrap_or_default();
+    let existing_algorithm_ids = existing
+        .iter()
+        .filter_map(|item| serde_json::from_str::<Value>(&item.geometry_json).ok())
+        .filter_map(|geometry| {
+            geometry
+                .get("algorithmDetectionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<HashSet<_>>();
+    let run_id = algorithm_payload
+        .pointer("/result/manifest/runId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut inserted = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = Vec::new();
+    for (index, item) in defects.iter().enumerate() {
+        let detection_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("ALG-{:04}", index + 1));
+        let stable_id = format!("{run_id}:{detection_id}");
+        if existing_algorithm_ids.contains(&stable_id) {
+            skipped += 1;
+            continue;
+        }
+        let mut geometry = item
+            .get("geometry")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let synthetic = geometry
+            .get("synthetic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let detection_source = if synthetic {
+            "python-temporary-mock"
+        } else {
+            "python-radial-residual"
+        };
+        geometry.insert("algorithmDetectionId".to_string(), json!(stable_id));
+        geometry.insert("runId".to_string(), json!(run_id));
+        geometry.insert("source".to_string(), json!(detection_source));
+        let input = db::ProductionDefectInput {
+            inspection_id: inspection_id.to_string(),
+            material_id: material_id.to_string(),
+            camera_id: value_string(item, &["cameraId", "camera_id"]),
+            defect_type: value_string(item, &["defectType", "defect_type", "type"])
+                .if_empty("review"),
+            severity: value_string(item, &["severity"])
+                .if_empty("review")
+                .to_ascii_lowercase(),
+            x_mm: value_f64(item, &["xMm", "x_mm", "x"]),
+            y_mm: value_f64(item, &["yMm", "y_mm", "y"]),
+            z_mm: value_f64(item, &["zMm", "z_mm", "z"]),
+            width_mm: value_f64(item, &["widthMm", "width_mm", "width"]),
+            height_mm: value_f64(item, &["heightMm", "height_mm", "height"]),
+            depth_mm: value_f64(item, &["depthMm", "depth_mm", "depth"]),
+            confidence: value_f64(item, &["confidence", "score"]),
+            geometry_json: Value::Object(geometry).to_string(),
+        };
+        let alarm_payload = json!({
+            "source": detection_source, "algorithmDetectionId": stable_id,
+            "materialId": material_id, "sessionId": session_id,
+            "inspectionId": inspection_id, "defect": item
+        });
+        let alarm = production_defect_alarm_input(&alarm_payload, material_id, session_id, &input);
+        match state
+            .runtime
+            .block_on(db::append_production_defect_with_alarm(
+                &state.database.connection,
+                input,
+                alarm,
+            )) {
+            Ok(_) => inserted += 1,
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    json!({
+        "status": if errors.is_empty() { "complete" } else { "partial" },
+        "detected": defects.len(), "inserted": inserted, "skipped": skipped,
+        "existing": existing.len(), "total": existing.len() + inserted, "errors": errors
+    })
+}
+
+fn automatic_calibration_activation_decision(
+    result: &Value,
+    auto_activate: bool,
+) -> (bool, bool, &'static str) {
+    let target_detected = result
+        .get("targetDetection")
+        .and_then(|value| value.get("detected"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let correction_accepted = result
+        .get("correctionAccepted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let reason = if !target_detected {
+        "calibration_target_not_detected"
+    } else if !correction_accepted {
+        "correction_quality_gate_failed"
+    } else if !auto_activate {
+        "automatic_activation_disabled"
+    } else {
+        "pending"
+    };
+    (target_detected, correction_accepted, reason)
+}
+
 fn run_bar_surface_calibration_capture_fit(
     state: &ServiceState,
     request: &Value,
     actor: &str,
+    cancellation_requested: Option<&dyn Fn() -> bool>,
 ) -> Result<Value, Value> {
-    let expected_cameras = algorithm_value_i64(request, "expectedCameras", 6);
-    if expected_cameras != 6 {
+    let expected_cameras = algorithm_value_i64(request, "expectedCameras", 8);
+    if expected_cameras != 8 {
         return Err(json!({
             "code": 400,
-            "error": "calibration_capture_requires_six_cameras",
+            "error": "calibration_capture_requires_eight_cameras",
             "expectedCameras": expected_cameras
         }));
     }
@@ -9828,7 +12381,7 @@ fn run_bar_surface_calibration_capture_fit(
         &format!("continuous-test/auto-calibration-{}", current_time_millis()),
     );
     let mut capture_body = serde_json::Map::new();
-    capture_body.insert("expectedCameras".to_string(), json!(6));
+    capture_body.insert("expectedCameras".to_string(), json!(8));
     capture_body.insert("rounds".to_string(), json!(1));
     capture_body.insert(
         "lines".to_string(),
@@ -9882,15 +12435,165 @@ fn run_bar_surface_calibration_capture_fit(
             "capture": capture
         }));
     }
-    let data_dir = calibration_capture_data_dir(&capture, expected_cameras)?;
+    let capture_summary_dir = calibration_capture_data_dir(&capture, expected_cameras)?;
     let mut fit_request = request.as_object().cloned().unwrap_or_default();
+    let requested_calibration = algorithm_value_string(
+        request,
+        "calibrationPath",
+        &algorithm_value_string(request, "calibration", ""),
+    );
+    if requested_calibration.trim().is_empty() {
+        let active_response = state.capture.proxy_response_with_read_timeout(
+            "GET",
+            "/api/calibration/active",
+            "",
+            Duration::from_secs(10),
+        );
+        let Some(active_response) = active_response else {
+            return Err(json!({
+                "code": 503,
+                "error": "active_calibration_provider_offline"
+            }));
+        };
+        let active = serde_json::from_slice::<Value>(&active_response.body).map_err(|error| {
+            json!({
+                "code": 502,
+                "error": "active_calibration_response_invalid",
+                "detail": error.to_string()
+            })
+        })?;
+        let active_path = active
+            .get("calibrationPath")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if !(200..300).contains(&active_response.status_code)
+            || active.get("code").and_then(Value::as_i64) != Some(0)
+            || active_path.is_empty()
+            || !active
+                .get("exists")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return Err(json!({
+                "code": 422,
+                "error": "active_array_calibration_unavailable",
+                "activeCalibration": active
+            }));
+        }
+        fit_request.insert("calibrationPath".to_string(), json!(active_path));
+    }
+    fit_request.remove("dataDir");
     fit_request.insert(
-        "dataDir".to_string(),
-        json!(data_dir.display().to_string()),
+        "captureRoot".to_string(),
+        json!(algorithm_value_string(
+            request,
+            "captureRoot",
+            &bar_surface_capture_root().display().to_string(),
+        )),
     );
     fit_request.insert("materialId".to_string(), json!(material_id));
-    let fit = run_bar_surface_calibration_fit(&Value::Object(fit_request))?;
+    let fit = run_bar_surface_calibration_fit(&Value::Object(fit_request), cancellation_requested)?;
     let result = fit.get("result").cloned().unwrap_or_else(|| json!({}));
+    let auto_activate = algorithm_value_bool(request, "autoActivate", true);
+    let (target_detected, correction_accepted, activation_reason) =
+        automatic_calibration_activation_decision(&result, auto_activate);
+    let mut auto_activation = json!({
+        "attempted": false,
+        "activated": false,
+        "saveToDevice": false,
+        "reason": activation_reason
+    });
+    if target_detected && correction_accepted && auto_activate {
+        let corrected_xml = result
+            .get("correctedXml")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if corrected_xml.is_empty() {
+            return Err(json!({
+                "code": 422,
+                "error": "accepted_calibration_missing_corrected_xml",
+                "fit": fit
+            }));
+        }
+        let output_dir = result
+            .get("outputDir")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let version = Path::new(output_dir)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("automatic-array-calibration");
+        let profile_name = algorithm_value_string(request, "profile", "current-8-time-trigger");
+        let activation_request = json!({
+            "name": profile_name,
+            "path": corrected_xml,
+            "version": version,
+            "fitReport": result.get("fitReport").and_then(Value::as_str).unwrap_or_default(),
+            "beforePreview": result.get("beforePreview").and_then(Value::as_str).unwrap_or_default(),
+            "afterPreview": result.get("afterPreview").and_then(Value::as_str).unwrap_or_default(),
+            "sourceCalibration": result.get("calibration").and_then(Value::as_str).unwrap_or_default(),
+            "fitBefore": result.get("fitBefore").cloned().unwrap_or_else(|| json!({})),
+            "fitAfter": result.get("fitAfter").cloned().unwrap_or_else(|| json!({})),
+            "cameraParamDir": format!("config/camera-params/{profile_name}"),
+            "allowExternal": true,
+            "saveToDevice": false,
+            "appliedBy": format!("automatic-calibration:{actor}")
+        });
+        let activation_response = state.capture.proxy_response_with_read_timeout(
+            "POST",
+            "/api/calibration/active",
+            &activation_request.to_string(),
+            Duration::from_secs(30),
+        );
+        let Some(activation_response) = activation_response else {
+            return Err(json!({
+                "code": 503,
+                "error": "calibration_activation_provider_offline",
+                "fit": fit
+            }));
+        };
+        let activation =
+            serde_json::from_slice::<Value>(&activation_response.body).map_err(|error| {
+                json!({
+                    "code": 502,
+                    "error": "calibration_activation_response_invalid",
+                    "detail": error.to_string(),
+                    "fit": fit
+                })
+            })?;
+        let activation_code = activation
+            .get("code")
+            .and_then(Value::as_i64)
+            .unwrap_or(502);
+        let activation_exists = activation
+            .get("exists")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !(200..300).contains(&activation_response.status_code)
+            || activation_code != 0
+            || !activation_exists
+        {
+            return Err(json!({
+                "code": 502,
+                "error": "calibration_automatic_activation_failed",
+                "providerStatus": activation_response.status_code,
+                "activation": activation,
+                "fit": fit
+            }));
+        }
+        auto_activation = json!({
+            "attempted": true,
+            "activated": true,
+            "saveToDevice": false,
+            "profile": profile_name,
+            "version": version,
+            "calibrationPath": activation.get("calibrationPath").cloned().unwrap_or_else(|| json!(corrected_xml)),
+            "provider": activation
+        });
+    }
     let _ = state.runtime.block_on(db::append_audit_log(
         &state.database.connection,
         actor,
@@ -9900,8 +12603,11 @@ fn run_bar_surface_calibration_capture_fit(
             .and_then(Value::as_str)
             .unwrap_or("calibration-fit"),
         &format!(
-            "six-camera calibration capture and fit completed from {}",
-            data_dir.display()
+            "eight-camera calibration capture and fit completed from {}; targetDetected={}; correctionAccepted={}; autoActivated={}",
+            capture_summary_dir.display(),
+            target_detected,
+            correction_accepted,
+            auto_activation.get("activated").and_then(Value::as_bool).unwrap_or(false)
         ),
         "warning",
     ));
@@ -9909,7 +12615,8 @@ fn run_bar_surface_calibration_capture_fit(
         "code": 0,
         "capture": capture,
         "fit": fit,
-        "result": result
+        "result": result,
+        "autoActivation": auto_activation
     }))
 }
 
@@ -9917,6 +12624,7 @@ fn write_production_calibration_capture_fit_response(
     state: &ServiceState,
     body: &str,
     actor: &str,
+    cancellation_requested: Option<&dyn Fn() -> bool>,
 ) -> Vec<u8> {
     let request = match serde_json::from_str::<Value>(body.trim()) {
         Ok(value @ Value::Object(_)) => value,
@@ -9929,7 +12637,7 @@ fn write_production_calibration_capture_fit_response(
             );
         }
     };
-    match run_bar_surface_calibration_capture_fit(state, &request, actor) {
+    match run_bar_surface_calibration_capture_fit(state, &request, actor, cancellation_requested) {
         Ok(payload) => http_response(
             "200 OK",
             "application/json; charset=utf-8",
@@ -9949,7 +12657,7 @@ fn write_production_calibration_capture_fit_response(
 
 fn algorithm_run_response(body: &str) -> Vec<u8> {
     let request: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    match run_bar_surface_algorithm(&request) {
+    match run_bar_surface_algorithm(&request, None) {
         Ok(payload) => http_response(
             "200 OK",
             "application/json; charset=utf-8",
@@ -9965,7 +12673,7 @@ fn algorithm_run_response(body: &str) -> Vec<u8> {
 
 fn algorithm_calibration_fit_response(body: &str) -> Vec<u8> {
     let request: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    match run_bar_surface_calibration_fit(&request) {
+    match run_bar_surface_calibration_fit(&request, None) {
         Ok(payload) => http_response(
             "200 OK",
             "application/json; charset=utf-8",
@@ -10012,7 +12720,9 @@ fn algorithm_capture_materials_response(query: &str) -> Vec<u8> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(80)
         .clamp(1, 500);
-    let camera_names = ["camera1", "camera2", "camera3", "camera4", "camera5", "camera6"];
+    let camera_names = [
+        "camera1", "camera2", "camera3", "camera4", "camera5", "camera6", "camera7", "camera8",
+    ];
     let camera_roots = camera_names
         .iter()
         .map(|name| root.join(name))
@@ -10072,7 +12782,11 @@ fn algorithm_capture_materials_response(query: &str) -> Vec<u8> {
         b.get("updatedAtMillis")
             .and_then(Value::as_u64)
             .unwrap_or(0)
-            .cmp(&a.get("updatedAtMillis").and_then(Value::as_u64).unwrap_or(0))
+            .cmp(
+                &a.get("updatedAtMillis")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
     });
     materials.truncate(limit);
     http_response(
@@ -10081,6 +12795,7 @@ fn algorithm_capture_materials_response(query: &str) -> Vec<u8> {
         &json!({
             "code": 0,
             "captureRoot": root.display().to_string(),
+            "configuration": algorithm_runtime_configuration(),
             "materials": materials
         })
         .to_string(),
@@ -10155,7 +12870,11 @@ fn algorithm_runs_response(query: &str) -> Vec<u8> {
         b.get("updatedAtMillis")
             .and_then(Value::as_u64)
             .unwrap_or(0)
-            .cmp(&a.get("updatedAtMillis").and_then(Value::as_u64).unwrap_or(0))
+            .cmp(
+                &a.get("updatedAtMillis")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
     });
     http_response(
         "200 OK",
@@ -10163,6 +12882,7 @@ fn algorithm_runs_response(query: &str) -> Vec<u8> {
         &json!({
             "code": 0,
             "root": root.display().to_string(),
+            "configuration": algorithm_runtime_configuration(),
             "runs": runs
         })
         .to_string(),
@@ -10264,15 +12984,20 @@ fn record_retention_detail(
     deleted_records: u64,
     deleted_defects: u64,
     deleted_capture_files: u64,
+    files_planned: i64,
+    files_deleted: i64,
+    files_missing: i64,
+    bytes_deleted: i64,
+    failures: usize,
     dry_run: bool,
 ) -> String {
     if dry_run {
         format!(
-            "预览检测记录保留策略：保留 {retention_days} 天，截止 {cutoff_at}，可清理 {matched} 条记录"
+            "预览检测记录保留策略：保留 {retention_days} 天，截止 {cutoff_at}，可清理 {matched} 条记录，计划物理文件 {files_planned} 个，规划失败 {failures} 条"
         )
     } else {
         format!(
-            "执行检测记录保留策略：保留 {retention_days} 天，截止 {cutoff_at}，清理生产记录 {deleted_records} / {matched} 条，缺陷 {deleted_defects} 条，采集文件索引 {deleted_capture_files} 条"
+            "执行检测记录保留策略：保留 {retention_days} 天，截止 {cutoff_at}，清理生产记录 {deleted_records} / {matched} 条，物理文件 {files_deleted} / {files_planned} 个，缺失 {files_missing} 个，删除字节 {bytes_deleted}，失败 {failures} 条，缺陷 {deleted_defects} 条，采集文件索引 {deleted_capture_files} 条；生产会话保留"
         )
     }
 }
@@ -10450,6 +13175,7 @@ fn admin_users_json(users: Vec<db::entities::admin_user::Model>) -> String {
                 "displayName": &user.display_name,
                 "role": &user.role,
                 "status": &user.status,
+                "mustChangePassword": user.must_change_password,
                 "lastLoginAt": &user.last_login_at,
                 "createdAt": &user.created_at
             })
@@ -10506,7 +13232,8 @@ fn session_user_json(session: &AdminSession) -> Value {
         "id": &session.user_id,
         "displayName": &session.display_name,
         "role": &session.role,
-        "permissions": &session.permissions
+        "permissions": &session.permissions,
+        "mustChangePassword": session.must_change_password
     })
 }
 
@@ -10723,10 +13450,7 @@ fn inspection_record_json(row: &db::AdminInspectionRecord) -> Value {
 
 fn inspection_record_detail_json(detail: db::AdminInspectionRecordDetail) -> String {
     let mut record = inspection_record_json(&detail.record);
-    let plate = production_plate_value(
-        &detail.record.inspection,
-        detail.record.session.as_ref(),
-    );
+    let plate = production_plate_value(&detail.record.inspection, detail.record.session.as_ref());
     if let Some(object) = record.as_object_mut() {
         object.insert(
             "defects".to_string(),
@@ -10749,6 +13473,17 @@ fn inspection_record_detail_json(detail: db::AdminInspectionRecordDetail) -> Str
                     .map(production_capture_image_value)
                     .collect::<Vec<_>>(),
             ),
+        );
+        let raw_payload = serde_json::from_str::<Value>(&detail.record.inspection.raw_payload)
+            .unwrap_or_else(|_| json!({}));
+        let algorithm_manifest = raw_payload
+            .pointer("/algorithm/result/manifest")
+            .or_else(|| raw_payload.pointer("/result/manifest"));
+        object.insert(
+            "algorithmTrace".to_string(),
+            algorithm_manifest
+                .map(algorithm_traceability_summary)
+                .unwrap_or(Value::Null),
         );
     }
     json!({ "record": record }).to_string()
@@ -12250,6 +14985,381 @@ fn read_admin_record_detail_response(state: &ServiceState, query: &str) -> Vec<u
     }
 }
 
+fn inspection_report_archive_root() -> PathBuf {
+    env::var("STEEL_REPORT_ARCHIVE_ROOT")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            env::var("STEEL_RUNTIME_STATE_ROOT")
+                .map(|root| PathBuf::from(root).join("reports").join("inspection"))
+        })
+        .unwrap_or_else(|_| config_dir().join("reports").join("inspection"))
+}
+
+fn issue_inspection_report_at(
+    state: &ServiceState,
+    archive_root: &Path,
+    inspection_id: &str,
+    actor: &str,
+) -> Result<Value, String> {
+    let detail = state
+        .runtime
+        .block_on(db::find_inspection_record_detail(
+            &state.database.connection,
+            inspection_id,
+        ))
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "record_not_found".to_string())?;
+    let detail_value = serde_json::from_str::<Value>(&inspection_record_detail_json(detail))
+        .map_err(|error| format!("report_snapshot_invalid: {error}"))?;
+    let record = detail_value
+        .get("record")
+        .cloned()
+        .ok_or_else(|| "report_record_missing".to_string())?;
+    let snapshot = json!({
+        "schema": "steel.inspection.report.v1",
+        "inspectionId": inspection_id,
+        "materialId": record.get("materialId").and_then(Value::as_str).unwrap_or_default(),
+        "record": record
+    });
+    let snapshot_bytes = serde_json::to_vec(&snapshot)
+        .map_err(|error| format!("report_snapshot_serialize_failed: {error}"))?;
+    let snapshot_sha256 = format!("{:x}", Sha256::digest(&snapshot_bytes));
+    let report_id = format!(
+        "RPT-{}-{}",
+        safe_storage_segment(inspection_id),
+        &snapshot_sha256[..12]
+    );
+    let inspection_root = archive_root.join(safe_storage_segment(inspection_id));
+    fs::create_dir_all(&inspection_root)
+        .map_err(|error| format!("report_archive_directory_failed: {error}"))?;
+    let archive_path = inspection_root.join(format!("{report_id}.json"));
+    if archive_path.is_file() {
+        let existing = fs::read_to_string(&archive_path)
+            .map_err(|error| format!("report_archive_read_failed: {error}"))?;
+        let archive = serde_json::from_str::<Value>(&existing)
+            .map_err(|error| format!("report_archive_invalid: {error}"))?;
+        validate_inspection_report_archive(&archive, inspection_id, &report_id)
+            .map_err(str::to_string)?;
+        if archive.get("documentSha256").and_then(Value::as_str) != Some(&snapshot_sha256) {
+            return Err("report_archive_hash_conflict".to_string());
+        }
+        return Ok(json!({
+            "code": 0, "created": false, "reportId": report_id,
+            "archivePath": archive_path.display().to_string(), "archive": archive
+        }));
+    }
+    let archive = json!({
+        "schema": "steel.inspection.report-archive.v1",
+        "reportId": report_id,
+        "inspectionId": inspection_id,
+        "materialId": snapshot.get("materialId"),
+        "issuedAt": current_time_string(),
+        "issuedBy": actor,
+        "documentSha256": snapshot_sha256,
+        "document": snapshot
+    });
+    let archive_bytes = serde_json::to_vec_pretty(&archive)
+        .map_err(|error| format!("report_archive_serialize_failed: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&archive_path)
+        .map_err(|error| format!("report_archive_create_failed: {error}"))?;
+    file.write_all(&archive_bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("report_archive_write_failed: {error}"))?;
+    Ok(json!({
+        "code": 0, "created": true, "reportId": report_id,
+        "archivePath": archive_path.display().to_string(), "archive": archive
+    }))
+}
+
+fn write_inspection_report_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(payload) if payload.is_object() => payload,
+        _ => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                "{\"code\":400,\"error\":\"invalid_json\"}",
+            )
+        }
+    };
+    let inspection_id = value_string(&payload, &["inspectionId", "inspection_id", "id"]);
+    if inspection_id.trim().is_empty() {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"inspection_id_required\"}",
+        );
+    }
+    match issue_inspection_report_at(
+        state,
+        &inspection_report_archive_root(),
+        &inspection_id,
+        actor,
+    ) {
+        Ok(result) => {
+            let _ = state.runtime.block_on(db::append_audit_log(
+                &state.database.connection,
+                actor,
+                "inspection.report.issue",
+                &inspection_id,
+                &format!(
+                    "签发检测报告 {}（created={}）",
+                    result
+                        .get("reportId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                    result
+                        .get("created")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                ),
+                "info",
+            ));
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &result.to_string(),
+            )
+        }
+        Err(error) if error == "record_not_found" => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            "{\"code\":404,\"error\":\"record_not_found\"}",
+        ),
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code": 500, "error": error}).to_string(),
+        ),
+    }
+}
+
+fn validate_inspection_report_archive(
+    archive: &Value,
+    inspection_id: &str,
+    report_id: &str,
+) -> Result<(), &'static str> {
+    let document = archive
+        .get("document")
+        .ok_or("report_archive_document_missing")?;
+    let document_bytes =
+        serde_json::to_vec(document).map_err(|_| "report_archive_document_invalid")?;
+    let document_sha256 = format!("{:x}", Sha256::digest(document_bytes));
+    let expected_report_id = format!(
+        "RPT-{}-{}",
+        safe_storage_segment(inspection_id),
+        &document_sha256[..12]
+    );
+    let document_material_id = document.get("materialId").and_then(Value::as_str);
+    let valid = archive.get("schema").and_then(Value::as_str)
+        == Some("steel.inspection.report-archive.v1")
+        && archive.get("inspectionId").and_then(Value::as_str) == Some(inspection_id)
+        && archive.get("reportId").and_then(Value::as_str) == Some(report_id)
+        && expected_report_id == report_id
+        && document.get("schema").and_then(Value::as_str) == Some("steel.inspection.report.v1")
+        && document.get("inspectionId").and_then(Value::as_str) == Some(inspection_id)
+        && archive.get("materialId").and_then(Value::as_str) == document_material_id
+        && archive.get("documentSha256").and_then(Value::as_str) == Some(document_sha256.as_str());
+    if valid {
+        Ok(())
+    } else {
+        Err("report_archive_integrity_failed")
+    }
+}
+
+fn read_inspection_reports_at(archive_root: &Path, query: &str) -> Vec<u8> {
+    let Some(inspection_id) =
+        query_value(query, "inspectionId").or_else(|| query_value(query, "id"))
+    else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"inspection_id_required\"}",
+        );
+    };
+    if inspection_id.is_empty() || safe_storage_segment(&inspection_id) != inspection_id {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"invalid_report_identity\"}",
+        );
+    }
+    let inspection_root = archive_root.join(&inspection_id);
+    let entries =
+        match fs::read_dir(&inspection_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return http_response(
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &json!({"code": 0, "inspectionId": inspection_id, "reports": []}).to_string(),
+                )
+            }
+            Err(error) => return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"code": 500, "error": format!("report_archive_directory_failed: {error}")})
+                    .to_string(),
+            ),
+        };
+    let mut reports = Vec::new();
+    let mut invalid_archives = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                invalid_archives
+                    .push(json!({"file": Value::Null, "reason": "report_archive_entry_failed"}));
+                continue;
+            }
+        };
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let report_id = entry
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            || report_id.is_empty()
+            || safe_storage_segment(&report_id) != report_id
+        {
+            invalid_archives
+                .push(json!({"file": file_name, "reason": "unexpected_report_archive_entry"}));
+            continue;
+        }
+        let archive = match fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        {
+            Some(archive) => archive,
+            None => {
+                invalid_archives
+                    .push(json!({"file": file_name, "reason": "report_archive_invalid"}));
+                continue;
+            }
+        };
+        match validate_inspection_report_archive(&archive, &inspection_id, &report_id) {
+            Ok(()) => reports.push(json!({
+                "reportId": archive.get("reportId"),
+                "inspectionId": archive.get("inspectionId"),
+                "materialId": archive.get("materialId"),
+                "issuedAt": archive.get("issuedAt"),
+                "issuedBy": archive.get("issuedBy"),
+                "documentSha256": archive.get("documentSha256")
+            })),
+            Err(reason) => invalid_archives.push(json!({"file": file_name, "reason": reason})),
+        }
+    }
+    if !invalid_archives.is_empty() {
+        return http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": "report_archive_integrity_failed",
+                "inspectionId": inspection_id,
+                "invalidArchiveCount": invalid_archives.len(),
+                "invalidArchives": invalid_archives
+            })
+            .to_string(),
+        );
+    }
+    reports.sort_by(|left, right| {
+        right
+            .get("issuedAt")
+            .and_then(Value::as_str)
+            .cmp(&left.get("issuedAt").and_then(Value::as_str))
+    });
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({"code": 0, "inspectionId": inspection_id, "reports": reports}).to_string(),
+    )
+}
+
+fn read_inspection_reports_response(query: &str) -> Vec<u8> {
+    read_inspection_reports_at(&inspection_report_archive_root(), query)
+}
+
+fn read_inspection_report_detail_at(archive_root: &Path, query: &str) -> Vec<u8> {
+    let Some(inspection_id) = query_value(query, "inspectionId") else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"inspection_id_required\"}",
+        );
+    };
+    let Some(report_id) = query_value(query, "reportId") else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"report_id_required\"}",
+        );
+    };
+    if inspection_id.is_empty()
+        || report_id.is_empty()
+        || safe_storage_segment(&inspection_id) != inspection_id
+        || safe_storage_segment(&report_id) != report_id
+    {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"invalid_report_identity\"}",
+        );
+    }
+    let archive_path = archive_root
+        .join(&inspection_id)
+        .join(format!("{report_id}.json"));
+    let archive_text = match fs::read_to_string(&archive_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                "{\"code\":404,\"error\":\"report_archive_not_found\"}",
+            )
+        }
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"code": 500, "error": format!("report_archive_read_failed: {error}")})
+                    .to_string(),
+            )
+        }
+    };
+    let archive = match serde_json::from_str::<Value>(&archive_text) {
+        Ok(value) => value,
+        Err(_) => {
+            return http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                "{\"code\":409,\"error\":\"report_archive_invalid\"}",
+            )
+        }
+    };
+    if validate_inspection_report_archive(&archive, &inspection_id, &report_id).is_err() {
+        return http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            "{\"code\":409,\"error\":\"report_archive_integrity_failed\"}",
+        );
+    }
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({"code": 0, "archive": archive}).to_string(),
+    )
+}
+
+fn read_inspection_report_detail_response(query: &str) -> Vec<u8> {
+    read_inspection_report_detail_at(&inspection_report_archive_root(), query)
+}
+
 fn read_admin_records_export_response(state: &ServiceState, query: &str, actor: &str) -> Vec<u8> {
     let keyword = query_value(query, "keyword");
     let status = query_value(query, "status");
@@ -12294,6 +15404,240 @@ fn read_admin_records_export_response(state: &ServiceState, query: &str, actor: 
             "application/json; charset=utf-8",
             &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
         ),
+    }
+}
+
+fn execute_record_artifact_cleanup(
+    state: &ServiceState,
+    record_id: &str,
+    actor: &str,
+    reason: &str,
+) -> Result<artifact_cleanup::CleanupExecution, (String, Option<String>)> {
+    if let Some(cleanup) = state
+        .runtime
+        .block_on(db::find_open_record_cleanup_for_record(
+            &state.database.connection,
+            record_id,
+        ))
+        .map_err(|error| (error.to_string(), None))?
+    {
+        let cleanup_id = cleanup.id.clone();
+        return state
+            .runtime
+            .block_on(artifact_cleanup::execute_persisted_cleanup(
+                &state.database.connection,
+                cleanup,
+            ))
+            .map_err(|error| (error, Some(cleanup_id)));
+    }
+    let detail = state
+        .runtime
+        .block_on(db::find_inspection_record_detail(
+            &state.database.connection,
+            record_id,
+        ))
+        .map_err(|error| (error.to_string(), None))?
+        .ok_or_else(|| ("record not found".to_string(), None))?;
+    let unresolved = state
+        .runtime
+        .block_on(db::count_unresolved_production_tasks_for_session(
+            &state.database.connection,
+            &detail.record.inspection.session_id,
+        ))
+        .map_err(|error| (error.to_string(), None))?;
+    if unresolved > 0 {
+        return Err((
+            "record cleanup is blocked by unresolved production tasks".to_string(),
+            None,
+        ));
+    }
+    let roots_text =
+        artifact_cleanup::configured_roots_for_planning().map_err(|error| (error, None))?;
+    let manifest =
+        artifact_cleanup::build_manifest(&detail, &roots_text).map_err(|error| (error, None))?;
+    let (files_planned, bytes_planned) = artifact_cleanup::manifest_plan_counts(&manifest);
+    let manifest_json =
+        artifact_cleanup::manifest_json(&manifest).map_err(|error| (error, None))?;
+    let cleanup = state
+        .runtime
+        .block_on(db::create_or_load_record_cleanup(
+            &state.database.connection,
+            db::RecordCleanupInput {
+                record_id: detail.record.inspection.id,
+                material_id: detail.record.inspection.material_id,
+                actor: actor.to_string(),
+                reason: reason.to_string(),
+                manifest_json,
+                files_planned,
+                bytes_planned,
+            },
+        ))
+        .map_err(|error| (error.to_string(), None))?;
+    let cleanup_id = cleanup.id.clone();
+    state
+        .runtime
+        .block_on(artifact_cleanup::execute_persisted_cleanup(
+            &state.database.connection,
+            cleanup,
+        ))
+        .map_err(|error| (error, Some(cleanup_id)))
+}
+
+fn record_cleanup_failure_response(error: &str, cleanup_id: Option<&str>) -> Vec<u8> {
+    let configuration_missing = error.contains("STEEL_ARTIFACT_ALLOWED_ROOTS");
+    let not_found = error == "record not found";
+    let status = if configuration_missing {
+        "503 Service Unavailable"
+    } else if not_found {
+        "404 Not Found"
+    } else {
+        "409 Conflict"
+    };
+    let code = if configuration_missing {
+        503
+    } else if not_found {
+        404
+    } else {
+        409
+    };
+    http_response(
+        status,
+        "application/json; charset=utf-8",
+        &json!({
+            "code": code,
+            "error": "record_artifact_cleanup_failed",
+            "message": error,
+            "cleanupId": cleanup_id,
+            "retryable": !not_found
+        })
+        .to_string(),
+    )
+}
+
+fn record_cleanup_json(model: db::entities::record_cleanup::Model) -> Value {
+    json!({
+        "id": model.id,
+        "recordId": model.record_id,
+        "materialId": model.material_id,
+        "status": model.status,
+        "actor": model.actor,
+        "reason": model.reason,
+        "manifest": serde_json::from_str::<Value>(&model.manifest_json).unwrap_or(Value::Null),
+        "filesPlanned": model.files_planned,
+        "filesDeleted": model.files_deleted,
+        "filesMissing": model.files_missing,
+        "bytesPlanned": model.bytes_planned,
+        "bytesDeleted": model.bytes_deleted,
+        "error": model.error,
+        "createdAt": model.created_at,
+        "updatedAt": model.updated_at,
+        "completedAt": model.completed_at
+    })
+}
+
+fn read_record_cleanup_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let Some(id) = query_value(query, "id").filter(|value| !value.trim().is_empty()) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"cleanup id required\"}",
+        );
+    };
+    match state
+        .runtime
+        .block_on(db::find_record_cleanup(&state.database.connection, &id))
+    {
+        Ok(Some(model)) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({ "code": 0, "cleanup": record_cleanup_json(model) }).to_string(),
+        ),
+        Ok(None) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            "{\"code\":404,\"error\":\"cleanup not found\"}",
+        ),
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({ "code": 500, "error": error.to_string() }).to_string(),
+        ),
+    }
+}
+
+fn retry_record_cleanup_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+    let payload = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    let Some(id) = payload
+        .get("cleanupId")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"cleanup id required\"}",
+        );
+    };
+    let cleanup = match state
+        .runtime
+        .block_on(db::find_record_cleanup(&state.database.connection, id))
+    {
+        Ok(Some(model)) => model,
+        Ok(None) => {
+            return http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                "{\"code\":404,\"error\":\"cleanup not found\"}",
+            )
+        }
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({ "code": 500, "error": error.to_string() }).to_string(),
+            )
+        }
+    };
+    if cleanup.status == "completed" {
+        return http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({ "code": 0, "cleanup": record_cleanup_json(cleanup), "replayed": true })
+                .to_string(),
+        );
+    }
+    let cleanup_id = cleanup.id.clone();
+    match state
+        .runtime
+        .block_on(artifact_cleanup::execute_persisted_cleanup(
+            &state.database.connection,
+            cleanup,
+        )) {
+        Ok(result) => {
+            let _ = state.runtime.block_on(db::append_audit_log(
+                &state.database.connection,
+                actor,
+                "record.cleanup.retry.completed",
+                &result.record_id,
+                &format!("cleanup {} completed on retry", result.cleanup_id),
+                "warning",
+            ));
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 0,
+                    "cleanupId": result.cleanup_id,
+                    "recordId": result.record_id,
+                    "filesDeleted": result.files_deleted,
+                    "filesMissing": result.files_missing,
+                    "bytesDeleted": result.bytes_deleted
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => record_cleanup_failure_response(&error, Some(&cleanup_id)),
     }
 }
 
@@ -12350,40 +15694,79 @@ fn apply_record_retention_response(state: &ServiceState, body: &str, actor: &str
         }
     };
 
-    let result = if dry_run {
-        match state.runtime.block_on(db::count_inspection_records_before(
-            &state.database.connection,
-            retention_days,
-        )) {
-            Ok(matched) => db::InspectionRecordRetentionResult {
-                matched,
-                deleted_records: 0,
-                deleted_defects: 0,
-                deleted_capture_files: 0,
-            },
-            Err(error) => {
-                return http_response(
-                    "500 Internal Server Error",
-                    "application/json; charset=utf-8",
-                    &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
-                );
+    let candidate_ids = match state.runtime.block_on(db::inspection_record_ids_before(
+        &state.database.connection,
+        retention_days,
+    )) {
+        Ok(ids) => ids,
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({ "code": 500, "error": error.to_string() }).to_string(),
+            )
+        }
+    };
+    let matched = candidate_ids.len() as u64;
+    let mut deleted_records = 0_u64;
+    let mut deleted_defects = 0_u64;
+    let mut deleted_capture_files = 0_u64;
+    let mut files_planned = 0_i64;
+    let mut files_deleted = 0_i64;
+    let mut files_missing = 0_i64;
+    let mut bytes_planned = 0_i64;
+    let mut bytes_deleted = 0_i64;
+    let mut cleanup_ids = Vec::new();
+    let mut failures = Vec::new();
+
+    if dry_run {
+        let roots_text = match artifact_cleanup::configured_roots_for_planning() {
+            Ok(value) => value,
+            Err(error) => return record_cleanup_failure_response(&error, None),
+        };
+        for id in &candidate_ids {
+            let detail = match state.runtime.block_on(db::find_inspection_record_detail(
+                &state.database.connection,
+                id,
+            )) {
+                Ok(Some(detail)) => detail,
+                Ok(None) => continue,
+                Err(error) => {
+                    failures.push(json!({ "recordId": id, "error": error.to_string() }));
+                    continue;
+                }
+            };
+            match artifact_cleanup::build_manifest(&detail, &roots_text) {
+                Ok(manifest) => {
+                    let (count, bytes) = artifact_cleanup::manifest_plan_counts(&manifest);
+                    files_planned += i64::from(count);
+                    bytes_planned = bytes_planned.saturating_add(bytes);
+                }
+                Err(error) => failures.push(json!({ "recordId": id, "error": error })),
             }
         }
     } else {
-        match state.runtime.block_on(db::delete_inspection_records_before(
-            &state.database.connection,
-            retention_days,
-        )) {
-            Ok(result) => result,
-            Err(error) => {
-                return http_response(
-                    "500 Internal Server Error",
-                    "application/json; charset=utf-8",
-                    &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
-                );
+        for id in &candidate_ids {
+            match execute_record_artifact_cleanup(state, id, actor, "record-retention") {
+                Ok(result) => {
+                    deleted_records += 1;
+                    deleted_defects += result.defects_deleted;
+                    deleted_capture_files += result.capture_files_deleted;
+                    files_planned += i64::from(result.files_planned);
+                    files_deleted += i64::from(result.files_deleted);
+                    files_missing += i64::from(result.files_missing);
+                    bytes_planned = bytes_planned.saturating_add(result.bytes_planned);
+                    bytes_deleted = bytes_deleted.saturating_add(result.bytes_deleted);
+                    cleanup_ids.push(result.cleanup_id);
+                }
+                Err((error, cleanup_id)) => failures.push(json!({
+                    "recordId": id,
+                    "cleanupId": cleanup_id,
+                    "error": error
+                })),
             }
         }
-    };
+    }
 
     let _ = state.runtime.block_on(db::append_audit_log(
         &state.database.connection,
@@ -12397,27 +15780,43 @@ fn apply_record_retention_response(state: &ServiceState, body: &str, actor: &str
         &record_retention_detail(
             retention_days,
             &cutoff_at,
-            result.matched,
-            result.deleted_records,
-            result.deleted_defects,
-            result.deleted_capture_files,
+            matched,
+            deleted_records,
+            deleted_defects,
+            deleted_capture_files,
+            files_planned,
+            files_deleted,
+            files_missing,
+            bytes_deleted,
+            failures.len(),
             dry_run,
         ),
         if dry_run { "info" } else { "warning" },
     ));
 
     http_response(
-        "200 OK",
+        if failures.is_empty() {
+            "200 OK"
+        } else {
+            "207 Multi-Status"
+        },
         "application/json; charset=utf-8",
         &json!({
-            "code": 0,
+            "code": if failures.is_empty() { 0 } else { 207 },
             "retentionDays": retention_days,
             "cutoffAt": cutoff_at,
-            "matched": result.matched,
-            "deletedRecords": result.deleted_records,
-            "deletedDefects": result.deleted_defects,
-            "deletedCaptureFiles": result.deleted_capture_files,
+            "matched": matched,
+            "deletedRecords": deleted_records,
+            "deletedDefects": deleted_defects,
+            "deletedCaptureFiles": deleted_capture_files,
             "deletedPlates": 0,
+            "filesPlanned": files_planned,
+            "filesDeleted": files_deleted,
+            "filesMissing": files_missing,
+            "bytesPlanned": bytes_planned,
+            "bytesDeleted": bytes_deleted,
+            "cleanupIds": cleanup_ids,
+            "failures": failures,
             "dryRun": dry_run
         })
         .to_string(),
@@ -12439,23 +15838,25 @@ fn delete_admin_record_response(state: &ServiceState, query: &str, actor: &str) 
             "{\"code\":400,\"error\":\"record id required\"}",
         );
     }
-    match state.runtime.block_on(db::delete_inspection_record(
-        &state.database.connection,
-        &id,
-    )) {
-        Ok(Some(result)) => {
+    match execute_record_artifact_cleanup(state, &id, actor, "manual-record-delete") {
+        Ok(result) => {
             let detail = format!(
-                "删除生产检测记录 {}，材料 {}，同步删除缺陷 {} 条、采集文件索引 {} 条；流程会话保留",
-                result.id,
+                "完成清理 {}：生产检测记录 {}，材料 {}，物理文件 {}/{}，缺失 {}，删除字节 {}，缺陷 {} 条、采集文件索引 {} 条；流程会话保留",
+                result.cleanup_id,
+                result.record_id,
                 result.material_id,
+                result.files_deleted,
+                result.files_planned,
+                result.files_missing,
+                result.bytes_deleted,
                 result.defects_deleted,
                 result.capture_files_deleted
             );
             let _ = state.runtime.block_on(db::append_audit_log(
                 &state.database.connection,
                 actor,
-                "record.delete",
-                &result.id,
+                "record.cleanup.completed",
+                &result.record_id,
                 &detail,
                 "warning",
             ));
@@ -12465,9 +15866,15 @@ fn delete_admin_record_response(state: &ServiceState, query: &str, actor: &str) 
                 &json!({
                     "code": 0,
                     "deleted": true,
-                    "recordId": result.id,
+                    "cleanupId": result.cleanup_id,
+                    "recordId": result.record_id,
                     "plateNo": result.material_id,
                     "materialId": result.material_id,
+                    "filesPlanned": result.files_planned,
+                    "filesDeleted": result.files_deleted,
+                    "filesMissing": result.files_missing,
+                    "bytesPlanned": result.bytes_planned,
+                    "bytesDeleted": result.bytes_deleted,
                     "defectsDeleted": result.defects_deleted,
                     "captureFilesDeleted": result.capture_files_deleted,
                     "plateDeleted": false
@@ -12475,16 +15882,7 @@ fn delete_admin_record_response(state: &ServiceState, query: &str, actor: &str) 
                 .to_string(),
             )
         }
-        Ok(None) => http_response(
-            "404 Not Found",
-            "application/json; charset=utf-8",
-            "{\"code\":404,\"error\":\"record not found\"}",
-        ),
-        Err(error) => http_response(
-            "500 Internal Server Error",
-            "application/json; charset=utf-8",
-            &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
-        ),
+        Err((error, cleanup_id)) => record_cleanup_failure_response(&error, cleanup_id.as_deref()),
     }
 }
 
@@ -12509,7 +15907,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
                 "name": "capture-service",
                 "managed": true,
                 "running": false,
-                "fallback": "simulated-six-camera"
+                "fallback": "simulated-eight-camera"
             })
         });
     let service_port = env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string());
@@ -12611,6 +16009,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/trigger/manual/steel-info", "scope": "trigger-proxy" },
             { "method": "POST", "path": "/api/trigger/manual/steel-in", "scope": "trigger-proxy" },
             { "method": "POST", "path": "/api/trigger/manual/steel-out", "scope": "trigger-proxy" },
+            { "method": "POST", "path": "/api/trigger/capture-once", "scope": "trigger-proxy" },
             { "method": "GET", "path": "/api/algorithm/bar-surface/latest", "scope": "algorithm" },
             { "method": "GET", "path": "/api/algorithm/bar-surface/manifest", "scope": "algorithm" },
             { "method": "GET", "path": "/api/algorithm/bar-surface/file", "scope": "algorithm" },
@@ -12659,8 +16058,13 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/admin/security/policy", "scope": "admin" },
             { "method": "GET", "path": "/api/admin/records", "scope": "admin" },
             { "method": "GET", "path": "/api/admin/records/detail", "scope": "admin" },
+            { "method": "GET", "path": "/api/admin/records/reports", "scope": "admin" },
+            { "method": "GET", "path": "/api/admin/records/reports/detail", "scope": "admin" },
+            { "method": "POST", "path": "/api/admin/records/reports", "scope": "admin" },
+            { "method": "GET", "path": "/api/admin/records/cleanup", "scope": "admin" },
             { "method": "GET", "path": "/api/admin/records/export", "scope": "admin" },
             { "method": "POST", "path": "/api/admin/records/retention", "scope": "admin" },
+            { "method": "POST", "path": "/api/admin/records/cleanup/retry", "scope": "admin" },
             { "method": "DELETE", "path": "/api/admin/records", "scope": "admin" },
             { "method": "GET", "path": "/api/database", "scope": "admin" },
             { "method": "GET", "path": "/api/admin/database/backup", "scope": "admin" },
@@ -12697,6 +16101,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/production/defect", "scope": "production" },
             { "method": "GET", "path": "/api/production/file", "scope": "production" },
             { "method": "GET", "path": "/api/steel/status", "scope": "capture" },
+            { "method": "POST", "path": "/api/steel/capture-mode", "scope": "capture" },
             { "method": "POST", "path": "/api/steel/event", "scope": "capture" },
             { "method": "GET", "path": "/api/camera/statuses", "scope": "capture" },
             { "method": "GET", "path": "/api/capture/latest", "scope": "capture" },
@@ -12733,6 +16138,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
 }
 
 fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
+    let peer = stream.peer_addr().ok();
     let request = match read_http_request(&mut stream) {
         Some(request) => request,
         None => return,
@@ -12754,6 +16160,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         let _ = stream.write_all(&auth_failure("403 Forbidden", 403, "origin_not_allowed"));
         return;
     }
+    if method == "POST" && path == "/api/runtime/drain" {
+        let _ = stream.write_all(&runtime_drain_response(&state, &request, peer));
+        return;
+    }
     let authorized_session = match authorize_request(&state, &request, method, path) {
         Ok(session) => session,
         Err(response) => {
@@ -12765,11 +16175,16 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         .as_ref()
         .map(|session| session.user_id.as_str())
         .unwrap_or("admin");
+    let _runtime_admission_guard = match enter_runtime_admission(&state, method, path) {
+        Ok(guard) => guard,
+        Err(response) => {
+            let _ = stream.write_all(&response);
+            return;
+        }
+    };
     if calibration_operations::mutation_requires_reconciliation_fence(method, path) {
-        if let Some(response) = calibration_operations::reconciliation_fence_response(
-            &state,
-            path,
-        ) {
+        if let Some(response) = calibration_operations::reconciliation_fence_response(&state, path)
+        {
             let _ = stream.write_all(&response);
             return;
         }
@@ -12882,8 +16297,19 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             read_admin_records_export_response(&state, query, actor)
         }
         ("GET", "/api/admin/records/detail") => read_admin_record_detail_response(&state, query),
+        ("GET", "/api/admin/records/reports/detail") => {
+            read_inspection_report_detail_response(query)
+        }
+        ("GET", "/api/admin/records/reports") => read_inspection_reports_response(query),
+        ("POST", "/api/admin/records/reports") => {
+            write_inspection_report_response(&state, body, actor)
+        }
+        ("GET", "/api/admin/records/cleanup") => read_record_cleanup_response(&state, query),
         ("POST", "/api/admin/records/retention") => {
             apply_record_retention_response(&state, body, actor)
+        }
+        ("POST", "/api/admin/records/cleanup/retry") => {
+            retry_record_cleanup_response(&state, body, actor)
         }
         ("DELETE", "/api/admin/records") => delete_admin_record_response(&state, query, actor),
         ("GET", "/api/admin/records") => read_admin_records_response(&state, query),
@@ -12942,7 +16368,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             write_production_capture_once_response(&state, body, actor)
         }
         ("POST", "/api/production/algorithm/run") => {
-            write_production_algorithm_run_response(&state, body, actor)
+            write_production_algorithm_run_response(&state, body, actor, None)
         }
         ("POST", "/api/production/defect") => {
             write_production_defect_response(&state, body, actor)
@@ -12998,7 +16424,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             }
         }
         _ if is_trigger_gateway_proxy_route(method, path) => {
-            trigger_gateway_proxy_http_response(&state, method, raw_path, body)
+            trigger_gateway_proxy_http_response(&state, method, raw_path, body, actor)
         }
         _ if is_capture_json_proxy_route(method, path) => {
             capture_proxy_http_response(&state.capture, method, raw_path, path, body)
@@ -13060,13 +16486,24 @@ fn main() -> std::io::Result<()> {
         production_task_wakeup_generation: Mutex::new(0),
         production_task_worker_status: Mutex::new(ProductionTaskWorkerStatus::default()),
         production_task_sequence: AtomicU64::new(0),
+        runtime_admission: Mutex::new(RuntimeAdmissionState::default()),
+        runtime_drain_token: env::var("TRIGGER_OPERATOR_TOKEN")
+            .unwrap_or_default()
+            .into_bytes(),
         trigger_gateway_origin: trigger_gateway_origin(),
         trigger_health_required: trigger_health_required(),
+        runtime_profile: env::var("STEEL_RUNTIME_PROFILE")
+            .unwrap_or_else(|_| "production".to_string()),
+        algorithm_mode: env::var("STEEL_ALGORITHM_MODE")
+            .unwrap_or_else(|_| "production".to_string()),
+        algorithm_mock_defect_count: env::var("BAR_SURFACE_MOCK_DEFECT_COUNT")
+            .unwrap_or_else(|_| "0".to_string()),
         sessions: Mutex::new(HashMap::new()),
         login_failures: Mutex::new(HashMap::new()),
         started_at: current_time_millis(),
     });
     production_tasks::start_worker(Arc::clone(&state));
+    start_system_health_alarm_monitor(Arc::clone(&state));
     println!("steel inspection service listening on http://127.0.0.1:{port}");
     println!(
         "capture provider {} at {}",
@@ -13112,16 +16549,26 @@ mod tests {
                 PathBuf::from(":memory:"),
             ))
             .expect("in-memory production database");
+        production_test_state_with_database(runtime, database, provider, origin)
+    }
+
+    fn production_test_state_with_database(
+        runtime: Runtime,
+        database: db::AppDatabase,
+        provider: CaptureProvider,
+        origin: &str,
+    ) -> ServiceState {
         ServiceState {
             fallback_snapshot_json: Arc::new(build_snapshot_json()),
             config_json: Mutex::new(String::new()),
             capture: Arc::new(CaptureServiceManager {
-                host: capture_host_from_origin(origin)
-                    .unwrap_or_else(|| "127.0.0.1".to_string()),
+                host: capture_host_from_origin(origin).unwrap_or_else(|| "127.0.0.1".to_string()),
                 port: capture_port_from_origin(origin).unwrap_or(0),
                 origin: origin.to_string(),
                 provider,
                 process: Mutex::new(None),
+                simulated_capture_mode: Mutex::new("continuous".to_string()),
+                simulated_continuous_line_rate: Mutex::new(300.0),
             }),
             database,
             runtime,
@@ -13132,8 +16579,13 @@ mod tests {
             production_task_wakeup_generation: Mutex::new(0),
             production_task_worker_status: Mutex::new(ProductionTaskWorkerStatus::default()),
             production_task_sequence: AtomicU64::new(0),
+            runtime_admission: Mutex::new(RuntimeAdmissionState::default()),
+            runtime_drain_token: b"operator-0123456789abcdef-ABCDEF!".to_vec(),
             trigger_gateway_origin: "disabled".to_string(),
             trigger_health_required: false,
+            runtime_profile: "test".to_string(),
+            algorithm_mode: "demo".to_string(),
+            algorithm_mock_defect_count: "0".to_string(),
             sessions: Mutex::new(HashMap::new()),
             login_failures: Mutex::new(HashMap::new()),
             started_at: current_time_millis(),
@@ -13151,6 +16603,168 @@ mod tests {
             .map(|(_, body)| body)
             .expect("HTTP response should contain a body");
         serde_json::from_str(body).expect("HTTP response body should be JSON")
+    }
+
+    #[test]
+    fn runtime_drain_requires_loopback_operator_token_and_is_idempotent() {
+        let state = production_test_state();
+        let valid_request = concat!(
+            "POST /api/runtime/drain HTTP/1.1\r\n",
+            "X-Trigger-Operator-Token: operator-0123456789abcdef-ABCDEF!\r\n",
+            "Content-Length: 2\r\n\r\n{}"
+        );
+        let remote = response_text(runtime_drain_response(
+            &state,
+            valid_request,
+            Some("192.0.2.20:42000".parse().expect("remote address")),
+        ));
+        assert!(remote.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        let missing = response_text(runtime_drain_response(
+            &state,
+            "POST /api/runtime/drain HTTP/1.1\r\n\r\n{}",
+            Some("127.0.0.1:42000".parse().expect("loopback address")),
+        ));
+        assert!(missing.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(!runtime_is_draining(&state));
+
+        for _ in 0..2 {
+            let accepted = response_json(runtime_drain_response(
+                &state,
+                valid_request,
+                Some("127.0.0.1:42000".parse().expect("loopback address")),
+            ));
+            assert_eq!(accepted["code"], json!(0));
+            assert_eq!(accepted["admission"]["draining"], json!(true));
+            assert_eq!(accepted["admission"]["accepting"], json!(false));
+        }
+    }
+
+    #[test]
+    fn runtime_drain_atomically_closes_admission_and_counts_preexisting_work() {
+        let state = Arc::new(production_test_state());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let worker_state = Arc::clone(&state);
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let worker = std::thread::spawn(move || {
+            let guard = enter_runtime_admission(&worker_state, "POST", "/api/production/steel-in")
+                .expect("pre-drain admission")
+                .expect("mutation should be counted");
+            worker_entered.wait();
+            worker_release.wait();
+            drop(guard);
+        });
+        entered.wait();
+
+        let request = concat!(
+            "POST /api/runtime/drain HTTP/1.1\r\n",
+            "X-Trigger-Operator-Token: operator-0123456789abcdef-ABCDEF!\r\n\r\n{}"
+        );
+        let accepted = response_json(runtime_drain_response(
+            &state,
+            request,
+            Some("127.0.0.1:42000".parse().expect("loopback address")),
+        ));
+        assert_eq!(accepted["admission"]["accepting"], json!(false));
+        assert_eq!(accepted["admission"]["inFlight"], json!(1));
+        let post_drain = enter_runtime_admission(&state, "POST", "/api/production/steel-in");
+        match post_drain {
+            Err(response) => assert!(response_text(response).contains("runtime_draining")),
+            Ok(_) => panic!("post-drain work admission must be rejected"),
+        }
+
+        release.wait();
+        worker.join().expect("admitted request thread");
+        assert_eq!(runtime_drain_status_json(&state)["inFlight"], json!(0));
+    }
+
+    #[test]
+    fn runtime_drain_is_visible_before_waiting_for_the_production_boundary() {
+        let state = Arc::new(production_test_state());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let worker_state = Arc::clone(&state);
+        let worker_entered = Arc::clone(&entered);
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = worker_state
+                .production_command_lock
+                .lock()
+                .expect("production command lock");
+            worker_entered.wait();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !runtime_is_draining(&worker_state) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            observed_tx
+                .send(runtime_is_draining(&worker_state))
+                .expect("publish observed drain state");
+        });
+        entered.wait();
+
+        let accepted = response_json(runtime_drain_response(
+            &state,
+            concat!(
+                "POST /api/runtime/drain HTTP/1.1\r\n",
+                "X-Trigger-Operator-Token: operator-0123456789abcdef-ABCDEF!\r\n\r\n{}"
+            ),
+            Some("127.0.0.1:42000".parse().expect("loopback address")),
+        ));
+
+        assert_eq!(accepted["code"], json!(0));
+        assert!(observed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should observe drain before releasing command lock"));
+        worker.join().expect("production-boundary worker");
+    }
+
+    #[test]
+    fn runtime_drain_rejects_new_admission_but_allows_safe_completion() {
+        let state = production_test_state();
+        let first = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"steel-in","idempotencyKey":"DRAIN-REPLAY","payload":{"materialId":"MAT-DRAIN"}}"#,
+            "tester",
+        ));
+        assert!(first.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        state
+            .runtime_admission
+            .lock()
+            .expect("runtime admission")
+            .accepting = false;
+
+        let replay = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"steel-in","idempotencyKey":"DRAIN-REPLAY","payload":{"materialId":"MAT-DRAIN"}}"#,
+            "tester",
+        ));
+        assert!(replay.starts_with("HTTP/1.1 200 OK\r\n"));
+        let rejected = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"steel-in","idempotencyKey":"DRAIN-NEW","payload":{"materialId":"MAT-NEW"}}"#,
+            "tester",
+        ));
+        assert!(rejected.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(rejected.contains("runtime_draining"));
+        let steel_out = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"steel-out","idempotencyKey":"DRAIN-OUT","payload":{"materialId":"MAT-DRAIN"}}"#,
+            "tester",
+        ));
+        assert!(steel_out.starts_with("HTTP/1.1 202 Accepted\r\n"));
+
+        let rejected_admission =
+            enter_runtime_admission(&state, "POST", "/api/production/steel-in");
+        match rejected_admission {
+            Err(response) => assert!(response_text(response).contains("runtime_draining")),
+            Ok(_) => panic!("new production admission must be rejected while draining"),
+        }
+        let completion = enter_runtime_admission(&state, "POST", "/api/production/steel-out")
+            .expect("steel-out admission")
+            .expect("steel-out should be counted in flight");
+        assert_eq!(runtime_drain_status_json(&state)["inFlight"], json!(1));
+        drop(completion);
+        assert_eq!(runtime_drain_status_json(&state)["inFlight"], json!(0));
     }
 
     fn calibration_apply_operation_body(operation_id: &str) -> String {
@@ -13281,8 +16895,14 @@ mod tests {
         let snapshot = service_health_snapshot(&state);
         assert!(snapshot.ready);
         assert_eq!(snapshot.body["checks"]["database"]["ok"], json!(true));
-        assert_eq!(snapshot.body["checks"]["taskWorker"]["status"], json!("idle"));
-        assert_eq!(snapshot.body["checks"]["capture"]["status"], json!("simulated"));
+        assert_eq!(
+            snapshot.body["checks"]["taskWorker"]["status"],
+            json!("idle")
+        );
+        assert_eq!(
+            snapshot.body["checks"]["capture"]["status"],
+            json!("simulated")
+        );
 
         let response = response_text(service_health_response(&state, HealthEndpoint::Ready));
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -13300,8 +16920,8 @@ mod tests {
                 .lock()
                 .expect("task worker status lock");
             status.running = true;
-            status.last_heartbeat_at = current_time_millis()
-                .saturating_sub(TASK_WORKER_IDLE_HEARTBEAT_MAX_AGE_MS + 1);
+            status.last_heartbeat_at =
+                current_time_millis().saturating_sub(TASK_WORKER_IDLE_HEARTBEAT_MAX_AGE_MS + 1);
         }
 
         let stale = service_health_snapshot(&state);
@@ -13310,8 +16930,10 @@ mod tests {
             stale.body["checks"]["taskWorker"]["reason"],
             json!("task_worker_heartbeat_stale")
         );
-        assert!(response_text(service_health_response(&state, HealthEndpoint::Ready))
-            .starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(
+            response_text(service_health_response(&state, HealthEndpoint::Ready))
+                .starts_with("HTTP/1.1 503 Service Unavailable\r\n")
+        );
 
         {
             let mut status = state
@@ -13366,12 +16988,41 @@ mod tests {
         let (ok, detail) = capture_health_component(&state);
         server.join().expect("capture recovery health server");
         assert!(!ok);
-        assert_eq!(detail["reason"], json!("capture_calibration_recovery_required"));
+        assert_eq!(
+            detail["reason"],
+            json!("capture_calibration_recovery_required")
+        );
         assert_eq!(detail["recoveryRequired"], json!(true));
         assert_eq!(detail["invalidManifest"], json!(false));
         assert_eq!(detail["pendingRecoveryCount"], json!(1));
         assert!(!detail.to_string().contains("classified"));
         assert!(!detail.to_string().contains("manifest.json"));
+    }
+
+    #[test]
+    fn capture_health_rejects_hard_timeout_restart_requirement_even_with_stale_sdk_ready() {
+        let body = json!({
+            "service": "steel_capture_service",
+            "ready": true,
+            "sdkReady": true,
+            "sdkCode": 49007,
+            "recoveryRequired": false,
+            "sdkCaptureState": {
+                "poisoned": true,
+                "restartRequired": true,
+                "reason": "production capture worker exceeded hard timeout"
+            }
+        })
+        .to_string();
+        let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
+        let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+        let (ok, detail) = capture_health_component(&state);
+        server
+            .join()
+            .expect("capture restart-required health server");
+        assert!(!ok);
+        assert_eq!(detail["reason"], json!("capture_sdk_restart_required"));
+        assert_eq!(detail["restartRequired"], json!(true));
     }
 
     #[test]
@@ -13389,7 +17040,10 @@ mod tests {
         let body = response_json(response);
         assert_eq!(body["ok"], json!(false));
         assert_eq!(body["endpoint"], json!("compatibility"));
-        assert_eq!(body["checks"]["database"]["reason"], json!("database_ping_failed"));
+        assert_eq!(
+            body["checks"]["database"]["reason"],
+            json!("database_ping_failed")
+        );
     }
 
     #[test]
@@ -13398,6 +17052,7 @@ mod tests {
         let (simulated_ok, simulated_detail) = storage_health_component(&simulated);
         assert!(simulated_ok);
         assert_eq!(simulated_detail["status"], json!("simulated"));
+        assert_eq!(simulated_detail["level"], json!("simulated"));
         assert_eq!(simulated_detail["simulated"], json!(true));
         assert_eq!(simulated_detail["queueRequired"], json!(false));
 
@@ -13406,26 +17061,46 @@ mod tests {
             "root": "C:\\classified-storage-root",
             "exists": true,
             "writable": true,
+            "capacityAvailable": true,
+            "capacityBytes": 1_000_000_000_000_u64,
+            "freeBytes": 500_000_000_000_u64,
+            "freePercent": 50.0,
             "cameraRoots": [
-                { "ip": "192.168.1.10", "root": "C:\\classified-camera-root", "exists": true, "writable": true }
+                {
+                    "ip": "192.168.1.10",
+                    "root": "C:\\classified-camera-root",
+                    "exists": true,
+                    "writable": true,
+                    "capacityAvailable": true,
+                    "capacityBytes": 1_000_000_000_000_u64,
+                    "freeBytes": 400_000_000_000_u64,
+                    "freePercent": 40.0
+                }
             ],
             "queue": {
                 "accepting": true,
                 "pendingItems": 2,
-                "capacityItems": 64
+                "capacityItems": 64,
+                "recentWriteBytesPerSecond": 100_000_000.0
             }
         })
         .to_string();
-        let (origin, server) =
-            spawn_health_http_server("200 OK", provider_body, Duration::ZERO);
+        let (origin, server) = spawn_health_http_server("200 OK", provider_body, Duration::ZERO);
         let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
         let (ok, detail) =
             storage_health_component_with_timeout(&state, Duration::from_millis(500));
         server.join().expect("storage health server");
         assert!(ok);
+        assert_eq!(detail["status"], json!("up"));
+        assert_eq!(detail["level"], json!("ok"));
+        assert_eq!(detail["warningReason"], Value::Null);
         assert_eq!(detail["rootExists"], json!(true));
         assert_eq!(detail["rootWritable"], json!(true));
         assert_eq!(detail["queueAccepting"], json!(true));
+        assert_eq!(detail["freeBytes"], json!(400_000_000_000_u64));
+        assert_eq!(detail["freePercent"], json!(40.0));
+        assert_eq!(detail["recentWriteBytesPerSecond"], json!(100_000_000.0));
+        assert_eq!(detail["estimatedRemainingSeconds"], json!(4_000_u64));
         assert_eq!(detail["queuePendingItems"], json!(2));
         assert_eq!(detail["cameraRootCount"], json!(1));
         let detail_text = detail.to_string();
@@ -13446,7 +17121,18 @@ mod tests {
                 "root": "D:\\must-not-leak",
                 "exists": exists,
                 "writable": writable,
-                "cameraRoots": [],
+                "capacityAvailable": true,
+                "capacityBytes": 1_000_000_000_000_u64,
+                "freeBytes": 500_000_000_000_u64,
+                "freePercent": 50.0,
+                "cameraRoots": [{
+                    "ip": "192.168.1.10",
+                    "root": "D:\\must-not-leak\\camera1",
+                    "capacityAvailable": true,
+                    "capacityBytes": 1_000_000_000_000_u64,
+                    "freeBytes": 500_000_000_000_u64,
+                    "freePercent": 50.0
+                }],
                 "queue": { "accepting": accepting, "pendingItems": 0, "capacityItems": 8 }
             })
             .to_string();
@@ -13460,25 +17146,130 @@ mod tests {
             assert!(!detail.to_string().contains("must-not-leak"));
         }
 
+        let low_capacity_body = json!({
+            "code": 0,
+            "exists": true,
+            "writable": true,
+            "capacityAvailable": true,
+            "capacityBytes": 100_000_000_000_u64,
+            "freeBytes": 1_000_000_000_u64,
+            "freePercent": 1.0,
+            "cameraRoots": [{
+                "capacityAvailable": true,
+                "capacityBytes": 100_000_000_000_u64,
+                "freeBytes": 900_000_000_u64,
+                "freePercent": 0.9
+            }],
+            "queue": { "accepting": true }
+        })
+        .to_string();
+        let (origin, server) =
+            spawn_health_http_server("200 OK", low_capacity_body, Duration::ZERO);
+        let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+        let (ok, detail) =
+            storage_health_component_with_timeout(&state, Duration::from_millis(500));
+        server.join().expect("low capacity storage health server");
+        assert!(!ok);
+        assert_eq!(detail["reason"], json!("storage_capacity_below_watermark"));
+        assert_eq!(detail["status"], json!("unavailable"));
+        assert_eq!(detail["level"], json!("critical"));
+        assert_eq!(detail["warningReason"], Value::Null);
+        assert_eq!(detail["freeBytes"], json!(900_000_000_u64));
+        assert_eq!(detail["freePercent"], json!(0.9));
+
         let body = json!({
             "code": 0,
             "root": "E:\\slow-secret-root",
             "exists": true,
             "writable": true,
+            "capacityAvailable": true,
+            "capacityBytes": 1_000_000_000_000_u64,
+            "freeBytes": 500_000_000_000_u64,
+            "freePercent": 50.0,
+            "cameraRoots": [{
+                "capacityAvailable": true,
+                "capacityBytes": 1_000_000_000_000_u64,
+                "freeBytes": 500_000_000_000_u64,
+                "freePercent": 50.0
+            }],
             "queue": { "accepting": true }
         })
         .to_string();
-        let (origin, server) =
-            spawn_health_http_server("200 OK", body, Duration::from_millis(150));
+        let (origin, server) = spawn_health_http_server("200 OK", body, Duration::from_millis(150));
         let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
         let started = Instant::now();
-        let (ok, detail) =
-            storage_health_component_with_timeout(&state, Duration::from_millis(30));
+        let (ok, detail) = storage_health_component_with_timeout(&state, Duration::from_millis(30));
         assert!(!ok);
         assert!(started.elapsed() < Duration::from_millis(120));
         assert_eq!(detail["reason"], json!("storage_timeout"));
         assert!(!detail.to_string().contains("slow-secret-root"));
         server.join().expect("slow storage health server");
+    }
+
+    #[test]
+    fn storage_health_warns_before_the_hard_admission_watermark() {
+        let warning_body = json!({
+            "code": 0,
+            "exists": true,
+            "writable": true,
+            "capacityAvailable": true,
+            "capacityBytes": 100_000_000_000_u64,
+            "freeBytes": 30_000_000_000_u64,
+            "freePercent": 12.0,
+            "cameraRoots": [{
+                "capacityAvailable": true,
+                "capacityBytes": 100_000_000_000_u64,
+                "freeBytes": 30_000_000_000_u64,
+                "freePercent": 12.0
+            }],
+            "queue": {
+                "accepting": true,
+                "recentWriteBytesPerSecond": 100_000_000.0
+            }
+        })
+        .to_string();
+        let (origin, server) = spawn_health_http_server("200 OK", warning_body, Duration::ZERO);
+        let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+        let (ok, detail) =
+            storage_health_component_with_timeout(&state, Duration::from_millis(500));
+        server.join().expect("warning storage health server");
+        assert!(
+            ok,
+            "warning capacity must not interrupt an active production path"
+        );
+        assert_eq!(detail["status"], json!("warning"));
+        assert_eq!(detail["level"], json!("warning"));
+        assert_eq!(
+            detail["warningReason"],
+            json!("storage_capacity_near_watermark")
+        );
+        assert_eq!(
+            detail["warningFreeBytes"],
+            json!(40_u64 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(detail["warningFreePercent"], json!(15.0));
+        assert_eq!(detail["estimatedRemainingSeconds"], json!(300_u64));
+    }
+
+    #[test]
+    fn low_storage_blocks_only_new_session_admission_and_preserves_safe_completion() {
+        let storage = json!({ "reason": "storage_capacity_below_watermark" });
+        let rejected = new_session_storage_admission_response("steel-in", false, false, &storage)
+            .expect("new steel-in should be rejected");
+        let rejected_text = String::from_utf8(rejected).expect("response utf-8");
+        assert!(rejected_text.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(rejected_text.contains("storage_not_ready_for_new_session"));
+        assert!(rejected_text.contains("storage_capacity_below_watermark"));
+
+        assert!(
+            new_session_storage_admission_response("steel-in", true, false, &storage).is_none()
+        );
+        assert!(
+            new_session_storage_admission_response("steel-out", false, false, &storage).is_none()
+        );
+        assert!(
+            new_session_storage_admission_response("steel-info", false, true, &storage).is_none()
+        );
     }
 
     #[test]
@@ -13497,11 +17288,8 @@ mod tests {
         })
         .to_string();
         let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
-        let (required_ready, detail) = trigger_health_component_with_timeout(
-            &origin,
-            true,
-            Duration::from_millis(500),
-        );
+        let (required_ready, detail) =
+            trigger_health_component_with_timeout(&origin, true, Duration::from_millis(500));
         server.join().expect("trigger health server");
         assert!(required_ready);
         assert_eq!(detail["ok"], json!(true));
@@ -13513,21 +17301,15 @@ mod tests {
         assert!(!detail_text.contains(&origin));
 
         let unreachable = unused_local_http_origin();
-        let (required_ready, required_detail) = trigger_health_component_with_timeout(
-            &unreachable,
-            true,
-            Duration::from_millis(100),
-        );
+        let (required_ready, required_detail) =
+            trigger_health_component_with_timeout(&unreachable, true, Duration::from_millis(100));
         assert!(!required_ready);
         assert_eq!(required_detail["required"], json!(true));
         assert_eq!(required_detail["readyContribution"], json!(false));
         assert!(!required_detail.to_string().contains(&unreachable));
 
-        let (optional_ready, optional_detail) = trigger_health_component_with_timeout(
-            &unreachable,
-            false,
-            Duration::from_millis(100),
-        );
+        let (optional_ready, optional_detail) =
+            trigger_health_component_with_timeout(&unreachable, false, Duration::from_millis(100));
         assert!(optional_ready);
         assert_eq!(optional_detail["ok"], json!(false));
         assert_eq!(optional_detail["status"], json!("optional-unavailable"));
@@ -13545,11 +17327,8 @@ mod tests {
         let (slow_origin, slow_server) =
             spawn_health_http_server("200 OK", body, Duration::from_millis(150));
         let started = Instant::now();
-        let (ready, detail) = trigger_health_component_with_timeout(
-            &slow_origin,
-            true,
-            Duration::from_millis(30),
-        );
+        let (ready, detail) =
+            trigger_health_component_with_timeout(&slow_origin, true, Duration::from_millis(30));
         assert!(!ready);
         assert!(started.elapsed() < Duration::from_millis(120));
         assert_eq!(detail["reason"], json!("trigger_gateway_timeout"));
@@ -13562,8 +17341,14 @@ mod tests {
         unavailable_state.trigger_gateway_origin = unused_local_http_origin();
         let unavailable = service_health_snapshot(&unavailable_state);
         assert!(!unavailable.ready);
-        assert_eq!(unavailable.body["checks"]["storage"]["status"], json!("simulated"));
-        assert_eq!(unavailable.body["checks"]["trigger"]["required"], json!(true));
+        assert_eq!(
+            unavailable.body["checks"]["storage"]["status"],
+            json!("simulated")
+        );
+        assert_eq!(
+            unavailable.body["checks"]["trigger"]["required"],
+            json!(true)
+        );
 
         let body = json!({
             "code": 0,
@@ -13589,10 +17374,12 @@ mod tests {
         );
         state
             .runtime
-            .block_on(state.database.connection.execute(Statement::from_string(
-                DbBackend::Sqlite,
-                sql,
-            )))
+            .block_on(
+                state
+                    .database
+                    .connection
+                    .execute(Statement::from_string(DbBackend::Sqlite, sql)),
+            )
             .expect("failing insert trigger should install");
     }
 
@@ -13915,11 +17702,19 @@ mod tests {
             Some("admin.records")
         );
         assert_eq!(
+            permission_for_route("GET", "/api/admin/records/cleanup"),
+            Some("admin.records")
+        );
+        assert_eq!(
             permission_for_route("GET", "/api/admin/records/export"),
             Some("admin.records")
         );
         assert_eq!(
             permission_for_route("POST", "/api/admin/records/retention"),
+            Some("admin.records")
+        );
+        assert_eq!(
+            permission_for_route("POST", "/api/admin/records/cleanup/retry"),
             Some("admin.records")
         );
         assert_eq!(
@@ -13939,6 +17734,46 @@ mod tests {
             database_integrity_status(&["ok".to_string(), "extra".to_string()]),
             "warning"
         );
+    }
+
+    #[test]
+    fn sqlite_database_backup_uses_a_valid_online_snapshot() {
+        let root = env::temp_dir().join(format!(
+            "steel-sqlite-backup-test-{}",
+            db::now_millis_string()
+        ));
+        fs::create_dir_all(&root).expect("backup test root");
+        let database_path = root.join("steel-inspection.sqlite");
+        let runtime = Runtime::new().expect("test runtime");
+        let database = runtime
+            .block_on(db::open_database(database_path.clone()))
+            .expect("file sqlite database");
+        let state = production_test_state_with_database(
+            runtime,
+            database,
+            CaptureProvider::Simulated,
+            "simulated://capture",
+        );
+
+        let response = database_backup_response(&state, "backup-test");
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let separator = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP body separator");
+        assert!(response[separator + 4..].starts_with(b"SQLite format 3\0"));
+        assert!(database_path.is_file());
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("backup directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(".steel-"))
+                .count(),
+            0
+        );
+
+        drop(state);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -13985,6 +17820,7 @@ mod tests {
             role: "operator".to_string(),
             status: "active".to_string(),
             password_hash,
+            must_change_password: false,
             last_login_at: "未登录".to_string(),
             created_at: "0".to_string(),
         }
@@ -14070,12 +17906,12 @@ mod tests {
     #[test]
     fn record_retention_detail_reports_preview_and_purge_results() {
         assert_eq!(
-            record_retention_detail(365, "2025-07-02 10:00:00", 4, 0, 0, 0, true),
-            "预览检测记录保留策略：保留 365 天，截止 2025-07-02 10:00:00，可清理 4 条记录"
+            record_retention_detail(365, "2025-07-02 10:00:00", 4, 0, 0, 0, 8, 0, 0, 0, 0, true),
+            "预览检测记录保留策略：保留 365 天，截止 2025-07-02 10:00:00，可清理 4 条记录，计划物理文件 8 个，规划失败 0 条"
         );
         assert_eq!(
-            record_retention_detail(365, "2025-07-02 10:00:00", 4, 4, 12, 4, false),
-            "执行检测记录保留策略：保留 365 天，截止 2025-07-02 10:00:00，清理生产记录 4 / 4 条，缺陷 12 条，采集文件索引 4 条"
+            record_retention_detail(365, "2025-07-02 10:00:00", 4, 4, 12, 4, 8, 7, 1, 4096, 1, false),
+            "执行检测记录保留策略：保留 365 天，截止 2025-07-02 10:00:00，清理生产记录 4 / 4 条，物理文件 7 / 8 个，缺失 1 个，删除字节 4096，失败 1 条，缺陷 12 条，采集文件索引 4 条；生产会话保留"
         );
     }
 
@@ -14254,10 +18090,6 @@ mod tests {
             CaptureProvider::HeadlessCpp
         );
         assert_eq!(
-            CaptureProvider::from_env_value("qt-terminal"),
-            CaptureProvider::QtTerminal
-        );
-        assert_eq!(
             CaptureProvider::from_env_value("external-api"),
             CaptureProvider::ExternalApi
         );
@@ -14269,28 +18101,98 @@ mod tests {
 
     #[test]
     fn latest_capture_metadata_is_read_through_the_rust_proxy() {
-        assert!(is_capture_json_proxy_route(
-            "GET",
-            "/api/capture/latest"
-        ));
-        assert!(!is_capture_json_proxy_route(
-            "POST",
-            "/api/capture/latest"
-        ));
-        assert!(!is_capture_json_proxy_route(
-            "GET",
-            "/api/capture/file"
-        ));
+        assert!(is_capture_json_proxy_route("GET", "/api/capture/logs"));
+        assert!(is_capture_json_proxy_route("GET", "/api/capture/latest"));
+        assert!(!is_capture_json_proxy_route("POST", "/api/capture/latest"));
+        assert!(!is_capture_json_proxy_route("GET", "/api/capture/file"));
         assert!(is_capture_json_proxy_route("POST", "/api/stream/start"));
-        assert!(is_capture_json_proxy_route("GET", "/api/stream/status"));
-        assert!(is_capture_binary_proxy_route(
-            "GET",
-            "/api/stream/latest"
+        assert!(is_capture_json_proxy_route(
+            "POST",
+            "/api/steel/capture-mode"
         ));
+        assert!(is_capture_json_proxy_route("GET", "/api/stream/status"));
+        assert!(is_capture_binary_proxy_route("GET", "/api/stream/latest"));
         assert!(is_capture_json_proxy_route(
             "POST",
             "/api/capture/preset/line-continuous"
         ));
+        assert!(is_capture_json_proxy_route(
+            "POST",
+            "/api/capture/continuous-settings"
+        ));
+        assert!(is_capture_json_proxy_route(
+            "GET",
+            "/api/capture/continuous-settings"
+        ));
+    }
+
+    #[test]
+    fn simulated_capture_mode_is_retained_in_provider_status() {
+        let state = production_test_state();
+        let changed: Value = serde_json::from_slice(
+            &state
+                .capture
+                .simulated_proxy(
+                    "POST",
+                    "/api/steel/capture-mode",
+                    r#"{"captureMode":"on-demand"}"#,
+                )
+                .expect("simulated capture mode response"),
+        )
+        .expect("simulated capture mode is json");
+        assert_eq!(changed["code"], 0);
+        assert_eq!(changed["captureMode"], "on-demand");
+        assert_eq!(changed["automaticCaptureEnabled"], false);
+
+        let status: Value = serde_json::from_slice(
+            &state
+                .capture
+                .simulated_proxy("GET", "/api/steel/status", "")
+                .expect("simulated steel status"),
+        )
+        .expect("simulated steel status is json");
+        assert_eq!(status["captureMode"], "on-demand");
+        assert_eq!(status["automaticCaptureEnabled"], false);
+    }
+
+    #[test]
+    fn simulated_continuous_line_rate_requires_explicit_runtime_apply() {
+        let state = production_test_state();
+        let dry_run: Value = serde_json::from_slice(
+            &state
+                .capture
+                .simulated_proxy(
+                    "POST",
+                    "/api/capture/continuous-settings",
+                    r#"{"timeTriggerFreq":480}"#,
+                )
+                .expect("simulated continuous settings dry-run"),
+        )
+        .expect("simulated continuous settings dry-run is json");
+        assert_eq!(dry_run["code"], 0);
+        assert_eq!(dry_run["timeTriggerFreq"], 300.0);
+        assert_eq!(dry_run["applied"], 0);
+
+        let applied: Value = serde_json::from_slice(
+            &state
+                .capture
+                .simulated_proxy(
+                    "POST",
+                    "/api/capture/continuous-settings",
+                    r#"{"timeTriggerFreq":480,"applyToDevice":true}"#,
+                )
+                .expect("simulated continuous settings apply"),
+        )
+        .expect("simulated continuous settings apply is json");
+        assert_eq!(applied["code"], 0);
+        assert_eq!(applied["timeTriggerFreq"], 480.0);
+        assert_eq!(applied["applied"], CAPTURE_CAMERA_IPS.len());
+
+        let invalid = validate_capture_device_mutation_request(
+            "/api/capture/continuous-settings",
+            r#"{"timeTriggerFreq":0}"#,
+        );
+        assert_eq!(invalid, Err("continuous_line_rate_out_of_range"));
     }
 
     #[test]
@@ -14492,7 +18394,7 @@ mod tests {
     }
 
     #[test]
-    fn qt_operator_workflows_have_explicit_rust_proxy_routes() {
+    fn migrated_operator_workflows_have_explicit_rust_proxy_routes() {
         let json_routes = [
             ("GET", "/api/storage/status"),
             ("POST", "/api/storage/config"),
@@ -14522,10 +18424,7 @@ mod tests {
                 "missing capture proxy route {method} {path}"
             );
         }
-        assert!(is_capture_binary_proxy_route(
-            "GET",
-            "/api/stream/latest"
-        ));
+        assert!(is_capture_binary_proxy_route("GET", "/api/stream/latest"));
     }
 
     #[test]
@@ -14540,11 +18439,14 @@ mod tests {
             .iter()
             .chain(CAPTURE_BINARY_PROXY_ROUTES.iter())
         {
-            assert!(routes.iter().any(|route| {
-                route.get("method").and_then(Value::as_str) == Some(*method)
-                    && route.get("path").and_then(Value::as_str) == Some(*path)
-                    && route.get("scope").and_then(Value::as_str) == Some("capture")
-            }), "capture proxy route missing from manifest: {method} {path}");
+            assert!(
+                routes.iter().any(|route| {
+                    route.get("method").and_then(Value::as_str) == Some(*method)
+                        && route.get("path").and_then(Value::as_str) == Some(*path)
+                        && route.get("scope").and_then(Value::as_str) == Some("capture")
+                }),
+                "capture proxy route missing from manifest: {method} {path}"
+            );
         }
     }
 
@@ -14608,10 +18510,7 @@ mod tests {
         let conflict = response_json(conflict);
         assert_eq!(conflict["code"], 409);
         assert_eq!(conflict["error"], "calibration_operation_id_conflict");
-        assert_eq!(
-            dispatches.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -14665,10 +18564,7 @@ mod tests {
         assert_eq!(current["status"], "dispatching");
         assert_eq!(current["replayed"], true);
         assert_eq!(current["needsReconciliation"], false);
-        assert_eq!(
-            dispatches.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         release_sender.send(()).expect("release first operation");
         let first = first.join().expect("first operation thread");
@@ -14766,10 +18662,7 @@ mod tests {
         let response = response_json(response);
         assert_eq!(response["status"], "needs-reconciliation");
         assert_eq!(response["needsReconciliation"], true);
-        assert_eq!(
-            response["error"],
-            "capture_provider_timeout_or_unavailable"
-        );
+        assert_eq!(response["error"], "capture_provider_timeout_or_unavailable");
 
         let replay = calibration_operations::mutation_response_with_dispatch(
             &state,
@@ -14782,10 +18675,7 @@ mod tests {
         assert_eq!(replay["status"], "needs-reconciliation");
         assert_eq!(replay["replayed"], true);
 
-        let detail = calibration_operations::detail_response(
-            &state,
-            "id=cal-op-unknown-001",
-        );
+        let detail = calibration_operations::detail_response(&state, "id=cal-op-unknown-001");
         let detail = response_json(detail);
         assert_eq!(detail["operationId"], "cal-op-unknown-001");
         assert_eq!(detail["actor"], "admin-reconciler");
@@ -14842,11 +18732,9 @@ mod tests {
                 "device mutation must be fenced: {path}"
             );
         }
-        let generic_fence = calibration_operations::reconciliation_fence_response(
-            &state,
-            "/api/param",
-        )
-        .expect("unresolved operation must fence generic device mutations");
+        let generic_fence =
+            calibration_operations::reconciliation_fence_response(&state, "/api/param")
+                .expect("unresolved operation must fence generic device mutations");
         let generic_fence_text = response_text(generic_fence.clone());
         assert!(generic_fence_text.starts_with("HTTP/1.1 423 Locked"));
         let generic_fence = response_json(generic_fence);
@@ -14899,11 +18787,9 @@ mod tests {
         assert_eq!(parent.resolved_by, "admin-reconciler");
         assert!(!parent.resolved_at.is_empty());
         assert_eq!(parent.row_version, 3);
-        assert!(calibration_operations::reconciliation_fence_response(
-            &state,
-            "/api/param"
-        )
-        .is_none());
+        assert!(
+            calibration_operations::reconciliation_fence_response(&state, "/api/param").is_none()
+        );
 
         let after_reconciliation = calibration_operations::mutation_response_with_dispatch(
             &state,
@@ -14970,11 +18856,9 @@ mod tests {
             .expect("parent lookup")
             .expect("parent operation");
         assert_eq!(parent.status, "needs-reconciliation");
-        assert!(calibration_operations::reconciliation_fence_response(
-            &state,
-            "/api/param"
-        )
-        .is_some());
+        assert!(
+            calibration_operations::reconciliation_fence_response(&state, "/api/param").is_some()
+        );
         let (ready, reconciliation) = calibration_reconciliation_health_component(&state);
         assert!(!ready);
         assert_eq!(reconciliation["status"], "reconciliation-required");
@@ -15028,11 +18912,8 @@ mod tests {
         );
         assert_eq!(response_json(interrupted)["status"], "needs-reconciliation");
 
-        let fenced = calibration_operations::reconciliation_fence_response(
-            &state,
-            "/api/param",
-        )
-        .expect("interrupted rollback must close the fence");
+        let fenced = calibration_operations::reconciliation_fence_response(&state, "/api/param")
+            .expect("interrupted rollback must close the fence");
         let fenced = response_json(fenced);
         assert_eq!(
             fenced["unresolvedOperations"][0]["operationId"],
@@ -15083,11 +18964,9 @@ mod tests {
             .expect("interrupted rollback row");
         assert_eq!(interrupted.status, "reconciled");
         assert_eq!(interrupted.reconciliation_id, recovery_id);
-        assert!(calibration_operations::reconciliation_fence_response(
-            &state,
-            "/api/param"
-        )
-        .is_none());
+        assert!(
+            calibration_operations::reconciliation_fence_response(&state, "/api/param").is_none()
+        );
     }
 
     #[test]
@@ -15176,6 +19055,7 @@ mod tests {
             ("POST", "/api/trigger/manual/steel-info"),
             ("POST", "/api/trigger/manual/steel-in"),
             ("POST", "/api/trigger/manual/steel-out"),
+            ("POST", "/api/trigger/capture-once"),
         ] {
             assert!(
                 is_trigger_gateway_proxy_route(method, path),
@@ -15202,6 +19082,7 @@ mod tests {
             "GET",
             "/api/trigger/status",
             "",
+            "operator-a",
         ));
         server.join().expect("trigger proxy test server");
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -15216,10 +19097,21 @@ mod tests {
             "GET",
             "/api/trigger/status",
             "",
+            "operator-a",
         ));
         assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(response.contains("trigger_gateway_unavailable"));
         assert!(!response.contains(&private_origin));
+
+        for path in [
+            "/api/trigger/mode",
+            "/api/trigger/manual/steel-info",
+            "/api/trigger/manual/steel-in",
+            "/api/trigger/manual/steel-out",
+            "/api/trigger/capture-once",
+        ] {
+            assert_eq!(permission_for_route("POST", path), Some("admin.services"));
+        }
     }
 
     #[test]
@@ -15388,9 +19280,7 @@ mod tests {
         assert!(retry.starts_with("HTTP/1.1 200 OK\r\n"));
         let active = state
             .runtime
-            .block_on(db::latest_open_material_session(
-                &state.database.connection,
-            ))
+            .block_on(db::latest_open_material_session(&state.database.connection))
             .expect("active session query")
             .expect("active session should exist");
         assert_eq!(active.id, "SESSION-A");
@@ -15399,10 +19289,8 @@ mod tests {
 
     #[test]
     fn steel_out_provider_failure_remains_retryable_and_never_marks_session_finished() {
-        let state = production_test_state_with_provider(
-            CaptureProvider::ExternalApi,
-            "http://127.0.0.1:0",
-        );
+        let state =
+            production_test_state_with_provider(CaptureProvider::ExternalApi, "http://127.0.0.1:0");
         insert_production_record(
             &state,
             "INSP-SESSION-A",
@@ -15489,9 +19377,16 @@ mod tests {
 
     #[test]
     fn steel_in_provider_failure_does_not_arm_capture() {
-        let state = production_test_state_with_provider(
-            CaptureProvider::ExternalApi,
-            "http://127.0.0.1:0",
+        let state =
+            production_test_state_with_provider(CaptureProvider::ExternalApi, "http://127.0.0.1:0");
+        insert_production_record(
+            &state,
+            "INSP-SESSION-FAILED",
+            "MAT-FAILED",
+            "SESSION-FAILED",
+            "info-received",
+            "info-received",
+            "",
         );
         let response = response_text(write_production_event_response(
             &state,
@@ -15631,8 +19526,7 @@ mod tests {
         ));
 
         let state = production_test_state();
-        let request =
-            r#"{"materialId":"MAT-IDEMPOTENT","sessionId":"SESSION-IDEMPOTENT","requestId":"STEEL-IN-001","autoCapture":false}"#;
+        let request = r#"{"materialId":"MAT-IDEMPOTENT","sessionId":"SESSION-IDEMPOTENT","requestId":"STEEL-IN-001","autoCapture":false}"#;
         let first = response_text(production_tasks::enqueue_kind_response(
             &state, "steel-in", request, "tester",
         ));
@@ -15684,7 +19578,15 @@ mod tests {
         assert!(!session_id.is_empty());
         for task in [&capture, &algorithm, &steel_out] {
             assert_eq!(task["task"]["sessionId"], json!(session_id.clone()));
+            assert_eq!(task["task"]["chainId"], json!(session_id.clone()));
         }
+        assert_eq!(steel_in["task"]["dependsOnTaskId"], Value::Null);
+        assert_eq!(capture["task"]["dependsOnTaskId"], steel_in["task"]["id"]);
+        assert_eq!(algorithm["task"]["dependsOnTaskId"], capture["task"]["id"]);
+        assert_eq!(
+            steel_out["task"]["dependsOnTaskId"],
+            algorithm["task"]["id"]
+        );
 
         let mut claimed_kinds = Vec::new();
         for _ in 0..4 {
@@ -15723,6 +19625,203 @@ mod tests {
             claimed_kinds,
             ["steel-in", "capture-once", "algorithm-run", "steel-out"]
         );
+    }
+
+    #[test]
+    fn failed_chain_dependency_blocks_all_downstream_tasks_until_parent_retry() {
+        let state = production_test_state();
+        let steel_in = response_json(production_tasks::enqueue_kind_response(
+            &state,
+            "steel-in",
+            r#"{"materialId":"MAT-BLOCK","sessionId":"SESSION-BLOCK","requestId":"BLOCK-IN","autoCapture":false}"#,
+            "tester",
+        ));
+        let capture = response_json(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"capture-once","idempotencyKey":"BLOCK-CAPTURE","payload":{"materialId":"MAT-BLOCK","sessionId":"SESSION-BLOCK"}}"#,
+            "tester",
+        ));
+        let algorithm = response_json(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"algorithm-run","idempotencyKey":"BLOCK-ALGORITHM","payload":{"materialId":"MAT-BLOCK","sessionId":"SESSION-BLOCK","runCore":false}}"#,
+            "tester",
+        ));
+        let steel_out = response_json(production_tasks::enqueue_kind_response(
+            &state,
+            "steel-out",
+            r#"{"materialId":"MAT-BLOCK","sessionId":"SESSION-BLOCK","requestId":"BLOCK-OUT"}"#,
+            "tester",
+        ));
+        let root_id = steel_in["task"]["id"].as_str().expect("root id");
+        let capture_id = capture["task"]["id"].as_str().expect("capture id");
+        let algorithm_id = algorithm["task"]["id"].as_str().expect("algorithm id");
+        let steel_out_id = steel_out["task"]["id"].as_str().expect("steel-out id");
+
+        let claimed = state
+            .runtime
+            .block_on(db::claim_next_production_task(&state.database.connection))
+            .expect("claim root")
+            .expect("root task");
+        assert_eq!(claimed.id, root_id);
+        state
+            .runtime
+            .block_on(db::finish_production_task(
+                &state.database.connection,
+                root_id,
+                "failed",
+                100,
+                String::new(),
+                "provider failed".to_string(),
+            ))
+            .expect("fail root");
+
+        for (id, parent_id) in [
+            (capture_id, root_id),
+            (algorithm_id, capture_id),
+            (steel_out_id, algorithm_id),
+        ] {
+            let task = state
+                .runtime
+                .block_on(db::find_production_task(&state.database.connection, id))
+                .expect("blocked task query")
+                .expect("blocked task");
+            assert_eq!(task.status, "blocked");
+            assert!(task.blocked_reason.contains(parent_id));
+        }
+        assert!(state
+            .runtime
+            .block_on(db::claim_next_production_task(&state.database.connection))
+            .expect("empty claim")
+            .is_none());
+
+        let downstream_retry = response_text(production_tasks::retry_response(
+            &state,
+            &json!({ "taskId": capture_id }).to_string(),
+            "tester",
+        ));
+        assert!(downstream_retry.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(downstream_retry.contains("production_task_dependency_unresolved"));
+
+        let root_retry = response_text(production_tasks::retry_response(
+            &state,
+            &json!({ "taskId": root_id }).to_string(),
+            "tester",
+        ));
+        assert!(root_retry.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        for id in [capture_id, algorithm_id, steel_out_id] {
+            let task = state
+                .runtime
+                .block_on(db::find_production_task(&state.database.connection, id))
+                .expect("requeued task query")
+                .expect("requeued task");
+            assert_eq!(task.status, "queued");
+            assert!(task.blocked_reason.is_empty());
+        }
+        let retried_root = state
+            .runtime
+            .block_on(db::claim_next_production_task(&state.database.connection))
+            .expect("claim retried root")
+            .expect("retried root");
+        assert_eq!(retried_root.id, root_id);
+        state
+            .runtime
+            .block_on(db::finish_production_task(
+                &state.database.connection,
+                root_id,
+                "succeeded",
+                100,
+                "{}".to_string(),
+                String::new(),
+            ))
+            .expect("finish retried root");
+        let next = state
+            .runtime
+            .block_on(db::claim_next_production_task(&state.database.connection))
+            .expect("claim downstream")
+            .expect("capture after recovery");
+        assert_eq!(next.id, capture_id);
+    }
+
+    #[test]
+    fn safety_critical_tasks_reject_always_run_bypass() {
+        let state = production_test_state();
+        let response = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"steel-out","dependencyPolicy":"always-run","payload":{"materialId":"MAT-SAFE","sessionId":"SESSION-SAFE"}}"#,
+            "tester",
+        ));
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains("always_run_not_allowed_for_safety_critical_task"));
+    }
+
+    #[test]
+    fn one_session_cannot_fork_into_a_second_production_chain() {
+        let state = production_test_state();
+        let first = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"steel-in","idempotencyKey":"CHAIN-A-IN","chainId":"CHAIN-A","payload":{"materialId":"MAT-CHAIN","sessionId":"SESSION-CHAIN","autoCapture":false}}"#,
+            "tester",
+        ));
+        assert!(first.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        let fork = response_text(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"capture-once","idempotencyKey":"CHAIN-B-CAPTURE","chainId":"CHAIN-B","payload":{"materialId":"MAT-CHAIN","sessionId":"SESSION-CHAIN"}}"#,
+            "tester",
+        ));
+        assert!(fork.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(fork.contains("production_session_chain_mismatch"));
+    }
+
+    #[test]
+    fn explicitly_safe_trigger_cleanup_can_run_after_terminal_dependency_failure() {
+        let state = production_test_state();
+        let parent = response_json(production_tasks::enqueue_response(
+            &state,
+            r#"{"kind":"steel-in","idempotencyKey":"CLEANUP-IN","chainId":"CHAIN-CLEANUP","payload":{"materialId":"MAT-CLEANUP","sessionId":"SESSION-CLEANUP","autoCapture":false}}"#,
+            "tester",
+        ));
+        let parent_id = parent["task"]["id"].as_str().expect("parent id");
+        let cleanup = response_json(production_tasks::enqueue_kind_response(
+            &state,
+            "trigger-event",
+            &json!({
+                "materialId": "MAT-CLEANUP",
+                "sessionId": "SESSION-CLEANUP",
+                "requestId": "CLEANUP-EVENT",
+                "chainId": "CHAIN-CLEANUP",
+                "dependsOnTaskId": parent_id,
+                "dependencyPolicy": "always-run",
+                "command": "safe-cleanup"
+            })
+            .to_string(),
+            "tester",
+        ));
+        let cleanup_id = cleanup["task"]["id"].as_str().expect("cleanup id");
+        assert_eq!(cleanup["task"]["dependencyPolicy"], "always-run");
+
+        let claimed_parent = state
+            .runtime
+            .block_on(db::claim_next_production_task(&state.database.connection))
+            .expect("claim parent")
+            .expect("parent");
+        assert_eq!(claimed_parent.id, parent_id);
+        state
+            .runtime
+            .block_on(db::finish_production_task(
+                &state.database.connection,
+                parent_id,
+                "failed",
+                100,
+                String::new(),
+                "provider failed".to_string(),
+            ))
+            .expect("fail parent");
+        let claimed_cleanup = state
+            .runtime
+            .block_on(db::claim_next_production_task(&state.database.connection))
+            .expect("claim cleanup")
+            .expect("cleanup after terminal parent");
+        assert_eq!(claimed_cleanup.id, cleanup_id);
     }
 
     #[test]
@@ -15800,10 +19899,8 @@ mod tests {
         assert!(invalid_response.starts_with("HTTP/1.1 409 Conflict\r\n"));
         assert!(invalid_response.contains("active_session_required"));
 
-        let state = production_test_state_with_provider(
-            CaptureProvider::ExternalApi,
-            "http://127.0.0.1:0",
-        );
+        let state =
+            production_test_state_with_provider(CaptureProvider::ExternalApi, "http://127.0.0.1:0");
         let queued = response_text(production_tasks::enqueue_kind_response(
             &state,
             "steel-in",
@@ -16002,12 +20099,34 @@ mod tests {
                     kind: "algorithm-run".to_string(),
                     material_id: "MAT-A".to_string(),
                     session_id: "SESSION-A".to_string(),
+                    chain_id: "SESSION-A".to_string(),
+                    depends_on_task_id: String::new(),
+                    dependency_policy: "require-success".to_string(),
                     payload: r#"{"materialId":"MAT-A"}"#.to_string(),
                     actor: "tester".to_string(),
                     max_attempts: 3,
                 },
             ))
             .expect("insert recovery task");
+        state
+            .runtime
+            .block_on(db::insert_production_task(
+                &state.database.connection,
+                db::ProductionTaskInput {
+                    id: "TASK-RECOVERY-DOWNSTREAM".to_string(),
+                    idempotency_key: "steel-out:RECOVERY-DOWNSTREAM".to_string(),
+                    kind: "steel-out".to_string(),
+                    material_id: "MAT-A".to_string(),
+                    session_id: "SESSION-A".to_string(),
+                    chain_id: "SESSION-A".to_string(),
+                    depends_on_task_id: "TASK-RECOVERY".to_string(),
+                    dependency_policy: "require-success".to_string(),
+                    payload: r#"{"materialId":"MAT-A"}"#.to_string(),
+                    actor: "tester".to_string(),
+                    max_attempts: 3,
+                },
+            ))
+            .expect("insert downstream recovery task");
         let claimed = state
             .runtime
             .block_on(db::claim_next_production_task(&state.database.connection))
@@ -16032,6 +20151,16 @@ mod tests {
             .expect("recovered task");
         assert_eq!(task.status, "interrupted");
         assert!(task.error.contains("explicit retry required"));
+        let downstream = state
+            .runtime
+            .block_on(db::find_production_task(
+                &state.database.connection,
+                "TASK-RECOVERY-DOWNSTREAM",
+            ))
+            .expect("downstream recovery query")
+            .expect("downstream task");
+        assert_eq!(downstream.status, "blocked");
+        assert!(downstream.blocked_reason.contains("dependency_interrupted"));
     }
 
     #[test]
@@ -16076,7 +20205,20 @@ mod tests {
                     height_mm: 2.0,
                     depth_mm: 1.0,
                     confidence: 0.99,
-                    geometry_json: "{}".to_string(),
+                    geometry_json: json!({
+                        "cameraIndex": 1,
+                        "artifacts": {
+                            "schema": "steel.surface.defect.artifacts.v1",
+                            "cameraId": "camera1",
+                            "frameId": "frame-001",
+                            "sequenceNo": 1,
+                            "roi": { "x": 10, "y": 20, "width": 30, "height": 40 },
+                            "roiImage": "runs/MAT-PROD-1/RUN-1/defects/ALG-0001/intensity-roi.png",
+                            "localPointCloud": "runs/MAT-PROD-1/RUN-1/defects/ALG-0001/local-point-cloud.json",
+                            "lengthProfile": "runs/MAT-PROD-1/RUN-1/defects/ALG-0001/length-profile.json",
+                            "widthProfile": "runs/MAT-PROD-1/RUN-1/defects/ALG-0001/width-profile.json"
+                        }
+                    }).to_string(),
                 },
             ))
             .expect("production defect insert");
@@ -16157,7 +20299,157 @@ mod tests {
         assert!(snapshot["inspections"][0]["captureSummaryPath"]
             .as_str()
             .is_some_and(|path| !path.is_empty()));
-        assert_eq!(snapshot["inspections"][0]["captureImages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            snapshot["inspections"][0]["captureImages"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot["inspections"][0]["defects"][0]["artifacts"]["schema"],
+            "steel.surface.defect.artifacts.v1"
+        );
+        assert_eq!(
+            snapshot["inspections"][0]["defects"][0]["artifacts"]["sequenceNo"],
+            1
+        );
+        assert_eq!(
+            snapshot["inspections"][0]["defects"][0]["artifacts"]["roiImage"],
+            "runs/MAT-PROD-1/RUN-1/defects/ALG-0001/intensity-roi.png"
+        );
+    }
+
+    #[test]
+    fn inspection_reports_are_content_addressed_immutable_and_idempotent() {
+        let state = production_test_state();
+        insert_production_record(
+            &state,
+            "INSP-REPORT-1",
+            "MAT-REPORT-1",
+            "SESSION-REPORT-1",
+            "finished",
+            "algorithm-complete",
+            &current_time_string(),
+        );
+        let archive_root = env::temp_dir().join(format!(
+            "steel-inspection-report-test-{}",
+            current_time_millis()
+        ));
+        let first =
+            issue_inspection_report_at(&state, &archive_root, "INSP-REPORT-1", "quality-user")
+                .expect("first report issue");
+        assert_eq!(first["created"], true);
+        assert_eq!(
+            first["archive"]["schema"],
+            "steel.inspection.report-archive.v1"
+        );
+        assert_eq!(
+            first["archive"]["document"]["schema"],
+            "steel.inspection.report.v1"
+        );
+        let first_path = PathBuf::from(first["archivePath"].as_str().expect("first archive path"));
+        let first_bytes = fs::read(&first_path).expect("first archive bytes");
+        let detail_response = response_text(read_inspection_report_detail_at(
+            &archive_root,
+            &format!(
+                "inspectionId=INSP-REPORT-1&reportId={}",
+                first["reportId"].as_str().expect("first report id")
+            ),
+        ));
+        assert!(detail_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        let detail_body = detail_response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("report detail response body");
+        let detail_json: Value = serde_json::from_str(detail_body).expect("report detail json");
+        assert_eq!(detail_json["archive"]["reportId"], first["reportId"]);
+        assert_eq!(
+            detail_json["archive"]["documentSha256"],
+            first["archive"]["documentSha256"]
+        );
+        let replay =
+            issue_inspection_report_at(&state, &archive_root, "INSP-REPORT-1", "quality-user")
+                .expect("idempotent report issue");
+        assert_eq!(replay["created"], false);
+        assert_eq!(replay["reportId"], first["reportId"]);
+        let initial_history = response_text(read_inspection_reports_at(
+            &archive_root,
+            "inspectionId=INSP-REPORT-1",
+        ));
+        assert!(initial_history.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(initial_history.contains(first["reportId"].as_str().expect("first report id")));
+
+        state
+            .runtime
+            .block_on(db::append_production_defect(
+                &state.database.connection,
+                db::ProductionDefectInput {
+                    inspection_id: "INSP-REPORT-1".to_string(),
+                    material_id: "MAT-REPORT-1".to_string(),
+                    camera_id: "camera1".to_string(),
+                    defect_type: "pit".to_string(),
+                    severity: "review".to_string(),
+                    x_mm: 1.0,
+                    y_mm: 2.0,
+                    z_mm: -0.5,
+                    width_mm: 1.0,
+                    height_mm: 1.0,
+                    depth_mm: 0.5,
+                    confidence: 0.9,
+                    geometry_json: "{}".to_string(),
+                },
+            ))
+            .expect("report defect insert");
+        let revised =
+            issue_inspection_report_at(&state, &archive_root, "INSP-REPORT-1", "quality-user")
+                .expect("revised report issue");
+        assert_eq!(revised["created"], true);
+        assert_ne!(revised["reportId"], first["reportId"]);
+        assert_eq!(
+            fs::read(&first_path).expect("immutable first archive"),
+            first_bytes
+        );
+        assert_eq!(
+            fs::read_dir(archive_root.join("INSP-REPORT-1"))
+                .expect("report archive directory")
+                .count(),
+            2
+        );
+        assert_eq!(
+            permission_for_route("POST", "/api/admin/records/reports"),
+            Some("admin.records")
+        );
+        assert_eq!(
+            permission_for_route("GET", "/api/admin/records/reports/detail"),
+            Some("admin.records")
+        );
+        let mut tampered_archive = first["archive"].clone();
+        tampered_archive["reportId"] = json!("RPT-TAMPERED");
+        tampered_archive["document"]["record"]["materialId"] = json!("MAT-TAMPERED");
+        fs::write(
+            archive_root.join("INSP-REPORT-1").join("RPT-TAMPERED.json"),
+            serde_json::to_vec_pretty(&tampered_archive).expect("tampered archive bytes"),
+        )
+        .expect("write tampered report archive");
+        let tampered_response = response_text(read_inspection_report_detail_at(
+            &archive_root,
+            "inspectionId=INSP-REPORT-1&reportId=RPT-TAMPERED",
+        ));
+        assert!(tampered_response.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(tampered_response.contains("report_archive_integrity_failed"));
+        let tampered_history = response_text(read_inspection_reports_at(
+            &archive_root,
+            "inspectionId=INSP-REPORT-1",
+        ));
+        assert!(tampered_history.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(tampered_history.contains("\"invalidArchiveCount\":1"));
+        assert!(tampered_history.contains("RPT-TAMPERED.json"));
+        let invalid_identity = response_text(read_inspection_report_detail_at(
+            &archive_root,
+            "inspectionId=../INSP-REPORT-1&reportId=RPT-invalid",
+        ));
+        assert!(invalid_identity.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        let _ = fs::remove_dir_all(archive_root);
     }
 
     #[test]
@@ -16240,6 +20532,169 @@ mod tests {
     }
 
     #[test]
+    fn record_cleanup_deletes_frozen_artifacts_before_database_indexes_and_is_auditable() {
+        let state = production_test_state();
+        let root =
+            env::temp_dir().join(format!("steel-record-cleanup-{}", db::now_millis_string()));
+        fs::create_dir_all(&root).expect("cleanup root");
+        let depth = root.join("depth.bin");
+        let metadata = root.join("metadata.json");
+        let mesh = root.join("mesh.bin");
+        let summary = root.join("summary.json");
+        fs::write(&depth, b"depth").expect("depth artifact");
+        fs::write(&metadata, b"metadata").expect("metadata artifact");
+        fs::write(&mesh, b"mesh").expect("mesh artifact");
+        fs::write(
+            &summary,
+            json!({ "mesh": mesh.display().to_string() }).to_string(),
+        )
+        .expect("summary artifact");
+        insert_production_record(
+            &state,
+            "INSP-CLEANUP",
+            "MAT-CLEANUP",
+            "SESSION-CLEANUP",
+            "finished",
+            "algorithm-complete",
+            "1",
+        );
+        state
+            .runtime
+            .block_on(db::upsert_production_inspection(
+                &state.database.connection,
+                db::ProductionInspectionInput {
+                    id: "INSP-CLEANUP".to_string(),
+                    material_id: "MAT-CLEANUP".to_string(),
+                    session_id: "SESSION-CLEANUP".to_string(),
+                    status: "algorithm-complete".to_string(),
+                    storage_root: root.display().to_string(),
+                    summary_path: summary.display().to_string(),
+                    started_at: "1".to_string(),
+                    finished_at: "1".to_string(),
+                    capture_count: 1,
+                    defect_count: 0,
+                    raw_payload: "{}".to_string(),
+                },
+            ))
+            .expect("inspection path update");
+        state
+            .runtime
+            .block_on(db::append_capture_file(
+                &state.database.connection,
+                db::CaptureFileInput {
+                    inspection_id: "INSP-CLEANUP".to_string(),
+                    session_id: "SESSION-CLEANUP".to_string(),
+                    material_id: "MAT-CLEANUP".to_string(),
+                    camera_id: "CAM-01".to_string(),
+                    camera_ip: "192.168.101.100".to_string(),
+                    data_name: "depth".to_string(),
+                    sequence_no: 1,
+                    file_type: "bin".to_string(),
+                    path: depth.display().to_string(),
+                    metadata_path: metadata.display().to_string(),
+                },
+            ))
+            .expect("capture file index");
+
+        let previous = env::var("STEEL_ARTIFACT_ALLOWED_ROOTS").ok();
+        env::set_var("STEEL_ARTIFACT_ALLOWED_ROOTS", &root);
+        let detail = state
+            .runtime
+            .block_on(db::find_inspection_record_detail(
+                &state.database.connection,
+                "INSP-CLEANUP",
+            ))
+            .expect("cleanup detail")
+            .expect("cleanup record");
+        let manifest = artifact_cleanup::build_manifest(&detail, &root.display().to_string())
+            .expect("cleanup manifest");
+        let (files_planned, bytes_planned) = artifact_cleanup::manifest_plan_counts(&manifest);
+        let cleanup = state
+            .runtime
+            .block_on(db::create_or_load_record_cleanup(
+                &state.database.connection,
+                db::RecordCleanupInput {
+                    record_id: "INSP-CLEANUP".to_string(),
+                    material_id: "MAT-CLEANUP".to_string(),
+                    actor: "test-admin".to_string(),
+                    reason: "retry-test".to_string(),
+                    manifest_json: artifact_cleanup::manifest_json(&manifest)
+                        .expect("manifest json"),
+                    files_planned,
+                    bytes_planned,
+                },
+            ))
+            .expect("cleanup ledger");
+        fs::write(&depth, b"other").expect("mutate frozen artifact");
+        let failed_response = response_text(delete_admin_record_response(
+            &state,
+            "id=INSP-CLEANUP",
+            "test-admin",
+        ));
+        assert!(
+            failed_response.starts_with("HTTP/1.1 409 Conflict"),
+            "{failed_response}"
+        );
+        assert!(depth.exists());
+        assert!(state
+            .runtime
+            .block_on(db::find_production_inspection(
+                &state.database.connection,
+                "INSP-CLEANUP",
+            ))
+            .expect("inspection retained after failed cleanup")
+            .is_some());
+        let failed_cleanup = state
+            .runtime
+            .block_on(db::find_record_cleanup(
+                &state.database.connection,
+                &cleanup.id,
+            ))
+            .expect("failed cleanup lookup")
+            .expect("failed cleanup row");
+        assert_eq!(failed_cleanup.status, "failed");
+        assert!(failed_cleanup.error.contains("changed"));
+
+        fs::write(&depth, b"depth").expect("restore frozen artifact");
+        let response = response_text(delete_admin_record_response(
+            &state,
+            "id=INSP-CLEANUP",
+            "test-admin",
+        ));
+        if let Some(value) = previous {
+            env::set_var("STEEL_ARTIFACT_ALLOWED_ROOTS", value);
+        } else {
+            env::remove_var("STEEL_ARTIFACT_ALLOWED_ROOTS");
+        }
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let payload = response_json(response.into_bytes());
+        assert_eq!(payload["filesDeleted"], json!(4));
+        assert!(!depth.exists() && !metadata.exists() && !mesh.exists() && !summary.exists());
+        assert!(state
+            .runtime
+            .block_on(db::find_production_inspection(
+                &state.database.connection,
+                "INSP-CLEANUP",
+            ))
+            .expect("inspection lookup")
+            .is_none());
+        let cleanup = state
+            .runtime
+            .block_on(db::find_record_cleanup(
+                &state.database.connection,
+                payload["cleanupId"].as_str().expect("cleanup id"),
+            ))
+            .expect("cleanup lookup")
+            .expect("cleanup row");
+        assert_eq!(cleanup.status, "completed");
+        assert_eq!(cleanup.id, failed_cleanup.id);
+        assert_eq!(cleanup.files_deleted, 4);
+        assert!(!cleanup.completed_at.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn production_record_retention_excludes_active_and_recent_records() {
         let state = production_test_state();
         insert_production_record(
@@ -16286,6 +20741,8 @@ mod tests {
             .expect("retention purge");
         assert_eq!(result.matched, 1);
         assert_eq!(result.deleted_records, 1);
+        assert_eq!(result.deleted_defects, 0);
+        assert_eq!(result.deleted_capture_files, 0);
         assert!(state
             .runtime
             .block_on(db::find_production_inspection(
@@ -16481,6 +20938,21 @@ mod tests {
     }
 
     #[test]
+    fn radial_candidate_labels_do_not_claim_material_defect_classification() {
+        let depression = json!({
+            "classificationState": "candidate-only",
+            "candidatePolarity": "depression"
+        });
+        let protrusion = json!({
+            "classificationState": "candidate-only",
+            "candidatePolarity": "protrusion"
+        });
+        assert_eq!(production_defect_label("pit", &depression), "凹陷候选");
+        assert_eq!(production_defect_label("foreign", &protrusion), "凸起候选");
+        assert_eq!(production_defect_label("pit", &json!({})), "凹坑");
+    }
+
+    #[test]
     fn severe_and_review_defect_ingest_create_one_idempotent_alarm() {
         let state = production_test_state();
         let severe = r#"{
@@ -16496,12 +20968,8 @@ mod tests {
             "depthMm":0.21,
             "confidence":0.98
         }"#;
-        let first = response_text(write_production_defect_response(
-            &state, severe, "detector",
-        ));
-        let duplicate = response_text(write_production_defect_response(
-            &state, severe, "detector",
-        ));
+        let first = response_text(write_production_defect_response(&state, severe, "detector"));
+        let duplicate = response_text(write_production_defect_response(&state, severe, "detector"));
         assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(first.contains("\"created\":true"));
         assert!(duplicate.contains("\"created\":false"));
@@ -16539,9 +21007,8 @@ mod tests {
         let minor = severe
             .replace("SOURCE-DEFECT-001", "SOURCE-DEFECT-003")
             .replace("\"severity\":\"severe\"", "\"severity\":\"minor\"");
-        let minor_response = response_text(write_production_defect_response(
-            &state, &minor, "detector",
-        ));
+        let minor_response =
+            response_text(write_production_defect_response(&state, &minor, "detector"));
         assert!(minor_response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(minor_response.contains("\"alarm\":null"));
         let counts = state
@@ -16642,7 +21109,339 @@ mod tests {
     }
 
     #[test]
-    fn calibration_capture_fit_requires_one_complete_frame_from_each_of_six_cameras() {
+    fn managed_health_alarm_is_one_episode_until_recovery_and_reopens_with_a_new_id() {
+        let state = production_test_state();
+        let input = |id: &str, message: &str, details: &str| db::ProductionAlarmInput {
+            id: id.to_string(),
+            source: SYSTEM_HEALTH_ALARM_SOURCE.to_string(),
+            alarm_type: "storage-capacity-warning".to_string(),
+            severity: "warning".to_string(),
+            material_id: String::new(),
+            session_id: String::new(),
+            inspection_id: String::new(),
+            camera_id: String::new(),
+            message: message.to_string(),
+            details: details.to_string(),
+        };
+
+        let created = state
+            .runtime
+            .block_on(db::reconcile_managed_alarm(
+                &state.database.connection,
+                SYSTEM_HEALTH_ALARM_SOURCE,
+                "storage-capacity-warning",
+                Some(input(
+                    "ALARM-HEALTH-EPISODE-1",
+                    "30 GiB remaining",
+                    r#"{"free":30}"#,
+                )),
+                SYSTEM_HEALTH_ALARM_ACTOR,
+            ))
+            .expect("create managed alarm");
+        let first_id = match created {
+            db::ManagedAlarmReconcile::Created(alarm) => alarm.id,
+            _ => panic!("first unhealthy observation must create an alarm"),
+        };
+
+        let refreshed = state
+            .runtime
+            .block_on(db::reconcile_managed_alarm(
+                &state.database.connection,
+                SYSTEM_HEALTH_ALARM_SOURCE,
+                "storage-capacity-warning",
+                Some(input(
+                    "ALARM-HEALTH-IGNORED",
+                    "24 GiB remaining",
+                    r#"{"free":24}"#,
+                )),
+                SYSTEM_HEALTH_ALARM_ACTOR,
+            ))
+            .expect("refresh managed alarm");
+        match refreshed {
+            db::ManagedAlarmReconcile::Updated(alarm) => {
+                assert_eq!(alarm.id, first_id);
+                assert_eq!(alarm.message, "24 GiB remaining");
+                assert_eq!(alarm.details, r#"{"free":24}"#);
+            }
+            _ => panic!("ongoing episode must refresh the original alarm"),
+        }
+
+        let acknowledged = state
+            .runtime
+            .block_on(db::acknowledge_production_alarm(
+                &state.database.connection,
+                &first_id,
+                "operator-a",
+                "cleanup scheduled",
+            ))
+            .expect("acknowledge managed alarm");
+        assert!(matches!(
+            acknowledged,
+            db::ProductionAlarmTransition::Changed(_)
+        ));
+
+        let recovered = state
+            .runtime
+            .block_on(db::reconcile_managed_alarm(
+                &state.database.connection,
+                SYSTEM_HEALTH_ALARM_SOURCE,
+                "storage-capacity-warning",
+                None,
+                SYSTEM_HEALTH_ALARM_ACTOR,
+            ))
+            .expect("resolve recovered managed alarm");
+        match recovered {
+            db::ManagedAlarmReconcile::Resolved(alarm) => {
+                assert_eq!(alarm.id, first_id);
+                assert_eq!(alarm.status, "resolved");
+                assert_eq!(alarm.acknowledged_by, "operator-a");
+                assert_eq!(alarm.resolved_by, SYSTEM_HEALTH_ALARM_ACTOR);
+            }
+            _ => panic!("recovery must resolve the open episode"),
+        }
+
+        let recurrence = state
+            .runtime
+            .block_on(db::reconcile_managed_alarm(
+                &state.database.connection,
+                SYSTEM_HEALTH_ALARM_SOURCE,
+                "storage-capacity-warning",
+                Some(input(
+                    "ALARM-HEALTH-EPISODE-2",
+                    "28 GiB remaining",
+                    r#"{"free":28}"#,
+                )),
+                SYSTEM_HEALTH_ALARM_ACTOR,
+            ))
+            .expect("create recurring managed alarm");
+        match recurrence {
+            db::ManagedAlarmReconcile::Created(alarm) => {
+                assert_ne!(alarm.id, first_id);
+                assert_eq!(alarm.status, "active");
+            }
+            _ => panic!("a recurring incident must create a new history episode"),
+        }
+
+        let counts = state
+            .runtime
+            .block_on(db::production_alarm_counts(&state.database.connection))
+            .expect("managed alarm counts");
+        assert_eq!(counts.active, 1);
+        assert_eq!(counts.acknowledged, 0);
+        assert_eq!(counts.resolved, 1);
+    }
+
+    #[test]
+    fn system_health_alarm_mapping_separates_warning_critical_and_blocking_components() {
+        let warning = json!({
+            "checks": {
+                "storage": {
+                    "ok": true,
+                    "status": "warning",
+                    "level": "warning",
+                    "warningReason": "storage_capacity_near_watermark",
+                    "freeBytes": 30_000_000_000_u64,
+                    "freePercent": 12.0,
+                    "estimatedRemainingSeconds": 300
+                }
+            }
+        });
+        let warning_specs = system_health_alarm_specs(&warning);
+        assert_eq!(warning_specs.len(), 1);
+        assert_eq!(warning_specs[0].alarm_type, "storage-capacity-warning");
+        assert_eq!(warning_specs[0].severity, "warning");
+
+        let critical = json!({
+            "checks": {
+                "storage": {
+                    "ok": false,
+                    "status": "unavailable",
+                    "level": "critical",
+                    "reason": "storage_capacity_below_watermark",
+                    "freeBytes": 10_000_000_000_u64,
+                    "freePercent": 5.0
+                }
+            }
+        });
+        let critical_specs = system_health_alarm_specs(&critical);
+        assert_eq!(critical_specs.len(), 1);
+        assert_eq!(critical_specs[0].alarm_type, "storage-critical");
+        assert_eq!(critical_specs[0].severity, "critical");
+
+        let blocking = json!({
+            "checks": {
+                "capture": {
+                    "ok": false,
+                    "reason": "capture_sdk_restart_required",
+                    "restartRequired": true
+                },
+                "taskWorker": {
+                    "ok": false,
+                    "reason": "task_worker_heartbeat_stale"
+                },
+                "calibrationReconciliation": {
+                    "ok": false,
+                    "reason": "calibration_reconciliation_required",
+                    "unresolvedCount": 1,
+                    "unresolvedOperations": [{"operationId": "CAL-1"}]
+                },
+                "trigger": {
+                    "ok": false,
+                    "required": true,
+                    "reason": "trigger_gateway_unreachable"
+                },
+                "algorithm": {
+                    "ok": false,
+                    "reason": "algorithm_acceptance_missing_or_invalid"
+                },
+                "productionPolicy": {
+                    "ok": false,
+                    "reason": "production_algorithm_policy_invalid"
+                }
+            }
+        });
+        let types = system_health_alarm_specs(&blocking)
+            .into_iter()
+            .map(|spec| spec.alarm_type)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            types,
+            HashSet::from([
+                "capture-unavailable",
+                "task-worker-unavailable",
+                "calibration-reconciliation-required",
+                "trigger-unavailable",
+                "algorithm-not-qualified",
+                "production-policy-invalid"
+            ])
+        );
+
+        let optional_trigger = json!({
+            "checks": {
+                "trigger": {
+                    "ok": false,
+                    "required": false,
+                    "reason": "trigger_gateway_unreachable"
+                }
+            }
+        });
+        assert!(system_health_alarm_specs(&optional_trigger).is_empty());
+    }
+
+    #[test]
+    fn supervisor_restart_budget_status_is_validated_and_mapped_to_a_persistent_alarm() {
+        let root = std::env::temp_dir().join(format!(
+            "steel-supervisor-status-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let service_root = root.join("service");
+        fs::create_dir_all(&service_root).expect("create supervisor status root");
+        let status_path = service_root.join("supervisor-status.json");
+        fs::write(
+            &status_path,
+            r#"{
+                "schema":"steel.runtime-supervisor.status.v1",
+                "status":"restart-budget-exhausted",
+                "restartBudgetExhausted":true,
+                "restartCountWindow":6,
+                "restartBudgetMaximum":5,
+                "restartBudgetWindowSeconds":600,
+                "recoveryStableSeconds":30,
+                "reason":"more_than_5_restarts_in_10_minutes",
+                "updatedAt":"2026-07-16T10:00:00.000Z"
+            }"#,
+        )
+        .expect("write supervisor status");
+
+        let status = supervisor_runtime_status_from_root(Some(&root))
+            .expect("valid supervisor status")
+            .expect("supervisor status present");
+        let specs =
+            system_health_alarm_specs_with_supervisor(&json!({"checks": {}}), Ok(Some(status)));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].alarm_type, "supervisor-restart-budget-exhausted");
+        assert_eq!(specs[0].severity, "critical");
+        assert_eq!(specs[0].details["restartCountWindow"], json!(6));
+
+        fs::write(&status_path, r#"{"schema":"wrong","status":"running"}"#)
+            .expect("write invalid supervisor status");
+        let invalid = supervisor_runtime_status_from_root(Some(&root))
+            .expect_err("invalid status contract must fail");
+        let invalid_specs =
+            system_health_alarm_specs_with_supervisor(&json!({"checks": {}}), Err(invalid));
+        assert_eq!(invalid_specs.len(), 1);
+        assert_eq!(invalid_specs[0].alarm_type, "supervisor-status-invalid");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn system_health_alarm_reconciliation_persists_and_auto_resolves_the_episode() {
+        let state = production_test_state();
+        let warning = json!({
+            "checks": {
+                "storage": {
+                    "ok": true,
+                    "status": "warning",
+                    "level": "warning",
+                    "warningReason": "storage_capacity_near_watermark",
+                    "freeBytes": 30_000_000_000_u64,
+                    "freePercent": 12.0
+                }
+            }
+        });
+        let created =
+            reconcile_system_health_alarms(&state, &warning).expect("persist health alarm");
+        assert_eq!(created.len(), 1);
+        assert!(created[0].starts_with("created:ALARM-HEALTH-"));
+
+        let open = state
+            .runtime
+            .block_on(db::list_production_alarms(
+                &state.database.connection,
+                db::ProductionAlarmFilter {
+                    status: Some("open".to_string()),
+                    source: Some(SYSTEM_HEALTH_ALARM_SOURCE.to_string()),
+                    ..db::ProductionAlarmFilter::default()
+                },
+            ))
+            .expect("open health alarms");
+        assert_eq!(open.total, 1);
+        assert_eq!(open.alarms[0].alarm_type, "storage-capacity-warning");
+
+        let healthy = json!({
+            "checks": {
+                "storage": {
+                    "ok": true,
+                    "status": "up",
+                    "level": "ok"
+                }
+            }
+        });
+        let resolved =
+            reconcile_system_health_alarms(&state, &healthy).expect("resolve health alarm");
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].starts_with("resolved:ALARM-HEALTH-"));
+
+        let history = state
+            .runtime
+            .block_on(db::list_production_alarms(
+                &state.database.connection,
+                db::ProductionAlarmFilter {
+                    status: Some("history".to_string()),
+                    source: Some(SYSTEM_HEALTH_ALARM_SOURCE.to_string()),
+                    ..db::ProductionAlarmFilter::default()
+                },
+            ))
+            .expect("health alarm history");
+        assert_eq!(history.total, 1);
+        assert_eq!(history.alarms[0].status, "resolved");
+        assert_eq!(history.alarms[0].acknowledged_by, SYSTEM_HEALTH_ALARM_ACTOR);
+        assert_eq!(history.alarms[0].resolved_by, SYSTEM_HEALTH_ALARM_ACTOR);
+    }
+
+    #[test]
+    fn calibration_capture_fit_requires_one_complete_frame_from_each_of_eight_cameras() {
         let root = std::env::temp_dir().join(format!(
             "steel-calibration-capture-summary-{}-{}",
             std::process::id(),
@@ -16651,7 +21450,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create calibration capture test directory");
         let summary_path = root.join("summary.json");
         fs::write(&summary_path, "{}").expect("write calibration capture summary");
-        let results = (1..=6)
+        let results = (1..=8)
             .map(|index| {
                 json!({
                     "code": 0,
@@ -16663,21 +21462,21 @@ mod tests {
             .collect::<Vec<_>>();
         let complete = json!({
             "code": 0,
-            "successes": 6,
+            "successes": 8,
             "failures": 0,
-            "completeFrames": 6,
-            "metadataFrames": 6,
+            "completeFrames": 8,
+            "metadataFrames": 8,
             "summaryOutput": summary_path.display().to_string(),
             "results": results
         });
         assert_eq!(
-            calibration_capture_data_dir(&complete, 6).expect("complete capture"),
+            calibration_capture_data_dir(&complete, 8).expect("complete capture"),
             root
         );
 
         let mut incomplete = complete;
-        incomplete["metadataFrames"] = json!(5);
-        let error = calibration_capture_data_dir(&incomplete, 6)
+        incomplete["metadataFrames"] = json!(7);
+        let error = calibration_capture_data_dir(&incomplete, 8)
             .expect_err("incomplete calibration capture must fail");
         assert_eq!(error["error"], "calibration_capture_incomplete");
         let _ = fs::remove_dir_all(&root);
@@ -16687,21 +21486,239 @@ mod tests {
     fn calibration_capture_fit_rejects_service_only_simulated_artifacts() {
         let simulated = json!({
             "code": 0,
-            "successes": 6,
+            "successes": 8,
             "failures": 0,
-            "completeFrames": 6,
-            "metadataFrames": 6,
+            "completeFrames": 8,
+            "metadataFrames": 8,
             "summaryOutput": "simulated://calibration/summary.json",
-            "results": (1..=6).map(|index| json!({
+            "results": (1..=8).map(|index| json!({
                 "code": 0,
                 "ip": format!("192.168.200.{index}"),
                 "completeFrame": true,
                 "metadataOutput": format!("simulated://camera-{index}.json")
             })).collect::<Vec<_>>()
         });
-        let error = calibration_capture_data_dir(&simulated, 6)
+        let error = calibration_capture_data_dir(&simulated, 8)
             .expect_err("non-file simulated capture must not enter fitter");
         assert_eq!(error["error"], "calibration_capture_artifacts_unavailable");
+    }
+
+    #[test]
+    fn algorithm_mock_defects_default_off_and_are_rejected_by_production_policy() {
+        assert!(!synthetic_algorithm_fixtures_allowed("production", "demo"));
+        assert!(!synthetic_algorithm_fixtures_allowed(
+            "development",
+            "validation"
+        ));
+        assert!(synthetic_algorithm_fixtures_allowed("development", "demo"));
+        assert_eq!(
+            algorithm_mock_defect_count(&json!({}), false).expect("default mock count"),
+            0
+        );
+        assert_eq!(
+            algorithm_mock_defect_count(&json!({ "mockDefectCount": 4 }), false)
+                .expect("explicit development fixture"),
+            4
+        );
+        let error = algorithm_mock_defect_count(&json!({ "mockDefectCount": 1 }), true)
+            .expect_err("production policy must reject synthetic defects");
+        assert_eq!(error["error"], "synthetic_defects_forbidden_in_production");
+    }
+
+    #[test]
+    fn algorithm_runtime_configuration_reports_one_active_source_of_truth() {
+        let configuration = algorithm_runtime_configuration();
+        assert_eq!(configuration["schema"], "steel.algorithm-runtime-config.v1");
+        for key in ["captureRoot", "algorithmRoot", "algorithmConfig"] {
+            let desired = configuration["desired"][key]
+                .as_str()
+                .expect("desired configuration path");
+            let active = configuration["active"][key]
+                .as_str()
+                .expect("active configuration path");
+            assert!(!desired.trim().is_empty());
+            assert_eq!(desired, active);
+        }
+        assert_eq!(configuration["readback"]["configValid"], true);
+        assert!(configuration["active"]["configRevision"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(configuration["active"]["configSha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64));
+        assert_eq!(
+            configuration["readback"]["ready"],
+            json!(
+                configuration["readback"]["configValid"] == true
+                    && configuration["readback"]["algorithmRootExists"] == true
+                    && configuration["readback"]["captureRootExists"] == true
+                    && configuration["readback"]["paths"]["algorithmCalibration"]["ready"] == true
+            )
+        );
+        assert!(configuration["readback"]["paths"]["algorithmConfig"]["ready"] == true);
+    }
+
+    #[test]
+    fn production_algorithm_paths_cannot_override_the_active_configuration() {
+        let configured_request = json!({
+            "captureRoot": bar_surface_capture_root().display().to_string(),
+            "outputRoot": algorithm_data_root().display().to_string()
+        });
+        assert_eq!(
+            production_algorithm_request_config_error(&configured_request),
+            None
+        );
+        assert_eq!(
+            production_algorithm_request_config_error(&json!({
+                "outputRoot": algorithm_data_root().join("alternate").display().to_string()
+            })),
+            Some("production_algorithm_path_override_forbidden")
+        );
+
+        let test_root = env::temp_dir().join(format!(
+            "steel-algorithm-runtime-path-test-{}",
+            current_time_millis()
+        ));
+        fs::create_dir_all(&test_root).expect("runtime path fixture");
+        let directory = runtime_path_readback(&test_root, "directory");
+        assert_eq!(directory["ready"], true);
+        let missing = runtime_path_readback(&test_root.join("missing"), "directory");
+        assert_eq!(missing["ready"], false);
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    fn production_algorithm_policy_detects_declared_or_embedded_synthetic_output() {
+        assert_eq!(algorithm_synthetic_defect_count(&json!({})), 0);
+        assert_eq!(
+            algorithm_synthetic_defect_count(&json!({
+                "result": { "manifest": { "detection": {
+                    "syntheticDefectCount": 3,
+                    "defects": []
+                } } }
+            })),
+            3
+        );
+        assert_eq!(
+            algorithm_synthetic_defect_count(&json!({
+                "result": { "manifest": { "detection": {
+                    "syntheticDefectCount": 0,
+                    "defects": [
+                        { "geometry": { "synthetic": false } },
+                        { "geometry": { "synthetic": true } }
+                    ]
+                } } }
+            })),
+            1
+        );
+    }
+
+    #[test]
+    fn production_algorithm_traceability_requires_identity_hashes_inputs_thresholds_and_gate() {
+        let sha = "a".repeat(64);
+        let artifact = json!({
+            "camera": "camera1",
+            "frameId": "frame-001",
+            "kind": "depth",
+            "path": r"H:\camera1\plate\depth\frame-001.png",
+            "bytes": 42,
+            "sha256": "d".repeat(64)
+        });
+        let input_summary =
+            canonical_value_sha256(&json!([artifact.clone()])).expect("canonical input hash");
+        assert_eq!(
+            input_summary,
+            "eaf4f395409243cfebeadb938c63b5b64afeec6e3162c27b7e188e09b0441a53"
+        );
+        let valid = json!({
+            "result": { "manifest": {
+                "algorithmName": "bar-surface-defect-detector",
+                "algorithmVersion": "bar-surface-radial-residual-1.0.0",
+                "configRevision": "ALGCFG-1",
+                "configSha256": sha,
+                "calibrationRevision": "CAL-1",
+                "calibrationSha256": "b".repeat(64),
+                "scriptSha256": "e".repeat(64),
+                "coreSha256": "f".repeat(64),
+                "acceptanceReportSha256": "1".repeat(64),
+                "datasetRevision": "DATASET-1",
+                "datasetSha256": "2".repeat(64),
+                "evaluatorRevision": "EVALUATOR-1",
+                "evaluatorSha256": "3".repeat(64),
+                "releaseCommit": "4".repeat(40),
+                "inputSummarySha256": input_summary,
+                "inputFrameIds": ["frame-001"],
+                "inputArtifactCount": 1,
+                "inputArtifacts": [artifact],
+                "thresholds": {
+                    "meshRows": 144,
+                    "meshColsPerCamera": 72,
+                    "radiusMm": 75.0,
+                    "radialScaleMm": 8.0,
+                    "maxFaceEdgeMm": 8.0,
+                    "contourRadiusToleranceMm": 0.0,
+                    "contourMinKeepRatio": 0.55,
+                    "contourMinRowCoverage": 0.25,
+                    "contourAutoPercentile": 96.0,
+                    "defectMinDepthMm": 0.35,
+                    "defectMinAreaPoints": 6
+                },
+                "qualityGate": { "passed": true, "reasons": [] },
+                "core": { "available": true, "summary": { "outputBytes": 128 } },
+                "realDefectCount": 0,
+                "syntheticDefectCount": 0
+            }}
+        });
+        assert_eq!(
+            algorithm_traceability_structure_error(&valid["result"]["manifest"]),
+            None
+        );
+
+        let mut bad_hash = valid.clone();
+        bad_hash["result"]["manifest"]["inputSummarySha256"] = json!("not-a-hash");
+        assert_eq!(
+            algorithm_traceability_structure_error(&bad_hash["result"]["manifest"]),
+            Some("algorithm_traceability_sha256_missing".to_string())
+        );
+
+        let mut failed_gate = valid;
+        failed_gate["result"]["manifest"]["qualityGate"]["passed"] = json!(false);
+        assert_eq!(
+            algorithm_traceability_structure_error(&failed_gate["result"]["manifest"]),
+            Some("algorithm_quality_gate_failed".to_string())
+        );
+    }
+
+    #[test]
+    fn automatic_calibration_activation_requires_target_quality_and_opt_in() {
+        assert_eq!(
+            automatic_calibration_activation_decision(
+                &json!({ "targetDetection": { "detected": false }, "correctionAccepted": true }),
+                true,
+            ),
+            (false, true, "calibration_target_not_detected")
+        );
+        assert_eq!(
+            automatic_calibration_activation_decision(
+                &json!({ "targetDetection": { "detected": true }, "correctionAccepted": false }),
+                true,
+            ),
+            (true, false, "correction_quality_gate_failed")
+        );
+        assert_eq!(
+            automatic_calibration_activation_decision(
+                &json!({ "targetDetection": { "detected": true }, "correctionAccepted": true }),
+                false,
+            ),
+            (true, true, "automatic_activation_disabled")
+        );
+        assert_eq!(
+            automatic_calibration_activation_decision(
+                &json!({ "targetDetection": { "detected": true }, "correctionAccepted": true }),
+                true,
+            ),
+            (true, true, "pending")
+        );
     }
 
     #[test]

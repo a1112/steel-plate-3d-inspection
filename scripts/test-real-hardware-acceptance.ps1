@@ -4,7 +4,7 @@ param(
   [string]$TriggerOrigin = "http://127.0.0.1:4881",
   [string]$ClientOrigin = "http://127.0.0.1:1432/?app=terminal",
   [string]$CaptureRoot = "H:\",
-  [int]$ExpectedCameras = 6,
+  [int]$ExpectedCameras = 8,
   [int]$Rounds = 1,
   [int]$Lines = 1000,
   [int]$Width = 0,
@@ -25,15 +25,24 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Expected production layout: H:\camera1..camera6\<material>\{depth,intensity,metadata}; sdk-derived stays disabled by default.
+if ($ExpectedCameras -ne 8) {
+  throw "Formal real-hardware acceptance requires exactly eight cameras."
+}
+if ($Rounds -lt 1) {
+  throw "Rounds must be positive."
+}
+
+# Expected production layout: H:\camera1..camera8\<material>\{depth,intensity,metadata}; sdk-derived stays disabled by default.
 $ExpectedCameraDirs = 1..$ExpectedCameras | ForEach-Object { "camera$_" }
 $KnownClockwiseIps = @(
   "192.168.101.100",
   "192.168.102.100",
   "192.168.103.100",
   "192.168.104.100",
-  "192.168.105.13",
-  "192.168.106.100"
+  "192.168.105.100",
+  "192.168.106.100",
+  "192.168.107.100",
+  "192.168.108.100"
 )
 
 function Join-OriginPath {
@@ -330,6 +339,7 @@ function Get-CameraStatusRows {
   return @($Statuses | ForEach-Object {
       [ordered]@{
         ip = [string]$_.ip
+        sn = [string]$_.sn
         connected = [bool]$_.connected
         sdkStatus = [string]$_.sdkStatus
         acquisitionState = [string]$_.acquisitionState
@@ -415,10 +425,11 @@ $LatestArtifacts = foreach ($Ip in @($DiscoveredIps | Select-Object -First $Expe
 
 Test-Condition -Failures $Failures -Condition ($CaptureHealth.json.code -eq 0 -or $CaptureHealth.json.sdkReady -eq $true) -Message "Capture provider health did not report a healthy SDK/provider."
 Test-Condition -Failures $Failures -Condition ($Cameras.json.code -eq 0) -Message "Camera discovery returned non-zero code."
-Test-Condition -Failures $Failures -Condition ($DiscoveredIps.Count -ge $ExpectedCameras) -Message "Discovered $($DiscoveredIps.Count) camera(s), expected at least $ExpectedCameras."
+Test-Condition -Failures $Failures -Condition ($DiscoveredIps.Count -eq $ExpectedCameras) -Message "Discovered $($DiscoveredIps.Count) camera(s), expected exactly $ExpectedCameras."
+Test-Condition -Failures $Failures -Condition (@($DiscoveredIps | Select-Object -Unique).Count -eq $ExpectedCameras) -Message "Discovered camera IPs are not eight unique values."
 Test-Condition -Failures $Failures -Condition (Test-Path $CaptureRoot -PathType Container) -Message "Capture root drive/folder does not exist: $CaptureRoot"
 Test-Condition -Failures $Failures -Condition ([bool]$StorageStatus.json.writable) -Message "Provider storage root is not writable."
-Test-Condition -Failures $Failures -Condition ($StorageRoots.Count -ge $ExpectedCameras) -Message "Provider returned $($StorageRoots.Count) camera storage root(s), expected $ExpectedCameras."
+Test-Condition -Failures $Failures -Condition ($StorageRoots.Count -eq $ExpectedCameras) -Message "Provider returned $($StorageRoots.Count) camera storage root(s), expected exactly $ExpectedCameras."
 foreach ($Row in $ExpectedRootRows) {
   Test-Condition -Failures $Failures -Condition ([bool]$Row.mapped) -Message "No provider camera root maps to $($Row.expectedRoot)."
 }
@@ -446,7 +457,9 @@ if ($ConnectFirst -and $Failures.Count -eq 0) {
 
 if (($RunCapture -or $ConnectFirst) -and $Failures.Count -eq 0) {
   $ConnectedRows = @($StatusRows | Where-Object { $_.connected })
-  Test-Condition -Failures $Failures -Condition ($ConnectedRows.Count -ge $ExpectedCameras) -Message "Connected $($ConnectedRows.Count) camera(s), expected at least $ExpectedCameras."
+  Test-Condition -Failures $Failures -Condition ($ConnectedRows.Count -eq $ExpectedCameras) -Message "Connected $($ConnectedRows.Count) camera(s), expected exactly $ExpectedCameras."
+  Test-Condition -Failures $Failures -Condition (@($ConnectedRows.ip | Select-Object -Unique).Count -eq $ExpectedCameras) -Message "Connected camera IPs are not eight unique values."
+  Test-Condition -Failures $Failures -Condition (@($ConnectedRows.sn | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique).Count -eq $ExpectedCameras) -Message "Connected camera serial numbers are not eight non-empty unique values."
   foreach ($Row in @($ConnectedRows | Select-Object -First $ExpectedCameras)) {
     Test-Condition -Failures $Failures -Condition ([int]$Row.controlMode -eq $ControlMode) -Message "Camera $($Row.ip) controlMode readback $($Row.controlMode), expected $ControlMode."
     Test-Condition -Failures $Failures -Condition ([int]$Row.triggerInputType -eq 4) -Message "Camera $($Row.ip) triggerInputType readback $($Row.triggerInputType), expected 4 (time trigger)."
@@ -507,13 +520,14 @@ if ($RunCapture -and $Failures.Count -eq 0) {
     $ProviderRows = Get-ProviderResultRows -Provider $Provider
     Test-Condition -Failures $Failures -Condition ($CaptureResult.json.code -eq 0) -Message "Production capture-once returned non-zero code."
     Test-Condition -Failures $Failures -Condition ($Provider.parallel -eq $true) -Message "Provider did not report parallel synchronized capture."
-    Test-Condition -Failures $Failures -Condition ($Provider.workerCount -ge $ExpectedCameras) -Message "Provider worker count $($Provider.workerCount) is below expected $ExpectedCameras."
+    Test-Condition -Failures $Failures -Condition ($Provider.workerCount -eq $ExpectedCameras) -Message "Provider worker count $($Provider.workerCount) does not equal expected $ExpectedCameras."
     Test-Condition -Failures $Failures -Condition ($Provider.saveSdkDerived -eq $false) -Message "Provider saveSdkDerived was not false."
     Test-Condition -Failures $Failures -Condition ($Provider.failures -eq 0) -Message "Provider reported capture failures: $($Provider.failures)."
-    Test-Condition -Failures $Failures -Condition ($Provider.completeFrames -ge ($ExpectedCameras * $Rounds)) -Message "Provider completeFrames $($Provider.completeFrames) below expected $($ExpectedCameras * $Rounds)."
-    Test-Condition -Failures $Failures -Condition ($Provider.metadataFrames -ge ($ExpectedCameras * $Rounds)) -Message "Provider metadataFrames $($Provider.metadataFrames) below expected $($ExpectedCameras * $Rounds)."
-    Test-Condition -Failures $Failures -Condition ($ProviderRows.Count -ge ($ExpectedCameras * $Rounds)) -Message "Provider returned $($ProviderRows.Count) per-camera result row(s), expected at least $($ExpectedCameras * $Rounds)."
-    Test-Condition -Failures $Failures -Condition ([int]$CaptureResult.json.record.captureFileRows -ge ($ExpectedCameras * $Rounds * 3)) -Message "Rust record captureFileRows $($CaptureResult.json.record.captureFileRows) below expected $($ExpectedCameras * $Rounds * 3)."
+    Test-Condition -Failures $Failures -Condition ($Provider.successes -eq ($ExpectedCameras * $Rounds)) -Message "Provider successes $($Provider.successes) does not equal expected $($ExpectedCameras * $Rounds)."
+    Test-Condition -Failures $Failures -Condition ($Provider.completeFrames -eq ($ExpectedCameras * $Rounds)) -Message "Provider completeFrames $($Provider.completeFrames) does not equal expected $($ExpectedCameras * $Rounds)."
+    Test-Condition -Failures $Failures -Condition ($Provider.metadataFrames -eq ($ExpectedCameras * $Rounds)) -Message "Provider metadataFrames $($Provider.metadataFrames) does not equal expected $($ExpectedCameras * $Rounds)."
+    Test-Condition -Failures $Failures -Condition ($ProviderRows.Count -eq ($ExpectedCameras * $Rounds)) -Message "Provider returned $($ProviderRows.Count) per-camera result row(s), expected exactly $($ExpectedCameras * $Rounds)."
+    Test-Condition -Failures $Failures -Condition ([int]$CaptureResult.json.record.captureFileRows -eq ($ExpectedCameras * $Rounds * 3)) -Message "Rust record captureFileRows $($CaptureResult.json.record.captureFileRows) does not equal expected $($ExpectedCameras * $Rounds * 3)."
     foreach ($Row in $ProviderRows) {
       Test-Condition -Failures $Failures -Condition ($Row.code -eq 0) -Message "Capture failed for $($Row.ip) round $($Row.round): code=$($Row.code), error=$($Row.errorName), hint=$($Row.operatorHint)."
       Test-Condition -Failures $Failures -Condition ([bool]$Row.completeFrame) -Message "Incomplete frame for $($Row.ip) round $($Row.round): depth=$($Row.depthExists), intensity=$($Row.intensityExists), metadata=$($Row.metadataExists)."
@@ -575,10 +589,10 @@ if ($RunCapture -and $Failures.Count -eq 0) {
         Add-Failure -Failures $Failures -Message "Production summary is not readable JSON: $LatestSummaryPath`: $($_.Exception.Message)"
       }
       Test-Condition -Failures $Failures -Condition ($ProductionSummary.schema -eq "steel.production.summary.v1") -Message "Production summary schema mismatch: $($ProductionSummary.schema)"
-      Test-Condition -Failures $Failures -Condition ($ProductionSummary.fileCount -ge ($ExpectedCameras * $Rounds * 3)) -Message "Production summary fileCount $($ProductionSummary.fileCount) below expected $($ExpectedCameras * $Rounds * 3)."
-      Test-Condition -Failures $Failures -Condition ($ProductionSummary.depth -ge ($ExpectedCameras * $Rounds)) -Message "Production summary depth count $($ProductionSummary.depth) below expected $($ExpectedCameras * $Rounds)."
-      Test-Condition -Failures $Failures -Condition ($ProductionSummary.intensity -ge ($ExpectedCameras * $Rounds)) -Message "Production summary intensity count $($ProductionSummary.intensity) below expected $($ExpectedCameras * $Rounds)."
-      Test-Condition -Failures $Failures -Condition ($ProductionSummary.metadata -ge ($ExpectedCameras * $Rounds)) -Message "Production summary metadata count $($ProductionSummary.metadata) below expected $($ExpectedCameras * $Rounds)."
+      Test-Condition -Failures $Failures -Condition ($ProductionSummary.fileCount -eq ($ExpectedCameras * $Rounds * 3)) -Message "Production summary fileCount $($ProductionSummary.fileCount) does not equal expected $($ExpectedCameras * $Rounds * 3)."
+      Test-Condition -Failures $Failures -Condition ($ProductionSummary.depth -eq ($ExpectedCameras * $Rounds)) -Message "Production summary depth count $($ProductionSummary.depth) does not equal expected $($ExpectedCameras * $Rounds)."
+      Test-Condition -Failures $Failures -Condition ($ProductionSummary.intensity -eq ($ExpectedCameras * $Rounds)) -Message "Production summary intensity count $($ProductionSummary.intensity) does not equal expected $($ExpectedCameras * $Rounds)."
+      Test-Condition -Failures $Failures -Condition ($ProductionSummary.metadata -eq ($ExpectedCameras * $Rounds)) -Message "Production summary metadata count $($ProductionSummary.metadata) does not equal expected $($ExpectedCameras * $Rounds)."
       Test-Condition -Failures $Failures -Condition ($ProductionSummary.sdkDerived -eq 0) -Message "Production summary should keep sdk-derived disabled by default; got $($ProductionSummary.sdkDerived)."
     }
     Test-Condition -Failures $Failures -Condition ($null -eq $PostCaptureStatus.json.activeSession) -Message "Production activeSession should be null after steel-out."

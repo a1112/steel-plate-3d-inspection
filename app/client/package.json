@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc && vite build",
-    "build:standalone": "tauri build",
+    "build:standalone": "tauri build --ci -- --locked",
     "test": "vitest run",
     "test:watch": "vitest",
     "tauri": "tauri"

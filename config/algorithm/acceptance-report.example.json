@@ -1,0 +1,38 @@
+{
+  "schema": "steel.algorithm-acceptance.v1",
+  "status": "pending-site-approval",
+  "algorithmName": "bar-surface-defect-detector",
+  "algorithmVersion": "bar-surface-radial-residual-candidate-1.1.0",
+  "configRevision": "ALGCFG-2026-07-16-002",
+  "configSha256": "REPLACE_WITH_CONFIG_SHA256",
+  "scriptSha256": "REPLACE_WITH_PACKAGED_PYTHON_SCRIPT_SHA256",
+  "coreSha256": "REPLACE_WITH_PACKAGED_CPP_CORE_SHA256",
+  "releaseCommit": "REPLACE_WITH_EXACT_RELEASE_GIT_COMMIT",
+  "datasetRevision": "REPLACE_WITH_FROZEN_DATASET_REVISION",
+  "datasetSha256": "REPLACE_WITH_DATASET_MANIFEST_SHA256",
+  "evaluatorRevision": "REPLACE_WITH_FROZEN_EVALUATOR_REVISION",
+  "evaluatorSha256": "REPLACE_WITH_EVALUATOR_SHA256",
+  "calibrationRevision": "REPLACE_WITH_CALIBRATION_REVISION",
+  "calibrationSha256": "REPLACE_WITH_CALIBRATION_SHA256",
+  "metrics": {
+    "detectionRecall": null,
+    "falsePositiveRate": null,
+    "missRate": null,
+    "localizationErrorMmP95": null,
+    "sizeErrorMmP95": null,
+    "endToEndLatencyMsP95": null
+  },
+  "acceptanceCriteria": {
+    "minimumDetectionRecall": null,
+    "maximumFalsePositiveRate": null,
+    "maximumMissRate": null,
+    "maximumLocalizationErrorMmP95": null,
+    "maximumSizeErrorMmP95": null,
+    "maximumEndToEndLatencyMsP95": null
+  },
+  "approvals": {
+    "algorithmOwner": "",
+    "qualityOwner": "",
+    "approvedAt": ""
+  }
+}

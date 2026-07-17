@@ -743,7 +743,7 @@ def frame_transaction_and_overlap(executable, root):
                 "autoCapture": True,
                 "width": 160,
                 "lines": 96,
-                "intervalMs": 0,
+                "intervalMs": 10,
                 "retries": 0,
             },
         )
@@ -759,19 +759,107 @@ def frame_transaction_and_overlap(executable, root):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             production = service.request("/api/steel/status")
-            if not production.get("productionCaptureRunning"):
+            if (production.get("productionCaptureRunning")
+                    and production.get("saveEnabled") is False
+                    and production.get("present") is False):
                 break
             time.sleep(0.05)
         else:
-            raise AssertionError("production pipeline did not stop and drain")
+            raise AssertionError("steel-out did not leave continuous acquisition running in discard mode")
+
+        stable_deadline = time.monotonic() + 5
+        previous_saved = None
+        while time.monotonic() < stable_deadline:
+            time.sleep(0.1)
+            production = service.request("/api/steel/status")
+            saved_now = production["captureSuccessCount"]
+            if previous_saved == saved_now:
+                break
+            previous_saved = saved_now
+        else:
+            raise AssertionError("saved frame count did not settle after steel-out")
 
         success_count = production["captureSuccessCount"]
+        acquired_before = production.get("continuousAcquisitionFrameCount", 0)
+        discarded_before = production.get("continuousDiscardedFrameCount", 0)
+        discard_deadline = time.monotonic() + 2
+        while time.monotonic() < discard_deadline:
+            time.sleep(0.05)
+            discard_status = service.request("/api/steel/status")
+            require(discard_status["captureSuccessCount"] == success_count,
+                    "steel-out continued persisting frames")
+            if (discard_status.get("continuousAcquisitionFrameCount", 0) > acquired_before
+                    and discard_status.get("continuousDiscardedFrameCount", 0) > discarded_before):
+                break
+        else:
+            raise AssertionError(
+                "continuous software acquisition did not resume in discard mode after steel-out"
+            )
+
+        on_demand = service.request(
+            "/api/steel/capture-mode", {"captureMode": "on-demand"}
+        )
+        require(on_demand.get("code") == 0
+                and on_demand.get("captureMode") == "on-demand"
+                and on_demand.get("automaticCaptureEnabled") is False,
+                "on-demand capture mode was not accepted")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if not service.request("/api/steel/status").get("productionCaptureRunning"):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("on-demand mode did not stop continuous acquisition")
+
+        invalid_capture_mode = service.request(
+            "/api/steel/capture-mode", {"captureMode": "unexpected"}
+        )
+        require(invalid_capture_mode.get("code") == 400,
+                "invalid capture mode was accepted")
+
+        service.request("/api/steel/event", {"cmd": "reset"})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if not service.request("/api/steel/status").get("productionCaptureRunning"):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("production reset did not stop continuous acquisition")
+
+        held = service.request(
+            "/api/steel/event",
+            {
+                "cmd": "steelIn",
+                "value": 1,
+                "id": "MAT-ON-DEMAND",
+                "autoCapture": True,
+                "width": 160,
+                "lines": 96,
+            },
+        )
+        require(held.get("captureMode") == "on-demand"
+                and held.get("phase") == "steel-in-waiting-images",
+                "on-demand steel-in did not enter its waiting state")
+        time.sleep(0.2)
+        held_status = service.request("/api/steel/status")
+        require(held_status.get("productionCaptureRunning") is False
+                and held_status.get("captureSuccessCount") == 0,
+                "on-demand steel-in unexpectedly started continuous acquisition")
+        disabled = service.request(
+            "/api/steel/capture-mode", {"captureMode": "disabled"}
+        )
+        require(disabled.get("code") == 0
+                and disabled.get("captureMode") == "disabled"
+                and disabled.get("automaticCaptureEnabled") is False,
+                "disabled capture mode was not applied")
+        service.request("/api/steel/event", {"cmd": "steelIn", "value": 0})
+
         require(success_count > 0 and success_count % 4 == 0, "production result count is not round-aligned")
-        require(production["captureCount"] == success_count, "production counted a frame before successful storage")
-        require(production["captureFailureCount"] == 0, "simulated production storage failed")
+        require(discard_status["captureCount"] == success_count, "production counted a frame before successful storage")
+        require(discard_status["captureFailureCount"] == 0, "simulated production storage failed")
         require(
-            production["nextCaptureSequence"] == success_count // 4 + 1,
-            "production sequence reservation is inconsistent with completed rounds",
+            discard_status["nextCaptureSequence"] >= success_count // 4 + 1,
+            "production sequence reservation moved behind completed rounds",
         )
         production_metadata = [
             path

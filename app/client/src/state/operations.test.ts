@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { getMockInspectionSnapshot } from '../data/inspection';
 import {
   applyInspectionSettingsToDefects,
+  createReportMetadata,
   createDefaultSettings,
   createInitialOperationState,
   exportRowsAsCsv,
+  exportReportAsJson,
   filterDefectsForReport,
   getDeviceStatusWithOperation,
   getReportMetrics,
@@ -113,5 +115,30 @@ describe('operations state helpers', () => {
 
     expect(csv.split('\n')[0]).toBe('序号,钢管号,缺陷类别,相机区,等级,距头距离(mm),尺寸(mm),深度(mm)');
     expect(csv).toContain('D-001,202606131900,凹坑,1-3号相机,严重,8342,0.42 x 0.36,-0.12');
+  });
+
+  it('binds report identity and JSON metadata to the actual inspection records', () => {
+    const snapshot = getMockInspectionSnapshot();
+    const inspection = {
+      ...snapshot.inspections[0],
+      inspectionId: 'INSP-PROD-001',
+      source: 'production',
+    };
+    const rows = inspection.defects.slice(0, 2);
+    const metadata = createReportMetadata([inspection], rows);
+
+    expect(metadata.reportId).toBe('RPT-INSP-PROD-001');
+    expect(metadata.dataSource).toBe('生产检测数据库');
+    expect(metadata.materialIds).toEqual([inspection.plate.plateNo]);
+    expect(metadata.recordCount).toBe(2);
+    const exported = JSON.parse(exportReportAsJson(metadata, rows));
+    expect(exported.schema).toBe('steel.inspection.report.v1');
+    expect(exported.metadata.reportId).toBe('RPT-INSP-PROD-001');
+    expect(exported.defects).toHaveLength(2);
+
+    const noDefectMetadata = createReportMetadata([{ ...inspection, defects: [] }], []);
+    expect(noDefectMetadata.reportId).toBe('RPT-INSP-PROD-001');
+    expect(noDefectMetadata.inspectionIds).toEqual(['INSP-PROD-001']);
+    expect(noDefectMetadata.recordCount).toBe(0);
   });
 });

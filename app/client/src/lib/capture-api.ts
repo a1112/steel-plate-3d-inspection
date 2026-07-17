@@ -51,6 +51,18 @@ export type CaptureCameraStatus = {
   acquisitionState?:
     "connected" | "discovered" | "offline" | "disabled" | string;
   sdkStatus?: string;
+  /**
+   * Rolling rate of completed depth-map captures from the production
+   * continuous-acquisition worker.  This is deliberately separate from the
+   * preview stream's `streamRunning` / `streamFrames` telemetry.
+   */
+  continuousFps?: number | null;
+  continuousFrameCount?: number | null;
+  continuousFinalizedCount?: number | null;
+  continuousSuccessfulFrameCount?: number | null;
+  continuousLastResultCode?: number | null;
+  lastContinuousFrameAt?: string | null;
+  continuousAcquiring?: boolean;
   fps?: number | null;
   bufferPercent?: number | null;
   lastFrameTime?: string | null;
@@ -64,6 +76,8 @@ export type CaptureCameraStatus = {
   bufferOverflowCounter?: number;
   streamRunning?: boolean;
   streamFrames?: number;
+  streamFps?: number | null;
+  streamLastFrameAt?: string | null;
   captureConfig?: CaptureSdkReadback;
   error?: string | null;
 };
@@ -146,7 +160,7 @@ export type CaptureLogEvent = {
   id: string;
   time: string;
   level: "info" | "warning" | "error" | string;
-  source?: "provider-snapshot" | "client-operation" | "system-operation";
+  source?: "provider-log" | "provider-snapshot" | "client-operation" | "system-operation";
   cameraIp?: string | null;
   message: string;
 };
@@ -251,6 +265,74 @@ export type CaptureCommandResult = {
   saveCode?: number;
   external?: boolean;
   saveToDevice?: boolean;
+};
+
+export type CaptureOutputMode = "continuous" | "on-demand" | "disabled";
+
+export type CaptureOutputModeStatus = CaptureCommandResult & {
+  captureMode?: CaptureOutputMode | string;
+  automaticCaptureEnabled?: boolean;
+  productionCaptureRunning?: boolean;
+  captureModeChanged?: boolean;
+};
+
+export type CaptureContinuousSettingsInput = {
+  /** Line trigger rate in Hz, not the completed depth-map FPS. */
+  timeTriggerFreq: number;
+  /** Defaults to the currently connected enabled cameras when omitted. */
+  ips?: string[];
+  /** False performs validation only; true applies a runtime-only SDK setting. */
+  applyToDevice?: boolean;
+  /** The provider pauses and resumes the continuous worker around a runtime update. */
+  restartContinuous?: boolean;
+};
+
+export type CaptureContinuousSettingsResult = CaptureCommandResult & {
+  timeTriggerFreq?: number;
+  lineTriggerFrequency?: number;
+  /** Provider compatibility: current C++ service returns the committed camera count. */
+  applied?: number | boolean;
+  appliedCount?: number;
+  transactionCommitted?: boolean;
+  validatedOnly?: boolean;
+  runtimeOnly?: boolean;
+  devicePersistent?: boolean;
+  deviceReadbackVerified?: boolean;
+  readbackSource?: string;
+  dryRun?: boolean;
+  restartContinuous?: boolean;
+  captureMode?: CaptureOutputMode | string;
+  results?: Array<CaptureCommandResult & {
+    applied?: boolean;
+    dryRun?: boolean;
+    previousTimeTriggerFreq?: number;
+    timeTriggerFreq?: number;
+    lineTriggerFrequency?: number;
+    sdkMaxAcquisitionFrameRate?: number;
+    lineTriggerRateMaximumKnown?: boolean;
+    deviceReadbackVerified?: boolean;
+  }>;
+  settings?: CaptureContinuousSettingsStatus;
+};
+
+export type CaptureContinuousSettingsStatus = {
+  supported?: boolean;
+  route?: string;
+  connectedCameras?: number;
+  configuredCameras?: number;
+  timeTriggerFreq?: number;
+  lineTriggerFrequency?: number;
+  sdkMaxAcquisitionFrameRate?: number;
+  lineTriggerRateMaximumKnown?: boolean;
+  mixedLineTriggerFrequency?: boolean;
+  requiresApplyToDevice?: boolean;
+  runtimeOnly?: boolean;
+  devicePersistent?: boolean;
+  readbackSource?: string;
+};
+
+export type CaptureContinuousSettingsReadResult = CaptureCommandResult & {
+  settings?: CaptureContinuousSettingsStatus;
 };
 
 export type CaptureImageKind = "depth" | "intensity" | "metadata" | "sdk-derived";
@@ -885,12 +967,14 @@ function timestamp() {
 
 export function createDefaultCaptureCameras(): CaptureCameraConfig[] {
   const cameras = [
-    { ip: "192.168.105.13", model: "LVM3450CA", role: "camera1 周向采集相机" },
+    { ip: "192.168.101.100", model: "LVM3450BE", role: "camera1 周向采集相机" },
     { ip: "192.168.102.100", model: "LVM3450CA", role: "camera2 周向采集相机" },
-    { ip: "192.168.101.100", model: "LVM3450BE", role: "camera3 周向采集相机" },
-    { ip: "192.168.103.100", model: "LVM3450RE", role: "camera4 周向采集相机" },
-    { ip: "192.168.104.100", model: "LVM3450BE", role: "camera5 周向采集相机" },
-    { ip: "192.168.106.100", model: "LVM3450RE", role: "camera6 周向采集相机" },
+    { ip: "192.168.103.100", model: "LVM3450RE", role: "camera3 周向采集相机" },
+    { ip: "192.168.104.100", model: "LVM3450GE(520)", role: "camera4 周向采集相机" },
+    { ip: "192.168.105.100", model: "LVM3450BE", role: "camera5 周向采集相机" },
+    { ip: "192.168.106.100", model: "LVM3450CA", role: "camera6 周向采集相机" },
+    { ip: "192.168.107.100", model: "LVM3450RE", role: "camera7 周向采集相机" },
+    { ip: "192.168.108.100", model: "LVM3450GE(520)", role: "camera8 周向采集相机" },
   ];
   return cameras.map((camera, index) => {
     const cameraNo = index + 1;
@@ -932,8 +1016,8 @@ export function createDefaultCaptureDriver(): CaptureDriverInfo {
 
 export function createDefaultCaptureConfig(): CaptureAppliedConfig {
   return {
-    id: "six-camera-capture",
-    name: "Six-Camera-Capture",
+    id: "eight-camera-capture",
+    name: "Eight-Camera-Capture",
     applied: true,
     updatedAt: timestamp(),
     cameras: createDefaultCaptureCameras(),
@@ -1031,6 +1115,24 @@ export function createDefaultCaptureCapabilities(
         label: "采集深度图",
         scope: "camera",
       },
+      {
+        method: "POST",
+        path: "/api/steel/capture-mode",
+        label: "切换相机出图模式",
+        scope: "system",
+      },
+      {
+        method: "GET",
+        path: "/api/capture/continuous-settings",
+        label: "读取连续采集设置",
+        scope: "system",
+      },
+      {
+        method: "POST",
+        path: "/api/capture/continuous-settings",
+        label: "运行时应用连续采集设置",
+        scope: "system",
+      },
     ],
   };
 }
@@ -1056,6 +1158,10 @@ function createStatusFromConfig(
         : "offline"
       : "disabled",
     sdkStatus: "pending",
+    continuousFps: null,
+    continuousFrameCount: 0,
+    lastContinuousFrameAt: null,
+    continuousAcquiring: false,
     fps: null,
     bufferPercent: 0,
     lastFrameTime: null,
@@ -1097,7 +1203,7 @@ function hydrateSnapshot(
 }
 
 export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
-  const [configResult, health, camerasResult, status, statusesResult] =
+  const [configResult, health, camerasResult, status, statusesResult, logsResult] =
     await Promise.all([
       readAdminJson<ServiceConfigResponse>("/api/config").catch(
         (): ServiceConfigResponse => ({}),
@@ -1108,6 +1214,9 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
       readJson<{ statuses: CaptureCameraStatus[] }>(
         "/api/camera/statuses",
       ).catch(() => ({ statuses: [] })),
+      readJson<{ events: CaptureLogEvent[] }>("/api/capture/logs").catch(
+        () => ({ events: [] }),
+      ),
     ]);
 
   const config = {
@@ -1167,18 +1276,11 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
     cameras,
     status,
     statuses,
-    logs: [
-      {
-        id: "HTTP-001",
-        time: timestamp(),
-        level: health.sdkReady ? "info" : "warning",
-        source: "provider-snapshot",
-        cameraIp: health.ip || null,
-        message: health.sdkReady
-          ? "HTTP capture service ready"
-          : "HTTP capture service waiting for SDK",
-      },
-    ],
+    logs: logsResult.events.map((event) => ({
+      ...event,
+      source: event.source ?? "provider-log",
+      cameraIp: event.cameraIp ?? null,
+    })),
   });
 }
 
@@ -1315,12 +1417,65 @@ export async function applyCaptureConfig(config: CaptureAppliedConfig) {
       updatedAt: timestamp(),
     },
     capture: {
-      mode: "six-camera",
+      mode: "eight-camera",
       driver: "lvm-nvt",
       fallback: "simulated",
       cameras: config.cameras,
     },
   });
+}
+
+export async function setCaptureOutputMode(
+  mode: CaptureOutputMode,
+): Promise<CaptureOutputModeStatus> {
+  return writeJson<CaptureOutputModeStatus>("/api/steel/capture-mode", {
+    captureMode: mode,
+  });
+}
+
+export function validateCaptureContinuousSettings(
+  input: CaptureContinuousSettingsInput,
+): string | null {
+  if (!Number.isFinite(input.timeTriggerFreq)
+    || input.timeTriggerFreq < 0.1
+    || input.timeTriggerFreq > 100000) {
+    return "连续采集线触发频率必须在 0.1 到 100000 Hz 之间";
+  }
+  if (input.ips?.some((ip) => !ip.trim())) {
+    return "连续采集设置中存在空相机 IP";
+  }
+  return null;
+}
+
+/**
+ * Updates the production continuous-acquisition worker through the Rust
+ * service.  `applyToDevice` is runtime-only: the provider does not persist a
+ * camera parameter file or call SDK save-to-device.
+ */
+export async function applyCaptureContinuousSettings(
+  input: CaptureContinuousSettingsInput,
+): Promise<CaptureContinuousSettingsResult> {
+  const request: CaptureContinuousSettingsInput = {
+    ...input,
+    timeTriggerFreq: Number(input.timeTriggerFreq),
+    ips: input.ips?.map((ip) => ip.trim()).filter(Boolean),
+    applyToDevice: input.applyToDevice ?? false,
+    restartContinuous: input.restartContinuous ?? true,
+  };
+  const validationError = validateCaptureContinuousSettings(request);
+  if (validationError) {
+    throw new Error(validationError);
+  }
+  return writeJson<CaptureContinuousSettingsResult>(
+    "/api/capture/continuous-settings",
+    request,
+  );
+}
+
+export async function readCaptureContinuousSettings(): Promise<CaptureContinuousSettingsReadResult> {
+  return readJson<CaptureContinuousSettingsReadResult>(
+    "/api/capture/continuous-settings",
+  );
 }
 
 export async function readCaptureProfiles(): Promise<CaptureProfilesStatus> {
@@ -1734,7 +1889,7 @@ export function captureStreamImageUrl(
 }
 
 export async function readActiveCaptureCalibration(
-  profile = "current-6-soft-trigger",
+  profile = "current-8-time-trigger",
 ): Promise<ActiveCaptureCalibration> {
   const query = new URLSearchParams({ profile });
   return readAdminJson<ActiveCaptureCalibration>(
@@ -1792,8 +1947,8 @@ export async function applyCaptureCalibrationSet(
     .filter((item) => item.ip && item.path);
   const saveToDevice = input.saveToDevice === true;
   const uniqueIps = new Set(cameraCalibrations.map((item) => item.ip));
-  if (cameraCalibrations.length !== 6 || uniqueIps.size !== 6) {
-    throw new Error("整组标定必须包含 6 台唯一相机");
+  if (cameraCalibrations.length !== 8 || uniqueIps.size !== 8) {
+    throw new Error("整组标定必须包含 8 台唯一相机");
   }
   const uniqueCalibrationPaths = new Set(
     cameraCalibrations.map((item) => item.path.replaceAll("\\", "/").toUpperCase()),
@@ -1831,7 +1986,7 @@ export async function applyCaptureCalibrationSet(
       path: input.path?.trim() || undefined,
       cameraCalibrations,
       ips: cameraCalibrations.map((item) => item.ip),
-      expectedCameras: 6,
+      expectedCameras: 8,
       stopStreams: true,
       atomic: true,
       rollbackOnFailure: true,

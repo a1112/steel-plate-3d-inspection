@@ -118,14 +118,14 @@ beforeEach(() => {
 });
 
 describe('CaptureAdvancedOperations', () => {
-  it('edits all six structured camera fields and keeps JSON/storage mappings synchronized', async () => {
-    const sixIps = Array.from({ length: 6 }, (_, index) => `192.168.10${index + 1}.100`);
+  it('edits all eight structured camera fields and keeps JSON/storage mappings synchronized', async () => {
+    const eightIps = Array.from({ length: 8 }, (_, index) => `192.168.10${index + 1}.100`);
     api.readCaptureProfile.mockResolvedValue({
       schema: 'steel.capture.profile.v1',
       name: 'current-6-soft-trigger',
       vendorExtension: { keep: true },
       saveToDevice: false,
-      cameras: sixIps.map((ip, index) => ({
+      cameras: eightIps.map((ip, index) => ({
         ip,
         enabled: true,
         model: `LVM-${index + 1}`,
@@ -137,8 +137,8 @@ describe('CaptureAdvancedOperations', () => {
       })),
     });
 
-    renderTools(sixIps);
-    await screen.findByDisplayValue('LVM-6');
+    renderTools(eightIps);
+    await screen.findByDisplayValue('LVM-8');
 
     fireEvent.change(screen.getByLabelText('Profile 相机 1 IP'), { target: { value: '10.0.0.11' } });
     fireEvent.change(screen.getByLabelText('Profile 相机 1 型号'), { target: { value: 'LVM3450CA' } });
@@ -149,13 +149,13 @@ describe('CaptureAdvancedOperations', () => {
     fireEvent.change(screen.getByLabelText('Profile 相机 1 曝光'), { target: { value: '1250' } });
     fireEvent.change(screen.getByLabelText('Profile 相机 1 增益'), { target: { value: '1.25' } });
     fireEvent.change(screen.getByLabelText('Profile 相机 1 触发频率'), { target: { value: '450' } });
-    fireEvent.click(screen.getByLabelText('Profile 相机 6 启用'));
+    fireEvent.click(screen.getByLabelText('Profile 相机 8 启用'));
 
     const document = JSON.parse((screen.getByLabelText('Profile JSON') as HTMLTextAreaElement).value);
     expect(document.vendorExtension).toEqual({ keep: true });
     expect(document.saveToDevice).toBe(false);
-    expect(document.expectedCameras).toBe(5);
-    expect(document.cameras).toHaveLength(6);
+    expect(document.expectedCameras).toBe(7);
+    expect(document.cameras).toHaveLength(8);
     expect(document.cameras[0]).toMatchObject({
       ip: '10.0.0.11',
       model: 'LVM3450CA',
@@ -166,7 +166,7 @@ describe('CaptureAdvancedOperations', () => {
       storageRoot: 'E:/steel/camera1',
       params: { exposureTime: 1250, gainK: 1.25, timeTriggerFreq: 450 },
     });
-    expect(document.cameras[5].enabled).toBe(false);
+    expect(document.cameras[7].enabled).toBe(false);
     expect(document.cameraStorageRoots[0]).toEqual({ ip: '10.0.0.11', root: 'E:/steel/camera1' });
   });
 

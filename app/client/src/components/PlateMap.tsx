@@ -6,7 +6,7 @@ import heightMapBottomImage from '../assets/plate-surfaces/height-map-bottom.png
 import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
 import type { CaptureImageItem, DefectItem, DefectType } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
-import type { BarSurfaceMesh } from '../services/bar-surface-api';
+import { barSurfaceFileUrl, type BarSurfaceCamera, type BarSurfaceMesh } from '../services/bar-surface-api';
 import { clampPreviewPositionM, DEFAULT_PLATE_LENGTH_M, type SurfaceDisplayMode } from '../state/inspection-ui';
 import { Panel } from './Panel';
 import { ProductionArtifactView } from './ProductionArtifactView';
@@ -24,11 +24,15 @@ interface PlateMapProps {
   inspectionId?: string;
   captureImages?: CaptureImageItem[];
   surfaceMesh?: BarSurfaceMesh | null;
+  surfaceCameras?: BarSurfaceCamera[];
   artifactStatus?: string;
+  viewMode?: PlateMapViewMode;
+  integratedToolbar?: boolean;
   onToggleType: (typeId: string) => void;
   onSurfaceModeChange: (surfaceMode: SurfaceDisplayMode) => void;
   onPreviewPositionChange: (positionM: number) => void;
   onSelectDefect: (defectId: string) => void;
+  onViewModeChange?: (viewMode: PlateMapViewMode) => void;
 }
 
 const surfaceModeOptions: { id: SurfaceDisplayMode; label: string }[] = [
@@ -37,7 +41,16 @@ const surfaceModeOptions: { id: SurfaceDisplayMode; label: string }[] = [
   { id: 'all', label: '全部' },
 ];
 
-type PlateMapViewMode = '2d' | '3d' | 'point-cloud';
+export type PlateMapViewMode = '2d' | '3d' | 'point-cloud';
+type UnfoldOrientation = 'horizontal' | 'vertical';
+
+export function cameraBandRotationRadians(orientation: UnfoldOrientation) {
+  // Line-scan frames store the camera cross-section on X and acquisition
+  // progress (steel length) on Y. Vertical unfolding therefore uses the
+  // frame as-is; horizontal unfolding rotates counter-clockwise so source Y
+  // still runs from the steel-in side to the steel-out side.
+  return orientation === 'horizontal' ? -Math.PI / 2 : 0;
+}
 
 const viewModeOptions: { id: PlateMapViewMode; label: string }[] = [
   { id: '2d', label: '2D' },
@@ -52,7 +65,7 @@ const MAX_PLATE_3D_YAW = 0.5;
 const MIN_PLATE_3D_ZOOM = 0.72;
 const MAX_PLATE_3D_ZOOM = 2.2;
 const PLATE_3D_ZOOM_STEP = 0.12;
-const BAR_CAMERA_COUNT = 6;
+const BAR_CAMERA_COUNT = 8;
 const BAR_CAMERA_LANES = Array.from({ length: BAR_CAMERA_COUNT }, (_, index) => ({
   index,
   label: `camera${index + 1}`,
@@ -70,6 +83,9 @@ function getDefectLengthPercent(defect: DefectItem, plateLengthM: number) {
 }
 
 function getDefectCircumferenceRatio(defect: DefectItem) {
+  if (typeof defect.circumferenceRatio === 'number' && Number.isFinite(defect.circumferenceRatio)) {
+    return Math.max(0, Math.min(0.999, defect.circumferenceRatio));
+  }
   const span = defect.operatorSideMm + defect.driveSideMm;
   if (Number.isFinite(span) && span > 0) {
     return Math.max(0, Math.min(0.999, defect.operatorSideMm / span));
@@ -78,12 +94,12 @@ function getDefectCircumferenceRatio(defect: DefectItem) {
 }
 
 function getDefectCameraIndex(defect: DefectItem) {
-  const explicitCamera = defect as DefectItem & { cameraIndex?: number; camera?: number; cameraId?: string; cameraName?: string };
+  const explicitCamera = defect as DefectItem & { camera?: number; cameraName?: string };
   const explicitIndex = explicitCamera.cameraIndex ?? explicitCamera.camera;
   if (typeof explicitIndex === 'number' && Number.isFinite(explicitIndex) && explicitIndex >= 1 && explicitIndex <= BAR_CAMERA_COUNT) {
     return Math.round(explicitIndex) - 1;
   }
-  const parsed = String(explicitCamera.cameraId ?? explicitCamera.cameraName ?? '').match(/(?:camera|cam|相机)\s*([1-6])/i);
+  const parsed = String(explicitCamera.cameraId ?? explicitCamera.cameraName ?? '').match(/(?:camera|cam|相机)\s*([1-8])/i);
   if (parsed) {
     return Number(parsed[1]) - 1;
   }
@@ -178,6 +194,7 @@ function DefectHoverCard({
       <div className="defect-hover-title">
         <i />
         <strong>{defect.typeLabel}</strong>
+        {defect.synthetic ? <em className="synthetic-defect-badge">模拟</em> : null}
         <span>{defect.id}</span>
       </div>
       {defect.previewImageUrl ? (
@@ -219,6 +236,112 @@ function DefectHoverCard({
   );
 }
 
+function CameraBandImage({
+  src,
+  label,
+  orientation,
+  cropBlackBorders = false,
+}: {
+  src: string;
+  label: string;
+  orientation: UnfoldOrientation;
+  cropBlackBorders?: boolean;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !src) {
+      return;
+    }
+    let disposed = false;
+    const image = new Image();
+    const draw = () => {
+      if (disposed || !image.complete || image.naturalWidth <= 0) {
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.round(rect.width * dpr));
+      canvas.height = Math.max(1, Math.round(rect.height * dpr));
+      const context = canvas.getContext('2d');
+      if (!context) {
+        return;
+      }
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+      context.clearRect(0, 0, rect.width, rect.height);
+      context.globalAlpha = 0.76;
+      let sourceX = 0;
+      let sourceY = 0;
+      let sourceWidth = image.naturalWidth;
+      let sourceHeight = image.naturalHeight;
+      if (cropBlackBorders) {
+        try {
+          const sample = document.createElement('canvas');
+          sample.width = Math.min(256, image.naturalWidth);
+          sample.height = Math.min(128, image.naturalHeight);
+          const sampleContext = sample.getContext('2d', { willReadFrequently: true });
+          if (sampleContext) {
+            sampleContext.drawImage(image, 0, 0, sample.width, sample.height);
+            const pixels = sampleContext.getImageData(0, 0, sample.width, sample.height).data;
+            let minX = sample.width;
+            let minY = sample.height;
+            let maxX = -1;
+            let maxY = -1;
+            for (let y = 0; y < sample.height; y += 1) {
+              for (let x = 0; x < sample.width; x += 1) {
+                const offset = (y * sample.width + x) * 4;
+                const luminance = Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
+                if (luminance > 8) {
+                  minX = Math.min(minX, x);
+                  minY = Math.min(minY, y);
+                  maxX = Math.max(maxX, x);
+                  maxY = Math.max(maxY, y);
+                }
+              }
+            }
+            if (maxX >= minX && maxY >= minY) {
+              const paddingX = Math.max(2, Math.round((maxX - minX + 1) * 0.02));
+              const paddingY = Math.max(2, Math.round((maxY - minY + 1) * 0.02));
+              minX = Math.max(0, minX - paddingX);
+              minY = Math.max(0, minY - paddingY);
+              maxX = Math.min(sample.width - 1, maxX + paddingX);
+              maxY = Math.min(sample.height - 1, maxY + paddingY);
+              sourceX = (minX / sample.width) * image.naturalWidth;
+              sourceY = (minY / sample.height) * image.naturalHeight;
+              sourceWidth = ((maxX - minX + 1) / sample.width) * image.naturalWidth;
+              sourceHeight = ((maxY - minY + 1) / sample.height) * image.naturalHeight;
+            }
+          }
+        } catch {
+          // Cross-origin images can disallow pixel reads. The full production
+          // frame remains usable in that case instead of hiding the lane.
+        }
+      }
+      const rotation = cameraBandRotationRadians(orientation);
+      if (rotation !== 0) {
+        context.translate(0, rect.height);
+        context.rotate(rotation);
+        context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, rect.height, rect.width);
+      } else {
+        context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, rect.width, rect.height);
+      }
+    };
+    image.crossOrigin = 'anonymous';
+    image.onload = draw;
+    image.src = src;
+    const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(draw) : null;
+    observer?.observe(canvas);
+    return () => {
+      disposed = true;
+      observer?.disconnect();
+      image.onload = null;
+    };
+  }, [orientation, src]);
+
+  return <canvas ref={canvasRef} className="bar-camera-band-image" aria-label={`${label} 实际裁剪图`} />;
+}
+
 function BarUnfoldedMap({
   defects,
   defectTypes,
@@ -230,6 +353,9 @@ function BarUnfoldedMap({
   onHoverDefect,
   onDefectNavigationKeyDown,
   onDefectNavigationWheel,
+  orientation,
+  surfaceCameras,
+  captureImages,
 }: {
   defects: DefectItem[];
   defectTypes: DefectType[];
@@ -241,36 +367,74 @@ function BarUnfoldedMap({
   onHoverDefect: (defectId: string | null) => void;
   onDefectNavigationKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
   onDefectNavigationWheel: (event: WheelEvent<HTMLDivElement>) => void;
+  orientation: UnfoldOrientation;
+  surfaceCameras: BarSurfaceCamera[];
+  captureImages: CaptureImageItem[];
 }) {
+  const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
   const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
   const hoveredDefect = defects.find((defect) => defect.id === hoveredDefectId) ?? null;
   const hoveredType = hoveredDefect ? defectTypes.find((type) => type.id === hoveredDefect.typeId) : null;
   const hoveredXPercent = hoveredDefect ? getDefectLengthPercent(hoveredDefect, plateLengthM) : 0;
   const hoveredYPercent = hoveredDefect ? getDefectUnfoldedTopPercent(hoveredDefect) : 0;
+  const captureImageByCamera = useMemo(() => {
+    const images = new Map<string, CaptureImageItem>();
+    captureImages
+      .filter((image) => image.dataName.toLowerCase() === 'intensity')
+      .forEach((image) => {
+        const pathMatch = image.path.match(/camera(\d+)/i);
+        const ipMatch = image.cameraId.match(/\.10(\d)\./);
+        const cameraName = pathMatch ? `camera${Number(pathMatch[1])}` : ipMatch ? `camera${Number(ipMatch[1])}` : '';
+        if (!cameraName) return;
+        const current = images.get(cameraName);
+        if (!current || image.sequenceNo > current.sequenceNo) images.set(cameraName, image);
+      });
+    return images;
+  }, [captureImages]);
 
   return (
-    <div className="bar-unfolded-map" data-testid="bar-unfolded-map">
+    <div className={`bar-unfolded-map orientation-${orientation} ${expandedCamera ? 'camera-expanded' : ''}`} data-testid="bar-unfolded-map" data-orientation={orientation} data-expanded-camera={expandedCamera || undefined}>
       <div className="bar-unfolded-axis" aria-hidden="true">
         <span className="bar-unfolded-axis-title">圆周展开</span>
         {BAR_CAMERA_LANES.map((lane) => (
-          <span key={lane.label}>{lane.label}</span>
+          <span key={lane.label} className={expandedCamera && expandedCamera !== lane.label ? 'is-collapsed' : ''}>{lane.label}</span>
         ))}
       </div>
       <div
         className="bar-unfolded-canvas"
         role="region"
         tabIndex={0}
-        aria-label="六相机圆周展开缺陷图"
+        aria-label="8 相机圆周展开缺陷图"
         style={{ '--preview-position': `${previewPercent}%` } as CSSProperties}
         onKeyDown={onDefectNavigationKeyDown}
         onWheel={onDefectNavigationWheel}
       >
-        <div className="bar-camera-bands" aria-hidden="true">
-          {BAR_CAMERA_LANES.map((lane) => (
-            <div key={lane.label} className="bar-camera-band">
+        <div className="bar-camera-bands">
+          {BAR_CAMERA_LANES.map((lane) => {
+            const camera = surfaceCameras.find((item) => item.name.toLowerCase() === lane.label);
+            const preview = camera?.relative.intensityPreview || camera?.latest.intensityPreview || '';
+            const captureImage = captureImageByCamera.get(lane.label);
+            const source = preview ? barSurfaceFileUrl(preview) : captureImage?.url || '';
+            const expanded = expandedCamera === lane.label;
+            return <div
+              key={lane.label}
+              className={`bar-camera-band ${source ? 'has-production-image' : ''} ${expanded ? 'is-expanded' : ''} ${expandedCamera && !expanded ? 'is-collapsed' : ''}`}
+              role="button"
+              tabIndex={0}
+              aria-label={`${lane.label} 采集图像${expanded ? '，已展开，双击恢复' : '，双击展开'}`}
+              title={expanded ? '双击恢复 8 相机展开图' : `双击展开 ${lane.label}；悬停查看采集轮廓`}
+              onDoubleClick={() => setExpandedCamera((current) => current === lane.label ? null : lane.label)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  setExpandedCamera((current) => current === lane.label ? null : lane.label);
+                }
+              }}
+            >
+              {source ? <CameraBandImage src={source} label={lane.label} orientation={orientation} cropBlackBorders={!preview} /> : null}
               <span>{lane.shortLabel}</span>
-            </div>
-          ))}
+            </div>;
+          })}
         </div>
         <span className="bar-unfolded-note bar-unfolded-note-start">进钢</span>
         <span className="bar-unfolded-note bar-unfolded-note-end">出钢</span>
@@ -279,7 +443,7 @@ function BarUnfoldedMap({
           className={`strip-preview-cursor bar-unfolded-preview-cursor ${previewPercent > 82 ? 'near-end' : ''}`}
           data-testid="preview-cursor-unfolded"
           aria-hidden="true"
-          style={{ left: `${previewPercent}%` }}
+          style={orientation === 'horizontal' ? { left: `${previewPercent}%` } : { top: `${previewPercent}%` }}
         >
           <span>{clampPreviewPositionM(previewPositionM, plateLengthM).toFixed(2)}m</span>
         </div>
@@ -293,8 +457,8 @@ function BarUnfoldedMap({
               className={`defect-marker ${type.shape} ${defect.id === selectedDefectId ? 'selected' : ''}`}
               aria-label={`${defect.typeLabel}，${getDefectCameraLabel(defect)}，距头${defect.distanceHeadMm}mm`}
               style={{
-                left: `${getDefectLengthPercent(defect, plateLengthM)}%`,
-                top: `${getDefectUnfoldedTopPercent(defect)}%`,
+                left: `${orientation === 'horizontal' ? getDefectLengthPercent(defect, plateLengthM) : getDefectUnfoldedTopPercent(defect)}%`,
+                top: `${orientation === 'horizontal' ? getDefectUnfoldedTopPercent(defect) : getDefectLengthPercent(defect, plateLengthM)}%`,
                 backgroundColor: type.color,
               }}
               title={`${defect.typeLabel} ${getDefectCameraLabel(defect)} ${defect.distanceHeadMm}mm`}
@@ -307,7 +471,12 @@ function BarUnfoldedMap({
           );
         })}
         {hoveredDefect && hoveredType ? (
-          <DefectHoverCard defect={hoveredDefect} type={hoveredType} xPercent={hoveredXPercent} yPercent={hoveredYPercent} />
+          <DefectHoverCard
+            defect={hoveredDefect}
+            type={hoveredType}
+            xPercent={orientation === 'horizontal' ? hoveredXPercent : hoveredYPercent}
+            yPercent={orientation === 'horizontal' ? hoveredYPercent : hoveredXPercent}
+          />
         ) : null}
       </div>
     </div>
@@ -318,10 +487,12 @@ function LengthRuler({
   previewPositionM,
   plateLengthM,
   onPreviewPositionChange,
+  orientation,
 }: {
   previewPositionM: number;
   plateLengthM: number;
   onPreviewPositionChange: (positionM: number) => void;
+  orientation: UnfoldOrientation;
 }) {
   const activePointerId = useRef<number | null>(null);
   const mouseDragging = useRef(false);
@@ -329,12 +500,13 @@ function LengthRuler({
   const safePositionM = clampPreviewPositionM(previewPositionM, safePlateLengthM);
   const previewPercent = (safePositionM / safePlateLengthM) * 100;
 
-  const updateFromClientX = (clientX: number, element: HTMLElement) => {
+  const updateFromPointer = (clientX: number, clientY: number, element: HTMLElement) => {
     const rect = element.getBoundingClientRect();
-    if (rect.width <= 0) {
+    const extent = orientation === 'horizontal' ? rect.width : rect.height;
+    if (extent <= 0) {
       return;
     }
-    const ratio = (clientX - rect.left) / rect.width;
+    const ratio = orientation === 'horizontal' ? (clientX - rect.left) / rect.width : (clientY - rect.top) / rect.height;
     const nextPositionM = clampPreviewPositionM(Number((ratio * safePlateLengthM).toFixed(2)), safePlateLengthM);
     onPreviewPositionChange(nextPositionM);
   };
@@ -344,14 +516,14 @@ function LengthRuler({
     if (typeof event.currentTarget.setPointerCapture === 'function') {
       event.currentTarget.setPointerCapture(event.pointerId);
     }
-    updateFromClientX(event.clientX, event.currentTarget);
+    updateFromPointer(event.clientX, event.clientY, event.currentTarget);
   };
 
   const handlePointerMove = (event: PointerEvent<HTMLDivElement>) => {
     if (activePointerId.current !== event.pointerId) {
       return;
     }
-    updateFromClientX(event.clientX, event.currentTarget);
+    updateFromPointer(event.clientX, event.clientY, event.currentTarget);
   };
 
   const stopDragging = (event: PointerEvent<HTMLDivElement>) => {
@@ -369,14 +541,14 @@ function LengthRuler({
       return;
     }
     mouseDragging.current = true;
-    updateFromClientX(event.clientX, event.currentTarget);
+    updateFromPointer(event.clientX, event.clientY, event.currentTarget);
   };
 
   const handleMouseMove = (event: MouseEvent<HTMLDivElement>) => {
     if (!mouseDragging.current || activePointerId.current !== null) {
       return;
     }
-    updateFromClientX(event.clientX, event.currentTarget);
+    updateFromPointer(event.clientX, event.clientY, event.currentTarget);
   };
 
   const stopMouseDragging = () => {
@@ -385,10 +557,10 @@ function LengthRuler({
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const step = event.shiftKey ? 1 : 0.1;
-    if (event.key === 'ArrowLeft') {
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
       event.preventDefault();
       onPreviewPositionChange(clampPreviewPositionM(Number((safePositionM - step).toFixed(2)), safePlateLengthM));
-    } else if (event.key === 'ArrowRight') {
+    } else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
       event.preventDefault();
       onPreviewPositionChange(clampPreviewPositionM(Number((safePositionM + step).toFixed(2)), safePlateLengthM));
     } else if (event.key === 'Home') {
@@ -402,7 +574,7 @@ function LengthRuler({
 
   return (
     <div
-      className="length-ruler"
+      className={`length-ruler orientation-${orientation}`}
       role="slider"
       tabIndex={0}
       aria-label="预览位置"
@@ -425,12 +597,17 @@ function LengthRuler({
         <span
           key={meter}
           className={`ruler-tick-label ${meter === 0 ? 'ruler-start-label' : meter === 12 ? 'ruler-end-label' : ''}`}
-          style={meter === 12 ? { right: 0 } : { left: `${(meter / 12) * 100}%` }}
+          style={orientation === 'horizontal'
+            ? (meter === 12 ? { right: 0 } : { left: `${(meter / 12) * 100}%` })
+            : (meter === 12 ? { bottom: 0 } : { top: `${(meter / 12) * 100}%` })}
         >
           {meter}m
         </span>
       ))}
-      <div className={`ruler-preview-position ${previewPercent > 82 ? 'near-end' : ''}`} style={{ left: `${previewPercent}%` }}>
+      <div
+        className={`ruler-preview-position ${previewPercent > 82 ? 'near-end' : ''}`}
+        style={orientation === 'horizontal' ? { left: `${previewPercent}%` } : { top: `${previewPercent}%` }}
+      >
         <span className="ruler-preview-label">{safePositionM.toFixed(2)}m</span>
       </div>
     </div>
@@ -496,6 +673,53 @@ function PlateMapActions({
   return (
     <div className="plate-map-actions">
       <ViewModeSwitch value={viewMode} onChange={onViewModeChange} />
+    </div>
+  );
+}
+
+export function PlateMapToolbar({
+  defectTypes,
+  defectTypeCounts,
+  hiddenTypeIds,
+  viewMode,
+  onToggleType,
+  onViewModeChange,
+}: {
+  defectTypes: DefectType[];
+  defectTypeCounts: Record<string, number>;
+  hiddenTypeIds: Set<string>;
+  viewMode: PlateMapViewMode;
+  onToggleType: (typeId: string) => void;
+  onViewModeChange: (viewMode: PlateMapViewMode) => void;
+}) {
+  return (
+    <div className="plate-map-toolbar" aria-label="棒材圆周展开缺陷图工具栏">
+      <strong className="plate-map-toolbar-title">棒材圆周展开缺陷图</strong>
+      <div className="defect-legend plate-map-toolbar-legend">
+        {defectTypes.map((type) => {
+          const active = !hiddenTypeIds.has(type.id);
+          const count = defectTypeCounts[type.id] ?? 0;
+          return (
+            <button
+              key={type.id}
+              type="button"
+              className={`legend-toggle ${active ? 'is-selected' : 'is-cancelled'}`}
+              style={{ '--legend-color': type.color } as CSSProperties}
+              aria-pressed={active}
+              aria-label={`${type.label} ${count} 个${active ? '已选中，点击取消' : '已取消，点击选中'}`}
+              title={`${type.label}：${count} 个${active ? '，点击取消显示' : '，点击选中显示'}`}
+              onClick={() => onToggleType(type.id)}
+            >
+              <span className="legend-swatch" aria-hidden="true">
+                {active ? <Check size={11} strokeWidth={3} /> : <X size={11} strokeWidth={3} />}
+              </span>
+              <span className="legend-label">{type.label}</span>
+              <span className="legend-count">{count}</span>
+            </button>
+          );
+        })}
+      </div>
+      <PlateMapActions viewMode={viewMode} onViewModeChange={onViewModeChange} />
     </div>
   );
 }
@@ -950,14 +1174,24 @@ export function PlateMap({
   inspectionId,
   captureImages = [],
   surfaceMesh,
+  surfaceCameras = [],
   artifactStatus,
+  viewMode: controlledViewMode,
+  integratedToolbar = false,
   onToggleType,
   onSurfaceModeChange,
   onPreviewPositionChange,
   onSelectDefect,
+  onViewModeChange,
 }: PlateMapProps) {
-  const [viewMode, setViewMode] = useState<PlateMapViewMode>('2d');
+  const [localViewMode, setLocalViewMode] = useState<PlateMapViewMode>('2d');
+  const viewMode = controlledViewMode ?? localViewMode;
+  const setViewMode = onViewModeChange ?? setLocalViewMode;
   const [hoveredDefectId, setHoveredDefectId] = useState<string | null>(null);
+  const [unfoldOrientation, setUnfoldOrientation] = useState<UnfoldOrientation>('horizontal');
+  const productionCameraImageCount = surfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
+  const capturedCameraImageCount = new Set(captureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
+  const displayedCameraImageCount = Math.min(BAR_CAMERA_COUNT, Math.max(productionCameraImageCount, capturedCameraImageCount));
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
   const selectRelativeDefect = (step: number) => {
     if (defects.length === 0) {
@@ -996,7 +1230,8 @@ export function PlateMap({
   return (
     <Panel
       title="棒材圆周展开缺陷图"
-      className={`plate-map-panel surface-mode-${surfaceMode} view-mode-${viewMode}`}
+      className={`plate-map-panel surface-mode-${surfaceMode} view-mode-${viewMode} ${integratedToolbar ? 'integrated-toolbar' : ''}`}
+      headerless={integratedToolbar}
       action={
         <PlateMapActions
           viewMode={viewMode}
@@ -1004,7 +1239,7 @@ export function PlateMap({
         />
       }
     >
-      <div className="defect-legend">
+      {integratedToolbar ? null : <div className="defect-legend">
         {defectTypes.map((type) => {
           const active = !hiddenTypeIds.has(type.id);
           const count = defectTypeCounts[type.id] ?? 0;
@@ -1027,12 +1262,20 @@ export function PlateMap({
             </button>
           );
         })}
-      </div>
+      </div>}
 
+      <div className="record-artifact-row">
       <div className={`record-artifact-provenance ${artifactMode}`} role="note">
         {artifactMode === 'demo'
           ? '演示/测试数据：允许使用内置表面与模拟点云，不代表当前生产结果。'
-          : `生产记录 ${inspectionId || '未绑定'}：二维图仅显示数据库缺陷坐标（非表面图像产物）；记录采集产物 ${captureImages.length} 件。`}
+          : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；实际相机图像 ${displayedCameraImageCount}/8 路（自动裁剪黑边）。`}
+      </div>
+      {viewMode === '2d' ? (
+        <div className="unfold-orientation-switch" role="group" aria-label="二维展开方向">
+          <button type="button" className={unfoldOrientation === 'horizontal' ? 'active' : ''} aria-pressed={unfoldOrientation === 'horizontal'} onClick={() => setUnfoldOrientation('horizontal')}>横向</button>
+          <button type="button" className={unfoldOrientation === 'vertical' ? 'active' : ''} aria-pressed={unfoldOrientation === 'vertical'} onClick={() => setUnfoldOrientation('vertical')}>纵向</button>
+        </div>
+      ) : null}
       </div>
 
       {viewMode === '3d' ? (
@@ -1075,7 +1318,7 @@ export function PlateMap({
           artifactStatus={artifactStatus}
         />
       ) : (
-        <>
+        <div className={`bar-unfolded-layout orientation-${unfoldOrientation}`}>
           <BarUnfoldedMap
             defects={defects}
             defectTypes={defectTypes}
@@ -1087,9 +1330,12 @@ export function PlateMap({
             onHoverDefect={setHoveredDefectId}
             onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
             onDefectNavigationWheel={handleDefectNavigationWheel}
+            orientation={unfoldOrientation}
+            surfaceCameras={surfaceCameras}
+            captureImages={captureImages}
           />
-          <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} />
-        </>
+          <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} orientation={unfoldOrientation} />
+        </div>
       )}
     </Panel>
   );

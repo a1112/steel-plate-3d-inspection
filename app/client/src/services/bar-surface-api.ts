@@ -33,6 +33,39 @@ export type BarSurfaceCamera = {
 
 export type BarSurfaceManifest = {
   schema: string;
+  algorithmName?: string;
+  algorithmVersion?: string;
+  configRevision?: string;
+  configSha256?: string;
+  scriptSha256?: string;
+  coreSha256?: string;
+  releaseCommit?: string;
+  acceptanceReportSha256?: string;
+  datasetRevision?: string;
+  datasetSha256?: string;
+  evaluatorRevision?: string;
+  evaluatorSha256?: string;
+  calibrationRevision?: string;
+  calibrationSha256?: string;
+  inputSummarySha256?: string;
+  inputFrameIds?: string[];
+  inputArtifactCount?: number;
+  inputArtifacts?: Array<{
+    camera: string;
+    frameId: string;
+    kind: string;
+    path: string;
+    bytes: number;
+    sha256: string;
+  }>;
+  thresholds?: Record<string, number | boolean>;
+  qualification?: Record<string, string>;
+  qualityGate?: {
+    passed?: boolean;
+    reasons?: string[];
+  };
+  realDefectCount?: number;
+  syntheticDefectCount?: number;
   materialId: string;
   runId: string;
   createdAt: string;
@@ -46,6 +79,8 @@ export type BarSurfaceManifest = {
     available: boolean;
     matchedCameras: number;
     totalCameras: number;
+    revision?: string;
+    sha256?: string;
   };
   inputCrop?: {
     schema?: string;
@@ -99,6 +134,8 @@ export type BarSurfaceManifest = {
       sampleCount?: number;
     };
     contourCrop?: BarSurfaceContourCrop;
+    coordinateFrame?: BarSurfaceCoordinateFrame;
+    angularSectorFit?: BarSurfaceAngularSectorFit;
     topology?: BarSurfaceTopology;
     surfaceCompleteness?: {
       keptQuadRatio?: number;
@@ -118,6 +155,8 @@ export type BarSurfaceManifest = {
     colsPerCamera: number;
     topology?: BarSurfaceTopology;
     contourCrop?: BarSurfaceContourCrop;
+    coordinateFrame?: BarSurfaceCoordinateFrame;
+    angularSectorFit?: BarSurfaceAngularSectorFit;
   };
   core?: BarSurfaceCoreInfo;
   reports?: {
@@ -233,6 +272,7 @@ export type BarSurfaceLatestResponse = {
 export type BarSurfaceMesh = {
   schema: string;
   coordinateUnit: string;
+  coordinateFrame?: BarSurfaceCoordinateFrame;
   cameraCount: number;
   frameStems: string[];
   rows: number;
@@ -278,7 +318,38 @@ export type BarSurfaceCaptureMaterial = {
 export type BarSurfaceCapturesResponse = {
   code: number;
   captureRoot: string;
+  configuration?: BarSurfaceRuntimeConfiguration;
   materials: BarSurfaceCaptureMaterial[];
+};
+
+export type BarSurfaceRuntimeConfiguration = {
+  schema: 'steel.algorithm-runtime-config.v1' | string;
+  desired: { captureRoot: string; algorithmRoot: string; algorithmConfig: string; algorithmCalibration?: string };
+  active: {
+    captureRoot: string;
+    algorithmRoot: string;
+    algorithmConfig: string;
+    algorithmCalibration?: string;
+    algorithmName?: string;
+    algorithmVersion?: string;
+    configRevision?: string;
+    configSha256?: string;
+    thresholds?: Record<string, number | boolean>;
+  };
+  readback: {
+    ready: boolean;
+    configValid: boolean;
+    algorithmRootExists: boolean;
+    captureRootExists: boolean;
+    paths?: {
+      ok: boolean;
+      status: string;
+      captureRoot: { path: string; absolute: boolean; exists: boolean; typeValid: boolean; ready: boolean };
+      algorithmRoot: { path: string; absolute: boolean; exists: boolean; typeValid: boolean; ready: boolean };
+      algorithmConfig: { path: string; absolute: boolean; exists: boolean; typeValid: boolean; ready: boolean };
+      algorithmCalibration: { path: string; absolute: boolean; exists: boolean; typeValid: boolean; ready: boolean; reason?: string };
+    };
+  };
 };
 
 export type BarSurfaceRun = {
@@ -302,6 +373,7 @@ export type BarSurfaceRun = {
 export type BarSurfaceRunsResponse = {
   code: number;
   root: string;
+  configuration?: BarSurfaceRuntimeConfiguration;
   runs: BarSurfaceRun[];
 };
 
@@ -369,7 +441,11 @@ export type BarSurfaceProductionTask<T = unknown> = {
   kind: 'capture-once' | 'algorithm-run' | string;
   materialId: string;
   sessionId: string;
-  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | string;
+  chainId?: string;
+  dependsOnTaskId?: string | null;
+  dependencyPolicy?: 'require-success' | 'always-run' | string;
+  blockedReason?: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | 'blocked' | string;
   phase: string;
   progress: number;
   attempts: number;
@@ -412,7 +488,7 @@ async function waitForProductionTask<T>(
   let envelope = await readJsonResponse<ProductionTaskEnvelope<T>>(response, 'production task enqueue failed');
   onTaskStatus?.(envelope.task);
   const deadline = Date.now() + 60 * 60 * 1000;
-  while (!['succeeded', 'failed', 'cancelled', 'interrupted'].includes(envelope.task.status)) {
+  while (!['succeeded', 'failed', 'cancelled', 'interrupted', 'blocked'].includes(envelope.task.status)) {
     if (Date.now() >= deadline) {
       throw new Error(`production task ${envelope.task.taskId} did not finish within one hour`);
     }
@@ -521,6 +597,8 @@ export type BarSurfaceProductionCaptureResponse = {
 };
 
 export type BarSurfaceCalibrationFitReport = {
+  schema?: string;
+  status?: 'corrected' | 'skipped-no-target' | 'rejected-quality' | string;
   calibration?: string;
   dataDir?: string;
   captureRoot?: string;
@@ -533,7 +611,30 @@ export type BarSurfaceCalibrationFitReport = {
   correctionsCsv?: string;
   pointsCsv?: string;
   cameraCount?: number;
+  expectedCameras?: number;
   maxShiftMm?: number;
+  targetDetection?: {
+    detected?: boolean;
+    reasons?: string[];
+    expectedCameras?: number;
+    cameraCount?: number;
+    pointCount?: number;
+    diameterMm?: number;
+    angularCoverageDeg?: number;
+    meanAbsResidualMm?: number;
+    residualLimitMm?: number;
+    robustInlierRatio?: number;
+  };
+  correctionAccepted?: boolean;
+  correctionQuality?: {
+    accepted?: boolean;
+    reasons?: string[];
+    beforeMeanAbsResidualMm?: number;
+    afterMeanAbsResidualMm?: number;
+    improvementRatio?: number;
+    minimumImprovementRatio?: number;
+    saturatedCameras?: string[];
+  };
   fitBefore?: {
     radius?: number;
     diameter?: number;
@@ -580,7 +681,47 @@ export type BarSurfaceCalibrationFitResponse = {
     stdout?: string;
     stderr?: string;
   };
+  autoActivation?: {
+    attempted?: boolean;
+    activated?: boolean;
+    saveToDevice?: boolean;
+    reason?: string;
+    profile?: string;
+    version?: string;
+    calibrationPath?: string;
+  };
   result: BarSurfaceCalibrationFitReport;
+};
+
+export type BarSurfaceCoordinateFrame = {
+  schema?: string;
+  applied?: boolean;
+  origin?: string;
+  targetOrigin?: string;
+  axis?: string;
+  fitSource?: string;
+  translationMm?: { x?: number; y?: number; z?: number };
+  reason?: string;
+};
+
+export type BarSurfaceAngularSectorFit = {
+  schema?: string;
+  applied?: boolean;
+  method?: string;
+  direction?: 'clockwise' | 'counter-clockwise' | string;
+  phaseDeg?: number;
+  sectorWidthDeg?: number;
+  fitScoreDegRms?: number;
+  reason?: string;
+  cameras?: Array<{
+    cameraIndex?: number;
+    observedCenterDeg?: number;
+    targetCenterDeg?: number;
+    angularCorrectionDeg?: number;
+    sectorWidthDeg?: number;
+    inputPointCount?: number;
+    resampledRows?: number;
+  }>;
 };
 
 function origin() {
@@ -752,7 +893,8 @@ export async function fetchBarSurfaceCaptures(signal?: AbortSignal): Promise<Bar
   const payload = await readJsonResponse<Partial<BarSurfaceCapturesResponse>>(response, 'bar surface captures unavailable');
   return {
     code: typeof payload.code === 'number' ? payload.code : 0,
-    captureRoot: payload.captureRoot || 'H:\\',
+    captureRoot: payload.captureRoot || '',
+    configuration: payload.configuration,
     materials: listOrEmpty(payload.materials),
   };
 }
@@ -770,7 +912,8 @@ export async function fetchBarSurfaceRuns(materialId?: string, signal?: AbortSig
   const payload = await readJsonResponse<Partial<BarSurfaceRunsResponse>>(response, 'bar surface runs unavailable');
   return {
     code: typeof payload.code === 'number' ? payload.code : 0,
-    root: payload.root || 'G:\\bar-surface-algorithm',
+    root: payload.root || '',
+    configuration: payload.configuration,
     runs: listOrEmpty(payload.runs),
   };
 }
@@ -836,7 +979,7 @@ export async function captureBarSurfaceProductionOnce(options: {
 } = {}): Promise<BarSurfaceProductionCaptureResponse> {
   const body: Record<string, unknown> = {
     materialId: options.materialId || 'latest',
-    expectedCameras: 6,
+    expectedCameras: 8,
     rounds: options.rounds ?? 1,
     lines: options.lines ?? 1000,
     width: 0,
@@ -910,29 +1053,11 @@ export async function runBarSurfaceProductionAlgorithm(options: {
   sessionId?: string;
   inspectionId?: string;
   calibrationPath?: string;
-  maxFrames?: number;
-  meshRows?: number;
-  meshColsPerCamera?: number;
-  maxFaceEdgeMm?: number;
-  contourCrop?: boolean;
-  contourRadiusToleranceMm?: number;
-  contourMinKeepRatio?: number;
-  contourMinRowCoverage?: number;
-  contourAutoPercentile?: number;
   runCore?: boolean;
   onTaskStatus?: (task: BarSurfaceProductionTask<BarSurfaceProductionRunResponse>) => void;
 } = {}): Promise<BarSurfaceProductionRunResponse> {
   const body: Record<string, unknown> = {
     materialId: options.materialId || 'latest',
-    maxFrames: options.maxFrames ?? 24,
-    meshRows: options.meshRows ?? 144,
-    meshColsPerCamera: options.meshColsPerCamera ?? 72,
-    maxFaceEdgeMm: options.maxFaceEdgeMm ?? 8,
-    contourCrop: options.contourCrop ?? true,
-    contourRadiusToleranceMm: options.contourRadiusToleranceMm ?? 0,
-    contourMinKeepRatio: options.contourMinKeepRatio ?? 0.55,
-    contourMinRowCoverage: options.contourMinRowCoverage ?? 0.25,
-    contourAutoPercentile: options.contourAutoPercentile ?? 96,
     runCore: options.runCore ?? true,
   };
   if (options.sessionId) {
@@ -959,6 +1084,15 @@ export async function fitBarSurfaceCalibration(options: {
   outputRoot?: string;
   maxPointsPerCamera?: number;
   maxShiftMm?: number;
+  minPointsPerCamera?: number;
+  minDiameterMm?: number;
+  maxDiameterMm?: number;
+  minAngularCoverageDeg?: number;
+  maxFitResidualMm?: number;
+  maxRelativeResidual?: number;
+  minImprovementRatio?: number;
+  autoActivate?: boolean;
+  profile?: string;
   expectedCameras?: number;
   lines?: number;
   width?: number;
@@ -974,7 +1108,16 @@ export async function fitBarSurfaceCalibration(options: {
     rows: options.rows || '250,500,750',
     maxPointsPerCamera: options.maxPointsPerCamera ?? 2400,
     maxShiftMm: options.maxShiftMm ?? 5,
-    expectedCameras: options.expectedCameras ?? 6,
+    expectedCameras: options.expectedCameras ?? 8,
+    minPointsPerCamera: options.minPointsPerCamera ?? 100,
+    minDiameterMm: options.minDiameterMm ?? 20,
+    maxDiameterMm: options.maxDiameterMm ?? 1000,
+    minAngularCoverageDeg: options.minAngularCoverageDeg ?? 220,
+    maxFitResidualMm: options.maxFitResidualMm ?? 8,
+    maxRelativeResidual: options.maxRelativeResidual ?? 0.08,
+    minImprovementRatio: options.minImprovementRatio ?? 0.03,
+    autoActivate: options.autoActivate ?? true,
+    profile: options.profile || 'current-8-time-trigger',
     lines: options.lines ?? 1000,
     width: options.width ?? 0,
     timeoutMs: options.timeoutMs ?? 8000,

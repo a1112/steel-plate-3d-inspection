@@ -4,13 +4,16 @@ param(
   [string]$RepoRoot = "",
   [string]$RuntimeRoot = "",
   [string]$ReportDir = "",
-  [int]$ExpectedCameras = 6,
+  [int]$ExpectedCameras = 8,
   [int]$MinEnduranceCycles = 100,
-  [switch]$RunArchitectureCheck,
-  [string]$QtPrefixPath = "C:\Qt"
+  [switch]$RunArchitectureCheck
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($ExpectedCameras -ne 8) {
+  throw "Formal integrated acceptance requires exactly eight cameras."
+}
 
 $ScriptRoot = (Resolve-Path $PSScriptRoot).Path
 $SourceMode = Test-Path (Join-Path $ScriptRoot "package-runtime.ps1") -PathType Leaf
@@ -190,7 +193,7 @@ $Architecture = [ordered]@{
   requested = [bool]$RunArchitectureCheck
   ok = $null
   outputTail = @()
-  note = "Run scripts/verify-independent-architecture.ps1 for the formal headless boundary check; add -CheckQt only when validating the optional diagnostic viewer."
+  note = "Run scripts/verify-independent-architecture.ps1 for the formal Tauri/Rust/headless boundary check."
 }
 
 $Items = [System.Collections.Generic.List[object]]::new()
@@ -225,7 +228,7 @@ $Hw = $RealHardware.summary.checks
 $StorageRoots = @($Hw.storage.cameraRoots)
 $Readback = @($Hw.cameras.readback)
 $HardwareOk = $RealHardware.ok -eq $true -and [int]$Hw.cameras.discovered -eq $ExpectedCameras -and [int]$Hw.cameras.connected -eq $ExpectedCameras -and (Test-All $StorageRoots { param($r) $r.mapped -eq $true -and $r.exists -eq $true -and $r.writable -eq $true })
-Add-AuditItem $Items "ICM-04" "Six real cameras are discovered/connected through the LVM/NVT provider and H-drive camera roots are mapped and writable." $HardwareOk @($IntegratedReportPath) @{
+Add-AuditItem $Items "ICM-04" "Eight real cameras are discovered/connected through the LVM/NVT provider and H-drive camera1..camera8 roots are mapped and writable." $HardwareOk @($IntegratedReportPath) @{
   discovered = $Hw.cameras.discovered
   connected = $Hw.cameras.connected
   storageRoot = $Hw.storage.root
@@ -254,7 +257,7 @@ Add-AuditItem $Items "ICM-07" "Production steel-in writes the inspection/session
 }
 
 $ParallelOk = Test-All $ShortCycles { param($c) $c.capture.parallel -eq $true -and [int]$c.capture.workerCount -eq $ExpectedCameras -and [int]$c.capture.successes -eq $ExpectedCameras -and [int]$c.capture.completeFrames -eq $ExpectedCameras -and [int]$c.capture.metadataFrames -eq $ExpectedCameras }
-Add-AuditItem $Items "ICM-08" "Capture uses parallel six-camera execution and produces complete frames for all cameras." $ParallelOk @($IntegratedReportPath) @{
+Add-AuditItem $Items "ICM-08" "Capture uses parallel eight-camera execution and produces complete frames for all cameras." $ParallelOk @($IntegratedReportPath) @{
   cycles = $ShortTotals.cycles
   captureFrames = $ShortTotals.captureFrames
   metadataFrames = $ShortTotals.metadataFrames
@@ -263,15 +266,15 @@ Add-AuditItem $Items "ICM-08" "Capture uses parallel six-camera execution and pr
 $LayoutOk = Test-All $ShortCycles {
   param($c)
   $Rows = @($c.layout)
-  return $Rows.Count -eq $ExpectedCameras -and (Test-All $Rows { param($r) [string]$r.root -like "H:\camera*" -and [int]$r.depth -ge 1 -and [int]$r.intensity -ge 1 -and [int]$r.metadata -ge 1 -and $r.sdkDerivedExists -eq $false })
+  return $Rows.Count -eq $ExpectedCameras -and (Test-All $Rows { param($r) [string]$r.root -like "H:\camera*" -and [int]$r.depth -eq 1 -and [int]$r.intensity -eq 1 -and [int]$r.metadata -eq 1 -and $r.sdkDerivedExists -eq $false })
 }
-Add-AuditItem $Items "ICM-09" "Production storage writes depth, intensity, and metadata under H:\camera1..camera6\<material> and keeps sdk-derived disabled by default." $LayoutOk @($IntegratedReportPath) @{
+Add-AuditItem $Items "ICM-09" "Production storage writes depth, intensity, and metadata under H:\camera1..camera8\<material> and keeps sdk-derived disabled by default." $LayoutOk @($IntegratedReportPath) @{
   latestMaterial = $LastShortCycle.materialId
   latestRoots = @($LastShortCycle.layout | Select-Object -ExpandProperty root)
 }
 
-$SummaryOk = Test-All $ShortCycles { param($c) $c.summary.schema -eq "steel.production.summary.v1" -and [int]$c.summary.files -eq 18 -and [int]$c.summary.depth -eq $ExpectedCameras -and [int]$c.summary.intensity -eq $ExpectedCameras -and [int]$c.summary.metadata -eq $ExpectedCameras -and [int]$c.summary.sdkDerived -eq 0 -and (Test-Path ([string]$c.summary.path) -PathType Leaf) }
-Add-AuditItem $Items "ICM-10" "Production summary is written under H:\production\<material>\<session>\summary.json and references all six-camera files." $SummaryOk @($IntegratedReportPath, [string]$LastShortCycle.summary.path) @{
+$SummaryOk = Test-All $ShortCycles { param($c) $c.summary.schema -eq "steel.production.summary.v1" -and [int]$c.summary.files -eq ($ExpectedCameras * 3) -and [int]$c.summary.depth -eq $ExpectedCameras -and [int]$c.summary.intensity -eq $ExpectedCameras -and [int]$c.summary.metadata -eq $ExpectedCameras -and [int]$c.summary.sdkDerived -eq 0 -and (Test-Path ([string]$c.summary.path) -PathType Leaf) }
+Add-AuditItem $Items "ICM-10" "Production summary is written under H:\production\<material>\<session>\summary.json and references all eight-camera files." $SummaryOk @($IntegratedReportPath, [string]$LastShortCycle.summary.path) @{
   latestSummary = $LastShortCycle.summary.path
   latestFiles = $LastShortCycle.summary.files
 }
@@ -304,7 +307,7 @@ Add-AuditItem $Items "ICM-13" "Receiver network popover shows monitoring-only re
 }
 
 $BarLatestOk = $BarSurface.ok -eq $true -and $BarSummary.materialId -eq $LastShortCycle.materialId -and [int]$BarSummary.capture.successes -eq $ExpectedCameras -and [int]$BarSummary.capture.completeFrames -eq $ExpectedCameras
-Add-AuditItem $Items "ICM-14" "Latest six-camera production capture can be consumed by the bar-surface reconstruction API." $BarLatestOk @($IntegratedReportPath, $BarManifestPath) @{
+Add-AuditItem $Items "ICM-14" "Latest eight-camera production capture can be consumed by the bar-surface reconstruction API." $BarLatestOk @($IntegratedReportPath, $BarManifestPath) @{
   materialId = $BarSummary.materialId
   captureSuccesses = $BarSummary.capture.successes
 }
@@ -334,23 +337,12 @@ $QtDeclared = if ($IsTargetRuntimeManifest) {
 } else {
   $PackageManifest -ne $null -and $null -ne $PackageManifest.captureQt
 }
-$QtRole = if ($IsTargetRuntimeManifest) { [string]$PackageManifest.captureQtRole } else { [string]$PackageManifest.captureQt.role }
-$QtOwnsApi = if ($IsTargetRuntimeManifest) { $PackageManifest.captureQtOwnsApi } else { $PackageManifest.captureQt.ownsApi }
-$QtFormalRuntime = if ($IsTargetRuntimeManifest) { $PackageManifest.captureQtFormalRuntime } else { $PackageManifest.captureQt.formalRuntime }
-$QtDiagnosticOk = -not $QtDeclared -or (
-  $QtRole -eq "diagnostic-only" -and
-  $QtOwnsApi -eq $false -and
-  $QtFormalRuntime -eq $false -and
-  (Test-Path (Join-Path $QtPackageDir "steel_capture_qt_terminal.exe") -PathType Leaf) -and
-  (Test-Path (Join-Path $QtPackageDir "Qt6Core.dll") -PathType Leaf) -and
-  (Test-Path (Join-Path $QtPackageDir "Qt6Widgets.dll") -PathType Leaf)
-)
-Add-AuditItem $Items "ICM-17" "The headless C++ provider is the formal SDK owner; Qt is absent by default or packaged only as a non-owning diagnostic viewer." ($FormalCaptureOk -and $QtDiagnosticOk) @($IntegratedReportPath, $PackageManifestPath, $HeadlessCaptureExe, $HeadlessCaptureSdk) @{
+$QtRemoved = -not $QtDeclared -and -not (Test-Path $QtPackageDir)
+Add-AuditItem $Items "ICM-17" "The headless C++ provider is the sole SDK owner and Qt artifacts are absent from the package." ($FormalCaptureOk -and $QtRemoved) @($IntegratedReportPath, $PackageManifestPath, $HeadlessCaptureExe, $HeadlessCaptureSdk) @{
   formalCapture = if ($PackageManifest) { $PackageManifest.formalCapture } else { $null }
   captureRole = $CaptureRole
   qtDeclared = $QtDeclared
-  qtRole = if ($QtDeclared) { $QtRole } else { $null }
-  qtPackageDir = if ($QtDeclared) { $QtPackageDir } else { $null }
+  qtPackageDirExists = Test-Path $QtPackageDir
 }
 
 $FullScriptPath = if ($SourceMode) { Join-Path $RepoRoot "scripts\test-integrated-capture-management-full.ps1" } else { Join-Path $RuntimeRoot "test-integrated-capture-management-full.ps1" }
@@ -467,7 +459,7 @@ $CalibrationSoftwareContractOk =
   $CalibrationOperations.realHardwareIntegrityGenerationRequiredForFullCoverage -eq $true -and
   (Test-ExactStringSet @($CalibrationOperations.decisiveRollbackPreflightEvidence) @("attempted", "sideEffects")) -and
   $CalibrationOperations.processCrashFaultInjectionSeparate -eq $true -and
-  [int]$CalibrationOperations.requiredCameraCount -eq 6 -and
+  [int]$CalibrationOperations.requiredCameraCount -eq $ExpectedCameras -and
   $CalibrationOperations.uniqueCameraIps -eq $true -and
   $CalibrationOperations.uniqueExpectedSerials -eq $true -and
   $CalibrationOperations.uniqueSdkCalibrationPaths -eq $true -and
@@ -508,7 +500,7 @@ $RealCalibrationIntegrityGenerationOk =
   $IntegrityGenerationSummary.evidence.stagedTamper.zeroWriteEvidence -eq $true -and
   $IntegrityGenerationSummary.evidence.recovery.complete -eq $true
 $CalibrationOperationsOk = $CalibrationSoftwareContractOk -and $RealCalibrationOk -and $RealCalibrationCrashRecoveryOk -and $RealCalibrationIntegrityGenerationOk
-Add-AuditItem $Items "ICM-23" "Calibration apply and rollback use a persistent operationId ledger, a readiness/device-write fence, parent-bound recovery, staged cross-restart rollback material, and six distinct camera SDK mappings without automatic replay; real hardware apply/rollback must also finish with six validation frames." $CalibrationOperationsOk @($PackageManifestPath, $MigrationArchitectureTestPath, $IntegratedReportPath) @{
+Add-AuditItem $Items "ICM-23" "Calibration apply and rollback use a persistent operationId ledger, a readiness/device-write fence, parent-bound recovery, staged cross-restart rollback material, and eight distinct camera SDK mappings without automatic replay; real hardware apply/rollback must also finish with eight validation frames." $CalibrationOperationsOk @($PackageManifestPath, $MigrationArchitectureTestPath, $IntegratedReportPath) @{
   softwareContract = $CalibrationSoftwareContractOk
   realHardwareApplyRollback = $RealCalibrationOk
   realHardwareCrashRecovery = $RealCalibrationCrashRecoveryOk
@@ -549,6 +541,39 @@ Add-AuditItem $Items "ICM-23" "Calibration apply and rollback use a persistent o
   contractError = $MigrationContractError
 }
 
+$TriggerSecurityCheck = Get-Check $Integrated "trigger-security"
+$TriggerSecuritySummary = $TriggerSecurityCheck.summary
+$TriggerSecurityOk =
+  $TriggerSecurityCheck.ok -eq $true -and
+  $TriggerSecurityCheck.skipped -ne $true -and
+  [int]$TriggerSecuritySummary.code -eq 0 -and
+  $TriggerSecuritySummary.missingSecretFailClosed -eq $true -and
+  [string]$TriggerSecuritySummary.authentication -eq "HMAC-SHA256" -and
+  [string]$TriggerSecuritySummary.canonicalVersion -eq "steel-trigger-v1" -and
+  @($TriggerSecuritySummary.transports).Count -eq 3 -and
+  @($TriggerSecuritySummary.transports) -contains "http" -and
+  @($TriggerSecuritySummary.transports) -contains "tcp" -and
+  @($TriggerSecuritySummary.transports) -contains "udp" -and
+  $TriggerSecuritySummary.replayRejected.http -eq $true -and
+  $TriggerSecuritySummary.replayRejected.tcp -eq $true -and
+  $TriggerSecuritySummary.replayRejected.udp -eq $true -and
+  $TriggerSecuritySummary.sourceAllowlistConfigured -eq $true -and
+  $TriggerSecuritySummary.operatorCredentialSeparated -eq $true -and
+  $TriggerSecuritySummary.modeMutationLocked -eq $true -and
+  $TriggerSecuritySummary.wildcardCors -eq $false -and
+  $TriggerSecuritySummary.statusRedacted -eq $true
+Add-AuditItem $Items "ICM-24" "Production HTTP/TCP/UDP trigger ingress is fail-closed, HMAC-authenticated, replay-protected, source-restricted, mode-locked, status-redacted, and free of wildcard CORS." $TriggerSecurityOk @($IntegratedReportPath, $PackageManifestPath) @{
+  missingSecretFailClosed = $TriggerSecuritySummary.missingSecretFailClosed
+  authentication = $TriggerSecuritySummary.authentication
+  transports = @($TriggerSecuritySummary.transports)
+  replayRejected = $TriggerSecuritySummary.replayRejected
+  sourceAllowlistConfigured = $TriggerSecuritySummary.sourceAllowlistConfigured
+  operatorCredentialSeparated = $TriggerSecuritySummary.operatorCredentialSeparated
+  modeMutationLocked = $TriggerSecuritySummary.modeMutationLocked
+  wildcardCors = $TriggerSecuritySummary.wildcardCors
+  statusRedacted = $TriggerSecuritySummary.statusRedacted
+}
+
 $EnduranceSummary = $null
 if ($Endurance) {
   $EnduranceSummary = [ordered]@{
@@ -567,7 +592,7 @@ if ($Endurance) {
 }
 
 $PassedCount = @($Items | Where-Object { $_.passed }).Count
-$RequiredCount = 23
+$RequiredCount = 24
 $Report = [ordered]@{
   schema = "steel.integrated-capture-management.acceptance-audit.v1"
   code = if ($PassedCount -eq $RequiredCount) { 0 } else { 1 }

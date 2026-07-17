@@ -5,6 +5,7 @@ param(
   [int]$ServicePort = 4973,
   [int]$TriggerPort = 4981,
   [int]$ClientPort = 1494,
+  [string]$WorkRoot = "",
   [switch]$SkipSmoke,
   [switch]$SkipClient,
   [switch]$NoPortCleanup
@@ -23,6 +24,7 @@ if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) {
 $RuntimeRoot = (Resolve-Path $RuntimeRoot).Path
 $LayoutScript = Join-Path $RuntimeRoot "test-runtime-layout.ps1"
 $SmokeScript = Join-Path $RuntimeRoot "test-integrated-management-smoke.ps1"
+$TriggerSecurityScript = Join-Path $RuntimeRoot "test-trigger-gateway-security.ps1"
 $AcceptanceMutex = $null
 $MutexAcquired = $false
 
@@ -52,7 +54,13 @@ function Stop-AcceptancePorts {
     return
   }
 
-  $Ports = @($ServicePort, $TriggerPort, $ClientPort) | Where-Object { $_ -gt 0 } | Sort-Object -Unique
+  $Ports = @(
+    $ServicePort,
+    $TriggerPort,
+    ($TriggerPort + 1),
+    ($TriggerPort + 2),
+    $ClientPort
+  ) | Where-Object { $_ -gt 0 -and $_ -le 65535 } | Sort-Object -Unique
   if (-not $Ports.Count) {
     return
   }
@@ -192,17 +200,22 @@ function Assert-SmokeResult {
   if ($Smoke.production.captureOnce.parallel -ne $true) {
     throw "Smoke capture-once did not report parallel provider capture."
   }
-  if ([int]$Smoke.production.captureOnce.workerCount -lt 6) {
-    throw "Smoke capture-once worker count was below 6."
+  if ([int]$Smoke.production.captureOnce.workerCount -ne 8) {
+    throw "Smoke capture-once worker count was not exactly 8."
   }
-  if ([int]$Smoke.production.captureOnce.completeFrames -lt 6) {
-    throw "Smoke capture-once did not produce six complete frames."
+  if ([int]$Smoke.production.captureOnce.completeFrames -ne 8) {
+    throw "Smoke capture-once did not produce exactly eight complete frames."
   }
-  if ([int]$Smoke.production.captureOnce.metadataFrames -lt 6) {
-    throw "Smoke capture-once did not produce six metadata frames."
+  if ([int]$Smoke.production.captureOnce.metadataFrames -ne 8) {
+    throw "Smoke capture-once did not produce exactly eight metadata frames."
   }
-  if ([int]$Smoke.production.captureOnce.captureFileRows -lt 18) {
-    throw "Smoke capture summary did not record depth/intensity/metadata rows for six cameras."
+  if ([int]$Smoke.production.captureOnce.captureFileRows -ne 24) {
+    throw "Smoke capture summary did not record exactly 24 depth/intensity/metadata rows for eight cameras."
+  }
+  if ([int]$Smoke.triggerGateway.httpPort -ne $TriggerPort -or
+      [int]$Smoke.triggerGateway.tcpPort -ne ($TriggerPort + 1) -or
+      [int]$Smoke.triggerGateway.udpPort -ne ($TriggerPort + 2)) {
+    throw "Smoke trigger listeners did not use the isolated HTTP/TCP/UDP port group."
   }
   if ($Smoke.production.captureOnce.saveSdkDerived -ne $false) {
     throw "Smoke capture-once should keep sdk-derived disabled."
@@ -216,6 +229,8 @@ function Assert-SmokeResult {
 
 $StartedAt = Get-Date
 $LayoutOutput = @()
+$TriggerSecurityOutput = @()
+$TriggerSecuritySummary = $null
 $SmokeOutput = @()
 $SmokeSummary = $null
 
@@ -224,6 +239,12 @@ try {
   Stop-AcceptancePorts
 
   $LayoutOutput = Invoke-CheckedScript -ScriptPath $LayoutScript -Arguments @("-RuntimeRoot", $RuntimeRoot)
+
+  $TriggerSecurityOutput = Invoke-CheckedScript -ScriptPath $TriggerSecurityScript
+  $TriggerSecuritySummary = Read-JsonFromOutput $TriggerSecurityOutput
+  if ([int]$TriggerSecuritySummary.code -ne 0 -or $TriggerSecuritySummary.missingSecretFailClosed -ne $true -or $TriggerSecuritySummary.operatorCredentialSeparated -ne $true -or $TriggerSecuritySummary.replayRejected.http -ne $true -or $TriggerSecuritySummary.replayRejected.tcp -ne $true -or $TriggerSecuritySummary.replayRejected.udp -ne $true) {
+    throw "Trigger security gate did not prove fail-closed startup and replay rejection on all transports."
+  }
 
   if (-not $SkipSmoke) {
     $SmokeArgs = @(
@@ -234,6 +255,9 @@ try {
     )
     if ($SkipClient) {
       $SmokeArgs += "-SkipClient"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($WorkRoot)) {
+      $SmokeArgs += @("-WorkRoot", $WorkRoot)
     }
     $SmokeOutput = Invoke-CheckedScript -ScriptPath $SmokeScript -Arguments $SmokeArgs
     $SmokeSummary = Read-JsonFromOutput $SmokeOutput
@@ -251,12 +275,27 @@ try {
         script = $LayoutScript
         outputTail = Get-OutputTail $LayoutOutput
       }
+      triggerSecurity = [ordered]@{
+        ok = $true
+        script = $TriggerSecurityScript
+        reportPath = $TriggerSecuritySummary.reportPath
+        authentication = $TriggerSecuritySummary.authentication
+        transports = @($TriggerSecuritySummary.transports)
+        replayRejected = $TriggerSecuritySummary.replayRejected
+        operatorCredentialSeparated = $TriggerSecuritySummary.operatorCredentialSeparated
+        modeMutationLocked = $TriggerSecuritySummary.modeMutationLocked
+        wildcardCors = $TriggerSecuritySummary.wildcardCors
+        statusRedacted = $TriggerSecuritySummary.statusRedacted
+        outputTail = Get-OutputTail $TriggerSecurityOutput
+      }
       smoke = [ordered]@{
         ok = -not $SkipSmoke
         skipped = [bool]$SkipSmoke
         script = if ($SkipSmoke) { $null } else { $SmokeScript }
         servicePort = if ($SkipSmoke) { $null } else { $ServicePort }
         triggerPort = if ($SkipSmoke) { $null } else { $TriggerPort }
+        triggerTcpPort = if ($SkipSmoke) { $null } else { [int]$SmokeSummary.triggerGateway.tcpPort }
+        triggerUdpPort = if ($SkipSmoke) { $null } else { [int]$SmokeSummary.triggerGateway.udpPort }
         clientPort = if ($SkipSmoke -or $SkipClient) { $null } else { $ClientPort }
         reportPath = if ($SkipSmoke -or $null -eq $SmokeSummary) { $null } else { $SmokeSummary.reportPath }
         network = if ($SkipSmoke -or $null -eq $SmokeSummary) { $null } else { $SmokeSummary.service.network }
@@ -275,6 +314,7 @@ try {
     runtimeRoot = $RuntimeRoot
     error = $_.Exception.Message
     layoutTail = Get-OutputTail $LayoutOutput
+    triggerSecurityTail = Get-OutputTail $TriggerSecurityOutput
     smokeTail = Get-OutputTail $SmokeOutput
   } | ConvertTo-Json -Depth 8
   exit 1

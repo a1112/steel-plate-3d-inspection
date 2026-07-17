@@ -20,9 +20,18 @@ interface DefectDetectionListProps {
 }
 
 function getDefectCameraLabel(defect: DefectItem) {
+  if (typeof defect.cameraIndex === 'number' && defect.cameraIndex >= 1 && defect.cameraIndex <= 8) {
+    return `camera${Math.round(defect.cameraIndex)}`;
+  }
+  const cameraMatch = defect.cameraId?.match(/(?:camera|cam)\s*([1-8])/i);
+  if (cameraMatch) {
+    return `camera${cameraMatch[1]}`;
+  }
   const span = defect.operatorSideMm + defect.driveSideMm;
-  const ratio = span > 0 ? defect.operatorSideMm / span : (defect.yOffsetMm + 1.5) / 3;
-  const cameraIndex = Math.max(0, Math.min(5, Math.floor(Math.max(0, Math.min(0.999, ratio)) * 6)));
+  const ratio = typeof defect.circumferenceRatio === 'number'
+    ? defect.circumferenceRatio
+    : span > 0 ? defect.operatorSideMm / span : (defect.yOffsetMm + 1.5) / 3;
+  const cameraIndex = Math.max(0, Math.min(7, Math.floor(Math.max(0, Math.min(0.999, ratio)) * 8)));
   return `camera${cameraIndex + 1}`;
 }
 
@@ -87,7 +96,11 @@ export function DefectDetectionList({
                   onClick={() => onSelectDefect(defect.id)}
                 >
                   <td>{String((page - 1) * 10 + index + 1).padStart(2, '0')}</td>
-                  <td>{defect.typeLabel}</td>
+                  <td>
+                    {defect.typeLabel}
+                    {defect.classificationState === 'candidate-only' ? <small className="candidate-defect-badge">候选</small> : null}
+                    {defect.synthetic ? <small className="synthetic-defect-badge">模拟</small> : null}
+                  </td>
                   <td>{getDefectCameraLabel(defect)}</td>
                   <td>{defect.distanceHeadMm}mm</td>
                   <td className={defect.severity}>{severityLabels[defect.severity]}</td>

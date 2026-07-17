@@ -1,0 +1,85 @@
+{
+  "$schema": "./external-components.schema.json",
+  "schema": "steel.release-external-components.v1",
+  "approved": false,
+  "components": [
+    {
+      "id": "msvc-cpp-toolchain",
+      "category": "cpp-toolchain",
+      "type": "application",
+      "name": "Microsoft Visual C++ Build Tools",
+      "version": "REPLACE_WITH_APPROVED_VERSION",
+      "supplier": "Microsoft Corporation",
+      "scope": "build",
+      "artifact": "REPLACE_WITH_OFFLINE_LAYOUT_OR_INSTALLER_NAME",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "purl": "pkg:generic/microsoft-msvc-build-tools@REPLACE_WITH_APPROVED_VERSION",
+      "licenses": ["LicenseRef-Microsoft-Visual-Studio"]
+    },
+    {
+      "id": "nvt-lvm-camera-sdk",
+      "category": "camera-sdk",
+      "type": "library",
+      "name": "NVT LVM Camera SDK",
+      "version": "REPLACE_WITH_APPROVED_VERSION",
+      "supplier": "REPLACE_WITH_VENDOR_LEGAL_NAME",
+      "scope": "runtime",
+      "artifact": "nvt_lvm_sdk.dll",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "purl": "pkg:generic/nvt-lvm-camera-sdk@REPLACE_WITH_APPROVED_VERSION",
+      "licenses": ["LicenseRef-Vendor-Proprietary"]
+    },
+    {
+      "id": "vc-redist-x64",
+      "category": "vc-runtime",
+      "type": "application",
+      "name": "Microsoft Visual C++ Redistributable x64",
+      "version": "REPLACE_WITH_APPROVED_VERSION",
+      "supplier": "Microsoft Corporation",
+      "scope": "runtime",
+      "artifact": "VC_redist.x64.exe",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "purl": "pkg:generic/microsoft-vc-redist-x64@REPLACE_WITH_APPROVED_VERSION",
+      "licenses": ["LicenseRef-Microsoft-Visual-Cpp-Runtime"]
+    },
+    {
+      "id": "webview2-evergreen-offline-x64",
+      "category": "webview2-runtime",
+      "type": "framework",
+      "name": "Microsoft Edge WebView2 Evergreen Standalone Installer x64",
+      "version": "REPLACE_WITH_APPROVED_VERSION",
+      "supplier": "Microsoft Corporation",
+      "scope": "runtime",
+      "artifact": "MicrosoftEdgeWebView2RuntimeInstallerX64.exe",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "purl": "pkg:generic/microsoft-edge-webview2-runtime-x64@REPLACE_WITH_APPROVED_VERSION",
+      "licenses": ["LicenseRef-Microsoft-WebView2-Runtime"]
+    },
+    {
+      "id": "wix-toolset",
+      "category": "wix-toolset",
+      "type": "application",
+      "name": "WiX Toolset",
+      "version": "REPLACE_WITH_APPROVED_VERSION",
+      "supplier": "WiX Toolset Foundation",
+      "scope": "build",
+      "artifact": "REPLACE_WITH_AUDITED_WIX_ARCHIVE_NAME",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "purl": "pkg:generic/wix-toolset@REPLACE_WITH_APPROVED_VERSION",
+      "licenses": ["MS-RL"]
+    },
+    {
+      "id": "nsis",
+      "category": "nsis",
+      "type": "application",
+      "name": "Nullsoft Scriptable Install System",
+      "version": "REPLACE_WITH_APPROVED_VERSION",
+      "supplier": "NSIS Contributors",
+      "scope": "build",
+      "artifact": "REPLACE_WITH_AUDITED_NSIS_ARCHIVE_OR_INSTALLER_NAME",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256",
+      "purl": "pkg:generic/nsis@REPLACE_WITH_APPROVED_VERSION",
+      "licenses": ["Zlib"]
+    }
+  ]
+}

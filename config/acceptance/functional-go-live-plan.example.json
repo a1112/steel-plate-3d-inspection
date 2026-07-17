@@ -1,0 +1,19 @@
+{
+  "schema": "steel.functional-go-live-plan.v1",
+  "releaseVersion": "REPLACE-WITH-APPROVED-VERSION",
+  "releaseCommit": "REPLACE-WITH-40-TO-64-LOWERCASE-HEX-COMMIT",
+  "packageManifestPath": "C:\\steel-acceptance\\release\\manifest.json",
+  "evidence": {
+    "algorithmAuditPath": "C:\\steel-acceptance\\01-algorithm\\algorithm-acceptance-audit.json",
+    "integrated24Path": "C:\\steel-acceptance\\02-eight-camera\\integrated-capture-management.json",
+    "plcL2Path": "C:\\steel-acceptance\\03-plc-l2\\plc-l2-functional-acceptance.json",
+    "productionSoakPath": "C:\\steel-acceptance\\04-soak\\production-stability.json",
+    "targetMachinePath": "C:\\steel-acceptance\\05-target-machine\\target-machine-functional-acceptance.json"
+  },
+  "thresholds": {
+    "expectedCameras": 8,
+    "requiredIntegratedCoverage": 24,
+    "minimumSoakSeconds": 28800,
+    "minimumSoakCycles": 100
+  }
+}
