@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getMockInspectionSnapshot } from '../data/inspection';
 import {
   captureProductionOnce,
+  fetchInspectionReportArchive,
+  fetchInspectionReportArchives,
   fetchInspectionSnapshot,
   fetchServiceHealthDetails,
+  issueInspectionReportArchive,
   startProductionSteelIn,
   stopProductionSteelOut,
   triggerGatewayManualSteelIn,
@@ -27,6 +30,74 @@ afterEach(() => {
 });
 
 describe('persistent production command client', () => {
+  it('issues and queries immutable inspection report archives through the admin API', async () => {
+    window.localStorage.setItem(
+      'steel-inspection-admin-session',
+      JSON.stringify({
+        authenticated: true,
+        token: 'report-token',
+        expiresAt: '2099-01-01T00:00:00.000Z',
+        user: { id: 'operator-1', displayName: 'Operator', role: 'operator', permissions: ['admin.records'] },
+      }),
+    );
+    const issued = {
+      code: 0,
+      created: true,
+      reportId: 'RPT-INS-1-abc123',
+      archivePath: 'reports/INS-1/RPT-INS-1-abc123.json',
+      archive: {
+        schema: 'steel.inspection.report-archive.v1',
+        reportId: 'RPT-INS-1-abc123',
+        inspectionId: 'INS-1',
+        materialId: 'MAT-1',
+        issuedAt: '2026-07-16 10:00:00',
+        issuedBy: 'operator-1',
+        documentSha256: 'abc123',
+        document: {},
+      },
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(issued))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, inspectionId: 'INS-1', reports: [issued.archive] }))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, archive: issued.archive }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await issueInspectionReportArchive('INS-1');
+    const history = await fetchInspectionReportArchives('INS-1');
+    const detail = await fetchInspectionReportArchive('INS-1', 'RPT-INS-1-abc123');
+
+    expect(result.reportId).toBe('RPT-INS-1-abc123');
+    expect(history.reports[0].documentSha256).toBe('abc123');
+    expect(detail.archive.reportId).toBe('RPT-INS-1-abc123');
+    expect(fetchMock.mock.calls[0][0]).toBe('http://127.0.0.1:4873/api/admin/records/reports');
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      method: 'POST',
+      headers: expect.objectContaining({ Authorization: 'Bearer report-token' }),
+      body: JSON.stringify({ inspectionId: 'INS-1' }),
+    });
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      'http://127.0.0.1:4873/api/admin/records/reports?inspectionId=INS-1',
+    );
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      'http://127.0.0.1:4873/api/admin/records/reports/detail?inspectionId=INS-1&reportId=RPT-INS-1-abc123',
+    );
+    expect(fetchMock.mock.calls[2][1]).toMatchObject({
+      headers: expect.objectContaining({ Authorization: 'Bearer report-token' }),
+    });
+  });
+
+  it('surfaces an actionable failure when an immutable report archive is damaged', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+      code: 409,
+      error: 'report_archive_integrity_failed',
+      invalidArchiveCount: 1,
+    }, 409)));
+
+    await expect(fetchInspectionReportArchives('INS-1')).rejects.toThrow(
+      '检测报告归档完整性校验失败，请停止打印并联系运维恢复归档',
+    );
+  });
+
   it('does not inject bundled defect images into an online database snapshot', async () => {
     const fixture = getMockInspectionSnapshot();
     const productionSnapshot = {
@@ -181,6 +252,20 @@ describe('persistent production command client', () => {
   });
 
   it('preserves queued task identity returned through the trigger gateway', async () => {
+    window.localStorage.setItem(
+      'steel-inspection-admin-session',
+      JSON.stringify({
+        authenticated: true,
+        token: 'operator-token',
+        expiresAt: '2099-01-01T00:00:00.000Z',
+        user: {
+          id: 'operator-1',
+          displayName: 'Operator',
+          role: 'operator',
+          permissions: ['admin.services'],
+        },
+      }),
+    );
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse({
         code: 0,
@@ -216,6 +301,9 @@ describe('persistent production command client', () => {
       requestId: 'IN-1',
       present: true,
       value: 1,
+    });
+    expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({
+      Authorization: 'Bearer operator-token',
     });
   });
 });

@@ -166,6 +166,45 @@ describe('bar-surface persistent production tasks', () => {
 
     await flushMicrotasks();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    const enqueueBody = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.body));
+    expect(enqueueBody.payload).toMatchObject({ materialId: 'MAT-001', runCore: true });
+    expect(enqueueBody.payload).not.toHaveProperty('meshRows');
+    expect(enqueueBody.payload).not.toHaveProperty('maxFrames');
+    expect(enqueueBody.payload).not.toHaveProperty('contourCrop');
+    await vi.advanceTimersByTimeAsync(400);
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats a dependency-blocked task as terminal and reports the persisted reason', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          code: 0,
+          duplicate: false,
+          task: productionTask('queued'),
+        }, 202),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          code: 0,
+          task: productionTask('blocked', {
+            chainId: 'SESSION-001',
+            dependsOnTaskId: 'TASK-PARENT',
+            dependencyPolicy: 'require-success',
+            blockedReason: 'dependency_failed:TASK-PARENT',
+            error: 'dependency_failed:TASK-PARENT',
+            finishedAt: '1783771200400',
+          }),
+        }),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const resultPromise = captureBarSurfaceProductionOnce({ materialId: 'MAT-001' });
+    const rejection = expect(resultPromise).rejects.toThrow('dependency_failed:TASK-PARENT');
+
+    await flushMicrotasks();
     await vi.advanceTimersByTimeAsync(400);
     await rejection;
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -198,14 +237,14 @@ describe('bar-surface persistent production tasks', () => {
       code: 0,
       capture: {
         code: 0,
-        successes: 6,
+        successes: 8,
         failures: 0,
-        completeFrames: 6,
-        metadataFrames: 6,
+        completeFrames: 8,
+        metadataFrames: 8,
         summaryOutput: 'H:\\calibration\\summary.json',
       },
       result: {
-        cameraCount: 6,
+        cameraCount: 8,
         correctedXml: 'H:\\calibration\\ArrayCalibration.corrected.xml',
       },
     };
@@ -222,7 +261,7 @@ describe('bar-surface persistent production tasks', () => {
     );
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(fitBarSurfaceCalibration({ expectedCameras: 6 })).resolves.toEqual(fitResult);
+    await expect(fitBarSurfaceCalibration({ expectedCameras: 8 })).resolves.toEqual(fitResult);
     const enqueueBody = JSON.parse(
       String((fetchMock.mock.calls[0][1] as RequestInit).body),
     ) as Record<string, unknown>;
@@ -231,7 +270,9 @@ describe('bar-surface persistent production tasks', () => {
       maxAttempts: 1,
       payload: {
         operation: 'calibration-capture-fit',
-        expectedCameras: 6,
+        expectedCameras: 8,
+        autoActivate: true,
+        profile: 'current-8-time-trigger',
         lines: 1000,
         width: 0,
         timeoutMs: 8000,

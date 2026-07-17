@@ -5,13 +5,16 @@ param(
   [string]$PlanPath,
   [string]$AdminToken = $env:STEEL_ADMIN_TOKEN,
   [string]$SafetyConfirmation = "",
-  [int]$ExpectedCameras = 6,
+  [int]$ExpectedCameras = 8,
   [int]$Lines = 1000,
   [int]$TimeoutMs = 8000,
   [string]$ReportDir = ""
 )
 
 $ErrorActionPreference = "Stop"
+if ($ExpectedCameras -ne 8) {
+  throw "Formal calibration integrity/generation acceptance requires exactly eight cameras."
+}
 $DrillConfirmation = "RUN REAL CALIBRATION INTEGRITY AND GENERATION DRILL"
 $StartedAt = Get-Date
 $Failures = [Collections.Generic.List[string]]::new()
@@ -144,7 +147,7 @@ try {
   if ($Failures.Count -eq 0) {
     $ResolvedPlanPath = (Resolve-Path -LiteralPath $PlanPath).Path
     $Plan = Read-JsonFileUtf8 $ResolvedPlanPath
-    Test-Condition (@($Plan.ips).Count -eq $ExpectedCameras -and @($Plan.cameraCalibrations).Count -eq $ExpectedCameras) "Plan must contain exactly six cameras."
+    Test-Condition (@($Plan.ips).Count -eq $ExpectedCameras -and @($Plan.cameraCalibrations).Count -eq $ExpectedCameras) "Plan must contain exactly eight cameras."
 
     $DryRunScript = Join-Path $PSScriptRoot "test-real-calibration-acceptance.ps1"
     $DryRunOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $DryRunScript -ServiceOrigin $ServiceOrigin -PlanPath $ResolvedPlanPath -AdminToken $AdminToken -ExpectedCameras $ExpectedCameras 2>&1

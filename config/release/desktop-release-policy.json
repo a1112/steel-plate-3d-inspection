@@ -1,0 +1,17 @@
+{
+  "schema": "steel.desktop-release-policy.v1",
+  "publisher": "\u5317\u79d1\u5de5\u7814",
+  "targets": ["msi", "nsis"],
+  "beforeDevCommand": "npm run dev",
+  "beforeBuildCommand": "npm run build",
+  "cargoFeatures": [],
+  "contentSecurityPolicy": "default-src 'self' customprotocol: asset:; connect-src ipc: http://ipc.localhost http://127.0.0.1:*; img-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:",
+  "webView2InstallMode": "offlineInstaller",
+  "nsisInstallMode": "perMachine",
+  "allowDowngrades": false,
+  "devtools": false,
+  "rustTarget": "x86_64-pc-windows-msvc",
+  "cargoConfigSha256": "09721ea55b37685910ef3162b7d8e073c368ea23ce96c46db2f522f94a44a84a",
+  "tauriConfigSha256": "1dd437b62ceb8c7dc9373991904dffdcabfdfcf75b230967472a28719896d07c",
+  "tauriCargoSha256": "9583f84baed1ba7f79f9e27f3ed0b33112cdbf5d19ffc914844e7547a93f5c88"
+}

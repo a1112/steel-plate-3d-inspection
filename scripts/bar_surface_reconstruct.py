@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a six-camera bar-surface stitching prototype from captured frames.
+"""Build an eight-camera bar-surface stitching prototype from captured frames.
 
 The prototype reads the production capture layout:
   H:/camera1/<material>/depth/*.png
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -34,16 +35,50 @@ from PIL import Image
 
 DEFAULT_CAPTURE_ROOT = Path(r"H:\\")
 DEFAULT_OUTPUT_ROOT = Path(r"G:\\bar-surface-algorithm")
-DEFAULT_CALIBRATION_ROOT = Path(r"E:\\steel-capture-data\\config\\calibrations\\current-6-soft-trigger")
-DEFAULT_CAMERA_PARAM_CALIBRATION = Path(r"E:\\steel-capture-data\\config\\camera-params\\current-6-soft-trigger\\ArrayCalibration.xml")
+DEFAULT_CALIBRATION_ROOT = Path(r"E:\\steel-capture-data\\config\\calibrations\\current-8-time-trigger")
+DEFAULT_CAMERA_PARAM_CALIBRATION = Path(r"E:\\steel-capture-data\\config\\camera-params\\current-8-time-trigger\\ArrayCalibration.xml")
+DEFAULT_ALGORITHM_CONFIG = Path(__file__).resolve().parent.parent / "config" / "algorithm" / "bar-surface-production.json"
 DEFAULT_CAMERA_ROOTS = [
-    ("camera1", "192.168.101.100", "3G506401BE08818"),
-    ("camera2", "192.168.102.100", "3G506501CA09165"),
-    ("camera3", "192.168.103.100", "3G506401RE08993"),
-    ("camera4", "192.168.104.100", "3G506401BE08819"),
-    ("camera5", "192.168.105.13", "YF-0263"),
-    ("camera6", "192.168.106.100", "3G506401RE08991"),
+    ("camera1", "192.168.101.100", "3G506601BE09220"),
+    ("camera2", "192.168.102.100", "3G506501CA09164"),
+    ("camera3", "192.168.103.100", "3G506401RE08999"),
+    ("camera4", "192.168.104.100", "YF-0270"),
+    ("camera5", "192.168.105.100", "3G506601BE09221"),
+    ("camera6", "192.168.106.100", "3G506501CA09163"),
+    ("camera7", "192.168.107.100", "3G506401RE08995"),
+    ("camera8", "192.168.108.100", "YF-0269"),
 ]
+
+ALGORITHM_THRESHOLD_BINDINGS = (
+    ("contourEnabled", "contour_crop", True, bool),
+    ("maxFrames", "max_frames", 24, int),
+    ("meshRows", "mesh_rows", 144, int),
+    ("meshColsPerCamera", "mesh_cols_per_camera", 72, int),
+    ("radiusMm", "radius_mm", 75.0, float),
+    ("radialScaleMm", "radial_scale_mm", 8.0, float),
+    ("maxFaceEdgeMm", "max_face_edge_mm", 8.0, float),
+    ("contourRadiusToleranceMm", "contour_radius_tolerance_mm", 0.0, float),
+    ("contourMinKeepRatio", "contour_min_keep_ratio", 0.55, float),
+    ("contourMinRowCoverage", "contour_min_row_coverage", 0.25, float),
+    ("contourAutoPercentile", "contour_auto_percentile", 96.0, float),
+    ("contourMinimumToleranceMm", "contour_minimum_tolerance_mm", 0.25, float),
+    ("contourMadMultiplier", "contour_mad_multiplier", 6.0, float),
+    ("contourFallbackPercentile", "contour_fallback_percentile", 99.0, float),
+    ("meshLongitudinalStepMm", "mesh_longitudinal_step_mm", 0.25, float),
+    ("defectMinDepthMm", "defect_min_depth_mm", 0.35, float),
+    ("defectMinAreaPoints", "defect_min_area_points", 6, int),
+    ("defectMadMultiplier", "defect_mad_multiplier", 6.0, float),
+    ("defectLongitudinalSpanFloorMm", "defect_longitudinal_span_floor_mm", 0.25, float),
+    ("severitySevereAbsoluteMm", "severity_severe_absolute_mm", 1.0, float),
+    ("severitySevereThresholdMultiplier", "severity_severe_threshold_multiplier", 2.5, float),
+    ("severityReviewAbsoluteMm", "severity_review_absolute_mm", 0.5, float),
+    ("severityReviewThresholdMultiplier", "severity_review_threshold_multiplier", 1.35, float),
+    ("confidenceBase", "confidence_base", 0.55, float),
+    ("confidenceMagnitudeWeight", "confidence_magnitude_weight", 0.2, float),
+    ("confidenceAreaWeight", "confidence_area_weight", 0.25, float),
+    ("confidenceAreaNormalizationPoints", "confidence_area_normalization_points", 32.0, float),
+    ("confidenceMaximum", "confidence_maximum", 0.999, float),
+)
 
 
 @dataclass(frozen=True)
@@ -114,7 +149,279 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     os.replace(tmp, path)
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def canonical_sha256(payload: Any) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_algorithm_config(path: Path, production: bool) -> dict[str, Any]:
+    if not path.is_file():
+        if production:
+            raise ValueError(f"production algorithm config is required: {path}")
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict) or payload.get("schema") != "steel.algorithm-config.v1":
+        raise ValueError("algorithm config schema must be steel.algorithm-config.v1")
+    for key in ("algorithmName", "algorithmVersion", "configRevision"):
+        if not str(payload.get(key, "")).strip():
+            raise ValueError(f"algorithm config requires {key}")
+    thresholds = payload.get("thresholds")
+    if not isinstance(thresholds, dict):
+        raise ValueError("algorithm config requires thresholds")
+    missing = [key for key, _, _, _ in ALGORITHM_THRESHOLD_BINDINGS if key not in thresholds]
+    if missing:
+        raise ValueError(f"algorithm config is missing thresholds: {','.join(missing)}")
+    if not isinstance(thresholds.get("contourEnabled"), bool):
+        raise ValueError("algorithm threshold contourEnabled must be boolean")
+    numeric_bounds: dict[str, tuple[float, float]] = {
+        "maxFrames": (1, 240),
+        "meshRows": (24, 512),
+        "meshColsPerCamera": (24, 256),
+        "radiusMm": (0.001, 1_000_000),
+        "radialScaleMm": (0.0, 1_000_000),
+        "maxFaceEdgeMm": (0.0, 1_000_000),
+        "contourRadiusToleranceMm": (0.0, 1_000_000),
+        "contourMinKeepRatio": (0.0, 1.0),
+        "contourMinRowCoverage": (0.0, 1.0),
+        "contourAutoPercentile": (50.0, 99.9),
+        "contourMinimumToleranceMm": (0.0, 1_000_000),
+        "contourMadMultiplier": (0.001, 1_000_000),
+        "contourFallbackPercentile": (50.0, 100.0),
+        "meshLongitudinalStepMm": (0.000001, 1_000_000),
+        "defectMinDepthMm": (0.000001, 1_000_000),
+        "defectMinAreaPoints": (1, 1_000_000),
+        "defectMadMultiplier": (0.001, 1_000_000),
+        "defectLongitudinalSpanFloorMm": (0.0, 1_000_000),
+        "severitySevereAbsoluteMm": (0.0, 1_000_000),
+        "severitySevereThresholdMultiplier": (0.0, 1_000_000),
+        "severityReviewAbsoluteMm": (0.0, 1_000_000),
+        "severityReviewThresholdMultiplier": (0.0, 1_000_000),
+        "confidenceBase": (0.0, 1.0),
+        "confidenceMagnitudeWeight": (0.0, 1.0),
+        "confidenceAreaWeight": (0.0, 1.0),
+        "confidenceAreaNormalizationPoints": (0.000001, 1_000_000),
+        "confidenceMaximum": (0.0, 1.0),
+    }
+    for key, (minimum, maximum) in numeric_bounds.items():
+        value = thresholds.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError(f"algorithm threshold {key} must be a finite number")
+        if not minimum <= float(value) <= maximum:
+            raise ValueError(f"algorithm threshold {key} is outside [{minimum}, {maximum}]")
+    quality_gate = payload.get("qualityGate")
+    if not isinstance(quality_gate, dict) or int(quality_gate.get("requiredCameraCount", 0)) != 8:
+        raise ValueError("algorithm config qualityGate must require exactly eight cameras")
+    if quality_gate.get("requireCalibrationForEveryCamera") is not True:
+        raise ValueError("algorithm config qualityGate must require calibration for every camera")
+    if quality_gate.get("requireReconstructionAcceptance") is not True:
+        raise ValueError("algorithm config qualityGate must require reconstruction acceptance")
+    if quality_gate.get("maximumSyntheticDefectCount") != 0:
+        raise ValueError("algorithm config qualityGate must forbid synthetic defects")
+    payload["configSha256"] = sha256_file(path)
+    payload["path"] = str(path)
+    return payload
+
+
+def apply_algorithm_config(args: argparse.Namespace, production: bool) -> dict[str, Any]:
+    config_path = Path(args.algorithm_config) if args.algorithm_config else DEFAULT_ALGORITHM_CONFIG
+    config = load_algorithm_config(config_path, production)
+    configured_thresholds = config.get("thresholds", {})
+    effective_thresholds: dict[str, Any] = {}
+    for config_key, argument_name, fallback, cast in ALGORITHM_THRESHOLD_BINDINGS:
+        requested = getattr(args, argument_name)
+        configured = configured_thresholds.get(config_key)
+        if production and requested is not None and cast(requested) != cast(configured):
+            raise ValueError(f"production threshold override is forbidden: {config_key}")
+        effective = requested if requested is not None and not production else configured
+        if effective is None:
+            effective = fallback
+        effective = cast(effective)
+        setattr(args, argument_name, effective)
+        effective_thresholds[config_key] = effective
+    if not config:
+        config = {
+            "schema": "steel.algorithm-config.development.v1",
+            "algorithmName": "bar-surface-defect-detector",
+            "algorithmVersion": "development-unversioned",
+            "configRevision": "development-defaults",
+            "configSha256": canonical_sha256(effective_thresholds),
+            "path": "",
+            "thresholds": effective_thresholds,
+            "qualityGate": {
+                "requiredCameraCount": 8,
+                "requireCalibrationForEveryCamera": False,
+                "requireReconstructionAcceptance": True,
+                "maximumSyntheticDefectCount": 64,
+            },
+        }
+    config["effectiveThresholds"] = effective_thresholds
+    return config
+
+
+def calibration_identity(calibration_path: Path | None) -> tuple[str, str]:
+    calibration_sha256 = sha256_file(calibration_path) if calibration_path and calibration_path.is_file() else ""
+    calibration_revision = os.environ.get("STEEL_CALIBRATION_REVISION", "").strip()
+    if not calibration_revision and calibration_sha256:
+        calibration_revision = f"sha256:{calibration_sha256[:16]}"
+    return calibration_revision, calibration_sha256
+
+
+def load_algorithm_qualification(
+    algorithm_config: dict[str, Any],
+    calibration_path: Path | None,
+    production: bool,
+) -> dict[str, Any]:
+    if not production:
+        return {}
+    report_text = os.environ.get("STEEL_ALGORITHM_ACCEPTANCE_REPORT", "").strip()
+    if not report_text:
+        raise ValueError("production algorithm acceptance report is required")
+    report_path = Path(report_text)
+    if not report_path.is_file():
+        raise ValueError(f"production algorithm acceptance report does not exist: {report_path}")
+    report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(report, dict) or report.get("schema") != "steel.algorithm-acceptance.v1":
+        raise ValueError("algorithm acceptance report schema must be steel.algorithm-acceptance.v1")
+    if report.get("status") != "pass":
+        raise ValueError("algorithm acceptance report status must be pass")
+    exact_config_fields = ("algorithmName", "algorithmVersion", "configRevision", "configSha256")
+    for key in exact_config_fields:
+        if str(report.get(key, "")) != str(algorithm_config.get(key, "")):
+            raise ValueError(f"algorithm acceptance report {key} does not match current config")
+
+    calibration_revision, calibration_sha256 = calibration_identity(calibration_path)
+    if not calibration_sha256:
+        raise ValueError("production algorithm calibration file is required")
+    if str(report.get("calibrationRevision", "")) != calibration_revision:
+        raise ValueError("algorithm acceptance report calibrationRevision does not match current calibration")
+    if str(report.get("calibrationSha256", "")).lower() != calibration_sha256:
+        raise ValueError("algorithm acceptance report calibrationSha256 does not match current calibration")
+
+    script_sha256 = sha256_file(Path(__file__).resolve())
+    core_text = os.environ.get("STEEL_BAR_SURFACE_CORE_EXE", "").strip()
+    core_path = Path(core_text) if core_text else None
+    if core_path is None or not core_path.is_file():
+        raise ValueError("production algorithm C++ core executable is required")
+    core_sha256 = sha256_file(core_path)
+    release_commit = os.environ.get("STEEL_RELEASE_COMMIT", "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", release_commit):
+        raise ValueError("STEEL_RELEASE_COMMIT must be an exact 40-64 character hexadecimal commit")
+    implementation = {
+        "scriptSha256": script_sha256,
+        "coreSha256": core_sha256,
+        "releaseCommit": release_commit,
+    }
+    for key, actual in implementation.items():
+        if str(report.get(key, "")).lower() != actual:
+            raise ValueError(f"algorithm acceptance report {key} does not match packaged implementation")
+    for revision_key, hash_key in (
+        ("datasetRevision", "datasetSha256"),
+        ("evaluatorRevision", "evaluatorSha256"),
+    ):
+        if not str(report.get(revision_key, "")).strip():
+            raise ValueError(f"algorithm acceptance report requires {revision_key}")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", str(report.get(hash_key, ""))):
+            raise ValueError(f"algorithm acceptance report requires valid {hash_key}")
+    approvals = report.get("approvals")
+    if not isinstance(approvals, dict) or any(
+        not str(approvals.get(key, "")).strip()
+        for key in ("algorithmOwner", "qualityOwner", "approvedAt")
+    ):
+        raise ValueError("algorithm acceptance report requires algorithm and quality approvals")
+    metrics = report.get("metrics")
+    criteria = report.get("acceptanceCriteria")
+    if not isinstance(metrics, dict) or not isinstance(criteria, dict):
+        raise ValueError("algorithm acceptance report requires metrics and acceptanceCriteria")
+    metric_checks = (
+        ("detectionRecall", "minimumDetectionRecall", True),
+        ("falsePositiveRate", "maximumFalsePositiveRate", False),
+        ("missRate", "maximumMissRate", False),
+        ("localizationErrorMmP95", "maximumLocalizationErrorMmP95", False),
+        ("sizeErrorMmP95", "maximumSizeErrorMmP95", False),
+        ("endToEndLatencyMsP95", "maximumEndToEndLatencyMsP95", False),
+    )
+    for metric_key, criterion_key, minimum in metric_checks:
+        try:
+            actual = float(metrics[metric_key])
+            limit = float(criteria[criterion_key])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"algorithm acceptance report metric is invalid: {metric_key}") from error
+        if (minimum and actual < limit) or (not minimum and actual > limit):
+            raise ValueError(f"algorithm acceptance report metric failed: {metric_key}")
+    return {
+        "acceptanceReport": str(report_path.resolve()),
+        "acceptanceReportSha256": sha256_file(report_path),
+        "datasetRevision": str(report["datasetRevision"]),
+        "datasetSha256": str(report["datasetSha256"]).lower(),
+        "evaluatorRevision": str(report["evaluatorRevision"]),
+        "evaluatorSha256": str(report["evaluatorSha256"]).lower(),
+        "approvedCalibrationRevision": calibration_revision,
+        "approvedCalibrationSha256": calibration_sha256,
+        **implementation,
+    }
+
+
+def build_input_traceability(
+    sources: list[CameraPrepared] | list[tuple[CameraInput, list[CameraFrame]]],
+    frame_ids: list[str],
+) -> dict[str, Any]:
+    artifacts: list[dict[str, Any]] = []
+    selected = set(frame_ids)
+    normalized_sources: list[tuple[CameraInput, list[CameraFrame]]] = []
+    for source in sources:
+        if isinstance(source, CameraPrepared):
+            normalized_sources.append((source.camera, source.frames))
+        else:
+            normalized_sources.append(source)
+    for camera, frames in sorted(normalized_sources, key=lambda value: value[0].name):
+        for frame in sorted((value for value in frames if value.stem in selected), key=lambda value: value.stem):
+            for kind, path in (
+                ("depth", frame.depth_path),
+                ("intensity", frame.intensity_path),
+                ("metadata", frame.metadata_path),
+            ):
+                if path is None or not path.is_file():
+                    continue
+                artifacts.append({
+                    "camera": camera.name,
+                    "frameId": frame.stem,
+                    "kind": kind,
+                    "path": str(path.resolve()),
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                })
+    return {
+        "inputFrameIds": list(frame_ids),
+        "inputArtifactCount": len(artifacts),
+        "inputArtifacts": artifacts,
+        "inputSummarySha256": canonical_sha256(artifacts),
+    }
+
+
+def assert_input_traceability_unchanged(
+    frozen: dict[str, Any],
+    sources: list[CameraPrepared] | list[tuple[CameraInput, list[CameraFrame]]],
+    frame_ids: list[str],
+) -> None:
+    current = build_input_traceability(sources, frame_ids)
+    if current != frozen:
+        raise ValueError("algorithm input artifacts changed while the run was in progress")
+
+
 def latest_default_calibration() -> Path | None:
+    configured = os.environ.get("STEEL_ALGORITHM_CALIBRATION_PATH", "").strip()
+    if configured:
+        configured_path = Path(configured)
+        if configured_path.is_file():
+            return configured_path
     candidates: list[Path] = []
     if DEFAULT_CALIBRATION_ROOT.exists():
         candidates.extend(DEFAULT_CALIBRATION_ROOT.rglob("ArrayCalibration.corrected.xml"))
@@ -360,8 +667,8 @@ def write_profile(output_root: Path) -> None:
         profile_path,
         {
             "schema": "steel.bar_surface.profile.v1",
-            "name": "six-camera-bar-surface-prototype",
-            "captureLayout": "H:/camera1..camera6/<material>/{depth,intensity,metadata}",
+            "name": "eight-camera-bar-surface-prototype",
+            "captureLayout": "H:/camera1..camera8/<material>/{depth,intensity,metadata}",
             "algorithmRoot": str(output_root),
             "outputs": [
                 "cropped-2d",
@@ -508,6 +815,8 @@ def estimate_3d_contour_crop_boxes(
     calibration: dict[str, CameraCalibration],
     radius_tolerance_mm: float,
     auto_percentile: float,
+    minimum_tolerance_mm: float,
+    mad_multiplier: float,
     padding: int = 12,
     max_points_per_camera: int = 18000,
 ) -> tuple[dict[str, tuple[int, int, int, int]], dict[str, Any]]:
@@ -515,7 +824,7 @@ def estimate_3d_contour_crop_boxes(
     point_chunks: list[np.ndarray] = []
     sample_records: list[dict[str, Any]] = []
 
-    for camera, frames in zip(cameras, per_camera_frames):
+    for camera_index, (camera, frames) in enumerate(zip(cameras, per_camera_frames)):
         latest = frames[-1]
         calibration_item = camera_calibration_for_input(camera, latest, calibration)
         depth = read_u16_image(latest.depth_path)
@@ -563,6 +872,7 @@ def estimate_3d_contour_crop_boxes(
         sample_records.append(
             {
                 "camera": camera,
+                "cameraIndex": camera_index,
                 "frame": latest,
                 "depthShape": depth.shape,
                 "rows": row_grid[valid].astype(np.int32),
@@ -607,17 +917,78 @@ def estimate_3d_contour_crop_boxes(
         p_value = float(np.percentile(residual, percentile))
         median = float(np.median(residual))
         mad = float(np.median(np.abs(residual - median)))
-        tolerance = max(0.25, min(p_value, median + 6.0 * max(mad, 1e-6)))
+        tolerance = max(
+            float(minimum_tolerance_mm),
+            min(p_value, median + float(mad_multiplier) * max(mad, 1e-6)),
+        )
         tolerance_mode = "auto"
+
+    angular_targets: dict[int, float] = {}
+    angular_summary: dict[str, Any] = {
+        "applied": False,
+        "cameraCount": len(cameras),
+        "sectorWidthDeg": round(360.0 / max(1, len(cameras)), 6),
+    }
+    if len(sample_records) == len(cameras) and len(cameras) > 1:
+        sector = 2.0 * math.pi / len(cameras)
+        observed = []
+        for sample in sample_records:
+            sample_points = sample["points"]
+            sample_angles = np.arctan2(
+                sample_points[:, 2] - center[1],
+                sample_points[:, 0] - center[0],
+            )
+            observed.append(float(np.angle(np.mean(np.exp(1j * sample_angles)))))
+        candidates: list[tuple[float, int, float, list[float]]] = []
+        for direction in (-1, 1):
+            offsets = np.asarray(
+                [direction * index * sector for index in range(len(cameras))],
+                dtype=np.float64,
+            )
+            phase = float(np.angle(np.mean(np.exp(1j * (np.asarray(observed) - offsets)))))
+            targets = [phase + direction * index * sector for index in range(len(cameras))]
+            errors = [
+                float((observed[index] - targets[index] + math.pi) % (2.0 * math.pi) - math.pi)
+                for index in range(len(cameras))
+            ]
+            candidates.append((float(np.mean(np.square(errors))), direction, phase, targets))
+        score, direction, phase, targets = min(candidates, key=lambda item: item[0])
+        angular_targets = {index: target for index, target in enumerate(targets)}
+        angular_summary = {
+            "applied": True,
+            "method": "calibrated-circle-equal-camera-sector-crop",
+            "cameraCount": len(cameras),
+            "direction": "clockwise" if direction < 0 else "counter-clockwise",
+            "phaseDeg": round(math.degrees(phase) % 360.0, 6),
+            "sectorWidthDeg": round(math.degrees(sector), 6),
+            "fitScoreDegRms": round(math.degrees(math.sqrt(score)), 6),
+        }
 
     crop_boxes: dict[str, tuple[int, int, int, int]] = {}
     for sample in sample_records:
         camera = sample["camera"]
+        record = per_camera[camera.name]
         points = sample["points"]
         sample_residual = np.abs(np.linalg.norm(points[:, [0, 2]] - center, axis=1) - radius)
         keep = sample_residual <= tolerance
+        target_angle = angular_targets.get(int(sample["cameraIndex"]))
+        if target_angle is not None:
+            point_angles = np.arctan2(
+                points[:, 2] - center[1],
+                points[:, 0] - center[0],
+            )
+            angle_delta = (point_angles - target_angle + math.pi) % (2.0 * math.pi) - math.pi
+            sector_half_width = math.pi / len(cameras)
+            sector_keep = np.abs(angle_delta) <= sector_half_width * 1.02
+            combined_keep = keep & sector_keep
+            if int(np.sum(combined_keep)) >= 64:
+                keep = combined_keep
+                record["source"] = "calibrated-3d-angular-sector"
+                record["targetCenterDeg"] = round(math.degrees(target_angle) % 360.0, 6)
+                record["sectorWidthDeg"] = round(360.0 / len(cameras), 6)
+            else:
+                record["angularSectorFallback"] = "not_enough_sector_points"
         kept_count = int(np.sum(keep))
-        record = per_camera[camera.name]
         record["keptPointCount"] = kept_count
         record["radiusToleranceMm"] = round(float(tolerance), 6)
         if kept_count < 64:
@@ -636,7 +1007,8 @@ def estimate_3d_contour_crop_boxes(
             record["reason"] = "contour_crop_too_small"
             continue
         crop_boxes[camera.name] = (left, top, right, bottom)
-        record["source"] = "calibrated-3d-contour"
+        if record.get("source") != "calibrated-3d-angular-sector":
+            record["source"] = "calibrated-3d-contour"
         record["cropBox"] = [left, top, right, bottom]
         record["keptPointRatio"] = round(kept_count / max(1, int(record["pointCount"])), 6)
         record["reason"] = "ok"
@@ -650,6 +1022,7 @@ def estimate_3d_contour_crop_boxes(
         "toleranceMode": tolerance_mode,
         "matchedCameras": len(crop_boxes),
         "totalCameras": len(cameras),
+        "angularSectorCrop": angular_summary,
         "perCamera": per_camera,
     }
 
@@ -663,6 +1036,9 @@ def contour_crop_valid_mask(
     min_keep_ratio: float,
     min_row_coverage: float,
     auto_percentile: float,
+    minimum_tolerance_mm: float,
+    mad_multiplier: float,
+    fallback_percentile: float,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     finite_array = np.isfinite(position_array).all(axis=2)
     base_valid = valid_array & finite_array
@@ -679,6 +1055,9 @@ def contour_crop_valid_mask(
         "minKeepRatio": round(float(min_keep_ratio), 6),
         "minRowCoverage": round(float(min_row_coverage), 6),
         "autoPercentile": round(float(auto_percentile), 6),
+        "minimumToleranceMm": round(float(minimum_tolerance_mm), 6),
+        "madMultiplier": round(float(mad_multiplier), 6),
+        "fallbackPercentile": round(float(fallback_percentile), 6),
     }
     if not enabled:
         summary["reason"] = "disabled"
@@ -716,7 +1095,10 @@ def contour_crop_valid_mask(
         p_value = float(np.percentile(valid_residual, percentile))
         median = float(np.median(valid_residual))
         mad = float(np.median(np.abs(valid_residual - median)))
-        tolerance = max(0.25, min(p_value, median + 6.0 * max(mad, 1e-6)))
+        tolerance = max(
+            float(minimum_tolerance_mm),
+            min(p_value, median + float(mad_multiplier) * max(mad, 1e-6)),
+        )
         tolerance_mode = "auto"
 
     keep = base_valid & (residual <= tolerance)
@@ -727,7 +1109,9 @@ def contour_crop_valid_mask(
     kept_count = int(np.sum(keep))
     min_keep_count = max(64, int(round(base_valid_count * max(0.0, min(1.0, min_keep_ratio)))))
     if kept_count < min_keep_count:
-        fallback_tolerance = float(np.percentile(valid_residual, 99.0))
+        fallback_tolerance = float(
+            np.percentile(valid_residual, max(50.0, min(100.0, float(fallback_percentile))))
+        )
         keep = base_valid & (residual <= fallback_tolerance)
         row_coverages = keep.sum(axis=1) / max(1, keep.shape[1])
         kept_count = int(np.sum(keep))
@@ -766,6 +1150,167 @@ def contour_crop_valid_mask(
     return keep, summary
 
 
+def center_mesh_cross_section_origin(
+    position_array: np.ndarray,
+    valid_array: np.ndarray,
+    calibrated_array: np.ndarray,
+) -> dict[str, Any]:
+    """Move the fitted X/Z circular center to the mesh coordinate origin.
+
+    The axial Y coordinate remains referenced to the first sampled row.  This
+    keeps longitudinal measurements stable while making every exported mesh,
+    point cloud and downstream core artifact share the physical cross-section
+    origin at (0, 0) in X/Z.
+    """
+    finite_array = np.isfinite(position_array).all(axis=2)
+    valid = valid_array & finite_array
+    calibrated_valid = valid & calibrated_array
+    fit_mask = calibrated_valid if int(np.sum(calibrated_valid)) >= 12 else valid
+    source = "calibrated-3d" if fit_mask is calibrated_valid else "hybrid-3d"
+    source_circle = robust_circle_quality(position_array[fit_mask]) if int(np.sum(fit_mask)) >= 12 else {"available": False}
+    translation = {"x": 0.0, "y": 0.0, "z": 0.0}
+
+    if not source_circle.get("available"):
+        return {
+            "schema": "steel.bar_surface.coordinate_transform.v1",
+            "applied": False,
+            "origin": "source-array-coordinate",
+            "targetOrigin": "cross-section-circle-center",
+            "axis": "XZ",
+            "fitSource": source,
+            "translationMm": translation,
+            "sourceCircleFit": source_circle,
+            "reason": "circle_fit_unavailable",
+        }
+
+    translation["x"] = -float(source_circle["centerX"])
+    translation["z"] = -float(source_circle["centerZ"])
+    position_array[:, :, 0] += translation["x"]
+    position_array[:, :, 2] += translation["z"]
+    centered_circle = robust_circle_quality(position_array[fit_mask])
+    return {
+        "schema": "steel.bar_surface.coordinate_transform.v1",
+        "applied": True,
+        "origin": "cross-section-circle-center",
+        "targetOrigin": "cross-section-circle-center",
+        "axis": "XZ",
+        "fitSource": source,
+        "translationMm": {key: round(value, 6) for key, value in translation.items()},
+        "sourceCircleFit": source_circle,
+        "centeredCircleFit": centered_circle,
+    }
+
+
+def circular_delta(values: np.ndarray | float, center: float) -> np.ndarray:
+    return (np.asarray(values, dtype=np.float64) - center + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def resample_calibrated_camera_sectors(
+    position_array: np.ndarray,
+    color_array: np.ndarray,
+    valid_array: np.ndarray,
+    calibrated_array: np.ndarray,
+    camera_count: int,
+    cols_per_camera: int,
+) -> dict[str, Any]:
+    """Fit and apply one non-overlapping angular sector per calibrated camera.
+
+    Array cameras observe considerably more than 1/8 of the circumference.  A
+    direct crop-to-grid mapping therefore creates overlapping sheets.  This
+    routine fits the camera sequence direction and global phase around the
+    calibrated circle, then resamples each camera onto its Voronoi 45° sector.
+    """
+    calibrated_valid = valid_array & calibrated_array & np.isfinite(position_array).all(axis=2)
+    if int(np.sum(calibrated_valid)) < max(24, camera_count * 3):
+        return {"applied": False, "reason": "insufficient_calibrated_points"}
+    fit = robust_circle_quality(position_array[calibrated_valid])
+    if not fit.get("available"):
+        return {"applied": False, "reason": "circle_fit_unavailable", "circleFit": fit}
+    center_x = float(fit["centerX"])
+    center_z = float(fit["centerZ"])
+    sector = 2.0 * math.pi / camera_count
+    observed: list[float] = []
+    for camera_index in range(camera_count):
+        start = camera_index * cols_per_camera
+        end = start + cols_per_camera
+        mask = calibrated_valid[:, start:end]
+        points = position_array[:, start:end, :][mask]
+        if points.shape[0] < 3:
+            return {"applied": False, "reason": "camera_sector_points_missing", "cameraIndex": camera_index + 1}
+        angles = np.arctan2(points[:, 2] - center_z, points[:, 0] - center_x)
+        observed.append(float(np.angle(np.mean(np.exp(1j * angles)))))
+
+    candidates: list[tuple[float, int, float, list[float]]] = []
+    for direction in (-1, 1):
+        offsets = np.asarray([direction * camera_index * sector for camera_index in range(camera_count)])
+        phase = float(np.angle(np.mean(np.exp(1j * (np.asarray(observed) - offsets)))))
+        targets = [phase + direction * camera_index * sector for camera_index in range(camera_count)]
+        errors = [float(circular_delta(observed[index], targets[index])) for index in range(camera_count)]
+        score = float(np.mean(np.square(errors)))
+        candidates.append((score, direction, phase, targets))
+    score, direction, phase, targets = min(candidates, key=lambda item: item[0])
+
+    source_positions = position_array.copy()
+    source_colors = color_array.copy()
+    source_valid = valid_array.copy()
+    output_valid = np.zeros_like(valid_array, dtype=bool)
+    output_calibrated = np.zeros_like(calibrated_array, dtype=bool)
+    half_sector = sector / 2.0
+    target_deltas = np.linspace(-direction * half_sector, direction * half_sector, cols_per_camera)
+    per_camera: list[dict[str, Any]] = []
+
+    for camera_index, target_center in enumerate(targets):
+        start = camera_index * cols_per_camera
+        end = start + cols_per_camera
+        valid_rows = 0
+        input_count = int(np.sum(source_valid[:, start:end]))
+        for row in range(position_array.shape[0]):
+            mask = source_valid[row, start:end] & np.isfinite(source_positions[row, start:end]).all(axis=1)
+            if int(np.sum(mask)) < 3:
+                continue
+            points = source_positions[row, start:end][mask]
+            colors = source_colors[row, start:end][mask]
+            angles = np.arctan2(points[:, 2] - center_z, points[:, 0] - center_x)
+            deltas = circular_delta(angles, target_center)
+            order = np.argsort(deltas)
+            deltas = deltas[order]
+            points = points[order]
+            colors = colors[order]
+            unique, unique_indices = np.unique(np.round(deltas, 10), return_index=True)
+            points = points[unique_indices]
+            colors = colors[unique_indices]
+            if unique.size < 3 or unique[0] > -half_sector or unique[-1] < half_sector:
+                continue
+            for axis in range(3):
+                position_array[row, start:end, axis] = np.interp(target_deltas, unique, points[:, axis])
+                color_array[row, start:end, axis] = np.interp(target_deltas, unique, colors[:, axis])
+            output_valid[row, start:end] = True
+            output_calibrated[row, start:end] = True
+            valid_rows += 1
+        per_camera.append({
+            "cameraIndex": camera_index + 1,
+            "observedCenterDeg": round(math.degrees(observed[camera_index]) % 360.0, 6),
+            "targetCenterDeg": round(math.degrees(target_center) % 360.0, 6),
+            "angularCorrectionDeg": round(math.degrees(float(circular_delta(observed[camera_index], target_center))), 6),
+            "sectorWidthDeg": round(math.degrees(sector), 6),
+            "inputPointCount": input_count,
+            "resampledRows": valid_rows,
+        })
+    valid_array[:, :] = output_valid
+    calibrated_array[:, :] = output_calibrated
+    return {
+        "schema": "steel.bar_surface.angular_sector_fit.v1",
+        "applied": True,
+        "method": "calibrated-circle-equal-sector-resample",
+        "direction": "clockwise" if direction < 0 else "counter-clockwise",
+        "phaseDeg": round(math.degrees(phase) % 360.0, 6),
+        "sectorWidthDeg": round(math.degrees(sector), 6),
+        "fitScoreDegRms": round(math.degrees(math.sqrt(score)), 6),
+        "circleFit": fit,
+        "cameras": per_camera,
+    }
+
+
 def build_mesh(
     prepared: list[CameraPrepared],
     stems: list[str],
@@ -780,6 +1325,10 @@ def build_mesh(
     contour_min_keep_ratio: float,
     contour_min_row_coverage: float,
     contour_auto_percentile: float,
+    contour_minimum_tolerance_mm: float,
+    contour_mad_multiplier: float,
+    contour_fallback_percentile: float,
+    mesh_longitudinal_step_mm: float,
 ) -> dict[str, Any]:
     if not stems:
         raise ValueError("No common frame stems for mesh stitching")
@@ -844,7 +1393,7 @@ def build_mesh(
         intensity_hi = intensity_lo + 1.0
 
     for row in range(total_rows):
-        y_mm = row * 0.25
+        y_mm = row * float(mesh_longitudinal_step_mm)
         v = 1.0 - (row / max(1, total_rows - 1))
         for camera_index, item in enumerate(prepared):
             depth_grid = depth_grids[camera_index]
@@ -878,8 +1427,18 @@ def build_mesh(
                 uvs.extend([u, v])
 
     position_array = np.array(positions, dtype=np.float64).reshape((total_rows, full_cols, 3))
+    color_array = np.array(colors, dtype=np.float64).reshape((total_rows, full_cols, 3))
     valid_array = np.array(valid_mask, dtype=bool).reshape((total_rows, full_cols))
     calibrated_array = np.array(calibrated_mask, dtype=bool).reshape((total_rows, full_cols))
+    angular_sector_fit = resample_calibrated_camera_sectors(
+        position_array,
+        color_array,
+        valid_array,
+        calibrated_array,
+        camera_count,
+        cols_per_camera,
+    )
+    structural_valid_array = valid_array.copy()
     contour_valid_array, contour_summary = contour_crop_valid_mask(
         position_array,
         valid_array,
@@ -889,9 +1448,26 @@ def build_mesh(
         contour_min_keep_ratio,
         contour_min_row_coverage,
         contour_auto_percentile,
+        contour_minimum_tolerance_mm,
+        contour_mad_multiplier,
+        contour_fallback_percentile,
     )
-    valid_array = contour_valid_array
+    analysis_valid_array = contour_valid_array.copy()
+    valid_array = contour_valid_array.copy()
+    restored_seam_anchor_pairs = 0
+    if angular_sector_fit.get("applied"):
+        for camera_index in range(camera_count):
+            left_col = (camera_index + 1) * cols_per_camera - 1
+            right_col = ((camera_index + 1) % camera_count) * cols_per_camera
+            paired = structural_valid_array[:, left_col] & structural_valid_array[:, right_col]
+            restored_seam_anchor_pairs += int(np.sum(paired & ~(valid_array[:, left_col] & valid_array[:, right_col])))
+            valid_array[paired, left_col] = True
+            valid_array[paired, right_col] = True
     valid_mask = [1 if value else 0 for value in valid_array.reshape(-1)]
+    analysis_valid_mask = [1 if value else 0 for value in analysis_valid_array.reshape(-1)]
+    coordinate_transform = center_mesh_cross_section_origin(position_array, analysis_valid_array, calibrated_array)
+    positions = position_array.reshape(-1).tolist()
+    colors = color_array.reshape(-1).tolist()
     indices: list[int] = []
     skipped_invalid_quads = 0
     skipped_gap_quads = 0
@@ -938,6 +1514,7 @@ def build_mesh(
     return {
         "schema": "steel.bar_surface.mesh.v1",
         "coordinateUnit": "mm",
+        "coordinateFrame": coordinate_transform,
         "stitchMode": "calibrated-hybrid" if calibrated_camera_count else "cylindrical-preview",
         "calibratedCameraCount": calibrated_camera_count,
         "cameraCount": camera_count,
@@ -948,14 +1525,17 @@ def build_mesh(
         "uvs": [round(value, 6) for value in uvs],
         "colors": [round(value, 4) for value in colors],
         "validMask": valid_mask,
+        "analysisValidMask": analysis_valid_mask,
         "calibratedMask": calibrated_mask,
         "contourCrop": contour_summary,
+        "angularSectorFit": angular_sector_fit,
         "topology": {
             "maxFaceEdgeMm": max_edge,
             "candidateQuads": candidate_quads,
             "keptQuads": len(indices) // 6,
             "skippedInvalidQuads": skipped_invalid_quads,
             "skippedGapQuads": skipped_gap_quads,
+            "restoredSeamAnchorPairs": restored_seam_anchor_pairs,
         },
         "indices": indices,
     }
@@ -1056,6 +1636,8 @@ def mesh_quality_metrics(mesh: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema": "steel.bar_surface.quality.v1",
         "stitchMode": mesh.get("stitchMode", "unknown"),
+        "coordinateFrame": mesh.get("coordinateFrame", {}),
+        "angularSectorFit": mesh.get("angularSectorFit", {}),
         "calibratedCameraCount": mesh.get("calibratedCameraCount", 0),
         "validPointCount": int(np.sum(valid_mask)),
         "calibratedPointCount": int(np.sum(calibrated_mask)),
@@ -1081,6 +1663,385 @@ def mesh_quality_metrics(mesh: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def detect_surface_defects(
+    mesh: dict[str, Any],
+    min_depth_mm: float,
+    min_area_points: int,
+    mad_multiplier: float,
+    longitudinal_span_floor_mm: float,
+    severe_absolute_mm: float,
+    severe_threshold_multiplier: float,
+    review_absolute_mm: float,
+    review_threshold_multiplier: float,
+    confidence_base: float,
+    confidence_magnitude_weight: float,
+    confidence_area_weight: float,
+    confidence_area_normalization_points: float,
+    confidence_maximum: float,
+) -> dict[str, Any]:
+    """Detect coherent radial deviations on the closed, centered surface mesh.
+
+    The per-row median removes slow diameter/oval-shape drift. A MAD-derived
+    threshold then isolates local deviations, and an 8-neighbour component
+    pass (with circumferential wrap) turns pixels into production candidates.
+    """
+    positions = np.asarray(mesh["positions"], dtype=np.float64).reshape((-1, 3))
+    rows = int(mesh["rows"])
+    camera_count = int(mesh["cameraCount"])
+    cols_per_camera = int(mesh["colsPerCamera"])
+    cols = camera_count * cols_per_camera
+    valid = np.asarray(
+        mesh.get("analysisValidMask", mesh.get("validMask", [1] * positions.shape[0])),
+        dtype=bool,
+    ).reshape((rows, cols))
+    grid = positions.reshape((rows, cols, 3))
+    radii = np.hypot(grid[:, :, 0], grid[:, :, 2])
+    residual = np.zeros_like(radii)
+    for row in range(rows):
+        samples = radii[row, valid[row] & np.isfinite(radii[row])]
+        if samples.size:
+            residual[row] = radii[row] - float(np.median(samples))
+    samples = np.abs(residual[valid & np.isfinite(residual)])
+    if samples.size == 0:
+        return {"schema": "steel.surface.defects.v1", "status": "complete", "defectCount": 0, "defects": [], "reason": "no_valid_points"}
+    median = float(np.median(samples))
+    mad = float(np.median(np.abs(samples - median)))
+    robust_threshold = median + float(mad_multiplier) * max(mad, 1e-6)
+    threshold = max(float(min_depth_mm), robust_threshold)
+    candidate = valid & np.isfinite(residual) & (np.abs(residual) >= threshold)
+    visited = np.zeros_like(candidate, dtype=bool)
+    defects: list[dict[str, Any]] = []
+    nominal_radius = float(np.median(radii[valid])) if np.any(valid) else 0.0
+    circumference = max(1.0, 2.0 * math.pi * nominal_radius)
+    longitudinal_samples = grid[:, :, 1][valid & np.isfinite(grid[:, :, 1])]
+    longitudinal_min = float(np.min(longitudinal_samples)) if longitudinal_samples.size else 0.0
+    longitudinal_max = float(np.max(longitudinal_samples)) if longitudinal_samples.size else 1.0
+    longitudinal_span = max(1e-6, longitudinal_max - longitudinal_min)
+
+    for seed_row in range(rows):
+        for seed_col in range(cols):
+            if not candidate[seed_row, seed_col] or visited[seed_row, seed_col]:
+                continue
+            stack = [(seed_row, seed_col)]
+            visited[seed_row, seed_col] = True
+            component: list[tuple[int, int]] = []
+            while stack:
+                row, col = stack.pop()
+                component.append((row, col))
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        next_row = row + dr
+                        next_col = (col + dc) % cols
+                        if 0 <= next_row < rows and candidate[next_row, next_col] and not visited[next_row, next_col]:
+                            visited[next_row, next_col] = True
+                            stack.append((next_row, next_col))
+            if len(component) < max(1, int(min_area_points)):
+                continue
+            rr = np.asarray([item[0] for item in component], dtype=np.int32)
+            cc = np.asarray([item[1] for item in component], dtype=np.int32)
+            values = residual[rr, cc]
+            sign = -1.0 if float(np.median(values)) < 0 else 1.0
+            peak_index = int(np.argmax(np.abs(values)))
+            peak = float(values[peak_index])
+            point_rows = grid[rr, cc]
+            camera_index = int(np.bincount(cc // cols_per_camera, minlength=camera_count).argmax())
+            angular_span = max(1, len(set(int(value) for value in cc))) / cols * circumference
+            longitudinal_span = max(
+                float(longitudinal_span_floor_mm),
+                float(np.max(point_rows[:, 1]) - np.min(point_rows[:, 1])),
+            )
+            magnitude = abs(peak)
+            severity = (
+                "severe"
+                if magnitude >= max(float(severe_absolute_mm), threshold * float(severe_threshold_multiplier))
+                else "review"
+                if magnitude >= max(float(review_absolute_mm), threshold * float(review_threshold_multiplier))
+                else "minor"
+            )
+            confidence = min(
+                float(confidence_maximum),
+                float(confidence_base)
+                + float(confidence_magnitude_weight) * min(1.0, magnitude / max(threshold, 1e-6))
+                + float(confidence_area_weight)
+                * min(1.0, len(component) / max(1.0, float(confidence_area_normalization_points))),
+            )
+            angle = math.atan2(float(point_rows[peak_index, 2]), float(point_rows[peak_index, 0]))
+            circumference_ratio = ((angle + math.pi) / (2.0 * math.pi)) % 1.0
+            circumference_mm = circumference_ratio * circumference
+            length_ratio = float(np.clip((float(np.mean(point_rows[:, 1])) - longitudinal_min) / longitudinal_span, 0.0, 1.0))
+            defects.append({
+                "id": f"ALG-{len(defects) + 1:04d}",
+                "cameraId": f"camera{camera_index + 1}",
+                # Keep the two legacy IDs for database/UI compatibility. They
+                # describe radial polarity only and are not a material-defect
+                # classification result.
+                "defectType": "pit" if sign < 0 else "foreign",
+                "severity": severity,
+                "xMm": round(float(np.mean(point_rows[:, 1])), 4),
+                "yMm": round(circumference_mm, 4),
+                "zMm": round(peak, 4),
+                "widthMm": round(angular_span, 4),
+                "heightMm": round(longitudinal_span, 4),
+                "depthMm": round(magnitude, 4),
+                "confidence": round(confidence, 6),
+                "detectionConfidence": round(confidence, 6),
+                "geometry": {
+                    "schema": "steel.surface.defect.geometry.v1",
+                    "classificationState": "candidate-only",
+                    "classificationVersion": "radial-polarity-candidate-v1",
+                    "candidatePolarity": "depression" if sign < 0 else "protrusion",
+                    "classificationConfidence": None,
+                    "pointCount": len(component),
+                    "rowRange": [int(np.min(rr)), int(np.max(rr))],
+                    "columnRange": [int(np.min(cc)), int(np.max(cc))],
+                    "signedRadialDeviationMm": round(peak, 4),
+                    "cameraIndex": camera_index + 1,
+                    "lengthRatio": round(length_ratio, 6),
+                    "circumferenceRatio": round(circumference_ratio, 6),
+                    "synthetic": False,
+                },
+            })
+    return {
+        "schema": "steel.surface.defects.v1",
+        "status": "complete",
+        "method": "row-median-radial-residual-mad-components",
+        "classification": {
+            "state": "candidate-only",
+            "version": "radial-polarity-candidate-v1",
+            "legacyTypeIdsDescribePolarityOnly": True,
+            "requiresOperatorReview": True,
+        },
+        "thresholdMm": round(threshold, 6),
+        "robustThresholdMm": round(robust_threshold, 6),
+        "minimumDepthMm": round(float(min_depth_mm), 6),
+        "minimumAreaPoints": int(min_area_points),
+        "candidatePointCount": int(np.sum(candidate)),
+        "defectCount": len(defects),
+        "defects": defects,
+    }
+
+
+def generate_mock_defects(mesh: dict[str, Any], count: int) -> list[dict[str, Any]]:
+    """Generate deterministic temporary defects for UI and database integration.
+
+    These records are deliberately marked as synthetic in their geometry so
+    they can be distinguished from radial-residual detections and disabled by
+    setting --mock-defect-count 0 once the production detector is ready.
+    """
+    count = max(0, min(int(count), 64))
+    if count == 0:
+        return []
+    positions = np.asarray(mesh["positions"], dtype=np.float64).reshape((-1, 3))
+    valid = np.asarray(mesh.get("validMask", [1] * positions.shape[0]), dtype=bool)
+    valid_positions = positions[valid & np.all(np.isfinite(positions), axis=1)]
+    if valid_positions.size:
+        longitudinal_min = float(np.min(valid_positions[:, 1]))
+        longitudinal_max = float(np.max(valid_positions[:, 1]))
+        nominal_radius = float(np.median(np.hypot(valid_positions[:, 0], valid_positions[:, 2])))
+    else:
+        longitudinal_min, longitudinal_max, nominal_radius = 0.0, 12000.0, 75.0
+    longitudinal_span = max(1.0, longitudinal_max - longitudinal_min)
+    circumference = max(1.0, 2.0 * math.pi * nominal_radius)
+    defect_types = ("pit", "scratch", "roll", "foreign", "burnt", "edge", "bubble", "inclusion")
+    severities = ("minor", "review", "severe")
+    defects: list[dict[str, Any]] = []
+    for index in range(count):
+        length_ratio = (index + 1.0) / (count + 1.0)
+        camera_index = index % max(1, int(mesh.get("cameraCount", 8)))
+        local_ratio = 0.28 + 0.44 * ((index * 37) % 100) / 100.0
+        circumference_ratio = (camera_index + local_ratio) / max(1, int(mesh.get("cameraCount", 8)))
+        depth = 0.32 + 0.11 * (index % 5)
+        signed_depth = -depth if index % 2 == 0 else depth
+        defects.append({
+            "id": f"MOCK-{index + 1:04d}",
+            "cameraId": f"camera{camera_index + 1}",
+            "defectType": defect_types[index % len(defect_types)],
+            "severity": severities[index % len(severities)],
+            "xMm": round(longitudinal_min + length_ratio * longitudinal_span, 4),
+            "yMm": round(circumference_ratio * circumference, 4),
+            "zMm": round(signed_depth, 4),
+            "widthMm": round(2.4 + 0.65 * (index % 4), 4),
+            "heightMm": round(5.0 + 1.4 * (index % 5), 4),
+            "depthMm": round(depth, 4),
+            "confidence": round(0.82 + 0.015 * (index % 8), 6),
+            "geometry": {
+                "schema": "steel.surface.defect.geometry.v1",
+                "generator": "temporary-deterministic-mock-v1",
+                "synthetic": True,
+                "cameraIndex": camera_index + 1,
+                "lengthRatio": round(length_ratio, 6),
+                "circumferenceRatio": round(circumference_ratio, 6),
+                "signedRadialDeviationMm": round(signed_depth, 4),
+            },
+        })
+    return defects
+
+
+def _atomic_save_image(image: Image.Image, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    image.save(temporary)
+    temporary.replace(path)
+
+
+def _frame_sequence_no(stem: str, fallback: int) -> int:
+    matches = re.findall(r"\d+", stem)
+    return int(matches[-1]) if matches else fallback
+
+
+def _profile_point(distance_mm: float, deviation_mm: float) -> dict[str, float]:
+    return {"x": round(float(distance_mm), 6), "z": round(float(deviation_mm), 6)}
+
+
+def materialize_defect_artifacts(
+    mesh: dict[str, Any],
+    detection: dict[str, Any],
+    prepared: list[CameraPrepared],
+    stems: list[str],
+    run_dir: Path,
+    output_root: Path,
+) -> None:
+    """Bind every detected component to a source frame and local review artifacts.
+
+    Artifact references are stored inside the versioned geometry JSON so older
+    databases remain readable without a destructive schema migration.
+    """
+    defects = detection.get("defects", [])
+    if not isinstance(defects, list) or not defects or not stems:
+        return
+    rows = int(mesh["rows"])
+    camera_count = int(mesh["cameraCount"])
+    cols_per_camera = int(mesh["colsPerCamera"])
+    full_cols = camera_count * cols_per_camera
+    rows_per_frame = max(1, rows // len(stems))
+    positions = np.asarray(mesh["positions"], dtype=np.float64).reshape((rows, full_cols, 3))
+    colors = np.asarray(mesh.get("colors", [0.5] * (rows * full_cols * 3)), dtype=np.float64).reshape((rows, full_cols, 3))
+    valid = np.asarray(
+        mesh.get("analysisValidMask", mesh.get("validMask", [1] * (rows * full_cols))),
+        dtype=bool,
+    ).reshape((rows, full_cols))
+
+    for index, defect in enumerate(defects):
+        if not isinstance(defect, dict):
+            continue
+        geometry = defect.get("geometry")
+        if not isinstance(geometry, dict):
+            geometry = {}
+            defect["geometry"] = geometry
+        row_range = geometry.get("rowRange", [0, 0])
+        column_range = geometry.get("columnRange", [0, 0])
+        if not isinstance(row_range, list) or len(row_range) != 2:
+            row_range = [0, 0]
+        if not isinstance(column_range, list) or len(column_range) != 2:
+            column_range = [0, 0]
+        camera_index = int(geometry.get("cameraIndex", index % max(1, camera_count))) - 1
+        camera_index = max(0, min(camera_count - 1, camera_index))
+        camera = prepared[camera_index]
+        center_row = max(0, min(rows - 1, int(round((int(row_range[0]) + int(row_range[1])) / 2))))
+        frame_index = max(0, min(len(stems) - 1, center_row // rows_per_frame))
+        frame_stem = stems[frame_index]
+        frames_by_stem = frame_by_stem(camera.frames)
+        frame = frames_by_stem.get(frame_stem)
+        if frame is None:
+            continue
+
+        source_intensity = Image.open(frame.intensity_path)
+        source_depth = Image.open(frame.depth_path)
+        source_width, source_height = source_intensity.size
+        crop_left, crop_top, crop_right, crop_bottom = camera.crop_box
+        crop_width = max(1, crop_right - crop_left)
+        crop_height = max(1, crop_bottom - crop_top)
+        local_columns = [int(value) % cols_per_camera for value in column_range]
+        local_min_col, local_max_col = min(local_columns), max(local_columns)
+        frame_row_min = max(0, int(row_range[0]) - frame_index * rows_per_frame)
+        frame_row_max = min(rows_per_frame - 1, int(row_range[1]) - frame_index * rows_per_frame)
+        x0 = crop_left + int(math.floor(local_min_col / max(1, cols_per_camera - 1) * (crop_width - 1)))
+        x1 = crop_left + int(math.ceil(local_max_col / max(1, cols_per_camera - 1) * (crop_width - 1)))
+        y0 = crop_top + int(math.floor(frame_row_min / max(1, rows_per_frame - 1) * (crop_height - 1)))
+        y1 = crop_top + int(math.ceil(frame_row_max / max(1, rows_per_frame - 1) * (crop_height - 1)))
+        padding_x = max(8, int(round(crop_width / max(8, cols_per_camera))))
+        padding_y = max(8, int(round(crop_height / max(8, rows_per_frame))))
+        left = max(0, x0 - padding_x)
+        top = max(0, y0 - padding_y)
+        right = min(source_width, max(x1 + padding_x + 1, left + 1))
+        bottom = min(source_height, max(y1 + padding_y + 1, top + 1))
+
+        defect_id = safe_segment(str(defect.get("id", f"ALG-{index + 1:04d}")))
+        artifact_dir = run_dir / "defects" / defect_id
+        intensity_roi = artifact_dir / "intensity-roi.png"
+        depth_roi = artifact_dir / "depth-roi.png"
+        point_cloud_path = artifact_dir / "local-point-cloud.json"
+        length_profile_path = artifact_dir / "length-profile.json"
+        width_profile_path = artifact_dir / "width-profile.json"
+        _atomic_save_image(source_intensity.crop((left, top, right, bottom)), intensity_roi)
+        _atomic_save_image(source_depth.crop((left, top, right, bottom)), depth_roi)
+
+        row_start = max(0, int(row_range[0]) - 2)
+        row_end = min(rows - 1, int(row_range[1]) + 2)
+        camera_col_start = camera_index * cols_per_camera
+        col_start = max(camera_col_start, int(column_range[0]) - 2)
+        col_end = min(camera_col_start + cols_per_camera - 1, int(column_range[1]) + 2)
+        local_valid = valid[row_start : row_end + 1, col_start : col_end + 1]
+        local_positions = positions[row_start : row_end + 1, col_start : col_end + 1][local_valid]
+        local_colors = colors[row_start : row_end + 1, col_start : col_end + 1][local_valid]
+        atomic_write_json(point_cloud_path, {
+            "schema": "steel.surface.defect.point-cloud.v1",
+            "defectId": defect_id,
+            "coordinateFrame": mesh.get("coordinateFrame", {}),
+            "pointCount": int(local_positions.shape[0]),
+            "positions": local_positions.reshape(-1).round(6).tolist(),
+            "colors": local_colors.reshape(-1).round(6).tolist(),
+        })
+
+        center_col = max(camera_col_start, min(camera_col_start + cols_per_camera - 1, int(round((col_start + col_end) / 2))))
+        length_points: list[dict[str, float]] = []
+        center_y = float(positions[center_row, center_col, 1])
+        for row in range(row_start, row_end + 1):
+            if not valid[row, center_col]:
+                continue
+            row_radii = np.hypot(positions[row, :, 0], positions[row, :, 2])
+            baseline = float(np.median(row_radii[valid[row]])) if np.any(valid[row]) else 0.0
+            radius = float(np.hypot(positions[row, center_col, 0], positions[row, center_col, 2]))
+            length_points.append(_profile_point(float(positions[row, center_col, 1]) - center_y, radius - baseline))
+        width_points: list[dict[str, float]] = []
+        row_radii = np.hypot(positions[center_row, :, 0], positions[center_row, :, 2])
+        baseline = float(np.median(row_radii[valid[center_row]])) if np.any(valid[center_row]) else 0.0
+        nominal_radius = max(1e-6, baseline)
+        for col in range(col_start, col_end + 1):
+            if not valid[center_row, col]:
+                continue
+            radius = float(row_radii[col])
+            distance = (col - center_col) / max(1, full_cols) * (2.0 * math.pi * nominal_radius)
+            width_points.append(_profile_point(distance, radius - baseline))
+        atomic_write_json(length_profile_path, {
+            "schema": "steel.surface.defect.profile.v1", "axis": "length", "unit": "mm", "points": length_points,
+        })
+        atomic_write_json(width_profile_path, {
+            "schema": "steel.surface.defect.profile.v1", "axis": "width", "unit": "mm", "points": width_points,
+        })
+
+        geometry["artifacts"] = {
+            "schema": "steel.surface.defect.artifacts.v1",
+            "cameraId": camera.camera.name,
+            "frameId": frame_stem,
+            "sequenceNo": _frame_sequence_no(frame_stem, frame_index + 1),
+            "roi": {"x": left, "y": top, "width": right - left, "height": bottom - top},
+            "sourceFrame": {
+                "intensity": str(frame.intensity_path.resolve()),
+                "intensitySha256": sha256_file(frame.intensity_path),
+                "depth": str(frame.depth_path.resolve()),
+                "depthSha256": sha256_file(frame.depth_path),
+            },
+            "roiImage": relative_to_root(intensity_roi, output_root),
+            "depthRoiImage": relative_to_root(depth_roi, output_root),
+            "localPointCloud": relative_to_root(point_cloud_path, output_root),
+            "lengthProfile": relative_to_root(length_profile_path, output_root),
+            "widthProfile": relative_to_root(width_profile_path, output_root),
+        }
+
+
 def write_obj(mesh: dict[str, Any], texture_name: str, obj_path: Path) -> Path:
     obj_path.parent.mkdir(parents=True, exist_ok=True)
     mtl_path = obj_path.with_suffix(".mtl")
@@ -1090,7 +2051,7 @@ def write_obj(mesh: dict[str, Any], texture_name: str, obj_path: Path) -> Path:
     indices = mesh["indices"]
     with obj_path.open("w", encoding="utf-8") as handle:
         handle.write(f"mtllib {mtl_path.name}\n")
-        handle.write("o bar_surface_six_camera\n")
+        handle.write("o bar_surface_eight_camera\n")
         for index in range(0, len(positions), 3):
             c_index = index
             handle.write(
@@ -1217,6 +2178,11 @@ def build_artifact_index(
         file_artifact(mtl_path, output_root, "obj-material"),
         file_artifact(texture_path, output_root, "texture-atlas"),
     ]
+    defect_outputs = []
+    defects_root = run_dir / "defects"
+    if defects_root.is_dir():
+        for path in sorted(item for item in defects_root.rglob("*") if item.is_file()):
+            defect_outputs.append(file_artifact(path, output_root, "defect-review-artifact"))
     report_outputs = [
         file_artifact(artifact_index_path, output_root, "artifact-index"),
         file_artifact(acceptance_report_path, output_root, "acceptance-report"),
@@ -1231,12 +2197,14 @@ def build_artifact_index(
         "manifest": file_artifact(manifest_path, output_root, "manifest"),
         "cameras": camera_outputs,
         "mesh": mesh_outputs,
+        "defects": defect_outputs,
         "reports": report_outputs,
         "totals": {
             "cameraCount": len(prepared),
             "previewFiles": sum(1 for item in camera_outputs for file in item["previews"] if file["exists"]),
             "stripFiles": sum(1 for item in camera_outputs for file in item["strips"] if file["exists"]),
             "meshFiles": sum(1 for file in mesh_outputs if file["exists"]),
+            "defectFiles": sum(1 for file in defect_outputs if file["exists"]),
         },
     }
 
@@ -1272,8 +2240,10 @@ def build_acceptance_report(
         for path in (item.intensity_strip, item.depth_strip)
         if path.is_file()
     )
+    angular_sector_fit = mesh.get("angularSectorFit", {})
+    seam_gap = quality.get("seamGapMm", {})
     checks = {
-        "sixCameras": len(prepared) == 6,
+        "eightCameras": len(prepared) == 8,
         "sourceDepthComplete": all(item["depthFrames"] >= 1 for item in camera_captures),
         "sourceIntensityComplete": all(item["intensityFrames"] >= 1 for item in camera_captures),
         "sourceMetadataComplete": all(item["metadataFrames"] >= 1 for item in camera_captures),
@@ -1287,10 +2257,13 @@ def build_acceptance_report(
         "objExists": obj_path.is_file() and mtl_path.is_file(),
         "contourCropApplied": bool(mesh.get("contourCrop", {}).get("applied")),
         "contourCropUses3d": mesh.get("contourCrop", {}).get("source") in {"calibrated-3d", "hybrid-3d"},
+        "angularSectorFitApplied": bool(angular_sector_fit.get("applied"))
+        and sum(1 for item in angular_sector_fit.get("cameras", []) if int(item.get("resampledRows", 0)) > 0) >= len(prepared),
+        "closedSurfaceSeam": bool(seam_gap.get("available")) and float(seam_gap.get("max", math.inf)) <= 1.0,
         "manifestExists": manifest_path.is_file(),
         "artifactIndexExists": artifact_index_path.is_file(),
         "algorithmRootOnGDrive": str(output_root).replace("/", "\\").upper().startswith("G:\\"),
-        "defectDetectionSkipped": True,
+        "defectDetectionComplete": mesh.get("detection", {}).get("status") == "complete",
     }
     status = "pass" if all(checks.values()) else "attention"
     return {
@@ -1304,7 +2277,7 @@ def build_acceptance_report(
         "runDir": str(run_dir),
         "checks": checks,
         "capture": {
-            "layout": "H:/camera1..camera6/<material>/{depth,intensity,metadata}",
+            "layout": "H:/camera1..camera8/<material>/{depth,intensity,metadata}",
             "cameraCount": len(prepared),
             "cameras": camera_captures,
         },
@@ -1350,6 +2323,7 @@ def build_acceptance_report(
             "calibratedPointCount": quality.get("calibratedPointCount"),
             "circleFit": quality.get("circleFit", {}),
             "seamGapMm": quality.get("seamGapMm", {}),
+            "angularSectorFit": quality.get("angularSectorFit", {}),
             "surfaceCompleteness": quality.get("surfaceCompleteness", {}),
             "contourCrop": quality.get("contourCrop", {}),
             "topology": mesh.get("topology", {}),
@@ -1357,7 +2331,7 @@ def build_acceptance_report(
             "triangleCount": len(mesh["indices"]) // 3,
         },
         "notes": [
-            "This report verifies reconstruction outputs and folder layout; it does not perform defect detection.",
+            "Radial-residual defect detection is executed after calibrated closed-surface reconstruction.",
             "C++ core output is expected after the Rust service invokes the core converter for this manifest.",
         ],
     }
@@ -1377,8 +2351,56 @@ def acceptance_manifest_summary(report: dict[str, Any], output_root: Path, accep
         "sdkDerivedDisabled": bool(checks.get("sdkDerivedDisabled")),
         "frontendReady": bool(report.get("frontendReadiness", {}).get("hasTexture"))
         and bool(report.get("frontendReadiness", {}).get("hasMeshJson"))
-        and int(report.get("frontendReadiness", {}).get("cameraTiles", 0)) >= 6,
+        and int(report.get("frontendReadiness", {}).get("cameraTiles", 0)) >= 8,
     }
+
+
+def finalize_quality_gate(
+    manifest: dict[str, Any],
+    reconstruction_acceptance: dict[str, Any],
+    algorithm_config: dict[str, Any],
+) -> dict[str, Any]:
+    policy = algorithm_config.get("qualityGate", {})
+    reasons: list[str] = []
+    required_cameras = int(policy.get("requiredCameraCount", 8))
+    if int(manifest.get("cameraCount", 0)) != required_cameras:
+        reasons.append("required_camera_count_not_met")
+    if bool(policy.get("requireCalibrationForEveryCamera", True)) and int(
+        manifest.get("calibration", {}).get("matchedCameras", 0)
+    ) != required_cameras:
+        reasons.append("calibration_not_matched_for_every_camera")
+    if bool(policy.get("requireReconstructionAcceptance", True)) and reconstruction_acceptance.get("status") != "pass":
+        reasons.append("reconstruction_acceptance_failed")
+    maximum_synthetic = int(policy.get("maximumSyntheticDefectCount", 0))
+    if int(manifest.get("syntheticDefectCount", 0)) > maximum_synthetic:
+        reasons.append("synthetic_defect_limit_exceeded")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("inputSummarySha256", ""))):
+        reasons.append("input_summary_sha256_missing")
+    if not str(manifest.get("algorithmVersion", "")).strip():
+        reasons.append("algorithm_version_missing")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("configSha256", ""))):
+        reasons.append("config_sha256_missing")
+    input_artifacts = manifest.get("inputArtifacts")
+    if not isinstance(input_artifacts, list) or not input_artifacts:
+        reasons.append("input_artifacts_missing")
+    elif canonical_sha256(input_artifacts) != manifest.get("inputSummarySha256"):
+        reasons.append("input_summary_sha256_mismatch")
+    for key in (
+        "scriptSha256",
+        "coreSha256",
+        "acceptanceReportSha256",
+        "datasetSha256",
+        "evaluatorSha256",
+        "calibrationSha256",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get(key, ""))):
+            reasons.append(f"{key}_missing")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", str(manifest.get("releaseCommit", ""))):
+        reasons.append("release_commit_missing")
+    for key in ("datasetRevision", "evaluatorRevision", "calibrationRevision"):
+        if not str(manifest.get(key, "")).strip():
+            reasons.append(f"{key}_missing")
+    return {"passed": not reasons, "reasons": reasons}
 
 
 def build_manifest(
@@ -1396,6 +2418,9 @@ def build_manifest(
     quality: dict[str, Any],
     calibration_path: Path | None,
     calibration: dict[str, CameraCalibration],
+    algorithm_config: dict[str, Any],
+    algorithm_qualification: dict[str, Any],
+    input_traceability: dict[str, Any],
     input_crop: dict[str, Any],
     quality_path: Path,
     artifact_index_path: Path,
@@ -1438,8 +2463,33 @@ def build_manifest(
                 },
             }
         )
+    calibration_revision, calibration_sha256 = calibration_identity(calibration_path)
+    detection = mesh.get("detection", {})
     return {
         "schema": "steel.bar_surface.manifest.v1",
+        "algorithmName": algorithm_config.get("algorithmName", "bar-surface-defect-detector"),
+        "algorithmVersion": algorithm_config.get("algorithmVersion", "development-unversioned"),
+        "configRevision": algorithm_config.get("configRevision", "development-defaults"),
+        "configSha256": algorithm_config.get("configSha256", ""),
+        "scriptSha256": algorithm_qualification.get("scriptSha256", sha256_file(Path(__file__).resolve())),
+        "coreSha256": algorithm_qualification.get("coreSha256", ""),
+        "releaseCommit": algorithm_qualification.get("releaseCommit", ""),
+        "acceptanceReportSha256": algorithm_qualification.get("acceptanceReportSha256", ""),
+        "datasetRevision": algorithm_qualification.get("datasetRevision", ""),
+        "datasetSha256": algorithm_qualification.get("datasetSha256", ""),
+        "evaluatorRevision": algorithm_qualification.get("evaluatorRevision", ""),
+        "evaluatorSha256": algorithm_qualification.get("evaluatorSha256", ""),
+        "calibrationRevision": calibration_revision,
+        "calibrationSha256": calibration_sha256,
+        "inputSummarySha256": input_traceability.get("inputSummarySha256", ""),
+        "inputFrameIds": input_traceability.get("inputFrameIds", []),
+        "inputArtifactCount": input_traceability.get("inputArtifactCount", 0),
+        "inputArtifacts": input_traceability.get("inputArtifacts", []),
+        "qualification": algorithm_qualification,
+        "thresholds": algorithm_config.get("effectiveThresholds", {}),
+        "qualityGate": {"passed": False, "reasons": ["acceptance_pending"]},
+        "realDefectCount": int(detection.get("realDefectCount", 0)),
+        "syntheticDefectCount": int(detection.get("syntheticDefectCount", 0)),
         "materialId": material_id,
         "runId": run_dir.name,
         "createdAt": utc_now_text(),
@@ -1453,6 +2503,8 @@ def build_manifest(
             "available": bool(calibration),
             "matchedCameras": mesh.get("calibratedCameraCount", 0),
             "totalCameras": len(prepared),
+            "revision": calibration_revision,
+            "sha256": calibration_sha256,
         },
         "inputCrop": input_crop,
         "mesh": {
@@ -1468,8 +2520,11 @@ def build_manifest(
             "colsPerCamera": mesh["colsPerCamera"],
             "topology": mesh.get("topology", {}),
             "contourCrop": mesh.get("contourCrop", {}),
+            "coordinateFrame": mesh.get("coordinateFrame", {}),
+            "angularSectorFit": mesh.get("angularSectorFit", {}),
         },
         "quality": quality,
+        "detection": detection,
         "reports": {
             "artifactIndex": str(artifact_index_path),
             "acceptanceReport": str(acceptance_report_path),
@@ -1487,12 +2542,25 @@ def build_manifest(
         "notes": [
             "Prototype uses ArrayCalibration XML when available and falls back per camera to cylindrical preview.",
             "Depth values are transformed with BlendScale/Offset and Matrix fields for calibrated cameras.",
-            "No defect detection is executed in this stage.",
+            "Defects use robust per-row radial residuals and connected components; operator review remains required.",
         ],
     }
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    runtime_profile = os.environ.get("STEEL_RUNTIME_PROFILE", "production").strip().lower()
+    algorithm_mode = os.environ.get("STEEL_ALGORITHM_MODE", "production").strip().lower()
+    synthetic_fixtures_allowed = (
+        runtime_profile in {"development", "dev", "test"}
+        and algorithm_mode == "demo"
+    )
+    production_policy = not synthetic_fixtures_allowed
+    algorithm_config = apply_algorithm_config(args, production_policy)
+    if not synthetic_fixtures_allowed and args.mock_defect_count != 0:
+        raise ValueError(
+            "synthetic defects require STEEL_RUNTIME_PROFILE=development "
+            "and STEEL_ALGORITHM_MODE=demo"
+        )
     output_root = Path(args.output_root)
     cameras = parse_camera_roots(args)
     material_id = args.material_id.strip() if args.material_id else ""
@@ -1504,6 +2572,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     write_profile(output_root)
     calibration_path = Path(args.calibration) if args.calibration else latest_default_calibration()
     calibration = load_array_calibration(calibration_path)
+    algorithm_qualification = load_algorithm_qualification(
+        algorithm_config,
+        calibration_path,
+        production_policy,
+    )
 
     per_camera_frames: list[list[CameraFrame]] = [
         discover_camera_frames(camera, material_id, args.max_frames) for camera in cameras
@@ -1512,10 +2585,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.max_frames > 0:
         common_stems = common_stems[-args.max_frames :]
     if not common_stems:
-        raise ValueError("No common frame stems across the six cameras")
+        raise ValueError("No common frame stems across the eight cameras")
     per_camera_frames = [
         [frame for frame in frames if frame.stem in set(common_stems)] for frames in per_camera_frames
     ]
+    input_sources = list(zip(cameras, per_camera_frames))
+    input_traceability = build_input_traceability(input_sources, common_stems)
 
     crop_boxes, input_crop = estimate_3d_contour_crop_boxes(
         cameras,
@@ -1523,6 +2598,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         calibration,
         args.contour_radius_tolerance_mm,
         args.contour_auto_percentile,
+        args.contour_minimum_tolerance_mm,
+        args.contour_mad_multiplier,
     )
     prepared = []
     for camera, frames in zip(cameras, per_camera_frames):
@@ -1544,6 +2621,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     stems = common_frame_stems(prepared)
     if args.max_frames > 0:
         stems = stems[-args.max_frames :]
+    if stems != common_stems:
+        input_traceability = build_input_traceability(input_sources, stems)
 
     texture_path = run_dir / "mesh" / "bar_surface_texture.png"
     texture_size = build_texture_atlas(prepared, texture_path)
@@ -1561,8 +2640,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.contour_min_keep_ratio,
         args.contour_min_row_coverage,
         args.contour_auto_percentile,
+        args.contour_minimum_tolerance_mm,
+        args.contour_mad_multiplier,
+        args.contour_fallback_percentile,
+        args.mesh_longitudinal_step_mm,
     )
     quality = mesh_quality_metrics(mesh)
+    detection = detect_surface_defects(
+        mesh,
+        args.defect_min_depth_mm,
+        args.defect_min_area_points,
+        args.defect_mad_multiplier,
+        args.defect_longitudinal_span_floor_mm,
+        args.severity_severe_absolute_mm,
+        args.severity_severe_threshold_multiplier,
+        args.severity_review_absolute_mm,
+        args.severity_review_threshold_multiplier,
+        args.confidence_base,
+        args.confidence_magnitude_weight,
+        args.confidence_area_weight,
+        args.confidence_area_normalization_points,
+        args.confidence_maximum,
+    )
+    real_defect_count = int(detection.get("defectCount", 0))
+    mock_defects = generate_mock_defects(mesh, args.mock_defect_count)
+    detection["defects"] = list(detection.get("defects", [])) + mock_defects
+    detection["realDefectCount"] = real_defect_count
+    detection["syntheticDefectCount"] = len(mock_defects)
+    detection["defectCount"] = len(detection["defects"])
+    detection["syntheticEnabled"] = bool(mock_defects)
+    materialize_defect_artifacts(mesh, detection, prepared, stems, run_dir, output_root)
+    mesh["detection"] = detection
+    assert_input_traceability_unchanged(input_traceability, input_sources, stems)
     mesh_json_path = run_dir / "mesh" / "bar_surface_mesh.json"
     quality_path = run_dir / "mesh" / "bar_surface_quality.json"
     reports_dir = run_dir / "reports"
@@ -1589,6 +2698,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         quality,
         calibration_path,
         calibration,
+        algorithm_config,
+        algorithm_qualification,
+        input_traceability,
         input_crop,
         quality_path,
         artifact_index_path,
@@ -1631,6 +2743,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     atomic_write_json(acceptance_report_path, acceptance_report)
     manifest["acceptance"] = acceptance_manifest_summary(acceptance_report, output_root, acceptance_report_path)
+    manifest["qualityGate"] = finalize_quality_gate(manifest, acceptance_report, algorithm_config)
     atomic_write_json(manifest_path, manifest)
     artifact_index = build_artifact_index(
         material_id,
@@ -1647,6 +2760,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         acceptance_report_path,
     )
     atomic_write_json(artifact_index_path, artifact_index)
+    assert_input_traceability_unchanged(input_traceability, input_sources, stems)
+    if production_policy and not bool(manifest["qualityGate"].get("passed")):
+        raise ValueError(
+            "production algorithm quality gate failed: "
+            + ",".join(str(reason) for reason in manifest["qualityGate"].get("reasons", []))
+        )
     latest = {
         "schema": "steel.bar_surface.latest.v1",
         "updatedAt": utc_now_text(),
@@ -1663,26 +2782,50 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build bar-surface stitching prototype outputs.")
-    parser.add_argument("--capture-root", default=str(DEFAULT_CAPTURE_ROOT), help="Root that contains camera1..camera6")
+    parser.add_argument("--capture-root", default=str(DEFAULT_CAPTURE_ROOT), help="Root that contains camera1..camera8")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Algorithm output root")
     parser.add_argument("--material-id", default="latest", help="Material/coil directory name, or latest")
     parser.add_argument("--calibration", default="", help="ArrayCalibration.xml path; defaults to latest corrected calibration")
+    parser.add_argument("--algorithm-config", default=os.environ.get("STEEL_ALGORITHM_CONFIG", str(DEFAULT_ALGORITHM_CONFIG)), help="Versioned algorithm threshold configuration")
     parser.add_argument("--camera-root", dest="camera_roots", action="append", default=[], help="name,path[,ip[,sn]]")
-    parser.add_argument("--max-frames", type=int, default=24, help="Latest common frame count to use")
+    parser.add_argument("--max-frames", type=int, default=None, help="Latest common frame count to use")
     parser.add_argument("--preview-max-width", type=int, default=1200)
     parser.add_argument("--texture-tile-width", type=int, default=512)
     parser.add_argument("--texture-frame-height", type=int, default=96)
-    parser.add_argument("--mesh-cols-per-camera", type=int, default=72)
-    parser.add_argument("--mesh-rows", type=int, default=144)
-    parser.add_argument("--radius-mm", type=float, default=75.0)
-    parser.add_argument("--radial-scale-mm", type=float, default=8.0)
-    parser.add_argument("--max-face-edge-mm", type=float, default=8.0, help="Skip triangles across larger gaps; 0 disables")
+    parser.add_argument("--mesh-cols-per-camera", type=int, default=None)
+    parser.add_argument("--mesh-rows", type=int, default=None)
+    parser.add_argument("--radius-mm", type=float, default=None)
+    parser.add_argument("--radial-scale-mm", type=float, default=None)
+    parser.add_argument("--max-face-edge-mm", type=float, default=None, help="Skip triangles across larger gaps; 0 disables")
     parser.add_argument("--no-contour-crop", dest="contour_crop", action="store_false", help="Disable 3D contour clipping")
-    parser.add_argument("--contour-radius-tolerance-mm", type=float, default=0.0, help="Fixed X/Z circle residual tolerance; 0 uses robust auto tolerance")
-    parser.add_argument("--contour-min-keep-ratio", type=float, default=0.55, help="Fallback instead of over-cropping if too many points would be removed")
-    parser.add_argument("--contour-min-row-coverage", type=float, default=0.25, help="Drop scan rows whose contour coverage is below this ratio")
-    parser.add_argument("--contour-auto-percentile", type=float, default=96.0, help="Auto contour tolerance residual percentile")
-    parser.set_defaults(contour_crop=True)
+    parser.add_argument("--contour-radius-tolerance-mm", type=float, default=None, help="Fixed X/Z circle residual tolerance; 0 uses robust auto tolerance")
+    parser.add_argument("--contour-min-keep-ratio", type=float, default=None, help="Fallback instead of over-cropping if too many points would be removed")
+    parser.add_argument("--contour-min-row-coverage", type=float, default=None, help="Drop scan rows whose contour coverage is below this ratio")
+    parser.add_argument("--contour-auto-percentile", type=float, default=None, help="Auto contour tolerance residual percentile")
+    parser.add_argument("--contour-minimum-tolerance-mm", type=float, default=None, help="Minimum automatic contour tolerance")
+    parser.add_argument("--contour-mad-multiplier", type=float, default=None, help="MAD multiplier for automatic contour tolerance")
+    parser.add_argument("--contour-fallback-percentile", type=float, default=None, help="Fallback contour residual percentile")
+    parser.add_argument("--mesh-longitudinal-step-mm", type=float, default=None, help="Fallback uncalibrated mesh row spacing")
+    parser.add_argument("--defect-min-depth-mm", type=float, default=None, help="Minimum local radial deviation for defect candidates")
+    parser.add_argument("--defect-min-area-points", type=int, default=None, help="Minimum connected mesh samples for a defect")
+    parser.add_argument("--defect-mad-multiplier", type=float, default=None, help="MAD multiplier for defect candidates")
+    parser.add_argument("--defect-longitudinal-span-floor-mm", type=float, default=None)
+    parser.add_argument("--severity-severe-absolute-mm", type=float, default=None)
+    parser.add_argument("--severity-severe-threshold-multiplier", type=float, default=None)
+    parser.add_argument("--severity-review-absolute-mm", type=float, default=None)
+    parser.add_argument("--severity-review-threshold-multiplier", type=float, default=None)
+    parser.add_argument("--confidence-base", type=float, default=None)
+    parser.add_argument("--confidence-magnitude-weight", type=float, default=None)
+    parser.add_argument("--confidence-area-weight", type=float, default=None)
+    parser.add_argument("--confidence-area-normalization-points", type=float, default=None)
+    parser.add_argument("--confidence-maximum", type=float, default=None)
+    parser.add_argument(
+        "--mock-defect-count",
+        type=int,
+        default=int(os.environ.get("BAR_SURFACE_MOCK_DEFECT_COUNT", "0")),
+        help="Explicit demo-only deterministic defects appended for UI/database verification; defaults to 0",
+    )
+    parser.set_defaults(contour_crop=None)
     return parser
 
 

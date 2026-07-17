@@ -1,13 +1,22 @@
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::env;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+type HmacSha256 = Hmac<Sha256>;
+
+const DEFAULT_AUTH_WINDOW_SECONDS: i64 = 30;
+const MAX_REPLAY_ENTRIES: usize = 10_000;
 
 fn http_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Authorization\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         body.as_bytes().len(),
         body
     )
@@ -92,9 +101,450 @@ fn gateway_host() -> String {
     env::var("TRIGGER_GATEWAY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
+fn gateway_port(name: &str, default: u16) -> u16 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(default)
+}
+
+fn env_flag(name: &str) -> Option<bool> {
+    env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+fn signature_message(timestamp: &str, nonce: &str, transport: &str, body: &str) -> String {
+    format!("steel-trigger-v1\n{timestamp}\n{nonce}\n{transport}\n{body}")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AuthError {
+    code: u16,
+    error: &'static str,
+}
+
+impl AuthError {
+    fn response(&self) -> Value {
+        json!({ "code": self.code, "error": self.error })
+    }
+}
+
+fn valid_nonce(value: &str) -> bool {
+    (16..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+}
+
+fn authenticate_message(
+    state: &Arc<Mutex<GatewayState>>,
+    timestamp: &str,
+    nonce: &str,
+    signature: &str,
+    transport: &str,
+    body: &str,
+    now: i64,
+) -> Result<(), AuthError> {
+    let mut state = state.lock().map_err(|_| AuthError {
+        code: 503,
+        error: "security_state_unavailable",
+    })?;
+    if !state.security.auth_required {
+        return Ok(());
+    }
+    let timestamp_value = timestamp.parse::<i64>().map_err(|_| AuthError {
+        code: 401,
+        error: "invalid_trigger_timestamp",
+    })?;
+    if now.abs_diff(timestamp_value) > state.security.auth_window_seconds as u64 {
+        return Err(AuthError {
+            code: 401,
+            error: "trigger_timestamp_out_of_window",
+        });
+    }
+    if !valid_nonce(nonce) {
+        return Err(AuthError {
+            code: 401,
+            error: "invalid_trigger_nonce",
+        });
+    }
+    let signature = decode_hex(signature).ok_or(AuthError {
+        code: 401,
+        error: "invalid_trigger_signature",
+    })?;
+    let mut mac =
+        HmacSha256::new_from_slice(&state.security.shared_secret).map_err(|_| AuthError {
+            code: 503,
+            error: "trigger_auth_unavailable",
+        })?;
+    mac.update(signature_message(timestamp, nonce, transport, body).as_bytes());
+    mac.verify_slice(&signature).map_err(|_| AuthError {
+        code: 401,
+        error: "invalid_trigger_signature",
+    })?;
+    let cutoff = now - state.security.auth_window_seconds;
+    state.replay_nonces.retain(|_, seen_at| *seen_at >= cutoff);
+    if state.replay_nonces.contains_key(nonce) {
+        return Err(AuthError {
+            code: 409,
+            error: "trigger_replay_detected",
+        });
+    }
+    if state.replay_nonces.len() >= MAX_REPLAY_ENTRIES {
+        return Err(AuthError {
+            code: 503,
+            error: "trigger_replay_cache_full",
+        });
+    }
+    state.replay_nonces.insert(nonce.to_string(), now);
+    Ok(())
+}
+
+fn source_allowed(state: &Arc<Mutex<GatewayState>>, peer: SocketAddr) -> bool {
+    state
+        .lock()
+        .map(|state| state.security.source_allowed(peer.ip()))
+        .unwrap_or(false)
+}
+
+fn security_snapshot(state: &Arc<Mutex<GatewayState>>) -> Value {
+    state
+        .lock()
+        .map(|state| {
+            json!({
+                "profile": if state.security.production { "production" } else { "development" },
+                "authenticationRequired": state.security.auth_required,
+                "operatorAuthenticationRequired": state.security.production,
+                "sourceAllowlistConfigured": !state.security.allowed_sources.is_empty(),
+                "authWindowSeconds": state.security.auth_window_seconds,
+                "modeMutationAllowed": state.security.allow_mode_mutation
+            })
+        })
+        .unwrap_or_else(|_| json!({ "error": "security_state_unavailable" }))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceRule {
+    Address(IpAddr),
+    Cidr(IpAddr, u8),
+}
+
+impl SourceRule {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if let Some((address, prefix)) = value.split_once('/') {
+            let address = address.parse::<IpAddr>().ok()?;
+            let prefix = prefix.parse::<u8>().ok()?;
+            let valid = match address {
+                IpAddr::V4(_) => prefix <= 32,
+                IpAddr::V6(_) => prefix <= 128,
+            };
+            return valid.then_some(Self::Cidr(address, prefix));
+        }
+        value.parse::<IpAddr>().ok().map(Self::Address)
+    }
+
+    fn contains(&self, candidate: IpAddr) -> bool {
+        match (self, candidate) {
+            (Self::Address(expected), actual) => *expected == actual,
+            (Self::Cidr(IpAddr::V4(network), prefix), IpAddr::V4(actual)) => {
+                let mask = if *prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - *prefix)
+                };
+                (u32::from(*network) & mask) == (u32::from(actual) & mask)
+            }
+            (Self::Cidr(IpAddr::V6(network), prefix), IpAddr::V6(actual)) => {
+                let mask = if *prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - *prefix)
+                };
+                (u128::from(*network) & mask) == (u128::from(actual) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SecurityConfig {
+    production: bool,
+    auth_required: bool,
+    shared_secret: Vec<u8>,
+    operator_token: Vec<u8>,
+    allowed_sources: Vec<SourceRule>,
+    auth_window_seconds: i64,
+    allow_mode_mutation: bool,
+}
+
+impl SecurityConfig {
+    fn from_env(host: &str) -> Result<Self, String> {
+        let profile = env::var("STEEL_RUNTIME_PROFILE")
+            .unwrap_or_else(|_| "development".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        let production = profile == "production";
+        let explicit_auth = env_flag("TRIGGER_AUTH_REQUIRED").unwrap_or(false);
+        let auth_required = production || explicit_auth;
+        let shared_secret = env::var("TRIGGER_SHARED_SECRET")
+            .unwrap_or_default()
+            .into_bytes();
+        if auth_required && shared_secret.len() < 32 {
+            return Err(
+                "TRIGGER_SHARED_SECRET must contain at least 32 bytes when trigger authentication is required"
+                    .to_string(),
+            );
+        }
+        let operator_token = env::var("TRIGGER_OPERATOR_TOKEN")
+            .unwrap_or_default()
+            .into_bytes();
+        if production && operator_token.len() < 32 {
+            return Err(
+                "TRIGGER_OPERATOR_TOKEN must contain at least 32 bytes in production".to_string(),
+            );
+        }
+        let allowed_sources = env::var("TRIGGER_SOURCE_ALLOWLIST")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                SourceRule::parse(value)
+                    .ok_or_else(|| format!("invalid TRIGGER_SOURCE_ALLOWLIST entry: {value}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let host_ip = host.parse::<IpAddr>().ok();
+        let exposes_remote = host_ip.is_none_or(|address| !address.is_loopback());
+        if production && exposes_remote && allowed_sources.is_empty() {
+            return Err(
+                "production trigger gateway bound beyond loopback requires TRIGGER_SOURCE_ALLOWLIST"
+                    .to_string(),
+            );
+        }
+        let auth_window_seconds = env::var("TRIGGER_AUTH_WINDOW_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_AUTH_WINDOW_SECONDS);
+        if !(5..=300).contains(&auth_window_seconds) {
+            return Err("TRIGGER_AUTH_WINDOW_SECONDS must be between 5 and 300".to_string());
+        }
+        let allow_mode_mutation = env_flag("TRIGGER_ALLOW_MODE_MUTATION").unwrap_or(!production);
+        Ok(Self {
+            production,
+            auth_required,
+            shared_secret,
+            operator_token,
+            allowed_sources,
+            auth_window_seconds,
+            allow_mode_mutation,
+        })
+    }
+
+    fn source_allowed(&self, address: IpAddr) -> bool {
+        address.is_loopback()
+            || (self.allowed_sources.is_empty() && !self.production)
+            || self
+                .allowed_sources
+                .iter()
+                .any(|rule| rule.contains(address))
+    }
+}
+
+fn constant_time_token_matches(expected: &[u8], supplied: &[u8]) -> bool {
+    let expected_hash = Sha256::digest(expected);
+    let supplied_hash = Sha256::digest(supplied);
+    let mut difference = expected.len() ^ supplied.len();
+    for (left, right) in expected_hash.iter().zip(supplied_hash.iter()) {
+        difference |= (*left ^ *right) as usize;
+    }
+    difference == 0
+}
+
+fn authorize_operator_request(
+    request: &str,
+    peer: SocketAddr,
+    state: &Arc<Mutex<GatewayState>>,
+) -> Result<(), Vec<u8>> {
+    if !peer.ip().is_loopback() {
+        return Err(http_response(
+            "403 Forbidden",
+            "application/json; charset=utf-8",
+            &json!({ "code": 403, "error": "local_operator_only" }).to_string(),
+        ));
+    }
+    let state = state.lock().map_err(|_| {
+        http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({ "code": 503, "error": "security_state_unavailable" }).to_string(),
+        )
+    })?;
+    if !state.security.production {
+        return Ok(());
+    }
+    let supplied = request_header(request, "X-Trigger-Operator-Token").unwrap_or_default();
+    if supplied.is_empty()
+        || !constant_time_token_matches(&state.security.operator_token, supplied.as_bytes())
+    {
+        return Err(http_response(
+            "401 Unauthorized",
+            "application/json; charset=utf-8",
+            &json!({ "code": 401, "error": "trigger_operator_auth_required" }).to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct GatewayState {
     mode: String,
+    accepting: bool,
+    in_flight: u64,
+    security: SecurityConfig,
+    replay_nonces: HashMap<String, i64>,
+    listeners: ListenerStatus,
+}
+
+#[derive(Debug)]
+struct TriggerAdmissionGuard {
+    state: Arc<Mutex<GatewayState>>,
+}
+
+impl Drop for TriggerAdmissionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+fn trigger_draining_json() -> Value {
+    json!({ "code": 503, "error": "trigger_draining" })
+}
+
+fn gateway_state_unavailable_json() -> Value {
+    json!({ "code": 503, "error": "gateway_state_unavailable" })
+}
+
+fn admit_trigger(
+    state: &Arc<Mutex<GatewayState>>,
+    completion: bool,
+) -> Result<TriggerAdmissionGuard, Value> {
+    let mut gateway = state.lock().map_err(|_| gateway_state_unavailable_json())?;
+    if !gateway.accepting && !completion {
+        return Err(trigger_draining_json());
+    }
+    gateway.in_flight = gateway
+        .in_flight
+        .checked_add(1)
+        .ok_or_else(gateway_state_unavailable_json)?;
+    drop(gateway);
+    Ok(TriggerAdmissionGuard {
+        state: Arc::clone(state),
+    })
+}
+
+fn completion_target(target: &str) -> bool {
+    target == "/api/production/tasks/steel-out"
+}
+
+fn admission_status_json(state: &Arc<Mutex<GatewayState>>) -> Value {
+    state
+        .lock()
+        .map(|state| {
+            json!({
+                "accepting": state.accepting,
+                "inFlight": state.in_flight,
+                "drained": !state.accepting && state.in_flight == 0
+            })
+        })
+        .unwrap_or_else(|_| {
+            json!({
+                "accepting": false,
+                "inFlight": Value::Null,
+                "drained": false,
+                "error": "gateway_state_unavailable"
+            })
+        })
+}
+
+fn enter_drain(state: &Arc<Mutex<GatewayState>>) -> Result<Value, Vec<u8>> {
+    let mut state = state.lock().map_err(|_| {
+        http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({ "code": 503, "error": "gateway_state_unavailable" }).to_string(),
+        )
+    })?;
+    state.accepting = false;
+    Ok(json!({
+        "code": 0,
+        "accepting": false,
+        "inFlight": state.in_flight,
+        "drained": state.in_flight == 0
+    }))
+}
+
+fn trigger_admission_http_response(error: Value) -> Vec<u8> {
+    http_response(
+        "503 Service Unavailable",
+        "application/json; charset=utf-8",
+        &error.to_string(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListenerStatus {
+    http_enabled: bool,
+    http_bound: bool,
+    tcp_enabled: bool,
+    tcp_bound: bool,
+    udp_enabled: bool,
+    udp_bound: bool,
+}
+
+impl ListenerStatus {
+    fn ready(self) -> bool {
+        (!self.http_enabled || self.http_bound)
+            && (!self.tcp_enabled || self.tcp_bound)
+            && (!self.udp_enabled || self.udp_bound)
+    }
+
+    fn to_json(self) -> Value {
+        json!({
+            "http": { "enabled": self.http_enabled, "bound": self.http_bound },
+            "tcp": { "enabled": self.tcp_enabled, "bound": self.tcp_bound },
+            "udp": { "enabled": self.udp_enabled, "bound": self.udp_bound }
+        })
+    }
 }
 
 fn normalize_gateway_mode(value: &str) -> String {
@@ -102,15 +552,15 @@ fn normalize_gateway_mode(value: &str) -> String {
         "manual" | "手动" => "manual".to_string(),
         "gray" | "grey" | "grayscale" | "灰度" => "gray".to_string(),
         "secondary" | "level2" | "l2" | "二级" => "secondary".to_string(),
+        "tcp" => "tcp".to_string(),
+        "udp" => "udp".to_string(),
         "api" | "direct" | "" => "api".to_string(),
         _ => "api".to_string(),
     }
 }
 
 fn gateway_mode_from_env() -> String {
-    normalize_gateway_mode(
-        &env::var("TRIGGER_MODE").unwrap_or_else(|_| "api".to_string()),
-    )
+    normalize_gateway_mode(&env::var("TRIGGER_MODE").unwrap_or_else(|_| "api".to_string()))
 }
 
 fn current_mode(state: &Arc<Mutex<GatewayState>>) -> String {
@@ -133,6 +583,8 @@ fn mode_label(mode: &str) -> &'static str {
         "manual" => "手动",
         "gray" => "灰度",
         "secondary" => "二级",
+        "tcp" => "TCP",
+        "udp" => "UDP",
         _ => "API",
     }
 }
@@ -143,8 +595,22 @@ fn mode_json(mode: &str) -> Value {
         "mode": mode,
         "modeLabel": mode_label(mode),
         "manualAllowed": mode == "manual",
-        "allowedModes": ["api", "gray", "secondary", "manual"]
+        "allowedModes": ["api", "tcp", "udp", "gray", "secondary", "manual"]
     })
+}
+
+fn event_service_path(event: &str) -> Option<&'static str> {
+    match event.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "steel-info" | "info" | "material-info" => Some("/api/production/tasks/steel-info"),
+        "steel-in" | "in" | "enter" => Some("/api/production/tasks/steel-in"),
+        "steel-out" | "out" | "leave" => Some("/api/production/tasks/steel-out"),
+        "secondary-data" | "l2-data" => Some("/api/production/secondary-data"),
+        "capture-summary" => Some("/api/production/capture-summary"),
+        "capture-once" => Some("/api/production/capture-once"),
+        "defect" => Some("/api/production/defect"),
+        "event" | "trigger-event" => Some("/api/production/tasks/trigger-event"),
+        _ => None,
+    }
 }
 
 fn gateway_source(path: &str) -> &'static str {
@@ -162,21 +628,15 @@ fn service_path_for(path: &str) -> Option<&'static str> {
         "/api/trigger/steel-info" | "/api/l2/steel-info" => {
             Some("/api/production/tasks/steel-info")
         }
-        "/api/trigger/steel-in" | "/api/plc/steel-in" => {
-            Some("/api/production/tasks/steel-in")
-        }
-        "/api/trigger/steel-out" | "/api/plc/steel-out" => {
-            Some("/api/production/tasks/steel-out")
-        }
+        "/api/trigger/steel-in" | "/api/plc/steel-in" => Some("/api/production/tasks/steel-in"),
+        "/api/trigger/steel-out" | "/api/plc/steel-out" => Some("/api/production/tasks/steel-out"),
         "/api/trigger/secondary-data" | "/api/l2/secondary-data" => {
             Some("/api/production/secondary-data")
         }
         "/api/trigger/capture-summary" => Some("/api/production/capture-summary"),
         "/api/trigger/capture-once" => Some("/api/production/capture-once"),
         "/api/trigger/defect" => Some("/api/production/defect"),
-        "/api/trigger/event" | "/api/plc/event" => {
-            Some("/api/production/tasks/trigger-event")
-        }
+        "/api/trigger/event" | "/api/plc/event" => Some("/api/production/tasks/trigger-event"),
         _ => None,
     }
 }
@@ -262,6 +722,8 @@ fn manual_page_html() -> &'static str {
       <label>进出钢模式
         <select id="mode">
           <option value="api">API</option>
+          <option value="tcp">TCP</option>
+          <option value="udp">UDP</option>
           <option value="gray">灰度</option>
           <option value="secondary">二级</option>
           <option value="manual">手动</option>
@@ -384,7 +846,281 @@ fn get_json(origin: &str, path: &str) -> Option<Value> {
     serde_json::from_slice::<Value>(&response[body_start..]).ok()
 }
 
+fn authenticated_network_payload(
+    body: &str,
+    transport: &str,
+    state: &Arc<Mutex<GatewayState>>,
+    now: i64,
+) -> Result<Value, Value> {
+    let envelope = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(Value::Object(object)) => Value::Object(object),
+        Ok(_) => {
+            return Err(json!({
+                "code": 400,
+                "error": "invalid_payload",
+                "message": "trigger payload must be a JSON object"
+            }))
+        }
+        Err(error) => {
+            return Err(json!({
+                "code": 400,
+                "error": "invalid_json",
+                "message": error.to_string()
+            }))
+        }
+    };
+    let auth_required = state
+        .lock()
+        .map(|state| state.security.auth_required)
+        .unwrap_or(true);
+    let Some(payload) = envelope.get("payload") else {
+        if auth_required {
+            return Err(json!({ "code": 401, "error": "trigger_auth_required" }));
+        }
+        return Ok(envelope);
+    };
+    if !payload.is_object() {
+        return Err(json!({ "code": 400, "error": "invalid_trigger_payload" }));
+    }
+    let Some(auth) = envelope.get("auth").and_then(Value::as_object) else {
+        return Err(json!({ "code": 401, "error": "trigger_auth_required" }));
+    };
+    let timestamp = auth
+        .get("timestamp")
+        .map(|value| match value {
+            Value::String(value) => value.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    let nonce = auth
+        .get("nonce")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let signature = auth
+        .get("signature")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let canonical_payload = payload.to_string();
+    authenticate_message(
+        state,
+        &timestamp,
+        nonce,
+        signature,
+        transport,
+        &canonical_payload,
+        now,
+    )
+    .map_err(|error| error.response())?;
+    Ok(payload.clone())
+}
+
+fn network_trigger_response(
+    body: &str,
+    transport: &str,
+    peer: SocketAddr,
+    origin: &str,
+    state: &Arc<Mutex<GatewayState>>,
+) -> Value {
+    if !source_allowed(state, peer) {
+        return json!({ "code": 403, "error": "trigger_source_forbidden" });
+    }
+    let payload = match authenticated_network_payload(body, transport, state, unix_seconds()) {
+        Ok(payload) => payload,
+        Err(error) => return error,
+    };
+    let event = payload
+        .get("event")
+        .or_else(|| payload.get("type"))
+        .or_else(|| payload.get("action"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(target) = event_service_path(event) else {
+        return json!({
+            "code": 400,
+            "error": "unsupported_event",
+            "event": event,
+            "supportedEvents": ["steel-info", "steel-in", "steel-out", "secondary-data", "capture-once", "capture-summary", "defect", "event"]
+        });
+    };
+    let _admission_guard = match admit_trigger(state, completion_target(target)) {
+        Ok(guard) => guard,
+        Err(error) => return error,
+    };
+    let mode = current_mode(state);
+    let enriched = enrich_payload(&payload.to_string(), transport, &mode);
+    let service = post_json(origin, target, &enriched)
+        .unwrap_or_else(|| json!({ "code": 503, "error": "inspection_service_offline" }));
+    json!({
+        "code": service.get("code").and_then(Value::as_i64).unwrap_or(503),
+        "gateway": "steel-trigger-gateway",
+        "transport": transport,
+        "mode": mode,
+        "event": event,
+        "target": target,
+        "service": service
+    })
+}
+
+fn handle_tcp_trigger(mut stream: TcpStream, origin: &str, state: Arc<Mutex<GatewayState>>) {
+    let peer = match stream.peer_addr() {
+        Ok(peer) => peer,
+        Err(_) => return,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let reader_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(reader_stream);
+    loop {
+        let mut line = String::new();
+        let read = match reader.read_line(&mut line) {
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        if read == 0 {
+            break;
+        }
+        let response = if line.len() > 65_536 {
+            json!({ "code": 413, "error": "payload_too_large" })
+        } else if line.trim().is_empty() {
+            continue;
+        } else {
+            network_trigger_response(&line, "tcp", peer, origin, &state)
+        };
+        let mut encoded = response.to_string();
+        encoded.push('\n');
+        if stream.write_all(encoded.as_bytes()).is_err() {
+            break;
+        }
+    }
+}
+
+fn bind_tcp_trigger_listener(host: &str, port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind((host, port)).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to bind TCP trigger listener {host}:{port}: {error}"),
+        )
+    })
+}
+
+fn run_tcp_trigger_listener(
+    listener: TcpListener,
+    host: String,
+    port: u16,
+    origin: String,
+    state: Arc<Mutex<GatewayState>>,
+) -> std::io::Result<()> {
+    println!("TCP trigger listener tcp://{host}:{port} (newline-delimited JSON)");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let origin = origin.clone();
+                let state = state.clone();
+                thread::spawn(move || handle_tcp_trigger(stream, &origin, state));
+            }
+            Err(error) => eprintln!("failed to accept TCP trigger: {error}"),
+        }
+    }
+    Ok(())
+}
+
+fn bind_udp_trigger_listener(host: &str, port: u16) -> std::io::Result<UdpSocket> {
+    UdpSocket::bind((host, port)).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to bind UDP trigger listener {host}:{port}: {error}"),
+        )
+    })
+}
+
+fn run_udp_trigger_listener(
+    socket: UdpSocket,
+    host: String,
+    port: u16,
+    origin: String,
+    state: Arc<Mutex<GatewayState>>,
+) -> std::io::Result<()> {
+    println!("UDP trigger listener udp://{host}:{port} (one JSON object per datagram)");
+    let mut buffer = [0_u8; 65_507];
+    loop {
+        match socket.recv_from(&mut buffer) {
+            Ok((size, peer)) => {
+                let response = match std::str::from_utf8(&buffer[..size]) {
+                    Ok(body) => network_trigger_response(body, "udp", peer, &origin, &state),
+                    Err(error) => json!({
+                        "code": 400,
+                        "error": "invalid_utf8",
+                        "message": error.to_string()
+                    }),
+                };
+                let _ = socket.send_to(response.to_string().as_bytes(), peer);
+            }
+            Err(error) => eprintln!("failed to receive UDP trigger: {error}"),
+        }
+    }
+}
+
+fn http_auth_error(error: AuthError) -> Vec<u8> {
+    let status = match error.code {
+        409 => "409 Conflict",
+        503 => "503 Service Unavailable",
+        _ => "401 Unauthorized",
+    };
+    http_response(
+        status,
+        "application/json; charset=utf-8",
+        &error.response().to_string(),
+    )
+}
+
+fn authorize_http_trigger(
+    request: &str,
+    body: &str,
+    peer: SocketAddr,
+    state: &Arc<Mutex<GatewayState>>,
+) -> Result<(), Vec<u8>> {
+    if !source_allowed(state, peer) {
+        return Err(http_response(
+            "403 Forbidden",
+            "application/json; charset=utf-8",
+            &json!({ "code": 403, "error": "trigger_source_forbidden" }).to_string(),
+        ));
+    }
+    if request_header(request, "X-Trigger-Operator-Token").is_some() {
+        return authorize_operator_request(request, peer, state);
+    }
+    let timestamp = request_header(request, "X-Trigger-Timestamp").unwrap_or_default();
+    let nonce = request_header(request, "X-Trigger-Nonce").unwrap_or_default();
+    let signature = request_header(request, "X-Trigger-Signature").unwrap_or_default();
+    let auth_required = state
+        .lock()
+        .map(|state| state.security.auth_required)
+        .unwrap_or(true);
+    if auth_required && (timestamp.is_empty() || nonce.is_empty() || signature.is_empty()) {
+        return Err(http_auth_error(AuthError {
+            code: 401,
+            error: "trigger_auth_required",
+        }));
+    }
+    authenticate_message(
+        state,
+        &timestamp,
+        &nonce,
+        &signature,
+        "http",
+        body,
+        unix_seconds(),
+    )
+    .map_err(http_auth_error)
+}
+
 fn handle_client(mut stream: TcpStream, origin: &str, state: Arc<Mutex<GatewayState>>) {
+    let peer = match stream.peer_addr() {
+        Ok(peer) => peer,
+        Err(_) => return,
+    };
     let Some(request) = read_http_request(&mut stream) else {
         return;
     };
@@ -405,7 +1141,19 @@ fn handle_client(mut stream: TcpStream, origin: &str, state: Arc<Mutex<GatewaySt
     let response = match (method, path) {
         ("OPTIONS", _) => http_response("204 No Content", "application/json; charset=utf-8", ""),
         ("GET", "/") | ("GET", "/manual") => {
-            http_response("200 OK", "text/html; charset=utf-8", manual_page_html())
+            let production = state
+                .lock()
+                .map(|state| state.security.production)
+                .unwrap_or(true);
+            if peer.ip().is_loopback() && !production {
+                http_response("200 OK", "text/html; charset=utf-8", manual_page_html())
+            } else {
+                http_response(
+                    "403 Forbidden",
+                    "application/json; charset=utf-8",
+                    &json!({ "code": 403, "error": "local_operator_only" }).to_string(),
+                )
+            }
         }
         ("GET", "/api/trigger/mode") => http_response(
             "200 OK",
@@ -413,31 +1161,94 @@ fn handle_client(mut stream: TcpStream, origin: &str, state: Arc<Mutex<GatewaySt
             &mode_json(&mode).to_string(),
         ),
         ("POST", "/api/trigger/mode") => {
-            let requested = serde_json::from_str::<Value>(body)
-                .ok()
-                .and_then(|value| value.get("mode").and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_else(|| "api".to_string());
-            let mode = set_current_mode(&state, &requested);
-            http_response(
-                "200 OK",
-                "application/json; charset=utf-8",
-                &mode_json(&mode).to_string(),
-            )
+            let mutation_allowed = state
+                .lock()
+                .map(|state| state.security.allow_mode_mutation)
+                .unwrap_or(false);
+            if !mutation_allowed {
+                http_response(
+                    "423 Locked",
+                    "application/json; charset=utf-8",
+                    &json!({ "code": 423, "error": "trigger_mode_locked" }).to_string(),
+                )
+            } else if let Err(response) = authorize_operator_request(&request, peer, &state) {
+                response
+            } else {
+                let requested = serde_json::from_str::<Value>(body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("mode")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "api".to_string());
+                let mode = set_current_mode(&state, &requested);
+                http_response(
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &mode_json(&mode).to_string(),
+                )
+            }
+        }
+        ("POST", "/api/trigger/drain") => {
+            if let Err(response) = authorize_operator_request(&request, peer, &state) {
+                response
+            } else {
+                match enter_drain(&state) {
+                    Ok(status) => http_response(
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        &status.to_string(),
+                    ),
+                    Err(response) => response,
+                }
+            }
         }
         ("GET", "/health") | ("GET", "/api/trigger/status") => {
             let service = get_json(origin, "/api/production/status")
                 .unwrap_or_else(|| json!({ "code": 503, "error": "inspection_service_offline" }));
             let mut status = mode_json(&mode);
             if let Some(object) = status.as_object_mut() {
+                let listener_status =
+                    state
+                        .lock()
+                        .map(|state| state.listeners)
+                        .unwrap_or(ListenerStatus {
+                            http_enabled: true,
+                            http_bound: false,
+                            tcp_enabled: true,
+                            tcp_bound: false,
+                            udp_enabled: true,
+                            udp_bound: false,
+                        });
                 object.insert(
                     "service".to_string(),
                     Value::String("steel-trigger-gateway".to_string()),
                 );
                 object.insert(
-                    "inspectionServiceOrigin".to_string(),
-                    Value::String(origin.to_string()),
+                    "gatewayReady".to_string(),
+                    Value::Bool(listener_status.ready()),
                 );
-                object.insert("production".to_string(), service);
+                object.insert("listeners".to_string(), listener_status.to_json());
+                object.insert("security".to_string(), security_snapshot(&state));
+                let admission = admission_status_json(&state);
+                object.insert(
+                    "accepting".to_string(),
+                    admission
+                        .get("accepting")
+                        .cloned()
+                        .unwrap_or(Value::Bool(false)),
+                );
+                object.insert(
+                    "inFlight".to_string(),
+                    admission.get("inFlight").cloned().unwrap_or(Value::Null),
+                );
+                object.insert("drained".to_string(), admission["drained"].clone());
+                object.insert(
+                    "inspectionServiceHealthy".to_string(),
+                    Value::Bool(service.get("code").and_then(Value::as_i64) == Some(0)),
+                );
             }
             http_response(
                 "200 OK",
@@ -447,42 +1258,58 @@ fn handle_client(mut stream: TcpStream, origin: &str, state: Arc<Mutex<GatewaySt
         }
         ("POST", _) => {
             if let Some(target) = manual_service_path_for(path) {
-                if mode != "manual" {
+                if let Err(response) = authorize_operator_request(&request, peer, &state) {
+                    response
+                } else if mode != "manual" {
                     manual_mode_required_response(&mode)
                 } else {
-                    let payload = enrich_payload(body, "manual", &mode);
-                    let service = post_json(origin, target, &payload).unwrap_or_else(|| {
-                        json!({ "code": 503, "error": "inspection_service_offline" })
-                    });
-                    http_response(
-                        "200 OK",
-                        "application/json; charset=utf-8",
-                        &json!({
-                            "code": service.get("code").and_then(Value::as_i64).unwrap_or(503),
-                            "gateway": "steel-trigger-gateway",
-                            "mode": mode,
-                            "target": target,
-                            "service": service
-                        })
-                        .to_string(),
-                    )
+                    match admit_trigger(&state, completion_target(target)) {
+                        Err(error) => trigger_admission_http_response(error),
+                        Ok(_admission_guard) => {
+                            let payload = enrich_payload(body, "manual", &mode);
+                            let service = post_json(origin, target, &payload).unwrap_or_else(
+                                || json!({ "code": 503, "error": "inspection_service_offline" }),
+                            );
+                            http_response(
+                                "200 OK",
+                                "application/json; charset=utf-8",
+                                &json!({
+                                    "code": service.get("code").and_then(Value::as_i64).unwrap_or(503),
+                                    "gateway": "steel-trigger-gateway",
+                                    "mode": mode,
+                                    "target": target,
+                                    "service": service
+                                })
+                                .to_string(),
+                            )
+                        }
+                    }
                 }
             } else if let Some(target) = service_path_for(path) {
-                let payload = enrich_payload(body, gateway_source(path), &mode);
-                let service = post_json(origin, target, &payload)
-                    .unwrap_or_else(|| json!({ "code": 503, "error": "inspection_service_offline" }));
-                http_response(
-                    "200 OK",
-                    "application/json; charset=utf-8",
-                    &json!({
-                        "code": service.get("code").and_then(Value::as_i64).unwrap_or(503),
-                        "gateway": "steel-trigger-gateway",
-                        "mode": mode,
-                        "target": target,
-                        "service": service
-                    })
-                    .to_string(),
-                )
+                match authorize_http_trigger(&request, body, peer, &state) {
+                    Err(response) => response,
+                    Ok(()) => match admit_trigger(&state, completion_target(target)) {
+                        Err(error) => trigger_admission_http_response(error),
+                        Ok(_admission_guard) => {
+                            let payload = enrich_payload(body, gateway_source(path), &mode);
+                            let service = post_json(origin, target, &payload).unwrap_or_else(
+                                || json!({ "code": 503, "error": "inspection_service_offline" }),
+                            );
+                            http_response(
+                            "200 OK",
+                            "application/json; charset=utf-8",
+                            &json!({
+                                "code": service.get("code").and_then(Value::as_i64).unwrap_or(503),
+                                "gateway": "steel-trigger-gateway",
+                                "mode": mode,
+                                "target": target,
+                                "service": service
+                            })
+                            .to_string(),
+                        )
+                        }
+                    },
+                }
             } else {
                 http_response(
                     "404 Not Found",
@@ -501,19 +1328,82 @@ fn handle_client(mut stream: TcpStream, origin: &str, state: Arc<Mutex<GatewaySt
 }
 
 fn main() -> std::io::Result<()> {
-    let port = env::var("TRIGGER_GATEWAY_PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(4881);
+    let port = gateway_port("TRIGGER_GATEWAY_PORT", 4881);
+    let tcp_port = gateway_port("TRIGGER_TCP_PORT", 4882);
+    let udp_port = gateway_port("TRIGGER_UDP_PORT", 4883);
     let host = gateway_host();
     let origin = service_origin();
+    let security = SecurityConfig::from_env(&host)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // Bind every configured transport before exposing the HTTP readiness endpoint.  A
+    // TCP/UDP collision must fail the process synchronously instead of being hidden in
+    // a detached listener thread while SCM reports the gateway as running.
+    let tcp_listener = if tcp_port == 0 {
+        None
+    } else {
+        Some(bind_tcp_trigger_listener(&host, tcp_port)?)
+    };
+    let udp_socket = if udp_port == 0 {
+        None
+    } else {
+        Some(bind_udp_trigger_listener(&host, udp_port)?)
+    };
+    let listener = TcpListener::bind((host.as_str(), port)).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to bind HTTP trigger listener {host}:{port}: {error}"),
+        )
+    })?;
+    let listeners = ListenerStatus {
+        http_enabled: port != 0,
+        http_bound: true,
+        tcp_enabled: tcp_port != 0,
+        tcp_bound: tcp_listener.is_some(),
+        udp_enabled: udp_port != 0,
+        udp_bound: udp_socket.is_some(),
+    };
     let state = Arc::new(Mutex::new(GatewayState {
         mode: gateway_mode_from_env(),
+        accepting: true,
+        in_flight: 0,
+        security,
+        replay_nonces: HashMap::new(),
+        listeners,
     }));
-    let listener = TcpListener::bind((host.as_str(), port))?;
+    if let Some(tcp_listener) = tcp_listener {
+        let tcp_host = host.clone();
+        let tcp_origin = origin.clone();
+        let tcp_state = state.clone();
+        thread::spawn(move || {
+            if let Err(error) =
+                run_tcp_trigger_listener(tcp_listener, tcp_host, tcp_port, tcp_origin, tcp_state)
+            {
+                eprintln!("TCP trigger listener stopped: {error}");
+            }
+        });
+    }
+    if let Some(udp_socket) = udp_socket {
+        let udp_host = host.clone();
+        let udp_origin = origin.clone();
+        let udp_state = state.clone();
+        thread::spawn(move || {
+            if let Err(error) =
+                run_udp_trigger_listener(udp_socket, udp_host, udp_port, udp_origin, udp_state)
+            {
+                eprintln!("UDP trigger listener stopped: {error}");
+            }
+        });
+    }
     println!("steel trigger gateway listening on http://{host}:{port}");
     println!("inspection service origin {origin}");
     println!("trigger mode {}", current_mode(&state));
+    let security = security_snapshot(&state);
+    println!(
+        "trigger security authenticationRequired={} sourceAllowlistConfigured={} modeMutationAllowed={}",
+        security["authenticationRequired"],
+        security["sourceAllowlistConfigured"],
+        security["modeMutationAllowed"]
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => handle_client(stream, &origin, state.clone()),
@@ -526,6 +1416,49 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Barrier, Condvar};
+
+    fn sign_message(
+        secret: &[u8],
+        timestamp: &str,
+        nonce: &str,
+        transport: &str,
+        body: &str,
+    ) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+        mac.update(signature_message(timestamp, nonce, transport, body).as_bytes());
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn secured_state() -> Arc<Mutex<GatewayState>> {
+        Arc::new(Mutex::new(GatewayState {
+            mode: "api".to_string(),
+            accepting: true,
+            in_flight: 0,
+            security: SecurityConfig {
+                production: true,
+                auth_required: true,
+                shared_secret: b"0123456789abcdef0123456789abcdef".to_vec(),
+                operator_token: b"operator-0123456789abcdef-ABCDEF!".to_vec(),
+                allowed_sources: vec![SourceRule::parse("10.20.0.0/16").unwrap()],
+                auth_window_seconds: 30,
+                allow_mode_mutation: false,
+            },
+            replay_nonces: HashMap::new(),
+            listeners: ListenerStatus {
+                http_enabled: true,
+                http_bound: true,
+                tcp_enabled: true,
+                tcp_bound: true,
+                udp_enabled: true,
+                udp_bound: true,
+            },
+        }))
+    }
 
     fn response_body(response: &[u8]) -> Value {
         let text = String::from_utf8(response.to_vec()).expect("response is utf-8");
@@ -535,12 +1468,37 @@ mod tests {
         serde_json::from_str(body).expect("response body is json")
     }
 
+    fn invoke_http(state: Arc<Mutex<GatewayState>>, request: &str) -> Vec<u8> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test HTTP listener");
+        let address = listener.local_addr().expect("test HTTP address");
+        let request = request.to_string();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect test HTTP client");
+            stream
+                .write_all(request.as_bytes())
+                .expect("write test HTTP request");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("finish test HTTP request");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .expect("read test HTTP response");
+            response
+        });
+        let (stream, _) = listener.accept().expect("accept test HTTP client");
+        handle_client(stream, "http://127.0.0.1:9", state);
+        client.join().expect("test HTTP client joins")
+    }
+
     #[test]
     fn normalizes_gateway_modes_from_external_labels() {
         assert_eq!(normalize_gateway_mode("manual"), "manual");
         assert_eq!(normalize_gateway_mode("grey"), "gray");
         assert_eq!(normalize_gateway_mode("level2"), "secondary");
         assert_eq!(normalize_gateway_mode("direct"), "api");
+        assert_eq!(normalize_gateway_mode("tcp"), "tcp");
+        assert_eq!(normalize_gateway_mode("UDP"), "udp");
         assert_eq!(normalize_gateway_mode("unknown"), "api");
     }
 
@@ -555,7 +1513,295 @@ mod tests {
         assert_eq!(api["manualAllowed"], false);
         assert_eq!(gray["manualAllowed"], false);
         assert_eq!(secondary["manualAllowed"], false);
-        assert_eq!(manual["allowedModes"].as_array().map(Vec::len), Some(4));
+        assert_eq!(manual["allowedModes"].as_array().map(Vec::len), Some(6));
+    }
+
+    #[test]
+    fn drain_is_idempotent_and_fails_trigger_admission_closed() {
+        let state = secured_state();
+
+        let guard = admit_trigger(&state, false).expect("work admitted before drain");
+        assert_eq!(admission_status_json(&state)["inFlight"], 1);
+        let first_drain = enter_drain(&state).unwrap();
+        assert_eq!(first_drain["accepting"], false);
+        assert_eq!(first_drain["inFlight"], 1);
+        assert_eq!(first_drain["drained"], false);
+        assert_eq!(enter_drain(&state).unwrap()["inFlight"], 1);
+        assert_eq!(
+            admit_trigger(&state, false).unwrap_err()["error"],
+            "trigger_draining"
+        );
+        drop(guard);
+        assert_eq!(admission_status_json(&state)["inFlight"], 0);
+        assert_eq!(admission_status_json(&state)["drained"], true);
+
+        let http = trigger_admission_http_response(trigger_draining_json());
+        let http_text = String::from_utf8(http.clone()).expect("response is utf-8");
+        assert!(http_text.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert_eq!(response_body(&http)["error"], "trigger_draining");
+    }
+
+    #[test]
+    fn concurrent_drain_and_admission_have_no_check_increment_window() {
+        const WORKERS: usize = 32;
+        let state = secured_state();
+        let start = Arc::new(Barrier::new(WORKERS + 2));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+
+        for _ in 0..WORKERS {
+            let state = Arc::clone(&state);
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let result_tx = result_tx.clone();
+            workers.push(thread::spawn(move || {
+                start.wait();
+                let admission = admit_trigger(&state, false);
+                result_tx
+                    .send(admission.is_ok())
+                    .expect("report admission result");
+                if let Ok(_guard) = admission {
+                    let (lock, changed) = &*release;
+                    let released = lock.lock().expect("lock release gate");
+                    let _released = changed
+                        .wait_while(released, |released| !*released)
+                        .expect("wait for guard release");
+                }
+            }));
+        }
+
+        let drain_state = Arc::clone(&state);
+        let drain_start = Arc::clone(&start);
+        let drain = thread::spawn(move || {
+            drain_start.wait();
+            enter_drain(&drain_state).expect("enter concurrent drain")
+        });
+        start.wait();
+
+        let drain_status = drain.join().expect("drain thread joins");
+        let admitted = (0..WORKERS)
+            .map(|_| {
+                result_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("receive admission result")
+            })
+            .filter(|admitted| *admitted)
+            .count() as u64;
+        assert_eq!(drain_status["inFlight"].as_u64(), Some(admitted));
+        assert_eq!(
+            admit_trigger(&state, false).unwrap_err()["error"],
+            "trigger_draining"
+        );
+        let completion =
+            admit_trigger(&state, true).expect("steel-out completion remains admitted");
+        assert_eq!(
+            admission_status_json(&state)["inFlight"].as_u64(),
+            Some(admitted + 1)
+        );
+        assert_eq!(admission_status_json(&state)["drained"], false);
+        drop(completion);
+        assert_eq!(
+            admission_status_json(&state)["inFlight"].as_u64(),
+            Some(admitted)
+        );
+
+        let (lock, changed) = &*release;
+        *lock.lock().expect("lock release gate") = true;
+        changed.notify_all();
+        for worker in workers {
+            worker.join().expect("admission worker joins");
+        }
+        let final_status = admission_status_json(&state);
+        assert_eq!(final_status["inFlight"], 0);
+        assert_eq!(final_status["drained"], true);
+    }
+
+    #[test]
+    fn operator_can_drain_http_gateway_while_status_remains_available() {
+        let state = secured_state();
+        state.lock().expect("set manual mode").mode = "manual".to_string();
+        let drain = invoke_http(
+            state.clone(),
+            concat!(
+                "POST /api/trigger/drain HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "X-Trigger-Operator-Token: operator-0123456789abcdef-ABCDEF!\r\n",
+                "Content-Length: 0\r\n\r\n"
+            ),
+        );
+        assert!(String::from_utf8_lossy(&drain).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(response_body(&drain)["accepting"], false);
+
+        let status = invoke_http(
+            state.clone(),
+            "GET /api/trigger/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(String::from_utf8_lossy(&status).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(response_body(&status)["accepting"], false);
+
+        assert_eq!(response_body(&status)["inFlight"], 0);
+        assert_eq!(response_body(&status)["drained"], true);
+
+        let body = "{}";
+        let timestamp = unix_seconds().to_string();
+        let nonce = "http-drain-cycle-0001";
+        let signature = sign_message(
+            b"0123456789abcdef0123456789abcdef",
+            &timestamp,
+            nonce,
+            "http",
+            body,
+        );
+        let request = format!(
+            "POST /api/trigger/steel-in HTTP/1.1\r\nHost: localhost\r\nX-Trigger-Timestamp: {timestamp}\r\nX-Trigger-Nonce: {nonce}\r\nX-Trigger-Signature: {signature}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let trigger = invoke_http(Arc::clone(&state), &request);
+        assert!(String::from_utf8_lossy(&trigger).starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert_eq!(response_body(&trigger)["error"], "trigger_draining");
+
+        let manual_completion = invoke_http(
+            Arc::clone(&state),
+            concat!(
+                "POST /api/trigger/manual/steel-out HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "X-Trigger-Operator-Token: operator-0123456789abcdef-ABCDEF!\r\n",
+                "Content-Length: 2\r\n\r\n{}"
+            ),
+        );
+        assert!(String::from_utf8_lossy(&manual_completion).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            response_body(&manual_completion)["service"]["error"],
+            "inspection_service_offline"
+        );
+
+        let completion_nonce = "http-drain-cycle-0002";
+        let completion_signature = sign_message(
+            b"0123456789abcdef0123456789abcdef",
+            &timestamp,
+            completion_nonce,
+            "http",
+            body,
+        );
+        let completion_request = format!(
+            "POST /api/trigger/steel-out HTTP/1.1\r\nHost: localhost\r\nX-Trigger-Timestamp: {timestamp}\r\nX-Trigger-Nonce: {completion_nonce}\r\nX-Trigger-Signature: {completion_signature}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let machine_completion = invoke_http(Arc::clone(&state), &completion_request);
+        assert!(String::from_utf8_lossy(&machine_completion).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            response_body(&machine_completion)["service"]["error"],
+            "inspection_service_offline"
+        );
+        assert_eq!(admission_status_json(&state)["inFlight"], 0);
+    }
+
+    #[test]
+    fn drain_rejects_authenticated_tcp_and_udp_before_forwarding() {
+        let state = secured_state();
+        enter_drain(&state).unwrap();
+        let peer: SocketAddr = "10.20.7.9:49152".parse().unwrap();
+        let timestamp = unix_seconds().to_string();
+
+        for (index, transport) in ["tcp", "udp"].into_iter().enumerate() {
+            let payload = json!({ "event": "steel-in" });
+            let nonce = format!("{transport}-drain-cycle-{index:04}");
+            let signature = sign_message(
+                b"0123456789abcdef0123456789abcdef",
+                &timestamp,
+                &nonce,
+                transport,
+                &payload.to_string(),
+            );
+            let envelope = json!({
+                "auth": {
+                    "timestamp": timestamp.clone(),
+                    "nonce": nonce,
+                    "signature": signature
+                },
+                "payload": payload
+            });
+            let response = network_trigger_response(
+                &envelope.to_string(),
+                transport,
+                peer,
+                "http://127.0.0.1:9",
+                &state,
+            );
+            assert_eq!(response["code"], 503);
+            assert_eq!(response["error"], "trigger_draining");
+
+            let completion_payload = json!({ "event": "steel-out" });
+            let completion_nonce = format!("{transport}-completion-cycle-{index:04}");
+            let completion_signature = sign_message(
+                b"0123456789abcdef0123456789abcdef",
+                &timestamp,
+                &completion_nonce,
+                transport,
+                &completion_payload.to_string(),
+            );
+            let completion_envelope = json!({
+                "auth": {
+                    "timestamp": timestamp.clone(),
+                    "nonce": completion_nonce,
+                    "signature": completion_signature
+                },
+                "payload": completion_payload
+            });
+            let completion_response = network_trigger_response(
+                &completion_envelope.to_string(),
+                transport,
+                peer,
+                "http://127.0.0.1:9",
+                &state,
+            );
+            assert_eq!(
+                completion_response["service"]["error"],
+                "inspection_service_offline"
+            );
+            assert_eq!(admission_status_json(&state)["inFlight"], 0);
+        }
+    }
+
+    #[test]
+    fn listener_readiness_requires_every_enabled_transport_to_be_bound() {
+        let ready = ListenerStatus {
+            http_enabled: true,
+            http_bound: true,
+            tcp_enabled: true,
+            tcp_bound: true,
+            udp_enabled: true,
+            udp_bound: true,
+        };
+        assert!(ready.ready());
+        let tcp_failed = ListenerStatus {
+            tcp_bound: false,
+            ..ready
+        };
+        assert!(!tcp_failed.ready());
+        let tcp_disabled = ListenerStatus {
+            tcp_enabled: false,
+            tcp_bound: false,
+            ..ready
+        };
+        assert!(tcp_disabled.ready());
+        assert_eq!(ready.to_json()["udp"]["bound"], true);
+    }
+
+    #[test]
+    fn configured_trigger_transport_bind_collisions_fail_synchronously() {
+        let tcp_owner = TcpListener::bind(("127.0.0.1", 0)).expect("reserve TCP port");
+        let tcp_port = tcp_owner.local_addr().expect("TCP local address").port();
+        let tcp_error = bind_tcp_trigger_listener("127.0.0.1", tcp_port)
+            .expect_err("second TCP bind must fail");
+        assert!(tcp_error.to_string().contains("TCP trigger listener"));
+
+        let udp_owner = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve UDP port");
+        let udp_port = udp_owner.local_addr().expect("UDP local address").port();
+        let udp_error = bind_udp_trigger_listener("127.0.0.1", udp_port)
+            .expect_err("second UDP bind must fail");
+        assert!(udp_error.to_string().contains("UDP trigger listener"));
     }
 
     #[test]
@@ -577,6 +1823,19 @@ mod tests {
             Some("/api/production/tasks/steel-out")
         );
         assert_eq!(manual_service_path_for("/api/trigger/steel-out"), None);
+        assert_eq!(
+            event_service_path("steel_info"),
+            Some("/api/production/tasks/steel-info")
+        );
+        assert_eq!(
+            event_service_path("enter"),
+            Some("/api/production/tasks/steel-in")
+        );
+        assert_eq!(
+            event_service_path("OUT"),
+            Some("/api/production/tasks/steel-out")
+        );
+        assert_eq!(event_service_path("not-supported"), None);
     }
 
     #[test]
@@ -616,5 +1875,138 @@ mod tests {
             assert_eq!(body["mode"], mode);
             assert_eq!(body["manualAllowed"], false);
         }
+    }
+
+    #[test]
+    fn production_http_responses_do_not_emit_wildcard_cors_and_disable_caching() {
+        let response =
+            String::from_utf8(http_response("200 OK", "application/json", "{}")).unwrap();
+
+        assert!(!response.contains("Access-Control-Allow-Origin"));
+        assert!(response.contains("X-Content-Type-Options: nosniff"));
+        assert!(response.contains("Cache-Control: no-store"));
+    }
+
+    #[test]
+    fn source_allowlist_supports_exact_ipv4_ipv6_and_cidr_rules() {
+        assert!(SourceRule::parse("10.20.0.0/16")
+            .unwrap()
+            .contains("10.20.7.9".parse().unwrap()));
+        assert!(!SourceRule::parse("10.20.0.0/16")
+            .unwrap()
+            .contains("10.21.7.9".parse().unwrap()));
+        assert!(SourceRule::parse("192.0.2.12")
+            .unwrap()
+            .contains("192.0.2.12".parse().unwrap()));
+        assert!(SourceRule::parse("2001:db8::/32")
+            .unwrap()
+            .contains("2001:db8::1234".parse().unwrap()));
+        assert!(SourceRule::parse("10.0.0.0/33").is_none());
+    }
+
+    #[test]
+    fn production_operator_routes_require_the_separate_loopback_token() {
+        let state = secured_state();
+        let loopback: SocketAddr = "127.0.0.1:49152".parse().unwrap();
+        let remote: SocketAddr = "10.20.7.9:49152".parse().unwrap();
+        let without_token = "POST /api/trigger/manual/steel-in HTTP/1.1\r\n\r\n{}";
+        let with_token = concat!(
+            "POST /api/trigger/manual/steel-in HTTP/1.1\r\n",
+            "X-Trigger-Operator-Token: operator-0123456789abcdef-ABCDEF!\r\n\r\n{}"
+        );
+
+        let missing = authorize_operator_request(without_token, loopback, &state).unwrap_err();
+        assert_eq!(
+            response_body(&missing)["error"],
+            "trigger_operator_auth_required"
+        );
+        assert_eq!(
+            authorize_operator_request(with_token, loopback, &state),
+            Ok(())
+        );
+
+        let forbidden = authorize_operator_request(with_token, remote, &state).unwrap_err();
+        assert_eq!(response_body(&forbidden)["error"], "local_operator_only");
+    }
+
+    #[test]
+    fn hmac_authentication_accepts_once_then_rejects_replay_and_stale_time() {
+        let state = secured_state();
+        let timestamp = "1000";
+        let nonce = "plc-a-cycle-0001";
+        let body = r#"{"event":"steel-in","requestId":"cycle-1"}"#;
+        let signature = sign_message(
+            b"0123456789abcdef0123456789abcdef",
+            timestamp,
+            nonce,
+            "http",
+            body,
+        );
+
+        assert_eq!(
+            authenticate_message(&state, timestamp, nonce, &signature, "http", body, 1000),
+            Ok(())
+        );
+        assert_eq!(
+            authenticate_message(&state, timestamp, nonce, &signature, "http", body, 1000),
+            Err(AuthError {
+                code: 409,
+                error: "trigger_replay_detected"
+            })
+        );
+
+        let stale_nonce = "plc-a-cycle-0002";
+        let stale_signature = sign_message(
+            b"0123456789abcdef0123456789abcdef",
+            "900",
+            stale_nonce,
+            "http",
+            body,
+        );
+        assert_eq!(
+            authenticate_message(
+                &state,
+                "900",
+                stale_nonce,
+                &stale_signature,
+                "http",
+                body,
+                1000
+            ),
+            Err(AuthError {
+                code: 401,
+                error: "trigger_timestamp_out_of_window"
+            })
+        );
+    }
+
+    #[test]
+    fn tcp_and_udp_envelope_authenticates_only_the_canonical_payload() {
+        let state = secured_state();
+        let payload = json!({ "event": "steel-out", "requestId": "cycle-9-out" });
+        let timestamp = "2000";
+        let nonce = "plc-b-cycle-0009";
+        let signature = sign_message(
+            b"0123456789abcdef0123456789abcdef",
+            timestamp,
+            nonce,
+            "tcp",
+            &payload.to_string(),
+        );
+        let envelope = json!({
+            "auth": { "timestamp": timestamp, "nonce": nonce, "signature": signature },
+            "payload": payload
+        });
+
+        assert_eq!(
+            authenticated_network_payload(&envelope.to_string(), "tcp", &state, 2000).unwrap(),
+            payload
+        );
+        let missing_auth = json!({ "event": "steel-out" });
+        assert_eq!(
+            authenticated_network_payload(&missing_auth.to_string(), "udp", &state, 2000)
+                .unwrap_err()["error"],
+            "trigger_auth_required"
+        );
     }
 }

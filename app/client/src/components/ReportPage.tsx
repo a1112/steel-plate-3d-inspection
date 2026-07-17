@@ -1,8 +1,10 @@
-import { Download, FileText, RotateCcw, Search } from 'lucide-react';
+import { Download, FileText, Printer, RotateCcw, Search } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import type { ChangeEvent, CSSProperties } from 'react';
 import type { DefectItem, DefectType, PlateInspection, Severity } from '../data/inspection';
 import { severityLabels } from '../data/inspection';
-import type { ReportFilters, ReportMetrics } from '../state/operations';
+import type { ReportFilters, ReportMetadata, ReportMetrics } from '../state/operations';
+import type { InspectionReportArchiveSummary } from '../services/inspection-api';
 import { Panel } from './Panel';
 
 const severityOptions: Array<{ value: ReportFilters['severity']; label: string }> = [
@@ -129,6 +131,7 @@ export function ReportPage({
   rows,
   pageRows,
   metrics,
+  metadata,
   filters,
   page,
   pageCount,
@@ -141,12 +144,19 @@ export function ReportPage({
   onSelectDefect,
   onExportCsv,
   onExportJson,
+  onIssueArchive,
+  onPrintArchive,
+  issueArchiveDisabled,
+  printArchiveDisabled,
+  archiveReports,
+  archiveStatus,
 }: {
   defectTypes: DefectType[];
   inspections: PlateInspection[];
   rows: DefectItem[];
   pageRows: DefectItem[];
   metrics: ReportMetrics;
+  metadata: ReportMetadata;
   filters: ReportFilters;
   page: number;
   pageCount: number;
@@ -159,8 +169,21 @@ export function ReportPage({
   onSelectDefect: (defectId: string) => void;
   onExportCsv: () => void;
   onExportJson: () => void;
+  onIssueArchive: () => void;
+  onPrintArchive: (archive: InspectionReportArchiveSummary) => void;
+  issueArchiveDisabled: boolean;
+  printArchiveDisabled: boolean;
+  archiveReports: InspectionReportArchiveSummary[];
+  archiveStatus: string;
 }) {
   const plateRows = createPlateReportRows(rows, inspections);
+  const [selectedArchiveId, setSelectedArchiveId] = useState(archiveReports[0]?.reportId ?? '');
+  useEffect(() => {
+    if (!archiveReports.some((archive) => archive.reportId === selectedArchiveId)) {
+      setSelectedArchiveId(archiveReports[0]?.reportId ?? '');
+    }
+  }, [archiveReports, selectedArchiveId]);
+  const selectedArchive = archiveReports.find((archive) => archive.reportId === selectedArchiveId) ?? archiveReports[0];
   const donutStyle = {
     '--severe': metrics.severe,
     '--review': metrics.review,
@@ -186,9 +209,13 @@ export function ReportPage({
             <h1>钢管表面缺陷检测报表</h1>
           </div>
           <div className="report-document-meta">
-            <span>报表编号 RPT-20260613-1900</span>
-            <span>数据来源 本地检测快照</span>
+            <span>报表编号 {metadata.reportId}</span>
+            <span>数据来源 {metadata.dataSource}</span>
+            {metadata.dataThrough ? <span>数据截止 {metadata.dataThrough}</span> : null}
             <span>记录数 {rows.length}</span>
+            <span title={archiveReports[0]?.reportId ?? archiveStatus}>
+              归档 {archiveReports.length} 份{archiveReports[0]?.issuedAt ? ` · 最近 ${archiveReports[0].issuedAt}` : ''}
+            </span>
           </div>
         </header>
 
@@ -197,6 +224,28 @@ export function ReportPage({
           className="report-filter-panel"
           action={
             <div className="report-export-actions">
+              <select
+                aria-label="归档版本"
+                value={selectedArchive?.reportId ?? ''}
+                onChange={(event) => setSelectedArchiveId(event.target.value)}
+                disabled={archiveReports.length === 0}
+                title="选择需要打印的不可变归档版本"
+              >
+                {archiveReports.length === 0 ? <option value="">无归档版本</option> : null}
+                {archiveReports.map((archive) => (
+                  <option key={archive.reportId} value={archive.reportId}>
+                    {archive.issuedAt} · {archive.reportId}
+                  </option>
+                ))}
+              </select>
+              <button type="button" onClick={onIssueArchive} disabled={issueArchiveDisabled} title={issueArchiveDisabled ? '只支持对单个生产检测记录签发归档报告' : '签发不可变检测报告'}>
+                <FileText size={15} />
+                签发归档
+              </button>
+              <button type="button" onClick={() => selectedArchive && onPrintArchive(selectedArchive)} disabled={printArchiveDisabled || !selectedArchive} title={printArchiveDisabled ? '请先选择单个检测记录并签发归档报告' : '下载与所选不可变归档一致的打印版 HTML'}>
+                <Printer size={15} />
+                打印版
+              </button>
               <button type="button" onClick={onExportCsv}>
                 <Download size={15} />
                 CSV

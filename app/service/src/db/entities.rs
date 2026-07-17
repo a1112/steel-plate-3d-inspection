@@ -244,6 +244,10 @@ pub mod production_task {
         pub kind: String,
         pub material_id: String,
         pub session_id: String,
+        pub chain_id: String,
+        pub depends_on_task_id: String,
+        pub dependency_policy: String,
+        pub blocked_reason: String,
         pub status: String,
         pub phase: String,
         pub payload: String,
@@ -319,6 +323,37 @@ pub mod capture_file {
         pub path: String,
         pub metadata_path: String,
         pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod record_cleanup {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "record_cleanup")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub record_id: String,
+        pub material_id: String,
+        pub status: String,
+        pub actor: String,
+        pub reason: String,
+        pub manifest_json: String,
+        pub files_planned: i32,
+        pub files_deleted: i32,
+        pub files_missing: i32,
+        pub bytes_planned: i64,
+        pub bytes_deleted: i64,
+        pub error: String,
+        pub created_at: String,
+        pub updated_at: String,
+        pub completed_at: String,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -433,6 +468,7 @@ pub mod admin_user {
         pub role: String,
         pub status: String,
         pub password_hash: String,
+        pub must_change_password: bool,
         pub last_login_at: String,
         pub created_at: String,
     }

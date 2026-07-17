@@ -83,8 +83,8 @@ export function CaptureOperationsPanel({
   );
   const [profiles, setProfiles] = useState<CaptureProfilesStatus | null>(null);
   const [storage, setStorage] = useState<CaptureStorageStatus | null>(null);
-  const [selectedProfile, setSelectedProfile] = useState('current-6-soft-trigger');
-  const [cameraParamDir, setCameraParamDir] = useState('config/camera-params/current-6-soft-trigger');
+  const [selectedProfile, setSelectedProfile] = useState('current-8-time-trigger');
+  const [cameraParamDir, setCameraParamDir] = useState('config/camera-params/current-8-time-trigger');
   const [storageRoot, setStorageRoot] = useState('H:/');
   const [recoveryIp, setRecoveryIp] = useState(normalizedIps[0] ?? '');
   const [autoConnect, setAutoConnect] = useState(true);
@@ -300,7 +300,7 @@ export function CaptureOperationsPanel({
           <header>
             <Link size={17} />
             <div>
-              <strong>六相机连接</strong>
+              <strong>8 相机连接</strong>
               <span>{normalizedIps.length || 0} 个配置地址</span>
             </div>
           </header>

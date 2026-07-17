@@ -1,0 +1,7 @@
+{
+  "schema": "steel.database-migration-index.v1",
+  "baseSchemaVersion": 1,
+  "targetSchemaVersion": 1,
+  "engines": ["sqlite", "mysql"],
+  "migrations": []
+}

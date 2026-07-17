@@ -680,10 +680,10 @@ export function CaptureAdvancedOperations({
             <span>Profile JSON</span>
             <textarea value={profileJson} onChange={(event) => setProfileJson(event.target.value)} spellCheck={false} />
           </label>
-          <section className="capture-profile-camera-editor" aria-label="Profile 六相机结构化编辑器">
+          <section className="capture-profile-camera-editor" aria-label="Profile 8 相机结构化编辑器">
             <header>
               <div>
-                <strong>六相机结构化配置</strong>
+                <strong>8 相机结构化配置</strong>
                 <span>字段变更立即同步到上方 Profile JSON；原始 JSON 手工修改后需重新读取。</span>
               </div>
               <div className="capture-operation-actions">

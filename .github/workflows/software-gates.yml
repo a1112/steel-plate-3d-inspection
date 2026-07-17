@@ -1,0 +1,126 @@
+name: software-gates
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: software-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-software-gates:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: app/client/package-lock.json
+          package-manager-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Record toolchain versions
+        shell: pwsh
+        run: |
+          node --version
+          npm --version
+          python --version
+          rustc --version
+          cargo --version
+          cmake --version
+          git --version
+
+      - name: Install locked frontend dependencies
+        working-directory: app/client
+        run: npm ci --no-audit --no-fund
+
+      - name: Test and build frontend
+        working-directory: app/client
+        run: |
+          npm test -- --run
+          npm run build
+
+      - name: Test Rust service
+        run: cargo test --locked --manifest-path app/service/Cargo.toml
+
+      - name: Test Rust trigger gateway
+        run: cargo test --locked --manifest-path app/trigger/Cargo.toml --target-dir target/ci-trigger
+
+      - name: Check production Tauri target
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo check --locked --manifest-path app/client/src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --target-dir target/ci-tauri
+
+      - name: Build SDK-independent C++ gates
+        shell: pwsh
+        run: |
+          cmake -S app/capture -B target/ci-capture -A x64 -DSTEEL_CAPTURE_BUILD_CORE=OFF -DSTEEL_CAPTURE_BUILD_SERVICE=OFF -DSTEEL_CAPTURE_BUILD_SUPERVISOR=ON
+          cmake --build target/ci-capture --config Release
+          ctest --test-dir target/ci-capture -C Release --output-on-failure
+
+      - name: Run offline release-input contract tests
+        shell: pwsh
+        run: |
+          ./scripts/test-tauri-bundle-toolchain-provisioning.ps1
+          ./scripts/test-release-sbom.ps1
+          ./scripts/test-packaged-release-sbom.ps1
+          if (Test-Path ./scripts/test-database-migration-contract.ps1) {
+            ./scripts/test-database-migration-contract.ps1
+          }
+
+      - name: Run deployment and recovery contract tests
+        shell: pwsh
+        run: |
+          ./scripts/test-runtime-deployment-transaction.ps1
+          ./scripts/test-runtime-service-uninstall-policy.ps1
+          ./scripts/test-database-backup-restore-contract.ps1
+          ./scripts/test-runtime-supervisor.ps1 `
+            -SupervisorPath ./target/ci-capture/Release/steel_runtime_supervisor.exe
+
+      - name: Run source architecture contract
+        shell: pwsh
+        run: |
+          ./scripts/verify-independent-architecture.ps1 `
+            -SkipFrontendBuild `
+            -SkipClientTests `
+            -SkipServiceTests `
+            -SkipTriggerTests `
+            -SkipCaptureBuild `
+            -SkipServiceBuild `
+            -SkipTriggerBuild `
+            -SkipExternalProviderCheck `
+            -SkipPackage
+
+      - name: Prove tracked source stayed clean
+        shell: pwsh
+        run: |
+          $status = @(git status --porcelain --untracked-files=all)
+          if ($status.Count -ne 0) {
+            $status | Write-Host
+            throw "CI commands changed or generated files in the source tree."
+          }

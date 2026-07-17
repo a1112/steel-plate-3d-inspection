@@ -173,7 +173,7 @@ export function CaptureDiagnosticOperations({
   const [calibrationConfirmation, setCalibrationConfirmation] = useState('');
   const [roiConfirmation, setRoiConfirmation] = useState('');
   const [validationConfirmation, setValidationConfirmation] = useState('');
-  const [calibrationSetProfile, setCalibrationSetProfile] = useState('current-6-soft-trigger');
+  const [calibrationSetProfile, setCalibrationSetProfile] = useState('current-8-time-trigger');
   const [arrayCalibrationPath, setArrayCalibrationPath] = useState('');
   const [calibrationMappings, setCalibrationMappings] = useState<CaptureCalibrationMapping[]>(() =>
     normalizedIps.map((ip) => ({
@@ -249,7 +249,7 @@ export function CaptureDiagnosticOperations({
     calibrationSetSaveToDevice,
     calibrationSetAllowExternal,
   ]);
-  const calibrationMappingsComplete = calibrationMappings.length === 6
+  const calibrationMappingsComplete = calibrationMappings.length === 8
     && calibrationMappings.every((item) =>
       item.ip.trim() && item.path.trim() && item.expectedSn?.trim() && item.rollbackPath?.trim());
   const calibrationSetPreflightPassed = calibrationSetPreflightSignature === calibrationSetSignature;
@@ -480,9 +480,9 @@ export function CaptureDiagnosticOperations({
     const response = await run(
       'persist-param-all',
       () => persistAllCaptureCameraParams({
-        name: calibrationSetProfile.trim() || 'current-6-soft-trigger',
+        name: calibrationSetProfile.trim() || 'current-8-time-trigger',
         ips: normalizedIps,
-        cameraParamDir: `config/camera-params/${calibrationSetProfile.trim() || 'current-6-soft-trigger'}`,
+        cameraParamDir: `config/camera-params/${calibrationSetProfile.trim() || 'current-8-time-trigger'}`,
         applySoftTrigger: false,
       }),
       (next) => `全部相机参数快照/设备持久化完成：成功 ${next.saved ?? 0}，失败 ${next.failed ?? 0}`,
@@ -567,7 +567,7 @@ export function CaptureDiagnosticOperations({
     path: arrayCalibrationPath,
     cameraCalibrations: calibrationMappings,
     ips: calibrationMappings.map((item) => item.ip),
-    expectedCameras: 6,
+    expectedCameras: 8,
     dryRun,
     stopStreams: true,
     atomic: true,
@@ -586,7 +586,7 @@ export function CaptureDiagnosticOperations({
 
   const handleCalibrationSetPreflight = async (newOperation = false) => {
     if (!calibrationSetProfile.trim() || !calibrationMappingsComplete) {
-      setMessage('整组标定预检需要 6 台相机的唯一 IP、SDK 标定文件、期望 SN 和已知良好回滚文件');
+      setMessage('整组标定预检需要 8 台相机的唯一 IP、SDK 标定文件、期望 SN 和已知良好回滚文件');
       return;
     }
     if (calibrationSetPersistActive && !arrayCalibrationPath.trim()) {
@@ -978,7 +978,7 @@ export function CaptureDiagnosticOperations({
         </section>
 
         <section className="capture-calibration-set-diagnostic">
-          <header><Camera size={16} /><strong>六相机 SDK 标定整组下发</strong></header>
+          <header><Camera size={16} /><strong>8 相机 SDK 标定整组下发</strong></header>
           <p>先执行 <code>dryRun=true</code> 预检；只有同一份配置预检通过后才能真实应用。默认原子下发、失败回滚、不更新 active pointer、不写设备。</p>
           <div className="capture-calibration-set-header-fields">
             <label>

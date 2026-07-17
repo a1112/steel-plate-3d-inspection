@@ -40,6 +40,36 @@ export interface DefectItem {
   previewX: number;
   previewY: number;
   previewImageUrl: string;
+  cameraId?: string;
+  cameraIndex?: number;
+  circumferenceRatio?: number;
+  confidence?: number;
+  detectionConfidence?: number;
+  classificationConfidence?: number | null;
+  classificationState?: 'candidate-only' | 'classified' | string;
+  classificationVersion?: string;
+  candidatePolarity?: 'depression' | 'protrusion' | string;
+  synthetic?: boolean;
+  artifacts?: DefectArtifacts;
+}
+
+export interface DefectArtifacts {
+  schema: 'steel.surface.defect.artifacts.v1' | string;
+  cameraId: string;
+  frameId: string;
+  sequenceNo: number;
+  roi: { x: number; y: number; width: number; height: number };
+  sourceFrame?: {
+    intensity?: string;
+    intensitySha256?: string;
+    depth?: string;
+    depthSha256?: string;
+  };
+  roiImage?: string;
+  depthRoiImage?: string;
+  localPointCloud?: string;
+  lengthProfile?: string;
+  widthProfile?: string;
 }
 
 export interface CaptureImageItem {

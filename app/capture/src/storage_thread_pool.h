@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <future>
@@ -47,6 +48,10 @@ struct StorageQueueStats {
   std::size_t high_water_items = 0;
   std::size_t high_water_bytes = 0;
   std::uint64_t completed = 0;
+  std::uint64_t completed_bytes = 0;
+  std::uint64_t recent_completed_bytes = 0;
+  double recent_window_seconds = 60.0;
+  double recent_write_bytes_per_second = 0.0;
   std::uint64_t failed = 0;
   std::uint64_t rejected = 0;
   bool accepting = false;
@@ -185,6 +190,16 @@ class StorageThreadPool {
     result.high_water_items = high_water_items_;
     result.high_water_bytes = high_water_bytes_;
     result.completed = completed_;
+    result.completed_bytes = completed_bytes_;
+    const auto now = std::chrono::steady_clock::now();
+    const auto recent_cutoff = now - std::chrono::seconds(60);
+    for (const auto& sample : completion_samples_) {
+      if (sample.first >= recent_cutoff) {
+        result.recent_completed_bytes += sample.second;
+      }
+    }
+    result.recent_write_bytes_per_second =
+        static_cast<double>(result.recent_completed_bytes) / result.recent_window_seconds;
     result.failed = failed_;
     result.rejected = rejected_;
     result.accepting = accepting_;
@@ -234,6 +249,13 @@ class StorageThreadPool {
           ++failed_;
         } else {
           ++completed_;
+          completed_bytes_ += task.pending_bytes;
+          const auto completed_at = std::chrono::steady_clock::now();
+          completion_samples_.push_back({completed_at, task.pending_bytes});
+          const auto cutoff = completed_at - std::chrono::seconds(60);
+          while (!completion_samples_.empty() && completion_samples_.front().first < cutoff) {
+            completion_samples_.pop_front();
+          }
         }
         if (error) {
           task.promise->set_exception(error);
@@ -261,6 +283,8 @@ class StorageThreadPool {
   std::size_t high_water_items_ = 0;
   std::size_t high_water_bytes_ = 0;
   std::uint64_t completed_ = 0;
+  std::uint64_t completed_bytes_ = 0;
+  std::deque<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>> completion_samples_;
   std::uint64_t failed_ = 0;
   std::uint64_t rejected_ = 0;
   bool accepting_ = true;

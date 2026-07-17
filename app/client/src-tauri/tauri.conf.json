@@ -7,6 +7,7 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1432",
     "beforeBuildCommand": "npm run build",
+    "features": [],
     "frontendDist": "../../../target/client/frontend-dist"
   },
   "app": {
@@ -31,17 +32,33 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' customprotocol: asset:; connect-src ipc: http://ipc.localhost http://127.0.0.1:*; img-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:"
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "publisher": "\u5317\u79d1\u5de5\u7814",
+    "shortDescription": "\u94a2\u677f\u4e09\u7ef4\u68c0\u6d4b\u64cd\u4f5c\u7aef",
+    "longDescription": "\u94a2\u677f\u4e09\u7ef4\u91c7\u96c6\u3001\u91cd\u5efa\u3001\u68c0\u6d4b\u4e0e\u8fd0\u884c\u72b6\u6001\u7ba1\u7406\u64cd\u4f5c\u7aef\u3002",
+    "useLocalToolsDir": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "webviewInstallMode": {
+        "type": "offlineInstaller",
+        "silent": true
+      },
+      "allowDowngrades": false,
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    }
   }
 }

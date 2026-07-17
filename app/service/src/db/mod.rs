@@ -4,10 +4,9 @@ use argon2::{
 };
 use rand_core::OsRng;
 use sea_orm::{
-    sea_query::Expr,
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
-    TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection,
+    DbBackend, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    Statement, TransactionTrait,
 };
 use serde_json::{self, json, Value};
 use std::env;
@@ -17,12 +16,203 @@ pub mod entities;
 
 use entities::{
     admin_role, admin_user, app_config, audit_log, calibration_operation, camera_config,
-    capture_file, config_revision, defect, defect_type, inspection_record, material_session, production_alarm,
-    production_defect, production_inspection, production_task, secondary_data, steel_plate,
-    trigger_event,
+    capture_file, config_revision, defect, defect_type, inspection_record, material_session,
+    production_alarm, production_defect, production_inspection, production_task, record_cleanup,
+    secondary_data, steel_plate, trigger_event,
 };
 
-pub const DEFAULT_ADMIN_PASSWORD: &str = "admin123";
+pub const DEVELOPMENT_DEFAULT_ADMIN_PASSWORD: &str = "admin123";
+pub const DATABASE_SCHEMA_VERSION: i64 = 1;
+
+fn production_security_policy_enabled() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    !matches!(
+        env::var("STEEL_RUNTIME_PROFILE")
+            .unwrap_or_else(|_| "production".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "development" | "dev" | "test"
+    )
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn production_mysql_rejects_default_credentials_and_plaintext_remote_hosts() {
+        assert!(normalize_database_url(
+            "mysql://root:Strong%21Password1@127.0.0.1:3306/steel_inspection",
+            true
+        )
+        .is_err());
+        assert!(normalize_database_url(
+            "mysql://steel_service:nercar@127.0.0.1:3306/steel_inspection",
+            true
+        )
+        .is_err());
+        assert!(normalize_database_url(
+            "mysql://steel_service:Strong%21Password1@10.0.0.8:3306/steel_inspection",
+            true
+        )
+        .is_err());
+        assert!(normalize_database_url(
+            "mysql://steel_service:Strong%21Password1@10.0.0.8:3306/steel_inspection?ssl-mode=disabled",
+            true
+        )
+        .is_err());
+        assert!(normalize_database_url(
+            "mysql://steel_service:Strong%21Password1@10.0.0.8:3306/steel_inspection?ssl-mode=required",
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn production_mysql_accepts_strict_remote_tls_and_redacts_credentials() {
+        let url = normalize_database_url(
+            "mysql://steel_service:Strong%21Password1@10.0.0.8:3306/steel_inspection?ssl-mode=verify-identity",
+            true,
+        )
+        .expect("strict remote TLS URL");
+        assert_eq!(
+            redact_database_url(&url),
+            "mysql://10.0.0.8:3306/steel_inspection?ssl-mode=verify-identity"
+        );
+        assert!(!redact_database_url(&url).contains("Password"));
+    }
+
+    #[test]
+    fn development_mysql_compatibility_does_not_weaken_production() {
+        let development =
+            normalize_database_url("mysql://root:nercar@127.0.0.1:3306/steel_inspection", false)
+                .expect("development URL");
+        assert!(development.ends_with("ssl-mode=disabled"));
+        let production = normalize_database_url(
+            "mysql://steel_service:Strong%21Password1@127.0.0.1:3306/steel_inspection",
+            true,
+        )
+        .expect("local production URL");
+        assert!(production.ends_with("ssl-mode=disabled"));
+    }
+
+    #[test]
+    fn bootstrap_admin_password_requires_a_strong_non_default_secret() {
+        assert!(validate_bootstrap_admin_password("admin123").is_err());
+        assert!(validate_bootstrap_admin_password("onlylowercase123!").is_err());
+        assert!(validate_bootstrap_admin_password("StrongBootstrap1!").is_ok());
+    }
+
+    #[test]
+    fn production_bootstrap_creates_one_admin_and_rejects_development_passwords() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let production = Database::connect("sqlite::memory:")
+                .await
+                .expect("production memory database");
+            create_schema(&production).await.expect("production schema");
+            assert!(ensure_admin_data_with_policy(&production, true, None)
+                .await
+                .is_err());
+            ensure_admin_data_with_policy(&production, true, Some("StrongBootstrap1!"))
+                .await
+                .expect("production bootstrap");
+            let users = admin_user::Entity::find()
+                .all(&production)
+                .await
+                .expect("production users");
+            assert_eq!(users.len(), 1);
+            assert_eq!(users[0].id, "admin");
+            assert!(users[0].must_change_password);
+            assert!(verify_admin_password(&users[0], "StrongBootstrap1!"));
+            update_admin_user_password(
+                &production,
+                "admin",
+                &hash_admin_password("admin", "ChangedPassword2!"),
+            )
+            .await
+            .expect("change bootstrap password");
+            let changed = find_admin_user(&production, "admin")
+                .await
+                .expect("changed user query")
+                .expect("changed user");
+            assert!(!changed.must_change_password);
+
+            let development = Database::connect("sqlite::memory:")
+                .await
+                .expect("development memory database");
+            create_schema(&development)
+                .await
+                .expect("development schema");
+            ensure_admin_data_with_policy(&development, false, None)
+                .await
+                .expect("development bootstrap");
+            let error = ensure_admin_data_with_policy(&development, true, None)
+                .await
+                .expect_err("production must reject development passwords");
+            assert!(error.to_string().contains("development default password"));
+        });
+    }
+
+    #[test]
+    fn production_schema_contract_rejects_unversioned_or_dirty_databases() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let fresh = Database::connect("sqlite::memory:")
+                .await
+                .expect("fresh memory database");
+            assert_eq!(
+                prepare_schema(&fresh, true)
+                    .await
+                    .expect("fresh production schema"),
+                DATABASE_SCHEMA_VERSION
+            );
+            assert_eq!(
+                prepare_schema(&fresh, true)
+                    .await
+                    .expect("versioned production schema"),
+                DATABASE_SCHEMA_VERSION
+            );
+
+            execute(
+                &fresh,
+                "UPDATE steel_schema_state SET dirty = 1, active_migration_id = 'test' WHERE singleton_id = 1",
+            )
+            .await
+            .expect("mark schema dirty");
+            let dirty_error = prepare_schema(&fresh, true)
+                .await
+                .expect_err("dirty schema must fail closed");
+            assert!(dirty_error.to_string().contains("dirty or has an active migration"));
+            execute(
+                &fresh,
+                "UPDATE steel_schema_state SET current_version = 2, dirty = 0, active_migration_id = '' WHERE singleton_id = 1",
+            )
+            .await
+            .expect("mark schema unreadable");
+            let version_error = prepare_schema(&fresh, true)
+                .await
+                .expect_err("unreadable schema version must fail closed");
+            assert!(version_error.to_string().contains("outside this service's readable range"));
+
+            let unversioned = Database::connect("sqlite::memory:")
+                .await
+                .expect("legacy memory database");
+            execute(&unversioned, "CREATE TABLE legacy_data (id INTEGER PRIMARY KEY)")
+                .await
+                .expect("legacy table");
+            let legacy_error = prepare_schema(&unversioned, true)
+                .await
+                .expect_err("unversioned production database must fail closed");
+            assert!(legacy_error
+                .to_string()
+                .contains("unversioned non-empty production database"));
+        });
+    }
+}
 
 #[derive(Clone)]
 pub struct AppDatabase {
@@ -31,6 +221,7 @@ pub struct AppDatabase {
     pub engine: String,
     pub url: String,
     pub file_path: Option<PathBuf>,
+    pub schema_version: i64,
 }
 
 impl AppDatabase {
@@ -202,6 +393,9 @@ pub struct ProductionTaskInput {
     pub kind: String,
     pub material_id: String,
     pub session_id: String,
+    pub chain_id: String,
+    pub depends_on_task_id: String,
+    pub dependency_policy: String,
     pub payload: String,
     pub actor: String,
     pub max_attempts: i32,
@@ -311,6 +505,15 @@ pub enum ProductionAlarmTransition {
     NotFound,
 }
 
+#[derive(Clone)]
+pub enum ManagedAlarmReconcile {
+    Created(production_alarm::Model),
+    Updated(production_alarm::Model),
+    Resolved(production_alarm::Model),
+    Unchanged,
+    Absent,
+}
+
 #[derive(Clone, Default)]
 pub struct AuditLogFilter {
     pub keyword: Option<String>,
@@ -359,12 +562,24 @@ pub struct DeleteInspectionRecordResult {
     pub capture_files_deleted: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub struct InspectionRecordRetentionResult {
     pub matched: u64,
     pub deleted_records: u64,
     pub deleted_defects: u64,
     pub deleted_capture_files: u64,
+}
+
+#[derive(Clone)]
+pub struct RecordCleanupInput {
+    pub record_id: String,
+    pub material_id: String,
+    pub actor: String,
+    pub reason: String,
+    pub manifest_json: String,
+    pub files_planned: i32,
+    pub bytes_planned: i64,
 }
 
 #[derive(Clone)]
@@ -376,8 +591,9 @@ pub struct AdminAuditLogPage {
 }
 
 pub async fn open_database(path: PathBuf) -> Result<AppDatabase, DbErr> {
+    let production_policy = production_security_policy_enabled();
     if let Ok(url) = env::var("STEEL_DATABASE_URL") {
-        let url = normalize_database_url(url.trim());
+        let url = normalize_database_url(url.trim(), production_policy)?;
         if !url.is_empty() {
             return open_database_url(url, path).await;
         }
@@ -388,19 +604,25 @@ pub async fn open_database(path: PathBuf) -> Result<AppDatabase, DbErr> {
     {
         let host = env::var("STEEL_MYSQL_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port = env::var("STEEL_MYSQL_PORT").unwrap_or_else(|_| "3306".to_string());
-        let user = env::var("STEEL_MYSQL_USER").unwrap_or_else(|_| "root".to_string());
-        let password = env::var("STEEL_MYSQL_PASSWORD").unwrap_or_else(|_| "nercar".to_string());
+        let user =
+            required_production_database_setting("STEEL_MYSQL_USER", "root", production_policy)?;
+        let password = required_production_database_setting(
+            "STEEL_MYSQL_PASSWORD",
+            "nercar",
+            production_policy,
+        )?;
         let database =
             env::var("STEEL_MYSQL_DATABASE").unwrap_or_else(|_| "steel_inspection".to_string());
-        let url = normalize_database_url(&format!(
-            "mysql://{user}:{password}@{host}:{port}/{database}"
-        ));
+        let url = normalize_database_url(
+            &format!("mysql://{user}:{password}@{host}:{port}/{database}"),
+            production_policy,
+        )?;
         return open_database_url(url, path).await;
     }
 
     let url = format!("sqlite://{}?mode=rwc", path.display());
     let connection = Database::connect(url.clone()).await?;
-    create_schema(&connection).await?;
+    let schema_version = prepare_schema(&connection, production_policy).await?;
     seed_database(&connection).await?;
     Ok(AppDatabase {
         connection,
@@ -408,26 +630,148 @@ pub async fn open_database(path: PathBuf) -> Result<AppDatabase, DbErr> {
         engine: "sqlite".to_string(),
         url,
         file_path: Some(path),
+        schema_version,
     })
 }
 
-fn normalize_database_url(url: &str) -> String {
-    if (url.starts_with("mysql://") || url.starts_with("mysqlx://"))
-        && !url.to_ascii_lowercase().contains("ssl-mode=")
-    {
-        let separator = if url.contains('?') { '&' } else { '?' };
-        format!("{url}{separator}ssl-mode=disabled")
-    } else {
-        url.to_string()
+fn required_production_database_setting(
+    name: &str,
+    development_default: &str,
+    production_policy: bool,
+) -> Result<String, DbErr> {
+    match env::var(name).ok().filter(|value| !value.trim().is_empty()) {
+        Some(value) => Ok(value),
+        None if production_policy => Err(DbErr::Custom(format!(
+            "{name} is required when STEEL_DATABASE_ENGINE=mysql in production"
+        ))),
+        None => Ok(development_default.to_string()),
     }
 }
 
+fn normalize_database_url(url: &str, production_policy: bool) -> Result<String, DbErr> {
+    if !(url.starts_with("mysql://") || url.starts_with("mysqlx://")) {
+        return Ok(url.to_string());
+    }
+    if production_policy {
+        validate_production_mysql_url(url)?;
+    }
+    if mysql_ssl_mode(url).is_none() {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        Ok(format!("{url}{separator}ssl-mode=disabled"))
+    } else {
+        Ok(url.to_string())
+    }
+}
+
+fn validate_production_mysql_url(url: &str) -> Result<(), DbErr> {
+    let (user, password, host) = mysql_connection_identity(url).ok_or_else(|| {
+        DbErr::Custom("production MySQL URL must include user, password, host, and database".into())
+    })?;
+    if user.eq_ignore_ascii_case("root") {
+        return Err(DbErr::Custom(
+            "production MySQL must not use the root account".to_string(),
+        ));
+    }
+    if password.is_empty() || password.eq_ignore_ascii_case("nercar") {
+        return Err(DbErr::Custom(
+            "production MySQL requires a non-default password".to_string(),
+        ));
+    }
+    if !mysql_host_is_loopback(&host) {
+        let ssl_mode = mysql_ssl_mode(url).unwrap_or_default();
+        if !matches!(ssl_mode.as_str(), "verify-ca" | "verify-identity") {
+            return Err(DbErr::Custom(
+                "remote production MySQL requires ssl-mode=verify-ca or verify-identity"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mysql_connection_identity(url: &str) -> Option<(String, String, String)> {
+    let (_, remainder) = url.split_once("://")?;
+    let (authority, database_and_query) = remainder.split_once('/')?;
+    if database_and_query.split('?').next()?.trim().is_empty() {
+        return None;
+    }
+    let (user_info, host_port) = authority.rsplit_once('@')?;
+    let (user, password) = user_info.split_once(':')?;
+    let host = if let Some(ipv6) = host_port.strip_prefix('[') {
+        ipv6.split(']').next()?.to_string()
+    } else {
+        host_port
+            .rsplit_once(':')
+            .filter(|(_, port)| port.chars().all(|ch| ch.is_ascii_digit()))
+            .map(|(host, _)| host)
+            .unwrap_or(host_port)
+            .to_string()
+    };
+    Some((
+        percent_decode_url_component(user),
+        percent_decode_url_component(password),
+        host,
+    ))
+}
+
+fn percent_decode_url_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &value[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                decoded.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn mysql_host_is_loopback(host: &str) -> bool {
+    matches!(
+        host.trim().to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
+fn mysql_ssl_mode(url: &str) -> Option<String> {
+    url.split_once('?')?.1.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        key.eq_ignore_ascii_case("ssl-mode").then(|| {
+            percent_decode_url_component(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+    })
+}
+
+fn redact_database_url(url: &str) -> String {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some((authority, suffix)) = remainder.split_once('/') else {
+        return format!("{scheme}://<redacted>");
+    };
+    let redacted_authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    format!("{scheme}://{redacted_authority}/{suffix}")
+}
+
 pub async fn open_database_url(url: String, fallback_path: PathBuf) -> Result<AppDatabase, DbErr> {
+    let production_policy = production_security_policy_enabled();
     if url.starts_with("mysql://") || url.starts_with("mysqlx://") {
         ensure_mysql_database(&url).await?;
     }
     let connection = Database::connect(url.clone()).await?;
-    create_schema(&connection).await?;
+    let schema_version = prepare_schema(&connection, production_policy).await?;
     seed_database(&connection).await?;
     let engine = match connection.get_database_backend() {
         DbBackend::MySql => "mysql",
@@ -440,8 +784,9 @@ pub async fn open_database_url(url: String, fallback_path: PathBuf) -> Result<Ap
         connection,
         path: fallback_path,
         engine,
-        url,
+        url: redact_database_url(&url),
         file_path,
+        schema_version,
     })
 }
 
@@ -526,12 +871,8 @@ pub async fn load_admin_overview(connection: &DatabaseConnection) -> Result<Admi
                 .count(connection)
                 .await?,
             capture_file_count: capture_file::Entity::find().count(connection).await?,
-            production_defect_count: production_defect::Entity::find()
-                .count(connection)
-                .await?,
-            production_alarm_count: production_alarm::Entity::find()
-                .count(connection)
-                .await?,
+            production_defect_count: production_defect::Entity::find().count(connection).await?,
+            production_alarm_count: production_alarm::Entity::find().count(connection).await?,
         },
         configs: app_config::Entity::find()
             .order_by_asc(app_config::Column::Key)
@@ -723,19 +1064,21 @@ pub async fn save_admin_user(
         active.status = Set(input.status);
         if let Some(password_hash) = input.password_hash {
             active.password_hash = Set(password_hash);
+            active.must_change_password = Set(true);
         }
         active.last_login_at = Set(input.last_login_at);
         active.update(connection).await
     } else {
-        let password_hash = input
-            .password_hash
-            .unwrap_or_else(|| hash_admin_password(&input.id, DEFAULT_ADMIN_PASSWORD));
+        let password_hash = input.password_hash.ok_or_else(|| {
+            DbErr::Custom("password hash is required when creating an admin user".to_string())
+        })?;
         admin_user::ActiveModel {
             id: Set(input.id),
             display_name: Set(input.display_name),
             role: Set(input.role),
             status: Set(input.status),
             password_hash: Set(password_hash),
+            must_change_password: Set(true),
             last_login_at: Set(input.last_login_at),
             created_at: Set(now_millis_string()),
         }
@@ -765,6 +1108,7 @@ pub async fn update_admin_user_password(
     if let Some(model) = find_admin_user(connection, id).await? {
         let mut active: admin_user::ActiveModel = model.into();
         active.password_hash = Set(password_hash.to_string());
+        active.must_change_password = Set(false);
         active.update(connection).await?;
     }
     Ok(())
@@ -1152,6 +1496,7 @@ pub async fn find_inspection_record_detail(
     }))
 }
 
+#[cfg(test)]
 pub async fn delete_inspection_record(
     connection: &DatabaseConnection,
     id: &str,
@@ -1191,6 +1536,153 @@ pub async fn delete_inspection_record(
         defects_deleted,
         capture_files_deleted,
     }))
+}
+
+pub async fn create_or_load_record_cleanup(
+    connection: &DatabaseConnection,
+    input: RecordCleanupInput,
+) -> Result<record_cleanup::Model, DbErr> {
+    if let Some(existing) = record_cleanup::Entity::find()
+        .filter(record_cleanup::Column::RecordId.eq(&input.record_id))
+        .filter(record_cleanup::Column::Status.is_in(["planned", "deleting", "failed"]))
+        .order_by_desc(record_cleanup::Column::CreatedAt)
+        .one(connection)
+        .await?
+    {
+        return Ok(existing);
+    }
+    let now = now_millis_string();
+    record_cleanup::ActiveModel {
+        id: Set(format!("CLEAN-{}", now_nanos_string())),
+        record_id: Set(input.record_id),
+        material_id: Set(input.material_id),
+        status: Set("planned".to_string()),
+        actor: Set(input.actor),
+        reason: Set(input.reason),
+        manifest_json: Set(input.manifest_json),
+        files_planned: Set(input.files_planned),
+        files_deleted: Set(0),
+        files_missing: Set(0),
+        bytes_planned: Set(input.bytes_planned),
+        bytes_deleted: Set(0),
+        error: Set(String::new()),
+        created_at: Set(now.clone()),
+        updated_at: Set(now),
+        completed_at: Set(String::new()),
+    }
+    .insert(connection)
+    .await
+}
+
+pub async fn find_record_cleanup(
+    connection: &DatabaseConnection,
+    id: &str,
+) -> Result<Option<record_cleanup::Model>, DbErr> {
+    record_cleanup::Entity::find()
+        .filter(record_cleanup::Column::Id.eq(id))
+        .one(connection)
+        .await
+}
+
+pub async fn find_open_record_cleanup_for_record(
+    connection: &DatabaseConnection,
+    record_id: &str,
+) -> Result<Option<record_cleanup::Model>, DbErr> {
+    record_cleanup::Entity::find()
+        .filter(record_cleanup::Column::RecordId.eq(record_id))
+        .filter(record_cleanup::Column::Status.is_in(["planned", "deleting", "failed"]))
+        .order_by_desc(record_cleanup::Column::CreatedAt)
+        .one(connection)
+        .await
+}
+
+pub async fn update_record_cleanup_progress(
+    connection: &DatabaseConnection,
+    id: &str,
+    status: &str,
+    manifest_json: &str,
+    files_deleted: i32,
+    files_missing: i32,
+    bytes_deleted: i64,
+    error: &str,
+) -> Result<record_cleanup::Model, DbErr> {
+    let Some(model) = find_record_cleanup(connection, id).await? else {
+        return Err(DbErr::RecordNotFound(format!("record cleanup {id}")));
+    };
+    let mut active: record_cleanup::ActiveModel = model.into();
+    active.status = Set(status.to_string());
+    active.manifest_json = Set(manifest_json.to_string());
+    active.files_deleted = Set(files_deleted);
+    active.files_missing = Set(files_missing);
+    active.bytes_deleted = Set(bytes_deleted);
+    active.error = Set(error.to_string());
+    active.updated_at = Set(now_millis_string());
+    active.update(connection).await
+}
+
+pub async fn complete_record_cleanup(
+    connection: &DatabaseConnection,
+    cleanup_id: &str,
+    record_id: &str,
+    manifest_json: &str,
+    files_deleted: i32,
+    files_missing: i32,
+    bytes_deleted: i64,
+) -> Result<DeleteInspectionRecordResult, DbErr> {
+    let Some(inspection) = production_inspection::Entity::find()
+        .filter(production_inspection::Column::Id.eq(record_id))
+        .one(connection)
+        .await?
+    else {
+        return Err(DbErr::RecordNotFound(format!(
+            "production inspection {record_id}"
+        )));
+    };
+    let transaction = connection.begin().await?;
+    let defects_deleted = production_defect::Entity::delete_many()
+        .filter(production_defect::Column::InspectionId.eq(record_id))
+        .exec(&transaction)
+        .await?
+        .rows_affected;
+    let capture_files_deleted = capture_file::Entity::delete_many()
+        .filter(capture_file::Column::InspectionId.eq(record_id))
+        .exec(&transaction)
+        .await?
+        .rows_affected;
+    let deleted = production_inspection::Entity::delete_many()
+        .filter(production_inspection::Column::Id.eq(record_id))
+        .exec(&transaction)
+        .await?
+        .rows_affected;
+    if deleted != 1 {
+        transaction.rollback().await?;
+        return Err(DbErr::Custom(
+            "record cleanup lost inspection ownership".to_string(),
+        ));
+    }
+    let cleanup = record_cleanup::Entity::find()
+        .filter(record_cleanup::Column::Id.eq(cleanup_id))
+        .one(&transaction)
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound(format!("record cleanup {cleanup_id}")))?;
+    let now = now_millis_string();
+    let mut active: record_cleanup::ActiveModel = cleanup.into();
+    active.status = Set("completed".to_string());
+    active.manifest_json = Set(manifest_json.to_string());
+    active.files_deleted = Set(files_deleted);
+    active.files_missing = Set(files_missing);
+    active.bytes_deleted = Set(bytes_deleted);
+    active.error = Set(String::new());
+    active.updated_at = Set(now.clone());
+    active.completed_at = Set(now);
+    active.update(&transaction).await?;
+    transaction.commit().await?;
+    Ok(DeleteInspectionRecordResult {
+        id: inspection.id,
+        material_id: inspection.material_id,
+        defects_deleted,
+        capture_files_deleted,
+    })
 }
 
 pub async fn inspection_record_retention_cutoff(
@@ -1239,6 +1731,14 @@ async fn inspection_records_before(
     Ok(candidates)
 }
 
+pub async fn inspection_record_ids_before(
+    connection: &DatabaseConnection,
+    retention_days: u64,
+) -> Result<Vec<String>, DbErr> {
+    inspection_records_before(connection, retention_days).await
+}
+
+#[cfg(test)]
 pub async fn count_inspection_records_before(
     connection: &DatabaseConnection,
     retention_days: u64,
@@ -1248,6 +1748,7 @@ pub async fn count_inspection_records_before(
         .len() as u64)
 }
 
+#[cfg(test)]
 pub async fn delete_inspection_records_before(
     connection: &DatabaseConnection,
     retention_days: u64,
@@ -1531,8 +2032,7 @@ pub async fn list_unresolved_calibration_operations(
 ) -> Result<Vec<calibration_operation::Model>, DbErr> {
     calibration_operation::Entity::find()
         .filter(
-            calibration_operation::Column::Status
-                .is_in(["dispatching", "needs-reconciliation"]),
+            calibration_operation::Column::Status.is_in(["dispatching", "needs-reconciliation"]),
         )
         .order_by_asc(calibration_operation::Column::CreatedAt)
         .all(connection)
@@ -1578,10 +2078,7 @@ pub async fn reconcile_calibration_operation(
             calibration_operation::Column::RowVersion,
             Expr::value(existing.row_version.saturating_add(1)),
         )
-        .col_expr(
-            calibration_operation::Column::UpdatedAt,
-            Expr::value(now),
-        )
+        .col_expr(calibration_operation::Column::UpdatedAt, Expr::value(now))
         .filter(calibration_operation::Column::Id.eq(operation_id))
         .filter(calibration_operation::Column::Status.eq("needs-reconciliation"))
         .filter(calibration_operation::Column::RowVersion.eq(existing.row_version))
@@ -1618,18 +2115,12 @@ pub async fn finish_calibration_operation(
             calibration_operation::Column::ProviderResponseBody,
             Expr::value(provider_response_body),
         )
-        .col_expr(
-            calibration_operation::Column::Error,
-            Expr::value(error),
-        )
+        .col_expr(calibration_operation::Column::Error, Expr::value(error))
         .col_expr(
             calibration_operation::Column::FinishedAt,
             Expr::value(now.clone()),
         )
-        .col_expr(
-            calibration_operation::Column::UpdatedAt,
-            Expr::value(now),
-        )
+        .col_expr(calibration_operation::Column::UpdatedAt, Expr::value(now))
         .col_expr(
             calibration_operation::Column::RowVersion,
             Expr::value(existing.row_version.saturating_add(1)),
@@ -1668,10 +2159,7 @@ pub async fn recover_dispatching_calibration_operations(
                 calibration_operation::Column::FinishedAt,
                 Expr::value(now.clone()),
             )
-            .col_expr(
-                calibration_operation::Column::UpdatedAt,
-                Expr::value(now),
-            )
+            .col_expr(calibration_operation::Column::UpdatedAt, Expr::value(now))
             .col_expr(
                 calibration_operation::Column::RowVersion,
                 Expr::value(existing.row_version.saturating_add(1)),
@@ -1697,6 +2185,10 @@ pub async fn insert_production_task(
         kind: Set(input.kind),
         material_id: Set(input.material_id),
         session_id: Set(input.session_id),
+        chain_id: Set(input.chain_id),
+        depends_on_task_id: Set(input.depends_on_task_id),
+        dependency_policy: Set(input.dependency_policy),
+        blocked_reason: Set(String::new()),
         status: Set("queued".to_string()),
         phase: Set("queued".to_string()),
         payload: Set(input.payload),
@@ -1740,27 +2232,235 @@ pub async fn find_production_task_by_idempotency_key(
         .await
 }
 
-pub async fn count_open_production_tasks(
+pub async fn latest_production_task_in_chain(
     connection: &DatabaseConnection,
+    chain_id: &str,
+) -> Result<Option<production_task::Model>, DbErr> {
+    if chain_id.trim().is_empty() {
+        return Ok(None);
+    }
+    production_task::Entity::find()
+        .filter(production_task::Column::ChainId.eq(chain_id))
+        .order_by_desc(production_task::Column::CreatedAt)
+        .order_by_desc(production_task::Column::Id)
+        .one(connection)
+        .await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProductionTaskDependencyState {
+    Ready,
+    Waiting,
+    Blocked(String),
+}
+
+fn production_task_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "succeeded" | "failed" | "cancelled" | "interrupted" | "blocked"
+    )
+}
+
+async fn production_task_dependency_state(
+    connection: &DatabaseConnection,
+    task: &production_task::Model,
+) -> Result<ProductionTaskDependencyState, DbErr> {
+    if task.depends_on_task_id.trim().is_empty() {
+        return Ok(ProductionTaskDependencyState::Ready);
+    }
+    if task.depends_on_task_id == task.id {
+        return Ok(ProductionTaskDependencyState::Blocked(format!(
+            "dependency_cycle:{}",
+            task.id
+        )));
+    }
+    let Some(dependency) = find_production_task(connection, &task.depends_on_task_id).await? else {
+        return Ok(ProductionTaskDependencyState::Blocked(format!(
+            "dependency_not_found:{}",
+            task.depends_on_task_id
+        )));
+    };
+    if dependency.chain_id != task.chain_id
+        || dependency.session_id != task.session_id
+        || dependency.material_id != task.material_id
+    {
+        return Ok(ProductionTaskDependencyState::Blocked(format!(
+            "dependency_chain_mismatch:{}",
+            dependency.id
+        )));
+    }
+    if task.dependency_policy == "always-run" {
+        return Ok(if production_task_status_is_terminal(&dependency.status) {
+            ProductionTaskDependencyState::Ready
+        } else {
+            ProductionTaskDependencyState::Waiting
+        });
+    }
+    Ok(match dependency.status.as_str() {
+        "succeeded" => ProductionTaskDependencyState::Ready,
+        "failed" | "cancelled" | "interrupted" | "blocked" => {
+            ProductionTaskDependencyState::Blocked(format!(
+                "dependency_{}:{}",
+                dependency.status, dependency.id
+            ))
+        }
+        _ => ProductionTaskDependencyState::Waiting,
+    })
+}
+
+async fn mark_production_task_blocked(
+    connection: &DatabaseConnection,
+    id: &str,
+    reason: &str,
+) -> Result<bool, DbErr> {
+    let now = now_millis_string();
+    let update = production_task::Entity::update_many()
+        .col_expr(production_task::Column::Status, Expr::value("blocked"))
+        .col_expr(production_task::Column::Phase, Expr::value("blocked"))
+        .col_expr(production_task::Column::Progress, Expr::value(0))
+        .col_expr(
+            production_task::Column::BlockedReason,
+            Expr::value(reason.to_string()),
+        )
+        .col_expr(
+            production_task::Column::Error,
+            Expr::value(reason.to_string()),
+        )
+        .col_expr(
+            production_task::Column::FinishedAt,
+            Expr::value(now.clone()),
+        )
+        .col_expr(production_task::Column::UpdatedAt, Expr::value(now))
+        .filter(production_task::Column::Id.eq(id))
+        .filter(production_task::Column::Status.eq("queued"))
+        .exec(connection)
+        .await?;
+    Ok(update.rows_affected == 1)
+}
+
+pub async fn propagate_production_task_dependency_failure(
+    connection: &DatabaseConnection,
+    parent_id: &str,
 ) -> Result<u64, DbErr> {
+    let mut frontier = vec![parent_id.to_string()];
+    let mut blocked = 0_u64;
+    while let Some(parent) = frontier.pop() {
+        let dependents = production_task::Entity::find()
+            .filter(production_task::Column::DependsOnTaskId.eq(&parent))
+            .filter(production_task::Column::DependencyPolicy.eq("require-success"))
+            .filter(production_task::Column::Status.eq("queued"))
+            .all(connection)
+            .await?;
+        let parent_status = find_production_task(connection, &parent)
+            .await?
+            .map(|task| task.status)
+            .unwrap_or_else(|| "not_found".to_string());
+        for dependent in dependents {
+            let reason = format!("dependency_{}:{}", parent_status, parent);
+            if mark_production_task_blocked(connection, &dependent.id, &reason).await? {
+                blocked = blocked.saturating_add(1);
+                frontier.push(dependent.id);
+            }
+        }
+    }
+    Ok(blocked)
+}
+
+async fn requeue_blocked_production_task_descendants(
+    connection: &DatabaseConnection,
+    parent_id: &str,
+) -> Result<u64, DbErr> {
+    let mut frontier = vec![parent_id.to_string()];
+    let mut requeued = 0_u64;
+    while let Some(parent) = frontier.pop() {
+        let dependents = production_task::Entity::find()
+            .filter(production_task::Column::DependsOnTaskId.eq(&parent))
+            .filter(production_task::Column::Status.eq("blocked"))
+            .all(connection)
+            .await?;
+        for dependent in dependents {
+            let now = now_millis_string();
+            let update = production_task::Entity::update_many()
+                .col_expr(production_task::Column::Status, Expr::value("queued"))
+                .col_expr(
+                    production_task::Column::Phase,
+                    Expr::value("waiting-dependency"),
+                )
+                .col_expr(production_task::Column::BlockedReason, Expr::value(""))
+                .col_expr(production_task::Column::Error, Expr::value(""))
+                .col_expr(production_task::Column::FinishedAt, Expr::value(""))
+                .col_expr(production_task::Column::UpdatedAt, Expr::value(now))
+                .filter(production_task::Column::Id.eq(&dependent.id))
+                .filter(production_task::Column::Status.eq("blocked"))
+                .exec(connection)
+                .await?;
+            if update.rows_affected == 1 {
+                requeued = requeued.saturating_add(1);
+                frontier.push(dependent.id);
+            }
+        }
+    }
+    Ok(requeued)
+}
+
+pub async fn count_open_production_tasks(connection: &DatabaseConnection) -> Result<u64, DbErr> {
     production_task::Entity::find()
         .filter(production_task::Column::Status.is_in(["queued", "running"]))
         .count(connection)
         .await
 }
 
-pub async fn latest_open_production_task(
+pub async fn count_unresolved_production_tasks_for_session(
+    connection: &DatabaseConnection,
+    session_id: &str,
+) -> Result<u64, DbErr> {
+    production_task::Entity::find()
+        .filter(production_task::Column::SessionId.eq(session_id))
+        .filter(production_task::Column::Status.is_in([
+            "queued",
+            "running",
+            "failed",
+            "interrupted",
+            "blocked",
+        ]))
+        .count(connection)
+        .await
+}
+
+pub async fn latest_unresolved_production_task(
     connection: &DatabaseConnection,
     material_id: Option<&str>,
 ) -> Result<Option<production_task::Model>, DbErr> {
     let mut query = production_task::Entity::find()
-        .filter(production_task::Column::Status.is_in(["queued", "running"]))
+        .filter(production_task::Column::Status.is_in([
+            "queued",
+            "running",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "blocked",
+        ]))
         .order_by_desc(production_task::Column::CreatedAt)
         .order_by_desc(production_task::Column::Id);
     if let Some(material_id) = material_id.filter(|value| !value.trim().is_empty()) {
         query = query.filter(production_task::Column::MaterialId.eq(material_id));
     }
     query.one(connection).await
+}
+
+pub async fn latest_production_task_for_session(
+    connection: &DatabaseConnection,
+    session_id: &str,
+) -> Result<Option<production_task::Model>, DbErr> {
+    if session_id.trim().is_empty() {
+        return Ok(None);
+    }
+    production_task::Entity::find()
+        .filter(production_task::Column::SessionId.eq(session_id))
+        .order_by_desc(production_task::Column::CreatedAt)
+        .order_by_desc(production_task::Column::Id)
+        .one(connection)
+        .await
 }
 
 pub async fn list_production_tasks(
@@ -1792,38 +2492,51 @@ pub async fn claim_next_production_task(
     connection: &DatabaseConnection,
 ) -> Result<Option<production_task::Model>, DbErr> {
     loop {
-        let Some(model) = production_task::Entity::find()
+        let queued = production_task::Entity::find()
             .filter(production_task::Column::Status.eq("queued"))
             .filter(production_task::Column::CancelRequested.eq(false))
             .order_by_asc(production_task::Column::CreatedAt)
             .order_by_asc(production_task::Column::Id)
-            .one(connection)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let now = now_millis_string();
-        let update = production_task::Entity::update_many()
-            .col_expr(production_task::Column::Status, Expr::value("running"))
-            .col_expr(production_task::Column::Phase, Expr::value("executing"))
-            .col_expr(production_task::Column::Progress, Expr::value(5))
-            .col_expr(
-                production_task::Column::Attempts,
-                Expr::value(model.attempts + 1),
-            )
-            .col_expr(
-                production_task::Column::StartedAt,
-                Expr::value(now.clone()),
-            )
-            .col_expr(production_task::Column::FinishedAt, Expr::value(""))
-            .col_expr(production_task::Column::UpdatedAt, Expr::value(now))
-            .filter(production_task::Column::Id.eq(&model.id))
-            .filter(production_task::Column::Status.eq("queued"))
-            .filter(production_task::Column::CancelRequested.eq(false))
-            .exec(connection)
+            .all(connection)
             .await?;
-        if update.rows_affected == 1 {
-            return find_production_task(connection, &model.id).await;
+        if queued.is_empty() {
+            return Ok(None);
+        }
+        let mut changed = false;
+        for model in queued {
+            match production_task_dependency_state(connection, &model).await? {
+                ProductionTaskDependencyState::Waiting => continue,
+                ProductionTaskDependencyState::Blocked(reason) => {
+                    changed |= mark_production_task_blocked(connection, &model.id, &reason).await?;
+                }
+                ProductionTaskDependencyState::Ready => {
+                    let now = now_millis_string();
+                    let update = production_task::Entity::update_many()
+                        .col_expr(production_task::Column::Status, Expr::value("running"))
+                        .col_expr(production_task::Column::Phase, Expr::value("executing"))
+                        .col_expr(production_task::Column::Progress, Expr::value(5))
+                        .col_expr(
+                            production_task::Column::Attempts,
+                            Expr::value(model.attempts + 1),
+                        )
+                        .col_expr(production_task::Column::BlockedReason, Expr::value(""))
+                        .col_expr(production_task::Column::StartedAt, Expr::value(now.clone()))
+                        .col_expr(production_task::Column::FinishedAt, Expr::value(""))
+                        .col_expr(production_task::Column::UpdatedAt, Expr::value(now))
+                        .filter(production_task::Column::Id.eq(&model.id))
+                        .filter(production_task::Column::Status.eq("queued"))
+                        .filter(production_task::Column::CancelRequested.eq(false))
+                        .exec(connection)
+                        .await?;
+                    if update.rows_affected == 1 {
+                        return find_production_task(connection, &model.id).await;
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Ok(None);
         }
     }
 }
@@ -1866,7 +2579,7 @@ pub async fn finish_production_task(
     let Some(model) = find_production_task(connection, id).await? else {
         return Ok(None);
     };
-    let terminal = matches!(status, "succeeded" | "failed" | "cancelled" | "interrupted");
+    let terminal = production_task_status_is_terminal(status);
     let now = now_millis_string();
     let mut active: production_task::ActiveModel = model.into();
     active.status = Set(status.to_string());
@@ -1876,7 +2589,11 @@ pub async fn finish_production_task(
     active.error = Set(error);
     active.finished_at = Set(if terminal { now.clone() } else { String::new() });
     active.updated_at = Set(now);
-    active.update(connection).await.map(Some)
+    let updated = active.update(connection).await?;
+    if matches!(status, "failed" | "cancelled" | "interrupted" | "blocked") {
+        propagate_production_task_dependency_failure(connection, id).await?;
+    }
+    Ok(Some(updated))
 }
 
 pub async fn request_cancel_production_task(
@@ -1888,7 +2605,7 @@ pub async fn request_cancel_production_task(
     };
     if matches!(
         model.status.as_str(),
-        "succeeded" | "failed" | "cancelled" | "interrupted"
+        "succeeded" | "failed" | "cancelled" | "interrupted" | "blocked"
     ) {
         return Ok(Some(model));
     }
@@ -1903,7 +2620,11 @@ pub async fn request_cancel_production_task(
         active.error = Set("cancelled before execution".to_string());
         active.finished_at = Set(now);
     }
-    active.update(connection).await.map(Some)
+    let updated = active.update(connection).await?;
+    if queued {
+        propagate_production_task_dependency_failure(connection, id).await?;
+    }
+    Ok(Some(updated))
 }
 
 pub async fn retry_production_task(
@@ -1913,7 +2634,16 @@ pub async fn retry_production_task(
     let Some(model) = find_production_task(connection, id).await? else {
         return Ok(None);
     };
-    if !matches!(model.status.as_str(), "failed" | "cancelled" | "interrupted") {
+    if !matches!(
+        model.status.as_str(),
+        "failed" | "cancelled" | "interrupted" | "blocked"
+    ) {
+        return Ok(Some(model));
+    }
+    if model.status == "blocked"
+        && production_task_dependency_state(connection, &model).await?
+            != ProductionTaskDependencyState::Ready
+    {
         return Ok(Some(model));
     }
     let now = now_millis_string();
@@ -1924,12 +2654,15 @@ pub async fn retry_production_task(
     active.progress = Set(0);
     active.max_attempts = Set(next_max_attempts);
     active.cancel_requested = Set(false);
+    active.blocked_reason = Set(String::new());
     active.result = Set(String::new());
     active.error = Set(String::new());
     active.started_at = Set(String::new());
     active.finished_at = Set(String::new());
     active.updated_at = Set(now);
-    active.update(connection).await.map(Some)
+    let updated = active.update(connection).await?;
+    requeue_blocked_production_task_descendants(connection, id).await?;
+    Ok(Some(updated))
 }
 
 pub async fn recover_incomplete_production_tasks(
@@ -1941,11 +2674,22 @@ pub async fn recover_incomplete_production_tasks(
         .await?;
     let mut recovered = 0;
     for model in tasks {
+        let task_id = model.id.clone();
         let now = now_millis_string();
         let cancelled = model.cancel_requested;
         let mut active: production_task::ActiveModel = model.into();
-        active.status = Set(if cancelled { "cancelled" } else { "interrupted" }.to_string());
-        active.phase = Set(if cancelled { "cancelled" } else { "interrupted" }.to_string());
+        active.status = Set(if cancelled {
+            "cancelled"
+        } else {
+            "interrupted"
+        }
+        .to_string());
+        active.phase = Set(if cancelled {
+            "cancelled"
+        } else {
+            "interrupted"
+        }
+        .to_string());
         active.progress = Set(0);
         active.error = Set(if cancelled {
             "cancelled during service restart".to_string()
@@ -1956,6 +2700,7 @@ pub async fn recover_incomplete_production_tasks(
         active.finished_at = Set(now.clone());
         active.updated_at = Set(now);
         active.update(connection).await?;
+        propagate_production_task_dependency_failure(connection, &task_id).await?;
         recovered += 1;
     }
     Ok(recovered)
@@ -2108,6 +2853,139 @@ pub async fn ensure_production_alarm(
     ensure_production_alarm_on(connection, input).await
 }
 
+pub async fn reconcile_managed_alarm(
+    connection: &DatabaseConnection,
+    source: &str,
+    alarm_type: &str,
+    active: Option<ProductionAlarmInput>,
+    actor: &str,
+) -> Result<ManagedAlarmReconcile, DbErr> {
+    let existing = production_alarm::Entity::find()
+        .filter(production_alarm::Column::Source.eq(source))
+        .filter(production_alarm::Column::AlarmType.eq(alarm_type))
+        .filter(production_alarm::Column::Status.is_in(["active", "acknowledged"]))
+        .order_by_desc(production_alarm::Column::CreatedAt)
+        .order_by_desc(production_alarm::Column::Id)
+        .one(connection)
+        .await?;
+
+    match (existing, active) {
+        (None, None) => Ok(ManagedAlarmReconcile::Absent),
+        (None, Some(input)) => {
+            let (alarm, created) = ensure_production_alarm_on(connection, input).await?;
+            if created {
+                Ok(ManagedAlarmReconcile::Created(alarm))
+            } else {
+                Ok(ManagedAlarmReconcile::Unchanged)
+            }
+        }
+        (Some(existing), Some(input)) => {
+            let changed = existing.severity != input.severity
+                || existing.material_id != input.material_id
+                || existing.session_id != input.session_id
+                || existing.inspection_id != input.inspection_id
+                || existing.camera_id != input.camera_id
+                || existing.message != input.message
+                || existing.details != input.details;
+            if !changed {
+                return Ok(ManagedAlarmReconcile::Unchanged);
+            }
+            production_alarm::Entity::update_many()
+                .col_expr(
+                    production_alarm::Column::Severity,
+                    Expr::value(input.severity),
+                )
+                .col_expr(
+                    production_alarm::Column::MaterialId,
+                    Expr::value(input.material_id),
+                )
+                .col_expr(
+                    production_alarm::Column::SessionId,
+                    Expr::value(input.session_id),
+                )
+                .col_expr(
+                    production_alarm::Column::InspectionId,
+                    Expr::value(input.inspection_id),
+                )
+                .col_expr(
+                    production_alarm::Column::CameraId,
+                    Expr::value(input.camera_id),
+                )
+                .col_expr(
+                    production_alarm::Column::Message,
+                    Expr::value(input.message),
+                )
+                .col_expr(
+                    production_alarm::Column::Details,
+                    Expr::value(input.details),
+                )
+                .filter(production_alarm::Column::Id.eq(&existing.id))
+                .filter(production_alarm::Column::Status.is_in(["active", "acknowledged"]))
+                .exec(connection)
+                .await?;
+            let current = production_alarm::Entity::find_by_id(&existing.id)
+                .one(connection)
+                .await?
+                .ok_or_else(|| {
+                    DbErr::Custom("managed alarm disappeared during refresh".to_string())
+                })?;
+            Ok(ManagedAlarmReconcile::Updated(current))
+        }
+        (Some(existing), None) => {
+            let now = now_millis_string();
+            let acknowledged_at = if existing.acknowledged_at.is_empty() {
+                now.clone()
+            } else {
+                existing.acknowledged_at.clone()
+            };
+            let acknowledged_by = if existing.acknowledged_by.is_empty() {
+                actor.to_string()
+            } else {
+                existing.acknowledged_by.clone()
+            };
+            let acknowledge_note = if existing.acknowledge_note.is_empty() {
+                "系统检测到运行条件已恢复，自动确认并关闭告警。".to_string()
+            } else {
+                existing.acknowledge_note.clone()
+            };
+            production_alarm::Entity::update_many()
+                .col_expr(production_alarm::Column::Status, Expr::value("resolved"))
+                .col_expr(
+                    production_alarm::Column::AcknowledgedAt,
+                    Expr::value(acknowledged_at),
+                )
+                .col_expr(
+                    production_alarm::Column::AcknowledgedBy,
+                    Expr::value(acknowledged_by),
+                )
+                .col_expr(
+                    production_alarm::Column::AcknowledgeNote,
+                    Expr::value(acknowledge_note),
+                )
+                .col_expr(production_alarm::Column::ResolvedAt, Expr::value(now))
+                .col_expr(
+                    production_alarm::Column::ResolvedBy,
+                    Expr::value(actor.to_string()),
+                )
+                .col_expr(
+                    production_alarm::Column::ResolveNote,
+                    Expr::value("系统健康监视器确认运行条件已恢复。"),
+                )
+                .filter(production_alarm::Column::Id.eq(&existing.id))
+                .filter(production_alarm::Column::Status.is_in(["active", "acknowledged"]))
+                .exec(connection)
+                .await?;
+            let current = production_alarm::Entity::find_by_id(&existing.id)
+                .one(connection)
+                .await?
+                .ok_or_else(|| {
+                    DbErr::Custom("managed alarm disappeared during recovery".to_string())
+                })?;
+            Ok(ManagedAlarmReconcile::Resolved(current))
+        }
+    }
+}
+
 pub async fn append_production_defect_with_alarm(
     connection: &DatabaseConnection,
     defect: ProductionDefectInput,
@@ -2137,9 +3015,9 @@ fn filtered_production_alarms(
         .order_by_desc(production_alarm::Column::Id);
     if let Some(status) = filter.status.as_deref().filter(|value| !value.is_empty()) {
         query = match status {
-            "open" => query.filter(
-                production_alarm::Column::Status.is_in(["active", "acknowledged"]),
-            ),
+            "open" => {
+                query.filter(production_alarm::Column::Status.is_in(["active", "acknowledged"]))
+            }
             "history" => query.filter(production_alarm::Column::Status.eq("resolved")),
             "all" => query,
             _ => query.filter(production_alarm::Column::Status.eq(status)),
@@ -2234,10 +3112,7 @@ pub async fn acknowledge_production_alarm(
             production_alarm::Column::Status,
             Expr::value("acknowledged"),
         )
-        .col_expr(
-            production_alarm::Column::AcknowledgedAt,
-            Expr::value(now),
-        )
+        .col_expr(production_alarm::Column::AcknowledgedAt, Expr::value(now))
         .col_expr(
             production_alarm::Column::AcknowledgedBy,
             Expr::value(actor.to_string()),
@@ -2520,6 +3395,184 @@ async fn execute_compatible_migration(
     }
 }
 
+async fn schema_table_count(
+    connection: &DatabaseConnection,
+    table_name: &str,
+) -> Result<i64, DbErr> {
+    if table_name != "steel_schema_state" && table_name != "steel_schema_migration" {
+        return Err(DbErr::Custom(
+            "unsupported schema ledger table name".to_string(),
+        ));
+    }
+    let sql = match connection.get_database_backend() {
+        DbBackend::Sqlite => format!(
+            "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type = 'table' AND name = '{table_name}'"
+        ),
+        DbBackend::MySql => format!(
+            "SELECT CAST(COUNT(*) AS SIGNED) AS table_count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{table_name}'"
+        ),
+        DbBackend::Postgres => {
+            return Err(DbErr::Custom(
+                "PostgreSQL is not supported by the production schema contract".to_string(),
+            ));
+        }
+    };
+    connection
+        .query_one(Statement::from_string(
+            connection.get_database_backend(),
+            sql,
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("schema table count query returned no row".to_string()))?
+        .try_get("", "table_count")
+}
+
+async fn application_table_count(connection: &DatabaseConnection) -> Result<i64, DbErr> {
+    let sql = match connection.get_database_backend() {
+        DbBackend::Sqlite => "SELECT COUNT(*) AS table_count FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             AND name NOT IN ('steel_schema_state', 'steel_schema_migration')"
+            .to_string(),
+        DbBackend::MySql => "SELECT CAST(COUNT(*) AS SIGNED) AS table_count \
+             FROM information_schema.tables WHERE table_schema = DATABASE() \
+             AND table_name NOT IN ('steel_schema_state', 'steel_schema_migration')"
+            .to_string(),
+        DbBackend::Postgres => {
+            return Err(DbErr::Custom(
+                "PostgreSQL is not supported by the production schema contract".to_string(),
+            ));
+        }
+    };
+    connection
+        .query_one(Statement::from_string(
+            connection.get_database_backend(),
+            sql,
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("application table count query returned no row".to_string()))?
+        .try_get("", "table_count")
+}
+
+async fn create_schema_ledger(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    execute(
+        connection,
+        "CREATE TABLE steel_schema_state (
+            singleton_id INTEGER PRIMARY KEY NOT NULL,
+            current_version BIGINT NOT NULL,
+            dirty INTEGER NOT NULL,
+            active_migration_id VARCHAR(128) NOT NULL,
+            updated_at VARCHAR(64) NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
+        "CREATE TABLE steel_schema_migration (
+            migration_id VARCHAR(128) PRIMARY KEY NOT NULL,
+            from_version BIGINT NOT NULL,
+            to_version BIGINT NOT NULL,
+            engine VARCHAR(32) NOT NULL,
+            checksum VARCHAR(64) NOT NULL,
+            release_version VARCHAR(64) NOT NULL,
+            release_commit VARCHAR(64) NOT NULL,
+            transaction_id VARCHAR(128) NOT NULL,
+            state VARCHAR(32) NOT NULL,
+            started_at VARCHAR(64) NOT NULL,
+            applied_at VARCHAR(64) NOT NULL,
+            error TEXT NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
+        &format!(
+            "INSERT INTO steel_schema_state \
+             (singleton_id, current_version, dirty, active_migration_id, updated_at) \
+             VALUES (1, {}, 0, '', CURRENT_TIMESTAMP)",
+            DATABASE_SCHEMA_VERSION
+        ),
+    )
+    .await
+}
+
+async fn validate_schema_ledger(connection: &DatabaseConnection) -> Result<i64, DbErr> {
+    let count_sql = match connection.get_database_backend() {
+        DbBackend::MySql => "SELECT CAST(COUNT(*) AS SIGNED) AS row_count FROM steel_schema_state",
+        _ => "SELECT COUNT(*) AS row_count FROM steel_schema_state",
+    };
+    let row_count = connection
+        .query_one(Statement::from_string(
+            connection.get_database_backend(),
+            count_sql.to_string(),
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("schema state count query returned no row".to_string()))?
+        .try_get::<i64>("", "row_count")?;
+    if row_count != 1 {
+        return Err(DbErr::Custom(format!(
+            "steel_schema_state must contain exactly one row, found {row_count}"
+        )));
+    }
+    let state_sql = match connection.get_database_backend() {
+        DbBackend::MySql => {
+            "SELECT current_version, CAST(dirty AS SIGNED) AS dirty, active_migration_id \
+             FROM steel_schema_state WHERE singleton_id = 1"
+        }
+        _ => {
+            "SELECT current_version, dirty, active_migration_id \
+             FROM steel_schema_state WHERE singleton_id = 1"
+        }
+    };
+    let row = connection
+        .query_one(Statement::from_string(
+            connection.get_database_backend(),
+            state_sql.to_string(),
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("steel_schema_state singleton row is missing".to_string()))?;
+    let current_version = row.try_get::<i64>("", "current_version")?;
+    let dirty = row.try_get::<i64>("", "dirty")?;
+    let active_migration_id = row.try_get::<String>("", "active_migration_id")?;
+    if dirty != 0 || !active_migration_id.is_empty() {
+        return Err(DbErr::Custom(
+            "database schema is dirty or has an active migration; service startup is forbidden"
+                .to_string(),
+        ));
+    }
+    if current_version != DATABASE_SCHEMA_VERSION {
+        return Err(DbErr::Custom(format!(
+            "database schema version {current_version} is outside this service's readable range {}..={}",
+            DATABASE_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION
+        )));
+    }
+    Ok(current_version)
+}
+
+async fn prepare_schema(
+    connection: &DatabaseConnection,
+    production_policy: bool,
+) -> Result<i64, DbErr> {
+    let state_tables = schema_table_count(connection, "steel_schema_state").await?;
+    let migration_tables = schema_table_count(connection, "steel_schema_migration").await?;
+    if state_tables == 1 && migration_tables == 1 {
+        return validate_schema_ledger(connection).await;
+    }
+    if state_tables != 0 || migration_tables != 0 {
+        return Err(DbErr::Custom(
+            "database schema ledger is incomplete; offline recovery is required".to_string(),
+        ));
+    }
+    if production_policy && application_table_count(connection).await? != 0 {
+        return Err(DbErr::Custom(
+            "refusing to adopt an unversioned non-empty production database; use an approved baseline migration"
+                .to_string(),
+        ));
+    }
+    create_schema(connection).await?;
+    create_schema_ledger(connection).await?;
+    validate_schema_ledger(connection).await
+}
+
 async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
     execute(
         connection,
@@ -2673,6 +3726,10 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             kind VARCHAR(64) NOT NULL,
             material_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
+            chain_id VARCHAR(128) NOT NULL DEFAULT '',
+            depends_on_task_id VARCHAR(128) NOT NULL DEFAULT '',
+            dependency_policy VARCHAR(32) NOT NULL DEFAULT 'require-success',
+            blocked_reason VARCHAR(512) NOT NULL DEFAULT '',
             status VARCHAR(32) NOT NULL,
             phase VARCHAR(64) NOT NULL,
             payload TEXT NOT NULL,
@@ -2740,6 +3797,28 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             path VARCHAR(1024) NOT NULL,
             metadata_path VARCHAR(1024) NOT NULL,
             created_at VARCHAR(64) NOT NULL
+        )",
+    )
+    .await?;
+    execute(
+        connection,
+        "CREATE TABLE IF NOT EXISTS record_cleanup (
+            id VARCHAR(128) PRIMARY KEY NOT NULL,
+            record_id VARCHAR(128) NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            actor VARCHAR(128) NOT NULL,
+            reason VARCHAR(256) NOT NULL,
+            manifest_json TEXT NOT NULL,
+            files_planned INTEGER NOT NULL,
+            files_deleted INTEGER NOT NULL,
+            files_missing INTEGER NOT NULL,
+            bytes_planned BIGINT NOT NULL,
+            bytes_deleted BIGINT NOT NULL,
+            error TEXT NOT NULL,
+            created_at VARCHAR(64) NOT NULL,
+            updated_at VARCHAR(64) NOT NULL,
+            completed_at VARCHAR(64) NOT NULL
         )",
     )
     .await?;
@@ -2818,6 +3897,7 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             role VARCHAR(128) NOT NULL,
             status VARCHAR(64) NOT NULL,
             password_hash VARCHAR(512) NOT NULL DEFAULT '',
+            must_change_password BOOLEAN NOT NULL DEFAULT 0,
             last_login_at VARCHAR(64) NOT NULL,
             created_at VARCHAR(64) NOT NULL
         )",
@@ -2826,6 +3906,11 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
     execute_compatible_migration(
         connection,
         "ALTER TABLE admin_user ADD COLUMN password_hash VARCHAR(512) NOT NULL DEFAULT ''",
+    )
+    .await?;
+    execute_compatible_migration(
+        connection,
+        "ALTER TABLE admin_user ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0",
     )
     .await?;
     execute(
@@ -2853,10 +3938,20 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
         )",
     )
     .await?;
+    for migration in [
+        "ALTER TABLE production_task ADD COLUMN chain_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_task ADD COLUMN depends_on_task_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_task ADD COLUMN dependency_policy VARCHAR(32) NOT NULL DEFAULT 'require-success'",
+        "ALTER TABLE production_task ADD COLUMN blocked_reason VARCHAR(512) NOT NULL DEFAULT ''",
+    ] {
+        execute_compatible_migration(connection, migration).await?;
+    }
     for index in [
         "CREATE UNIQUE INDEX idx_production_task_idempotency ON production_task(idempotency_key)",
         "CREATE INDEX idx_production_task_due ON production_task(status, created_at)",
         "CREATE INDEX idx_production_task_session ON production_task(session_id, created_at)",
+        "CREATE INDEX idx_production_task_chain ON production_task(chain_id, created_at)",
+        "CREATE INDEX idx_production_task_dependency ON production_task(depends_on_task_id, status)",
         "CREATE INDEX idx_calibration_operation_status_updated ON calibration_operation(status, updated_at)",
         "CREATE INDEX idx_production_inspection_status_started ON production_inspection(status, started_at)",
         "CREATE INDEX idx_production_inspection_material ON production_inspection(material_id)",
@@ -2867,6 +3962,8 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
         "CREATE INDEX idx_production_alarm_inspection ON production_alarm(inspection_id)",
         "CREATE INDEX idx_capture_file_inspection ON capture_file(inspection_id)",
         "CREATE INDEX idx_capture_file_frame_data ON capture_file(inspection_id, camera_id, sequence_no, data_name)",
+        "CREATE INDEX idx_record_cleanup_record_created ON record_cleanup(record_id, created_at)",
+        "CREATE INDEX idx_record_cleanup_status_updated ON record_cleanup(status, updated_at)",
     ] {
         execute_compatible_migration(connection, index).await?;
     }
@@ -2888,7 +3985,38 @@ async fn seed_database(connection: &DatabaseConnection) -> Result<(), DbErr> {
     seed_inspection_data(connection).await
 }
 
+fn validate_bootstrap_admin_password(password: &str) -> Result<(), DbErr> {
+    let valid = password.chars().count() >= 12
+        && password.chars().any(|ch| ch.is_ascii_lowercase())
+        && password.chars().any(|ch| ch.is_ascii_uppercase())
+        && password.chars().any(|ch| ch.is_ascii_digit())
+        && password.chars().any(|ch| !ch.is_ascii_alphanumeric())
+        && password != DEVELOPMENT_DEFAULT_ADMIN_PASSWORD;
+    if valid {
+        Ok(())
+    } else {
+        Err(DbErr::Custom(
+            "STEEL_BOOTSTRAP_ADMIN_PASSWORD must contain at least 12 characters with uppercase, lowercase, digit, and symbol"
+                .to_string(),
+        ))
+    }
+}
+
 async fn ensure_admin_data(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    let bootstrap_password = env::var("STEEL_BOOTSTRAP_ADMIN_PASSWORD").ok();
+    ensure_admin_data_with_policy(
+        connection,
+        production_security_policy_enabled(),
+        bootstrap_password.as_deref(),
+    )
+    .await
+}
+
+async fn ensure_admin_data_with_policy(
+    connection: &DatabaseConnection,
+    production_policy: bool,
+    bootstrap_password: Option<&str>,
+) -> Result<(), DbErr> {
     if admin_role::Entity::find().count(connection).await? == 0 {
         let updated_at = now_millis_string();
         let roles = [
@@ -2949,37 +4077,38 @@ async fn ensure_admin_data(connection: &DatabaseConnection) -> Result<(), DbErr>
 
     if admin_user::Entity::find().count(connection).await? == 0 {
         let created_at = now_millis_string();
-        let rows = [
-            (
-                "admin",
-                "系统管理员",
-                "administrator",
-                "active",
-                "2026-06-13 19:00",
-            ),
-            (
-                "engineer",
-                "工艺工程师",
-                "engineer",
-                "active",
-                "2026-06-13 18:42",
-            ),
-            (
-                "operator",
-                "产线操作员",
-                "operator",
-                "active",
-                "2026-06-13 18:20",
-            ),
+        let bootstrap_password = if production_policy {
+            let password = bootstrap_password.ok_or_else(|| {
+                DbErr::Custom(
+                    "STEEL_BOOTSTRAP_ADMIN_PASSWORD is required for an empty production database"
+                        .to_string(),
+                )
+            })?;
+            validate_bootstrap_admin_password(password)?;
+            password.to_string()
+        } else {
+            DEVELOPMENT_DEFAULT_ADMIN_PASSWORD.to_string()
+        };
+        let production_rows = [("admin", "系统管理员", "administrator", "active", "")];
+        let development_rows = [
+            ("admin", "系统管理员", "administrator", "active", ""),
+            ("engineer", "工艺工程师", "engineer", "active", ""),
+            ("operator", "产线操作员", "operator", "active", ""),
         ];
+        let rows: &[_] = if production_policy {
+            &production_rows
+        } else {
+            &development_rows
+        };
         for (id, display_name, role, status, last_login_at) in rows {
             admin_user::ActiveModel {
-                id: Set(id.to_string()),
-                display_name: Set(display_name.to_string()),
-                role: Set(role.to_string()),
-                status: Set(status.to_string()),
-                password_hash: Set(hash_admin_password(id, DEFAULT_ADMIN_PASSWORD)),
-                last_login_at: Set(last_login_at.to_string()),
+                id: Set((*id).to_string()),
+                display_name: Set((*display_name).to_string()),
+                role: Set((*role).to_string()),
+                status: Set((*status).to_string()),
+                password_hash: Set(hash_admin_password(id, &bootstrap_password)),
+                must_change_password: Set(production_policy),
+                last_login_at: Set((*last_login_at).to_string()),
                 created_at: Set(created_at.clone()),
             }
             .insert(connection)
@@ -2989,9 +4118,24 @@ async fn ensure_admin_data(connection: &DatabaseConnection) -> Result<(), DbErr>
 
     for user in admin_user::Entity::find().all(connection).await? {
         if user.password_hash.trim().is_empty() {
+            if production_policy {
+                return Err(DbErr::Custom(format!(
+                    "production admin user {} has an empty password hash",
+                    user.id
+                )));
+            }
             let mut active: admin_user::ActiveModel = user.clone().into();
-            active.password_hash = Set(hash_admin_password(&user.id, DEFAULT_ADMIN_PASSWORD));
+            active.password_hash = Set(hash_admin_password(
+                &user.id,
+                DEVELOPMENT_DEFAULT_ADMIN_PASSWORD,
+            ));
             active.update(connection).await?;
+        }
+        if production_policy && verify_admin_password(&user, DEVELOPMENT_DEFAULT_ADMIN_PASSWORD) {
+            return Err(DbErr::Custom(format!(
+                "production admin user {} still uses the development default password",
+                user.id
+            )));
         }
     }
 
@@ -3019,7 +4163,8 @@ async fn ensure_admin_data(connection: &DatabaseConnection) -> Result<(), DbErr>
     Ok(())
 }
 
-fn default_camera_configs() -> Vec<CameraConfigInput> {
+#[allow(dead_code)]
+fn legacy_default_camera_configs() -> Vec<CameraConfigInput> {
     let cameras = [
         ("192.168.105.13", "LVM3450CA", "camera1 周向采集相机"),
         ("192.168.102.100", "LVM3450CA", "camera2 周向采集相机"),
@@ -3043,6 +4188,41 @@ fn default_camera_configs() -> Vec<CameraConfigInput> {
                 role: (*role).to_string(),
                 enabled: true,
                 trigger_mode: "软件触发".to_string(),
+                exposure_us: 850,
+                gain: 1.0,
+                depth_lines: 1280,
+                output_path: format!("captures/{id}"),
+            }
+        })
+        .collect()
+}
+
+fn default_camera_configs() -> Vec<CameraConfigInput> {
+    let cameras = [
+        ("192.168.101.100", "LVM3450BE", "camera1 array camera"),
+        ("192.168.102.100", "LVM3450CA", "camera2 array camera"),
+        ("192.168.103.100", "LVM3450RE", "camera3 array camera"),
+        ("192.168.104.100", "LVM3450GE(520)", "camera4 array camera"),
+        ("192.168.105.100", "LVM3450BE", "camera5 array camera"),
+        ("192.168.106.100", "LVM3450CA", "camera6 array camera"),
+        ("192.168.107.100", "LVM3450RE", "camera7 array camera"),
+        ("192.168.108.100", "LVM3450GE(520)", "camera8 array camera"),
+    ];
+    cameras
+        .iter()
+        .enumerate()
+        .map(|(index, (ip, model, role))| {
+            let camera_no = index + 1;
+            let id = format!("CAM-{camera_no:02}");
+            CameraConfigInput {
+                id: id.clone(),
+                name: format!("camera{camera_no}"),
+                ip: (*ip).to_string(),
+                driver_id: "lvm-nvt".to_string(),
+                model_hint: (*model).to_string(),
+                role: (*role).to_string(),
+                enabled: true,
+                trigger_mode: "device-current".to_string(),
                 exposure_us: 850,
                 gain: 1.0,
                 depth_lines: 1280,
@@ -3079,7 +4259,7 @@ fn default_capture_config_value() -> Value {
             "updatedAt": now_millis_string()
         },
         "capture": {
-            "mode": "six-camera",
+            "mode": "eight-camera",
             "driver": "lvm-nvt",
             "fallback": "simulated",
             "cameras": cameras
@@ -3087,10 +4267,16 @@ fn default_capture_config_value() -> Value {
     })
 }
 
-fn capture_config_matches_current_cameras(raw: &str) -> bool {
+#[allow(dead_code)]
+fn legacy_capture_config_matches_current_cameras(raw: &str) -> bool {
     serde_json::from_str::<Value>(raw)
         .ok()
-        .and_then(|value| value.pointer("/capture/cameras").and_then(Value::as_array).cloned())
+        .and_then(|value| {
+            value
+                .pointer("/capture/cameras")
+                .and_then(Value::as_array)
+                .cloned()
+        })
         .is_some_and(|cameras| {
             cameras.len() >= 6
                 && cameras.iter().all(|camera| {
@@ -3110,6 +4296,35 @@ fn capture_config_matches_current_cameras(raw: &str) -> bool {
                         .get("ip")
                         .and_then(Value::as_str)
                         .is_some_and(|ip| ip == "192.168.106.100")
+                })
+        })
+}
+
+fn capture_config_matches_current_cameras(raw: &str) -> bool {
+    const EXPECTED_IPS: [&str; 8] = [
+        "192.168.101.100",
+        "192.168.102.100",
+        "192.168.103.100",
+        "192.168.104.100",
+        "192.168.105.100",
+        "192.168.106.100",
+        "192.168.107.100",
+        "192.168.108.100",
+    ];
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/capture/cameras")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|cameras| {
+            cameras.len() >= EXPECTED_IPS.len()
+                && EXPECTED_IPS.iter().all(|ip| {
+                    cameras
+                        .iter()
+                        .any(|camera| camera.get("ip").and_then(Value::as_str) == Some(*ip))
                 })
         })
 }
@@ -3164,9 +4379,11 @@ async fn ensure_default_configs(connection: &DatabaseConnection) -> Result<(), D
         .await?;
     }
 
-    let should_refresh_default_cameras = camera_config::Entity::find().count(connection).await? < 6;
+    let should_refresh_default_cameras = camera_config::Entity::find().count(connection).await? < 8;
     for camera in default_camera_configs() {
-        if should_refresh_default_cameras || find_camera_config(connection, &camera.id).await?.is_none() {
+        if should_refresh_default_cameras
+            || find_camera_config(connection, &camera.id).await?.is_none()
+        {
             save_camera_config(connection, camera).await?;
         }
     }

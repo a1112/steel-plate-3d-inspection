@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit cross-section stitching corrections for the 6-camera array calibration.
+"""Fit cross-section stitching corrections for the 8-camera array calibration.
 
 This tool is intentionally conservative:
 - It reads ArrayCalibration.xml and one continuous-test capture directory.
@@ -25,10 +25,13 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
-DEFAULT_CALIBRATION = Path(r"E:\steel-capture-data\config\camera-params\current-6-soft-trigger\ArrayCalibration.xml")
-DEFAULT_STORAGE = Path(r"E:\steel-capture-data")
+DEFAULT_CALIBRATION = Path(__file__).resolve().parents[1] / "config" / "capture" / "calibrations" / "current-8-time-trigger" / "ArrayCalibration.xml"
+DEFAULT_STORAGE = Path("H:/")
 DEFAULT_CAPTURE_ROOT = Path(r"H:\\")
-DEFAULT_CAMERA_NAMES = ["camera1", "camera2", "camera3", "camera4", "camera5", "camera6"]
+DEFAULT_CAMERA_NAMES = [
+    "camera1", "camera2", "camera3", "camera4",
+    "camera5", "camera6", "camera7", "camera8",
+]
 
 
 def parse_rows(value: str) -> list[int]:
@@ -64,7 +67,7 @@ def latest_production_material_id(capture_root: Path) -> str:
         material_id = candidate.name
         if all((capture_root / camera / material_id / "metadata").is_dir() for camera in DEFAULT_CAMERA_NAMES):
             return material_id
-    raise FileNotFoundError(f"No six-camera production material found under {capture_root}")
+    raise FileNotFoundError(f"No eight-camera production material found under {capture_root}")
 
 
 def load_calibration(path: Path) -> tuple[ET.ElementTree, dict[str, dict]]:
@@ -175,6 +178,7 @@ def fit_circle(points: np.ndarray) -> dict:
 
 
 def robust_fit_circle(points: np.ndarray, iterations: int = 4) -> dict:
+    input_count = len(points)
     active = points
     fit = fit_circle(active)
     for _ in range(iterations):
@@ -189,6 +193,8 @@ def robust_fit_circle(points: np.ndarray, iterations: int = 4) -> dict:
             break
         active = kept
         fit = fit_circle(active)
+    fit["fitPointCount"] = int(len(active))
+    fit["pointCount"] = int(input_count)
     fit["robustPointCount"] = int(len(active))
     return fit
 
@@ -202,6 +208,78 @@ def residual_stats(points: np.ndarray, fit: dict) -> dict:
         "medianResidual": float(np.median(residual)),
         "stdResidual": float(np.std(residual)),
         "maxAbsResidual": float(np.max(np.abs(residual))),
+    }
+
+
+def angular_coverage_deg(points: np.ndarray, fit: dict) -> float:
+    if len(points) < 3:
+        return 0.0
+    center = np.array([fit["centerX"], fit["centerZ"]])
+    angles = np.sort(np.mod(np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0]), 2.0 * math.pi))
+    gaps = np.diff(np.concatenate([angles, angles[:1] + 2.0 * math.pi]))
+    return float(math.degrees(2.0 * math.pi - float(np.max(gaps))))
+
+
+def evaluate_target_detection(
+    chunks: list[dict],
+    points: np.ndarray,
+    fit: dict,
+    expected_cameras: int,
+    min_points_per_camera: int,
+    min_diameter_mm: float,
+    max_diameter_mm: float,
+    min_angular_coverage_deg: float,
+    max_fit_residual_mm: float,
+    max_relative_residual: float,
+) -> dict:
+    reasons: list[str] = []
+    camera_count = len(chunks)
+    unique_ips = {str(chunk.get("ip", "")).strip() for chunk in chunks if str(chunk.get("ip", "")).strip()}
+    unique_serials = {str(chunk.get("sn", "")).strip() for chunk in chunks if str(chunk.get("sn", "")).strip()}
+    camera_points = {str(chunk.get("sn", "")): int(len(chunk["points"])) for chunk in chunks}
+    coverage = angular_coverage_deg(points, fit)
+    robust_ratio = float(fit.get("robustPointCount", 0)) / max(1, int(fit.get("pointCount", len(points))))
+    residual_limit = max(max_fit_residual_mm, float(fit["radius"]) * max_relative_residual)
+
+    if camera_count != expected_cameras:
+        reasons.append("camera_count_mismatch")
+    if len(unique_ips) != expected_cameras:
+        reasons.append("camera_ip_identity_mismatch")
+    if len(unique_serials) != expected_cameras:
+        reasons.append("camera_serial_identity_mismatch")
+    if any(count < min_points_per_camera for count in camera_points.values()) or len(camera_points) != expected_cameras:
+        reasons.append("insufficient_points_per_camera")
+    if not math.isfinite(float(fit["diameter"])) or not (min_diameter_mm <= float(fit["diameter"]) <= max_diameter_mm):
+        reasons.append("diameter_out_of_range")
+    if coverage < min_angular_coverage_deg:
+        reasons.append("insufficient_angular_coverage")
+    if float(fit["meanAbsResidual"]) > residual_limit:
+        reasons.append("circle_fit_residual_too_large")
+    if robust_ratio < 0.5:
+        reasons.append("insufficient_robust_inliers")
+
+    return {
+        "detected": not reasons,
+        "reasons": reasons,
+        "expectedCameras": expected_cameras,
+        "cameraCount": camera_count,
+        "uniqueIpCount": len(unique_ips),
+        "uniqueSerialCount": len(unique_serials),
+        "pointCount": int(len(points)),
+        "cameraPointCounts": camera_points,
+        "diameterMm": float(fit["diameter"]),
+        "angularCoverageDeg": coverage,
+        "meanAbsResidualMm": float(fit["meanAbsResidual"]),
+        "residualLimitMm": residual_limit,
+        "robustInlierRatio": robust_ratio,
+        "thresholds": {
+            "minPointsPerCamera": min_points_per_camera,
+            "minDiameterMm": min_diameter_mm,
+            "maxDiameterMm": max_diameter_mm,
+            "minAngularCoverageDeg": min_angular_coverage_deg,
+            "maxFitResidualMm": max_fit_residual_mm,
+            "maxRelativeResidual": max_relative_residual,
+        },
     }
 
 
@@ -307,11 +385,11 @@ def draw_preview(path: Path, chunks: list[dict], fit: dict, corrected: bool) -> 
     for index, chunk in enumerate(chunks):
         color = palette[index % len(palette)]
         draw.rectangle([30, y + 4, 48, y + 22], fill=color)
-        after = chunk["after"]["meanAbsResidual"]
-        before = chunk["before"]["meanAbsResidual"]
+        before = chunk.get("before", residual_stats(chunk["points"], fit))["meanAbsResidual"]
+        after = chunk.get("after", {"meanAbsResidual": before})["meanAbsResidual"]
         draw.text(
             (58, y),
-            f"{chunk['ip']} SN {chunk['sn']} before {before:.3f}mm after {after:.3f}mm shift {chunk['dx']:.3f},{chunk['dz']:.3f}",
+            f"{chunk['ip']} SN {chunk['sn']} before {before:.3f}mm after {after:.3f}mm shift {chunk.get('dx', 0.0):.3f},{chunk.get('dz', 0.0):.3f}",
             fill=(0, 0, 0),
         )
         y += 26
@@ -324,11 +402,19 @@ def main() -> int:
     parser.add_argument("--data-dir", type=Path, default=None)
     parser.add_argument("--storage-root", type=Path, default=DEFAULT_STORAGE)
     parser.add_argument("--capture-root", type=Path, default=DEFAULT_CAPTURE_ROOT)
-    parser.add_argument("--material-id", default="", help="Production material folder under camera1..camera6, or latest")
+    parser.add_argument("--material-id", default="", help="Production material folder under camera1..camera8, or latest")
     parser.add_argument("--rows", default="500", help="Comma-separated source rows, for example 250,500,750")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_STORAGE / "analysis")
     parser.add_argument("--max-points-per-camera", type=int, default=2400)
     parser.add_argument("--max-shift-mm", type=float, default=5.0)
+    parser.add_argument("--expected-cameras", type=int, default=8)
+    parser.add_argument("--min-points-per-camera", type=int, default=100)
+    parser.add_argument("--min-diameter-mm", type=float, default=20.0)
+    parser.add_argument("--max-diameter-mm", type=float, default=1000.0)
+    parser.add_argument("--min-angular-coverage-deg", type=float, default=220.0)
+    parser.add_argument("--max-fit-residual-mm", type=float, default=8.0)
+    parser.add_argument("--max-relative-residual", type=float, default=0.08)
+    parser.add_argument("--min-improvement-ratio", type=float, default=0.03)
     args = parser.parse_args()
 
     material_id = args.material_id.strip()
@@ -367,11 +453,78 @@ def main() -> int:
         chunks.append(chunk)
         all_points.append(points)
 
-    if not chunks:
-        raise RuntimeError("No camera data matched the calibration file")
+    report_path = output_dir / "fit_report.json"
+    if not chunks or sum(len(chunk["points"]) for chunk in chunks) < 20:
+        report = {
+            "schema": "steel.array-calibration-fit.v2",
+            "status": "skipped-no-target",
+            "calibration": str(args.calibration),
+            "dataDir": str(data_dir),
+            "captureRoot": str(args.capture_root),
+            "materialId": material_id,
+            "rows": rows,
+            "outputDir": str(output_dir),
+            "fitReport": str(report_path),
+            "cameraCount": len(chunks),
+            "expectedCameras": args.expected_cameras,
+            "targetDetection": {
+                "detected": False,
+                "reasons": ["no_valid_depth_points"],
+                "expectedCameras": args.expected_cameras,
+                "cameraCount": len(chunks),
+                "pointCount": int(sum(len(chunk["points"]) for chunk in chunks)),
+            },
+            "correctionAccepted": False,
+            "note": "No valid round calibration target was detected; no calibration XML was generated or activated.",
+        }
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
 
     points = np.vstack(all_points)
     fit_before = robust_fit_circle(points)
+    target_detection = evaluate_target_detection(
+        chunks,
+        points,
+        fit_before,
+        args.expected_cameras,
+        args.min_points_per_camera,
+        args.min_diameter_mm,
+        args.max_diameter_mm,
+        args.min_angular_coverage_deg,
+        args.max_fit_residual_mm,
+        args.max_relative_residual,
+    )
+    for chunk in chunks:
+        chunk["before"] = residual_stats(chunk["points"], fit_before)
+        chunk["dx"] = 0.0
+        chunk["dz"] = 0.0
+
+    before_png = output_dir / "cross_section_before.png"
+    draw_preview(before_png, chunks, fit_before, corrected=False)
+    if not target_detection["detected"]:
+        report = {
+            "schema": "steel.array-calibration-fit.v2",
+            "status": "skipped-no-target",
+            "calibration": str(args.calibration),
+            "dataDir": str(data_dir),
+            "captureRoot": str(args.capture_root),
+            "materialId": material_id,
+            "rows": rows,
+            "outputDir": str(output_dir),
+            "fitReport": str(report_path),
+            "beforePreview": str(before_png),
+            "fitBefore": fit_before,
+            "cameraCount": len(chunks),
+            "expectedCameras": args.expected_cameras,
+            "targetDetection": target_detection,
+            "correctionAccepted": False,
+            "note": "Round calibration target quality gates did not pass; no calibration XML was generated or activated.",
+        }
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
     corrections: dict[str, dict] = {}
 
     corrected_all: list[np.ndarray] = []
@@ -397,14 +550,29 @@ def main() -> int:
         }
 
     fit_after = robust_fit_circle(np.vstack(corrected_all))
-    apply_xml_corrections(tree, calibration, corrections)
-    corrected_xml = output_dir / "ArrayCalibration.corrected.xml"
-    tree.write(corrected_xml, encoding="UTF-8", xml_declaration=True)
+    before_residual = float(fit_before["meanAbsResidual"])
+    after_residual = float(fit_after["meanAbsResidual"])
+    improvement_ratio = (before_residual - after_residual) / max(before_residual, 1e-9)
+    saturated_cameras = [
+        item["sn"] for item in corrections.values()
+        if item["shiftMagnitude"] >= args.max_shift_mm * 0.98
+    ]
+    correction_reasons: list[str] = []
+    if after_residual > before_residual + 1e-6:
+        correction_reasons.append("residual_regressed")
+    if improvement_ratio < args.min_improvement_ratio and before_residual > 0.5:
+        correction_reasons.append("insufficient_residual_improvement")
+    if saturated_cameras:
+        correction_reasons.append("correction_reached_shift_limit")
+    correction_accepted = not correction_reasons
 
-    before_png = output_dir / "cross_section_before.png"
     after_png = output_dir / "cross_section_corrected.png"
-    draw_preview(before_png, chunks, fit_before, corrected=False)
     draw_preview(after_png, chunks, fit_after, corrected=True)
+
+    corrected_xml = output_dir / "ArrayCalibration.corrected.xml"
+    if correction_accepted:
+        apply_xml_corrections(tree, calibration, corrections)
+        tree.write(corrected_xml, encoding="UTF-8", xml_declaration=True)
 
     csv_path = output_dir / "camera_corrections.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as file:
@@ -458,13 +626,16 @@ def main() -> int:
                 )
 
     report = {
+        "schema": "steel.array-calibration-fit.v2",
+        "status": "corrected" if correction_accepted else "rejected-quality",
         "calibration": str(args.calibration),
         "dataDir": str(data_dir),
         "captureRoot": str(args.capture_root),
         "materialId": material_id,
         "rows": rows,
         "outputDir": str(output_dir),
-        "correctedXml": str(corrected_xml),
+        "fitReport": str(report_path),
+        "correctedXml": str(corrected_xml) if correction_accepted else "",
         "beforePreview": str(before_png),
         "afterPreview": str(after_png),
         "correctionsCsv": str(csv_path),
@@ -472,11 +643,26 @@ def main() -> int:
         "fitBefore": fit_before,
         "fitAfter": fit_after,
         "cameraCount": len(chunks),
+        "expectedCameras": args.expected_cameras,
         "maxShiftMm": args.max_shift_mm,
+        "targetDetection": target_detection,
+        "correctionAccepted": correction_accepted,
+        "correctionQuality": {
+            "accepted": correction_accepted,
+            "reasons": correction_reasons,
+            "beforeMeanAbsResidualMm": before_residual,
+            "afterMeanAbsResidualMm": after_residual,
+            "improvementRatio": improvement_ratio,
+            "minimumImprovementRatio": args.min_improvement_ratio,
+            "saturatedCameras": saturated_cameras,
+        },
         "corrections": list(corrections.values()),
-        "note": "Corrections are X/Z translations only. Review before replacing the production calibration XML.",
+        "note": (
+            "Round target detected and correction quality gates passed. Corrections are X/Z translations only; camera devices were not written."
+            if correction_accepted
+            else "Round target detected, but correction quality gates failed; no calibration XML was generated or activated."
+        ),
     }
-    report_path = output_dir / "fit_report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0

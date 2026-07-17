@@ -1,8 +1,8 @@
 [package]
 name = "steel-plate-3d-inspection-tauri"
 version = "0.1.0"
-description = "Bar Surface 3D Reconstruction desktop shell"
-authors = ["codex"]
+description = "Steel plate 3D inspection operator desktop"
+authors = ["北科工研"]
 edition = "2021"
 
 [lib]
@@ -14,10 +14,14 @@ crate-type = ["cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+devtools = ["tauri/devtools"]
+
+[profile.release]
+debug-assertions = false

@@ -1,0 +1,37 @@
+{
+  "schema": "steel.capture.profile.v1",
+  "name": "current-8-time-trigger",
+  "driverMode": "lvm",
+  "storageRoot": "H:/",
+  "cameraParamDir": "config/camera-params/current-8-time-trigger",
+  "startupMode": "auto-connect",
+  "autoConnect": true,
+  "expectedCameras": 8,
+  "devType": -1,
+  "changeStorage": false,
+  "applyCameraParams": false,
+  "applySoftTrigger": false,
+  "loadCameraParams": false,
+  "saveToDevice": false,
+  "arrayCalibrationFile": "config/calibrations/current-8-time-trigger/ArrayCalibration.xml",
+  "cameras": [
+    { "cameraIndex": 1, "ip": "192.168.101.100", "model": "LVM3450BE", "sn": "3G506601BE09220", "driverId": "lvm-nvt", "enabled": true, "role": "array-1", "storageRoot": "H:/camera1" },
+    { "cameraIndex": 2, "ip": "192.168.102.100", "model": "LVM3450CA", "sn": "3G506501CA09164", "driverId": "lvm-nvt", "enabled": true, "role": "array-2", "storageRoot": "H:/camera2" },
+    { "cameraIndex": 3, "ip": "192.168.103.100", "model": "LVM3450RE", "sn": "3G506401RE08999", "driverId": "lvm-nvt", "enabled": true, "role": "array-3", "storageRoot": "H:/camera3" },
+    { "cameraIndex": 4, "ip": "192.168.104.100", "model": "LVM3450GE(520)", "sn": "YF-0270", "driverId": "lvm-nvt", "enabled": true, "role": "array-4", "storageRoot": "H:/camera4" },
+    { "cameraIndex": 5, "ip": "192.168.105.100", "model": "LVM3450BE", "sn": "3G506601BE09221", "driverId": "lvm-nvt", "enabled": true, "role": "array-5", "storageRoot": "H:/camera5" },
+    { "cameraIndex": 6, "ip": "192.168.106.100", "model": "LVM3450CA", "sn": "3G506501CA09163", "driverId": "lvm-nvt", "enabled": true, "role": "array-6", "storageRoot": "H:/camera6" },
+    { "cameraIndex": 7, "ip": "192.168.107.100", "model": "LVM3450RE", "sn": "3G506401RE08995", "driverId": "lvm-nvt", "enabled": true, "role": "array-7", "storageRoot": "H:/camera7" },
+    { "cameraIndex": 8, "ip": "192.168.108.100", "model": "LVM3450GE(520)", "sn": "YF-0269", "driverId": "lvm-nvt", "enabled": true, "role": "array-8", "storageRoot": "H:/camera8" }
+  ],
+  "cameraStorageRoots": [
+    { "ip": "192.168.101.100", "root": "H:/camera1" },
+    { "ip": "192.168.102.100", "root": "H:/camera2" },
+    { "ip": "192.168.103.100", "root": "H:/camera3" },
+    { "ip": "192.168.104.100", "root": "H:/camera4" },
+    { "ip": "192.168.105.100", "root": "H:/camera5" },
+    { "ip": "192.168.106.100", "root": "H:/camera6" },
+    { "ip": "192.168.107.100", "root": "H:/camera7" },
+    { "ip": "192.168.108.100", "root": "H:/camera8" }
+  ]
+}

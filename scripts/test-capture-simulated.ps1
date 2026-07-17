@@ -1,12 +1,17 @@
 param(
   [int]$Port = 45317,
   [int]$ExpectedCameras = 4,
-  [string]$Configuration = "Release"
+  [string]$Configuration = "Release",
+  [string]$ServiceExe = ""
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$Exe = Join-Path $RepoRoot "target\capture\$Configuration\steel_capture_service.exe"
+$Exe = if ([string]::IsNullOrWhiteSpace($ServiceExe)) {
+  Join-Path $RepoRoot "target\capture\$Configuration\steel_capture_service.exe"
+} else {
+  (Resolve-Path $ServiceExe).Path
+}
 $StorageRoot = Join-Path $RepoRoot "target\simulated-capture-test\storage"
 $ConfigRoot = Join-Path $RepoRoot "target\simulated-capture-test\config"
 $Origin = "http://127.0.0.1:$Port"
@@ -108,6 +113,17 @@ try {
   Assert-True ([int]$Cameras.count -eq $ExpectedCameras) "Expected $ExpectedCameras simulated cameras, got $($Cameras.count)"
   $FirstIp = [string]$Cameras.cameras[0].ip
   Assert-True ($FirstIp -eq "192.168.200.101") "Expected first simulated IP 192.168.200.101, got $FirstIp"
+
+  $Storage = Invoke-CaptureJson -Method GET -Path "/api/storage/status"
+  Assert-True ($Storage.capacityAvailable -eq $true) "Storage capacity was not available."
+  Assert-True ([uint64]$Storage.capacityBytes -gt 0) "Storage capacityBytes was not positive."
+  Assert-True ([uint64]$Storage.freeBytes -gt 0) "Storage freeBytes was not positive."
+  Assert-True ([double]$Storage.freePercent -gt 0) "Storage freePercent was not positive."
+  foreach ($CameraRoot in @($Storage.cameraRoots)) {
+    Assert-True ($CameraRoot.capacityAvailable -eq $true) "Camera storage capacity was not available for $($CameraRoot.ip)."
+    Assert-True ([uint64]$CameraRoot.capacityBytes -gt 0) "Camera storage capacityBytes was not positive for $($CameraRoot.ip)."
+    Assert-True ([uint64]$CameraRoot.freeBytes -gt 0) "Camera storage freeBytes was not positive for $($CameraRoot.ip)."
+  }
 
   $Connect = Invoke-CaptureJson -Method POST -Path "/api/cameras/connect-all" -Body @{
     expectedCameras = $ExpectedCameras

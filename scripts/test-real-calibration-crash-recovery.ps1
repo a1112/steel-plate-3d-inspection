@@ -10,13 +10,16 @@ param(
   [string]$AdminToken = $env:STEEL_ADMIN_TOKEN,
   [string]$SafetyConfirmation = "",
   [switch]$SaveToDevice,
-  [int]$ExpectedCameras = 6,
+  [int]$ExpectedCameras = 8,
   [int]$Lines = 1000,
   [int]$TimeoutMs = 8000,
   [string]$ReportDir = ""
 )
 
 $ErrorActionPreference = "Stop"
+if ($ExpectedCameras -ne 8) {
+  throw "Formal calibration crash-recovery acceptance requires exactly eight cameras."
+}
 $DrillConfirmation = "RUN CONTROLLED CALIBRATION PROCESS CRASH RECOVERY"
 $CrashArmConfirmation = "ALLOW CONTROLLED CAMERA CALIBRATION PROCESS CRASH"
 $StartedAt = Get-Date
@@ -168,7 +171,7 @@ function Assert-CrashArm {
   param([object]$Health, [string]$ScenarioName)
   Test-Condition ($Health.calibrationCrashFailpointArmed -eq $true) "Capture crash failpoint is not armed."
   Test-Condition (-not [string]::IsNullOrWhiteSpace([string]$Health.calibrationCrashOperationId)) "Crash failpoint operationId is empty."
-  Test-Condition ([int]$Health.calibrationCrashCameraIndex -ge 1 -and [int]$Health.calibrationCrashCameraIndex -le $ExpectedCameras) "Crash camera index is outside the six-camera range."
+  Test-Condition ([int]$Health.calibrationCrashCameraIndex -ge 1 -and [int]$Health.calibrationCrashCameraIndex -le $ExpectedCameras) "Crash camera index is outside the eight-camera range."
   $AllowedPhases = if ($ScenarioName -eq "ApplyCrash") {
     @("apply-before-sdk", "apply-after-sdk")
   } else {
@@ -196,7 +199,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($PlanPath)) { throw "PlanPath is required in Prepare mode." }
     $ResolvedPlanPath = (Resolve-Path -LiteralPath $PlanPath).Path
     $Plan = Read-JsonFileUtf8 $ResolvedPlanPath
-    Test-Condition (@($Plan.ips).Count -eq $ExpectedCameras) "Crash drill plan must contain exactly six IPs."
+    Test-Condition (@($Plan.ips).Count -eq $ExpectedCameras) "Crash drill plan must contain exactly eight IPs."
 
     $Health = (Invoke-JsonRequest -Method GET -Uri (Join-OriginPath $CaptureOrigin "/health")).json
     Assert-CrashArm -Health $Health -ScenarioName $Scenario
@@ -333,7 +336,7 @@ try {
         discardBlackFrames = $false
       }) -RequestTimeoutSec 180
       $Evidence.validationCapture = $Validation.json
-      Test-Condition ($Validation.json.code -eq 0 -and [int]$Validation.json.completeFrames -eq $ExpectedCameras -and [int]$Validation.json.metadataFrames -eq $ExpectedCameras) "Post-recovery six-camera validation capture was incomplete."
+      Test-Condition ($Validation.json.code -eq 0 -and [int]$Validation.json.completeFrames -eq $ExpectedCameras -and [int]$Validation.json.metadataFrames -eq $ExpectedCameras) "Post-recovery eight-camera validation capture was incomplete."
     }
   }
 } catch {

@@ -1,1 +1,1 @@
-﻿current-6-soft-trigger
+current-8-time-trigger

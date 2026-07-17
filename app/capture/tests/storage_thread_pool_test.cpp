@@ -70,6 +70,12 @@ void bounded_queue_applies_item_and_byte_backpressure() {
           "drained pool should have no pending work");
   require(drained.completed == 2 && drained.failed == 0,
           "successful task counters are incorrect");
+  require(drained.completed_bytes == 10,
+          "completed byte accounting should include successful task estimates");
+  require(drained.recent_completed_bytes == 10,
+          "recent completed bytes should cover the active 60-second window");
+  require(drained.recent_write_bytes_per_second > 0.0,
+          "recent storage throughput should be observable after successful writes");
 }
 
 void failed_tasks_and_exceptions_are_observable() {
@@ -89,6 +95,8 @@ void failed_tasks_and_exceptions_are_observable() {
   const auto stats = pool.stats();
   require(stats.completed == 0 && stats.failed == 2,
           "non-zero results and exceptions should increment failed count");
+  require(stats.completed_bytes == 0 && stats.recent_completed_bytes == 0,
+          "failed writes must not inflate successful throughput metrics");
 }
 
 void blocked_submit_resumes_on_capacity_and_stop() {

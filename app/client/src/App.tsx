@@ -19,6 +19,8 @@ import {
   createDefaultReportFilters,
   createDefaultSettings,
   createInitialOperationState,
+  createReportMetadata,
+  exportReportAsJson,
   exportRowsAsCsv,
   filterDefectsForReport,
   getDeviceStatusWithOperation,
@@ -37,13 +39,19 @@ import {
   fetchTriggerGatewayStatus,
   fetchInspectionSnapshot,
   fetchInspectionSettings,
+  fetchInspectionReportArchives,
+  fetchInspectionReportArchive,
   fetchProductionStatus,
   saveAdminInspectionSettings,
   saveConnectionConfig,
   type ConnectionConfig,
+  type TriggerGatewayStatus,
   getInspectionServiceOrigin,
   getTriggerGatewayOrigin,
+  issueInspectionReportArchive,
+  type InspectionReportArchiveSummary,
 } from './services/inspection-api';
+import { exportInspectionArchiveAsPrintableHtml } from './lib/report-export';
 import { canStartTitlebarDrag } from './lib/titlebar-drag';
 import { getTauriWindowApi } from './lib/tauri-window';
 import {
@@ -58,7 +66,7 @@ import { AlarmAnalysis } from './components/AlarmAnalysis';
 import { AlarmCenter } from './components/AlarmCenter';
 import { DefectDetectionList } from './components/DefectDetectionList';
 import { LeftSidebar } from './components/LeftSidebar';
-import { PlateMap } from './components/PlateMap';
+import { PlateMap, PlateMapToolbar, type PlateMapViewMode } from './components/PlateMap';
 import { ReportPage } from './components/ReportPage';
 import { SettingsPage } from './components/SettingsPage';
 import { StatisticsPanel } from './components/StatisticsPanel';
@@ -68,9 +76,11 @@ import { BarSurfaceApp } from './components/BarSurfaceApp';
 import {
   fetchBarSurfaceManifest,
   fetchBarSurfaceMesh,
+  type BarSurfaceCamera,
   type BarSurfaceMesh,
 } from './services/bar-surface-api';
-import { Toast } from './components/Toast';
+import { InspectionFlowTool } from './components/InspectionFlowTool';
+import { inferNotificationTone, notify } from './state/notifications';
 import './styles.css';
 
 const DEFECT_PAGE_SIZE = 10;
@@ -78,6 +88,26 @@ const RECORD_PAGE_SIZE = 10;
 const REPORT_PAGE_SIZE = 8;
 const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
 const UNKNOWN_SERVICE_ENDPOINT = 'unknown';
+
+export function formatStorageBytes(value?: number | null) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return '--';
+  }
+  const gib = value / (1024 ** 3);
+  return `${gib.toFixed(gib >= 100 ? 0 : 1)} GiB`;
+}
+
+export function formatStorageWarning(check?: {
+  freeBytes?: number | null;
+  freePercent?: number | null;
+  estimatedRemainingSeconds?: number | null;
+}) {
+  const percent = typeof check?.freePercent === 'number' ? `${check.freePercent.toFixed(1)}%` : '--';
+  const remainingHours = typeof check?.estimatedRemainingSeconds === 'number'
+    ? `${(check.estimatedRemainingSeconds / 3600).toFixed(1)} 小时`
+    : '按当前吞吐暂无法估算';
+  return `存储容量预警：剩余 ${formatStorageBytes(check?.freeBytes)} / ${percent}，预计 ${remainingHours}`;
+}
 
 type ServiceConnectionState = 'online' | 'warning' | 'offline';
 
@@ -99,6 +129,7 @@ type RecordBoundSurfaceArtifact = {
   loading: boolean;
   mesh: BarSurfaceMesh | null;
   status: string;
+  cameras?: BarSurfaceCamera[];
 };
 
 function buildUnknownService(name: string, endpoint: string): ServiceStatusPanelItem {
@@ -201,6 +232,8 @@ function InspectionDashboard({
   const [recordSearchFilters, setRecordSearchFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
   const [defectFilterOpen, setDefectFilterOpen] = useState(false);
   const [reportPage, setReportPage] = useState(1);
+  const [reportArchives, setReportArchives] = useState<InspectionReportArchiveSummary[]>([]);
+  const [reportArchiveStatus, setReportArchiveStatus] = useState('请选择单个生产检测记录');
   const [savedSettings, setSavedSettings] = useState<InspectionSettings>(() => createDefaultSettings());
   const [settingsDraft, setSettingsDraft] = useState<InspectionSettings>(() => createDefaultSettings());
   const [settingsErrors, setSettingsErrors] = useState(() => validateSettings(createDefaultSettings()));
@@ -210,6 +243,7 @@ function InspectionDashboard({
   const [toast, setToast] = useState<string | null>(null);
   const [viewportSize, setViewportSize] = useState(readViewportSize);
   const [analysisCollapsed, setAnalysisCollapsed] = useState(false);
+  const [plateMapViewMode, setPlateMapViewMode] = useState<PlateMapViewMode>('2d');
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>('latest');
   const [snapshotSyncState, setSnapshotSyncState] = useState('等待实时同步');
@@ -225,6 +259,20 @@ function InspectionDashboard({
     captureService: buildUnknownService('采集服务', UNKNOWN_SERVICE_ENDPOINT),
     triggerGateway: buildUnknownService('触发网关', getTriggerGatewayOrigin()),
   }));
+  const [triggerGatewayStatus, setTriggerGatewayStatus] = useState<TriggerGatewayStatus | null>(null);
+
+  useEffect(() => {
+    if (!toast) {
+      return;
+    }
+    const tone = inferNotificationTone(toast);
+    notify({
+      title: tone === 'error' ? '操作失败' : tone === 'warning' ? '操作提醒' : tone === 'success' ? '操作完成' : '系统消息',
+      message: toast,
+      tone,
+    });
+    setToast(null);
+  }, [toast]);
   const [networkSnapshot, setNetworkSnapshot] = useState(() => calculateSystemNetworkRates({
     code: 1,
     sampledAtMs: Date.now(),
@@ -434,7 +482,8 @@ function InspectionDashboard({
           const healthDetail = health.ok
             ? '检测服务已就绪'
             : `检测服务降级：${blockingCheckDetail.join('、') || health.status}`;
-          const captureHealthy = checks.capture?.ok === true && checks.storage?.ok === true;
+          const storageWarning = checks.storage?.level === 'warning';
+          const captureHealthy = checks.capture?.ok === true && checks.storage?.ok === true && !storageWarning;
           const captureReachable = checks.capture?.apiReachable === true || checks.capture?.status === 'simulated';
           setServiceStatus((current) => ({
             ...current,
@@ -458,11 +507,13 @@ function InspectionDashboard({
               detail:
                 captureHealthy
                   ? '采集 API、SDK 与存储均就绪'
-                  : captureReachable
-                    ? `采集服务降级：${checks.capture?.reason || checks.storage?.reason || '依赖未就绪'}`
-                  : payload.capture?.running === false
-                    ? '采集服务离线'
-                    : '采集服务不可达',
+                  : storageWarning
+                    ? formatStorageWarning(checks.storage)
+                    : captureReachable
+                      ? `采集服务降级：${checks.capture?.reason || checks.storage?.reason || '依赖未就绪'}`
+                      : payload.capture?.running === false
+                        ? '采集服务离线'
+                        : '采集服务不可达',
               endpoint: payload.capture?.origin || current.captureService.endpoint,
             },
           }));
@@ -494,8 +545,10 @@ function InspectionDashboard({
             endpoint: getTriggerGatewayOrigin(),
           },
         }));
+        setTriggerGatewayStatus(triggerStatus);
       } catch (error) {
         if (!cancelled) {
+          setTriggerGatewayStatus(null);
           setServiceStatus((current) => ({
             ...current,
             triggerGateway: {
@@ -611,6 +664,7 @@ function InspectionDashboard({
           inspectionId,
           loading: false,
           mesh,
+          cameras: manifest.cameras,
           status: `已绑定 ${manifest.runId} · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点`,
         });
         artifactLoaded = true;
@@ -683,6 +737,47 @@ function InspectionDashboard({
   );
   const reportRows = useMemo(() => filterDefectsForReport(allDefects, reportFilters), [allDefects, reportFilters]);
   const reportMetrics = useMemo(() => getReportMetrics(reportRows), [reportRows]);
+  const reportScopeInspections = useMemo(() => {
+    const exactRecord = reportFilters.keyword.trim().toLowerCase();
+    if (!exactRecord) {
+      return snapshot.inspections;
+    }
+    const exactMatches = snapshot.inspections.filter((inspection) =>
+      inspection.plate.plateNo.toLowerCase() === exactRecord || inspection.inspectionId?.toLowerCase() === exactRecord,
+    );
+    return exactMatches.length > 0 ? exactMatches : snapshot.inspections;
+  }, [reportFilters.keyword, snapshot.inspections]);
+  const reportMetadata = useMemo(
+    () => createReportMetadata(reportScopeInspections, reportRows),
+    [reportRows, reportScopeInspections],
+  );
+  const reportInspectionId = reportMetadata.inspectionIds.length === 1 ? reportMetadata.inspectionIds[0] : '';
+
+  useEffect(() => {
+    if (uiState.activeNav !== 'report' || !reportInspectionId) {
+      setReportArchives([]);
+      setReportArchiveStatus('请选择单个生产检测记录');
+      return;
+    }
+    let cancelled = false;
+    setReportArchiveStatus('正在读取归档记录');
+    fetchInspectionReportArchives(reportInspectionId)
+      .then((result) => {
+        if (!cancelled) {
+          setReportArchives(result.reports);
+          setReportArchiveStatus(result.reports.length > 0 ? `已读取 ${result.reports.length} 份归档` : '尚未签发归档报告');
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setReportArchives([]);
+          setReportArchiveStatus(error instanceof Error ? error.message : '归档记录读取失败');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reportInspectionId, uiState.activeNav]);
   const filteredRecords = useMemo(
     () => filterInspectionRecords(snapshot.records, snapshot.inspections, recordSearchFilters),
     [snapshot.records, snapshot.inspections, recordSearchFilters],
@@ -877,7 +972,6 @@ function InspectionDashboard({
   if (appMode === 'capture') {
     return (
       <div className={`app-shell theme-${uiState.theme} ${responsiveClassName} capture-standalone-shell`}>
-        <Toast message={toast} tone="success" onClear={() => setToast(null)} />
         <main className="workspace-page capture-page capture-standalone-page">
           <CaptureManagementApp
             status={deviceStatus}
@@ -887,6 +981,7 @@ function InspectionDashboard({
             className="standalone-capture-manager"
           />
         </main>
+        <InspectionFlowTool onSnapshot={onSnapshotChange} />
       </div>
     );
   }
@@ -894,7 +989,6 @@ function InspectionDashboard({
   if (appMode === 'parameters') {
     return (
       <div className={`app-shell theme-${uiState.theme} ${responsiveClassName} parameter-standalone-shell`}>
-        <Toast message={toast} tone="success" onClear={() => setToast(null)} />
         <ParameterManagementApp />
       </div>
     );
@@ -907,20 +1001,20 @@ function InspectionDashboard({
         theme={uiState.theme}
         capture={captureSnapshot}
         network={networkSnapshot}
+        trigger={triggerGatewayStatus}
         services={serviceStatus}
         activeNav={uiState.activeNav}
         onNavChange={(activeNav) => setState({ activeNav })}
         onSettingsOpen={() => setSettingsModalOpen(true)}
         onDragMouseDown={(event) => void handleTitlebarMouseDown(event)}
       />
-      <Toast message={toast} tone="success" onClear={() => setToast(null)} />
-
       {uiState.activeNav === 'online' ? (
         <div className="online-workspace">
           <LeftSidebar
             plate={activeSnapshot.currentPlate}
             summary={activeSummary}
             records={pageRecords}
+            inspections={snapshot.inspections}
             selectedRecordId={uiState.selectedRecordId}
             page={uiState.recordPage}
             pageCount={recordPageCount}
@@ -934,12 +1028,25 @@ function InspectionDashboard({
           />
           <section className="online-main">
             <div className="snapshot-follow-bar" role="status" aria-label="检测数据实时跟随状态">
-              <div>
+              <div className="snapshot-follow-summary">
                 <i className={snapshotTracking === 'latest' ? 'live' : 'history'} />
                 <strong>{snapshotTracking === 'latest' ? '实时跟随最新检测' : `固定查看 ${activeSnapshot.currentPlate.plateNo}`}</strong>
                 <span>{snapshotSyncState} · 每 8 秒刷新</span>
               </div>
-              <div role="group" aria-label="检测记录跟随模式">
+              <PlateMapToolbar
+                defectTypes={snapshot.defectTypes}
+                defectTypeCounts={defectTypeCounts}
+                hiddenTypeIds={uiState.hiddenDefectTypeIds}
+                viewMode={plateMapViewMode}
+                onToggleType={(typeId) =>
+                  setUiState((current) => ({
+                    ...toggleDefectType(current, typeId),
+                    defectPage: 1,
+                  }))
+                }
+                onViewModeChange={setPlateMapViewMode}
+              />
+              <div className="snapshot-follow-actions" role="group" aria-label="检测记录跟随模式">
                 <button type="button" className={snapshotTracking === 'latest' ? 'active' : ''} onClick={followLatestSnapshot}>
                   跟随最新
                 </button>
@@ -963,7 +1070,10 @@ function InspectionDashboard({
                   inspectionId={activeInspection?.inspectionId}
                   captureImages={activeSnapshot.captureImages ?? []}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
+                  surfaceCameras={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameras : undefined}
                   artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
+                  viewMode={plateMapViewMode}
+                  integratedToolbar
                   onToggleType={(typeId) =>
                     setUiState((current) => ({
                       ...toggleDefectType(current, typeId),
@@ -973,6 +1083,7 @@ function InspectionDashboard({
                   onSurfaceModeChange={(surfaceDisplayMode) => setState({ surfaceDisplayMode, defectPage: 1 })}
                   onPreviewPositionChange={(previewPositionM) => setState({ previewPositionM: clampPreviewPositionM(previewPositionM, activePlateLengthM) })}
                   onSelectDefect={selectDefectById}
+                  onViewModeChange={setPlateMapViewMode}
                 />
                 <AlarmAnalysis
                   selectedDefect={selectedOnlineDefect}
@@ -1024,6 +1135,7 @@ function InspectionDashboard({
               rows={reportRows}
               pageRows={reportPageRows}
               metrics={reportMetrics}
+              metadata={reportMetadata}
               filters={reportFilters}
               page={reportPage}
               pageCount={reportPageCount}
@@ -1042,12 +1154,50 @@ function InspectionDashboard({
               onPageChange={setReportPage}
               onSelectDefect={selectDefectById}
               onExportCsv={() => {
-                downloadTextFile('defect-report.csv', exportRowsAsCsv(reportRows), 'text/csv;charset=utf-8');
+                downloadTextFile(`${reportMetadata.reportId}.csv`, exportRowsAsCsv(reportRows), 'text/csv;charset=utf-8');
                 setToast('缺陷报表 CSV 已导出');
               }}
               onExportJson={() => {
-                downloadTextFile('defect-report.json', JSON.stringify(reportRows, null, 2), 'application/json;charset=utf-8');
+                downloadTextFile(`${reportMetadata.reportId}.json`, exportReportAsJson(reportMetadata, reportRows), 'application/json;charset=utf-8');
                 setToast('缺陷报表 JSON 已导出');
+              }}
+              issueArchiveDisabled={reportMetadata.inspectionIds.length !== 1}
+              printArchiveDisabled={reportMetadata.inspectionIds.length !== 1 || reportArchives.length === 0}
+              archiveReports={reportArchives}
+              archiveStatus={reportArchiveStatus}
+              onPrintArchive={(selectedArchive) => {
+                if (!selectedArchive || reportMetadata.inspectionIds.length !== 1) {
+                  setToast('请先选择单个检测记录并签发归档报告');
+                  return;
+                }
+                void fetchInspectionReportArchive(selectedArchive.inspectionId, selectedArchive.reportId)
+                  .then(({ archive }) => {
+                    downloadTextFile(
+                      `${archive.reportId}.print.html`,
+                      exportInspectionArchiveAsPrintableHtml(archive),
+                      'text/html;charset=utf-8',
+                    );
+                    setToast(`归档打印版已生成：${archive.reportId}`);
+                  })
+                  .catch((error: unknown) => setToast(error instanceof Error ? error.message : '归档打印版生成失败'));
+              }}
+              onIssueArchive={() => {
+                const inspectionId = reportMetadata.inspectionIds[0];
+                if (!inspectionId || reportMetadata.inspectionIds.length !== 1) {
+                  setToast('请选择单个生产检测记录后再签发归档报告');
+                  return;
+                }
+                void issueInspectionReportArchive(inspectionId)
+                  .then((result) => {
+                    downloadTextFile(`${result.reportId}.json`, JSON.stringify(result.archive, null, 2), 'application/json;charset=utf-8');
+                    setToast(result.created ? `检测报告已签发：${result.reportId}` : `已读取相同归档报告：${result.reportId}`);
+                    return fetchInspectionReportArchives(inspectionId);
+                  })
+                  .then((archivePage) => {
+                    setReportArchives(archivePage.reports);
+                    setReportArchiveStatus(archivePage.reports.length > 0 ? `已读取 ${archivePage.reports.length} 份归档` : '尚未签发归档报告');
+                  })
+                  .catch((error: unknown) => setToast(error instanceof Error ? error.message : '检测报告签发失败'));
               }}
             />
           ) : uiState.activeNav === 'alarms' ? (
@@ -1102,6 +1252,7 @@ function InspectionDashboard({
           </section>
         </div>
       ) : null}
+      <InspectionFlowTool onSnapshot={onSnapshotChange} />
     </div>
   );
 }

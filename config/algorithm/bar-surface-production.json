@@ -1,0 +1,42 @@
+{
+  "schema": "steel.algorithm-config.v1",
+  "algorithmName": "bar-surface-defect-detector",
+  "algorithmVersion": "bar-surface-radial-residual-candidate-1.1.0",
+  "configRevision": "ALGCFG-2026-07-16-002",
+  "thresholds": {
+    "contourEnabled": true,
+    "maxFrames": 24,
+    "meshRows": 144,
+    "meshColsPerCamera": 72,
+    "radiusMm": 75.0,
+    "radialScaleMm": 8.0,
+    "maxFaceEdgeMm": 8.0,
+    "contourRadiusToleranceMm": 0.0,
+    "contourMinKeepRatio": 0.55,
+    "contourMinRowCoverage": 0.25,
+    "contourAutoPercentile": 96.0,
+    "contourMinimumToleranceMm": 0.25,
+    "contourMadMultiplier": 6.0,
+    "contourFallbackPercentile": 99.0,
+    "meshLongitudinalStepMm": 0.25,
+    "defectMinDepthMm": 0.35,
+    "defectMinAreaPoints": 6,
+    "defectMadMultiplier": 6.0,
+    "defectLongitudinalSpanFloorMm": 0.25,
+    "severitySevereAbsoluteMm": 1.0,
+    "severitySevereThresholdMultiplier": 2.5,
+    "severityReviewAbsoluteMm": 0.5,
+    "severityReviewThresholdMultiplier": 1.35,
+    "confidenceBase": 0.55,
+    "confidenceMagnitudeWeight": 0.2,
+    "confidenceAreaWeight": 0.25,
+    "confidenceAreaNormalizationPoints": 32.0,
+    "confidenceMaximum": 0.999
+  },
+  "qualityGate": {
+    "requiredCameraCount": 8,
+    "requireCalibrationForEveryCamera": true,
+    "requireReconstructionAcceptance": true,
+    "maximumSyntheticDefectCount": 0
+  }
+}

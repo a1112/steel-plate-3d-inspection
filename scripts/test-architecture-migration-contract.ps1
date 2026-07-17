@@ -53,6 +53,23 @@ function Get-MissingLiterals {
   return @($Missing)
 }
 
+function Get-MissingWhitespaceInsensitiveLiterals {
+  param(
+    [string]$Text,
+    [string[]]$Literals
+  )
+
+  $NormalizedText = [regex]::Replace($Text, '\s+', '')
+  $Missing = [System.Collections.Generic.List[string]]::new()
+  foreach ($Literal in $Literals) {
+    $NormalizedLiteral = [regex]::Replace($Literal, '\s+', '')
+    if ($NormalizedText.IndexOf($NormalizedLiteral, [System.StringComparison]::Ordinal) -lt 0) {
+      $Missing.Add($Literal) | Out-Null
+    }
+  }
+  return @($Missing)
+}
+
 function Get-SourceBeforeTests {
   param([string]$Text)
 
@@ -87,6 +104,8 @@ $TaskRoutes = @(
   "/api/production/tasks/steel-out",
   "/api/production/tasks/trigger-event"
 )
+$TaskDependencyFields = @("chainId", "dependsOnTaskId", "dependencyPolicy", "blockedReason")
+$TaskDependencyPolicies = @("require-success", "always-run")
 $TriggerMappings = @(
   "steel-info=>/api/production/tasks/steel-info",
   "steel-in=>/api/production/tasks/steel-in",
@@ -99,7 +118,8 @@ $FrontendTaskRoutes = @(
   "/api/production/tasks/steel-in",
   "/api/production/tasks/steel-out"
 )
-$ReadinessComponents = @("database", "taskWorker", "capture", "calibrationReconciliation", "storage", "trigger")
+$TriggerSecurityTransports = @("http", "tcp", "udp")
+$ReadinessComponents = @("database", "taskWorker", "capture", "calibrationReconciliation", "storage", "trigger", "algorithm", "productionPolicy")
 $AlarmApiRoutes = @(
   "GET /api/alarms",
   "POST /api/alarms/acknowledge",
@@ -107,6 +127,18 @@ $AlarmApiRoutes = @(
 )
 $AlarmLifecycle = @("active", "acknowledged", "resolved")
 $AlarmListStatuses = @("open", "active", "acknowledged", "resolved", "history", "all")
+$ManagedHealthAlarmTypes = @(
+  "supervisor-restart-budget-exhausted",
+  "supervisor-status-invalid",
+  "storage-capacity-warning",
+  "storage-critical",
+  "capture-unavailable",
+  "task-worker-unavailable",
+  "calibration-reconciliation-required",
+  "trigger-unavailable",
+  "algorithm-not-qualified",
+  "production-policy-invalid"
+)
 $CalibrationOperationMutationRoutes = @(
   "POST /api/calibration/apply-all",
   "POST /api/calibration/rollback"
@@ -121,6 +153,12 @@ $ExpectedContract = [ordered]@{
     routes = $TaskRoutes
     fifo = $true
     restartRecovery = $true
+    dependencyFields = $TaskDependencyFields
+    dependencyPolicies = $TaskDependencyPolicies
+    blockedStatus = "blocked"
+    failurePropagation = $true
+    safetyCriticalRequireSuccess = $true
+    retryRequeuesDescendants = $true
   }
   dispatch = [ordered]@{
     triggerMappings = $TriggerMappings
@@ -128,12 +166,45 @@ $ExpectedContract = [ordered]@{
     preservesCallerRequestId = $true
     serviceUsesRequestIdForIdempotency = $true
   }
+  triggerSecurity = [ordered]@{
+    transports = $TriggerSecurityTransports
+    authentication = "HMAC-SHA256"
+    canonicalVersion = "steel-trigger-v1"
+    timestampHeader = "X-Trigger-Timestamp"
+    nonceHeader = "X-Trigger-Nonce"
+    signatureHeader = "X-Trigger-Signature"
+    operatorCredentialHeader = "X-Trigger-Operator-Token"
+    networkEnvelope = $true
+    replayProtection = $true
+    sourceAllowlist = $true
+    productionSecretMinBytes = 32
+    productionOperatorTokenMinBytes = 32
+    upstreamAndOperatorCredentialsSeparated = $true
+    productionModeMutationDefault = $false
+    manualOperationsPermission = "admin.services"
+    wildcardCors = $false
+    statusRedacted = $true
+  }
   readiness = [ordered]@{
     route = "/api/health/details"
     components = $ReadinessComponents
     storageEndpoint = "/api/storage/status"
     triggerEndpoint = "/api/trigger/status"
     triggerRequiredByDefault = $true
+    storageCapacityFields = @(
+      "capacityBytes",
+      "freeBytes",
+      "freePercent",
+      "recentWriteBytesPerSecond",
+      "estimatedRemainingSeconds",
+      "level",
+      "warningFreeBytes",
+      "warningFreePercent",
+      "warningReason"
+    )
+    storageWatermarkFailClosed = $true
+    newSessionAdmissionBlockedOnCriticalStorage = $true
+    existingSessionCompletionAllowed = $true
   }
   alarms = [ordered]@{
     persistent = $true
@@ -141,8 +212,30 @@ $ExpectedContract = [ordered]@{
     lifecycle = $AlarmLifecycle
     listStatuses = $AlarmListStatuses
     defectIngestTransactional = $true
+    managedHealthSource = "system-health"
+    managedHealthAlarmTypes = $ManagedHealthAlarmTypes
+    episodeDeduplication = $true
+    automaticRecoveryResolution = $true
     frontendEntry = "AlarmCenter"
     serverOwnedActor = $true
+  }
+  dataLifecycle = [ordered]@{
+    persistentCleanupLedger = $true
+    manifestSchema = "steel.record-artifact-cleanup.v1"
+    allowedRootsRequired = $true
+    fileFingerprint = "sha256+size"
+    perFileProgress = $true
+    databaseDeleteAfterFiles = $true
+    atomicConfirmation = $true
+    retryRoute = "POST /api/admin/records/cleanup/retry"
+    retainedSession = $true
+    sqliteOnlineSnapshot = "VACUUM INTO"
+    mysqlServerSideBackup = $true
+    backupManifestSchema = "steel.database-backup.v2"
+    reportArchiveBackupManifestSchema = "steel.report-archive-backup.v1"
+    reportArchiveAuthoritativeValidation = $true
+    reportArchiveOfflineRestore = $true
+    reportArchivePriorTreeRetention = $true
   }
   calibrationOperations = [ordered]@{
     persistent = $true
@@ -171,7 +264,7 @@ $ExpectedContract = [ordered]@{
     realHardwareIntegrityGenerationRequiredForFullCoverage = $true
     decisiveRollbackPreflightEvidence = @("attempted", "sideEffects")
     processCrashFaultInjectionSeparate = $true
-    requiredCameraCount = 6
+    requiredCameraCount = 8
     uniqueCameraIps = $true
     uniqueExpectedSerials = $true
     uniqueSdkCalibrationPaths = $true
@@ -179,8 +272,13 @@ $ExpectedContract = [ordered]@{
   }
   runtime = [ordered]@{
     formalCapture = "headless-cpp"
-    qtRole = "diagnostic-only"
-    qtFormalRuntime = $false
+    qtRemoved = $true
+    windowsServiceSupervisor = $true
+    windowsServiceName = "SteelInspectionRuntime"
+    orderedChildren = @("capture", "trigger", "service")
+    gracefulStop = "CTRL_BREAK-then-timeout-terminate"
+    restartBudget = "5-per-10-minutes"
+    logRotation = "50MiB-5-generations"
   }
 }
 
@@ -201,22 +299,69 @@ if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) {
       (Test-ExactStringSet @($Contract.durableTasks.routes) $TaskRoutes) -and
       $Contract.durableTasks.fifo -eq $true -and
       $Contract.durableTasks.restartRecovery -eq $true -and
+      (Test-ExactStringSet @($Contract.durableTasks.dependencyFields) $TaskDependencyFields) -and
+      (Test-ExactStringSet @($Contract.durableTasks.dependencyPolicies) $TaskDependencyPolicies) -and
+      [string]$Contract.durableTasks.blockedStatus -eq "blocked" -and
+      $Contract.durableTasks.failurePropagation -eq $true -and
+      $Contract.durableTasks.safetyCriticalRequireSuccess -eq $true -and
+      $Contract.durableTasks.retryRequeuesDescendants -eq $true -and
       (Test-ExactStringSet @($Contract.dispatch.triggerMappings) $TriggerMappings) -and
       (Test-ExactStringSet @($Contract.dispatch.frontendTaskRoutes) $FrontendTaskRoutes) -and
       $Contract.dispatch.preservesCallerRequestId -eq $true -and
       $Contract.dispatch.serviceUsesRequestIdForIdempotency -eq $true -and
+      (Test-ExactStringSet @($Contract.triggerSecurity.transports) $TriggerSecurityTransports) -and
+      [string]$Contract.triggerSecurity.authentication -eq "HMAC-SHA256" -and
+      [string]$Contract.triggerSecurity.canonicalVersion -eq "steel-trigger-v1" -and
+      [string]$Contract.triggerSecurity.timestampHeader -eq "X-Trigger-Timestamp" -and
+      [string]$Contract.triggerSecurity.nonceHeader -eq "X-Trigger-Nonce" -and
+      [string]$Contract.triggerSecurity.signatureHeader -eq "X-Trigger-Signature" -and
+      [string]$Contract.triggerSecurity.operatorCredentialHeader -eq "X-Trigger-Operator-Token" -and
+      $Contract.triggerSecurity.networkEnvelope -eq $true -and
+      $Contract.triggerSecurity.replayProtection -eq $true -and
+      $Contract.triggerSecurity.sourceAllowlist -eq $true -and
+      [int]$Contract.triggerSecurity.productionSecretMinBytes -eq 32 -and
+      [int]$Contract.triggerSecurity.productionOperatorTokenMinBytes -eq 32 -and
+      $Contract.triggerSecurity.upstreamAndOperatorCredentialsSeparated -eq $true -and
+      $Contract.triggerSecurity.productionModeMutationDefault -eq $false -and
+      [string]$Contract.triggerSecurity.manualOperationsPermission -eq "admin.services" -and
+      $Contract.triggerSecurity.wildcardCors -eq $false -and
+      $Contract.triggerSecurity.statusRedacted -eq $true -and
       [string]$Contract.readiness.route -eq $ExpectedContract.readiness.route -and
       (Test-ExactStringSet @($Contract.readiness.components) $ReadinessComponents) -and
       [string]$Contract.readiness.storageEndpoint -eq $ExpectedContract.readiness.storageEndpoint -and
       [string]$Contract.readiness.triggerEndpoint -eq $ExpectedContract.readiness.triggerEndpoint -and
       $Contract.readiness.triggerRequiredByDefault -eq $true -and
+      (Test-ExactStringSet @($Contract.readiness.storageCapacityFields) $ExpectedContract.readiness.storageCapacityFields) -and
+      $Contract.readiness.storageWatermarkFailClosed -eq $true -and
+      $Contract.readiness.newSessionAdmissionBlockedOnCriticalStorage -eq $true -and
+      $Contract.readiness.existingSessionCompletionAllowed -eq $true -and
       $Contract.alarms.persistent -eq $true -and
       (Test-ExactStringSet @($Contract.alarms.apiRoutes) $AlarmApiRoutes) -and
       (Test-ExactStringSet @($Contract.alarms.lifecycle) $AlarmLifecycle) -and
       (Test-ExactStringSet @($Contract.alarms.listStatuses) $AlarmListStatuses) -and
       $Contract.alarms.defectIngestTransactional -eq $true -and
+      [string]$Contract.alarms.managedHealthSource -eq "system-health" -and
+      (Test-ExactStringSet @($Contract.alarms.managedHealthAlarmTypes) $ManagedHealthAlarmTypes) -and
+      $Contract.alarms.episodeDeduplication -eq $true -and
+      $Contract.alarms.automaticRecoveryResolution -eq $true -and
       [string]$Contract.alarms.frontendEntry -eq "AlarmCenter" -and
       $Contract.alarms.serverOwnedActor -eq $true -and
+      $Contract.dataLifecycle.persistentCleanupLedger -eq $true -and
+      [string]$Contract.dataLifecycle.manifestSchema -eq "steel.record-artifact-cleanup.v1" -and
+      $Contract.dataLifecycle.allowedRootsRequired -eq $true -and
+      [string]$Contract.dataLifecycle.fileFingerprint -eq "sha256+size" -and
+      $Contract.dataLifecycle.perFileProgress -eq $true -and
+      $Contract.dataLifecycle.databaseDeleteAfterFiles -eq $true -and
+      $Contract.dataLifecycle.atomicConfirmation -eq $true -and
+      [string]$Contract.dataLifecycle.retryRoute -eq "POST /api/admin/records/cleanup/retry" -and
+      $Contract.dataLifecycle.retainedSession -eq $true -and
+      [string]$Contract.dataLifecycle.sqliteOnlineSnapshot -eq "VACUUM INTO" -and
+      $Contract.dataLifecycle.mysqlServerSideBackup -eq $true -and
+      [string]$Contract.dataLifecycle.backupManifestSchema -eq "steel.database-backup.v2" -and
+      [string]$Contract.dataLifecycle.reportArchiveBackupManifestSchema -eq "steel.report-archive-backup.v1" -and
+      $Contract.dataLifecycle.reportArchiveAuthoritativeValidation -eq $true -and
+      $Contract.dataLifecycle.reportArchiveOfflineRestore -eq $true -and
+      $Contract.dataLifecycle.reportArchivePriorTreeRetention -eq $true -and
       $Contract.calibrationOperations.persistent -eq $true -and
       (Test-ExactStringSet @($Contract.calibrationOperations.mutationRoutes) $CalibrationOperationMutationRoutes) -and
       [string]$Contract.calibrationOperations.detailRoute -eq "GET /api/calibration/operations/detail" -and
@@ -243,14 +388,19 @@ if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) {
       $Contract.calibrationOperations.realHardwareIntegrityGenerationRequiredForFullCoverage -eq $true -and
       (Test-ExactStringSet @($Contract.calibrationOperations.decisiveRollbackPreflightEvidence) @("attempted", "sideEffects")) -and
       $Contract.calibrationOperations.processCrashFaultInjectionSeparate -eq $true -and
-      [int]$Contract.calibrationOperations.requiredCameraCount -eq 6 -and
+      [int]$Contract.calibrationOperations.requiredCameraCount -eq 8 -and
       $Contract.calibrationOperations.uniqueCameraIps -eq $true -and
       $Contract.calibrationOperations.uniqueExpectedSerials -eq $true -and
       $Contract.calibrationOperations.uniqueSdkCalibrationPaths -eq $true -and
       $Contract.calibrationOperations.arrayArtifactAsSdkCalibrationAllowed -eq $false -and
       [string]$Contract.runtime.formalCapture -eq "headless-cpp" -and
-      [string]$Contract.runtime.qtRole -eq "diagnostic-only" -and
-      $Contract.runtime.qtFormalRuntime -eq $false
+      $Contract.runtime.qtRemoved -eq $true -and
+      $Contract.runtime.windowsServiceSupervisor -eq $true -and
+      [string]$Contract.runtime.windowsServiceName -eq "SteelInspectionRuntime" -and
+      (Test-ExactStringSet @($Contract.runtime.orderedChildren) @("capture", "trigger", "service")) -and
+      [string]$Contract.runtime.gracefulStop -eq "CTRL_BREAK-then-timeout-terminate" -and
+      [string]$Contract.runtime.restartBudget -eq "5-per-10-minutes" -and
+      [string]$Contract.runtime.logRotation -eq "50MiB-5-generations"
     Add-ContractCheck $Checks "manifest-shape" "Runtime migration contract has the exact durable-task, readiness, alarm, calibration-safety, and runtime boundaries." $ShapeOk @($ResolvedManifest)
   }
 
@@ -261,18 +411,11 @@ if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) {
   } else {
     $null -ne $Manifest.captureQt
   }
-  $QtRole = if ($IsTargetManifest) { [string]$Manifest.captureQtRole } else { [string]$Manifest.captureQt.role }
-  $QtOwnsApi = if ($IsTargetManifest) { $Manifest.captureQtOwnsApi } else { $Manifest.captureQt.ownsApi }
-  $QtFormalRuntime = if ($IsTargetManifest) { $Manifest.captureQtFormalRuntime } else { $Manifest.captureQt.formalRuntime }
   $RuntimeBoundaryOk =
     [string]$Manifest.formalCapture -eq "headless-cpp" -and
     $CaptureRole -eq "formal-sdk-owner" -and
-    (-not $QtDeclared -or (
-      $QtRole -eq "diagnostic-only" -and
-      $QtOwnsApi -eq $false -and
-      $QtFormalRuntime -eq $false
-    ))
-  Add-ContractCheck $Checks "manifest-runtime-boundary" "Headless C++ is the formal SDK owner and optional Qt is diagnostic-only." $RuntimeBoundaryOk @($ResolvedManifest)
+    -not $QtDeclared
+  Add-ContractCheck $Checks "manifest-runtime-boundary" "Headless C++ is the sole SDK owner and Qt is absent from the runtime manifest." $RuntimeBoundaryOk @($ResolvedManifest)
 
   $Passed = @($Checks | Where-Object { $_.passed }).Count
   $Report = [ordered]@{
@@ -304,7 +447,12 @@ $ServicePath = Join-Path $RepoRoot "app\service\src\main.rs"
 $CalibrationOperationsPath = Join-Path $RepoRoot "app\service\src\calibration_operations.rs"
 $DatabasePath = Join-Path $RepoRoot "app\service\src\db\mod.rs"
 $EntityPath = Join-Path $RepoRoot "app\service\src\db\entities.rs"
+$ArtifactCleanupPath = Join-Path $RepoRoot "app\service\src\artifact_cleanup.rs"
 $TriggerPath = Join-Path $RepoRoot "app\trigger\src\main.rs"
+$TriggerCargoPath = Join-Path $RepoRoot "app\trigger\Cargo.toml"
+$TriggerEnvPath = Join-Path $RepoRoot "config\env\trigger-gateway.env.example"
+$HeadlessEnvPath = Join-Path $RepoRoot "config\env\headless-cpp.env.example"
+$TriggerDemoPath = Join-Path $RepoRoot "scripts\trigger_demo.py"
 $InspectionApiPath = Join-Path $RepoRoot "app\client\src\services\inspection-api.ts"
 $InspectionApiTestPath = Join-Path $RepoRoot "app\client\src\services\inspection-api.production.test.ts"
 $AlarmApiPath = Join-Path $RepoRoot "app\client\src\services\alarm-api.ts"
@@ -319,10 +467,20 @@ $BarSurfaceApiPath = Join-Path $RepoRoot "app\client\src\services\bar-surface-ap
 $BarSurfaceAppPath = Join-Path $RepoRoot "app\client\src\components\BarSurfaceApp.tsx"
 $CaptureProviderPath = Join-Path $RepoRoot "app\capture\src\capture_service_app.cpp"
 $PackageRuntimePath = Join-Path $RepoRoot "scripts\package-runtime.ps1"
+$IntegratedManagementSmokePath = Join-Path $RepoRoot "scripts\test-integrated-management-smoke.ps1"
 $RealCalibrationAcceptancePath = Join-Path $RepoRoot "scripts\test-real-calibration-acceptance.ps1"
 $RealCalibrationCrashRecoveryPath = Join-Path $RepoRoot "scripts\test-real-calibration-crash-recovery.ps1"
 $RealCalibrationIntegrityGenerationPath = Join-Path $RepoRoot "scripts\test-real-calibration-integrity-generation.ps1"
 $IntegratedFullPath = Join-Path $RepoRoot "scripts\test-integrated-capture-management-full.ps1"
+$DatabaseBackupPath = Join-Path $RepoRoot "scripts\backup-database.ps1"
+$DatabaseRestorePath = Join-Path $RepoRoot "scripts\restore-database.ps1"
+$DatabaseRecoveryCommonPath = Join-Path $RepoRoot "scripts\database-recovery-common.ps1"
+$ReportArchiveRecoveryPath = Join-Path $RepoRoot "scripts\manage-report-archives.ps1"
+$ReportArchiveRecoveryTestPath = Join-Path $RepoRoot "scripts\test-report-archive-recovery.ps1"
+$RuntimeSupervisorPath = Join-Path $RepoRoot "app\capture\src\steel_runtime_supervisor_main.cpp"
+$RuntimeServiceInstallPath = Join-Path $RepoRoot "scripts\install-runtime-service.ps1"
+$RuntimeServiceUninstallPath = Join-Path $RepoRoot "scripts\uninstall-runtime-service.ps1"
+$RuntimeSupervisorTestPath = Join-Path $RepoRoot "scripts\test-runtime-supervisor.ps1"
 
 $TaskText = Read-RequiredText $TaskPath
 $TaskProductionText = Get-SourceBeforeTests $TaskText
@@ -331,7 +489,12 @@ $ServiceProductionText = Get-SourceBeforeTests $ServiceText
 $CalibrationOperationsText = Read-RequiredText $CalibrationOperationsPath
 $DatabaseText = Read-RequiredText $DatabasePath
 $EntityText = Read-RequiredText $EntityPath
+$ArtifactCleanupText = Read-RequiredText $ArtifactCleanupPath
 $TriggerText = Read-RequiredText $TriggerPath
+$TriggerCargoText = Read-RequiredText $TriggerCargoPath
+$TriggerEnvText = Read-RequiredText $TriggerEnvPath
+$HeadlessEnvText = Read-RequiredText $HeadlessEnvPath
+$TriggerDemoText = Read-RequiredText $TriggerDemoPath
 $TriggerProductionText = Get-SourceBeforeTests $TriggerText
 $InspectionApiText = Read-RequiredText $InspectionApiPath
 $InspectionApiTestText = Read-RequiredText $InspectionApiTestPath
@@ -347,10 +510,20 @@ $BarSurfaceApiText = Read-RequiredText $BarSurfaceApiPath
 $BarSurfaceAppText = Read-RequiredText $BarSurfaceAppPath
 $CaptureProviderText = Read-RequiredText $CaptureProviderPath
 $PackageRuntimeText = Read-RequiredText $PackageRuntimePath
+$IntegratedManagementSmokeText = Read-RequiredText $IntegratedManagementSmokePath
 $RealCalibrationAcceptanceText = Read-RequiredText $RealCalibrationAcceptancePath
 $RealCalibrationCrashRecoveryText = Read-RequiredText $RealCalibrationCrashRecoveryPath
 $RealCalibrationIntegrityGenerationText = Read-RequiredText $RealCalibrationIntegrityGenerationPath
 $IntegratedFullText = Read-RequiredText $IntegratedFullPath
+$DatabaseBackupText = Read-RequiredText $DatabaseBackupPath
+$DatabaseRestoreText = Read-RequiredText $DatabaseRestorePath
+$DatabaseRecoveryCommonText = Read-RequiredText $DatabaseRecoveryCommonPath
+$ReportArchiveRecoveryText = Read-RequiredText $ReportArchiveRecoveryPath
+$ReportArchiveRecoveryTestText = Read-RequiredText $ReportArchiveRecoveryTestPath
+$RuntimeSupervisorText = Read-RequiredText $RuntimeSupervisorPath
+$RuntimeServiceInstallText = Read-RequiredText $RuntimeServiceInstallPath
+$RuntimeServiceUninstallText = Read-RequiredText $RuntimeServiceUninstallPath
+$RuntimeSupervisorTestText = Read-RequiredText $RuntimeSupervisorTestPath
 
 $DurableMissing = [System.Collections.Generic.List[string]]::new()
 foreach ($Value in $TaskKinds + $TaskRoutes) {
@@ -382,18 +555,38 @@ foreach ($Missing in @(Get-MissingLiterals $DatabaseText @(
   'claim_next_production_task',
   'order_by_asc(production_task::Column::CreatedAt)',
   'recover_incomplete_production_tasks',
-  'idx_production_task_idempotency'
+  'idx_production_task_idempotency',
+  'production_task_dependency_state',
+  'propagate_production_task_dependency_failure',
+  'requeue_blocked_production_task_descendants',
+  'idx_production_task_chain',
+  'idx_production_task_dependency'
 ))) {
   $DurableMissing.Add($Missing) | Out-Null
 }
 foreach ($Missing in @(Get-MissingLiterals $ServiceText @(
   'queued_production_event_routes_are_explicit_and_do_not_take_the_sync_lane',
   'queued_production_chain_reuses_session_and_claims_fifo_through_steel_out',
-  'service_restart_marks_inflight_task_interrupted_without_replaying_it'
+  'service_restart_marks_inflight_task_interrupted_without_replaying_it',
+  'failed_chain_dependency_blocks_all_downstream_tasks_until_parent_retry',
+  'safety_critical_tasks_reject_always_run_bypass',
+  'one_session_cannot_fork_into_a_second_production_chain',
+  'explicitly_safe_trigger_cleanup_can_run_after_terminal_dependency_failure'
 ))) {
   $DurableMissing.Add($Missing) | Out-Null
 }
-Add-ContractCheck $Checks "durable-six-kind-tasks" "Rust persists, recovers, and FIFO-claims all six production task kinds through durable routes." ($DurableMissing.Count -eq 0) @($TaskPath, $ServicePath, $DatabasePath, $EntityPath) @($DurableMissing)
+foreach ($Missing in @(Get-MissingLiterals ($TaskProductionText + $EntityText) @(
+  'chainId',
+  'dependsOnTaskId',
+  'dependencyPolicy',
+  'blockedReason',
+  'require-success',
+  'always-run',
+  'blocked'
+))) {
+  $DurableMissing.Add($Missing) | Out-Null
+}
+Add-ContractCheck $Checks "durable-six-kind-tasks" "Rust persists, recovers, FIFO-claims, and dependency-gates all six production task kinds through durable routes." ($DurableMissing.Count -eq 0) @($TaskPath, $ServicePath, $DatabasePath, $EntityPath) @($DurableMissing)
 
 $DispatchMissing = [System.Collections.Generic.List[string]]::new()
 foreach ($Value in @(
@@ -411,7 +604,7 @@ foreach ($Value in @(
     $DispatchMissing.Add($Missing) | Out-Null
   }
 }
-foreach ($Missing in @(Get-MissingLiterals $TaskProductionText @(
+foreach ($Missing in @(Get-MissingWhitespaceInsensitiveLiterals $TaskProductionText @(
   '"idempotencyKey", "idempotency_key", "requestId", "request_id"',
   'find_production_task_by_idempotency_key',
   'idempotency_conflict'
@@ -438,6 +631,68 @@ foreach ($Missing in @(Get-MissingLiterals ($TriggerText + $InspectionApiTestTex
 }
 Add-ContractCheck $Checks "durable-dispatch-request-id" "Trigger and Tauri dispatch to durable task routes, preserve a caller requestId, and Rust applies it as the idempotency key." ($DispatchMissing.Count -eq 0) @($TriggerPath, $InspectionApiPath, $InspectionApiTestPath, $TaskPath) @($DispatchMissing)
 
+$TriggerSecurityMissing = [System.Collections.Generic.List[string]]::new()
+foreach ($Missing in @(Get-MissingLiterals $TriggerProductionText @(
+  'HmacSha256',
+  'steel-trigger-v1',
+  'TRIGGER_SHARED_SECRET',
+  'TRIGGER_OPERATOR_TOKEN',
+  'TRIGGER_SOURCE_ALLOWLIST',
+  'TRIGGER_AUTH_WINDOW_SECONDS',
+  'TRIGGER_ALLOW_MODE_MUTATION',
+  'trigger_replay_detected',
+  'trigger_source_forbidden',
+  'X-Trigger-Timestamp',
+  'X-Trigger-Nonce',
+  'X-Trigger-Signature',
+  'X-Trigger-Operator-Token',
+  'local_operator_only',
+  'trigger_mode_locked',
+  'inspectionServiceHealthy'
+))) {
+  $TriggerSecurityMissing.Add($Missing) | Out-Null
+}
+foreach ($Missing in @(Get-MissingLiterals ($TriggerText + $TriggerCargoText) @(
+  'hmac = "0.12"',
+  'sha2 = "0.10"',
+  'production_http_responses_do_not_emit_wildcard_cors_and_disable_caching',
+  'hmac_authentication_accepts_once_then_rejects_replay_and_stale_time',
+  'tcp_and_udp_envelope_authenticates_only_the_canonical_payload'
+))) {
+  $TriggerSecurityMissing.Add($Missing) | Out-Null
+}
+foreach ($Missing in @(Get-MissingLiterals ($ServiceProductionText + $InspectionApiText) @(
+  '("POST", "/api/trigger/mode")',
+  '("POST", "/api/trigger/manual/steel-in")',
+  'trigger.operator.forwarded',
+  'TRIGGER_OPERATOR_TOKEN',
+  'createAdminHeaders'
+))) {
+  $TriggerSecurityMissing.Add($Missing) | Out-Null
+}
+foreach ($Missing in @(Get-MissingLiterals ($TriggerEnvText + $TriggerDemoText) @(
+  'STEEL_RUNTIME_PROFILE=production',
+  'TRIGGER_SHARED_SECRET',
+  'TRIGGER_OPERATOR_TOKEN',
+  'TRIGGER_SOURCE_ALLOWLIST',
+  'hashlib.sha256',
+  'X-Trigger-Signature',
+  'steel-trigger-v1'
+))) {
+  $TriggerSecurityMissing.Add($Missing) | Out-Null
+}
+foreach ($Missing in @(Get-MissingLiterals ($PackageRuntimeText + $IntegratedFullText) @(
+  'test-trigger-gateway-security.ps1',
+  'triggerSecurityTest',
+  'production-trigger-security'
+))) {
+  $TriggerSecurityMissing.Add($Missing) | Out-Null
+}
+if ($TriggerProductionText -match [regex]::Escape('Access-Control-Allow-Origin: *')) {
+  $TriggerSecurityMissing.Add('wildcard CORS remains in production trigger source') | Out-Null
+}
+Add-ContractCheck $Checks "production-trigger-security" "Production HTTP/TCP/UDP triggers require HMAC-SHA256 with timestamp and nonce replay protection, enforce a source allowlist, lock operator mutations behind local/admin boundaries, redact status, never emit wildcard CORS, and ship a live release gate." ($TriggerSecurityMissing.Count -eq 0) @($TriggerPath, $TriggerCargoPath, $TriggerEnvPath, $TriggerDemoPath, $ServicePath, $InspectionApiPath, $PackageRuntimePath, $IntegratedFullPath) @($TriggerSecurityMissing)
+
 $ReadinessMissing = [System.Collections.Generic.List[string]]::new()
 foreach ($Missing in @(Get-MissingLiterals $ServiceProductionText @(
   '"/api/health/details"',
@@ -456,19 +711,41 @@ foreach ($Missing in @(Get-MissingLiterals $ServiceProductionText @(
   '"trigger": trigger',
   '"/api/storage/status"',
   '"/api/trigger/status"',
-  'STEEL_TRIGGER_HEALTH_REQUIRED'
+  'STEEL_TRIGGER_HEALTH_REQUIRED',
+  'STEEL_STORAGE_MIN_FREE_BYTES',
+  'STEEL_STORAGE_MIN_FREE_PERCENT',
+  'storage_capacity_below_watermark',
+  'storage_capacity_near_watermark',
+  'storage_not_ready_for_new_session',
+  'recentWriteBytesPerSecond',
+  'estimatedRemainingSeconds',
+  '"warningFreeBytes": warning_free_bytes',
+  '"warningFreePercent": warning_free_percent'
+))) {
+  $ReadinessMissing.Add($Missing) | Out-Null
+}
+foreach ($Missing in @(Get-MissingLiterals ($CaptureProviderText + $HeadlessEnvText) @(
+  'capacityAvailable',
+  'capacityBytes',
+  'freeBytes',
+  'freePercent',
+  'recentWriteBytesPerSecond',
+  'STEEL_STORAGE_MIN_FREE_BYTES=21474836480',
+  'STEEL_STORAGE_MIN_FREE_PERCENT=10'
 ))) {
   $ReadinessMissing.Add($Missing) | Out-Null
 }
 foreach ($Missing in @(Get-MissingLiterals $ServiceText @(
   'layered_health_routes_are_explicit_and_get_only',
   'storage_health_rejects_missing_unwritable_or_non_accepting_storage_and_times_out',
+  'storage_health_warns_before_the_hard_admission_watermark',
+  'low_storage_blocks_only_new_session_admission_and_preserves_safe_completion',
   'trigger_health_defaults_required_supports_explicit_optional_and_never_leaks_origin',
   'trigger_health_timeout_is_bounded_and_required_trigger_gates_service_readiness'
 ))) {
   $ReadinessMissing.Add($Missing) | Out-Null
 }
-Add-ContractCheck $Checks "layered-readiness" "Rust readiness is layered across database, task worker, capture, persistent calibration reconciliation, storage, and required-by-default trigger health." ($ReadinessMissing.Count -eq 0) @($ServicePath) @($ReadinessMissing)
+Add-ContractCheck $Checks "layered-readiness" "Rust readiness is layered across database, task worker, capture, persistent calibration reconciliation, capacity-watermarked storage, required trigger health, approved algorithm identity, and fail-closed production policy." ($ReadinessMissing.Count -eq 0) @($ServicePath, $CaptureProviderPath, $HeadlessEnvPath) @($ReadinessMissing)
 
 $AlarmMissing = [System.Collections.Generic.List[string]]::new()
 foreach ($Missing in @(Get-MissingLiterals $EntityText @('table_name = "production_alarm"'))) {
@@ -481,6 +758,7 @@ foreach ($Missing in @(Get-MissingLiterals $DatabaseText @(
   'production_alarm_counts',
   'acknowledge_production_alarm',
   'resolve_production_alarm',
+  'reconcile_managed_alarm',
   'Status.is_in(["active", "acknowledged"])',
   '"history" => query.filter',
   'Status.eq("active")',
@@ -498,6 +776,22 @@ foreach ($Missing in @(Get-MissingLiterals $ServiceProductionText @(
   '"open" | "active" | "acknowledged" | "resolved" | "history" | "all"',
   'alarm_acknowledgement_required',
   'append_production_defect_with_alarm',
+  'start_system_health_alarm_monitor',
+  'system_health_alarm_specs',
+  'supervisor_runtime_status',
+  'steel.runtime-supervisor.status.v1',
+  'supervisor-restart-budget-exhausted',
+  'supervisor-status-invalid',
+  'storage-capacity-warning',
+  'storage-critical',
+  'capture-unavailable',
+  'task-worker-unavailable',
+  'calibration-reconciliation-required',
+  'trigger-unavailable',
+  'algorithm-not-qualified',
+  'production-policy-invalid',
+  'system.health.alarm.created',
+  'system.health.alarm.resolved',
   'append_audit_log'
 ))) {
   $AlarmMissing.Add($Missing) | Out-Null
@@ -524,13 +818,108 @@ foreach ($Missing in @(Get-MissingLiterals ($AlarmCenterText + $AppText) @(
 foreach ($Missing in @(Get-MissingLiterals ($ServiceText + $AlarmApiTestText + $AlarmCenterTestText) @(
   'severe_and_review_defect_ingest_create_one_idempotent_alarm',
   'alarm_transition_requires_acknowledgement_and_preserves_confirming_actor',
+  'managed_health_alarm_is_one_episode_until_recovery_and_reopens_with_a_new_id',
+  'system_health_alarm_reconciliation_persists_and_auto_resolves_the_episode',
+  'supervisor_restart_budget_status_is_validated_and_mapped_to_a_persistent_alarm',
   'without trusting or sending a client actor',
   'loads durable open alarms',
   'server-owned confirmation and resolution identities'
 ))) {
   $AlarmMissing.Add($Missing) | Out-Null
 }
-Add-ContractCheck $Checks "persistent-alarm-lifecycle" "Persistent alarms are created transactionally, listed as open/history, and move active to acknowledged to resolved with server-owned audit identity in the Tauri alarm center." ($AlarmMissing.Count -eq 0) @($ServicePath, $DatabasePath, $EntityPath, $AlarmApiPath, $AlarmCenterPath, $AppPath) @($AlarmMissing)
+Add-ContractCheck $Checks "persistent-alarm-lifecycle" "Persistent defect and managed system-health alarms are episode-deduplicated, audited, listed as open/history, and move active to acknowledged to resolved in the Tauri alarm center; recovered health episodes close automatically and recur under a new ID." ($AlarmMissing.Count -eq 0) @($ServicePath, $DatabasePath, $EntityPath, $AlarmApiPath, $AlarmCenterPath, $AppPath) @($AlarmMissing)
+
+$DataLifecycleMissing = [System.Collections.Generic.List[string]]::new()
+foreach ($Missing in @(Get-MissingLiterals ($ArtifactCleanupText + $EntityText + $DatabaseText) @(
+  'steel.record-artifact-cleanup.v1',
+  'STEEL_ARTIFACT_ALLOWED_ROOTS',
+  'sha256_file',
+  'files_deleted',
+  'bytes_deleted',
+  'table_name = "record_cleanup"',
+  'complete_record_cleanup',
+  'connection.begin().await?',
+  'idx_record_cleanup_status_updated'
+))) {
+  $DataLifecycleMissing.Add($Missing) | Out-Null
+}
+foreach ($Missing in @(Get-MissingLiterals $ServiceProductionText @(
+  '("GET", "/api/admin/records/cleanup")',
+  '("POST", "/api/admin/records/cleanup/retry")',
+  'execute_record_artifact_cleanup',
+  'find_open_record_cleanup_for_record',
+  'VACUUM INTO',
+  'database_backup_requires_server_side_job'
+))) {
+  $DataLifecycleMissing.Add($Missing) | Out-Null
+}
+foreach ($Missing in @(Get-MissingLiterals ($DatabaseBackupText + $DatabaseRestoreText + $DatabaseRecoveryCommonText) @(
+  'steel.database-backup.v2',
+  '--single-transaction',
+  '--defaults-extra-file',
+  'Get-SteelFileSha256',
+  'Get-FileHash',
+  'RESTORE $Engine',
+  'Get-NetTCPConnection'
+))) {
+  $DataLifecycleMissing.Add($Missing) | Out-Null
+}
+foreach ($Missing in @(Get-MissingLiterals ($ReportArchiveRecoveryText + $ReportArchiveRecoveryTestText) @(
+  'steel.report-archive-backup.v1',
+  'Assert-ServiceArchiveValidation',
+  'AllowRestoreFromOfflineUnvalidatedBackup',
+  'RESTORE REPORTS',
+  'priorArchiveRetained',
+  'payloadTamperRejection',
+  'offlineUnvalidatedRestoreRejection'
+))) {
+  $DataLifecycleMissing.Add($Missing) | Out-Null
+}
+foreach ($Missing in @(Get-MissingLiterals $ServiceText @(
+  'record_cleanup_deletes_frozen_artifacts_before_database_indexes_and_is_auditable',
+  'failed_cleanup.status, "failed"',
+  'cleanup.id, failed_cleanup.id'
+))) {
+  $DataLifecycleMissing.Add($Missing) | Out-Null
+}
+Add-ContractCheck $Checks "persistent-data-lifecycle" "Record cleanup persists an allowed-root and sha256+size manifest, resumes per-file deletion before atomic index confirmation, retains the production session, and ships verified database plus immutable report-archive backup/restore paths." ($DataLifecycleMissing.Count -eq 0) @($ArtifactCleanupPath, $DatabasePath, $EntityPath, $ServicePath, $DatabaseBackupPath, $DatabaseRestorePath, $DatabaseRecoveryCommonPath, $ReportArchiveRecoveryPath, $ReportArchiveRecoveryTestPath) @($DataLifecycleMissing)
+
+$RuntimeSupervisorMissing = [System.Collections.Generic.List[string]]::new()
+foreach ($Missing in @(Get-MissingLiterals ($RuntimeSupervisorText + $RuntimeServiceInstallText + $RuntimeServiceUninstallText + $RuntimeSupervisorTestText + $PackageRuntimeText + $IntegratedManagementSmokeText) @(
+  'SteelInspectionRuntime',
+  'SERVICE_WIN32_OWN_PROCESS',
+  'SERVICE_CONTROL_STOP',
+  'GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT',
+  'TerminateProcess',
+  'more than 5 restarts in 10 minutes',
+  'steel.runtime-supervisor.status.v1',
+  'restartBudgetExhausted',
+  'MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH',
+  '--test-restart-budget-status',
+  'restart-budget-status-atomic=passed',
+  '50ULL * 1024ULL * 1024ULL',
+  'steel-runtime-supervisor.exe',
+  'CaptureBuildRoot',
+  'Formal release packaging must use the clean canonical target/capture build root.',
+  'captureBuild',
+  '$env:STEEL_RUNTIME_PROFILE = $RuntimeProfile',
+  '$env:STEEL_ALGORITHM_MODE = $AlgorithmMode',
+  '-RuntimeProfile", "development"',
+  '-AlgorithmMode", "demo"',
+  '-TcpPort", [string]$TriggerTcpPort',
+  '-UdpPort", [string]$TriggerUdpPort',
+  '$env:TRIGGER_TCP_PORT = [string]$TcpPort',
+  '$env:TRIGGER_UDP_PORT = [string]$UdpPort',
+  'steel-runtime-package-smoke',
+  '$WorkingDirectory = $RunWorkDir',
+  'workRoot = $RunWorkDir',
+  'TRIGGER_SHARED_SECRET and TRIGGER_OPERATOR_TOKEN must be different values.',
+  "'unrestricted'",
+  'serviceInstallStartStop = "requires elevated field acceptance"'
+))) {
+  $RuntimeSupervisorMissing.Add($Missing) | Out-Null
+}
+Add-ContractCheck $Checks "windows-runtime-supervisor" "The runtime provides one Windows SCM supervisor with ordered application readiness, reverse stop plus Job Object process-tree cleanup, bounded restart, atomic restart-budget exhaustion state for persistent alarms, restart-time log generations, and fail-closed secret/config preflight; application-level drain and live log rotation remain separate field gates." ($RuntimeSupervisorMissing.Count -eq 0) @($RuntimeSupervisorPath, $RuntimeServiceInstallPath, $RuntimeServiceUninstallPath, $RuntimeSupervisorTestPath, $PackageRuntimePath, $IntegratedManagementSmokePath) @($RuntimeSupervisorMissing)
 
 # This check reads only explicitly named source/configuration files. It never
 # searches target/, package output, minified bundles, object files, or binaries.
@@ -539,7 +928,7 @@ foreach ($Missing in @(Get-MissingLiterals $CaptureApiText @(
   'export type CaptureImageKind = "depth" | "intensity" | "metadata" | "sdk-derived";',
   '"/api/calibration/apply-all"',
   '"/api/calibration/rollback"',
-  'cameraCalibrations.length !== 6',
+  'cameraCalibrations.length !== 8',
   '!item.expectedSn',
   '!item.rollbackPath',
   'uniqueExpectedSns',
@@ -576,12 +965,15 @@ foreach ($Missing in @(Get-MissingLiterals $CaptureDiagnosticText @(
 }
 foreach ($Missing in @(Get-MissingLiterals ($BarSurfaceApiText + $BarSurfaceAppText + $TaskProductionText + $ServiceProductionText) @(
   "operation: 'calibration-capture-fit'",
-  '正在采集六相机标定帧',
+  'autoActivate: true',
   'write_production_calibration_capture_fit_response',
   'calibration_capture_data_dir',
   '"completeFrames"',
   '"metadataFrames"',
-  '"dataDir"'
+  '"dataDir"',
+  'targetDetection',
+  'correctionAccepted',
+  'autoActivation'
 ))) {
   $QtCapabilityMissing.Add("Automatic calibration: $Missing") | Out-Null
 }
@@ -590,7 +982,7 @@ foreach ($Missing in @(Get-MissingLiterals $ServiceProductionText @(
   '("POST", "/api/calibration/apply-all")',
   '("POST", "/api/calibration/rollback")',
   'validate_calibration_set_safety',
-  'CALIBRATION_SET_CAMERA_COUNT: usize = 6',
+  'CALIBRATION_SET_CAMERA_COUNT: usize = 8',
   'calibration_set_duplicate_serial',
   'calibration_set_duplicate_artifact',
   'calibration_set_durable_rollback_path_required',
@@ -620,13 +1012,11 @@ foreach ($Missing in @(Get-MissingLiterals $CaptureProviderText @(
 }
 foreach ($Missing in @(Get-MissingLiterals $PackageRuntimeText @(
   'formalCapture = "headless-cpp"',
-  'role = "diagnostic-only"',
-  'formalRuntime = $false',
-  '$env:CAPTURE_QT_API_AUTOSTART = "0"'
+  'role = "formal-sdk-owner"'
 ))) {
   $QtCapabilityMissing.Add("Formal runtime: $Missing") | Out-Null
 }
-Add-ContractCheck $Checks "qt-capability-formal-chain" "Former Qt operations are covered by the formal Tauri-to-Rust-to-C++ chain: parameterized preview, real merged logs, per-camera batch evidence, capture-before-fit automatic calibration, four latest artifact kinds, safe six-camera calibration and durable rollback, and no formal Qt runtime dependency." ($QtCapabilityMissing.Count -eq 0) @($CaptureApiPath, $SystemStatusPath, $CaptureDiagnosticPath, $BarSurfaceApiPath, $BarSurfaceAppPath, $ServicePath, $CaptureProviderPath, $PackageRuntimePath) @($QtCapabilityMissing)
+Add-ContractCheck $Checks "qt-capability-formal-chain" "Former Qt operations are covered by the Tauri-to-Rust-to-C++ chain: parameterized preview, real merged logs, per-camera batch evidence, target-gated automatic calibration, four latest artifact kinds, safe eight-camera calibration and durable rollback, with Qt source and runtime branches removed." ($QtCapabilityMissing.Count -eq 0) @($CaptureApiPath, $SystemStatusPath, $CaptureDiagnosticPath, $BarSurfaceApiPath, $BarSurfaceAppPath, $ServicePath, $CaptureProviderPath, $PackageRuntimePath) @($QtCapabilityMissing)
 
 $CalibrationLedgerMissing = [System.Collections.Generic.List[string]]::new()
 foreach ($Missing in @(Get-MissingLiterals $CalibrationOperationsText @(
@@ -727,7 +1117,7 @@ foreach ($Missing in @(Get-MissingLiterals $RealCalibrationAcceptanceText @(
   '/api/calibration/apply-all'
   '/api/calibration/rollback'
   '/api/calibration/operations/detail'
-  'RUN REAL SIX CAMERA CALIBRATION APPLY AND ROLLBACK'
+  'RUN REAL EIGHT CAMERA CALIBRATION APPLY AND ROLLBACK'
   '/api/capture/continuous-test'
   'calibrationReconciliation'
   'does not prove a process crash'

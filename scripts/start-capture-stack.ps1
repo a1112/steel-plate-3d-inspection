@@ -4,17 +4,15 @@ param(
   [string]$StorageRoot = "H:\",
   [string]$CameraStorageRoot = "H:\",
   [string]$ConfigRoot = "",
-  [string]$Profile = "current-6-soft-trigger",
-  [int]$ExpectedCameras = 6,
+  [string]$Profile = "current-8-time-trigger",
+  [int]$ExpectedCameras = 8,
   [int]$Lines = 1000,
   [int]$TimeTriggerFreq = 300,
   [int]$LaserPower = 100,
   [int]$LaserLineSelect = 0,
   [int]$ControlMode = 0,
   [switch]$ApplyPreset,
-  [switch]$StopExisting,
-  [switch]$WithQtViewer,
-  [switch]$NoQt
+  [switch]$StopExisting
 )
 
 $ErrorActionPreference = "Stop"
@@ -90,7 +88,6 @@ if ($ConfigRoot.Trim().Length -eq 0) {
   $ConfigRoot = Join-Path $RepoRoot "target\config\capture"
 }
 $CaptureExe = Join-Path $RepoRoot "target\capture\$Configuration\steel_capture_service.exe"
-$QtExe = Join-Path $RepoRoot "target\capture-qt\$Configuration\steel_capture_qt_terminal.exe"
 $LogDir = Join-Path $RepoRoot "target\logs\capture"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ConfigRoot | Out-Null
@@ -105,12 +102,8 @@ if (-not (Test-Path $ExpectedProfilePath -PathType Leaf) -and (Test-Path $SeedCo
 if (-not (Test-Path $CaptureExe -PathType Leaf)) {
   throw "Missing $CaptureExe. Run scripts/build-capture-headless.ps1 first."
 }
-if ($WithQtViewer -and -not (Test-Path $QtExe -PathType Leaf)) {
-  throw "Missing $QtExe. Run scripts/build-capture-qt.ps1 -QtPrefixPath C:\Qt first, or omit -WithQtViewer."
-}
-
 if ($StopExisting) {
-  Get-Process steel_capture_qt_terminal, steel_capture_service -ErrorAction SilentlyContinue | Stop-Process -Force
+  Get-Process steel_capture_service -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
 $ExistingHealth = $null
@@ -149,7 +142,8 @@ Write-Host "Provider health: sdkReady=$($Health.sdkReady), cameraCount=$($Health
 
 $Apply = Invoke-CaptureJson -Method POST -Path "/api/config/profile/apply" -TimeoutSec 60 -Body @{
   name = $Profile
-  connect = $true
+  autoConnect = $true
+  applyCameraParams = $false
   applySoftTrigger = [bool]$ApplyPreset
   expectedCameras = $ExpectedCameras
 }
@@ -192,28 +186,4 @@ $StatusRows = @($Statuses.statuses | Sort-Object ip | ForEach-Object {
 })
 $StatusRows | Format-Table -AutoSize
 
-if ($WithQtViewer -and -not $NoQt) {
-  $QtRunning = Get-Process steel_capture_qt_terminal -ErrorAction SilentlyContinue
-  if ($QtRunning) {
-    Write-Host "Qt capture viewer is already running: $($QtRunning.Id -join ', ')."
-  } else {
-    $OldQtAutostart = $env:CAPTURE_QT_API_AUTOSTART
-    $OldServicePort = $env:CAPTURE_SERVICE_PORT
-    $env:CAPTURE_QT_API_AUTOSTART = "0"
-    $env:CAPTURE_SERVICE_PORT = [string]$Port
-    $QtProcess = Start-Process -FilePath $QtExe `
-      -WorkingDirectory (Split-Path $QtExe) `
-      -WindowStyle Hidden `
-      -RedirectStandardOutput (Join-Path $LogDir "capture-qt.out.log") `
-      -RedirectStandardError (Join-Path $LogDir "capture-qt.err.log") `
-      -PassThru
-    $env:CAPTURE_QT_API_AUTOSTART = $OldQtAutostart
-    $env:CAPTURE_SERVICE_PORT = $OldServicePort
-    Write-Host "Started Qt capture viewer PID $($QtProcess.Id)."
-  }
-}
-
 Write-Host "Headless capture stack ready at http://127.0.0.1:$Port"
-if ($NoQt) {
-  Write-Warning "-NoQt is deprecated because headless mode is now the default. Use -WithQtViewer only for local diagnostics."
-}

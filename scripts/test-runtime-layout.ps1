@@ -1,7 +1,4 @@
-param(
-  [string]$RuntimeRoot = "",
-  [switch]$AllowMissingQt
-)
+param([string]$RuntimeRoot = "")
 
 $ErrorActionPreference = "Stop"
 
@@ -95,21 +92,24 @@ if (
   $CalibrationOperations.realHardwareIntegrityGenerationRequiredForFullCoverage -ne $true -or
   (@($CalibrationOperations.decisiveRollbackPreflightEvidence | Sort-Object) -join ",") -ne "attempted,sideEffects" -or
   $CalibrationOperations.processCrashFaultInjectionSeparate -ne $true -or
-  [int]$CalibrationOperations.requiredCameraCount -ne 6 -or
+  [int]$CalibrationOperations.requiredCameraCount -ne 8 -or
   $CalibrationOperations.uniqueCameraIps -ne $true -or
   $CalibrationOperations.uniqueExpectedSerials -ne $true -or
   $CalibrationOperations.uniqueSdkCalibrationPaths -ne $true -or
   $CalibrationOperations.arrayArtifactAsSdkCalibrationAllowed -ne $false
 ) {
-  throw "Runtime manifest is missing the persistent calibration ledger or six-camera calibration safety contract."
+  throw "Runtime manifest is missing the persistent calibration ledger or eight-camera calibration safety contract."
 }
 
 $IsTargetRuntimeManifest = -not [string]::IsNullOrWhiteSpace([string]$Manifest.captureHeadless)
-$QtDeclared = if ($IsTargetRuntimeManifest) {
-  -not [string]::IsNullOrWhiteSpace([string]$Manifest.captureQt)
+
+$DeclaredWindowsServiceName = if ($IsTargetRuntimeManifest) {
+  [string]$Manifest.windowsServiceName
 } else {
-  $null -ne $Manifest.captureQt -and
-    -not [string]::IsNullOrWhiteSpace([string]$Manifest.captureQt.path)
+  [string]$Manifest.service.windowsServiceName
+}
+if ($DeclaredWindowsServiceName -ne "SteelInspectionRuntime") {
+  throw "Runtime manifest must declare the fixed SteelInspectionRuntime service name."
 }
 
 if ($IsTargetRuntimeManifest) {
@@ -117,6 +117,8 @@ if ($IsTargetRuntimeManifest) {
     captureHeadless = $Manifest.captureHeadless
     service = $Manifest.service
     triggerGateway = $Manifest.triggerGateway
+    serviceTriggerGateway = $Manifest.serviceTriggerGateway
+    supervisor = $Manifest.supervisor
     client = $Manifest.client
     clientStatic = $Manifest.clientStatic
     integrated = $Manifest.integrated
@@ -124,34 +126,50 @@ if ($IsTargetRuntimeManifest) {
     integratedAcceptanceAuditTest = $Manifest.integratedAcceptanceAuditTest
     migrationArchitectureTest = $Manifest.migrationArchitectureTest
     integratedSmokeTest = $Manifest.integratedSmokeTest
+    triggerSecurityTest = $Manifest.triggerSecurityTest
     integratedReadyTest = $Manifest.integratedReadyTest
     runtimeAcceptanceTest = $Manifest.runtimeAcceptanceTest
     runtimeLayoutTest = $Manifest.runtimeLayoutTest
+    runtimeSupervisorTest = $Manifest.runtimeSupervisorTest
+    installRuntimeService = $Manifest.installRuntimeService
+    uninstallRuntimeService = $Manifest.uninstallRuntimeService
     runtimeUiSmokeTest = $Manifest.runtimeUiSmokeTest
     realHardwareAcceptanceTest = $Manifest.realHardwareAcceptanceTest
     realCalibrationAcceptanceTest = $Manifest.realCalibrationAcceptanceTest
     realCalibrationCrashRecoveryTest = $Manifest.realCalibrationCrashRecoveryTest
     realCalibrationIntegrityGenerationTest = $Manifest.realCalibrationIntegrityGenerationTest
     productionStabilityTest = $Manifest.productionStabilityTest
+    productionStabilityWorkRootContractTest = $Manifest.productionStabilityWorkRootContractTest
     barSurfaceE2ETest = $Manifest.barSurfaceE2ETest
     algorithmCore = $Manifest.algorithmCore
-  }
-
-  if (-not $AllowMissingQt -and $Manifest.captureQt) {
-    $RequiredFiles.captureQt = $Manifest.captureQt
+    algorithmConfig = $Manifest.algorithmConfig
+    algorithmAcceptanceTemplate = $Manifest.algorithmAcceptanceTemplate
+    algorithmAcceptanceTest = $Manifest.algorithmAcceptanceTest
+    functionalGoLivePlanTemplate = $Manifest.functionalGoLivePlanTemplate
+    plcL2FunctionalAcceptanceTemplate = $Manifest.plcL2FunctionalAcceptanceTemplate
+    targetMachineFunctionalAcceptanceTemplate = $Manifest.targetMachineFunctionalAcceptanceTemplate
+    functionalScenarioEvidenceTemplate = $Manifest.functionalScenarioEvidenceTemplate
+    functionalGoLiveReadinessTest = $Manifest.functionalGoLiveReadinessTest
+    functionalScenarioEvidenceGenerator = $Manifest.functionalScenarioEvidenceGenerator
+    functionalAcceptanceWorkspaceInitializer = $Manifest.functionalAcceptanceWorkspaceInitializer
+    functionalAcceptanceWorkspaceContractTest = $Manifest.functionalAcceptanceWorkspaceContractTest
+    functionalScenarioEvidenceAttacher = $Manifest.functionalScenarioEvidenceAttacher
+    functionalScenarioAttachmentContractTest = $Manifest.functionalScenarioAttachmentContractTest
+    algorithmTraceabilityTest = $Manifest.algorithmTraceabilityTest
+    databaseContractVerify = $Manifest.databaseContractVerify
+    databaseContractTest = $Manifest.databaseContractTest
+    databaseRecoveryCommon = $Manifest.databaseRecoveryCommon
   }
 
   if ($Manifest.dlls.captureSdk) {
     $RequiredFiles.captureSdkDll = $Manifest.dlls.captureSdk
-  }
-  if (-not $AllowMissingQt -and $Manifest.dlls.qtSdk) {
-    $RequiredFiles.captureQtSdkDll = $Manifest.dlls.qtSdk
   }
 } else {
   $RequiredFiles = [ordered]@{
     captureHeadless = $Manifest.capture.path
     service = $Manifest.service.path
     triggerGateway = $Manifest.service.triggerGateway
+    supervisor = $Manifest.service.supervisor
     client = $Manifest.client.path
     clientStatic = $Manifest.scripts.clientStatic
     integrated = $Manifest.scripts.integrated
@@ -159,26 +177,43 @@ if ($IsTargetRuntimeManifest) {
     integratedAcceptanceAuditTest = $Manifest.scripts.integratedAcceptanceAuditTest
     migrationArchitectureTest = $Manifest.scripts.migrationArchitectureTest
     integratedSmokeTest = $Manifest.scripts.integratedSmokeTest
+    triggerSecurityTest = $Manifest.scripts.triggerSecurityTest
     integratedReadyTest = $Manifest.scripts.integratedReadyTest
     runtimeAcceptanceTest = $Manifest.scripts.runtimeAcceptanceTest
     runtimeLayoutTest = $Manifest.scripts.runtimeLayoutTest
+    runtimePackageVerify = $Manifest.scripts.runtimePackageVerify
+    runtimeSupervisorTest = $Manifest.scripts.runtimeSupervisorTest
+    installRuntimeService = $Manifest.scripts.installRuntimeService
+    uninstallRuntimeService = $Manifest.scripts.uninstallRuntimeService
     runtimeUiSmokeTest = $Manifest.scripts.runtimeUiSmokeTest
     realHardwareAcceptanceTest = $Manifest.scripts.realHardwareAcceptanceTest
     realCalibrationAcceptanceTest = $Manifest.scripts.realCalibrationAcceptanceTest
     realCalibrationCrashRecoveryTest = $Manifest.scripts.realCalibrationCrashRecoveryTest
     realCalibrationIntegrityGenerationTest = $Manifest.scripts.realCalibrationIntegrityGenerationTest
     productionStabilityTest = $Manifest.scripts.productionStabilityTest
+    productionStabilityWorkRootContractTest = $Manifest.scripts.productionStabilityWorkRootContractTest
     barSurfaceE2ETest = $Manifest.scripts.barSurfaceE2ETest
     stop = $Manifest.scripts.stop
     captureSdkDll = $Manifest.capture.sdk
     algorithmCore = $Manifest.algorithm.core
-  }
-
-  if (-not $AllowMissingQt -and $Manifest.captureQt.path) {
-    $RequiredFiles.captureQt = $Manifest.captureQt.path
-  }
-  if (-not $AllowMissingQt -and $Manifest.captureQt.sdk) {
-    $RequiredFiles.captureQtSdkDll = $Manifest.captureQt.sdk
+    algorithmConfig = $Manifest.config.algorithm
+    algorithmAcceptanceTemplate = $Manifest.config.algorithmAcceptanceTemplate
+    algorithmAcceptanceTest = $Manifest.scripts.algorithmAcceptanceTest
+    functionalGoLivePlanTemplate = $Manifest.config.functionalGoLivePlanTemplate
+    plcL2FunctionalAcceptanceTemplate = $Manifest.config.plcL2FunctionalAcceptanceTemplate
+    targetMachineFunctionalAcceptanceTemplate = $Manifest.config.targetMachineFunctionalAcceptanceTemplate
+    functionalScenarioEvidenceTemplate = $Manifest.config.functionalScenarioEvidenceTemplate
+    functionalGoLiveReadinessTest = $Manifest.scripts.functionalGoLiveReadinessTest
+    functionalScenarioEvidenceGenerator = $Manifest.scripts.functionalScenarioEvidenceGenerator
+    functionalAcceptanceWorkspaceInitializer = $Manifest.scripts.functionalAcceptanceWorkspaceInitializer
+    functionalAcceptanceWorkspaceContractTest = $Manifest.scripts.functionalAcceptanceWorkspaceContractTest
+    functionalScenarioEvidenceAttacher = $Manifest.scripts.functionalScenarioEvidenceAttacher
+    functionalScenarioAttachmentContractTest = $Manifest.scripts.functionalScenarioAttachmentContractTest
+    algorithmTraceabilityTest = $Manifest.scripts.algorithmTraceabilityTest
+    databaseContractVerify = $Manifest.scripts.databaseContractVerify
+    databaseContractTest = $Manifest.scripts.databaseContractTest
+    databaseRecoveryCommon = $Manifest.scripts.databaseRecoveryCommon
+    releaseSbomStaticVerify = $Manifest.scripts.releaseSbomStaticVerify
   }
 }
 
@@ -206,6 +241,7 @@ $ScriptNames = if ($IsTargetRuntimeManifest) {
     "run-client-static.ps1",
     "stop-runtime.ps1",
     "test-integrated-management-smoke.ps1",
+    "test-trigger-gateway-security.ps1",
     "test-integrated-runtime-ready.ps1",
     "test-integrated-capture-management-full.ps1",
     "test-integrated-acceptance-audit.ps1",
@@ -216,9 +252,25 @@ $ScriptNames = if ($IsTargetRuntimeManifest) {
     "test-real-calibration-crash-recovery.ps1",
     "test-real-calibration-integrity-generation.ps1",
     "test-production-stability.ps1",
+    "test-production-stability-workroot-contract.ps1",
     "test-runtime-ui-smoke.ps1",
     "scripts\test-bar-surface-e2e.ps1",
-    "test-runtime-layout.ps1"
+    "test-runtime-layout.ps1",
+    "test-runtime-supervisor.ps1",
+    "test-algorithm-acceptance-report.ps1",
+    "test-functional-go-live-readiness.ps1",
+    "new-functional-scenario-evidence.ps1",
+    "new-functional-acceptance-workspace.ps1",
+    "test-functional-acceptance-workspace-contract.ps1",
+    "add-functional-scenario-evidence.ps1",
+    "test-functional-scenario-attachment-contract.ps1",
+    "verify-database-migration-contract.ps1",
+    "test-database-migration-contract.ps1",
+    "database-recovery-common.ps1",
+    "manage-report-archives.ps1",
+    "test-report-archive-recovery.ps1",
+    "install-runtime-service.ps1",
+    "uninstall-runtime-service.ps1"
   )
 } else {
   @(
@@ -230,6 +282,7 @@ $ScriptNames = if ($IsTargetRuntimeManifest) {
     "run-client-static.ps1",
     "stop-runtime.ps1",
     "test-integrated-management-smoke.ps1",
+    "test-trigger-gateway-security.ps1",
     "test-integrated-runtime-ready.ps1",
     "test-integrated-capture-management-full.ps1",
     "test-integrated-acceptance-audit.ps1",
@@ -240,31 +293,60 @@ $ScriptNames = if ($IsTargetRuntimeManifest) {
     "test-real-calibration-crash-recovery.ps1",
     "test-real-calibration-integrity-generation.ps1",
     "test-production-stability.ps1",
+    "test-production-stability-workroot-contract.ps1",
     "test-runtime-ui-smoke.ps1",
     "scripts\test-bar-surface-e2e.ps1",
-    "test-runtime-layout.ps1"
+    "test-runtime-layout.ps1",
+    "verify-independent-architecture.ps1",
+    "verify-runtime-package.ps1",
+    "verify-packaged-release-sbom.ps1",
+    "test-runtime-supervisor.ps1",
+    "test-algorithm-acceptance-report.ps1",
+    "test-functional-go-live-readiness.ps1",
+    "new-functional-scenario-evidence.ps1",
+    "new-functional-acceptance-workspace.ps1",
+    "test-functional-acceptance-workspace-contract.ps1",
+    "add-functional-scenario-evidence.ps1",
+    "test-functional-scenario-attachment-contract.ps1",
+    "verify-database-migration-contract.ps1",
+    "test-database-migration-contract.ps1",
+    "database-recovery-common.ps1",
+    "manage-report-archives.ps1",
+    "test-report-archive-recovery.ps1",
+    "install-runtime-service.ps1",
+    "uninstall-runtime-service.ps1"
   )
 }
-if (-not $AllowMissingQt -and $QtDeclared) {
-  $ScriptNames += "run-capture-qt.ps1"
-}
-
 foreach ($ScriptName in $ScriptNames) {
   Assert-PowerShellScriptParses (Join-Path $RuntimeRoot $ScriptName)
 }
 
+$DatabaseContractVerifierPath = Resolve-RuntimePath ([string]$RequiredFiles.databaseContractVerify)
+$DatabaseContractReportText = (& $DatabaseContractVerifierPath `
+  -PackageRoot $RuntimeRoot `
+  -ManifestPath $ManifestPath | Out-String)
+$DatabaseContractReport = $DatabaseContractReportText | ConvertFrom-Json
+if ($DatabaseContractReport.code -ne 0 -or
+    [string]$DatabaseContractReport.schema -cne 'steel.database-contract-verification.v1' -or
+    [long]$DatabaseContractReport.schemaVersion -ne 1) {
+  throw "Runtime package failed the database migration contract."
+}
+$AlgorithmTraceabilityTest = Join-Path $RuntimeRoot "scripts\test_algorithm_traceability.py"
+& python -B $AlgorithmTraceabilityTest
+if ($LASTEXITCODE -ne 0) {
+  throw "Packaged algorithm traceability test failed."
+}
+
 $CaptureConfigRoot = Join-Path $RuntimeRoot "config\capture"
 $CalibrationAcceptancePlanExample = Join-Path $CaptureConfigRoot "calibration-acceptance-plan.example.json"
-Assert-PathExists $CalibrationAcceptancePlanExample "Runtime is missing the reviewed six-camera calibration acceptance plan template." "Leaf"
-$CaptureProfileName = "current-6-soft-trigger"
+Assert-PathExists $CalibrationAcceptancePlanExample "Runtime is missing the reviewed eight-camera calibration acceptance plan template." "Leaf"
+$CaptureProfileName = "current-8-time-trigger"
 $CaptureProfilePath = Join-Path $CaptureConfigRoot "profiles\$CaptureProfileName\profile.json"
 $CaptureActiveProfilePath = Join-Path $CaptureConfigRoot "active-profile.txt"
-$CaptureCameraParamDir = Join-Path $CaptureConfigRoot "camera-params\$CaptureProfileName"
-$CaptureCalibrationPath = Join-Path $CaptureConfigRoot "calibrations\$CaptureProfileName\array-calibration-fit-20260707-151317\ArrayCalibration.corrected.xml"
+$CaptureCalibrationPath = Join-Path $CaptureConfigRoot "calibrations\$CaptureProfileName\ArrayCalibration.xml"
 
 Assert-PathExists $CaptureProfilePath "Runtime capture config is missing $CaptureProfileName profile." "Leaf"
 Assert-PathExists $CaptureActiveProfilePath "Runtime capture config is missing active-profile.txt." "Leaf"
-Assert-PathExists $CaptureCameraParamDir "Runtime capture config is missing camera parameter directory." "Container"
 Assert-PathExists $CaptureCalibrationPath "Runtime capture config is missing corrected array calibration XML." "Leaf"
 Assert-PathExists (Join-Path $RuntimeRoot "scripts\bar_surface_reconstruct.py") "Runtime package is missing bar surface reconstruction script." "Leaf"
 Assert-PathExists (Join-Path $RuntimeRoot "scripts\fit_array_calibration_cross_section.py") "Runtime package is missing calibration fit script." "Leaf"
@@ -275,11 +357,6 @@ if ($ActiveProfile -ne $CaptureProfileName) {
   throw "Runtime capture active profile must be $CaptureProfileName, got $ActiveProfile"
 }
 
-$CameraParamFiles = @(Get-ChildItem -LiteralPath $CaptureCameraParamDir -Filter "*.nccfg" -File)
-if ($CameraParamFiles.Count -lt 6) {
-  throw "Runtime capture config must include six .nccfg files, found $($CameraParamFiles.Count)."
-}
-
 $CaptureProfile = Get-Content $CaptureProfilePath -Raw | ConvertFrom-Json
 if ($CaptureProfile.loadCameraParams -ne $false) {
   throw "Runtime capture profile must default to built-in camera parameters; loadCameraParams should be false."
@@ -287,8 +364,8 @@ if ($CaptureProfile.loadCameraParams -ne $false) {
 if ($CaptureProfile.changeStorage -ne $false) {
   throw "Runtime capture profile must not overwrite the provider storage root on startup."
 }
-if (@($CaptureProfile.cameras).Count -ne 6) {
-  throw "Runtime capture profile must describe six cameras."
+if (@($CaptureProfile.cameras).Count -ne 8) {
+  throw "Runtime capture profile must describe eight cameras."
 }
 
 $StopScript = Join-Path $RuntimeRoot "stop-runtime.ps1"
@@ -306,14 +383,14 @@ foreach ($RequiredText in @("/health", "/api/production/status", "/api/trigger/s
   }
 }
 
-foreach ($CaptureScriptName in @("run-capture-headless.ps1", "run-capture-qt.ps1", "run-integrated-capture-management.ps1")) {
+foreach ($CaptureScriptName in @("run-capture-headless.ps1", "run-integrated-capture-management.ps1")) {
   $CaptureScript = Join-Path $RuntimeRoot $CaptureScriptName
   if (-not (Test-Path $CaptureScript -PathType Leaf)) {
     continue
   }
   $CaptureText = Get-Content $CaptureScript -Raw
   if ($CaptureText -match [regex]::Escape("H:\steel-capture-data")) {
-    throw "$CaptureScriptName must default to H:\ so production frames land under H:\camera1..camera6, not H:\steel-capture-data."
+    throw "$CaptureScriptName must default to H:\ so production frames land under H:\camera1..camera8, not H:\steel-capture-data."
   }
   $RequiredStorageTexts = if ($CaptureScriptName -eq "run-integrated-capture-management.ps1") {
     @('[string]$StorageRoot = "H:\"', '[string]$CameraStorageRoot = "H:\"', "-CameraStorageRoot")
@@ -328,9 +405,23 @@ foreach ($CaptureScriptName in @("run-capture-headless.ps1", "run-capture-qt.ps1
 }
 
 $SmokeText = Get-Content (Join-Path $RuntimeRoot "test-integrated-management-smoke.ps1") -Raw
-foreach ($RequiredText in @("/api/production/tasks/steel-info", "/api/production/tasks/steel-in", "/api/production/tasks/steel-out", "/api/production/tasks", "/api/production/tasks/detail", "/api/trigger/manual/steel-in", "recordWrittenBeforeCapture", "/api/system/network", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "rateFields", "/api/production/capture-once", "captureGuard", "captureOnce", "captureFileRows", "durableTasks", "requestId", "RunId", 'runs\$RunId\config\service', "-ConfigRoot", "Write-SmokeReport", "reportPath")) {
+foreach ($RequiredText in @("/api/production/tasks/steel-info", "/api/production/tasks/steel-in", "/api/production/tasks/steel-out", "/api/production/tasks", "/api/production/tasks/detail", "/api/trigger/manual/steel-in", "recordWrittenBeforeCapture", "/api/system/network", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "rateFields", "/api/production/capture-once", "captureGuard", "captureOnce", "captureFileRows", "durableTasks", "chainId", "dependsOnTaskId", "dependencyPolicy", "require-success", "dependencyOrder", "requestId", "RunId", 'runs\$RunId\work', "steel-runtime-package-smoke", "-ConfigRoot", '[string]$WorkRoot', "Write-SmokeReport", "reportPath", "startedProcesses", "startedListeners")) {
   if ($SmokeText -notmatch [regex]::Escape($RequiredText)) {
     throw "test-integrated-management-smoke.ps1 must verify $RequiredText"
+  }
+}
+
+$TriggerSecurityText = Get-Content (Join-Path $RuntimeRoot "test-trigger-gateway-security.ps1") -Raw
+foreach ($RequiredText in @("STEEL_RUNTIME_PROFILE", "production", "TRIGGER_SHARED_SECRET", "TRIGGER_OPERATOR_TOKEN", "TRIGGER_SOURCE_ALLOWLIST", "HMACSHA256", "steel-trigger-v1", "X-Trigger-Timestamp", "X-Trigger-Nonce", "X-Trigger-Signature", "X-Trigger-Operator-Token", "trigger_replay_detected", "trigger_operator_auth_required", "trigger_mode_locked", "Access-Control-Allow-Origin", "missingSecretFailClosed", "operatorCredentialSeparated", 'transports = @("http", "tcp", "udp")', "statusRedacted", "trigger-security-report.json")) {
+  if ($TriggerSecurityText -notmatch [regex]::Escape($RequiredText)) {
+    throw "test-trigger-gateway-security.ps1 must verify $RequiredText"
+  }
+}
+
+$TriggerRunText = Get-Content (Join-Path $RuntimeRoot "run-trigger-gateway.ps1") -Raw
+foreach ($RequiredText in @('[string]$RuntimeProfile = "production"', "STEEL_RUNTIME_PROFILE", "TRIGGER_SOURCE_ALLOWLIST", "TRIGGER_ALLOW_MODE_MUTATION")) {
+  if ($TriggerRunText -notmatch [regex]::Escape($RequiredText)) {
+    throw "run-trigger-gateway.ps1 must enforce the production trigger boundary via $RequiredText"
   }
 }
 
@@ -364,6 +455,7 @@ foreach ($RequiredText in @(
   "steel.integrated-capture-management.acceptance.v1",
   "test-runtime-layout.ps1",
   "test-integrated-runtime-ready.ps1",
+  "test-trigger-gateway-security.ps1",
   "test-real-hardware-acceptance.ps1",
   "test-real-calibration-acceptance.ps1",
   "test-runtime-ui-smoke.ps1",
@@ -375,6 +467,8 @@ foreach ($RequiredText in @(
   "ApplyCrashRecoveryReportPath",
   "RollbackCrashRecoveryReportPath",
   "CalibrationIntegrityGenerationReportPath",
+  "ReleaseIdentity",
+  "manifestSha256",
   "RunBarSurface",
   "RunShortStability",
   "StabilityDurationSec",
@@ -388,6 +482,7 @@ foreach ($RequiredText in @(
   "required =",
   "uncovered",
   "trigger-gateway-route",
+  "production-trigger-security",
   "real-calibration-apply-rollback",
   "real-calibration-crash-recovery",
   "real-calibration-integrity-generation",
@@ -405,7 +500,8 @@ foreach ($RequiredText in @(
   "steel.integrated-capture-management.acceptance-audit.v1",
   "ICM-01",
   "ICM-23",
-  'RequiredCount = 23',
+  "ICM-24",
+  'RequiredCount = 24',
   "test-architecture-migration-contract.ps1",
   "integratedReportPath",
   "tenMinuteReportPath",
@@ -415,6 +511,8 @@ foreach ($RequiredText in @(
   "calibrated-3d",
   "sdkDerived",
   "trigger-gateway-route",
+  "trigger-security",
+  "HMAC-SHA256",
   "verify-independent-architecture.ps1"
   "steel.real-calibration.acceptance.v1"
   "steel.real-calibration.crash-recovery.v1"
@@ -426,7 +524,26 @@ foreach ($RequiredText in @(
 }
 
 $IntegratedAcceptanceDoc = Join-Path $RuntimeRoot "docs\integrated-capture-management-acceptance.md"
+$ReleaseOperationsDoc = Join-Path $RuntimeRoot "docs\release-deployment-and-operations.md"
+$ReadinessClosureDoc = Join-Path $RuntimeRoot "docs\production-readiness-gap-and-closure-design.md"
+$AtomicUpgradeDoc = Join-Path $RuntimeRoot "docs\atomic-upgrade-and-database-migration-design.md"
+$ScriptRunbook = Join-Path $RuntimeRoot "scripts\README.md"
+Assert-PathExists $ReleaseOperationsDoc "Runtime is missing the release deployment and operations runbook." "Leaf"
+Assert-PathExists $ReadinessClosureDoc "Runtime is missing the production readiness closure design." "Leaf"
+Assert-PathExists $AtomicUpgradeDoc "Runtime is missing the atomic upgrade and database migration design." "Leaf"
+Assert-PathExists $ScriptRunbook "Runtime is missing the script usage runbook at scripts/README.md." "Leaf"
 Assert-PathExists $IntegratedAcceptanceDoc "Missing integrated capture management acceptance matrix: $IntegratedAcceptanceDoc" "Leaf"
+$AtomicUpgradeDocText = Get-Content $AtomicUpgradeDoc -Raw
+foreach ($RequiredText in @(
+  "Global\SteelInspectionRuntime-Deployment",
+  "steel.database-backup.v2",
+  "failed-safe",
+  "P0 No-Go"
+)) {
+  if ($AtomicUpgradeDocText -notmatch [regex]::Escape($RequiredText)) {
+    throw "atomic-upgrade-and-database-migration-design.md must document $RequiredText"
+  }
+}
 $IntegratedAcceptanceDocText = Get-Content $IntegratedAcceptanceDoc -Raw
 foreach ($RequiredText in @(
   "Integrated Capture Management Acceptance Matrix",
@@ -436,7 +553,8 @@ foreach ($RequiredText in @(
   "coverage.required",
   "ICM-01",
   "ICM-23",
-  "summary.passed=23",
+  "ICM-24",
+  "summary.passed=24",
   "test-architecture-migration-contract.ps1",
   "H:\camera1",
   "integrated-capture-management-20260709-121522-831.json",
@@ -477,7 +595,7 @@ foreach ($RequiredText in @(
 }
 
 $AcceptanceText = Get-Content (Join-Path $RuntimeRoot "test-runtime-acceptance.ps1") -Raw
-foreach ($RequiredText in @("test-runtime-layout.ps1", "test-integrated-management-smoke.ps1", "Stop-AcceptancePorts", "Get-NetTCPConnection", "netstat -ano", "SteelInspectionRuntimeAcceptance", "Assert-SmokeResult", "Read-JsonFromOutput", "reportPath", "service.network", "network =", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "rateFields", "captureGuard", "captureOnce", "captureFileRows")) {
+foreach ($RequiredText in @("test-runtime-layout.ps1", "test-integrated-management-smoke.ps1", "test-trigger-gateway-security.ps1", "TriggerSecuritySummary", "missingSecretFailClosed", "operatorCredentialSeparated", "replayRejected.http", "replayRejected.tcp", "replayRejected.udp", "modeMutationLocked", "wildcardCors", "statusRedacted", "Stop-AcceptancePorts", "Get-NetTCPConnection", "netstat -ano", "SteelInspectionRuntimeAcceptance", "Assert-SmokeResult", "Read-JsonFromOutput", "reportPath", "service.network", "network =", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "rateFields", "captureGuard", "captureOnce", "captureFileRows")) {
   if ($AcceptanceText -notmatch [regex]::Escape($RequiredText)) {
     throw "test-runtime-acceptance.ps1 must run $RequiredText"
   }
@@ -512,9 +630,104 @@ foreach ($RequiredText in @("steel.real-calibration.integrity-generation.v1", "s
 }
 
 $ProductionStabilityText = Get-Content (Join-Path $RuntimeRoot "test-production-stability.ps1") -Raw
-foreach ($RequiredText in @("/api/production/steel-in", "/api/production/capture-once", "/api/production/steel-out", "/api/production/algorithm/run", "/api/system/network", "/api/trigger/manual/steel-in", "/api/trigger/capture-once", "UseTriggerGateway", "triggerRoute", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "steel.production.stability.v1", "steel.production.summary.v1", "H:\", "RunAlgorithmEvery", "activeSession", "sdkDerived")) {
+foreach ($RequiredText in @("/api/production/steel-in", "/api/production/capture-once", "/api/production/steel-out", "/api/production/algorithm/run", "/api/system/network", "/api/trigger/manual/steel-in", "/api/trigger/capture-once", "UseTriggerGateway", "triggerRoute", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "steel.production.stability.v1", "steel.production.summary.v1", "H:\", "RunAlgorithmEvery", "activeSession", "sdkDerived", "HardwareCaptureConfigurationRequired", "not-applicable-simulated-provider", "simulated-uri-ledger", 'simulated://$MaterialId/*', '[string]$WorkRoot', '[string]$ReleaseManifestPath', "manifestSha256", "steel-runtime-package-stability", "queueDepthAvailable", "activeTaskId", "admission.inFlight", "identityBinding", "identityIsolation", "finalConvergence", "Resolve-ProductionSummaryPath", "ProviderSummaryOutput", "Join-Path `$WorkRoot `$ProviderSummaryOutput")) {
   if ($ProductionStabilityText -notmatch [regex]::Escape($RequiredText)) {
     throw "test-production-stability.ps1 must verify $RequiredText"
+  }
+}
+
+$ProductionStabilityWorkRootContractText = Get-Content (Join-Path $RuntimeRoot "test-production-stability-workroot-contract.ps1") -Raw
+foreach ($RequiredText in @(
+  "steel.production-stability-workroot.contract-test.v1",
+  "KeepRunning smoke launcher did not return",
+  "startedProcesses",
+  "startedListeners",
+  "relative provider.summaryOutput",
+  "summary-contained-in-workroot",
+  "production-cycle-converged",
+  "Stop-ContractProcesses"
+)) {
+  if ($ProductionStabilityWorkRootContractText -notmatch [regex]::Escape($RequiredText)) {
+    throw "test-production-stability-workroot-contract.ps1 must contain $RequiredText"
+  }
+}
+
+$FunctionalGoLiveText = Get-Content (Join-Path $RuntimeRoot "test-functional-go-live-readiness.ps1") -Raw
+foreach ($RequiredText in @(
+  "steel.functional-go-live-plan.v1",
+  "steel.functional-go-live-readiness.v1",
+  "steel.algorithm-acceptance.audit.v1",
+  "steel.integrated-capture-management.acceptance.v1",
+  "steel.plc-l2-functional-acceptance.v1",
+  "steel.production.stability.v1",
+  "steel.target-machine-functional-acceptance.v1",
+  "requiredIntegratedCoverage",
+  "minimumSoakSeconds",
+  "manifestSha256",
+  "release identity does not match",
+  "evidence SHA-256 mismatch",
+  "steel.functional-scenario-evidence.v1",
+  "different scenarioId",
+  "observedAt was outside",
+  "source metadata is incomplete",
+  "raw log SHA-256 mismatch",
+  "raw log file is missing",
+  "startedAt/finishedAt",
+  "approval time is required",
+  "approval time cannot precede",
+  "simulated provider cannot satisfy",
+  "identityBinding",
+  "excludedFromDecision",
+  '"security", "signing", "supply-chain"'
+)) {
+  if ($FunctionalGoLiveText -notmatch [regex]::Escape($RequiredText)) {
+    throw "test-functional-go-live-readiness.ps1 must verify $RequiredText"
+  }
+}
+
+$FunctionalEvidenceGeneratorText = Get-Content (Join-Path $RuntimeRoot "new-functional-scenario-evidence.ps1") -Raw
+foreach ($RequiredText in @(
+  "steel.functional-scenario-evidence.v1",
+  "steel.functional-scenario-evidence.reference.v1",
+  "releaseManifestSha256",
+  "rawLogSha256",
+  "Write-Utf8JsonAtomically",
+  "Get-FileHash"
+)) {
+  if ($FunctionalEvidenceGeneratorText -notmatch [regex]::Escape($RequiredText)) {
+    throw "new-functional-scenario-evidence.ps1 must contain $RequiredText"
+  }
+}
+
+$FunctionalWorkspaceInitializerText = Get-Content (Join-Path $RuntimeRoot "new-functional-acceptance-workspace.ps1") -Raw
+foreach ($RequiredText in @(
+  "steel.functional-acceptance-workspace.v1",
+  "steel.functional-acceptance-workspace.reference.v1",
+  "steel.functional-go-live-plan.v1",
+  "steel.plc-l2-functional-acceptance.v1",
+  "steel.target-machine-functional-acceptance.v1",
+  "MinimumSoakSeconds cannot be below",
+  "initializer never overwrites or deletes acceptance evidence",
+  "Write-Utf8JsonAtomically"
+)) {
+  if ($FunctionalWorkspaceInitializerText -notmatch [regex]::Escape($RequiredText)) {
+    throw "new-functional-acceptance-workspace.ps1 must contain $RequiredText"
+  }
+}
+
+$FunctionalScenarioAttacherText = Get-Content (Join-Path $RuntimeRoot "add-functional-scenario-evidence.ps1") -Raw
+foreach ($RequiredText in @(
+  "steel.functional-scenario-attachment.v1",
+  "already approved and is frozen",
+  "cannot be attached twice",
+  "must fall inside the scenario report execution window",
+  "must stay inside",
+  "changed while evidence was being generated",
+  "Write-Utf8JsonAtomically",
+  "new-functional-scenario-evidence.ps1"
+)) {
+  if ($FunctionalScenarioAttacherText -notmatch [regex]::Escape($RequiredText)) {
+    throw "add-functional-scenario-evidence.ps1 must contain $RequiredText"
   }
 }
 
@@ -527,17 +740,19 @@ foreach ($RequiredText in @("/api/production/algorithm/run", "/api/algorithm/bar
 
 $BarSurfaceAlgorithmText = Get-Content (Join-Path $RuntimeRoot "scripts\bar_surface_reconstruct.py") -Raw
 foreach ($RequiredText in @(
-  '("camera1", "192.168.101.100", "3G506401BE08818")',
-  '("camera2", "192.168.102.100", "3G506501CA09165")',
-  '("camera3", "192.168.103.100", "3G506401RE08993")',
-  '("camera4", "192.168.104.100", "3G506401BE08819")',
-  '("camera5", "192.168.105.13", "YF-0263")',
-  '("camera6", "192.168.106.100", "3G506401RE08991")',
+  '("camera1", "192.168.101.100", "3G506601BE09220")',
+  '("camera2", "192.168.102.100", "3G506501CA09164")',
+  '("camera3", "192.168.103.100", "3G506401RE08999")',
+  '("camera4", "192.168.104.100", "YF-0270")',
+  '("camera5", "192.168.105.100", "3G506601BE09221")',
+  '("camera6", "192.168.106.100", "3G506501CA09163")',
+  '("camera7", "192.168.107.100", "3G506401RE08995")',
+  '("camera8", "192.168.108.100", "YF-0269")',
   'metadata_text(frame.metadata, "sn", "serial", "cameraSn")',
   'metadata_text(frame.metadata, "ip", "cameraIp")'
 )) {
   if ($BarSurfaceAlgorithmText -notmatch [regex]::Escape($RequiredText)) {
-    throw "bar_surface_reconstruct.py must preserve current six-camera metadata/calibration mapping via $RequiredText"
+    throw "bar_surface_reconstruct.py must preserve current eight-camera metadata/calibration mapping via $RequiredText"
   }
 }
 
@@ -547,7 +762,7 @@ $Summary = [ordered]@{
   manifest = $ManifestPath
   requiredFiles = $RequiredFiles.Count
   scripts = $ScriptNames.Count
-  hasQt = [bool]$QtDeclared
+  qtRemoved = $true
   client = Resolve-RuntimePath ([string]$RequiredFiles.client)
 }
 

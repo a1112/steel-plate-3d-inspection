@@ -1,4 +1,4 @@
-import type { DefectItem, DeviceStatus, Severity, Surface } from '../data/inspection';
+import type { DefectItem, DeviceStatus, PlateInspection, Severity, Surface } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 
 export type ReportSeverityFilter = Severity | 'all';
@@ -21,6 +21,49 @@ export interface ReportMetrics {
   top: number;
   bottom: number;
   maxDepthMm: number;
+}
+
+export interface ReportMetadata {
+  reportId: string;
+  dataSource: string;
+  dataThrough: string;
+  inspectionIds: string[];
+  materialIds: string[];
+  recordCount: number;
+}
+
+function stableReportSuffix(values: string[]) {
+  let hash = 2166136261;
+  for (const character of values.join('|')) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).toUpperCase().padStart(8, '0');
+}
+
+export function createReportMetadata(inspections: PlateInspection[], defects: DefectItem[]): ReportMetadata {
+  const relevantMaterials = new Set(defects.map((defect) => defect.plateNo));
+  const relevant = inspections.filter((inspection) => relevantMaterials.size === 0 || relevantMaterials.has(inspection.plate.plateNo));
+  const inspectionIds = [...new Set(relevant.map((inspection) => inspection.inspectionId).filter((value): value is string => Boolean(value)))].sort();
+  const materialIds = [...new Set((defects.length ? defects.map((defect) => defect.plateNo) : relevant.map((inspection) => inspection.plate.plateNo)).filter(Boolean))].sort();
+  const identity = inspectionIds.length ? inspectionIds : materialIds.length ? materialIds : ['EMPTY'];
+  const reportId = inspectionIds.length === 1
+    ? `RPT-${inspectionIds[0]}`
+    : `RPT-${inspectionIds.length > 1 ? 'MULTI' : 'DATA'}-${stableReportSuffix(identity)}`;
+  const sources = new Set(relevant.map((inspection) => inspection.source || 'unknown'));
+  const dataSource = sources.size === 1 && sources.has('production')
+    ? '生产检测数据库'
+    : sources.size === 1 && (sources.has('demo') || sources.has('test'))
+      ? '演示数据'
+      : sources.has('production')
+        ? '生产与兼容记录'
+        : '检测记录快照';
+  const dataThrough = relevant
+    .map((inspection) => inspection.plate.detectedAt)
+    .filter(Boolean)
+    .sort()
+    .at(-1) ?? '';
+  return { reportId, dataSource, dataThrough, inspectionIds, materialIds, recordCount: defects.length };
 }
 
 export interface InspectionSettings {
@@ -254,4 +297,8 @@ export function exportRowsAsCsv(defects: DefectItem[]): string {
     ].join(','),
   );
   return [header, ...rows].join('\n');
+}
+
+export function exportReportAsJson(metadata: ReportMetadata, defects: DefectItem[]): string {
+  return JSON.stringify({ schema: 'steel.inspection.report.v1', metadata, defects }, null, 2);
 }

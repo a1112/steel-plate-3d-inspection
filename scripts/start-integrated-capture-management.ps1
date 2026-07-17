@@ -5,14 +5,14 @@ param(
   [int]$ClientPort = 1432,
   [string]$Configuration = "Release",
   [ValidateSet("debug", "release")]
-  [string]$ServiceProfile = "debug",
+  [string]$ServiceProfile = "release",
   [string]$StorageRoot = "H:\",
   [string]$CameraStorageRoot = "H:\",
-  [string]$CaptureProfile = "current-6-soft-trigger",
-  [ValidateSet("api", "gray", "secondary", "manual")]
+  [Parameter(Mandatory = $true)]
+  [string]$ArtifactAllowedRoots,
+  [string]$CaptureProfile = "current-8-time-trigger",
+  [ValidateSet("api", "tcp", "udp", "gray", "secondary", "manual")]
   [string]$TriggerMode = "manual",
-  [switch]$WithQtViewer,
-  [switch]$NoQt,
   [switch]$StopExisting,
   [switch]$OpenBrowser
 )
@@ -141,9 +141,6 @@ $CaptureStartArgs = @{
   CameraStorageRoot = $CameraStorageRoot
   Profile = $CaptureProfile
 }
-if ($WithQtViewer -and -not $NoQt) {
-  $CaptureStartArgs.WithQtViewer = $true
-}
 if ($StopExisting) {
   $CaptureStartArgs.StopExisting = $true
 }
@@ -158,6 +155,7 @@ if (-not (Test-LocalTcpPort -Port $ServicePort)) {
     "-TriggerOrigin", "http://127.0.0.1:$TriggerPort",
     "-Port", [string]$ServicePort,
     "-Profile", $ServiceProfile,
+    "-ArtifactAllowedRoots", $ArtifactAllowedRoots,
     "-NoCaptureAutostart",
     "-ForceParameters"
   ) | Out-Null
@@ -206,6 +204,3 @@ Write-Host "  Rust service    http://127.0.0.1:$ServicePort"
 Write-Host "  Trigger gateway http://127.0.0.1:$TriggerPort/manual"
 Write-Host "  Client          $ClientUrl"
 Write-Host "  Logs            $LogDir"
-if ($NoQt) {
-  Write-Warning "-NoQt is deprecated because Qt is no longer part of the formal runtime. Use -WithQtViewer only for local diagnostics."
-}

@@ -5,6 +5,7 @@ param(
   [ValidateSet("debug", "release")]
   [string]$Profile = "debug",
   [string]$ConfigRoot = "",
+  [string]$WorkRoot = "",
   [switch]$SkipClient,
   [switch]$KeepRunning,
   [int]$TimeoutSec = 30
@@ -18,18 +19,24 @@ $RepoRoot = if ($SourceMode) {
 } else {
   $ScriptRoot
 }
-$LogDir = if ($SourceMode) {
-  Join-Path $RepoRoot "target\logs\integrated-smoke"
-} else {
-  Join-Path $RepoRoot "logs\integrated-smoke"
+$RunId = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+if ([string]::IsNullOrWhiteSpace($WorkRoot)) {
+  $WorkRoot = if ($SourceMode) {
+    Join-Path $RepoRoot "target\logs\integrated-smoke"
+  } else {
+    Join-Path ([System.IO.Path]::GetTempPath()) "steel-runtime-package-smoke"
+  }
 }
+$WorkRoot = [System.IO.Path]::GetFullPath($WorkRoot)
+$LogDir = $WorkRoot
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $ReportDir = Join-Path $LogDir "reports"
 New-Item -ItemType Directory -Force -Path $ReportDir | Out-Null
 
-$RunId = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+$RunWorkDir = Join-Path $LogDir "runs\$RunId\work"
+New-Item -ItemType Directory -Force -Path $RunWorkDir | Out-Null
 if ([string]::IsNullOrWhiteSpace($ConfigRoot)) {
-  $ConfigRoot = Join-Path $LogDir "runs\$RunId\config\service"
+  $ConfigRoot = Join-Path $RunWorkDir "config\service"
 }
 New-Item -ItemType Directory -Force -Path $ConfigRoot | Out-Null
 
@@ -138,7 +145,7 @@ function Start-SmokeScript {
   Remove-Item $OutLog, $ErrLog -ErrorAction SilentlyContinue
   $ArgList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $ScriptPath) + $Arguments
   Normalize-ProcessPathEnvironment
-  $WorkingDirectory = if ($SourceMode) { $RepoRoot } else { $ScriptRoot }
+  $WorkingDirectory = $RunWorkDir
   $Process = Start-Process -FilePath "powershell.exe" `
     -ArgumentList $ArgList `
     -WorkingDirectory $WorkingDirectory `
@@ -259,7 +266,7 @@ function Wait-ProductionTask {
   do {
     $Response = Invoke-HttpJson -Method GET -Uri "$ServiceOrigin/api/production/tasks/detail?id=$([uri]::EscapeDataString($TaskId))"
     $Task = $Response.Json.task
-    if ($Task.status -in @("succeeded", "failed", "cancelled", "interrupted")) {
+    if ($Task.status -in @("succeeded", "failed", "cancelled", "interrupted", "blocked")) {
       Assert-Condition ($Task.kind -eq $ExpectedKind) "Task $TaskId kind mismatch: $($Task.kind)"
       Assert-Condition ($Task.status -eq "succeeded") "Task $TaskId ($ExpectedKind) ended as $($Task.status): $($Task.error)"
       return $Response
@@ -290,6 +297,8 @@ function Test-StaticClient {
 
 $ServiceOrigin = "http://127.0.0.1:$ServicePort"
 $TriggerOrigin = "http://127.0.0.1:$TriggerPort"
+$TriggerTcpPort = $TriggerPort + 1
+$TriggerUdpPort = $TriggerPort + 2
 $ClientOrigin = "http://127.0.0.1:$ClientPort"
 $MaterialId = "BAR-SMOKE-" + (Get-Date -Format "yyyyMMdd-HHmmss")
 $StartedAt = Get-Date
@@ -302,13 +311,19 @@ try {
         "-Port", [string]$ServicePort,
         "-Profile", $Profile,
         "-ConfigRoot", $ConfigRoot,
+        "-RuntimeProfile", "development",
+        "-AlgorithmMode", "demo",
+        "-TriggerOrigin", $TriggerOrigin,
         "-NoCaptureAutostart",
         "-ForceParameters"
       ) | Out-Null
     } else {
       Start-SmokeScript -Name "service" -ScriptPath (Join-Path $ScriptRoot "run-service-simulated.ps1") -Arguments @(
         "-Port", [string]$ServicePort,
-        "-ConfigRoot", $ConfigRoot
+        "-ConfigRoot", $ConfigRoot,
+        "-TriggerOrigin", $TriggerOrigin,
+        "-RuntimeProfile", "development",
+        "-AlgorithmMode", "demo"
       ) | Out-Null
     }
     $StartedPorts.Add($ServicePort)
@@ -325,14 +340,20 @@ try {
   if (-not (Test-LocalTcpPort -Port $TriggerPort)) {
     $TriggerArguments = @(
       "-Port", [string]$TriggerPort,
+      "-TcpPort", [string]$TriggerTcpPort,
+      "-UdpPort", [string]$TriggerUdpPort,
       "-InspectionServiceOrigin", $ServiceOrigin,
-      "-Mode", "api"
+      "-Mode", "api",
+      "-RuntimeProfile", "development",
+      "-AllowModeMutation"
     )
     if ($SourceMode) {
       $TriggerArguments += @("-Profile", $Profile, "-ForceParameters")
     }
     Start-SmokeScript -Name "trigger-gateway" -ScriptPath (Join-Path $ScriptRoot "run-trigger-gateway.ps1") -Arguments $TriggerArguments | Out-Null
     $StartedPorts.Add($TriggerPort)
+    $StartedPorts.Add($TriggerTcpPort)
+    $StartedPorts.Add($TriggerUdpPort)
   } else {
     Write-Host "Trigger gateway already listening on port $TriggerPort."
   }
@@ -387,7 +408,7 @@ try {
 
   $CaptureGuard = Invoke-HttpJson -Method POST -Uri "$ServiceOrigin/api/production/capture-once" -Body @{
     materialId = $MaterialId
-    expectedCameras = 6
+    expectedCameras = 8
     rounds = 1
     steelStateAware = $true
     requireSteelPresent = $true
@@ -424,7 +445,7 @@ try {
     payload = @{
       requestId = "smoke-capture-$RunId"
       materialId = $MaterialId
-      expectedCameras = 6
+      expectedCameras = 8
       rounds = 1
       lines = 1000
       width = 0
@@ -446,12 +467,13 @@ try {
   $CaptureOnce = $CaptureTask.Json.task.result
   Assert-Condition ($CaptureOnce.code -eq 0) "Persistent production capture-once failed."
   Assert-Condition ($CaptureOnce.provider.parallel -eq $true) "Production capture-once did not report parallel provider capture."
-  Assert-Condition ($CaptureOnce.provider.workerCount -ge 6) "Production capture-once worker count was below six cameras."
+  Assert-Condition ($CaptureOnce.provider.workerCount -eq 8) "Production capture-once worker count was not exactly eight cameras."
   Assert-Condition ($CaptureOnce.provider.failures -eq 0) "Production capture-once provider reported failures."
-  Assert-Condition ($CaptureOnce.provider.completeFrames -ge 6) "Production capture-once did not produce six complete frames."
-  Assert-Condition ($CaptureOnce.provider.metadataFrames -ge 6) "Production capture-once did not produce six metadata frames."
+  Assert-Condition ($CaptureOnce.provider.successes -eq 8) "Production capture-once did not report exactly eight successful cameras."
+  Assert-Condition ($CaptureOnce.provider.completeFrames -eq 8) "Production capture-once did not produce exactly eight complete frames."
+  Assert-Condition ($CaptureOnce.provider.metadataFrames -eq 8) "Production capture-once did not produce exactly eight metadata commits."
   Assert-Condition ($CaptureOnce.provider.saveSdkDerived -eq $false) "Production capture-once should keep sdk-derived disabled by default."
-  Assert-Condition ($CaptureOnce.record.captureFileRows -ge 18) "Production capture summary did not record depth/intensity/metadata files for six cameras."
+  Assert-Condition ($CaptureOnce.record.captureFileRows -eq 24) "Production capture summary did not record exactly three files for each of eight cameras."
 
   $SteelOutBody = $EventBody.Clone()
   $SteelOutBody.requestId = "smoke-steel-out-$RunId"
@@ -463,7 +485,13 @@ try {
   foreach ($PersistedTask in @($SteelInfoTask.Json.task, $SteelInTask.Json.task, $CaptureTask.Json.task, $SteelOutTask.Json.task)) {
     Assert-Condition ($PersistedTask.materialId -eq $MaterialId) "Durable task $($PersistedTask.kind) changed material identity."
     Assert-Condition ([string]$PersistedTask.sessionId -eq $PersistedSessionId) "Durable task $($PersistedTask.kind) changed session identity."
+    Assert-Condition ([string]$PersistedTask.chainId -eq $PersistedSessionId) "Durable task $($PersistedTask.kind) changed production chain identity."
+    Assert-Condition ([string]$PersistedTask.dependencyPolicy -eq "require-success") "Durable task $($PersistedTask.kind) did not use the fail-closed dependency policy."
   }
+  Assert-Condition ([string]::IsNullOrWhiteSpace([string]$SteelInfoTask.Json.task.dependsOnTaskId)) "Steel-info should be the production chain root."
+  Assert-Condition ([string]$SteelInTask.Json.task.dependsOnTaskId -eq [string]$SteelInfoTask.Json.task.taskId) "Steel-in did not depend on steel-info."
+  Assert-Condition ([string]$CaptureTask.Json.task.dependsOnTaskId -eq [string]$SteelInTask.Json.task.taskId) "Capture-once did not depend on steel-in."
+  Assert-Condition ([string]$SteelOutTask.Json.task.dependsOnTaskId -eq [string]$CaptureTask.Json.task.taskId) "Steel-out did not depend on capture-once."
 
   $StatusAfter = Invoke-HttpJson -Method GET -Uri "$ServiceOrigin/api/production/status"
   Assert-Condition ($StatusAfter.Json.latestSession.materialId -eq $MaterialId) "Latest production session mismatch after steel-out."
@@ -478,6 +506,7 @@ try {
     service = @{
       origin = $ServiceOrigin
       configRoot = $ConfigRoot
+      workRoot = $RunWorkDir
       database = $StatusAfter.Json.database
       network = $NetworkSummary
     }
@@ -485,6 +514,9 @@ try {
       origin = $TriggerOrigin
       manualGuard = $Guard.StatusCode
       mode = $ModeSet.Json.mode
+      httpPort = $TriggerPort
+      tcpPort = $TriggerTcpPort
+      udpPort = $TriggerUdpPort
     }
     client = @{
       origin = if ($SkipClient) { $null } else { "$ClientOrigin/?app=terminal" }
@@ -496,10 +528,13 @@ try {
       latestStatus = $StatusAfter.Json.latestSession.status
       recordWrittenBeforeCapture = $SteelInResult.flow.recordWrittenBeforeCapture
       durableTasks = @{
+        chainId = $PersistedSessionId
         steelInfo = $SteelInfoTask.Json.task.taskId
         steelIn = $SteelInTask.Json.task.taskId
         captureOnce = $CaptureTask.Json.task.taskId
         steelOut = $SteelOutTask.Json.task.taskId
+        dependencyPolicy = "require-success"
+        dependencyOrder = @("steel-info", "steel-in", "capture-once", "steel-out")
       }
       captureGuard = @{
         statusCode = $CaptureGuard.StatusCode
@@ -518,6 +553,14 @@ try {
     }
     logs = $LogDir
     keptRunning = [bool]$KeepRunning
+    startedProcesses = @($StartedProcesses | ForEach-Object {
+      [ordered]@{
+        id = $_.Id
+        processName = $_.ProcessName
+        hasExited = $_.HasExited
+      }
+    })
+    startedListeners = @($StartedPorts | Sort-Object -Unique)
   }
 
   $null = Write-SmokeReport -Report $Summary
@@ -533,6 +576,7 @@ try {
     service = @{
       origin = $ServiceOrigin
       configRoot = $ConfigRoot
+      workRoot = $RunWorkDir
     }
     triggerGateway = @{
       origin = $TriggerOrigin
@@ -566,3 +610,5 @@ try {
     }
   }
 }
+
+exit 0

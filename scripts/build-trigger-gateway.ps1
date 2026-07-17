@@ -1,6 +1,7 @@
 param(
   [ValidateSet("debug", "release")]
-  [string]$Profile = "debug"
+  [string]$Profile = "debug",
+  [switch]$Locked
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,6 +14,9 @@ $Args = @(
 
 if ($Profile -eq "release") {
   $Args += "--release"
+}
+if ($Locked) {
+  $Args += "--locked"
 }
 
 & cargo @Args

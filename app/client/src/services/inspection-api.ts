@@ -8,8 +8,13 @@ const DEFAULT_SERVICE_ORIGIN = 'http://127.0.0.1:4873';
 const CONNECTION_CONFIG_KEY = 'steel-inspection-connection-config';
 const ADMIN_SESSION_KEY = 'steel-inspection-admin-session';
 const ADMIN_ERROR_MESSAGES: Record<string, string> = {
+  report_archive_integrity_failed: '检测报告归档完整性校验失败，请停止打印并联系运维恢复归档',
+  report_archive_invalid: '检测报告归档格式损坏，请联系运维恢复归档',
+  report_archive_not_found: '指定的检测报告归档不存在或已丢失',
+  invalid_report_identity: '检测报告归档编号无效',
   auth_required: '请先登录后台管理',
   permission_denied: '当前账号没有该操作权限',
+  password_change_required: '首次登录必须先修改初始密码',
   origin_not_allowed: '请求来源不受信任，请从本机客户端操作',
   trigger_gateway_unavailable: '触发网关不可达',
   trigger_gateway_timeout: '触发网关响应超时',
@@ -105,6 +110,7 @@ export type AdminUser = {
   displayName: string;
   role: string;
   status: string;
+  mustChangePassword?: boolean;
   lastLoginAt: string;
 };
 
@@ -113,6 +119,7 @@ export type AdminAuthenticatedUser = {
   displayName: string;
   role: string;
   permissions: string[];
+  mustChangePassword?: boolean;
 };
 
 export type AdminAuthSession = {
@@ -458,10 +465,72 @@ export type AdminDefectDetail = {
   previewX: number;
   previewY: number;
   previewImageUrl?: string;
+  artifacts?: import('../data/inspection').DefectArtifacts;
 };
 
 export type AdminInspectionRecordDetail = AdminInspectionRecord & {
   defects: AdminDefectDetail[];
+  algorithmTrace?: {
+    schema: string;
+    algorithmName?: string;
+    algorithmVersion?: string;
+    configRevision?: string;
+    configSha256?: string;
+    scriptSha256?: string;
+    coreSha256?: string;
+    releaseCommit?: string;
+    acceptanceReportSha256?: string;
+    datasetRevision?: string;
+    datasetSha256?: string;
+    evaluatorRevision?: string;
+    evaluatorSha256?: string;
+    calibrationRevision?: string;
+    calibrationSha256?: string;
+    inputSummarySha256?: string;
+    inputArtifactCount?: number;
+    qualityGate?: { passed?: boolean; reasons?: string[] };
+    realDefectCount?: number;
+    syntheticDefectCount?: number;
+  } | null;
+};
+
+export type InspectionReportArchive = {
+  schema: 'steel.inspection.report-archive.v1' | string;
+  reportId: string;
+  inspectionId: string;
+  materialId: string;
+  issuedAt: string;
+  issuedBy: string;
+  documentSha256: string;
+  document: Record<string, unknown>;
+};
+
+export type IssuedInspectionReport = {
+  code: number;
+  created: boolean;
+  reportId: string;
+  archivePath: string;
+  archive: InspectionReportArchive;
+};
+
+export type InspectionReportArchiveSummary = {
+  reportId: string;
+  inspectionId: string;
+  materialId: string;
+  issuedAt: string;
+  issuedBy: string;
+  documentSha256: string;
+};
+
+export type InspectionReportArchivePage = {
+  code: number;
+  inspectionId: string;
+  reports: InspectionReportArchiveSummary[];
+};
+
+export type InspectionReportArchiveDetail = {
+  code: number;
+  archive: InspectionReportArchive;
 };
 
 export type AdminInspectionRecordPage = {
@@ -478,8 +547,32 @@ export type AdminRecordRetentionResult = {
   matched: number;
   deletedRecords: number;
   deletedDefects: number;
+  deletedCaptureFiles: number;
   deletedPlates: number;
+  filesPlanned: number;
+  filesDeleted: number;
+  filesMissing: number;
+  bytesPlanned: number;
+  bytesDeleted: number;
+  cleanupIds: string[];
+  failures: Array<{ recordId: string; cleanupId?: string; error: string }>;
   dryRun: boolean;
+};
+
+export type AdminRecordCleanupResult = {
+  code: number;
+  deleted: boolean;
+  cleanupId: string;
+  recordId: string;
+  materialId: string;
+  filesPlanned: number;
+  filesDeleted: number;
+  filesMissing: number;
+  bytesPlanned: number;
+  bytesDeleted: number;
+  defectsDeleted: number;
+  captureFilesDeleted: number;
+  plateDeleted: false;
 };
 
 export type AdminRecordFilter = {
@@ -545,6 +638,7 @@ export type ProductionEventInput = {
   width?: number;
   length?: number;
   thick?: number;
+  captureMode?: string;
   autoCapture?: boolean;
   discardBlackFrames?: boolean;
 };
@@ -555,11 +649,19 @@ export type ProductionTaskSummary = {
   kind: string;
   materialId: string;
   sessionId: string;
-  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | string;
+  chainId?: string;
+  dependsOnTaskId?: string | null;
+  dependencyPolicy?: 'require-success' | 'always-run' | string;
+  blockedReason?: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | 'blocked' | string;
   phase?: string;
   progress?: number;
   cancelRequested?: boolean;
   error?: string;
+};
+
+export type ProductionTaskDetail = ProductionTaskSummary & {
+  result?: ProductionCommandResult | null;
 };
 
 export type ProductionCommandResult = {
@@ -585,7 +687,7 @@ export type ProductionCommandResult = {
   message?: string;
 };
 
-export type TriggerGatewayMode = 'api' | 'gray' | 'secondary' | 'manual';
+export type TriggerGatewayMode = 'api' | 'tcp' | 'udp' | 'gray' | 'secondary' | 'manual';
 
 export type TriggerGatewayStatus = {
   code: number;
@@ -594,8 +696,16 @@ export type TriggerGatewayStatus = {
   modeLabel?: string;
   manualAllowed: boolean;
   allowedModes?: TriggerGatewayMode[];
-  inspectionServiceOrigin?: string;
-  production?: ProductionStatus;
+  listeners?: Partial<Record<'http' | 'tcp' | 'udp', { enabled: boolean }>>;
+  security?: {
+    profile?: 'development' | 'production' | string;
+    authenticationRequired?: boolean;
+    operatorAuthenticationRequired?: boolean;
+    sourceAllowlistConfigured?: boolean;
+    authWindowSeconds?: number;
+    modeMutationAllowed?: boolean;
+  };
+  inspectionServiceHealthy?: boolean;
   error?: string;
   message?: string;
 };
@@ -603,13 +713,25 @@ export type TriggerGatewayStatus = {
 export type ServiceHealthCheck = {
   ok: boolean;
   status: string;
+  level?: 'ok' | 'warning' | 'critical' | 'simulated' | string;
   reason?: string | null;
+  warningReason?: string | null;
   required?: boolean;
   readyContribution?: boolean;
   apiReachable?: boolean;
   sdkReady?: boolean | null;
   writable?: boolean;
   accepting?: boolean;
+  capacityAvailable?: boolean | null;
+  capacityBytes?: number | null;
+  freeBytes?: number | null;
+  freePercent?: number | null;
+  minimumFreeBytes?: number | null;
+  minimumFreePercent?: number | null;
+  warningFreeBytes?: number | null;
+  warningFreePercent?: number | null;
+  recentWriteBytesPerSecond?: number | null;
+  estimatedRemainingSeconds?: number | null;
   unresolvedCount?: number | null;
   unresolvedOperations?: Array<{
     operationId: string;
@@ -633,6 +755,8 @@ export type ServiceHealthDetails = {
     calibrationReconciliation?: ServiceHealthCheck;
     storage?: ServiceHealthCheck;
     trigger?: ServiceHealthCheck;
+    algorithm?: ServiceHealthCheck;
+    productionPolicy?: ServiceHealthCheck;
   };
 };
 
@@ -988,6 +1112,20 @@ export async function stopProductionSteelOut(input: ProductionEventInput): Promi
   });
 }
 
+export function hasStoredAdminSession() {
+  return getStoredAdminSession() !== null;
+}
+
+export async function writeProductionSecondaryData(
+  input: ProductionEventInput & Record<string, unknown>,
+): Promise<ProductionCommandResult> {
+  return postProductionCommand('/api/production/secondary-data', {
+    ...input,
+    requestId: productionRequestId('secondary-data', input),
+    payloadType: input.payloadType ?? 'trigger-secondary-data',
+  });
+}
+
 export async function captureProductionOnce(input: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
   const requestId = productionRequestId('capture-once', input);
   return postProductionCommand('/api/production/tasks', {
@@ -1001,6 +1139,52 @@ export async function captureProductionOnce(input: ProductionEventInput & Record
       discardBlackFrames: input.discardBlackFrames ?? true,
     },
   });
+}
+
+export async function waitForProductionCommandTask(
+  command: ProductionCommandResult,
+  onTaskStatus?: (task: ProductionTaskDetail) => void,
+): Promise<ProductionCommandResult> {
+  if (!command.task?.taskId) {
+    return command;
+  }
+
+  const config = getStoredConnectionConfig();
+  const origin = getInspectionServiceOrigin(config);
+  const terminalStates = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'blocked']);
+  let task: ProductionTaskDetail = command.task;
+  const deadline = Date.now() + 60 * 60 * 1000;
+  onTaskStatus?.(task);
+
+  while (!terminalStates.has(task.status)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`生产任务 ${task.taskId} 在一小时内未完成`);
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 400));
+    const response = await fetch(
+      `${origin}/api/production/tasks/detail?id=${encodeURIComponent(task.taskId)}`,
+      { headers: { Accept: 'application/json' } },
+    );
+    if (!response.ok) {
+      throw new Error(await readAdminErrorMessage(response, '生产任务状态读取失败'));
+    }
+    const envelope = (await response.json()) as { code: number; task: ProductionTaskDetail };
+    task = envelope.task;
+    onTaskStatus?.(task);
+  }
+
+  if (task.status !== 'succeeded') {
+    throw new Error(task.error || `生产任务 ${task.taskId} 结束状态为 ${task.status}`);
+  }
+
+  return {
+    ...command,
+    ...(task.result ?? {}),
+    code: task.result?.code ?? command.code ?? 0,
+    materialId: task.result?.materialId ?? task.materialId ?? command.materialId,
+    sessionId: task.result?.sessionId ?? task.sessionId ?? command.sessionId,
+    task,
+  };
 }
 
 export async function fetchTriggerGatewayStatus(signal?: AbortSignal): Promise<TriggerGatewayStatus> {
@@ -1017,7 +1201,7 @@ export async function fetchTriggerGatewayStatus(signal?: AbortSignal): Promise<T
 export async function setTriggerGatewayMode(mode: TriggerGatewayMode): Promise<TriggerGatewayStatus> {
   const response = await fetch(`${getInspectionServiceOrigin()}/api/trigger/mode`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    headers: createAdminHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
     body: JSON.stringify({ mode }),
   });
   if (!response.ok) {
@@ -1048,7 +1232,7 @@ function mergeTriggerGatewayResult(payload: TriggerGatewayCommandResult): Produc
 async function postTriggerGatewayManualCommand(path: string, body: ProductionEventInput & Record<string, unknown>): Promise<ProductionCommandResult> {
   const response = await fetch(`${getInspectionServiceOrigin()}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    headers: createAdminHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
     body: JSON.stringify(body),
   });
   if (!response.ok) {
@@ -1785,7 +1969,7 @@ export async function applyRecordRetentionPolicy(
   return response.json() as Promise<AdminRecordRetentionResult>;
 }
 
-export async function deleteAdminRecord(id: string): Promise<void> {
+export async function deleteAdminRecord(id: string): Promise<AdminRecordCleanupResult> {
   const config = getStoredConnectionConfig();
   const params = new URLSearchParams({ id });
   const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/records?${params.toString()}`, {
@@ -1795,4 +1979,45 @@ export async function deleteAdminRecord(id: string): Promise<void> {
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '检测记录删除失败'));
   }
+  return response.json() as Promise<AdminRecordCleanupResult>;
+}
+
+export async function issueInspectionReportArchive(inspectionId: string): Promise<IssuedInspectionReport> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/records/reports`, {
+    method: 'POST',
+    headers: createAdminHeaders({ Accept: 'application/json', 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ inspectionId }),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '检测报告签发失败'));
+  }
+  return response.json() as Promise<IssuedInspectionReport>;
+}
+
+export async function fetchInspectionReportArchives(inspectionId: string): Promise<InspectionReportArchivePage> {
+  const config = getStoredConnectionConfig();
+  const params = new URLSearchParams({ inspectionId });
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/records/reports?${params.toString()}`, {
+    headers: createAdminHeaders({ Accept: 'application/json' }),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '检测报告归档查询失败'));
+  }
+  return response.json() as Promise<InspectionReportArchivePage>;
+}
+
+export async function fetchInspectionReportArchive(
+  inspectionId: string,
+  reportId: string,
+): Promise<InspectionReportArchiveDetail> {
+  const config = getStoredConnectionConfig();
+  const params = new URLSearchParams({ inspectionId, reportId });
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/records/reports/detail?${params.toString()}`, {
+    headers: createAdminHeaders({ Accept: 'application/json' }),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '检测报告归档正文读取失败'));
+  }
+  return response.json() as Promise<InspectionReportArchiveDetail>;
 }

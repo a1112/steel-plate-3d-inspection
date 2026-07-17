@@ -1,6 +1,6 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createElement } from 'react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CaptureImageItem, ChartPoint, DefectItem } from '../data/inspection';
 import { createSectionProfiles } from '../lib/section-profiles';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
@@ -68,6 +68,25 @@ describe('createSectionProfiles', () => {
 });
 
 describe('AlarmAnalysis', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('opens a single-camera modal from a production capture thumbnail', () => {
+    render(createElement(AlarmAnalysis, {
+      selectedDefect: null,
+      heightProfile: [],
+      captureImages: [captureImage],
+      headerless: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: '打开 camera2 intensity #7' }));
+    expect(screen.getByRole('dialog', { name: '单相机采集图像查看' })).toBeInTheDocument();
+    expect(screen.getByRole('dialog')).toHaveTextContent('camera2');
+    fireEvent.click(screen.getByRole('button', { name: '关闭图像弹窗' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
   it('can show the lower analysis charts without the removed panel title', () => {
     render(createElement(AlarmAnalysis, { selectedDefect: defect, heightProfile: points, headerless: true, artifactMode: 'demo' }));
 
@@ -84,15 +103,18 @@ describe('AlarmAnalysis', () => {
 
     const collapseButton = screen.getByRole('button', { name: '收起缺陷分析区' });
     expect(collapseButton).toHaveAttribute('aria-expanded', 'true');
+    expect(collapseButton.closest('.analysis-detail-bar')).not.toBeNull();
 
     fireEvent.click(collapseButton);
     expect(screen.queryByRole('heading', { name: '灰度图' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: '点云图' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: '缺陷高度剖面图' })).not.toBeInTheDocument();
     expect(screen.getByTestId('analysis-collapsed-summary')).toHaveTextContent('距头 8342mm');
-    expect(screen.getByRole('button', { name: '展开缺陷分析区' })).toHaveAttribute('aria-expanded', 'false');
+    const expandButton = screen.getByRole('button', { name: '展开缺陷分析区' });
+    expect(expandButton).toHaveAttribute('aria-expanded', 'false');
+    expect(expandButton.closest('.analysis-detail-bar')).toContainElement(screen.getByTestId('analysis-collapsed-summary'));
 
-    fireEvent.click(screen.getByRole('button', { name: '展开缺陷分析区' }));
+    fireEvent.click(expandButton);
     expect(screen.getByRole('heading', { name: '灰度图' })).toBeInTheDocument();
     expect(screen.queryByTestId('analysis-collapsed-summary')).not.toBeInTheDocument();
   });
@@ -194,5 +216,44 @@ describe('AlarmAnalysis', () => {
     expect(screen.getByTestId('analysis-production-point-cloud')).toHaveAttribute('data-artifact-source', 'production-record');
     expect(screen.getByTestId('analysis-production-point-cloud')).toHaveAttribute('data-artifact-points', '4');
     expect(screen.queryByTestId('point-cloud-viewer')).not.toBeInTheDocument();
+  });
+
+  it('loads defect-bound ROI, local point cloud, and two real profiles before record-wide fallbacks', async () => {
+    const artifactDefect: DefectItem = {
+      ...defect,
+      artifacts: {
+        schema: 'steel.surface.defect.artifacts.v1',
+        cameraId: 'camera2',
+        frameId: 'frame-007',
+        sequenceNo: 7,
+        roi: { x: 10, y: 20, width: 30, height: 40 },
+        roiImage: 'runs/MAT/RUN/defects/D-001/intensity-roi.png',
+        localPointCloud: 'runs/MAT/RUN/defects/D-001/local-point-cloud.json',
+        lengthProfile: 'runs/MAT/RUN/defects/D-001/length-profile.json',
+        widthProfile: 'runs/MAT/RUN/defects/D-001/width-profile.json',
+      },
+    };
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('local-point-cloud')) {
+        return new Response(JSON.stringify({ schema: 'steel.surface.defect.point-cloud.v1', positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], colors: [1, 0, 0, 0, 1, 0, 0, 0, 1] }), { status: 200 });
+      }
+      const axis = url.includes('width-profile') ? 'width' : 'length';
+      return new Response(JSON.stringify({ axis, points: [{ x: -1, z: 0 }, { x: 0, z: -0.4 }, { x: 1, z: 0 }] }), { status: 200 });
+    });
+
+    render(createElement(AlarmAnalysis, {
+      selectedDefect: artifactDefect,
+      heightProfile: [],
+      surfaceMesh: productionMesh,
+      inspectionId: 'INS-PROD-3',
+      headerless: true,
+    }));
+
+    await waitFor(() => expect(screen.getByTestId('analysis-production-point-cloud')).toHaveAttribute('data-artifact-points', '3'));
+    expect(screen.queryByText('整管参考 · 非缺陷局部点云')).not.toBeInTheDocument();
+    expect(screen.getByTestId('height-profile-chart')).toBeInTheDocument();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    expect(document.querySelector('.defect-preview')).toHaveAttribute('data-artifact-source', 'production-record');
   });
 });

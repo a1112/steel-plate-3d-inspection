@@ -8,6 +8,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $CaptureExe = Join-Path $RepoRoot "target\capture\$Configuration\steel_capture_service.exe"
 $ServiceExe = Join-Path $RepoRoot "target\cargo\debug\steel-inspection-service.exe"
+$TestConfigDir = Join-Path ([System.IO.Path]::GetTempPath()) ("steel-external-provider-" + [Guid]::NewGuid().ToString("N"))
 
 function Invoke-Checked {
   param(
@@ -32,6 +33,27 @@ function Stop-IfRunning {
     $Process.Kill()
     $Process.WaitForExit()
   }
+}
+
+function Wait-HttpResponse {
+  param(
+    [Parameter(Mandatory = $true)][string]$Uri,
+    [Parameter(Mandatory = $true)]$Process,
+    [int]$TimeoutSeconds = 20
+  )
+
+  $Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  do {
+    if ($Process.HasExited) {
+      throw "Process exited before HTTP readiness at $Uri (exit=$($Process.ExitCode))."
+    }
+    try {
+      return Invoke-WebRequest -Uri $Uri -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+    } catch {
+      Start-Sleep -Milliseconds 200
+    }
+  } while ([DateTime]::UtcNow -lt $Deadline)
+  throw "Timed out waiting for HTTP readiness at $Uri."
 }
 
 if (-not (Test-Path $CaptureExe)) {
@@ -61,11 +83,27 @@ try {
   $ServiceStart.Environment["STEEL_CAPTURE_PROVIDER"] = "external-api"
   $ServiceStart.Environment["CAPTURE_SERVICE_ORIGIN"] = "http://127.0.0.1:$CapturePort"
   $ServiceStart.Environment["INSPECTION_SERVICE_PORT"] = [string]$ServicePort
+  $ServiceStart.Environment["STEEL_RUNTIME_PROFILE"] = "test"
+  $ServiceStart.Environment["STEEL_ALGORITHM_MODE"] = "demo"
+  $ServiceStart.Environment["BAR_SURFACE_MOCK_DEFECT_COUNT"] = "0"
+  $ServiceStart.Environment["STEEL_TRIGGER_HEALTH_REQUIRED"] = "0"
+  $ServiceStart.Environment["STEEL_DATABASE_ENGINE"] = "sqlite"
+  $ServiceStart.Environment["STEEL_SERVICE_CONFIG_DIR"] = $TestConfigDir
+  foreach ($InheritedDatabaseSecret in @(
+    "STEEL_DATABASE_URL",
+    "STEEL_MYSQL_HOST",
+    "STEEL_MYSQL_PORT",
+    "STEEL_MYSQL_USER",
+    "STEEL_MYSQL_PASSWORD",
+    "STEEL_MYSQL_DATABASE",
+    "STEEL_MYSQL_TLS_MODE",
+    "STEEL_MYSQL_CA_PATH"
+  )) {
+    [void]$ServiceStart.Environment.Remove($InheritedDatabaseSecret)
+  }
   $Service = [System.Diagnostics.Process]::Start($ServiceStart)
 
-  Start-Sleep -Milliseconds 1200
-
-  $Health = Invoke-WebRequest -Uri "http://127.0.0.1:$ServicePort/api/capture/health" -UseBasicParsing -ErrorAction Stop
+  $Health = Wait-HttpResponse -Uri "http://127.0.0.1:$ServicePort/api/capture/health" -Process $Service
   $HealthJson = $Health.Content | ConvertFrom-Json
   if ($Health.StatusCode -ne 200 -or -not $HealthJson.service) {
     throw "Unexpected capture health response: $($Health.Content)"
@@ -81,4 +119,7 @@ try {
 } finally {
   Stop-IfRunning $Service
   Stop-IfRunning $Capture
+  if (Test-Path -LiteralPath $TestConfigDir -PathType Container) {
+    Remove-Item -LiteralPath $TestConfigDir -Recurse -Force
+  }
 }

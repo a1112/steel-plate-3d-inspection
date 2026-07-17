@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://steel-inspection.invalid/schema/release-external-components-v1.json",
+  "title": "Steel inspection release external components",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "approved", "components"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema": { "const": "steel.release-external-components.v1" },
+    "approved": { "const": true },
+    "components": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "category",
+          "type",
+          "name",
+          "version",
+          "supplier",
+          "scope",
+          "artifact",
+          "sha256",
+          "purl"
+        ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+          "category": {
+            "enum": [
+              "cpp-toolchain",
+              "camera-sdk",
+              "vc-runtime",
+              "webview2-runtime",
+              "wix-toolset",
+              "nsis"
+            ]
+          },
+          "type": { "enum": ["application", "framework", "library"] },
+          "name": { "type": "string", "minLength": 1 },
+          "version": {
+            "type": "string",
+            "minLength": 1,
+            "not": { "pattern": "(TODO|todo|TBD|tbd|UNKNOWN|unknown|PENDING|pending|REQUIRED|required|REPLACE|replace)" }
+          },
+          "supplier": { "type": "string", "minLength": 1 },
+          "scope": { "enum": ["build", "runtime"] },
+          "artifact": { "type": "string", "minLength": 1 },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9A-Fa-f]{64}$",
+            "not": { "const": "0000000000000000000000000000000000000000000000000000000000000000" }
+          },
+          "purl": { "type": "string", "pattern": "^pkg:[^\\s]+$" },
+          "licenses": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true
+          }
+        }
+      }
+    }
+  }
+}
