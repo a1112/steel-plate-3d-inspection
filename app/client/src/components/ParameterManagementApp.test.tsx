@@ -335,7 +335,17 @@ const adminServices = {
     origin: 'http://127.0.0.1:4317',
     processAvailable: true,
     executable: '/tmp/steel_capture_service.exe',
-      fallback: 'simulated-eight-camera',
+    fallback: 'simulated-eight-camera',
+    lifecycle: {
+      phase: 'starting',
+      desiredRunning: true,
+      autostart: true,
+      pid: 43210,
+      restartCount: 2,
+      consecutiveFailures: 1,
+      restartBudget: 5,
+      restartBudgetExhausted: false,
+    },
   },
   diagnostics: [
     { id: 'api', label: 'API 服务', status: 'normal', detail: '运行 125000ms，在线会话 1 个' },
@@ -619,7 +629,20 @@ describe('ParameterManagementApp', () => {
         return { ok: true, json: async () => ({ mode: 'online', host: '127.0.0.1', port: 4873 }) };
       }
       if (url.includes('/api/database')) {
-        return { ok: true, json: async () => ({ engine: 'sqlite', orm: 'sea-orm', path: '/tmp/steel-inspection.sqlite', configDir: '/tmp/config' }) };
+        return {
+          ok: true,
+          json: async () => ({
+            engine: 'sqlite',
+            requestedEngine: 'sqlite',
+            supportedEngines: ['sqlite', 'mysql', 'postgres'],
+            fallbackEnabled: false,
+            fallbackActive: false,
+            fallbackReason: null,
+            orm: 'sea-orm',
+            path: '/tmp/steel-inspection.sqlite',
+            configDir: '/tmp/config',
+          }),
+        };
       }
       if (url.includes('/api/admin/overview')) {
         return { ok: true, json: async () => adminOverview };
@@ -878,6 +901,7 @@ describe('ParameterManagementApp', () => {
     expect(screen.getByText('总体状态')).toBeInTheDocument();
     expect(screen.getByText('已完成 3 项后台自检')).toBeInTheDocument();
     expect(screen.getByText('数据库完整性')).toBeInTheDocument();
+    expect(screen.getByText('sqlite / mysql / postgres')).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:4873/api/admin/diagnostics',
       expect.objectContaining({ headers: expect.objectContaining({ Accept: 'application/json' }) }),
@@ -1553,6 +1577,10 @@ describe('ParameterManagementApp', () => {
     expect(screen.getByText('SQLite 数据库')).toBeInTheDocument();
     expect(screen.getByText('采集服务连通性')).toBeInTheDocument();
     expect(screen.getByText('/tmp/steel_capture_service.exe')).toBeInTheDocument();
+    expect(screen.getByText('启动中')).toBeInTheDocument();
+    expect(screen.getByText('PID 43210')).toBeInTheDocument();
+    expect(screen.getByText('Rust 服务子进程')).toBeInTheDocument();
+    expect(screen.getByText('2 次 · 剩余 4')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /启动采集服务/ }));
 
     await waitFor(() => {

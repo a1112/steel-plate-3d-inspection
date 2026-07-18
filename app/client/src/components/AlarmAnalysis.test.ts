@@ -98,25 +98,29 @@ describe('AlarmAnalysis', () => {
     expect(screen.getByText('宽度切面')).toBeInTheDocument();
   });
 
-  it('collapses the analysis area to a single summary line and restores it', () => {
-    render(createElement(AlarmAnalysis, { selectedDefect: defect, heightProfile: points, headerless: true, artifactMode: 'demo' }));
+  it('switches to a focused analysis view and fully collapses from the footer state', () => {
+    const { rerender } = render(createElement(AlarmAnalysis, {
+      selectedDefect: defect,
+      heightProfile: points,
+      headerless: true,
+      artifactMode: 'demo',
+      viewMode: 'image',
+    }));
 
-    const collapseButton = screen.getByRole('button', { name: '收起缺陷分析区' });
-    expect(collapseButton).toHaveAttribute('aria-expanded', 'true');
-    expect(collapseButton.closest('.analysis-detail-bar')).not.toBeNull();
-
-    fireEvent.click(collapseButton);
-    expect(screen.queryByRole('heading', { name: '灰度图' })).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '灰度图' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: '点云图' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: '缺陷高度剖面图' })).not.toBeInTheDocument();
-    expect(screen.getByTestId('analysis-collapsed-summary')).toHaveTextContent('距头 8342mm');
-    const expandButton = screen.getByRole('button', { name: '展开缺陷分析区' });
-    expect(expandButton).toHaveAttribute('aria-expanded', 'false');
-    expect(expandButton.closest('.analysis-detail-bar')).toContainElement(screen.getByTestId('analysis-collapsed-summary'));
 
-    fireEvent.click(expandButton);
-    expect(screen.getByRole('heading', { name: '灰度图' })).toBeInTheDocument();
-    expect(screen.queryByTestId('analysis-collapsed-summary')).not.toBeInTheDocument();
+    rerender(createElement(AlarmAnalysis, {
+      selectedDefect: defect,
+      heightProfile: points,
+      headerless: true,
+      artifactMode: 'demo',
+      viewMode: 'image',
+      collapsed: true,
+    }));
+
+    expect(screen.queryByRole('heading', { name: '灰度图' })).not.toBeInTheDocument();
   });
 
   it('adds horizontal drag and wheel zoom controls to the point cloud', () => {

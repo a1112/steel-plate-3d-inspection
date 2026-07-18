@@ -7,10 +7,24 @@ Copy one of these files to a local `.env` file or pass it directly with `-EnvFil
 - `headless-cpp.env.example`: Rust starts and supervises the headless C++ capture provider.
 - `external-api.env.example`: Rust connects to an already running capture API process.
 - `simulated.env.example`: Rust uses the eight-camera simulation fallback.
+- `simulated-mysql.env.example`: development MySQL primary with explicit SQLite fallback.
+- `simulated-postgres.env.example`: development PostgreSQL primary with explicit SQLite fallback.
 - `trigger-gateway.env.example`: standalone trigger gateway from `app/trigger` forwards L2/PLC/API steel events to the Rust production API.
 - `runtime-service.env.example`: non-secret baseline for the unified `SteelInspectionRuntime` Windows service. The installer writes the active `runtime-service.env` beside this template.
 
 Formal readiness requires the gateway at `TRIGGER_GATEWAY_ORIGIN` by default. Set `STEEL_TRIGGER_HEALTH_REQUIRED=0` only for an explicit development/service-only run.
+
+Non-production database adapters are `sqlite`, `mysql`, and `postgres`. Select
+one with `STEEL_DATABASE_ENGINE` or supply `STEEL_DATABASE_URL`. To opt into
+degraded startup when a remote development database cannot be connected, set
+`STEEL_DATABASE_FALLBACK=sqlite`. The fallback is never automatic: production
+rejects it, and an incompatible or dirty primary schema still stops startup
+instead of being hidden by SQLite. `GET /api/database` and layered health
+responses report the requested engine, active engine, supported adapters, and
+whether fallback is active. PostgreSQL is a development/test adapter only; the
+formal release database contract remains SQLite/MySQL. Fallback does not copy
+or merge rows back into the recovered primary database; it is a development
+continuity mechanism, not a high-availability replication design.
 
 For non-simulated capture, readiness also requires capacity telemetry from the global and every camera storage root. `STEEL_STORAGE_MIN_FREE_BYTES` and `STEEL_STORAGE_MIN_FREE_PERCENT` are independent hard watermarks; crossing either one returns `storage_capacity_below_watermark` and blocks admission of a new steel session while preserving retries and steel-out for an existing session. A soft warning is derived as twice the hard byte watermark and five percentage points above the hard percentage watermark. The warning publishes `level=warning` and `storage_capacity_near_watermark` without closing readiness, so operators have time to release capacity before the hard admission gate is reached. The templates use hard values of 20 GiB and 10%; replace these values with the approved site capacity calculation.
 

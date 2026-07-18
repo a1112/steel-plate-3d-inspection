@@ -9,8 +9,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
@@ -126,6 +126,12 @@ const ALARM_RULES_CONFIG_KEY: &str = "alarm_rules";
 const EXTERNAL_INTEGRATIONS_CONFIG_KEY: &str = "external_integrations";
 const CONFIG_JSON_MAX_BYTES: usize = 128 * 1024;
 const CAPTURE_CAMERA_MAX_COUNT: usize = 16;
+const CAPTURE_SUPERVISOR_POLL_MS: u64 = 500;
+const CAPTURE_READY_TIMEOUT_MS_DEFAULT: u64 = 15_000;
+const CAPTURE_RESTART_BUDGET_DEFAULT: u32 = 5;
+const CAPTURE_RESTART_BACKOFF_MS_DEFAULT: u64 = 1_000;
+const CAPTURE_RESTART_BACKOFF_MAX_MS: u64 = 30_000;
+const CAPTURE_RESTART_STABLE_MS: u128 = 30_000;
 const TASK_WORKER_IDLE_HEARTBEAT_MAX_AGE_MS: u128 = 5_000;
 const DEFAULT_TRIGGER_GATEWAY_ORIGIN: &str = "http://127.0.0.1:4881";
 const TRIGGER_HEALTH_TIMEOUT_MS: u64 = 1_200;
@@ -310,9 +316,59 @@ struct CaptureServiceManager {
     port: u16,
     origin: String,
     provider: CaptureProvider,
-    process: Mutex<Option<Child>>,
+    process: Mutex<Option<controlled_process::ManagedChild>>,
+    lifecycle: Mutex<CaptureLifecycleState>,
+    supervisor_shutdown: AtomicBool,
     simulated_capture_mode: Mutex<String>,
     simulated_continuous_line_rate: Mutex<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct CaptureLifecycleState {
+    phase: &'static str,
+    desired_running: bool,
+    autostart: bool,
+    pid: Option<u32>,
+    started_at: Option<u128>,
+    ready_at: Option<u128>,
+    last_exit_at: Option<u128>,
+    last_exit_code: Option<i32>,
+    last_error: String,
+    restart_count: u32,
+    consecutive_failures: u32,
+    unhealthy_confirmations: u32,
+    restart_budget: u32,
+    next_restart_at: Option<u128>,
+}
+
+impl CaptureLifecycleState {
+    fn new(provider: CaptureProvider) -> Self {
+        let autostart = provider == CaptureProvider::Simulated
+            || (provider.is_managed()
+                && env::var("STEEL_CAPTURE_SERVICE_AUTOSTART").as_deref() != Ok("0"));
+        Self {
+            phase: if provider == CaptureProvider::Simulated {
+                "ready"
+            } else if autostart {
+                "starting"
+            } else {
+                "stopped"
+            },
+            desired_running: provider == CaptureProvider::Simulated || autostart,
+            autostart,
+            pid: None,
+            started_at: None,
+            ready_at: (provider == CaptureProvider::Simulated).then(current_time_millis),
+            last_exit_at: None,
+            last_exit_code: None,
+            last_error: String::new(),
+            restart_count: 0,
+            consecutive_failures: 0,
+            unhealthy_confirmations: 0,
+            restart_budget: capture_restart_budget(),
+            next_restart_at: None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -346,9 +402,10 @@ struct CaptureProxyResponse {
 
 impl Drop for CaptureServiceManager {
     fn drop(&mut self) {
+        self.supervisor_shutdown.store(true, Ordering::Release);
         if let Ok(mut process) = self.process.lock() {
-            if let Some(child) = process.as_mut() {
-                let _ = child.kill();
+            if let Some(mut child) = process.take() {
+                let _ = child.terminate();
             }
         }
     }
@@ -939,6 +996,30 @@ fn capture_port() -> u16 {
         .unwrap_or(CAPTURE_SERVICE_PORT)
 }
 
+fn capture_ready_timeout_ms() -> u64 {
+    env::var("STEEL_CAPTURE_READY_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(1_000, 120_000))
+        .unwrap_or(CAPTURE_READY_TIMEOUT_MS_DEFAULT)
+}
+
+fn capture_restart_budget() -> u32 {
+    env::var("STEEL_CAPTURE_RESTART_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|value| value.clamp(1, 20))
+        .unwrap_or(CAPTURE_RESTART_BUDGET_DEFAULT)
+}
+
+fn capture_restart_backoff_ms() -> u64 {
+    env::var("STEEL_CAPTURE_RESTART_BACKOFF_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(100, CAPTURE_RESTART_BACKOFF_MAX_MS))
+        .unwrap_or(CAPTURE_RESTART_BACKOFF_MS_DEFAULT)
+}
+
 fn capture_origin(port: u16) -> String {
     env::var("CAPTURE_SERVICE_ORIGIN").unwrap_or_else(|_| format!("http://127.0.0.1:{port}"))
 }
@@ -1119,101 +1200,365 @@ impl CaptureServiceManager {
             origin,
             provider,
             process: Mutex::new(None),
+            lifecycle: Mutex::new(CaptureLifecycleState::new(provider)),
+            supervisor_shutdown: AtomicBool::new(false),
             simulated_capture_mode: Mutex::new("continuous".to_string()),
             simulated_continuous_line_rate: Mutex::new(300.0),
         };
-        manager.ensure_started();
         manager
     }
 
-    fn ensure_started(&self) {
-        if !self.provider.is_managed() {
-            return;
-        }
-        if self.endpoint_listening() {
-            return;
-        }
-        if env::var("STEEL_CAPTURE_SERVICE_AUTOSTART").as_deref() == Ok("0") {
-            return;
-        }
-        let _ = self.spawn_process();
+    fn start_supervisor(manager: &Arc<Self>) {
+        manager.supervisor_tick();
+        let weak = Arc::downgrade(manager);
+        let _ = std::thread::Builder::new()
+            .name("capture-service-supervisor".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(CAPTURE_SUPERVISOR_POLL_MS));
+                let Some(manager) = weak.upgrade() else {
+                    break;
+                };
+                if manager.supervisor_shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                manager.supervisor_tick();
+            });
     }
 
-    fn spawn_process(&self) -> bool {
-        if !self.provider.is_managed() {
-            return false;
-        }
+    fn spawn_managed_process(&self) -> Result<u32, String> {
         let Some(exe) = find_capture_service_exe() else {
-            return false;
+            return Err("capture executable not found".to_string());
         };
+        let log_root = env::var("STEEL_RUNTIME_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| config_dir().join("logs"));
+        fs::create_dir_all(&log_root)
+            .map_err(|error| format!("capture log directory failed: {error}"))?;
+        let capture_log_path = log_root.join("capture-child.log");
+        let capture_log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&capture_log_path)
+            .map_err(|error| format!("capture log open failed: {error}"))?;
+        let capture_error_log = capture_log
+            .try_clone()
+            .map_err(|error| format!("capture log clone failed: {error}"))?;
         let mut command = Command::new(&exe);
         command
             .arg("--port")
             .arg(self.port.to_string())
             .current_dir(exe.parent().unwrap_or_else(|| Path::new(".")))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(capture_log))
+            .stderr(Stdio::from(capture_error_log));
+        let child = controlled_process::ManagedChild::spawn(&mut command)
+            .map_err(|error| format!("capture spawn failed: {error:?}"))?;
+        let pid = child.id();
+        self.process
+            .lock()
+            .map_err(|_| "capture process lock poisoned".to_string())?
+            .replace(child);
+        Ok(pid)
+    }
 
-        if let Ok(child) = command.spawn() {
-            if let Ok(mut process) = self.process.lock() {
-                *process = Some(child);
+    fn schedule_restart(&self, error: String, exit_code: Option<i32>) {
+        let now = current_time_millis();
+        if let Ok(mut lifecycle) = self.lifecycle.lock() {
+            lifecycle.pid = None;
+            lifecycle.ready_at = None;
+            lifecycle.last_exit_at = Some(now);
+            lifecycle.last_exit_code = exit_code;
+            lifecycle.last_error = error;
+            lifecycle.consecutive_failures = lifecycle.consecutive_failures.saturating_add(1);
+            lifecycle.unhealthy_confirmations = 0;
+            if !lifecycle.desired_running {
+                lifecycle.phase = "stopped";
+                lifecycle.next_restart_at = None;
+                return;
             }
-            std::thread::sleep(Duration::from_millis(250));
-            self.endpoint_listening()
-        } else {
-            false
+            lifecycle.phase = "degraded";
+            if lifecycle.consecutive_failures >= lifecycle.restart_budget {
+                lifecycle.next_restart_at = None;
+                return;
+            }
+            let exponent = lifecycle.consecutive_failures.saturating_sub(1).min(10);
+            let delay = capture_restart_backoff_ms()
+                .saturating_mul(1_u64 << exponent)
+                .min(CAPTURE_RESTART_BACKOFF_MAX_MS);
+            lifecycle.next_restart_at = Some(now.saturating_add(u128::from(delay)));
         }
+    }
+
+    fn supervisor_tick(&self) {
+        if self.supervisor_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+
+        if self.provider == CaptureProvider::Simulated {
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.phase = if lifecycle.desired_running {
+                    "ready"
+                } else {
+                    "stopped"
+                };
+                if lifecycle.desired_running {
+                    lifecycle.ready_at.get_or_insert_with(current_time_millis);
+                } else {
+                    lifecycle.ready_at = None;
+                }
+                lifecycle.last_error.clear();
+            }
+            return;
+        }
+
+        if !self.provider.is_managed() {
+            let listening = self.endpoint_listening();
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.desired_running = true;
+                lifecycle.phase = if listening { "ready" } else { "degraded" };
+                if listening {
+                    lifecycle.ready_at.get_or_insert_with(current_time_millis);
+                } else {
+                    lifecycle.ready_at = None;
+                }
+                lifecycle.last_error = if listening {
+                    String::new()
+                } else {
+                    "external capture endpoint unavailable".to_string()
+                };
+            }
+            return;
+        }
+
+        let mut exited = None;
+        let mut wait_error = None;
+        let mut running_pid = None;
+        if let Ok(mut process) = self.process.lock() {
+            if let Some(child) = process.as_mut() {
+                running_pid = Some(child.id());
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        exited = Some(status.code());
+                        process.take();
+                        running_pid = None;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        wait_error = Some(format!("capture wait failed: {error:?}"));
+                        if let Some(mut child) = process.take() {
+                            let _ = child.terminate();
+                        }
+                        running_pid = None;
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = wait_error {
+            self.schedule_restart(error, None);
+            return;
+        }
+        if let Some(exit_code) = exited {
+            self.schedule_restart(
+                format!(
+                    "capture process exited with code {}",
+                    exit_code.unwrap_or(-1)
+                ),
+                exit_code,
+            );
+            return;
+        }
+
+        if let Some(pid) = running_pid {
+            let listening = self.endpoint_listening();
+            let now = current_time_millis();
+            let timed_out = self
+                .lifecycle
+                .lock()
+                .ok()
+                .and_then(|lifecycle| lifecycle.started_at)
+                .is_some_and(|started_at| {
+                    now.saturating_sub(started_at) > u128::from(capture_ready_timeout_ms())
+                });
+            if listening {
+                let restart_required = self
+                    .probe_response("/health", Duration::from_millis(1_500))
+                    .and_then(|response| serde_json::from_slice::<Value>(&response.body).ok())
+                    .is_some_and(|health| {
+                        health
+                            .get("restartRequired")
+                            .and_then(Value::as_bool)
+                            .or_else(|| {
+                                health
+                                    .get("sdkCaptureState")
+                                    .and_then(|state| state.get("restartRequired"))
+                                    .and_then(Value::as_bool)
+                            })
+                            == Some(true)
+                    });
+                let confirmed_restart = self.lifecycle.lock().ok().is_some_and(|mut lifecycle| {
+                    lifecycle.unhealthy_confirmations = if restart_required {
+                        lifecycle.unhealthy_confirmations.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    lifecycle.unhealthy_confirmations >= 2
+                });
+                if confirmed_restart {
+                    if let Ok(mut process) = self.process.lock() {
+                        if let Some(mut child) = process.take() {
+                            let _ = child.terminate();
+                        }
+                    }
+                    self.schedule_restart(
+                        "capture provider requested process restart".to_string(),
+                        None,
+                    );
+                    return;
+                }
+                if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                    lifecycle.phase = "ready";
+                    lifecycle.pid = Some(pid);
+                    lifecycle.ready_at.get_or_insert(now);
+                    lifecycle.last_error.clear();
+                    if lifecycle.started_at.is_some_and(|started_at| {
+                        now.saturating_sub(started_at) >= CAPTURE_RESTART_STABLE_MS
+                    }) {
+                        lifecycle.consecutive_failures = 0;
+                    }
+                    lifecycle.next_restart_at = None;
+                }
+            } else if timed_out {
+                if let Ok(mut process) = self.process.lock() {
+                    if let Some(mut child) = process.take() {
+                        let _ = child.terminate();
+                    }
+                }
+                self.schedule_restart("capture readiness timeout".to_string(), None);
+            } else if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.phase = "starting";
+                lifecycle.pid = Some(pid);
+            }
+            return;
+        }
+
+        if self.endpoint_listening() {
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.phase = "ready";
+                lifecycle.pid = None;
+                lifecycle.ready_at.get_or_insert(current_time_millis());
+                lifecycle.last_error.clear();
+                lifecycle.consecutive_failures = 0;
+                lifecycle.next_restart_at = None;
+            }
+            return;
+        }
+
+        let now = current_time_millis();
+        let should_spawn = self.lifecycle.lock().ok().is_some_and(|lifecycle| {
+            lifecycle.desired_running
+                && lifecycle.consecutive_failures < lifecycle.restart_budget
+                && lifecycle.next_restart_at.is_none_or(|next| now >= next)
+        });
+        if !should_spawn {
+            return;
+        }
+
+        match self.spawn_managed_process() {
+            Ok(pid) => {
+                if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                    lifecycle.phase = "starting";
+                    lifecycle.pid = Some(pid);
+                    lifecycle.started_at = Some(now);
+                    lifecycle.ready_at = None;
+                    lifecycle.next_restart_at = None;
+                    lifecycle.restart_count = lifecycle.restart_count.saturating_add(1);
+                }
+            }
+            Err(error) => self.schedule_restart(error, None),
+        }
+    }
+
+    fn wait_for_ready(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.supervisor_tick();
+            if self.is_running() {
+                return true;
+            }
+            let exhausted = self.lifecycle.lock().ok().is_some_and(|lifecycle| {
+                lifecycle.consecutive_failures >= lifecycle.restart_budget
+            });
+            if exhausted {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
     }
 
     fn start(&self) -> bool {
+        if let Ok(mut lifecycle) = self.lifecycle.lock() {
+            lifecycle.desired_running = true;
+            lifecycle.phase = "starting";
+            lifecycle.consecutive_failures = 0;
+            lifecycle.next_restart_at = None;
+            lifecycle.last_error.clear();
+        }
         if self.provider == CaptureProvider::Simulated {
+            self.supervisor_tick();
             return true;
         }
         if !self.provider.is_managed() {
+            self.supervisor_tick();
             return self.endpoint_listening();
         }
-        if self.endpoint_listening() {
-            return true;
-        }
-        self.spawn_process()
+        self.wait_for_ready(Duration::from_millis(capture_ready_timeout_ms()))
     }
 
     fn stop(&self) -> bool {
+        if let Ok(mut lifecycle) = self.lifecycle.lock() {
+            lifecycle.desired_running = false;
+            lifecycle.phase = "stopping";
+            lifecycle.next_restart_at = None;
+        }
         if self.provider == CaptureProvider::Simulated {
+            self.supervisor_tick();
             return true;
         }
         if !self.provider.is_managed() {
+            self.supervisor_tick();
             return !self.endpoint_listening();
         }
         if let Ok(mut process) = self.process.lock() {
             if let Some(mut child) = process.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.terminate();
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
-        !self.endpoint_listening()
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.endpoint_listening() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let stopped = !self.endpoint_listening();
+        if let Ok(mut lifecycle) = self.lifecycle.lock() {
+            lifecycle.phase = if stopped { "stopped" } else { "degraded" };
+            lifecycle.pid = None;
+            lifecycle.ready_at = None;
+            if !stopped {
+                lifecycle.last_error = "capture endpoint remained available after stop".to_string();
+            }
+        }
+        stopped
     }
 
     fn restart(&self) -> bool {
-        if self.provider == CaptureProvider::Simulated {
-            return true;
-        }
-        if !self.provider.is_managed() {
-            return self.endpoint_listening();
-        }
-        let mut killed_managed_process = false;
-        if let Ok(mut process) = self.process.lock() {
-            if let Some(mut child) = process.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-                killed_managed_process = true;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        self.ensure_started();
-        killed_managed_process || self.endpoint_listening()
+        let _ = self.stop();
+        self.start()
+    }
+
+    fn shutdown(&self) {
+        let _ = self.stop();
+        self.supervisor_shutdown.store(true, Ordering::Release);
     }
 
     fn endpoint_listening(&self) -> bool {
@@ -1221,30 +1566,66 @@ impl CaptureServiceManager {
     }
 
     fn is_running(&self) -> bool {
-        self.provider == CaptureProvider::Simulated
-            || (self.provider.uses_local_api() && self.endpoint_listening())
+        self.lifecycle
+            .lock()
+            .map(|lifecycle| matches!(lifecycle.phase, "ready" | "collecting"))
+            .unwrap_or(false)
+    }
+
+    fn set_collecting(&self, collecting: bool) {
+        if let Ok(mut lifecycle) = self.lifecycle.lock() {
+            if collecting && lifecycle.phase == "ready" {
+                lifecycle.phase = "collecting";
+            } else if !collecting && lifecycle.phase == "collecting" {
+                lifecycle.phase = "ready";
+            }
+        }
     }
 
     fn status_json(&self) -> String {
         let exe = find_capture_service_exe()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        let running = self.is_running();
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| CaptureLifecycleState::new(self.provider));
+        let running = matches!(lifecycle.phase, "ready" | "collecting");
         let process_available = match self.provider {
             CaptureProvider::HeadlessCpp => !exe.is_empty(),
             CaptureProvider::ExternalApi => true,
             CaptureProvider::Simulated => false,
         };
-        format!(
-            "{{\"name\":\"capture-service\",\"provider\":\"{}\",\"managed\":{},\"running\":{},\"port\":{},\"origin\":\"{}\",\"processAvailable\":{},\"executable\":\"{}\",\"fallback\":\"simulated-eight-camera\"}}",
-            self.provider.as_str(),
-            if self.provider.is_managed() { "true" } else { "false" },
-            if running { "true" } else { "false" },
-            self.port,
-            json_escape(&self.origin),
-            if process_available { "true" } else { "false" },
-            json_escape(&exe)
-        )
+        json!({
+            "name": "capture-service",
+            "provider": self.provider.as_str(),
+            "managed": self.provider.is_managed(),
+            "running": running,
+            "port": self.port,
+            "origin": self.origin,
+            "processAvailable": process_available,
+            "executable": exe,
+            "fallback": "simulated-eight-camera",
+            "lifecycle": {
+                "phase": lifecycle.phase,
+                "desiredRunning": lifecycle.desired_running,
+                "autostart": lifecycle.autostart,
+                "pid": lifecycle.pid,
+                "startedAt": lifecycle.started_at.map(|value| value.to_string()),
+                "readyAt": lifecycle.ready_at.map(|value| value.to_string()),
+                "lastExitAt": lifecycle.last_exit_at.map(|value| value.to_string()),
+                "lastExitCode": lifecycle.last_exit_code,
+                "lastError": lifecycle.last_error,
+                "restartCount": lifecycle.restart_count,
+                "consecutiveFailures": lifecycle.consecutive_failures,
+                "unhealthyConfirmations": lifecycle.unhealthy_confirmations,
+                "restartBudget": lifecycle.restart_budget,
+                "restartBudgetExhausted": lifecycle.consecutive_failures >= lifecycle.restart_budget,
+                "nextRestartAt": lifecycle.next_restart_at.map(|value| value.to_string())
+            }
+        })
+        .to_string()
     }
 
     fn simulated_proxy(&self, method: &str, path_with_query: &str, body: &str) -> Option<Vec<u8>> {
@@ -1646,7 +2027,7 @@ impl CaptureServiceManager {
         if !self.provider.uses_local_api() {
             return None;
         }
-        self.ensure_started();
+        self.supervisor_tick();
         if !self.endpoint_listening() {
             return None;
         }
@@ -2601,8 +2982,13 @@ fn database_health_component(state: &ServiceState) -> (bool, Value) {
         ok,
         json!({
             "ok": ok,
-            "status": if ok { "up" } else { "unavailable" },
+            "status": if !ok { "unavailable" } else if state.database.fallback_active { "degraded" } else { "up" },
             "engine": state.database.engine.clone(),
+            "requestedEngine": state.database.requested_engine.clone(),
+            "supportedEngines": state.database.supported_engines(),
+            "fallbackEnabled": state.database.fallback_enabled,
+            "fallbackActive": state.database.fallback_active,
+            "fallbackReason": state.database.fallback_reason.clone(),
             "schemaVersion": state.database.schema_version,
             "latencyMs": health_latency_ms(started),
             "reason": if ok { Value::Null } else { json!("database_ping_failed") }
@@ -2668,20 +3054,29 @@ fn task_worker_health_component(state: &ServiceState) -> (bool, Value) {
 }
 
 fn capture_health_component(state: &ServiceState) -> (bool, Value) {
+    let mut lifecycle = serde_json::from_str::<Value>(&state.capture.status_json())
+        .ok()
+        .and_then(|status| status.get("lifecycle").cloned())
+        .unwrap_or_else(|| json!({ "phase": "unknown" }));
+    if let Some(lifecycle) = lifecycle.as_object_mut() {
+        lifecycle.remove("lastError");
+    }
     if state.capture.provider == CaptureProvider::Simulated {
+        let running = state.capture.is_running();
         return (
-            true,
+            running,
             json!({
-                "ok": true,
-                "status": "simulated",
+                "ok": running,
+                "status": if running { "simulated" } else { "stopped" },
                 "provider": state.capture.provider.as_str(),
                 "managed": false,
-                "apiReachable": true,
+                "apiReachable": running,
                 "sdkRequired": false,
                 "sdkReady": Value::Null,
                 "httpStatus": Value::Null,
                 "latencyMs": 0,
-                "reason": Value::Null
+                "reason": if running { Value::Null } else { json!("capture_stopped") },
+                "lifecycle": lifecycle
             }),
         );
     }
@@ -2704,7 +3099,12 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
                 "sdkReady": Value::Null,
                 "httpStatus": Value::Null,
                 "latencyMs": latency_ms,
-                "reason": "capture_provider_unreachable"
+                "reason": if lifecycle.get("restartBudgetExhausted").and_then(Value::as_bool) == Some(true) {
+                    "capture_restart_budget_exhausted"
+                } else {
+                    "capture_provider_unreachable"
+                },
+                "lifecycle": lifecycle
             }),
         );
     };
@@ -2781,7 +3181,8 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
             "pendingRecoveryCount": pending_recovery_count,
             "httpStatus": response.status_code,
             "latencyMs": latency_ms,
-            "reason": reason
+            "reason": reason,
+            "lifecycle": lifecycle
         }),
     )
 }
@@ -3770,6 +4171,10 @@ fn system_health_alarm_specs_with_supervisor(
                 alarm_type: "capture-unavailable",
                 severity: if capture.get("restartRequired").and_then(Value::as_bool) == Some(true)
                     || capture.get("recoveryRequired").and_then(Value::as_bool) == Some(true)
+                    || capture
+                        .pointer("/lifecycle/restartBudgetExhausted")
+                        .and_then(Value::as_bool)
+                        == Some(true)
                 {
                     "critical"
                 } else {
@@ -3787,7 +4192,8 @@ fn system_health_alarm_specs_with_supervisor(
                     "restartRequired": capture.get("restartRequired"),
                     "recoveryRequired": capture.get("recoveryRequired"),
                     "invalidManifest": capture.get("invalidManifest"),
-                    "pendingRecoveryCount": capture.get("pendingRecoveryCount")
+                    "pendingRecoveryCount": capture.get("pendingRecoveryCount"),
+                    "lifecycle": capture.get("lifecycle")
                 }),
             });
         }
@@ -5025,6 +5431,9 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("POST", "/api/admin/services/capture/start")
         | ("POST", "/api/admin/services/capture/stop")
         | ("POST", "/api/admin/services/capture/restart")
+        | ("POST", "/api/capture/start")
+        | ("POST", "/api/capture/stop")
+        | ("POST", "/api/capture/restart")
         | ("POST", "/api/trigger/mode")
         | ("POST", "/api/trigger/manual/steel-info")
         | ("POST", "/api/trigger/manual/steel-in")
@@ -5868,6 +6277,11 @@ fn admin_services_json(state: &ServiceState) -> String {
             "activeSessions": active_sessions,
             "database": {
                 "engine": state.database.engine,
+                "requestedEngine": state.database.requested_engine,
+                "supportedEngines": state.database.supported_engines(),
+                "fallbackEnabled": state.database.fallback_enabled,
+                "fallbackActive": state.database.fallback_active,
+                "fallbackReason": state.database.fallback_reason,
                 "path": state.database.display_path(),
                 "bytes": database_bytes,
                 "configDir": config_dir
@@ -5883,9 +6297,13 @@ fn admin_services_json(state: &ServiceState) -> String {
             },
             {
                 "id": "database",
-                "label": "SQLite 数据库",
-                "status": if state.database.engine != "sqlite" || database_bytes > 0 { "normal" } else { "warning" },
-                "detail": format!("{} / {}", state.database.engine, state.database.display_path())
+                "label": "数据库适配器",
+                "status": if state.database.fallback_active || (state.database.engine == "sqlite" && database_bytes == 0) { "warning" } else { "normal" },
+                "detail": if state.database.fallback_active {
+                    format!("{} 不可用，已降级至 {}", state.database.requested_engine, state.database.engine)
+                } else {
+                    format!("{} / {}", state.database.engine, state.database.display_path())
+                }
             },
             {
                 "id": "config",
@@ -5976,76 +6394,114 @@ fn admin_diagnostics_json(state: &ServiceState) -> String {
         "保持本机服务常驻运行",
     );
 
-    match fs::metadata(&state.database.path) {
-        Ok(metadata) => push_admin_diagnostic_check(
-            &mut checks,
-            &mut summary,
-            "database-file",
-            "database",
-            "SQLite 文件",
-            if metadata.len() > 0 {
-                "normal"
-            } else {
-                "warning"
-            },
-            format!(
-                "{} bytes / {}",
-                metadata.len(),
-                state.database.path.display()
+    if let Some(path) = state.database.file_path.as_ref() {
+        match fs::metadata(path) {
+            Ok(metadata) => push_admin_diagnostic_check(
+                &mut checks,
+                &mut summary,
+                "database-file",
+                "database",
+                "SQLite 文件",
+                if metadata.len() > 0 {
+                    "normal"
+                } else {
+                    "warning"
+                },
+                format!("{} bytes / {}", metadata.len(), path.display()),
+                if metadata.len() > 0 {
+                    "定期备份数据库文件"
+                } else {
+                    "确认数据库初始化和写入流程"
+                },
             ),
-            if metadata.len() > 0 {
-                "定期备份数据库文件"
-            } else {
-                "确认数据库初始化和写入流程"
-            },
-        ),
-        Err(error) => push_admin_diagnostic_check(
+            Err(error) => push_admin_diagnostic_check(
+                &mut checks,
+                &mut summary,
+                "database-file",
+                "database",
+                "SQLite 文件",
+                "error",
+                format!("无法读取 {}：{}", path.display(), error),
+                "检查配置目录权限并重启服务",
+            ),
+        }
+    } else {
+        let reachable = state
+            .runtime
+            .block_on(state.database.connection.ping())
+            .is_ok();
+        push_admin_diagnostic_check(
             &mut checks,
             &mut summary,
-            "database-file",
+            "database-connection",
             "database",
-            "SQLite 文件",
-            "error",
-            format!("无法读取 {}：{}", state.database.path.display(), error),
-            "检查配置目录权限并重启服务",
-        ),
+            "远程数据库连接",
+            if reachable { "normal" } else { "error" },
+            format!(
+                "{} / {}",
+                state.database.engine,
+                state.database.display_path()
+            ),
+            if reachable {
+                "连接正常；备份请使用服务端数据库工具"
+            } else {
+                "检查数据库地址、账号、TLS 和网络"
+            },
+        );
+    }
+    if state.database.fallback_active {
+        push_admin_diagnostic_check(
+            &mut checks,
+            &mut summary,
+            "database-fallback",
+            "database",
+            "数据库降级",
+            "warning",
+            format!(
+                "请求 {}，当前使用 {}",
+                state.database.requested_engine, state.database.engine
+            ),
+            "恢复主数据库连接后重启服务；不要把降级库作为生产数据源",
+        );
     }
 
-    match state
-        .runtime
-        .block_on(db::database_maintenance_stats(&state.database.connection))
-    {
-        Ok(stats) => push_admin_diagnostic_check(
-            &mut checks,
-            &mut summary,
-            "database-pages",
-            "database",
-            "数据库页状态",
-            if stats.freelist_count > 256 {
-                "warning"
-            } else {
-                "normal"
-            },
-            format!(
-                "page={} size={} freelist={}",
-                stats.page_count, stats.page_size, stats.freelist_count
+    if state.database.engine == "sqlite" {
+        match state
+            .runtime
+            .block_on(db::database_maintenance_stats(&state.database.connection))
+        {
+            Ok(stats) => push_admin_diagnostic_check(
+                &mut checks,
+                &mut summary,
+                "database-pages",
+                "database",
+                "数据库页状态",
+                if stats.freelist_count > 256 {
+                    "warning"
+                } else {
+                    "normal"
+                },
+                format!(
+                    "page={} size={} freelist={}",
+                    stats.page_count, stats.page_size, stats.freelist_count
+                ),
+                if stats.freelist_count > 256 {
+                    "建议执行数据库压缩整理"
+                } else {
+                    "无需立即维护"
+                },
             ),
-            if stats.freelist_count > 256 {
-                "建议执行数据库压缩整理"
-            } else {
-                "无需立即维护"
-            },
-        ),
-        Err(error) => push_admin_diagnostic_check(
-            &mut checks,
-            &mut summary,
-            "database-pages",
-            "database",
-            "数据库页状态",
-            "error",
-            format!("读取 SQLite 页信息失败：{}", error),
-            "检查数据库连接和 SeaORM 初始化",
-        ),
+            Err(error) => push_admin_diagnostic_check(
+                &mut checks,
+                &mut summary,
+                "database-pages",
+                "database",
+                "数据库页状态",
+                "error",
+                format!("读取 SQLite 页信息失败：{}", error),
+                "检查数据库连接和 SeaORM 初始化",
+            ),
+        }
     }
 
     match state
@@ -6063,7 +6519,11 @@ fn admin_diagnostics_json(state: &ServiceState) -> String {
                 &mut summary,
                 "database-integrity",
                 "database",
-                "数据库完整性",
+                if state.database.engine == "sqlite" {
+                    "数据库完整性"
+                } else {
+                    "数据库连通性"
+                },
                 status,
                 messages.join("；"),
                 if status == "normal" {
@@ -7884,6 +8344,11 @@ fn database_info_response(state: &ServiceState) -> Vec<u8> {
         "application/json; charset=utf-8",
         &json!({
             "engine": state.database.engine,
+            "requestedEngine": state.database.requested_engine,
+            "supportedEngines": state.database.supported_engines(),
+            "fallbackEnabled": state.database.fallback_enabled,
+            "fallbackActive": state.database.fallback_active,
+            "fallbackReason": state.database.fallback_reason,
             "orm": "sea-orm",
             "path": state.database.display_path(),
             "configDir": state.database.file_path.as_ref()
@@ -8036,7 +8501,7 @@ fn database_integrity_response(state: &ServiceState, actor: &str) -> Vec<u8> {
                 &state.database.connection,
                 actor,
                 "database.integrity_check",
-                "steel-inspection.sqlite",
+                &state.database.engine,
                 &detail,
                 level,
             ));
@@ -8063,7 +8528,7 @@ fn database_integrity_response(state: &ServiceState, actor: &str) -> Vec<u8> {
                 &state.database.connection,
                 actor,
                 "database.integrity_check.failed",
-                "steel-inspection.sqlite",
+                &state.database.engine,
                 &format!("数据库完整性检查失败：{}", error),
                 "error",
             ));
@@ -8077,6 +8542,19 @@ fn database_integrity_response(state: &ServiceState, actor: &str) -> Vec<u8> {
 }
 
 fn database_maintenance_response(state: &ServiceState, actor: &str) -> Vec<u8> {
+    if state.database.engine != "sqlite" {
+        return http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": "database_maintenance_requires_native_tool",
+                "engine": state.database.engine,
+                "message": "远程数据库维护必须使用对应数据库的服务端运维工具"
+            })
+            .to_string(),
+        );
+    }
     let before_stats = state
         .runtime
         .block_on(db::database_maintenance_stats(&state.database.connection));
@@ -8100,7 +8578,7 @@ fn database_maintenance_response(state: &ServiceState, actor: &str) -> Vec<u8> {
                 &state.database.connection,
                 actor,
                 "database.maintenance",
-                "steel-inspection.sqlite",
+                &state.database.engine,
                 &format!(
                     "执行数据库压缩整理，{} -> {} bytes，释放 {} bytes，完整性 {}",
                     before_bytes, after_bytes, reclaimed_bytes, status
@@ -8137,7 +8615,7 @@ fn database_maintenance_response(state: &ServiceState, actor: &str) -> Vec<u8> {
                 &state.database.connection,
                 actor,
                 "database.maintenance.failed",
-                "steel-inspection.sqlite",
+                &state.database.engine,
                 &format!("数据库压缩整理失败：{}", error),
                 "error",
             ));
@@ -8228,6 +8706,17 @@ fn capture_proxy_http_response(
             );
         }
     }
+    let tracks_capture_activity = method == "POST"
+        && matches!(
+            path,
+            "/api/capture/continuous-test"
+                | "/api/capture/once"
+                | "/api/production/capture-once"
+                | "/api/steel/capture"
+        );
+    if tracks_capture_activity {
+        capture.set_collecting(true);
+    }
     let proxy_response = if method == "POST" && path == "/api/capture/continuous-test" {
         let payload = serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
         capture.proxy_response_with_read_timeout(
@@ -8253,6 +8742,9 @@ fn capture_proxy_http_response(
     } else {
         capture.proxy_response(method, raw_path, body)
     };
+    if tracks_capture_activity {
+        capture.set_collecting(false);
+    }
     if let Some(response) = proxy_response {
         return http_bytes_response_with_headers(
             &capture_proxy_status(response.status_code),
@@ -8607,6 +9099,9 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
             "code": 0,
             "database": {
                 "engine": state.database.engine.clone(),
+                "requestedEngine": state.database.requested_engine.clone(),
+                "fallbackActive": state.database.fallback_active,
+                "fallbackReason": state.database.fallback_reason.clone(),
                 "path": state.database.display_path(),
                 "schemaVersion": state.database.schema_version
             },
@@ -15932,6 +16427,11 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
         },
         "database": {
             "engine": state.database.engine.clone(),
+            "requestedEngine": state.database.requested_engine.clone(),
+            "supportedEngines": state.database.supported_engines(),
+            "fallbackEnabled": state.database.fallback_enabled,
+            "fallbackActive": state.database.fallback_active,
+            "fallbackReason": state.database.fallback_reason.clone(),
             "orm": "sea-orm",
             "path": database_path,
             "configDir": config_dir,
@@ -16028,6 +16528,10 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/admin/services/capture/start", "scope": "admin" },
             { "method": "POST", "path": "/api/admin/services/capture/stop", "scope": "admin" },
             { "method": "POST", "path": "/api/admin/services/capture/restart", "scope": "admin" },
+            { "method": "GET", "path": "/api/capture/lifecycle", "scope": "service" },
+            { "method": "POST", "path": "/api/capture/start", "scope": "admin" },
+            { "method": "POST", "path": "/api/capture/stop", "scope": "admin" },
+            { "method": "POST", "path": "/api/capture/restart", "scope": "admin" },
             { "method": "GET", "path": "/api/admin/overview", "scope": "admin" },
             { "method": "GET", "path": "/api/admin/users", "scope": "admin" },
             { "method": "POST", "path": "/api/admin/users", "scope": "admin" },
@@ -16211,6 +16715,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
                 state.capture.status_json()
             ),
         ),
+        ("GET", "/api/capture/lifecycle") => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &state.capture.status_json(),
+        ),
         ("GET", "/api/algorithm/bar-surface/latest") => algorithm_latest_response(),
         ("GET", "/api/algorithm/bar-surface/manifest") => algorithm_manifest_response(query),
         ("GET", "/api/algorithm/bar-surface/file") => algorithm_file_response(query),
@@ -16237,6 +16746,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("POST", "/api/admin/services/capture/restart") => {
             restart_capture_service_response(&state, actor)
         }
+        ("POST", "/api/capture/start") => start_capture_service_response(&state, actor),
+        ("POST", "/api/capture/stop") => stop_capture_service_response(&state, actor),
+        ("POST", "/api/capture/restart") => restart_capture_service_response(&state, actor),
         ("GET", "/api/config") | ("GET", "/api/config/capture") => read_config_response(&state),
         ("POST", "/api/config/capture") => write_config_response(&state, body, actor),
         ("GET", "/api/config/connection") => read_connection_response(&state),
@@ -16449,7 +16961,7 @@ fn main() -> std::io::Result<()> {
     let config_dir = config_dir();
     std::fs::create_dir_all(&config_dir)?;
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    listener.set_nonblocking(false)?;
+    listener.set_nonblocking(true)?;
     let database_path = config_dir.join("steel-inspection.sqlite");
     let runtime = Runtime::new()?;
     let database = runtime
@@ -16467,6 +16979,7 @@ fn main() -> std::io::Result<()> {
     }
     let capture_port = capture_port();
     let capture_manager = Arc::new(CaptureServiceManager::new(capture_port));
+    CaptureServiceManager::start_supervisor(&capture_manager);
     let config_json = runtime
         .block_on(db::get_config(&database.connection, "capture"))
         .ok()
@@ -16510,10 +17023,21 @@ fn main() -> std::io::Result<()> {
         capture_manager.provider.as_str(),
         capture_manager.origin.as_str()
     );
-    println!("sqlite config directory {}", config_dir.display());
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    println!(
+        "database adapter {} (requested {})",
+        state.database.engine, state.database.requested_engine
+    );
+    if state.database.fallback_active {
+        println!("database running in explicit non-production SQLite fallback mode");
+    }
+    println!("service config directory {}", config_dir.display());
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_signal = Arc::clone(&shutdown_requested);
+    ctrlc::set_handler(move || shutdown_signal.store(true, Ordering::Release))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+    while !shutdown_requested.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
                 let state = Arc::clone(&state);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 if let Err(error) = std::thread::Builder::new()
@@ -16523,9 +17047,14 @@ fn main() -> std::io::Result<()> {
                     eprintln!("failed to start request worker: {error}");
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
             Err(error) => eprintln!("failed to accept connection: {error}"),
         }
     }
+    capture_manager.shutdown();
+    println!("steel inspection service stopped; capture child lifecycle drained");
     Ok(())
 }
 
@@ -16567,6 +17096,8 @@ mod tests {
                 origin: origin.to_string(),
                 provider,
                 process: Mutex::new(None),
+                lifecycle: Mutex::new(CaptureLifecycleState::new(provider)),
+                supervisor_shutdown: AtomicBool::new(false),
                 simulated_capture_mode: Mutex::new("continuous".to_string()),
                 simulated_continuous_line_rate: Mutex::new(300.0),
             }),
@@ -16603,6 +17134,72 @@ mod tests {
             .map(|(_, body)| body)
             .expect("HTTP response should contain a body");
         serde_json::from_str(body).expect("HTTP response body should be JSON")
+    }
+
+    #[test]
+    fn simulated_capture_uses_the_same_lifecycle_contract_as_a_managed_child() {
+        let state = production_test_state();
+        let initial = serde_json::from_str::<Value>(&state.capture.status_json())
+            .expect("capture lifecycle status");
+        assert_eq!(initial["running"], true);
+        assert_eq!(initial["lifecycle"]["phase"], "ready");
+        assert_eq!(initial["lifecycle"]["desiredRunning"], true);
+
+        assert!(state.capture.stop());
+        let stopped = serde_json::from_str::<Value>(&state.capture.status_json())
+            .expect("stopped lifecycle status");
+        assert_eq!(stopped["running"], false);
+        assert_eq!(stopped["lifecycle"]["phase"], "stopped");
+        assert_eq!(stopped["lifecycle"]["desiredRunning"], false);
+
+        assert!(state.capture.start());
+        let restarted = serde_json::from_str::<Value>(&state.capture.status_json())
+            .expect("restarted lifecycle status");
+        assert_eq!(restarted["running"], true);
+        assert_eq!(restarted["lifecycle"]["phase"], "ready");
+    }
+
+    #[test]
+    fn capture_restart_budget_closes_the_automatic_restart_loop() {
+        let state = production_test_state_with_provider(
+            CaptureProvider::HeadlessCpp,
+            "http://127.0.0.1:43179",
+        );
+        let budget = state
+            .capture
+            .lifecycle
+            .lock()
+            .expect("capture lifecycle")
+            .restart_budget;
+        for attempt in 0..budget {
+            state
+                .capture
+                .schedule_restart(format!("failure-{attempt}"), Some(7));
+        }
+        let status = serde_json::from_str::<Value>(&state.capture.status_json())
+            .expect("degraded lifecycle status");
+        assert_eq!(status["running"], false);
+        assert_eq!(status["lifecycle"]["phase"], "degraded");
+        assert_eq!(status["lifecycle"]["restartBudgetExhausted"], true);
+        assert_eq!(status["lifecycle"]["nextRestartAt"], Value::Null);
+        assert_eq!(status["lifecycle"]["lastExitCode"], 7);
+    }
+
+    #[test]
+    fn capture_lifecycle_mutations_require_service_admin_permission() {
+        assert_eq!(
+            permission_for_route("POST", "/api/capture/start"),
+            Some("admin.services")
+        );
+        assert_eq!(
+            permission_for_route("POST", "/api/capture/stop"),
+            Some("admin.services")
+        );
+        assert_eq!(
+            permission_for_route("POST", "/api/capture/restart"),
+            Some("admin.services")
+        );
+        assert_eq!(permission_for_route("GET", "/api/capture/lifecycle"), None);
     }
 
     #[test]
@@ -17383,6 +17980,18 @@ mod tests {
             .expect("failing insert trigger should install");
     }
 
+    fn production_test_summary_path(inspection_id: &str) -> String {
+        if cfg!(windows) {
+            format!("H:\\production\\{inspection_id}.json")
+        } else {
+            std::env::temp_dir()
+                .join("steel-inspection-service-tests")
+                .join(format!("{}-{inspection_id}.json", std::process::id()))
+                .display()
+                .to_string()
+        }
+    }
+
     fn insert_production_record(
         state: &ServiceState,
         inspection_id: &str,
@@ -17392,6 +18001,7 @@ mod tests {
         inspection_status: &str,
         finished_at: &str,
     ) {
+        let summary_path = production_test_summary_path(inspection_id);
         state
             .runtime
             .block_on(db::upsert_material_session(
@@ -17426,7 +18036,7 @@ mod tests {
                     session_id: session_id.to_string(),
                     status: inspection_status.to_string(),
                     storage_root: "H:\\".to_string(),
-                    summary_path: format!("H:\\production\\{inspection_id}.json"),
+                    summary_path,
                     started_at: "1".to_string(),
                     finished_at: finished_at.to_string(),
                     capture_count: 6,
@@ -20294,7 +20904,7 @@ mod tests {
         assert_eq!(snapshot["inspections"][0]["inspectionId"], "INSP-PROD-1");
         assert_eq!(
             snapshot["inspections"][0]["summaryPath"],
-            "H:\\production\\INSP-PROD-1.json"
+            production_test_summary_path("INSP-PROD-1")
         );
         assert!(snapshot["inspections"][0]["captureSummaryPath"]
             .as_str()

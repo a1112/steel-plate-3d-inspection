@@ -506,6 +506,10 @@ bool is_public_environment_name(const std::string &name) {
       "STEEL_CAPTURE_PROVIDER",
       "CAPTURE_SERVICE_ORIGIN",
       "STEEL_CAPTURE_SERVICE_AUTOSTART",
+      "STEEL_CAPTURE_SERVICE_EXE",
+      "STEEL_CAPTURE_RESTART_BUDGET",
+      "STEEL_CAPTURE_RESTART_BACKOFF_MS",
+      "STEEL_CAPTURE_READY_TIMEOUT_MS",
        "CAPTURE_STORAGE_ROOT",
        "CAPTURE_CAMERA_STORAGE_ROOT",
        "STEEL_BAR_CAPTURE_ROOT",
@@ -637,6 +641,9 @@ bool configure_environment(std::string &error) {
                            "bar-surface-production.json").c_str());
   SetEnvironmentVariableW(L"CAPTURE_CONFIG_ROOT",
                           (g_state_root / "capture-config").c_str());
+  SetEnvironmentVariableW(
+      L"STEEL_CAPTURE_SERVICE_EXE",
+      (g_runtime_root / "capture-headless" / "steel_capture_service.exe").c_str());
   SetEnvironmentVariableW(L"TEMP", (g_state_root / "temp").c_str());
   SetEnvironmentVariableW(L"TMP", (g_state_root / "temp").c_str());
   return true;
@@ -654,8 +661,8 @@ bool validate_production_environment(std::string &error) {
   if (!require_exact(L"STEEL_RUNTIME_PROFILE", L"production") ||
       !require_exact(L"STEEL_ALGORITHM_MODE", L"production") ||
       !require_exact(L"BAR_SURFACE_MOCK_DEFECT_COUNT", L"0") ||
-      !require_exact(L"STEEL_CAPTURE_PROVIDER", L"external-api") ||
-      !require_exact(L"STEEL_CAPTURE_SERVICE_AUTOSTART", L"0") ||
+      !require_exact(L"STEEL_CAPTURE_PROVIDER", L"headless-cpp") ||
+      !require_exact(L"STEEL_CAPTURE_SERVICE_AUTOSTART", L"1") ||
       !require_exact(L"TRIGGER_ALLOW_MODE_MUTATION", L"0") ||
       !require_exact(L"STEEL_TRIGGER_HEALTH_REQUIRED", L"1")) {
     return false;
@@ -664,13 +671,18 @@ bool validate_production_environment(std::string &error) {
   const auto state_root = environment_value(L"STEEL_RUNTIME_STATE_ROOT");
   const auto service_config = environment_value(L"STEEL_SERVICE_CONFIG_DIR");
   const auto capture_config = environment_value(L"CAPTURE_CONFIG_ROOT");
+  const auto capture_executable = environment_value(L"STEEL_CAPTURE_SERVICE_EXE");
   const auto path_equals = [](const fs::path &left, const fs::path &right) {
     return path_is_same_or_descendant(left, right) && path_is_same_or_descendant(right, left);
   };
   if (!state_root || !path_equals(fs::path(*state_root), g_state_root) ||
       !service_config || !path_equals(fs::path(*service_config), g_state_root / "service") ||
       !capture_config || !path_equals(fs::path(*capture_config),
-                                      g_state_root / "capture-config")) {
+                                      g_state_root / "capture-config") ||
+      !capture_executable ||
+      !path_equals(fs::path(*capture_executable),
+                   g_runtime_root / "capture-headless" /
+                       "steel_capture_service.exe")) {
     error = "trusted mutable state environment paths do not match --state-root";
     return false;
   }
@@ -780,14 +792,11 @@ std::optional<std::vector<wchar_t>> child_environment_block(const ChildSpec &spe
 
 std::vector<ChildSpec> child_specs() {
   return {
-      {L"capture", g_runtime_root / "capture-headless" / "steel_capture_service.exe",
-       g_state_root / "work" / "capture", L"--port 4317", 4317, "/health",
-       "\"ready\":true", 30000},
-      {L"trigger", g_runtime_root / "service" / "steel-trigger-gateway.exe",
-       g_state_root / "work" / "trigger", L"", 4881, "/health", "\"gatewayReady\":true", 15000},
       {L"service", g_runtime_root / "service" / "steel-inspection-service.exe",
        g_state_root / "work" / "service", L"", 4873, "/api/health/live", "\"status\":\"live\"",
        20000},
+      {L"trigger", g_runtime_root / "service" / "steel-trigger-gateway.exe",
+       g_state_root / "work" / "trigger", L"", 4881, "/health", "\"gatewayReady\":true", 15000},
   };
 }
 
@@ -798,7 +807,9 @@ bool validate_runtime(std::string &error) {
       return false;
     }
   }
-  for (const auto &path : {g_runtime_root / "algorithm-core" / "steel_bar_surface_core.exe",
+  for (const auto &path : {g_runtime_root / "capture-headless" /
+                               "steel_capture_service.exe",
+                           g_runtime_root / "algorithm-core" / "steel_bar_surface_core.exe",
                            g_runtime_root / "config" / "capture",
                            g_runtime_root / "config" / "algorithm" /
                                "bar-surface-production.json"}) {

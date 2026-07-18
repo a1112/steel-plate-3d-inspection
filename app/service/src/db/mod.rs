@@ -4,13 +4,14 @@ use argon2::{
 };
 use rand_core::OsRng;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection,
-    DbBackend, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    Statement, TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
+    DatabaseConnection, DbBackend, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde_json::{self, json, Value};
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub mod entities;
 
@@ -23,6 +24,8 @@ use entities::{
 
 pub const DEVELOPMENT_DEFAULT_ADMIN_PASSWORD: &str = "admin123";
 pub const DATABASE_SCHEMA_VERSION: i64 = 1;
+pub const NON_PRODUCTION_DATABASE_ENGINES: [&str; 3] = ["sqlite", "mysql", "postgres"];
+pub const PRODUCTION_DATABASE_ENGINES: [&str; 2] = ["sqlite", "mysql"];
 
 fn production_security_policy_enabled() -> bool {
     if cfg!(test) {
@@ -97,6 +100,110 @@ mod security_tests {
         )
         .expect("local production URL");
         assert!(production.ends_with("ssl-mode=disabled"));
+    }
+
+    #[test]
+    fn postgres_is_a_non_production_adapter_and_fallback_is_fail_closed_in_production() {
+        let development = normalize_database_url(
+            "postgres://postgres:postgres@127.0.0.1:5432/steel_inspection?sslmode=disable",
+            false,
+        )
+        .expect("development postgres URL");
+        assert_eq!(
+            database_engine_from_url(&development).expect("postgres engine"),
+            "postgres"
+        );
+        assert!(normalize_database_url(&development, true).is_err());
+        assert_eq!(
+            database_fallback_policy(Some("sqlite"), false).expect("development fallback"),
+            DatabaseFallback::Sqlite
+        );
+        assert!(database_fallback_policy(Some("sqlite"), true).is_err());
+        assert!(database_fallback_policy(Some("postgres"), false).is_err());
+    }
+
+    #[test]
+    fn explicit_non_production_fallback_uses_sqlite_when_primary_is_unreachable() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let path = env::temp_dir().join(format!(
+                "steel-database-fallback-{}-{}.sqlite",
+                std::process::id(),
+                now_nanos_string()
+            ));
+            let database = open_database_request(
+                DatabaseRequest {
+                    url:
+                        "postgres://postgres:postgres@127.0.0.1:9/steel_inspection?sslmode=disable"
+                            .to_string(),
+                    engine: "postgres".to_string(),
+                    fallback: DatabaseFallback::Sqlite,
+                },
+                path.clone(),
+                false,
+            )
+            .await
+            .expect("explicit SQLite fallback");
+            assert_eq!(database.engine, "sqlite");
+            assert_eq!(database.requested_engine, "postgres");
+            assert!(database.fallback_enabled);
+            assert!(database.fallback_active);
+            assert_eq!(
+                database.fallback_reason.as_deref(),
+                Some("primary_connection_failed")
+            );
+            database
+                .connection
+                .close_by_ref()
+                .await
+                .expect("fallback database close");
+            let _ = std::fs::remove_file(path);
+        });
+    }
+
+    #[test]
+    fn fallback_does_not_hide_a_connected_primary_schema_failure() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let suffix = format!("{}-{}", std::process::id(), now_nanos_string());
+            let primary_path =
+                env::temp_dir().join(format!("steel-database-primary-invalid-{suffix}.sqlite"));
+            let fallback_path =
+                env::temp_dir().join(format!("steel-database-fallback-unused-{suffix}.sqlite"));
+            let primary_url = format!("sqlite://{}?mode=rwc", primary_path.display());
+            let primary = connect_database(&primary_url)
+                .await
+                .expect("primary sqlite connection");
+            execute(
+                &primary,
+                "CREATE TABLE steel_schema_state (singleton_id INTEGER PRIMARY KEY)",
+            )
+            .await
+            .expect("partial schema ledger");
+            primary
+                .close_by_ref()
+                .await
+                .expect("primary database close");
+
+            let result = open_database_request(
+                DatabaseRequest {
+                    url: primary_url,
+                    engine: "postgres".to_string(),
+                    fallback: DatabaseFallback::Sqlite,
+                },
+                fallback_path.clone(),
+                false,
+            )
+            .await;
+            let error = match result {
+                Ok(_) => panic!("schema failures must not activate fallback"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("schema ledger is incomplete"));
+            assert!(!fallback_path.exists());
+            let _ = std::fs::remove_file(primary_path);
+            let _ = std::fs::remove_file(fallback_path);
+        });
     }
 
     #[test]
@@ -222,6 +329,10 @@ pub struct AppDatabase {
     pub url: String,
     pub file_path: Option<PathBuf>,
     pub schema_version: i64,
+    pub requested_engine: String,
+    pub fallback_enabled: bool,
+    pub fallback_active: bool,
+    pub fallback_reason: Option<String>,
 }
 
 impl AppDatabase {
@@ -230,6 +341,14 @@ impl AppDatabase {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| self.url.clone())
+    }
+
+    pub fn supported_engines(&self) -> &'static [&'static str] {
+        if production_security_policy_enabled() {
+            &PRODUCTION_DATABASE_ENGINES
+        } else {
+            &NON_PRODUCTION_DATABASE_ENGINES
+        }
     }
 }
 
@@ -590,47 +709,251 @@ pub struct AdminAuditLogPage {
     pub offset: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatabaseFallback {
+    None,
+    Sqlite,
+}
+
+#[derive(Clone, Debug)]
+struct DatabaseRequest {
+    url: String,
+    engine: String,
+    fallback: DatabaseFallback,
+}
+
 pub async fn open_database(path: PathBuf) -> Result<AppDatabase, DbErr> {
     let production_policy = production_security_policy_enabled();
+    let request = configured_database_request(&path, production_policy)?;
+    open_database_request(request, path, production_policy).await
+}
+
+fn configured_database_request(
+    path: &PathBuf,
+    production_policy: bool,
+) -> Result<DatabaseRequest, DbErr> {
+    let fallback = database_fallback_policy(
+        env::var("STEEL_DATABASE_FALLBACK").ok().as_deref(),
+        production_policy,
+    )?;
     if let Ok(url) = env::var("STEEL_DATABASE_URL") {
         let url = normalize_database_url(url.trim(), production_policy)?;
         if !url.is_empty() {
-            return open_database_url(url, path).await;
+            return Ok(DatabaseRequest {
+                engine: database_engine_from_url(&url)?.to_string(),
+                url,
+                fallback,
+            });
         }
     }
-    if env::var("STEEL_DATABASE_ENGINE")
-        .map(|value| value.eq_ignore_ascii_case("mysql"))
-        .unwrap_or(false)
-    {
-        let host = env::var("STEEL_MYSQL_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let port = env::var("STEEL_MYSQL_PORT").unwrap_or_else(|_| "3306".to_string());
-        let user =
-            required_production_database_setting("STEEL_MYSQL_USER", "root", production_policy)?;
-        let password = required_production_database_setting(
-            "STEEL_MYSQL_PASSWORD",
-            "nercar",
-            production_policy,
-        )?;
-        let database =
-            env::var("STEEL_MYSQL_DATABASE").unwrap_or_else(|_| "steel_inspection".to_string());
-        let url = normalize_database_url(
-            &format!("mysql://{user}:{password}@{host}:{port}/{database}"),
-            production_policy,
-        )?;
-        return open_database_url(url, path).await;
-    }
 
-    let url = format!("sqlite://{}?mode=rwc", path.display());
-    let connection = Database::connect(url.clone()).await?;
+    let engine = env::var("STEEL_DATABASE_ENGINE")
+        .unwrap_or_else(|_| "sqlite".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let url = match engine.as_str() {
+        "" | "sqlite" | "sqlite3" => format!("sqlite://{}?mode=rwc", path.display()),
+        "mysql" => {
+            let host = env::var("STEEL_MYSQL_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let port = env::var("STEEL_MYSQL_PORT").unwrap_or_else(|_| "3306".to_string());
+            let user = required_production_database_setting(
+                "STEEL_MYSQL_USER",
+                "root",
+                production_policy,
+            )?;
+            let password = required_production_database_setting(
+                "STEEL_MYSQL_PASSWORD",
+                "nercar",
+                production_policy,
+            )?;
+            let database =
+                env::var("STEEL_MYSQL_DATABASE").unwrap_or_else(|_| "steel_inspection".to_string());
+            normalize_database_url(
+                &format!(
+                    "mysql://{}:{}@{}:{}/{}",
+                    percent_encode_url_component(&user),
+                    percent_encode_url_component(&password),
+                    host,
+                    port,
+                    mysql_identifier(&database)?
+                ),
+                production_policy,
+            )?
+        }
+        "postgres" | "postgresql" if production_policy => {
+            return Err(DbErr::Custom(
+                "PostgreSQL is available only in non-production runtime profiles".to_string(),
+            ));
+        }
+        "postgres" | "postgresql" => {
+            let host = env::var("STEEL_POSTGRES_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let port = env::var("STEEL_POSTGRES_PORT").unwrap_or_else(|_| "5432".to_string());
+            let user = env::var("STEEL_POSTGRES_USER").unwrap_or_else(|_| "postgres".to_string());
+            let password =
+                env::var("STEEL_POSTGRES_PASSWORD").unwrap_or_else(|_| "postgres".to_string());
+            let database = env::var("STEEL_POSTGRES_DATABASE")
+                .unwrap_or_else(|_| "steel_inspection".to_string());
+            let ssl_mode =
+                env::var("STEEL_POSTGRES_SSL_MODE").unwrap_or_else(|_| "disable".to_string());
+            normalize_database_url(
+                &format!(
+                    "postgres://{}:{}@{}:{}/{}?sslmode={}",
+                    percent_encode_url_component(&user),
+                    percent_encode_url_component(&password),
+                    host,
+                    port,
+                    postgres_identifier(&database)?,
+                    percent_encode_url_component(&ssl_mode)
+                ),
+                false,
+            )?
+        }
+        other => {
+            return Err(DbErr::Custom(format!(
+                "unsupported STEEL_DATABASE_ENGINE '{other}'; expected sqlite, mysql, or postgres"
+            )));
+        }
+    };
+    Ok(DatabaseRequest {
+        engine: database_engine_from_url(&url)?.to_string(),
+        url,
+        fallback,
+    })
+}
+
+fn database_fallback_policy(
+    value: Option<&str>,
+    production_policy: bool,
+) -> Result<DatabaseFallback, DbErr> {
+    let fallback = match value.unwrap_or("none").trim().to_ascii_lowercase().as_str() {
+        "" | "none" | "off" | "disabled" | "0" => DatabaseFallback::None,
+        "sqlite" | "sqlite3" => DatabaseFallback::Sqlite,
+        other => {
+            return Err(DbErr::Custom(format!(
+                "unsupported STEEL_DATABASE_FALLBACK '{other}'; expected none or sqlite"
+            )));
+        }
+    };
+    if production_policy && fallback != DatabaseFallback::None {
+        return Err(DbErr::Custom(
+            "database fallback is forbidden in production; startup must fail closed".to_string(),
+        ));
+    }
+    Ok(fallback)
+}
+
+fn database_engine_from_url(url: &str) -> Result<&'static str, DbErr> {
+    let normalized = url.trim().to_ascii_lowercase();
+    if normalized.starts_with("sqlite:") {
+        Ok("sqlite")
+    } else if normalized.starts_with("mysql://") || normalized.starts_with("mysqlx://") {
+        Ok("mysql")
+    } else if normalized.starts_with("postgres://") || normalized.starts_with("postgresql://") {
+        Ok("postgres")
+    } else {
+        Err(DbErr::Custom(
+            "STEEL_DATABASE_URL must use sqlite, mysql, or postgres".to_string(),
+        ))
+    }
+}
+
+fn database_connect_timeout_ms() -> u64 {
+    env::var("STEEL_DATABASE_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000)
+        .clamp(100, 30_000)
+}
+
+async fn connect_database(url: &str) -> Result<DatabaseConnection, DbErr> {
+    let mut options = ConnectOptions::new(url.to_string());
+    options.connect_timeout(Duration::from_millis(database_connect_timeout_ms()));
+    Database::connect(options).await
+}
+
+async fn connect_requested_database(url: &str) -> Result<DatabaseConnection, DbErr> {
+    if database_engine_from_url(url)? == "mysql" {
+        ensure_mysql_database(url).await?;
+    }
+    connect_database(url).await
+}
+
+async fn open_database_request(
+    request: DatabaseRequest,
+    fallback_path: PathBuf,
+    production_policy: bool,
+) -> Result<AppDatabase, DbErr> {
+    match connect_requested_database(&request.url).await {
+        Ok(connection) => {
+            initialize_database(
+                connection,
+                request.url,
+                fallback_path,
+                production_policy,
+                request.engine,
+                request.fallback != DatabaseFallback::None,
+                false,
+                None,
+            )
+            .await
+        }
+        Err(primary_error)
+            if !production_policy
+                && request.fallback == DatabaseFallback::Sqlite
+                && request.engine != "sqlite" =>
+        {
+            eprintln!(
+                "database adapter {} unavailable; using explicit non-production SQLite fallback: {}",
+                request.engine, primary_error
+            );
+            let fallback_url = format!("sqlite://{}?mode=rwc", fallback_path.display());
+            let connection = connect_database(&fallback_url).await?;
+            initialize_database(
+                connection,
+                fallback_url,
+                fallback_path,
+                false,
+                request.engine,
+                true,
+                true,
+                Some("primary_connection_failed".to_string()),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn initialize_database(
+    connection: DatabaseConnection,
+    url: String,
+    fallback_path: PathBuf,
+    production_policy: bool,
+    requested_engine: String,
+    fallback_enabled: bool,
+    fallback_active: bool,
+    fallback_reason: Option<String>,
+) -> Result<AppDatabase, DbErr> {
     let schema_version = prepare_schema(&connection, production_policy).await?;
     seed_database(&connection).await?;
+    let engine = match connection.get_database_backend() {
+        DbBackend::MySql => "mysql",
+        DbBackend::Postgres => "postgres",
+        DbBackend::Sqlite => "sqlite",
+    }
+    .to_string();
+    let file_path = (engine == "sqlite").then_some(fallback_path.clone());
     Ok(AppDatabase {
         connection,
-        path: path.clone(),
-        engine: "sqlite".to_string(),
-        url,
-        file_path: Some(path),
+        path: fallback_path,
+        engine,
+        url: redact_database_url(&url),
+        file_path,
         schema_version,
+        requested_engine,
+        fallback_enabled,
+        fallback_active,
+        fallback_reason,
     })
 }
 
@@ -649,7 +972,19 @@ fn required_production_database_setting(
 }
 
 fn normalize_database_url(url: &str, production_policy: bool) -> Result<String, DbErr> {
-    if !(url.starts_with("mysql://") || url.starts_with("mysqlx://")) {
+    if url.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let engine = database_engine_from_url(url)?;
+    if engine == "postgres" {
+        if production_policy {
+            return Err(DbErr::Custom(
+                "PostgreSQL is available only in non-production runtime profiles".to_string(),
+            ));
+        }
+        return Ok(url.to_string());
+    }
+    if engine != "mysql" {
         return Ok(url.to_string());
     }
     if production_policy {
@@ -661,6 +996,18 @@ fn normalize_database_url(url: &str, production_policy: bool) -> Result<String, 
     } else {
         Ok(url.to_string())
     }
+}
+
+fn percent_encode_url_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(*byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn validate_production_mysql_url(url: &str) -> Result<(), DbErr> {
@@ -765,29 +1112,21 @@ fn redact_database_url(url: &str) -> String {
     format!("{scheme}://{redacted_authority}/{suffix}")
 }
 
+#[cfg(test)]
 pub async fn open_database_url(url: String, fallback_path: PathBuf) -> Result<AppDatabase, DbErr> {
     let production_policy = production_security_policy_enabled();
-    if url.starts_with("mysql://") || url.starts_with("mysqlx://") {
-        ensure_mysql_database(&url).await?;
-    }
-    let connection = Database::connect(url.clone()).await?;
-    let schema_version = prepare_schema(&connection, production_policy).await?;
-    seed_database(&connection).await?;
-    let engine = match connection.get_database_backend() {
-        DbBackend::MySql => "mysql",
-        DbBackend::Postgres => "postgres",
-        DbBackend::Sqlite => "sqlite",
-    }
-    .to_string();
-    let file_path = (engine == "sqlite").then_some(fallback_path.clone());
-    Ok(AppDatabase {
-        connection,
-        path: fallback_path,
-        engine,
-        url: redact_database_url(&url),
-        file_path,
-        schema_version,
-    })
+    let url = normalize_database_url(&url, production_policy)?;
+    let engine = database_engine_from_url(&url)?.to_string();
+    open_database_request(
+        DatabaseRequest {
+            url,
+            engine,
+            fallback: DatabaseFallback::None,
+        },
+        fallback_path,
+        production_policy,
+    )
+    .await
 }
 
 async fn ensure_mysql_database(url: &str) -> Result<(), DbErr> {
@@ -797,7 +1136,7 @@ async fn ensure_mysql_database(url: &str) -> Result<(), DbErr> {
     let Some(server_url) = mysql_server_url(url) else {
         return Ok(());
     };
-    let admin = Database::connect(server_url).await?;
+    let admin = connect_database(&server_url).await?;
     let sql = format!(
         "CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
         mysql_identifier(&database_name)?
@@ -836,6 +1175,14 @@ fn mysql_identifier(value: &str) -> Result<String, DbErr> {
             "mysql database name must use ASCII letters, digits, or underscore".to_string(),
         ))
     }
+}
+
+fn postgres_identifier(value: &str) -> Result<String, DbErr> {
+    mysql_identifier(value).map_err(|_| {
+        DbErr::Custom(
+            "postgres database name must use ASCII letters, digits, or underscore".to_string(),
+        )
+    })
 }
 
 pub async fn load_snapshot(connection: &DatabaseConnection) -> Result<DatabaseSnapshot, DbErr> {
@@ -945,6 +1292,7 @@ pub async fn database_integrity_messages(
     connection: &DatabaseConnection,
 ) -> Result<Vec<String>, DbErr> {
     if connection.get_database_backend() != DbBackend::Sqlite {
+        connection.ping().await?;
         return Ok(vec!["ok".to_string()]);
     }
     let rows = connection
@@ -3411,11 +3759,9 @@ async fn schema_table_count(
         DbBackend::MySql => format!(
             "SELECT CAST(COUNT(*) AS SIGNED) AS table_count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{table_name}'"
         ),
-        DbBackend::Postgres => {
-            return Err(DbErr::Custom(
-                "PostgreSQL is not supported by the production schema contract".to_string(),
-            ));
-        }
+        DbBackend::Postgres => format!(
+            "SELECT COUNT(*) AS table_count FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = '{table_name}'"
+        ),
     };
     connection
         .query_one(Statement::from_string(
@@ -3437,11 +3783,10 @@ async fn application_table_count(connection: &DatabaseConnection) -> Result<i64,
              FROM information_schema.tables WHERE table_schema = DATABASE() \
              AND table_name NOT IN ('steel_schema_state', 'steel_schema_migration')"
             .to_string(),
-        DbBackend::Postgres => {
-            return Err(DbErr::Custom(
-                "PostgreSQL is not supported by the production schema contract".to_string(),
-            ));
-        }
+        DbBackend::Postgres => "SELECT COUNT(*) AS table_count \
+             FROM information_schema.tables WHERE table_schema = current_schema() \
+             AND table_name NOT IN ('steel_schema_state', 'steel_schema_migration')"
+            .to_string(),
     };
     connection
         .query_one(Statement::from_string(
@@ -3488,8 +3833,9 @@ async fn create_schema_ledger(connection: &DatabaseConnection) -> Result<(), DbE
         &format!(
             "INSERT INTO steel_schema_state \
              (singleton_id, current_version, dirty, active_migration_id, updated_at) \
-             VALUES (1, {}, 0, '', CURRENT_TIMESTAMP)",
-            DATABASE_SCHEMA_VERSION
+             VALUES (1, {}, 0, '', '{}')",
+            DATABASE_SCHEMA_VERSION,
+            now_millis_string()
         ),
     )
     .await
@@ -3531,7 +3877,11 @@ async fn validate_schema_ledger(connection: &DatabaseConnection) -> Result<i64, 
         .await?
         .ok_or_else(|| DbErr::Custom("steel_schema_state singleton row is missing".to_string()))?;
     let current_version = row.try_get::<i64>("", "current_version")?;
-    let dirty = row.try_get::<i64>("", "dirty")?;
+    let dirty = if connection.get_database_backend() == DbBackend::Postgres {
+        i64::from(row.try_get::<i32>("", "dirty")?)
+    } else {
+        row.try_get::<i64>("", "dirty")?
+    };
     let active_migration_id = row.try_get::<String>("", "active_migration_id")?;
     if dirty != 0 || !active_migration_id.is_empty() {
         return Err(DbErr::Custom(
@@ -3574,13 +3924,20 @@ async fn prepare_schema(
 }
 
 async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    let app_config_key = if connection.get_database_backend() == DbBackend::Postgres {
+        "\"key\""
+    } else {
+        "`key`"
+    };
     execute(
         connection,
-        "CREATE TABLE IF NOT EXISTS app_config (
-            `key` VARCHAR(128) PRIMARY KEY NOT NULL,
+        &format!(
+            "CREATE TABLE IF NOT EXISTS app_config (
+            {app_config_key} VARCHAR(128) PRIMARY KEY NOT NULL,
             value TEXT NOT NULL,
             updated_at VARCHAR(64) NOT NULL
-        )",
+        )"
+        ),
     )
     .await?;
     execute(
@@ -3608,7 +3965,7 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             enabled BOOLEAN NOT NULL,
             trigger_mode VARCHAR(64) NOT NULL,
             exposure_us INTEGER NOT NULL,
-            gain REAL NOT NULL,
+            gain DOUBLE PRECISION NOT NULL,
             depth_lines INTEGER NOT NULL,
             output_path VARCHAR(512) NOT NULL
         )",
@@ -3657,9 +4014,9 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             control_mode VARCHAR(64) NOT NULL,
             trigger_mode VARCHAR(64) NOT NULL,
             steel_type VARCHAR(128) NOT NULL,
-            width_mm REAL NOT NULL,
-            length_mm REAL NOT NULL,
-            thickness_mm REAL NOT NULL,
+            width_mm DOUBLE PRECISION NOT NULL,
+            length_mm DOUBLE PRECISION NOT NULL,
+            thickness_mm DOUBLE PRECISION NOT NULL,
             client VARCHAR(128) NOT NULL,
             hard VARCHAR(128) NOT NULL,
             storage_root VARCHAR(512) NOT NULL,
@@ -3834,11 +4191,11 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             distance_head_mm INTEGER NOT NULL,
             operator_side_mm INTEGER NOT NULL,
             drive_side_mm INTEGER NOT NULL,
-            width_mm REAL NOT NULL,
-            height_mm REAL NOT NULL,
-            depth_mm REAL NOT NULL,
-            x_ratio REAL NOT NULL,
-            y_offset_mm REAL NOT NULL,
+            width_mm DOUBLE PRECISION NOT NULL,
+            height_mm DOUBLE PRECISION NOT NULL,
+            depth_mm DOUBLE PRECISION NOT NULL,
+            x_ratio DOUBLE PRECISION NOT NULL,
+            y_offset_mm DOUBLE PRECISION NOT NULL,
             preview_x INTEGER NOT NULL,
             preview_y INTEGER NOT NULL
         )",
@@ -3853,13 +4210,13 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             camera_id VARCHAR(128) NOT NULL,
             defect_type VARCHAR(128) NOT NULL,
             severity VARCHAR(32) NOT NULL,
-            x_mm REAL NOT NULL,
-            y_mm REAL NOT NULL,
-            z_mm REAL NOT NULL,
-            width_mm REAL NOT NULL,
-            height_mm REAL NOT NULL,
-            depth_mm REAL NOT NULL,
-            confidence REAL NOT NULL,
+            x_mm DOUBLE PRECISION NOT NULL,
+            y_mm DOUBLE PRECISION NOT NULL,
+            z_mm DOUBLE PRECISION NOT NULL,
+            width_mm DOUBLE PRECISION NOT NULL,
+            height_mm DOUBLE PRECISION NOT NULL,
+            depth_mm DOUBLE PRECISION NOT NULL,
+            confidence DOUBLE PRECISION NOT NULL,
             geometry_json TEXT NOT NULL,
             created_at VARCHAR(64) NOT NULL
         )",
@@ -3897,7 +4254,7 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             role VARCHAR(128) NOT NULL,
             status VARCHAR(64) NOT NULL,
             password_hash VARCHAR(512) NOT NULL DEFAULT '',
-            must_change_password BOOLEAN NOT NULL DEFAULT 0,
+            must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
             last_login_at VARCHAR(64) NOT NULL,
             created_at VARCHAR(64) NOT NULL
         )",
@@ -3910,7 +4267,7 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
     .await?;
     execute_compatible_migration(
         connection,
-        "ALTER TABLE admin_user ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0",
+        "ALTER TABLE admin_user ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT FALSE",
     )
     .await?;
     execute(

@@ -109,6 +109,17 @@ The API smoke script checks endpoint shape and expected error handling. The cont
 
 ## Production database and trigger gateway
 
+For development/test only, `STEEL_DATABASE_ENGINE` accepts `sqlite`, `mysql`,
+or `postgres`. `STEEL_DATABASE_FALLBACK=sqlite` explicitly permits startup on
+the managed SQLite file when a remote primary cannot be connected. It does not
+hide schema or migration errors, and production rejects both fallback and the
+PostgreSQL development adapter. Examples:
+
+```powershell
+scripts/run-service.ps1 -RuntimeProfile development -DatabaseEngine mysql -DatabaseFallback sqlite
+scripts/run-service.ps1 -RuntimeProfile development -DatabaseEngine postgres -DatabaseFallback sqlite
+```
+
 The Rust service defaults to the local SQLite file. An empty production database also requires a one-time `STEEL_BOOTSTRAP_ADMIN_PASSWORD` injected by the service manager; it must be at least 12 characters and contain uppercase, lowercase, digit, and symbol characters. Do not store that secret in a checked-in env file.
 
 For a dedicated local production MySQL account, set:

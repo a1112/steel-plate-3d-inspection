@@ -71,7 +71,7 @@ function NotificationToast({ item }: { item: AppNotification }) {
   );
 }
 
-export function NotificationCenter() {
+export function NotificationCenter({ embedded = false }: { embedded?: boolean }) {
   const notifications = useSyncExternalStore(subscribeNotifications, getNotificationsSnapshot, getNotificationsSnapshot);
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
@@ -176,10 +176,12 @@ export function NotificationCenter() {
   return (
     <aside
       ref={rootRef}
-      className={`app-notification-system ${dragging ? 'is-dragging' : ''}`}
+      className={`app-notification-system ${embedded ? 'is-embedded' : ''} ${dragging ? 'is-dragging' : ''}`}
       data-notification-root
+      data-no-drag
       data-dragging={dragging || undefined}
-      style={position ? { left: `${position.left}px`, top: `${position.top}px`, right: 'auto' } : undefined}
+      style={!embedded && position ? { left: `${position.left}px`, top: `${position.top}px`, right: 'auto' } : undefined}
+      onMouseDown={embedded ? (event) => event.stopPropagation() : undefined}
     >
       <div className="app-notification-toasts" aria-live="polite" aria-relevant="additions">
         {visibleToasts.map((item) => <NotificationToast key={item.id} item={item} />)}
@@ -220,11 +222,11 @@ export function NotificationCenter() {
         aria-label={open ? '关闭消息通知' : '打开消息通知'}
         aria-expanded={open}
         data-notification="silent"
-        title="拖动调整位置，点击打开消息通知"
-        onPointerDown={handleDragStart}
-        onPointerMove={handleDragMove}
-        onPointerUp={finishDrag}
-        onPointerCancel={finishDrag}
+        title={embedded ? '消息通知' : '拖动调整位置，点击打开消息通知'}
+        onPointerDown={embedded ? undefined : handleDragStart}
+        onPointerMove={embedded ? undefined : handleDragMove}
+        onPointerUp={embedded ? undefined : finishDrag}
+        onPointerCancel={embedded ? undefined : finishDrag}
         onClick={toggleOpen}
       >
         <Bell size={19} />

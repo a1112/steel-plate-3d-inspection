@@ -1,10 +1,11 @@
-import { Activity, Bell, Camera, Cpu, Server, Settings } from 'lucide-react';
+import { Activity, Camera, Cpu, Server } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent } from 'react';
 import ustbLogoDark from '../assets/USTB-dark.png';
 import ustbLogo from '../assets/USTB.png';
 import type { DeviceStatus, ThemeMode } from '../data/inspection';
 import type { TriggerGatewayStatus } from '../services/inspection-api';
 import type { CaptureCameraStatus, CaptureSnapshot, SystemNetworkRateInterface, SystemNetworkRateSnapshot } from '../lib/capture-api';
+import { NotificationCenter } from './NotificationCenter';
 import { TopNav, type NavKey } from './TopNav';
 import { WindowControls } from './WindowControls';
 
@@ -17,7 +18,6 @@ interface BrandHeaderProps {
   services?: ServiceStatusPanel;
   activeNav: NavKey;
   onNavChange: (next: NavKey) => void;
-  onSettingsOpen: () => void;
   onDragMouseDown: (event: MouseEvent<HTMLElement>) => void;
 }
 
@@ -34,12 +34,6 @@ type ServiceStatusPanel = {
   inspectionService: ServiceStatusPanelItem;
   captureService: ServiceStatusPanelItem;
   triggerGateway: ServiceStatusPanelItem;
-};
-
-const serviceLabels: Record<keyof ServiceStatusPanel, string> = {
-  inspectionService: '检测服务',
-  captureService: '采集服务',
-  triggerGateway: '触发网关',
 };
 
 function serviceStatusText(state: ServiceConnectionState) {
@@ -108,8 +102,8 @@ type ReceiverNetworkTotals = {
   bandwidth: number;
 };
 
-const cameraStations = ['1号采集相机', '2号采集相机', '3号采集相机', '4号采集相机', '5号采集相机', '6号采集相机'];
-const REAL_CAMERA_LIMIT = 6;
+const cameraStations = Array.from({ length: 8 }, (_, index) => `${index + 1}号采集相机`);
+const REAL_CAMERA_LIMIT = 8;
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -668,35 +662,6 @@ function SystemStatusDetailPanel({ status }: { status: DeviceStatus }) {
   );
 }
 
-function ServiceStatusDetailPanel({ services }: { services: ServiceStatusPanel }) {
-  const entries = Object.entries(services) as Array<[keyof ServiceStatusPanel, ServiceStatusPanelItem]>;
-  const issueCount = entries.filter(([, service]) => service.state !== 'online').length;
-
-  return (
-    <div className="service-status-popover" id="service-status-detail-panel" role="dialog" aria-label="服务连接状态详情" data-no-drag>
-      <header>
-        <div>
-          <strong>服务连接状态</strong>
-          <span>{issueCount > 0 ? `${issueCount} 项服务异常` : '全部服务在线'}</span>
-        </div>
-      </header>
-      <div className="service-status-detail-list">
-        {entries.map(([key, service]) => (
-          <section key={key} className={service.state}>
-            <i aria-hidden="true" />
-            <div>
-              <strong>{serviceLabels[key]}</strong>
-              <span>{service.detail}</span>
-              <small>{service.endpoint}</small>
-            </div>
-            <em>{serviceStatusText(service.state)}</em>
-          </section>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 export function BrandHeader({
   status,
   theme,
@@ -706,7 +671,6 @@ export function BrandHeader({
   services,
   activeNav,
   onNavChange,
-  onSettingsOpen,
   onDragMouseDown,
 }: BrandHeaderProps) {
   const serviceStatus = services ?? {
@@ -715,11 +679,10 @@ export function BrandHeader({
     triggerGateway: makeUnknownService('触发网关'),
   };
   const logoSrc = theme === 'light' ? ustbLogo : ustbLogoDark;
-  const [activeDetail, setActiveDetail] = useState<'receiver' | 'camera' | 'system' | 'service' | null>(null);
+  const [activeDetail, setActiveDetail] = useState<'receiver' | 'camera' | 'system' | null>(null);
   const receiverWrapRef = useRef<HTMLDivElement>(null);
   const cameraWrapRef = useRef<HTMLDivElement>(null);
   const systemWrapRef = useRef<HTMLDivElement>(null);
-  const serviceWrapRef = useRef<HTMLDivElement>(null);
   const receiverDetails = useMemo(() => createReceiverDetailsFromCapture(capture, network), [capture, network]);
   const receiverRealtime = receiverDetails.some((detail) => detail.realtime);
   const receiverPorts = useMemo(
@@ -786,7 +749,7 @@ export function BrandHeader({
       if (!(target instanceof Node)) {
         return false;
       }
-      return [receiverWrapRef.current, cameraWrapRef.current, systemWrapRef.current, serviceWrapRef.current].some((element) => element?.contains(target));
+      return [receiverWrapRef.current, cameraWrapRef.current, systemWrapRef.current].some((element) => element?.contains(target));
     };
 
     const closeWhenOutside = (event: Event) => {
@@ -906,31 +869,7 @@ export function BrandHeader({
           <i />
           <span>{serviceIssueCount > 0 ? '服务异常' : '运行中'}</span>
         </div>
-        <div ref={serviceWrapRef} className="service-status-wrap" data-no-drag onMouseDown={(event) => event.stopPropagation()}>
-          <button
-            className={`alarm-status ${serviceIssueCount > 0 ? 'has-service-alarm' : ''}`}
-            type="button"
-            aria-label={`系统报警 ${status.alarmCount} 项，服务异常 ${serviceIssueCount} 项`}
-            aria-expanded={activeDetail === 'service'}
-            aria-controls="service-status-detail-panel"
-            onClick={() => setActiveDetail((current) => (current === 'service' ? null : 'service'))}
-          >
-            <Bell size={20} fill="currentColor" />
-            <span>{status.alarmCount}</span>
-          </button>
-          {activeDetail === 'service' ? <ServiceStatusDetailPanel services={serviceStatus} /> : null}
-        </div>
-        <button
-          className="header-settings-button"
-          type="button"
-          title="系统设置"
-          aria-label="打开系统设置"
-          data-no-drag
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={onSettingsOpen}
-        >
-          <Settings size={18} />
-        </button>
+        <NotificationCenter embedded />
       </div>
 
       <div className="brand-right">

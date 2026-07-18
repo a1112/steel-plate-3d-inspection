@@ -682,6 +682,7 @@ export function PlateMapToolbar({
   defectTypeCounts,
   hiddenTypeIds,
   viewMode,
+  showViewSwitch = true,
   onToggleType,
   onViewModeChange,
 }: {
@@ -689,6 +690,7 @@ export function PlateMapToolbar({
   defectTypeCounts: Record<string, number>;
   hiddenTypeIds: Set<string>;
   viewMode: PlateMapViewMode;
+  showViewSwitch?: boolean;
   onToggleType: (typeId: string) => void;
   onViewModeChange: (viewMode: PlateMapViewMode) => void;
 }) {
@@ -719,7 +721,7 @@ export function PlateMapToolbar({
           );
         })}
       </div>
-      <PlateMapActions viewMode={viewMode} onViewModeChange={onViewModeChange} />
+      {showViewSwitch ? <PlateMapActions viewMode={viewMode} onViewModeChange={onViewModeChange} /> : null}
     </div>
   );
 }

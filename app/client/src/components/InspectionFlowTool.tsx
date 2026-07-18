@@ -34,9 +34,17 @@ function phaseLabel(phase: FlowPhase) {
   }[phase];
 }
 
-export function InspectionFlowTool({ onSnapshot }: { onSnapshot?: (snapshot: InspectionSnapshot) => void }) {
+export function InspectionFlowTool({
+  onSnapshot,
+  visible: controlledVisible,
+  onVisibleChange,
+}: {
+  onSnapshot?: (snapshot: InspectionSnapshot) => void;
+  visible?: boolean;
+  onVisibleChange?: (visible: boolean) => void;
+}) {
   const [open, setOpen] = useState(true);
-  const [visible, setVisible] = useState(true);
+  const [internalVisible, setInternalVisible] = useState(true);
   const [materialId, setMaterialId] = useState(createMaterialId);
   const [holdSeconds, setHoldSeconds] = useState(15);
   const [phase, setPhase] = useState<FlowPhase>('idle');
@@ -55,6 +63,13 @@ export function InspectionFlowTool({ onSnapshot }: { onSnapshot?: (snapshot: Ins
   const drag = useRef<{ pointerId: number; x: number; y: number; startX: number; startY: number } | null>(null);
   const stopRequested = useRef(false);
   const busy = !['idle', 'complete', 'failed'].includes(phase);
+  const visible = controlledVisible ?? internalVisible;
+  const setVisible = (next: boolean) => {
+    if (controlledVisible === undefined) {
+      setInternalVisible(next);
+    }
+    onVisibleChange?.(next);
+  };
 
   useEffect(() => {
     localStorage.setItem(POSITION_KEY, JSON.stringify(position));
@@ -168,6 +183,9 @@ export function InspectionFlowTool({ onSnapshot }: { onSnapshot?: (snapshot: Ins
   };
 
   if (!visible) {
+    if (controlledVisible !== undefined) {
+      return null;
+    }
     return (
       <button className="inspection-flow-launcher" type="button" onClick={() => setVisible(true)} title="打开完整检测流程工具">
         <Play size={17} />

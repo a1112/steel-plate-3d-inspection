@@ -18,11 +18,9 @@ const settingsSections: Array<{ id: SettingsSection; label: string; hint: string
 ];
 
 const themeOptions: Array<{ id: ThemeMode; label: string; description: string; swatches: string[] }> = [
-  { id: 'dark', label: '深色工业', description: '默认验收暗色', swatches: ['#11181c', '#2f7dff', '#4ed463'] },
-  { id: 'light', label: '浅色巡检', description: '亮环境值守', swatches: ['#f3f6fa', '#2f7dff', '#07162c'] },
+  { id: 'light', label: '浅色巡检', description: '默认亮环境值守', swatches: ['#f3f6fa', '#2f7dff', '#07162c'] },
+  { id: 'dark', label: '深色工业', description: '工业监控暗色', swatches: ['#11181c', '#2f7dff', '#4ed463'] },
   { id: 'graphite', label: '石墨高对比', description: '低照度机房', swatches: ['#090d10', '#00b8d4', '#f2f5f6'] },
-  { id: 'cobalt', label: '蓝钢夜视', description: '蓝色监控风格', swatches: ['#081220', '#4d8dff', '#50d890'] },
-  { id: 'emerald', label: '绿光值守', description: '产线运行风格', swatches: ['#0c1715', '#21b8c7', '#45e38a'] },
 ];
 
 function NumberField({

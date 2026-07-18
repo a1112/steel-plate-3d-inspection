@@ -1,9 +1,15 @@
 import { ChevronLeft, ChevronRight, Filter } from 'lucide-react';
-import type { ChangeEvent } from 'react';
+import { useState, type ChangeEvent, type CSSProperties, type KeyboardEvent } from 'react';
+import { createPortal } from 'react-dom';
 import type { DefectItem } from '../data/inspection';
-import { severityLabels } from '../data/inspection';
+import { getDefectPreviewImage, severityLabels, surfaceLabels } from '../data/inspection';
+import { barSurfaceFileUrl } from '../services/bar-surface-api';
 import type { ReportFilters } from '../state/operations';
 import { Panel } from './Panel';
+
+const DEFECT_POPOVER_WIDTH = 330;
+const DEFECT_POPOVER_HEIGHT = 318;
+const DEFECT_POPOVER_GAP = 10;
 
 interface DefectDetectionListProps {
   defects: DefectItem[];
@@ -35,6 +41,77 @@ function getDefectCameraLabel(defect: DefectItem) {
   return `camera${cameraIndex + 1}`;
 }
 
+function getDefectPreview(defect: DefectItem) {
+  if (defect.previewImageUrl) {
+    return { url: defect.previewImageUrl, source: defect.synthetic ? '模拟算法产物' : '检测记录预览' };
+  }
+  if (defect.artifacts?.roiImage) {
+    return { url: barSurfaceFileUrl(defect.artifacts.roiImage), source: '生产 ROI 产物' };
+  }
+  if (import.meta.env.DEV) {
+    return { url: getDefectPreviewImage(defect.typeId), source: '开发模拟图 · 非生产产物' };
+  }
+  return { url: '', source: '暂无图像产物' };
+}
+
+function getDefectConfidence(defect: DefectItem) {
+  const confidence = defect.classificationConfidence ?? defect.detectionConfidence ?? defect.confidence;
+  return typeof confidence === 'number' ? `${(confidence * 100).toFixed(1)}%` : '--';
+}
+
+function DefectListHoverCard({
+  defect,
+  top,
+  left,
+}: {
+  defect: DefectItem;
+  top: number;
+  left: number;
+}) {
+  const preview = getDefectPreview(defect);
+  const style = {
+    top,
+    left,
+  } as CSSProperties;
+
+  return (
+    <aside
+      id={`defect-list-hover-${defect.id}`}
+      className="defect-list-hover-card"
+      role="tooltip"
+      style={style}
+      data-testid="defect-list-hover-card"
+    >
+      <header>
+        <div>
+          <span>缺陷详情</span>
+          <strong>{defect.typeLabel}</strong>
+        </div>
+        <em className={defect.severity}>{severityLabels[defect.severity]}</em>
+      </header>
+      <figure className={preview.url ? '' : 'is-empty'}>
+        {preview.url ? <img src={preview.url} alt={`${defect.typeLabel}缺陷图像`} /> : <span>暂无缺陷 ROI 图像</span>}
+        <figcaption>
+          <b>{getDefectCameraLabel(defect)}</b>
+          <span>{preview.source}</span>
+        </figcaption>
+      </figure>
+      <dl>
+        <div><dt>缺陷编号</dt><dd title={defect.id}>{defect.id}</dd></div>
+        <div><dt>钢管号</dt><dd>{defect.plateNo}</dd></div>
+        <div><dt>表面</dt><dd>{surfaceLabels[defect.surface]}</dd></div>
+        <div><dt>置信度</dt><dd>{getDefectConfidence(defect)}</dd></div>
+        <div className="wide"><dt>尺寸</dt><dd>{defect.widthMm.toFixed(2)} × {defect.heightMm.toFixed(2)} × {Math.abs(defect.depthMm).toFixed(2)}mm</dd></div>
+        <div><dt>距头</dt><dd>{defect.distanceHeadMm}mm</dd></div>
+        <div><dt>深度</dt><dd>{defect.depthMm.toFixed(2)}mm</dd></div>
+        <div><dt>距操作侧</dt><dd>{defect.operatorSideMm}mm</dd></div>
+        <div><dt>距传动侧</dt><dd>{defect.driveSideMm}mm</dd></div>
+        <div className="wide"><dt>识别状态</dt><dd>{defect.classificationState === 'candidate-only' ? '候选待分类' : '已分类'}{defect.classificationVersion ? ` · ${defect.classificationVersion}` : ''}</dd></div>
+      </dl>
+    </aside>
+  );
+}
+
 export function DefectDetectionList({
   defects,
   selectedDefectId,
@@ -48,8 +125,37 @@ export function DefectDetectionList({
   onFilterChange,
   onClearFilters,
 }: DefectDetectionListProps) {
+  const [hoveredDefect, setHoveredDefect] = useState<{
+    defect: DefectItem;
+    top: number;
+    left: number;
+  } | null>(null);
+
   const handleSelect = (event: ChangeEvent<HTMLSelectElement>, key: 'severity') => {
     onFilterChange({ [key]: event.target.value } as Partial<ReportFilters>);
+  };
+
+  const showDefectDetails = (defect: DefectItem, target: HTMLElement) => {
+    const rect = target.getBoundingClientRect();
+    const opensLeft = rect.left >= DEFECT_POPOVER_WIDTH + DEFECT_POPOVER_GAP + 12;
+    const left = opensLeft
+      ? rect.left - DEFECT_POPOVER_WIDTH - DEFECT_POPOVER_GAP
+      : Math.min(window.innerWidth - DEFECT_POPOVER_WIDTH - 12, rect.right + DEFECT_POPOVER_GAP);
+    const top = Math.max(
+      54,
+      Math.min(rect.top - 16, window.innerHeight - DEFECT_POPOVER_HEIGHT - 44),
+    );
+    setHoveredDefect({ defect, top, left: Math.max(12, left) });
+  };
+
+  const handleRowKeyDown = (event: KeyboardEvent<HTMLTableRowElement>, defect: DefectItem) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      onSelectDefect(defect.id);
+    } else if (event.key === 'Escape') {
+      setHoveredDefect(null);
+      event.currentTarget.blur();
+    }
   };
 
   return (
@@ -93,7 +199,15 @@ export function DefectDetectionList({
                 <tr
                   key={defect.id}
                   className={defect.id === selectedDefectId ? 'selected' : ''}
+                  tabIndex={0}
+                  aria-label={`${defect.typeLabel}，${getDefectCameraLabel(defect)}，距头${defect.distanceHeadMm}mm，${severityLabels[defect.severity]}`}
+                  aria-describedby={hoveredDefect?.defect.id === defect.id ? `defect-list-hover-${defect.id}` : undefined}
                   onClick={() => onSelectDefect(defect.id)}
+                  onMouseEnter={(event) => showDefectDetails(defect, event.currentTarget)}
+                  onMouseLeave={() => setHoveredDefect(null)}
+                  onFocus={(event) => showDefectDetails(defect, event.currentTarget)}
+                  onBlur={() => setHoveredDefect(null)}
+                  onKeyDown={(event) => handleRowKeyDown(event, defect)}
                 >
                   <td>{String((page - 1) * 10 + index + 1).padStart(2, '0')}</td>
                   <td>
@@ -127,6 +241,16 @@ export function DefectDetectionList({
           <ChevronRight size={16} />
         </button>
       </div>
+      {hoveredDefect && typeof document !== 'undefined'
+        ? createPortal(
+          <DefectListHoverCard
+            defect={hoveredDefect.defect}
+            top={hoveredDefect.top}
+            left={hoveredDefect.left}
+          />,
+          document.body,
+        )
+        : null}
     </Panel>
   );
 }

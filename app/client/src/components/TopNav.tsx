@@ -1,4 +1,4 @@
-import { BellRing, Box, ClipboardList, Gauge, MonitorCog } from 'lucide-react';
+import { BellRing, ClipboardList, Gauge } from 'lucide-react';
 import type { ElementType, MouseEvent } from 'react';
 import type { InspectionUiState } from '../state/inspection-ui';
 
@@ -8,7 +8,6 @@ const navItems: Array<{ id: NavKey; label: string; icon: ElementType }> = [
   { id: 'online', label: '在线检测', icon: Gauge },
   { id: 'report', label: '缺陷报表', icon: ClipboardList },
   { id: 'alarms', label: '报警中心', icon: BellRing },
-  { id: 'status', label: '采集管理', icon: MonitorCog },
 ];
 
 export function TopNav({
@@ -22,10 +21,6 @@ export function TopNav({
   onDragMouseDown?: (event: MouseEvent<HTMLElement>) => void;
   embedded?: boolean;
 }) {
-  const openBarSurfaceWorkbench = () => {
-    window.location.assign('/?app=bar-surface');
-  };
-
   const handleMouseDown = (event: MouseEvent<HTMLElement>) => {
     if (embedded) {
       event.stopPropagation();
@@ -45,15 +40,6 @@ export function TopNav({
           </button>
         );
       })}
-      <button
-        type="button"
-        className="top-nav-workbench"
-        onMouseDown={(event) => event.stopPropagation()}
-        onClick={openBarSurfaceWorkbench}
-      >
-        <Box size={18} />
-        <span>3D 重建</span>
-      </button>
     </nav>
   );
 }

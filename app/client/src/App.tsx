@@ -5,6 +5,8 @@ import type { DefectItem, InspectionSnapshot, Severity } from './data/inspection
 import type { InspectionUiState } from './state/inspection-ui';
 import {
   createInitialUiState,
+  persistTheme,
+  readStoredTheme,
   filterDefectsBySurfaceMode,
   getPageCount,
   getVisibleDefects,
@@ -62,7 +64,8 @@ import {
   type SystemNetworkSnapshot,
 } from './lib/capture-api';
 import { BrandHeader } from './components/BrandHeader';
-import { AlarmAnalysis } from './components/AlarmAnalysis';
+import { AppFooter } from './components/AppFooter';
+import { AlarmAnalysis, type AnalysisViewMode } from './components/AlarmAnalysis';
 import { AlarmCenter } from './components/AlarmCenter';
 import { DefectDetectionList } from './components/DefectDetectionList';
 import { LeftSidebar } from './components/LeftSidebar';
@@ -203,8 +206,9 @@ export default function App() {
   }, []);
 
   if (!snapshot) {
+    const loadingTheme = readStoredTheme();
     return (
-      <div className="app-shell theme-dark app-loading-shell">
+      <div className={`app-shell theme-${loadingTheme} app-loading-shell`}>
         <section className="app-loading-panel" role="status" aria-live="polite">
           <span>后台数据系统</span>
           <h1>{loadError ? '后台连接失败' : '正在连接后台数据服务'}</h1>
@@ -226,6 +230,11 @@ function InspectionDashboard({
 }) {
   const [appMode] = useState(readAppMode);
   const [uiState, setUiState] = useState(() => createInitialUiState(snapshot));
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = uiState.theme;
+    persistTheme(uiState.theme);
+  }, [uiState.theme]);
   const [onlineFilters, setOnlineFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
   const [selectedOnlineSeverities, setSelectedOnlineSeverities] = useState<Set<Severity>>(() => new Set(ALL_SEVERITY_FILTERS));
   const [reportFilters, setReportFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
@@ -243,8 +252,10 @@ function InspectionDashboard({
   const [toast, setToast] = useState<string | null>(null);
   const [viewportSize, setViewportSize] = useState(readViewportSize);
   const [analysisCollapsed, setAnalysisCollapsed] = useState(false);
+  const [analysisViewMode, setAnalysisViewMode] = useState<AnalysisViewMode>('overview');
   const [plateMapViewMode, setPlateMapViewMode] = useState<PlateMapViewMode>('2d');
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [inspectionFlowVisible, setInspectionFlowVisible] = useState(false);
   const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>('latest');
   const [snapshotSyncState, setSnapshotSyncState] = useState('等待实时同步');
   const [captureSnapshot, setCaptureSnapshot] = useState(() => createEmptyCaptureSnapshot('capture service pending'));
@@ -1005,7 +1016,6 @@ function InspectionDashboard({
         services={serviceStatus}
         activeNav={uiState.activeNav}
         onNavChange={(activeNav) => setState({ activeNav })}
-        onSettingsOpen={() => setSettingsModalOpen(true)}
         onDragMouseDown={(event) => void handleTitlebarMouseDown(event)}
       />
       {uiState.activeNav === 'online' ? (
@@ -1038,6 +1048,7 @@ function InspectionDashboard({
                 defectTypeCounts={defectTypeCounts}
                 hiddenTypeIds={uiState.hiddenDefectTypeIds}
                 viewMode={plateMapViewMode}
+                showViewSwitch={false}
                 onToggleType={(typeId) =>
                   setUiState((current) => ({
                     ...toggleDefectType(current, typeId),
@@ -1095,7 +1106,7 @@ function InspectionDashboard({
                   artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
                   headerless
                   collapsed={analysisCollapsed}
-                  onCollapsedChange={setAnalysisCollapsed}
+                  viewMode={analysisViewMode}
                 />
               </section>
               <aside className="right-column">
@@ -1207,6 +1218,22 @@ function InspectionDashboard({
           )}
         </>
       )}
+      <AppFooter
+        activeNav={uiState.activeNav}
+        flowVisible={inspectionFlowVisible}
+        onFlowToggle={() => setInspectionFlowVisible((current) => !current)}
+        analysis={selectedOnlineDefect ? {
+          defect: selectedOnlineDefect,
+          surfaceViewMode: plateMapViewMode,
+          analysisViewMode,
+          collapsed: analysisCollapsed,
+          onSurfaceViewModeChange: setPlateMapViewMode,
+          onAnalysisViewModeChange: setAnalysisViewMode,
+          onCollapsedChange: setAnalysisCollapsed,
+        } : null}
+        onNavChange={(activeNav) => setState({ activeNav })}
+        onSettingsOpen={() => setSettingsModalOpen(true)}
+      />
       {settingsModalOpen ? (
         <div
           className="settings-modal-backdrop"
@@ -1220,8 +1247,8 @@ function InspectionDashboard({
           <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" data-no-drag>
             <header className="settings-modal-header">
               <div>
-                <span>系统参数</span>
-                <h2 id="settings-modal-title">系统设置</h2>
+                <span>系统配置</span>
+                <h2 id="settings-modal-title">配置中心</h2>
               </div>
               <button type="button" aria-label="关闭系统设置" onClick={() => setSettingsModalOpen(false)}>
                 <X size={18} />
@@ -1252,7 +1279,11 @@ function InspectionDashboard({
           </section>
         </div>
       ) : null}
-      <InspectionFlowTool onSnapshot={onSnapshotChange} />
+      <InspectionFlowTool
+        visible={inspectionFlowVisible}
+        onVisibleChange={setInspectionFlowVisible}
+        onSnapshot={onSnapshotChange}
+      />
     </div>
   );
 }

@@ -169,6 +169,11 @@ export type AdminServices = {
     activeSessions: number;
     database: {
       engine: string;
+      requestedEngine?: string;
+      supportedEngines?: string[];
+      fallbackEnabled?: boolean;
+      fallbackActive?: boolean;
+      fallbackReason?: string | null;
       path: string;
       bytes?: number;
       configDir?: string;
@@ -176,6 +181,7 @@ export type AdminServices = {
   };
   capture: {
     name?: string;
+    provider?: 'headless-cpp' | 'external-api' | 'simulated' | string;
     managed?: boolean;
     running?: boolean;
     port?: number;
@@ -183,6 +189,23 @@ export type AdminServices = {
     processAvailable?: boolean;
     executable?: string;
     fallback?: string;
+    lifecycle?: {
+      phase?: 'starting' | 'ready' | 'collecting' | 'degraded' | 'stopping' | 'stopped' | string;
+      desiredRunning?: boolean;
+      autostart?: boolean;
+      pid?: number | null;
+      startedAt?: string | null;
+      readyAt?: string | null;
+      lastExitAt?: string | null;
+      lastExitCode?: number | null;
+      lastError?: string;
+      restartCount?: number;
+      consecutiveFailures?: number;
+      unhealthyConfirmations?: number;
+      restartBudget?: number;
+      restartBudgetExhausted?: boolean;
+      nextRestartAt?: string | null;
+    };
   };
   diagnostics?: Array<{
     id: string;
@@ -228,6 +251,11 @@ export type AdminOverview = {
   };
   database: {
     engine: string;
+    requestedEngine?: string;
+    supportedEngines?: string[];
+    fallbackEnabled?: boolean;
+    fallbackActive?: boolean;
+    fallbackReason?: string | null;
     orm: string;
     path: string;
     configDir: string;
@@ -608,6 +636,9 @@ export type ProductionStatus = {
   code: number;
   database?: {
     engine: string;
+    requestedEngine?: string;
+    fallbackActive?: boolean;
+    fallbackReason?: string | null;
     path: string;
   };
   latestSession?: ProductionMaterialSession | null;
@@ -1369,7 +1400,19 @@ export async function restoreConfigRevision(id: string): Promise<{
   }>;
 }
 
-export async function fetchDatabaseInfo(signal?: AbortSignal): Promise<{ engine: string; orm: string; path: string; configDir: string }> {
+export type DatabaseInfo = {
+  engine: string;
+  requestedEngine: string;
+  supportedEngines: string[];
+  fallbackEnabled: boolean;
+  fallbackActive: boolean;
+  fallbackReason?: string | null;
+  orm: string;
+  path: string;
+  configDir: string;
+};
+
+export async function fetchDatabaseInfo(signal?: AbortSignal): Promise<DatabaseInfo> {
   const config = getStoredConnectionConfig();
   const response = await fetch(`${getInspectionServiceOrigin(config)}/api/database`, {
     headers: createAdminHeaders({ Accept: 'application/json' }),
@@ -1378,7 +1421,7 @@ export async function fetchDatabaseInfo(signal?: AbortSignal): Promise<{ engine:
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '数据库信息接口异常'));
   }
-  return response.json() as Promise<{ engine: string; orm: string; path: string; configDir: string }>;
+  return response.json() as Promise<DatabaseInfo>;
 }
 
 export async function downloadDatabaseBackup(signal?: AbortSignal): Promise<Blob> {

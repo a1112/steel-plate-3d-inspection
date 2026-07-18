@@ -1104,6 +1104,58 @@ New-Item -ItemType Directory -Force -Path $env:STEEL_SERVICE_CONFIG_DIR | Out-Nu
 exit $LASTEXITCODE
 '@
 
+Write-PackageFile "run-service-managed.ps1" @'
+param(
+  [int]$Port = 4873,
+  [int]$CapturePort = 4317,
+  [string]$TriggerOrigin = "http://127.0.0.1:4881",
+  [string]$StorageRoot = "H:\",
+  [string]$CameraStorageRoot = "H:\",
+  [string]$ConfigRoot = "",
+  [Parameter(Mandatory = $true)]
+  [string]$ArtifactAllowedRoots
+)
+
+$ErrorActionPreference = "Stop"
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Exe = Join-Path $Root "service\steel-inspection-service.exe"
+$CaptureExe = Join-Path $Root "capture-headless\steel_capture_service.exe"
+if (-not (Test-Path $Exe -PathType Leaf)) { throw "Missing service executable: $Exe" }
+if (-not (Test-Path $CaptureExe -PathType Leaf)) { throw "Missing capture executable: $CaptureExe" }
+
+$env:INSPECTION_SERVICE_HOST = "127.0.0.1"
+$env:INSPECTION_SERVICE_PORT = [string]$Port
+$env:STEEL_CAPTURE_PROVIDER = "headless-cpp"
+$env:CAPTURE_SERVICE_ORIGIN = "http://127.0.0.1:$CapturePort"
+$env:STEEL_CAPTURE_SERVICE_AUTOSTART = "1"
+$env:STEEL_CAPTURE_SERVICE_EXE = $CaptureExe
+$env:STEEL_CAPTURE_RESTART_BUDGET = "5"
+$env:STEEL_CAPTURE_RESTART_BACKOFF_MS = "1000"
+$env:STEEL_CAPTURE_READY_TIMEOUT_MS = "15000"
+$env:CAPTURE_STORAGE_ROOT = $StorageRoot
+$env:CAPTURE_CAMERA_STORAGE_ROOT = $CameraStorageRoot
+$env:CAPTURE_CONFIG_ROOT = Join-Path $Root "config\capture"
+$env:TRIGGER_GATEWAY_ORIGIN = $TriggerOrigin
+$env:STEEL_RUNTIME_PROFILE = "production"
+$env:STEEL_ALGORITHM_MODE = "production"
+$env:BAR_SURFACE_MOCK_DEFECT_COUNT = "0"
+$env:STEEL_TRIGGER_HEALTH_REQUIRED = "1"
+$env:STEEL_STORAGE_MIN_FREE_BYTES = "21474836480"
+$env:STEEL_STORAGE_MIN_FREE_PERCENT = "10"
+$env:STEEL_ARTIFACT_ALLOWED_ROOTS = $ArtifactAllowedRoots
+$env:STEEL_WORKSPACE_ROOT = $Root
+$env:STEEL_BAR_SURFACE_CORE_EXE = Join-Path $Root "algorithm-core\steel_bar_surface_core.exe"
+if ([string]::IsNullOrWhiteSpace($ConfigRoot)) {
+  $ConfigRoot = Join-Path $Root "config\service"
+}
+$env:STEEL_SERVICE_CONFIG_DIR = $ConfigRoot
+New-Item -ItemType Directory -Force -Path $env:STEEL_SERVICE_CONFIG_DIR | Out-Null
+New-Item -ItemType Directory -Force -Path $env:CAPTURE_CONFIG_ROOT | Out-Null
+
+& $Exe
+exit $LASTEXITCODE
+'@
+
 Write-PackageFile "run-service-simulated.ps1" @'
 param(
   [int]$Port = 4873,
@@ -1296,26 +1348,23 @@ if ($StopExisting) {
   }
 }
 
-$CaptureScript = Join-Path $Root "run-capture-headless.ps1"
-$ServiceScript = Join-Path $Root "run-service-external.ps1"
+$ServiceScript = Join-Path $Root "run-service-managed.ps1"
 $TriggerScript = Join-Path $Root "run-trigger-gateway.ps1"
 $ClientScript = Join-Path $Root "run-client-static.ps1"
 
-if (-not (Test-LocalTcpPort -Port $CapturePort)) {
-  Start-PackageScript -Name "capture" -ScriptPath $CaptureScript -Arguments @("-Port", [string]$CapturePort, "-StorageRoot", $StorageRoot, "-CameraStorageRoot", $CameraStorageRoot)
+if (-not (Test-LocalTcpPort -Port $ServicePort)) {
+  Start-PackageScript -Name "service" -ScriptPath $ServiceScript -Arguments @("-Port", [string]$ServicePort, "-CapturePort", [string]$CapturePort, "-TriggerOrigin", "http://127.0.0.1:$TriggerPort", "-StorageRoot", $StorageRoot, "-CameraStorageRoot", $CameraStorageRoot, "-ArtifactAllowedRoots", $ArtifactAllowedRoots)
 } else {
-  Write-Host "Capture provider already listening on port $CapturePort."
+  Write-Host "Rust service already listening on port $ServicePort."
+}
+$CaptureLifecycle = Wait-HttpJson -Name "Managed capture lifecycle" -Uri "http://127.0.0.1:$ServicePort/api/capture/lifecycle" -TimeoutSec 30
+if ([string]$CaptureLifecycle.lifecycle.phase -ne "ready") {
+  throw "Managed capture lifecycle is '$($CaptureLifecycle.lifecycle.phase)': $($CaptureLifecycle.lifecycle.lastError)"
 }
 $CaptureHealth = Wait-HttpJson -Name "Capture provider" -Uri "http://127.0.0.1:$CapturePort/health" -TimeoutSec 30
 $ExpectedCaptureConfigRoot = Join-Path $Root "config\capture"
 Assert-CaptureProviderMatches -Health $CaptureHealth -ExpectedStorageRoot $StorageRoot -ExpectedConfigRoot $ExpectedCaptureConfigRoot
-Write-Host ("Capture ready: sdkReady={0}, cameraCount={1}" -f $CaptureHealth.sdkReady, $CaptureHealth.cameraCount)
-
-if (-not (Test-LocalTcpPort -Port $ServicePort)) {
-  Start-PackageScript -Name "service" -ScriptPath $ServiceScript -Arguments @("-Port", [string]$ServicePort, "-CaptureOrigin", "http://127.0.0.1:$CapturePort", "-TriggerOrigin", "http://127.0.0.1:$TriggerPort", "-ArtifactAllowedRoots", $ArtifactAllowedRoots)
-} else {
-  Write-Host "Rust service already listening on port $ServicePort."
-}
+Write-Host ("Managed capture ready: sdkReady={0}, cameraCount={1}" -f $CaptureHealth.sdkReady, $CaptureHealth.cameraCount)
 $ProductionStatus = Wait-HttpJson -Name "Rust service" -Uri "http://127.0.0.1:$ServicePort/api/production/status" -TimeoutSec 30
 Write-Host ("Service ready: production code={0}" -f $ProductionStatus.code)
 
@@ -1421,23 +1470,16 @@ This package keeps runtime boundaries independent:
 - `config/env/`: environment templates.
 - `docs/`: architecture and API documentation copied from the source tree.
 
-## Start Headless Capture + Rust Service
-
-Terminal 1:
+## Start Rust Service with Managed Capture
 
 ```powershell
-.\run-capture-headless.ps1 -Port 4317
+.\run-service-managed.ps1 -Port 4873 -CapturePort 4317 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction"
 ```
 
-Terminal 2:
-
-```powershell
-.\run-service-external.ps1 -Port 4873 -CaptureOrigin http://127.0.0.1:4317
-```
-
-The service then exposes capture proxy APIs such as:
+Rust starts, monitors, restarts, and stops the capture child. The service exposes:
 
 ```text
+http://127.0.0.1:4873/api/capture/lifecycle
 http://127.0.0.1:4873/api/capture/health
 http://127.0.0.1:4873/api/cameras
 ```
@@ -1450,7 +1492,7 @@ The packaged trigger gateway defaults to `STEEL_RUNTIME_PROFILE=production`. Inj
 .\run-integrated-capture-management.ps1 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction" -TriggerMode manual -OpenBrowser
 ```
 
-This starts the capture provider, Rust service, trigger gateway, and static client, then waits for:
+This starts Rust (which owns the capture child), the trigger gateway, and the static client, then waits for:
 
 ```text
 http://127.0.0.1:4317/health
@@ -1781,6 +1823,7 @@ $Manifest = [ordered]@{
   scripts = @{
     captureHeadless = "run-capture-headless.ps1"
     serviceExternal = "run-service-external.ps1"
+    serviceManaged = "run-service-managed.ps1"
     serviceSimulated = "run-service-simulated.ps1"
     triggerGateway = "run-trigger-gateway.ps1"
     integrated = "run-integrated-capture-management.ps1"

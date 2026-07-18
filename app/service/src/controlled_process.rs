@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,8 @@ mod process_tree {
     }
 
     impl ProcessTree {
+        pub(super) fn configure(_command: &mut std::process::Command) {}
+
         pub(super) fn attach(child: &Child) -> Result<Self, String> {
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -81,16 +83,82 @@ mod process_tree {
 
 #[cfg(not(windows))]
 mod process_tree {
-    use std::process::Child;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
 
-    pub(super) struct ProcessTree;
+    pub(super) struct ProcessTree {
+        process_group: i32,
+    }
 
     impl ProcessTree {
-        pub(super) fn attach(_child: &Child) -> Result<Self, String> {
-            Ok(Self)
+        pub(super) fn configure(command: &mut Command) {
+            command.process_group(0);
         }
 
-        pub(super) fn terminate(&self) {}
+        pub(super) fn attach(child: &Child) -> Result<Self, String> {
+            Ok(Self {
+                process_group: child.id() as i32,
+            })
+        }
+
+        pub(super) fn terminate(&self) {
+            unsafe {
+                let _ = libc::kill(-self.process_group, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// A long-running child attached to an OS process container. Closing or
+/// terminating this handle also terminates descendants, preventing orphaned
+/// capture SDK helpers when the Rust service stops.
+pub(super) struct ManagedChild {
+    child: Child,
+    process_tree: process_tree::ProcessTree,
+}
+
+impl ManagedChild {
+    pub(super) fn spawn(command: &mut Command) -> Result<Self, ControlledProcessError> {
+        process_tree::ProcessTree::configure(command);
+        let mut child = command
+            .spawn()
+            .map_err(|error| ControlledProcessError::Spawn(error.to_string()))?;
+        let process_tree = match process_tree::ProcessTree::attach(&child) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ControlledProcessError::Containment(error));
+            }
+        };
+        Ok(Self {
+            child,
+            process_tree,
+        })
+    }
+
+    pub(super) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub(super) fn try_wait(&mut self) -> Result<Option<ExitStatus>, ControlledProcessError> {
+        self.child
+            .try_wait()
+            .map_err(|error| ControlledProcessError::Wait(error.to_string()))
+    }
+
+    pub(super) fn terminate(&mut self) -> Result<ExitStatus, ControlledProcessError> {
+        self.process_tree.terminate();
+        let _ = self.child.kill();
+        self.child
+            .wait()
+            .map_err(|error| ControlledProcessError::Wait(error.to_string()))
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        let _ = self.terminate();
     }
 }
 
@@ -171,6 +239,7 @@ pub(super) fn run(
     cancellation_requested: Option<&dyn Fn() -> bool>,
 ) -> Result<ControlledProcessOutput, ControlledProcessError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    process_tree::ProcessTree::configure(command);
     let mut child = command
         .spawn()
         .map_err(|error| ControlledProcessError::Spawn(error.to_string()))?;
@@ -250,11 +319,37 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    #[cfg(windows)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(windows)]
     fn powershell(script: &str) -> Command {
         let mut command = Command::new("powershell.exe");
         command.args(["-NoProfile", "-Command", script]);
+        command
+    }
+
+    #[cfg(windows)]
+    fn output_command() -> Command {
+        powershell("[Console]::Out.Write('ok'); [Console]::Error.Write('warn')")
+    }
+
+    #[cfg(not(windows))]
+    fn output_command() -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf ok; printf warn >&2"]);
+        command
+    }
+
+    #[cfg(windows)]
+    fn sleep_command(seconds: u64) -> Command {
+        powershell(&format!("Start-Sleep -Seconds {seconds}"))
+    }
+
+    #[cfg(not(windows))]
+    fn sleep_command(seconds: u64) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", &format!("sleep {seconds}")]);
         command
     }
 
@@ -286,7 +381,7 @@ mod tests {
 
     #[test]
     fn captures_output_without_pipe_deadlock() {
-        let mut command = powershell("[Console]::Out.Write('ok'); [Console]::Error.Write('warn')");
+        let mut command = output_command();
         let output = run(&mut command, Duration::from_secs(5), None).expect("controlled output");
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
@@ -322,7 +417,7 @@ mod tests {
             cancellation_signal.store(true, Ordering::Release);
         });
         let check = || cancellation.load(Ordering::Acquire);
-        let mut command = powershell("Start-Sleep -Seconds 30");
+        let mut command = sleep_command(30);
         let started = Instant::now();
         let result = run(&mut command, Duration::from_secs(10), Some(&check));
         setter.join().expect("cancellation setter");
@@ -399,10 +494,25 @@ mod tests {
 
     #[test]
     fn terminates_a_timed_out_calculation() {
-        let mut command = powershell("Start-Sleep -Seconds 30");
+        let mut command = sleep_command(30);
         let started = Instant::now();
         let result = run(&mut command, Duration::from_millis(300), None);
         assert_eq!(result.unwrap_err(), ControlledProcessError::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn managed_child_can_be_terminated_as_a_long_running_service() {
+        let mut command = sleep_command(30);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let mut child = ManagedChild::spawn(&mut command).expect("managed child");
+        assert!(child.id() > 0);
+        assert!(child.try_wait().expect("child status").is_none());
+        let _ = child.terminate().expect("managed child termination");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

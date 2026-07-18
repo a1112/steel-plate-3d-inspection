@@ -20,7 +20,6 @@ function renderHeader(overrides: Partial<ComponentProps<typeof BrandHeader>> = {
       theme="dark"
       activeNav="online"
       onNavChange={vi.fn()}
-      onSettingsOpen={vi.fn()}
       onDragMouseDown={vi.fn()}
       {...overrides}
     />,
@@ -53,17 +52,11 @@ describe('BrandHeader', () => {
     expect(screen.getByText('192.168.20.103')).toBeInTheDocument();
   });
 
-  it('opens system settings from the header settings button without starting titlebar drag', () => {
-    const onSettingsOpen = vi.fn();
-    const onDragMouseDown = vi.fn();
-    renderHeader({ onSettingsOpen, onDragMouseDown });
+  it('keeps configuration controls out of the business header and renders one notification entry', () => {
+    renderHeader();
 
-    const settingsButton = screen.getByRole('button', { name: '打开系统设置' });
-    fireEvent.mouseDown(settingsButton);
-    fireEvent.click(settingsButton);
-
-    expect(onDragMouseDown).not.toHaveBeenCalled();
-    expect(onSettingsOpen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: '打开系统设置' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: '打开消息通知' })).toHaveLength(1);
   });
 
   it('shows receiver port monitor placeholder and switches detail panels when realtime network data is pending', () => {
@@ -214,7 +207,7 @@ describe('BrandHeader', () => {
     render(
       <>
         <button type="button">outside</button>
-        <BrandHeader status={status} theme="dark" activeNav="online" onNavChange={vi.fn()} onSettingsOpen={vi.fn()} onDragMouseDown={vi.fn()} />
+        <BrandHeader status={status} theme="dark" activeNav="online" onNavChange={vi.fn()} onDragMouseDown={vi.fn()} />
       </>,
     );
 
@@ -281,12 +274,8 @@ describe('BrandHeader', () => {
     expect(screen.getByText('离线')).toBeInTheDocument();
     expect(screen.getAllByText('在线')[0]).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '系统报警 1 项，服务异常 2 项' }));
-    expect(screen.getByRole('dialog', { name: '服务连接状态详情' })).toBeInTheDocument();
-    expect(screen.getByText('2 项服务异常')).toBeInTheDocument();
-    expect(screen.getByText('SDK 未就绪')).toBeInTheDocument();
-    expect(screen.getByText('网关离线')).toBeInTheDocument();
-    expect(screen.getByText('http://127.0.0.1:18888')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '系统报警 1 项，服务异常 2 项' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: '打开消息通知' })).toHaveLength(1);
   });
 
   it('renders navigation beside the app title without starting titlebar drag', () => {

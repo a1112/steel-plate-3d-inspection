@@ -3,6 +3,27 @@ import type { DefectItem, InspectionSnapshot, Surface, ThemeMode } from '../data
 
 export type SurfaceDisplayMode = Surface | 'all';
 export const DEFAULT_PLATE_LENGTH_M = 12;
+export const THEME_STORAGE_KEY = 'steel-inspection-theme';
+const THEME_MODES: readonly ThemeMode[] = ['dark', 'light', 'graphite'];
+
+export function readStoredTheme(storage?: Pick<Storage, 'getItem'> | null): ThemeMode {
+  const target = storage ?? (typeof window === 'undefined' ? null : window.localStorage);
+  try {
+    const stored = target?.getItem(THEME_STORAGE_KEY);
+    return THEME_MODES.includes(stored as ThemeMode) ? stored as ThemeMode : 'light';
+  } catch {
+    return 'light';
+  }
+}
+
+export function persistTheme(theme: ThemeMode, storage?: Pick<Storage, 'setItem'> | null) {
+  const target = storage ?? (typeof window === 'undefined' ? null : window.localStorage);
+  try {
+    target?.setItem(THEME_STORAGE_KEY, theme);
+  } catch {
+    // The selected theme still applies for the current session when storage is unavailable.
+  }
+}
 
 export interface InspectionUiState {
   theme: ThemeMode;
@@ -29,7 +50,7 @@ function getDefectPreviewPositionM(defect?: Pick<DefectItem, 'distanceHeadMm'>) 
 
 export function createInitialUiState(snapshot: InspectionSnapshot): InspectionUiState {
   return {
-    theme: 'dark',
+    theme: readStoredTheme(),
     activeNav: 'online',
     selectedRecordId: snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo,
     selectedDefectId: snapshot.defects[0]?.id ?? null,

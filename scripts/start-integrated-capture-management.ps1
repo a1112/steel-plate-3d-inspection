@@ -133,7 +133,44 @@ if (-not (Test-Path $ServiceScript -PathType Leaf)) { throw "Missing $ServiceScr
 if (-not (Test-Path $TriggerScript -PathType Leaf)) { throw "Missing $TriggerScript" }
 if (-not (Test-Path $ClientScript -PathType Leaf)) { throw "Missing $ClientScript" }
 
-Write-Host "Starting headless capture provider..."
+$CaptureExe = Join-Path $RepoRoot "target\capture\$Configuration\steel_capture_service.exe"
+$CaptureConfigRoot = Join-Path $RepoRoot "target\config\capture"
+if (-not (Test-Path $CaptureExe -PathType Leaf)) {
+  throw "Missing $CaptureExe. Run scripts/build-capture-headless.ps1 first."
+}
+New-Item -ItemType Directory -Force -Path $CaptureConfigRoot | Out-Null
+$SeedConfigRoot = Join-Path $RepoRoot "config\capture"
+$ExpectedProfilePath = Join-Path $CaptureConfigRoot "profiles\$CaptureProfile\profile.json"
+if (-not (Test-Path $ExpectedProfilePath -PathType Leaf) -and (Test-Path $SeedConfigRoot -PathType Container)) {
+  Get-ChildItem -LiteralPath $SeedConfigRoot -Force | Copy-Item -Destination $CaptureConfigRoot -Recurse -Force
+}
+
+Write-Host "Starting Rust service with managed capture child..."
+if (-not (Test-LocalTcpPort -Port $ServicePort)) {
+  Start-LongRunningScript -Name "service" -ScriptPath $ServiceScript -Arguments @(
+    "-Provider", "headless-cpp",
+    "-CaptureOrigin", "http://127.0.0.1:$CapturePort",
+    "-CaptureExe", $CaptureExe,
+    "-CaptureConfigRoot", $CaptureConfigRoot,
+    "-CaptureStorageRoot", $StorageRoot,
+    "-CameraStorageRoot", $CameraStorageRoot,
+    "-TriggerOrigin", "http://127.0.0.1:$TriggerPort",
+    "-Port", [string]$ServicePort,
+    "-Profile", $ServiceProfile,
+    "-ArtifactAllowedRoots", $ArtifactAllowedRoots,
+    "-ForceParameters"
+  ) | Out-Null
+} else {
+  Write-Host "Rust service already listening on port $ServicePort."
+}
+$ServiceLive = Wait-HttpJson -Name "Rust service" -Uri "http://127.0.0.1:$ServicePort/api/health/live" -TimeoutSec 30
+$CaptureLifecycle = Wait-HttpJson -Name "Managed capture lifecycle" -Uri "http://127.0.0.1:$ServicePort/api/capture/lifecycle" -TimeoutSec 30
+if ([string]$CaptureLifecycle.lifecycle.phase -ne "ready") {
+  throw "Managed capture lifecycle is '$($CaptureLifecycle.lifecycle.phase)': $($CaptureLifecycle.lifecycle.lastError)"
+}
+
+# Reuse the capture configuration/profile checks, but the provider is already
+# running as a Rust-owned child and this script will not spawn another process.
 $CaptureStartArgs = @{
   Port = $CapturePort
   Configuration = $Configuration
@@ -141,27 +178,10 @@ $CaptureStartArgs = @{
   CameraStorageRoot = $CameraStorageRoot
   Profile = $CaptureProfile
 }
-if ($StopExisting) {
-  $CaptureStartArgs.StopExisting = $true
-}
 & $CaptureScript @CaptureStartArgs
 $CaptureHealth = Wait-HttpJson -Name "Capture provider" -Uri "http://127.0.0.1:$CapturePort/health" -TimeoutSec 30
 Write-Host ("Capture ready: sdkReady={0}, cameraCount={1}" -f $CaptureHealth.sdkReady, $CaptureHealth.cameraCount)
 
-if (-not (Test-LocalTcpPort -Port $ServicePort)) {
-  Start-LongRunningScript -Name "service" -ScriptPath $ServiceScript -Arguments @(
-    "-Provider", "external-api",
-    "-CaptureOrigin", "http://127.0.0.1:$CapturePort",
-    "-TriggerOrigin", "http://127.0.0.1:$TriggerPort",
-    "-Port", [string]$ServicePort,
-    "-Profile", $ServiceProfile,
-    "-ArtifactAllowedRoots", $ArtifactAllowedRoots,
-    "-NoCaptureAutostart",
-    "-ForceParameters"
-  ) | Out-Null
-} else {
-  Write-Host "Rust service already listening on port $ServicePort."
-}
 $ProductionStatus = Wait-HttpJson -Name "Rust service" -Uri "http://127.0.0.1:$ServicePort/api/production/status" -TimeoutSec 30
 Write-Host ("Service ready: production code={0}" -f $ProductionStatus.code)
 

@@ -88,15 +88,9 @@ import {
   type AdminUser,
   type AdminUserInput,
   type ConnectionConfig,
+  type DatabaseInfo,
 } from '../services/inspection-api';
 import { Panel } from './Panel';
-
-type DatabaseInfo = {
-  engine: string;
-  orm: string;
-  path: string;
-  configDir: string;
-};
 
 type JsonToken = {
   value: string;
@@ -311,6 +305,18 @@ function formatDiagnosticStatus(status?: string) {
     return '异常';
   }
   return '关注';
+}
+
+function formatCaptureLifecycle(phase?: string) {
+  const labels: Record<string, string> = {
+    starting: '启动中',
+    ready: '就绪',
+    collecting: '采集中',
+    degraded: '降级',
+    stopping: '停止中',
+    stopped: '已停止',
+  };
+  return labels[phase ?? ''] ?? '未知';
 }
 
 type ConfigDiffSummary = {
@@ -1441,7 +1447,9 @@ export function ParameterManagementApp() {
   });
   const canManageSecurityPolicy = authSession?.user.permissions.includes('admin.audit') ?? false;
   const canManageDefectTypes = authSession?.user.permissions.includes('admin.config') ?? false;
-  const canMaintainDatabase = authSession?.user.permissions.includes('admin.services') ?? false;
+  const canMaintainDatabase = (authSession?.user.permissions.includes('admin.services') ?? false)
+    && database?.engine === 'sqlite';
+  const canDownloadDatabaseBackup = database?.engine === 'sqlite';
   const recordRows = recordPage?.records ?? [];
   const canPrevRecords = (recordPage?.offset ?? 0) > 0;
   const canNextRecords = recordPage ? recordPage.offset + recordPage.limit < recordPage.total : false;
@@ -1701,11 +1709,19 @@ export function ParameterManagementApp() {
           <dl className="parameter-facts">
             <div>
               <dt>引擎</dt>
-              <dd>{database?.engine ?? '-'}</dd>
+              <dd>
+                <span className={database?.fallbackActive ? 'status-dot warning' : 'status-dot online'} />
+                {database?.engine ?? '-'}
+                {database?.fallbackActive ? '（降级）' : ''}
+              </dd>
             </div>
             <div>
-              <dt>ORM</dt>
-              <dd>{database?.orm ?? '-'}</dd>
+              <dt>主数据库</dt>
+              <dd>{database?.requestedEngine ?? '-'}</dd>
+            </div>
+            <div>
+              <dt>可用适配器</dt>
+              <dd>{database?.supportedEngines?.join(' / ') || '-'}</dd>
             </div>
             <div>
               <dt>数据行数</dt>
@@ -1715,7 +1731,12 @@ export function ParameterManagementApp() {
           <div className="admin-database-actions">
             <span>{database?.path ?? '-'}</span>
             <div className="admin-database-buttons">
-              <button type="button" onClick={() => void backupDatabase()}>
+              <button
+                type="button"
+                onClick={() => void backupDatabase()}
+                disabled={!canDownloadDatabaseBackup}
+                title={canDownloadDatabaseBackup ? '下载 SQLite 在线快照' : '远程数据库请使用服务端备份工具'}
+              >
                 <Download size={16} />
                 备份数据库
               </button>
@@ -1809,23 +1830,31 @@ export function ParameterManagementApp() {
         <Panel title="采集服务" className="parameter-card parameter-capture-service-card">
           <dl className="parameter-facts">
             <div>
-              <dt>状态</dt>
+              <dt>生命周期</dt>
               <dd>
                 <span className={adminServices?.capture.running ? 'status-dot online' : 'status-dot warning'} />
-                {adminServices?.capture.running ? '运行中' : '模拟回退'}
+                {formatCaptureLifecycle(adminServices?.capture.lifecycle?.phase)}
               </dd>
             </div>
             <div>
-              <dt>端口</dt>
-              <dd>{adminServices?.capture.port ?? '-'}</dd>
+              <dt>进程</dt>
+              <dd>{adminServices?.capture.lifecycle?.pid ? `PID ${adminServices.capture.lifecycle.pid}` : '无活动进程'}</dd>
             </div>
             <div>
               <dt>托管</dt>
-              <dd>{adminServices?.capture.managed ? '服务端托管' : '外部服务'}</dd>
+              <dd>{adminServices?.capture.managed ? 'Rust 服务子进程' : '外部服务'}</dd>
             </div>
             <div>
-              <dt>可执行文件</dt>
-              <dd>{adminServices?.capture.processAvailable ? '已找到' : '未找到'}</dd>
+              <dt>自动重启</dt>
+              <dd>
+                {adminServices?.capture.lifecycle?.restartBudgetExhausted
+                  ? '预算已耗尽'
+                  : `${adminServices?.capture.lifecycle?.restartCount ?? 0} 次 · 剩余 ${Math.max(
+                    0,
+                    (adminServices?.capture.lifecycle?.restartBudget ?? 0)
+                      - (adminServices?.capture.lifecycle?.consecutiveFailures ?? 0),
+                  )}`}
+              </dd>
             </div>
           </dl>
           <div className="admin-service-actions">

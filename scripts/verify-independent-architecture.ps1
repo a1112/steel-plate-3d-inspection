@@ -1066,6 +1066,7 @@ function Test-PackagedRuntimeContract {
   $ScriptNames = @(
     "run-capture-headless.ps1",
     "run-service-external.ps1",
+    "run-service-managed.ps1",
     "run-service-simulated.ps1",
     "run-trigger-gateway.ps1",
     "run-integrated-capture-management.ps1",
@@ -1158,7 +1159,7 @@ function Test-PackagedRuntimeContract {
     }
   }
 
-  foreach ($ServiceScriptName in @("run-service-simulated.ps1", "run-service-external.ps1")) {
+  foreach ($ServiceScriptName in @("run-service-simulated.ps1", "run-service-external.ps1", "run-service-managed.ps1")) {
     $ServiceScript = Join-Path $PackageDir $ServiceScriptName
     $ServiceText = Get-Content $ServiceScript -Raw
   foreach ($RequiredText in @('[string]$ConfigRoot', '$env:STEEL_SERVICE_CONFIG_DIR = $ConfigRoot')) {

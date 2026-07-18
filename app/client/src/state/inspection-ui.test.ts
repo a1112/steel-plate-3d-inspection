@@ -6,6 +6,8 @@ import {
   filterDefectsBySurfaceMode,
   getVisibleDefects,
   paginateItems,
+  persistTheme,
+  readStoredTheme,
   selectRecord,
   selectDefect,
   toggleDefectType,
@@ -76,8 +78,22 @@ describe('inspection UI state helpers', () => {
     expect(paginateItems(rows, 10, 4)).toEqual([9, 10]);
   });
 
-  it('keeps the default inspection theme on the industrial dark palette', () => {
+  it('uses the light inspection palette by default', () => {
     const snapshot = getMockInspectionSnapshot();
-    expect(createInitialUiState(snapshot).theme).toBe('dark');
+    expect(createInitialUiState(snapshot).theme).toBe('light');
+  });
+
+  it('persists valid theme choices and rejects unknown stored values', () => {
+    let stored: string | null = null;
+    const storage = {
+      getItem: () => stored,
+      setItem: (_key: string, value: string) => { stored = value; },
+    };
+
+    persistTheme('graphite', storage);
+    expect(readStoredTheme(storage)).toBe('graphite');
+
+    stored = 'emerald';
+    expect(readStoredTheme(storage)).toBe('light');
   });
 });

@@ -276,6 +276,7 @@ $ScriptNames = if ($IsTargetRuntimeManifest) {
   @(
     "run-capture-headless.ps1",
     "run-service-external.ps1",
+    "run-service-managed.ps1",
     "run-service-simulated.ps1",
     "run-trigger-gateway.ps1",
     "run-integrated-capture-management.ps1",
@@ -425,7 +426,7 @@ foreach ($RequiredText in @('[string]$RuntimeProfile = "production"', "STEEL_RUN
   }
 }
 
-foreach ($ServiceScriptName in @("run-service-simulated.ps1", "run-service-external.ps1")) {
+foreach ($ServiceScriptName in @("run-service-simulated.ps1", "run-service-external.ps1", "run-service-managed.ps1")) {
   $ServiceScript = Join-Path $RuntimeRoot $ServiceScriptName
   if (-not (Test-Path $ServiceScript -PathType Leaf)) {
     continue

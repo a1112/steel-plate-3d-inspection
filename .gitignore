@@ -16,3 +16,4 @@ logFile.ini
 config/*.sqlite
 config/*.sqlite-*
 simulated/production/
+._*

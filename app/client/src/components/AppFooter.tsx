@@ -1,0 +1,151 @@
+import { Box, ChevronDown, ChevronUp, Database, MonitorCog, Play, Settings2 } from 'lucide-react';
+import type { DefectItem } from '../data/inspection';
+import { severityLabels, surfaceLabels } from '../data/inspection';
+import type { AnalysisViewMode } from './AlarmAnalysis';
+import type { PlateMapViewMode } from './PlateMap';
+import type { NavKey } from './TopNav';
+
+interface FooterAnalysisContext {
+  defect: DefectItem;
+  surfaceViewMode: PlateMapViewMode;
+  analysisViewMode: AnalysisViewMode;
+  collapsed: boolean;
+  onSurfaceViewModeChange: (next: PlateMapViewMode) => void;
+  onAnalysisViewModeChange: (next: AnalysisViewMode) => void;
+  onCollapsedChange: (collapsed: boolean) => void;
+}
+
+interface AppFooterProps {
+  activeNav: NavKey;
+  analysis?: FooterAnalysisContext | null;
+  flowVisible?: boolean;
+  onFlowToggle?: () => void;
+  onNavChange: (next: NavKey) => void;
+  onSettingsOpen: () => void;
+}
+
+const surfaceViewOptions: Array<{ id: PlateMapViewMode; label: string }> = [
+  { id: '2d', label: '2D' },
+  { id: '3d', label: '3D' },
+  { id: 'point-cloud', label: '点云' },
+];
+
+const analysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
+  { id: 'overview', label: '综合' },
+  { id: 'image', label: '灰度' },
+  { id: 'point-cloud', label: '局部点云' },
+  { id: 'profile', label: '剖面' },
+];
+
+function getDefectSizeLabel(defect: DefectItem) {
+  return `${defect.widthMm.toFixed(2)}×${defect.heightMm.toFixed(2)}×${Math.abs(defect.depthMm).toFixed(2)}mm`;
+}
+
+export function AppFooter({
+  activeNav,
+  analysis,
+  flowVisible = false,
+  onFlowToggle,
+  onNavChange,
+  onSettingsOpen,
+}: AppFooterProps) {
+  const activeAnalysis = activeNav === 'online' ? analysis : null;
+  const changeAnalysisView = (next: AnalysisViewMode) => {
+    activeAnalysis?.onAnalysisViewModeChange(next);
+    if (activeAnalysis?.collapsed) {
+      activeAnalysis.onCollapsedChange(false);
+    }
+  };
+
+  return (
+    <footer className={`app-footer ${activeAnalysis ? 'has-analysis-context' : ''}`} data-no-drag>
+      {activeAnalysis ? (
+        <div className="app-footer-analysis" aria-label="选中缺陷分析工具">
+          <div className="app-footer-defect-summary" title={`缺陷 ${activeAnalysis.defect.id} · ${activeAnalysis.defect.plateNo}`}>
+            <span className="app-footer-kicker">当前缺陷</span>
+            <strong>{activeAnalysis.defect.typeLabel}</strong>
+            <em className={activeAnalysis.defect.severity}>{severityLabels[activeAnalysis.defect.severity]}</em>
+            <span>{surfaceLabels[activeAnalysis.defect.surface]}</span>
+            <b>{getDefectSizeLabel(activeAnalysis.defect)}</b>
+            <span>距头 {activeAnalysis.defect.distanceHeadMm}mm</span>
+            <span>操作 {activeAnalysis.defect.operatorSideMm}mm</span>
+            <span>传动 {activeAnalysis.defect.driveSideMm}mm</span>
+            <span>周期 {activeAnalysis.defect.typeId === 'roll' ? '是' : '否'}</span>
+          </div>
+          <div className="app-footer-view-group" role="group" aria-label="主检测视图">
+            <span>主视图</span>
+            {surfaceViewOptions.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                className={activeAnalysis.surfaceViewMode === option.id ? 'active' : ''}
+                aria-pressed={activeAnalysis.surfaceViewMode === option.id}
+                onClick={() => activeAnalysis.onSurfaceViewModeChange(option.id)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <div className="app-footer-view-group analysis-views" role="group" aria-label="缺陷分析视图">
+            <span>分析</span>
+            {analysisViewOptions.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                className={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id ? 'active' : ''}
+                aria-pressed={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id}
+                onClick={() => changeAnalysisView(option.id)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            className="app-footer-collapse"
+            aria-label={activeAnalysis.collapsed ? '展开缺陷分析区' : '收起缺陷分析区'}
+            aria-expanded={!activeAnalysis.collapsed}
+            onClick={() => activeAnalysis.onCollapsedChange(!activeAnalysis.collapsed)}
+          >
+            {activeAnalysis.collapsed ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+          </button>
+        </div>
+      ) : (
+        <div className="app-footer-context" aria-label="系统工具栏">
+          <span>系统工具</span>
+          <strong>钢管 3D 表面检测平台</strong>
+        </div>
+      )}
+      {onFlowToggle ? (
+        <button
+          type="button"
+          className={`app-footer-flow-button ${flowVisible ? 'active' : ''}`}
+          aria-pressed={flowVisible}
+          title={flowVisible ? '关闭完整检测流程工具' : '打开完整检测流程工具'}
+          onClick={onFlowToggle}
+        >
+          <Play size={14} />
+          <span>全流程</span>
+        </button>
+      ) : null}
+      <nav className="app-footer-nav" aria-label="非业务功能">
+        <button type="button" onClick={onSettingsOpen}>
+          <Settings2 size={15} />
+          <span>配置中心</span>
+        </button>
+        <button type="button" onClick={() => window.location.assign('/?app=parameters')}>
+          <Database size={15} />
+          <span>后台管理</span>
+        </button>
+        <button type="button" className={activeNav === 'status' ? 'active' : ''} onClick={() => onNavChange('status')}>
+          <MonitorCog size={15} />
+          <span>采集管理</span>
+        </button>
+        <button type="button" onClick={() => window.location.assign('/?app=bar-surface')}>
+          <Box size={15} />
+          <span>3D 重建</span>
+        </button>
+      </nav>
+    </footer>
+  );
+}

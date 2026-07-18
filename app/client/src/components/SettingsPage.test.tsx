@@ -30,11 +30,11 @@ describe('SettingsPage', () => {
     expect(screen.getByRole('button', { name: '选择深色工业主题' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: '选择浅色巡检主题' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '选择石墨高对比主题' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '选择蓝钢夜视主题' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '选择绿光值守主题' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择蓝钢夜视主题' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择绿光值守主题' })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '选择蓝钢夜视主题' }));
-    expect(onThemeChange).toHaveBeenCalledWith('cobalt');
+    fireEvent.click(screen.getByRole('button', { name: '选择石墨高对比主题' }));
+    expect(onThemeChange).toHaveBeenCalledWith('graphite');
   });
 
   it('switches setting sections from the left navigation', () => {

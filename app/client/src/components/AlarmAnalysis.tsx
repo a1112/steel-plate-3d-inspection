@@ -1,11 +1,11 @@
 import { Canvas } from '@react-three/fiber';
-import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Maximize2, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Maximize2, X } from 'lucide-react';
 import { Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { BufferGeometry, Float32BufferAttribute } from 'three';
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react';
 import { createPortal } from 'react-dom';
 import type { CaptureImageItem, ChartPoint, DefectItem } from '../data/inspection';
-import { severityLabels, surfaceLabels } from '../data/inspection';
+import { surfaceLabels } from '../data/inspection';
 import { createPointCloudGeometryArrays } from '../lib/point-cloud-simulator';
 import { createSectionProfiles } from '../lib/section-profiles';
 import { barSurfaceFileUrl, type BarSurfaceMesh } from '../services/bar-surface-api';
@@ -21,6 +21,8 @@ const POINT_CLOUD_ZOOM_STEP = 0.12;
 const CHART_AXIS_MIN_ZOOM = 1;
 const CHART_AXIS_MAX_ZOOM = 3;
 const CHART_AXIS_ZOOM_STEP = 0.2;
+
+export type AnalysisViewMode = 'overview' | 'image' | 'point-cloud' | 'profile';
 
 function clampPointCloudYaw(yaw: number) {
   return Math.max(POINT_CLOUD_INITIAL_YAW - POINT_CLOUD_MAX_YAW_OFFSET, Math.min(POINT_CLOUD_INITIAL_YAW + POINT_CLOUD_MAX_YAW_OFFSET, yaw));
@@ -158,10 +160,6 @@ function CaptureImagePreview({ captureImages }: { captureImages: CaptureImageIte
       ) : null}
     </div>
   );
-}
-
-function getDefectSizeLabel(defect: DefectItem) {
-  return `${defect.widthMm.toFixed(2)} × ${defect.heightMm.toFixed(2)} × ${Math.abs(defect.depthMm).toFixed(2)}mm`;
 }
 
 function DemoSurfacePointCloud() {
@@ -334,7 +332,7 @@ export function AlarmAnalysis({
   inspectionId,
   headerless = false,
   collapsed,
-  onCollapsedChange,
+  viewMode = 'overview',
 }: {
   selectedDefect: DefectItem | null;
   heightProfile: ChartPoint[];
@@ -345,18 +343,16 @@ export function AlarmAnalysis({
   inspectionId?: string;
   headerless?: boolean;
   collapsed?: boolean;
-  onCollapsedChange?: (collapsed: boolean) => void;
+  viewMode?: AnalysisViewMode;
 }) {
-  const [internalCollapsed, setInternalCollapsed] = useState(false);
   const [localArtifacts, setLocalArtifacts] = useState<{
     pointCloud: BarSurfaceMesh | null;
     lengthProfile: ChartPoint[];
     widthProfile: ChartPoint[];
     status: string;
   }>({ pointCloud: null, lengthProfile: [], widthProfile: [], status: '' });
-  const isCollapsed = selectedDefect ? (collapsed ?? internalCollapsed) : false;
-  const setCollapsed = onCollapsedChange ?? setInternalCollapsed;
-  const panelClassName = `alarm-analysis-panel ${isCollapsed ? 'is-collapsed' : ''}`;
+  const isCollapsed = selectedDefect ? Boolean(collapsed) : false;
+  const panelClassName = `alarm-analysis-panel analysis-view-${viewMode}`;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -397,6 +393,10 @@ export function AlarmAnalysis({
     return () => controller.abort();
   }, [artifactMode, selectedDefect?.id, selectedDefect?.artifacts]);
 
+  if (isCollapsed) {
+    return null;
+  }
+
   if (!selectedDefect && captureImages.length > 0) {
     return (
       <Panel title="缺陷检测报警图" className={panelClassName} headerless={headerless}>
@@ -418,12 +418,14 @@ export function AlarmAnalysis({
 
   return (
     <Panel title="缺陷检测报警图" className={panelClassName} headerless={headerless}>
-      {isCollapsed ? null : (
-        <div className="analysis-grid">
+      <div className={`analysis-grid ${viewMode === 'overview' ? '' : 'single-view'}`}>
+        {viewMode === 'overview' || viewMode === 'image' ? (
           <div className="analysis-cell">
             <h3>灰度图</h3>
             <DefectPreview defect={selectedDefect} captureImages={captureImages} artifactMode={artifactMode} />
           </div>
+        ) : null}
+        {viewMode === 'overview' || viewMode === 'point-cloud' ? (
           <div className="analysis-cell point-cloud">
             <h3>点云图</h3>
             {artifactMode === 'demo' ? (
@@ -458,6 +460,8 @@ export function AlarmAnalysis({
               </div>
             )}
           </div>
+        ) : null}
+        {viewMode === 'overview' || viewMode === 'profile' ? (
           <div className="analysis-cell">
             <h3>缺陷高度剖面图</h3>
             {artifactMode === 'demo' || localArtifacts.lengthProfile.length >= 2 || heightProfile.length >= 2 ? (
@@ -473,56 +477,7 @@ export function AlarmAnalysis({
               </div>
             )}
           </div>
-        </div>
-      )}
-      <div className="analysis-detail-bar">
-        {isCollapsed ? (
-          <div className="detail-summary-line" data-testid="analysis-collapsed-summary">
-            <span>{surfaceLabels[selectedDefect.surface]}</span>
-            <strong>{selectedDefect.typeLabel}</strong>
-            <b>{getDefectSizeLabel(selectedDefect)}</b>
-            <span>距头 {selectedDefect.distanceHeadMm}mm</span>
-            <span>操作 {selectedDefect.operatorSideMm}mm</span>
-            <span>传动 {selectedDefect.driveSideMm}mm</span>
-            <em className={selectedDefect.severity}>{severityLabels[selectedDefect.severity]}</em>
-          </div>
-        ) : (
-          <table className="detail-table">
-            <tbody>
-              <tr>
-                <th>缺陷类别名</th>
-                <th>缺陷尺寸</th>
-                <th>距头距离</th>
-                <th>距操作侧</th>
-                <th>距传动侧</th>
-                <th>缺陷等级</th>
-                <th>周期缺陷</th>
-                <th>周期值</th>
-              </tr>
-              <tr>
-                <td>{selectedDefect.typeLabel}</td>
-                <td>{getDefectSizeLabel(selectedDefect)}</td>
-                <td>{selectedDefect.distanceHeadMm}mm</td>
-                <td>{selectedDefect.operatorSideMm}mm</td>
-                <td>{selectedDefect.driveSideMm}mm</td>
-                <td className={selectedDefect.severity}>{severityLabels[selectedDefect.severity]}</td>
-                <td>{selectedDefect.typeId === 'roll' ? '是' : '否'}</td>
-                <td>--</td>
-              </tr>
-            </tbody>
-          </table>
-        )}
-        <button
-          type="button"
-          className="analysis-collapse-button"
-          aria-label={isCollapsed ? '展开缺陷分析区' : '收起缺陷分析区'}
-          aria-expanded={!isCollapsed}
-          title={isCollapsed ? '展开缺陷分析区' : '收起缺陷分析区'}
-          data-no-drag
-          onClick={() => setCollapsed(!isCollapsed)}
-        >
-          {isCollapsed ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-        </button>
+        ) : null}
       </div>
       <div className="surface-caption">{surfaceLabels[selectedDefect.surface]}</div>
     </Panel>
