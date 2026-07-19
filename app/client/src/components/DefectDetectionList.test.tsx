@@ -45,11 +45,8 @@ describe('DefectDetectionList algorithm defects', () => {
       <DefectDetectionList
         defects={[syntheticDefect]}
         selectedDefectId={null}
-        page={1}
-        pageCount={1}
         filters={{ keyword: '', severity: 'all', surface: 'all', typeId: 'all' }}
         filterOpen={false}
-        onPageChange={vi.fn()}
         onSelectDefect={vi.fn()}
         onToggleFilter={vi.fn()}
         onFilterChange={vi.fn()}
@@ -67,11 +64,8 @@ describe('DefectDetectionList algorithm defects', () => {
       <DefectDetectionList
         defects={[candidateDefect]}
         selectedDefectId={null}
-        page={1}
-        pageCount={1}
         filters={{ keyword: '', severity: 'all', surface: 'all', typeId: 'all' }}
         filterOpen={false}
-        onPageChange={vi.fn()}
         onSelectDefect={vi.fn()}
         onToggleFilter={vi.fn()}
         onFilterChange={vi.fn()}
@@ -89,11 +83,8 @@ describe('DefectDetectionList algorithm defects', () => {
       <DefectDetectionList
         defects={[syntheticDefect]}
         selectedDefectId={null}
-        page={1}
-        pageCount={1}
         filters={{ keyword: '', severity: 'all', surface: 'all', typeId: 'all' }}
         filterOpen={false}
-        onPageChange={vi.fn()}
         onSelectDefect={vi.fn()}
         onToggleFilter={vi.fn()}
         onFilterChange={vi.fn()}

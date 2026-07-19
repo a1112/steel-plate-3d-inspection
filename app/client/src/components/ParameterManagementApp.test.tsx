@@ -493,6 +493,7 @@ describe('ParameterManagementApp', () => {
   let failLoginSessions = false;
   let failDiagnostics = false;
   let forcePasswordChangeLogin = false;
+  let defaultAccessRequiresPassword = false;
   let loginFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
   let saveUserFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
   let deleteUserFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
@@ -507,6 +508,7 @@ describe('ParameterManagementApp', () => {
     failLoginSessions = false;
     failDiagnostics = false;
     forcePasswordChangeLogin = false;
+    defaultAccessRequiresPassword = false;
     loginFailureResponse = null;
     saveUserFailureResponse = null;
     deleteUserFailureResponse = null;
@@ -547,6 +549,14 @@ describe('ParameterManagementApp', () => {
         };
       }
       if (url.includes('/api/admin/auth/login')) {
+        const loginBody = JSON.parse(String(init?.body ?? '{}')) as { defaultAccess?: boolean };
+        if (loginBody.defaultAccess && defaultAccessRequiresPassword) {
+          return {
+            ok: false,
+            status: 401,
+            json: async () => ({ code: 401, error: 'password_configured' }),
+          };
+        }
         if (loginFailureResponse) {
           return {
             ok: false,
@@ -1612,8 +1622,24 @@ describe('ParameterManagementApp', () => {
     expect(await screen.findByText('采集服务已重启')).toBeInTheDocument();
   });
 
-  it('shows login form and authenticates when no admin session is stored', async () => {
+  it('opens the backend directly with default access when no password was configured', async () => {
     storage.clear();
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('钢管档案')).toBeInTheDocument();
+    expect(screen.queryByText('后台登录')).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4873/api/admin/auth/login',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ userId: 'admin', defaultAccess: true }),
+      }),
+    );
+  });
+
+  it('shows login form and authenticates when an admin password is configured', async () => {
+    storage.clear();
+    defaultAccessRequiresPassword = true;
     render(<ParameterManagementApp />);
 
     expect(await screen.findByText('后台登录')).toBeInTheDocument();
@@ -1656,6 +1682,7 @@ describe('ParameterManagementApp', () => {
   it('forces a bootstrap admin to change the initial password before loading management data', async () => {
     storage.clear();
     forcePasswordChangeLogin = true;
+    defaultAccessRequiresPassword = true;
     render(<ParameterManagementApp />);
 
     expect(await screen.findByText('后台登录')).toBeInTheDocument();

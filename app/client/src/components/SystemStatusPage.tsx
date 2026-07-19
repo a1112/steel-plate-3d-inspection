@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DeviceStatus } from '../data/inspection';
+import { openBarSurfaceWindow, openCaptureManagementWindow } from '../lib/app-windows';
 import {
   captureProductionOnce,
   fetchProductionStatus,
@@ -46,7 +47,6 @@ import {
   createDefaultCaptureCameras,
   createDefaultCaptureConfig,
   disconnectCaptureCamera,
-  openCaptureManagementWindow,
   openCaptureLocalPath,
   readCaptureContinuousSettings,
   readLatestCaptureFile,
@@ -2492,8 +2492,13 @@ export function SystemStatusPage({
     }
   };
 
-  const openBarSurfaceWorkbench = () => {
-    window.location.assign('/?app=bar-surface');
+  const openBarSurfaceWorkbench = async () => {
+    try {
+      await openBarSurfaceWindow();
+      setTerminalMessage('已打开独立 3D 重建窗口');
+    } catch (error) {
+      setTerminalMessage(error instanceof Error ? error.message : '独立 3D 重建窗口打开失败');
+    }
   };
 
   if (embeddedManager) {

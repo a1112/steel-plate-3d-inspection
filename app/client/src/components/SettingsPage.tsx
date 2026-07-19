@@ -1,6 +1,7 @@
 import { ClipboardCheck, Gauge, Palette, RadioTower, RotateCcw, Save, Send, Server } from 'lucide-react';
 import { useState, type ChangeEvent, type ElementType } from 'react';
 import type { ThemeMode } from '../data/inspection';
+import { openParameterManagementWindow } from '../lib/app-windows';
 import type { ConnectionConfig, ConnectionMode } from '../services/inspection-api';
 import type { InspectionSettings, SettingsErrors } from '../state/operations';
 import { Panel } from './Panel';
@@ -213,7 +214,7 @@ export function SettingsPage({
                   <Save size={16} />
                   保存连接
                 </button>
-                <button type="button" onClick={() => window.open('/?app=parameters', '_blank', 'popup,width=1480,height=900')}>
+                <button type="button" onClick={() => void openParameterManagementWindow()}>
                   <Server size={16} />
                   参数管理
                 </button>

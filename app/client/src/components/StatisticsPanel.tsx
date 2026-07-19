@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import type { InspectionSummary, Severity, SteelPlate } from '../data/inspection';
+import type { DefectType, InspectionSummary, Severity, SteelPlate } from '../data/inspection';
 import { severityLabels } from '../data/inspection';
 import { Panel } from './Panel';
 
@@ -8,13 +8,21 @@ const severityOrder: Severity[] = ['severe', 'review', 'minor'];
 export function StatisticsPanel({
   plate,
   summary,
+  defectTypes,
+  defectTypeCounts,
+  hiddenDefectTypeIds,
   selectedSeverityFilters,
+  onDefectTypeToggle,
   onSeverityFilterToggle,
   onOpenReport,
 }: {
   plate: SteelPlate;
   summary: InspectionSummary;
+  defectTypes: DefectType[];
+  defectTypeCounts: Record<string, number>;
+  hiddenDefectTypeIds: ReadonlySet<string>;
   selectedSeverityFilters: ReadonlySet<Severity>;
+  onDefectTypeToggle: (typeId: string) => void;
   onSeverityFilterToggle: (severity: Severity) => void;
   onOpenReport: () => void;
 }) {
@@ -28,7 +36,7 @@ export function StatisticsPanel({
   };
 
   return (
-    <Panel title="缺陷统计信息" className="statistics-panel">
+    <Panel title="缺陷类别、等级过滤" className="statistics-panel">
       <div className="stat-heading">
         <span>钢管号</span>
         <strong>{plate.plateNo}</strong>
@@ -36,12 +44,37 @@ export function StatisticsPanel({
           本钢管统计
         </button>
       </div>
-      <div className="summary-layout">
-        <div className="donut" style={{ '--severe': severe, '--review': review, '--minor': minor } as CSSProperties}>
-          <div>
-            <span>缺陷总数</span>
-            <strong>{summary.total}</strong>
-          </div>
+      <section className="statistics-filter-group" aria-labelledby="defect-category-filter-title">
+        <div className="statistics-filter-heading">
+          <strong id="defect-category-filter-title">缺陷类别</strong>
+          <span>当前共 {summary.total} 项</span>
+        </div>
+        <div className="defect-type-filter-grid">
+          {defectTypes.map((type) => {
+            const active = !hiddenDefectTypeIds.has(type.id);
+            const count = defectTypeCounts[type.id] ?? 0;
+            return (
+              <button
+                key={type.id}
+                type="button"
+                className={`defect-type-filter ${active ? 'active' : ''}`}
+                style={{ '--defect-type-color': type.color } as CSSProperties}
+                aria-pressed={active}
+                aria-label={`${type.label}类别过滤，当前${count}项`}
+                onClick={() => onDefectTypeToggle(type.id)}
+              >
+                <i aria-hidden="true" />
+                <span>{type.label}</span>
+                <strong>{count}</strong>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+      <section className="statistics-filter-group severity-filter-group" aria-labelledby="defect-severity-filter-title">
+        <div className="statistics-filter-heading">
+          <strong id="defect-severity-filter-title">缺陷等级</strong>
+          <span>可多选</span>
         </div>
         <div className="severity-cards">
           {severityOrder.map((severity) => {
@@ -61,19 +94,7 @@ export function StatisticsPanel({
             );
           })}
         </div>
-      </div>
-      <div className="surface-counts">
-        <div>
-          <span>1-3号相机</span>
-          <strong>{summary.bySurface.top}</strong>
-          <i />
-        </div>
-        <div>
-          <span>4-6号相机</span>
-          <strong>{summary.bySurface.bottom}</strong>
-          <i />
-        </div>
-      </div>
+      </section>
     </Panel>
   );
 }

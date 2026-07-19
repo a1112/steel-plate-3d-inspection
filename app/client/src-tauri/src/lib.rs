@@ -5,6 +5,7 @@ use tauri::Manager;
 
 const CAPTURE_MANAGEMENT_WINDOW: &str = "capture-management";
 const PARAMETER_MANAGEMENT_WINDOW: &str = "parameter-management";
+const BAR_SURFACE_WINDOW: &str = "bar-surface";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,7 +192,7 @@ fn open_app_window(
     app: tauri::AppHandle,
     label: &str,
     title: &str,
-    url: &str,
+    route: &str,
 ) -> Result<WindowCommandResult, String> {
     if let Some(window) = app.get_webview_window(label) {
         window.show().map_err(|error| error.to_string())?;
@@ -203,13 +204,26 @@ fn open_app_window(
         });
     }
 
-    tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::App(url.into()))
+    let url = if cfg!(debug_assertions) {
+        tauri::WebviewUrl::External(
+            format!("http://localhost:1432/#app={route}")
+                .parse()
+                .map_err(|error| format!("invalid development tool window URL: {error}"))?,
+        )
+    } else {
+        tauri::WebviewUrl::App(format!("index.html#app={route}").into())
+    };
+
+    tauri::WebviewWindowBuilder::new(&app, label, url)
         .title(title)
         .inner_size(1480.0, 900.0)
         .min_inner_size(1180.0, 720.0)
         .resizable(true)
         .maximizable(true)
         .minimizable(true)
+        .closable(true)
+        .decorations(false)
+        .shadow(true)
         .center()
         .build()
         .map_err(|error| error.to_string())?;
@@ -227,7 +241,7 @@ fn open_capture_management_window(app: tauri::AppHandle) -> Result<WindowCommand
         app,
         CAPTURE_MANAGEMENT_WINDOW,
         "采集管理",
-        "index.html?app=capture",
+        "capture",
     )
 }
 
@@ -236,8 +250,18 @@ fn open_parameter_management_window(app: tauri::AppHandle) -> Result<WindowComma
     open_app_window(
         app,
         PARAMETER_MANAGEMENT_WINDOW,
-        "参数管理",
-        "index.html?app=parameters",
+        "后台管理",
+        "parameters",
+    )
+}
+
+#[tauri::command]
+fn open_bar_surface_window(app: tauri::AppHandle) -> Result<WindowCommandResult, String> {
+    open_app_window(
+        app,
+        BAR_SURFACE_WINDOW,
+        "3D 重建工作台",
+        "bar-surface",
     )
 }
 
@@ -247,6 +271,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_capture_management_window,
             open_parameter_management_window,
+            open_bar_surface_window,
             choose_local_file,
             choose_local_directory,
             save_binary_file_with_dialog,

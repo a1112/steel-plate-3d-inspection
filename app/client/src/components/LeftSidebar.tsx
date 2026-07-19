@@ -1,4 +1,4 @@
-import { AlertTriangle, ChevronLeft, ChevronRight, RotateCcw, Search } from 'lucide-react';
+import { AlertTriangle, RotateCcw, Search } from 'lucide-react';
 import { useState, type ChangeEvent, type FormEvent } from 'react';
 import { createPortal } from 'react-dom';
 import type { InspectionRecord, InspectionSummary, PlateInspection, SteelPlate } from '../data/inspection';
@@ -26,12 +26,9 @@ interface LeftSidebarProps {
   records: InspectionRecord[];
   inspections?: PlateInspection[];
   selectedRecordId: string;
-  page: number;
-  pageCount: number;
   searchFilters: RecordSearchFilters;
   filteredCount: number;
   totalCount: number;
-  onPageChange: (page: number) => void;
   onRecordSelect: (plateNo: string) => void;
   onSearchChange: (patch: Partial<RecordSearchFilters>) => void;
   onSearchReset: () => void;
@@ -67,12 +64,9 @@ export function LeftSidebar({
   records,
   inspections = [],
   selectedRecordId,
-  page,
-  pageCount,
   searchFilters,
   filteredCount,
   totalCount,
-  onPageChange,
   onRecordSelect,
   onSearchChange,
   onSearchReset,
@@ -235,17 +229,6 @@ export function LeftSidebar({
               )}
             </tbody>
           </table>
-        </div>
-        <div className="pager">
-          <button type="button" onClick={() => onPageChange(page - 1)} disabled={page <= 1}>
-            <ChevronLeft size={16} />
-          </button>
-          <span>
-            {page} / {pageCount}
-          </span>
-          <button type="button" onClick={() => onPageChange(page + 1)} disabled={page >= pageCount}>
-            <ChevronRight size={16} />
-          </button>
         </div>
       </Panel>
       {hoveredRecord && typeof document !== 'undefined' ? createPortal(

@@ -19,6 +19,7 @@ const ADMIN_ERROR_MESSAGES: Record<string, string> = {
   trigger_gateway_unavailable: '触发网关不可达',
   trigger_gateway_timeout: '触发网关响应超时',
   invalid_credentials: '账号或密码错误',
+  password_configured: '后台已设置密码，请输入密码登录',
   login_locked: '登录失败次数过多，请稍后再试',
   role_disabled: '当前账号角色已停用',
   'cannot delete current user': '不能删除当前登录账号',
@@ -955,6 +956,21 @@ export async function loginAdmin(userId: string, password: string): Promise<Admi
   });
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '后台登录失败'));
+  }
+  const session = (await response.json()) as AdminAuthSession;
+  saveAdminSession(session);
+  return session;
+}
+
+export async function loginAdminWithDefaultAccess(): Promise<AdminAuthSession> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ userId: 'admin', defaultAccess: true }),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '后台默认访问失败'));
   }
   const session = (await response.json()) as AdminAuthSession;
   saveAdminSession(session);

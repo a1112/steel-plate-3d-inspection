@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, Filter } from 'lucide-react';
+import { Filter } from 'lucide-react';
 import { useState, type ChangeEvent, type CSSProperties, type KeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import type { DefectItem } from '../data/inspection';
@@ -14,11 +14,8 @@ const DEFECT_POPOVER_GAP = 10;
 interface DefectDetectionListProps {
   defects: DefectItem[];
   selectedDefectId: string | null;
-  page: number;
-  pageCount: number;
   filters: ReportFilters;
   filterOpen: boolean;
-  onPageChange: (page: number) => void;
   onSelectDefect: (defectId: string) => void;
   onToggleFilter: () => void;
   onFilterChange: (patch: Partial<ReportFilters>) => void;
@@ -115,11 +112,8 @@ function DefectListHoverCard({
 export function DefectDetectionList({
   defects,
   selectedDefectId,
-  page,
-  pageCount,
   filters,
   filterOpen,
-  onPageChange,
   onSelectDefect,
   onToggleFilter,
   onFilterChange,
@@ -209,7 +203,7 @@ export function DefectDetectionList({
                   onBlur={() => setHoveredDefect(null)}
                   onKeyDown={(event) => handleRowKeyDown(event, defect)}
                 >
-                  <td>{String((page - 1) * 10 + index + 1).padStart(2, '0')}</td>
+                  <td>{String(index + 1).padStart(2, '0')}</td>
                   <td>
                     {defect.typeLabel}
                     {defect.classificationState === 'candidate-only' ? <small className="candidate-defect-badge">候选</small> : null}
@@ -229,17 +223,6 @@ export function DefectDetectionList({
             )}
           </tbody>
         </table>
-      </div>
-      <div className="pager">
-        <button type="button" onClick={() => onPageChange(page - 1)} disabled={page <= 1}>
-          <ChevronLeft size={16} />
-        </button>
-        <span>
-          {page} / {pageCount}
-        </span>
-        <button type="button" onClick={() => onPageChange(page + 1)} disabled={page >= pageCount}>
-          <ChevronRight size={16} />
-        </button>
       </div>
       {hoveredDefect && typeof document !== 'undefined'
         ? createPortal(

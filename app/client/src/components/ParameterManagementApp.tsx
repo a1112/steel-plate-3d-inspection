@@ -38,6 +38,7 @@ import {
   exportAuditLogsCsv,
   getInspectionServiceOrigin,
   loginAdmin,
+  loginAdminWithDefaultAccess,
   logoutAdmin,
   readAdminErrorMessage,
   restartCaptureService,
@@ -654,6 +655,16 @@ export function ParameterManagementApp() {
   useEffect(() => {
     let cancelled = false;
     fetchAdminSession()
+      .then(async (session) => {
+        if (session) {
+          return session;
+        }
+        try {
+          return await loginAdminWithDefaultAccess();
+        } catch {
+          return null;
+        }
+      })
       .then((session) => {
         if (cancelled) {
           return;
@@ -665,7 +676,7 @@ export function ParameterManagementApp() {
         } else if (session) {
           refresh().catch((error: unknown) => setMessage(error instanceof Error ? error.message : '参数读取失败'));
         } else {
-          setMessage('请登录后台管理');
+          setMessage('后台已设置密码，请登录');
         }
       })
       .catch((error: unknown) => {

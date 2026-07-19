@@ -46,12 +46,9 @@ function SidebarHarness() {
       summary={summary}
       records={filteredRecords}
       selectedRecordId={plate.plateNo}
-      page={1}
-      pageCount={1}
       searchFilters={filters}
       filteredCount={filteredRecords.length}
       totalCount={records.length}
-      onPageChange={() => undefined}
       onRecordSelect={() => undefined}
       onSearchChange={(patch) => setFilters((current) => ({ ...current, ...patch }))}
       onSearchReset={() => setFilters(emptyRecordSearchFilters)}

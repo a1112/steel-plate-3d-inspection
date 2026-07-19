@@ -33,17 +33,31 @@ describe('AppFooter', () => {
     expect(screen.getByRole('button', { name: '3D 重建' })).toBeInTheDocument();
   });
 
-  it('opens configuration and capture management through callbacks', () => {
+  it('opens management tools through independent-window callbacks', () => {
     const onSettingsOpen = vi.fn();
-    const onNavChange = vi.fn();
-    render(<AppFooter activeNav="status" onNavChange={onNavChange} onSettingsOpen={onSettingsOpen} />);
+    const onParameterManagementOpen = vi.fn();
+    const onCaptureManagementOpen = vi.fn();
+    const onBarSurfaceOpen = vi.fn();
+    render(
+      <AppFooter
+        activeNav="status"
+        onNavChange={vi.fn()}
+        onSettingsOpen={onSettingsOpen}
+        onParameterManagementOpen={onParameterManagementOpen}
+        onCaptureManagementOpen={onCaptureManagementOpen}
+        onBarSurfaceOpen={onBarSurfaceOpen}
+      />,
+    );
 
     fireEvent.click(screen.getByRole('button', { name: '配置中心' }));
+    fireEvent.click(screen.getByRole('button', { name: '后台管理' }));
     fireEvent.click(screen.getByRole('button', { name: '采集管理' }));
+    fireEvent.click(screen.getByRole('button', { name: '3D 重建' }));
 
     expect(onSettingsOpen).toHaveBeenCalledTimes(1);
-    expect(onNavChange).toHaveBeenCalledWith('status');
-    expect(screen.getByRole('button', { name: '采集管理' })).toHaveClass('active');
+    expect(onParameterManagementOpen).toHaveBeenCalledTimes(1);
+    expect(onCaptureManagementOpen).toHaveBeenCalledTimes(1);
+    expect(onBarSurfaceOpen).toHaveBeenCalledTimes(1);
   });
 
   it('opens the complete inspection flow from the footer without a floating launcher', () => {

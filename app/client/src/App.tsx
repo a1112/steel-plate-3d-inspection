@@ -83,11 +83,10 @@ import {
   type BarSurfaceMesh,
 } from './services/bar-surface-api';
 import { InspectionFlowTool } from './components/InspectionFlowTool';
+import { StandaloneWindowTitlebar } from './components/StandaloneWindowTitlebar';
 import { inferNotificationTone, notify } from './state/notifications';
 import './styles.css';
 
-const DEFECT_PAGE_SIZE = 10;
-const RECORD_PAGE_SIZE = 10;
 const REPORT_PAGE_SIZE = 8;
 const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
 const UNKNOWN_SERVICE_ENDPOINT = 'unknown';
@@ -155,8 +154,9 @@ function readAppMode() {
   if (typeof window === 'undefined') {
     return 'terminal';
   }
-  const params = new URLSearchParams(window.location.search);
-  const app = params.get('app');
+  const queryParams = new URLSearchParams(window.location.search);
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#\??/, ''));
+  const app = queryParams.get('app') ?? hashParams.get('app');
   if (app === 'capture' || app === 'parameters' || app === 'bar-surface' || app === 'bar' || app === '3d' || app === 'reconstruction') {
     return app === 'bar' || app === '3d' || app === 'reconstruction' ? 'bar-surface' : app;
   }
@@ -183,7 +183,12 @@ function filterDefectsBySelectedSeverities(defects: DefectItem[], selectedSeveri
 export default function App() {
   const appMode = readAppMode();
   if (appMode === 'bar-surface') {
-    return <BarSurfaceApp />;
+    return (
+      <div className={`app-shell theme-${readStoredTheme()} standalone-tool-shell bar-surface-standalone-shell`}>
+        <StandaloneWindowTitlebar kind="bar-surface" title="3D 重建工作台" />
+        <BarSurfaceApp />
+      </div>
+    );
   }
 
   const [snapshot, setSnapshot] = useState<InspectionSnapshot | null>(null);
@@ -793,11 +798,7 @@ function InspectionDashboard({
     () => filterInspectionRecords(snapshot.records, snapshot.inspections, recordSearchFilters),
     [snapshot.records, snapshot.inspections, recordSearchFilters],
   );
-  const defectPageCount = getPageCount(visibleDefects.length, DEFECT_PAGE_SIZE);
-  const recordPageCount = getPageCount(filteredRecords.length, RECORD_PAGE_SIZE);
   const reportPageCount = getPageCount(reportRows.length, REPORT_PAGE_SIZE);
-  const pageDefects = paginateItems(visibleDefects, uiState.defectPage, DEFECT_PAGE_SIZE);
-  const pageRecords = paginateItems(filteredRecords, uiState.recordPage, RECORD_PAGE_SIZE);
   const reportPageRows = paginateItems(reportRows, reportPage, REPORT_PAGE_SIZE);
   const selectedOnlineDefect = visibleDefects.find((defect) => defect.id === uiState.selectedDefectId) ?? visibleDefects[0] ?? null;
   const selectedOnlineDefectId = selectedOnlineDefect?.id ?? null;
@@ -983,6 +984,7 @@ function InspectionDashboard({
   if (appMode === 'capture') {
     return (
       <div className={`app-shell theme-${uiState.theme} ${responsiveClassName} capture-standalone-shell`}>
+        <StandaloneWindowTitlebar kind="capture" title="采集管理" />
         <main className="workspace-page capture-page capture-standalone-page">
           <CaptureManagementApp
             status={deviceStatus}
@@ -1000,6 +1002,7 @@ function InspectionDashboard({
   if (appMode === 'parameters') {
     return (
       <div className={`app-shell theme-${uiState.theme} ${responsiveClassName} parameter-standalone-shell`}>
+        <StandaloneWindowTitlebar kind="parameters" title="后台管理" />
         <ParameterManagementApp />
       </div>
     );
@@ -1023,15 +1026,12 @@ function InspectionDashboard({
           <LeftSidebar
             plate={activeSnapshot.currentPlate}
             summary={activeSummary}
-            records={pageRecords}
+            records={filteredRecords}
             inspections={snapshot.inspections}
             selectedRecordId={uiState.selectedRecordId}
-            page={uiState.recordPage}
-            pageCount={recordPageCount}
             searchFilters={recordSearchFilters}
             filteredCount={filteredRecords.length}
             totalCount={snapshot.records.length}
-            onPageChange={(recordPage) => setState({ recordPage })}
             onRecordSelect={selectRecordByPlateNo}
             onSearchChange={updateRecordSearchFilters}
             onSearchReset={resetRecordSearchFilters}
@@ -1111,13 +1111,10 @@ function InspectionDashboard({
               </section>
               <aside className="right-column">
                 <DefectDetectionList
-                  defects={pageDefects}
+                  defects={visibleDefects}
                   selectedDefectId={selectedOnlineDefectId}
-                  page={uiState.defectPage}
-                  pageCount={defectPageCount}
                   filters={onlineFilters}
                   filterOpen={defectFilterOpen}
-                  onPageChange={(defectPage) => setState({ defectPage })}
                   onSelectDefect={selectDefectById}
                   onToggleFilter={() => setDefectFilterOpen((current) => !current)}
                   onFilterChange={updateOnlineFilters}
@@ -1129,7 +1126,16 @@ function InspectionDashboard({
                 <StatisticsPanel
                   plate={activeSnapshot.currentPlate}
                   summary={activeSummary}
+                  defectTypes={snapshot.defectTypes}
+                  defectTypeCounts={defectTypeCounts}
+                  hiddenDefectTypeIds={uiState.hiddenDefectTypeIds}
                   selectedSeverityFilters={selectedOnlineSeverities}
+                  onDefectTypeToggle={(typeId) =>
+                    setUiState((current) => ({
+                      ...toggleDefectType(current, typeId),
+                      defectPage: 1,
+                    }))
+                  }
                   onSeverityFilterToggle={toggleOnlineSeverity}
                   onOpenReport={openCurrentPlateReport}
                 />

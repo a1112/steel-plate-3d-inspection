@@ -5860,16 +5860,26 @@ fn write_auth_login_response(state: &ServiceState, request: &str, body: &str) ->
             "{\"code\":400,\"error\":\"user id required\"}",
         );
     };
-    let Some(password) = payload
-        .get("password")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-    else {
-        return http_response(
-            "400 Bad Request",
-            "application/json; charset=utf-8",
-            "{\"code\":400,\"error\":\"password required\"}",
-        );
+    let default_access = payload
+        .get("defaultAccess")
+        .or_else(|| payload.get("default_access"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let password = if default_access {
+        db::DEVELOPMENT_DEFAULT_ADMIN_PASSWORD.to_string()
+    } else {
+        let Some(password) = payload
+            .get("password")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                "{\"code\":400,\"error\":\"password required\"}",
+            );
+        };
+        password
     };
     let now = current_time_millis();
     let security_policy = load_security_policy(state);
@@ -5910,13 +5920,27 @@ fn write_auth_login_response(state: &ServiceState, request: &str, body: &str) ->
         }
     };
 
-    if user.status != "active" || !db::verify_admin_password(&user, &password) {
+    if user.status != "active" {
         let _ = state.runtime.block_on(db::append_audit_log(
             &state.database.connection,
             &user.id,
             "auth.login.failed",
             &user.id,
             "后台登录失败：账号停用或密码错误",
+            "warning",
+        ));
+        return login_failure_response(state, &user.id, now, &security_policy);
+    }
+    if !db::verify_admin_password(&user, &password) {
+        if default_access {
+            return auth_failure("401 Unauthorized", 401, "password_configured");
+        }
+        let _ = state.runtime.block_on(db::append_audit_log(
+            &state.database.connection,
+            &user.id,
+            "auth.login.failed",
+            &user.id,
+            "后台登录失败：密码错误",
             "warning",
         ));
         return login_failure_response(state, &user.id, now, &security_policy);

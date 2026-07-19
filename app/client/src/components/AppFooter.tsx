@@ -1,6 +1,12 @@
 import { Box, ChevronDown, ChevronUp, Database, MonitorCog, Play, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
+import {
+  openBarSurfaceWindow,
+  openCaptureManagementWindow,
+  openParameterManagementWindow,
+} from '../lib/app-windows';
+import { notify } from '../state/notifications';
 import type { AnalysisViewMode } from './AlarmAnalysis';
 import type { PlateMapViewMode } from './PlateMap';
 import type { NavKey } from './TopNav';
@@ -22,6 +28,9 @@ interface AppFooterProps {
   onFlowToggle?: () => void;
   onNavChange: (next: NavKey) => void;
   onSettingsOpen: () => void;
+  onParameterManagementOpen?: () => unknown;
+  onCaptureManagementOpen?: () => unknown;
+  onBarSurfaceOpen?: () => unknown;
 }
 
 const surfaceViewOptions: Array<{ id: PlateMapViewMode; label: string }> = [
@@ -46,14 +55,28 @@ export function AppFooter({
   analysis,
   flowVisible = false,
   onFlowToggle,
-  onNavChange,
   onSettingsOpen,
+  onParameterManagementOpen = openParameterManagementWindow,
+  onCaptureManagementOpen = openCaptureManagementWindow,
+  onBarSurfaceOpen = openBarSurfaceWindow,
 }: AppFooterProps) {
   const activeAnalysis = activeNav === 'online' ? analysis : null;
   const changeAnalysisView = (next: AnalysisViewMode) => {
     activeAnalysis?.onAnalysisViewModeChange(next);
     if (activeAnalysis?.collapsed) {
       activeAnalysis.onCollapsedChange(false);
+    }
+  };
+  const runWindowAction = async (label: string, action: () => unknown) => {
+    try {
+      await action();
+      notify({ title: '独立窗口', message: `已打开${label}窗口`, tone: 'success' });
+    } catch (error) {
+      notify({
+        title: `${label}打开失败`,
+        message: error instanceof Error ? error.message : 'Tauri 窗口创建失败',
+        tone: 'error',
+      });
     }
   };
 
@@ -133,15 +156,15 @@ export function AppFooter({
           <Settings2 size={15} />
           <span>配置中心</span>
         </button>
-        <button type="button" onClick={() => window.location.assign('/?app=parameters')}>
+        <button type="button" onClick={() => void runWindowAction('后台管理', onParameterManagementOpen)}>
           <Database size={15} />
           <span>后台管理</span>
         </button>
-        <button type="button" className={activeNav === 'status' ? 'active' : ''} onClick={() => onNavChange('status')}>
+        <button type="button" onClick={() => void runWindowAction('采集管理', onCaptureManagementOpen)}>
           <MonitorCog size={15} />
           <span>采集管理</span>
         </button>
-        <button type="button" onClick={() => window.location.assign('/?app=bar-surface')}>
+        <button type="button" onClick={() => void runWindowAction('3D 重建', onBarSurfaceOpen)}>
           <Box size={15} />
           <span>3D 重建</span>
         </button>

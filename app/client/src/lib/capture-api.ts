@@ -1799,7 +1799,6 @@ export async function captureDepthMap(
       : result.imageUrl,
   };
 }
-
 export async function readLatestCaptureFile(
   ip: string,
   kind: CaptureImageKind = "depth",
@@ -2099,21 +2098,5 @@ export async function captureValidationFrame(input: {
     imageUrl: result.imageUrl?.startsWith("/")
       ? `${getCaptureServiceOrigin()}${result.imageUrl}`
       : result.imageUrl,
-  };
-}
-
-export async function openCaptureManagementWindow() {
-  const result = await invokeCapture<{
-    opened: boolean;
-    label: string;
-    error?: string | null;
-  }>("open_capture_management_window");
-  if (result) {
-    return result;
-  }
-  window.open("/?app=capture", "_blank", "popup,width=1480,height=900");
-  return {
-    opened: true,
-    label: "browser-capture-management",
   };
 }

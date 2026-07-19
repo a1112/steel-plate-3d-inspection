@@ -55,7 +55,7 @@ describe('App online severity filters', () => {
     );
   });
 
-  it('defaults all statistics severities selected and toggles them from the online defect list', async () => {
+  it('shows the complete scrollable defect list and toggles statistics severities', async () => {
     const { container } = render(<App />);
 
     const severeCard = await screen.findByRole('button', { name: '严重等级过滤，当前4项' });
@@ -64,7 +64,8 @@ describe('App online severity filters', () => {
     expect(severeCard).toHaveAttribute('aria-pressed', 'true');
     expect(reviewCard).toHaveAttribute('aria-pressed', 'true');
     expect(minorCard).toHaveAttribute('aria-pressed', 'true');
-    expect(getDefectTableRows(container)).toHaveLength(10);
+    expect(getDefectTableRows(container)).toHaveLength(12);
+    expect(container.querySelector('.defect-list-panel .pager')).not.toBeInTheDocument();
 
     fireEvent.click(severeCard);
 
@@ -77,7 +78,7 @@ describe('App online severity filters', () => {
 
     expect(severeCard).toHaveAttribute('aria-pressed', 'true');
     const restoredRows = getDefectTableRows(container);
-    expect(restoredRows).toHaveLength(10);
+    expect(restoredRows).toHaveLength(12);
     expect(restoredRows.some((row) => row.endsWith('严重'))).toBe(true);
     expect(restoredRows.some((row) => row.endsWith('轻微'))).toBe(true);
     expect(restoredRows.some((row) => row.endsWith('待复核'))).toBe(true);
