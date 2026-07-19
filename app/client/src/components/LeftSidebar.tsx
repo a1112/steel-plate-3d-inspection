@@ -113,7 +113,7 @@ export function LeftSidebar({
     <aside className="left-column">
       <SidebarAlertCard summary={summary} />
 
-      <Panel title="钢管信息" className="plate-info-panel">
+      <Panel title="钢管信息" className="plate-info-panel" headerless>
         <dl className="plate-info-list">
           <div>
             <dt>钢管号:</dt>

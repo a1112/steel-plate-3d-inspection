@@ -89,4 +89,26 @@ describe('App online severity filters', () => {
     fireEvent.click(holdHistory);
     expect(holdHistory).toHaveClass('active');
   });
+
+  it('keeps follow and view controls with the unfolded map instead of a separate status bar', async () => {
+    render(<App />);
+
+    await screen.findByRole('button', { name: '跟随最新' });
+
+    expect(screen.queryByRole('status', { name: '检测数据实时跟随状态' })).not.toBeInTheDocument();
+    expect(screen.getByRole('group', { name: '检测记录跟随模式' })).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: '显示视图切换' })).toBeInTheDocument();
+  });
+
+  it('places defect filters before the list and keeps the right panel for counts only', async () => {
+    render(<App />);
+
+    const filterHeading = await screen.findByRole('heading', { name: '缺陷过滤' });
+    const listHeading = screen.getByRole('heading', { name: '缺陷检测列表' });
+    expect(filterHeading.compareDocumentPosition(listHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '缺陷数量' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '凹坑类别过滤，当前3项' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '严重等级过滤，当前4项' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '本钢管统计' })).not.toBeInTheDocument();
+  });
 });

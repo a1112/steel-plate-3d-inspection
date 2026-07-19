@@ -57,6 +57,14 @@ function SidebarHarness() {
 }
 
 describe('LeftSidebar', () => {
+  it('shows steel information without a redundant panel heading', () => {
+    render(<SidebarHarness />);
+
+    expect(screen.queryByRole('heading', { name: '钢管信息' })).not.toBeInTheDocument();
+    expect(screen.getByText('钢管号:')).toBeInTheDocument();
+    expect(screen.getByText('Q355B')).toBeInTheDocument();
+  });
+
   it('shows record details beside the table while a row is hovered', () => {
     render(<SidebarHarness />);
 

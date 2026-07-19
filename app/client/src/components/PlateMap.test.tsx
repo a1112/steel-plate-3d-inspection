@@ -152,8 +152,10 @@ describe('PlateMap', () => {
     expect(screen.queryByRole('group', { name: '相机区显示切换' })).not.toBeInTheDocument();
     expect(screen.queryByText('上表面')).not.toBeInTheDocument();
     expect(screen.queryByText('下表面')).not.toBeInTheDocument();
-    expect(screen.getByText('camera1')).toBeInTheDocument();
-    expect(screen.getByText('camera8')).toBeInTheDocument();
+    expect(screen.queryByText('camera1', { exact: true })).not.toBeInTheDocument();
+    expect(screen.queryByText('camera8', { exact: true })).not.toBeInTheDocument();
+    expect(screen.getByText('C1')).toBeInTheDocument();
+    expect(screen.getByText('C8')).toBeInTheDocument();
     expect(onSurfaceModeChange).not.toHaveBeenCalled();
   });
 

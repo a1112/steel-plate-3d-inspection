@@ -69,10 +69,10 @@ import { AlarmAnalysis, type AnalysisViewMode } from './components/AlarmAnalysis
 import { AlarmCenter } from './components/AlarmCenter';
 import { DefectDetectionList } from './components/DefectDetectionList';
 import { LeftSidebar } from './components/LeftSidebar';
-import { PlateMap, PlateMapToolbar, type PlateMapViewMode } from './components/PlateMap';
+import { PlateMap, type PlateMapViewMode } from './components/PlateMap';
 import { ReportPage } from './components/ReportPage';
 import { SettingsPage } from './components/SettingsPage';
-import { StatisticsPanel } from './components/StatisticsPanel';
+import { DefectFilterPanel, StatisticsPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { BarSurfaceApp } from './components/BarSurfaceApp';
@@ -885,13 +885,6 @@ function InspectionDashboard({
     setState({ recordPage: 1 });
   };
 
-  const openCurrentPlateReport = () => {
-    setReportFilters({ ...createDefaultReportFilters(), keyword: activeSnapshot.currentPlate.plateNo });
-    setReportPage(1);
-    setState({ activeNav: 'report', selectedRecordId: activeSnapshot.currentPlate.plateNo });
-    setToast('已切换到当前钢管报表');
-  };
-
   const saveSettings = async (message: string) => {
     const errors = validateSettings(settingsDraft);
     setSettingsErrors(errors);
@@ -1037,35 +1030,6 @@ function InspectionDashboard({
             onSearchReset={resetRecordSearchFilters}
           />
           <section className="online-main">
-            <div className="snapshot-follow-bar" role="status" aria-label="检测数据实时跟随状态">
-              <div className="snapshot-follow-summary">
-                <i className={snapshotTracking === 'latest' ? 'live' : 'history'} />
-                <strong>{snapshotTracking === 'latest' ? '实时跟随最新检测' : `固定查看 ${activeSnapshot.currentPlate.plateNo}`}</strong>
-                <span>{snapshotSyncState} · 每 8 秒刷新</span>
-              </div>
-              <PlateMapToolbar
-                defectTypes={snapshot.defectTypes}
-                defectTypeCounts={defectTypeCounts}
-                hiddenTypeIds={uiState.hiddenDefectTypeIds}
-                viewMode={plateMapViewMode}
-                showViewSwitch={false}
-                onToggleType={(typeId) =>
-                  setUiState((current) => ({
-                    ...toggleDefectType(current, typeId),
-                    defectPage: 1,
-                  }))
-                }
-                onViewModeChange={setPlateMapViewMode}
-              />
-              <div className="snapshot-follow-actions" role="group" aria-label="检测记录跟随模式">
-                <button type="button" className={snapshotTracking === 'latest' ? 'active' : ''} onClick={followLatestSnapshot}>
-                  跟随最新
-                </button>
-                <button type="button" className={snapshotTracking === 'history' ? 'active' : ''} onClick={() => setSnapshotTracking('history')}>
-                  固定当前
-                </button>
-              </div>
-            </div>
             <main className="dashboard-grid online-dashboard-grid">
               <section className={`center-column ${analysisCollapsed ? 'analysis-collapsed' : ''}`}>
                 <PlateMap
@@ -1085,6 +1049,23 @@ function InspectionDashboard({
                   artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
                   viewMode={plateMapViewMode}
                   integratedToolbar
+                  toolbarExtra={
+                    <>
+                      <div className="snapshot-follow-summary" aria-label="检测数据状态">
+                        <i className={snapshotTracking === 'latest' ? 'live' : 'history'} />
+                        <strong>{snapshotTracking === 'latest' ? '实时跟随最新检测' : `固定查看 ${activeSnapshot.currentPlate.plateNo}`}</strong>
+                        <span>{snapshotSyncState} · 每 8 秒刷新</span>
+                      </div>
+                      <div className="snapshot-follow-actions" role="group" aria-label="检测记录跟随模式">
+                        <button type="button" className={snapshotTracking === 'latest' ? 'active' : ''} onClick={followLatestSnapshot}>
+                          跟随最新
+                        </button>
+                        <button type="button" className={snapshotTracking === 'history' ? 'active' : ''} onClick={() => setSnapshotTracking('history')}>
+                          固定当前
+                        </button>
+                      </div>
+                    </>
+                  }
                   onToggleType={(typeId) =>
                     setUiState((current) => ({
                       ...toggleDefectType(current, typeId),
@@ -1110,6 +1091,20 @@ function InspectionDashboard({
                 />
               </section>
               <aside className="right-column">
+                <DefectFilterPanel
+                  summary={activeSummary}
+                  defectTypes={snapshot.defectTypes}
+                  defectTypeCounts={defectTypeCounts}
+                  hiddenDefectTypeIds={uiState.hiddenDefectTypeIds}
+                  selectedSeverityFilters={selectedOnlineSeverities}
+                  onDefectTypeToggle={(typeId) =>
+                    setUiState((current) => ({
+                      ...toggleDefectType(current, typeId),
+                      defectPage: 1,
+                    }))
+                  }
+                  onSeverityFilterToggle={toggleOnlineSeverity}
+                />
                 <DefectDetectionList
                   defects={visibleDefects}
                   selectedDefectId={selectedOnlineDefectId}
@@ -1124,20 +1119,9 @@ function InspectionDashboard({
                   }}
                 />
                 <StatisticsPanel
-                  plate={activeSnapshot.currentPlate}
                   summary={activeSummary}
                   defectTypes={snapshot.defectTypes}
                   defectTypeCounts={defectTypeCounts}
-                  hiddenDefectTypeIds={uiState.hiddenDefectTypeIds}
-                  selectedSeverityFilters={selectedOnlineSeverities}
-                  onDefectTypeToggle={(typeId) =>
-                    setUiState((current) => ({
-                      ...toggleDefectType(current, typeId),
-                      defectPage: 1,
-                    }))
-                  }
-                  onSeverityFilterToggle={toggleOnlineSeverity}
-                  onOpenReport={openCurrentPlateReport}
                 />
               </aside>
             </main>

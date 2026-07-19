@@ -1,28 +1,12 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import type { DefectType, InspectionSummary, Severity, SteelPlate } from '../data/inspection';
-import { StatisticsPanel } from './StatisticsPanel';
-
-const plate: SteelPlate = {
-  plateNo: '202606131900',
-  widthMm: 3500,
-  lengthMm: 12000,
-  thicknessMm: 12,
-  steelGrade: 'Q355B',
-  detectedAt: '2026-06-13 19:00',
-};
+import type { DefectType, InspectionSummary, Severity } from '../data/inspection';
+import { DefectFilterPanel, StatisticsPanel } from './StatisticsPanel';
 
 const summary: InspectionSummary = {
   total: 12,
-  bySeverity: {
-    severe: 4,
-    review: 3,
-    minor: 5,
-  },
-  bySurface: {
-    top: 5,
-    bottom: 7,
-  },
+  bySeverity: { severe: 4, review: 3, minor: 5 },
+  bySurface: { top: 5, bottom: 7 },
 };
 
 const defectTypes: DefectType[] = [
@@ -30,13 +14,12 @@ const defectTypes: DefectType[] = [
   { id: 'scratch', label: '划伤', color: '#24a647', shape: 'rect' },
 ];
 
-describe('StatisticsPanel', () => {
-  it('filters defects by category and severity', () => {
+describe('defect filters and counts', () => {
+  it('keeps category and severity filters interactive above the defect list', () => {
     const onDefectTypeToggle = vi.fn();
     const onSeverityFilterToggle = vi.fn();
-    const { rerender } = render(
-      <StatisticsPanel
-        plate={plate}
+    render(
+      <DefectFilterPanel
         summary={summary}
         defectTypes={defectTypes}
         defectTypeCounts={{ pit: 5, scratch: 7 }}
@@ -44,43 +27,26 @@ describe('StatisticsPanel', () => {
         selectedSeverityFilters={new Set<Severity>(['severe', 'review', 'minor'])}
         onDefectTypeToggle={onDefectTypeToggle}
         onSeverityFilterToggle={onSeverityFilterToggle}
-        onOpenReport={vi.fn()}
       />,
     );
 
     const pitFilter = screen.getByRole('button', { name: '凹坑类别过滤，当前5项' });
-    const scratchFilter = screen.getByRole('button', { name: '划伤类别过滤，当前7项' });
-    const severeCard = screen.getByRole('button', { name: '严重等级过滤，当前4项' });
-    const reviewCard = screen.getByRole('button', { name: '待复核等级过滤，当前3项' });
-    const minorCard = screen.getByRole('button', { name: '轻微等级过滤，当前5项' });
+    const severeFilter = screen.getByRole('button', { name: '严重等级过滤，当前4项' });
     expect(pitFilter).toHaveAttribute('aria-pressed', 'true');
-    expect(scratchFilter).toHaveAttribute('aria-pressed', 'true');
-    expect(severeCard).toHaveAttribute('aria-pressed', 'true');
-    expect(reviewCard).toHaveAttribute('aria-pressed', 'true');
-    expect(minorCard).toHaveAttribute('aria-pressed', 'true');
+    expect(severeFilter).toHaveAttribute('aria-pressed', 'true');
 
     fireEvent.click(pitFilter);
+    fireEvent.click(severeFilter);
     expect(onDefectTypeToggle).toHaveBeenCalledWith('pit');
-    fireEvent.click(severeCard);
     expect(onSeverityFilterToggle).toHaveBeenCalledWith('severe');
+  });
 
-    rerender(
-      <StatisticsPanel
-        plate={plate}
-        summary={summary}
-        defectTypes={defectTypes}
-        defectTypeCounts={{ pit: 5, scratch: 7 }}
-        hiddenDefectTypeIds={new Set<string>(['pit'])}
-        selectedSeverityFilters={new Set<Severity>(['review', 'minor'])}
-        onDefectTypeToggle={onDefectTypeToggle}
-        onSeverityFilterToggle={onSeverityFilterToggle}
-        onOpenReport={vi.fn()}
-      />,
-    );
+  it('shows defect quantities without a steel record summary row', () => {
+    render(<StatisticsPanel summary={summary} defectTypes={defectTypes} defectTypeCounts={{ pit: 5, scratch: 7 }} />);
 
-    expect(screen.getByRole('button', { name: '凹坑类别过滤，当前5项' })).toHaveAttribute('aria-pressed', 'false');
-    expect(screen.getByRole('button', { name: '划伤类别过滤，当前7项' })).toHaveClass('active');
-    expect(screen.getByRole('button', { name: '严重等级过滤，当前4项' })).toHaveAttribute('aria-pressed', 'false');
-    expect(screen.getByRole('button', { name: '待复核等级过滤，当前3项' })).toHaveClass('active');
+    expect(screen.getByRole('heading', { name: '缺陷数量' })).toBeInTheDocument();
+    expect(screen.getByLabelText('当前共 12 项缺陷')).toHaveTextContent('凹坑5');
+    expect(screen.queryByText('钢管号')).not.toBeInTheDocument();
+    expect(screen.queryByText('缺陷类别')).not.toBeInTheDocument();
   });
 });

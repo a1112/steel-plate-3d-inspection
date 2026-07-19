@@ -1,6 +1,6 @@
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Check, X } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type WheelEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type WheelEvent } from 'react';
 import { DoubleSide, type Mesh, type PerspectiveCamera } from 'three';
 import heightMapBottomImage from '../assets/plate-surfaces/height-map-bottom.png';
 import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
@@ -28,6 +28,7 @@ interface PlateMapProps {
   artifactStatus?: string;
   viewMode?: PlateMapViewMode;
   integratedToolbar?: boolean;
+  toolbarExtra?: ReactNode;
   onToggleType: (typeId: string) => void;
   onSurfaceModeChange: (surfaceMode: SurfaceDisplayMode) => void;
   onPreviewPositionChange: (positionM: number) => void;
@@ -394,12 +395,6 @@ function BarUnfoldedMap({
 
   return (
     <div className={`bar-unfolded-map orientation-${orientation} ${expandedCamera ? 'camera-expanded' : ''}`} data-testid="bar-unfolded-map" data-orientation={orientation} data-expanded-camera={expandedCamera || undefined}>
-      <div className="bar-unfolded-axis" aria-hidden="true">
-        <span className="bar-unfolded-axis-title">圆周展开</span>
-        {BAR_CAMERA_LANES.map((lane) => (
-          <span key={lane.label} className={expandedCamera && expandedCamera !== lane.label ? 'is-collapsed' : ''}>{lane.label}</span>
-        ))}
-      </div>
       <div
         className="bar-unfolded-canvas"
         role="region"
@@ -1180,6 +1175,7 @@ export function PlateMap({
   artifactStatus,
   viewMode: controlledViewMode,
   integratedToolbar = false,
+  toolbarExtra,
   onToggleType,
   onSurfaceModeChange,
   onPreviewPositionChange,
@@ -1266,18 +1262,20 @@ export function PlateMap({
         })}
       </div>}
 
-      <div className="record-artifact-row">
-      <div className={`record-artifact-provenance ${artifactMode}`} role="note">
+      <div className={`record-artifact-row ${integratedToolbar ? 'integrated-map-tools' : ''}`}>
+      {integratedToolbar ? null : <div className={`record-artifact-provenance ${artifactMode}`} role="note">
         {artifactMode === 'demo'
           ? '演示/测试数据：允许使用内置表面与模拟点云，不代表当前生产结果。'
           : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；实际相机图像 ${displayedCameraImageCount}/8 路（自动裁剪黑边）。`}
-      </div>
+      </div>}
       {viewMode === '2d' ? (
         <div className="unfold-orientation-switch" role="group" aria-label="二维展开方向">
           <button type="button" className={unfoldOrientation === 'horizontal' ? 'active' : ''} aria-pressed={unfoldOrientation === 'horizontal'} onClick={() => setUnfoldOrientation('horizontal')}>横向</button>
           <button type="button" className={unfoldOrientation === 'vertical' ? 'active' : ''} aria-pressed={unfoldOrientation === 'vertical'} onClick={() => setUnfoldOrientation('vertical')}>纵向</button>
         </div>
       ) : null}
+      {integratedToolbar ? <PlateMapActions viewMode={viewMode} onViewModeChange={setViewMode} /> : null}
+      {toolbarExtra}
       </div>
 
       {viewMode === '3d' ? (
