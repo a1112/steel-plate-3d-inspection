@@ -8,6 +8,7 @@ target/
 app/capture/build/
 app/service/build/
 .vite/
+.worktrees/
 *.log
 *.local
 __pycache__/
