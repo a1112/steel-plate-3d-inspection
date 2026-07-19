@@ -18,9 +18,9 @@ pub(super) enum ControlledProcessError {
 #[cfg(windows)]
 mod process_tree {
     use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::process::Child;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -28,7 +28,7 @@ mod process_tree {
     };
 
     pub(super) struct ProcessTree {
-        job: HANDLE,
+        job: OwnedHandle,
     }
 
     impl ProcessTree {
@@ -36,29 +36,32 @@ mod process_tree {
 
         pub(super) fn attach(child: &Child) -> Result<Self, String> {
             unsafe {
-                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if job.is_null() {
+                let raw_job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if raw_job.is_null() {
                     return Err(format!(
                         "CreateJobObjectW failed: {}",
                         std::io::Error::last_os_error()
                     ));
                 }
+                let job = OwnedHandle::from_raw_handle(raw_job);
                 let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
                 limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
                 if SetInformationJobObject(
-                    job,
+                    job.as_raw_handle() as HANDLE,
                     JobObjectExtendedLimitInformation,
                     (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 ) == 0
                 {
                     let error = std::io::Error::last_os_error();
-                    CloseHandle(job);
                     return Err(format!("SetInformationJobObject failed: {error}"));
                 }
-                if AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) == 0 {
+                if AssignProcessToJobObject(
+                    job.as_raw_handle() as HANDLE,
+                    child.as_raw_handle() as HANDLE,
+                ) == 0
+                {
                     let error = std::io::Error::last_os_error();
-                    CloseHandle(job);
                     return Err(format!("AssignProcessToJobObject failed: {error}"));
                 }
                 Ok(Self { job })
@@ -67,15 +70,7 @@ mod process_tree {
 
         pub(super) fn terminate(&self) {
             unsafe {
-                let _ = TerminateJobObject(self.job, 1);
-            }
-        }
-    }
-
-    impl Drop for ProcessTree {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = CloseHandle(self.job);
+                let _ = TerminateJobObject(self.job.as_raw_handle() as HANDLE, 1);
             }
         }
     }
@@ -503,6 +498,9 @@ mod tests {
 
     #[test]
     fn managed_child_can_be_terminated_as_a_long_running_service() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ManagedChild>();
+
         let mut command = sleep_command(30);
         command
             .stdin(Stdio::null())
