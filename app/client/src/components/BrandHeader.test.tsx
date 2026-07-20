@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import type { DeviceStatus } from '../data/inspection';
@@ -293,12 +293,12 @@ describe('BrandHeader', () => {
 
   it('renders the embedded navigation before the system title', () => {
     const { container } = renderHeader();
-    const navigation = container.querySelector('.top-nav');
-    const title = screen.getByText('钢管3D表面检测系统');
-    const titleMetaGroup = container.querySelector('.title-meta-group');
+    const titleMetaGroup = container.querySelector<HTMLElement>('.title-meta-group');
 
-    expect(navigation).not.toBeNull();
-    expect(titleMetaGroup).toContainElement(title);
-    expect(navigation!.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(titleMetaGroup).not.toBeNull();
+    const navigation = within(titleMetaGroup!).getByRole('navigation');
+    const title = within(titleMetaGroup!).getByText('钢管3D表面检测系统');
+
+    expect(navigation.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
