@@ -290,4 +290,15 @@ describe('BrandHeader', () => {
     expect(onDragMouseDown).not.toHaveBeenCalled();
     expect(onNavChange).toHaveBeenCalledWith('report');
   });
+
+  it('renders the embedded navigation before the system title', () => {
+    const { container } = renderHeader();
+    const navigation = container.querySelector('.top-nav');
+    const title = screen.getByText('钢管3D表面检测系统');
+    const titleMetaGroup = container.querySelector('.title-meta-group');
+
+    expect(navigation).not.toBeNull();
+    expect(titleMetaGroup).toContainElement(title);
+    expect(navigation!.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
 });

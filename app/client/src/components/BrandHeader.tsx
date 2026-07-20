@@ -784,8 +784,8 @@ export function BrandHeader({
       </div>
 
       <div className="title-meta-group">
-        <div className="system-title">钢管3D表面检测系统</div>
         <TopNav active={activeNav} onChange={onNavChange} embedded />
+        <div className="system-title">钢管3D表面检测系统</div>
       </div>
 
       <div className="brand-status">
