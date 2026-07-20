@@ -75,6 +75,7 @@ describe('compact online detection layout CSS contract', () => {
   it.each([
     '.density-dense .defect-filter-panel .panel-body',
     '.theme-dark .defect-filter-panel .panel-body',
+    '.app-shell.theme-light .defect-filter-panel .panel-body',
   ])('preserves compact defect filter sizing through the %s cascade', (selector) => {
     expectDeclaration(selector, 'height', 'auto');
     expectDeclaration(selector, 'padding', '6px 8px 8px');

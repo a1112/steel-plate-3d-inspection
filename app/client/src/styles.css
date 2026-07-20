@@ -9666,6 +9666,11 @@ button {
   background: transparent;
 }
 
+.app-shell.theme-light .defect-filter-panel .panel-body {
+  height: auto;
+  padding: 6px 8px 8px;
+}
+
 /* Additional UI Elements Light Theme */
 .theme-light .inspected-plate-preview {
   background: rgba(247, 250, 253, 0.9);
