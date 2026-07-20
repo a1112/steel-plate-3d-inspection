@@ -12,7 +12,6 @@ export function Panel({ title, children, className = '', action, headerless = fa
   return (
     <section
       className={`panel ${headerless ? 'panel-headerless' : ''} ${className}`}
-      aria-label={title}
       data-layout-card
       data-card-label={title}
     >
