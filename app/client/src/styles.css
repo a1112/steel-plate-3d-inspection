@@ -1843,6 +1843,13 @@ button {
   border-bottom: 1px solid var(--line);
 }
 
+.panel-header .severity-filters-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
 .panel-header h2 {
   position: relative;
   margin: 0;
@@ -2852,12 +2859,12 @@ button {
 }
 
 .theme-light .plate-strip {
-  border-color: rgba(0, 94, 214, 0.45);
+  border-color: rgba(0, 94, 214, 0.35);
   background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.12), rgba(0, 0, 0, 0.08)),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.04) 20%, rgba(0, 0, 0, 0.02) 78%, rgba(0, 0, 0, 0.12)),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.2), rgba(0, 0, 0, 0.05)),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.15), rgba(255, 255, 255, 0.05) 20%, rgba(0, 0, 0, 0.02) 78%, rgba(0, 0, 0, 0.08)),
     var(--plate-surface-image),
-    #a6adb2;
+    #c8d4dc;
   background-position: center;
   background-repeat: no-repeat;
   background-size:
@@ -2866,9 +2873,9 @@ button {
     100% 100%,
     auto;
   box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.54),
-    inset 0 9px 0 rgba(255, 255, 255, 0.22),
-    inset 0 -9px 0 rgba(44, 65, 82, 0.12),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.6),
+    inset 0 8px 0 rgba(255, 255, 255, 0.2),
+    inset 0 -8px 0 rgba(44, 65, 82, 0.1),
     0 0 0 1px rgba(0, 94, 214, 0.12);
 }
 
@@ -2900,18 +2907,18 @@ button {
 }
 
 .theme-light .plate-strip::before {
-  border-color: rgba(0, 94, 214, 0.55);
+  border-color: rgba(0, 94, 214, 0.45);
   box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.65),
-    inset 0 0 16px rgba(255, 255, 255, 0.22);
+    0 0 0 1px rgba(255, 255, 255, 0.75),
+    inset 0 0 12px rgba(255, 255, 255, 0.18);
 }
 
 .theme-light .plate-strip::after {
   background:
-    linear-gradient(90deg, rgba(0, 94, 214, 0.82) 0 18px, transparent 18px calc(100% - 18px), rgba(0, 94, 214, 0.82) calc(100% - 18px) 100%) top left / 100% 2px no-repeat,
-    linear-gradient(90deg, rgba(0, 94, 214, 0.82) 0 18px, transparent 18px calc(100% - 18px), rgba(0, 94, 214, 0.82) calc(100% - 18px) 100%) bottom left / 100% 2px no-repeat,
-    linear-gradient(180deg, rgba(0, 94, 214, 0.82) 0 18px, transparent 18px calc(100% - 18px), rgba(0, 94, 214, 0.82) calc(100% - 18px) 100%) top left / 2px 100% no-repeat,
-    linear-gradient(180deg, rgba(0, 94, 214, 0.82) 0 18px, transparent 18px calc(100% - 18px), rgba(0, 94, 214, 0.82) calc(100% - 18px) 100%) top right / 2px 100% no-repeat;
+    linear-gradient(90deg, rgba(0, 94, 214, 0.75) 0 18px, transparent 18px calc(100% - 18px), rgba(0, 94, 214, 0.75) calc(100% - 18px) 100%) top left / 100% 2px no-repeat,
+    linear-gradient(90deg, rgba(0, 94, 214, 0.75) 0 18px, transparent 18px calc(100% - 18px), rgba(0, 94, 214, 0.75) calc(100% - 18px) 100%) bottom left / 100% 2px no-repeat,
+    linear-gradient(180deg, rgba(0, 94, 214, 0.75) 0 18px, transparent 18px calc(100% - 18px), rgba(0, 94, 214, 0.75) calc(100% - 18px) 100%) top left / 2px 100% no-repeat,
+    linear-gradient(180deg, rgba(0, 94, 214, 0.75) 0 18px, transparent 18px calc(100% - 18px), rgba(0, 94, 214, 0.75) calc(100% - 18px) 100%) top right / 2px 100% no-repeat;
 }
 
 .center-line {
@@ -3468,7 +3475,7 @@ button {
 }
 
 .theme-light .point-cloud-unfold-title span {
-  color: #5f7da1;
+  color: #3a5a85;
 }
 
 .point-cloud-unfold-axis {
@@ -3482,7 +3489,7 @@ button {
 }
 
 .theme-light .point-cloud-unfold-axis {
-  color: #64748b;
+  color: #4a6080;
 }
 
 .point-cloud-unfold-map {
@@ -4365,9 +4372,20 @@ button {
     border-color 0.15s ease;
 }
 
-.severity-filter-inline.severe { color: #d62939; }
-.severity-filter-inline.review { color: #a87000; }
-.severity-filter-inline.minor { color: #16844a; }
+.severity-filter-inline.severe {
+  --severity-color: #d62939;
+  color: var(--severity-color);
+}
+
+.severity-filter-inline.review {
+  --severity-color: #a87000;
+  color: var(--severity-color);
+}
+
+.severity-filter-inline.minor {
+  --severity-color: #16844a;
+  color: var(--severity-color);
+}
 
 .severity-filter-inline:hover {
   background: color-mix(in srgb, currentColor 18%, var(--panel));
@@ -4380,8 +4398,9 @@ button {
 
 .severity-filter-inline.active {
   color: #fff;
-  background: currentColor;
-  box-shadow: 0 1px 5px color-mix(in srgb, currentColor 35%, transparent);
+  border-color: var(--severity-color);
+  background: var(--severity-color);
+  box-shadow: 0 1px 5px color-mix(in srgb, var(--severity-color) 35%, transparent);
 }
 
 .severity-filter-inline.active strong {
@@ -9386,6 +9405,321 @@ button {
 
 .theme-light .capture-mode-banner span {
   color: #76511f;
+}
+
+/* Inspection Flow Tool Light Theme */
+.theme-light .inspection-flow-tool {
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 18px 46px rgba(30, 52, 84, 0.15), 0 0 0 1px rgba(255, 255, 255, 0.8) inset;
+}
+
+.theme-light .inspection-flow-tool > header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 252, 0.96));
+  border-bottom-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .inspection-flow-tool > header button {
+  border-color: rgba(47, 125, 255, 0.24);
+  color: var(--blue);
+  background: rgba(47, 125, 255, 0.08);
+}
+
+.theme-light .inspection-flow-tool > header button:hover {
+  border-color: var(--blue);
+  color: #ffffff;
+  background: var(--blue);
+}
+
+.theme-light .inspection-flow-tool button,
+.theme-light .inspection-flow-launcher {
+  border-color: rgba(18, 35, 58, 0.14);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.theme-light .inspection-flow-tool button:hover,
+.theme-light .inspection-flow-launcher:hover {
+  border-color: var(--blue);
+  color: var(--blue);
+  background: rgba(47, 125, 255, 0.08);
+}
+
+/* Capture Operations Panel Light Theme */
+.theme-light .capture-operations-panel {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .capture-operations-panel > header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 252, 0.94));
+  border-bottom-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .capture-operations-permission {
+  background: rgba(47, 125, 255, 0.06);
+  color: var(--blue);
+}
+
+.theme-light .capture-operations-grid > section {
+  background: rgba(247, 250, 253, 0.9);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .capture-operations-grid > section > header {
+  color: var(--blue);
+}
+
+/* Capture Advanced Operations Light Theme */
+.theme-light .capture-advanced-operations {
+  border-top-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .capture-calibration-safety {
+  border-color: rgba(214, 125, 0, 0.3);
+  background: rgba(255, 191, 38, 0.06);
+  color: #a45d00;
+}
+
+.theme-light .capture-calibration-safety svg {
+  color: #a45d00;
+}
+
+/* Capture Diagnostic Operations Light Theme */
+.theme-light .capture-diagnostic-operations {
+  border-top-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .capture-diagnostic-operations > header {
+  border-color: rgba(214, 125, 0, 0.3);
+  background: rgba(255, 191, 38, 0.06);
+  color: #a45d00;
+}
+
+.theme-light .capture-diagnostic-operations > header strong {
+  color: #07162c;
+}
+
+.theme-light .capture-diagnostic-operations > header span,
+.theme-light .capture-diagnostic-operations p {
+  color: var(--muted);
+}
+
+/* Statistics Panel Light Theme */
+.theme-light .statistics-panel {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .statistics-panel > header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 252, 0.94));
+  border-bottom-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .statistics-panel .panel-body {
+  background: transparent;
+}
+
+.theme-light .stat-heading {
+  color: var(--text);
+}
+
+.theme-light .stat-heading button {
+  border-color: rgba(47, 125, 255, 0.24);
+  color: var(--blue);
+  background: rgba(47, 125, 255, 0.08);
+}
+
+.theme-light .stat-heading button:hover {
+  border-color: var(--blue);
+  color: #ffffff;
+  background: var(--blue);
+}
+
+.theme-light .statistics-filter-group {
+  background: rgba(247, 250, 253, 0.9);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .category-filter,
+.theme-light .severity-filter-group {
+  background: rgba(247, 250, 253, 0.9);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .severity-filter-inline {
+  color: var(--severity-color);
+  border-color: var(--severity-color);
+  background: color-mix(in srgb, var(--severity-color) 8%, white);
+}
+
+.theme-light .severity-filter-inline:hover {
+  background: color-mix(in srgb, var(--severity-color) 16%, white);
+}
+
+.theme-light .severity-filter-inline.active {
+  color: #fff;
+  border-color: var(--severity-color);
+  background: var(--severity-color);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--severity-color) 25%, transparent);
+}
+
+/* Alarm Analysis Panel Light Theme */
+.theme-light .alarm-analysis-panel {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .alarm-analysis-panel > header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 252, 0.94));
+  border-bottom-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .alarm-analysis-panel .panel-body {
+  background: transparent;
+}
+
+.theme-light .analysis-collapse-button {
+  border-color: rgba(47, 125, 255, 0.24);
+  color: var(--blue);
+  background: rgba(47, 125, 255, 0.08);
+}
+
+.theme-light .analysis-collapse-button:hover {
+  border-color: var(--blue);
+  color: #ffffff;
+  background: var(--blue);
+}
+
+.theme-light .analysis-detail-bar {
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+/* Point Cloud Improvements for Light Theme */
+.theme-light .point-cloud-unfold-title span {
+  color: #3a5a85;
+}
+
+.theme-light .point-cloud-unfold-axis {
+  color: #5a7da0;
+}
+
+/* Defect Detection List Light Theme */
+.theme-light .defect-detection-list {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .defect-detection-list > header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 252, 0.94));
+  border-bottom-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .defect-list-item {
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .defect-list-item:hover {
+  background: rgba(47, 125, 255, 0.05);
+  border-color: rgba(47, 125, 255, 0.2);
+}
+
+.theme-light .defect-list-item.selected {
+  background: rgba(47, 125, 255, 0.08);
+  border-color: rgba(47, 125, 255, 0.3);
+}
+
+/* Panel Generic Light Theme */
+.theme-light .panel {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .panel > header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 252, 0.94));
+  border-bottom-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .panel-header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 252, 0.94));
+  border-bottom-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .panel-header h2 {
+  color: var(--text);
+}
+
+.theme-light .panel .panel-body {
+  background: transparent;
+}
+
+/* Additional UI Elements Light Theme */
+.theme-light .inspected-plate-preview {
+  background: rgba(247, 250, 253, 0.9);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .plate-map-view {
+  background: rgba(247, 250, 253, 0.9);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .alarm-center {
+  background: rgba(255, 255, 255, 0.96);
+  border-color: rgba(18, 35, 58, 0.14);
+}
+
+.theme-light .alarm-center > header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 252, 0.94));
+  border-bottom-color: rgba(18, 35, 58, 0.14);
+}
+
+/* Button Consistency Light Theme */
+.theme-light button:not(.primary):not(.active):not(.severity-filter-inline) {
+  border-color: rgba(18, 35, 58, 0.14);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.theme-light button:not(.primary):not(.active):not(.severity-filter-inline):hover {
+  border-color: rgba(47, 125, 255, 0.2);
+  color: var(--blue);
+  background: rgba(47, 125, 255, 0.05);
+}
+
+/* Status Indicators Light Theme */
+.theme-light .status-indicator.online {
+  background: rgba(22, 216, 111, 0.15);
+  border-color: rgba(22, 216, 111, 0.4);
+  color: #16a86f;
+}
+
+.theme-light .status-indicator.offline {
+  background: rgba(255, 51, 51, 0.1);
+  border-color: rgba(255, 51, 51, 0.3);
+  color: #cc3333;
+}
+
+.theme-light .status-indicator.warning {
+  background: rgba(255, 191, 38, 0.15);
+  border-color: rgba(255, 191, 38, 0.4);
+  color: #cc8a00;
+}
+
+/* Capture Mode Banner Enhanced Light Theme */
+.theme-light .capture-mode-banner {
+  color: #8d5700;
+  border-color: rgba(214, 125, 0, 0.4);
+  background: linear-gradient(90deg, rgba(255, 191, 38, 0.12), rgba(255, 191, 38, 0.06));
+  box-shadow: 0 8px 20px rgba(110, 72, 12, 0.1);
+}
+
+.theme-light .capture-mode-banner svg,
+.theme-light .capture-mode-banner strong {
+  color: #b46d00;
+}
+
+.theme-light .capture-mode-banner span {
+  color: #7d6130;
 }
 
 .capture-terminal-page {
