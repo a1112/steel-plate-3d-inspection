@@ -74,7 +74,7 @@ import { LeftSidebar } from './components/LeftSidebar';
 import { PlateMap, type PlateMapViewMode } from './components/PlateMap';
 import { ReportPage } from './components/ReportPage';
 import { SettingsPage } from './components/SettingsPage';
-import { DefectFilterPanel, StatisticsPanel } from './components/StatisticsPanel';
+import { DefectFilterPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { BarSurfaceApp } from './components/BarSurfaceApp';
@@ -1127,11 +1127,6 @@ function InspectionDashboard({
                     setOnlineFilters(createDefaultReportFilters());
                     setState({ defectPage: 1 });
                   }}
-                />
-                <StatisticsPanel
-                  summary={activeSummary}
-                  defectTypes={snapshot.defectTypes}
-                  defectTypeCounts={defectTypeCounts}
                 />
               </aside>
             </main>
