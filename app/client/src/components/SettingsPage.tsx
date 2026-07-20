@@ -1,6 +1,6 @@
-import { ClipboardCheck, Gauge, Palette, RadioTower, RotateCcw, Save, Send, Server } from 'lucide-react';
+import { ClipboardCheck, Cpu, Factory, Gauge, Monitor, Palette, RadioTower, RotateCcw, Save, Send, Server, Sparkles } from 'lucide-react';
 import { useState, type ChangeEvent, type ElementType } from 'react';
-import type { ThemeMode } from '../data/inspection';
+import type { ThemeMode, ThemeStyle } from '../data/inspection';
 import { openParameterManagementWindow } from '../lib/app-windows';
 import type { ConnectionConfig, ConnectionMode } from '../services/inspection-api';
 import type { InspectionSettings, SettingsErrors } from '../state/operations';
@@ -22,6 +22,14 @@ const themeOptions: Array<{ id: ThemeMode; label: string; description: string; s
   { id: 'light', label: '浅色巡检', description: '默认亮环境值守', swatches: ['#f3f6fa', '#2f7dff', '#07162c'] },
   { id: 'dark', label: '深色工业', description: '工业监控暗色', swatches: ['#11181c', '#2f7dff', '#4ed463'] },
   { id: 'graphite', label: '石墨高对比', description: '低照度机房', swatches: ['#090d10', '#00b8d4', '#f2f5f6'] },
+];
+
+const themeStyleOptions: Array<{ id: ThemeStyle; label: string; description: string; icon: ElementType; swatches: string[] }> = [
+  { id: 'default', label: '默认', description: '项目原有蓝钢体系', icon: Palette, swatches: ['#f3f6fa', '#009dff', '#001427'] },
+  { id: 'soft', label: '柔和', description: '玫瑰与青绿色调', icon: Sparkles, swatches: ['#fff7fa', '#f472b6', '#14b8a6'] },
+  { id: 'tech', label: '科技', description: '高辨识蓝青光感', icon: Cpu, swatches: ['#eef6fb', '#0284c7', '#22d3ee'] },
+  { id: 'industrial', label: '工业', description: '石墨与安全琥珀', icon: Factory, swatches: ['#f3f4f6', '#52525b', '#f59e0b'] },
+  { id: 'modern', label: '现代', description: '靛蓝与翡翠层次', icon: Monitor, swatches: ['#f5f7ff', '#4f46e5', '#10b981'] },
 ];
 
 function NumberField({
@@ -73,41 +81,77 @@ function ToggleField({ label, checked, onChange }: { label: string; checked: boo
   );
 }
 
-function ThemeSelector({ theme, onThemeChange }: { theme: ThemeMode; onThemeChange: (theme: ThemeMode) => void }) {
+function ThemeSelector({
+  theme,
+  themeStyle,
+  onThemeChange,
+  onThemeStyleChange,
+}: {
+  theme: ThemeMode;
+  themeStyle: ThemeStyle;
+  onThemeChange: (theme: ThemeMode) => void;
+  onThemeStyleChange: (themeStyle: ThemeStyle) => void;
+}) {
   return (
-    <div className="theme-option-grid">
-      {themeOptions.map((option) => (
-        <button
-          key={option.id}
-          type="button"
-          className={`theme-option-card ${theme === option.id ? 'active' : ''}`}
-          aria-pressed={theme === option.id}
-          aria-label={`选择${option.label}主题`}
-          onClick={() => onThemeChange(option.id)}
-        >
-          <span className="theme-option-copy">
-            <strong>{option.label}</strong>
-            <em>{option.description}</em>
-          </span>
-          <span className="theme-option-swatches" aria-hidden="true">
-            {option.swatches.map((color) => (
-              <i key={color} style={{ background: color }} />
-            ))}
-          </span>
-        </button>
-      ))}
+    <div className="theme-system-selector">
+      <section>
+        <header><strong>界面风格</strong><span>控制色彩性格、表面材质与强调色</span></header>
+        <div className="theme-style-grid">
+          {themeStyleOptions.map((option) => {
+            const Icon = option.icon;
+            return (
+              <button
+                key={option.id}
+                type="button"
+                className={`theme-style-card ${themeStyle === option.id ? 'active' : ''}`}
+                aria-pressed={themeStyle === option.id}
+                aria-label={`选择${option.label}界面风格`}
+                onClick={() => onThemeStyleChange(option.id)}
+              >
+                <Icon size={18} />
+                <span className="theme-option-copy"><strong>{option.label}</strong><em>{option.description}</em></span>
+                <span className="theme-option-swatches" aria-hidden="true">
+                  {option.swatches.map((color) => <i key={color} style={{ background: color }} />)}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+      <section>
+        <header><strong>明暗主题</strong><span>可与任一界面风格组合</span></header>
+        <div className="theme-option-grid">
+          {themeOptions.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              className={`theme-option-card ${theme === option.id ? 'active' : ''}`}
+              aria-pressed={theme === option.id}
+              aria-label={`选择${option.label}主题`}
+              onClick={() => onThemeChange(option.id)}
+            >
+              <span className="theme-option-copy"><strong>{option.label}</strong><em>{option.description}</em></span>
+              <span className="theme-option-swatches" aria-hidden="true">
+                {option.swatches.map((color) => <i key={color} style={{ background: color }} />)}
+              </span>
+            </button>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
 
 export function SettingsPage({
   theme,
+  themeStyle = 'default',
   draft,
   saved,
   errors,
   connection = { mode: 'online', host: '127.0.0.1', port: 4873 },
   connectionStatus,
   onThemeChange,
+  onThemeStyleChange = () => undefined,
   onDraftChange,
   onConnectionChange = () => undefined,
   onConnectionSave = () => undefined,
@@ -117,12 +161,14 @@ export function SettingsPage({
   embedded = false,
 }: {
   theme: ThemeMode;
+  themeStyle?: ThemeStyle;
   draft: InspectionSettings;
   saved: InspectionSettings;
   errors: SettingsErrors;
   connection?: ConnectionConfig;
   connectionStatus?: string | null;
   onThemeChange: (theme: ThemeMode) => void;
+  onThemeStyleChange?: (themeStyle: ThemeStyle) => void;
   onDraftChange: (patch: Partial<InspectionSettings>) => void;
   onConnectionChange?: (patch: Partial<ConnectionConfig>) => void;
   onConnectionSave?: () => void;
@@ -171,7 +217,7 @@ export function SettingsPage({
         <section className="settings-content">
           {activeSection === 'theme' ? (
             <Panel title="主题外观" className="settings-panel settings-theme-panel">
-              <ThemeSelector theme={theme} onThemeChange={onThemeChange} />
+              <ThemeSelector theme={theme} themeStyle={themeStyle} onThemeChange={onThemeChange} onThemeStyleChange={onThemeStyleChange} />
             </Panel>
           ) : null}
 

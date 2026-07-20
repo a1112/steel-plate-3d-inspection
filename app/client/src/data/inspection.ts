@@ -3,6 +3,7 @@ import defectPitImage from '../assets/mock-defects/defect-pit.png';
 import defectScratchImage from '../assets/mock-defects/defect-scratch.png';
 
 export type ThemeMode = 'dark' | 'light' | 'graphite';
+export type ThemeStyle = 'default' | 'soft' | 'tech' | 'industrial' | 'modern';
 export type Severity = 'severe' | 'review' | 'minor';
 export type Surface = 'top' | 'bottom';
 

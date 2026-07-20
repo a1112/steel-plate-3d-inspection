@@ -1,10 +1,12 @@
 import { getPlateInspectionSnapshot } from '../data/inspection';
-import type { DefectItem, InspectionSnapshot, Surface, ThemeMode } from '../data/inspection';
+import type { DefectItem, InspectionSnapshot, Surface, ThemeMode, ThemeStyle } from '../data/inspection';
 
 export type SurfaceDisplayMode = Surface | 'all';
 export const DEFAULT_PLATE_LENGTH_M = 12;
 export const THEME_STORAGE_KEY = 'steel-inspection-theme';
+export const THEME_STYLE_STORAGE_KEY = 'steel-inspection-theme-style';
 const THEME_MODES: readonly ThemeMode[] = ['dark', 'light', 'graphite'];
+const THEME_STYLES: readonly ThemeStyle[] = ['default', 'soft', 'tech', 'industrial', 'modern'];
 
 export function readStoredTheme(storage?: Pick<Storage, 'getItem'> | null): ThemeMode {
   const target = storage ?? (typeof window === 'undefined' ? null : window.localStorage);
@@ -25,8 +27,28 @@ export function persistTheme(theme: ThemeMode, storage?: Pick<Storage, 'setItem'
   }
 }
 
+export function readStoredThemeStyle(storage?: Pick<Storage, 'getItem'> | null): ThemeStyle {
+  const target = storage ?? (typeof window === 'undefined' ? null : window.localStorage);
+  try {
+    const stored = target?.getItem(THEME_STYLE_STORAGE_KEY);
+    return THEME_STYLES.includes(stored as ThemeStyle) ? stored as ThemeStyle : 'default';
+  } catch {
+    return 'default';
+  }
+}
+
+export function persistThemeStyle(themeStyle: ThemeStyle, storage?: Pick<Storage, 'setItem'> | null) {
+  const target = storage ?? (typeof window === 'undefined' ? null : window.localStorage);
+  try {
+    target?.setItem(THEME_STYLE_STORAGE_KEY, themeStyle);
+  } catch {
+    // The selected style still applies for the current session when storage is unavailable.
+  }
+}
+
 export interface InspectionUiState {
   theme: ThemeMode;
+  themeStyle: ThemeStyle;
   activeNav: 'online' | 'report' | 'alarms' | 'settings' | 'status';
   selectedRecordId: string;
   selectedDefectId: string | null;
@@ -51,6 +73,7 @@ function getDefectPreviewPositionM(defect?: Pick<DefectItem, 'distanceHeadMm'>) 
 export function createInitialUiState(snapshot: InspectionSnapshot): InspectionUiState {
   return {
     theme: readStoredTheme(),
+    themeStyle: readStoredThemeStyle(),
     activeNav: 'online',
     selectedRecordId: snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo,
     selectedDefectId: snapshot.defects[0]?.id ?? null,

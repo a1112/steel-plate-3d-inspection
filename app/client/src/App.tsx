@@ -6,7 +6,9 @@ import type { InspectionUiState } from './state/inspection-ui';
 import {
   createInitialUiState,
   persistTheme,
+  persistThemeStyle,
   readStoredTheme,
+  readStoredThemeStyle,
   filterDefectsBySurfaceMode,
   getPageCount,
   getVisibleDefects,
@@ -86,6 +88,7 @@ import { InspectionFlowTool } from './components/InspectionFlowTool';
 import { StandaloneWindowTitlebar } from './components/StandaloneWindowTitlebar';
 import { inferNotificationTone, notify } from './state/notifications';
 import './styles.css';
+import './styles/theme-system.css';
 
 const REPORT_PAGE_SIZE = 8;
 const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
@@ -183,8 +186,10 @@ function filterDefectsBySelectedSeverities(defects: DefectItem[], selectedSeveri
 export default function App() {
   const appMode = readAppMode();
   if (appMode === 'bar-surface') {
+    const theme = readStoredTheme();
+    const themeStyle = readStoredThemeStyle();
     return (
-      <div className={`app-shell theme-${readStoredTheme()} standalone-tool-shell bar-surface-standalone-shell`}>
+      <div className={`app-shell theme-${theme} style-${themeStyle} standalone-tool-shell bar-surface-standalone-shell`}>
         <StandaloneWindowTitlebar kind="bar-surface" title="3D 重建工作台" />
         <BarSurfaceApp />
       </div>
@@ -212,8 +217,9 @@ export default function App() {
 
   if (!snapshot) {
     const loadingTheme = readStoredTheme();
+    const loadingThemeStyle = readStoredThemeStyle();
     return (
-      <div className={`app-shell theme-${loadingTheme} app-loading-shell`}>
+      <div className={`app-shell theme-${loadingTheme} style-${loadingThemeStyle} app-loading-shell`}>
         <section className="app-loading-panel" role="status" aria-live="polite">
           <span>后台数据系统</span>
           <h1>{loadError ? '后台连接失败' : '正在连接后台数据服务'}</h1>
@@ -240,6 +246,10 @@ function InspectionDashboard({
     document.documentElement.dataset.theme = uiState.theme;
     persistTheme(uiState.theme);
   }, [uiState.theme]);
+  useEffect(() => {
+    document.documentElement.dataset.themeStyle = uiState.themeStyle;
+    persistThemeStyle(uiState.themeStyle);
+  }, [uiState.themeStyle]);
   const [onlineFilters, setOnlineFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
   const [selectedOnlineSeverities, setSelectedOnlineSeverities] = useState<Set<Severity>>(() => new Set(ALL_SEVERITY_FILTERS));
   const [reportFilters, setReportFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
@@ -976,7 +986,7 @@ function InspectionDashboard({
 
   if (appMode === 'capture') {
     return (
-      <div className={`app-shell theme-${uiState.theme} ${responsiveClassName} capture-standalone-shell`}>
+      <div className={`app-shell theme-${uiState.theme} style-${uiState.themeStyle} ${responsiveClassName} capture-standalone-shell`}>
         <StandaloneWindowTitlebar kind="capture" title="采集管理" />
         <main className="workspace-page capture-page capture-standalone-page">
           <CaptureManagementApp
@@ -994,7 +1004,7 @@ function InspectionDashboard({
 
   if (appMode === 'parameters') {
     return (
-      <div className={`app-shell theme-${uiState.theme} ${responsiveClassName} parameter-standalone-shell`}>
+      <div className={`app-shell theme-${uiState.theme} style-${uiState.themeStyle} ${responsiveClassName} parameter-standalone-shell`}>
         <StandaloneWindowTitlebar kind="parameters" title="后台管理" />
         <ParameterManagementApp />
       </div>
@@ -1002,7 +1012,7 @@ function InspectionDashboard({
   }
 
   return (
-    <div className={`app-shell theme-${uiState.theme} ${responsiveClassName}`}>
+    <div className={`app-shell theme-${uiState.theme} style-${uiState.themeStyle} ${responsiveClassName}`}>
       <BrandHeader
         status={deviceStatus}
         theme={uiState.theme}
@@ -1247,12 +1257,14 @@ function InspectionDashboard({
             <SettingsPage
               embedded
               theme={uiState.theme}
+              themeStyle={uiState.themeStyle}
               draft={settingsDraft}
               saved={savedSettings}
               errors={settingsErrors}
               connection={connectionDraft}
               connectionStatus={connectionStatus}
               onThemeChange={(theme) => setState({ theme })}
+              onThemeStyleChange={(themeStyle) => setState({ themeStyle })}
               onDraftChange={(patch) => {
                 const nextDraft = { ...settingsDraft, ...patch };
                 setSettingsDraft(nextDraft);

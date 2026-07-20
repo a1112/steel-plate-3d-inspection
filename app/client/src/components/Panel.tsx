@@ -10,7 +10,12 @@ interface PanelProps {
 
 export function Panel({ title, children, className = '', action, headerless = false }: PanelProps) {
   return (
-    <section className={`panel ${headerless ? 'panel-headerless' : ''} ${className}`}>
+    <section
+      className={`panel ${headerless ? 'panel-headerless' : ''} ${className}`}
+      aria-label={title}
+      data-layout-card
+      data-card-label={title}
+    >
       {headerless ? null : (
         <div className="panel-header">
           <h2>{title}</h2>

@@ -7,7 +7,9 @@ import {
   getVisibleDefects,
   paginateItems,
   persistTheme,
+  persistThemeStyle,
   readStoredTheme,
+  readStoredThemeStyle,
   selectRecord,
   selectDefect,
   toggleDefectType,
@@ -95,5 +97,19 @@ describe('inspection UI state helpers', () => {
 
     stored = 'emerald';
     expect(readStoredTheme(storage)).toBe('light');
+  });
+
+  it('persists the independent style dimension and rejects unknown styles', () => {
+    let stored: string | null = null;
+    const storage = {
+      getItem: () => stored,
+      setItem: (_key: string, value: string) => { stored = value; },
+    };
+
+    persistThemeStyle('tech', storage);
+    expect(readStoredThemeStyle(storage)).toBe('tech');
+
+    stored = 'neon';
+    expect(readStoredThemeStyle(storage)).toBe('default');
   });
 });

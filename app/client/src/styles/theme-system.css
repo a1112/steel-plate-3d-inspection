@@ -1,0 +1,696 @@
+/*
+ * Style system adapted from StraightnessGauge.
+ *
+ * Theme mode (light/dark/graphite) controls luminance. Theme style controls
+ * visual character. Existing components continue to consume the established
+ * semantic tokens, so the style system stays independent of business markup.
+ */
+
+.app-shell.style-soft.theme-light {
+  --style-page-bg:
+    radial-gradient(circle at 18% 0, rgba(244, 114, 182, 0.16), transparent 32%),
+    radial-gradient(circle at 82% 8%, rgba(45, 212, 191, 0.1), transparent 30%),
+    linear-gradient(135deg, #fff7fa 0%, #fffdfb 48%, #f4fbf9 100%);
+  --style-bg: #fff7fa;
+  --style-bg-2: #f4fbf9;
+  --style-card: rgba(255, 255, 255, 0.78);
+  --style-card-soft: rgba(255, 250, 252, 0.72);
+  --style-header: rgba(255, 255, 255, 0.74);
+  --style-border: rgba(244, 114, 182, 0.24);
+  --style-border-strong: rgba(20, 184, 166, 0.46);
+  --style-accent: #14b8a6;
+  --style-accent-2: #fb7185;
+  --style-accent-soft: rgba(20, 184, 166, 0.13);
+  --style-table-head: rgba(253, 242, 248, 0.8);
+  --style-shadow: 0 14px 34px rgba(244, 114, 182, 0.11);
+}
+
+.app-shell.style-soft:is(.theme-dark, .theme-graphite) {
+  --style-page-bg:
+    radial-gradient(circle at 16% 0, rgba(236, 72, 153, 0.3), transparent 32%),
+    radial-gradient(circle at 85% 6%, rgba(45, 212, 191, 0.25), transparent 28%),
+    linear-gradient(135deg, #111827 0%, #221538 48%, #082f2c 100%);
+  --style-bg: #111827;
+  --style-bg-2: #221538;
+  --style-card: rgba(15, 23, 42, 0.78);
+  --style-card-soft: rgba(30, 41, 59, 0.66);
+  --style-header: rgba(30, 20, 55, 0.78);
+  --style-border: rgba(244, 114, 182, 0.24);
+  --style-border-strong: rgba(94, 234, 212, 0.46);
+  --style-accent: #5eead4;
+  --style-accent-2: #fb7185;
+  --style-accent-soft: rgba(20, 184, 166, 0.16);
+  --style-table-head: rgba(42, 27, 61, 0.78);
+  --style-shadow: 0 18px 42px rgba(15, 23, 42, 0.5);
+}
+
+.app-shell.style-tech.theme-light {
+  --style-page-bg:
+    radial-gradient(circle at 12% 0, rgba(37, 99, 235, 0.14), transparent 28%),
+    radial-gradient(circle at 88% 8%, rgba(34, 211, 238, 0.16), transparent 30%),
+    linear-gradient(135deg, #eef6fb 0%, #fff 46%, #f0fbfd 100%);
+  --style-bg: #eef6fb;
+  --style-bg-2: #f0fbfd;
+  --style-card: rgba(255, 255, 255, 0.78);
+  --style-card-soft: rgba(240, 249, 255, 0.72);
+  --style-header: rgba(255, 255, 255, 0.74);
+  --style-border: rgba(14, 165, 233, 0.25);
+  --style-border-strong: rgba(6, 182, 212, 0.5);
+  --style-accent: #0284c7;
+  --style-accent-2: #06b6d4;
+  --style-accent-soft: rgba(14, 165, 233, 0.13);
+  --style-table-head: rgba(224, 242, 254, 0.78);
+  --style-shadow: 0 14px 34px rgba(2, 132, 199, 0.11);
+}
+
+.app-shell.style-tech:is(.theme-dark, .theme-graphite) {
+  --style-page-bg:
+    radial-gradient(circle at 15% 0, rgba(37, 99, 235, 0.38), transparent 32%),
+    radial-gradient(circle at 82% 8%, rgba(6, 182, 212, 0.3), transparent 28%),
+    linear-gradient(135deg, #010817 0%, #06223d 46%, #064e63 100%);
+  --style-bg: #010817;
+  --style-bg-2: #06223d;
+  --style-card: rgba(2, 15, 35, 0.78);
+  --style-card-soft: rgba(7, 35, 58, 0.66);
+  --style-header: rgba(7, 35, 58, 0.78);
+  --style-border: rgba(56, 189, 248, 0.28);
+  --style-border-strong: rgba(34, 211, 238, 0.52);
+  --style-accent: #22d3ee;
+  --style-accent-2: #60a5fa;
+  --style-accent-soft: rgba(34, 211, 238, 0.15);
+  --style-table-head: rgba(7, 42, 67, 0.8);
+  --style-shadow: 0 18px 44px rgba(2, 6, 23, 0.54);
+}
+
+.app-shell.style-industrial.theme-light {
+  --style-page-bg:
+    radial-gradient(circle at 18% 0, rgba(245, 158, 11, 0.14), transparent 28%),
+    radial-gradient(circle at 86% 8%, rgba(82, 82, 91, 0.1), transparent 28%),
+    linear-gradient(135deg, #f3f4f6 0%, #fff 48%, #f7f2e8 100%);
+  --style-bg: #f3f4f6;
+  --style-bg-2: #f7f2e8;
+  --style-card: rgba(255, 255, 255, 0.78);
+  --style-card-soft: rgba(250, 250, 250, 0.72);
+  --style-header: rgba(255, 255, 255, 0.74);
+  --style-border: rgba(245, 158, 11, 0.26);
+  --style-border-strong: rgba(82, 82, 91, 0.42);
+  --style-accent: #f59e0b;
+  --style-accent-2: #52525b;
+  --style-accent-soft: rgba(245, 158, 11, 0.14);
+  --style-table-head: rgba(244, 244, 245, 0.8);
+  --style-shadow: 0 14px 34px rgba(39, 39, 42, 0.12);
+}
+
+.app-shell.style-industrial:is(.theme-dark, .theme-graphite) {
+  --style-page-bg:
+    radial-gradient(circle at 18% 0, rgba(245, 158, 11, 0.26), transparent 30%),
+    radial-gradient(circle at 85% 8%, rgba(113, 113, 122, 0.2), transparent 28%),
+    linear-gradient(135deg, #09090b 0%, #1f1b14 48%, #312615 100%);
+  --style-bg: #09090b;
+  --style-bg-2: #1f1b14;
+  --style-card: rgba(9, 9, 11, 0.78);
+  --style-card-soft: rgba(39, 39, 42, 0.68);
+  --style-header: rgba(24, 24, 27, 0.8);
+  --style-border: rgba(245, 158, 11, 0.28);
+  --style-border-strong: rgba(251, 191, 36, 0.5);
+  --style-accent: #fbbf24;
+  --style-accent-2: #e5e7eb;
+  --style-accent-soft: rgba(245, 158, 11, 0.15);
+  --style-table-head: rgba(39, 39, 42, 0.82);
+  --style-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+}
+
+.app-shell.style-modern.theme-light {
+  --style-page-bg:
+    radial-gradient(circle at 10% 0, rgba(99, 102, 241, 0.14), transparent 28%),
+    radial-gradient(circle at 88% 8%, rgba(16, 185, 129, 0.1), transparent 30%),
+    linear-gradient(135deg, #f5f7ff 0%, #fff 48%, #f3fbf6 100%);
+  --style-bg: #f5f7ff;
+  --style-bg-2: #f3fbf6;
+  --style-card: rgba(255, 255, 255, 0.78);
+  --style-card-soft: rgba(248, 250, 252, 0.72);
+  --style-header: rgba(255, 255, 255, 0.74);
+  --style-border: rgba(99, 102, 241, 0.23);
+  --style-border-strong: rgba(16, 185, 129, 0.46);
+  --style-accent: #4f46e5;
+  --style-accent-2: #10b981;
+  --style-accent-soft: rgba(79, 70, 229, 0.12);
+  --style-table-head: rgba(238, 242, 255, 0.8);
+  --style-shadow: 0 14px 34px rgba(79, 70, 229, 0.1);
+}
+
+.app-shell.style-modern:is(.theme-dark, .theme-graphite) {
+  --style-page-bg:
+    radial-gradient(circle at 12% 0, rgba(99, 102, 241, 0.32), transparent 30%),
+    radial-gradient(circle at 85% 8%, rgba(16, 185, 129, 0.22), transparent 28%),
+    linear-gradient(135deg, #0f172a 0%, #1e1b4b 46%, #052e2b 100%);
+  --style-bg: #0f172a;
+  --style-bg-2: #1e1b4b;
+  --style-card: rgba(15, 23, 42, 0.78);
+  --style-card-soft: rgba(30, 41, 59, 0.67);
+  --style-header: rgba(30, 27, 75, 0.78);
+  --style-border: rgba(129, 140, 248, 0.25);
+  --style-border-strong: rgba(52, 211, 153, 0.46);
+  --style-accent: #818cf8;
+  --style-accent-2: #34d399;
+  --style-accent-soft: rgba(99, 102, 241, 0.16);
+  --style-table-head: rgba(30, 41, 79, 0.82);
+  --style-shadow: 0 18px 44px rgba(2, 6, 23, 0.48);
+}
+
+.app-shell:is(.style-soft, .style-tech, .style-industrial, .style-modern) {
+  --bg: var(--style-bg);
+  --bg-2: var(--style-bg-2);
+  --panel: var(--style-card);
+  --panel-soft: var(--style-card-soft);
+  --header: var(--style-header);
+  --nav: var(--style-card-soft);
+  --line: var(--style-border);
+  --line-strong: var(--style-border-strong);
+  --blue: var(--style-accent);
+  --cyan: var(--style-accent-2);
+  --blue-soft: var(--style-accent-soft);
+  --table-head: var(--style-table-head);
+  --shadow: var(--style-shadow);
+  --surface-elevated: var(--style-card);
+  --surface-overlay: color-mix(in srgb, var(--style-bg) 88%, transparent);
+  --surface-input: var(--style-card-soft);
+  --surface-hover: var(--style-accent-soft);
+  --accent-text: var(--style-accent);
+  background: var(--style-page-bg);
+}
+
+.app-shell[class*='style-'] :is(
+  .panel,
+  .settings-modal,
+  .report-document-header,
+  .camera-detail-popover,
+  .brand-header,
+  .app-footer
+) {
+  -webkit-backdrop-filter: blur(18px) saturate(1.5);
+  backdrop-filter: blur(18px) saturate(1.5);
+}
+
+.app-shell:is(.style-soft, .style-tech, .style-industrial, .style-modern) :is(
+  .panel,
+  .settings-modal,
+  .report-document-header,
+  .camera-detail-popover
+) {
+  border-color: var(--style-border);
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--style-accent) 8%, transparent), transparent 54%),
+    var(--style-card);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 0 0 1px color-mix(in srgb, var(--style-accent) 10%, transparent),
+    var(--style-shadow);
+}
+
+.app-shell:is(.style-soft, .style-tech, .style-industrial, .style-modern) :is(
+  .brand-header,
+  .app-footer,
+  .panel-header,
+  .settings-modal-header
+) {
+  border-color: var(--style-border);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--style-accent) 9%, transparent), transparent),
+    var(--style-header);
+}
+
+.theme-system-selector {
+  display: grid;
+  gap: 22px;
+}
+
+.theme-system-selector > section {
+  display: grid;
+  gap: 10px;
+}
+
+.theme-system-selector > section > header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.theme-system-selector > section > header strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.theme-system-selector > section > header span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.theme-style-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(132px, 1fr));
+  gap: 10px;
+}
+
+.theme-style-card {
+  min-height: 112px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: 1fr auto;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--panel-soft);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+}
+
+.theme-style-card > svg {
+  color: var(--blue);
+}
+
+.theme-style-card .theme-option-swatches {
+  grid-column: 1 / -1;
+}
+
+.theme-style-card:hover,
+.theme-style-card.active {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 2px var(--blue-soft) inset, 0 8px 20px color-mix(in srgb, var(--blue) 12%, transparent);
+  transform: translateY(-1px);
+}
+
+.theme-system-selector .theme-option-grid {
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+}
+
+.theme-system-selector .theme-option-card {
+  min-height: 88px;
+}
+
+@media (max-width: 1420px) {
+  .theme-style-grid {
+    grid-template-columns: repeat(3, minmax(150px, 1fr));
+  }
+}
+
+/* Component language: compact glass cards and controls from StraightnessGauge. */
+.app-shell[class*='style-'] {
+  --component-radius: 10px;
+  --control-radius: 8px;
+  --control-height: 34px;
+  --component-border: color-mix(in srgb, var(--line-strong) 72%, transparent);
+  --component-highlight: color-mix(in srgb, var(--blue) 13%, transparent);
+  --component-focus: 0 0 0 3px color-mix(in srgb, var(--blue) 18%, transparent);
+}
+
+.app-shell[class*='style-'] button,
+.app-shell[class*='style-'] input,
+.app-shell[class*='style-'] select,
+.app-shell[class*='style-'] textarea {
+  transition:
+    color 140ms ease,
+    border-color 140ms ease,
+    background-color 140ms ease,
+    box-shadow 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease;
+}
+
+.app-shell[class*='style-'] .panel,
+.app-shell[class*='style-'] .settings-modal,
+.app-shell[class*='style-'] .report-document-header,
+.app-shell[class*='style-'] .camera-detail-popover {
+  border: 1px solid var(--component-border);
+  border-radius: var(--component-radius);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.045), transparent 44%),
+    var(--panel);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 12px 28px color-mix(in srgb, var(--bg) 34%, transparent);
+}
+
+.app-shell[class*='style-'] :is(.panel, .settings-modal, .report-document-header)::before {
+  display: none;
+}
+
+.app-shell[class*='style-'] .panel-header {
+  height: 38px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-soft) 74%, transparent);
+}
+
+.app-shell[class*='style-'] .panel-header h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  text-shadow: none;
+}
+
+.app-shell[class*='style-'] .panel-header h2::before {
+  position: static;
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 999px;
+  background: var(--blue);
+  box-shadow: 0 0 9px color-mix(in srgb, var(--blue) 64%, transparent);
+}
+
+.app-shell[class*='style-'] .panel-body {
+  height: calc(100% - 38px);
+  padding: 11px;
+}
+
+.app-shell[class*='style-'] .panel-headerless .panel-body {
+  height: 100%;
+}
+
+.app-shell[class*='style-'] :is(
+  .record-search-field-select,
+  .record-search-form input,
+  .record-search-form select,
+  .workspace-page input,
+  .workspace-page select,
+  .workspace-page textarea,
+  .settings-page input,
+  .settings-page select,
+  .settings-page textarea,
+  .settings-modal input,
+  .settings-modal select,
+  .settings-modal textarea
+) {
+  min-height: var(--control-height);
+  border: 1px solid var(--line);
+  border-radius: var(--control-radius);
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface-input) 88%, transparent);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--bg) 14%, transparent);
+  outline: none;
+}
+
+.app-shell[class*='style-'] :is(
+  .record-search-field-select,
+  .record-search-form input,
+  .record-search-form select,
+  .workspace-page input,
+  .workspace-page select,
+  .workspace-page textarea,
+  .settings-page input,
+  .settings-page select,
+  .settings-page textarea,
+  .settings-modal input,
+  .settings-modal select,
+  .settings-modal textarea
+):focus {
+  border-color: color-mix(in srgb, var(--blue) 68%, var(--line));
+  box-shadow: var(--component-focus);
+}
+
+.app-shell[class*='style-'] :is(
+  .record-search-actions button,
+  .form-actions button,
+  .settings-actions button,
+  .status-actions button,
+  .pager button,
+  .icon-filter,
+  .analysis-collapse-button,
+  .inspection-flow-launcher,
+  .app-footer-nav button,
+  .app-footer-flow-button
+) {
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--control-radius);
+  color: var(--text);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.055), transparent),
+    var(--panel-soft);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+}
+
+.app-shell[class*='style-'] :is(
+  .record-search-actions button,
+  .form-actions button,
+  .settings-actions button,
+  .status-actions button,
+  .pager button,
+  .icon-filter,
+  .analysis-collapse-button,
+  .inspection-flow-launcher,
+  .app-footer-nav button,
+  .app-footer-flow-button
+):not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--blue) 65%, var(--line));
+  color: var(--accent-text);
+  background: var(--component-highlight);
+  box-shadow: var(--component-focus);
+  transform: translateY(-1px);
+}
+
+.app-shell[class*='style-'] :is(
+  .plate-view-switch,
+  .surface-mode-switch,
+  .app-footer-view-group,
+  .connection-mode-toggle
+) {
+  border: 1px solid var(--line);
+  border-radius: var(--control-radius);
+  background: color-mix(in srgb, var(--panel-soft) 86%, transparent);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--bg) 15%, transparent);
+}
+
+.app-shell[class*='style-'] :is(
+  .plate-view-switch,
+  .surface-mode-switch,
+  .app-footer-view-group,
+  .connection-mode-toggle
+) button {
+  border-radius: calc(var(--control-radius) - 3px);
+}
+
+.app-shell[class*='style-'] :is(
+  .plate-view-switch,
+  .surface-mode-switch,
+  .app-footer-view-group,
+  .connection-mode-toggle
+) button.active {
+  color: #fff;
+  background: var(--blue);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 4px 12px color-mix(in srgb, var(--blue) 28%, transparent);
+}
+
+.app-shell[class*='style-'] .top-nav {
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--component-radius);
+  background: color-mix(in srgb, var(--panel-soft) 78%, transparent);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--bg) 16%, transparent);
+}
+
+.app-shell[class*='style-'] .top-nav button {
+  min-height: 32px;
+  border: 1px solid transparent;
+  border-radius: calc(var(--control-radius) - 1px);
+  color: var(--muted);
+  background: transparent;
+}
+
+.app-shell[class*='style-'] .top-nav button:hover {
+  border-color: var(--line);
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.app-shell[class*='style-'] .top-nav button.active {
+  border-color: color-mix(in srgb, var(--blue) 46%, var(--line));
+  color: var(--accent-text);
+  background: var(--component-highlight);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 4px 14px color-mix(in srgb, var(--blue) 14%, transparent);
+}
+
+.app-shell[class*='style-'] .settings-section-list button {
+  min-height: 58px;
+  border: 1px solid transparent;
+  border-radius: var(--control-radius);
+  background: transparent;
+}
+
+.app-shell[class*='style-'] .settings-section-list button:hover {
+  border-color: var(--line);
+  background: var(--surface-hover);
+}
+
+.app-shell[class*='style-'] .settings-section-list button.active {
+  border-color: color-mix(in srgb, var(--blue) 46%, var(--line));
+  background: var(--component-highlight);
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+
+.app-shell[class*='style-'] :is(.theme-option-card, .theme-style-card) {
+  border-radius: var(--component-radius);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.05), transparent 45%),
+    var(--panel-soft);
+}
+
+.app-shell[class*='style-'] :is(.theme-option-card, .theme-style-card).active {
+  border-color: color-mix(in srgb, var(--blue) 64%, var(--line));
+  background: var(--component-highlight);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--blue) 14%, transparent),
+    0 8px 20px color-mix(in srgb, var(--blue) 13%, transparent);
+}
+
+.app-shell[class*='style-'] :is(.records-table, .defect-table, .detail-table) {
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.app-shell[class*='style-'] :is(.records-table, .defect-table, .detail-table) th {
+  height: 32px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  background: color-mix(in srgb, var(--table-head) 88%, transparent);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.app-shell[class*='style-'] :is(.records-table, .defect-table, .detail-table) td {
+  height: 32px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+  font-size: 12px;
+}
+
+.app-shell[class*='style-'] :is(.records-table, .defect-table) tbody tr {
+  border: 0;
+}
+
+.app-shell[class*='style-'] :is(.records-table, .defect-table) tbody tr:hover {
+  background: color-mix(in srgb, var(--blue) 8%, transparent);
+}
+
+.app-shell[class*='style-'] :is(.records-table, .defect-table) tbody tr.selected {
+  background: color-mix(in srgb, var(--blue) 14%, transparent);
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+
+.app-shell[class*='style-'] .sidebar-alert-card {
+  min-height: 48px;
+  border-radius: var(--component-radius);
+  background:
+    linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(127, 29, 29, 0.12)),
+    var(--panel);
+  border-color: rgba(248, 113, 113, 0.36);
+  color: var(--text);
+  box-shadow:
+    inset 3px 0 0 #ef4444,
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 8px 22px rgba(127, 29, 29, 0.13);
+}
+
+.app-shell[class*='style-'] .sidebar-alert-card.stable {
+  border-color: rgba(52, 211, 153, 0.3);
+  background:
+    linear-gradient(135deg, rgba(16, 185, 129, 0.16), rgba(6, 78, 59, 0.09)),
+    var(--panel);
+  box-shadow:
+    inset 3px 0 0 #10b981,
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 8px 22px rgba(6, 78, 59, 0.12);
+}
+
+.app-shell[class*='style-'] :is(
+  .sidebar-alert-card b,
+  .production-artifact-tag,
+  .demo-artifact-badge,
+  .synthetic-defect-badge,
+  .candidate-defect-badge,
+  .admin-session-badge,
+  .alarm-center-status,
+  .status-chip,
+  .point-cloud-zoom-tag,
+  .depth-tag,
+  .chart-axis-range-tag
+) {
+  border-radius: 999px;
+  -webkit-backdrop-filter: blur(10px) saturate(1.25);
+  backdrop-filter: blur(10px) saturate(1.25);
+}
+
+.app-shell[class*='style-'] .toggle-field {
+  border: 1px solid var(--line);
+  border-radius: var(--control-radius);
+  background: color-mix(in srgb, var(--panel-soft) 72%, transparent);
+}
+
+.app-shell[class*='style-'] .toggle-field i {
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-input) 84%, transparent);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--bg) 20%, transparent);
+}
+
+.app-shell[class*='style-'] .toggle-field input:checked + i {
+  border-color: var(--blue);
+  background: var(--blue);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 13%, transparent);
+}
+
+.app-shell[class*='style-'] :is(.toast, .app-notification-toast) {
+  border: 1px solid var(--component-border);
+  border-radius: var(--component-radius);
+  background: color-mix(in srgb, var(--surface-overlay) 86%, transparent);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    var(--floating-shadow);
+  -webkit-backdrop-filter: blur(18px) saturate(1.45);
+  backdrop-filter: blur(18px) saturate(1.45);
+}
+
+.app-shell[class*='style-'] :is(
+  .records-table-wrap,
+  .defect-table-wrap,
+  .settings-content,
+  .settings-theme-panel .panel-body,
+  .custom-scrollbar
+) {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--blue) 34%, transparent) transparent;
+}
+
+.app-shell[class*='style-'] :is(
+  .records-table-wrap,
+  .defect-table-wrap,
+  .settings-content,
+  .settings-theme-panel .panel-body,
+  .custom-scrollbar
+)::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.app-shell[class*='style-'] :is(
+  .records-table-wrap,
+  .defect-table-wrap,
+  .settings-content,
+  .settings-theme-panel .panel-body,
+  .custom-scrollbar
+)::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--blue) 34%, transparent);
+}
