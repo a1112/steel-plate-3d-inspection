@@ -461,12 +461,12 @@ button {
 .brand-header {
   position: relative;
   z-index: 20;
-  height: 58px;
+  height: 50px;
   display: grid;
-  grid-template-columns: auto minmax(520px, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: 10px;
-  padding: 5px 8px;
+  gap: 8px;
+  padding: 3px 6px;
   border-bottom: 1px solid var(--line-strong);
   background:
     linear-gradient(90deg, color-mix(in srgb, var(--blue) 16%, transparent), transparent 40%),
@@ -487,34 +487,36 @@ button {
 }
 
 .ustb-logo {
-  width: 176px;
-  height: 48px;
+  width: 164px;
+  height: 42px;
   object-fit: contain;
   border-radius: 3px;
 }
 
 .title-meta-group {
   min-width: 0;
-  display: flex;
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  gap: 14px;
-  justify-self: start;
+  gap: 10px;
 }
 
 .system-title {
   position: relative;
   z-index: 1;
-  flex: 0 0 auto;
-  max-width: none;
+  min-width: 0;
+  max-width: 100%;
+  justify-self: center;
   padding: 0;
   border-right: 0;
   border-left: 0;
   color: var(--text);
-  font-size: 24px;
+  font-size: 22px;
   font-weight: 900;
   line-height: 1;
   overflow: hidden;
-  text-align: left;
+  text-align: center;
   text-overflow: ellipsis;
   white-space: nowrap;
   pointer-events: none;
@@ -1476,7 +1478,7 @@ button {
 }
 
 .brand-header .top-nav.top-nav-embedded {
-  height: 34px;
+  height: 30px;
   flex: 0 1 auto;
   justify-content: flex-start;
   gap: 6px;
@@ -1487,9 +1489,9 @@ button {
 }
 
 .brand-header .top-nav.top-nav-embedded button {
-  height: 32px;
-  min-width: 96px;
-  padding: 0 10px;
+  height: 30px;
+  min-width: 90px;
+  padding: 0 8px;
   gap: 6px;
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -1521,7 +1523,7 @@ button {
 }
 
 .brand-header .top-nav.top-nav-embedded .top-nav-workbench {
-  min-width: 96px;
+  min-width: 90px;
   color: var(--blue);
 }
 
@@ -1555,8 +1557,8 @@ button {
   min-height: 0;
   display: grid;
   grid-template-columns: clamp(260px, 16.8vw, 280px) minmax(0, 1fr);
-  gap: 10px;
-  padding: 0 12px 12px;
+  gap: 6px;
+  padding: 0 8px 8px;
   background: var(--bg);
 }
 
@@ -1801,7 +1803,8 @@ button {
 
 .dashboard-grid.online-dashboard-grid {
   grid-template-columns: minmax(0, 1fr) clamp(340px, 22.7vw, 380px);
-  padding: 10px 0 0;
+  gap: 6px;
+  padding: 6px 0 0;
   background: transparent;
 }
 
@@ -1822,7 +1825,8 @@ button {
 }
 
 .right-column {
-  grid-template-rows: minmax(430px, 1fr) minmax(330px, 0.8fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 6px;
 }
 
 .panel {
@@ -4283,13 +4287,13 @@ button {
 
 .defect-filter-panel .panel-body {
   height: auto;
-  padding: 8px 10px 10px;
+  padding: 6px 8px 8px;
   overflow: visible;
 }
 
 .defect-type-filter {
   min-width: 0;
-  height: 34px;
+  height: 30px;
   display: grid;
   grid-template-columns: 10px minmax(0, 1fr) auto;
   align-items: center;
@@ -4352,7 +4356,7 @@ button {
 }
 
 .severity-filter-inline {
-  height: 26px;
+  height: 24px;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -4397,14 +4401,14 @@ button {
 }
 
 .severity-filter-inline.active {
-  color: #fff;
+  color: var(--severity-color);
   border-color: var(--severity-color);
-  background: var(--severity-color);
+  background: color-mix(in srgb, var(--severity-color) 16%, var(--panel));
   box-shadow: 0 1px 5px color-mix(in srgb, var(--severity-color) 35%, transparent);
 }
 
 .severity-filter-inline.active strong {
-  color: #fff;
+  color: var(--severity-color);
 }
 
 .defect-count-grid {
@@ -7599,14 +7603,14 @@ button {
 
 .density-dense .online-workspace {
   grid-template-columns: clamp(238px, 19vw, 250px) minmax(0, 1fr);
-  gap: 8px;
-  padding: 0 8px 10px;
+  gap: 6px;
+  padding: 0 8px 8px;
 }
 
 .density-dense .dashboard-grid.online-dashboard-grid {
   grid-template-columns: minmax(0, 1fr) clamp(300px, 25vw, 330px);
-  gap: 8px;
-  padding: 8px 0 0;
+  gap: 6px;
+  padding: 6px 0 0;
 }
 
 .density-dense .online-workspace > .left-column {
@@ -7616,7 +7620,7 @@ button {
 .density-dense .left-column,
 .density-dense .center-column,
 .density-dense .right-column {
-  gap: 7px;
+  gap: 6px;
 }
 
 .density-dense .left-column {
@@ -8176,11 +8180,11 @@ button {
 
 @media (max-height: 820px) {
   .brand-header {
-    height: 64px;
+    height: 50px;
   }
 
   .ustb-logo {
-    height: 54px;
+    height: 42px;
   }
 
   .top-nav,
@@ -8193,7 +8197,7 @@ button {
   }
 
   .online-workspace {
-    padding: 0 10px 10px;
+    padding: 0 8px 8px;
   }
 
   .online-workspace > .left-column {
@@ -8201,7 +8205,7 @@ button {
   }
 
   .dashboard-grid.online-dashboard-grid {
-    padding: 8px 0 0;
+    padding: 6px 0 0;
   }
 
   .left-column {
@@ -8213,7 +8217,7 @@ button {
   }
 
   .right-column {
-    grid-template-rows: minmax(340px, 1fr) minmax(250px, 0.8fr);
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .panel-header {
@@ -8571,13 +8575,13 @@ button {
 
 .theme-dark .online-workspace {
   grid-template-columns: clamp(230px, 14.4vw, 246px) minmax(0, 1fr);
-  gap: 8px;
+  gap: 6px;
   padding: 0 8px 8px;
 }
 
 .theme-dark .dashboard-grid.online-dashboard-grid {
   grid-template-columns: minmax(0, 1fr) clamp(282px, 16vw, 312px);
-  gap: 8px;
+  gap: 6px;
 }
 
 .theme-dark .center-column {
@@ -8586,8 +8590,8 @@ button {
 }
 
 .theme-dark .right-column {
-  gap: 8px;
-  grid-template-rows: minmax(380px, 1fr) minmax(300px, 0.8fr);
+  gap: 6px;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .theme-dark .left-column {
@@ -9557,9 +9561,9 @@ button {
 }
 
 .theme-light .severity-filter-inline.active {
-  color: #fff;
+  color: var(--severity-color);
   border-color: var(--severity-color);
-  background: var(--severity-color);
+  background: color-mix(in srgb, var(--severity-color) 16%, white);
   box-shadow: 0 2px 8px color-mix(in srgb, var(--severity-color) 25%, transparent);
 }
 
