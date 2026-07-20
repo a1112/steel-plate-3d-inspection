@@ -7678,11 +7678,6 @@ button {
   padding: 8px;
 }
 
-.density-dense .defect-filter-panel .panel-body {
-  height: auto;
-  padding: 6px 8px 8px;
-}
-
 .density-dense .record-search-form {
   grid-template-rows: 28px 25px auto;
   gap: 7px;
@@ -8669,11 +8664,6 @@ button {
 .theme-dark .panel-body {
   height: calc(100% - 34px);
   padding: 9px;
-}
-
-.theme-dark .defect-filter-panel .panel-body {
-  height: auto;
-  padding: 6px 8px 8px;
 }
 
 .theme-dark .panel-headerless .panel-body {
@@ -9666,7 +9656,7 @@ button {
   background: transparent;
 }
 
-.app-shell.theme-light .defect-filter-panel .panel-body {
+.app-shell[class*='style-'] .defect-filter-panel .panel-body {
   height: auto;
   padding: 6px 8px 8px;
 }

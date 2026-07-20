@@ -72,11 +72,8 @@ describe('compact online detection layout CSS contract', () => {
     expectDeclaration('.severity-filter-inline', 'height', '24px');
   });
 
-  it.each([
-    '.density-dense .defect-filter-panel .panel-body',
-    '.theme-dark .defect-filter-panel .panel-body',
-    '.app-shell.theme-light .defect-filter-panel .panel-body',
-  ])('preserves compact defect filter sizing through the %s cascade', (selector) => {
+  it('preserves compact defect filter sizing across every themed style cascade', () => {
+    const selector = ".app-shell[class*='style-'] .defect-filter-panel .panel-body";
     expectDeclaration(selector, 'height', 'auto');
     expectDeclaration(selector, 'padding', '6px 8px 8px');
   });
