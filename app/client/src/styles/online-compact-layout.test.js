@@ -58,6 +58,7 @@ describe('compact online detection layout CSS contract', () => {
     expectDeclaration('.title-meta-group', 'min-width', '0');
     expectDeclaration('.system-title', 'justify-self', 'center');
     expectDeclaration('.system-title', 'min-width', '0');
+    expectDeclaration('.system-title', 'width', '100%');
     expectDeclaration('.system-title', 'font-size', '22px');
     expectDeclaration('.system-title', 'text-align', 'center');
     expectDeclaration('.brand-header .top-nav.top-nav-embedded', 'height', '30px');
@@ -95,6 +96,17 @@ describe('compact online detection layout CSS contract', () => {
     );
     expect(lightActive).not.toMatch(/color\s*:\s*#fff|background\s*:\s*var\(--severity-color\)/);
   });
+
+  it.each(['severe', 'review', 'minor'])(
+    'keeps the %s severity button color aligned with its border and tint',
+    (severity) => {
+      expectDeclaration(
+        `.severity-filter-inline.${severity}`,
+        'color',
+        'var(--severity-color) !important',
+      );
+    },
+  );
 
   it('does not restore legacy spacing through density, responsive, or theme overrides', () => {
     expectEveryDeclaredValue('.brand-header', 'height', '50px');

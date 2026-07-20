@@ -506,6 +506,7 @@ button {
   position: relative;
   z-index: 1;
   min-width: 0;
+  width: 100%;
   max-width: 100%;
   justify-self: center;
   padding: 0;
@@ -4378,17 +4379,17 @@ button {
 
 .severity-filter-inline.severe {
   --severity-color: #d62939;
-  color: var(--severity-color);
+  color: var(--severity-color) !important;
 }
 
 .severity-filter-inline.review {
   --severity-color: #a87000;
-  color: var(--severity-color);
+  color: var(--severity-color) !important;
 }
 
 .severity-filter-inline.minor {
   --severity-color: #16844a;
-  color: var(--severity-color);
+  color: var(--severity-color) !important;
 }
 
 .severity-filter-inline:hover {
