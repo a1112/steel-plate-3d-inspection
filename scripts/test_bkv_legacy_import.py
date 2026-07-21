@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import stat
 import subprocess
 import tempfile
@@ -25,6 +26,17 @@ Name: image_copy/CamImageSource1/1893699/2D/old.jpg
 Type: File
 Size: 7
 CRC32: 87654321
+"""
+
+RAR_LISTING_ZH = """名称: image_copy/CamImageSource1/1893700/2D/a.jpg
+类型: 文件
+大小: 12
+CRC32: ABCDEF01
+
+名称: image_copy/CamImageSource6/1893710/3D/a.d3img
+类型: 文件
+大小: 24
+CRC32: 12345678
 """
 
 
@@ -68,6 +80,31 @@ class MemberPolicyTests(unittest.TestCase):
                 else:
                     self.assertIsNone(subject.normalize_member(value))
 
+    def test_windows_unsafe_components_and_batch_ids_are_rejected(self):
+        unsafe_names = (
+            "bad:name.jpg",
+            "control\x1f.jpg",
+            "trailing.jpg.",
+            "trailing.jpg ",
+            "CON.jpg",
+            "prn",
+            "AUX.dat",
+            "nul.jpg",
+            "COM1.jpg",
+            "lpt9.d3img",
+        )
+        for name in unsafe_names:
+            member = f"image_copy/CamImageSource1/1893700/2D/{name}"
+            with self.subTest(member=member):
+                self.assertIsNone(subject.normalize_member(member))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            for batch_id in ("CON", "aux.txt", "bad:id", "bad.", "bad "):
+                with self.subTest(batch_id=batch_id):
+                    with self.assertRaisesRegex(ValueError, "batch-id"):
+                        subject._validate_output_path(output, batch_id, ())
+
 
 class InventoryTests(unittest.TestCase):
     def setUp(self):
@@ -89,6 +126,8 @@ class InventoryTests(unittest.TestCase):
     def _runner(self, command, **kwargs):
         self.assertEqual(Path(command[0]), self.unrar.resolve())
         self.assertIn("lt", command)
+        self.assertIn("-cfg-", command)
+        self.assertEqual(kwargs["timeout"], subject.UNRAR_TIMEOUT_SECONDS)
         archive = Path(command[-1])
         listing = RAR_LISTING if archive == self.part1.resolve() else ""
         return subprocess.CompletedProcess(command, 0, listing, "")
@@ -140,6 +179,14 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(
             manifest["archives"]["image-part1"]["sha256"],
             hashlib.sha256(b"part-one").hexdigest(),
+        )
+        self.assertEqual(
+            manifest["statistics"]["image-part1"],
+            {"recordsSeen": 3, "accepted": 2, "rejected": 1},
+        )
+        self.assertEqual(
+            manifest["statistics"]["database-zip"],
+            {"recordsSeen": 1, "accepted": 1, "rejected": 0},
         )
 
     def test_zip_crc_failure_is_recorded_not_reported_ok(self):
@@ -263,6 +310,232 @@ Target: ../../escape.jpg
                 unrar=self.unrar,
                 runner=linked_rar_runner,
             )
+
+    def test_unrar_english_chinese_and_malformed_listings(self):
+        for listing in (RAR_LISTING, RAR_LISTING_ZH):
+            with self.subTest(language=listing[:4]):
+                records = subject._parse_unrar_listing(listing)
+                entries, statistics = subject._records_to_rar_entries(
+                    records, "image-part1"
+                )
+                self.assertEqual(len(entries), 2)
+                self.assertEqual(statistics["recordsSeen"], len(records))
+                self.assertEqual(statistics["accepted"], 2)
+
+        def malformed_runner(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, "not technical output\n", "")
+
+        with self.assertRaisesRegex(RuntimeError, "structured"):
+            subject.inventory_archives(
+                database_zip=self.database_zip,
+                image_part1=self.part1,
+                image_part2=self.part2,
+                output_root=self.root / "malformed-output",
+                batch_id="malformed",
+                unrar=self.unrar,
+                runner=malformed_runner,
+            )
+
+    def test_inventory_limits_are_fail_closed(self):
+        with mock.patch.object(subject, "MAX_ZIP_MEMBERS", 0):
+            with self.assertRaisesRegex(subject.InventoryLimitError, "ZIP member count"):
+                subject.inventory_archives(
+                    database_zip=self.database_zip,
+                    image_part1=self.part1,
+                    image_part2=self.part2,
+                    output_root=self.root / "zip-limit-output",
+                    batch_id="zip-limit",
+                    unrar=self.unrar,
+                    runner=self._runner,
+                )
+
+        for constant, message in (
+            ("MAX_ZIP_MEMBER_BYTES", "ZIP member bytes"),
+            ("MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES", "ZIP total uncompressed bytes"),
+        ):
+            with self.subTest(constant=constant):
+                with mock.patch.object(subject, constant, 1):
+                    with self.assertRaisesRegex(subject.InventoryLimitError, message):
+                        subject.inventory_archives(
+                            database_zip=self.database_zip,
+                            image_part1=self.part1,
+                            image_part2=self.part2,
+                            output_root=self.root / f"{constant}-output",
+                            batch_id=constant.lower(),
+                            unrar=self.unrar,
+                            runner=self._runner,
+                        )
+
+        with mock.patch.object(subject, "MAX_ZIP_COMPRESSION_RATIO", 0.5):
+            with self.assertRaisesRegex(subject.InventoryLimitError, "compression ratio"):
+                subject.inventory_archives(
+                    database_zip=self.database_zip,
+                    image_part1=self.part1,
+                    image_part2=self.part2,
+                    output_root=self.root / "ratio-limit-output",
+                    batch_id="ratio-limit",
+                    unrar=self.unrar,
+                    runner=self._runner,
+                )
+
+        with mock.patch.object(subject, "MAX_UNRAR_OUTPUT_BYTES", 8):
+            with self.assertRaisesRegex(subject.InventoryLimitError, "output bytes"):
+                subject.inventory_archives(
+                    database_zip=self.database_zip,
+                    image_part1=self.part1,
+                    image_part2=self.part2,
+                    output_root=self.root / "output-limit-output",
+                    batch_id="output-limit",
+                    unrar=self.unrar,
+                    runner=self._runner,
+                )
+
+        with mock.patch.object(subject, "MAX_RAR_LISTING_RECORDS", 1):
+            with self.assertRaisesRegex(subject.InventoryLimitError, "record count"):
+                subject.inventory_archives(
+                    database_zip=self.database_zip,
+                    image_part1=self.part1,
+                    image_part2=self.part2,
+                    output_root=self.root / "record-limit-output",
+                    batch_id="record-limit",
+                    unrar=self.unrar,
+                    runner=self._runner,
+                )
+
+        with mock.patch.object(subject, "MAX_MANIFEST_BYTES", 1):
+            with self.assertRaisesRegex(subject.InventoryLimitError, "manifest bytes"):
+                subject.inventory_archives(
+                    database_zip=self.database_zip,
+                    image_part1=self.part1,
+                    image_part2=self.part2,
+                    output_root=self.root / "manifest-limit-output",
+                    batch_id="manifest-limit",
+                    unrar=self.unrar,
+                    runner=self._runner,
+                )
+
+    def test_unrar_timeout_and_absolute_trust_boundary(self):
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            subject.locate_unrar("UnRAR.exe")
+
+        def timeout_runner(command, **kwargs):
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            subject.inventory_archives(
+                database_zip=self.database_zip,
+                image_part1=self.part1,
+                image_part2=self.part2,
+                output_root=self.root / "timeout-output",
+                batch_id="timeout",
+                unrar=self.unrar,
+                runner=timeout_runner,
+            )
+
+    def test_archive_change_during_inventory_is_rejected(self):
+        changed = False
+
+        def mutating_runner(command, **kwargs):
+            nonlocal changed
+            if not changed:
+                self.part1.write_bytes(b"changed-during-listing")
+                changed = True
+            return subprocess.CompletedProcess(command, 0, RAR_LISTING, "")
+
+        with self.assertRaisesRegex(RuntimeError, "changed during inventory"):
+            subject.inventory_archives(
+                database_zip=self.database_zip,
+                image_part1=self.part1,
+                image_part2=self.part2,
+                output_root=self.root / "changed-output",
+                batch_id="changed",
+                unrar=self.unrar,
+                runner=mutating_runner,
+            )
+        self.assertFalse(
+            (self.root / "changed-output" / "changed" / subject.MANIFEST_NAME).exists()
+        )
+
+    def test_windows_casefold_collisions_are_rejected(self):
+        collision_listing = """Name: image_copy/CamImageSource1/1893700/2D/A.jpg
+Type: File
+Size: 12
+
+Name: image_copy/CamImageSource1/1893700/2D/a.JPG
+Type: File
+Size: 12
+"""
+
+        def collision_runner(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, collision_listing, "")
+
+        with self.assertRaisesRegex(ValueError, "case-insensitive collision"):
+            subject.inventory_archives(
+                database_zip=self.database_zip,
+                image_part1=self.part1,
+                image_part2=self.part2,
+                output_root=self.root / "collision-output",
+                batch_id="collision",
+                unrar=self.unrar,
+                runner=collision_runner,
+            )
+
+        collision_zip = self.root / "collision-database.zip"
+        with zipfile.ZipFile(collision_zip, "w") as archive:
+            archive.writestr("A.sql", b"one")
+            archive.writestr("a.SQL", b"two")
+        with self.assertRaisesRegex(ValueError, "case-insensitive collision"):
+            subject.inventory_archives(
+                database_zip=collision_zip,
+                image_part1=self.part1,
+                image_part2=self.part2,
+                output_root=self.root / "zip-collision-output",
+                batch_id="zip-collision",
+                unrar=self.unrar,
+                runner=self._runner,
+            )
+
+
+@unittest.skipUnless(
+    os.name == "nt"
+    and Path(r"C:\Program Files\WinRAR\UnRAR.exe").is_file()
+    and Path(r"C:\Program Files\WinRAR\WinRAR.exe").is_file(),
+    "requires local WinRAR and UnRAR executables",
+)
+class RealUnrarSmokeTests(unittest.TestCase):
+    def test_localized_unrar_technical_listing_is_parsed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "smoke.rar"
+            member = "image_copy/CamImageSource1/1893700/2D/smoke.jpg"
+            source = root / Path(member)
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"smoke")
+            created = subprocess.run(
+                [
+                    r"C:\Program Files\WinRAR\WinRAR.exe",
+                    "a",
+                    "-cfg-",
+                    "-r",
+                    str(archive_path),
+                    "image_copy",
+                ],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            output = subject._run_unrar_listing(
+                Path(r"C:\Program Files\WinRAR\UnRAR.exe"), archive_path
+            )
+            records = subject._parse_unrar_listing(output)
+            entries, statistics = subject._records_to_rar_entries(
+                records, "image-part1"
+            )
+            self.assertEqual([entry["memberPath"] for entry in entries], [member])
+            self.assertGreaterEqual(statistics["recordsSeen"], 1)
 
 
 if __name__ == "__main__":
