@@ -100,7 +100,27 @@ pub(super) struct BkvReplayRuntime {
     pub replay_index: usize,
     pub replay_status: String,
     pub replay_version: i64,
+    pub replay_snapshot: Value,
+    pub selected_inspection: Option<BkvImportedInspectionEvidence>,
     pub artifacts: Vec<BkvServingArtifact>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BkvImportedInspectionEvidence {
+    pub id: String,
+    pub status: String,
+    pub capture_count: i32,
+    pub defect_count: i32,
+    pub batch_id: String,
+    pub content_id: String,
+    pub legacy_seq_no: i64,
+    pub provenance: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BkvValidatedSelectedInspection {
+    pub model: db::entities::production_inspection::Model,
+    pub evidence: BkvImportedInspectionEvidence,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +145,7 @@ pub(super) struct BkvReplaySelection {
     pub inspection_id: String,
     pub material_id: String,
     pub session_id: String,
+    pub inspection: BkvImportedInspectionEvidence,
     pub artifacts: Vec<BkvReplayArtifactEvidence>,
     pub captures: Vec<Value>,
     pub defects: Vec<Value>,
@@ -1073,6 +1094,136 @@ fn bkv_config_json(
     })
 }
 
+fn bkv_imported_inspection_evidence(
+    inspection: &db::entities::production_inspection::Model,
+    expected_batch_id: &str,
+    expected_content_id: &str,
+    expected_seq_no: i64,
+) -> Result<BkvImportedInspectionEvidence, BkvRejection> {
+    let raw: Value = serde_json::from_str(&inspection.raw_payload).map_err(|_| {
+        BkvRejection::new(
+            "bkv_selected_inspection_invalid",
+            "selected inspection provenance is invalid",
+        )
+    })?;
+    if raw.get("source").and_then(Value::as_str) != Some("bkv")
+        || raw.get("batchId").and_then(Value::as_str) != Some(expected_batch_id)
+        || raw.get("contentId").and_then(Value::as_str) != Some(expected_content_id)
+        || raw.get("legacySeqNo").and_then(Value::as_i64) != Some(expected_seq_no)
+    {
+        return Err(BkvRejection::new(
+            "bkv_selected_inspection_invalid",
+            "selected inspection is not bound to the active replay item",
+        ));
+    }
+    Ok(BkvImportedInspectionEvidence {
+        id: inspection.id.clone(),
+        status: inspection.status.clone(),
+        capture_count: inspection.capture_count,
+        defect_count: inspection.defect_count,
+        batch_id: expected_batch_id.to_string(),
+        content_id: expected_content_id.to_string(),
+        legacy_seq_no: expected_seq_no,
+        provenance: json!({
+            "source":"bkv",
+            "batchId":expected_batch_id,
+            "contentId":expected_content_id,
+            "legacySeqNo":expected_seq_no
+        }),
+    })
+}
+
+async fn bkv_validate_replay_state(
+    connection: &sea_orm::DatabaseConnection,
+    batch_id: &str,
+    content_id: &str,
+    replay: &Value,
+) -> Result<(usize, String, i64, Option<BkvValidatedSelectedInspection>), BkvRejection> {
+    if replay.get("batchId").and_then(Value::as_str) != Some(batch_id)
+        || replay.get("contentId").and_then(Value::as_str) != Some(content_id)
+    {
+        return Err(BkvRejection::new(
+            "bkv_replay_state_invalid",
+            "replay binding is invalid",
+        ));
+    }
+    let index = replay
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value <= BKV_TARGET_SEQ_NOS.len())
+        .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "replay index invalid"))?;
+    let status = replay
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "replay status missing"))?;
+    let expected_status = if index == 0 {
+        "ready"
+    } else if index == BKV_TARGET_SEQ_NOS.len() {
+        "completed"
+    } else {
+        "replaying"
+    };
+    let version = replay
+        .get("version")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= index as i64)
+        .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "replay version invalid"))?;
+    let selected_seq = replay.get("selectedLegacySeqNo").and_then(Value::as_i64);
+    let selected_id = replay
+        .get("selectedInspectionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if status != expected_status {
+        return Err(BkvRejection::new(
+            "bkv_replay_state_invalid",
+            "replay status contradicts index",
+        ));
+    }
+    if index == 0 {
+        if selected_seq.is_some() || selected_id.is_some() {
+            return Err(BkvRejection::new(
+                "bkv_replay_state_invalid",
+                "ready replay must not select an inspection",
+            ));
+        }
+        return Ok((index, status.to_string(), version, None));
+    }
+    let expected_seq = BKV_TARGET_SEQ_NOS[index - 1];
+    if selected_seq != Some(expected_seq) || selected_id.is_none() {
+        return Err(BkvRejection::new(
+            "bkv_replay_state_invalid",
+            "selected replay item contradicts index",
+        ));
+    }
+    let inspection = db::find_production_inspection(connection, selected_id.unwrap())
+        .await
+        .map_err(|_| {
+            BkvRejection::new(
+                "bkv_imported_data_unavailable",
+                "selected inspection lookup failed",
+            )
+        })?
+        .ok_or_else(|| {
+            BkvRejection::new(
+                "bkv_selected_inspection_invalid",
+                "selected inspection is missing",
+            )
+        })?;
+    let evidence =
+        bkv_imported_inspection_evidence(&inspection, batch_id, content_id, expected_seq)?;
+    Ok((
+        index,
+        status.to_string(),
+        version,
+        Some(BkvValidatedSelectedInspection {
+            model: inspection,
+            evidence,
+        }),
+    ))
+}
+
 fn verify_bkv_runtime_artifact(
     index: &BkvServingIndex,
     artifact: &BkvServingArtifact,
@@ -1191,31 +1342,8 @@ pub(super) async fn load_bkv_replay_runtime(
             .map_err(|_| BkvRejection::new("bkv_status_unavailable", "replay lookup failed"))?,
         "bkv_replay_state_missing",
     )?;
-    if replay.get("batchId").and_then(Value::as_str) != Some(batch_id.as_str())
-        || replay.get("contentId").and_then(Value::as_str) != Some(content_id.as_str())
-    {
-        return Err(BkvRejection::new(
-            "bkv_replay_state_invalid",
-            "replay binding is invalid",
-        ));
-    }
-    let replay_index = replay
-        .get("index")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| *value <= BKV_TARGET_SEQ_NOS.len())
-        .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "replay index invalid"))?;
-    let replay_status = replay
-        .get("status")
-        .and_then(Value::as_str)
-        .filter(|value| matches!(*value, "ready" | "replaying" | "completed"))
-        .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "replay status invalid"))?
-        .to_string();
-    let replay_version = replay
-        .get("version")
-        .and_then(Value::as_i64)
-        .filter(|value| *value >= 0)
-        .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "replay version invalid"))?;
+    let (replay_index, replay_status, replay_version, selected_inspection) =
+        bkv_validate_replay_state(connection, &batch_id, &content_id, &replay).await?;
     Ok(BkvReplayRuntime {
         batch_id,
         content_id,
@@ -1223,6 +1351,8 @@ pub(super) async fn load_bkv_replay_runtime(
         replay_index,
         replay_status,
         replay_version,
+        replay_snapshot: replay,
+        selected_inspection: selected_inspection.map(|selected| selected.evidence),
         artifacts: index.artifacts,
     })
 }
@@ -1309,6 +1439,12 @@ pub(super) async fn advance_bkv_replay(
                 "selected imported inspection is missing",
             )
         })?;
+    let inspection_evidence = bkv_imported_inspection_evidence(
+        &inspection,
+        &runtime.batch_id,
+        &runtime.content_id,
+        legacy_seq_no,
+    )?;
     let capture_rows = db::capture_files_for_inspection(connection, &inspection.id)
         .await
         .map_err(|_| BkvRejection::new("bkv_imported_data_unavailable", "capture lookup failed"))?;
@@ -1348,7 +1484,8 @@ pub(super) async fn advance_bkv_replay(
         .ok_or_else(|| BkvRejection::new("bkv_replay_state_missing", "replay state missing"))?;
     let current: Value = serde_json::from_str(&replay_model.value)
         .map_err(|_| BkvRejection::new("bkv_replay_state_invalid", "replay state invalid"))?;
-    if current.get("version").and_then(Value::as_i64) != Some(runtime.replay_version)
+    if current != runtime.replay_snapshot
+        || current.get("version").and_then(Value::as_i64) != Some(runtime.replay_version)
         || current.get("index").and_then(Value::as_u64) != Some(runtime.replay_index as u64)
     {
         transaction.rollback().await.ok();
@@ -1400,6 +1537,7 @@ pub(super) async fn advance_bkv_replay(
         inspection_id: inspection.id,
         material_id: inspection.material_id,
         session_id: inspection.session_id,
+        inspection: inspection_evidence,
         artifacts: selected_artifacts,
         captures,
         defects,
@@ -1926,9 +2064,11 @@ fn bkv_final_db_batch(
 
 fn bkv_rejection_response(error: BkvRejection) -> Vec<u8> {
     let status = match error.code {
-        "bkv_root_invalid" | "bkv_manifest_unavailable" | "bkv_file_unavailable" => {
-            "503 Service Unavailable"
-        }
+        "bkv_root_invalid"
+        | "bkv_manifest_unavailable"
+        | "bkv_file_unavailable"
+        | "bkv_status_unavailable"
+        | "bkv_imported_data_unavailable" => "503 Service Unavailable",
         "bkv_batch_failed" | "bkv_partial_review_required" | "bkv_batch_id_collision" => {
             "409 Conflict"
         }
@@ -1987,6 +2127,16 @@ fn bkv_replay_selection_value(selection: &BkvReplaySelection) -> Value {
         "inspectionId":selection.inspection_id,
         "materialId":selection.material_id,
         "sessionId":selection.session_id,
+        "inspection":{
+            "id":selection.inspection.id,
+            "status":selection.inspection.status,
+            "captureCount":selection.inspection.capture_count,
+            "defectCount":selection.inspection.defect_count,
+            "batchId":selection.inspection.batch_id,
+            "contentId":selection.inspection.content_id,
+            "legacySeqNo":selection.inspection.legacy_seq_no,
+            "provenance":selection.inspection.provenance
+        },
         "replay":{
             "previousIndex":selection.previous_index,
             "index":selection.next_index,
@@ -2014,41 +2164,51 @@ pub(super) fn bkv_capture_once_configured_response(state: &ServiceState, actor: 
     }
 }
 
-pub(super) async fn selected_bkv_inspection_id(
+pub(super) async fn selected_bkv_inspection(
     connection: &sea_orm::DatabaseConnection,
-) -> Result<Option<String>, BkvRejection> {
+) -> Result<Option<db::entities::production_inspection::Model>, BkvRejection> {
     let active = match db::get_config(connection, "bkv.active-batch")
         .await
         .map_err(|_| BkvRejection::new("bkv_status_unavailable", "active batch lookup failed"))?
     {
         Some(value) => serde_json::from_str::<Value>(&value.value)
             .map_err(|_| BkvRejection::new("bkv_replay_state_invalid", "active batch invalid"))?,
-        None => return Ok(None),
+        None => {
+            return Err(BkvRejection::new(
+                "bkv_active_batch_missing",
+                "active BKV batch is missing",
+            ))
+        }
     };
     let batch_id = active
         .get("batchId")
         .and_then(Value::as_str)
+        .filter(|value| bkv_valid_batch_id(value))
         .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "active batch id missing"))?;
-    let content_id = active.get("contentId").and_then(Value::as_str);
+    let content_id = active
+        .get("contentId")
+        .and_then(Value::as_str)
+        .filter(|value| bkv_valid_sha256(value))
+        .ok_or_else(|| {
+            BkvRejection::new("bkv_replay_state_invalid", "active content id missing")
+        })?;
     let replay = bkv_config_json(
         db::get_config(connection, &format!("bkv.replay.{batch_id}"))
             .await
             .map_err(|_| BkvRejection::new("bkv_status_unavailable", "replay lookup failed"))?,
         "bkv_replay_state_missing",
     )?;
-    if replay.get("batchId").and_then(Value::as_str) != Some(batch_id)
-        || replay.get("contentId").and_then(Value::as_str) != content_id
-    {
-        return Err(BkvRejection::new(
-            "bkv_replay_state_invalid",
-            "selected inspection binding invalid",
-        ));
-    }
-    Ok(replay
-        .get("selectedInspectionId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string))
+    let (_, _, _, selected) =
+        bkv_validate_replay_state(connection, batch_id, content_id, &replay).await?;
+    Ok(selected.map(|inspection| inspection.model))
+}
+
+pub(super) async fn selected_bkv_inspection_id(
+    connection: &sea_orm::DatabaseConnection,
+) -> Result<Option<String>, BkvRejection> {
+    Ok(selected_bkv_inspection(connection)
+        .await?
+        .map(|inspection| inspection.id))
 }
 
 pub(super) fn bkv_status_response(state: &ServiceState) -> Vec<u8> {
@@ -2063,6 +2223,12 @@ pub(super) fn bkv_status_response(state: &ServiceState) -> Vec<u8> {
             &json!({"code":0,"active":false}).to_string(),
         ),
         Ok(Some(active)) => {
+            if let Err(error) = state
+                .runtime
+                .block_on(selected_bkv_inspection(&state.database.connection))
+            {
+                return bkv_rejection_response(error);
+            }
             let active_value: Value = serde_json::from_str(&active.value).unwrap_or(Value::Null);
             let batch_id = active_value
                 .get("batchId")
@@ -3674,6 +3840,188 @@ mod tests {
     }
 
     #[test]
+    fn bkv_replay_state_machine_rejects_contradictory_status_index_selection_and_version() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("runtime-state-machine");
+        let key = "bkv.replay.batch-001";
+        let active: Value = serde_json::from_str(
+            &runtime
+                .block_on(db::get_config(&database.connection, "bkv.active-batch"))
+                .unwrap()
+                .unwrap()
+                .value,
+        )
+        .unwrap();
+        let content_id = active["contentId"].clone();
+        for invalid in [
+            json!({"batchId":"batch-001","contentId":content_id,"index":0,"status":"replaying","version":0}),
+            json!({"batchId":"batch-001","contentId":content_id,"index":0,"status":"ready","version":0,"selectedLegacySeqNo":1893700,"selectedInspectionId":"unexpected"}),
+            json!({"batchId":"batch-001","contentId":content_id,"index":1,"status":"replaying","version":0,"selectedLegacySeqNo":1893700,"selectedInspectionId":"missing"}),
+            json!({"batchId":"batch-001","contentId":content_id,"index":11,"status":"replaying","version":11,"selectedLegacySeqNo":1893710,"selectedInspectionId":"missing"}),
+        ] {
+            runtime
+                .block_on(db::set_config(
+                    &database.connection,
+                    key,
+                    &invalid.to_string(),
+                ))
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .block_on(load_bkv_replay_runtime(&database.connection, &root))
+                    .unwrap_err()
+                    .code,
+                "bkv_replay_state_invalid"
+            );
+            assert_eq!(
+                runtime
+                    .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
+                    .unwrap_err()
+                    .code,
+                "bkv_replay_state_invalid"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_selected_inspection_must_match_active_batch_content_and_selected_seq() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("selected-binding");
+        let selected = runtime
+            .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .block_on(selected_bkv_inspection_id(&database.connection))
+                .unwrap(),
+            Some(selected.inspection_id.clone())
+        );
+        let key = "bkv.replay.batch-001";
+        let original_replay = runtime
+            .block_on(db::get_config(&database.connection, key))
+            .unwrap()
+            .unwrap()
+            .value;
+        let mut replay: Value = serde_json::from_str(&original_replay).unwrap();
+        replay["selectedLegacySeqNo"] = json!(1_893_701);
+        runtime
+            .block_on(db::set_config(
+                &database.connection,
+                key,
+                &replay.to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .block_on(load_bkv_replay_runtime(&database.connection, &root))
+                .unwrap_err()
+                .code,
+            "bkv_replay_state_invalid"
+        );
+        runtime
+            .block_on(db::set_config(&database.connection, key, &original_replay))
+            .unwrap();
+        let wrong_inspection = runtime
+            .block_on(db::list_recent_production_inspections(
+                &database.connection,
+                100,
+            ))
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                serde_json::from_str::<Value>(&item.raw_payload)
+                    .ok()
+                    .and_then(|raw| raw["legacySeqNo"].as_i64())
+                    == Some(1_893_701)
+            })
+            .unwrap();
+        let mut replay: Value = serde_json::from_str(&original_replay).unwrap();
+        replay["selectedInspectionId"] = json!(wrong_inspection.id);
+        runtime
+            .block_on(db::set_config(
+                &database.connection,
+                key,
+                &replay.to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .block_on(selected_bkv_inspection_id(&database.connection))
+                .unwrap_err()
+                .code,
+            "bkv_selected_inspection_invalid"
+        );
+        runtime
+            .block_on(db::set_config(&database.connection, key, &original_replay))
+            .unwrap();
+        let mut inspection = runtime
+            .block_on(db::find_production_inspection(
+                &database.connection,
+                &selected.inspection_id,
+            ))
+            .unwrap()
+            .unwrap();
+        let original: Value = serde_json::from_str(&inspection.raw_payload).unwrap();
+        for (field, invalid) in [
+            ("source", json!("real")),
+            ("batchId", json!("other-batch")),
+            ("contentId", json!("f".repeat(64))),
+            ("legacySeqNo", json!(1_893_701)),
+        ] {
+            let mut raw = original.clone();
+            raw[field] = invalid;
+            let mut candidate = inspection.clone();
+            candidate.raw_payload = raw.to_string();
+            assert_eq!(
+                bkv_imported_inspection_evidence(
+                    &candidate,
+                    "batch-001",
+                    selected.content_id.as_str(),
+                    1_893_700,
+                )
+                .unwrap_err()
+                .code,
+                "bkv_selected_inspection_invalid"
+            );
+        }
+        let mut raw: Value = serde_json::from_str(&inspection.raw_payload).unwrap();
+        raw["contentId"] = json!("f".repeat(64));
+        inspection.raw_payload = raw.to_string();
+        runtime
+            .block_on(db::upsert_production_inspection(
+                &database.connection,
+                db::ProductionInspectionInput {
+                    id: inspection.id,
+                    material_id: inspection.material_id,
+                    session_id: inspection.session_id,
+                    status: inspection.status,
+                    storage_root: inspection.storage_root,
+                    summary_path: inspection.summary_path,
+                    started_at: inspection.started_at,
+                    finished_at: inspection.finished_at,
+                    capture_count: inspection.capture_count,
+                    defect_count: inspection.defect_count,
+                    raw_payload: inspection.raw_payload,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .block_on(selected_bkv_inspection_id(&database.connection))
+                .unwrap_err()
+                .code,
+            "bkv_selected_inspection_invalid"
+        );
+        assert_eq!(
+            runtime
+                .block_on(load_bkv_replay_runtime(&database.connection, &root))
+                .unwrap_err()
+                .code,
+            "bkv_selected_inspection_invalid"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn bkv_runtime_and_replay_fail_closed_when_an_artifact_is_tampered() {
         let (runtime, database, root) = imported_bkv_replay_fixture("runtime-tamper");
         fs::write(
@@ -3724,6 +4072,19 @@ mod tests {
             inspection_id: "inspection-001".to_string(),
             material_id: "material-001".to_string(),
             session_id: "session-001".to_string(),
+            inspection: BkvImportedInspectionEvidence {
+                id: "inspection-001".to_string(),
+                status: "completed".to_string(),
+                capture_count: 6,
+                defect_count: 1,
+                batch_id: "batch-001".to_string(),
+                content_id: "a".repeat(64),
+                legacy_seq_no: 1_893_700,
+                provenance: json!({
+                    "source":"bkv","batchId":"batch-001",
+                    "contentId":"a".repeat(64),"legacySeqNo":1_893_700
+                }),
+            },
             artifacts: vec![BkvReplayArtifactEvidence {
                 path: "artifacts/camera1/1893700/2d/one.jpg".to_string(),
                 sha256: "b".repeat(64),
@@ -3746,6 +4107,15 @@ mod tests {
         );
         assert_eq!(evidence["artifacts"][0]["sha256"], "b".repeat(64));
         assert_eq!(evidence["inspectionId"], "inspection-001");
+        assert_eq!(evidence["inspection"]["id"], "inspection-001");
+        assert_eq!(evidence["inspection"]["status"], "completed");
+        assert_eq!(evidence["inspection"]["captureCount"], 6);
+        assert_eq!(evidence["inspection"]["defectCount"], 1);
+        assert_eq!(evidence["inspection"]["provenance"]["source"], "bkv");
+        assert_eq!(
+            evidence["inspection"]["provenance"]["legacySeqNo"],
+            1_893_700
+        );
         assert_eq!(evidence["captures"][0]["id"], "capture-001");
         assert_eq!(evidence["defects"][0]["id"], "defect-001");
     }

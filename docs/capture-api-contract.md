@@ -40,6 +40,15 @@ selected `legacySeqNo`, imported inspection/capture/defect rows, and the exact
 manifest-relative artifact paths, sizes, and SHA-256 values verified immediately
 before advancement. Replay advancement uses a transaction and compare-and-swap
 over the persisted version/index while holding the production command boundary.
+The replay state is fail-closed: index 0 is `ready` with no selected fields,
+indexes 1 through 10 are `replaying`, and index 11 is `completed`; every
+nonzero index must name the preceding fixed SeqNo and an imported inspection
+whose stored provenance matches `source=bkv`, the active batch/content IDs, and
+that SeqNo. Health, BKV status, production status, and snapshot reads reject the
+same contradictory or stale state instead of falling back to an unrelated real
+inspection. Capture responses include a bounded `inspection` DTO with its ID,
+status, capture/defect counts, batch/content/SeqNo binding, and minimal BKV
+provenance; raw database payloads and local unrestricted paths are not exposed.
 After item 11 the state is `completed`; another capture returns HTTP 409 with
 `bkv_replay_completed` until `POST /api/bkv/replay/reset` is authorized and
 called. Production snapshot/status prefers the selected imported inspection only

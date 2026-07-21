@@ -2548,6 +2548,39 @@ fn production_device_status_value(state: &ServiceState) -> Value {
 }
 
 fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>, String> {
+    let selected_bkv_inspection = if state.capture.provider == CaptureProvider::Bkv {
+        state
+            .runtime
+            .block_on(production_tasks::selected_bkv_inspection(
+                &state.database.connection,
+            ))
+            .map_err(|error| error.code.to_string())?
+    } else {
+        None
+    };
+    if state.capture.provider == CaptureProvider::Bkv && selected_bkv_inspection.is_none() {
+        return Ok(Some(
+            json!({
+                "currentPlate": {
+                    "plateNo":"暂无BKV回放记录","widthMm":0,"lengthMm":0,
+                    "thicknessMm":0,"steelGrade":"-","detectedAt":""
+                },
+                "defectTypes":production_defect_types_value(),
+                "defects":[],"records":[],
+                "status":{
+                    "receiverPorts":[],
+                    "cameraPorts":(1..=6).map(|index| json!({
+                        "index":index,"ok":false,"offline":true,"source":"bkv"
+                    })).collect::<Vec<_>>(),
+                    "encoder":"offline","plc":"offline","l2":"offline","alarmCount":0
+                },
+                "summary":summarize_defect_values(&[]),
+                "heightProfile":[],"inspections":[],"captureImages":[],
+                "source":"bkv-offline"
+            })
+            .to_string(),
+        ));
+    }
     let mut inspections = state
         .runtime
         .block_on(db::list_recent_production_inspections(
@@ -2555,30 +2588,15 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             20,
         ))
         .map_err(|error| error.to_string())?;
-    if state.capture.provider == CaptureProvider::Bkv {
-        if let Some(selected_id) = state
-            .runtime
-            .block_on(production_tasks::selected_bkv_inspection_id(
-                &state.database.connection,
-            ))
-            .map_err(|error| error.code.to_string())?
+    if let Some(selected) = selected_bkv_inspection {
+        if let Some(index) = inspections
+            .iter()
+            .position(|inspection| inspection.id == selected.id)
         {
-            if let Some(index) = inspections
-                .iter()
-                .position(|inspection| inspection.id == selected_id)
-            {
-                inspections.swap(0, index);
-            } else if let Some(selected) = state
-                .runtime
-                .block_on(db::find_production_inspection(
-                    &state.database.connection,
-                    &selected_id,
-                ))
-                .map_err(|error| error.to_string())?
-            {
-                inspections.insert(0, selected);
-                inspections.truncate(20);
-            }
+            inspections.swap(0, index);
+        } else {
+            inspections.insert(0, selected);
+            inspections.truncate(20);
         }
     }
     if inspections.is_empty() {
@@ -3120,7 +3138,9 @@ fn bkv_capture_health_ready_value(
             "index":runtime.replay_index,
             "status":runtime.replay_status,
             "version":runtime.replay_version,
-            "total":11
+            "total":11,
+            "selectedLegacySeqNo":runtime.selected_inspection.as_ref().map(|item| item.legacy_seq_no),
+            "selectedInspectionId":runtime.selected_inspection.as_ref().map(|item| item.id.as_str())
         },
         "httpStatus":Value::Null,
         "latencyMs":0,
@@ -9216,35 +9236,50 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
         }
     };
     let selected_bkv_inspection = if state.capture.provider == CaptureProvider::Bkv {
-        state
+        match state
             .runtime
-            .block_on(production_tasks::selected_bkv_inspection_id(
+            .block_on(production_tasks::selected_bkv_inspection(
                 &state.database.connection,
-            ))
-            .ok()
-            .flatten()
-            .and_then(|inspection_id| {
-                state
-                    .runtime
-                    .block_on(db::find_production_inspection(
-                        &state.database.connection,
-                        &inspection_id,
-                    ))
-                    .ok()
-                    .flatten()
-            })
+            )) {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                return http_response(
+                    "503 Service Unavailable",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "code":error.code,
+                        "error":error.code,
+                        "message":"BKV selected inspection is unavailable"
+                    })
+                    .to_string(),
+                );
+            }
+        }
     } else {
         None
     };
-    if let Some(inspection) = selected_bkv_inspection.as_ref() {
-        latest_session = state
-            .runtime
-            .block_on(db::find_material_session(
+    if state.capture.provider == CaptureProvider::Bkv {
+        latest_session = match selected_bkv_inspection.as_ref() {
+            Some(inspection) => match state.runtime.block_on(db::find_material_session(
                 &state.database.connection,
                 &inspection.session_id,
-            ))
-            .ok()
-            .flatten();
+            )) {
+                Ok(Some(session)) => Some(session),
+                Ok(None) | Err(_) => {
+                    return http_response(
+                        "503 Service Unavailable",
+                        "application/json; charset=utf-8",
+                        &json!({
+                            "code":"bkv_imported_data_unavailable",
+                            "error":"bkv_imported_data_unavailable",
+                            "message":"BKV imported session is unavailable"
+                        })
+                        .to_string(),
+                    );
+                }
+            },
+            None => None,
+        };
     }
     let latest_session_json = latest_session.as_ref().map(|session| {
         json!({
@@ -9266,7 +9301,7 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
             "updatedAt": session.updated_at
         })
     });
-    let latest_inspection = if selected_bkv_inspection.is_some() {
+    let latest_inspection = if state.capture.provider == CaptureProvider::Bkv {
         selected_bkv_inspection
     } else {
         match state
@@ -17606,6 +17641,8 @@ mod tests {
             replay_index: 3,
             replay_status: "replaying".to_string(),
             replay_version: 3,
+            replay_snapshot: json!({}),
+            selected_inspection: None,
             artifacts: Vec::new(),
         };
         let capture = bkv_capture_health_ready_value(&runtime, json!({"phase":"stopped"}));
@@ -17649,8 +17686,15 @@ mod tests {
                         finished_at: finished_at.to_string(),
                         capture_count: 0,
                         defect_count: 0,
-                        raw_payload: json!({"source":if id == "selected" {"bkv"} else {"real"}})
-                            .to_string(),
+                        raw_payload: if id == "selected" {
+                            json!({
+                                "source":"bkv","batchId":"batch-001",
+                                "contentId":"a".repeat(64),"legacySeqNo":1_893_700
+                            })
+                            .to_string()
+                        } else {
+                            json!({"source":"real"}).to_string()
+                        },
                     },
                 ))
                 .unwrap();
@@ -17670,7 +17714,8 @@ mod tests {
                 "bkv.replay.batch-001",
                 &json!({
                     "batchId":"batch-001","contentId":"a".repeat(64),
-                    "selectedInspectionId":"selected"
+                    "index":1,"status":"replaying","version":1,
+                    "selectedLegacySeqNo":1_893_700,"selectedInspectionId":"selected"
                 })
                 .to_string(),
             ))
@@ -17684,6 +17729,111 @@ mod tests {
         assert_eq!(snapshot["currentPlate"]["plateNo"], "BKV-SELECTED");
         assert_eq!(snapshot["inspections"][0]["inspectionId"], "selected");
 
+        let selected = state
+            .runtime
+            .block_on(db::find_production_inspection(
+                &state.database.connection,
+                "selected",
+            ))
+            .unwrap()
+            .unwrap();
+        let original_raw = selected.raw_payload.clone();
+        let mut tampered_raw: Value = serde_json::from_str(&original_raw).unwrap();
+        tampered_raw["contentId"] = json!("f".repeat(64));
+        state
+            .runtime
+            .block_on(db::upsert_production_inspection(
+                &state.database.connection,
+                db::ProductionInspectionInput {
+                    id: selected.id.clone(),
+                    material_id: selected.material_id.clone(),
+                    session_id: selected.session_id.clone(),
+                    status: selected.status.clone(),
+                    storage_root: selected.storage_root.clone(),
+                    summary_path: selected.summary_path.clone(),
+                    started_at: selected.started_at.clone(),
+                    finished_at: selected.finished_at.clone(),
+                    capture_count: selected.capture_count,
+                    defect_count: selected.defect_count,
+                    raw_payload: tampered_raw.to_string(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            build_production_snapshot_json(&state).unwrap_err(),
+            "bkv_selected_inspection_invalid"
+        );
+        assert_eq!(
+            response_json(production_status_response(&state))["code"],
+            "bkv_selected_inspection_invalid"
+        );
+        assert_eq!(
+            response_json(production_tasks::bkv_status_response(&state))["code"],
+            "bkv_selected_inspection_invalid"
+        );
+        state
+            .runtime
+            .block_on(db::upsert_production_inspection(
+                &state.database.connection,
+                db::ProductionInspectionInput {
+                    id: selected.id,
+                    material_id: selected.material_id,
+                    session_id: selected.session_id,
+                    status: selected.status,
+                    storage_root: selected.storage_root,
+                    summary_path: selected.summary_path,
+                    started_at: selected.started_at,
+                    finished_at: selected.finished_at,
+                    capture_count: selected.capture_count,
+                    defect_count: selected.defect_count,
+                    raw_payload: original_raw,
+                },
+            ))
+            .unwrap();
+
+        let replaying = state
+            .runtime
+            .block_on(db::get_config(
+                &state.database.connection,
+                "bkv.replay.batch-001",
+            ))
+            .unwrap()
+            .unwrap()
+            .value;
+        state
+            .runtime
+            .block_on(db::set_config(
+                &state.database.connection,
+                "bkv.replay.batch-001",
+                &json!({
+                    "batchId":"batch-001","contentId":"a".repeat(64),
+                    "index":0,"status":"ready","version":2
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let ready_snapshot: Value = serde_json::from_str(
+            &build_production_snapshot_json(&state)
+                .unwrap()
+                .expect("empty BKV replay snapshot"),
+        )
+        .unwrap();
+        assert_eq!(ready_snapshot["source"], "bkv-offline");
+        assert!(ready_snapshot["inspections"].as_array().unwrap().is_empty());
+        assert_ne!(ready_snapshot["currentPlate"]["plateNo"], "REAL-NEWER");
+        assert_eq!(
+            response_json(production_status_response(&state))["latestInspection"],
+            Value::Null
+        );
+        state
+            .runtime
+            .block_on(db::set_config(
+                &state.database.connection,
+                "bkv.replay.batch-001",
+                &replaying,
+            ))
+            .unwrap();
+
         let mut real_state = state;
         Arc::get_mut(&mut real_state.capture).unwrap().provider = CaptureProvider::Simulated;
         let real_snapshot: Value = serde_json::from_str(
@@ -17693,6 +17843,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(real_snapshot["currentPlate"]["plateNo"], "REAL-NEWER");
+    }
+
+    #[test]
+    fn bkv_snapshot_and_status_fail_closed_when_selected_inspection_lookup_fails() {
+        let state = production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
+        state
+            .runtime
+            .block_on(db::set_config(
+                &state.database.connection,
+                "bkv.active-batch",
+                &json!({"batchId":"batch-001","contentId":"a".repeat(64)}).to_string(),
+            ))
+            .unwrap();
+        state
+            .runtime
+            .block_on(db::set_config(
+                &state.database.connection,
+                "bkv.replay.batch-001",
+                &json!({
+                    "batchId":"batch-001","contentId":"a".repeat(64),
+                    "index":1,"status":"replaying","version":1,
+                    "selectedLegacySeqNo":1_893_700,"selectedInspectionId":"selected"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        state
+            .runtime
+            .block_on(state.database.connection.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "DROP TABLE production_inspection".to_string(),
+            )))
+            .unwrap();
+        assert_eq!(
+            build_production_snapshot_json(&state).unwrap_err(),
+            "bkv_imported_data_unavailable"
+        );
+        assert_eq!(
+            response_json(production_status_response(&state))["code"],
+            "bkv_imported_data_unavailable"
+        );
     }
 
     #[test]
