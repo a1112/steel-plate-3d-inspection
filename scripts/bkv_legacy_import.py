@@ -33,7 +33,9 @@ MAX_ZIP_MEMBERS = 100_000
 MAX_ZIP_CENTRAL_DIRECTORY_RECORDS = 100_000
 MAX_ZIP_CENTRAL_DIRECTORY_BYTES = 256 * 1024 * 1024
 MAX_ZIP64_EOCD_BYTES = 1024 * 1024
+MAX_INPUT_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_INPUT_ARCHIVE_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+INPUT_SNAPSHOT_TIMEOUT_SECONDS = 600
 MAX_ZIP_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_ZIP_COMPRESSION_RATIO = 100
@@ -154,10 +156,30 @@ def wanted_image_member(value: str) -> bool:
     return _image_metadata(value) is not None
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+    deadline: float | None = None,
+) -> str:
+    if max_bytes is None:
+        max_bytes = MAX_INPUT_ARCHIVE_BYTES
+    if deadline is None:
+        deadline = time.monotonic() + INPUT_SNAPSHOT_TIMEOUT_SECONDS
     digest = hashlib.sha256()
+    total = 0
     with path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    "input archive hash deadline exceeded "
+                    f"({INPUT_SNAPSHOT_TIMEOUT_SECONDS} seconds)"
+                )
+            total += len(chunk)
+            if total > max_bytes:
+                raise InventoryLimitError(
+                    f"hash input archive bytes {total} exceed limit {max_bytes}: {path}"
+                )
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -177,58 +199,125 @@ def _assert_snapshot(path: Path, expected: FileSnapshot) -> None:
         raise RuntimeError(f"input archive changed during inventory: {path}")
 
 
+def _open_windows_locked_file(path: Path) -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(
+        str(path),
+        0x80000000,  # GENERIC_READ
+        0x00000001,  # FILE_SHARE_READ; deny concurrent write/delete
+        None,
+        3,  # OPEN_EXISTING
+        0x08000080,  # FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"cannot lock input archive for stable read: {path}")
+    return handle
+
+
+def _windows_locked_file_size(handle: int) -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_size = kernel32.GetFileSizeEx
+    get_size.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_longlong)]
+    get_size.restype = ctypes.c_int
+    size = ctypes.c_longlong()
+    if not get_size(handle, ctypes.byref(size)):
+        error = ctypes.get_last_error()
+        raise OSError(error, "cannot fstat locked input archive")
+    return size.value
+
+
+def _close_windows_handle(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    close_handle(handle)
+
+
+def _copy_snapshot_bounded(
+    source: Path,
+    destination: Path,
+    *,
+    deadline: float,
+    cumulative_bytes: int,
+) -> int:
+    member_bytes = 0
+    with source.open("rb") as input_file, destination.open("xb") as output_file:
+        while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    "controlled snapshot deadline exceeded "
+                    f"({INPUT_SNAPSHOT_TIMEOUT_SECONDS} seconds)"
+                )
+            chunk = input_file.read(_IO_CHUNK_BYTES)
+            if not chunk:
+                break
+            member_bytes += len(chunk)
+            cumulative_bytes += len(chunk)
+            if member_bytes > MAX_INPUT_ARCHIVE_BYTES:
+                raise InventoryLimitError(
+                    f"snapshot input archive bytes {member_bytes} exceed "
+                    f"MAX_INPUT_ARCHIVE_BYTES={MAX_INPUT_ARCHIVE_BYTES}: {source}"
+                )
+            if cumulative_bytes > MAX_INPUT_ARCHIVE_TOTAL_BYTES:
+                raise InventoryLimitError(
+                    f"snapshot input archive bytes total {cumulative_bytes} exceed "
+                    "MAX_INPUT_ARCHIVE_TOTAL_BYTES="
+                    f"{MAX_INPUT_ARCHIVE_TOTAL_BYTES}"
+                )
+            output_file.write(chunk)
+    return cumulative_bytes
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 @contextlib.contextmanager
 def _stable_archive_inputs(
     paths: Sequence[Path],
 ) -> Iterable[dict[Path, Path]]:
     """Hold Windows read locks, or use verified controlled snapshots elsewhere."""
-    total_size = sum(path.stat().st_size for path in paths)
-    if total_size > MAX_INPUT_ARCHIVE_TOTAL_BYTES:
-        raise InventoryLimitError(
-            f"input archive bytes {total_size} exceed "
-            f"MAX_INPUT_ARCHIVE_TOTAL_BYTES={MAX_INPUT_ARCHIVE_TOTAL_BYTES}"
-        )
-    if os.name == "nt":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        create_file = kernel32.CreateFileW
-        create_file.argtypes = [
-            ctypes.c_wchar_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-        ]
-        create_file.restype = ctypes.c_void_p
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = [ctypes.c_void_p]
-        close_handle.restype = ctypes.c_int
-        invalid_handle = ctypes.c_void_p(-1).value
+    if _is_windows():
         handles: list[int] = []
         try:
             for path in paths:
-                handle = create_file(
-                    str(path),
-                    0x80000000,  # GENERIC_READ
-                    0x00000001,  # FILE_SHARE_READ; deny concurrent write/delete
-                    None,
-                    3,  # OPEN_EXISTING
-                    0x08000080,  # FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL
-                    None,
+                handles.append(_open_windows_locked_file(path))
+            sizes = [_windows_locked_file_size(handle) for handle in handles]
+            for path, size in zip(paths, sizes, strict=True):
+                if size > MAX_INPUT_ARCHIVE_BYTES:
+                    raise InventoryLimitError(
+                        f"locked input archive bytes {size} exceed "
+                        f"MAX_INPUT_ARCHIVE_BYTES={MAX_INPUT_ARCHIVE_BYTES}: {path}"
+                    )
+            total_size = sum(sizes)
+            if total_size > MAX_INPUT_ARCHIVE_TOTAL_BYTES:
+                raise InventoryLimitError(
+                    f"locked input archive bytes total {total_size} exceed "
+                    "MAX_INPUT_ARCHIVE_TOTAL_BYTES="
+                    f"{MAX_INPUT_ARCHIVE_TOTAL_BYTES}"
                 )
-                if handle == invalid_handle:
-                    error = ctypes.get_last_error()
-                    raise OSError(error, f"cannot lock input archive for stable read: {path}")
-                handles.append(handle)
             yield {path: path for path in paths}
         finally:
             for handle in reversed(handles):
-                close_handle(handle)
+                _close_windows_handle(handle)
         return
 
     temp_parent = Path(tempfile.gettempdir())
-    required_free = total_size + 256 * 1024 * 1024
+    required_free = MAX_INPUT_ARCHIVE_TOTAL_BYTES + 256 * 1024 * 1024
     if shutil.disk_usage(temp_parent).free < required_free:
         raise InventoryLimitError(
             f"controlled snapshot requires {required_free} free bytes under {temp_parent}"
@@ -236,17 +325,31 @@ def _stable_archive_inputs(
     with tempfile.TemporaryDirectory(prefix="bkv-inventory-snapshot-", dir=temp_parent) as root:
         snapshot_root = Path(root)
         mapping: dict[Path, Path] = {}
+        deadline = time.monotonic() + INPUT_SNAPSHOT_TIMEOUT_SECONDS
+        cumulative_bytes = 0
         for index, path in enumerate(paths):
             before = _file_snapshot(path)
-            before_hash = _sha256_file(path)
+            before_hash = _sha256_file(path, deadline=deadline)
             destination = snapshot_root / f"{index}-{path.name}"
-            shutil.copyfile(path, destination)
-            destination_hash = _sha256_file(destination)
-            after_hash = _sha256_file(path)
+            cumulative_bytes = _copy_snapshot_bounded(
+                path,
+                destination,
+                deadline=deadline,
+                cumulative_bytes=cumulative_bytes,
+            )
+            destination_hash = _sha256_file(destination, deadline=deadline)
+            after_hash = _sha256_file(path, deadline=deadline)
             _assert_snapshot(path, before)
             if before_hash != after_hash or before_hash != destination_hash:
                 raise RuntimeError(f"input archive changed while creating snapshot: {path}")
             mapping[path] = destination
+        snapshot_sizes = [path.stat().st_size for path in mapping.values()]
+        if any(size > MAX_INPUT_ARCHIVE_BYTES for size in snapshot_sizes):
+            raise InventoryLimitError("controlled snapshot file exceeds per-archive limit")
+        if sum(snapshot_sizes) != cumulative_bytes:
+            raise RuntimeError("controlled snapshot byte count changed after copy")
+        if cumulative_bytes > MAX_INPUT_ARCHIVE_TOTAL_BYTES:
+            raise InventoryLimitError("controlled snapshot total exceeds archive limit")
         yield mapping
 
 
@@ -440,6 +543,17 @@ def _inspect_zip_structure(path: Path, deadline: float | None = None) -> dict[st
                 raise InventoryLimitError(
                     f"ZIP64 EOCD bytes {record_bytes} exceed "
                     f"MAX_ZIP64_EOCD_BYTES={MAX_ZIP64_EOCD_BYTES}"
+                )
+            if record_bytes != 56 or zip64_offset + record_bytes != locator_offset:
+                raise zipfile.BadZipFile(
+                    "ZIP64 standard fixed layout is required; gaps and dual records "
+                    "are not supported"
+                )
+            source.seek(locator_offset - 56)
+            adjacent = source.read(56)
+            if adjacent != fixed:
+                raise zipfile.BadZipFile(
+                    "ZIP64 locator and adjacent record describe different objects"
                 )
             (
                 _,

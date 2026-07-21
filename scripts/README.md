@@ -51,15 +51,26 @@ combined UnRAR stdout/stderr, and a 300-second process timeout; the manifest is
 limited to 128 MiB. EOCD/ZIP64 metadata is read with a bounded tail read before
 `ZipFile` construction; multi-disk, malformed, inconsistent, or oversized
 central directories fail closed. Exceeding any limit is an explicit failure.
+ZIP64 is accepted only in the standard fixed layout: the 56-byte ZIP64 EOCD must
+be immediately adjacent to its locator, and the locator target must be exactly
+that same record. Extensible/gapped or dual-record interpretations are rejected
+instead of allowing the preflight and Python `zipfile` to consume different
+metadata.
 
 Windows ADS/control/trailing-dot names, reserved device names, case-insensitive
 collisions, links, traversal, and reparse output paths are rejected. On Windows,
-all three inputs are held through `CreateFileW` handles that allow other readers
-but deny write/delete sharing for the complete hash + ZIP + two-volume UnRAR
-inventory. On other platforms, verified copies are made in a space-preflighted
-controlled temporary directory and removed after publication. The manifest's
-archive hashes therefore describe the same locked/snapshotted bytes that were
-inventoried, rather than a later path read.
+all three inputs are first held through `CreateFileW` handles that allow other
+readers but deny write/delete sharing. Per-file and cumulative source-size limits
+are then rechecked from those locked handles before the complete hash + ZIP +
+two-volume UnRAR inventory. Hash loops have byte quotas and a 600-second snapshot
+deadline. On other platforms, verified copies are made in a space-preflighted
+controlled temporary directory; preflight reserves the full 4 GiB permitted
+input total plus 256 MiB rather than trusting initial file sizes. Copies use
+counted streams; per-file/cumulative
+limits and the deadline are checked during copying and again from completed
+snapshot files. Snapshots are removed after publication. The manifest's archive
+hashes therefore describe the same locked/snapshotted bytes that were inventoried,
+rather than a later path read.
 
 The output root and its ancestors must be provisioned with trusted ACLs that
 prevent untrusted local users from replacing directories during the run. The

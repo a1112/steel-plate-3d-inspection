@@ -664,6 +664,115 @@ CRC32: 66666666
             with self.assertRaisesRegex(TimeoutError, "deadline"):
                 subject._inventory_zip(self.database_zip)
 
+    def test_zip64_dual_interpretation_and_locator_gap_are_rejected(self):
+        def zip64_record(records):
+            return struct.pack(
+                "<4sQ2H2L4Q",
+                b"PK\x06\x06",
+                44,
+                45,
+                45,
+                0,
+                0,
+                records,
+                records,
+                0,
+                0,
+            )
+
+        eocd = struct.pack(
+            "<4s4H2LH",
+            b"PK\x05\x06",
+            0,
+            0,
+            0xFFFF,
+            0xFFFF,
+            0xFFFFFFFF,
+            0xFFFFFFFF,
+            0,
+        )
+        malicious = self.root / "dual-zip64.zip"
+        first = zip64_record(0)
+        adjacent = zip64_record(99_999)
+        locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, 0, 1)
+        malicious.write_bytes(first + adjacent + locator + eocd)
+        with self.assertRaisesRegex(zipfile.BadZipFile, "ZIP64.*layout"):
+            subject._inspect_zip_structure(malicious)
+
+        gap = self.root / "gap-zip64.zip"
+        locator_offset = len(first) + 8
+        gap_locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, 0, 1)
+        self.assertEqual(locator_offset, 64)
+        gap.write_bytes(first + b"gap-data" + gap_locator + eocd)
+        with self.assertRaisesRegex(zipfile.BadZipFile, "ZIP64.*layout"):
+            subject._inspect_zip_structure(gap)
+
+    @unittest.skipUnless(os.name == "nt", "Windows locking contract")
+    def test_size_is_rechecked_from_locked_file_after_prelock_replacement(self):
+        replacement = self.root / "larger-part1.rar"
+        replacement.write_bytes(b"x" * 32)
+        original_open = subject._open_windows_locked_file
+        replaced = False
+
+        def replace_then_lock(path):
+            nonlocal replaced
+            if Path(path) == self.part1.resolve() and not replaced:
+                os.replace(replacement, self.part1)
+                replaced = True
+            return original_open(path)
+
+        with mock.patch.object(subject, "MAX_INPUT_ARCHIVE_BYTES", 16):
+            with mock.patch.object(
+                subject, "_open_windows_locked_file", side_effect=replace_then_lock
+            ):
+                with self.assertRaisesRegex(
+                    subject.InventoryLimitError, "locked input archive bytes"
+                ):
+                    subject.inventory_archives(
+                        database_zip=self.database_zip,
+                        image_part1=self.part1,
+                        image_part2=self.part2,
+                        output_root=self.root / "locked-size-output",
+                        batch_id="locked-size",
+                        unrar=self.unrar,
+                        runner=self._runner,
+                    )
+
+    def test_controlled_snapshot_copy_counts_actual_stream_bytes(self):
+        source = self.root / "growing-source.rar"
+        source.write_bytes(b"0123456789")
+        destination = self.root / "snapshot.rar"
+        with mock.patch.object(subject, "MAX_INPUT_ARCHIVE_BYTES", 5):
+            with self.assertRaisesRegex(
+                subject.InventoryLimitError, "snapshot input archive bytes"
+            ):
+                subject._copy_snapshot_bounded(
+                    source,
+                    destination,
+                    deadline=float("inf"),
+                    cumulative_bytes=0,
+                )
+            with self.assertRaisesRegex(
+                subject.InventoryLimitError, "hash input archive bytes"
+            ):
+                subject._sha256_file(source, deadline=float("inf"))
+
+    def test_controlled_snapshot_space_preflight_uses_maximum_allowed_bytes(self):
+        available = subject.MAX_INPUT_ARCHIVE_TOTAL_BYTES
+        with mock.patch.object(subject, "_is_windows", return_value=False):
+            with mock.patch.object(
+                subject.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=available),
+            ):
+                with self.assertRaisesRegex(
+                    subject.InventoryLimitError, "controlled snapshot requires"
+                ):
+                    with subject._stable_archive_inputs(
+                        (self.database_zip, self.part1, self.part2)
+                    ):
+                        self.fail("space preflight unexpectedly allowed snapshot copy")
+
 
 @unittest.skipUnless(
     os.name == "nt"
@@ -718,31 +827,47 @@ class SuppliedArchiveSmokeTests(unittest.TestCase):
     def test_both_supplied_rar_volumes_have_unique_target_members_and_six_cameras(self):
         root = Path(os.environ["BKV_SUPPLIED_ARCHIVE_DIR"])
         unrar = Path(r"C:\Program Files\WinRAR\UnRAR.exe")
-        first_entries, first_stats = subject._inventory_rar(
-            root / "image_copy.part1.rar", "image-part1", unrar, None
-        )
-        second_entries, second_stats = subject._inventory_rar(
-            root / "image_copy.part2.rar", "image-part2", unrar, None
-        )
-        first = {entry["memberPath"] for entry in first_entries}
-        second = {entry["memberPath"] for entry in second_entries}
-        union = first | second
-        cameras = {
-            entry["cameraNumber"] for entry in [*first_entries, *second_entries]
-        }
-        self.assertTrue(first - second)
-        self.assertTrue(second - first)
-        self.assertTrue(union)
+        smoke_parent = Path(os.environ.get("BKV_SMOKE_OUTPUT_ROOT", r"E:\Temp\codex"))
+        smoke_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="bkv-supplied-contract-", dir=smoke_parent
+        ) as directory:
+            manifest_path = subject.inventory_archives(
+                database_zip=root / "database.zip",
+                image_part1=root / "image_copy.part1.rar",
+                image_part2=root / "image_copy.part2.rar",
+                output_root=Path(directory) / "output",
+                batch_id="supplied-contract",
+                unrar=unrar,
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        images = [entry for entry in manifest["entries"] if entry["seqNo"] is not None]
+        cameras = {entry["cameraNumber"] for entry in images}
+        shared = [entry for entry in images if len(entry["archiveParts"]) == 2]
+        self.assertEqual(len(images), 2_724)
         self.assertEqual(cameras, set(range(1, 7)))
+        self.assertEqual(len(shared), 1)
+        self.assertEqual(shared[0]["archiveParts"], ["image-part1", "image-part2"])
+        self.assertEqual(manifest["schema"], "steel.bkv-archive-inventory.v1")
+        self.assertEqual(manifest["statistics"]["image-part1"]["accepted"], 1_441)
+        self.assertEqual(manifest["statistics"]["image-part2"]["accepted"], 1_284)
+        for archive in manifest["archives"].values():
+            self.assertRegex(archive["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            next(
+                entry["integrityStatus"]
+                for entry in manifest["entries"]
+                if entry["archivePart"] == "database-zip"
+            ),
+            "crc-failed",
+        )
         print(
             json.dumps(
                 {
-                    "part1": first_stats,
-                    "part2": second_stats,
-                    "part1Unique": len(first - second),
-                    "part2Unique": len(second - first),
-                    "overlap": len(first & second),
-                    "union": len(union),
+                    "part1": manifest["statistics"]["image-part1"],
+                    "part2": manifest["statistics"]["image-part2"],
+                    "overlap": len(shared),
+                    "union": len(images),
                     "cameras": sorted(cameras),
                 },
                 ensure_ascii=False,
