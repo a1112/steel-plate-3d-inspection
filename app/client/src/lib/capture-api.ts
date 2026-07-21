@@ -24,9 +24,18 @@ export type CaptureCamera = {
   configured?: boolean;
 };
 
-export type CaptureHealth = {
+export type PhysicalCaptureProvider = "headless-cpp" | "external-api" | "simulated";
+
+export type BkvOfflineChannel = {
+  index: number;
+  status: "offline";
+  source: "bkv";
+};
+
+export type PhysicalCaptureHealth = {
   service: string;
   time: string;
+  provider?: PhysicalCaptureProvider;
   sdkReady: boolean;
   sdkCode: number;
   sdkVersion?: string;
@@ -36,6 +45,33 @@ export type CaptureHealth = {
   driverName?: string;
   cameraCount?: number;
 };
+
+export type BkvCaptureHealth = {
+  service: string;
+  time: string;
+  provider: "bkv";
+  status: "bkv-offline";
+  sdkRequired: false;
+  sdkReady: null;
+  connected: false;
+  cameraCount: 6;
+  channels: BkvOfflineChannel[];
+  driverId?: never;
+  sdkVersion?: never;
+  sdkCode?: never;
+  ip?: never;
+  batchId?: string;
+  contentId?: string;
+  replay?: {
+    index: number;
+    total: number;
+    status: "ready" | "replaying" | "completed";
+    version: number;
+    legacySeqNo?: number;
+  };
+};
+
+export type CaptureHealth = PhysicalCaptureHealth | BkvCaptureHealth;
 
 export type CaptureCameraStatus = {
   connected: boolean;

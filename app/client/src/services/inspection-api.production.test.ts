@@ -1,16 +1,25 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import type { BkvCaptureHealth, CaptureHealth, PhysicalCaptureHealth } from '../lib/capture-api';
 import { getMockInspectionSnapshot } from '../data/inspection';
 import {
   captureProductionOnce,
   fetchInspectionReportArchive,
   fetchInspectionReportArchives,
   fetchInspectionSnapshot,
+  fetchBkvStatus,
+  fetchBkvArtifact,
   fetchServiceHealthDetails,
   issueInspectionReportArchive,
   startProductionSteelIn,
   stopProductionSteelOut,
   triggerGatewayManualSteelIn,
   writeProductionSteelInfo,
+} from './inspection-api';
+import type {
+  BkvArtifact,
+  BkvProductionCommandResult,
+  BkvStatus,
+  ProductionCommandResult,
 } from './inspection-api';
 
 function jsonResponse(body: unknown, status = 200) {
@@ -30,6 +39,178 @@ afterEach(() => {
 });
 
 describe('persistent production command client', () => {
+  it('keeps BKV replay and physical capture contracts discriminated', () => {
+    const bkvHealth: BkvCaptureHealth = {
+      service: 'steel-inspection-service',
+      time: '2026-07-21T00:00:00Z',
+      provider: 'bkv',
+      status: 'bkv-offline',
+      sdkRequired: false,
+      sdkReady: null,
+      connected: false,
+      cameraCount: 6,
+      channels: Array.from({ length: 6 }, (_, offset) => ({
+        index: offset + 1,
+        status: 'offline' as const,
+        source: 'bkv' as const,
+      })),
+    };
+    const physicalHealth: PhysicalCaptureHealth = {
+      service: 'steel-capture-service',
+      time: '2026-07-21T00:00:00Z',
+      provider: 'headless-cpp',
+      sdkReady: true,
+      sdkCode: 0,
+      connected: true,
+      ip: '192.168.101.100',
+    };
+    expectTypeOf(bkvHealth).toMatchTypeOf<CaptureHealth>();
+    expectTypeOf(physicalHealth).toMatchTypeOf<CaptureHealth>();
+    expect(bkvHealth.channels).toHaveLength(6);
+    expect(bkvHealth.channels.every((channel) => channel.status === 'offline')).toBe(true);
+  });
+
+  it('reads typed BKV batch and replay state', async () => {
+    const payload: BkvStatus = {
+      code: 0,
+      active: true,
+      provider: 'bkv',
+      source: 'bkv',
+      sourceBadge: 'BKV 离线回放',
+      offline: true,
+      activeBatch: { batchId: 'batch-001', contentId: 'a'.repeat(64) },
+      batch: {
+        batchId: 'batch-001',
+        contentId: 'a'.repeat(64),
+        status: 'ready',
+        counts: { inspections: 11 },
+      },
+      replay: {
+        index: 3,
+        total: 11,
+        status: 'replaying',
+        version: 3,
+        legacySeqNo: 1_893_702,
+      },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const status = await fetchBkvStatus();
+
+    expect(status).toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4873/api/bkv/status',
+      { headers: { Accept: 'application/json' }, signal: undefined },
+    );
+  });
+
+  it('normalizes only authenticated service URLs while retaining safe BKV artifact refs', async () => {
+    const fixture = getMockInspectionSnapshot();
+    const depthArtifact: BkvArtifact = {
+      artifactRef: 'bkv://batch-001/artifacts/camera1/1893700/3d/0000.d3img',
+      relativePath: 'artifacts/camera1/1893700/3d/0000.d3img',
+      url: '/api/production/file?path=bkv%3A%2F%2Fbatch-001%2Fartifacts%2Fcamera1%2F1893700%2F3d%2F0000.d3img',
+      authenticated: true,
+      source: 'bkv',
+      sourceBadge: 'BKV 离线回放',
+      offline: true,
+      sha256: 'b'.repeat(64),
+      size: 84,
+      cameraNumber: 1,
+      legacySeqNo: 1_893_700,
+      kind: '3d',
+      depthDecode: {
+        status: 'unsupported',
+        reason: 'no_evidenced_decoder',
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+      ...fixture,
+      source: 'bkv',
+      sourceBadge: 'BKV 离线回放',
+      offline: true,
+      legacySeqNo: 1_893_700,
+      bkvArtifacts: [depthArtifact],
+    })));
+
+    const snapshot = await fetchInspectionSnapshot();
+
+    expect(snapshot.source).toBe('bkv');
+    expect(snapshot.bkvArtifacts?.[0]).toMatchObject({
+      artifactRef: depthArtifact.artifactRef,
+      url: `http://127.0.0.1:4873${depthArtifact.url}`,
+      depthDecode: {
+        status: 'unsupported',
+        reason: 'no_evidenced_decoder',
+      },
+    });
+  });
+
+  it('types BKV capture evidence without exposing local paths', () => {
+    const result: BkvProductionCommandResult = {
+      code: 0,
+      provider: 'bkv',
+      source: 'bkv',
+      sourceBadge: 'BKV 离线回放',
+      offline: true,
+      cameraCount: 6,
+      batchId: 'batch-001',
+      contentId: 'a'.repeat(64),
+      legacySeqNo: 1_893_700,
+      replay: { previousIndex: 0, index: 1, total: 11, status: 'replaying', version: 1 },
+      artifacts: [],
+    };
+    expectTypeOf(result).toMatchTypeOf<ProductionCommandResult>();
+    expect(result).not.toHaveProperty('localPath');
+  });
+
+  it('reads BKV artifact URLs with the authenticated records session', async () => {
+    window.localStorage.setItem(
+      'steel-inspection-admin-session',
+      JSON.stringify({
+        authenticated: true,
+        token: 'records-token',
+        expiresAt: '2099-01-01T00:00:00.000Z',
+        user: { id: 'operator-1', permissions: ['admin.records'] },
+      }),
+    );
+    const artifact = {
+      artifactRef: 'bkv://batch-001/artifacts/camera1/1893700/2d/0000.jpg',
+      relativePath: 'artifacts/camera1/1893700/2d/0000.jpg',
+      url: '/api/production/file?path=ignored',
+      authenticated: true,
+      source: 'bkv',
+      sourceBadge: 'BKV 离线回放',
+      offline: true,
+      sha256: 'c'.repeat(64),
+      size: 4,
+      cameraNumber: 1,
+      legacySeqNo: 1_893_700,
+      kind: '2d',
+      depthDecode: null,
+    } satisfies BkvArtifact;
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'Content-Type': 'image/jpeg' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const blob = await fetchBkvArtifact(artifact);
+
+    expect(blob.size).toBe(4);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://127.0.0.1:4873/api/production/file?path=${encodeURIComponent(artifact.artifactRef)}`,
+      {
+        headers: expect.objectContaining({
+          Accept: 'application/octet-stream',
+          Authorization: 'Bearer records-token',
+        }),
+        signal: undefined,
+      },
+    );
+  });
+
   it('issues and queries immutable inspection report archives through the admin API', async () => {
     window.localStorage.setItem(
       'steel-inspection-admin-session',

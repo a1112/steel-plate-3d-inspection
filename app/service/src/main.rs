@@ -2464,6 +2464,34 @@ fn production_capture_image_value(file: &db::entities::capture_file::Model) -> V
     })
 }
 
+fn production_capture_image_value_for_bkv(
+    state: &ServiceState,
+    root: &Path,
+    file: &db::entities::capture_file::Model,
+) -> Option<Value> {
+    let mut artifact = bkv_client_artifact_value(state, root, &file.path)?;
+    let object = artifact.as_object_mut()?;
+    object.insert("id".to_string(), json!(file.id));
+    object.insert("cameraId".to_string(), json!(file.camera_id));
+    object.insert("cameraIp".to_string(), json!(file.camera_ip));
+    object.insert("dataName".to_string(), json!(file.data_name));
+    object.insert("sequenceNo".to_string(), json!(file.sequence_no));
+    object.insert("fileType".to_string(), json!(file.file_type));
+    object.insert("createdAt".to_string(), json!(file.created_at));
+    if !file.metadata_path.trim().is_empty() {
+        let metadata = bkv_client_artifact_value(state, root, &file.metadata_path)?;
+        object.insert(
+            "metadataArtifactRef".to_string(),
+            metadata.get("artifactRef").cloned().unwrap_or(Value::Null),
+        );
+        object.insert(
+            "metadataUrl".to_string(),
+            metadata.get("url").cloned().unwrap_or(Value::Null),
+        );
+    }
+    Some(artifact)
+}
+
 fn summarize_defect_values(defects: &[Value]) -> Value {
     let mut severe = 0;
     let mut review = 0;
@@ -2586,6 +2614,16 @@ fn selected_bkv_inspection_for_view(
 }
 
 fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>, String> {
+    let _bkv_command_guard = if state.capture.provider == CaptureProvider::Bkv {
+        Some(
+            state
+                .production_command_lock
+                .lock()
+                .map_err(|_| "production_command_lock_poisoned".to_string())?,
+        )
+    } else {
+        None
+    };
     let selected_bkv_inspection = if state.capture.provider == CaptureProvider::Bkv {
         selected_bkv_inspection_for_view(state).map_err(|error| error.code.to_string())?
     } else {
@@ -2609,11 +2647,15 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
                 },
                 "summary":summarize_defect_values(&[]),
                 "heightProfile":[],"inspections":[],"captureImages":[],
-                "source":"bkv-offline"
+                "source":"bkv-offline","provider":"bkv","sourceBadge":"BKV 离线回放",
+                "offline":true,"bkvArtifacts":[]
             })
             .to_string(),
         ));
     }
+    let bkv_binding = selected_bkv_inspection
+        .as_ref()
+        .and_then(|inspection| serde_json::from_str::<Value>(&inspection.raw_payload).ok());
     let mut inspections = state
         .runtime
         .block_on(db::list_recent_production_inspections(
@@ -2678,8 +2720,16 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             .collect::<Vec<_>>();
         let capture_images = files
             .iter()
-            .map(production_capture_image_value)
-            .collect::<Vec<_>>();
+            .map(|file| {
+                if file.path.starts_with("bkv://") {
+                    let root = production_tasks::configured_bkv_root().ok()?;
+                    production_capture_image_value_for_bkv(state, &root, file)
+                } else {
+                    Some(production_capture_image_value(file))
+                }
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "bkv_artifact_unavailable".to_string())?;
         let capture_summary_path = production_session_summary_path(
             &inspection.storage_root,
             &inspection.material_id,
@@ -2707,7 +2757,7 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             "inspectionId": inspection.id,
             "summaryPath": inspection.summary_path,
             "captureSummaryPath": capture_summary_path,
-            "source": "production"
+            "source": if state.capture.provider == CaptureProvider::Bkv { "bkv" } else { "production" }
         }));
     }
 
@@ -2722,7 +2772,14 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             "heightProfile": [],
             "inspections": plate_inspections,
             "captureImages": current_capture_images,
-            "source": "production-sqlite"
+            "bkvArtifacts": if state.capture.provider == CaptureProvider::Bkv { current_capture_images.clone() } else { Vec::new() },
+            "source": if state.capture.provider == CaptureProvider::Bkv { "bkv" } else { "production-sqlite" },
+            "provider": state.capture.provider.as_str(),
+            "sourceBadge": if state.capture.provider == CaptureProvider::Bkv { "BKV 离线回放" } else { "" },
+            "offline": state.capture.provider == CaptureProvider::Bkv,
+            "batchId": bkv_binding.as_ref().and_then(|value| value.get("batchId")),
+            "contentId": bkv_binding.as_ref().and_then(|value| value.get("contentId")),
+            "legacySeqNo": bkv_binding.as_ref().and_then(|value| value.get("legacySeqNo"))
         })
         .to_string(),
     ))
@@ -3156,6 +3213,9 @@ fn bkv_capture_health_ready_value(
         "ok":true,
         "status":"bkv-offline",
         "provider":"bkv",
+        "source":"bkv",
+        "sourceBadge":"BKV 离线回放",
+        "offline":true,
         "managed":false,
         "apiReachable":Value::Null,
         "sdkRequired":false,
@@ -3172,6 +3232,7 @@ fn bkv_capture_health_ready_value(
             "status":runtime.replay_status,
             "version":runtime.replay_version,
             "total":11,
+            "legacySeqNo":runtime.selected_inspection.as_ref().map(|item| item.legacy_seq_no),
             "selectedLegacySeqNo":runtime.selected_inspection.as_ref().map(|item| item.legacy_seq_no),
             "selectedInspectionId":runtime.selected_inspection.as_ref().map(|item| item.id.as_str())
         },
@@ -6004,7 +6065,21 @@ fn authorize_request(
     method: &str,
     path: &str,
 ) -> Result<Option<AdminSession>, Vec<u8>> {
-    let required_permission = permission_for_route(method, path);
+    let required_permission = permission_for_route(method, path).or_else(|| {
+        if method == "GET" && path == "/api/production/file" {
+            let raw_path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default();
+            let (_, query) = split_path_and_query(raw_path);
+            query_value(query, "path")
+                .is_some_and(|value| value.starts_with("bkv://"))
+                .then_some("admin.records")
+        } else {
+            None
+        }
+    });
     let session = session_from_request(state, request);
     if session
         .as_ref()
@@ -10740,7 +10815,11 @@ fn write_production_capture_once_response(
         }
     };
     if state.capture.provider == CaptureProvider::Bkv {
-        return production_tasks::bkv_capture_once_configured_response(state, actor);
+        let response = production_tasks::bkv_capture_once_configured_response(state, actor);
+        return match production_tasks::configured_bkv_root() {
+            Ok(root) => decorate_bkv_capture_response(state, &root, response),
+            Err(_) => response,
+        };
     }
     if let Err(response) = validate_capture_open_session(state, &payload) {
         return response;
@@ -12191,7 +12270,11 @@ fn read_bkv_verified_file(path: &Path, expected_size: u64, expected_hash: &str) 
     Some(bytes)
 }
 
-fn resolve_bkv_file(state: &ServiceState, token: &str) -> Option<(PathBuf, Vec<u8>)> {
+fn resolve_bkv_file_at_root(
+    state: &ServiceState,
+    root: &Path,
+    token: &str,
+) -> Option<(PathBuf, Vec<u8>)> {
     let value = token.strip_prefix("bkv://")?;
     let (batch_id, relative) = value.split_once('/')?;
     if batch_id.is_empty()
@@ -12230,8 +12313,7 @@ fn resolve_bkv_file(state: &ServiceState, token: &str) -> Option<(PathBuf, Vec<u
     if !bkv_batch_is_active(&active, batch_id, content_id) {
         return None;
     }
-    let root = PathBuf::from(env::var("STEEL_BKV_DATA_ROOT").ok()?);
-    if !root.is_absolute() || file_component_is_link(&root) {
+    if !root.is_absolute() || file_component_is_link(root) {
         return None;
     }
     let summary = imported.get("summary")?;
@@ -12244,7 +12326,7 @@ fn resolve_bkv_file(state: &ServiceState, token: &str) -> Option<(PathBuf, Vec<u
     let manifest_sha256 = summary.get("manifestSha256").and_then(Value::as_str)?;
     let publication_sha256 = summary.get("publicationSha256").and_then(Value::as_str)?;
     let refreshed = production_tasks::load_bkv_serving_index(
-        &root,
+        root,
         &manifest_path,
         batch_id,
         content_id,
@@ -12268,7 +12350,183 @@ fn resolve_bkv_file(state: &ServiceState, token: &str) -> Option<(PathBuf, Vec<u
     Some((path, bytes))
 }
 
-fn production_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
+fn bkv_client_artifact_value(state: &ServiceState, root: &Path, token: &str) -> Option<Value> {
+    let value = token.strip_prefix("bkv://")?;
+    let (batch_id, relative) = value.split_once('/')?;
+    let (_, bytes) = resolve_bkv_file_at_root(state, root, token)?;
+    let imported = state
+        .runtime
+        .block_on(db::get_config(
+            &state.database.connection,
+            &format!("bkv.batch.{batch_id}"),
+        ))
+        .ok()
+        .flatten()?;
+    let imported: Value = serde_json::from_str(&imported.value).ok()?;
+    let summary = imported.get("summary")?;
+    let manifest_relative = summary.get("manifestPath").and_then(Value::as_str)?;
+    if manifest_relative != format!("{batch_id}/manifest.json") {
+        return None;
+    }
+    let manifest_path = root.join(manifest_relative);
+    let metadata = fs::symlink_metadata(&manifest_path).ok()?;
+    if file_component_is_link(&manifest_path)
+        || !metadata.is_file()
+        || metadata.len() > 16 * 1024 * 1024
+    {
+        return None;
+    }
+    let manifest_hash = summary.get("manifestSha256").and_then(Value::as_str)?;
+    let manifest_bytes = read_bkv_verified_file(&manifest_path, metadata.len(), manifest_hash)?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).ok()?;
+    let artifact = manifest
+        .get("artifacts")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|artifact| artifact.get("path").and_then(Value::as_str) == Some(relative))?;
+    let expected_size = artifact.get("size").and_then(Value::as_u64)?;
+    let expected_hash = artifact.get("sha256").and_then(Value::as_str)?;
+    if expected_size != bytes.len() as u64
+        || expected_hash != format!("{:x}", Sha256::digest(&bytes))
+    {
+        return None;
+    }
+    let extension = artifact
+        .get("extension")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let depth_decode = if extension.eq_ignore_ascii_case(".d3img") {
+        let evidence = artifact.get("depthDecode")?.clone();
+        let status = evidence.get("status").and_then(Value::as_str)?;
+        let reason = evidence.get("reason").and_then(Value::as_str)?;
+        if !matches!(status, "decoded" | "unsupported" | "invalid") || reason.trim().is_empty() {
+            return None;
+        }
+        evidence
+    } else {
+        Value::Null
+    };
+    Some(json!({
+        "artifactRef":token,
+        "relativePath":relative,
+        "url":production_file_url(token),
+        "authenticated":true,
+        "source":"bkv",
+        "sourceBadge":"BKV 离线回放",
+        "offline":true,
+        "sha256":expected_hash,
+        "size":expected_size,
+        "cameraNumber":artifact.get("cameraNumber"),
+        "legacySeqNo":artifact.get("seqNo"),
+        "kind":artifact.get("kind"),
+        "depthDecode":depth_decode
+    }))
+}
+
+fn decorate_bkv_capture_response(state: &ServiceState, root: &Path, response: Vec<u8>) -> Vec<u8> {
+    let Some(body) = std::str::from_utf8(&response)
+        .ok()
+        .and_then(|text| text.split_once("\r\n\r\n").map(|(_, body)| body))
+    else {
+        return response;
+    };
+    let Ok(mut payload) = serde_json::from_str::<Value>(body) else {
+        return response;
+    };
+    if payload.get("code").and_then(Value::as_i64) != Some(0) {
+        return response;
+    }
+    let Some(batch_id) = payload
+        .get("batchId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            r#"{"code":"bkv_artifact_response_invalid","error":"bkv_artifact_response_invalid"}"#,
+        );
+    };
+    let Some(artifacts) = payload.get("artifacts").and_then(Value::as_array) else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            r#"{"code":"bkv_artifact_response_invalid","error":"bkv_artifact_response_invalid"}"#,
+        );
+    };
+    let mut client_artifacts = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let Some(relative) = artifact.get("path").and_then(Value::as_str) else {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                r#"{"code":"bkv_artifact_response_invalid","error":"bkv_artifact_response_invalid"}"#,
+            );
+        };
+        let token = if relative.starts_with("bkv://") {
+            relative.to_string()
+        } else {
+            format!("bkv://{batch_id}/{relative}")
+        };
+        let Some(mut client) = bkv_client_artifact_value(state, root, &token) else {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                r#"{"code":"bkv_artifact_unavailable","error":"bkv_artifact_unavailable"}"#,
+            );
+        };
+        client["verified"] = json!(true);
+        client_artifacts.push(client);
+    }
+    payload["source"] = json!("bkv");
+    payload["provider"] = json!("bkv");
+    payload["sourceBadge"] = json!("BKV 离线回放");
+    payload["offline"] = json!(true);
+    payload["cameraCount"] = json!(6);
+    payload["artifacts"] = Value::Array(client_artifacts);
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &payload.to_string(),
+    )
+}
+
+fn decorate_bkv_status_response(response: Vec<u8>) -> Vec<u8> {
+    let Some(body) = std::str::from_utf8(&response)
+        .ok()
+        .and_then(|text| text.split_once("\r\n\r\n").map(|(_, body)| body))
+    else {
+        return response;
+    };
+    let Ok(mut payload) = serde_json::from_str::<Value>(body) else {
+        return response;
+    };
+    if payload.get("code").and_then(Value::as_i64) != Some(0) {
+        return response;
+    }
+    payload["provider"] = json!("bkv");
+    payload["source"] = json!("bkv");
+    payload["sourceBadge"] = json!("BKV 离线回放");
+    payload["offline"] = json!(true);
+    if let Some(replay) = payload.get_mut("replay").and_then(Value::as_object_mut) {
+        let index = replay.get("index").and_then(Value::as_u64).unwrap_or(0);
+        replay.insert("total".to_string(), json!(11));
+        if (1..=11).contains(&index) {
+            replay.insert("legacySeqNo".to_string(), json!(1_893_699_u64 + index));
+        }
+    }
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &payload.to_string(),
+    )
+}
+
+fn production_file_response_with_bkv_root(
+    state: &ServiceState,
+    query: &str,
+    bkv_root: Option<&Path>,
+) -> Vec<u8> {
     let Some(path_value) = query_value(query, "path") else {
         return http_response(
             "400 Bad Request",
@@ -12292,7 +12550,7 @@ fn production_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
         None
     };
     let resolved_bkv = if bkv_path {
-        resolve_bkv_file(state, &path_value)
+        bkv_root.and_then(|root| resolve_bkv_file_at_root(state, root, &path_value))
     } else {
         None
     };
@@ -12323,6 +12581,11 @@ fn production_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
             "{\"error\":\"file_unavailable\"}",
         ),
     }
+}
+
+fn production_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let root = env::var("STEEL_BKV_DATA_ROOT").ok().map(PathBuf::from);
+    production_file_response_with_bkv_root(state, query, root.as_deref())
 }
 
 fn resolve_algorithm_file(root: &Path, value: &str) -> Result<PathBuf, String> {
@@ -17221,7 +17484,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("GET", "/api/admin/services") => read_admin_services_response(&state),
         ("GET", "/api/admin/diagnostics") => read_admin_diagnostics_response(&state),
-        ("GET", "/api/bkv/status") => production_tasks::bkv_status_response(&state),
+        ("GET", "/api/bkv/status") => {
+            decorate_bkv_status_response(production_tasks::bkv_status_response(&state))
+        }
         ("POST", "/api/bkv/import") => {
             production_tasks::bkv_import_response(&state, body, actor)
         }
@@ -17553,6 +17818,7 @@ mod tests {
     #[test]
     fn bkv_import_mutations_require_admin_services_permission() {
         assert_eq!(permission_for_route("GET", "/api/bkv/status"), None);
+        assert_eq!(permission_for_route("GET", "/api/production/file"), None);
         assert_eq!(
             permission_for_route("POST", "/api/bkv/import"),
             Some("admin.services")
@@ -17566,6 +17832,45 @@ mod tests {
             "POST",
             "/api/bkv/replay/reset"
         ));
+        let state = production_test_state();
+        let unauthorized = match authorize_request(
+            &state,
+            "GET /api/production/file?path=bkv%3A%2F%2Fbatch%2Fartifact HTTP/1.1\r\n\r\n",
+            "GET",
+            "/api/production/file",
+        ) {
+            Err(response) => response,
+            Ok(_) => panic!("BKV artifact route accepted an unauthenticated request"),
+        };
+        assert!(response_text(unauthorized).starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(authorize_request(
+            &state,
+            "GET /api/production/file?path=records%2FINS-1%2Fintensity.png HTTP/1.1\r\n\r\n",
+            "GET",
+            "/api/production/file",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn bkv_status_client_contract_identifies_offline_replay_progress() {
+        let response = decorate_bkv_status_response(http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "code":0,"active":true,
+                "activeBatch":{"batchId":"batch-001","contentId":"a".repeat(64)},
+                "batch":{"batchId":"batch-001","contentId":"a".repeat(64),"status":"ready"},
+                "replay":{"index":3,"status":"replaying","version":3}
+            })
+            .to_string(),
+        ));
+        let status = response_json(response);
+        assert_eq!(status["provider"], "bkv");
+        assert_eq!(status["sourceBadge"], "BKV 离线回放");
+        assert_eq!(status["offline"], true);
+        assert_eq!(status["replay"]["total"], 11);
+        assert_eq!(status["replay"]["legacySeqNo"], 1_893_702);
     }
 
     #[test]
@@ -17638,6 +17943,229 @@ mod tests {
         assert!(bkv_batch_is_active(&active, "batch-001", &"a".repeat(64)));
         assert!(!bkv_batch_is_active(&active, "batch-002", &"a".repeat(64)));
         assert!(!bkv_batch_is_active(&active, "batch-001", &"b".repeat(64)));
+    }
+
+    fn write_bkv_client_file_fixture(state: &ServiceState, root: &Path) -> (String, PathBuf) {
+        let batch_id = "batch-client";
+        let batch = root.join(batch_id);
+        fs::create_dir_all(batch.join("normalized")).unwrap();
+        let mut normalized = Vec::new();
+        for table in [
+            "allexcel",
+            "checkrecord",
+            "defect",
+            "defectclass",
+            "diameter",
+        ] {
+            let relative = format!("normalized/{table}.jsonl");
+            let payload = if table == "allexcel" {
+                (1_893_700..=1_893_710)
+                    .map(|seq| {
+                        format!(
+                            "{}\n",
+                            json!({
+                                "legacySeqNo":seq,"legacyTable":"allexcel",
+                                "id":seq.to_string(),"originalRowHash":format!("{seq:064x}"),
+                                "width":100,"length":12000,"thickness":10
+                            })
+                        )
+                    })
+                    .collect::<String>()
+            } else {
+                String::new()
+            };
+            fs::write(batch.join(&relative), payload.as_bytes()).unwrap();
+            normalized.push(json!({
+                "table":table,"path":relative,"size":payload.len(),
+                "sha256":format!("{:x}", Sha256::digest(payload.as_bytes())),
+                "count":if table == "allexcel" { 11 } else { 0 }
+            }));
+        }
+        let relative = "artifacts/camera1/1893700/3d/0000.d3img";
+        let artifact_path = batch.join(relative);
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, b"legacy-depth").unwrap();
+        let mut manifest = json!({
+            "schema":"steel.bkv-import-manifest.v1","batchId":batch_id,
+            "batchContentId":"0".repeat(64),"contentId":"0".repeat(64),
+            "seqNos":(1_893_700..=1_893_710).collect::<Vec<_>>(),
+            "sourceArchives":{
+                "database-zip":{"size":1,"sha256":"1".repeat(64)},
+                "image-part1":{"size":1,"sha256":"2".repeat(64)},
+                "image-part2":{"size":1,"sha256":"3".repeat(64)}
+            },
+            "normalizationEvidence":{"sha256":"4".repeat(64)},
+            "normalizationResultEvidence":{},"normalized":normalized,
+            "artifacts":[{
+                "path":relative,"memberPath":"image_copy/CamImageSource1/1893700/3D/0000.d3img",
+                "size":12,"sha256":format!("{:x}", Sha256::digest(b"legacy-depth")),
+                "cameraNumber":1,"seqNo":1_893_700,"kind":"3d","extension":".d3img",
+                "depthDecode":{
+                    "status":"unsupported","reason":"no_evidenced_decoder",
+                    "probeSchema":"steel.bkv-d3img-probe.v1","parserVersion":"1",
+                    "originalSha256":format!("{:x}", Sha256::digest(b"legacy-depth")),
+                    "decoderAvailable":false
+                }
+            }]
+        });
+        let content_id = production_tasks::bkv_batch_content_id(&manifest).unwrap();
+        manifest["batchContentId"] = json!(content_id);
+        manifest["contentId"] = json!(content_id);
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(batch.join("manifest.json"), &manifest_bytes).unwrap();
+        let publication = serde_json::to_vec(&json!({
+            "schema":"steel.bkv-publication.v1","state":"committed",
+            "batchId":batch_id,"contentId":content_id
+        }))
+        .unwrap();
+        fs::write(batch.join("publication.json"), &publication).unwrap();
+        let summary = json!({
+            "batchId":batch_id,"contentId":content_id,"status":"ready",
+            "summary":{
+                "manifestPath":format!("{batch_id}/manifest.json"),
+                "semanticDigest":"d".repeat(64),
+                "manifestSha256":format!("{:x}", Sha256::digest(&manifest_bytes)),
+                "publicationSha256":format!("{:x}", Sha256::digest(&publication))
+            }
+        });
+        state
+            .runtime
+            .block_on(db::set_config(
+                &state.database.connection,
+                &format!("bkv.batch.{batch_id}"),
+                &summary.to_string(),
+            ))
+            .unwrap();
+        state
+            .runtime
+            .block_on(db::set_config(
+                &state.database.connection,
+                "bkv.active-batch",
+                &json!({"batchId":batch_id,"contentId":content_id}).to_string(),
+            ))
+            .unwrap();
+        (format!("bkv://{batch_id}/{relative}"), artifact_path)
+    }
+
+    #[test]
+    fn bkv_client_artifact_is_active_root_bound_and_carries_decode_diagnostics() {
+        let state = production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
+        let root = env::temp_dir().join(format!(
+            "steel-bkv-client-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let (token, artifact_path) = write_bkv_client_file_fixture(&state, &root);
+
+        let artifact = bkv_client_artifact_value(&state, &root, &token).expect("active artifact");
+        assert_eq!(artifact["artifactRef"], token);
+        assert_eq!(artifact["url"], production_file_url(&token));
+        assert!(artifact["url"]
+            .as_str()
+            .unwrap()
+            .contains("path=bkv%3A%2F%2F"));
+        assert_eq!(artifact["legacySeqNo"], 1_893_700);
+        assert_eq!(artifact["depthDecode"]["status"], "unsupported");
+        assert_eq!(artifact["depthDecode"]["reason"], "no_evidenced_decoder");
+        assert!(artifact.get("localPath").is_none());
+        let routed = production_file_response_with_bkv_root(
+            &state,
+            &format!("path={}", url_encode_component(&token)),
+            Some(&root),
+        );
+        assert!(response_text(routed).starts_with("HTTP/1.1 200 OK"));
+        let capture = production_capture_image_value_for_bkv(
+            &state,
+            &root,
+            &db::entities::capture_file::Model {
+                id: "capture-1".to_string(),
+                inspection_id: "inspection-1".to_string(),
+                session_id: "session-1".to_string(),
+                material_id: "material-1".to_string(),
+                camera_id: "bkv-camera-1".to_string(),
+                camera_ip: String::new(),
+                data_name: "0000.d3img".to_string(),
+                sequence_no: 1_893_700,
+                file_type: "3d".to_string(),
+                path: token.clone(),
+                metadata_path: String::new(),
+                created_at: "2026-07-21T00:00:00Z".to_string(),
+            },
+        )
+        .expect("BKV capture DTO");
+        assert_eq!(capture["artifactRef"], token);
+        assert_eq!(capture["sourceBadge"], "BKV 离线回放");
+        assert_eq!(capture["depthDecode"]["reason"], "no_evidenced_decoder");
+        assert!(capture.get("path").is_none());
+        let decorated = decorate_bkv_capture_response(
+            &state,
+            &root,
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code":0,"source":"bkv","provider":"bkv","batchId":"batch-client",
+                    "artifacts":[{"path":"artifacts/camera1/1893700/3d/0000.d3img","verified":true}]
+                })
+                .to_string(),
+            ),
+        );
+        let decorated = response_json(decorated);
+        assert_eq!(decorated["sourceBadge"], "BKV 离线回放");
+        assert_eq!(decorated["artifacts"][0]["artifactRef"], token);
+        assert!(decorated["artifacts"][0].get("path").is_none());
+        assert!(
+            bkv_client_artifact_value(&state, &root, "bkv://batch-client/../manifest.json")
+                .is_none()
+        );
+        assert!(response_text(production_file_response(
+            &state,
+            "path=bkv%3A%2F%2Fbatch-client%2F..%2Fmanifest.json"
+        ))
+        .starts_with("HTTP/1.1 403 Forbidden"));
+
+        let outside = root.with_extension("outside-depth");
+        fs::write(&outside, b"legacy-depth").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            fs::remove_file(&artifact_path).unwrap();
+            symlink(&outside, &artifact_path).unwrap();
+            assert!(bkv_client_artifact_value(&state, &root, &token).is_none());
+            fs::remove_file(&artifact_path).unwrap();
+            fs::write(&artifact_path, b"legacy-depth").unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::symlink_file;
+            fs::remove_file(&artifact_path).unwrap();
+            match symlink_file(&outside, &artifact_path) {
+                Ok(()) => {
+                    assert!(file_component_is_link(&artifact_path));
+                    assert!(bkv_client_artifact_value(&state, &root, &token).is_none());
+                    fs::remove_file(&artifact_path).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(error) => panic!("create Windows reparse symlink: {error}"),
+            }
+            fs::write(&artifact_path, b"legacy-depth").unwrap();
+        }
+
+        fs::write(&artifact_path, b"changed-depth").unwrap();
+        assert!(bkv_client_artifact_value(&state, &root, &token).is_none());
+        fs::write(&artifact_path, b"legacy-depth").unwrap();
+        state
+            .runtime
+            .block_on(db::set_config(
+                &state.database.connection,
+                "bkv.active-batch",
+                &json!({"batchId":"batch-other","contentId":"e".repeat(64)}).to_string(),
+            ))
+            .unwrap();
+        assert!(bkv_client_artifact_value(&state, &root, &token).is_none());
+        fs::remove_file(outside).ok();
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

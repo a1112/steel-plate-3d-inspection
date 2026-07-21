@@ -655,7 +655,99 @@ export type ProductionStatus = {
       recoveredTasks?: number;
     };
   };
-  capture?: Record<string, unknown>;
+  capture?: BkvCaptureStatus | Record<string, unknown>;
+};
+
+export type CaptureProvider = 'headless-cpp' | 'external-api' | 'simulated' | 'bkv';
+
+export type BkvSourceBadge = 'BKV 离线回放';
+
+export type BkvDepthDecode = {
+  status: 'decoded' | 'unsupported' | 'invalid';
+  reason: string;
+  previewArtifactRef?: string;
+  depthArtifactRef?: string;
+  metadataArtifactRef?: string;
+};
+
+export type BkvArtifact = {
+  artifactRef: `bkv://${string}`;
+  relativePath: string;
+  url: string;
+  authenticated: true;
+  source: 'bkv';
+  sourceBadge: BkvSourceBadge;
+  offline: true;
+  sha256: string;
+  size: number;
+  cameraNumber: number;
+  legacySeqNo: number;
+  kind: string;
+  verified?: boolean;
+  depthDecode: BkvDepthDecode | null;
+};
+
+export type BkvReplayState = {
+  previousIndex?: number;
+  index: number;
+  total: number;
+  status: 'ready' | 'replaying' | 'completed';
+  version: number;
+  legacySeqNo?: number;
+};
+
+export type BkvCaptureStatus = {
+  provider: 'bkv';
+  status: 'bkv-offline';
+  sdkRequired: false;
+  sdkReady: null;
+  cameraCount: 6;
+  channels: Array<{
+    index: number;
+    status: 'offline';
+    source: 'bkv';
+  }>;
+  batchId?: string;
+  contentId?: string;
+  replay?: BkvReplayState;
+};
+
+export type BkvStatus = {
+  code: number;
+  active: boolean;
+  provider: 'bkv';
+  source: 'bkv';
+  sourceBadge: BkvSourceBadge;
+  offline: true;
+  activeBatch?: { batchId: string; contentId: string };
+  batch?: {
+    batchId: string;
+    contentId: string;
+    status: string;
+    counts?: Record<string, number>;
+  };
+  replay?: BkvReplayState;
+};
+
+export type BkvInspectionSnapshot = InspectionSnapshot & {
+  source: 'bkv' | 'bkv-offline';
+  sourceBadge?: BkvSourceBadge;
+  offline: true;
+  legacySeqNo?: number;
+  batchId?: string;
+  contentId?: string;
+  replay?: BkvReplayState;
+  bkvArtifacts?: BkvArtifact[];
+};
+
+export type InspectionSnapshotResponse = InspectionSnapshot & {
+  sourceBadge?: BkvSourceBadge;
+  offline?: true;
+  legacySeqNo?: number;
+  batchId?: string;
+  contentId?: string;
+  replay?: BkvReplayState;
+  bkvArtifacts?: BkvArtifact[];
 };
 
 export type ProductionEventInput = {
@@ -713,10 +805,32 @@ export type ProductionCommandResult = {
     discardBlackFrames?: boolean;
     algorithmPhase?: string;
   };
-  provider?: unknown;
+  provider?: CaptureProvider | Record<string, unknown>;
+  source?: string;
+  sourceBadge?: string;
+  offline?: boolean;
+  cameraCount?: number;
+  batchId?: string;
+  contentId?: string;
+  legacySeqNo?: number;
+  replay?: BkvReplayState;
+  artifacts?: BkvArtifact[];
   record?: unknown;
   error?: string;
   message?: string;
+};
+
+export type BkvProductionCommandResult = ProductionCommandResult & {
+  provider: 'bkv';
+  source: 'bkv';
+  sourceBadge: BkvSourceBadge;
+  offline: true;
+  cameraCount: 6;
+  batchId: string;
+  contentId: string;
+  legacySeqNo: number;
+  replay: BkvReplayState & { previousIndex: number };
+  artifacts: BkvArtifact[];
 };
 
 export type TriggerGatewayMode = 'api' | 'tcp' | 'udp' | 'gray' | 'secondary' | 'manual';
@@ -1053,7 +1167,10 @@ function withPreviewImage(defect: DefectItem, allowMockFallback: boolean, origin
   };
 }
 
-function normalizeInspectionSnapshot(snapshot: InspectionSnapshot, origin: string): InspectionSnapshot {
+function normalizeInspectionSnapshot(
+  snapshot: InspectionSnapshot | BkvInspectionSnapshot,
+  origin: string,
+): InspectionSnapshotResponse {
   // Static fixtures are allowed only for an explicitly identified demo/test
   // snapshot. Unknown and database-backed sources must fail closed so the
   // online page never presents bundled mock images as production evidence.
@@ -1063,15 +1180,28 @@ function normalizeInspectionSnapshot(snapshot: InspectionSnapshot, origin: strin
     defects: inspection.defects.map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
     captureImages: inspection.captureImages?.map((image) => normalizeCaptureImage(image, origin)),
   }));
-  return {
+  const normalized = {
     ...snapshot,
     defects: snapshot.defects.map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
     captureImages: snapshot.captureImages?.map((image) => normalizeCaptureImage(image, origin)),
     inspections,
   };
+  if (snapshot.source !== 'bkv' && snapshot.source !== 'bkv-offline') {
+    return normalized;
+  }
+  const bkvSnapshot = snapshot as BkvInspectionSnapshot;
+  return {
+    ...normalized,
+    bkvArtifacts: bkvSnapshot.bkvArtifacts?.map((artifact) => ({
+      ...artifact,
+      url: normalizeServiceUrl(artifact.url, origin),
+    })),
+  };
 }
 
-export async function fetchInspectionSnapshot(signal?: AbortSignal): Promise<InspectionSnapshot> {
+export async function fetchInspectionSnapshot(
+  signal?: AbortSignal,
+): Promise<InspectionSnapshotResponse> {
   const config = getStoredConnectionConfig();
   if (config.mode === 'demo') {
     return getMockInspectionSnapshot();
@@ -1085,7 +1215,45 @@ export async function fetchInspectionSnapshot(signal?: AbortSignal): Promise<Ins
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '后台数据接口异常'));
   }
-  return normalizeInspectionSnapshot((await response.json()) as InspectionSnapshot, origin);
+  return normalizeInspectionSnapshot(
+    (await response.json()) as InspectionSnapshot | BkvInspectionSnapshot,
+    origin,
+  );
+}
+
+export async function fetchBkvStatus(signal?: AbortSignal): Promise<BkvStatus> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/bkv/status`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, 'BKV 离线回放状态接口异常'));
+  }
+  return response.json() as Promise<BkvStatus>;
+}
+
+export async function fetchBkvArtifact(
+  artifact: BkvArtifact,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  if (!artifact.artifactRef.startsWith('bkv://')) {
+    throw new Error('BKV artifact reference is invalid');
+  }
+  const origin = getInspectionServiceOrigin(getStoredConnectionConfig());
+  const query = new URLSearchParams({ path: artifact.artifactRef });
+  const response = await fetch(`${origin}/api/production/file?${query.toString()}`, {
+    headers: createAdminHeaders({ Accept: 'application/octet-stream' }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, 'BKV 离线数据文件读取失败'));
+  }
+  const blob = await response.blob();
+  if (blob.size !== artifact.size) {
+    throw new Error('BKV artifact size mismatch');
+  }
+  return blob;
 }
 
 export async function fetchProductionStatus(signal?: AbortSignal): Promise<ProductionStatus> {
