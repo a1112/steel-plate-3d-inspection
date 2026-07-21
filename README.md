@@ -46,7 +46,6 @@ The release, two-stage installation, offline prerequisites, supervisor acceptanc
 - `test-real-calibration-acceptance.ps1` defaults to dry-run; real apply/rollback requires a reviewed eight-camera plan, an `admin.config` token, an explicit mutation switch, and an exact safety phrase.
 - Controlled process-crash recovery is available through `test-real-calibration-crash-recovery.ps1`. Its failpoint is disabled by default and bound to an exact confirmation, apply operation ID, phase, and camera index. Full live coverage requires successful ApplyCrash and RollbackCrash Resume reports; interrupted rollback reconciliation preserves the original apply correlation explicitly.
 - `test-real-calibration-integrity-generation.ps1` completes the remaining rollback-safety evidence by proving stale-generation and staged-hash rejection are zero-write decisions before restoring the staged bytes and validating all eight cameras.
-- BKV legacy staging treats `UnRAR.exe` as a fixed, explicitly reviewed binary: configure an absolute audited path and do not substitute an archive-provided executable. Windows Job Object process-tree containment remains a follow-up hardening item.
 
 ## Quick Start
 
