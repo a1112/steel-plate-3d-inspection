@@ -50,7 +50,8 @@ MAX_SQL_SAMPLE_ROWS = 1_000
 MAX_SQL_SAMPLE_BYTES = 4 * 1024 * 1024
 MAX_SQL_TABLE_ROWS = 2_000_000
 MAX_SQL_NORMALIZED_BYTES = 2 * 1024 * 1024 * 1024
-MAX_SQL_RELATIONSHIP_KEYS = 2_000_000
+MAX_SQL_RELATIONSHIP_KEYS = 10_000
+MAX_SQL_RELATIONSHIP_INDEX_BYTES = 16 * 1024 * 1024
 MAX_SQL_PENDING_BYTES = 512 * 1024 * 1024
 MAX_SQL_PENDING_REPLAY_PASSES = 32
 MAX_SQL_REJECTED_ROWS = 100_000
@@ -458,25 +459,39 @@ def _row_target_seq(
     row: dict[str, object],
     targets: frozenset[int],
     retained_relationships: dict[tuple[str, str], dict[object, int | None]],
-) -> tuple[int | None, bool, bool]:
+) -> tuple[int | None, str]:
     normalized = {_normalized_identifier(key): value for key, value in row.items()}
+    proofs: set[int] = set()
+    unresolved = False
     if "seqno" in normalized:
         direct = normalized["seqno"]
-        return (
-            direct if isinstance(direct, int) and direct in targets else None,
-            True,
-            False,
-        )
+        if isinstance(direct, int):
+            proofs.add(direct)
     for local_column, (parent_table, parent_column) in schema.foreign_keys.items():
         value = normalized.get(local_column)
+        if value is None:
+            continue
         parent_values = retained_relationships.get((parent_table, parent_column), {})
         try:
+            present = value in parent_values
             target_seq = parent_values.get(value)
         except TypeError:
+            present = False
             target_seq = None
-        if target_seq is not None:
-            return target_seq, True, False
-    return None, False, bool(schema.foreign_keys)
+        if not present:
+            unresolved = True
+        elif target_seq is None:
+            return None, "conflict"
+        else:
+            proofs.add(target_seq)
+    if len(proofs) > 1:
+        return None, "conflict"
+    if unresolved:
+        return None, "pending"
+    if len(proofs) == 1:
+        proof = next(iter(proofs))
+        return (proof, "accepted") if proof in targets else (None, "not_target")
+    return None, "unproven"
 
 
 def _stable_row_hash(table: str, columns: Sequence[str], raw_tuple: str) -> str:
@@ -497,11 +512,61 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _strict_sql_output_root(
+    output_root: os.PathLike[str] | str, *, create: bool
+) -> Path:
+    raw = Path(output_root).expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    for candidate in _existing_chain(raw):
+        if is_reparse_point(candidate):
+            raise ValueError(f"SQL output root contains a reparse point: {candidate}")
+    if create:
+        raw.mkdir(parents=True, exist_ok=True)
+    if not raw.is_dir():
+        raise ValueError(f"SQL output root is not a directory: {raw}")
+    for candidate in _existing_chain(raw):
+        if is_reparse_point(candidate):
+            raise ValueError(f"SQL output root contains a reparse point: {candidate}")
+    return raw.resolve(strict=True)
+
+
+def _strict_sql_generations_root(root: Path, *, create: bool) -> Path:
+    candidate = root / "normalized-generations"
+    if is_reparse_point(candidate):
+        raise ValueError(f"SQL generations root is a reparse point: {candidate}")
+    if create:
+        candidate.mkdir(exist_ok=True)
+    if not candidate.is_dir() or is_reparse_point(candidate):
+        raise ValueError(
+            f"SQL generations root is missing or a reparse point: {candidate}"
+        )
+    canonical = candidate.resolve(strict=True)
+    if canonical.parent != root or canonical.name != "normalized-generations":
+        raise ValueError("SQL generations root escaped the fixed output root")
+    return canonical
+
+
+def _strict_sql_generation(generations_root: Path, candidate: Path) -> Path:
+    if candidate.parent != generations_root or is_reparse_point(candidate):
+        raise ValueError("SQL generation is a reparse point or escaped its fixed root")
+    canonical = candidate.resolve(strict=True)
+    try:
+        canonical.relative_to(generations_root)
+    except ValueError as error:
+        raise ValueError("SQL generation escaped its fixed root") from error
+    if canonical.parent != generations_root or is_reparse_point(canonical):
+        raise ValueError("SQL generation is a reparse point or escaped its fixed root")
+    return canonical
+
+
 def _replace_sql_current_pointer(temporary: Path, current: Path) -> None:
     os.replace(temporary, current)
 
 
 def _sql_file_evidence(path: Path, count: int) -> dict[str, object]:
+    if is_reparse_point(path):
+        raise ValueError(f"SQL generation file is a reparse point: {path}")
     digest = hashlib.sha256()
     size = 0
     actual_count = 0
@@ -528,11 +593,14 @@ def _publish_sql_output(
     counts: dict[str, dict[str, int]],
 ) -> Path:
     """Publish an immutable generation, then atomically switch its small pointer."""
-    generations_root = output_root / "normalized-generations"
+    output_root = _strict_sql_output_root(output_root, create=False)
+    generations_root = _strict_sql_generations_root(output_root, create=False)
+    incoming = _strict_sql_generation(generations_root, incoming)
     generation = generations_root / (
         f"generation-{time.time_ns()}-{os.getpid()}-{incoming.name.rsplit('-', 1)[-1]}"
     )
     os.replace(incoming, generation)
+    generation = _strict_sql_generation(generations_root, generation)
     _fsync_directory(generations_root)
     files: dict[str, dict[str, object]] = {}
     for table in _SQL_TABLES:
@@ -563,6 +631,8 @@ def _publish_sql_output(
             os.fsync(output.fileno())
         _fsync_directory(output_root)
         current = output_root / "normalized.current.json"
+        if is_reparse_point(current):
+            raise ValueError("SQL current pointer is a reparse point")
         _replace_sql_current_pointer(temporary_pointer, current)
         temporary_pointer = None
         _fsync_directory(output_root)
@@ -572,62 +642,88 @@ def _publish_sql_output(
     return generation
 
 
+def _validate_sql_current_pointer(pointer: object) -> dict[str, object]:
+    if not isinstance(pointer, dict):
+        raise ValueError("invalid SQL current pointer: top level must be an object")
+    if pointer.get("schema") != "steel.bkv-sql-current.v1":
+        raise ValueError("invalid SQL current pointer: unsupported schema")
+    if not isinstance(pointer.get("generation"), str):
+        raise ValueError("invalid SQL current pointer: generation must be a string")
+    files = pointer.get("files")
+    if not isinstance(files, dict) or set(files) != set(_SQL_TABLES):
+        raise ValueError(
+            "invalid SQL current pointer: files must name exactly five tables"
+        )
+    for table in _SQL_TABLES:
+        evidence = files[table]
+        if not isinstance(evidence, dict):
+            raise ValueError(
+                f"invalid SQL current pointer: file evidence must be an object: {table}"
+            )
+        count = evidence.get("count")
+        size = evidence.get("size")
+        sha256 = evidence.get("sha256")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(
+                f"invalid SQL current pointer: count must be a non-negative integer: {table}"
+            )
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(
+                f"invalid SQL current pointer: size must be a non-negative integer: {table}"
+            )
+        if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+            raise ValueError(
+                f"invalid SQL current pointer: sha256 must be lowercase hex: {table}"
+            )
+    return pointer
+
+
 def resolve_sql_output(output_root: os.PathLike[str] | str) -> Path:
     """Resolve and verify the immutable generation named by the current pointer."""
-    root = Path(output_root).resolve(strict=True)
+    root = _strict_sql_output_root(output_root, create=False)
+    generations_root = _strict_sql_generations_root(root, create=False)
     pointer_path = root / "normalized.current.json"
     if is_reparse_point(pointer_path):
         raise ValueError("SQL current pointer may not be a reparse point")
     payload = pointer_path.read_bytes()
     if len(payload) > MAX_MANIFEST_BYTES:
         raise SqlDumpLimitError("SQL current pointer exceeds MAX_MANIFEST_BYTES")
-    pointer = json.loads(payload)
-    if pointer.get("schema") != "steel.bkv-sql-current.v1":
-        raise ValueError("unsupported SQL current pointer schema")
-    relative = pointer.get("generation")
-    if not isinstance(relative, str):
-        raise ValueError("SQL current generation is missing")
+    pointer = _validate_sql_current_pointer(json.loads(payload))
+    relative = pointer["generation"]
+    assert isinstance(relative, str)
     normalized = normalize_member(relative)
     if normalized != relative:
         raise ValueError("unsafe SQL generation path")
     parts = PurePosixPath(relative).parts
     if len(parts) != 2 or parts[0] != "normalized-generations":
         raise ValueError("SQL generation must be below normalized-generations")
-    generation = (root / Path(*parts)).resolve(strict=True)
-    generations_root = (root / "normalized-generations").resolve(strict=True)
-    if generation.parent != generations_root or is_reparse_point(generation):
-        raise ValueError("SQL generation escaped normalized-generations")
-    files = pointer.get("files")
-    if not isinstance(files, dict) or set(files) != set(_SQL_TABLES):
-        raise ValueError("SQL current pointer must describe exactly five tables")
+    generation = _strict_sql_generation(generations_root, root / Path(*parts))
+    files = pointer["files"]
+    assert isinstance(files, dict)
     for table in _SQL_TABLES:
         evidence = files[table]
-        if not isinstance(evidence, dict):
-            raise ValueError(f"invalid SQL file evidence: {table}")
+        assert isinstance(evidence, dict)
         path = generation / f"{table}.jsonl"
-        actual = _sql_file_evidence(path, int(evidence.get("count", -1)))
+        actual = _sql_file_evidence(path, evidence["count"])
         if evidence.get("size") != actual["size"]:
             raise ValueError(f"SQL generation size mismatch: {table}")
         if evidence.get("sha256") != actual["sha256"]:
             raise ValueError(f"SQL generation hash mismatch: {table}")
-        if not isinstance(evidence.get("count"), int) or evidence["count"] < 0:
-            raise ValueError(f"SQL generation count is invalid: {table}")
     return generation
 
 
 def cleanup_orphan_sql_generations(output_root: os.PathLike[str] | str) -> None:
     """Explicitly remove orphan generations; never called by the publish path."""
-    root = Path(output_root).resolve(strict=True)
+    root = _strict_sql_output_root(output_root, create=False)
     current = (
         resolve_sql_output(root)
         if (root / "normalized.current.json").is_file()
         else None
     )
-    generations_root = (root / "normalized-generations").resolve(strict=True)
+    generations_root = _strict_sql_generations_root(root, create=False)
     for candidate in generations_root.iterdir():
-        if is_reparse_point(candidate):
-            raise ValueError(f"refusing to clean reparse generation: {candidate}")
-        if current is not None and candidate.resolve() == current:
+        candidate = _strict_sql_generation(generations_root, candidate)
+        if current is not None and candidate == current:
             continue
         if candidate.name.startswith(("generation-", ".incoming-")):
             shutil.rmtree(candidate)
@@ -671,8 +767,10 @@ def filter_sql_dump(
     )
     schemas: dict[str, _SqlTableSchema] = {}
     retained_relationships: dict[tuple[str, str], dict[object, int | None]] = {}
+    relationship_demands: set[tuple[str, str]] = set()
     table_rows_seen = {table: 0 for table in _SQL_TABLES}
     relationship_key_count = 0
+    relationship_index_bytes = 0
     normalized_bytes = 0
     memory_result_bytes = 0
     sample_rows = 0
@@ -705,24 +803,49 @@ def filter_sql_dump(
         return True
 
     def add_relationships(table: str, row: dict[str, object], target_seq: int) -> None:
-        nonlocal relationship_key_count
-        for column, value in row.items():
+        nonlocal relationship_key_count, relationship_index_bytes
+        normalized_row = {column.casefold(): value for column, value in row.items()}
+        demanded_columns = [
+            parent_column
+            for parent_table, parent_column in relationship_demands
+            if parent_table == table
+        ]
+        for column in demanded_columns:
+            value = normalized_row.get(column)
             if value is None:
                 continue
             try:
                 hash(value)
             except TypeError:
                 continue
-            relationship_values = retained_relationships.setdefault(
-                (table, column.casefold()), {}
-            )
+            relationship_values = retained_relationships.setdefault((table, column), {})
             if value not in relationship_values:
                 if relationship_key_count >= MAX_SQL_RELATIONSHIP_KEYS:
                     raise SqlDumpLimitError(
                         "relationship keys exceed "
                         f"MAX_SQL_RELATIONSHIP_KEYS={MAX_SQL_RELATIONSHIP_KEYS}"
                     )
+                key_bytes = (
+                    len(
+                        json.dumps(
+                            [table, column, value, target_seq],
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8", errors="strict")
+                    )
+                    + 128
+                )
+                if (
+                    relationship_index_bytes + key_bytes
+                    > MAX_SQL_RELATIONSHIP_INDEX_BYTES
+                ):
+                    raise SqlDumpLimitError(
+                        "relationship index bytes exceed "
+                        "MAX_SQL_RELATIONSHIP_INDEX_BYTES="
+                        f"{MAX_SQL_RELATIONSHIP_INDEX_BYTES}"
+                    )
                 relationship_key_count += 1
+                relationship_index_bytes += key_bytes
                 relationship_values[value] = target_seq
             elif relationship_values[value] != target_seq:
                 relationship_values[value] = None
@@ -733,6 +856,8 @@ def filter_sql_dump(
         row: dict[str, object],
         raw_text: str,
         target_seq: int,
+        *,
+        index_relationships: bool = False,
     ) -> None:
         nonlocal normalized_bytes, memory_result_bytes, sample_rows, sample_bytes
         normalized_row = dict(row)
@@ -749,7 +874,8 @@ def filter_sql_dump(
                 f"MAX_SQL_NORMALIZED_BYTES={MAX_SQL_NORMALIZED_BYTES}"
             )
         normalized_bytes += len(line)
-        add_relationships(table, row, target_seq)
+        if index_relationships:
+            add_relationships(table, row, target_seq)
         if output_destination is None:
             accepted_total = sum(item["accepted"] for item in result.counts.values())
             if accepted_total >= MAX_SQL_RESULT_ROWS:
@@ -804,9 +930,12 @@ def filter_sql_dump(
         pending_bytes = 0
         try:
             if output_destination is not None:
-                output_destination.mkdir(parents=True, exist_ok=True)
-                generations_root = output_destination / "normalized-generations"
-                generations_root.mkdir(parents=True, exist_ok=True)
+                output_destination = _strict_sql_output_root(
+                    output_destination, create=True
+                )
+                generations_root = _strict_sql_generations_root(
+                    output_destination, create=True
+                )
                 incoming = Path(
                     tempfile.mkdtemp(
                         prefix=".incoming-",
@@ -911,23 +1040,19 @@ def filter_sql_dump(
                             ):
                                 reject(table, "negative_physical_dimension")
                                 continue
-                            target_seq, relationship_proven, can_be_pending = (
-                                _row_target_seq(
-                                    schema, row, targets, retained_relationships
-                                )
+                            target_seq, relationship_state = _row_target_seq(
+                                schema, row, targets, retained_relationships
                             )
-                            if relationship_proven:
-                                if target_seq is None:
-                                    reject(table, "seq_not_target")
-                                else:
-                                    accept(
-                                        table,
-                                        columns,
-                                        row,
-                                        sql_row.raw_text,
-                                        target_seq,
-                                    )
-                            elif can_be_pending:
+                            if relationship_state == "accepted":
+                                assert target_seq is not None
+                                accept(
+                                    table,
+                                    columns,
+                                    row,
+                                    sql_row.raw_text,
+                                    target_seq,
+                                )
+                            elif relationship_state == "pending":
                                 pending_bytes = spool_record(
                                     pending,
                                     table,
@@ -936,12 +1061,38 @@ def filter_sql_dump(
                                     sql_row.raw_text,
                                     pending_bytes,
                                 )
+                            elif relationship_state == "conflict":
+                                reject(table, "relationship_conflict")
+                            elif relationship_state == "not_target":
+                                reject(table, "seq_not_target")
                             else:
                                 reject(table, "relationship_unproven")
                 except (zipfile.BadZipFile, OSError, EOFError) as error:
                     if "crc" not in str(error).casefold():
                         raise
                     result.integrity = "partial-crc-error"
+
+            for schema in schemas.values():
+                relationship_demands.update(schema.foreign_keys.values())
+            if output_destination is None:
+                accepted_rows = (
+                    (table, row)
+                    for table, rows in result.rows_by_table.items()
+                    for row in rows
+                )
+                for table, row in accepted_rows:
+                    add_relationships(table, row, int(row["legacySeqNo"]))
+            else:
+                for writer in writers.values():
+                    writer.flush()
+                assert incoming is not None
+                for table in _SQL_TABLES:
+                    with (incoming / f"{table}.jsonl").open(
+                        "r", encoding="utf-8"
+                    ) as accepted_input:
+                        for line in accepted_input:
+                            row = json.loads(line)
+                            add_relationships(table, row, int(row["legacySeqNo"]))
 
             current = pending_path
             for pass_number in range(MAX_SQL_PENDING_REPLAY_PASSES):
@@ -962,16 +1113,26 @@ def filter_sql_dump(
                         if schema is None:
                             reject(table, "relationship_unproven")
                             continue
-                        target_seq, relationship_proven, can_be_pending = (
-                            _row_target_seq(
-                                schema, row, targets, retained_relationships
-                            )
+                        target_seq, relationship_state = _row_target_seq(
+                            schema, row, targets, retained_relationships
                         )
-                        if relationship_proven and target_seq is not None:
-                            accept(table, columns, row, raw_text, target_seq)
+                        if relationship_state == "accepted":
+                            assert target_seq is not None
+                            accept(
+                                table,
+                                columns,
+                                row,
+                                raw_text,
+                                target_seq,
+                                index_relationships=True,
+                            )
                             progress = True
-                        elif can_be_pending:
+                        elif relationship_state == "pending":
                             pending_output.write(payload)
+                        elif relationship_state == "conflict":
+                            reject(table, "relationship_conflict")
+                        elif relationship_state == "not_target":
+                            reject(table, "seq_not_target")
                         else:
                             reject(table, "relationship_unproven")
                 current.unlink(missing_ok=True)

@@ -465,10 +465,16 @@ CREATE TABLE `diameter` (`RecordId` bigint,
   FOREIGN KEY (`RecordId`) REFERENCES `checkrecord` (`Id`));
 INSERT INTO `diameter` VALUES (71);
 """
+        relationship = rb"""
+CREATE TABLE `allexcel` (`ParentKey` text, `SeqNo` bigint);
+INSERT INTO `allexcel` VALUES ('one', 1893700), ('two', 1893710);
+CREATE TABLE `diameter` (`ParentKey` text,
+  FOREIGN KEY (`ParentKey`) REFERENCES `allexcel` (`ParentKey`));
+"""
         cases = (
             ("MAX_SQL_TABLE_ROWS", 1, direct, "table rows"),
             ("MAX_SQL_NORMALIZED_BYTES", 1, direct, "normalized bytes"),
-            ("MAX_SQL_RELATIONSHIP_KEYS", 1, direct, "relationship keys"),
+            ("MAX_SQL_RELATIONSHIP_KEYS", 1, relationship, "relationship keys"),
             ("MAX_SQL_PENDING_BYTES", 1, pending, "pending spool bytes"),
         )
         for constant, limit, fixture, message in cases:
@@ -666,6 +672,159 @@ INSERT INTO `allexcel` VALUES (1893700, -1.0, 20.0);
         self.assertEqual(
             result.rejected_rows[-1]["reason"], "negative_physical_dimension"
         )
+
+    def test_all_direct_and_foreign_key_proofs_must_be_unique_and_consistent(self):
+        parents = rb"""
+CREATE TABLE `checkrecord` (`Id` bigint, `SeqNo` bigint);
+INSERT INTO `checkrecord` VALUES (71, 1893700), (72, 1893710);
+CREATE TABLE `allexcel` (`Id` bigint, `SeqNo` bigint);
+INSERT INTO `allexcel` VALUES (81, 1893700), (82, 1893710);
+"""
+        conflicts = (
+            rb"""CREATE TABLE `diameter` (`CheckId` bigint, `ExcelId` bigint,
+  FOREIGN KEY (`CheckId`) REFERENCES `checkrecord` (`Id`),
+  FOREIGN KEY (`ExcelId`) REFERENCES `allexcel` (`Id`));
+INSERT INTO `diameter` VALUES (71, 82);""",
+            rb"""CREATE TABLE `diameter` (`CheckId` bigint, `ExcelId` bigint,
+  FOREIGN KEY (`ExcelId`) REFERENCES `allexcel` (`Id`),
+  FOREIGN KEY (`CheckId`) REFERENCES `checkrecord` (`Id`));
+INSERT INTO `diameter` VALUES (71, 82);""",
+        )
+        for child in conflicts:
+            with self.subTest(order=child.splitlines()[1]):
+                result = subject.filter_sql_dump(
+                    io.BytesIO(parents + child), subject.TARGET_SEQ_NOS
+                )
+                self.assertEqual(
+                    result.rejected_rows[-1]["reason"], "relationship_conflict"
+                )
+                self.assertFalse(result.diameter_complete)
+
+        direct_conflict = rb"""
+CREATE TABLE `diameter` (`SeqNo` bigint, `CheckId` bigint,
+  FOREIGN KEY (`CheckId`) REFERENCES `checkrecord` (`Id`));
+INSERT INTO `diameter` VALUES (1893700, 72);
+"""
+        result = subject.filter_sql_dump(
+            io.BytesIO(parents + direct_conflict), subject.TARGET_SEQ_NOS
+        )
+        self.assertEqual(result.rejected_rows[-1]["reason"], "relationship_conflict")
+
+        consistent_child = rb"""
+CREATE TABLE `diameter` (`CheckId` bigint, `ExcelId` bigint,
+  FOREIGN KEY (`CheckId`) REFERENCES `checkrecord` (`Id`),
+  FOREIGN KEY (`ExcelId`) REFERENCES `allexcel` (`Id`));
+INSERT INTO `diameter` VALUES (71, 81);
+"""
+        result = subject.filter_sql_dump(
+            io.BytesIO(consistent_child + parents), subject.TARGET_SEQ_NOS
+        )
+        self.assertEqual(result.rows_by_table["diameter"][0]["legacySeqNo"], 1_893_700)
+
+        mixed_child = consistent_child.replace(b"(71, 81)", b"(71, 999)")
+        result = subject.filter_sql_dump(
+            io.BytesIO(parents + mixed_child), subject.TARGET_SEQ_NOS
+        )
+        self.assertEqual(result.rejected_rows[-1]["reason"], "relationship_unproven")
+        self.assertEqual(result.rows_by_table["diameter"], [])
+
+    def test_relationship_index_only_keeps_referenced_columns_and_bounds_bytes(self):
+        long_key = "k" * 200
+        fixture = f"""
+CREATE TABLE `allexcel` (`UnusedA` text, `ParentKey` text, `UnusedB` text, `SeqNo` bigint);
+INSERT INTO `allexcel` VALUES ('a', '{long_key}', 'b', 1893700);
+CREATE TABLE `diameter` (`ParentKey` text,
+  FOREIGN KEY (`ParentKey`) REFERENCES `allexcel` (`ParentKey`));
+INSERT INTO `diameter` VALUES ('{long_key}');
+""".encode()
+        with mock.patch.object(subject, "MAX_SQL_RELATIONSHIP_KEYS", 1):
+            result = subject.filter_sql_dump(
+                io.BytesIO(fixture), subject.TARGET_SEQ_NOS
+            )
+        self.assertEqual(len(result.rows_by_table["diameter"]), 1)
+
+        with mock.patch.object(subject, "MAX_SQL_RELATIONSHIP_KEYS", 100):
+            with mock.patch.object(subject, "MAX_SQL_RELATIONSHIP_INDEX_BYTES", 32):
+                with self.assertRaisesRegex(
+                    subject.SqlDumpLimitError, "relationship index bytes"
+                ):
+                    subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+    def test_pointer_types_fail_with_stable_value_errors(self):
+        fixture = rb"""CREATE TABLE `allexcel` (`SeqNo` bigint);
+INSERT INTO `allexcel` VALUES (1893700);"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "normalized"
+            subject.filter_sql_dump(
+                io.BytesIO(fixture), subject.TARGET_SEQ_NOS, output_dir=output
+            )
+            pointer_path = output / "normalized.current.json"
+            valid = json.loads(pointer_path.read_text(encoding="utf-8"))
+            invalid_documents = (
+                [],
+                {"schema": "steel.bkv-sql-current.v1", "generation": [], "files": {}},
+                {
+                    **valid,
+                    "files": {
+                        **valid["files"],
+                        "allexcel": {**valid["files"]["allexcel"], "count": "1"},
+                    },
+                },
+                {
+                    **valid,
+                    "files": {
+                        **valid["files"],
+                        "allexcel": {**valid["files"]["allexcel"], "sha256": []},
+                    },
+                },
+            )
+            for document in invalid_documents:
+                with self.subTest(document=document):
+                    pointer_path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        ValueError, "invalid SQL current pointer"
+                    ):
+                        subject.resolve_sql_output(output)
+
+    def test_generation_reparse_boundaries_reject_write_resolve_and_cleanup(self):
+        fixture = rb"""CREATE TABLE `allexcel` (`SeqNo` bigint);
+INSERT INTO `allexcel` VALUES (1893700);"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            external = root / "external"
+            external.mkdir()
+            linked_output = root / "linked-output"
+            try:
+                os.symlink(external, linked_output, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlink unavailable: {error}")
+            with self.assertRaisesRegex(ValueError, "reparse"):
+                subject.filter_sql_dump(
+                    io.BytesIO(fixture),
+                    subject.TARGET_SEQ_NOS,
+                    output_dir=linked_output,
+                )
+            self.assertEqual(list(external.iterdir()), [])
+
+            output = root / "normalized"
+            subject.filter_sql_dump(
+                io.BytesIO(fixture), subject.TARGET_SEQ_NOS, output_dir=output
+            )
+            pointer_path = output / "normalized.current.json"
+            original_pointer = pointer_path.read_bytes()
+            external_generation = root / "external-generation"
+            external_generation.mkdir()
+            evil = output / "normalized-generations" / "generation-evil"
+            os.symlink(external_generation, evil, target_is_directory=True)
+            pointer = json.loads(original_pointer)
+            pointer["generation"] = "normalized-generations/generation-evil"
+            pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "reparse"):
+                subject.resolve_sql_output(output)
+            pointer_path.write_bytes(original_pointer)
+            with self.assertRaisesRegex(ValueError, "reparse"):
+                subject.cleanup_orphan_sql_generations(output)
+            self.assertEqual(list(external_generation.iterdir()), [])
 
 
 class MemberPolicyTests(unittest.TestCase):
