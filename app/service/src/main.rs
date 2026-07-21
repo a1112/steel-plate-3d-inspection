@@ -2492,17 +2492,6 @@ fn production_capture_image_value_for_bkv(
     Some(artifact)
 }
 
-fn partition_snapshot_capture_images(
-    provider: CaptureProvider,
-    images: Vec<Value>,
-) -> (Vec<Value>, Vec<Value>) {
-    if provider == CaptureProvider::Bkv {
-        (Vec::new(), images)
-    } else {
-        (images, Vec::new())
-    }
-}
-
 fn summarize_defect_values(defects: &[Value]) -> Value {
     let mut severe = 0;
     let mut review = 0;
@@ -2667,24 +2656,18 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
     let bkv_binding = selected_bkv_inspection
         .as_ref()
         .and_then(|inspection| serde_json::from_str::<Value>(&inspection.raw_payload).ok());
-    let mut inspections = state
-        .runtime
-        .block_on(db::list_recent_production_inspections(
-            &state.database.connection,
-            20,
-        ))
-        .map_err(|error| error.to_string())?;
-    if let Some(selected) = selected_bkv_inspection {
-        if let Some(index) = inspections
-            .iter()
-            .position(|inspection| inspection.id == selected.id)
-        {
-            inspections.swap(0, index);
-        } else {
-            inspections.insert(0, selected);
-            inspections.truncate(20);
-        }
-    }
+    let inspections = if state.capture.provider == CaptureProvider::Bkv {
+        vec![selected_bkv_inspection
+            .expect("BKV selected inspection is guarded before snapshot assembly")]
+    } else {
+        state
+            .runtime
+            .block_on(db::list_recent_production_inspections(
+                &state.database.connection,
+                20,
+            ))
+            .map_err(|error| error.to_string())?
+    };
     if inspections.is_empty() {
         return Ok(None);
     }
@@ -2730,18 +2713,26 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             .iter()
             .map(|defect| production_defect_value(defect, inspection, &plate))
             .collect::<Vec<_>>();
-        let capture_images = files
-            .iter()
-            .map(|file| {
-                if file.path.starts_with("bkv://") {
-                    let root = production_tasks::configured_bkv_root().ok()?;
-                    production_capture_image_value_for_bkv(state, &root, file)
-                } else {
-                    Some(production_capture_image_value(file))
-                }
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| "bkv_artifact_unavailable".to_string())?;
+        let (legacy_capture_images, bkv_artifacts) =
+            if state.capture.provider == CaptureProvider::Bkv {
+                let root = production_tasks::configured_bkv_root().ok();
+                let artifacts = files
+                    .iter()
+                    .map(|file| {
+                        if !file.path.starts_with("bkv://") {
+                            return None;
+                        }
+                        production_capture_image_value_for_bkv(state, root.as_deref()?, file)
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| "bkv_artifact_unavailable".to_string())?;
+                (Vec::new(), artifacts)
+            } else {
+                (
+                    files.iter().map(production_capture_image_value).collect(),
+                    Vec::new(),
+                )
+            };
         let capture_summary_path = production_session_summary_path(
             &inspection.storage_root,
             &inspection.material_id,
@@ -2749,8 +2740,6 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
         )
         .map(|path| path.display().to_string())
         .unwrap_or_default();
-        let (legacy_capture_images, bkv_artifacts) =
-            partition_snapshot_capture_images(state.capture.provider, capture_images);
         if index == 0 {
             current_plate = plate.clone();
             current_defects = defects.clone();
@@ -18345,13 +18334,7 @@ mod tests {
     }
 
     #[test]
-    fn bkv_snapshot_and_capture_compatibility_never_reuse_physical_image_contracts() {
-        let artifact = json!({"artifactRef":"bkv://batch/a.d3img","url":"/api/production/file"});
-        let (legacy_images, bkv_artifacts) =
-            partition_snapshot_capture_images(CaptureProvider::Bkv, vec![artifact.clone()]);
-        assert!(legacy_images.is_empty());
-        assert_eq!(bkv_artifacts, vec![artifact]);
-
+    fn bkv_capture_compatibility_never_reuses_physical_camera_contracts() {
         let state = production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
         let cameras = response_json(
             bkv_capture_compat_response(&state, "/api/cameras").expect("BKV camera DTO"),
@@ -18403,6 +18386,26 @@ mod tests {
                 ))
                 .unwrap();
         }
+        let real_capture_path = r"D:\legacy-real\REAL-NEWER\camera-1\depth.png";
+        let real_metadata_path = r"D:\legacy-real\REAL-NEWER\camera-1\depth.json";
+        state
+            .runtime
+            .block_on(db::append_capture_file(
+                &state.database.connection,
+                db::CaptureFileInput {
+                    inspection_id: "newer".to_string(),
+                    session_id: "session-newer".to_string(),
+                    material_id: "REAL-NEWER".to_string(),
+                    camera_id: "camera-1".to_string(),
+                    camera_ip: "192.168.101.100".to_string(),
+                    data_name: "depth.png".to_string(),
+                    sequence_no: 1,
+                    file_type: "png".to_string(),
+                    path: real_capture_path.to_string(),
+                    metadata_path: real_metadata_path.to_string(),
+                },
+            ))
+            .unwrap();
         state
             .runtime
             .block_on(db::set_config(
@@ -18431,7 +18434,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot["currentPlate"]["plateNo"], "BKV-SELECTED");
+        assert_eq!(snapshot["inspections"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["records"].as_array().unwrap().len(), 1);
         assert_eq!(snapshot["inspections"][0]["inspectionId"], "selected");
+        assert!(snapshot["captureImages"].as_array().unwrap().is_empty());
+        assert!(snapshot["inspections"][0]["captureImages"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(snapshot["bkvArtifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|artifact| {
+                artifact.get("path").is_none() && artifact.get("metadataPath").is_none()
+            }));
+        let serialized = snapshot.to_string();
+        assert!(!serialized.contains("REAL-NEWER"));
+        assert!(!serialized.contains(real_capture_path));
+        assert!(!serialized.contains(real_metadata_path));
 
         let selected = state
             .runtime
@@ -18525,6 +18546,10 @@ mod tests {
         assert_eq!(ready_snapshot["source"], "bkv-offline");
         assert!(ready_snapshot["inspections"].as_array().unwrap().is_empty());
         assert_ne!(ready_snapshot["currentPlate"]["plateNo"], "REAL-NEWER");
+        let ready_serialized = ready_snapshot.to_string();
+        assert!(!ready_serialized.contains("REAL-NEWER"));
+        assert!(!ready_serialized.contains(real_capture_path));
+        assert!(!ready_serialized.contains(real_metadata_path));
         assert_eq!(
             response_json(production_status_response(&state))["latestInspection"],
             Value::Null
@@ -18547,6 +18572,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(real_snapshot["currentPlate"]["plateNo"], "REAL-NEWER");
+        assert_eq!(real_snapshot["inspections"].as_array().unwrap().len(), 2);
+        assert_eq!(real_snapshot["captureImages"][0]["path"], real_capture_path);
+        assert_eq!(
+            real_snapshot["captureImages"][0]["metadataPath"],
+            real_metadata_path
+        );
     }
 
     #[test]

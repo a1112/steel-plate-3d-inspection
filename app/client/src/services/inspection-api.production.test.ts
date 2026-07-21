@@ -137,6 +137,7 @@ describe('persistent production command client', () => {
       sourceBadge: 'BKV 离线回放',
       offline: true,
       legacySeqNo: 1_893_700,
+      records: fixture.records.slice(0, 1),
       captureImages: [{
         ...depthArtifact,
         id: 'legacy-slot-must-not-be-used',
@@ -147,7 +148,7 @@ describe('persistent production command client', () => {
         fileType: '3d',
         createdAt: '2026-07-21T00:00:00Z',
       }],
-      inspections: fixture.inspections.map((inspection) => ({
+      inspections: fixture.inspections.slice(0, 1).map((inspection) => ({
         ...inspection,
         bkvArtifacts: [depthArtifact],
         captureImages: [{
@@ -172,6 +173,7 @@ describe('persistent production command client', () => {
     expect(snapshot.source).toBe('bkv');
     expect(snapshot.provider).toBe('bkv');
     expect(snapshot.captureImages).toEqual([]);
+    expect(snapshot.inspections).toHaveLength(1);
     expect(snapshot.inspections.every((inspection) => inspection.captureImages?.length === 0)).toBe(true);
     expect(snapshot.inspections.every((inspection) => inspection.bkvArtifacts.length === 1)).toBe(true);
     expect(snapshot.bkvArtifacts?.[0]).toMatchObject({
