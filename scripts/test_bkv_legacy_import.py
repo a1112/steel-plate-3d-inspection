@@ -1112,8 +1112,19 @@ class ExtractionTests(unittest.TestCase):
                         "type": "file",
                         "size": len(payload),
                         "crc32": None,
+                        "attributes": None,
+                        "modified": None,
+                        "hostOS": None,
+                        "compression": None,
                     },
-                    "volumeMetadata": {archive_part: {}},
+                    "volumeMetadata": {
+                        archive_part: {
+                            "crc32": None,
+                            "packedSize": None,
+                            "ratio": None,
+                            "packCrc32": None,
+                        }
+                    },
                     "memberPath": member,
                     "integrityStatus": "listed-unverified",
                     "integrityEvidence": None,
@@ -1150,6 +1161,24 @@ class ExtractionTests(unittest.TestCase):
         self._write_inventory()
 
     def _runner(self, command, **kwargs):
+        if command[1] == "lt":
+            archive = Path(command[-1])
+            archive_part = (
+                "image-part1"
+                if archive.read_bytes() == self.part1.read_bytes()
+                else "image-part2"
+            )
+            records = []
+            for member, payload in self.payloads.items():
+                metadata = subject._image_metadata(member)
+                expected_part = (
+                    "image-part2" if metadata["cameraNumber"] == 6 else "image-part1"
+                )
+                if expected_part == archive_part:
+                    records.append(
+                        f"Name: {member}\nType: File\nSize: {len(payload)}\n"
+                    )
+            return subprocess.CompletedProcess(command, 0, "\n".join(records), "")
         self.commands.append((command, kwargs))
         member = command[-1]
         self.assertIn(member, self.payloads)
@@ -1169,6 +1198,9 @@ class ExtractionTests(unittest.TestCase):
         }
         arguments.update(overrides)
         return subject.stage_batch(**arguments)
+
+    def _deep_kwargs(self):
+        return {"unrar": self.unrar, "runner": self._runner}
 
     def test_extracts_only_explicit_inventory_members_and_publishes_verified_layout(self):
         self._use_complete_target_coverage()
@@ -1325,7 +1357,7 @@ class ExtractionTests(unittest.TestCase):
         verify = subject._verify_staged_batch
         tampered = False
 
-        def tamper_before_verify(batch, *, allow_failed=False):
+        def tamper_before_verify(batch, *, allow_failed=False, **kwargs):
             nonlocal tampered
             batch = Path(batch)
             if not allow_failed and ".incoming-" in batch.name and not tampered:
@@ -1333,7 +1365,7 @@ class ExtractionTests(unittest.TestCase):
                 payload = artifact.read_bytes()
                 artifact.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
                 tampered = True
-            return verify(batch, allow_failed=allow_failed)
+            return verify(batch, allow_failed=allow_failed, **kwargs)
 
         with mock.patch.object(
             subject, "_verify_staged_batch", side_effect=tamper_before_verify
@@ -1401,6 +1433,7 @@ class ExtractionTests(unittest.TestCase):
     def _complete_manifest_fields(self):
         return {
             "schema", "batchId", "status", "importEligible", "seqNos",
+            "batchContentId", "contentId", "reviewRequired",
             "presentSeqNos", "targetCoverageComplete", "coverage",
             "sourceInventory", "normalizationEvidence", "sourceArchives",
             "databaseIntegrity", "counts",
@@ -1603,6 +1636,9 @@ class ExtractionTests(unittest.TestCase):
 
     def test_importability_uses_derived_coverage_not_forged_ready_status(self):
         batch = self._stage()
+        content_id = json.loads(
+            (batch / "manifest.json").read_text(encoding="utf-8")
+        )["batchContentId"]
 
         def forge(manifest):
             manifest["status"] = "ready"
@@ -1610,7 +1646,9 @@ class ExtractionTests(unittest.TestCase):
 
         self._rewrite_manifest(batch, forge)
         with self.assertRaisesRegex(ValueError, "ready|coverage"):
-            subject.batch_is_importable(batch)
+            subject.batch_is_importable(
+                batch, expected_content_id=content_id, **self._deep_kwargs()
+            )
 
     def test_deep_source_rejects_forged_batch_inventory_and_db_integrity(self):
         self._use_complete_target_coverage()
@@ -1642,17 +1680,130 @@ class ExtractionTests(unittest.TestCase):
             manifest["databaseIntegrity"]["crcFailed"] = True
             manifest["status"] = "partial"
             manifest["importEligible"] = False
+            manifest["reviewRequired"] = True
 
         self._rewrite_manifest(batch, forge)
         with self.assertRaisesRegex(ValueError, "original inventory|database ZIP"):
-            subject._verify_staged_batch(batch, deep_source=True)
+            subject._verify_staged_batch(
+                batch, deep_source=True, **self._deep_kwargs()
+            )
+
+    def test_deep_source_reconstructs_rar_truth_instead_of_trusting_paths(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        staged_inventory_path = batch / "source/inventory.json"
+        staged_inventory = json.loads(staged_inventory_path.read_text(encoding="utf-8"))
+        replacement = dict(staged_inventory["archives"]["image-part2"])
+        staged_inventory["archives"]["image-part1"] = replacement
+        payload = json.dumps(staged_inventory).encode("utf-8")
+        staged_inventory_path.write_bytes(payload)
+        self.inventory_path.write_bytes(payload)
+
+        def forge(manifest):
+            self._refresh_file_evidence(manifest["sourceInventory"], staged_inventory_path)
+            manifest["sourceInventory"]["originalSha256"] = hashlib.sha256(payload).hexdigest()
+            manifest["sourceArchives"]["image-part1"].update(
+                {
+                    key: replacement[key]
+                    for key in ("path", "size", "sha256", "fileIdentity", "mtimeNs")
+                }
+            )
+            pointer = json.loads(
+                (batch / "source/normalized.current.json").read_text(encoding="utf-8")
+            )
+            forged_content_id = subject._compute_batch_content_id(
+                source_archives=manifest["sourceArchives"],
+                normalization_sha256=manifest["normalizationEvidence"]["sha256"],
+                result_evidence=pointer["resultEvidence"],
+                seq_nos=manifest["seqNos"],
+                artifacts=manifest["artifacts"],
+            )
+            manifest["batchContentId"] = forged_content_id
+            manifest["contentId"] = forged_content_id
+
+        self._rewrite_manifest(batch, forge)
+        with self.assertRaisesRegex(ValueError, "RAR|source inventory|artifact"):
+            subject._verify_staged_batch(batch, **self._deep_kwargs())
+
+    def test_manifest_exposes_deterministic_batch_content_id(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        manifest = json.loads((batch / "manifest.json").read_text(encoding="utf-8"))
+        self.assertRegex(manifest["batchContentId"], r"^[0-9a-f]{64}$")
+        self.assertEqual(manifest["contentId"], manifest["batchContentId"])
+        self.assertFalse(manifest["reviewRequired"])
+        verified = subject._verify_staged_batch(batch, **self._deep_kwargs())
+        self.assertEqual(verified["batchContentId"], manifest["batchContentId"])
+
+    def test_importability_requires_external_expected_content_id(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        content_id = json.loads(
+            (batch / "manifest.json").read_text(encoding="utf-8")
+        )["batchContentId"]
+        self.assertFalse(subject.batch_is_importable(batch, **self._deep_kwargs()))
+        self.assertFalse(
+            subject.batch_is_importable(
+                batch, expected_content_id="0" * 64
+            )
+        )
+        self.assertTrue(
+            subject.batch_is_importable(
+                batch, expected_content_id=content_id, **self._deep_kwargs()
+            )
+        )
+
+    def test_external_content_id_rejects_self_consistent_artifact_rewrite(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        manifest_path = batch / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        approved_content_id = manifest["batchContentId"]
+        artifact = manifest["artifacts"][0]
+        artifact_path = batch / Path(*PurePosixPath(artifact["path"]).parts)
+        replacement = b"x" * artifact["size"]
+        artifact_path.write_bytes(replacement)
+        artifact["sha256"] = hashlib.sha256(replacement).hexdigest()
+        pointer = json.loads(
+            (batch / "source/normalized.current.json").read_text(encoding="utf-8")
+        )
+        forged_content_id = subject._compute_batch_content_id(
+            source_archives=manifest["sourceArchives"],
+            normalization_sha256=manifest["normalizationEvidence"]["sha256"],
+            result_evidence=pointer["resultEvidence"],
+            seq_nos=manifest["seqNos"],
+            artifacts=manifest["artifacts"],
+        )
+        manifest["batchContentId"] = forged_content_id
+        manifest["contentId"] = forged_content_id
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        self.assertNotEqual(forged_content_id, approved_content_id)
+        self.assertFalse(
+            subject.batch_is_importable(
+                batch,
+                expected_content_id=approved_content_id,
+                **self._deep_kwargs(),
+            )
+        )
 
     def test_importability_rejects_deleted_or_replaced_original_sources(self):
         self._use_complete_target_coverage()
         batch = self._stage()
-        self.assertTrue(subject.batch_is_importable(batch))
+        content_id = json.loads(
+            (batch / "manifest.json").read_text(encoding="utf-8")
+        )["batchContentId"]
+        self.assertTrue(
+            subject.batch_is_importable(
+                batch, expected_content_id=content_id, **self._deep_kwargs()
+            )
+        )
         self.part1.unlink()
-        self.assertFalse(subject.batch_is_importable(batch))
+        self.assertFalse(
+            subject.batch_is_importable(
+                batch, expected_content_id=content_id, **self._deep_kwargs()
+            )
+        )
         self.assertIsNotNone(
             subject._verify_staged_batch(batch, deep_source=False)
         )
@@ -1661,21 +1812,42 @@ class ExtractionTests(unittest.TestCase):
         self.setUp()
         self._use_complete_target_coverage()
         batch = self._stage()
+        content_id = json.loads(
+            (batch / "manifest.json").read_text(encoding="utf-8")
+        )["batchContentId"]
         self.part1.write_bytes(b"replacement source")
-        self.assertFalse(subject.batch_is_importable(batch))
+        self.assertFalse(
+            subject.batch_is_importable(
+                batch, expected_content_id=content_id, **self._deep_kwargs()
+            )
+        )
 
     def test_importability_rejects_missing_original_inventory(self):
         self._use_complete_target_coverage()
         batch = self._stage()
+        content_id = json.loads(
+            (batch / "manifest.json").read_text(encoding="utf-8")
+        )["batchContentId"]
         self.inventory_path.unlink()
-        self.assertFalse(subject.batch_is_importable(batch))
+        self.assertFalse(
+            subject.batch_is_importable(
+                batch, expected_content_id=content_id, **self._deep_kwargs()
+            )
+        )
         self.assertIsNotNone(subject._verify_staged_batch(batch, deep_source=False))
 
     def test_importability_rejects_changed_original_inventory(self):
         self._use_complete_target_coverage()
         batch = self._stage()
+        content_id = json.loads(
+            (batch / "manifest.json").read_text(encoding="utf-8")
+        )["batchContentId"]
         self.inventory_path.write_bytes(self.inventory_path.read_bytes() + b"\n")
-        self.assertFalse(subject.batch_is_importable(batch))
+        self.assertFalse(
+            subject.batch_is_importable(
+                batch, expected_content_id=content_id, **self._deep_kwargs()
+            )
+        )
         self.assertIsNotNone(subject._verify_staged_batch(batch, deep_source=False))
 
     def test_artifact_fields_must_exactly_match_source_inventory_evidence(self):
@@ -1708,8 +1880,17 @@ class ExtractionTests(unittest.TestCase):
         batch = self._stage()
         manifest = json.loads((batch / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "partial")
+        self.assertTrue(manifest["reviewRequired"])
+        self.assertEqual(manifest["contentId"], manifest["batchContentId"])
         self.assertFalse(subject.batch_is_importable(batch))
-        self.assertTrue(subject.batch_is_importable(batch, operator_reviewed_partial=True))
+        self.assertTrue(
+            subject.batch_is_importable(
+                batch,
+                expected_content_id=manifest["batchContentId"],
+                operator_reviewed_partial=True,
+                **self._deep_kwargs(),
+            )
+        )
 
     def test_incomplete_target_or_camera_coverage_is_partial(self):
         batch = self._stage()

@@ -3230,6 +3230,9 @@ def _publish_failed_stage(
         "batchId": batch_id,
         "status": "failed",
         "importEligible": False,
+        "batchContentId": None,
+        "contentId": None,
+        "reviewRequired": False,
         "seqNos": list(TARGET_SEQ_NOS),
         "presentSeqNos": present_seq_nos,
         "targetCoverageComplete": False,
@@ -3345,10 +3348,79 @@ def _verify_manifest_file_evidence(
     return path
 
 
+def _compute_batch_content_id(
+    *,
+    source_archives: dict[str, object],
+    normalization_sha256: object,
+    result_evidence: object,
+    seq_nos: object,
+    artifacts: object,
+) -> str:
+    archive_binding: dict[str, dict[str, object]] = {}
+    for archive_part in ("database-zip", "image-part1", "image-part2"):
+        evidence = source_archives.get(archive_part)
+        if not isinstance(evidence, dict):
+            raise ValueError(f"batch content source evidence missing: {archive_part}")
+        size = evidence.get("size")
+        sha256 = evidence.get("sha256")
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        ):
+            raise ValueError(f"batch content source evidence invalid: {archive_part}")
+        archive_binding[archive_part] = {"size": size, "sha256": sha256}
+    if (
+        not isinstance(normalization_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", normalization_sha256) is None
+        or not isinstance(result_evidence, dict)
+        or seq_nos != list(TARGET_SEQ_NOS)
+        or not isinstance(artifacts, list)
+    ):
+        raise ValueError("batch content normalized or sequence evidence is invalid")
+    artifact_binding: list[dict[str, str]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise ValueError("batch content artifact evidence is invalid")
+        member = artifact.get("memberPath")
+        sha256 = artifact.get("sha256")
+        if (
+            not isinstance(member, str)
+            or normalize_member(member) != member
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        ):
+            raise ValueError("batch content artifact member/hash is invalid")
+        artifact_binding.append({"memberPath": member, "sha256": sha256})
+    artifact_binding.sort(key=lambda item: item["memberPath"])
+    if len({item["memberPath"] for item in artifact_binding}) != len(artifact_binding):
+        raise ValueError("batch content artifact members are not unique")
+    document = {
+        "schema": "steel.bkv-batch-content-id.v1",
+        "manifestSchema": "steel.bkv-import-manifest.v1",
+        "sourceArchives": archive_binding,
+        "normalization": {
+            "pointerSha256": normalization_sha256,
+            "resultEvidence": result_evidence,
+        },
+        "seqNos": list(TARGET_SEQ_NOS),
+        "artifacts": artifact_binding,
+    }
+    payload = json.dumps(
+        document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _deep_verify_original_sources(
     manifest: dict[str, object],
     staged_inventory: dict[str, object],
     source_inventory_evidence: dict[str, object],
+    *,
+    unrar: Path,
+    runner: Callable[..., subprocess.CompletedProcess[object]] | None,
 ) -> None:
     original_path_value = source_inventory_evidence.get("originalPath")
     original_sha256 = source_inventory_evidence.get("originalSha256")
@@ -3366,12 +3438,15 @@ def _deep_verify_original_sources(
     inventory_archives = staged_inventory.get("archives")
     if not isinstance(inventory_archives, dict):
         raise ValueError("original inventory archives are invalid")
+    source_archives = manifest.get("sourceArchives")
+    if not isinstance(source_archives, dict):
+        raise ValueError("source archive evidence is invalid")
     archive_paths: dict[str, Path] = {}
     try:
         for archive_part in ("database-zip", "image-part1", "image-part2"):
-            evidence = inventory_archives.get(archive_part)
+            evidence = source_archives.get(archive_part)
             if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
-                raise ValueError(f"original inventory archive is invalid: {archive_part}")
+                raise ValueError(f"source archive path is invalid: {archive_part}")
             archive_paths[archive_part] = Path(str(evidence["path"])).resolve(strict=True)
     except (OSError, FileNotFoundError) as error:
         raise SourceUnavailableError("original source archive is unavailable") from error
@@ -3398,8 +3473,6 @@ def _deep_verify_original_sources(
             if original_inventory != staged_inventory:
                 raise ValueError("staged source inventory differs from original inventory")
 
-            source_archives = manifest.get("sourceArchives")
-            assert isinstance(source_archives, dict)
             for archive_part, original_archive_path in archive_paths.items():
                 inventory_evidence = inventory_archives[archive_part]
                 assert isinstance(inventory_evidence, dict)
@@ -3426,6 +3499,19 @@ def _deep_verify_original_sources(
             actual_database_entries, _ = _inventory_zip(
                 working[archive_paths["database-zip"]]
             )
+            first_entries, _ = _inventory_rar(
+                working[archive_paths["image-part1"]],
+                "image-part1",
+                unrar,
+                runner,
+            )
+            second_entries, _ = _inventory_rar(
+                working[archive_paths["image-part2"]],
+                "image-part2",
+                unrar,
+                runner,
+            )
+            actual_rar_entries = _merge_rar_entries(first_entries, second_entries)
     except SourceUnavailableError:
         raise
     except (OSError, FileNotFoundError, RuntimeError) as error:
@@ -3457,9 +3543,52 @@ def _deep_verify_original_sources(
     ):
         raise ValueError("database ZIP integrity differs from source evidence")
 
+    rar_keys = (
+        "memberPath", "size", "archivePart", "archiveParts", "archiveMetadata",
+        "volumeMetadata", "cameraNumber", "seqNo", "kind", "extension",
+        "integrityStatus", "integrityEvidence",
+    )
+    actual_rar_members = sorted(
+        ({key: entry.get(key) for key in rar_keys} for entry in actual_rar_entries),
+        key=lambda entry: str(entry["memberPath"]),
+    )
+    expected_rar_members = sorted(
+        (
+            {key: entry.get(key) for key in rar_keys}
+            for entry in original_entries
+            if isinstance(entry, dict) and entry.get("cameraNumber") is not None
+        ),
+        key=lambda entry: str(entry["memberPath"]),
+    )
+    if actual_rar_members != expected_rar_members:
+        raise ValueError("RAR truth differs from staged source inventory")
+    actual_by_member = {
+        str(entry["memberPath"]): entry for entry in actual_rar_members
+    }
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("RAR truth lacks artifact evidence")
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise ValueError("RAR truth artifact evidence is invalid")
+        truth = actual_by_member.get(str(artifact.get("memberPath")))
+        if truth is None or any(
+            artifact.get(key) != truth.get(key)
+            for key in (
+                "archivePart", "archiveParts", "archiveMetadata", "volumeMetadata",
+                "cameraNumber", "seqNo", "kind", "extension",
+            )
+        ):
+            raise ValueError("artifact provenance differs from RAR truth")
+
 
 def _verify_staged_batch(
-    batch: Path, *, allow_failed: bool = False, deep_source: bool = True
+    batch: Path,
+    *,
+    allow_failed: bool = False,
+    deep_source: bool = True,
+    unrar: os.PathLike[str] | str | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[object]] | None = None,
 ) -> dict[str, object]:
     batch = batch.resolve(strict=True)
     if is_reparse_point(batch) or not batch.is_dir():
@@ -3486,6 +3615,13 @@ def _verify_staged_batch(
     expected_eligible = status == "ready"
     if manifest.get("importEligible") != expected_eligible:
         raise ValueError("staged manifest importEligible does not match status")
+    if status == "failed":
+        if (
+            manifest.get("batchContentId") is not None
+            or manifest.get("contentId") is not None
+            or manifest.get("reviewRequired") is not False
+        ):
+            raise ValueError("failed staged batch has invalid content binding")
     if status == "failed" and not allow_failed:
         raise ValueError("failed staged batch is not canonical")
     failure = manifest.get("failure")
@@ -3921,11 +4057,32 @@ def _verify_staged_batch(
             raise ValueError(f"{status} status conflicts with derived {expected_status} evidence")
         if manifest.get("importEligible") != derived_ready:
             raise ValueError("importEligible conflicts with derived evidence")
+        expected_content_id = _compute_batch_content_id(
+            source_archives=archives,
+            normalization_sha256=(
+                manifest.get("normalizationEvidence", {}).get("sha256")
+                if isinstance(manifest.get("normalizationEvidence"), dict)
+                else None
+            ),
+            result_evidence=result_evidence,
+            seq_nos=manifest.get("seqNos"),
+            artifacts=artifacts,
+        )
+        if (
+            manifest.get("batchContentId") != expected_content_id
+            or manifest.get("contentId") != expected_content_id
+            or manifest.get("reviewRequired") != (status == "partial")
+        ):
+            raise ValueError("batch content ID or review requirement mismatch")
         if deep_source:
             if not isinstance(source_inventory, dict) or inventory_document is None:
                 raise ValueError("original inventory evidence is unavailable")
             _deep_verify_original_sources(
-                manifest, inventory_document, source_inventory
+                manifest,
+                inventory_document,
+                source_inventory,
+                unrar=locate_unrar(unrar),
+                runner=runner,
             )
     return manifest
 
@@ -4019,7 +4176,7 @@ def _stage_batch_into(
     if final.exists() or is_reparse_point(final):
         if is_reparse_point(final) or not final.is_dir():
             raise ValueError("batch-id collision with a non-directory or reparse point")
-        existing = _verify_staged_batch(final)
+        existing = _verify_staged_batch(final, unrar=unrar_path, runner=runner)
         if existing.get("batchId") != batch_id:
             raise ValueError("existing batch-id collision")
         _verify_current_inputs(
@@ -4250,17 +4407,22 @@ def _stage_batch_into(
             for archive_part, evidence in archives.items()
             if isinstance(evidence, dict)
         }
+        ready = database_verified and target_coverage_complete and normalization_complete
+        batch_content_id = _compute_batch_content_id(
+            source_archives=manifest_archives,
+            normalization_sha256=normalization_pointer_evidence["sha256"],
+            result_evidence=result_evidence,
+            seq_nos=list(TARGET_SEQ_NOS),
+            artifacts=artifact_evidence,
+        )
         manifest = {
             "schema": "steel.bkv-import-manifest.v1",
             "batchId": batch_id,
-            "status": (
-                "ready"
-                if database_verified and target_coverage_complete and normalization_complete
-                else "partial"
-            ),
-            "importEligible": (
-                database_verified and target_coverage_complete and normalization_complete
-            ),
+            "status": "ready" if ready else "partial",
+            "importEligible": ready,
+            "batchContentId": batch_content_id,
+            "contentId": batch_content_id,
+            "reviewRequired": not ready,
             "seqNos": list(TARGET_SEQ_NOS),
             "presentSeqNos": seq_nos,
             "targetCoverageComplete": target_coverage_complete,
@@ -4316,13 +4478,15 @@ def _stage_batch_into(
         }
         failure_context["stage"] = "validation"
         _write_json_atomic(incoming / "manifest.json", manifest)
-        _verify_staged_batch(incoming)
+        _verify_staged_batch(
+            incoming, unrar=unrar_path, runner=runner
+        )
         if final.exists() or is_reparse_point(final):
             raise FileExistsError(f"batch-id collision during publish: {final}")
         quarantine_writer.close()
         os.rename(incoming, final)
         _fsync_directory(output)
-        _verify_staged_batch(final)
+        _verify_staged_batch(final, unrar=unrar_path, runner=runner)
         return final
     except BaseException as error:
         raise
@@ -4394,13 +4558,36 @@ def stage_batch(
 
 
 def batch_is_importable(
-    batch: os.PathLike[str] | str, *, operator_reviewed_partial: bool = False
+    batch: os.PathLike[str] | str,
+    *,
+    expected_content_id: str | None = None,
+    operator_reviewed_partial: bool = False,
+    unrar: os.PathLike[str] | str | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[object]] | None = None,
 ) -> bool:
+    if (
+        not isinstance(expected_content_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_content_id) is None
+    ):
+        return False
+    try:
+        raw_manifest = _load_json_document(
+            Path(batch).resolve(strict=True) / "manifest.json",
+            "staged manifest content binding",
+        )
+    except (OSError, FileNotFoundError, ValueError, InventoryLimitError):
+        return False
+    if raw_manifest.get("batchContentId") != expected_content_id:
+        return False
     try:
         manifest = _verify_staged_batch(
-            Path(batch), allow_failed=True, deep_source=True
+            Path(batch),
+            allow_failed=True,
+            deep_source=True,
+            unrar=unrar,
+            runner=runner,
         )
-    except SourceUnavailableError:
+    except (SourceUnavailableError, FileNotFoundError):
         return False
     status = manifest["status"]
     return status == "ready" or (
