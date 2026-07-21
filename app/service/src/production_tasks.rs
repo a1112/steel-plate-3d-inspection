@@ -964,30 +964,60 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
         let provenance_rows = batch
             .normalized
             .iter()
-            .flat_map(|file| file.rows.iter())
-            .filter(|row| row.get("legacySeqNo").and_then(Value::as_i64) == Some(*seq_no))
-            .map(|row| {
-                json!({
-                    "t":row.get("legacyTable"),
-                    "h":row.get("originalRowHash")
-                })
+            .flat_map(|file| {
+                file.rows
+                    .iter()
+                    .enumerate()
+                    .map(move |(line, row)| (file, line, row))
             })
-            .collect::<Vec<_>>();
-        let artifact_refs = batch
+            .filter(|(_, _, row)| row.get("legacySeqNo").and_then(Value::as_i64) == Some(*seq_no))
+            .map(|(file, line, row)| {
+                let row_hash = row
+                    .get("originalRowHash")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        BkvRejection::new(
+                            "bkv_normalized_row_invalid",
+                            "normalized row provenance hash missing",
+                        )
+                    })?;
+                let legacy_key = bkv_row_text(
+                    row,
+                    &[
+                        "id",
+                        "allexcelid",
+                        "checkrecordid",
+                        "defectid",
+                        "classId",
+                        "originalRowHash",
+                    ],
+                )
+                .unwrap_or_else(|| format!("{}:{}", file.table, line + 1));
+                Ok(json!({
+                    "t":row.get("legacyTable"),
+                    "k":legacy_key,
+                    "h":row_hash,
+                    "p":file.relative_path,
+                    "l":line + 1
+                }))
+            })
+            .collect::<Result<Vec<_>, BkvRejection>>()?;
+        let artifact_provenance = batch
             .artifacts
             .iter()
             .filter(|artifact| artifact.seq_no == *seq_no)
             .map(|artifact| {
-                format!(
-                    "{}:{}:{}",
-                    artifact.relative_path, artifact.member_path, artifact.sha256
-                )
+                json!({
+                    "p": artifact.relative_path,
+                    "m": artifact.member_path,
+                    "h": artifact.sha256,
+                    "c": artifact.camera_number,
+                    "s": artifact.seq_no,
+                    "k": artifact.kind
+                })
             })
             .collect::<Vec<_>>();
-        let artifact_provenance = json!({
-            "count": artifact_refs.len(),
-            "digest": bkv_sha256(artifact_refs.join("\n").as_bytes())
-        });
         materials.push(db::BkvImportMaterial {
             seq_no: *seq_no,
             material_id,
@@ -1252,6 +1282,7 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
         "contentId": batch.content_id,
         "status": batch.status,
         "semanticDigest": batch.semantic_digest,
+        "manifestPath": format!("{}/manifest.json", batch.batch_id),
         "counts": {
             "normalizedFiles": batch.normalized.len(),
             "normalizedRows": batch.normalized.iter().map(|file| file.rows.len()).sum::<usize>(),
@@ -2973,7 +3004,9 @@ mod tests {
         assert!(imported.materials[0]
             .raw_payload
             .contains("artifactProvenance"));
-        assert!(imported.materials[0].raw_payload.contains("digest"));
+        assert!(imported.materials[0]
+            .raw_payload
+            .contains("image_copy/CamImageSource1/1893700/2D/one.jpg"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -3004,7 +3037,8 @@ mod tests {
         batch.artifacts.clear();
         for index in 0..2_724 {
             let mut artifact = template.clone();
-            artifact.relative_path = format!("artifacts/camera1/1893700/{index}.d3img");
+            artifact.seq_no = BKV_TARGET_SEQ_NOS[index % BKV_TARGET_SEQ_NOS.len()];
+            artifact.relative_path = format!("artifacts/c1/{}/{index}.d3img", artifact.seq_no);
             artifact.member_path = format!("legacy/{index}.d3img");
             artifact.sha256 = bkv_sha256(artifact.member_path.as_bytes());
             batch.artifacts.push(artifact);
@@ -3018,6 +3052,20 @@ mod tests {
         assert!(!imported.manifest_json.contains("sourceArchives"));
         assert!(imported.manifest_json.contains("semanticDigest"));
         assert_eq!(imported.artifacts.len(), 2_724);
+        let provenance: Value = serde_json::from_str(&imported.materials[0].raw_payload).unwrap();
+        let row = &provenance["rowRefs"][0];
+        assert!(row.get("t").and_then(Value::as_str).is_some());
+        assert!(row.get("k").and_then(Value::as_str).is_some());
+        assert!(row.get("h").and_then(Value::as_str).is_some());
+        assert!(row.get("p").and_then(Value::as_str).is_some());
+        assert!(row.get("l").and_then(Value::as_u64).is_some());
+        let artifact = &provenance["artifactProvenance"][0];
+        for key in ["p", "m", "h", "c", "s", "k"] {
+            assert!(
+                artifact.get(key).is_some(),
+                "missing artifact provenance {key}"
+            );
+        }
         fs::remove_dir_all(root).ok();
     }
 

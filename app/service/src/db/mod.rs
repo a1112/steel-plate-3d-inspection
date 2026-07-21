@@ -3698,6 +3698,17 @@ pub async fn import_bkv_batch(
         if value.get("contentId").and_then(Value::as_str) != Some(batch.content_id.as_str()) {
             return Err(DbErr::Custom("bkv_batch_id_collision".to_string()));
         }
+        let persisted_digest = value
+            .pointer("/summary/semanticDigest")
+            .and_then(Value::as_str);
+        let incoming_summary: Value = serde_json::from_str(&batch.manifest_json)
+            .map_err(|_| DbErr::Custom("bkv_batch_id_collision".to_string()))?;
+        let incoming_digest = incoming_summary
+            .get("semanticDigest")
+            .and_then(Value::as_str);
+        if persisted_digest.is_none() || persisted_digest != incoming_digest {
+            return Err(DbErr::Custom("bkv_batch_id_collision".to_string()));
+        }
         let counts: BkvImportCounts =
             serde_json::from_value(value.get("counts").cloned().unwrap_or(Value::Null))
                 .map_err(|error| DbErr::Custom(format!("bkv_import_state_invalid: {error}")))?;
@@ -5415,7 +5426,7 @@ mod bkv_import_tests {
         BkvImportBatch {
             batch_id: "batch-001".to_string(),
             content_id: "a".repeat(64),
-            manifest_json: json!({"schema":"steel.bkv-import-manifest.v1"}).to_string(),
+            manifest_json: json!({"semanticDigest":"d".repeat(64)}).to_string(),
             status: "ready".to_string(),
             materials: (1_893_700..=1_893_710).map(material).collect(),
             artifacts: vec![BkvImportArtifact {
@@ -5716,6 +5727,54 @@ mod bkv_import_tests {
                 .await
                 .unwrap()
                 .is_some());
+        });
+    }
+
+    #[test]
+    fn bkv_existing_batch_with_changed_semantics_is_rejected_without_reactivation() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            import_bkv_batch(&database.connection, batch(), "tester")
+                .await
+                .unwrap();
+            let mut second = batch();
+            second.batch_id = "batch-002".to_string();
+            second.content_id = "c".repeat(64);
+            for material in &mut second.materials {
+                material.material_id.push_str("-two");
+                material.steel_plate_id.push_str("-two");
+                material.inspection_record_id.push_str("-two");
+                material.session_id.push_str("-two");
+                material.inspection_id.push_str("-two");
+            }
+            second.artifacts.clear();
+            second.defects.clear();
+            import_bkv_batch(&database.connection, second, "tester")
+                .await
+                .unwrap();
+
+            let mut changed = batch();
+            changed.manifest_json = json!({"semanticDigest":"e".repeat(64)}).to_string();
+            let error = import_bkv_batch(&database.connection, changed, "attacker")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, DbErr::Custom(message) if message == "bkv_batch_id_collision"));
+            let active: Value = serde_json::from_str(
+                &get_config(&database.connection, "bkv.active-batch")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .value,
+            )
+            .unwrap();
+            assert_eq!(
+                active.get("batchId").and_then(Value::as_str),
+                Some("batch-002")
+            );
         });
     }
 }
