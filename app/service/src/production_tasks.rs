@@ -126,7 +126,32 @@ pub(super) struct BkvServingIndex {
     pub identity: String,
     pub batch_dir: PathBuf,
     pub artifacts: Vec<BkvServingArtifact>,
-    pub deterministic_inspection_ids: HashMap<i64, String>,
+    pub deterministic_inspections: HashMap<i64, BkvExpectedInspection>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BkvExpectedInspection {
+    pub id: String,
+    pub material_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub storage_root: String,
+    pub summary_path: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub capture_count: i32,
+    pub defect_count: i32,
+    pub raw_payload: String,
+}
+
+#[derive(Clone, Debug)]
+struct BkvCompactNormalizedRow {
+    seq_no: i64,
+    line: usize,
+    legacy_key: String,
+    row_hash: String,
+    legacy_id: String,
+    occurred_at: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,7 +165,7 @@ pub(super) struct BkvReplayRuntime {
     pub replay_snapshot: Value,
     pub selected_inspection: Option<BkvImportedInspectionEvidence>,
     pub artifacts: Vec<BkvServingArtifact>,
-    pub deterministic_inspection_ids: HashMap<i64, String>,
+    pub deterministic_inspections: HashMap<i64, BkvExpectedInspection>,
 }
 
 #[derive(Clone, Debug)]
@@ -440,6 +465,40 @@ fn bkv_lock_runtime_verification_with_deadline(
                 std::thread::sleep(remaining.min(Duration::from_millis(1)));
             }
         }
+    }
+}
+
+fn bkv_runtime_verification_identity(
+    configured_root: &Path,
+    batch_id: &str,
+    content_id: &str,
+    semantic_digest: &str,
+    manifest_sha256: &str,
+    publication_sha256: &str,
+) -> String {
+    format!(
+        "{}|{batch_id}|{content_id}|{semantic_digest}|{manifest_sha256}|{publication_sha256}",
+        configured_root.display()
+    )
+}
+
+fn bkv_runtime_verification_lock(identity: &str) -> Result<Arc<Mutex<()>>, BkvRejection> {
+    let mut locks = BKV_RUNTIME_VERIFICATION_SINGLE_FLIGHT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| {
+            BkvRejection::new(
+                "bkv_status_unavailable",
+                "BKV runtime verification lock unavailable",
+            )
+        })?;
+    locks.retain(|_, lock| lock.upgrade().is_some());
+    if let Some(lock) = locks.get(identity).and_then(std::sync::Weak::upgrade) {
+        Ok(lock)
+    } else {
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(identity.to_string(), Arc::downgrade(&lock));
+        Ok(lock)
     }
 }
 
@@ -1298,7 +1357,7 @@ fn bkv_read_deterministic_mapping_file(
     expected_size: u64,
     expected_count: u64,
     deadline: Option<Instant>,
-) -> Result<HashMap<i64, String>, BkvRejection> {
+) -> Result<Vec<BkvCompactNormalizedRow>, BkvRejection> {
     if expected_size > BKV_MAX_JSONL_BYTES || expected_count > BKV_MAX_JSONL_ROWS_PER_TABLE as u64 {
         return Err(BkvRejection::new(
             "bkv_jsonl_row_limit_exceeded",
@@ -1340,7 +1399,7 @@ fn bkv_read_deterministic_mapping_file(
             })
             .unwrap_or_default(),
     };
-    let mut rows = HashMap::new();
+    let mut rows = Vec::new();
     let mut row_count = 0u64;
     let mut parse_failed = false;
     {
@@ -1378,17 +1437,51 @@ fn bkv_read_deterministic_mapping_file(
                     "mapping legacy table invalid",
                 ));
             }
-            let names: &[&str] = if table == "allexcel" {
+            let id_names: &[&str] = if table == "allexcel" {
                 &["id", "allexcelid", "recordid", "originalRowHash"]
             } else {
                 &["id", "checkrecordid", "originalRowHash"]
             };
             let legacy_id = if table == "allexcel" {
-                bkv_row_text(&row, names).unwrap_or_else(|| seq_no.to_string())
+                bkv_row_text(&row, id_names).unwrap_or_else(|| seq_no.to_string())
             } else {
-                bkv_row_text(&row, names).unwrap_or_default()
+                bkv_row_text(&row, id_names).unwrap_or_default()
             };
-            rows.entry(seq_no).or_insert(legacy_id);
+            let row_hash = row
+                .get("originalRowHash")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    BkvRejection::new(
+                        "bkv_normalized_row_invalid",
+                        "normalized row provenance hash missing",
+                    )
+                })?
+                .to_string();
+            let legacy_key = bkv_row_text(
+                &row,
+                &[
+                    "id",
+                    "allexcelid",
+                    "checkrecordid",
+                    "defectid",
+                    "classId",
+                    "originalRowHash",
+                ],
+            )
+            .unwrap_or_else(|| format!("{table}:{row_count}"));
+            let occurred_at = bkv_row_text(
+                &row,
+                &["time", "checktime", "datetime", "detecttime", "createdat"],
+            );
+            rows.push(BkvCompactNormalizedRow {
+                seq_no,
+                line: row_count as usize,
+                legacy_key,
+                row_hash,
+                legacy_id,
+                occurred_at,
+            });
         }
     }
     if reader.timed_out {
@@ -1432,7 +1525,7 @@ fn load_bkv_deterministic_inspection_map(
     serving_identity: &str,
     batch_id: &str,
     deadline: Option<Instant>,
-) -> Result<(String, HashMap<i64, String>), BkvRejection> {
+) -> Result<(String, HashMap<i64, BkvExpectedInspection>), BkvRejection> {
     let normalized = manifest
         .get("normalized")
         .and_then(Value::as_array)
@@ -1449,19 +1542,37 @@ fn load_bkv_deterministic_inspection_map(
             .get("table")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if matches!(table, "allexcel" | "checkrecord")
-            && evidence.insert(table.to_string(), item).is_some()
-        {
+        if evidence.insert(table.to_string(), item).is_some() {
             return Err(BkvRejection::new(
                 "bkv_normalized_table_invalid",
                 "deterministic mapping table is duplicated",
             ));
         }
     }
+    if evidence.len() != 5
+        || [
+            "allexcel",
+            "checkrecord",
+            "defect",
+            "defectclass",
+            "diameter",
+        ]
+        .into_iter()
+        .any(|table| !evidence.contains_key(table))
+    {
+        return Err(BkvRejection::new(
+            "bkv_normalized_table_invalid",
+            "deterministic parent tables are incomplete",
+        ));
+    }
     let mut fingerprint = Sha256::new();
     fingerprint.update(serving_identity.as_bytes());
     let mut files = Vec::new();
-    for table in ["allexcel", "checkrecord"] {
+    for item in normalized {
+        let table = item
+            .get("table")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let item = evidence.get(table).ok_or_else(|| {
             BkvRejection::new("bkv_normalized_table_invalid", "mapping table missing")
         })?;
@@ -1485,59 +1596,182 @@ fn load_bkv_deterministic_inspection_map(
             ));
         }
         let path = bkv_resolve_batch_file(batch_dir, relative)?;
-        let metadata = fs::metadata(&path)
+        let metadata = fs::symlink_metadata(&path)
             .map_err(|_| BkvRejection::new("bkv_file_unavailable", "mapping metadata missing"))?;
-        if metadata.len() != size {
+        if bkv_metadata_is_reparse(&metadata) || !metadata.is_file() || metadata.len() != size {
             return Err(BkvRejection::new(
                 "bkv_file_changed",
                 "mapping evidence size changed",
             ));
         }
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|value| value.as_nanos())
-            .unwrap_or_default();
         for value in [table, relative, sha256] {
             fingerprint.update(value.as_bytes());
         }
         fingerprint.update(size.to_le_bytes());
         fingerprint.update(count.to_le_bytes());
-        fingerprint.update(modified.to_le_bytes());
-        files.push((table, path, sha256, size, count));
+        files.push((
+            table.to_string(),
+            relative.to_string(),
+            path,
+            sha256,
+            size,
+            count,
+        ));
     }
     let identity = format!(
         "{serving_identity}:{}",
         format!("{:x}", fingerprint.finalize())
     );
-    let mut parsed = HashMap::new();
-    for (table, path, sha256, size, count) in files {
-        parsed.insert(
-            table,
-            bkv_read_deterministic_mapping_file(&path, table, sha256, size, count, deadline)?,
-        );
+    let mut parsed = Vec::new();
+    for (table, relative, path, sha256, size, count) in files {
+        let rows =
+            bkv_read_deterministic_mapping_file(&path, &table, sha256, size, count, deadline)?;
+        parsed.push((table, relative, rows));
     }
-    let allexcel = parsed.get("allexcel").expect("mapping table inserted");
-    let checkrecord = parsed.get("checkrecord").expect("mapping table inserted");
+    let content_id = manifest
+        .get("contentId")
+        .and_then(Value::as_str)
+        .filter(|value| bkv_valid_sha256(value))
+        .ok_or_else(|| BkvRejection::new("bkv_manifest_invalid", "content id invalid"))?;
+    let allexcel = parsed
+        .iter()
+        .find(|(table, _, _)| table == "allexcel")
+        .ok_or_else(|| BkvRejection::new("bkv_material_row_missing", "mapping material missing"))?;
+    let checkrecord = parsed
+        .iter()
+        .find(|(table, _, _)| table == "checkrecord")
+        .ok_or_else(|| {
+            BkvRejection::new("bkv_normalized_table_invalid", "check mapping missing")
+        })?;
     let mut mapping = HashMap::new();
     for seq_no in BKV_TARGET_SEQ_NOS {
-        let material_legacy_id = allexcel.get(&seq_no).ok_or_else(|| {
-            BkvRejection::new("bkv_material_row_missing", "mapping material missing")
-        })?;
-        let inspection_legacy_id = checkrecord
-            .get(&seq_no)
+        let material_row = allexcel
+            .2
+            .iter()
+            .find(|row| row.seq_no == seq_no)
+            .ok_or_else(|| {
+                BkvRejection::new("bkv_material_row_missing", "mapping material missing")
+            })?;
+        let check_row = checkrecord.2.iter().find(|row| row.seq_no == seq_no);
+        let material_legacy_id = material_row.legacy_id.as_str();
+        let inspection_legacy_id = check_row
+            .map(|row| row.legacy_id.as_str())
             .filter(|value| !value.is_empty())
             .unwrap_or(material_legacy_id);
+        let material_id = bkv_deterministic_id(
+            batch_id,
+            "material",
+            "allexcel",
+            material_legacy_id,
+            "normalized/allexcel.jsonl",
+        );
+        let session_id = bkv_deterministic_id(
+            batch_id,
+            "material-session",
+            "allexcel",
+            material_legacy_id,
+            "normalized/allexcel.jsonl",
+        );
+        let inspection_id = bkv_deterministic_id(
+            batch_id,
+            "production-inspection",
+            "checkrecord",
+            inspection_legacy_id,
+            "normalized/checkrecord.jsonl",
+        );
+        let occurred_at = check_row
+            .and_then(|row| row.occurred_at.clone())
+            .or_else(|| material_row.occurred_at.clone())
+            .unwrap_or_else(|| seq_no.to_string());
+        let row_refs = parsed
+            .iter()
+            .flat_map(|(table, relative, rows)| {
+                rows.iter()
+                    .filter(move |row| row.seq_no == seq_no)
+                    .map(move |row| {
+                        json!({
+                            "t":table,
+                            "k":row.legacy_key,
+                            "h":row.row_hash,
+                            "p":relative,
+                            "l":row.line
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let artifact_provenance = manifest
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| BkvRejection::new("bkv_manifest_invalid", "artifacts missing"))?
+            .iter()
+            .filter(|artifact| artifact.get("seqNo").and_then(Value::as_i64) == Some(seq_no))
+            .map(|artifact| {
+                json!({
+                    "p":artifact.get("path"),
+                    "m":artifact.get("memberPath"),
+                    "h":artifact.get("sha256"),
+                    "c":artifact.get("cameraNumber"),
+                    "s":artifact.get("seqNo"),
+                    "k":artifact.get("kind")
+                })
+            })
+            .collect::<Vec<_>>();
+        let raw_payload = json!({
+            "source":"bkv",
+            "batchId":batch_id,
+            "contentId":content_id,
+            "legacySeqNo":seq_no,
+            "legacyTable":"allexcel",
+            "legacyId":material_legacy_id,
+            "sourcePath":"normalized/allexcel.jsonl",
+            "rowRefs":row_refs,
+            "artifactProvenance":artifact_provenance
+        })
+        .to_string();
+        if raw_payload.len() > BKV_MAX_PERSISTED_JSON_BYTES {
+            return Err(BkvRejection::new(
+                "bkv_provenance_too_large",
+                "BKV provenance exceeds storage contract",
+            ));
+        }
+        let capture_count = manifest
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .map(|artifacts| {
+                artifacts
+                    .iter()
+                    .filter(|artifact| {
+                        artifact.get("seqNo").and_then(Value::as_i64) == Some(seq_no)
+                    })
+                    .count()
+                    .min(i32::MAX as usize) as i32
+            })
+            .unwrap_or_default();
+        let defect_count = parsed
+            .iter()
+            .find(|(table, _, _)| table == "defect")
+            .map(|(_, _, rows)| {
+                rows.iter()
+                    .filter(|row| row.seq_no == seq_no)
+                    .count()
+                    .min(i32::MAX as usize) as i32
+            })
+            .unwrap_or_default();
         mapping.insert(
             seq_no,
-            bkv_deterministic_id(
-                batch_id,
-                "production-inspection",
-                "checkrecord",
-                inspection_legacy_id,
-                "normalized/checkrecord.jsonl",
-            ),
+            BkvExpectedInspection {
+                id: inspection_id,
+                material_id,
+                session_id,
+                status: "completed".to_string(),
+                storage_root: String::new(),
+                summary_path: String::new(),
+                started_at: occurred_at.clone(),
+                finished_at: occurred_at,
+                capture_count,
+                defect_count,
+                raw_payload,
+            },
         );
     }
     Ok((identity, mapping))
@@ -1718,7 +1952,7 @@ fn load_bkv_serving_index_with_deadline(
         "{}:{expected_batch_id}:{expected_content_id}:{expected_semantic_digest}:{manifest_sha256}:{publication_sha256}",
         batch_dir.display()
     );
-    let (identity, deterministic_inspection_ids) = load_bkv_deterministic_inspection_map(
+    let (identity, deterministic_inspections) = load_bkv_deterministic_inspection_map(
         batch_dir,
         &manifest,
         &serving_identity,
@@ -1729,7 +1963,7 @@ fn load_bkv_serving_index_with_deadline(
         identity,
         batch_dir: batch_dir.to_path_buf(),
         artifacts,
-        deterministic_inspection_ids,
+        deterministic_inspections,
     })
 }
 
@@ -1854,6 +2088,23 @@ fn bkv_imported_inspection_evidence(
             "legacySeqNo":expected_seq_no
         }),
     })
+}
+
+fn bkv_inspection_matches_expected(
+    inspection: &db::entities::production_inspection::Model,
+    expected: &BkvExpectedInspection,
+) -> bool {
+    inspection.id == expected.id
+        && inspection.material_id == expected.material_id
+        && inspection.session_id == expected.session_id
+        && inspection.status == expected.status
+        && inspection.storage_root == expected.storage_root
+        && inspection.summary_path == expected.summary_path
+        && inspection.started_at == expected.started_at
+        && inspection.finished_at == expected.finished_at
+        && inspection.capture_count == expected.capture_count
+        && inspection.defect_count == expected.defect_count
+        && inspection.raw_payload == expected.raw_payload
 }
 
 async fn bkv_validate_replay_state(
@@ -2144,31 +2395,15 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
         .and_then(Value::as_str)
         .filter(|value| bkv_valid_sha256(value))
         .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "publication hash invalid"))?;
-    let verification_identity = format!(
-        "{}|{batch_id}|{content_id}|{semantic_digest}|{manifest_sha256}|{publication_sha256}",
-        configured_root.display()
+    let verification_identity = bkv_runtime_verification_identity(
+        configured_root,
+        &batch_id,
+        &content_id,
+        semantic_digest,
+        manifest_sha256,
+        publication_sha256,
     );
-    let verification_lock = {
-        let mut locks = BKV_RUNTIME_VERIFICATION_SINGLE_FLIGHT
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .map_err(|_| {
-                BkvRejection::new(
-                    "bkv_status_unavailable",
-                    "BKV runtime verification lock unavailable",
-                )
-            })?;
-        if let Some(lock) = locks
-            .get(&verification_identity)
-            .and_then(std::sync::Weak::upgrade)
-        {
-            lock
-        } else {
-            let lock = Arc::new(Mutex::new(()));
-            locks.insert(verification_identity.clone(), Arc::downgrade(&lock));
-            lock
-        }
-    };
+    let verification_lock = bkv_runtime_verification_lock(&verification_identity)?;
     let verification_guard =
         bkv_lock_runtime_verification_with_deadline(&verification_lock, deadline)?;
     #[cfg(test)]
@@ -2224,20 +2459,19 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
     let (replay_index, replay_status, replay_version, selected_inspection) =
         bkv_validate_replay_state(connection, &batch_id, &content_id, &replay).await?;
     if let Some(selected) = selected_inspection.as_ref() {
-        let expected_id = index
-            .deterministic_inspection_ids
+        let expected = index
+            .deterministic_inspections
             .get(&selected.evidence.legacy_seq_no)
-            .map(String::as_str)
             .ok_or_else(|| {
                 BkvRejection::new(
                     "bkv_selected_inspection_invalid",
                     "selected deterministic mapping is missing",
                 )
             })?;
-        if selected.model.id != expected_id {
+        if !bkv_inspection_matches_expected(&selected.model, expected) {
             return Err(BkvRejection::new(
                 "bkv_selected_inspection_invalid",
-                "selected inspection ID is not deterministic",
+                "selected inspection does not match deterministic evidence",
             ));
         }
     }
@@ -2251,7 +2485,7 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
         replay_snapshot: replay,
         selected_inspection: selected_inspection.map(|selected| selected.evidence),
         artifacts: index.artifacts,
-        deterministic_inspection_ids: index.deterministic_inspection_ids,
+        deterministic_inspections: index.deterministic_inspections,
     })
 }
 
@@ -2278,6 +2512,17 @@ pub(super) async fn advance_bkv_replay(
         "bkv_batch_state_missing",
     )?;
     let summary = &batch_config["summary"];
+    let verification_identity = bkv_runtime_verification_identity(
+        configured_root,
+        &runtime.batch_id,
+        &runtime.content_id,
+        summary["semanticDigest"].as_str().unwrap_or_default(),
+        summary["manifestSha256"].as_str().unwrap_or_default(),
+        summary["publicationSha256"].as_str().unwrap_or_default(),
+    );
+    let verification_lock = bkv_runtime_verification_lock(&verification_identity)?;
+    let _verification_guard =
+        bkv_lock_runtime_verification_with_deadline(&verification_lock, None)?;
     let serving_index = load_bkv_serving_index(
         configured_root,
         &manifest_path,
@@ -3268,7 +3513,7 @@ pub(super) async fn selected_bkv_inspection_unverified_test(
 
 pub(super) async fn selected_bkv_inspection_exact(
     connection: &sea_orm::DatabaseConnection,
-    deterministic_inspection_ids: &HashMap<i64, String>,
+    deterministic_inspections: &HashMap<i64, BkvExpectedInspection>,
 ) -> Result<Option<db::entities::production_inspection::Model>, BkvRejection> {
     let selected = selected_bkv_inspection(connection).await?;
     let Some(selected) = selected else {
@@ -3286,19 +3531,16 @@ pub(super) async fn selected_bkv_inspection_exact(
         .ok_or_else(|| {
             BkvRejection::new("bkv_selected_inspection_invalid", "selected SeqNo invalid")
         })?;
-    let expected = deterministic_inspection_ids
-        .get(&seq_no)
-        .map(String::as_str)
-        .ok_or_else(|| {
-            BkvRejection::new(
-                "bkv_selected_inspection_invalid",
-                "selected mapping missing",
-            )
-        })?;
-    if selected.id != expected {
+    let expected = deterministic_inspections.get(&seq_no).ok_or_else(|| {
+        BkvRejection::new(
+            "bkv_selected_inspection_invalid",
+            "selected mapping missing",
+        )
+    })?;
+    if !bkv_inspection_matches_expected(&selected, expected) {
         return Err(BkvRejection::new(
             "bkv_selected_inspection_invalid",
-            "selected inspection ID is not deterministic",
+            "selected inspection does not match deterministic evidence",
         ));
     }
     Ok(Some(selected))
@@ -3322,7 +3564,7 @@ async fn bkv_status_value(
     )
     .await?;
     let selected =
-        selected_bkv_inspection_exact(connection, &runtime.deterministic_inspection_ids).await?;
+        selected_bkv_inspection_exact(connection, &runtime.deterministic_inspections).await?;
     if runtime.replay_index > 0 && selected.is_none() {
         return Err(BkvRejection::new(
             "bkv_replay_state_invalid",
@@ -5179,10 +5421,10 @@ mod tests {
         let selected = runtime
             .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
             .unwrap();
-        let deterministic_inspection_ids = runtime
+        let deterministic_inspections = runtime
             .block_on(load_bkv_replay_runtime(&database.connection, &root))
             .unwrap()
-            .deterministic_inspection_ids;
+            .deterministic_inspections;
         let original = runtime
             .block_on(db::find_production_inspection(
                 &database.connection,
@@ -5245,7 +5487,7 @@ mod tests {
             runtime
                 .block_on(selected_bkv_inspection_exact(
                     &database.connection,
-                    &deterministic_inspection_ids,
+                    &deterministic_inspections,
                 ))
                 .unwrap_err()
                 .code,
@@ -5436,6 +5678,145 @@ mod tests {
                 "raw_payload" => original.raw_payload.clone(),
                 _ => unreachable!(),
             };
+            runtime
+                .block_on(database.connection.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("UPDATE production_inspection SET {field} = ? WHERE id = ?"),
+                    [restored.into(), original.id.clone().into()],
+                )))
+                .unwrap();
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_runtime_status_and_snapshot_reject_synchronized_parent_tampering() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("parent-trusted-model");
+        let selected = runtime
+            .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
+            .unwrap();
+        let original = runtime
+            .block_on(db::find_production_inspection(
+                &database.connection,
+                &selected.inspection_id,
+            ))
+            .unwrap()
+            .unwrap();
+
+        runtime
+            .block_on(database.connection.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE production_inspection SET started_at = ?, finished_at = ? WHERE id = ?",
+                [
+                    "synchronized-forged-time".into(),
+                    "synchronized-forged-time".into(),
+                    original.id.clone().into(),
+                ],
+            )))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .block_on(load_bkv_replay_runtime(&database.connection, &root))
+                .unwrap_err()
+                .code,
+            "bkv_selected_inspection_invalid"
+        );
+        assert_eq!(
+            runtime
+                .block_on(bkv_status_value(&database.connection, &root))
+                .unwrap_err()
+                .code,
+            "bkv_selected_inspection_invalid"
+        );
+        runtime
+            .block_on(database.connection.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE production_inspection SET started_at = ?, finished_at = ? WHERE id = ?",
+                [
+                    original.started_at.clone().into(),
+                    original.finished_at.clone().into(),
+                    original.id.clone().into(),
+                ],
+            )))
+            .unwrap();
+
+        let forged_legacy_id = "forged-legacy-id";
+        let mut forged_raw: Value = serde_json::from_str(&original.raw_payload).unwrap();
+        forged_raw["legacyId"] = json!(forged_legacy_id);
+        let forged_material_id = bkv_deterministic_id(
+            "batch-001",
+            "material",
+            "allexcel",
+            forged_legacy_id,
+            "normalized/allexcel.jsonl",
+        );
+        let forged_session_id = bkv_deterministic_id(
+            "batch-001",
+            "material-session",
+            "allexcel",
+            forged_legacy_id,
+            "normalized/allexcel.jsonl",
+        );
+        runtime
+            .block_on(database.connection.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE production_inspection SET material_id = ?, session_id = ?, raw_payload = ? WHERE id = ?",
+                [
+                    forged_material_id.into(),
+                    forged_session_id.into(),
+                    forged_raw.to_string().into(),
+                    original.id.clone().into(),
+                ],
+            )))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .block_on(load_bkv_replay_runtime(&database.connection, &root))
+                .unwrap_err()
+                .code,
+            "bkv_selected_inspection_invalid"
+        );
+        runtime
+            .block_on(database.connection.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE production_inspection SET material_id = ?, session_id = ?, raw_payload = ? WHERE id = ?",
+                [
+                    original.material_id.clone().into(),
+                    original.session_id.clone().into(),
+                    original.raw_payload.clone().into(),
+                    original.id.clone().into(),
+                ],
+            )))
+            .unwrap();
+
+        for (field, tampered, restored) in [
+            ("status", "running".to_string(), original.status.clone()),
+            (
+                "capture_count",
+                (original.capture_count + 1).to_string(),
+                original.capture_count.to_string(),
+            ),
+            (
+                "defect_count",
+                (original.defect_count + 1).to_string(),
+                original.defect_count.to_string(),
+            ),
+        ] {
+            runtime
+                .block_on(database.connection.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("UPDATE production_inspection SET {field} = ? WHERE id = ?"),
+                    [tampered.into(), original.id.clone().into()],
+                )))
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .block_on(load_bkv_replay_runtime(&database.connection, &root))
+                    .unwrap_err()
+                    .code,
+                "bkv_selected_inspection_invalid",
+                "runtime must reject {field}"
+            );
             runtime
                 .block_on(database.connection.execute(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
@@ -6170,7 +6551,7 @@ mod tests {
     }
 
     #[test]
-    fn bkv_serving_index_reads_only_manifest_publication_and_mapping_rows() {
+    fn bkv_serving_index_reads_only_manifest_publication_and_normalized_rows() {
         let root = bkv_test_root("serving-index");
         let manifest = write_bkv_test_batch(&root, "ready", false);
         let imported = load_bkv_batch(&root, &manifest, false).unwrap();
@@ -6190,7 +6571,7 @@ mod tests {
         )
         .expect("serving validation must read only identity mapping rows, not artifacts");
         assert_eq!(index.artifacts.len(), 2);
-        assert_eq!(index.deterministic_inspection_ids.len(), 11);
+        assert_eq!(index.deterministic_inspections.len(), 11);
         assert!(index
             .artifacts
             .iter()

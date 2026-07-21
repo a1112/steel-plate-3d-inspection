@@ -49,12 +49,16 @@ in this mode. Missing, changed, linked, out-of-root, or inactive artifacts close
 readiness with a stable `bkv_*` reason.
 
 For replay indexes above zero, readiness and status do not reload or transform
-the full normalized batch. The verified serving index streams only the manifest-
-declared `allexcel` and `checkrecord` JSONL rows under the same deadline and
-derives the fixed 11-item deterministic inspection-ID map on every independent
-request. Both files must pass same-handle size/SHA-256, identity, and row-count
-checks before they can supply a map. Capture-once still performs its immediate
-full-batch revalidation before advancing replay.
+the full normalized batch. The verified serving index streams each manifest-
+declared normalized JSONL file under the same deadline, verifies its same-handle
+size/SHA-256, identity, and row count, and retains only compact fields needed for
+the fixed 11-item expected parent map. Each entry contains the trusted inspection,
+material, and session IDs, timestamps, status, capture/defect counts, restricted
+path fields, and exact normalized raw binding. Counts come from the verified
+manifest artifact map and verified defect rows, never from the database parent's
+own raw payload. Capture-once still performs its immediate full-batch revalidation
+before advancing replay and holds the same serving-identity single-flight lock
+through that verification.
 
 `POST /api/production/capture-once` advances the active batch in the fixed
 legacy order `1893700` through `1893710`. The response is imported evidence,
@@ -69,8 +73,8 @@ deterministic ID, material/session IDs, completed status, start/finish time,
 capture/defect counts, empty unrestricted path fields, and normalized raw BKV
 binding; missing, extra, or modified parent evidence fails closed for advancement,
 status, and snapshot reads. Replay advancement uses a transaction and
-compare-and-swap
-over the persisted version/index while holding the production command boundary.
+compare-and-swap over the persisted version/index while holding the production
+command boundary.
 The replay state is fail-closed: index 0 is `ready` with no selected fields,
 indexes 1 through 10 are `replaying`, and index 11 is `completed`; every
 nonzero index must name the preceding fixed SeqNo and an imported inspection

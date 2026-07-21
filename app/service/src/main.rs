@@ -2564,7 +2564,7 @@ fn selected_bkv_inspection_for_view(
                 .runtime
                 .block_on(production_tasks::selected_bkv_inspection_exact(
                     &state.database.connection,
-                    &replay.deterministic_inspection_ids,
+                    &replay.deterministic_inspections,
                 ))
         }
         Err(error) => {
@@ -17582,7 +17582,7 @@ mod tests {
             identity: "identity".to_string(),
             batch_dir: PathBuf::from("batch-001"),
             artifacts: vec![artifact],
-            deterministic_inspection_ids: HashMap::new(),
+            deterministic_inspections: HashMap::new(),
         };
         assert!(bkv_allowlisted_artifact(&batch, "artifacts/c1/1893700/allowed.d3img").is_some());
         for forbidden in [
@@ -17717,7 +17717,7 @@ mod tests {
             replay_snapshot: json!({}),
             selected_inspection: None,
             artifacts: Vec::new(),
-            deterministic_inspection_ids: HashMap::new(),
+            deterministic_inspections: HashMap::new(),
         };
         let capture = bkv_capture_health_ready_value(&runtime, json!({"phase":"stopped"}));
         assert_eq!(capture["status"], "bkv-offline");
