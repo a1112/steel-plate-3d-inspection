@@ -218,10 +218,16 @@ def decode_d3img(
 
 
 def _reject_output_alias(input_path: Path, output_path: Path) -> None:
-    source = input_path.resolve(strict=True)
+    source_candidate = input_path.resolve(strict=False)
     destination = output_path.resolve(strict=False)
-    if source == destination:
+    if source_candidate == destination:
         raise OutputCollisionError("output_aliases_input")
+    try:
+        source = input_path.resolve(strict=True)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise OutputCollisionError("input_identity_unverifiable") from error
     try:
         same_file = output_path.exists() and os.path.samefile(source, output_path)
     except OSError as error:

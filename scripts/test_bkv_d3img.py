@@ -102,6 +102,30 @@ class D3ImageProbeTests(unittest.TestCase):
                 self.assertEqual(result, 2)
                 self.assertEqual(source.read_bytes(), original)
 
+    def test_cli_missing_or_directory_input_writes_stable_invalid_json(self):
+        directory_input = self.root / "directory-input"
+        directory_input.mkdir()
+        for label, source in (
+            ("missing", self.root / "missing.d3img"),
+            ("directory", directory_input),
+        ):
+            with self.subTest(label=label):
+                output = self.root / f"{label}-probe.json"
+                result = subject.main(
+                    ["probe", "--input", str(source), "--json", str(output)]
+                )
+                self.assertEqual(result, 2)
+                document = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(document["status"], "invalid")
+                self.assertEqual(document["reason"], "input_unreadable")
+
+        missing_alias = self.root / "still-missing.d3img"
+        result = subject.main(
+            ["probe", "--input", str(missing_alias), "--json", str(missing_alias)]
+        )
+        self.assertEqual(result, 2)
+        self.assertFalse(missing_alias.exists())
+
     def test_staging_diagnostic_uses_manifest_status_vocabulary(self):
         source = self.write("legacy.d3img", b"3DImg\0" + b"\0" * 64)
         diagnostic = legacy_import._depth_decode_evidence(source)
