@@ -7,9 +7,11 @@ import stat
 import struct
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 import bkv_legacy_import as subject
@@ -1024,6 +1026,342 @@ class MemberPolicyTests(unittest.TestCase):
                 with self.subTest(batch_id=batch_id):
                     with self.assertRaisesRegex(ValueError, "batch-id"):
                         subject._validate_output_path(output, batch_id, ())
+
+
+class ExtractionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.output_root = self.root / "batches"
+        self.database_zip = self.root / "database.zip"
+        self.part1 = self.root / "image_copy.part1.rar"
+        self.part2 = self.root / "image_copy.part2.rar"
+        self.database_zip.write_bytes(b"database-archive")
+        self.part1.write_bytes(b"part-one")
+        self.part2.write_bytes(b"part-two")
+        self.unrar = self.root / "UnRAR.exe"
+        self.unrar.write_bytes(b"not executed")
+        self.normalized = self.root / "sql-output"
+        subject.filter_sql_dump(
+            io.BytesIO(
+                b"CREATE TABLE `allexcel` (`SeqNo` bigint);"
+                b"INSERT INTO `allexcel` VALUES (1893700);"
+            ),
+            subject.TARGET_SEQ_NOS,
+            output_dir=self.normalized,
+        )
+        self.payloads = {
+            "image_copy/CamImageSource1/1893700/2D/one.jpg": b"jpeg-one",
+            "image_copy/CamImageSource1/1893700/3D/one.d3img": b"depth-one",
+            "image_copy/CamImageSource6/1893710/3D/camera.dat": b"metadata-six",
+        }
+        self.inventory_path = self.root / "manifest.inventory.json"
+        self._write_inventory()
+        self.commands = []
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _archive_evidence(self, path):
+        payload = path.read_bytes()
+        details = path.stat()
+        return {
+            "path": str(path.resolve()),
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "fileIdentity": f"{details.st_dev}:{details.st_ino}",
+            "mtimeNs": details.st_mtime_ns,
+        }
+
+    def _write_inventory(self, *, database_integrity="ok"):
+        entries = [
+            {
+                "sha256": hashlib.sha256(b"normalized source").hexdigest(),
+                "size": len(b"normalized source"),
+                "archivePart": "database-zip",
+                "memberPath": "ncdtube.sql",
+                "cameraNumber": None,
+                "seqNo": None,
+                "kind": "database",
+                "extension": ".sql",
+                "integrityStatus": database_integrity,
+                "integrityEvidence": None,
+            }
+        ]
+        for member, payload in self.payloads.items():
+            metadata = subject._image_metadata(member)
+            self.assertIsNotNone(metadata)
+            archive_part = "image-part2" if metadata["cameraNumber"] == 6 else "image-part1"
+            entries.append(
+                {
+                    "sha256": None,
+                    "size": len(payload),
+                    "archivePart": archive_part,
+                    "archiveParts": [archive_part],
+                    "archiveMetadata": {
+                        "type": "file",
+                        "size": len(payload),
+                        "crc32": None,
+                    },
+                    "volumeMetadata": {archive_part: {}},
+                    "memberPath": member,
+                    "integrityStatus": "listed-unverified",
+                    "integrityEvidence": None,
+                    **metadata,
+                }
+            )
+        document = {
+            "schema": "steel.bkv-archive-inventory.v1",
+            "batchId": "batch-001",
+            "archives": {
+                "database-zip": self._archive_evidence(self.database_zip),
+                "image-part1": self._archive_evidence(self.part1),
+                "image-part2": self._archive_evidence(self.part2),
+            },
+            "statistics": {
+                "database-zip": {"recordsSeen": 1, "accepted": 1, "rejected": 0},
+                "image-part1": {"recordsSeen": 2, "accepted": 2, "rejected": 0},
+                "image-part2": {"recordsSeen": 1, "accepted": 1, "rejected": 0},
+            },
+            "entries": entries,
+        }
+        self.inventory_path.write_text(json.dumps(document), encoding="utf-8")
+
+    def _use_complete_target_coverage(self):
+        for index, seq_no in enumerate(subject.TARGET_SEQ_NOS):
+            camera = index % 6 + 1
+            member = (
+                f"image_copy/CamImageSource{camera}/{seq_no}/2D/"
+                f"coverage-{seq_no}.jpg"
+            )
+            self.payloads.setdefault(member, f"jpeg-{camera}-{seq_no}".encode("ascii"))
+        self._write_inventory()
+
+    def _runner(self, command, **kwargs):
+        self.commands.append((command, kwargs))
+        member = command[-1]
+        self.assertIn(member, self.payloads)
+        self.assertEqual(kwargs["timeout"], subject.UNRAR_TIMEOUT_SECONDS)
+        self.assertEqual(kwargs["max_stdout_bytes"], len(self.payloads[member]))
+        self.assertEqual(kwargs["max_stderr_bytes"], subject.MAX_UNRAR_STDERR_BYTES)
+        return subprocess.CompletedProcess(command, 0, self.payloads[member], b"")
+
+    def _stage(self, **overrides):
+        arguments = {
+            "inventory_manifest": self.inventory_path,
+            "normalized_output": self.normalized,
+            "output_root": self.output_root,
+            "batch_id": "batch-001",
+            "unrar": self.unrar,
+            "runner": self._runner,
+        }
+        arguments.update(overrides)
+        return subject.stage_batch(**arguments)
+
+    def test_extracts_only_explicit_inventory_members_and_publishes_verified_layout(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+
+        self.assertEqual(batch, self.output_root.resolve() / "batch-001")
+        expected_commands = []
+        for member in self.payloads:
+            archive = self.part2 if "CamImageSource6" in member else self.part1
+            expected_commands.append(
+                [
+                    str(self.unrar.resolve()),
+                    "p",
+                    "-inul",
+                    "-cfg-",
+                    "-p-",
+                    str(archive.resolve()),
+                    member,
+                ]
+            )
+        self.assertEqual([call[0] for call in self.commands], expected_commands)
+        self.assertFalse(any("*" in argument for command, _ in self.commands for argument in command))
+
+        manifest = json.loads((batch / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["schema"], "steel.bkv-import-manifest.v1")
+        self.assertEqual(manifest["status"], "ready")
+        self.assertEqual(manifest["seqNos"], list(subject.TARGET_SEQ_NOS))
+        self.assertTrue(manifest["targetCoverageComplete"])
+        self.assertEqual(set(manifest["cameraInventory"]), {str(value) for value in range(1, 7)})
+        self.assertTrue(manifest["databaseIntegrity"]["allInventoryMembersVerified"])
+        self.assertEqual(manifest["counts"]["acceptedArtifacts"], len(self.payloads))
+        self.assertEqual(manifest["counts"]["rejectedEntries"], 0)
+        for artifact in manifest["artifacts"]:
+            path = batch / Path(*PurePosixPath(artifact["path"]).parts)
+            payload = path.read_bytes()
+            self.assertEqual(artifact["size"], len(payload))
+            self.assertEqual(artifact["sha256"], hashlib.sha256(payload).hexdigest())
+
+        self.assertEqual(
+            (batch / "artifacts/camera-1/1893700/2d/one.jpg").read_bytes(),
+            b"jpeg-one",
+        )
+        self.assertEqual(
+            (batch / "artifacts/camera-1/1893700/3d/one.d3img").read_bytes(),
+            b"depth-one",
+        )
+        self.assertEqual(
+            (batch / "artifacts/camera-6/1893710/metadata/camera.dat").read_bytes(),
+            b"metadata-six",
+        )
+        self.assertEqual(
+            json.loads((batch / "source/inventory.json").read_text(encoding="utf-8"))["batchId"],
+            "batch-001",
+        )
+        self.assertEqual((batch / "quarantine.jsonl").read_bytes(), b"")
+        self.assertEqual(
+            {path.name for path in (batch / "normalized").iterdir()},
+            {f"{table}.jsonl" for table in subject._SQL_TABLES},
+        )
+        self.assertEqual(list(self.output_root.glob("batch-001.incoming-*")), [])
+
+    def test_refuses_to_overwrite_a_precreated_stage_artifact(self):
+        def overwrite_runner(command, **kwargs):
+            if not self.commands:
+                incoming = next(self.output_root.glob("batch-001.incoming-*"))
+                destination = incoming / "artifacts/camera-1/1893700/2d/one.jpg"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"attacker")
+            return self._runner(command, **kwargs)
+
+        with self.assertRaises(FileExistsError):
+            self._stage(runner=overwrite_runner)
+        self.assertFalse((self.output_root / "batch-001").exists())
+
+    def test_declared_total_is_rejected_before_any_unrar_member_runs(self):
+        with mock.patch.object(subject, "MAX_STAGE_TOTAL_BYTES", 1):
+            with self.assertRaisesRegex(subject.InventoryLimitError, "declared artifact total"):
+                self._stage()
+        self.assertEqual(self.commands, [])
+        self.assertFalse((self.output_root / "batch-001").exists())
+
+    def test_duplicate_member_selects_volume_that_supplied_final_crc(self):
+        entry = {
+            "archiveParts": ["image-part1", "image-part2"],
+            "archiveMetadata": {"crc32": "A1B2C3D4"},
+            "volumeMetadata": {
+                "image-part1": {"crc32": "A1B2C3D4"},
+                "image-part2": {"crc32": None},
+            },
+        }
+        self.assertEqual(subject._select_archive_part(entry), "image-part1")
+
+    def test_second_run_revalidates_hashes_and_detects_changed_artifact(self):
+        batch = self._stage()
+        first_command_count = len(self.commands)
+        self.assertEqual(self._stage(), batch)
+        self.assertEqual(len(self.commands), first_command_count)
+
+        (batch / "artifacts/camera-1/1893700/2d/one.jpg").write_bytes(b"tampered")
+        with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
+            self._stage()
+
+    def test_same_batch_id_with_changed_source_archive_is_a_collision(self):
+        self._stage()
+        self.part1.write_bytes(b"changed!")
+        with self.assertRaisesRegex(ValueError, "source archive.*mismatch"):
+            self._stage()
+
+    def test_batch_output_may_not_overlap_supplied_normalized_output(self):
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            self._stage(output_root=self.normalized / "nested-batches")
+
+    def test_validation_failure_never_publishes_incoming_batch(self):
+        with mock.patch.object(
+            subject, "_verify_staged_batch", side_effect=ValueError("invalid stage")
+        ):
+            with self.assertRaisesRegex(ValueError, "invalid stage"):
+                self._stage()
+        self.assertFalse((self.output_root / "batch-001").exists())
+        incoming = list(self.output_root.glob("batch-001.incoming-*"))
+        self.assertEqual(len(incoming), 1)
+        self.assertFalse((incoming[0] / "manifest.json").exists())
+
+    def test_partial_database_requires_explicit_operator_review(self):
+        self._write_inventory(database_integrity="crc-failed")
+        batch = self._stage()
+        manifest = json.loads((batch / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "partial")
+        self.assertFalse(subject.batch_is_importable(batch))
+        self.assertTrue(subject.batch_is_importable(batch, operator_reviewed_partial=True))
+
+    def test_incomplete_target_or_camera_coverage_is_partial(self):
+        batch = self._stage()
+        manifest = json.loads((batch / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "partial")
+        self.assertFalse(manifest["targetCoverageComplete"])
+
+    def test_stage_cli_routes_explicit_inventory_and_normalized_generation(self):
+        expected = self.output_root / "batch-001"
+        with mock.patch.object(subject, "stage_batch", return_value=expected) as stage:
+            result = subject.main(
+                [
+                    "stage",
+                    "--inventory-manifest",
+                    str(self.inventory_path),
+                    "--normalized-output",
+                    str(self.normalized),
+                    "--output-root",
+                    str(self.output_root),
+                    "--batch-id",
+                    "batch-001",
+                    "--unrar",
+                    str(self.unrar),
+                ]
+            )
+        self.assertEqual(result, 0)
+        stage.assert_called_once_with(
+            inventory_manifest=self.inventory_path,
+            normalized_output=self.normalized,
+            output_root=self.output_root,
+            batch_id="batch-001",
+            unrar=self.unrar,
+        )
+
+    def test_real_pipe_timeout_does_not_wait_for_blocked_stdout_read(self):
+        released = threading.Event()
+
+        class BlockingStream:
+            def read(self, _size):
+                released.wait(0.25)
+                return b""
+
+            def close(self):
+                pass
+
+        class EmptyStream:
+            def read(self, _size):
+                return b""
+
+            def close(self):
+                pass
+
+        class HangingProcess:
+            def __init__(self):
+                self.stdout = BlockingStream()
+                self.stderr = EmptyStream()
+
+            def wait(self, timeout=None):
+                if released.is_set():
+                    return -9
+                time.sleep(timeout or 0)
+                raise subprocess.TimeoutExpired(["UnRAR.exe"], timeout)
+
+            def kill(self):
+                released.set()
+
+        destination = self.root / "blocked-output.bin"
+        started = time.monotonic()
+        with mock.patch.object(subject.subprocess, "Popen", return_value=HangingProcess()):
+            with mock.patch.object(subject, "UNRAR_TIMEOUT_SECONDS", 0.01):
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    subject._extract_unrar_member_default(
+                        ["UnRAR.exe", "p", "member"], destination, 0
+                    )
+        self.assertLess(time.monotonic() - started, 0.1)
 
 
 class InventoryTests(unittest.TestCase):

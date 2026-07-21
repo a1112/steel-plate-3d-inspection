@@ -41,6 +41,10 @@ MAX_ZIP_COMPRESSION_RATIO = 100
 ZIP_INVENTORY_TIMEOUT_SECONDS = 300
 MAX_RAR_LISTING_RECORDS = 1_000_000
 MAX_UNRAR_OUTPUT_BYTES = 64 * 1024 * 1024
+MAX_UNRAR_STDERR_BYTES = 1024 * 1024
+MAX_STAGE_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
+MAX_STAGE_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
+STAGE_TIMEOUT_SECONDS = 60 * 60
 MAX_MANIFEST_BYTES = 128 * 1024 * 1024
 MAX_SQL_STATEMENT_BYTES = 64 * 1024 * 1024
 MAX_SQL_FIELD_BYTES = 1024 * 1024
@@ -2287,6 +2291,7 @@ def _records_to_rar_entries(
         }
         entry["volumeMetadata"] = {
             archive_part: {
+                "crc32": record.get("crc32", "").upper() or None,
                 "packedSize": record.get("packedSize"),
                 "ratio": record.get("ratio"),
                 "packCrc32": record.get("packCrc32"),
@@ -2514,6 +2519,715 @@ def inventory_archives(
         return destination
 
 
+def _load_json_document(path: Path, label: str) -> dict[str, object]:
+    if is_reparse_point(path):
+        raise ValueError(f"{label} may not be a reparse point")
+    payload = path.read_bytes()
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise InventoryLimitError(
+            f"{label} bytes {len(payload)} exceed MAX_MANIFEST_BYTES={MAX_MANIFEST_BYTES}"
+        )
+    document = json.loads(payload)
+    if not isinstance(document, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return document
+
+
+def _verify_named_file(
+    path: Path,
+    evidence: object,
+    label: str,
+    *,
+    max_bytes: int = MAX_STAGE_ARTIFACT_BYTES,
+) -> None:
+    if not isinstance(evidence, dict):
+        raise ValueError(f"{label} evidence must be an object")
+    expected_size = evidence.get("size")
+    expected_hash = evidence.get("sha256")
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 0
+        or expected_size > max_bytes
+    ):
+        raise ValueError(f"{label} evidence has an invalid size")
+    if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
+        raise ValueError(f"{label} evidence has an invalid sha256")
+    if is_reparse_point(path) or not path.is_file():
+        raise ValueError(f"{label} is not a regular non-reparse file: {path}")
+    if path.stat().st_size != expected_size:
+        raise ValueError(f"{label} size mismatch: {path}")
+    actual_hash = _sha256_file(
+        path,
+        max_bytes=max_bytes,
+        deadline=time.monotonic() + STAGE_TIMEOUT_SECONDS,
+    )
+    if actual_hash != expected_hash:
+        raise ValueError(f"{label} hash mismatch: {path}")
+
+
+def _stage_path(root: Path, relative: str) -> Path:
+    normalized = normalize_member(relative)
+    if normalized != relative:
+        raise ValueError(f"unsafe staged relative path: {relative!r}")
+    candidate = root / Path(*PurePosixPath(relative).parts)
+    resolved = candidate.resolve(strict=False)
+    if resolved == root or not resolved.is_relative_to(root):
+        raise ValueError(f"staged path escapes incoming batch: {relative!r}")
+    for existing in _existing_chain(candidate):
+        if is_reparse_point(existing):
+            raise ValueError(f"staged path contains a reparse point: {existing}")
+    return candidate
+
+
+def _write_bytes_exclusive(destination: Path, payload: bytes) -> dict[str, object]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for existing in _existing_chain(destination):
+        if is_reparse_point(existing):
+            raise ValueError(f"staged path contains a reparse point: {existing}")
+    digest = hashlib.sha256()
+    total = 0
+    with destination.open("xb") as output:
+        for offset in range(0, len(payload), _IO_CHUNK_BYTES):
+            chunk = payload[offset : offset + _IO_CHUNK_BYTES]
+            total += len(chunk)
+            if total > MAX_STAGE_ARTIFACT_BYTES:
+                raise InventoryLimitError(
+                    "staged artifact exceeds "
+                    f"MAX_STAGE_ARTIFACT_BYTES={MAX_STAGE_ARTIFACT_BYTES}"
+                )
+            output.write(chunk)
+            digest.update(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+    return {"size": total, "sha256": digest.hexdigest()}
+
+
+def _extract_unrar_member_default(
+    command: Sequence[str], destination: Path, expected_size: int
+) -> tuple[int, bytes, int, str]:
+    output = destination.open("xb")
+    try:
+        process = subprocess.Popen(
+            list(command),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=(
+                getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            ),
+        )
+    except BaseException:
+        output.close()
+        raise
+    assert process.stdout is not None and process.stderr is not None
+    stderr = bytearray()
+    stderr_exceeded = threading.Event()
+    stdout_exceeded = threading.Event()
+    reader_error: list[BaseException] = []
+    digest = hashlib.sha256()
+    total = 0
+
+    def drain_stdout() -> None:
+        nonlocal total
+        try:
+            while True:
+                chunk = process.stdout.read(_IO_CHUNK_BYTES)
+                if not chunk:
+                    return
+                total += len(chunk)
+                if total > expected_size or total > MAX_STAGE_ARTIFACT_BYTES:
+                    stdout_exceeded.set()
+                    process.kill()
+                    return
+                output.write(chunk)
+                digest.update(chunk)
+        except BaseException as error:
+            reader_error.append(error)
+            process.kill()
+        finally:
+            process.stdout.close()
+
+    def drain_stderr() -> None:
+        try:
+            while True:
+                chunk = process.stderr.read(_IO_CHUNK_BYTES)
+                if not chunk:
+                    return
+                remaining = MAX_UNRAR_STDERR_BYTES - len(stderr)
+                if len(chunk) > remaining:
+                    if remaining > 0:
+                        stderr.extend(chunk[:remaining])
+                    stderr_exceeded.set()
+                    process.kill()
+                    return
+                stderr.extend(chunk)
+        finally:
+            process.stderr.close()
+
+    threads = [
+        threading.Thread(target=drain_stdout, daemon=True),
+        threading.Thread(target=drain_stderr, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    timed_out = False
+    try:
+        try:
+            return_code = process.wait(timeout=UNRAR_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            return_code = process.wait()
+    finally:
+        for thread in threads:
+            thread.join(timeout=5)
+        output.flush()
+        os.fsync(output.fileno())
+        output.close()
+        if any(thread.is_alive() for thread in threads):
+            process.kill()
+            raise RuntimeError("UnRAR extraction output reader did not terminate")
+    if timed_out:
+        raise RuntimeError(
+            f"UnRAR timed out after {UNRAR_TIMEOUT_SECONDS} seconds"
+        )
+    if reader_error:
+        raise RuntimeError("UnRAR stdout reader failed") from reader_error[0]
+    if stderr_exceeded.is_set():
+        raise InventoryLimitError(
+            f"UnRAR stderr exceeds MAX_UNRAR_STDERR_BYTES={MAX_UNRAR_STDERR_BYTES}"
+        )
+    if stdout_exceeded.is_set():
+        raise InventoryLimitError(
+            f"UnRAR member output exceeds declared size {expected_size}"
+        )
+    return return_code, bytes(stderr), total, digest.hexdigest()
+
+
+def _extract_unrar_member(
+    *,
+    unrar: Path,
+    archive: Path,
+    member: str,
+    destination: Path,
+    expected_size: int,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]] | None,
+) -> dict[str, object]:
+    if expected_size < 0 or expected_size > MAX_STAGE_ARTIFACT_BYTES:
+        raise InventoryLimitError(f"invalid staged artifact size for {member}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for existing in _existing_chain(destination):
+        if is_reparse_point(existing):
+            raise ValueError(f"staged artifact path contains a reparse point: {existing}")
+    command = [
+        str(unrar),
+        "p",
+        "-inul",
+        "-cfg-",
+        "-p-",
+        str(archive),
+        member,
+    ]
+    if runner is None:
+        return_code, stderr, total, digest = _extract_unrar_member_default(
+            command, destination, expected_size
+        )
+    else:
+        try:
+            result = runner(
+                command,
+                timeout=UNRAR_TIMEOUT_SECONDS,
+                max_stdout_bytes=expected_size,
+                max_stderr_bytes=MAX_UNRAR_STDERR_BYTES,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"UnRAR timed out after {UNRAR_TIMEOUT_SECONDS} seconds"
+            ) from error
+        stdout = result.stdout or b""
+        stderr = result.stderr or b""
+        if isinstance(stdout, str):
+            raise TypeError("UnRAR extraction runner stdout must be bytes")
+        if isinstance(stderr, str):
+            stderr = stderr.encode("utf-8", errors="replace")
+        if len(stderr) > MAX_UNRAR_STDERR_BYTES:
+            raise InventoryLimitError(
+                f"UnRAR stderr exceeds MAX_UNRAR_STDERR_BYTES={MAX_UNRAR_STDERR_BYTES}"
+            )
+        if len(stdout) > expected_size:
+            raise InventoryLimitError(
+                f"UnRAR member output exceeds declared size {expected_size}"
+            )
+        evidence = _write_bytes_exclusive(destination, stdout)
+        return_code = result.returncode
+        total = int(evidence["size"])
+        digest = str(evidence["sha256"])
+    if return_code != 0:
+        raise RuntimeError(
+            f"UnRAR extraction failed for {member} with exit {return_code}: "
+            f"{_decode_console(stderr).strip()}"
+        )
+    if total != expected_size:
+        raise ValueError(
+            f"UnRAR member size mismatch for {member}: expected {expected_size}, got {total}"
+        )
+    return {"size": total, "sha256": digest}
+
+
+def _artifact_relative_path(entry: dict[str, object]) -> str:
+    member = str(entry.get("memberPath", ""))
+    metadata = _image_metadata(member)
+    if metadata is None:
+        raise ValueError(f"inventory contains a non-approved image member: {member!r}")
+    for key in ("cameraNumber", "seqNo", "kind", "extension"):
+        if entry.get(key) != metadata[key]:
+            raise ValueError(f"inventory image metadata mismatch for {member}: {key}")
+    extension = str(metadata["extension"])
+    kind = str(metadata["kind"])
+    if extension == ".dat":
+        destination_kind = "metadata"
+    elif extension == ".jpg" and kind == "2D":
+        destination_kind = "2d"
+    elif extension == ".d3img" and kind == "3D":
+        destination_kind = "3d"
+    else:
+        raise ValueError(f"unsupported inventory image semantics: {member}")
+    filename = PurePosixPath(member).name
+    return (
+        f"artifacts/camera-{metadata['cameraNumber']}/{metadata['seqNo']}/"
+        f"{destination_kind}/{filename}"
+    )
+
+
+def _select_archive_part(entry: dict[str, object]) -> str:
+    parts = entry.get("archiveParts")
+    if not isinstance(parts, list) or not parts or not all(isinstance(item, str) for item in parts):
+        archive_part = entry.get("archivePart")
+        if not isinstance(archive_part, str):
+            raise ValueError("inventory image entry lacks archiveParts")
+        parts = [archive_part]
+    if any(part not in ("image-part1", "image-part2") for part in parts):
+        raise ValueError("inventory image entry names an unknown archive part")
+    archive_metadata = entry.get("archiveMetadata")
+    volume_metadata = entry.get("volumeMetadata")
+    final_crc = (
+        archive_metadata.get("crc32")
+        if isinstance(archive_metadata, dict)
+        else None
+    )
+    if isinstance(final_crc, str) and final_crc:
+        matches = []
+        for part in parts:
+            evidence = (
+                volume_metadata.get(part)
+                if isinstance(volume_metadata, dict)
+                else None
+            )
+            volume_crc = evidence.get("crc32") if isinstance(evidence, dict) else None
+            if isinstance(volume_crc, str) and volume_crc.upper() == final_crc.upper():
+                matches.append(part)
+        if matches:
+            return matches[0]
+        if len(parts) > 1:
+            raise ValueError(
+                "duplicate RAR member lacks per-volume evidence for its final CRC"
+            )
+    # Without a member CRC, use a deterministic single extraction from the
+    # last listing occurrence; duplicate metadata was already cross-checked.
+    return parts[-1]
+
+
+def _copy_verified_file(source: Path, destination: Path, max_bytes: int) -> dict[str, object]:
+    snapshot = _file_snapshot(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    total = 0
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        while True:
+            chunk = reader.read(_IO_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise InventoryLimitError(f"staged copy exceeds byte limit: {source}")
+            writer.write(chunk)
+            digest.update(chunk)
+        writer.flush()
+        os.fsync(writer.fileno())
+    _assert_snapshot(source, snapshot)
+    return {"size": total, "sha256": digest.hexdigest()}
+
+
+def _record_stage_failure(incoming: Path, error: BaseException) -> None:
+    if not incoming.is_dir() or is_reparse_point(incoming):
+        return
+    (incoming / "manifest.json").unlink(missing_ok=True)
+    evidence = {
+        "schema": "steel.bkv-stage-quarantine.v1",
+        "reason": type(error).__name__[:128],
+        "message": str(error)[:4096],
+    }
+    payload = (json.dumps(evidence, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    quarantine = incoming / "quarantine.jsonl"
+    try:
+        with quarantine.open("ab") as output:
+            output.write(payload[:8192])
+            output.flush()
+            os.fsync(output.fileno())
+    except OSError:
+        pass
+
+
+def _verify_staged_batch(batch: Path) -> dict[str, object]:
+    batch = batch.resolve(strict=True)
+    if is_reparse_point(batch) or not batch.is_dir():
+        raise ValueError("staged batch must be a non-reparse directory")
+    manifest = _load_json_document(batch / "manifest.json", "staged manifest")
+    if manifest.get("schema") != "steel.bkv-import-manifest.v1":
+        raise ValueError("invalid staged manifest schema")
+    if manifest.get("status") not in ("ready", "partial"):
+        raise ValueError("published stage status must be ready or partial")
+    source_inventory = manifest.get("sourceInventory")
+    _verify_named_file(
+        batch / "source" / "inventory.json",
+        source_inventory,
+        "source inventory",
+        max_bytes=MAX_MANIFEST_BYTES,
+    )
+    archives = manifest.get("sourceArchives")
+    if not isinstance(archives, dict):
+        raise ValueError("staged manifest sourceArchives must be an object")
+    for archive_part in ("database-zip", "image-part1", "image-part2"):
+        evidence = archives.get(archive_part)
+        if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
+            raise ValueError(f"missing source archive evidence: {archive_part}")
+        _verify_named_file(
+            Path(str(evidence["path"])).resolve(strict=True),
+            evidence,
+            f"source archive {archive_part}",
+            max_bytes=MAX_INPUT_ARCHIVE_BYTES,
+        )
+    normalized = manifest.get("normalized")
+    if not isinstance(normalized, list) or len(normalized) != len(_SQL_TABLES):
+        raise ValueError("staged manifest must declare five normalized files")
+    for evidence in normalized:
+        if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
+            raise ValueError("invalid normalized file evidence")
+        relative = str(evidence["path"])
+        path = _stage_path(batch, relative)
+        _verify_named_file(path, evidence, "normalized file")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("staged manifest artifacts must be an array")
+    total = 0
+    seen: set[str] = set()
+    for evidence in artifacts:
+        if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
+            raise ValueError("invalid artifact evidence")
+        relative = str(evidence["path"])
+        collision_key = unicodedata.normalize("NFC", relative).casefold()
+        if collision_key in seen:
+            raise ValueError(f"duplicate staged artifact path: {relative}")
+        seen.add(collision_key)
+        path = _stage_path(batch, relative)
+        try:
+            _verify_named_file(path, evidence, "artifact")
+        except ValueError as error:
+            if "hash mismatch" in str(error):
+                raise ValueError(f"artifact hash mismatch: {path}") from error
+            raise
+        total += int(evidence["size"])
+        if total > MAX_STAGE_TOTAL_BYTES:
+            raise InventoryLimitError(
+                f"staged artifact total exceeds MAX_STAGE_TOTAL_BYTES={MAX_STAGE_TOTAL_BYTES}"
+            )
+    quarantine = batch / "quarantine.jsonl"
+    if is_reparse_point(quarantine) or not quarantine.is_file():
+        raise ValueError("staged batch lacks a regular quarantine.jsonl")
+    return manifest
+
+
+def _verify_current_inputs(
+    *, inventory_path: Path, normalized_output: Path, existing: dict[str, object]
+) -> None:
+    source_inventory = existing.get("sourceInventory")
+    _verify_named_file(
+        inventory_path,
+        source_inventory,
+        "source inventory input",
+        max_bytes=MAX_MANIFEST_BYTES,
+    )
+    generation = resolve_sql_output(normalized_output)
+    normalized = existing.get("normalized")
+    if not isinstance(normalized, list):
+        raise ValueError("existing batch lacks normalized evidence")
+    expected = {str(item.get("table")): item for item in normalized if isinstance(item, dict)}
+    if set(expected) != set(_SQL_TABLES):
+        raise ValueError("existing batch normalized evidence mismatch")
+    for table in _SQL_TABLES:
+        evidence = expected[table]
+        _verify_named_file(generation / f"{table}.jsonl", evidence, "normalized input")
+
+
+def stage_batch(
+    *,
+    inventory_manifest: os.PathLike[str] | str,
+    normalized_output: os.PathLike[str] | str,
+    output_root: os.PathLike[str] | str,
+    batch_id: str,
+    unrar: os.PathLike[str] | str | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]] | None = None,
+) -> Path:
+    inventory_path = _resolve_input(inventory_manifest, "inventory manifest")
+    inventory = _load_json_document(inventory_path, "inventory manifest")
+    if inventory.get("schema") != MANIFEST_SCHEMA:
+        raise ValueError("invalid inventory manifest schema")
+    if inventory.get("batchId") != batch_id:
+        raise ValueError("inventory batchId does not match requested batch-id")
+    archives = inventory.get("archives")
+    if not isinstance(archives, dict) or set(archives) != {
+        "database-zip", "image-part1", "image-part2"
+    }:
+        raise ValueError("inventory must name exactly three source archives")
+    archive_paths: dict[str, Path] = {}
+    for archive_part, evidence in archives.items():
+        if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
+            raise ValueError(f"invalid archive evidence: {archive_part}")
+        archive_paths[archive_part] = _resolve_input(
+            str(evidence["path"]), f"source archive {archive_part}"
+        )
+        _verify_named_file(
+            archive_paths[archive_part],
+            evidence,
+            f"source archive {archive_part}",
+            max_bytes=MAX_INPUT_ARCHIVE_BYTES,
+        )
+    normalized_root = Path(normalized_output).resolve(strict=True)
+    generation = resolve_sql_output(normalized_root)
+    unrar_path = locate_unrar(unrar)
+    final = _validate_output_path(
+        Path(output_root),
+        batch_id,
+        [*archive_paths.values(), inventory_path, normalized_root],
+    )
+    output = final.parent
+    output.mkdir(parents=True, exist_ok=True)
+    for existing_path in _existing_chain(output):
+        if is_reparse_point(existing_path):
+            raise ValueError(f"output path contains a reparse point: {existing_path}")
+    if final.exists() or is_reparse_point(final):
+        if is_reparse_point(final) or not final.is_dir():
+            raise ValueError("batch-id collision with a non-directory or reparse point")
+        existing = _verify_staged_batch(final)
+        if existing.get("batchId") != batch_id:
+            raise ValueError("existing batch-id collision")
+        _verify_current_inputs(
+            inventory_path=inventory_path,
+            normalized_output=normalized_root,
+            existing=existing,
+        )
+        return final
+
+    incoming = Path(tempfile.mkdtemp(prefix=f"{batch_id}.incoming-", dir=output))
+    incoming = incoming.resolve(strict=True)
+    try:
+        (incoming / "source").mkdir()
+        source_inventory_evidence = _copy_verified_file(
+            inventory_path, incoming / "source" / "inventory.json", MAX_MANIFEST_BYTES
+        )
+        source_inventory_evidence.update(
+            {"path": "source/inventory.json", "originalPath": str(inventory_path)}
+        )
+
+        normalized_evidence: list[dict[str, object]] = []
+        for table in _SQL_TABLES:
+            source = generation / f"{table}.jsonl"
+            relative = f"normalized/{table}.jsonl"
+            evidence = _copy_verified_file(
+                source, _stage_path(incoming, relative), MAX_STAGE_ARTIFACT_BYTES
+            )
+            normalized_evidence.append({"table": table, "path": relative, **evidence})
+        # Re-resolve the pointer and re-hash its generation after every copy.
+        if resolve_sql_output(normalized_root) != generation:
+            raise RuntimeError("SQL normalized generation changed during staging")
+
+        entries = inventory.get("entries")
+        if not isinstance(entries, list):
+            raise ValueError("inventory entries must be an array")
+        artifact_entries = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("cameraNumber") is not None
+        ]
+        planned: list[tuple[dict[str, object], str]] = []
+        destinations: dict[str, str] = {}
+        for entry in artifact_entries:
+            relative = _artifact_relative_path(entry)
+            key = unicodedata.normalize("NFC", relative).casefold()
+            previous = destinations.get(key)
+            if previous is not None:
+                raise ValueError(
+                    f"Windows case-insensitive staged collision: {previous!r} and {relative!r}"
+                )
+            destinations[key] = relative
+            planned.append((entry, relative))
+        declared_total = 0
+        for entry, _ in planned:
+            size = entry.get("size")
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise ValueError("inventory image entry lacks a valid declared size")
+            declared_total += size
+            if declared_total > MAX_STAGE_TOTAL_BYTES:
+                raise InventoryLimitError(
+                    "declared artifact total exceeds "
+                    f"MAX_STAGE_TOTAL_BYTES={MAX_STAGE_TOTAL_BYTES}"
+                )
+
+        artifact_evidence: list[dict[str, object]] = []
+        camera_inventory: dict[str, dict[str, object]] = {
+            str(number): {
+                "cameraNumber": number,
+                "artifactCount": 0,
+                "seqNos": [],
+                "countsByKind": {"2d": 0, "3d": 0, "metadata": 0},
+            }
+            for number in range(1, 7)
+        }
+        with _stable_archive_inputs(tuple(archive_paths.values())) as working:
+            for archive_part, evidence in archives.items():
+                assert isinstance(evidence, dict)
+                _verify_named_file(
+                    working[archive_paths[archive_part]],
+                    evidence,
+                    f"locked source archive {archive_part}",
+                    max_bytes=MAX_INPUT_ARCHIVE_BYTES,
+                )
+            for entry, relative in planned:
+                archive_part = _select_archive_part(entry)
+                member = str(entry["memberPath"])
+                expected_size = entry.get("size")
+                if isinstance(expected_size, bool) or not isinstance(expected_size, int):
+                    raise ValueError(f"inventory member lacks valid size: {member}")
+                evidence = _extract_unrar_member(
+                    unrar=unrar_path,
+                    archive=working[archive_paths[archive_part]],
+                    member=member,
+                    destination=_stage_path(incoming, relative),
+                    expected_size=expected_size,
+                    runner=runner,
+                )
+                metadata = _image_metadata(member)
+                assert metadata is not None
+                artifact = {
+                    "path": relative,
+                    "memberPath": member,
+                    "archivePart": archive_part,
+                    **metadata,
+                    **evidence,
+                }
+                artifact_evidence.append(artifact)
+                camera = camera_inventory[str(metadata["cameraNumber"])]
+                camera["artifactCount"] = int(camera["artifactCount"]) + 1
+                seq_nos = camera["seqNos"]
+                assert isinstance(seq_nos, list)
+                if metadata["seqNo"] not in seq_nos:
+                    seq_nos.append(metadata["seqNo"])
+                destination_kind = PurePosixPath(relative).parts[-2]
+                counts_by_kind = camera["countsByKind"]
+                assert isinstance(counts_by_kind, dict)
+                counts_by_kind[destination_kind] = int(counts_by_kind[destination_kind]) + 1
+            for archive_part, evidence in archives.items():
+                assert isinstance(evidence, dict)
+                _verify_named_file(
+                    working[archive_paths[archive_part]],
+                    evidence,
+                    f"locked source archive {archive_part}",
+                    max_bytes=MAX_INPUT_ARCHIVE_BYTES,
+                )
+
+        for camera in camera_inventory.values():
+            camera["seqNos"] = sorted(camera["seqNos"])
+        database_entries = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("archivePart") == "database-zip"
+        ]
+        database_statuses = [str(entry.get("integrityStatus")) for entry in database_entries]
+        database_verified = bool(database_entries) and all(
+            status == "ok" for status in database_statuses
+        )
+        statistics = inventory.get("statistics")
+        if not isinstance(statistics, dict):
+            raise ValueError("inventory statistics must be an object")
+        rejected = 0
+        for value in statistics.values():
+            if not isinstance(value, dict):
+                raise ValueError("inventory statistics entry must be an object")
+            count = value.get("rejected")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError("inventory rejected count must be non-negative")
+            rejected += count
+        seq_nos = sorted({int(item["seqNo"]) for item in artifact_evidence})
+        if any(seq_no not in TARGET_SEQ_NOS for seq_no in seq_nos):
+            raise ValueError("staged artifact contains an unapproved SeqNo")
+        target_coverage_complete = seq_nos == list(TARGET_SEQ_NOS) and all(
+            int(camera["artifactCount"]) > 0
+            for camera in camera_inventory.values()
+        )
+        quarantine = incoming / "quarantine.jsonl"
+        with quarantine.open("xb") as output_file:
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        manifest = {
+            "schema": "steel.bkv-import-manifest.v1",
+            "batchId": batch_id,
+            "status": (
+                "ready"
+                if database_verified and target_coverage_complete
+                else "partial"
+            ),
+            "seqNos": seq_nos,
+            "targetCoverageComplete": target_coverage_complete,
+            "sourceInventory": source_inventory_evidence,
+            "sourceArchives": archives,
+            "databaseIntegrity": {
+                "statuses": database_statuses,
+                "allInventoryMembersVerified": database_verified,
+                "normalizedGenerationVerified": True,
+                "crcFailed": "crc-failed" in database_statuses,
+            },
+            "counts": {
+                "acceptedArtifacts": len(artifact_evidence),
+                "rejectedEntries": rejected,
+            },
+            "cameraInventory": camera_inventory,
+            "normalized": normalized_evidence,
+            "artifacts": artifact_evidence,
+        }
+        _write_json_atomic(incoming / "manifest.json", manifest)
+        _verify_staged_batch(incoming)
+        if final.exists() or is_reparse_point(final):
+            raise FileExistsError(f"batch-id collision during publish: {final}")
+        os.rename(incoming, final)
+        _fsync_directory(output)
+        _verify_staged_batch(final)
+        return final
+    except BaseException as error:
+        _record_stage_failure(incoming, error)
+        raise
+
+
+def batch_is_importable(
+    batch: os.PathLike[str] | str, *, operator_reviewed_partial: bool = False
+) -> bool:
+    manifest = _verify_staged_batch(Path(batch))
+    status = manifest["status"]
+    return status == "ready" or (
+        status == "partial" and operator_reviewed_partial is True
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2524,6 +3238,12 @@ def _build_parser() -> argparse.ArgumentParser:
     inventory.add_argument("--output-root", required=True, type=Path)
     inventory.add_argument("--batch-id", required=True)
     inventory.add_argument("--unrar", type=Path, help="absolute path to UnRAR.exe")
+    stage = subparsers.add_parser("stage", help="stage an immutable legacy batch")
+    stage.add_argument("--inventory-manifest", required=True, type=Path)
+    stage.add_argument("--normalized-output", required=True, type=Path)
+    stage.add_argument("--output-root", required=True, type=Path)
+    stage.add_argument("--batch-id", required=True)
+    stage.add_argument("--unrar", type=Path, help="absolute path to UnRAR.exe")
     return parser
 
 
@@ -2534,6 +3254,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             database_zip=args.database_zip,
             image_part1=args.image_part1,
             image_part2=args.image_part2,
+            output_root=args.output_root,
+            batch_id=args.batch_id,
+            unrar=args.unrar,
+        )
+        print(destination)
+        return 0
+    if args.command == "stage":
+        destination = stage_batch(
+            inventory_manifest=args.inventory_manifest,
+            normalized_output=args.normalized_output,
             output_root=args.output_root,
             batch_id=args.batch_id,
             unrar=args.unrar,
