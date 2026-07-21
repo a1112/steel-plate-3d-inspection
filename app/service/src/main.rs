@@ -2551,12 +2551,22 @@ fn selected_bkv_inspection_for_view(
     state: &ServiceState,
 ) -> Result<Option<db::entities::production_inspection::Model>, production_tasks::BkvRejection> {
     match production_tasks::configured_bkv_root() {
-        Ok(root) => state
-            .runtime
-            .block_on(production_tasks::selected_bkv_inspection_exact(
-                &state.database.connection,
-                &root,
-            )),
+        Ok(root) => {
+            let replay =
+                state
+                    .runtime
+                    .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
+                        &state.database.connection,
+                        &root,
+                        Some(Instant::now() + Duration::from_millis(1_500)),
+                    ))?;
+            state
+                .runtime
+                .block_on(production_tasks::selected_bkv_inspection_exact(
+                    &state.database.connection,
+                    &replay.deterministic_inspection_ids,
+                ))
+        }
         Err(error) => {
             #[cfg(test)]
             {
@@ -17531,6 +17541,7 @@ mod tests {
             identity: "identity".to_string(),
             batch_dir: PathBuf::from("batch-001"),
             artifacts: vec![artifact],
+            deterministic_inspection_ids: HashMap::new(),
         };
         assert!(bkv_allowlisted_artifact(&batch, "artifacts/c1/1893700/allowed.d3img").is_some());
         for forbidden in [
@@ -17665,6 +17676,7 @@ mod tests {
             replay_snapshot: json!({}),
             selected_inspection: None,
             artifacts: Vec::new(),
+            deterministic_inspection_ids: HashMap::new(),
         };
         let capture = bkv_capture_health_ready_value(&runtime, json!({"phase":"stopped"}));
         assert_eq!(capture["status"], "bkv-offline");

@@ -38,6 +38,16 @@ different serving identity invalidates that cache. A valid provider reports
 in this mode. Missing, changed, linked, out-of-root, or inactive artifacts close
 readiness with a stable `bkv_*` reason.
 
+For replay indexes above zero, readiness and status do not reload or transform
+the full normalized batch. The verified serving index streams only the manifest-
+declared `allexcel` and `checkrecord` JSONL rows under the same deadline and
+derives the fixed 11-item deterministic inspection-ID map. Its bounded cache key
+includes the canonical root, batch/content/semantic identity, manifest and
+publication hashes, and both mapping files' declared hashes plus current metadata.
+A metadata change invalidates the entry; the replacement must pass same-handle
+size/SHA-256 and row-count checks before it can supply a new map. Capture-once
+still performs its immediate full-batch revalidation before advancing replay.
+
 `POST /api/production/capture-once` advances the active batch in the fixed
 legacy order `1893700` through `1893710`. The response is imported evidence,
 not a new physical capture: `source=bkv`, `offline=true`, `cameraCount=6`, the

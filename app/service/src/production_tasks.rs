@@ -5,7 +5,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::fs;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(unix)]
@@ -94,6 +94,7 @@ pub(super) struct BkvServingIndex {
     pub identity: String,
     pub batch_dir: PathBuf,
     pub artifacts: Vec<BkvServingArtifact>,
+    pub deterministic_inspection_ids: HashMap<i64, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +108,7 @@ pub(super) struct BkvReplayRuntime {
     pub replay_snapshot: Value,
     pub selected_inspection: Option<BkvImportedInspectionEvidence>,
     pub artifacts: Vec<BkvServingArtifact>,
+    pub deterministic_inspection_ids: HashMap<i64, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,8 +167,17 @@ static BKV_ARTIFACT_VERIFICATION_CACHE: OnceLock<
     Mutex<HashMap<String, BkvArtifactVerificationCacheEntry>>,
 > = OnceLock::new();
 
+static BKV_DETERMINISTIC_MAP_CACHE: OnceLock<Mutex<HashMap<String, HashMap<i64, String>>>> =
+    OnceLock::new();
+
 #[cfg(test)]
 static BKV_ARTIFACT_HASH_READS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+#[cfg(test)]
+static BKV_FULL_BATCH_LOADS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+#[cfg(test)]
+static BKV_MAPPING_READ_DELAYS: OnceLock<Mutex<HashMap<String, Duration>>> = OnceLock::new();
 
 #[cfg(test)]
 fn bkv_test_hash_reads(root: &Path) -> u64 {
@@ -182,6 +193,51 @@ fn bkv_test_hash_reads(root: &Path) -> u64 {
                 .sum()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn bkv_test_full_batch_loads(root: &Path) -> u64 {
+    BKV_FULL_BATCH_LOADS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map(|loads| {
+            loads
+                .get(root.to_string_lossy().as_ref())
+                .copied()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn bkv_test_reset_full_batch_loads(root: &Path) {
+    if let Ok(mut loads) = BKV_FULL_BATCH_LOADS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        loads.insert(root.to_string_lossy().into_owned(), 0);
+    }
+}
+
+#[cfg(test)]
+fn bkv_test_set_mapping_delay(root: &Path, delay: Duration) {
+    if let Ok(mut delays) = BKV_MAPPING_READ_DELAYS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        delays.insert(root.to_string_lossy().into_owned(), delay);
+    }
+}
+
+#[cfg(test)]
+fn bkv_test_clear_mapping_cache(root: &Path) {
+    let root = root.to_string_lossy();
+    if let Ok(mut entries) = BKV_DETERMINISTIC_MAP_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        entries.retain(|identity, _| !identity.contains(root.as_ref()));
+    }
 }
 
 pub(super) fn bkv_sha256(bytes: &[u8]) -> String {
@@ -206,6 +262,14 @@ fn bkv_valid_batch_id(value: &str) -> bool {
 }
 
 fn bkv_hash_file(path: &Path, max_bytes: u64) -> Result<(String, u64, Vec<u8>), BkvRejection> {
+    bkv_hash_file_with_deadline(path, max_bytes, None)
+}
+
+fn bkv_hash_file_with_deadline(
+    path: &Path,
+    max_bytes: u64,
+    deadline: Option<Instant>,
+) -> Result<(String, u64, Vec<u8>), BkvRejection> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         BkvRejection::new(
             "bkv_file_unavailable",
@@ -237,6 +301,12 @@ fn bkv_hash_file(path: &Path, max_bytes: u64) -> Result<(String, u64, Vec<u8>), 
     let mut total = 0_u64;
     let mut bytes = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
     loop {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(BkvRejection::new(
+                "bkv_verification_timeout",
+                "BKV verification deadline exceeded",
+            ));
+        }
         let read = file.read(&mut buffer).map_err(|error| {
             BkvRejection::new(
                 "bkv_file_unavailable",
@@ -488,6 +558,15 @@ pub(super) fn load_bkv_batch(
     requested_manifest: &Path,
     operator_reviewed_partial: bool,
 ) -> Result<BkvValidatedBatch, BkvRejection> {
+    #[cfg(test)]
+    if let Ok(mut loads) = BKV_FULL_BATCH_LOADS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        *loads
+            .entry(configured_root.to_string_lossy().into_owned())
+            .or_default() += 1;
+    }
     if !configured_root.is_absolute() {
         return Err(BkvRejection::new(
             "bkv_root_invalid",
@@ -966,6 +1045,315 @@ pub(super) fn load_bkv_batch(
     })
 }
 
+struct BkvDeadlineHashReader {
+    file: fs::File,
+    digest: Sha256,
+    total: u64,
+    max_bytes: u64,
+    deadline: Option<Instant>,
+    timed_out: bool,
+    #[cfg(test)]
+    delay: Duration,
+}
+
+impl Read for BkvDeadlineHashReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.deadline.is_some_and(|limit| Instant::now() >= limit) {
+            self.timed_out = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "BKV verification deadline exceeded",
+            ));
+        }
+        #[cfg(test)]
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        let remaining = self.max_bytes.saturating_sub(self.total);
+        let allowed = buffer.len().min(remaining.saturating_add(1) as usize);
+        let read = self.file.read(&mut buffer[..allowed])?;
+        self.total = self.total.saturating_add(read as u64);
+        if self.total > self.max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "BKV normalized file exceeds limit",
+            ));
+        }
+        self.digest.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+fn bkv_read_deterministic_mapping_file(
+    path: &Path,
+    table: &str,
+    expected_sha256: &str,
+    expected_size: u64,
+    expected_count: u64,
+    deadline: Option<Instant>,
+) -> Result<HashMap<i64, String>, BkvRejection> {
+    if expected_size > BKV_MAX_JSONL_BYTES || expected_count > BKV_MAX_JSONL_ROWS_PER_TABLE as u64 {
+        return Err(BkvRejection::new(
+            "bkv_jsonl_row_limit_exceeded",
+            "deterministic mapping evidence exceeds limits",
+        ));
+    }
+    let before = fs::symlink_metadata(path)
+        .map_err(|_| BkvRejection::new("bkv_file_unavailable", "mapping file unavailable"))?;
+    if bkv_metadata_is_reparse(&before) || !before.is_file() || before.len() != expected_size {
+        return Err(BkvRejection::new(
+            "bkv_file_changed",
+            "deterministic mapping file metadata changed",
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(0x0002_0000);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(0x0000_0100);
+    let file = options
+        .open(path)
+        .map_err(|_| BkvRejection::new("bkv_file_unavailable", "mapping file open failed"))?;
+    let mut reader = BkvDeadlineHashReader {
+        file,
+        digest: Sha256::new(),
+        total: 0,
+        max_bytes: BKV_MAX_JSONL_BYTES,
+        deadline,
+        timed_out: false,
+        #[cfg(test)]
+        delay: BKV_MAPPING_READ_DELAYS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .ok()
+            .and_then(|delays| {
+                delays
+                    .iter()
+                    .find(|(root, _)| path.to_string_lossy().contains(root.as_str()))
+                    .map(|(_, delay)| *delay)
+            })
+            .unwrap_or_default(),
+    };
+    let mut rows = HashMap::new();
+    let mut row_count = 0u64;
+    let mut parse_failed = false;
+    {
+        let buffered = BufReader::with_capacity(BKV_REPLAY_HASH_BUFFER_BYTES, &mut reader);
+        for row in serde_json::Deserializer::from_reader(buffered).into_iter::<Value>() {
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                reader.timed_out = true;
+                parse_failed = true;
+                break;
+            }
+            let row = match row {
+                Ok(row) => row,
+                Err(_) => {
+                    parse_failed = true;
+                    break;
+                }
+            };
+            row_count = row_count.saturating_add(1);
+            if row_count > BKV_MAX_JSONL_ROWS_PER_TABLE as u64 {
+                return Err(BkvRejection::new(
+                    "bkv_jsonl_row_limit_exceeded",
+                    "deterministic mapping row limit exceeded",
+                ));
+            }
+            let seq_no = row
+                .get("legacySeqNo")
+                .and_then(Value::as_i64)
+                .filter(|seq_no| BKV_TARGET_SEQ_NOS.contains(seq_no))
+                .ok_or_else(|| {
+                    BkvRejection::new("bkv_normalized_row_invalid", "mapping SeqNo invalid")
+                })?;
+            if row.get("legacyTable").and_then(Value::as_str) != Some(table) {
+                return Err(BkvRejection::new(
+                    "bkv_normalized_row_invalid",
+                    "mapping legacy table invalid",
+                ));
+            }
+            let names: &[&str] = if table == "allexcel" {
+                &["id", "allexcelid", "recordid", "originalRowHash"]
+            } else {
+                &["id", "checkrecordid", "originalRowHash"]
+            };
+            let legacy_id = if table == "allexcel" {
+                bkv_row_text(&row, names).unwrap_or_else(|| seq_no.to_string())
+            } else {
+                bkv_row_text(&row, names).unwrap_or_default()
+            };
+            rows.entry(seq_no).or_insert(legacy_id);
+        }
+    }
+    if reader.timed_out {
+        return Err(BkvRejection::new(
+            "bkv_verification_timeout",
+            "BKV deterministic mapping deadline exceeded",
+        ));
+    }
+    if parse_failed || row_count != expected_count {
+        return Err(BkvRejection::new(
+            "bkv_normalized_row_invalid",
+            "deterministic mapping JSONL invalid",
+        ));
+    }
+    let after = reader
+        .file
+        .metadata()
+        .map_err(|_| BkvRejection::new("bkv_file_changed", "mapping metadata unavailable"))?;
+    if reader.total != expected_size
+        || after.len() != before.len()
+        || format!("{:x}", reader.digest.finalize()) != expected_sha256
+    {
+        return Err(BkvRejection::new(
+            "bkv_file_changed",
+            "deterministic mapping hash or size changed",
+        ));
+    }
+    #[cfg(unix)]
+    if after.dev() != before.dev() || after.ino() != before.ino() {
+        return Err(BkvRejection::new(
+            "bkv_file_changed",
+            "deterministic mapping identity changed",
+        ));
+    }
+    Ok(rows)
+}
+
+fn load_bkv_deterministic_inspection_map(
+    batch_dir: &Path,
+    manifest: &Value,
+    serving_identity: &str,
+    batch_id: &str,
+    deadline: Option<Instant>,
+) -> Result<(String, HashMap<i64, String>), BkvRejection> {
+    let normalized = manifest
+        .get("normalized")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BkvRejection::new("bkv_manifest_invalid", "normalized evidence missing"))?;
+    let mut evidence = HashMap::new();
+    for item in normalized {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(BkvRejection::new(
+                "bkv_verification_timeout",
+                "BKV deterministic mapping deadline exceeded",
+            ));
+        }
+        let table = item
+            .get("table")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if matches!(table, "allexcel" | "checkrecord")
+            && evidence.insert(table.to_string(), item).is_some()
+        {
+            return Err(BkvRejection::new(
+                "bkv_normalized_table_invalid",
+                "deterministic mapping table is duplicated",
+            ));
+        }
+    }
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(serving_identity.as_bytes());
+    let mut files = Vec::new();
+    for table in ["allexcel", "checkrecord"] {
+        let item = evidence.get(table).ok_or_else(|| {
+            BkvRejection::new("bkv_normalized_table_invalid", "mapping table missing")
+        })?;
+        let relative = item.get("path").and_then(Value::as_str).unwrap_or_default();
+        let sha256 = item
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let size = item
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| BkvRejection::new("bkv_manifest_invalid", "mapping size missing"))?;
+        let count = item
+            .get("count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| BkvRejection::new("bkv_manifest_invalid", "mapping count missing"))?;
+        if !bkv_safe_relative(relative) || !bkv_valid_sha256(sha256) {
+            return Err(BkvRejection::new(
+                "bkv_manifest_invalid",
+                "mapping evidence invalid",
+            ));
+        }
+        let path = bkv_resolve_batch_file(batch_dir, relative)?;
+        let metadata = fs::metadata(&path)
+            .map_err(|_| BkvRejection::new("bkv_file_unavailable", "mapping metadata missing"))?;
+        if metadata.len() != size {
+            return Err(BkvRejection::new(
+                "bkv_file_changed",
+                "mapping evidence size changed",
+            ));
+        }
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        for value in [table, relative, sha256] {
+            fingerprint.update(value.as_bytes());
+        }
+        fingerprint.update(size.to_le_bytes());
+        fingerprint.update(count.to_le_bytes());
+        fingerprint.update(modified.to_le_bytes());
+        files.push((table, path, sha256, size, count));
+    }
+    let identity = format!(
+        "{serving_identity}:{}",
+        format!("{:x}", fingerprint.finalize())
+    );
+    let cache = BKV_DETERMINISTIC_MAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(mapping) = cache
+        .lock()
+        .ok()
+        .and_then(|entries| entries.get(&identity).cloned())
+    {
+        return Ok((identity, mapping));
+    }
+    let mut parsed = HashMap::new();
+    for (table, path, sha256, size, count) in files {
+        parsed.insert(
+            table,
+            bkv_read_deterministic_mapping_file(&path, table, sha256, size, count, deadline)?,
+        );
+    }
+    let allexcel = parsed.get("allexcel").expect("mapping table inserted");
+    let checkrecord = parsed.get("checkrecord").expect("mapping table inserted");
+    let mut mapping = HashMap::new();
+    for seq_no in BKV_TARGET_SEQ_NOS {
+        let material_legacy_id = allexcel.get(&seq_no).ok_or_else(|| {
+            BkvRejection::new("bkv_material_row_missing", "mapping material missing")
+        })?;
+        let inspection_legacy_id = checkrecord
+            .get(&seq_no)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(material_legacy_id);
+        mapping.insert(
+            seq_no,
+            bkv_deterministic_id(
+                batch_id,
+                "production-inspection",
+                "checkrecord",
+                inspection_legacy_id,
+                "normalized/checkrecord.jsonl",
+            ),
+        );
+    }
+    if let Ok(mut entries) = cache.lock() {
+        if entries.len() >= 128 {
+            entries.clear();
+        }
+        entries.insert(identity.clone(), mapping.clone());
+    }
+    Ok((identity, mapping))
+}
+
 pub(super) fn load_bkv_serving_index(
     configured_root: &Path,
     manifest_path: &Path,
@@ -974,6 +1362,28 @@ pub(super) fn load_bkv_serving_index(
     expected_semantic_digest: &str,
     expected_manifest_sha256: &str,
     expected_publication_sha256: &str,
+) -> Result<BkvServingIndex, BkvRejection> {
+    load_bkv_serving_index_with_deadline(
+        configured_root,
+        manifest_path,
+        expected_batch_id,
+        expected_content_id,
+        expected_semantic_digest,
+        expected_manifest_sha256,
+        expected_publication_sha256,
+        None,
+    )
+}
+
+fn load_bkv_serving_index_with_deadline(
+    configured_root: &Path,
+    manifest_path: &Path,
+    expected_batch_id: &str,
+    expected_content_id: &str,
+    expected_semantic_digest: &str,
+    expected_manifest_sha256: &str,
+    expected_publication_sha256: &str,
+    deadline: Option<Instant>,
 ) -> Result<BkvServingIndex, BkvRejection> {
     if !configured_root.is_absolute() || !bkv_valid_batch_id(expected_batch_id) {
         return Err(BkvRejection::new(
@@ -1012,7 +1422,7 @@ pub(super) fn load_bkv_serving_index(
         ));
     }
     let (manifest_sha256, _, manifest_bytes) =
-        bkv_hash_file(&manifest_path, BKV_MAX_MANIFEST_BYTES)?;
+        bkv_hash_file_with_deadline(&manifest_path, BKV_MAX_MANIFEST_BYTES, deadline)?;
     if manifest_sha256 != expected_manifest_sha256 {
         return Err(BkvRejection::new(
             "bkv_manifest_changed",
@@ -1021,6 +1431,12 @@ pub(super) fn load_bkv_serving_index(
     }
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|_| BkvRejection::new("bkv_manifest_invalid_json", "manifest JSON invalid"))?;
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(BkvRejection::new(
+            "bkv_verification_timeout",
+            "BKV manifest parse deadline exceeded",
+        ));
+    }
     if manifest.get("schema").and_then(Value::as_str) != Some("steel.bkv-import-manifest.v1")
         || manifest.get("batchId").and_then(Value::as_str) != Some(expected_batch_id)
         || manifest.get("batchContentId").and_then(Value::as_str) != Some(expected_content_id)
@@ -1033,7 +1449,7 @@ pub(super) fn load_bkv_serving_index(
     }
     let publication_path = batch_dir.join("publication.json");
     let (publication_sha256, _, publication_bytes) =
-        bkv_hash_file(&publication_path, BKV_MAX_MANIFEST_BYTES)?;
+        bkv_hash_file_with_deadline(&publication_path, BKV_MAX_MANIFEST_BYTES, deadline)?;
     if publication_sha256 != expected_publication_sha256 {
         return Err(BkvRejection::new(
             "bkv_manifest_changed",
@@ -1042,6 +1458,12 @@ pub(super) fn load_bkv_serving_index(
     }
     let publication: Value = serde_json::from_slice(&publication_bytes)
         .map_err(|_| BkvRejection::new("bkv_batch_not_committed", "publication JSON invalid"))?;
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(BkvRejection::new(
+            "bkv_verification_timeout",
+            "BKV publication parse deadline exceeded",
+        ));
+    }
     if publication.get("schema").and_then(Value::as_str) != Some("steel.bkv-publication.v1")
         || publication.get("state").and_then(Value::as_str) != Some("committed")
         || publication.get("batchId").and_then(Value::as_str) != Some(expected_batch_id)
@@ -1065,6 +1487,12 @@ pub(super) fn load_bkv_serving_index(
     let mut seen = std::collections::HashSet::new();
     let mut artifacts = Vec::with_capacity(evidence.len());
     for item in evidence {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(BkvRejection::new(
+                "bkv_verification_timeout",
+                "BKV serving index deadline exceeded",
+            ));
+        }
         let relative_path = item.get("path").and_then(Value::as_str).unwrap_or_default();
         let sha256 = item
             .get("sha256")
@@ -1097,13 +1525,22 @@ pub(super) fn load_bkv_serving_index(
             kind: kind.to_string(),
         });
     }
+    let serving_identity = format!(
+        "{}:{expected_batch_id}:{expected_content_id}:{expected_semantic_digest}:{manifest_sha256}:{publication_sha256}",
+        batch_dir.display()
+    );
+    let (identity, deterministic_inspection_ids) = load_bkv_deterministic_inspection_map(
+        batch_dir,
+        &manifest,
+        &serving_identity,
+        expected_batch_id,
+        deadline,
+    )?;
     Ok(BkvServingIndex {
-        identity: format!(
-            "{}:{expected_batch_id}:{expected_content_id}:{expected_semantic_digest}:{manifest_sha256}:{publication_sha256}",
-            batch_dir.display()
-        ),
+        identity,
         batch_dir: batch_dir.to_path_buf(),
         artifacts,
+        deterministic_inspection_ids,
     })
 }
 
@@ -1411,7 +1848,7 @@ fn verify_bkv_runtime_artifacts(
         verify_bkv_runtime_artifact(index, artifact, deadline)?;
     }
     if let Ok(mut entries) = cache.lock() {
-        if entries.len() >= 4 {
+        if entries.len() >= 128 {
             entries.clear();
         }
         entries.insert(
@@ -1497,7 +1934,7 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
         .and_then(Value::as_str)
         .filter(|value| bkv_valid_sha256(value))
         .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "publication hash invalid"))?;
-    let index = load_bkv_serving_index(
+    let index = load_bkv_serving_index_with_deadline(
         configured_root,
         &configured_root.join(manifest_relative),
         &batch_id,
@@ -1505,6 +1942,7 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
         semantic_digest,
         manifest_sha256,
         publication_sha256,
+        deadline,
     )?;
     verify_bkv_runtime_artifacts(&index, deadline)?;
     let mut channels = std::collections::BTreeSet::new();
@@ -1527,23 +1965,10 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
     let (replay_index, replay_status, replay_version, selected_inspection) =
         bkv_validate_replay_state(connection, &batch_id, &content_id, &replay).await?;
     if let Some(selected) = selected_inspection.as_ref() {
-        let verified = load_bkv_batch(
-            configured_root,
-            &configured_root.join(manifest_relative),
-            batch.get("status").and_then(Value::as_str) == Some("partial"),
-        )?;
-        if verified.batch_id != batch_id || verified.content_id != content_id {
-            return Err(BkvRejection::new(
-                "bkv_manifest_changed",
-                "selected deterministic mapping changed",
-            ));
-        }
-        let deterministic = bkv_validated_to_db(&verified)?;
-        let expected_id = deterministic
-            .materials
-            .iter()
-            .find(|material| material.seq_no == selected.evidence.legacy_seq_no)
-            .map(|material| material.inspection_id.as_str())
+        let expected_id = index
+            .deterministic_inspection_ids
+            .get(&selected.evidence.legacy_seq_no)
+            .map(String::as_str)
             .ok_or_else(|| {
                 BkvRejection::new(
                     "bkv_selected_inspection_invalid",
@@ -1567,6 +1992,7 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
         replay_snapshot: replay,
         selected_inspection: selected_inspection.map(|selected| selected.evidence),
         artifacts: index.artifacts,
+        deterministic_inspection_ids: index.deterministic_inspection_ids,
     })
 }
 
@@ -2505,7 +2931,7 @@ pub(super) async fn selected_bkv_inspection_id(
 
 pub(super) async fn selected_bkv_inspection_exact(
     connection: &sea_orm::DatabaseConnection,
-    configured_root: &Path,
+    deterministic_inspection_ids: &HashMap<i64, String>,
 ) -> Result<Option<db::entities::production_inspection::Model>, BkvRejection> {
     let selected = selected_bkv_inspection(connection).await?;
     let Some(selected) = selected else {
@@ -2517,53 +2943,15 @@ pub(super) async fn selected_bkv_inspection_exact(
             "selected provenance invalid",
         )
     })?;
-    let batch_id = raw
-        .get("batchId")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let content_id = raw
-        .get("contentId")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     let seq_no = raw
         .get("legacySeqNo")
         .and_then(Value::as_i64)
         .ok_or_else(|| {
             BkvRejection::new("bkv_selected_inspection_invalid", "selected SeqNo invalid")
         })?;
-    let batch_config = bkv_config_json(
-        db::get_config(connection, &format!("bkv.batch.{batch_id}"))
-            .await
-            .map_err(|_| BkvRejection::new("bkv_status_unavailable", "batch lookup failed"))?,
-        "bkv_batch_state_missing",
-    )?;
-    if batch_config.get("contentId").and_then(Value::as_str) != Some(content_id) {
-        return Err(BkvRejection::new(
-            "bkv_selected_inspection_invalid",
-            "selected batch content binding invalid",
-        ));
-    }
-    let manifest_relative = batch_config
-        .pointer("/summary/manifestPath")
-        .and_then(Value::as_str)
-        .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "manifest path missing"))?;
-    let verified = load_bkv_batch(
-        configured_root,
-        &configured_root.join(manifest_relative),
-        batch_config.get("status").and_then(Value::as_str) == Some("partial"),
-    )?;
-    if verified.batch_id != batch_id || verified.content_id != content_id {
-        return Err(BkvRejection::new(
-            "bkv_manifest_changed",
-            "selected deterministic mapping changed",
-        ));
-    }
-    let deterministic = bkv_validated_to_db(&verified)?;
-    let expected = deterministic
-        .materials
-        .iter()
-        .find(|material| material.seq_no == seq_no)
-        .map(|material| material.inspection_id.as_str())
+    let expected = deterministic_inspection_ids
+        .get(&seq_no)
+        .map(String::as_str)
         .ok_or_else(|| {
             BkvRejection::new(
                 "bkv_selected_inspection_invalid",
@@ -2596,7 +2984,8 @@ async fn bkv_status_value(
         Some(Instant::now() + Duration::from_millis(1_500)),
     )
     .await?;
-    let selected = selected_bkv_inspection_exact(connection, configured_root).await?;
+    let selected =
+        selected_bkv_inspection_exact(connection, &runtime.deterministic_inspection_ids).await?;
     if runtime.replay_index > 0 && selected.is_none() {
         return Err(BkvRejection::new(
             "bkv_replay_state_invalid",
@@ -4453,6 +4842,10 @@ mod tests {
         let selected = runtime
             .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
             .unwrap();
+        let deterministic_inspection_ids = runtime
+            .block_on(load_bkv_replay_runtime(&database.connection, &root))
+            .unwrap()
+            .deterministic_inspection_ids;
         let original = runtime
             .block_on(db::find_production_inspection(
                 &database.connection,
@@ -4513,7 +4906,10 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .block_on(selected_bkv_inspection_exact(&database.connection, &root))
+                .block_on(selected_bkv_inspection_exact(
+                    &database.connection,
+                    &deterministic_inspection_ids,
+                ))
                 .unwrap_err()
                 .code,
             "bkv_selected_inspection_invalid"
@@ -4668,6 +5064,102 @@ mod tests {
         );
         fs::remove_dir_all(root).ok();
         fs::remove_dir_all(root2).ok();
+    }
+
+    #[test]
+    fn bkv_index_one_health_storage_and_status_never_reload_the_full_batch() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("runtime-compact-map");
+        runtime
+            .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
+            .unwrap();
+        bkv_test_reset_full_batch_loads(&root);
+        let artifact_reads = bkv_test_hash_reads(&root);
+
+        for _component in ["capture-health", "storage-health"] {
+            let replay = runtime
+                .block_on(load_bkv_replay_runtime_with_deadline(
+                    &database.connection,
+                    &root,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                ))
+                .unwrap();
+            assert_eq!(replay.replay_index, 1);
+        }
+        assert_eq!(
+            runtime
+                .block_on(bkv_status_value(&database.connection, &root))
+                .unwrap()["active"],
+            json!(true)
+        );
+        assert_eq!(bkv_test_full_batch_loads(&root), 0);
+        assert_eq!(bkv_test_hash_reads(&root), artifact_reads);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_index_one_slow_mapping_honors_capture_storage_and_status_deadlines() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("runtime-map-deadline");
+        runtime
+            .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
+            .unwrap();
+        bkv_test_reset_full_batch_loads(&root);
+        let artifact_reads = bkv_test_hash_reads(&root);
+
+        for _component in ["capture-health", "storage-health"] {
+            bkv_test_clear_mapping_cache(&root);
+            bkv_test_set_mapping_delay(&root, Duration::from_millis(20));
+            assert_eq!(
+                runtime
+                    .block_on(load_bkv_replay_runtime_with_deadline(
+                        &database.connection,
+                        &root,
+                        Some(Instant::now() + Duration::from_millis(5)),
+                    ))
+                    .unwrap_err()
+                    .code,
+                "bkv_verification_timeout"
+            );
+        }
+
+        bkv_test_clear_mapping_cache(&root);
+        bkv_test_set_mapping_delay(&root, Duration::from_millis(1_600));
+        assert_eq!(
+            runtime
+                .block_on(bkv_status_value(&database.connection, &root))
+                .unwrap_err()
+                .code,
+            "bkv_verification_timeout"
+        );
+        bkv_test_set_mapping_delay(&root, Duration::ZERO);
+        assert_eq!(bkv_test_full_batch_loads(&root), 0);
+        assert_eq!(bkv_test_hash_reads(&root), artifact_reads);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_deterministic_mapping_cache_invalidates_on_same_size_file_change() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("runtime-map-tamper");
+        runtime
+            .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
+            .unwrap();
+        let path = root.join("batch-001/normalized/allexcel.jsonl");
+        let original = fs::read_to_string(&path).unwrap();
+        let tampered = original.replacen("Q235", "Q236", 1);
+        assert_eq!(tampered.len(), original.len());
+        fs::write(&path, tampered).unwrap();
+
+        assert_eq!(
+            runtime
+                .block_on(load_bkv_replay_runtime_with_deadline(
+                    &database.connection,
+                    &root,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                ))
+                .unwrap_err()
+                .code,
+            "bkv_file_changed"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5065,15 +5557,10 @@ mod tests {
     }
 
     #[test]
-    fn bkv_serving_index_reads_only_manifest_and_publication() {
+    fn bkv_serving_index_reads_only_manifest_publication_and_mapping_rows() {
         let root = bkv_test_root("serving-index");
         let manifest = write_bkv_test_batch(&root, "ready", false);
         let imported = load_bkv_batch(&root, &manifest, false).unwrap();
-        fs::write(
-            root.join("batch-001/normalized/allexcel.jsonl"),
-            b"corrupted-but-not-opened",
-        )
-        .unwrap();
         fs::write(
             root.join("batch-001/artifacts/camera1/1893700/metadata/camera.dat"),
             b"corrupted-other-artifact",
@@ -5088,8 +5575,9 @@ mod tests {
             &imported.manifest_sha256,
             &imported.publication_sha256,
         )
-        .expect("serving validation must not open JSONL or artifacts");
+        .expect("serving validation must read only identity mapping rows, not artifacts");
         assert_eq!(index.artifacts.len(), 2);
+        assert_eq!(index.deterministic_inspection_ids.len(), 11);
         assert!(index
             .artifacts
             .iter()
