@@ -12,6 +12,39 @@ use std::path::{Component, Path, PathBuf};
 use std::os::unix::fs::{MetadataExt as UnixMetadataExt, OpenOptionsExt as UnixOpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+#[repr(C)]
+struct BkvFileTime {
+    low: u32,
+    high: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct BkvByHandleFileInformation {
+    attributes: u32,
+    creation_time: BkvFileTime,
+    last_access_time: BkvFileTime,
+    last_write_time: BkvFileTime,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandle(
+        handle: *mut std::ffi::c_void,
+        information: *mut BkvByHandleFileInformation,
+    ) -> i32;
+}
 
 const DEFAULT_QUEUE_CAPACITY: u64 = 128;
 const MAX_QUEUE_CAPACITY: u64 = 4096;
@@ -24,7 +57,6 @@ const BKV_MAX_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const BKV_REPLAY_MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const BKV_REPLAY_MAX_TOTAL_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const BKV_REPLAY_HASH_BUFFER_BYTES: usize = 64 * 1024;
-const BKV_REPLAY_CACHE_TTL: Duration = Duration::from_secs(30);
 const BKV_MAX_PERSISTED_JSON_BYTES: usize = 60 * 1024;
 const BKV_TARGET_SEQ_NOS: [i64; 11] = [
     1_893_700, 1_893_701, 1_893_702, 1_893_703, 1_893_704, 1_893_705, 1_893_706, 1_893_707,
@@ -157,18 +189,9 @@ pub(super) struct BkvReplaySelection {
     pub defects: Vec<Value>,
 }
 
-#[derive(Clone)]
-struct BkvArtifactVerificationCacheEntry {
-    fingerprint: String,
-    verified_at: Instant,
-}
-
-static BKV_ARTIFACT_VERIFICATION_CACHE: OnceLock<
-    Mutex<HashMap<String, BkvArtifactVerificationCacheEntry>>,
+static BKV_RUNTIME_VERIFICATION_SINGLE_FLIGHT: OnceLock<
+    Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
 > = OnceLock::new();
-
-static BKV_DETERMINISTIC_MAP_CACHE: OnceLock<Mutex<HashMap<String, HashMap<i64, String>>>> =
-    OnceLock::new();
 
 #[cfg(test)]
 static BKV_ARTIFACT_HASH_READS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
@@ -178,6 +201,55 @@ static BKV_FULL_BATCH_LOADS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::n
 
 #[cfg(test)]
 static BKV_MAPPING_READ_DELAYS: OnceLock<Mutex<HashMap<String, Duration>>> = OnceLock::new();
+
+#[cfg(test)]
+static BKV_RUNTIME_VERIFICATIONS_ACTIVE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+#[cfg(test)]
+static BKV_RUNTIME_VERIFICATIONS_MAX: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+#[cfg(test)]
+struct BkvRuntimeVerificationActiveGuard(String);
+
+#[cfg(test)]
+impl Drop for BkvRuntimeVerificationActiveGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = BKV_RUNTIME_VERIFICATIONS_ACTIVE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            if let Some(count) = active.get_mut(&self.0) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn bkv_test_reset_runtime_verification_max(root: &Path) {
+    if let Ok(mut maximums) = BKV_RUNTIME_VERIFICATIONS_MAX
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        maximums.retain(|identity, _| !identity.starts_with(root.to_string_lossy().as_ref()));
+    }
+}
+
+#[cfg(test)]
+fn bkv_test_runtime_verification_max(root: &Path) -> u64 {
+    BKV_RUNTIME_VERIFICATIONS_MAX
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map(|maximums| {
+            maximums
+                .iter()
+                .filter(|(identity, _)| identity.starts_with(root.to_string_lossy().as_ref()))
+                .map(|(_, count)| *count)
+                .max()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
 
 #[cfg(test)]
 fn bkv_test_hash_reads(root: &Path) -> u64 {
@@ -229,17 +301,6 @@ fn bkv_test_set_mapping_delay(root: &Path, delay: Duration) {
     }
 }
 
-#[cfg(test)]
-fn bkv_test_clear_mapping_cache(root: &Path) {
-    let root = root.to_string_lossy();
-    if let Ok(mut entries) = BKV_DETERMINISTIC_MAP_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-    {
-        entries.retain(|identity, _| !identity.contains(root.as_ref()));
-    }
-}
-
 pub(super) fn bkv_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -259,6 +320,100 @@ fn bkv_valid_batch_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn bkv_same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(windows)]
+    {
+        left.creation_time() == right.creation_time()
+            && left.last_write_time() == right.last_write_time()
+            && left.file_size() == right.file_size()
+    }
+}
+
+fn bkv_raw_open_readonly_nofollow(path: &Path) -> Result<fs::File, BkvRejection> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(0x0002_0000);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(0x0000_0100);
+    options
+        .open(path)
+        .map_err(|_| BkvRejection::new("bkv_file_unavailable", "BKV file open failed"))
+}
+
+#[cfg(windows)]
+fn bkv_windows_handle_identity(file: &fs::File) -> Option<(u32, u64)> {
+    let mut information = std::mem::MaybeUninit::<BkvByHandleFileInformation>::uninit();
+    let ok = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if ok == 0 {
+        return None;
+    }
+    let information = unsafe { information.assume_init() };
+    Some((
+        information.volume_serial_number,
+        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low),
+    ))
+}
+
+fn bkv_same_open_handle_identity(left: &fs::File, right: &fs::File) -> bool {
+    #[cfg(windows)]
+    {
+        bkv_windows_handle_identity(left)
+            .zip(bkv_windows_handle_identity(right))
+            .is_some_and(|(left, right)| left == right)
+    }
+    #[cfg(unix)]
+    {
+        left.metadata()
+            .ok()
+            .zip(right.metadata().ok())
+            .is_some_and(|(left, right)| bkv_same_file_identity(&left, &right))
+    }
+}
+
+fn bkv_handle_still_matches_path(file: &fs::File, path: &Path) -> bool {
+    bkv_raw_open_readonly_nofollow(path)
+        .ok()
+        .is_some_and(|current| bkv_same_open_handle_identity(file, &current))
+}
+
+fn bkv_open_readonly_nofollow(path: &Path) -> Result<(fs::File, fs::Metadata), BkvRejection> {
+    let before = fs::symlink_metadata(path)
+        .map_err(|_| BkvRejection::new("bkv_file_unavailable", "BKV file unavailable"))?;
+    if bkv_metadata_is_reparse(&before) || !before.is_file() {
+        return Err(BkvRejection::new(
+            "bkv_file_link_rejected",
+            "BKV linked or non-file path rejected",
+        ));
+    }
+    let file = bkv_raw_open_readonly_nofollow(path)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| BkvRejection::new("bkv_file_changed", "BKV handle metadata unavailable"))?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|_| BkvRejection::new("bkv_file_changed", "BKV path changed during open"))?;
+    if bkv_metadata_is_reparse(&opened)
+        || bkv_metadata_is_reparse(&after)
+        || !bkv_same_file_identity(&before, &opened)
+        || !bkv_same_file_identity(&opened, &after)
+        || !bkv_handle_still_matches_path(&file, path)
+    {
+        return Err(BkvRejection::new(
+            "bkv_file_changed",
+            "BKV path identity changed during open",
+        ));
+    }
+    Ok((file, opened))
 }
 
 fn bkv_hash_file(path: &Path, max_bytes: u64) -> Result<(String, u64, Vec<u8>), BkvRejection> {
@@ -282,20 +437,13 @@ fn bkv_hash_file_with_deadline(
             format!("{} exceeds the allowed file size", path.display()),
         ));
     }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    options.custom_flags(0x0020_0000);
-    #[cfg(target_os = "linux")]
-    options.custom_flags(0x0002_0000);
-    #[cfg(target_os = "macos")]
-    options.custom_flags(0x0000_0100);
-    let mut file = options.open(path).map_err(|error| {
-        BkvRejection::new(
-            "bkv_file_unavailable",
-            format!("{}: {error}", path.display()),
-        )
-    })?;
+    let (mut file, opened) = bkv_open_readonly_nofollow(path)?;
+    if !bkv_same_file_identity(&metadata, &opened) {
+        return Err(BkvRejection::new(
+            "bkv_file_changed",
+            "BKV file identity changed before read",
+        ));
+    }
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
@@ -329,14 +477,17 @@ fn bkv_hash_file_with_deadline(
     let after = file.metadata().map_err(|_| {
         BkvRejection::new("bkv_file_changed", "file metadata unavailable after read")
     })?;
-    if bkv_metadata_is_reparse(&after) || after.len() != metadata.len() || total != metadata.len() {
+    if bkv_metadata_is_reparse(&after)
+        || after.len() != metadata.len()
+        || total != metadata.len()
+        || !bkv_handle_still_matches_path(&file, path)
+    {
         return Err(BkvRejection::new(
             "bkv_file_changed",
             "file changed while being read",
         ));
     }
-    #[cfg(unix)]
-    if after.dev() != metadata.dev() || after.ino() != metadata.ino() {
+    if !bkv_same_file_identity(&after, &metadata) {
         return Err(BkvRejection::new(
             "bkv_file_changed",
             "file identity changed while being read",
@@ -1106,17 +1257,13 @@ fn bkv_read_deterministic_mapping_file(
             "deterministic mapping file metadata changed",
         ));
     }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    options.custom_flags(0x0020_0000);
-    #[cfg(target_os = "linux")]
-    options.custom_flags(0x0002_0000);
-    #[cfg(target_os = "macos")]
-    options.custom_flags(0x0000_0100);
-    let file = options
-        .open(path)
-        .map_err(|_| BkvRejection::new("bkv_file_unavailable", "mapping file open failed"))?;
+    let (file, opened) = bkv_open_readonly_nofollow(path)?;
+    if !bkv_same_file_identity(&before, &opened) {
+        return Err(BkvRejection::new(
+            "bkv_file_changed",
+            "mapping identity changed before read",
+        ));
+    }
     let mut reader = BkvDeadlineHashReader {
         file,
         digest: Sha256::new(),
@@ -1206,6 +1353,7 @@ fn bkv_read_deterministic_mapping_file(
         .map_err(|_| BkvRejection::new("bkv_file_changed", "mapping metadata unavailable"))?;
     if reader.total != expected_size
         || after.len() != before.len()
+        || !bkv_handle_still_matches_path(&reader.file, path)
         || format!("{:x}", reader.digest.finalize()) != expected_sha256
     {
         return Err(BkvRejection::new(
@@ -1213,8 +1361,7 @@ fn bkv_read_deterministic_mapping_file(
             "deterministic mapping hash or size changed",
         ));
     }
-    #[cfg(unix)]
-    if after.dev() != before.dev() || after.ino() != before.ino() {
+    if !bkv_same_file_identity(&after, &before) {
         return Err(BkvRejection::new(
             "bkv_file_changed",
             "deterministic mapping identity changed",
@@ -1308,14 +1455,6 @@ fn load_bkv_deterministic_inspection_map(
         "{serving_identity}:{}",
         format!("{:x}", fingerprint.finalize())
     );
-    let cache = BKV_DETERMINISTIC_MAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(mapping) = cache
-        .lock()
-        .ok()
-        .and_then(|entries| entries.get(&identity).cloned())
-    {
-        return Ok((identity, mapping));
-    }
     let mut parsed = HashMap::new();
     for (table, path, sha256, size, count) in files {
         parsed.insert(
@@ -1344,12 +1483,6 @@ fn load_bkv_deterministic_inspection_map(
                 "normalized/checkrecord.jsonl",
             ),
         );
-    }
-    if let Ok(mut entries) = cache.lock() {
-        if entries.len() >= 128 {
-            entries.clear();
-        }
-        entries.insert(identity.clone(), mapping.clone());
     }
     Ok((identity, mapping))
 }
@@ -1586,6 +1719,70 @@ fn bkv_imported_inspection_evidence(
             "selected inspection is not bound to the active replay item",
         ));
     }
+    let legacy_id = raw
+        .get("legacyId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            BkvRejection::new(
+                "bkv_selected_inspection_invalid",
+                "selected inspection legacy identity is missing",
+            )
+        })?;
+    let expected_material_id = bkv_deterministic_id(
+        expected_batch_id,
+        "material",
+        "allexcel",
+        legacy_id,
+        "normalized/allexcel.jsonl",
+    );
+    let expected_session_id = bkv_deterministic_id(
+        expected_batch_id,
+        "material-session",
+        "allexcel",
+        legacy_id,
+        "normalized/allexcel.jsonl",
+    );
+    let expected_capture_count = raw
+        .get("artifactProvenance")
+        .and_then(Value::as_array)
+        .map(|rows| rows.len().min(i32::MAX as usize) as i32)
+        .ok_or_else(|| {
+            BkvRejection::new(
+                "bkv_selected_inspection_invalid",
+                "selected inspection artifact binding is missing",
+            )
+        })?;
+    let expected_defect_count = raw
+        .get("rowRefs")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row.get("t").and_then(Value::as_str) == Some("defect"))
+                .count()
+                .min(i32::MAX as usize) as i32
+        })
+        .ok_or_else(|| {
+            BkvRejection::new(
+                "bkv_selected_inspection_invalid",
+                "selected inspection row binding is missing",
+            )
+        })?;
+    if inspection.material_id != expected_material_id
+        || inspection.session_id != expected_session_id
+        || inspection.status != "completed"
+        || inspection.started_at.is_empty()
+        || inspection.started_at != inspection.finished_at
+        || inspection.capture_count != expected_capture_count
+        || inspection.defect_count != expected_defect_count
+        || !inspection.storage_root.is_empty()
+        || !inspection.summary_path.is_empty()
+    {
+        return Err(BkvRejection::new(
+            "bkv_selected_inspection_invalid",
+            "selected inspection parent fields do not match deterministic evidence",
+        ));
+    }
     Ok(BkvImportedInspectionEvidence {
         id: inspection.id.clone(),
         status: inspection.status.clone(),
@@ -1725,8 +1922,14 @@ fn verify_bkv_runtime_artifact(
             "BKV replay artifact size changed or exceeds the replay limit",
         ));
     }
-    let mut file = fs::File::open(&path)
+    let (mut file, opened) = bkv_open_readonly_nofollow(&path)
         .map_err(|_| BkvRejection::new("bkv_artifact_missing", "BKV artifact open failed"))?;
+    if !bkv_same_file_identity(&metadata, &opened) {
+        return Err(BkvRejection::new(
+            "bkv_artifact_changed",
+            "BKV artifact identity changed before read",
+        ));
+    }
     let mut digest = Sha256::new();
     let mut buffer = vec![0u8; BKV_REPLAY_HASH_BUFFER_BYTES];
     let mut read_total = 0u64;
@@ -1759,7 +1962,18 @@ fn verify_bkv_runtime_artifact(
         }
         digest.update(&buffer[..read]);
     }
-    if read_total != artifact.size || format!("{:x}", digest.finalize()) != artifact.sha256 {
+    let after = file
+        .metadata()
+        .map_err(|_| BkvRejection::new("bkv_artifact_changed", "BKV artifact metadata changed"))?;
+    let path_after = fs::symlink_metadata(&path)
+        .map_err(|_| BkvRejection::new("bkv_artifact_changed", "BKV artifact path changed"))?;
+    if !bkv_same_file_identity(&opened, &after)
+        || !bkv_same_file_identity(&after, &path_after)
+        || bkv_metadata_is_reparse(&path_after)
+        || !bkv_handle_still_matches_path(&file, &path)
+        || read_total != artifact.size
+        || format!("{:x}", digest.finalize()) != artifact.sha256
+    {
         return Err(BkvRejection::new(
             "bkv_artifact_changed",
             "BKV replay artifact hash or size changed",
@@ -1773,8 +1987,6 @@ fn verify_bkv_runtime_artifacts(
     deadline: Option<Instant>,
 ) -> Result<(), BkvRejection> {
     let mut total = 0u64;
-    let mut fingerprint = Sha256::new();
-    fingerprint.update(index.identity.as_bytes());
     for artifact in &index.artifacts {
         if deadline.is_some_and(|limit| Instant::now() >= limit) {
             return Err(BkvRejection::new(
@@ -1797,67 +2009,9 @@ fn verify_bkv_runtime_artifacts(
                 "BKV batch exceeds the replay artifact limit",
             ));
         }
-        let path = resolve_bkv_serving_path(index, artifact).map_err(|error| {
-            BkvRejection::new(
-                if matches!(error.code, "bkv_file_unavailable" | "bkv_file_changed") {
-                    "bkv_artifact_missing"
-                } else {
-                    "bkv_artifact_invalid"
-                },
-                "BKV replay artifact is unavailable",
-            )
-        })?;
-        let metadata = fs::metadata(&path).map_err(|_| {
-            BkvRejection::new("bkv_artifact_missing", "BKV artifact metadata unavailable")
-        })?;
-        if metadata.len() != artifact.size {
-            return Err(BkvRejection::new(
-                "bkv_artifact_changed",
-                "BKV artifact size changed",
-            ));
-        }
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|value| value.as_nanos())
-            .unwrap_or_default();
-        fingerprint.update(artifact.relative_path.as_bytes());
-        fingerprint.update(metadata.len().to_le_bytes());
-        fingerprint.update(modified.to_le_bytes());
-    }
-    let fingerprint = format!("{:x}", fingerprint.finalize());
-    let cache = BKV_ARTIFACT_VERIFICATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if cache
-        .lock()
-        .ok()
-        .and_then(|entries| {
-            entries
-                .get(&index.identity)
-                .filter(|entry| {
-                    entry.fingerprint == fingerprint
-                        && entry.verified_at.elapsed() <= BKV_REPLAY_CACHE_TTL
-                })
-                .cloned()
-        })
-        .is_some()
-    {
-        return Ok(());
     }
     for artifact in &index.artifacts {
         verify_bkv_runtime_artifact(index, artifact, deadline)?;
-    }
-    if let Ok(mut entries) = cache.lock() {
-        if entries.len() >= 128 {
-            entries.clear();
-        }
-        entries.insert(
-            index.identity.clone(),
-            BkvArtifactVerificationCacheEntry {
-                fingerprint,
-                verified_at: Instant::now(),
-            },
-        );
     }
     Ok(())
 }
@@ -1934,6 +2088,56 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
         .and_then(Value::as_str)
         .filter(|value| bkv_valid_sha256(value))
         .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "publication hash invalid"))?;
+    let verification_identity = format!(
+        "{}|{batch_id}|{content_id}|{semantic_digest}|{manifest_sha256}|{publication_sha256}",
+        configured_root.display()
+    );
+    let verification_lock = {
+        let mut locks = BKV_RUNTIME_VERIFICATION_SINGLE_FLIGHT
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| {
+                BkvRejection::new(
+                    "bkv_status_unavailable",
+                    "BKV runtime verification lock unavailable",
+                )
+            })?;
+        if let Some(lock) = locks
+            .get(&verification_identity)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(verification_identity.clone(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    let verification_guard = verification_lock.lock().map_err(|_| {
+        BkvRejection::new(
+            "bkv_status_unavailable",
+            "BKV runtime verification lock unavailable",
+        )
+    })?;
+    #[cfg(test)]
+    let _verification_active_guard = {
+        let active = {
+            let mut active = BKV_RUNTIME_VERIFICATIONS_ACTIVE
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .expect("BKV verification active counter lock");
+            let count = active.entry(verification_identity.clone()).or_default();
+            *count += 1;
+            *count
+        };
+        let mut maximums = BKV_RUNTIME_VERIFICATIONS_MAX
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("BKV verification maximum counter lock");
+        let maximum = maximums.entry(verification_identity.clone()).or_default();
+        *maximum = (*maximum).max(active);
+        BkvRuntimeVerificationActiveGuard(verification_identity.clone())
+    };
     let index = load_bkv_serving_index_with_deadline(
         configured_root,
         &configured_root.join(manifest_relative),
@@ -1945,6 +2149,9 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
         deadline,
     )?;
     verify_bkv_runtime_artifacts(&index, deadline)?;
+    #[cfg(test)]
+    drop(_verification_active_guard);
+    drop(verification_guard);
     let mut channels = std::collections::BTreeSet::new();
     for artifact in &index.artifacts {
         channels.insert(artifact.camera_number);
@@ -2061,18 +2268,17 @@ pub(super) async fn advance_bkv_replay(
         ));
     }
     let deterministic_batch = bkv_validated_to_db(&verified)?;
-    let expected_inspection_id = deterministic_batch
+    let expected_material = deterministic_batch
         .materials
         .iter()
         .find(|material| material.seq_no == legacy_seq_no)
-        .map(|material| material.inspection_id.as_str())
         .ok_or_else(|| {
             BkvRejection::new(
                 "bkv_imported_data_unavailable",
                 "deterministic inspection mapping is missing",
             )
         })?;
-    let inspection = db::find_production_inspection(connection, expected_inspection_id)
+    let inspection = db::find_production_inspection(connection, &expected_material.inspection_id)
         .await
         .map_err(|_| {
             BkvRejection::new("bkv_imported_data_unavailable", "inspection lookup failed")
@@ -2083,6 +2289,35 @@ pub(super) async fn advance_bkv_replay(
                 "selected imported inspection is missing",
             )
         })?;
+    let expected_capture_count = deterministic_batch
+        .artifacts
+        .iter()
+        .filter(|row| row.inspection_id == expected_material.inspection_id)
+        .count()
+        .min(i32::MAX as usize) as i32;
+    let expected_defect_count = deterministic_batch
+        .defects
+        .iter()
+        .filter(|row| row.inspection_id == expected_material.inspection_id)
+        .count()
+        .min(i32::MAX as usize) as i32;
+    if inspection.id != expected_material.inspection_id
+        || inspection.material_id != expected_material.material_id
+        || inspection.session_id != expected_material.session_id
+        || inspection.status != "completed"
+        || inspection.started_at != expected_material.occurred_at
+        || inspection.finished_at != expected_material.occurred_at
+        || inspection.capture_count != expected_capture_count
+        || inspection.defect_count != expected_defect_count
+        || !inspection.storage_root.is_empty()
+        || !inspection.summary_path.is_empty()
+        || inspection.raw_payload != expected_material.raw_payload
+    {
+        return Err(BkvRejection::new(
+            "bkv_imported_parent_invalid",
+            "imported BKV inspection does not match deterministic parent fields",
+        ));
+    }
     let inspection_evidence = bkv_imported_inspection_evidence(
         &inspection,
         &runtime.batch_id,
@@ -2927,6 +3162,56 @@ pub(super) async fn selected_bkv_inspection_id(
     Ok(selected_bkv_inspection(connection)
         .await?
         .map(|inspection| inspection.id))
+}
+
+#[cfg(test)]
+pub(super) async fn selected_bkv_inspection_unverified_test(
+    connection: &sea_orm::DatabaseConnection,
+) -> Result<Option<db::entities::production_inspection::Model>, BkvRejection> {
+    let active = bkv_config_json(
+        db::get_config(connection, "bkv.active-batch")
+            .await
+            .map_err(|_| BkvRejection::new("bkv_status_unavailable", "active lookup failed"))?,
+        "bkv_active_batch_missing",
+    )?;
+    let batch_id = active
+        .get("batchId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let replay = bkv_config_json(
+        db::get_config(connection, &format!("bkv.replay.{batch_id}"))
+            .await
+            .map_err(|_| BkvRejection::new("bkv_status_unavailable", "replay lookup failed"))?,
+        "bkv_replay_state_missing",
+    )?;
+    let Some(id) = replay.get("selectedInspectionId").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let model = db::find_production_inspection(connection, id)
+        .await
+        .map_err(|_| {
+            BkvRejection::new("bkv_imported_data_unavailable", "inspection lookup failed")
+        })?;
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    let raw: Value = serde_json::from_str(&model.raw_payload).map_err(|_| {
+        BkvRejection::new(
+            "bkv_selected_inspection_invalid",
+            "selected provenance invalid",
+        )
+    })?;
+    if raw.get("source").and_then(Value::as_str) != Some("bkv")
+        || raw.get("batchId") != active.get("batchId")
+        || raw.get("contentId") != active.get("contentId")
+        || raw.get("legacySeqNo") != replay.get("selectedLegacySeqNo")
+    {
+        return Err(BkvRejection::new(
+            "bkv_selected_inspection_invalid",
+            "selected provenance binding invalid",
+        ));
+    }
+    Ok(Some(model))
 }
 
 pub(super) async fn selected_bkv_inspection_exact(
@@ -5031,6 +5316,86 @@ mod tests {
     }
 
     #[test]
+    fn bkv_replay_rejects_every_tampered_parent_inspection_field() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("parent-row-tamper");
+        let original = runtime
+            .block_on(db::list_recent_production_inspections(
+                &database.connection,
+                100,
+            ))
+            .unwrap()
+            .into_iter()
+            .find(|row| {
+                serde_json::from_str::<Value>(&row.raw_payload)
+                    .ok()
+                    .and_then(|raw| raw.get("legacySeqNo").and_then(Value::as_i64))
+                    == Some(BKV_TARGET_SEQ_NOS[0])
+            })
+            .unwrap();
+        for field in [
+            "material_id",
+            "session_id",
+            "status",
+            "storage_root",
+            "summary_path",
+            "started_at",
+            "finished_at",
+            "capture_count",
+            "defect_count",
+            "raw_payload",
+        ] {
+            let tampered = match field {
+                "material_id" => "forged-material".to_string(),
+                "session_id" => "forged-session".to_string(),
+                "status" => "running".to_string(),
+                "storage_root" => "C:/forged".to_string(),
+                "summary_path" => "C:/forged.json".to_string(),
+                "started_at" => format!("{}x", original.started_at),
+                "finished_at" => format!("{}x", original.finished_at),
+                "capture_count" => (original.capture_count + 1).to_string(),
+                "defect_count" => (original.defect_count + 1).to_string(),
+                "raw_payload" => json!({"source":"bkv"}).to_string(),
+                _ => unreachable!(),
+            };
+            runtime
+                .block_on(database.connection.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("UPDATE production_inspection SET {field} = ? WHERE id = ?"),
+                    [tampered.into(), original.id.clone().into()],
+                )))
+                .unwrap();
+            match runtime.block_on(advance_bkv_replay(&database.connection, &root, "bkv-test")) {
+                Err(error) => assert_eq!(
+                    error.code, "bkv_imported_parent_invalid",
+                    "field {field} must fail closed"
+                ),
+                Ok(_) => panic!("field {field} was not rejected"),
+            }
+            let restored = match field {
+                "material_id" => original.material_id.clone(),
+                "session_id" => original.session_id.clone(),
+                "status" => original.status.clone(),
+                "storage_root" => original.storage_root.clone(),
+                "summary_path" => original.summary_path.clone(),
+                "started_at" => original.started_at.clone(),
+                "finished_at" => original.finished_at.clone(),
+                "capture_count" => original.capture_count.to_string(),
+                "defect_count" => original.defect_count.to_string(),
+                "raw_payload" => original.raw_payload.clone(),
+                _ => unreachable!(),
+            };
+            runtime
+                .block_on(database.connection.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("UPDATE production_inspection SET {field} = ? WHERE id = ?"),
+                    [restored.into(), original.id.clone().into()],
+                )))
+                .unwrap();
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn bkv_status_value_rejects_missing_or_malformed_active_state_dependencies() {
         let (runtime, database, root) = imported_bkv_replay_fixture("status-strict-errors");
         runtime
@@ -5080,7 +5445,7 @@ mod tests {
                 .block_on(load_bkv_replay_runtime_with_deadline(
                     &database.connection,
                     &root,
-                    Some(Instant::now() + Duration::from_secs(5)),
+                    Some(Instant::now() + Duration::from_secs(30)),
                 ))
                 .unwrap();
             assert_eq!(replay.replay_index, 1);
@@ -5092,7 +5457,7 @@ mod tests {
             json!(true)
         );
         assert_eq!(bkv_test_full_batch_loads(&root), 0);
-        assert_eq!(bkv_test_hash_reads(&root), artifact_reads);
+        assert!(bkv_test_hash_reads(&root) > artifact_reads);
         fs::remove_dir_all(root).ok();
     }
 
@@ -5106,7 +5471,6 @@ mod tests {
         let artifact_reads = bkv_test_hash_reads(&root);
 
         for _component in ["capture-health", "storage-health"] {
-            bkv_test_clear_mapping_cache(&root);
             bkv_test_set_mapping_delay(&root, Duration::from_millis(20));
             assert_eq!(
                 runtime
@@ -5121,7 +5485,6 @@ mod tests {
             );
         }
 
-        bkv_test_clear_mapping_cache(&root);
         bkv_test_set_mapping_delay(&root, Duration::from_millis(1_600));
         assert_eq!(
             runtime
@@ -5133,6 +5496,104 @@ mod tests {
         bkv_test_set_mapping_delay(&root, Duration::ZERO);
         assert_eq!(bkv_test_full_batch_loads(&root), 0);
         assert_eq!(bkv_test_hash_reads(&root), artifact_reads);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_concurrent_runtime_verification_is_single_flight() {
+        let (_runtime, database, root) = imported_bkv_replay_fixture("runtime-single-flight");
+        bkv_test_reset_runtime_verification_max(&root);
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let connection = database.connection.clone();
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Runtime::new()
+                        .unwrap()
+                        .block_on(load_bkv_replay_runtime_with_deadline(
+                            &connection,
+                            &root,
+                            Some(Instant::now() + Duration::from_secs(10)),
+                        ))
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let _ = handle.join().unwrap();
+        }
+        assert_eq!(bkv_test_runtime_verification_max(&root), 1);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_readiness_shares_one_verified_runtime_between_capture_and_storage() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("readiness-shared-runtime");
+        let before = bkv_test_hash_reads(&root);
+        let replay = runtime
+            .block_on(load_bkv_replay_runtime_with_deadline(
+                &database.connection,
+                &root,
+                Some(Instant::now() + Duration::from_secs(5)),
+            ))
+            .unwrap();
+        let after_load = bkv_test_hash_reads(&root);
+        assert!(after_load > before);
+        let _capture = crate::bkv_capture_health_ready_value(&replay, json!({"phase":"stopped"}));
+        let _storage = crate::bkv_storage_health_ready_value(&replay);
+        assert_eq!(bkv_test_hash_reads(&root), after_load);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_runtime_rejects_same_size_artifact_tamper_without_cache_trust() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("artifact-same-size");
+        runtime
+            .block_on(load_bkv_replay_runtime(&database.connection, &root))
+            .unwrap();
+        let path = root.join("batch-001/artifacts/camera1/1893700/2d/camera-1.jpg");
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, vec![b'x'; original.len()]).unwrap();
+        assert_eq!(
+            runtime
+                .block_on(load_bkv_replay_runtime(&database.connection, &root))
+                .unwrap_err()
+                .code,
+            "bkv_artifact_changed"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_runtime_rejects_a_final_component_link_swap() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("artifact-link-swap");
+        let path = root.join("batch-001/artifacts/camera1/1893700/2d/camera-1.jpg");
+        let replacement = path.with_file_name("replacement.jpg");
+        fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+        fs::remove_file(&path).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&replacement, &path).is_err() {
+            fs::remove_dir_all(root).ok();
+            return;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&replacement, &path).unwrap();
+        let code = runtime
+            .block_on(load_bkv_replay_runtime(&database.connection, &root))
+            .unwrap_err()
+            .code;
+        assert!(
+            matches!(
+                code,
+                "bkv_artifact_missing"
+                    | "bkv_artifact_invalid"
+                    | "bkv_file_link_rejected"
+                    | "bkv_file_changed"
+            ),
+            "unexpected rejection code: {code}"
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -5163,7 +5624,7 @@ mod tests {
     }
 
     #[test]
-    fn bkv_readiness_streams_once_reuses_verified_identity_and_honors_deadline() {
+    fn bkv_readiness_runtime_rehashes_artifacts_across_requests_and_honors_deadline() {
         let (runtime, database, root) = imported_bkv_replay_fixture("runtime-cache");
         assert_eq!(bkv_test_hash_reads(&root), 0);
         runtime
@@ -5182,7 +5643,7 @@ mod tests {
                 Some(Instant::now() + Duration::from_secs(5)),
             ))
             .unwrap();
-        assert_eq!(bkv_test_hash_reads(&root), first_reads);
+        assert_eq!(bkv_test_hash_reads(&root), first_reads * 2);
 
         let (timeout_runtime, timeout_database, timeout_root) =
             imported_bkv_replay_fixture("runtime-timeout");

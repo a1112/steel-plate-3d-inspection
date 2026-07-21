@@ -29,9 +29,16 @@ manifest and publication hashes, every allowlisted artifact size and SHA-256,
 and exact channel coverage 1 through 6. Artifact verification stats the expected
 size before opening the file, rejects artifacts above 1 GiB or batches above
 64 GiB, and streams SHA-256 through a fixed 64 KiB buffer under the readiness
-deadline. Capture and storage checks may reuse one short-lived verification for
-the same serving identity and unchanged file metadata; a metadata change or
-different serving identity invalidates that cache. A valid provider reports
+deadline. Every independent runtime or status request reopens and rehashes this
+evidence; file size and modification time are never a cross-request trust cache.
+One readiness aggregation performs one runtime verification and shares that
+immutable result between its capture and storage components. Runtime verification
+is process-wide single-flight per serving identity, so concurrent callers cannot
+multiply artifact hash work. Each streamed artifact and deterministic mapping file is opened with
+no-follow semantics; Windows opens the reparse point and compares volume/file ID,
+while Unix uses `O_NOFOLLOW`. The service compares the opened handle with the path
+again after streaming and fails closed on a link, reparse point, replacement, or
+identity change. A valid provider reports
 `status=bkv-offline`, `sdkRequired=false`, `sdkReady=null`, and six channels with
 `status=offline`. BKV storage health reports the validated offline root with
 `queueRequired=false` and `queueAccepting=null`; there is no capture writer queue
@@ -41,12 +48,10 @@ readiness with a stable `bkv_*` reason.
 For replay indexes above zero, readiness and status do not reload or transform
 the full normalized batch. The verified serving index streams only the manifest-
 declared `allexcel` and `checkrecord` JSONL rows under the same deadline and
-derives the fixed 11-item deterministic inspection-ID map. Its bounded cache key
-includes the canonical root, batch/content/semantic identity, manifest and
-publication hashes, and both mapping files' declared hashes plus current metadata.
-A metadata change invalidates the entry; the replacement must pass same-handle
-size/SHA-256 and row-count checks before it can supply a new map. Capture-once
-still performs its immediate full-batch revalidation before advancing replay.
+derives the fixed 11-item deterministic inspection-ID map on every independent
+request. Both files must pass same-handle size/SHA-256, identity, and row-count
+checks before they can supply a map. Capture-once still performs its immediate
+full-batch revalidation before advancing replay.
 
 `POST /api/production/capture-once` advances the active batch in the fixed
 legacy order `1893700` through `1893710`. The response is imported evidence,
@@ -56,7 +61,12 @@ selected `legacySeqNo`, imported inspection/capture/defect rows, and safe
 before advancement. Imported capture and defect children must be the exact
 deterministic ID set for that inspection and every persisted business/provenance
 field must match the normalized manifest; missing, extra, or modified children
-fail closed. Replay advancement uses a transaction and compare-and-swap
+fail closed. The parent `production_inspection` must also exactly match its
+deterministic ID, material/session IDs, completed status, start/finish time,
+capture/defect counts, empty unrestricted path fields, and normalized raw BKV
+binding; missing, extra, or modified parent evidence fails closed for advancement,
+status, and snapshot reads. Replay advancement uses a transaction and
+compare-and-swap
 over the persisted version/index while holding the production command boundary.
 The replay state is fail-closed: index 0 is `ready` with no selected fields,
 indexes 1 through 10 are `replaying`, and index 11 is `completed`; every

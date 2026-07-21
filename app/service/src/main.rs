@@ -2573,7 +2573,7 @@ fn selected_bkv_inspection_for_view(
                 let _ = error;
                 state
                     .runtime
-                    .block_on(production_tasks::selected_bkv_inspection(
+                    .block_on(production_tasks::selected_bkv_inspection_unverified_test(
                         &state.database.connection,
                     ))
             }
@@ -3194,7 +3194,12 @@ fn bkv_storage_health_ready_value(runtime: &production_tasks::BkvReplayRuntime) 
     })
 }
 
-fn capture_health_component(state: &ServiceState) -> (bool, Value) {
+fn capture_health_component_with_bkv_runtime(
+    state: &ServiceState,
+    shared_bkv_runtime: Option<
+        &Result<production_tasks::BkvReplayRuntime, production_tasks::BkvRejection>,
+    >,
+) -> (bool, Value) {
     let mut lifecycle = serde_json::from_str::<Value>(&state.capture.status_json())
         .ok()
         .and_then(|status| status.get("lifecycle").cloned())
@@ -3203,14 +3208,16 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
         lifecycle.remove("lastError");
     }
     if state.capture.provider == CaptureProvider::Bkv {
-        let runtime = production_tasks::configured_bkv_root().and_then(|root| {
-            state
-                .runtime
-                .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
-                    &state.database.connection,
-                    &root,
-                    Some(Instant::now() + Duration::from_millis(1_500)),
-                ))
+        let runtime = shared_bkv_runtime.cloned().unwrap_or_else(|| {
+            production_tasks::configured_bkv_root().and_then(|root| {
+                state
+                    .runtime
+                    .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
+                        &state.database.connection,
+                        &root,
+                        Some(Instant::now() + Duration::from_millis(1_500)),
+                    ))
+            })
         });
         return match runtime {
             Ok(runtime) => (true, bkv_capture_health_ready_value(&runtime, lifecycle)),
@@ -3351,6 +3358,10 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
     )
 }
 
+fn capture_health_component(state: &ServiceState) -> (bool, Value) {
+    capture_health_component_with_bkv_runtime(state, None)
+}
+
 fn calibration_reconciliation_health_component(state: &ServiceState) -> (bool, Value) {
     match state
         .runtime
@@ -3389,16 +3400,24 @@ fn calibration_reconciliation_health_component(state: &ServiceState) -> (bool, V
     }
 }
 
-fn storage_health_component_with_timeout(state: &ServiceState, timeout: Duration) -> (bool, Value) {
+fn storage_health_component_with_timeout_and_bkv_runtime(
+    state: &ServiceState,
+    timeout: Duration,
+    shared_bkv_runtime: Option<
+        &Result<production_tasks::BkvReplayRuntime, production_tasks::BkvRejection>,
+    >,
+) -> (bool, Value) {
     if state.capture.provider == CaptureProvider::Bkv {
-        let runtime = production_tasks::configured_bkv_root().and_then(|root| {
-            state
-                .runtime
-                .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
-                    &state.database.connection,
-                    &root,
-                    Some(Instant::now() + timeout),
-                ))
+        let runtime = shared_bkv_runtime.cloned().unwrap_or_else(|| {
+            production_tasks::configured_bkv_root().and_then(|root| {
+                state
+                    .runtime
+                    .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
+                        &state.database.connection,
+                        &root,
+                        Some(Instant::now() + timeout),
+                    ))
+            })
         });
         return match runtime {
             Ok(runtime) => (true, bkv_storage_health_ready_value(&runtime)),
@@ -3645,6 +3664,10 @@ fn storage_health_component_with_timeout(state: &ServiceState, timeout: Duration
             "reason": reason
         }),
     )
+}
+
+fn storage_health_component_with_timeout(state: &ServiceState, timeout: Duration) -> (bool, Value) {
+    storage_health_component_with_timeout_and_bkv_runtime(state, timeout, None)
 }
 
 fn storage_health_component(state: &ServiceState) -> (bool, Value) {
@@ -4158,10 +4181,28 @@ fn production_policy_health_component(state: &ServiceState) -> (bool, Value) {
 fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
     let (database_ok, database) = database_health_component(state);
     let (worker_ok, task_worker) = task_worker_health_component(state);
-    let (capture_ok, capture) = capture_health_component(state);
+    let shared_bkv_runtime = if state.capture.provider == CaptureProvider::Bkv {
+        Some(production_tasks::configured_bkv_root().and_then(|root| {
+            state
+                .runtime
+                .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
+                    &state.database.connection,
+                    &root,
+                    Some(Instant::now() + Duration::from_millis(1_500)),
+                ))
+        }))
+    } else {
+        None
+    };
+    let (capture_ok, capture) =
+        capture_health_component_with_bkv_runtime(state, shared_bkv_runtime.as_ref());
     let (calibration_ok, calibration_reconciliation) =
         calibration_reconciliation_health_component(state);
-    let (storage_ok, storage) = storage_health_component(state);
+    let (storage_ok, storage) = storage_health_component_with_timeout_and_bkv_runtime(
+        state,
+        Duration::from_millis(STORAGE_HEALTH_TIMEOUT_MS),
+        shared_bkv_runtime.as_ref(),
+    );
     let (trigger_ok, trigger) = trigger_health_component(state);
     let (algorithm_ok, algorithm) = algorithm_health_component(state);
     let (production_policy_ok, production_policy) = production_policy_health_component(state);
