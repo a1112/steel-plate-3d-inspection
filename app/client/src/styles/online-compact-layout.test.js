@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
-const stylesCss = readFileSync('src/styles.css', 'utf8');
+const stylesCss = readFileSync('src/styles.css', 'utf8').replace(/\r\n?/g, '\n');
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
