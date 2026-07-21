@@ -169,12 +169,16 @@ _PHYSICAL_COLUMN_NAMES = {
     "wall_thickness",
     "width",
 }
-_SQL_IDENTIFIER = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"
+_SQL_IDENTIFIER = r"(?:`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*)"
 _SQL_TABLE_REFERENCE = rf"{_SQL_IDENTIFIER}(?:\s*\.\s*{_SQL_IDENTIFIER})?"
 
 
 def _identifier_value(value: str) -> str:
-    return value[1:-1] if value.startswith("`") and value.endswith("`") else value
+    return (
+        value[1:-1].replace("``", "`")
+        if value.startswith("`") and value.endswith("`")
+        else value
+    )
 
 
 def _table_reference_value(value: str) -> str:
@@ -300,6 +304,22 @@ def _extract_parenthesized(value: str, opening: int) -> tuple[str, int] | None:
     return None
 
 
+def _is_unquoted_table_constraint(definition: str) -> bool:
+    value = definition.lstrip()
+    patterns = (
+        r"PRIMARY\s+KEY\b",
+        r"FOREIGN\s+KEY\b",
+        r"UNIQUE\b(?:\s+(?:KEY|INDEX)\b)?",
+        r"KEY\b",
+        r"INDEX\b",
+        r"CONSTRAINT\b",
+        r"CHECK\b",
+    )
+    return any(
+        re.match(pattern, value, re.IGNORECASE) is not None for pattern in patterns
+    )
+
+
 def _parse_create_table(statement: str) -> tuple[str, _SqlTableSchema] | None:
     match = re.search(
         rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<table>{_SQL_TABLE_REFERENCE})\s*(?P<open>\()",
@@ -316,18 +336,16 @@ def _parse_create_table(statement: str) -> tuple[str, _SqlTableSchema] | None:
     columns: list[str] = []
     foreign_keys: dict[str, tuple[str, str]] = {}
     for definition in _split_sql_items(body):
-        column_match = re.match(rf"\s*(?P<column>{_SQL_IDENTIFIER})\s+", definition)
-        if column_match is not None:
+        stripped_definition = definition.lstrip()
+        column_match = re.match(
+            rf"(?P<column>{_SQL_IDENTIFIER})\s+", stripped_definition
+        )
+        if column_match is not None and (
+            stripped_definition.startswith("`")
+            or not _is_unquoted_table_constraint(stripped_definition)
+        ):
             candidate = _identifier_value(column_match.group("column"))
-            if candidate.casefold() not in {
-                "constraint",
-                "foreign",
-                "primary",
-                "unique",
-                "key",
-                "check",
-            }:
-                columns.append(candidate)
+            columns.append(candidate)
         foreign_match = re.search(
             rf"\bFOREIGN\s+KEY\s*\(\s*(?P<local>{_SQL_IDENTIFIER})\s*\)\s*"
             rf"REFERENCES\s+(?P<parent>{_SQL_TABLE_REFERENCE})\s*\(\s*(?P<parent_column>{_SQL_IDENTIFIER})\s*\)",

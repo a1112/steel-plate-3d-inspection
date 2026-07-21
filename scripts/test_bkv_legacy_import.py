@@ -826,6 +826,65 @@ INSERT INTO `allexcel` VALUES (1893700);"""
                 subject.cleanup_orphan_sql_generations(output)
             self.assertEqual(list(external_generation.iterdir()), [])
 
+    def test_backtick_keyword_columns_and_escaped_backticks_are_not_constraints(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (
+  `Key` bigint,
+  `Primary` text,
+  `Unique` text,
+  `Constraint` text,
+  `Check` text,
+  `Foreign` text,
+  `Key``Part` text,
+  `SeqNo` bigint,
+  PRIMARY KEY (`Key`),
+  UNIQUE KEY `uq_unique` (`Unique`),
+  KEY `idx_constraint` (`Constraint`),
+  INDEX `idx_foreign` (`Foreign`),
+  CHECK (`Check` IS NOT NULL)
+);
+INSERT INTO `allexcel` VALUES
+  (71, 'primary', 'unique', 'constraint', 'check', 'foreign', 'escaped', 1893700);
+CREATE TABLE `diameter` (
+  `Foreign` bigint,
+  FOREIGN KEY (`Foreign`) REFERENCES `allexcel` (`Key`)
+);
+INSERT INTO `diameter` VALUES (71);
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+        parent = result.rows_by_table["allexcel"][0]
+        self.assertEqual(
+            [
+                parent["Key"],
+                parent["Primary"],
+                parent["Unique"],
+                parent["Constraint"],
+                parent["Check"],
+                parent["Foreign"],
+                parent["Key`Part"],
+                parent["SeqNo"],
+            ],
+            [
+                71,
+                "primary",
+                "unique",
+                "constraint",
+                "check",
+                "foreign",
+                "escaped",
+                1_893_700,
+            ],
+        )
+        self.assertEqual(result.rows_by_table["diameter"][0]["legacySeqNo"], 1_893_700)
+
+        malformed = rb"CREATE TABLE `allexcel` (`unterminated bigint);"
+        malformed_result = subject.filter_sql_dump(
+            io.BytesIO(malformed), subject.TARGET_SEQ_NOS
+        )
+        self.assertEqual(malformed_result.integrity, "partial-parse-error")
+        self.assertEqual(malformed_result.parse_rejected_statements, 1)
+
 
 class MemberPolicyTests(unittest.TestCase):
     def test_target_sequence_numbers_and_member_filter_are_exact(self):
