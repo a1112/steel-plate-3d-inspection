@@ -2956,6 +2956,22 @@ def _artifact_relative_path(entry: dict[str, object]) -> str:
     )
 
 
+def _depth_decode_evidence(path: Path) -> dict[str, object]:
+    """Return bounded per-file decode evidence without promoting observations."""
+
+    from bkv_d3img import probe_d3img
+
+    probe = probe_d3img(path)
+    return {
+        "status": probe.status,
+        "reason": probe.reason,
+        "probeSchema": probe.schema,
+        "parserVersion": probe.parserVersion,
+        "originalSha256": probe.sha256,
+        "decoderAvailable": probe.decoderAvailable,
+    }
+
+
 def _select_archive_part(entry: dict[str, object]) -> str:
     parts = entry.get("archiveParts")
     if not isinstance(parts, list) or not parts or not all(isinstance(item, str) for item in parts):
@@ -3476,7 +3492,7 @@ def _compute_batch_content_id(
         or not isinstance(artifacts, list)
     ):
         raise ValueError("batch content normalized or sequence evidence is invalid")
-    artifact_binding: list[dict[str, str]] = []
+    artifact_binding: list[dict[str, object]] = []
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             raise ValueError("batch content artifact evidence is invalid")
@@ -3489,7 +3505,13 @@ def _compute_batch_content_id(
             or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
         ):
             raise ValueError("batch content artifact member/hash is invalid")
-        artifact_binding.append({"memberPath": member, "sha256": sha256})
+        binding: dict[str, object] = {"memberPath": member, "sha256": sha256}
+        if artifact.get("extension") == ".d3img":
+            depth_decode = artifact.get("depthDecode")
+            if not isinstance(depth_decode, dict):
+                raise ValueError("batch content .d3img decode evidence is invalid")
+            binding["depthDecode"] = depth_decode
+        artifact_binding.append(binding)
     artifact_binding.sort(key=lambda item: item["memberPath"])
     if len({item["memberPath"] for item in artifact_binding}) != len(artifact_binding):
         raise ValueError("batch content artifact members are not unique")
@@ -3900,6 +3922,23 @@ def _verify_staged_batch(
             if "hash mismatch" in str(error):
                 raise ValueError(f"artifact hash mismatch: {path}") from error
             raise
+        extension = evidence.get("extension")
+        depth_decode = evidence.get("depthDecode")
+        if extension == ".d3img":
+            if (
+                not isinstance(depth_decode, dict)
+                or depth_decode.get("status") not in ("decoded", "unsupported", "invalid")
+                or not isinstance(depth_decode.get("reason"), str)
+                or depth_decode.get("probeSchema") != "steel.bkv-d3img-probe.v1"
+                or not isinstance(depth_decode.get("parserVersion"), str)
+                or depth_decode.get("originalSha256") != evidence.get("sha256")
+                or not isinstance(depth_decode.get("decoderAvailable"), bool)
+            ):
+                raise ValueError(f"invalid .d3img decode evidence: {relative}")
+            if depth_decode != _depth_decode_evidence(path):
+                raise ValueError(f"stale or forged .d3img decode evidence: {relative}")
+        elif depth_decode is not None:
+            raise ValueError(f"non-.d3img artifact has depth decode evidence: {relative}")
         total += int(evidence["size"])
         if total > MAX_STAGE_TOTAL_BYTES:
             raise InventoryLimitError(
@@ -4422,6 +4461,10 @@ def _stage_batch_into(
                     "error": None,
                     **evidence,
                 }
+                if metadata["extension"] == ".d3img":
+                    artifact["depthDecode"] = _depth_decode_evidence(
+                        _stage_path(incoming, relative)
+                    )
                 artifact_evidence.append(artifact)
                 camera = camera_inventory[str(metadata["cameraNumber"])]
                 camera["artifactCount"] = int(camera["artifactCount"]) + 1
