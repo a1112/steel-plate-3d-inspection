@@ -16,6 +16,35 @@ $env:CAPTURE_SERVICE_ORIGIN='http://127.0.0.1:4317'
 
 The Tauri client must not consume this API directly. It calls the Rust service, and the Rust service proxies only an explicit allowlist while preserving provider status codes, content types, and error bodies. Provider failure must never be reported as simulated success unless `STEEL_CAPTURE_PROVIDER=simulated` was explicitly selected.
 
+## BKV Offline Replay Provider
+
+`STEEL_CAPTURE_PROVIDER=bkv` selects an explicit no-camera compatibility mode in
+the Rust service. It does not start, supervise, probe, or proxy the C++ capture
+service, and it never claims that a vendor SDK or physical camera is ready.
+`STEEL_BKV_DATA_ROOT` must be an absolute path containing the active, previously
+imported BKV batch.
+
+Layered readiness revalidates the active batch/content/replay binding, committed
+manifest and publication hashes, every allowlisted artifact size and SHA-256,
+and exact channel coverage 1 through 6. A valid provider reports
+`status=bkv-offline`, `sdkRequired=false`, `sdkReady=null`, and six channels with
+`status=offline`. BKV storage health reports the validated offline root with
+`queueRequired=false` and `queueAccepting=null`; there is no capture writer queue
+in this mode. Missing, changed, linked, out-of-root, or inactive artifacts close
+readiness with a stable `bkv_*` reason.
+
+`POST /api/production/capture-once` advances the active batch in the fixed
+legacy order `1893700` through `1893710`. The response is imported evidence,
+not a new physical capture: `source=bkv`, `offline=true`, `cameraCount=6`, the
+selected `legacySeqNo`, imported inspection/capture/defect rows, and the exact
+manifest-relative artifact paths, sizes, and SHA-256 values verified immediately
+before advancement. Replay advancement uses a transaction and compare-and-swap
+over the persisted version/index while holding the production command boundary.
+After item 11 the state is `completed`; another capture returns HTTP 409 with
+`bkv_replay_completed` until `POST /api/bkv/replay/reset` is authorized and
+called. Production snapshot/status prefers the selected imported inspection only
+under the BKV provider. Real and simulated provider ordering is unchanged.
+
 ## Health
 
 ```http

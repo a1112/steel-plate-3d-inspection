@@ -170,6 +170,7 @@ enum CaptureProvider {
     HeadlessCpp,
     ExternalApi,
     Simulated,
+    Bkv,
 }
 
 impl CaptureProvider {
@@ -177,6 +178,7 @@ impl CaptureProvider {
         match value.trim().to_ascii_lowercase().as_str() {
             "external" | "external-api" | "api" => Self::ExternalApi,
             "sim" | "simulated" | "simulation" => Self::Simulated,
+            "bkv" => Self::Bkv,
             _ => Self::HeadlessCpp,
         }
     }
@@ -192,6 +194,7 @@ impl CaptureProvider {
             Self::HeadlessCpp => "headless-cpp",
             Self::ExternalApi => "external-api",
             Self::Simulated => "simulated",
+            Self::Bkv => "bkv",
         }
     }
 
@@ -200,7 +203,7 @@ impl CaptureProvider {
     }
 
     fn uses_local_api(&self) -> bool {
-        !matches!(self, Self::Simulated)
+        !matches!(self, Self::Simulated | Self::Bkv)
     }
 }
 
@@ -1298,6 +1301,10 @@ impl CaptureServiceManager {
             return;
         }
 
+        if self.provider == CaptureProvider::Bkv {
+            return;
+        }
+
         if self.provider == CaptureProvider::Simulated {
             if let Ok(mut lifecycle) = self.lifecycle.lock() {
                 lifecycle.phase = if lifecycle.desired_running {
@@ -1502,6 +1509,9 @@ impl CaptureServiceManager {
     }
 
     fn start(&self) -> bool {
+        if self.provider == CaptureProvider::Bkv {
+            return true;
+        }
         if let Ok(mut lifecycle) = self.lifecycle.lock() {
             lifecycle.desired_running = true;
             lifecycle.phase = "starting";
@@ -1521,6 +1531,9 @@ impl CaptureServiceManager {
     }
 
     fn stop(&self) -> bool {
+        if self.provider == CaptureProvider::Bkv {
+            return true;
+        }
         if let Ok(mut lifecycle) = self.lifecycle.lock() {
             lifecycle.desired_running = false;
             lifecycle.phase = "stopping";
@@ -1600,6 +1613,7 @@ impl CaptureServiceManager {
             CaptureProvider::HeadlessCpp => !exe.is_empty(),
             CaptureProvider::ExternalApi => true,
             CaptureProvider::Simulated => false,
+            CaptureProvider::Bkv => false,
         };
         json!({
             "name": "capture-service",
@@ -2534,13 +2548,39 @@ fn production_device_status_value(state: &ServiceState) -> Value {
 }
 
 fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>, String> {
-    let inspections = state
+    let mut inspections = state
         .runtime
         .block_on(db::list_recent_production_inspections(
             &state.database.connection,
             20,
         ))
         .map_err(|error| error.to_string())?;
+    if state.capture.provider == CaptureProvider::Bkv {
+        if let Some(selected_id) = state
+            .runtime
+            .block_on(production_tasks::selected_bkv_inspection_id(
+                &state.database.connection,
+            ))
+            .map_err(|error| error.code.to_string())?
+        {
+            if let Some(index) = inspections
+                .iter()
+                .position(|inspection| inspection.id == selected_id)
+            {
+                inspections.swap(0, index);
+            } else if let Some(selected) = state
+                .runtime
+                .block_on(db::find_production_inspection(
+                    &state.database.connection,
+                    &selected_id,
+                ))
+                .map_err(|error| error.to_string())?
+            {
+                inspections.insert(0, selected);
+                inspections.truncate(20);
+            }
+        }
+    }
     if inspections.is_empty() {
         return Ok(None);
     }
@@ -3057,6 +3097,50 @@ fn task_worker_health_component(state: &ServiceState) -> (bool, Value) {
     )
 }
 
+fn bkv_capture_health_ready_value(
+    runtime: &production_tasks::BkvReplayRuntime,
+    lifecycle: Value,
+) -> Value {
+    json!({
+        "ok":true,
+        "status":"bkv-offline",
+        "provider":"bkv",
+        "managed":false,
+        "apiReachable":Value::Null,
+        "sdkRequired":false,
+        "sdkReady":Value::Null,
+        "cameraCount":6,
+        "artifactCount":runtime.artifacts.len(),
+        "channels":runtime.channels.iter().map(|channel| json!({
+            "index":channel,"status":"offline","source":"bkv"
+        })).collect::<Vec<_>>(),
+        "batchId":runtime.batch_id,
+        "contentId":runtime.content_id,
+        "replay":{
+            "index":runtime.replay_index,
+            "status":runtime.replay_status,
+            "version":runtime.replay_version,
+            "total":11
+        },
+        "httpStatus":Value::Null,
+        "latencyMs":0,
+        "reason":Value::Null,
+        "lifecycle":lifecycle
+    })
+}
+
+fn bkv_storage_health_ready_value(runtime: &production_tasks::BkvReplayRuntime) -> Value {
+    json!({
+        "ok":true,"status":"bkv-offline","provider":"bkv","simulated":false,
+        "apiReachable":Value::Null,"rootExists":true,"rootWritable":Value::Null,
+        "capacityAvailable":Value::Null,"capacityBytes":Value::Null,
+        "freeBytes":Value::Null,"freePercent":Value::Null,"level":"offline",
+        "warningReason":Value::Null,"queueAccepting":Value::Null,"queueRequired":false,
+        "httpStatus":Value::Null,"latencyMs":0,"reason":Value::Null,
+        "batchId":runtime.batch_id,"contentId":runtime.content_id
+    })
+}
+
 fn capture_health_component(state: &ServiceState) -> (bool, Value) {
     let mut lifecycle = serde_json::from_str::<Value>(&state.capture.status_json())
         .ok()
@@ -3064,6 +3148,28 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
         .unwrap_or_else(|| json!({ "phase": "unknown" }));
     if let Some(lifecycle) = lifecycle.as_object_mut() {
         lifecycle.remove("lastError");
+    }
+    if state.capture.provider == CaptureProvider::Bkv {
+        let runtime = production_tasks::configured_bkv_root().and_then(|root| {
+            state
+                .runtime
+                .block_on(production_tasks::load_bkv_replay_runtime(
+                    &state.database.connection,
+                    &root,
+                ))
+        });
+        return match runtime {
+            Ok(runtime) => (true, bkv_capture_health_ready_value(&runtime, lifecycle)),
+            Err(error) => (
+                false,
+                json!({
+                    "ok":false,"status":"unavailable","provider":"bkv","managed":false,
+                    "apiReachable":Value::Null,"sdkRequired":false,"sdkReady":Value::Null,
+                    "cameraCount":6,"channels":[],"httpStatus":Value::Null,"latencyMs":0,
+                    "reason":error.code,"lifecycle":lifecycle
+                }),
+            ),
+        };
     }
     if state.capture.provider == CaptureProvider::Simulated {
         let running = state.capture.is_running();
@@ -3230,6 +3336,30 @@ fn calibration_reconciliation_health_component(state: &ServiceState) -> (bool, V
 }
 
 fn storage_health_component_with_timeout(state: &ServiceState, timeout: Duration) -> (bool, Value) {
+    if state.capture.provider == CaptureProvider::Bkv {
+        let runtime = production_tasks::configured_bkv_root().and_then(|root| {
+            state
+                .runtime
+                .block_on(production_tasks::load_bkv_replay_runtime(
+                    &state.database.connection,
+                    &root,
+                ))
+        });
+        return match runtime {
+            Ok(runtime) => (true, bkv_storage_health_ready_value(&runtime)),
+            Err(error) => (
+                false,
+                json!({
+                    "ok":false,"status":"unavailable","provider":"bkv","simulated":false,
+                    "apiReachable":Value::Null,"rootExists":false,"rootWritable":Value::Null,
+                    "capacityAvailable":Value::Null,"capacityBytes":Value::Null,
+                    "freeBytes":Value::Null,"freePercent":Value::Null,"level":"unavailable",
+                    "warningReason":Value::Null,"queueAccepting":Value::Null,"queueRequired":false,
+                    "httpStatus":Value::Null,"latencyMs":0,"reason":error.code
+                }),
+            ),
+        };
+    }
     if state.capture.provider == CaptureProvider::Simulated {
         return (
             true,
@@ -9067,7 +9197,7 @@ fn provider_code_from_response(provider: &Value, fallback: i32) -> i32 {
 }
 
 fn production_status_response(state: &ServiceState) -> Vec<u8> {
-    let latest_session = match state
+    let mut latest_session = match state
         .runtime
         .block_on(db::latest_material_session(&state.database.connection))
     {
@@ -9085,6 +9215,37 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
             return production_database_error_response("load_active_session", &error.to_string());
         }
     };
+    let selected_bkv_inspection = if state.capture.provider == CaptureProvider::Bkv {
+        state
+            .runtime
+            .block_on(production_tasks::selected_bkv_inspection_id(
+                &state.database.connection,
+            ))
+            .ok()
+            .flatten()
+            .and_then(|inspection_id| {
+                state
+                    .runtime
+                    .block_on(db::find_production_inspection(
+                        &state.database.connection,
+                        &inspection_id,
+                    ))
+                    .ok()
+                    .flatten()
+            })
+    } else {
+        None
+    };
+    if let Some(inspection) = selected_bkv_inspection.as_ref() {
+        latest_session = state
+            .runtime
+            .block_on(db::find_material_session(
+                &state.database.connection,
+                &inspection.session_id,
+            ))
+            .ok()
+            .flatten();
+    }
     let latest_session_json = latest_session.as_ref().map(|session| {
         json!({
             "id": session.id,
@@ -9105,23 +9266,31 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
             "updatedAt": session.updated_at
         })
     });
-    let latest_inspection = match state
-        .runtime
-        .block_on(db::latest_production_inspection(&state.database.connection))
-    {
-        Ok(inspection) => inspection,
-        Err(error) => {
-            return production_database_error_response(
-                "load_latest_production_inspection",
-                &error.to_string(),
-            );
+    let latest_inspection = if selected_bkv_inspection.is_some() {
+        selected_bkv_inspection
+    } else {
+        match state
+            .runtime
+            .block_on(db::latest_production_inspection(&state.database.connection))
+        {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                return production_database_error_response(
+                    "load_latest_production_inspection",
+                    &error.to_string(),
+                );
+            }
         }
     };
-    let capture_status = state
-        .capture
-        .proxy("GET", "/api/steel/status", "")
-        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
-        .unwrap_or_else(|| json!({ "code": 503, "error": "capture_provider_offline" }));
+    let capture_status = if state.capture.provider == CaptureProvider::Bkv {
+        capture_health_component(state).1
+    } else {
+        state
+            .capture
+            .proxy("GET", "/api/steel/status", "")
+            .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+            .unwrap_or_else(|| json!({ "code": 503, "error": "capture_provider_offline" }))
+    };
     http_response(
         "200 OK",
         "application/json; charset=utf-8",
@@ -10463,6 +10632,9 @@ fn write_production_capture_once_response(
             );
         }
     };
+    if state.capture.provider == CaptureProvider::Bkv {
+        return production_tasks::bkv_capture_once_configured_response(state, actor);
+    }
     if let Err(response) = validate_capture_open_session(state, &payload) {
         return response;
     }
@@ -17295,6 +17467,9 @@ mod tests {
             relative_path: "artifacts/c1/1893700/allowed.d3img".to_string(),
             sha256: "a".repeat(64),
             size: 1,
+            camera_number: 1,
+            seq_no: 1_893_700,
+            kind: "3d".to_string(),
         };
         let batch = production_tasks::BkvServingIndex {
             identity: "identity".to_string(),
@@ -17396,6 +17571,136 @@ mod tests {
 
     fn production_test_state() -> ServiceState {
         production_test_state_with_provider(CaptureProvider::Simulated, "simulated://capture")
+    }
+
+    #[test]
+    fn bkv_capture_provider_is_explicit_offline_and_never_uses_capture_api() {
+        let provider = CaptureProvider::from_env_value("bkv");
+        assert_eq!(provider, CaptureProvider::Bkv);
+        assert_eq!(provider.as_str(), "bkv");
+        assert!(!provider.is_managed());
+        assert!(!provider.uses_local_api());
+        let lifecycle = CaptureLifecycleState::new(provider);
+        assert!(!lifecycle.autostart);
+        assert!(!lifecycle.desired_running);
+    }
+
+    #[test]
+    fn bkv_supervisor_tick_does_not_probe_or_manage_a_capture_endpoint() {
+        let state =
+            production_test_state_with_provider(CaptureProvider::Bkv, "http://127.0.0.1:43179");
+        state.capture.supervisor_tick();
+        let lifecycle = state.capture.lifecycle.lock().unwrap().clone();
+        assert_eq!(lifecycle.phase, "stopped");
+        assert!(!lifecycle.desired_running);
+        assert!(!lifecycle.autostart);
+        assert!(state.capture.process.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn bkv_health_contract_reports_six_offline_channels_without_sdk_or_writer_queue() {
+        let runtime = production_tasks::BkvReplayRuntime {
+            batch_id: "batch-001".to_string(),
+            content_id: "a".repeat(64),
+            channels: vec![1, 2, 3, 4, 5, 6],
+            replay_index: 3,
+            replay_status: "replaying".to_string(),
+            replay_version: 3,
+            artifacts: Vec::new(),
+        };
+        let capture = bkv_capture_health_ready_value(&runtime, json!({"phase":"stopped"}));
+        assert_eq!(capture["status"], "bkv-offline");
+        assert_eq!(capture["sdkRequired"], false);
+        assert_eq!(capture["sdkReady"], Value::Null);
+        assert_eq!(capture["cameraCount"], 6);
+        assert_eq!(capture["channels"].as_array().unwrap().len(), 6);
+        assert!(capture["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|channel| channel["status"] == "offline"));
+
+        let storage = bkv_storage_health_ready_value(&runtime);
+        assert_eq!(storage["status"], "bkv-offline");
+        assert_eq!(storage["queueRequired"], false);
+        assert_eq!(storage["queueAccepting"], Value::Null);
+        assert_eq!(storage["rootExists"], true);
+    }
+
+    #[test]
+    fn bkv_snapshot_prefers_the_replay_selected_imported_inspection_only_in_bkv_mode() {
+        let state = production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
+        for (id, material, finished_at) in [
+            ("selected", "BKV-SELECTED", "2026-01-01T00:00:00Z"),
+            ("newer", "REAL-NEWER", "2026-07-21T00:00:00Z"),
+        ] {
+            state
+                .runtime
+                .block_on(db::upsert_production_inspection(
+                    &state.database.connection,
+                    db::ProductionInspectionInput {
+                        id: id.to_string(),
+                        material_id: material.to_string(),
+                        session_id: format!("session-{id}"),
+                        status: "completed".to_string(),
+                        storage_root: String::new(),
+                        summary_path: String::new(),
+                        started_at: finished_at.to_string(),
+                        finished_at: finished_at.to_string(),
+                        capture_count: 0,
+                        defect_count: 0,
+                        raw_payload: json!({"source":if id == "selected" {"bkv"} else {"real"}})
+                            .to_string(),
+                    },
+                ))
+                .unwrap();
+        }
+        state
+            .runtime
+            .block_on(db::set_config(
+                &state.database.connection,
+                "bkv.active-batch",
+                &json!({"batchId":"batch-001","contentId":"a".repeat(64)}).to_string(),
+            ))
+            .unwrap();
+        state
+            .runtime
+            .block_on(db::set_config(
+                &state.database.connection,
+                "bkv.replay.batch-001",
+                &json!({
+                    "batchId":"batch-001","contentId":"a".repeat(64),
+                    "selectedInspectionId":"selected"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let snapshot: Value = serde_json::from_str(
+            &build_production_snapshot_json(&state)
+                .unwrap()
+                .expect("BKV snapshot"),
+        )
+        .unwrap();
+        assert_eq!(snapshot["currentPlate"]["plateNo"], "BKV-SELECTED");
+        assert_eq!(snapshot["inspections"][0]["inspectionId"], "selected");
+
+        let mut real_state = state;
+        Arc::get_mut(&mut real_state.capture).unwrap().provider = CaptureProvider::Simulated;
+        let real_snapshot: Value = serde_json::from_str(
+            &build_production_snapshot_json(&real_state)
+                .unwrap()
+                .expect("real snapshot"),
+        )
+        .unwrap();
+        assert_eq!(real_snapshot["currentPlate"]["plateNo"], "REAL-NEWER");
+    }
+
+    #[test]
+    fn real_capture_provider_contract_still_requires_eight_cameras() {
+        assert_eq!(CAPTURE_CAMERA_IPS.len(), 8);
+        assert!(CaptureProvider::HeadlessCpp.is_managed());
+        assert!(CaptureProvider::HeadlessCpp.uses_local_api());
+        assert_eq!(CaptureProvider::HeadlessCpp.as_str(), "headless-cpp");
     }
 
     fn production_test_state_with_provider(
