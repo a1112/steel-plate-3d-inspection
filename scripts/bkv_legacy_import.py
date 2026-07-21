@@ -304,13 +304,37 @@ def _extract_parenthesized(value: str, opening: int) -> tuple[str, int] | None:
     return None
 
 
+def _is_fulltext_or_spatial_index(definition: str) -> bool:
+    match = re.match(
+        rf"(?:FULLTEXT|SPATIAL)\b(?:\s+(?:INDEX|KEY)\b)?"
+        rf"(?:\s+{_SQL_IDENTIFIER})?\s*(?P<open>\()",
+        definition,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return False
+    extracted = _extract_parenthesized(definition, match.start("open"))
+    if extracted is None:
+        return False
+    body, closing = extracted
+    if definition[closing + 1 :].strip():
+        return False
+    key_parts = _split_sql_items(body)
+    key_part_pattern = rf"{_SQL_IDENTIFIER}(?:\s*\(\s*\d+\s*\))?(?:\s+(?:ASC|DESC))?"
+    return bool(key_parts) and all(
+        re.fullmatch(key_part_pattern, key_part.strip(), re.IGNORECASE) is not None
+        for key_part in key_parts
+    )
+
+
 def _is_unquoted_table_constraint(definition: str) -> bool:
     value = definition.lstrip()
+    if _is_fulltext_or_spatial_index(value):
+        return True
     patterns = (
         r"PRIMARY\s+KEY\b",
         r"FOREIGN\s+KEY\b",
         r"UNIQUE\b(?:\s+(?:KEY|INDEX)\b)?",
-        r"(?:FULLTEXT|SPATIAL)\s+(?:KEY|INDEX)\b",
         r"KEY\b",
         r"INDEX\b",
         r"CONSTRAINT\b",

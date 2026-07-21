@@ -845,8 +845,12 @@ CREATE TABLE `allexcel` (
   INDEX `idx_foreign` (`Foreign`),
   FULLTEXT KEY `ft_key` (`FULLTEXT`),
   FULLTEXT INDEX `ft_index` (`FULLTEXT`),
+  FULLTEXT ft_name (`FULLTEXT`),
+  FULLTEXT (`FULLTEXT`),
   SPATIAL KEY `sp_key` (`SPATIAL`),
   SPATIAL INDEX `sp_index` (`SPATIAL`),
+  SPATIAL sp_name (`SPATIAL`),
+  SPATIAL (`SPATIAL`),
   CHECK (`Check` IS NOT NULL)
 );
 INSERT INTO `allexcel` VALUES
@@ -854,9 +858,11 @@ INSERT INTO `allexcel` VALUES
    'escaped', 1893700);
 CREATE TABLE `diameter` (
   `Foreign` bigint,
+  FULLTEXT TEXT,
+  SPATIAL VARCHAR(32),
   FOREIGN KEY (`Foreign`) REFERENCES `allexcel` (`Key`)
 );
-INSERT INTO `diameter` VALUES (71);
+INSERT INTO `diameter` VALUES (71, 'fulltext data', 'spatial data');
 """
         result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
 
@@ -887,7 +893,31 @@ INSERT INTO `diameter` VALUES (71);
                 1_893_700,
             ],
         )
-        self.assertEqual(result.rows_by_table["diameter"][0]["legacySeqNo"], 1_893_700)
+        diameter = result.rows_by_table["diameter"][0]
+        self.assertEqual(diameter["legacySeqNo"], 1_893_700)
+        self.assertEqual(diameter["FULLTEXT"], "fulltext data")
+        self.assertEqual(diameter["SPATIAL"], "spatial data")
+
+        for definition in (
+            "FULLTEXT KEY ft_key (Note)",
+            "FULLTEXT INDEX ft_index (Note)",
+            "FULLTEXT ft_name (Note)",
+            "FULLTEXT (Note)",
+            "SPATIAL KEY sp_key (Shape)",
+            "SPATIAL INDEX sp_index (Shape)",
+            "SPATIAL sp_name (Shape)",
+            "SPATIAL (Shape)",
+        ):
+            with self.subTest(definition=definition):
+                self.assertTrue(subject._is_unquoted_table_constraint(definition))
+        for definition in (
+            "FULLTEXT TEXT",
+            "SPATIAL VARCHAR(32)",
+            "FULLTEXT KEY missing_columns",
+            "SPATIAL INDEX broken (Shape",
+        ):
+            with self.subTest(definition=definition):
+                self.assertFalse(subject._is_unquoted_table_constraint(definition))
 
         malformed = rb"CREATE TABLE `allexcel` (`unterminated bigint);"
         malformed_result = subject.filter_sql_dump(
