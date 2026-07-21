@@ -112,6 +112,14 @@ class SqlDumpLimitError(RuntimeError):
     """Raised when an untrusted SQL dump exceeds a named parser bound."""
 
 
+class StageFailedError(RuntimeError):
+    """Raised after a failed stage run has been preserved as bounded evidence."""
+
+    def __init__(self, message: str, failed_evidence_path: Path):
+        self.failed_evidence_path = failed_evidence_path
+        super().__init__(f"{message}; failedEvidencePath={failed_evidence_path}")
+
+
 @dataclass(frozen=True)
 class FileSnapshot:
     device: int
@@ -2795,7 +2803,7 @@ def _artifact_relative_path(entry: dict[str, object]) -> str:
         raise ValueError(f"unsupported inventory image semantics: {member}")
     filename = PurePosixPath(member).name
     return (
-        f"artifacts/camera-{metadata['cameraNumber']}/{metadata['seqNo']}/"
+        f"artifacts/camera{metadata['cameraNumber']}/{metadata['seqNo']}/"
         f"{destination_kind}/{filename}"
     )
 
@@ -2859,35 +2867,142 @@ def _copy_verified_file(source: Path, destination: Path, max_bytes: int) -> dict
     return {"size": total, "sha256": digest.hexdigest()}
 
 
-def _record_stage_failure(incoming: Path, error: BaseException) -> None:
+def _present_seq_nos_from_incoming(incoming: Path) -> list[int]:
+    present: set[int] = set()
+    artifacts = incoming / "artifacts"
+    if not artifacts.is_dir() or is_reparse_point(artifacts):
+        return []
+    for camera_number in range(1, 7):
+        camera = artifacts / f"camera{camera_number}"
+        if not camera.is_dir() or is_reparse_point(camera):
+            continue
+        for candidate in camera.iterdir():
+            if candidate.name.isdecimal():
+                seq_no = int(candidate.name)
+                if seq_no in TARGET_SEQ_NOS:
+                    present.add(seq_no)
+    return sorted(present)
+
+
+def _bounded_utf8_text(value: object, max_bytes: int) -> str:
+    encoded = str(value).encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return encoded.decode("utf-8")
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _publish_failed_stage(
+    incoming: Path,
+    output: Path,
+    batch_id: str,
+    error: BaseException,
+) -> Path:
     if not incoming.is_dir() or is_reparse_point(incoming):
-        return
+        raise RuntimeError("cannot preserve failed stage evidence") from error
     (incoming / "manifest.json").unlink(missing_ok=True)
     evidence = {
         "schema": "steel.bkv-stage-quarantine.v1",
-        "reason": type(error).__name__[:128],
-        "message": str(error)[:4096],
+        "reason": _bounded_utf8_text(type(error).__name__, 128),
+        "message": _bounded_utf8_text(error, 4096),
     }
     payload = (json.dumps(evidence, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    if len(payload) > 8192:
+        raise InventoryLimitError("failed quarantine evidence exceeds 8192 bytes")
     quarantine = incoming / "quarantine.jsonl"
-    try:
-        with quarantine.open("ab") as output:
-            output.write(payload[:8192])
-            output.flush()
-            os.fsync(output.fileno())
-    except OSError:
-        pass
+    with quarantine.open("ab") as quarantine_output:
+        quarantine_output.write(payload)
+        quarantine_output.flush()
+        os.fsync(quarantine_output.fileno())
+    quarantine_evidence = {
+        "path": "quarantine.jsonl",
+        "size": quarantine.stat().st_size,
+        "sha256": _sha256_file(
+            quarantine,
+            max_bytes=MAX_MANIFEST_BYTES,
+            deadline=time.monotonic() + STAGE_TIMEOUT_SECONDS,
+        ),
+    }
+    failed_manifest = {
+        "schema": "steel.bkv-import-manifest.v1",
+        "batchId": batch_id,
+        "status": "failed",
+        "importEligible": False,
+        "seqNos": list(TARGET_SEQ_NOS),
+        "presentSeqNos": _present_seq_nos_from_incoming(incoming),
+        "targetCoverageComplete": False,
+        "failure": evidence,
+        "quarantine": quarantine_evidence,
+    }
+    _write_json_atomic(incoming / "manifest.json", failed_manifest)
+    _verify_staged_batch(incoming, allow_failed=True)
+    prefix = f"{batch_id}.incoming-"
+    if not incoming.name.startswith(prefix):
+        raise ValueError("incoming batch lacks its trusted run identifier")
+    run_id = incoming.name[len(prefix) :]
+    failed = output / f"{batch_id}.failed-{run_id}"
+    if failed.exists() or is_reparse_point(failed):
+        raise FileExistsError(f"failed evidence collision: {failed}")
+    os.rename(incoming, failed)
+    _fsync_directory(output)
+    _verify_staged_batch(failed, allow_failed=True)
+    return failed
 
 
-def _verify_staged_batch(batch: Path) -> dict[str, object]:
+def _verify_staged_batch(
+    batch: Path, *, allow_failed: bool = False
+) -> dict[str, object]:
     batch = batch.resolve(strict=True)
     if is_reparse_point(batch) or not batch.is_dir():
         raise ValueError("staged batch must be a non-reparse directory")
     manifest = _load_json_document(batch / "manifest.json", "staged manifest")
     if manifest.get("schema") != "steel.bkv-import-manifest.v1":
         raise ValueError("invalid staged manifest schema")
-    if manifest.get("status") not in ("ready", "partial"):
-        raise ValueError("published stage status must be ready or partial")
+    status = manifest.get("status")
+    if status not in ("ready", "partial", "failed"):
+        raise ValueError("staged manifest status must be ready, partial, or failed")
+    if manifest.get("seqNos") != list(TARGET_SEQ_NOS):
+        raise ValueError("staged manifest seqNos must be the exact approved target")
+    present_seq_nos = manifest.get("presentSeqNos")
+    if (
+        not isinstance(present_seq_nos, list)
+        or not all(
+            isinstance(seq_no, int) and not isinstance(seq_no, bool)
+            for seq_no in present_seq_nos
+        )
+        or present_seq_nos != sorted(set(present_seq_nos))
+        or any(seq_no not in TARGET_SEQ_NOS for seq_no in present_seq_nos)
+    ):
+        raise ValueError("staged manifest presentSeqNos is invalid")
+    if status == "failed":
+        if not allow_failed:
+            raise ValueError("failed staged batch is not canonical")
+        if manifest.get("importEligible") is not False:
+            raise ValueError("failed staged batch must set importEligible=false")
+        failure = manifest.get("failure")
+        if (
+            not isinstance(failure, dict)
+            or failure.get("schema") != "steel.bkv-stage-quarantine.v1"
+            or not isinstance(failure.get("reason"), str)
+            or len(failure["reason"].encode("utf-8")) > 128
+            or not isinstance(failure.get("message"), str)
+            or len(failure["message"].encode("utf-8")) > 4096
+        ):
+            raise ValueError("failed staged batch has invalid bounded failure evidence")
+        quarantine_evidence = manifest.get("quarantine")
+        if not isinstance(quarantine_evidence, dict):
+            raise ValueError("failed staged batch lacks quarantine evidence")
+        relative = quarantine_evidence.get("path")
+        if relative != "quarantine.jsonl":
+            raise ValueError("failed quarantine path is invalid")
+        _verify_named_file(
+            _stage_path(batch, relative),
+            quarantine_evidence,
+            "failed quarantine evidence",
+            max_bytes=MAX_MANIFEST_BYTES,
+        )
+        return manifest
+    if manifest.get("importEligible") != (status == "ready"):
+        raise ValueError("staged manifest importEligible does not match status")
     source_inventory = manifest.get("sourceInventory")
     _verify_named_file(
         batch / "source" / "inventory.json",
@@ -3187,7 +3302,9 @@ def stage_batch(
                 if database_verified and target_coverage_complete
                 else "partial"
             ),
-            "seqNos": seq_nos,
+            "importEligible": database_verified and target_coverage_complete,
+            "seqNos": list(TARGET_SEQ_NOS),
+            "presentSeqNos": seq_nos,
             "targetCoverageComplete": target_coverage_complete,
             "sourceInventory": source_inventory_evidence,
             "sourceArchives": archives,
@@ -3214,14 +3331,14 @@ def stage_batch(
         _verify_staged_batch(final)
         return final
     except BaseException as error:
-        _record_stage_failure(incoming, error)
-        raise
+        failed = _publish_failed_stage(incoming, output, batch_id, error)
+        raise StageFailedError("BKV stage failed", failed) from error
 
 
 def batch_is_importable(
     batch: os.PathLike[str] | str, *, operator_reviewed_partial: bool = False
 ) -> bool:
-    manifest = _verify_staged_batch(Path(batch))
+    manifest = _verify_staged_batch(Path(batch), allow_failed=True)
     status = manifest["status"]
     return status == "ready" or (
         status == "partial" and operator_reviewed_partial is True

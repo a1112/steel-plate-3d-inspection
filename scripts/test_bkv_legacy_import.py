@@ -1184,6 +1184,7 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(manifest["schema"], "steel.bkv-import-manifest.v1")
         self.assertEqual(manifest["status"], "ready")
         self.assertEqual(manifest["seqNos"], list(subject.TARGET_SEQ_NOS))
+        self.assertEqual(manifest["presentSeqNos"], list(subject.TARGET_SEQ_NOS))
         self.assertTrue(manifest["targetCoverageComplete"])
         self.assertEqual(set(manifest["cameraInventory"]), {str(value) for value in range(1, 7)})
         self.assertTrue(manifest["databaseIntegrity"]["allInventoryMembersVerified"])
@@ -1196,16 +1197,20 @@ class ExtractionTests(unittest.TestCase):
             self.assertEqual(artifact["sha256"], hashlib.sha256(payload).hexdigest())
 
         self.assertEqual(
-            (batch / "artifacts/camera-1/1893700/2d/one.jpg").read_bytes(),
+            (batch / "artifacts/camera1/1893700/2d/one.jpg").read_bytes(),
             b"jpeg-one",
         )
         self.assertEqual(
-            (batch / "artifacts/camera-1/1893700/3d/one.d3img").read_bytes(),
+            (batch / "artifacts/camera1/1893700/3d/one.d3img").read_bytes(),
             b"depth-one",
         )
         self.assertEqual(
-            (batch / "artifacts/camera-6/1893710/metadata/camera.dat").read_bytes(),
+            (batch / "artifacts/camera6/1893710/metadata/camera.dat").read_bytes(),
             b"metadata-six",
+        )
+        self.assertEqual(
+            {path.name for path in (batch / "artifacts").iterdir()},
+            {f"camera{number}" for number in range(1, 7)},
         )
         self.assertEqual(
             json.loads((batch / "source/inventory.json").read_text(encoding="utf-8"))["batchId"],
@@ -1222,21 +1227,33 @@ class ExtractionTests(unittest.TestCase):
         def overwrite_runner(command, **kwargs):
             if not self.commands:
                 incoming = next(self.output_root.glob("batch-001.incoming-*"))
-                destination = incoming / "artifacts/camera-1/1893700/2d/one.jpg"
+                destination = incoming / "artifacts/camera1/1893700/2d/one.jpg"
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(b"attacker")
             return self._runner(command, **kwargs)
 
-        with self.assertRaises(FileExistsError):
+        with self.assertRaises(subject.StageFailedError) as raised:
             self._stage(runner=overwrite_runner)
         self.assertFalse((self.output_root / "batch-001").exists())
+        self.assertEqual(
+            subject._verify_staged_batch(
+                raised.exception.failed_evidence_path, allow_failed=True
+            )["status"],
+            "failed",
+        )
 
     def test_declared_total_is_rejected_before_any_unrar_member_runs(self):
         with mock.patch.object(subject, "MAX_STAGE_TOTAL_BYTES", 1):
-            with self.assertRaisesRegex(subject.InventoryLimitError, "declared artifact total"):
+            with self.assertRaises(subject.StageFailedError) as raised:
                 self._stage()
         self.assertEqual(self.commands, [])
         self.assertFalse((self.output_root / "batch-001").exists())
+        self.assertIn(
+            "declared artifact total",
+            (raised.exception.failed_evidence_path / "quarantine.jsonl").read_text(
+                encoding="utf-8"
+            ),
+        )
 
     def test_duplicate_member_selects_volume_that_supplied_final_crc(self):
         entry = {
@@ -1255,7 +1272,7 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(self._stage(), batch)
         self.assertEqual(len(self.commands), first_command_count)
 
-        (batch / "artifacts/camera-1/1893700/2d/one.jpg").write_bytes(b"tampered")
+        (batch / "artifacts/camera1/1893700/2d/one.jpg").write_bytes(b"tampered")
         with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
             self._stage()
 
@@ -1269,16 +1286,80 @@ class ExtractionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlaps"):
             self._stage(output_root=self.normalized / "nested-batches")
 
-    def test_validation_failure_never_publishes_incoming_batch(self):
-        with mock.patch.object(
-            subject, "_verify_staged_batch", side_effect=ValueError("invalid stage")
-        ):
-            with self.assertRaisesRegex(ValueError, "invalid stage"):
-                self._stage()
+    def test_extraction_failure_is_atomically_preserved_as_failed_evidence(self):
+        def short_runner(command, **kwargs):
+            result = self._runner(command, **kwargs)
+            return subprocess.CompletedProcess(command, 0, result.stdout[:-1], b"")
+
+        with self.assertRaises(subject.StageFailedError) as raised:
+            self._stage(runner=short_runner)
         self.assertFalse((self.output_root / "batch-001").exists())
-        incoming = list(self.output_root.glob("batch-001.incoming-*"))
-        self.assertEqual(len(incoming), 1)
-        self.assertFalse((incoming[0] / "manifest.json").exists())
+        self.assertEqual(list(self.output_root.glob("batch-001.incoming-*")), [])
+        failed = raised.exception.failed_evidence_path
+        self.assertTrue(failed.name.startswith("batch-001.failed-"))
+        manifest = subject._verify_staged_batch(failed, allow_failed=True)
+        self.assertEqual(manifest["status"], "failed")
+        self.assertFalse(manifest["importEligible"])
+        self.assertEqual(manifest["seqNos"], list(subject.TARGET_SEQ_NOS))
+        self.assertFalse(subject.batch_is_importable(failed))
+        with self.assertRaisesRegex(ValueError, "failed"):
+            subject._verify_staged_batch(failed)
+
+    def test_hash_validation_failure_is_preserved_as_failed_evidence(self):
+        verify = subject._verify_staged_batch
+        tampered = False
+
+        def tamper_before_verify(batch, *, allow_failed=False):
+            nonlocal tampered
+            batch = Path(batch)
+            if not allow_failed and ".incoming-" in batch.name and not tampered:
+                artifact = batch / "artifacts/camera1/1893700/2d/one.jpg"
+                payload = artifact.read_bytes()
+                artifact.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
+                tampered = True
+            return verify(batch, allow_failed=allow_failed)
+
+        with mock.patch.object(
+            subject, "_verify_staged_batch", side_effect=tamper_before_verify
+        ):
+            with self.assertRaises(subject.StageFailedError) as raised:
+                self._stage()
+        failed = raised.exception.failed_evidence_path
+        self.assertFalse((self.output_root / "batch-001").exists())
+        self.assertEqual(verify(failed, allow_failed=True)["status"], "failed")
+        self.assertIn(
+            "artifact hash mismatch",
+            (failed / "quarantine.jsonl").read_text(encoding="utf-8"),
+        )
+
+    def test_invalid_camera_coverage_evidence_is_preserved_as_failed(self):
+        inventory = json.loads(self.inventory_path.read_text(encoding="utf-8"))
+        image = next(entry for entry in inventory["entries"] if entry["seqNo"] is not None)
+        image["cameraNumber"] = 2
+        self.inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+
+        with self.assertRaises(subject.StageFailedError) as raised:
+            self._stage()
+        failed = raised.exception.failed_evidence_path
+        self.assertFalse((self.output_root / "batch-001").exists())
+        manifest = subject._verify_staged_batch(failed, allow_failed=True)
+        self.assertEqual(manifest["seqNos"], list(subject.TARGET_SEQ_NOS))
+        self.assertEqual(manifest["presentSeqNos"], [])
+        self.assertIn(
+            "cameraNumber",
+            (failed / "quarantine.jsonl").read_text(encoding="utf-8"),
+        )
+
+    def test_failed_quarantine_is_bounded_valid_utf8_jsonl(self):
+        def unicode_failure_runner(command, **kwargs):
+            raise RuntimeError("坏" * 5_000)
+
+        with self.assertRaises(subject.StageFailedError) as raised:
+            self._stage(runner=unicode_failure_runner)
+        payload = (raised.exception.failed_evidence_path / "quarantine.jsonl").read_bytes()
+        self.assertLessEqual(len(payload), 8_192)
+        document = json.loads(payload.decode("utf-8"))
+        self.assertEqual(document["reason"], "RuntimeError")
 
     def test_partial_database_requires_explicit_operator_review(self):
         self._write_inventory(database_integrity="crc-failed")
@@ -1292,6 +1373,8 @@ class ExtractionTests(unittest.TestCase):
         batch = self._stage()
         manifest = json.loads((batch / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "partial")
+        self.assertEqual(manifest["seqNos"], list(subject.TARGET_SEQ_NOS))
+        self.assertEqual(manifest["presentSeqNos"], [1_893_700, 1_893_710])
         self.assertFalse(manifest["targetCoverageComplete"])
 
     def test_stage_cli_routes_explicit_inventory_and_normalized_generation(self):
@@ -2060,22 +2143,23 @@ CRC32: 66666666
     "requires local WinRAR and UnRAR executables",
 )
 class RealUnrarSmokeTests(unittest.TestCase):
-    def test_localized_unrar_technical_listing_is_parsed(self):
+    def test_real_unrar_p_extracts_exact_member_bytes_and_sha256(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             archive_path = root / "smoke.rar"
-            member = "image_copy/CamImageSource1/1893700/2D/smoke.jpg"
-            source = root / Path(member)
-            source.parent.mkdir(parents=True)
-            source.write_bytes(b"smoke")
+            member = "single-member.dat"
+            payload = b"BKV-stage-real-pipe-smoke"
+            self.assertEqual(len(payload), 25)
+            source = root / member
+            source.write_bytes(payload)
             created = subprocess.run(
                 [
                     r"C:\Program Files\WinRAR\WinRAR.exe",
                     "a",
                     "-cfg-",
-                    "-r",
+                    "-ep",
                     str(archive_path),
-                    "image_copy",
+                    member,
                 ],
                 cwd=root,
                 stdin=subprocess.DEVNULL,
@@ -2084,17 +2168,19 @@ class RealUnrarSmokeTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(created.returncode, 0, created.stderr)
-            with subject._stable_archive_inputs((archive_path,)) as working:
-                output = subject._run_unrar_listing(
-                    Path(r"C:\Program Files\WinRAR\UnRAR.exe"),
-                    working[archive_path],
-                )
-            records = subject._parse_unrar_listing(output)
-            entries, statistics = subject._records_to_rar_entries(
-                records, "image-part1"
+            destination = root / "safe-output" / "extracted.dat"
+            destination.parent.mkdir()
+            evidence = subject._extract_unrar_member(
+                unrar=Path(r"C:\Program Files\WinRAR\UnRAR.exe"),
+                archive=archive_path,
+                member=member,
+                destination=destination,
+                expected_size=len(payload),
+                runner=None,
             )
-            self.assertEqual([entry["memberPath"] for entry in entries], [member])
-            self.assertGreaterEqual(statistics["recordsSeen"], 1)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(evidence["size"], 25)
+            self.assertEqual(evidence["sha256"], hashlib.sha256(payload).hexdigest())
 
 
 @unittest.skipUnless(
