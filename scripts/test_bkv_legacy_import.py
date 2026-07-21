@@ -843,9 +843,13 @@ CREATE TABLE `allexcel` (
   UNIQUE KEY `uq_unique` (`Unique`),
   KEY `idx_constraint` (`Constraint`),
   INDEX `idx_foreign` (`Foreign`),
-  FULLTEXT KEY `ft_key` (`FULLTEXT`) WITH PARSER `ngram`
-    COMMENT 'search ) ''quoted'' (' VISIBLE,
-  FULLTEXT INDEX `ft_index` (`FULLTEXT`) INVISIBLE,
+  FULLTEXT KEY `ft_key` (`FULLTEXT`) USING BTREE KEY_BLOCK_SIZE = 1024
+    WITH PARSER `ngram` COMMENT 'search ) ''quoted'' (' VISIBLE
+    ENGINE_ATTRIBUTE = '{"note":"value ) (","escaped":"a\"b"}'
+    SECONDARY_ENGINE_ATTRIBUTE '{"secondary":"(ok)"}',
+  FULLTEXT INDEX `ft_index` (`FULLTEXT`) USING HASH KEY_BLOCK_SIZE 2048
+    ENGINE_ATTRIBUTE '{"engine":"plain"}'
+    SECONDARY_ENGINE_ATTRIBUTE = '{"secondary":"plain"}' INVISIBLE,
   FULLTEXT ft_name (`FULLTEXT`) COMMENT 'named index',
   FULLTEXT (`FULLTEXT`) VISIBLE COMMENT 'unnamed',
   SPATIAL KEY `sp_key` (`SPATIAL`) COMMENT 'shape \' ) (' INVISIBLE,
@@ -900,12 +904,17 @@ INSERT INTO `diameter` VALUES (71, 'fulltext data', 'spatial data');
         self.assertEqual(diameter["SPATIAL"], "spatial data")
 
         for definition in (
-            "FULLTEXT KEY ft_key (Note) WITH PARSER ngram COMMENT 'note ) (' VISIBLE",
+            "FULLTEXT KEY ft_key (Note) USING BTREE KEY_BLOCK_SIZE = 1024 "
+            "WITH PARSER ngram COMMENT 'note ) (' VISIBLE "
+            'ENGINE_ATTRIBUTE = \'{"escaped":"a\\"b"}\' '
+            'SECONDARY_ENGINE_ATTRIBUTE \'{"secondary":"(ok)"}\'',
             'FULLTEXT INDEX ft_index (Note) COMMENT "double ""quote"" (" INVISIBLE',
             "FULLTEXT ft_name (Note) COMMENT 'named index'",
             "FULLTEXT (Note) VISIBLE COMMENT 'unnamed'",
-            "SPATIAL KEY sp_key (Shape) COMMENT 'shape \\' ) (' INVISIBLE",
-            "SPATIAL INDEX sp_index (Shape) VISIBLE",
+            "SPATIAL KEY sp_key (Shape) USING HASH KEY_BLOCK_SIZE 2048 "
+            "COMMENT 'shape \\' ) (' INVISIBLE",
+            'SPATIAL INDEX sp_index (Shape) ENGINE_ATTRIBUTE \'{"shape":"(polygon)"}\' '
+            'SECONDARY_ENGINE_ATTRIBUTE = \'{"escaped":"x\\"y"}\' VISIBLE',
             "SPATIAL sp_name (Shape)",
             "SPATIAL (Shape)",
         ):
@@ -918,6 +927,11 @@ INSERT INTO `diameter` VALUES (71, 'fulltext data', 'spatial data');
             "SPATIAL INDEX broken (Shape",
             "FULLTEXT ft_name (Note) UNKNOWN option",
             "SPATIAL (Shape) COMMENT unquoted",
+            "FULLTEXT (Note) KEY_BLOCK_SIZE = nope",
+            "FULLTEXT (Note) USING RTREE",
+            'SPATIAL (Shape) ENGINE_ATTRIBUTE {"unquoted":true}',
+            "SPATIAL (Shape) SECONDARY_ENGINE_ATTRIBUTE =",
+            "FULLTEXT (Note) VISIBLE INVISIBLE",
         ):
             with self.subTest(definition=definition):
                 self.assertFalse(subject._is_unquoted_table_constraint(definition))
@@ -935,6 +949,11 @@ INSERT INTO `diameter` VALUES (71, 'fulltext data', 'spatial data');
             "SPATIAL INDEX broken (Shape",
             "FULLTEXT ft_name (Note) UNKNOWN option",
             "SPATIAL (Shape) COMMENT unquoted",
+            "FULLTEXT (Note) KEY_BLOCK_SIZE = nope",
+            "FULLTEXT (Note) USING RTREE",
+            'SPATIAL (Shape) ENGINE_ATTRIBUTE {"unquoted":true}',
+            "SPATIAL (Shape) SECONDARY_ENGINE_ATTRIBUTE =",
+            "FULLTEXT (Note) VISIBLE INVISIBLE",
         ):
             with self.subTest(definition=definition):
                 fixture = f"""

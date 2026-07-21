@@ -323,6 +323,18 @@ def _quoted_sql_token_end(value: str, opening: int) -> int | None:
     return None
 
 
+def _sql_option_value_start(value: str, keyword_end: int) -> int | None:
+    position = keyword_end
+    while position < len(value) and value[position].isspace():
+        position += 1
+    if position < len(value) and value[position] == "=":
+        position += 1
+        while position < len(value) and value[position].isspace():
+            position += 1
+        return position
+    return position if position > keyword_end else None
+
+
 def _has_valid_fulltext_or_spatial_options(value: str) -> bool:
     position = 0
     seen: set[str] = set()
@@ -332,6 +344,34 @@ def _has_valid_fulltext_or_spatial_options(value: str) -> bool:
         position += position_match.end()
         if position == len(value):
             return True
+
+        key_block_match = re.match(r"KEY_BLOCK_SIZE\b", value[position:], re.IGNORECASE)
+        if key_block_match is not None:
+            if "key_block_size" in seen:
+                return False
+            value_start = _sql_option_value_start(
+                value, position + key_block_match.end()
+            )
+            if value_start is None:
+                return False
+            value_match = re.match(r"\d+\b", value[value_start:])
+            if value_match is None:
+                return False
+            seen.add("key_block_size")
+            position = value_start + value_match.end()
+            continue
+
+        using_match = re.match(
+            r"USING\s+(?P<index_type>BTREE|HASH)\b",
+            value[position:],
+            re.IGNORECASE,
+        )
+        if using_match is not None:
+            if "index_type" in seen:
+                return False
+            seen.add("index_type")
+            position += using_match.end()
+            continue
 
         parser_match = re.match(
             rf"WITH\s+PARSER\s+(?P<parser>{_SQL_IDENTIFIER})(?![A-Za-z0-9_])",
@@ -354,6 +394,27 @@ def _has_valid_fulltext_or_spatial_options(value: str) -> bool:
             if closing is None:
                 return False
             seen.add("comment")
+            position = closing
+            continue
+
+        attribute_match = re.match(
+            r"(?P<attribute>ENGINE_ATTRIBUTE|SECONDARY_ENGINE_ATTRIBUTE)\b",
+            value[position:],
+            re.IGNORECASE,
+        )
+        if attribute_match is not None:
+            attribute = attribute_match.group("attribute").casefold()
+            if attribute in seen:
+                return False
+            value_start = _sql_option_value_start(
+                value, position + attribute_match.end()
+            )
+            if value_start is None:
+                return False
+            closing = _quoted_sql_token_end(value, value_start)
+            if closing is None:
+                return False
+            seen.add(attribute)
             position = closing
             continue
 
