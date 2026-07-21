@@ -1036,7 +1036,9 @@ class ExtractionTests(unittest.TestCase):
         self.database_zip = self.root / "database.zip"
         self.part1 = self.root / "image_copy.part1.rar"
         self.part2 = self.root / "image_copy.part2.rar"
-        self.database_zip.write_bytes(b"database-archive")
+        self.database_sql = b"SELECT 1;\n"
+        with zipfile.ZipFile(self.database_zip, "w") as archive:
+            archive.writestr("ncdtube.sql", self.database_sql)
         self.part1.write_bytes(b"part-one")
         self.part2.write_bytes(b"part-two")
         self.unrar = self.root / "UnRAR.exe"
@@ -1084,8 +1086,8 @@ class ExtractionTests(unittest.TestCase):
     def _write_inventory(self, *, database_integrity="ok"):
         entries = [
             {
-                "sha256": hashlib.sha256(b"normalized source").hexdigest(),
-                "size": len(b"normalized source"),
+                "sha256": hashlib.sha256(self.database_sql).hexdigest(),
+                "size": len(self.database_sql),
                 "archivePart": "database-zip",
                 "memberPath": "ncdtube.sql",
                 "cameraNumber": None,
@@ -1610,8 +1612,99 @@ class ExtractionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ready|coverage"):
             subject.batch_is_importable(batch)
 
+    def test_deep_source_rejects_forged_batch_inventory_and_db_integrity(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        staged_inventory_path = batch / "source/inventory.json"
+        staged_inventory = json.loads(staged_inventory_path.read_text(encoding="utf-8"))
+        database_entry = next(
+            entry
+            for entry in staged_inventory["entries"]
+            if entry["archivePart"] == "database-zip"
+        )
+        database_entry["integrityStatus"] = "crc-failed"
+        database_entry["integrityEvidence"] = "forged CRC failure"
+        database_entry["sha256"] = None
+        staged_inventory_path.write_text(json.dumps(staged_inventory), encoding="utf-8")
+
+        def forge(manifest):
+            self._refresh_file_evidence(manifest["sourceInventory"], staged_inventory_path)
+            source_member = manifest["databaseIntegrity"]["sourceMembers"][0]
+            source_member.update(
+                {
+                    "sha256": None,
+                    "integrityStatus": "crc-failed",
+                    "integrityEvidence": "forged CRC failure",
+                }
+            )
+            manifest["databaseIntegrity"]["statuses"] = ["crc-failed"]
+            manifest["databaseIntegrity"]["allInventoryMembersVerified"] = False
+            manifest["databaseIntegrity"]["crcFailed"] = True
+            manifest["status"] = "partial"
+            manifest["importEligible"] = False
+
+        self._rewrite_manifest(batch, forge)
+        with self.assertRaisesRegex(ValueError, "original inventory|database ZIP"):
+            subject._verify_staged_batch(batch, deep_source=True)
+
+    def test_importability_rejects_deleted_or_replaced_original_sources(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        self.assertTrue(subject.batch_is_importable(batch))
+        self.part1.unlink()
+        self.assertFalse(subject.batch_is_importable(batch))
+        self.assertIsNotNone(
+            subject._verify_staged_batch(batch, deep_source=False)
+        )
+
+        self.tearDown()
+        self.setUp()
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        self.part1.write_bytes(b"replacement source")
+        self.assertFalse(subject.batch_is_importable(batch))
+
+    def test_importability_rejects_missing_original_inventory(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        self.inventory_path.unlink()
+        self.assertFalse(subject.batch_is_importable(batch))
+        self.assertIsNotNone(subject._verify_staged_batch(batch, deep_source=False))
+
+    def test_importability_rejects_changed_original_inventory(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        self.inventory_path.write_bytes(self.inventory_path.read_bytes() + b"\n")
+        self.assertFalse(subject.batch_is_importable(batch))
+        self.assertIsNotNone(subject._verify_staged_batch(batch, deep_source=False))
+
+    def test_artifact_fields_must_exactly_match_source_inventory_evidence(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        manifest_path = batch / "manifest.json"
+        original = manifest_path.read_bytes()
+        mutations = {
+            "kind": lambda artifact: artifact.__setitem__("kind", "3D"),
+            "extension": lambda artifact: artifact.__setitem__("extension", ".dat"),
+            "archivePart": lambda artifact: artifact.__setitem__("archivePart", "image-part2"),
+            "archiveParts": lambda artifact: artifact.__setitem__("archiveParts", ["image-part2"]),
+            "archiveMetadata": lambda artifact: artifact.__setitem__(
+                "archiveMetadata", {"crc32": "DEADBEEF"}
+            ),
+            "volumeMetadata": lambda artifact: artifact.__setitem__(
+                "volumeMetadata", {"image-part2": {"crc32": "DEADBEEF"}}
+            ),
+        }
+        for field, mutate in mutations.items():
+            with self.subTest(field=field):
+                manifest = json.loads(original)
+                mutate(manifest["artifacts"][0])
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "artifact.*source inventory"):
+                    subject._verify_staged_batch(batch, deep_source=False)
+        manifest_path.write_bytes(original)
+
     def test_partial_database_requires_explicit_operator_review(self):
-        self._write_inventory(database_integrity="crc-failed")
         batch = self._stage()
         manifest = json.loads((batch / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "partial")

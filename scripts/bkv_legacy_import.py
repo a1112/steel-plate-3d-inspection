@@ -120,6 +120,10 @@ class StageFailedError(RuntimeError):
         super().__init__(f"{message}; failedEvidencePath={failed_evidence_path}")
 
 
+class SourceUnavailableError(RuntimeError):
+    """Raised when deep import verification cannot reopen original evidence."""
+
+
 class _QuarantineWriter:
     def __init__(self, path: Path):
         self.path = path
@@ -3095,6 +3099,12 @@ def _publish_failed_stage(
         "source/inventory.json",
         max_bytes=MAX_MANIFEST_BYTES,
     )
+    source_inventory["originalPath"] = context.get("inventoryPath")
+    source_inventory["originalSha256"] = (
+        source_inventory.get("sha256")
+        if source_inventory.get("evidenceStatus") == "verified"
+        else None
+    )
     source_archives: dict[str, dict[str, object]] = {}
     inventory_archives = inventory.get("archives") if isinstance(inventory, dict) else None
     for archive_part in ("database-zip", "image-part1", "image-part2"):
@@ -3335,8 +3345,121 @@ def _verify_manifest_file_evidence(
     return path
 
 
+def _deep_verify_original_sources(
+    manifest: dict[str, object],
+    staged_inventory: dict[str, object],
+    source_inventory_evidence: dict[str, object],
+) -> None:
+    original_path_value = source_inventory_evidence.get("originalPath")
+    original_sha256 = source_inventory_evidence.get("originalSha256")
+    if (
+        not isinstance(original_path_value, str)
+        or not isinstance(original_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", original_sha256) is None
+    ):
+        raise ValueError("original inventory evidence is invalid")
+    try:
+        original_inventory_path = Path(original_path_value).resolve(strict=True)
+    except (OSError, FileNotFoundError) as error:
+        raise SourceUnavailableError("original inventory is unavailable") from error
+
+    inventory_archives = staged_inventory.get("archives")
+    if not isinstance(inventory_archives, dict):
+        raise ValueError("original inventory archives are invalid")
+    archive_paths: dict[str, Path] = {}
+    try:
+        for archive_part in ("database-zip", "image-part1", "image-part2"):
+            evidence = inventory_archives.get(archive_part)
+            if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
+                raise ValueError(f"original inventory archive is invalid: {archive_part}")
+            archive_paths[archive_part] = Path(str(evidence["path"])).resolve(strict=True)
+    except (OSError, FileNotFoundError) as error:
+        raise SourceUnavailableError("original source archive is unavailable") from error
+
+    locked_paths = (original_inventory_path, *archive_paths.values())
+    try:
+        with _stable_archive_inputs(locked_paths) as working:
+            locked_inventory = working[original_inventory_path]
+            try:
+                if is_reparse_point(locked_inventory) or not locked_inventory.is_file():
+                    raise ValueError("original inventory is not a regular file")
+                actual_inventory_sha256 = _sha256_file(
+                    locked_inventory,
+                    max_bytes=MAX_MANIFEST_BYTES,
+                    deadline=time.monotonic() + STAGE_TIMEOUT_SECONDS,
+                )
+                if actual_inventory_sha256 != original_sha256:
+                    raise ValueError("original inventory hash mismatch")
+            except ValueError as error:
+                raise SourceUnavailableError("original inventory changed") from error
+            original_inventory = _load_json_document(
+                locked_inventory, "original inventory"
+            )
+            if original_inventory != staged_inventory:
+                raise ValueError("staged source inventory differs from original inventory")
+
+            source_archives = manifest.get("sourceArchives")
+            assert isinstance(source_archives, dict)
+            for archive_part, original_archive_path in archive_paths.items():
+                inventory_evidence = inventory_archives[archive_part]
+                assert isinstance(inventory_evidence, dict)
+                manifest_evidence = source_archives.get(archive_part)
+                if not isinstance(manifest_evidence, dict) or any(
+                    manifest_evidence.get(key) != inventory_evidence.get(key)
+                    for key in ("path", "size", "sha256", "fileIdentity", "mtimeNs")
+                ):
+                    raise ValueError(
+                        f"source archive inventory mismatch: {archive_part}"
+                    )
+                try:
+                    _verify_named_file(
+                        working[original_archive_path],
+                        inventory_evidence,
+                        f"original source archive {archive_part}",
+                        max_bytes=MAX_INPUT_ARCHIVE_BYTES,
+                    )
+                except ValueError as error:
+                    raise SourceUnavailableError(
+                        f"original source archive changed: {archive_part}"
+                    ) from error
+
+            actual_database_entries, _ = _inventory_zip(
+                working[archive_paths["database-zip"]]
+            )
+    except SourceUnavailableError:
+        raise
+    except (OSError, FileNotFoundError, RuntimeError) as error:
+        raise SourceUnavailableError("original source evidence is unavailable") from error
+
+    keys = (
+        "memberPath", "size", "sha256", "integrityStatus", "integrityEvidence"
+    )
+    actual_database_members = [
+        {key: entry.get(key) for key in keys} for entry in actual_database_entries
+    ]
+    original_entries = original_inventory.get("entries")
+    if not isinstance(original_entries, list):
+        raise ValueError("original inventory entries are invalid")
+    expected_database_members = [
+        {key: entry.get(key) for key in keys}
+        for entry in original_entries
+        if isinstance(entry, dict) and entry.get("archivePart") == "database-zip"
+    ]
+    database_integrity = manifest.get("databaseIntegrity")
+    manifest_database_members = (
+        database_integrity.get("sourceMembers")
+        if isinstance(database_integrity, dict)
+        else None
+    )
+    if (
+        actual_database_members != expected_database_members
+        or manifest_database_members != actual_database_members
+    ):
+        raise ValueError("database ZIP integrity differs from source evidence")
+
+
 def _verify_staged_batch(
-    batch: Path, *, allow_failed: bool = False
+    batch: Path, *, allow_failed: bool = False, deep_source: bool = True
 ) -> dict[str, object]:
     batch = batch.resolve(strict=True)
     if is_reparse_point(batch) or not batch.is_dir():
@@ -3409,13 +3532,25 @@ def _verify_staged_batch(
             for key in ("integrity", "fileIdentity", "mtimeNs")
         ):
             raise ValueError(f"invalid source archive evidence: {archive_part}")
-        verified_archive_path = _verify_manifest_file_evidence(
-            batch,
-            evidence,
-            f"source archive {archive_part}",
-            max_bytes=MAX_INPUT_ARCHIVE_BYTES,
-            external=True,
-        )
+        if evidence.get("evidenceStatus") == "verified":
+            if (
+                not isinstance(evidence.get("path"), str)
+                or isinstance(evidence.get("size"), bool)
+                or not isinstance(evidence.get("size"), int)
+                or not isinstance(evidence.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", str(evidence["sha256"])) is None
+            ):
+                raise ValueError(f"invalid offline source archive evidence: {archive_part}")
+            verified_archive_path = Path(str(evidence["path"]))
+        else:
+            _verify_manifest_file_evidence(
+                batch,
+                evidence,
+                f"source archive {archive_part}",
+                max_bytes=MAX_INPUT_ARCHIVE_BYTES,
+                external=True,
+            )
+            verified_archive_path = None
         if inventory_document is not None:
             inventory_archives = inventory_document.get("archives")
             expected = (
@@ -3567,6 +3702,23 @@ def _verify_staged_batch(
                 raise ValueError(f"artifact lacks source inventory member: {relative}")
             if _artifact_relative_path(inventory_entry) != relative:
                 raise ValueError(f"artifact path conflicts with source inventory member: {relative}")
+            expected_archive_parts = inventory_entry.get("archiveParts")
+            if not isinstance(expected_archive_parts, list):
+                expected_archive_parts = [inventory_entry.get("archivePart")]
+            expected_fields = {
+                "kind": inventory_entry.get("kind"),
+                "extension": inventory_entry.get("extension"),
+                "cameraNumber": inventory_entry.get("cameraNumber"),
+                "seqNo": inventory_entry.get("seqNo"),
+                "archivePart": _select_archive_part(inventory_entry),
+                "archiveParts": expected_archive_parts,
+                "archiveMetadata": inventory_entry.get("archiveMetadata"),
+                "volumeMetadata": inventory_entry.get("volumeMetadata"),
+            }
+            if any(evidence.get(key) != value for key, value in expected_fields.items()):
+                raise ValueError(
+                    f"artifact fields conflict with source inventory: {relative}"
+                )
         camera = derived_camera_inventory[str(camera_number)]
         camera["artifactCount"] = int(camera["artifactCount"]) + 1
         camera_seq_nos = camera["seqNos"]
@@ -3769,6 +3921,12 @@ def _verify_staged_batch(
             raise ValueError(f"{status} status conflicts with derived {expected_status} evidence")
         if manifest.get("importEligible") != derived_ready:
             raise ValueError("importEligible conflicts with derived evidence")
+        if deep_source:
+            if not isinstance(source_inventory, dict) or inventory_document is None:
+                raise ValueError("original inventory evidence is unavailable")
+            _deep_verify_original_sources(
+                manifest, inventory_document, source_inventory
+            )
     return manifest
 
 
@@ -3807,6 +3965,9 @@ def _stage_batch_into(
     failure_context: dict[str, object],
 ) -> Path:
     failure_context["stage"] = "inventory"
+    failure_context["inventoryPath"] = str(
+        Path(inventory_manifest).expanduser().resolve(strict=False)
+    )
     inventory_path = _resolve_input(inventory_manifest, "inventory manifest")
     inventory = _load_json_document(inventory_path, "inventory manifest")
     failure_context["inventory"] = inventory
@@ -3878,6 +4039,7 @@ def _stage_batch_into(
             {
                 "path": "source/inventory.json",
                 "originalPath": str(inventory_path),
+                "originalSha256": source_inventory_evidence["sha256"],
                 "evidenceStatus": "verified",
                 "error": None,
             }
@@ -3983,6 +4145,9 @@ def _stage_batch_into(
                     "path": relative,
                     "memberPath": member,
                     "archivePart": archive_part,
+                    "archiveParts": entry.get("archiveParts", [entry.get("archivePart")]),
+                    "archiveMetadata": entry.get("archiveMetadata"),
+                    "volumeMetadata": entry.get("volumeMetadata"),
                     **metadata,
                     "evidenceStatus": "verified",
                     "error": None,
@@ -4231,7 +4396,12 @@ def stage_batch(
 def batch_is_importable(
     batch: os.PathLike[str] | str, *, operator_reviewed_partial: bool = False
 ) -> bool:
-    manifest = _verify_staged_batch(Path(batch), allow_failed=True)
+    try:
+        manifest = _verify_staged_batch(
+            Path(batch), allow_failed=True, deep_source=True
+        )
+    except SourceUnavailableError:
+        return False
     status = manifest["status"]
     return status == "ready" or (
         status == "partial" and operator_reviewed_partial is True
