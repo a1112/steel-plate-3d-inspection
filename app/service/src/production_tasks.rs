@@ -774,6 +774,35 @@ fn bkv_required_dimension(row: &Value, names: &[&str], label: &str) -> Result<f6
         })
 }
 
+fn bkv_canonical_defect_type(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pit" | "dent" | "凹坑" => Some("pit"),
+        "roll" | "roll-mark" | "rollmark" | "辊印" => Some("roll"),
+        "scratch" | "划伤" => Some("scratch"),
+        "foreign" | "foreign-object" | "异物压入" => Some("foreign"),
+        "burnt" | "burnt-steel" | "烂钢" => Some("burnt"),
+        "edge" | "edge-crack" | "边裂" => Some("edge"),
+        "longitudinal" | "longitudinal-crack" | "纵裂" => Some("longitudinal"),
+        "bubble" | "气泡" => Some("bubble"),
+        "inclusion" | "夹杂" => Some("inclusion"),
+        "review" | "待复核" => Some("review"),
+        _ => None,
+    }
+}
+
+fn bkv_required_defect_number(
+    row: &Value,
+    names: &[&str],
+    label: &str,
+) -> Result<f64, BkvRejection> {
+    bkv_row_number(row, names).ok_or_else(|| {
+        BkvRejection::new(
+            "bkv_defect_invalid",
+            format!("defect {label} is missing or non-finite"),
+        )
+    })
+}
+
 fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, BkvRejection> {
     let rows_for = |table: &str, seq_no: i64| -> Vec<&Value> {
         batch
@@ -829,6 +858,24 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
             .flat_map(|file| file.rows.iter())
             .filter(|row| row.get("legacySeqNo").and_then(Value::as_i64) == Some(*seq_no))
             .cloned()
+            .collect::<Vec<_>>();
+        let artifact_provenance = batch
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.seq_no == *seq_no)
+            .map(|artifact| {
+                json!({
+                    "legacyTable":"archive",
+                    "legacyId":artifact.sha256,
+                    "sourcePath":artifact.relative_path,
+                    "memberPath":artifact.member_path,
+                    "sha256":artifact.sha256,
+                    "cameraNumber":artifact.camera_number,
+                    "kind":artifact.kind,
+                    "extension":artifact.extension,
+                    "evidence":artifact.evidence
+                })
+            })
             .collect::<Vec<_>>();
         materials.push(db::BkvImportMaterial {
             seq_no: *seq_no,
@@ -889,7 +936,8 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
                 "legacyTable": "allexcel",
                 "legacyId": legacy_id,
                 "sourcePath": source_path,
-                "rows": provenance_rows
+                "rows": provenance_rows,
+                "artifactProvenance": artifact_provenance
             })
             .to_string(),
         });
@@ -914,6 +962,23 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
             .and_then(|name| name.to_str())
             .ok_or_else(|| BkvRejection::new("bkv_artifact_invalid", "artifact file name invalid"))?
             .to_string();
+        let metadata_path = batch
+            .artifacts
+            .iter()
+            .find(|candidate| {
+                candidate.camera_number == artifact.camera_number
+                    && candidate.seq_no == artifact.seq_no
+                    && candidate.extension.eq_ignore_ascii_case(".dat")
+            })
+            .or_else(|| {
+                batch.artifacts.iter().find(|candidate| {
+                    candidate.camera_number == artifact.camera_number
+                        && candidate.seq_no == artifact.seq_no
+                        && candidate.kind.eq_ignore_ascii_case("metadata")
+                })
+            })
+            .map(|candidate| candidate.relative_path.clone())
+            .unwrap_or_default();
         artifacts.push(db::BkvImportArtifact {
             id: bkv_deterministic_id(
                 &batch.batch_id,
@@ -930,20 +995,25 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
             sequence_no: artifact.seq_no,
             file_type: artifact.kind.clone(),
             path: artifact.relative_path.clone(),
-            metadata_json: json!({
-                "source": "bkv",
-                "batchId": batch.batch_id,
-                "contentId": batch.content_id,
-                "legacyTable": "archive",
-                "legacyId": artifact.sha256,
-                "sourcePath": artifact.relative_path,
-                "memberPath": artifact.member_path,
-                "sha256": artifact.sha256,
-                "extension": artifact.extension,
-                "evidence": artifact.evidence
-            })
-            .to_string(),
+            metadata_path,
         });
+    }
+    let mut defect_classes = std::collections::HashMap::<String, String>::new();
+    for row in batch
+        .normalized
+        .iter()
+        .filter(|file| file.table == "defectclass")
+        .flat_map(|file| file.rows.iter())
+    {
+        if let (Some(id), Some(name)) = (
+            bkv_row_text(row, &["id", "classid", "defectclassid", "typeid", "code"]),
+            bkv_row_text(
+                row,
+                &["name", "defectname", "typename", "label", "classname"],
+            ),
+        ) {
+            defect_classes.insert(id, name);
+        }
     }
     let mut defects = Vec::new();
     for file in batch
@@ -961,7 +1031,61 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
             let material = material_for(seq_no)?;
             let legacy_id = bkv_row_text(row, &["id", "defectid", "originalRowHash"])
                 .unwrap_or_else(|| format!("{seq_no}-{}", defects.len()));
-            let numeric = |names: &[&str]| bkv_row_number(row, names).unwrap_or(0.0);
+            let camera =
+                bkv_required_defect_number(row, &["camera", "cameraid", "camerano"], "camera")?;
+            if camera.fract() != 0.0 || !(1.0..=6.0).contains(&camera) {
+                return Err(BkvRejection::new(
+                    "bkv_defect_invalid",
+                    "defect camera must be an integer from 1 through 6",
+                ));
+            }
+            let x_mm = bkv_required_defect_number(row, &["x", "xmm"], "x")?;
+            let y_mm = bkv_required_defect_number(row, &["y", "ymm", "distance"], "y")?;
+            let z_mm = bkv_required_defect_number(row, &["z", "zmm"], "z")?;
+            let width_mm = bkv_required_defect_number(row, &["width", "widthmm"], "width")?;
+            let height_mm = bkv_required_defect_number(row, &["height", "heightmm"], "height")?;
+            let depth_mm = bkv_required_defect_number(row, &["depth", "depthmm"], "depth")?;
+            let confidence =
+                bkv_required_defect_number(row, &["confidence", "score"], "confidence")?;
+            if width_mm < 0.0
+                || height_mm < 0.0
+                || depth_mm < 0.0
+                || !(0.0..=1.0).contains(&confidence)
+            {
+                return Err(BkvRejection::new(
+                    "bkv_defect_invalid",
+                    "defect dimensions must be non-negative and confidence must be 0..=1",
+                ));
+            }
+            let class_id = bkv_row_text(
+                row,
+                &[
+                    "classid",
+                    "defectclassid",
+                    "typeid",
+                    "class",
+                    "defecttypeid",
+                ],
+            );
+            let mapped_class_name = class_id
+                .as_ref()
+                .and_then(|id| defect_classes.get(id))
+                .cloned();
+            let original_name = mapped_class_name.clone().or_else(|| {
+                bkv_row_text(
+                    row,
+                    &["defectname", "typename", "name", "defecttype", "type"],
+                )
+            });
+            let defect_type = original_name
+                .as_deref()
+                .and_then(bkv_canonical_defect_type)
+                .unwrap_or("review");
+            let severity = if defect_type == "review" {
+                "review".to_string()
+            } else {
+                bkv_row_text(row, &["severity", "level"]).unwrap_or_else(|| "review".to_string())
+            };
             defects.push(db::BkvImportDefect {
                 id: bkv_deterministic_id(
                     &batch.batch_id,
@@ -972,25 +1096,24 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
                 ),
                 inspection_id: material.inspection_id.clone(),
                 material_id: material.material_id.clone(),
-                camera_id: format!(
-                    "bkv-camera-{}",
-                    bkv_row_number(row, &["camera", "cameraid", "camerano"]).unwrap_or(0.0) as i64
-                ),
-                defect_type: bkv_row_text(row, &["defecttype", "type", "typename", "class"])
-                    .unwrap_or_else(|| "review".to_string()),
-                severity: bkv_row_text(row, &["severity", "level"])
-                    .unwrap_or_else(|| "review".to_string()),
-                x_mm: numeric(&["x", "xmm"]),
-                y_mm: numeric(&["y", "ymm", "distance"]),
-                z_mm: numeric(&["z", "zmm"]),
-                width_mm: numeric(&["width", "widthmm"]),
-                height_mm: numeric(&["height", "heightmm"]),
-                depth_mm: numeric(&["depth", "depthmm"]),
-                confidence: bkv_row_number(row, &["confidence", "score"]).unwrap_or(1.0),
+                camera_id: format!("bkv-camera-{}", camera as i64),
+                defect_type: defect_type.to_string(),
+                severity,
+                x_mm,
+                y_mm,
+                z_mm,
+                width_mm,
+                height_mm,
+                depth_mm,
+                confidence,
                 provenance_json: json!({
                     "source":"bkv","batchId":batch.batch_id,"contentId":batch.content_id,
                     "legacyTable":"defect","legacyId":legacy_id,"sourcePath":file.relative_path,
-                    "originalRowHash":row.get("originalRowHash"),"legacyRow":row
+                    "originalRowHash":row.get("originalRowHash"),
+                    "legacyDefectClassId":class_id,
+                    "legacyDefectName":original_name,
+                    "legacyDefectClassRow":mapped_class_name,
+                    "legacyRow":row
                 })
                 .to_string(),
             });
@@ -2434,6 +2557,8 @@ mod tests {
         let batch = root.join("batch-001");
         fs::create_dir_all(batch.join("normalized")).expect("normalized directory");
         fs::create_dir_all(batch.join("artifacts/camera1/1893700/2d")).expect("artifact directory");
+        fs::create_dir_all(batch.join("artifacts/camera1/1893700/metadata"))
+            .expect("metadata directory");
         let mut normalized = Vec::new();
         for table in [
             "allexcel",
@@ -2445,7 +2570,7 @@ mod tests {
             let relative = format!("normalized/{table}.jsonl");
             let payload = if table == "allexcel" {
                 (1_893_700..=1_893_710)
-                    .map(|seq| format!(r#"{{"legacySeqNo":{seq},"legacyTable":"allexcel","originalRowHash":"{:064x}"}}"#, seq) + "\n")
+                    .map(|seq| format!(r#"{{"legacySeqNo":{seq},"legacyTable":"allexcel","originalRowHash":"{:064x}","width":100,"length":12000,"thickness":10,"steelGrade":"Q235"}}"#, seq) + "\n")
                     .collect::<String>()
             } else {
                 String::new()
@@ -2462,7 +2587,9 @@ mod tests {
             }));
         }
         let artifact_relative = "artifacts/camera1/1893700/2d/one.jpg";
+        let metadata_relative = "artifacts/camera1/1893700/metadata/camera.dat";
         fs::write(batch.join(artifact_relative), b"jpeg").expect("write artifact");
+        fs::write(batch.join(metadata_relative), b"camera-metadata").expect("write metadata");
         let seq_nos = (1_893_700..=1_893_710).collect::<Vec<_>>();
         let manifest = json!({
             "schema": "steel.bkv-import-manifest.v1",
@@ -2498,6 +2625,15 @@ mod tests {
                 "seqNo": 1893700,
                 "kind": "2d",
                 "extension": ".jpg"
+            }, {
+                "path": metadata_relative,
+                "memberPath": "image_copy/CamImageSource1/1893700/3D/camera.dat",
+                "size": 15,
+                "sha256": bkv_sha256(b"camera-metadata"),
+                "cameraNumber": 1,
+                "seqNo": 1893700,
+                "kind": "metadata",
+                "extension": ".dat"
             }]
         });
         let content_id = bkv_batch_content_id(&manifest).expect("content id");
@@ -2583,6 +2719,84 @@ mod tests {
             load_bkv_batch(&root, &path, false).unwrap_err().code,
             "bkv_normalized_table_invalid"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn defect_row(class_id: &str, original_name: &str) -> Value {
+        json!({
+            "legacySeqNo":1893700,"legacyTable":"defect","originalRowHash":format!("hash-{class_id}"),
+            "classId":class_id,"defectName":original_name,"camera":1,
+            "x":1.0,"y":2.0,"z":-0.1,"width":3.0,"height":4.0,"depth":0.5,
+            "confidence":0.8
+        })
+    }
+
+    #[test]
+    fn bkv_import_rejects_missing_or_out_of_range_defect_measurements() {
+        let root = bkv_test_root("defect-invalid");
+        let path = write_bkv_test_batch(&root, "ready", false);
+        let mut batch = load_bkv_batch(&root, &path, false).unwrap();
+        let defect_file = batch
+            .normalized
+            .iter_mut()
+            .find(|file| file.table == "defect")
+            .unwrap();
+        let mut invalid = defect_row("7", "凹坑");
+        invalid.as_object_mut().unwrap().remove("camera");
+        defect_file.rows.push(invalid);
+        assert_eq!(
+            bkv_validated_to_db(&batch).unwrap_err().code,
+            "bkv_defect_invalid"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_import_maps_defectclass_and_preserves_unknown_names_for_review() {
+        let root = bkv_test_root("defect-map");
+        let path = write_bkv_test_batch(&root, "ready", false);
+        let mut batch = load_bkv_batch(&root, &path, false).unwrap();
+        batch
+            .normalized
+            .iter_mut()
+            .find(|file| file.table == "defectclass")
+            .unwrap()
+            .rows
+            .push(json!({
+                "legacySeqNo":1893700,"legacyTable":"defectclass","id":"7","name":"凹坑",
+                "originalRowHash":"class-hash"
+            }));
+        let defect_file = batch
+            .normalized
+            .iter_mut()
+            .find(|file| file.table == "defect")
+            .unwrap();
+        defect_file.rows.push(defect_row("7", "legacy-pit"));
+        defect_file.rows.push(defect_row("99", "神秘缺陷"));
+        let imported = bkv_validated_to_db(&batch).unwrap();
+        assert_eq!(imported.defects[0].defect_type, "pit");
+        assert_eq!(imported.defects[1].defect_type, "review");
+        assert_eq!(imported.defects[1].severity, "review");
+        assert!(imported.defects[1].provenance_json.contains("神秘缺陷"));
+        assert!(imported.defects[0].provenance_json.contains("凹坑"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_capture_metadata_path_is_verified_file_and_provenance_is_centralized() {
+        let root = bkv_test_root("metadata-path");
+        let path = write_bkv_test_batch(&root, "ready", false);
+        let batch = load_bkv_batch(&root, &path, false).unwrap();
+        let imported = bkv_validated_to_db(&batch).unwrap();
+        assert_eq!(
+            imported.artifacts[0].metadata_path,
+            "artifacts/camera1/1893700/metadata/camera.dat"
+        );
+        assert!(!imported.artifacts[0].metadata_path.starts_with('{'));
+        assert!(imported.materials[0]
+            .raw_payload
+            .contains("artifactProvenance"));
+        assert!(imported.materials[0].raw_payload.contains("one.jpg"));
         fs::remove_dir_all(root).ok();
     }
 

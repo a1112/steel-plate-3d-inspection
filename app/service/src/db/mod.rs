@@ -3600,7 +3600,7 @@ pub struct BkvImportArtifact {
     pub sequence_no: i64,
     pub file_type: String,
     pub path: String,
-    pub metadata_json: String,
+    pub metadata_path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -3701,6 +3701,42 @@ pub async fn import_bkv_batch(
         let counts: BkvImportCounts =
             serde_json::from_value(value.get("counts").cloned().unwrap_or(Value::Null))
                 .map_err(|error| DbErr::Custom(format!("bkv_import_state_invalid: {error}")))?;
+        let now = now_millis_string();
+        let transaction = connection.begin().await?;
+        bkv_upsert_config(
+            &transaction,
+            "bkv.active-batch".to_string(),
+            json!({"batchId":batch.batch_id,"contentId":batch.content_id}).to_string(),
+            &now,
+        )
+        .await?;
+        let replay_key = format!("bkv.replay.{}", batch.batch_id);
+        if app_config::Entity::find()
+            .filter(app_config::Column::Key.eq(&replay_key))
+            .one(&transaction)
+            .await?
+            .is_none()
+        {
+            bkv_upsert_config(
+                &transaction,
+                replay_key,
+                json!({"batchId":batch.batch_id,"contentId":batch.content_id,"index":0,"status":"ready","version":0,"updatedAt":now}).to_string(),
+                &now,
+            )
+            .await?;
+        }
+        audit_log::ActiveModel {
+            id: Set(format!("AUD-BKV-REACTIVATE-{}", now_nanos_string())),
+            actor: Set(actor.to_string()),
+            action: Set("bkv.import.reactivated".to_string()),
+            target: Set(batch.batch_id.clone()),
+            detail: Set(json!({"batchId":batch.batch_id,"contentId":batch.content_id,"counts":counts,"alreadyImported":true}).to_string()),
+            level: Set("info".to_string()),
+            created_at: Set(now),
+        }
+        .insert(&transaction)
+        .await?;
+        transaction.commit().await?;
         return Ok(BkvImportResult {
             batch_id: batch.batch_id,
             content_id: batch.content_id,
@@ -3716,6 +3752,22 @@ pub async fn import_bkv_batch(
         != (1_893_700_i64..=1_893_710).collect::<Vec<_>>()
     {
         return Err(DbErr::Custom("bkv_seq_scope_invalid".to_string()));
+    }
+    for artifact in &batch.artifacts {
+        if !artifact.metadata_path.is_empty()
+            && !batch.artifacts.iter().any(|candidate| {
+                candidate.path == artifact.metadata_path
+                    && candidate.inspection_id == artifact.inspection_id
+                    && candidate.camera_id == artifact.camera_id
+                    && candidate.sequence_no == artifact.sequence_no
+                    && (candidate.file_type.eq_ignore_ascii_case("metadata")
+                        || candidate.path.to_ascii_lowercase().ends_with(".dat"))
+            })
+        {
+            return Err(DbErr::Custom(
+                "bkv_artifact_metadata_path_invalid".to_string(),
+            ));
+        }
     }
     let counts = BkvImportCounts {
         materials: batch.materials.len(),
@@ -3825,24 +3877,33 @@ pub async fn import_bkv_batch(
                 .map_err(|_| DbErr::Custom("bkv_artifact_invalid".to_string()))?),
             file_type: Set(artifact.file_type.clone()),
             path: Set(artifact.path.clone()),
-            metadata_path: Set(artifact.metadata_json.clone()),
+            metadata_path: Set(artifact.metadata_path.clone()),
             created_at: Set(now.clone()),
         }
         .insert(&transaction)
         .await?;
     }
     for defect in &batch.defects {
-        if ![
-            defect.x_mm,
-            defect.y_mm,
-            defect.z_mm,
-            defect.width_mm,
-            defect.height_mm,
-            defect.depth_mm,
-            defect.confidence,
-        ]
-        .into_iter()
-        .all(f64::is_finite)
+        let camera_number = defect
+            .camera_id
+            .strip_prefix("bkv-camera-")
+            .and_then(|value| value.parse::<u8>().ok());
+        if !matches!(camera_number, Some(1..=6))
+            || ![
+                defect.x_mm,
+                defect.y_mm,
+                defect.z_mm,
+                defect.width_mm,
+                defect.height_mm,
+                defect.depth_mm,
+                defect.confidence,
+            ]
+            .into_iter()
+            .all(f64::is_finite)
+            || defect.width_mm < 0.0
+            || defect.height_mm < 0.0
+            || defect.depth_mm < 0.0
+            || !(0.0..=1.0).contains(&defect.confidence)
         {
             transaction.rollback().await?;
             return Err(DbErr::Custom("bkv_normalized_row_invalid".to_string()));
@@ -5363,7 +5424,7 @@ mod bkv_import_tests {
                 sequence_no: 1_893_700,
                 file_type: "2d".to_string(),
                 path: "artifacts/camera1/1893700/2d/one.jpg".to_string(),
-                metadata_json: json!({"sha256":"b".repeat(64)}).to_string(),
+                metadata_path: String::new(),
             }],
             defects: vec![BkvImportDefect {
                 id: "defect-1".to_string(),
@@ -5484,6 +5545,66 @@ mod bkv_import_tests {
     }
 
     #[test]
+    fn bkv_import_rolls_back_on_invalid_defect_camera_geometry_or_confidence() {
+        for mutate in [
+            |defect: &mut BkvImportDefect| defect.camera_id = "bkv-camera-7".to_string(),
+            |defect: &mut BkvImportDefect| defect.width_mm = -1.0,
+            |defect: &mut BkvImportDefect| defect.confidence = 1.5,
+            |defect: &mut BkvImportDefect| defect.x_mm = f64::NAN,
+        ] {
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            runtime.block_on(async {
+                let database =
+                    open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                        .await
+                        .expect("database");
+                let mut invalid = batch();
+                mutate(&mut invalid.defects[0]);
+                assert!(import_bkv_batch(&database.connection, invalid, "tester")
+                    .await
+                    .is_err());
+                assert_eq!(
+                    steel_plate::Entity::find()
+                        .count(&database.connection)
+                        .await
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    production_defect::Entity::find()
+                        .count(&database.connection)
+                        .await
+                        .unwrap(),
+                    0
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn bkv_import_rejects_metadata_path_that_is_not_an_imported_artifact() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            let mut invalid = batch();
+            invalid.artifacts[0].metadata_path = r#"{"sha256":"not-a-path"}"#.to_string();
+            assert!(import_bkv_batch(&database.connection, invalid, "tester")
+                .await
+                .is_err());
+            assert_eq!(
+                capture_file::Entity::find()
+                    .count(&database.connection)
+                    .await
+                    .unwrap(),
+                0
+            );
+        });
+    }
+
+    #[test]
     fn bkv_replay_reset_updates_state_and_audit_atomically() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
@@ -5556,6 +5677,40 @@ mod bkv_import_tests {
                 active.get("batchId").and_then(Value::as_str),
                 Some("batch-002")
             );
+
+            let before = production_inspection::Entity::find()
+                .count(&database.connection)
+                .await
+                .unwrap();
+            let reactivated = import_bkv_batch(&database.connection, batch(), "reactivator")
+                .await
+                .unwrap();
+            assert!(reactivated.already_imported);
+            let active: Value = serde_json::from_str(
+                &get_config(&database.connection, "bkv.active-batch")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .value,
+            )
+            .unwrap();
+            assert_eq!(
+                active.get("batchId").and_then(Value::as_str),
+                Some("batch-001")
+            );
+            assert_eq!(
+                production_inspection::Entity::find()
+                    .count(&database.connection)
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert!(audit_log::Entity::find()
+                .filter(audit_log::Column::Actor.eq("reactivator"))
+                .one(&database.connection)
+                .await
+                .unwrap()
+                .is_some());
         });
     }
 }
