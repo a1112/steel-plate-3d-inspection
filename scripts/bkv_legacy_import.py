@@ -23,8 +23,7 @@ import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Callable, Iterable, Sequence
-
+from typing import BinaryIO, Callable, Iterable, Sequence
 
 TARGET_SEQ_NOS = tuple(range(1_893_700, 1_893_711))
 MANIFEST_NAME = "manifest.inventory.json"
@@ -43,6 +42,10 @@ ZIP_INVENTORY_TIMEOUT_SECONDS = 300
 MAX_RAR_LISTING_RECORDS = 1_000_000
 MAX_UNRAR_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 128 * 1024 * 1024
+MAX_SQL_STATEMENT_BYTES = 64 * 1024 * 1024
+MAX_SQL_FIELD_BYTES = 1024 * 1024
+MAX_SQL_RESULT_ROWS = 1_000_000
+MAX_SQL_REJECTED_ROWS = 100_000
 UNRAR_TIMEOUT_SECONDS = 300
 _IO_CHUNK_BYTES = 64 * 1024
 _ZIP_EOCD_SEARCH_BYTES = 65_557
@@ -92,6 +95,10 @@ class InventoryLimitError(RuntimeError):
     """Raised when untrusted input exceeds a named inventory bound."""
 
 
+class SqlDumpLimitError(RuntimeError):
+    """Raised when an untrusted SQL dump exceeds a named parser bound."""
+
+
 @dataclass(frozen=True)
 class FileSnapshot:
     device: int
@@ -100,9 +107,516 @@ class FileSnapshot:
     mtime_ns: int
 
 
+@dataclass(frozen=True)
+class _SqlTableSchema:
+    columns: tuple[str, ...]
+    foreign_keys: dict[str, tuple[str, str]]
+
+
+@dataclass
+class SqlDumpResult:
+    rows_by_seq: dict[int, list[dict[str, object]]]
+    rows_by_table: dict[str, list[dict[str, object]]]
+    rejected_rows: list[dict[str, object]]
+    counts: dict[str, dict[str, int]]
+    integrity: str = "ok"
+    diameter_complete: bool = False
+
+
 def wanted_seq_no(value: int) -> bool:
     """Return whether value belongs to the exact approved legacy batch."""
     return value in TARGET_SEQ_NOS
+
+
+_SQL_TABLES = ("allexcel", "checkrecord", "defect", "defectclass", "diameter")
+_PHYSICAL_COLUMN_NAMES = {
+    "depth",
+    "diameter",
+    "height",
+    "length",
+    "measurement",
+    "radius",
+    "thickness",
+    "width",
+}
+_SQL_IDENTIFIER = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"
+
+
+def _identifier_value(value: str) -> str:
+    return value[1:-1] if value.startswith("`") and value.endswith("`") else value
+
+
+def _normalized_identifier(value: str) -> str:
+    return value.casefold()
+
+
+def _iter_sql_statements(source: BinaryIO) -> Iterable[str]:
+    statement = bytearray()
+    quote: int | None = None
+    escaped = False
+    quote_maybe_end = False
+    while True:
+        chunk = source.read(_IO_CHUNK_BYTES)
+        if not chunk:
+            break
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise TypeError("SQL source must return bytes")
+        for byte in chunk:
+            statement.append(byte)
+            if len(statement) > MAX_SQL_STATEMENT_BYTES:
+                raise SqlDumpLimitError(
+                    f"statement bytes exceed MAX_SQL_STATEMENT_BYTES={MAX_SQL_STATEMENT_BYTES}"
+                )
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                    continue
+                if quote_maybe_end:
+                    if byte == quote:
+                        quote_maybe_end = False
+                        continue
+                    quote = None
+                    quote_maybe_end = False
+                elif byte == 0x5C and quote in (0x27, 0x22):
+                    escaped = True
+                    continue
+                elif byte == quote:
+                    quote_maybe_end = True
+                    continue
+                else:
+                    continue
+            if byte in (0x27, 0x22, 0x60):
+                quote = byte
+            elif byte == 0x3B:
+                yield bytes(statement).decode("utf-8", errors="surrogateescape")
+                statement.clear()
+    if statement.strip():
+        yield bytes(statement).decode("utf-8", errors="surrogateescape")
+
+
+def _split_sql_items(value: str) -> list[str]:
+    items: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\" and quote in ("'", '"'):
+                escaped = True
+            elif character == quote:
+                if index + 1 < len(value) and value[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if character in ("'", '"', "`"):
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "," and depth == 0:
+            items.append(value[start:index].strip())
+            start = index + 1
+        index += 1
+    items.append(value[start:].strip())
+    return items
+
+
+def _parse_create_table(statement: str) -> tuple[str, _SqlTableSchema] | None:
+    match = re.search(
+        rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<table>{_SQL_IDENTIFIER})\s*\((?P<body>.*)\)\s*;?\s*\Z",
+        statement,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return None
+    table = _normalized_identifier(_identifier_value(match.group("table")))
+    columns: list[str] = []
+    foreign_keys: dict[str, tuple[str, str]] = {}
+    for definition in _split_sql_items(match.group("body")):
+        column_match = re.match(rf"\s*(?P<column>{_SQL_IDENTIFIER})\s+", definition)
+        if column_match is not None:
+            candidate = _identifier_value(column_match.group("column"))
+            if candidate.casefold() not in {
+                "constraint",
+                "foreign",
+                "primary",
+                "unique",
+                "key",
+                "check",
+            }:
+                columns.append(candidate)
+        foreign_match = re.search(
+            rf"\bFOREIGN\s+KEY\s*\(\s*(?P<local>{_SQL_IDENTIFIER})\s*\)\s*"
+            rf"REFERENCES\s+(?P<parent>{_SQL_IDENTIFIER})\s*\(\s*(?P<parent_column>{_SQL_IDENTIFIER})\s*\)",
+            definition,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if foreign_match is not None:
+            local = _identifier_value(foreign_match.group("local"))
+            parent_table = _identifier_value(foreign_match.group("parent"))
+            parent_column = _identifier_value(foreign_match.group("parent_column"))
+            foreign_keys[_normalized_identifier(local)] = (
+                _normalized_identifier(parent_table),
+                _normalized_identifier(parent_column),
+            )
+    if not columns:
+        return None
+    return table, _SqlTableSchema(tuple(columns), foreign_keys)
+
+
+def _mysql_unescape(value: str) -> str:
+    escapes = {
+        "0": "\0",
+        "b": "\b",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "Z": "\x1a",
+        "\\": "\\",
+        "'": "'",
+        '"': '"',
+    }
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "\\" and index + 1 < len(value):
+            index += 1
+            output.append(escapes.get(value[index], value[index]))
+        elif (
+            index + 1 < len(value)
+            and value[index + 1] == character
+            and character in ("'", '"')
+        ):
+            output.append(character)
+            index += 1
+        else:
+            output.append(character)
+        index += 1
+    return "".join(output)
+
+
+def _parse_sql_value(token: str) -> object:
+    token = token.strip()
+    if len(token.encode("utf-8", errors="surrogateescape")) > MAX_SQL_FIELD_BYTES:
+        raise SqlDumpLimitError("field_too_long")
+    if token.casefold() == "null":
+        return None
+    if len(token) >= 2 and token[0] in ("'", '"') and token[-1] == token[0]:
+        return _mysql_unescape(token[1:-1])
+    if re.fullmatch(r"[+-]?\d+", token):
+        return int(token)
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", token):
+        return float(token)
+    raise ValueError("unsupported SQL value")
+
+
+def _parse_insert(
+    statement: str,
+) -> tuple[str, tuple[str, ...] | None, list[list[str]]] | None:
+    match = re.search(
+        rf"\bINSERT\s+INTO\s+(?P<table>{_SQL_IDENTIFIER})\s*(?:\((?P<columns>.*?)\))?\s+VALUES\s+(?P<values>.*);?\s*\Z",
+        statement,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return None
+    table = _normalized_identifier(_identifier_value(match.group("table")))
+    column_text = match.group("columns")
+    columns: tuple[str, ...] | None = None
+    if column_text is not None:
+        parsed_columns: list[str] = []
+        for item in _split_sql_items(column_text):
+            column_match = re.fullmatch(rf"\s*(?P<column>{_SQL_IDENTIFIER})\s*", item)
+            if column_match is None:
+                return table, (), []
+            parsed_columns.append(_identifier_value(column_match.group("column")))
+        columns = tuple(parsed_columns)
+    values_text = match.group("values").rstrip().removesuffix(";").rstrip()
+    rows: list[list[str]] = []
+    for item in _split_sql_items(values_text):
+        item = item.strip()
+        if len(item) < 2 or item[0] != "(" or item[-1] != ")":
+            rows.append([])
+        else:
+            rows.append(_split_sql_items(item[1:-1]))
+    return table, columns, rows
+
+
+def _row_target_seq(
+    schema: _SqlTableSchema,
+    row: dict[str, object],
+    targets: frozenset[int],
+    retained_relationships: dict[tuple[str, str], dict[object, int | None]],
+) -> tuple[int | None, bool]:
+    normalized = {_normalized_identifier(key): value for key, value in row.items()}
+    if "seqno" in normalized:
+        direct = normalized["seqno"]
+        return (direct if isinstance(direct, int) and direct in targets else None), True
+    for local_column, (parent_table, parent_column) in schema.foreign_keys.items():
+        value = normalized.get(local_column)
+        parent_values = retained_relationships.get((parent_table, parent_column), {})
+        try:
+            target_seq = parent_values.get(value)
+        except TypeError:
+            target_seq = None
+        if target_seq is not None:
+            return target_seq, True
+    return None, False
+
+
+def _stable_row_hash(
+    table: str, columns: Sequence[str], values: Sequence[object]
+) -> str:
+    payload = json.dumps(
+        [table, list(columns), list(values)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8", errors="surrogateescape")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _write_sql_jsonl(output_dir: Path, result: SqlDumpResult) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for table in _SQL_TABLES:
+        destination = output_dir / f"{table}.jsonl"
+        with destination.open("w", encoding="utf-8", newline="\n") as output:
+            for row in result.rows_by_table[table]:
+                output.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def filter_sql_dump(
+    source: BinaryIO,
+    target_seq_nos: Sequence[int],
+    *,
+    output_dir: os.PathLike[str] | str | None = None,
+) -> SqlDumpResult:
+    """Stream a MySQL dump and retain only schema-proven target relationships."""
+    targets = frozenset(target_seq_nos)
+    if targets != frozenset(TARGET_SEQ_NOS):
+        raise ValueError("target SeqNo allowlist must exactly match TARGET_SEQ_NOS")
+    result = SqlDumpResult(
+        rows_by_seq={},
+        rows_by_table={table: [] for table in _SQL_TABLES},
+        rejected_rows=[],
+        counts={table: {"accepted": 0, "rejected": 0} for table in _SQL_TABLES},
+    )
+    schemas: dict[str, _SqlTableSchema] = {}
+    retained_relationships: dict[tuple[str, str], dict[object, int | None]] = {}
+
+    def reject(table: str, reason: str) -> None:
+        result.counts[table]["rejected"] += 1
+        if len(result.rejected_rows) >= MAX_SQL_REJECTED_ROWS:
+            raise SqlDumpLimitError(
+                f"rejected rows exceed MAX_SQL_REJECTED_ROWS={MAX_SQL_REJECTED_ROWS}"
+            )
+        result.rejected_rows.append({"table": table, "reason": reason})
+
+    try:
+        for statement in _iter_sql_statements(source):
+            created = _parse_create_table(statement)
+            if created is not None:
+                table, schema = created
+                if table in _SQL_TABLES:
+                    schemas[table] = schema
+                continue
+            inserted = _parse_insert(statement)
+            if inserted is None:
+                continue
+            table, explicit_columns, token_rows = inserted
+            if table not in _SQL_TABLES:
+                continue
+            schema = schemas.get(table)
+            if schema is None:
+                for _tokens in token_rows or [[]]:
+                    reject(table, "schema_unknown")
+                continue
+            columns = (
+                explicit_columns if explicit_columns is not None else schema.columns
+            )
+            schema_names = {column.casefold() for column in schema.columns}
+            if not columns or any(
+                column.casefold() not in schema_names for column in columns
+            ):
+                reject(table, "malformed_insert")
+                continue
+            for tokens in token_rows:
+                if len(tokens) != len(columns):
+                    reject(table, "malformed_insert")
+                    continue
+                try:
+                    values = [_parse_sql_value(token) for token in tokens]
+                except SqlDumpLimitError as error:
+                    if str(error) == "field_too_long":
+                        reject(table, "field_too_long")
+                        continue
+                    raise
+                except (TypeError, ValueError, OverflowError):
+                    reject(table, "malformed_insert")
+                    continue
+                row = dict(zip(columns, values, strict=True))
+                invalid_numeric = any(
+                    isinstance(value, float)
+                    and not (float("-inf") < value < float("inf"))
+                    for value in values
+                )
+                if invalid_numeric:
+                    reject(table, "non_finite_numeric")
+                    continue
+                negative_dimension = any(
+                    column.casefold() in _PHYSICAL_COLUMN_NAMES
+                    and isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and value < 0
+                    for column, value in row.items()
+                )
+                if negative_dimension:
+                    reject(table, "negative_physical_dimension")
+                    continue
+                target_seq, relationship_proven = _row_target_seq(
+                    schema, row, targets, retained_relationships
+                )
+                if not relationship_proven:
+                    reject(table, "relationship_unproven")
+                    continue
+                if target_seq is None:
+                    reject(table, "seq_not_target")
+                    continue
+                accepted_total = sum(
+                    item["accepted"] for item in result.counts.values()
+                )
+                if accepted_total >= MAX_SQL_RESULT_ROWS:
+                    raise SqlDumpLimitError(
+                        f"accepted rows exceed MAX_SQL_RESULT_ROWS={MAX_SQL_RESULT_ROWS}"
+                    )
+                normalized_row = dict(row)
+                normalized_row["legacySeqNo"] = target_seq
+                normalized_row["legacyTable"] = table
+                normalized_row["originalRowHash"] = _stable_row_hash(
+                    table, columns, values
+                )
+                result.rows_by_table[table].append(normalized_row)
+                result.rows_by_seq.setdefault(target_seq, []).append(normalized_row)
+                result.counts[table]["accepted"] += 1
+                for column, value in row.items():
+                    if value is None:
+                        continue
+                    try:
+                        hash(value)
+                    except TypeError:
+                        continue
+                    relationship_values = retained_relationships.setdefault(
+                        (table, column.casefold()), {}
+                    )
+                    previous = relationship_values.get(value)
+                    if previous is None and value not in relationship_values:
+                        relationship_values[value] = target_seq
+                    elif previous != target_seq:
+                        relationship_values[value] = None
+    except (zipfile.BadZipFile, OSError, EOFError) as error:
+        if "crc" not in str(error).casefold():
+            raise
+        result.integrity = "partial-crc-error"
+
+    diameter_schema = schemas.get("diameter")
+    diameter_relationship_proven = False
+    if diameter_schema is not None:
+        diameter_relationship_proven = any(
+            column.casefold() == "seqno" for column in diameter_schema.columns
+        )
+        for parent_table, parent_column in diameter_schema.foreign_keys.values():
+            parent_schema = schemas.get(parent_table)
+            if parent_schema is not None and any(
+                column.casefold() == parent_column for column in parent_schema.columns
+            ):
+                diameter_relationship_proven = True
+                break
+    result.diameter_complete = result.integrity == "ok" and diameter_relationship_proven
+    if output_dir is not None:
+        _write_sql_jsonl(Path(output_dir), result)
+    return result
+
+
+def filter_database_zip(
+    database_zip: os.PathLike[str] | str,
+    output_dir: os.PathLike[str] | str,
+    target_seq_nos: Sequence[int] = TARGET_SEQ_NOS,
+) -> SqlDumpResult:
+    """Open the dump through the Task 1 stable ZIP boundary and filter it."""
+    database = _resolve_input(database_zip, "database ZIP")
+    with _stable_archive_inputs((database,)) as working:
+        snapshot = working[database]
+        structure = _inspect_zip_structure(snapshot)
+        with zipfile.ZipFile(snapshot) as archive:
+            infos = archive.infolist()
+            if len(infos) != structure["records"]:
+                raise zipfile.BadZipFile(
+                    "ZIP central directory record count changed during parsing"
+                )
+            total_declared = 0
+            for info in infos:
+                if info.file_size > MAX_ZIP_MEMBER_BYTES:
+                    raise InventoryLimitError(
+                        f"ZIP member bytes {info.file_size} exceeds "
+                        f"MAX_ZIP_MEMBER_BYTES={MAX_ZIP_MEMBER_BYTES}: {info.filename}"
+                    )
+                total_declared += info.file_size
+                if total_declared > MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES:
+                    raise InventoryLimitError(
+                        f"ZIP total uncompressed bytes {total_declared} exceeds "
+                        "MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES="
+                        f"{MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES}"
+                    )
+                ratio = (
+                    info.file_size / info.compress_size
+                    if info.compress_size
+                    else (float("inf") if info.file_size else 0)
+                )
+                if ratio > MAX_ZIP_COMPRESSION_RATIO:
+                    raise InventoryLimitError(
+                        f"ZIP compression ratio {ratio:.2f} exceeds "
+                        f"MAX_ZIP_COMPRESSION_RATIO={MAX_ZIP_COMPRESSION_RATIO}: "
+                        f"{info.filename}"
+                    )
+                if info.is_dir():
+                    continue
+                member = normalize_member(info.filename)
+                if member is None:
+                    raise ValueError(f"unsafe ZIP member path: {info.filename!r}")
+                if stat.S_ISLNK(info.external_attr >> 16):
+                    raise ValueError(f"ZIP link member is not allowed: {member}")
+            candidates = [
+                info
+                for info in infos
+                if not info.is_dir()
+                and normalize_member(info.filename) is not None
+                and info.filename.casefold().endswith(".sql")
+            ]
+            preferred = [
+                info
+                for info in candidates
+                if PurePosixPath(info.filename).name.casefold() == "database.sql"
+            ]
+            selected = preferred or candidates
+            if len(selected) != 1:
+                raise ValueError(
+                    "database ZIP must contain exactly one unambiguous SQL dump"
+                )
+            info = selected[0]
+            if info.file_size > MAX_ZIP_MEMBER_BYTES:
+                raise InventoryLimitError(
+                    f"SQL member bytes exceed MAX_ZIP_MEMBER_BYTES={MAX_ZIP_MEMBER_BYTES}"
+                )
+            with archive.open(info, "r") as source:
+                return filter_sql_dump(source, target_seq_nos, output_dir=output_dir)
 
 
 def _safe_windows_component(value: str) -> bool:
@@ -322,7 +836,9 @@ def _stable_archive_inputs(
         raise InventoryLimitError(
             f"controlled snapshot requires {required_free} free bytes under {temp_parent}"
         )
-    with tempfile.TemporaryDirectory(prefix="bkv-inventory-snapshot-", dir=temp_parent) as root:
+    with tempfile.TemporaryDirectory(
+        prefix="bkv-inventory-snapshot-", dir=temp_parent
+    ) as root:
         snapshot_root = Path(root)
         mapping: dict[Path, Path] = {}
         deadline = time.monotonic() + INPUT_SNAPSHOT_TIMEOUT_SECONDS
@@ -341,11 +857,15 @@ def _stable_archive_inputs(
             after_hash = _sha256_file(path, deadline=deadline)
             _assert_snapshot(path, before)
             if before_hash != after_hash or before_hash != destination_hash:
-                raise RuntimeError(f"input archive changed while creating snapshot: {path}")
+                raise RuntimeError(
+                    f"input archive changed while creating snapshot: {path}"
+                )
             mapping[path] = destination
         snapshot_sizes = [path.stat().st_size for path in mapping.values()]
         if any(size > MAX_INPUT_ARCHIVE_BYTES for size in snapshot_sizes):
-            raise InventoryLimitError("controlled snapshot file exceeds per-archive limit")
+            raise InventoryLimitError(
+                "controlled snapshot file exceeds per-archive limit"
+            )
         if sum(snapshot_sizes) != cumulative_bytes:
             raise RuntimeError("controlled snapshot byte count changed after copy")
         if cumulative_bytes > MAX_INPUT_ARCHIVE_TOTAL_BYTES:
@@ -374,7 +894,9 @@ def _existing_chain(path: Path) -> Iterable[Path]:
         current = current.parent
 
 
-def _validate_output_path(output_root: Path, batch_id: str, inputs: Sequence[Path]) -> Path:
+def _validate_output_path(
+    output_root: Path, batch_id: str, inputs: Sequence[Path]
+) -> Path:
     if not _BATCH_ID.fullmatch(batch_id) or not _safe_windows_component(batch_id):
         raise ValueError("batch-id must be a safe single path component")
 
@@ -445,7 +967,9 @@ def locate_unrar(explicit: os.PathLike[str] | str | None = None) -> Path:
             candidates.append(Path(root) / "WinRAR" / "UnRAR.exe")
     for candidate in candidates:
         try:
-            return _trusted_unrar_candidate(candidate, f"fixed {candidate.parent} candidate")
+            return _trusted_unrar_candidate(
+                candidate, f"fixed {candidate.parent} candidate"
+            )
         except (FileNotFoundError, ValueError):
             continue
     raise FileNotFoundError(
@@ -510,7 +1034,9 @@ def _inspect_zip_structure(path: Path, deadline: float | None = None) -> dict[st
         ) = eocd
         eocd_offset = file_size - tail_size + marker
         if eocd_offset + 22 + comment_size != file_size:
-            raise zipfile.BadZipFile("ZIP EOCD comment length or trailing data is invalid")
+            raise zipfile.BadZipFile(
+                "ZIP EOCD comment length or trailing data is invalid"
+            )
         if disk_number != 0 or central_disk != 0 or disk_records != total_records:
             raise zipfile.BadZipFile("multi-disk ZIP archives are not supported")
 
@@ -942,7 +1468,9 @@ def _inventory_rar(
 ) -> tuple[list[dict[str, object]], dict[str, int]]:
     output = _run_unrar_listing(unrar, path, runner)
     records = _parse_unrar_listing(output)
-    if output.strip() and not any("name" in record and "type" in record for record in records):
+    if output.strip() and not any(
+        "name" in record and "type" in record for record in records
+    ):
         raise RuntimeError("UnRAR output contained no structured member records")
     return _records_to_rar_entries(records, archive_part)
 
@@ -960,7 +1488,9 @@ def _merge_rar_entries(
             continue
         previous_metadata = previous.get("archiveMetadata")
         current_metadata = entry.get("archiveMetadata")
-        assert isinstance(previous_metadata, dict) and isinstance(current_metadata, dict)
+        assert isinstance(previous_metadata, dict) and isinstance(
+            current_metadata, dict
+        )
         for key in previous_metadata.keys() | current_metadata.keys():
             previous_value = previous_metadata.get(key)
             current_value = current_metadata.get(key)
@@ -976,9 +1506,7 @@ def _merge_rar_entries(
             if previous_value is None and current_value is not None:
                 previous_metadata[key] = current_value
         if previous_metadata.get("crc32"):
-            previous["integrityEvidence"] = (
-                f"UnRAR CRC32={previous_metadata['crc32']}"
-            )
+            previous["integrityEvidence"] = f"UnRAR CRC32={previous_metadata['crc32']}"
         previous_volume_metadata = previous.get("volumeMetadata")
         current_volume_metadata = entry.get("volumeMetadata")
         assert isinstance(previous_volume_metadata, dict)
@@ -1065,7 +1593,9 @@ def _write_json_atomic(
         temporary = None
         _assert_publish_path(destination)
         if not destination.is_file():
-            raise RuntimeError(f"manifest publication did not create a regular file: {destination}")
+            raise RuntimeError(
+                f"manifest publication did not create a regular file: {destination}"
+            )
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import stat
@@ -11,7 +12,6 @@ from pathlib import Path
 from unittest import mock
 
 import bkv_legacy_import as subject
-
 
 RAR_LISTING = """Name: image_copy/CamImageSource1/1893700/2D/a.jpg
 Type: File
@@ -48,27 +48,225 @@ Attributes: ..A....
 """
 
 
-class MemberPolicyTests(unittest.TestCase):
-    def test_target_sequence_numbers_and_member_filter_are_exact(self):
+class _ChunkedCrcStream:
+    """A short-read stream that surfaces corruption only after partial data."""
+
+    def __init__(self, payload, chunk_size=17):
+        self._payload = payload
+        self._offset = 0
+        self._chunk_size = chunk_size
+
+    def read(self, size=-1):
+        if self._offset >= len(self._payload):
+            raise zipfile.BadZipFile("Bad CRC-32 for file 'database.sql'")
+        size = self._chunk_size if size < 0 else min(size, self._chunk_size)
+        end = min(self._offset + size, len(self._payload))
+        chunk = self._payload[self._offset : end]
+        self._offset = end
+        return chunk
+
+
+class SqlDumpTests(unittest.TestCase):
+    def _fixture(self):
+        return rb"""
+CREATE TABLE `allexcel` (
+  `Description` text,
+  `SeqNo` bigint NOT NULL,
+  `Width` double,
+  PRIMARY KEY (`SeqNo`)
+);
+INSERT INTO `allexcel` (`Description`, `SeqNo`, `Width`) VALUES ('malformed', 1893700);
+INSERT INTO `allexcel` (`Description`, `SeqNo`, `Width`) VALUES
+  ('target, one', 1893700, 12.5),
+  ('escaped \'quote\'', 1893710, NULL),
+  ('outside', 1893699, 4.0);
+CREATE TABLE `checkrecord` (
+  `Id` bigint NOT NULL,
+  `Comment` text,
+  `SeqNo` bigint NOT NULL,
+  PRIMARY KEY (`Id`),
+  UNIQUE KEY `checkrecord_seq` (`SeqNo`)
+);
+INSERT INTO `checkrecord` VALUES
+  (71, 'chunk; boundary', 1893700),
+  (72, 'second', 1893710),
+  (73, 'outside', 1893699);
+CREATE TABLE `defectclass` (
+  `Label` varchar(255),
+  `SeqNo` bigint NOT NULL,
+  `ClassId` bigint NOT NULL,
+  PRIMARY KEY (`ClassId`)
+);
+INSERT INTO `defectclass` VALUES
+  ('edge', 1893700, 8),
+  ('outside', 1893699, 9);
+CREATE TABLE `defect` (
+  `DefectId` bigint NOT NULL,
+  `Depth` double,
+  `SeqNo` bigint NOT NULL,
+  PRIMARY KEY (`DefectId`)
+);
+INSERT INTO `defect` VALUES
+  (801, 0.25, 1893710),
+  (802, -0.1, 1893700),
+  (803, 0.5, 1893699);
+CREATE TABLE `diameter` (
+  `Measurement` double,
+  `Id` bigint NOT NULL,
+  `RecordSeqNo` bigint NOT NULL,
+  PRIMARY KEY (`Id`),
+  CONSTRAINT `diameter_record` FOREIGN KEY (`RecordSeqNo`) REFERENCES `checkrecord` (`SeqNo`)
+);
+INSERT INTO `diameter` VALUES
+  (33.75, 901, 1893710),
+  (34.25, 902, 1893699);
+"""
+
+    def test_filters_target_rows_using_create_table_column_order(self):
+        result = subject.filter_sql_dump(
+            _ChunkedCrcStream(self._fixture()), subject.TARGET_SEQ_NOS
+        )
+
+        self.assertEqual(set(result.rows_by_seq), {1_893_700, 1_893_710})
+        self.assertEqual(result.integrity, "partial-crc-error")
+        self.assertEqual(result.rejected_rows[0]["reason"], "malformed_insert")
+        self.assertFalse(result.diameter_complete)
         self.assertEqual(
-            subject.TARGET_SEQ_NOS, tuple(range(1_893_700, 1_893_711))
+            set(result.rows_by_table),
+            {"allexcel", "checkrecord", "defect", "defectclass", "diameter"},
         )
         self.assertEqual(
-            subject.normalize_member(
-                "image_copy/CamImageSource1/1893700/2D/a.jpg"
-            ),
+            result.rows_by_table["allexcel"][0]["Description"], "target, one"
+        )
+        self.assertEqual(
+            result.rows_by_table["allexcel"][1]["Description"], "escaped 'quote'"
+        )
+        self.assertIsNone(result.rows_by_table["allexcel"][1]["Width"])
+        self.assertEqual(result.rows_by_table["diameter"][0]["RecordSeqNo"], 1_893_710)
+        self.assertRegex(
+            result.rows_by_table["diameter"][0]["originalRowHash"], r"^[0-9a-f]{64}$"
+        )
+        self.assertEqual(result.counts["defect"], {"accepted": 1, "rejected": 2})
+
+    def test_rejects_unproven_diameter_association_and_invalid_physical_values(self):
+        fixture = rb"""
+CREATE TABLE `diameter` (`Id` bigint, `Value` double, PRIMARY KEY (`Id`));
+INSERT INTO `diameter` VALUES (1893700, 12.0);
+CREATE TABLE `allexcel` (`SeqNo` bigint, `Length` double, PRIMARY KEY (`SeqNo`));
+INSERT INTO `allexcel` VALUES (1893700, -1.0), (1893710, 1e309);
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+        self.assertEqual(result.rows_by_seq, {})
+        self.assertEqual(
+            [row["reason"] for row in result.rejected_rows],
+            [
+                "relationship_unproven",
+                "negative_physical_dimension",
+                "non_finite_numeric",
+            ],
+        )
+        self.assertFalse(result.diameter_complete)
+
+    def test_enforces_statement_and_field_bounds_and_emits_jsonl(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text, PRIMARY KEY (`SeqNo`));
+INSERT INTO `allexcel` VALUES (1893700, 'abc');
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            result = subject.filter_sql_dump(
+                io.BytesIO(fixture), subject.TARGET_SEQ_NOS, output_dir=output
+            )
+            line = json.loads((output / "allexcel.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(line, result.rows_by_table["allexcel"][0])
+
+        with mock.patch.object(subject, "MAX_SQL_FIELD_BYTES", 2):
+            result = subject.filter_sql_dump(
+                io.BytesIO(fixture), subject.TARGET_SEQ_NOS
+            )
+            self.assertEqual(result.rejected_rows[-1]["reason"], "field_too_long")
+
+        with mock.patch.object(subject, "MAX_SQL_STATEMENT_BYTES", 20):
+            with self.assertRaisesRegex(subject.SqlDumpLimitError, "statement bytes"):
+                subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+    def test_filters_sql_member_through_stable_zip_open_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_zip = root / "database.zip"
+            with zipfile.ZipFile(database_zip, "w") as archive:
+                archive.writestr("database.sql", self._fixture())
+
+            result = subject.filter_database_zip(database_zip, root / "normalized")
+
+            self.assertEqual(set(result.rows_by_seq), {1_893_700, 1_893_710})
+            self.assertEqual(result.integrity, "ok")
+            self.assertTrue(result.diameter_complete)
+            self.assertTrue((root / "normalized" / "diameter.jsonl").is_file())
+
+    def test_foreign_key_requires_a_retained_parent_relationship(self):
+        fixture = rb"""
+CREATE TABLE `checkrecord` (`Id` bigint, `SeqNo` bigint, PRIMARY KEY (`Id`));
+INSERT INTO `checkrecord` VALUES (71, 1893700), (72, 1893699);
+CREATE TABLE `diameter` (
+  `Id` bigint,
+  `RecordId` bigint,
+  `Measurement` double,
+  FOREIGN KEY (`RecordId`) REFERENCES `checkrecord` (`Id`)
+);
+INSERT INTO `diameter` VALUES (1, 71, 12.0), (2, 72, 13.0), (3, 999, 14.0);
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+        self.assertEqual(len(result.rows_by_table["diameter"]), 1)
+        self.assertEqual(result.rows_by_table["diameter"][0]["legacySeqNo"], 1_893_700)
+        self.assertEqual(result.counts["diameter"], {"accepted": 1, "rejected": 2})
+        self.assertTrue(result.diameter_complete)
+
+    def test_parses_doubled_quote_escaping_without_losing_row_boundaries(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text, PRIMARY KEY (`SeqNo`));
+INSERT INTO `allexcel` VALUES
+  (1893700, 'doubled ''quote'', comma'),
+  (1893710, 'next row');
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+        self.assertEqual(
+            [row["Note"] for row in result.rows_by_table["allexcel"]],
+            ["doubled 'quote', comma", "next row"],
+        )
+
+    def test_zip_filter_reuses_inventory_compression_ratio_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_zip = root / "database.zip"
+            with zipfile.ZipFile(
+                database_zip, "w", compression=zipfile.ZIP_DEFLATED
+            ) as archive:
+                archive.writestr("database.sql", b" " * 10_000)
+
+            with mock.patch.object(subject, "MAX_ZIP_COMPRESSION_RATIO", 1):
+                with self.assertRaisesRegex(
+                    subject.InventoryLimitError, "compression ratio"
+                ):
+                    subject.filter_database_zip(database_zip, root / "normalized")
+
+
+class MemberPolicyTests(unittest.TestCase):
+    def test_target_sequence_numbers_and_member_filter_are_exact(self):
+        self.assertEqual(subject.TARGET_SEQ_NOS, tuple(range(1_893_700, 1_893_711)))
+        self.assertEqual(
+            subject.normalize_member("image_copy/CamImageSource1/1893700/2D/a.jpg"),
             "image_copy/CamImageSource1/1893700/2D/a.jpg",
         )
         self.assertIsNone(subject.normalize_member("../escape.jpg"))
         self.assertFalse(
-            subject.wanted_image_member(
-                "image_copy/CamImageSource1/1893699/2D/a.jpg"
-            )
+            subject.wanted_image_member("image_copy/CamImageSource1/1893699/2D/a.jpg")
         )
         self.assertTrue(
-            subject.wanted_image_member(
-                "image_copy/CamImageSource6/1893710/3D/a.d3img"
-            )
+            subject.wanted_image_member("image_copy/CamImageSource6/1893710/3D/a.d3img")
         )
 
     def test_member_policy_rejects_absolute_and_non_file_paths(self):
@@ -153,12 +351,15 @@ class InventoryTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            manifest_path, output_root.resolve() / "batch-001" / "manifest.inventory.json"
+            manifest_path,
+            output_root.resolve() / "batch-001" / "manifest.inventory.json",
         )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["schema"], "steel.bkv-archive-inventory.v1")
         self.assertEqual(manifest["batchId"], "batch-001")
-        self.assertFalse((manifest_path.parent / "manifest.inventory.json.tmp").exists())
+        self.assertFalse(
+            (manifest_path.parent / "manifest.inventory.json.tmp").exists()
+        )
 
         required = {
             "sha256",
@@ -176,7 +377,9 @@ class InventoryTests(unittest.TestCase):
             self.assertTrue(required.issubset(entry), entry)
 
         image_entries = [
-            entry for entry in manifest["entries"] if entry["archivePart"] == "image-part1"
+            entry
+            for entry in manifest["entries"]
+            if entry["archivePart"] == "image-part1"
         ]
         self.assertEqual(
             [entry["seqNo"] for entry in image_entries], [1_893_700, 1_893_710]
@@ -201,7 +404,9 @@ class InventoryTests(unittest.TestCase):
             {"recordsSeen": 1, "accepted": 1, "rejected": 0},
         )
         part2_entry = next(
-            entry for entry in manifest["entries"] if entry["archivePart"] == "image-part2"
+            entry
+            for entry in manifest["entries"]
+            if entry["archivePart"] == "image-part2"
         )
         self.assertEqual(part2_entry["cameraNumber"], 5)
 
@@ -209,7 +414,10 @@ class InventoryTests(unittest.TestCase):
         original_open = zipfile.ZipFile.open
 
         def fail_member_open(archive, name, *args, **kwargs):
-            if name == "ncdtube.sql" or getattr(name, "filename", None) == "ncdtube.sql":
+            if (
+                name == "ncdtube.sql"
+                or getattr(name, "filename", None) == "ncdtube.sql"
+            ):
                 raise zipfile.BadZipFile("Bad CRC-32 for file 'ncdtube.sql'")
             return original_open(archive, name, *args, **kwargs)
 
@@ -249,7 +457,9 @@ class InventoryTests(unittest.TestCase):
         def output_is_reparse(path):
             return "reparse-output" in Path(path).parts
 
-        with mock.patch.object(subject, "is_reparse_point", side_effect=output_is_reparse):
+        with mock.patch.object(
+            subject, "is_reparse_point", side_effect=output_is_reparse
+        ):
             with self.assertRaises(ValueError):
                 subject.inventory_archives(
                     database_zip=self.database_zip,
@@ -354,7 +564,9 @@ Target: ../../escape.jpg
 
     def test_inventory_limits_are_fail_closed(self):
         with mock.patch.object(subject, "MAX_INPUT_ARCHIVE_TOTAL_BYTES", 1):
-            with self.assertRaisesRegex(subject.InventoryLimitError, "input archive bytes"):
+            with self.assertRaisesRegex(
+                subject.InventoryLimitError, "input archive bytes"
+            ):
                 subject.inventory_archives(
                     database_zip=self.database_zip,
                     image_part1=self.part1,
@@ -366,7 +578,9 @@ Target: ../../escape.jpg
                 )
 
         with mock.patch.object(subject, "MAX_ZIP_MEMBERS", 0):
-            with self.assertRaisesRegex(subject.InventoryLimitError, "ZIP member count"):
+            with self.assertRaisesRegex(
+                subject.InventoryLimitError, "ZIP member count"
+            ):
                 subject.inventory_archives(
                     database_zip=self.database_zip,
                     image_part1=self.part1,
@@ -395,7 +609,9 @@ Target: ../../escape.jpg
                         )
 
         with mock.patch.object(subject, "MAX_ZIP_COMPRESSION_RATIO", 0.5):
-            with self.assertRaisesRegex(subject.InventoryLimitError, "compression ratio"):
+            with self.assertRaisesRegex(
+                subject.InventoryLimitError, "compression ratio"
+            ):
                 subject.inventory_archives(
                     database_zip=self.database_zip,
                     image_part1=self.part1,
@@ -491,7 +707,9 @@ Target: ../../escape.jpg
             runner=mutating_runner,
         )
         if os.name == "nt":
-            self.assertTrue(replacement_blocked, "Windows input lock allowed replacement")
+            self.assertTrue(
+                replacement_blocked, "Windows input lock allowed replacement"
+            )
 
     def test_windows_casefold_collisions_are_rejected(self):
         collision_listing = """Name: image_copy/CamImageSource1/1893700/2D/A.jpg
@@ -559,7 +777,11 @@ CRC32: 66666666
 """
 
         def two_volume_runner(command, **kwargs):
-            listing = first_listing if Path(command[-1]) == self.part1.resolve() else second_listing
+            listing = (
+                first_listing
+                if Path(command[-1]) == self.part1.resolve()
+                else second_listing
+            )
             return subprocess.CompletedProcess(command, 0, listing, "")
 
         manifest_path = subject.inventory_archives(
@@ -574,7 +796,9 @@ CRC32: 66666666
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         image_entries = [entry for entry in manifest["entries"] if entry["seqNo"]]
         self.assertEqual(len(image_entries), 3)
-        shared_entry = next(entry for entry in image_entries if entry["memberPath"] == shared)
+        shared_entry = next(
+            entry for entry in image_entries if entry["memberPath"] == shared
+        )
         self.assertEqual(shared_entry["archiveParts"], ["image-part1", "image-part2"])
         self.assertEqual(shared_entry["archiveMetadata"]["crc32"], "ABCDEF12")
         self.assertEqual(manifest["statistics"]["image-part1"]["accepted"], 2)
@@ -586,6 +810,7 @@ CRC32: 66666666
         )
         for index, conflicting_listing in enumerate(conflicts):
             with self.subTest(conflict=index):
+
                 def conflict_runner(command, **kwargs):
                     listing = (
                         first_listing
@@ -635,7 +860,9 @@ CRC32: 66666666
                 subject._inspect_zip_structure(self.database_zip)
 
         with mock.patch.object(subject, "MAX_ZIP_CENTRAL_DIRECTORY_BYTES", 1):
-            with self.assertRaisesRegex(subject.InventoryLimitError, "central directory bytes"):
+            with self.assertRaisesRegex(
+                subject.InventoryLimitError, "central directory bytes"
+            ):
                 subject._inspect_zip_structure(self.database_zip)
 
         malformed = self.root / "malformed-eocd.zip"
