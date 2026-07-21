@@ -45,6 +45,14 @@ MAX_MANIFEST_BYTES = 128 * 1024 * 1024
 MAX_SQL_STATEMENT_BYTES = 64 * 1024 * 1024
 MAX_SQL_FIELD_BYTES = 1024 * 1024
 MAX_SQL_RESULT_ROWS = 1_000_000
+MAX_SQL_RESULT_BYTES = 256 * 1024 * 1024
+MAX_SQL_SAMPLE_ROWS = 1_000
+MAX_SQL_SAMPLE_BYTES = 4 * 1024 * 1024
+MAX_SQL_TABLE_ROWS = 2_000_000
+MAX_SQL_NORMALIZED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_SQL_RELATIONSHIP_KEYS = 2_000_000
+MAX_SQL_PENDING_BYTES = 512 * 1024 * 1024
+MAX_SQL_PENDING_REPLAY_PASSES = 32
 MAX_SQL_REJECTED_ROWS = 100_000
 UNRAR_TIMEOUT_SECONDS = 300
 _IO_CHUNK_BYTES = 64 * 1024
@@ -127,6 +135,7 @@ class SqlDumpResult:
     counts: dict[str, dict[str, int]]
     integrity: str = "ok"
     diameter_complete: bool = False
+    parse_rejected_statements: int = 0
 
 
 def wanted_seq_no(value: int) -> bool:
@@ -139,17 +148,39 @@ _PHYSICAL_COLUMN_NAMES = {
     "depth",
     "diameter",
     "height",
+    "innerdiameter",
+    "inner_diameter",
     "length",
     "measurement",
+    "nominaldiameter",
+    "nominal_diameter",
+    "outerdiameter",
+    "outer_diameter",
+    "platelength",
+    "plate_length",
+    "platewidth",
+    "plate_width",
+    "plateheight",
+    "plate_height",
     "radius",
     "thickness",
+    "wallthickness",
+    "wall_thickness",
     "width",
 }
 _SQL_IDENTIFIER = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)"
+_SQL_TABLE_REFERENCE = rf"{_SQL_IDENTIFIER}(?:\s*\.\s*{_SQL_IDENTIFIER})?"
 
 
 def _identifier_value(value: str) -> str:
     return value[1:-1] if value.startswith("`") and value.endswith("`") else value
+
+
+def _table_reference_value(value: str) -> str:
+    identifiers = re.findall(_SQL_IDENTIFIER, value)
+    if not identifiers:
+        raise ValueError("invalid SQL table reference")
+    return _identifier_value(identifiers[-1])
 
 
 def _normalized_identifier(value: str) -> str:
@@ -270,7 +301,7 @@ def _extract_parenthesized(value: str, opening: int) -> tuple[str, int] | None:
 
 def _parse_create_table(statement: str) -> tuple[str, _SqlTableSchema] | None:
     match = re.search(
-        rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<table>{_SQL_IDENTIFIER})\s*(?P<open>\()",
+        rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<table>{_SQL_TABLE_REFERENCE})\s*(?P<open>\()",
         statement,
         re.IGNORECASE,
     )
@@ -280,7 +311,7 @@ def _parse_create_table(statement: str) -> tuple[str, _SqlTableSchema] | None:
     if extracted is None:
         return None
     body, _closing = extracted
-    table = _normalized_identifier(_identifier_value(match.group("table")))
+    table = _normalized_identifier(_table_reference_value(match.group("table")))
     columns: list[str] = []
     foreign_keys: dict[str, tuple[str, str]] = {}
     for definition in _split_sql_items(body):
@@ -298,13 +329,13 @@ def _parse_create_table(statement: str) -> tuple[str, _SqlTableSchema] | None:
                 columns.append(candidate)
         foreign_match = re.search(
             rf"\bFOREIGN\s+KEY\s*\(\s*(?P<local>{_SQL_IDENTIFIER})\s*\)\s*"
-            rf"REFERENCES\s+(?P<parent>{_SQL_IDENTIFIER})\s*\(\s*(?P<parent_column>{_SQL_IDENTIFIER})\s*\)",
+            rf"REFERENCES\s+(?P<parent>{_SQL_TABLE_REFERENCE})\s*\(\s*(?P<parent_column>{_SQL_IDENTIFIER})\s*\)",
             definition,
             re.IGNORECASE | re.DOTALL,
         )
         if foreign_match is not None:
             local = _identifier_value(foreign_match.group("local"))
-            parent_table = _identifier_value(foreign_match.group("parent"))
+            parent_table = _table_reference_value(foreign_match.group("parent"))
             parent_column = _identifier_value(foreign_match.group("parent_column"))
             foreign_keys[_normalized_identifier(local)] = (
                 _normalized_identifier(parent_table),
@@ -391,13 +422,13 @@ def _parse_insert(
     statement: str,
 ) -> tuple[str, tuple[str, ...] | None, list[_SqlTuple], bool] | None:
     match = re.search(
-        rf"\bINSERT\s+INTO\s+(?P<table>{_SQL_IDENTIFIER})",
+        rf"\bINSERT\s+INTO\s+(?P<table>{_SQL_TABLE_REFERENCE})",
         statement,
         re.IGNORECASE,
     )
     if match is None:
         return None
-    table = _normalized_identifier(_identifier_value(match.group("table")))
+    table = _normalized_identifier(_table_reference_value(match.group("table")))
     remainder = statement[match.end() :].lstrip()
     columns: tuple[str, ...] | None = None
     if remainder.startswith("("):
@@ -427,11 +458,15 @@ def _row_target_seq(
     row: dict[str, object],
     targets: frozenset[int],
     retained_relationships: dict[tuple[str, str], dict[object, int | None]],
-) -> tuple[int | None, bool]:
+) -> tuple[int | None, bool, bool]:
     normalized = {_normalized_identifier(key): value for key, value in row.items()}
     if "seqno" in normalized:
         direct = normalized["seqno"]
-        return (direct if isinstance(direct, int) and direct in targets else None), True
+        return (
+            direct if isinstance(direct, int) and direct in targets else None,
+            True,
+            False,
+        )
     for local_column, (parent_table, parent_column) in schema.foreign_keys.items():
         value = normalized.get(local_column)
         parent_values = retained_relationships.get((parent_table, parent_column), {})
@@ -440,31 +475,75 @@ def _row_target_seq(
         except TypeError:
             target_seq = None
         if target_seq is not None:
-            return target_seq, True
-    return None, False
+            return target_seq, True, False
+    return None, False, bool(schema.foreign_keys)
 
 
 def _stable_row_hash(table: str, columns: Sequence[str], raw_tuple: str) -> str:
-    """Hash UTF-8/surrogateescape SQL with CRLF and CR canonically mapped to LF."""
-    normalized_tuple = raw_tuple.replace("\r\n", "\n").replace("\r", "\n")
-    context = json.dumps(
-        [table.casefold(), [column.casefold() for column in columns]],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    payload = (
-        "steel.bkv-original-sql-tuple.v1\n" + context + "\n" + normalized_tuple
-    ).encode("utf-8", errors="surrogateescape")
-    return hashlib.sha256(payload).hexdigest()
+    """Hash the exact captured tuple bytes via UTF-8 surrogateescape round-trip."""
+    del table, columns
+    return hashlib.sha256(
+        raw_tuple.encode("utf-8", errors="surrogateescape")
+    ).hexdigest()
 
 
-def _write_sql_jsonl(output_dir: Path, result: SqlDumpResult) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_sql_output(incoming: Path, destination: Path) -> None:
+    """Publish a complete five-file directory and restore the old one on failure."""
+    backup: Path | None = None
+    published = False
+    try:
+        if destination.exists():
+            backup = destination.with_name(
+                f".{destination.name}.backup-{os.getpid()}-{time.time_ns()}"
+            )
+            os.replace(destination, backup)
+            _fsync_directory(destination.parent)
+        os.replace(incoming, destination)
+        published = True
+        _fsync_directory(destination.parent)
+    except BaseException:
+        failed_publish: Path | None = None
+        if backup is not None and backup.exists():
+            if destination.exists():
+                failed_publish = destination.with_name(
+                    f".{destination.name}.failed-{os.getpid()}-{time.time_ns()}"
+                )
+                os.replace(destination, failed_publish)
+            os.replace(backup, destination)
+            try:
+                _fsync_directory(destination.parent)
+            except BaseException:
+                pass
+            if failed_publish is not None:
+                shutil.rmtree(failed_publish, ignore_errors=True)
+        elif published and destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def _target_table_mentioned(statement: str) -> str | None:
+    if (
+        re.search(r"\b(?:CREATE\s+TABLE|INSERT\s+INTO)\b", statement, re.IGNORECASE)
+        is None
+    ):
+        return None
+    folded = statement.casefold()
     for table in _SQL_TABLES:
-        destination = output_dir / f"{table}.jsonl"
-        with destination.open("w", encoding="utf-8", newline="\n") as output:
-            for row in result.rows_by_table[table]:
-                output.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        if re.search(rf"(?<![a-z0-9_]){re.escape(table)}(?![a-z0-9_])", folded):
+            return table
+    return None
 
 
 def filter_sql_dump(
@@ -492,142 +571,362 @@ def filter_sql_dump(
     )
     schemas: dict[str, _SqlTableSchema] = {}
     retained_relationships: dict[tuple[str, str], dict[object, int | None]] = {}
+    table_rows_seen = {table: 0 for table in _SQL_TABLES}
+    relationship_key_count = 0
+    normalized_bytes = 0
+    memory_result_bytes = 0
+    sample_rows = 0
+    sample_bytes = 0
+    unknown_statement_rows = False
+    diameter_unproven = False
+    output_destination = Path(output_dir) if output_dir is not None else None
+    incoming: Path | None = None
+    writers: dict[str, BinaryIO] = {}
 
     def reject(table: str, reason: str) -> None:
+        nonlocal diameter_unproven
         result.counts[table]["rejected"] += 1
+        if table == "diameter" and reason == "relationship_unproven":
+            diameter_unproven = True
         if len(result.rejected_rows) >= MAX_SQL_REJECTED_ROWS:
             raise SqlDumpLimitError(
                 f"rejected rows exceed MAX_SQL_REJECTED_ROWS={MAX_SQL_REJECTED_ROWS}"
             )
         result.rejected_rows.append({"table": table, "reason": reason})
 
-    try:
-        for statement in _iter_sql_statements(source):
-            created = _parse_create_table(statement)
-            if created is not None:
-                table, schema = created
-                if table in _SQL_TABLES:
-                    schemas[table] = schema
+    def validate_text(row: dict[str, object], raw_text: str) -> bool:
+        try:
+            raw_text.encode("utf-8", errors="strict")
+            for value in row.values():
+                if isinstance(value, str):
+                    value.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            return False
+        return True
+
+    def add_relationships(table: str, row: dict[str, object], target_seq: int) -> None:
+        nonlocal relationship_key_count
+        for column, value in row.items():
+            if value is None:
                 continue
-            inserted = _parse_insert(statement)
-            if inserted is None:
+            try:
+                hash(value)
+            except TypeError:
                 continue
-            table, explicit_columns, sql_rows, row_count_known = inserted
-            if table not in _SQL_TABLES:
-                continue
-            if not row_count_known:
-                result.counts[table]["statementRejectedRowsUnknown"] += 1
-                continue
-            schema = schemas.get(table)
-            if schema is None:
-                for _sql_row in sql_rows:
-                    reject(table, "schema_unknown")
-                continue
-            columns = (
-                explicit_columns if explicit_columns is not None else schema.columns
+            relationship_values = retained_relationships.setdefault(
+                (table, column.casefold()), {}
             )
-            schema_names = {column.casefold() for column in schema.columns}
-            if not columns or any(
-                column.casefold() not in schema_names for column in columns
-            ):
-                for _sql_row in sql_rows:
-                    reject(table, "malformed_insert")
-                continue
-            for sql_row in sql_rows:
-                tokens = sql_row.tokens
-                if len(tokens) != len(columns):
-                    reject(table, "malformed_insert")
-                    continue
-                try:
-                    values = [_parse_sql_value(token) for token in tokens]
-                except SqlDumpLimitError as error:
-                    if str(error) == "field_too_long":
-                        reject(table, "field_too_long")
-                        continue
-                    raise
-                except (TypeError, ValueError, OverflowError):
-                    reject(table, "malformed_insert")
-                    continue
-                row = dict(zip(columns, values, strict=True))
-                invalid_numeric = any(
-                    isinstance(value, float)
-                    and not (float("-inf") < value < float("inf"))
-                    for value in values
-                )
-                if invalid_numeric:
-                    reject(table, "non_finite_numeric")
-                    continue
-                negative_dimension = any(
-                    column.casefold() in _PHYSICAL_COLUMN_NAMES
-                    and isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    and value < 0
-                    for column, value in row.items()
-                )
-                if negative_dimension:
-                    reject(table, "negative_physical_dimension")
-                    continue
-                target_seq, relationship_proven = _row_target_seq(
-                    schema, row, targets, retained_relationships
-                )
-                if not relationship_proven:
-                    reject(table, "relationship_unproven")
-                    continue
-                if target_seq is None:
-                    reject(table, "seq_not_target")
-                    continue
-                accepted_total = sum(
-                    item["accepted"] for item in result.counts.values()
-                )
-                if accepted_total >= MAX_SQL_RESULT_ROWS:
+            if value not in relationship_values:
+                if relationship_key_count >= MAX_SQL_RELATIONSHIP_KEYS:
                     raise SqlDumpLimitError(
-                        f"accepted rows exceed MAX_SQL_RESULT_ROWS={MAX_SQL_RESULT_ROWS}"
+                        "relationship keys exceed "
+                        f"MAX_SQL_RELATIONSHIP_KEYS={MAX_SQL_RELATIONSHIP_KEYS}"
                     )
-                normalized_row = dict(row)
-                normalized_row["legacySeqNo"] = target_seq
-                normalized_row["legacyTable"] = table
-                normalized_row["originalRowHash"] = _stable_row_hash(
-                    table, columns, sql_row.raw_text
+                relationship_key_count += 1
+                relationship_values[value] = target_seq
+            elif relationship_values[value] != target_seq:
+                relationship_values[value] = None
+
+    def accept(
+        table: str,
+        columns: Sequence[str],
+        row: dict[str, object],
+        raw_text: str,
+        target_seq: int,
+    ) -> None:
+        nonlocal normalized_bytes, memory_result_bytes, sample_rows, sample_bytes
+        normalized_row = dict(row)
+        normalized_row["legacySeqNo"] = target_seq
+        normalized_row["legacyTable"] = table
+        normalized_row["originalRowHash"] = _stable_row_hash(table, columns, raw_text)
+        normalized_row["originalRowHashAlgorithm"] = "sha256-raw-sql-tuple-bytes-v1"
+        line = (
+            json.dumps(normalized_row, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8", errors="strict")
+        if normalized_bytes + len(line) > MAX_SQL_NORMALIZED_BYTES:
+            raise SqlDumpLimitError(
+                "normalized bytes exceed "
+                f"MAX_SQL_NORMALIZED_BYTES={MAX_SQL_NORMALIZED_BYTES}"
+            )
+        normalized_bytes += len(line)
+        add_relationships(table, row, target_seq)
+        if output_destination is None:
+            accepted_total = sum(item["accepted"] for item in result.counts.values())
+            if accepted_total >= MAX_SQL_RESULT_ROWS:
+                raise SqlDumpLimitError(
+                    f"accepted rows exceed MAX_SQL_RESULT_ROWS={MAX_SQL_RESULT_ROWS}"
                 )
+            if memory_result_bytes + len(line) > MAX_SQL_RESULT_BYTES:
+                raise SqlDumpLimitError(
+                    f"result bytes exceed MAX_SQL_RESULT_BYTES={MAX_SQL_RESULT_BYTES}"
+                )
+            memory_result_bytes += len(line)
+            result.rows_by_table[table].append(normalized_row)
+            result.rows_by_seq.setdefault(target_seq, []).append(normalized_row)
+        else:
+            writers[table].write(line)
+            if (
+                sample_rows < MAX_SQL_SAMPLE_ROWS
+                and sample_bytes + len(line) <= MAX_SQL_SAMPLE_BYTES
+            ):
                 result.rows_by_table[table].append(normalized_row)
                 result.rows_by_seq.setdefault(target_seq, []).append(normalized_row)
-                result.counts[table]["accepted"] += 1
-                for column, value in row.items():
-                    if value is None:
-                        continue
-                    try:
-                        hash(value)
-                    except TypeError:
-                        continue
-                    relationship_values = retained_relationships.setdefault(
-                        (table, column.casefold()), {}
-                    )
-                    previous = relationship_values.get(value)
-                    if previous is None and value not in relationship_values:
-                        relationship_values[value] = target_seq
-                    elif previous != target_seq:
-                        relationship_values[value] = None
-    except (zipfile.BadZipFile, OSError, EOFError) as error:
-        if "crc" not in str(error).casefold():
-            raise
-        result.integrity = "partial-crc-error"
+                sample_rows += 1
+                sample_bytes += len(line)
+        result.counts[table]["accepted"] += 1
 
-    diameter_schema = schemas.get("diameter")
-    diameter_relationship_proven = False
-    if diameter_schema is not None:
-        diameter_relationship_proven = any(
-            column.casefold() == "seqno" for column in diameter_schema.columns
-        )
-        for parent_table, parent_column in diameter_schema.foreign_keys.values():
-            parent_schema = schemas.get(parent_table)
-            if parent_schema is not None and any(
-                column.casefold() == parent_column for column in parent_schema.columns
-            ):
-                diameter_relationship_proven = True
-                break
-    result.diameter_complete = result.integrity == "ok" and diameter_relationship_proven
-    if output_dir is not None:
-        _write_sql_jsonl(Path(output_dir), result)
+    def spool_record(
+        pending: BinaryIO,
+        table: str,
+        columns: Sequence[str],
+        row: dict[str, object],
+        raw_text: str,
+        pending_bytes: int,
+    ) -> int:
+        document = {
+            "table": table,
+            "columns": list(columns),
+            "row": row,
+            "rawText": raw_text,
+        }
+        payload = (
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8", errors="strict")
+        if pending_bytes + len(payload) > MAX_SQL_PENDING_BYTES:
+            raise SqlDumpLimitError(
+                f"pending spool bytes exceed MAX_SQL_PENDING_BYTES={MAX_SQL_PENDING_BYTES}"
+            )
+        pending.write(payload)
+        return pending_bytes + len(payload)
+
+    with tempfile.TemporaryDirectory(prefix="bkv-sql-spool-") as spool_directory:
+        pending_path = Path(spool_directory) / "pending-0.jsonl"
+        pending_bytes = 0
+        try:
+            if output_destination is not None:
+                output_destination.parent.mkdir(parents=True, exist_ok=True)
+                incoming = Path(
+                    tempfile.mkdtemp(
+                        prefix=f".{output_destination.name}.incoming-",
+                        dir=output_destination.parent,
+                    )
+                )
+                writers = {
+                    table: (incoming / f"{table}.jsonl").open("wb")
+                    for table in _SQL_TABLES
+                }
+            with pending_path.open("wb") as pending:
+                try:
+                    for statement in _iter_sql_statements(source):
+                        created = _parse_create_table(statement)
+                        if created is not None:
+                            table, schema = created
+                            if table in _SQL_TABLES:
+                                schemas[table] = schema
+                            continue
+                        inserted = _parse_insert(statement)
+                        if inserted is None:
+                            target_table = _target_table_mentioned(statement)
+                            if target_table is not None:
+                                result.parse_rejected_statements += 1
+                                result.integrity = "partial-parse-error"
+                                if "insert" in statement.casefold():
+                                    result.counts[target_table][
+                                        "statementRejectedRowsUnknown"
+                                    ] += 1
+                                    unknown_statement_rows = True
+                            continue
+                        table, explicit_columns, sql_rows, row_count_known = inserted
+                        if table not in _SQL_TABLES:
+                            target_table = _target_table_mentioned(statement)
+                            if target_table is not None:
+                                result.parse_rejected_statements += 1
+                                result.integrity = "partial-parse-error"
+                                result.counts[target_table][
+                                    "statementRejectedRowsUnknown"
+                                ] += 1
+                                unknown_statement_rows = True
+                            continue
+                        if not row_count_known:
+                            result.counts[table]["statementRejectedRowsUnknown"] += 1
+                            unknown_statement_rows = True
+                            continue
+                        if table_rows_seen[table] + len(sql_rows) > MAX_SQL_TABLE_ROWS:
+                            raise SqlDumpLimitError(
+                                "table rows exceed "
+                                f"MAX_SQL_TABLE_ROWS={MAX_SQL_TABLE_ROWS}: {table}"
+                            )
+                        table_rows_seen[table] += len(sql_rows)
+                        schema = schemas.get(table)
+                        if schema is None:
+                            for _sql_row in sql_rows:
+                                reject(table, "schema_unknown")
+                            continue
+                        columns = (
+                            explicit_columns
+                            if explicit_columns is not None
+                            else schema.columns
+                        )
+                        schema_names = {column.casefold() for column in schema.columns}
+                        if not columns or any(
+                            column.casefold() not in schema_names for column in columns
+                        ):
+                            for _sql_row in sql_rows:
+                                reject(table, "malformed_insert")
+                            continue
+                        for sql_row in sql_rows:
+                            tokens = sql_row.tokens
+                            if len(tokens) != len(columns):
+                                reject(table, "malformed_insert")
+                                continue
+                            try:
+                                values = [_parse_sql_value(token) for token in tokens]
+                            except SqlDumpLimitError as error:
+                                if str(error) == "field_too_long":
+                                    reject(table, "field_too_long")
+                                    continue
+                                raise
+                            except (TypeError, ValueError, OverflowError):
+                                reject(table, "malformed_insert")
+                                continue
+                            row = dict(zip(columns, values, strict=True))
+                            if not validate_text(row, sql_row.raw_text):
+                                reject(table, "invalid_text_encoding")
+                                continue
+                            if any(
+                                isinstance(value, float)
+                                and not (float("-inf") < value < float("inf"))
+                                for value in values
+                            ):
+                                reject(table, "non_finite_numeric")
+                                continue
+                            if any(
+                                column.casefold() in _PHYSICAL_COLUMN_NAMES
+                                and isinstance(value, (int, float))
+                                and not isinstance(value, bool)
+                                and value < 0
+                                for column, value in row.items()
+                            ):
+                                reject(table, "negative_physical_dimension")
+                                continue
+                            target_seq, relationship_proven, can_be_pending = (
+                                _row_target_seq(
+                                    schema, row, targets, retained_relationships
+                                )
+                            )
+                            if relationship_proven:
+                                if target_seq is None:
+                                    reject(table, "seq_not_target")
+                                else:
+                                    accept(
+                                        table,
+                                        columns,
+                                        row,
+                                        sql_row.raw_text,
+                                        target_seq,
+                                    )
+                            elif can_be_pending:
+                                pending_bytes = spool_record(
+                                    pending,
+                                    table,
+                                    columns,
+                                    row,
+                                    sql_row.raw_text,
+                                    pending_bytes,
+                                )
+                            else:
+                                reject(table, "relationship_unproven")
+                except (zipfile.BadZipFile, OSError, EOFError) as error:
+                    if "crc" not in str(error).casefold():
+                        raise
+                    result.integrity = "partial-crc-error"
+
+            current = pending_path
+            for pass_number in range(MAX_SQL_PENDING_REPLAY_PASSES):
+                if not current.exists() or current.stat().st_size == 0:
+                    break
+                next_path = Path(spool_directory) / f"pending-{pass_number + 1}.jsonl"
+                progress = False
+                with current.open("rb") as pending_input, next_path.open(
+                    "wb"
+                ) as pending_output:
+                    for payload in pending_input:
+                        document = json.loads(payload)
+                        table = document["table"]
+                        columns = tuple(document["columns"])
+                        row = document["row"]
+                        raw_text = document["rawText"]
+                        schema = schemas.get(table)
+                        if schema is None:
+                            reject(table, "relationship_unproven")
+                            continue
+                        target_seq, relationship_proven, can_be_pending = (
+                            _row_target_seq(
+                                schema, row, targets, retained_relationships
+                            )
+                        )
+                        if relationship_proven and target_seq is not None:
+                            accept(table, columns, row, raw_text, target_seq)
+                            progress = True
+                        elif can_be_pending:
+                            pending_output.write(payload)
+                        else:
+                            reject(table, "relationship_unproven")
+                current.unlink(missing_ok=True)
+                current = next_path
+                if not progress:
+                    with current.open("rb") as unresolved:
+                        for payload in unresolved:
+                            document = json.loads(payload)
+                            reject(document["table"], "relationship_unproven")
+                    current.unlink(missing_ok=True)
+                    break
+            if current.exists() and current.stat().st_size:
+                raise SqlDumpLimitError(
+                    "pending replay passes exceed "
+                    "MAX_SQL_PENDING_REPLAY_PASSES="
+                    f"{MAX_SQL_PENDING_REPLAY_PASSES}"
+                )
+
+            diameter_schema = schemas.get("diameter")
+            diameter_relationship_proven = False
+            if diameter_schema is not None:
+                diameter_relationship_proven = any(
+                    column.casefold() == "seqno" for column in diameter_schema.columns
+                )
+                for (
+                    parent_table,
+                    parent_column,
+                ) in diameter_schema.foreign_keys.values():
+                    parent_schema = schemas.get(parent_table)
+                    if parent_schema is not None and any(
+                        column.casefold() == parent_column
+                        for column in parent_schema.columns
+                    ):
+                        diameter_relationship_proven = True
+                        break
+            result.diameter_complete = (
+                result.integrity == "ok"
+                and not unknown_statement_rows
+                and not diameter_unproven
+                and diameter_relationship_proven
+            )
+            if output_destination is not None:
+                for writer in writers.values():
+                    writer.flush()
+                    os.fsync(writer.fileno())
+                    writer.close()
+                writers.clear()
+                assert incoming is not None
+                _fsync_directory(incoming)
+                _publish_sql_output(incoming, output_destination)
+                incoming = None
+        finally:
+            for writer in writers.values():
+                writer.close()
+            if incoming is not None:
+                shutil.rmtree(incoming, ignore_errors=True)
+
     return result
 
 

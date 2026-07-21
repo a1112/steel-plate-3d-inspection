@@ -209,7 +209,7 @@ INSERT INTO `allexcel` VALUES (1893700, 'abc');
 
             self.assertEqual(set(result.rows_by_seq), {1_893_700, 1_893_710})
             self.assertEqual(result.integrity, "ok")
-            self.assertTrue(result.diameter_complete)
+            self.assertFalse(result.diameter_complete)
             self.assertTrue((root / "normalized" / "diameter.jsonl").is_file())
 
     def test_foreign_key_requires_a_retained_parent_relationship(self):
@@ -236,7 +236,7 @@ INSERT INTO `diameter` VALUES (1, 71, 12.0), (2, 72, 13.0), (3, 999, 14.0);
                 "statementRejectedRowsUnknown": 0,
             },
         )
-        self.assertTrue(result.diameter_complete)
+        self.assertFalse(result.diameter_complete)
 
     def test_parses_doubled_quote_escaping_without_losing_row_boundaries(self):
         fixture = rb"""
@@ -327,6 +327,219 @@ INSERT INTO `allexcel` VALUES (1893700, 1.0), (1893700, 1.00);
         ]
         self.assertNotEqual(contiguous_hashes[0], contiguous_hashes[1])
         self.assertEqual(chunked_hashes, contiguous_hashes)
+
+    def test_pending_foreign_key_resolves_when_child_precedes_parent(self):
+        fixture = rb"""
+CREATE TABLE `diameter` (`Id` bigint, `RecordId` bigint, `Measurement` double,
+  FOREIGN KEY (`RecordId`) REFERENCES `checkrecord` (`Id`));
+INSERT INTO `diameter` VALUES (1, 71, 12.0);
+CREATE TABLE `checkrecord` (`Id` bigint, `SeqNo` bigint, PRIMARY KEY (`Id`));
+INSERT INTO `checkrecord` VALUES (71, 1893700);
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+        self.assertEqual(len(result.rows_by_table["diameter"]), 1)
+        self.assertEqual(result.rows_by_table["diameter"][0]["legacySeqNo"], 1_893_700)
+        self.assertTrue(result.diameter_complete)
+
+        crc_result = subject.filter_sql_dump(
+            _ChunkedCrcStream(fixture), subject.TARGET_SEQ_NOS
+        )
+        self.assertEqual(len(crc_result.rows_by_table["diameter"]), 1)
+        self.assertFalse(crc_result.diameter_complete)
+
+        child_only = fixture.split(b"CREATE TABLE `checkrecord`", 1)[0]
+        interrupted = subject.filter_sql_dump(
+            _ChunkedCrcStream(child_only), subject.TARGET_SEQ_NOS
+        )
+        self.assertEqual(interrupted.rows_by_table["diameter"], [])
+        self.assertEqual(
+            interrupted.rejected_rows[-1]["reason"], "relationship_unproven"
+        )
+        self.assertFalse(interrupted.diameter_complete)
+
+    def test_unresolved_or_unknown_diameter_rows_make_diameter_incomplete(self):
+        unresolved = rb"""
+CREATE TABLE `diameter` (`RecordId` bigint,
+  FOREIGN KEY (`RecordId`) REFERENCES `checkrecord` (`Id`));
+INSERT INTO `diameter` VALUES (999);
+CREATE TABLE `checkrecord` (`Id` bigint, `SeqNo` bigint);
+"""
+        result = subject.filter_sql_dump(io.BytesIO(unresolved), subject.TARGET_SEQ_NOS)
+        self.assertFalse(result.diameter_complete)
+        self.assertEqual(result.rejected_rows[-1]["reason"], "relationship_unproven")
+
+        unknown = rb"""
+CREATE TABLE `diameter` (`SeqNo` bigint);
+INSERT INTO `diameter` (`UnknownColumn`) VALUES (1893700), broken tuple;
+"""
+        result = subject.filter_sql_dump(io.BytesIO(unknown), subject.TARGET_SEQ_NOS)
+        self.assertFalse(result.diameter_complete)
+        self.assertEqual(result.counts["diameter"]["statementRejectedRowsUnknown"], 1)
+
+    def test_production_output_streams_with_small_sample_instead_of_full_rows(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text);
+INSERT INTO `allexcel` VALUES (1893700, 'one'), (1893710, 'two');
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "normalized"
+            with mock.patch.object(subject, "MAX_SQL_RESULT_ROWS", 1):
+                with mock.patch.object(subject, "MAX_SQL_SAMPLE_ROWS", 1):
+                    result = subject.filter_sql_dump(
+                        io.BytesIO(fixture),
+                        subject.TARGET_SEQ_NOS,
+                        output_dir=output,
+                    )
+            self.assertEqual(result.counts["allexcel"]["accepted"], 2)
+            self.assertLessEqual(sum(map(len, result.rows_by_table.values())), 1)
+            self.assertEqual(
+                len(
+                    (output / "allexcel.jsonl").read_text(encoding="utf-8").splitlines()
+                ),
+                2,
+            )
+
+    def test_sql_resource_limits_fail_closed(self):
+        direct = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text);
+INSERT INTO `allexcel` VALUES (1893700, 'one'), (1893710, 'two');
+"""
+        pending = rb"""
+CREATE TABLE `diameter` (`RecordId` bigint,
+  FOREIGN KEY (`RecordId`) REFERENCES `checkrecord` (`Id`));
+INSERT INTO `diameter` VALUES (71);
+"""
+        cases = (
+            ("MAX_SQL_TABLE_ROWS", 1, direct, "table rows"),
+            ("MAX_SQL_NORMALIZED_BYTES", 1, direct, "normalized bytes"),
+            ("MAX_SQL_RELATIONSHIP_KEYS", 1, direct, "relationship keys"),
+            ("MAX_SQL_PENDING_BYTES", 1, pending, "pending spool bytes"),
+        )
+        for constant, limit, fixture, message in cases:
+            with self.subTest(constant=constant):
+                with mock.patch.object(subject, constant, limit):
+                    with self.assertRaisesRegex(subject.SqlDumpLimitError, message):
+                        subject.filter_sql_dump(
+                            io.BytesIO(fixture), subject.TARGET_SEQ_NOS
+                        )
+
+        with mock.patch.object(subject, "MAX_SQL_PENDING_REPLAY_PASSES", 0):
+            with self.assertRaisesRegex(
+                subject.SqlDumpLimitError, "pending replay passes"
+            ):
+                subject.filter_sql_dump(io.BytesIO(pending), subject.TARGET_SEQ_NOS)
+
+    def test_jsonl_publish_is_atomic_and_invalid_surrogate_is_quarantined(self):
+        valid = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text);
+INSERT INTO `allexcel` VALUES (1893700, 'new');
+"""
+        invalid = (
+            b"CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text);"
+            b"INSERT INTO `allexcel` VALUES (1893700, 'bad\xff');"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "normalized"
+            output.mkdir()
+            old = output / "allexcel.jsonl"
+            old.write_text("old\n", encoding="utf-8")
+            with mock.patch.object(
+                subject, "_publish_sql_output", side_effect=OSError("publish failed")
+            ):
+                with self.assertRaisesRegex(OSError, "publish failed"):
+                    subject.filter_sql_dump(
+                        io.BytesIO(valid), subject.TARGET_SEQ_NOS, output_dir=output
+                    )
+            self.assertEqual(old.read_text(encoding="utf-8"), "old\n")
+
+            result = subject.filter_sql_dump(
+                io.BytesIO(invalid), subject.TARGET_SEQ_NOS
+            )
+            self.assertEqual(
+                result.rejected_rows[-1]["reason"], "invalid_text_encoding"
+            )
+
+    def test_jsonl_batch_fsyncs_directory_metadata_before_and_after_publish(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint);
+INSERT INTO `allexcel` VALUES (1893700);
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "normalized"
+            with mock.patch.object(subject, "_fsync_directory") as fsync_directory:
+                subject.filter_sql_dump(
+                    io.BytesIO(fixture), subject.TARGET_SEQ_NOS, output_dir=output
+                )
+            self.assertGreaterEqual(fsync_directory.call_count, 2)
+
+    def test_publish_fsync_failure_rolls_back_previous_directory(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint);
+INSERT INTO `allexcel` VALUES (1893700);
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "normalized"
+            output.mkdir()
+            old = output / "allexcel.jsonl"
+            old.write_text("old\n", encoding="utf-8")
+            with mock.patch.object(
+                subject,
+                "_fsync_directory",
+                side_effect=[None, OSError("directory fsync failed")],
+            ):
+                with self.assertRaisesRegex(OSError, "directory fsync failed"):
+                    subject.filter_sql_dump(
+                        io.BytesIO(fixture),
+                        subject.TARGET_SEQ_NOS,
+                        output_dir=output,
+                    )
+            self.assertEqual(old.read_text(encoding="utf-8"), "old\n")
+
+    def test_schema_qualified_tables_and_unsupported_target_syntax(self):
+        fixture = rb"""
+CREATE TABLE `legacy`.`allexcel` (`Note` text, `SeqNo` bigint);
+INSERT INTO legacy.allexcel VALUES ('qualified', 1893700);
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+        self.assertEqual(result.rows_by_table["allexcel"][0]["Note"], "qualified")
+
+        malformed = rb"""
+CREATE TABLE legacy..allexcel (`SeqNo` bigint);
+INSERT INTO legacy..allexcel VALUES (1893700);
+"""
+        result = subject.filter_sql_dump(io.BytesIO(malformed), subject.TARGET_SEQ_NOS)
+        self.assertEqual(result.integrity, "partial-parse-error")
+        self.assertEqual(result.parse_rejected_statements, 2)
+        self.assertEqual(result.counts["allexcel"]["statementRejectedRowsUnknown"], 1)
+
+    def test_original_row_hash_is_exact_raw_tuple_bytes(self):
+        lf = rb"""CREATE TABLE `allexcel` (`SeqNo` bigint, `Width` double);
+INSERT INTO `allexcel` VALUES (1893700,
+ 1.0);"""
+        crlf = lf.replace(b"\n 1.0", b"\r\n 1.0")
+        lf_result = subject.filter_sql_dump(io.BytesIO(lf), subject.TARGET_SEQ_NOS)
+        crlf_result = subject.filter_sql_dump(io.BytesIO(crlf), subject.TARGET_SEQ_NOS)
+        expected = hashlib.sha256(b"(1893700,\n 1.0)").hexdigest()
+
+        self.assertEqual(
+            lf_result.rows_by_table["allexcel"][0]["originalRowHash"], expected
+        )
+        self.assertNotEqual(
+            lf_result.rows_by_table["allexcel"][0]["originalRowHash"],
+            crlf_result.rows_by_table["allexcel"][0]["originalRowHash"],
+        )
+
+    def test_common_legacy_physical_column_names_are_non_negative(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, `PlateWidth` double, `OuterDiameter` double);
+INSERT INTO `allexcel` VALUES (1893700, -1.0, 20.0);
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+        self.assertEqual(
+            result.rejected_rows[-1]["reason"], "negative_physical_dimension"
+        )
 
 
 class MemberPolicyTests(unittest.TestCase):
