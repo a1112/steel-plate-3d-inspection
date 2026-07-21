@@ -2,7 +2,12 @@ import defectInclusionImage from '../assets/mock-defects/defect-inclusion.png';
 import defectPitImage from '../assets/mock-defects/defect-pit.png';
 import defectScratchImage from '../assets/mock-defects/defect-scratch.png';
 import { getMockInspectionSnapshot } from '../data/inspection';
-import type { CaptureImageItem, DefectItem, InspectionSnapshot } from '../data/inspection';
+import type {
+  CaptureImageItem,
+  DefectItem,
+  InspectionSnapshot,
+  PlateInspection,
+} from '../data/inspection';
 
 const DEFAULT_SERVICE_ORIGIN = 'http://127.0.0.1:4873';
 const CONNECTION_CONFIG_KEY = 'steel-inspection-connection-config';
@@ -729,26 +734,36 @@ export type BkvStatus = {
   replay?: BkvReplayState;
 };
 
-export type BkvInspectionSnapshot = InspectionSnapshot & {
-  source: 'bkv' | 'bkv-offline';
-  sourceBadge?: BkvSourceBadge;
-  offline: true;
-  legacySeqNo?: number;
-  batchId?: string;
-  contentId?: string;
-  replay?: BkvReplayState;
-  bkvArtifacts?: BkvArtifact[];
+export type BkvPlateInspection = Omit<PlateInspection, 'captureImages' | 'source'> & {
+  captureImages: [];
+  bkvArtifacts: BkvArtifact[];
+  source: 'bkv';
 };
 
-export type InspectionSnapshotResponse = InspectionSnapshot & {
-  sourceBadge?: BkvSourceBadge;
-  offline?: true;
+export type BkvInspectionSnapshot = Omit<
+  InspectionSnapshot,
+  'source' | 'captureImages' | 'inspections'
+> & {
+  provider: 'bkv';
+  source: 'bkv' | 'bkv-offline';
+  sourceBadge: BkvSourceBadge;
+  offline: true;
+  captureImages: [];
+  inspections: BkvPlateInspection[];
   legacySeqNo?: number;
   batchId?: string;
   contentId?: string;
   replay?: BkvReplayState;
-  bkvArtifacts?: BkvArtifact[];
+  bkvArtifacts: BkvArtifact[];
 };
+
+export type PhysicalInspectionSnapshot = InspectionSnapshot & {
+  provider?: Exclude<CaptureProvider, 'bkv'>;
+  bkvArtifacts?: never;
+  offline?: false;
+};
+
+export type InspectionSnapshotResponse = PhysicalInspectionSnapshot | BkvInspectionSnapshot;
 
 export type ProductionEventInput = {
   materialId: string;
@@ -1167,10 +1182,114 @@ function withPreviewImage(defect: DefectItem, allowMockFallback: boolean, origin
   };
 }
 
-function normalizeInspectionSnapshot(
-  snapshot: InspectionSnapshot | BkvInspectionSnapshot,
-  origin: string,
-): InspectionSnapshotResponse {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isInspectionSnapshotShape(value: unknown): value is InspectionSnapshot & Record<string, unknown> {
+  return isRecord(value)
+    && isRecord(value.currentPlate)
+    && Array.isArray(value.defectTypes)
+    && Array.isArray(value.defects)
+    && value.defects.every(isRecord)
+    && Array.isArray(value.records)
+    && isRecord(value.status)
+    && isRecord(value.summary)
+    && Array.isArray(value.heightProfile)
+    && Array.isArray(value.inspections)
+    && value.inspections.every((inspection) => (
+      isRecord(inspection)
+      && isRecord(inspection.plate)
+      && Array.isArray(inspection.defects)
+      && Array.isArray(inspection.heightProfile)
+    ));
+}
+
+function isBkvDepthDecode(value: unknown): value is BkvDepthDecode {
+  return isRecord(value)
+    && (value.status === 'decoded' || value.status === 'unsupported' || value.status === 'invalid')
+    && typeof value.reason === 'string'
+    && value.reason.trim().length > 0;
+}
+
+function isBkvArtifact(value: unknown): value is BkvArtifact {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const relativePath = typeof value.relativePath === 'string' ? value.relativePath : '';
+  const depthDecodeValid = relativePath.toLowerCase().endsWith('.d3img')
+    ? isBkvDepthDecode(value.depthDecode)
+    : value.depthDecode === null || isBkvDepthDecode(value.depthDecode);
+  return typeof value.artifactRef === 'string'
+    && value.artifactRef.startsWith('bkv://')
+    && relativePath.startsWith('artifacts/')
+    && typeof value.url === 'string'
+    && value.url.startsWith('/api/production/file?')
+    && value.authenticated === true
+    && value.source === 'bkv'
+    && value.sourceBadge === 'BKV 离线回放'
+    && value.offline === true
+    && typeof value.sha256 === 'string'
+    && /^[0-9a-f]{64}$/.test(value.sha256)
+    && typeof value.size === 'number'
+    && Number.isSafeInteger(value.size)
+    && value.size >= 0
+    && typeof value.cameraNumber === 'number'
+    && Number.isInteger(value.cameraNumber)
+    && value.cameraNumber >= 1
+    && value.cameraNumber <= 6
+    && typeof value.legacySeqNo === 'number'
+    && Number.isInteger(value.legacySeqNo)
+    && typeof value.kind === 'string'
+    && depthDecodeValid;
+}
+
+function isBkvPlateInspection(
+  value: PlateInspection,
+): value is PlateInspection & { bkvArtifacts: BkvArtifact[] } {
+  return isRecord(value)
+    && Array.isArray(value.bkvArtifacts)
+    && value.bkvArtifacts.every(isBkvArtifact);
+}
+
+function normalizeInspectionSnapshot(snapshot: unknown, origin: string): InspectionSnapshotResponse {
+  if (!isInspectionSnapshotShape(snapshot)) {
+    throw new Error('inspection snapshot shape is invalid');
+  }
+  if (snapshot.provider === 'bkv') {
+    const bkvInspections = snapshot.inspections;
+    if ((snapshot.source !== 'bkv' && snapshot.source !== 'bkv-offline')
+      || snapshot.offline !== true
+      || snapshot.sourceBadge !== 'BKV 离线回放'
+      || !Array.isArray(snapshot.bkvArtifacts)
+      || !snapshot.bkvArtifacts.every(isBkvArtifact)
+      || !bkvInspections.every(isBkvPlateInspection)) {
+      throw new Error('BKV inspection snapshot shape is invalid');
+    }
+    return {
+      ...snapshot,
+      provider: 'bkv',
+      source: snapshot.source,
+      sourceBadge: 'BKV 离线回放',
+      offline: true,
+      defects: snapshot.defects.map((defect) => withPreviewImage(defect, false, origin)),
+      captureImages: [],
+      inspections: bkvInspections.map((inspection) => ({
+        ...inspection,
+        defects: inspection.defects.map((defect) => withPreviewImage(defect, false, origin)),
+        captureImages: [],
+        bkvArtifacts: inspection.bkvArtifacts.map((artifact) => ({
+          ...artifact,
+          url: normalizeServiceUrl(artifact.url, origin),
+        })),
+        source: 'bkv',
+      })),
+      bkvArtifacts: snapshot.bkvArtifacts.map((artifact) => ({
+        ...artifact,
+        url: normalizeServiceUrl(artifact.url, origin),
+      })),
+    };
+  }
   // Static fixtures are allowed only for an explicitly identified demo/test
   // snapshot. Unknown and database-backed sources must fail closed so the
   // online page never presents bundled mock images as production evidence.
@@ -1186,17 +1305,7 @@ function normalizeInspectionSnapshot(
     captureImages: snapshot.captureImages?.map((image) => normalizeCaptureImage(image, origin)),
     inspections,
   };
-  if (snapshot.source !== 'bkv' && snapshot.source !== 'bkv-offline') {
-    return normalized;
-  }
-  const bkvSnapshot = snapshot as BkvInspectionSnapshot;
-  return {
-    ...normalized,
-    bkvArtifacts: bkvSnapshot.bkvArtifacts?.map((artifact) => ({
-      ...artifact,
-      url: normalizeServiceUrl(artifact.url, origin),
-    })),
-  };
+  return normalized;
 }
 
 export async function fetchInspectionSnapshot(
@@ -1215,10 +1324,7 @@ export async function fetchInspectionSnapshot(
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '后台数据接口异常'));
   }
-  return normalizeInspectionSnapshot(
-    (await response.json()) as InspectionSnapshot | BkvInspectionSnapshot,
-    origin,
-  );
+  return normalizeInspectionSnapshot(await response.json(), origin);
 }
 
 export async function fetchBkvStatus(signal?: AbortSignal): Promise<BkvStatus> {

@@ -2492,6 +2492,17 @@ fn production_capture_image_value_for_bkv(
     Some(artifact)
 }
 
+fn partition_snapshot_capture_images(
+    provider: CaptureProvider,
+    images: Vec<Value>,
+) -> (Vec<Value>, Vec<Value>) {
+    if provider == CaptureProvider::Bkv {
+        (Vec::new(), images)
+    } else {
+        (images, Vec::new())
+    }
+}
+
 fn summarize_defect_values(defects: &[Value]) -> Value {
     let mut severe = 0;
     let mut review = 0;
@@ -2690,6 +2701,7 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
     });
     let mut current_defects = Vec::new();
     let mut current_capture_images = Vec::new();
+    let mut current_bkv_artifacts = Vec::new();
 
     for (index, inspection) in inspections.iter().enumerate() {
         let session = state
@@ -2737,10 +2749,13 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
         )
         .map(|path| path.display().to_string())
         .unwrap_or_default();
+        let (legacy_capture_images, bkv_artifacts) =
+            partition_snapshot_capture_images(state.capture.provider, capture_images);
         if index == 0 {
             current_plate = plate.clone();
             current_defects = defects.clone();
-            current_capture_images = capture_images.clone();
+            current_capture_images = legacy_capture_images.clone();
+            current_bkv_artifacts = bkv_artifacts.clone();
         }
         records.push(json!({
             "id": inspection.session_id,
@@ -2753,7 +2768,8 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             "plate": plate,
             "defects": defects,
             "heightProfile": [],
-            "captureImages": capture_images,
+            "captureImages": legacy_capture_images,
+            "bkvArtifacts": bkv_artifacts,
             "inspectionId": inspection.id,
             "summaryPath": inspection.summary_path,
             "captureSummaryPath": capture_summary_path,
@@ -2772,7 +2788,7 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             "heightProfile": [],
             "inspections": plate_inspections,
             "captureImages": current_capture_images,
-            "bkvArtifacts": if state.capture.provider == CaptureProvider::Bkv { current_capture_images.clone() } else { Vec::new() },
+            "bkvArtifacts": current_bkv_artifacts,
             "source": if state.capture.provider == CaptureProvider::Bkv { "bkv" } else { "production-sqlite" },
             "provider": state.capture.provider.as_str(),
             "sourceBadge": if state.capture.provider == CaptureProvider::Bkv { "BKV 离线回放" } else { "" },
@@ -3211,6 +3227,8 @@ fn bkv_capture_health_ready_value(
 ) -> Value {
     json!({
         "ok":true,
+        "service":"steel-inspection-service",
+        "time":current_time_string(),
         "status":"bkv-offline",
         "provider":"bkv",
         "source":"bkv",
@@ -3220,6 +3238,7 @@ fn bkv_capture_health_ready_value(
         "apiReachable":Value::Null,
         "sdkRequired":false,
         "sdkReady":Value::Null,
+        "connected":false,
         "cameraCount":6,
         "artifactCount":runtime.artifacts.len(),
         "channels":runtime.channels.iter().map(|channel| json!({
@@ -3241,6 +3260,56 @@ fn bkv_capture_health_ready_value(
         "reason":Value::Null,
         "lifecycle":lifecycle
     })
+}
+
+fn bkv_camera_status_value(index: usize) -> Value {
+    json!({
+        "provider":"bkv",
+        "connected":false,
+        "deviceId":-1,
+        "ip":format!("bkv://camera-{index}"),
+        "source":"bkv",
+        "acquisitionState":"offline",
+        "sdkStatus":"not-required"
+    })
+}
+
+fn bkv_capture_compat_response(state: &ServiceState, path: &str) -> Option<Vec<u8>> {
+    if state.capture.provider != CaptureProvider::Bkv {
+        return None;
+    }
+    let payload = match path {
+        "/api/capture/health" => {
+            let (_, mut health) = capture_health_component_with_bkv_runtime(state, None);
+            if let Some(object) = health.as_object_mut() {
+                object.insert("service".to_string(), json!("steel-inspection-service"));
+                object.insert("time".to_string(), json!(current_time_string()));
+                object.insert("connected".to_string(), json!(false));
+            }
+            health
+        }
+        "/api/cameras" => json!({
+            "provider":"bkv",
+            "cameras":(1..=6).map(|index| json!({
+                "ip":format!("bkv://camera-{index}"),
+                "model":"BKV legacy offline channel",
+                "sn":format!("BKV-{index}"),
+                "source":"bkv"
+            })).collect::<Vec<_>>()
+        }),
+        "/api/camera/status" => bkv_camera_status_value(1),
+        "/api/camera/statuses" => json!({
+            "provider":"bkv",
+            "statuses":(1..=6).map(bkv_camera_status_value).collect::<Vec<_>>()
+        }),
+        "/api/capture/logs" => json!({"provider":"bkv","events":[]}),
+        _ => return None,
+    };
+    Some(http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &payload.to_string(),
+    ))
 }
 
 fn bkv_storage_health_ready_value(runtime: &production_tasks::BkvReplayRuntime) -> Value {
@@ -3285,7 +3354,8 @@ fn capture_health_component_with_bkv_runtime(
             Err(error) => (
                 false,
                 json!({
-                    "ok":false,"status":"unavailable","provider":"bkv","managed":false,
+                    "ok":false,"service":"steel-inspection-service","time":current_time_string(),
+                    "status":"unavailable","provider":"bkv","managed":false,"connected":false,
                     "apiReachable":Value::Null,"sdkRequired":false,"sdkReady":Value::Null,
                     "cameraCount":6,"channels":[],"httpStatus":Value::Null,"latencyMs":0,
                     "reason":error.code,"lifecycle":lifecycle
@@ -17443,8 +17513,16 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
     };
     let health_endpoint = health_endpoint_for_route(method, path);
     let queued_production_kind = production_tasks::queued_kind_for_route(method, path);
+    let bkv_capture_compat = if method == "GET" {
+        bkv_capture_compat_response(&state, path)
+    } else {
+        None
+    };
     let response = match (method, path) {
         ("OPTIONS", _) => http_response("204 No Content", "application/json; charset=utf-8", ""),
+        _ if bkv_capture_compat.is_some() => {
+            bkv_capture_compat.expect("BKV compatibility route guard")
+        }
         _ if health_endpoint.is_some() => {
             service_health_response(&state, health_endpoint.expect("health endpoint guard"))
         }
@@ -18264,6 +18342,30 @@ mod tests {
         assert_eq!(storage["queueRequired"], false);
         assert_eq!(storage["queueAccepting"], Value::Null);
         assert_eq!(storage["rootExists"], true);
+    }
+
+    #[test]
+    fn bkv_snapshot_and_capture_compatibility_never_reuse_physical_image_contracts() {
+        let artifact = json!({"artifactRef":"bkv://batch/a.d3img","url":"/api/production/file"});
+        let (legacy_images, bkv_artifacts) =
+            partition_snapshot_capture_images(CaptureProvider::Bkv, vec![artifact.clone()]);
+        assert!(legacy_images.is_empty());
+        assert_eq!(bkv_artifacts, vec![artifact]);
+
+        let state = production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
+        let cameras = response_json(
+            bkv_capture_compat_response(&state, "/api/cameras").expect("BKV camera DTO"),
+        );
+        assert_eq!(cameras["provider"], "bkv");
+        assert_eq!(cameras["cameras"].as_array().unwrap().len(), 6);
+        assert!(cameras["cameras"].as_array().unwrap().iter().all(|camera| {
+            camera["source"] == "bkv" && camera["ip"].as_str().unwrap().starts_with("bkv://camera-")
+        }));
+        assert!(bkv_capture_compat_response(&state, "/api/unknown").is_none());
+
+        let physical =
+            production_test_state_with_provider(CaptureProvider::Simulated, "simulated://capture");
+        assert!(bkv_capture_compat_response(&physical, "/api/cameras").is_none());
     }
 
     #[test]
