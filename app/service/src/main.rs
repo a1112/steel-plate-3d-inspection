@@ -4732,8 +4732,8 @@ fn split_path_and_query(raw_path: &str) -> (&str, &str) {
 
 fn is_production_mutation_route(method: &str, path: &str) -> bool {
     method == "POST"
-        && path.starts_with("/api/production/")
-        && !path.starts_with("/api/production/tasks")
+        && ((path.starts_with("/api/production/") && !path.starts_with("/api/production/tasks"))
+            || matches!(path, "/api/bkv/import" | "/api/bkv/replay/reset"))
 }
 
 const LINE_CONTINUOUS_PRESET_CONFIRMATION: &str = "APPLY LINE CONTINUOUS PRESET";
@@ -5438,7 +5438,9 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("POST", "/api/trigger/manual/steel-info")
         | ("POST", "/api/trigger/manual/steel-in")
         | ("POST", "/api/trigger/manual/steel-out")
-        | ("POST", "/api/trigger/capture-once") => Some("admin.services"),
+        | ("POST", "/api/trigger/capture-once")
+        | ("POST", "/api/bkv/import")
+        | ("POST", "/api/bkv/replay/reset") => Some("admin.services"),
         ("GET", "/api/admin/overview") => Some("admin.overview"),
         ("GET", "/api/admin/users")
         | ("POST", "/api/admin/users")
@@ -16765,6 +16767,13 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("GET", "/api/admin/services") => read_admin_services_response(&state),
         ("GET", "/api/admin/diagnostics") => read_admin_diagnostics_response(&state),
+        ("GET", "/api/bkv/status") => production_tasks::bkv_status_response(&state),
+        ("POST", "/api/bkv/import") => {
+            production_tasks::bkv_import_response(&state, body, actor)
+        }
+        ("POST", "/api/bkv/replay/reset") => {
+            production_tasks::bkv_replay_reset_response(&state, actor)
+        }
         ("POST", "/api/admin/services/capture/start") => start_capture_service_response(&state, actor),
         ("POST", "/api/admin/services/capture/stop") => stop_capture_service_response(&state, actor),
         ("POST", "/api/admin/services/capture/restart") => {
@@ -17086,6 +17095,24 @@ fn main() -> std::io::Result<()> {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, Set, Statement};
+
+    #[test]
+    fn bkv_import_mutations_require_admin_services_permission() {
+        assert_eq!(permission_for_route("GET", "/api/bkv/status"), None);
+        assert_eq!(
+            permission_for_route("POST", "/api/bkv/import"),
+            Some("admin.services")
+        );
+        assert_eq!(
+            permission_for_route("POST", "/api/bkv/replay/reset"),
+            Some("admin.services")
+        );
+        assert!(is_production_mutation_route("POST", "/api/bkv/import"));
+        assert!(is_production_mutation_route(
+            "POST",
+            "/api/bkv/replay/reset"
+        ));
+    }
 
     fn production_test_state() -> ServiceState {
         production_test_state_with_provider(CaptureProvider::Simulated, "simulated://capture")
