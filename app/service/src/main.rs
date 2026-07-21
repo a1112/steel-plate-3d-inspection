@@ -2547,14 +2547,37 @@ fn production_device_status_value(state: &ServiceState) -> Value {
     })
 }
 
+fn selected_bkv_inspection_for_view(
+    state: &ServiceState,
+) -> Result<Option<db::entities::production_inspection::Model>, production_tasks::BkvRejection> {
+    match production_tasks::configured_bkv_root() {
+        Ok(root) => state
+            .runtime
+            .block_on(production_tasks::selected_bkv_inspection_exact(
+                &state.database.connection,
+                &root,
+            )),
+        Err(error) => {
+            #[cfg(test)]
+            {
+                let _ = error;
+                state
+                    .runtime
+                    .block_on(production_tasks::selected_bkv_inspection(
+                        &state.database.connection,
+                    ))
+            }
+            #[cfg(not(test))]
+            {
+                Err(error)
+            }
+        }
+    }
+}
+
 fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>, String> {
     let selected_bkv_inspection = if state.capture.provider == CaptureProvider::Bkv {
-        state
-            .runtime
-            .block_on(production_tasks::selected_bkv_inspection(
-                &state.database.connection,
-            ))
-            .map_err(|error| error.code.to_string())?
+        selected_bkv_inspection_for_view(state).map_err(|error| error.code.to_string())?
     } else {
         None
     };
@@ -3173,9 +3196,10 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
         let runtime = production_tasks::configured_bkv_root().and_then(|root| {
             state
                 .runtime
-                .block_on(production_tasks::load_bkv_replay_runtime(
+                .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
                     &state.database.connection,
                     &root,
+                    Some(Instant::now() + Duration::from_millis(1_500)),
                 ))
         });
         return match runtime {
@@ -3360,9 +3384,10 @@ fn storage_health_component_with_timeout(state: &ServiceState, timeout: Duration
         let runtime = production_tasks::configured_bkv_root().and_then(|root| {
             state
                 .runtime
-                .block_on(production_tasks::load_bkv_replay_runtime(
+                .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
                     &state.database.connection,
                     &root,
+                    Some(Instant::now() + timeout),
                 ))
         });
         return match runtime {
@@ -9236,11 +9261,7 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
         }
     };
     let selected_bkv_inspection = if state.capture.provider == CaptureProvider::Bkv {
-        match state
-            .runtime
-            .block_on(production_tasks::selected_bkv_inspection(
-                &state.database.connection,
-            )) {
+        match selected_bkv_inspection_for_view(state) {
             Ok(inspection) => inspection,
             Err(error) => {
                 return http_response(

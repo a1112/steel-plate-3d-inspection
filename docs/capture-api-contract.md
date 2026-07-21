@@ -26,7 +26,12 @@ imported BKV batch.
 
 Layered readiness revalidates the active batch/content/replay binding, committed
 manifest and publication hashes, every allowlisted artifact size and SHA-256,
-and exact channel coverage 1 through 6. A valid provider reports
+and exact channel coverage 1 through 6. Artifact verification stats the expected
+size before opening the file, rejects artifacts above 1 GiB or batches above
+64 GiB, and streams SHA-256 through a fixed 64 KiB buffer under the readiness
+deadline. Capture and storage checks may reuse one short-lived verification for
+the same serving identity and unchanged file metadata; a metadata change or
+different serving identity invalidates that cache. A valid provider reports
 `status=bkv-offline`, `sdkRequired=false`, `sdkReady=null`, and six channels with
 `status=offline`. BKV storage health reports the validated offline root with
 `queueRequired=false` and `queueAccepting=null`; there is no capture writer queue
@@ -36,9 +41,12 @@ readiness with a stable `bkv_*` reason.
 `POST /api/production/capture-once` advances the active batch in the fixed
 legacy order `1893700` through `1893710`. The response is imported evidence,
 not a new physical capture: `source=bkv`, `offline=true`, `cameraCount=6`, the
-selected `legacySeqNo`, imported inspection/capture/defect rows, and the exact
-manifest-relative artifact paths, sizes, and SHA-256 values verified immediately
-before advancement. Replay advancement uses a transaction and compare-and-swap
+selected `legacySeqNo`, imported inspection/capture/defect rows, and safe
+`bkv://` artifact tokens with sizes and SHA-256 values verified immediately
+before advancement. Imported capture and defect children must be the exact
+deterministic ID set for that inspection and every persisted business/provenance
+field must match the normalized manifest; missing, extra, or modified children
+fail closed. Replay advancement uses a transaction and compare-and-swap
 over the persisted version/index while holding the production command boundary.
 The replay state is fail-closed: index 0 is `ready` with no selected fields,
 indexes 1 through 10 are `replaying`, and index 11 is `completed`; every
@@ -56,6 +64,10 @@ After item 11 the state is `completed`; another capture returns HTTP 409 with
 `bkv_replay_completed` until `POST /api/bkv/replay/reset` is authorized and
 called. Production snapshot/status prefers the selected imported inspection only
 under the BKV provider. Real and simulated provider ordering is unchanged.
+`GET /api/bkv/status` returns `active:true` only after the same active, batch,
+replay, manifest, artifact, deterministic inspection, and JSON checks succeed;
+missing, malformed, contradictory, or unreadable active dependencies return a
+stable non-200 `bkv_*` error and are never converted into null status fields.
 
 ## Health
 
