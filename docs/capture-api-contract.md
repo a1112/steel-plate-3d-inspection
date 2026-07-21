@@ -34,7 +34,10 @@ evidence; file size and modification time are never a cross-request trust cache.
 One readiness aggregation performs one runtime verification and shares that
 immutable result between its capture and storage components. Runtime verification
 is process-wide single-flight per serving identity, so concurrent callers cannot
-multiply artifact hash work. Each streamed artifact and deterministic mapping file is opened with
+multiply artifact hash work. Waiting for that identity lock remains subject to the
+caller's verification deadline and returns `bkv_verification_timeout` without
+waiting for the current verifier to finish. Each streamed artifact and
+deterministic mapping file is opened with
 no-follow semantics; Windows opens the reparse point and compares volume/file ID,
 while Unix uses `O_NOFOLLOW`. The service compares the opened handle with the path
 again after streaming and fails closed on a link, reparse point, replacement, or

@@ -252,6 +252,21 @@ fn bkv_test_runtime_verification_max(root: &Path) -> u64 {
 }
 
 #[cfg(test)]
+fn bkv_test_runtime_verification_active(root: &Path) -> u64 {
+    BKV_RUNTIME_VERIFICATIONS_ACTIVE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map(|active| {
+            active
+                .iter()
+                .filter(|(identity, _)| identity.starts_with(root.to_string_lossy().as_ref()))
+                .map(|(_, count)| *count)
+                .sum()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
 fn bkv_test_hash_reads(root: &Path) -> u64 {
     let root = root.to_string_lossy();
     BKV_ARTIFACT_HASH_READS
@@ -385,6 +400,47 @@ fn bkv_handle_still_matches_path(file: &fs::File, path: &Path) -> bool {
     bkv_raw_open_readonly_nofollow(path)
         .ok()
         .is_some_and(|current| bkv_same_open_handle_identity(file, &current))
+}
+
+fn bkv_lock_runtime_verification_with_deadline(
+    lock: &Mutex<()>,
+    deadline: Option<Instant>,
+) -> Result<std::sync::MutexGuard<'_, ()>, BkvRejection> {
+    let Some(deadline) = deadline else {
+        return lock.lock().map_err(|_| {
+            BkvRejection::new(
+                "bkv_status_unavailable",
+                "BKV runtime verification lock unavailable",
+            )
+        });
+    };
+    loop {
+        if Instant::now() >= deadline {
+            return Err(BkvRejection::new(
+                "bkv_verification_timeout",
+                "BKV verification deadline exceeded",
+            ));
+        }
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(BkvRejection::new(
+                    "bkv_status_unavailable",
+                    "BKV runtime verification lock unavailable",
+                ));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(BkvRejection::new(
+                        "bkv_verification_timeout",
+                        "BKV verification deadline exceeded",
+                    ));
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    }
 }
 
 fn bkv_open_readonly_nofollow(path: &Path) -> Result<(fs::File, fs::Metadata), BkvRejection> {
@@ -2113,12 +2169,8 @@ pub(super) async fn load_bkv_replay_runtime_with_deadline(
             lock
         }
     };
-    let verification_guard = verification_lock.lock().map_err(|_| {
-        BkvRejection::new(
-            "bkv_status_unavailable",
-            "BKV runtime verification lock unavailable",
-        )
-    })?;
+    let verification_guard =
+        bkv_lock_runtime_verification_with_deadline(&verification_lock, deadline)?;
     #[cfg(test)]
     let _verification_active_guard = {
         let active = {
@@ -5526,6 +5578,106 @@ mod tests {
         }
         assert_eq!(bkv_test_runtime_verification_max(&root), 1);
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_single_flight_waiter_honors_its_deadline_while_identity_is_busy() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("runtime-lock-deadline");
+        runtime
+            .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
+            .unwrap();
+        bkv_test_set_mapping_delay(&root, Duration::from_millis(250));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let holder_connection = database.connection.clone();
+        let holder_root = root.clone();
+        let holder_barrier = barrier.clone();
+        let holder = std::thread::spawn(move || {
+            holder_barrier.wait();
+            Runtime::new()
+                .unwrap()
+                .block_on(load_bkv_replay_runtime_with_deadline(
+                    &holder_connection,
+                    &holder_root,
+                    None,
+                ))
+        });
+        barrier.wait();
+        let wait_started = Instant::now();
+        while bkv_test_runtime_verification_active(&root) == 0 {
+            assert!(wait_started.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let started = Instant::now();
+        let error = runtime
+            .block_on(load_bkv_replay_runtime_with_deadline(
+                &database.connection,
+                &root,
+                Some(Instant::now() + Duration::from_millis(5)),
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, "bkv_verification_timeout");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        holder.join().unwrap().unwrap();
+        bkv_test_set_mapping_delay(&root, Duration::ZERO);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_single_flight_allows_different_serving_identities_in_parallel() {
+        let (runtime_a, database_a, root_a) = imported_bkv_replay_fixture("runtime-lock-a");
+        let (runtime_b, database_b, root_b) = imported_bkv_replay_fixture("runtime-lock-b");
+        runtime_a
+            .block_on(advance_bkv_replay(
+                &database_a.connection,
+                &root_a,
+                "bkv-test",
+            ))
+            .unwrap();
+        runtime_b
+            .block_on(advance_bkv_replay(
+                &database_b.connection,
+                &root_b,
+                "bkv-test",
+            ))
+            .unwrap();
+        bkv_test_set_mapping_delay(&root_a, Duration::from_millis(250));
+        bkv_test_set_mapping_delay(&root_b, Duration::from_millis(250));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = [
+            (database_a.connection.clone(), root_a.clone()),
+            (database_b.connection.clone(), root_b.clone()),
+        ]
+        .into_iter()
+        .map(|(connection, root)| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                Runtime::new()
+                    .unwrap()
+                    .block_on(load_bkv_replay_runtime_with_deadline(
+                        &connection,
+                        &root,
+                        None,
+                    ))
+            })
+        })
+        .collect::<Vec<_>>();
+        barrier.wait();
+        let wait_started = Instant::now();
+        while bkv_test_runtime_verification_active(&root_a) == 0
+            || bkv_test_runtime_verification_active(&root_b) == 0
+        {
+            assert!(wait_started.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        bkv_test_set_mapping_delay(&root_a, Duration::ZERO);
+        bkv_test_set_mapping_delay(&root_b, Duration::ZERO);
+        fs::remove_dir_all(root_a).ok();
+        fs::remove_dir_all(root_b).ok();
     }
 
     #[test]
