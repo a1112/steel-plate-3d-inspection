@@ -1322,6 +1322,109 @@ class ExtractionTests(unittest.TestCase):
             self._stage()
         self._assert_complete_failed_contract(raised.exception.failed_evidence_path)
 
+    def test_parent_fsync_failure_after_rename_is_quarantined_from_final(self):
+        original_fsync = subject._fsync_directory
+        failed_once = False
+
+        def fail_parent_once(path):
+            nonlocal failed_once
+            if Path(path).resolve() == self.output_root.resolve() and not failed_once:
+                failed_once = True
+                raise OSError("parent fsync boom")
+            return original_fsync(path)
+
+        with mock.patch.object(subject, "_fsync_directory", side_effect=fail_parent_once):
+            with self.assertRaises(subject.StageFailedError) as raised:
+                self._stage()
+
+        self.assertFalse((self.output_root / "batch-001").exists())
+        failed = raised.exception.failed_evidence_path
+        self.assertTrue(failed.name.startswith("batch-001.failed-"))
+        marker = json.loads((failed / "publication.json").read_text(encoding="utf-8"))
+        self.assertEqual(marker["state"], "failed")
+        quarantine = (failed / "quarantine.jsonl").read_text(encoding="utf-8")
+        self.assertIn("parent fsync boom", quarantine)
+        self.assertIn("publication_parent_fsync_failed", quarantine)
+
+    def test_commit_marker_failure_after_rename_keeps_batch_nonimportable(self):
+        with mock.patch.object(
+            subject,
+            "_commit_publication",
+            create=True,
+            side_effect=OSError("commit marker boom"),
+        ):
+            with self.assertRaises(subject.StageFailedError) as raised:
+                self._stage()
+
+        canonical = self.output_root / "batch-001"
+        self.assertFalse(canonical.exists())
+        failed = raised.exception.failed_evidence_path
+        marker = json.loads((failed / "publication.json").read_text(encoding="utf-8"))
+        self.assertEqual(marker["state"], "failed")
+        self.assertIn(
+            "commit marker boom",
+            (failed / "quarantine.jsonl").read_text(encoding="utf-8"),
+        )
+
+    def test_isolation_failure_preserves_original_error_and_prepared_gate(self):
+        original_fsync = subject._fsync_directory
+        original_marker = subject._write_publication_marker
+        fsync_failed = False
+
+        def fail_parent_once(path):
+            nonlocal fsync_failed
+            if Path(path).resolve() == self.output_root.resolve() and not fsync_failed:
+                fsync_failed = True
+                raise OSError("original parent fsync error")
+            return original_fsync(path)
+
+        def fail_failed_marker(root, *, state, batch_id, content_id):
+            if state == "failed":
+                raise OSError("failed marker evidence error")
+            return original_marker(
+                root, state=state, batch_id=batch_id, content_id=content_id
+            )
+
+        with mock.patch.object(subject, "_fsync_directory", side_effect=fail_parent_once):
+            with mock.patch.object(
+                subject, "_write_publication_marker", side_effect=fail_failed_marker
+            ):
+                with self.assertRaises(subject.StageFailedError) as raised:
+                    self._stage()
+
+        canonical = self.output_root / "batch-001"
+        self.assertTrue(canonical.is_dir())
+        marker = json.loads(
+            (canonical / "publication.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(marker["state"], "prepared")
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn("original parent fsync error", str(raised.exception))
+        self.assertIn("failed marker evidence error", str(raised.exception))
+        manifest = json.loads((canonical / "manifest.json").read_text(encoding="utf-8"))
+        self.assertFalse(
+            subject.batch_is_importable(
+                canonical,
+                expected_content_id=manifest["batchContentId"],
+                **self._deep_kwargs(),
+            )
+        )
+
+    def test_no_full_verification_occurs_after_commit_rename(self):
+        verify = subject._verify_staged_batch
+
+        def reject_post_rename(batch, **kwargs):
+            if Path(batch).name == "batch-001":
+                raise AssertionError("post-commit validation must not run")
+            return verify(batch, **kwargs)
+
+        with mock.patch.object(
+            subject, "_verify_staged_batch", side_effect=reject_post_rename
+        ):
+            batch = self._stage()
+        marker = json.loads((batch / "publication.json").read_text(encoding="utf-8"))
+        self.assertEqual(marker["state"], "committed")
+
     def test_same_batch_id_with_changed_source_archive_is_a_collision(self):
         self._stage()
         self.part1.write_bytes(b"changed!")
@@ -1645,10 +1748,11 @@ class ExtractionTests(unittest.TestCase):
             manifest["importEligible"] = True
 
         self._rewrite_manifest(batch, forge)
-        with self.assertRaisesRegex(ValueError, "ready|coverage"):
+        self.assertFalse(
             subject.batch_is_importable(
                 batch, expected_content_id=content_id, **self._deep_kwargs()
             )
+        )
 
     def test_deep_source_rejects_forged_batch_inventory_and_db_integrity(self):
         self._use_complete_target_coverage()
@@ -1722,6 +1826,13 @@ class ExtractionTests(unittest.TestCase):
             manifest["contentId"] = forged_content_id
 
         self._rewrite_manifest(batch, forge)
+        forged_manifest = json.loads(
+            (batch / "manifest.json").read_text(encoding="utf-8")
+        )
+        marker_path = batch / "publication.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["contentId"] = forged_manifest["contentId"]
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "RAR|source inventory|artifact"):
             subject._verify_staged_batch(batch, **self._deep_kwargs())
 
@@ -1741,13 +1852,85 @@ class ExtractionTests(unittest.TestCase):
         content_id = json.loads(
             (batch / "manifest.json").read_text(encoding="utf-8")
         )["batchContentId"]
+        self.assertEqual(
+            subject.batch_importability_reason(batch, **self._deep_kwargs()),
+            "expected_content_id_required",
+        )
         self.assertFalse(subject.batch_is_importable(batch, **self._deep_kwargs()))
+        self.assertEqual(
+            subject.batch_importability_reason(
+                batch, expected_content_id="0" * 64
+            ),
+            "content_id_mismatch",
+        )
         self.assertFalse(
             subject.batch_is_importable(
                 batch, expected_content_id="0" * 64
             )
         )
         self.assertTrue(
+            subject.batch_is_importable(
+                batch, expected_content_id=content_id, **self._deep_kwargs()
+            )
+        )
+
+    def test_importability_is_total_false_for_untrusted_batch_failures(self):
+        self._use_complete_target_coverage()
+        cases = ("invalid-status", "bad-json", "missing-artifact", "reparse", "limit")
+        for case in cases:
+            with self.subTest(case=case):
+                batch = self._stage()
+                manifest_path = batch / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                content_id = manifest["batchContentId"]
+                patcher = contextlib.nullcontext()
+                if case == "invalid-status":
+                    manifest["status"] = "malicious"
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                elif case == "bad-json":
+                    manifest_path.write_text("{", encoding="utf-8")
+                elif case == "missing-artifact":
+                    artifact = batch / Path(
+                        *PurePosixPath(manifest["artifacts"][0]["path"]).parts
+                    )
+                    artifact.unlink()
+                elif case == "reparse":
+                    original = subject.is_reparse_point
+                    artifact_path = batch / Path(
+                        *PurePosixPath(manifest["artifacts"][0]["path"]).parts
+                    )
+                    patcher = mock.patch.object(
+                        subject,
+                        "is_reparse_point",
+                        side_effect=lambda path: (
+                            Path(path) == artifact_path or original(Path(path))
+                        ),
+                    )
+                else:
+                    patcher = mock.patch.object(subject, "MAX_MANIFEST_BYTES", 1)
+                with patcher:
+                    self.assertFalse(
+                        subject.batch_is_importable(
+                            batch,
+                            expected_content_id=content_id,
+                            **self._deep_kwargs(),
+                        )
+                    )
+                self.tearDown()
+                self.setUp()
+
+    def test_importability_requires_committed_publication_marker(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        manifest = json.loads((batch / "manifest.json").read_text(encoding="utf-8"))
+        content_id = manifest["batchContentId"]
+        marker_path = batch / "publication.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["state"] = "prepared"
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        with self.assertRaises(subject.BkvValidationError):
+            subject._verify_staged_batch(batch, **self._deep_kwargs())
+        self.assertFalse(
             subject.batch_is_importable(
                 batch, expected_content_id=content_id, **self._deep_kwargs()
             )

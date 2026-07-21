@@ -28,6 +28,8 @@ from typing import BinaryIO, Callable, Iterable, Sequence
 TARGET_SEQ_NOS = tuple(range(1_893_700, 1_893_711))
 MANIFEST_NAME = "manifest.inventory.json"
 MANIFEST_SCHEMA = "steel.bkv-archive-inventory.v1"
+PUBLICATION_MARKER_NAME = "publication.json"
+PUBLICATION_SCHEMA = "steel.bkv-publication.v1"
 MAX_ZIP_MEMBERS = 100_000
 MAX_ZIP_CENTRAL_DIRECTORY_RECORDS = 100_000
 MAX_ZIP_CENTRAL_DIRECTORY_BYTES = 256 * 1024 * 1024
@@ -122,6 +124,10 @@ class StageFailedError(RuntimeError):
 
 class SourceUnavailableError(RuntimeError):
     """Raised when deep import verification cannot reopen original evidence."""
+
+
+class BkvValidationError(RuntimeError):
+    """Raised for a stable BKV validation boundary failure."""
 
 
 class _QuarantineWriter:
@@ -2537,6 +2543,62 @@ def _write_json_atomic(
             temporary.unlink(missing_ok=True)
 
 
+def _write_publication_marker(
+    root: Path,
+    *,
+    state: str,
+    batch_id: str,
+    content_id: str | None,
+) -> None:
+    if state not in ("prepared", "failed", "committed"):
+        raise ValueError(f"invalid publication state: {state}")
+    destination = root / PUBLICATION_MARKER_NAME
+    _assert_publish_path(destination)
+    document = {
+        "schema": PUBLICATION_SCHEMA,
+        "state": state,
+        "batchId": batch_id,
+        "contentId": content_id,
+    }
+    payload = (
+        json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    )
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{PUBLICATION_MARKER_NAME}.",
+            suffix=".tmp",
+            dir=root,
+            delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        _assert_publish_path(destination)
+        if is_reparse_point(temporary):
+            raise ValueError("publication marker temporary became a reparse point")
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _commit_publication(root: Path, *, batch_id: str, content_id: str) -> None:
+    """Publish the committed gate as the final potentially-failing stage action."""
+    _write_publication_marker(
+        root, state="committed", batch_id=batch_id, content_id=content_id
+    )
+
+
 def inventory_archives(
     *,
     database_zip: os.PathLike[str] | str,
@@ -3056,17 +3118,48 @@ def _collect_failed_artifacts(
     return artifacts, cameras
 
 
+def _append_closed_quarantine(path: Path, document: dict[str, object]) -> int:
+    if is_reparse_point(path) or not path.is_file():
+        raise ValueError("quarantine must remain a regular non-reparse file")
+    existing = path.read_bytes()
+    if len(existing) > MAX_MANIFEST_BYTES:
+        raise InventoryLimitError("existing quarantine evidence exceeds manifest limit")
+    payload = (
+        json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(payload) > 8192:
+        raise InventoryLimitError("failed quarantine evidence exceeds 8192 bytes")
+    flags = os.O_WRONLY | os.O_APPEND
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ValueError("quarantine descriptor is not a regular file")
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return len(existing.splitlines()) + 1
+
+
 def _publish_failed_stage(
-    incoming: Path,
+    source: Path,
     output: Path,
     batch_id: str,
     error: BaseException,
     quarantine_writer: _QuarantineWriter,
     context: dict[str, object],
 ) -> Path:
-    if not incoming.is_dir() or is_reparse_point(incoming):
-        raise RuntimeError("cannot preserve failed stage evidence") from error
-    (incoming / "manifest.json").unlink(missing_ok=True)
+    if not source.is_dir() or is_reparse_point(source):
+        raise BkvValidationError(
+            f"failed evidence source is unavailable: {source}"
+        ) from error
+    _write_publication_marker(
+        source, state="failed", batch_id=batch_id, content_id=None
+    )
+    (source / "manifest.json").unlink(missing_ok=True)
     evidence = {
         "schema": "steel.bkv-stage-quarantine.v1",
         "reason": _bounded_utf8_text(type(error).__name__, 128),
@@ -3074,26 +3167,29 @@ def _publish_failed_stage(
         "code": _bounded_utf8_text(context.get("code", "stage_failed"), 128),
         "stage": _bounded_utf8_text(context.get("stage", "unknown"), 128),
     }
-    quarantine = incoming / "quarantine.jsonl"
-    quarantine_writer.append(evidence)
-    quarantine_writer.close()
+    quarantine = source / "quarantine.jsonl"
+    if quarantine_writer.closed:
+        quarantine_writer.count = _append_closed_quarantine(quarantine, evidence)
+    else:
+        quarantine_writer.append(evidence)
+        quarantine_writer.close()
     quarantine_evidence = _failed_file_evidence(
         quarantine, "quarantine.jsonl", max_bytes=MAX_MANIFEST_BYTES
     )
     artifacts, camera_inventory = _collect_failed_artifacts(
-        incoming, context.get("artifacts")
+        source, context.get("artifacts")
     )
     accepted_paths = {str(item["path"]) for item in artifacts}
-    artifact_root = incoming / "artifacts"
+    artifact_root = source / "artifacts"
     if artifact_root.is_dir() and not is_reparse_point(artifact_root):
         for path in artifact_root.rglob("*"):
             if is_reparse_point(path):
                 raise ValueError(f"failed artifact tree contains a reparse point: {path}")
-            if path.is_file() and path.relative_to(incoming).as_posix() not in accepted_paths:
+            if path.is_file() and path.relative_to(source).as_posix() not in accepted_paths:
                 path.unlink()
     present_seq_nos = sorted({int(item["seqNo"]) for item in artifacts})
     inventory = context.get("inventory")
-    source_inventory_path = incoming / "source" / "inventory.json"
+    source_inventory_path = source / "source" / "inventory.json"
     source_inventory = _failed_file_evidence(
         source_inventory_path,
         "source/inventory.json",
@@ -3148,7 +3244,7 @@ def _publish_failed_stage(
             unavailable["mtimeNs"] = None
             source_archives[archive_part] = unavailable
     normalization_evidence = _failed_file_evidence(
-        incoming / "source" / "normalized.current.json",
+        source / "source" / "normalized.current.json",
         "source/normalized.current.json",
         max_bytes=MAX_MANIFEST_BYTES,
     )
@@ -3159,7 +3255,7 @@ def _publish_failed_stage(
     normalized: list[dict[str, object]] = []
     for table in _SQL_TABLES:
         relative = f"normalized/{table}.jsonl"
-        file_evidence = _failed_file_evidence(incoming / relative, relative)
+        file_evidence = _failed_file_evidence(source / relative, relative)
         normalized.append(
             {
                 "table": table,
@@ -3299,18 +3395,18 @@ def _publish_failed_stage(
         "failure": evidence,
         "quarantine": quarantine_evidence,
     }
-    _write_json_atomic(incoming / "manifest.json", failed_manifest)
-    _verify_staged_batch(incoming, allow_failed=True)
-    prefix = f"{batch_id}.incoming-"
-    if not incoming.name.startswith(prefix):
-        raise ValueError("incoming batch lacks its trusted run identifier")
-    run_id = incoming.name[len(prefix) :]
+    _write_json_atomic(source / "manifest.json", failed_manifest)
+    _verify_staged_batch(
+        source, allow_failed=True, expected_publication_state="failed"
+    )
+    run_id = context.get("runId")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("failed stage lacks its trusted run identifier")
     failed = output / f"{batch_id}.failed-{run_id}"
     if failed.exists() or is_reparse_point(failed):
         raise FileExistsError(f"failed evidence collision: {failed}")
-    os.rename(incoming, failed)
+    os.rename(source, failed)
     _fsync_directory(output)
-    _verify_staged_batch(failed, allow_failed=True)
     return failed
 
 
@@ -3589,16 +3685,32 @@ def _verify_staged_batch(
     deep_source: bool = True,
     unrar: os.PathLike[str] | str | None = None,
     runner: Callable[..., subprocess.CompletedProcess[object]] | None = None,
+    expected_publication_state: str | None = None,
 ) -> dict[str, object]:
     batch = batch.resolve(strict=True)
     if is_reparse_point(batch) or not batch.is_dir():
         raise ValueError("staged batch must be a non-reparse directory")
+    publication = _load_json_document(
+        batch / PUBLICATION_MARKER_NAME, "publication marker"
+    )
     manifest = _load_json_document(batch / "manifest.json", "staged manifest")
     if manifest.get("schema") != "steel.bkv-import-manifest.v1":
         raise ValueError("invalid staged manifest schema")
     status = manifest.get("status")
     if status not in ("ready", "partial", "failed"):
         raise ValueError("staged manifest status must be ready, partial, or failed")
+    required_publication_state = expected_publication_state
+    if required_publication_state is None:
+        required_publication_state = "failed" if status == "failed" else "committed"
+    if (
+        publication.get("schema") != PUBLICATION_SCHEMA
+        or publication.get("state") != required_publication_state
+        or publication.get("batchId") != manifest.get("batchId")
+        or publication.get("contentId") != manifest.get("contentId")
+    ):
+        raise BkvValidationError(
+            f"publication marker is not {required_publication_state}"
+        )
     if manifest.get("seqNos") != list(TARGET_SEQ_NOS):
         raise ValueError("staged manifest seqNos must be the exact approved target")
     present_seq_nos = manifest.get("presentSeqNos")
@@ -4476,17 +4588,39 @@ def _stage_batch_into(
             "failure": None,
             "quarantine": quarantine_evidence,
         }
-        failure_context["stage"] = "validation"
+        failure_context["stage"] = "publication-prepare"
         _write_json_atomic(incoming / "manifest.json", manifest)
+        _write_publication_marker(
+            incoming,
+            state="prepared",
+            batch_id=batch_id,
+            content_id=batch_content_id,
+        )
+        failure_context["publicationState"] = "prepared"
+        failure_context["publicationSource"] = str(incoming)
+        failure_context["stage"] = "validation"
         _verify_staged_batch(
-            incoming, unrar=unrar_path, runner=runner
+            incoming,
+            unrar=unrar_path,
+            runner=runner,
+            expected_publication_state="prepared",
         )
         if final.exists() or is_reparse_point(final):
             raise FileExistsError(f"batch-id collision during publish: {final}")
         quarantine_writer.close()
+        failure_context["stage"] = "publication-rename"
         os.rename(incoming, final)
+        failure_context["publicationState"] = "renamed"
+        failure_context["publicationSource"] = str(final)
+        failure_context["stage"] = "publication-parent-fsync"
+        failure_context["code"] = "publication_parent_fsync_failed"
         _fsync_directory(output)
-        _verify_staged_batch(final, unrar=unrar_path, runner=runner)
+        failure_context["stage"] = "publication-commit-marker"
+        failure_context["code"] = "publication_commit_marker_failed"
+        _commit_publication(
+            final, batch_id=batch_id, content_id=batch_content_id
+        )
+        failure_context["publicationState"] = "committed"
         return final
     except BaseException as error:
         raise
@@ -4518,6 +4652,9 @@ def stage_batch(
         "stage": "initialization",
         "code": "stage_failed",
         "inventory": None,
+        "runId": incoming.name[len(f"{batch_id}.incoming-") :],
+        "publicationState": "building",
+        "publicationSource": str(incoming),
     }
     try:
         result = _stage_batch_into(
@@ -4544,17 +4681,71 @@ def stage_batch(
     except BaseException as error:
         if isinstance(error, StageFailedError):
             raise
-        failed = _publish_failed_stage(
-            incoming,
-            output,
-            batch_id,
-            error,
-            quarantine_writer,
-            context,
-        )
+        source_value = context.get("publicationSource")
+        source = Path(str(source_value)) if source_value is not None else incoming
+        try:
+            failed = _publish_failed_stage(
+                source,
+                output,
+                batch_id,
+                error,
+                quarantine_writer,
+                context,
+            )
+        except Exception as evidence_error:
+            message = (
+                "BKV stage failed; "
+                f"originalError={type(error).__name__}: {_bounded_utf8_text(error, 1024)}; "
+                "evidenceFailure="
+                f"{type(evidence_error).__name__}: {_bounded_utf8_text(evidence_error, 1024)}"
+            )
+            raise StageFailedError(message, source) from error
         raise StageFailedError("BKV stage failed", failed) from error
     finally:
-        quarantine_writer.close()
+        # Never let cleanup replace the original staging/evidence exception.
+        with contextlib.suppress(Exception):
+            quarantine_writer.close()
+
+
+def batch_importability_reason(
+    batch: os.PathLike[str] | str,
+    *,
+    expected_content_id: str | None = None,
+    operator_reviewed_partial: bool = False,
+    unrar: os.PathLike[str] | str | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[object]] | None = None,
+) -> str:
+    if (
+        not isinstance(expected_content_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_content_id) is None
+    ):
+        return "expected_content_id_required"
+    try:
+        raw_manifest = _load_json_document(
+            Path(batch).resolve(strict=True) / "manifest.json",
+            "staged manifest content binding",
+        )
+    except Exception:
+        return "manifest_unreadable"
+    if raw_manifest.get("batchContentId") != expected_content_id:
+        return "content_id_mismatch"
+    try:
+        manifest = _verify_staged_batch(
+            Path(batch),
+            allow_failed=True,
+            deep_source=True,
+            unrar=unrar,
+            runner=runner,
+            expected_publication_state="committed",
+        )
+    except Exception:
+        return "validation_failed"
+    status = manifest["status"]
+    if status == "ready":
+        return "importable"
+    if status == "partial":
+        return "importable" if operator_reviewed_partial is True else "partial_review_required"
+    return "status_not_importable"
 
 
 def batch_is_importable(
@@ -4565,34 +4756,13 @@ def batch_is_importable(
     unrar: os.PathLike[str] | str | None = None,
     runner: Callable[..., subprocess.CompletedProcess[object]] | None = None,
 ) -> bool:
-    if (
-        not isinstance(expected_content_id, str)
-        or re.fullmatch(r"[0-9a-f]{64}", expected_content_id) is None
-    ):
-        return False
-    try:
-        raw_manifest = _load_json_document(
-            Path(batch).resolve(strict=True) / "manifest.json",
-            "staged manifest content binding",
-        )
-    except (OSError, FileNotFoundError, ValueError, InventoryLimitError):
-        return False
-    if raw_manifest.get("batchContentId") != expected_content_id:
-        return False
-    try:
-        manifest = _verify_staged_batch(
-            Path(batch),
-            allow_failed=True,
-            deep_source=True,
-            unrar=unrar,
-            runner=runner,
-        )
-    except (SourceUnavailableError, FileNotFoundError):
-        return False
-    status = manifest["status"]
-    return status == "ready" or (
-        status == "partial" and operator_reviewed_partial is True
-    )
+    return batch_importability_reason(
+        batch,
+        expected_content_id=expected_content_id,
+        operator_reviewed_partial=operator_reviewed_partial,
+        unrar=unrar,
+        runner=runner,
+    ) == "importable"
 
 
 def _build_parser() -> argparse.ArgumentParser:
