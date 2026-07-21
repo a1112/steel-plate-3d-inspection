@@ -8,6 +8,8 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11841,7 +11843,82 @@ fn path_stays_under(path: &Path, root: &Path) -> bool {
     canonical_path.starts_with(canonical_root)
 }
 
-fn production_file_response(query: &str) -> Vec<u8> {
+fn file_component_is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| {
+            #[cfg(windows)]
+            {
+                metadata.file_attributes() & 0x400 != 0
+            }
+            #[cfg(not(windows))]
+            {
+                metadata.file_type().is_symlink()
+            }
+        })
+        .unwrap_or(true)
+}
+
+fn resolve_bkv_file(state: &ServiceState, token: &str) -> Option<PathBuf> {
+    let value = token.strip_prefix("bkv://")?;
+    let (batch_id, relative) = value.split_once('/')?;
+    if batch_id.is_empty()
+        || relative.is_empty()
+        || Path::new(relative).is_absolute()
+        || Path::new(relative)
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let imported = state
+        .runtime
+        .block_on(db::get_config(
+            &state.database.connection,
+            &format!("bkv.batch.{batch_id}"),
+        ))
+        .ok()
+        .flatten()?;
+    let imported: Value = serde_json::from_str(&imported.value).ok()?;
+    if imported.get("batchId").and_then(Value::as_str) != Some(batch_id) {
+        return None;
+    }
+    let active = state
+        .runtime
+        .block_on(db::get_config(
+            &state.database.connection,
+            "bkv.active-batch",
+        ))
+        .ok()
+        .flatten()?;
+    let active: Value = serde_json::from_str(&active.value).ok()?;
+    if active.get("batchId").and_then(Value::as_str) != Some(batch_id) {
+        return None;
+    }
+    let root = PathBuf::from(env::var("STEEL_BKV_DATA_ROOT").ok()?);
+    if !root.is_absolute() || file_component_is_link(&root) {
+        return None;
+    }
+    let batch = root.join(batch_id);
+    let mut current = batch.clone();
+    if file_component_is_link(&batch) {
+        return None;
+    }
+    for part in Path::new(relative).components() {
+        if let std::path::Component::Normal(part) = part {
+            current.push(part);
+            if file_component_is_link(&current) {
+                return None;
+            }
+        }
+    }
+    let canonical_batch = batch.canonicalize().ok()?;
+    let canonical_file = current.canonicalize().ok()?;
+    canonical_file
+        .starts_with(&canonical_batch)
+        .then_some(canonical_file)
+}
+
+fn production_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
     let Some(path_value) = query_value(query, "path") else {
         return http_response(
             "400 Bad Request",
@@ -11849,8 +11926,14 @@ fn production_file_response(query: &str) -> Vec<u8> {
             "{\"error\":\"path_required\"}",
         );
     };
-    let path = PathBuf::from(path_value);
-    let allowed = path_stays_under(&path, &bar_surface_capture_root())
+    let bkv_path = path_value.starts_with("bkv://");
+    let path = if bkv_path {
+        resolve_bkv_file(state, &path_value).unwrap_or_default()
+    } else {
+        PathBuf::from(path_value)
+    };
+    let allowed = (bkv_path && !path.as_os_str().is_empty())
+        || path_stays_under(&path, &bar_surface_capture_root())
         || path_stays_under(&path, &algorithm_data_root());
     if !allowed {
         return http_response(
@@ -11863,10 +11946,10 @@ fn production_file_response(query: &str) -> Vec<u8> {
         Ok(body) => {
             http_bytes_response_with_headers("200 OK", content_type_for_path(&path), &body, &[])
         }
-        Err(error) => http_response(
+        Err(_) => http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
-            &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
+            "{\"error\":\"file_unavailable\"}",
         ),
     }
 }
@@ -16918,7 +17001,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("POST", "/api/production/defect") => {
             write_production_defect_response(&state, body, actor)
         }
-        ("GET", "/api/production/file") => production_file_response(query),
+        ("GET", "/api/production/file") => production_file_response(&state, query),
         ("GET", "/api/calibration/operations/detail") => {
             calibration_operations::detail_response(&state, query)
         }

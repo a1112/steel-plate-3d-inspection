@@ -3889,6 +3889,7 @@ pub async fn import_bkv_batch(
             .strip_prefix("bkv-camera-")
             .and_then(|value| value.parse::<u8>().ok());
         if !matches!(camera_number, Some(1..=6))
+            || !matches!(defect.severity.as_str(), "severe" | "review" | "minor")
             || ![
                 defect.x_mm,
                 defect.y_mm,
@@ -3932,11 +3933,14 @@ pub async fn import_bkv_batch(
         "batchId": batch.batch_id,
         "contentId": batch.content_id,
         "status": batch.status,
-        "manifest": serde_json::from_str::<Value>(&batch.manifest_json).map_err(|error| DbErr::Custom(format!("bkv_manifest_invalid_json: {error}")))?,
+        "summary": serde_json::from_str::<Value>(&batch.manifest_json).map_err(|_| DbErr::Custom("bkv_summary_invalid_json".to_string()))?,
         "counts": counts,
-        "importedAt": now,
-        "actor": actor
+        "importedAt": now
     });
+    if batch_state.to_string().len() > 64 * 1024 {
+        transaction.rollback().await?;
+        return Err(DbErr::Custom("bkv_summary_too_large".to_string()));
+    }
     bkv_upsert_config(&transaction, config_key, batch_state.to_string(), &now).await?;
     bkv_upsert_config(
         &transaction,
@@ -5551,6 +5555,7 @@ mod bkv_import_tests {
             |defect: &mut BkvImportDefect| defect.width_mm = -1.0,
             |defect: &mut BkvImportDefect| defect.confidence = 1.5,
             |defect: &mut BkvImportDefect| defect.x_mm = f64::NAN,
+            |defect: &mut BkvImportDefect| defect.severity = "critical".to_string(),
         ] {
             let runtime = tokio::runtime::Runtime::new().expect("runtime");
             runtime.block_on(async {
