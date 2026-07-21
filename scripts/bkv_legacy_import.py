@@ -304,27 +304,109 @@ def _extract_parenthesized(value: str, opening: int) -> tuple[str, int] | None:
     return None
 
 
-def _is_fulltext_or_spatial_index(definition: str) -> bool:
+def _quoted_sql_token_end(value: str, opening: int) -> int | None:
+    if opening >= len(value) or value[opening] not in ("'", '"'):
+        return None
+    quote = value[opening]
+    index = opening + 1
+    while index < len(value):
+        character = value[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == quote:
+            if index + 1 < len(value) and value[index + 1] == quote:
+                index += 2
+                continue
+            return index + 1
+        index += 1
+    return None
+
+
+def _has_valid_fulltext_or_spatial_options(value: str) -> bool:
+    position = 0
+    seen: set[str] = set()
+    while True:
+        position_match = re.match(r"\s*", value[position:])
+        assert position_match is not None
+        position += position_match.end()
+        if position == len(value):
+            return True
+
+        parser_match = re.match(
+            rf"WITH\s+PARSER\s+(?P<parser>{_SQL_IDENTIFIER})(?![A-Za-z0-9_])",
+            value[position:],
+            re.IGNORECASE,
+        )
+        if parser_match is not None:
+            if "parser" in seen:
+                return False
+            seen.add("parser")
+            position += parser_match.end()
+            continue
+
+        comment_match = re.match(r"COMMENT\b\s*", value[position:], re.IGNORECASE)
+        if comment_match is not None:
+            if "comment" in seen:
+                return False
+            opening = position + comment_match.end()
+            closing = _quoted_sql_token_end(value, opening)
+            if closing is None:
+                return False
+            seen.add("comment")
+            position = closing
+            continue
+
+        visibility_match = re.match(
+            r"(?P<visibility>VISIBLE|INVISIBLE)\b",
+            value[position:],
+            re.IGNORECASE,
+        )
+        if visibility_match is not None:
+            if "visibility" in seen:
+                return False
+            seen.add("visibility")
+            position += visibility_match.end()
+            continue
+        return False
+
+
+def _classify_fulltext_or_spatial_index(definition: str) -> str:
+    prefix = re.match(r"(?:FULLTEXT|SPATIAL)\b", definition, re.IGNORECASE)
+    if prefix is None:
+        return "column"
+    explicit_kind = re.match(
+        r"\s+(?:INDEX|KEY)\b", definition[prefix.end() :], re.IGNORECASE
+    )
     match = re.match(
         rf"(?:FULLTEXT|SPATIAL)\b(?:\s+(?:INDEX|KEY)\b)?"
-        rf"(?:\s+{_SQL_IDENTIFIER})?\s*(?P<open>\()",
+        rf"(?:\s+(?P<name>{_SQL_IDENTIFIER}))?\s*(?P<open>\()",
         definition,
         re.IGNORECASE,
     )
     if match is None:
-        return False
+        return "malformed" if explicit_kind is not None else "column"
     extracted = _extract_parenthesized(definition, match.start("open"))
     if extracted is None:
-        return False
+        if explicit_kind is not None or match.group("name") is None:
+            return "malformed"
+        return "column"
     body, closing = extracted
-    if definition[closing + 1 :].strip():
-        return False
     key_parts = _split_sql_items(body)
     key_part_pattern = rf"{_SQL_IDENTIFIER}(?:\s*\(\s*\d+\s*\))?(?:\s+(?:ASC|DESC))?"
-    return bool(key_parts) and all(
+    valid_key_parts = bool(key_parts) and all(
         re.fullmatch(key_part_pattern, key_part.strip(), re.IGNORECASE) is not None
         for key_part in key_parts
     )
+    if not valid_key_parts:
+        return "malformed" if explicit_kind is not None else "column"
+    if not _has_valid_fulltext_or_spatial_options(definition[closing + 1 :]):
+        return "malformed"
+    return "index"
+
+
+def _is_fulltext_or_spatial_index(definition: str) -> bool:
+    return _classify_fulltext_or_spatial_index(definition) == "index"
 
 
 def _is_unquoted_table_constraint(definition: str) -> bool:
@@ -362,6 +444,9 @@ def _parse_create_table(statement: str) -> tuple[str, _SqlTableSchema] | None:
     foreign_keys: dict[str, tuple[str, str]] = {}
     for definition in _split_sql_items(body):
         stripped_definition = definition.lstrip()
+        index_classification = _classify_fulltext_or_spatial_index(stripped_definition)
+        if index_classification == "malformed":
+            return None
         column_match = re.match(
             rf"(?P<column>{_SQL_IDENTIFIER})\s+", stripped_definition
         )

@@ -843,12 +843,13 @@ CREATE TABLE `allexcel` (
   UNIQUE KEY `uq_unique` (`Unique`),
   KEY `idx_constraint` (`Constraint`),
   INDEX `idx_foreign` (`Foreign`),
-  FULLTEXT KEY `ft_key` (`FULLTEXT`),
-  FULLTEXT INDEX `ft_index` (`FULLTEXT`),
-  FULLTEXT ft_name (`FULLTEXT`),
-  FULLTEXT (`FULLTEXT`),
-  SPATIAL KEY `sp_key` (`SPATIAL`),
-  SPATIAL INDEX `sp_index` (`SPATIAL`),
+  FULLTEXT KEY `ft_key` (`FULLTEXT`) WITH PARSER `ngram`
+    COMMENT 'search ) ''quoted'' (' VISIBLE,
+  FULLTEXT INDEX `ft_index` (`FULLTEXT`) INVISIBLE,
+  FULLTEXT ft_name (`FULLTEXT`) COMMENT 'named index',
+  FULLTEXT (`FULLTEXT`) VISIBLE COMMENT 'unnamed',
+  SPATIAL KEY `sp_key` (`SPATIAL`) COMMENT 'shape \' ) (' INVISIBLE,
+  SPATIAL INDEX `sp_index` (`SPATIAL`) VISIBLE,
   SPATIAL sp_name (`SPATIAL`),
   SPATIAL (`SPATIAL`),
   CHECK (`Check` IS NOT NULL)
@@ -899,12 +900,12 @@ INSERT INTO `diameter` VALUES (71, 'fulltext data', 'spatial data');
         self.assertEqual(diameter["SPATIAL"], "spatial data")
 
         for definition in (
-            "FULLTEXT KEY ft_key (Note)",
-            "FULLTEXT INDEX ft_index (Note)",
-            "FULLTEXT ft_name (Note)",
-            "FULLTEXT (Note)",
-            "SPATIAL KEY sp_key (Shape)",
-            "SPATIAL INDEX sp_index (Shape)",
+            "FULLTEXT KEY ft_key (Note) WITH PARSER ngram COMMENT 'note ) (' VISIBLE",
+            'FULLTEXT INDEX ft_index (Note) COMMENT "double ""quote"" (" INVISIBLE',
+            "FULLTEXT ft_name (Note) COMMENT 'named index'",
+            "FULLTEXT (Note) VISIBLE COMMENT 'unnamed'",
+            "SPATIAL KEY sp_key (Shape) COMMENT 'shape \\' ) (' INVISIBLE",
+            "SPATIAL INDEX sp_index (Shape) VISIBLE",
             "SPATIAL sp_name (Shape)",
             "SPATIAL (Shape)",
         ):
@@ -915,6 +916,8 @@ INSERT INTO `diameter` VALUES (71, 'fulltext data', 'spatial data');
             "SPATIAL VARCHAR(32)",
             "FULLTEXT KEY missing_columns",
             "SPATIAL INDEX broken (Shape",
+            "FULLTEXT ft_name (Note) UNKNOWN option",
+            "SPATIAL (Shape) COMMENT unquoted",
         ):
             with self.subTest(definition=definition):
                 self.assertFalse(subject._is_unquoted_table_constraint(definition))
@@ -925,6 +928,25 @@ INSERT INTO `diameter` VALUES (71, 'fulltext data', 'spatial data');
         )
         self.assertEqual(malformed_result.integrity, "partial-parse-error")
         self.assertEqual(malformed_result.parse_rejected_statements, 1)
+
+    def test_malformed_fulltext_spatial_indexes_downgrade_parse_integrity(self):
+        for definition in (
+            "FULLTEXT KEY missing_columns",
+            "SPATIAL INDEX broken (Shape",
+            "FULLTEXT ft_name (Note) UNKNOWN option",
+            "SPATIAL (Shape) COMMENT unquoted",
+        ):
+            with self.subTest(definition=definition):
+                fixture = f"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, {definition});
+INSERT INTO `allexcel` VALUES (1893700);
+""".encode()
+                result = subject.filter_sql_dump(
+                    io.BytesIO(fixture), subject.TARGET_SEQ_NOS
+                )
+                self.assertEqual(result.integrity, "partial-parse-error")
+                self.assertEqual(result.parse_rejected_statements, 1)
+                self.assertEqual(result.rows_by_table["allexcel"], [])
 
 
 class MemberPolicyTests(unittest.TestCase):
