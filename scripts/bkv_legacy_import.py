@@ -113,6 +113,12 @@ class _SqlTableSchema:
     foreign_keys: dict[str, tuple[str, str]]
 
 
+@dataclass(frozen=True)
+class _SqlTuple:
+    raw_text: str
+    tokens: tuple[str, ...]
+
+
 @dataclass
 class SqlDumpResult:
     rows_by_seq: dict[int, list[dict[str, object]]]
@@ -229,18 +235,55 @@ def _split_sql_items(value: str) -> list[str]:
     return items
 
 
+def _extract_parenthesized(value: str, opening: int) -> tuple[str, int] | None:
+    if opening >= len(value) or value[opening] != "(":
+        return None
+    depth = 1
+    quote: str | None = None
+    escaped = False
+    index = opening + 1
+    while index < len(value):
+        character = value[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\" and quote in ("'", '"'):
+                escaped = True
+            elif character == quote:
+                if index + 1 < len(value) and value[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if character in ("'", '"', "`"):
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return value[opening + 1 : index], index
+        index += 1
+    return None
+
+
 def _parse_create_table(statement: str) -> tuple[str, _SqlTableSchema] | None:
     match = re.search(
-        rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<table>{_SQL_IDENTIFIER})\s*\((?P<body>.*)\)\s*;?\s*\Z",
+        rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<table>{_SQL_IDENTIFIER})\s*(?P<open>\()",
         statement,
-        re.IGNORECASE | re.DOTALL,
+        re.IGNORECASE,
     )
     if match is None:
         return None
+    extracted = _extract_parenthesized(statement, match.start("open"))
+    if extracted is None:
+        return None
+    body, _closing = extracted
     table = _normalized_identifier(_identifier_value(match.group("table")))
     columns: list[str] = []
     foreign_keys: dict[str, tuple[str, str]] = {}
-    for definition in _split_sql_items(match.group("body")):
+    for definition in _split_sql_items(body):
         column_match = re.match(rf"\s*(?P<column>{_SQL_IDENTIFIER})\s+", definition)
         if column_match is not None:
             candidate = _identifier_value(column_match.group("column"))
@@ -319,36 +362,64 @@ def _parse_sql_value(token: str) -> object:
     raise ValueError("unsupported SQL value")
 
 
+def _parse_values_rows(value: str) -> tuple[list[_SqlTuple], bool]:
+    value = value.rstrip().removesuffix(";").rstrip()
+    rows: list[_SqlTuple] = []
+    index = 0
+    while True:
+        while index < len(value) and value[index].isspace():
+            index += 1
+        if index == len(value):
+            return rows, bool(rows)
+        extracted = _extract_parenthesized(value, index)
+        if extracted is None:
+            return [], False
+        body, closing = extracted
+        raw_text = value[index : closing + 1]
+        rows.append(_SqlTuple(raw_text, tuple(_split_sql_items(body))))
+        index = closing + 1
+        while index < len(value) and value[index].isspace():
+            index += 1
+        if index == len(value):
+            return rows, True
+        if value[index] != ",":
+            return [], False
+        index += 1
+
+
 def _parse_insert(
     statement: str,
-) -> tuple[str, tuple[str, ...] | None, list[list[str]]] | None:
+) -> tuple[str, tuple[str, ...] | None, list[_SqlTuple], bool] | None:
     match = re.search(
-        rf"\bINSERT\s+INTO\s+(?P<table>{_SQL_IDENTIFIER})\s*(?:\((?P<columns>.*?)\))?\s+VALUES\s+(?P<values>.*);?\s*\Z",
+        rf"\bINSERT\s+INTO\s+(?P<table>{_SQL_IDENTIFIER})",
         statement,
-        re.IGNORECASE | re.DOTALL,
+        re.IGNORECASE,
     )
     if match is None:
         return None
     table = _normalized_identifier(_identifier_value(match.group("table")))
-    column_text = match.group("columns")
+    remainder = statement[match.end() :].lstrip()
     columns: tuple[str, ...] | None = None
-    if column_text is not None:
+    if remainder.startswith("("):
+        extracted = _extract_parenthesized(remainder, 0)
+        if extracted is None:
+            return table, (), [], False
+        column_text, closing = extracted
         parsed_columns: list[str] = []
+        valid_columns = True
         for item in _split_sql_items(column_text):
             column_match = re.fullmatch(rf"\s*(?P<column>{_SQL_IDENTIFIER})\s*", item)
             if column_match is None:
-                return table, (), []
+                valid_columns = False
+                continue
             parsed_columns.append(_identifier_value(column_match.group("column")))
-        columns = tuple(parsed_columns)
-    values_text = match.group("values").rstrip().removesuffix(";").rstrip()
-    rows: list[list[str]] = []
-    for item in _split_sql_items(values_text):
-        item = item.strip()
-        if len(item) < 2 or item[0] != "(" or item[-1] != ")":
-            rows.append([])
-        else:
-            rows.append(_split_sql_items(item[1:-1]))
-    return table, columns, rows
+        columns = tuple(parsed_columns) if valid_columns else ()
+        remainder = remainder[closing + 1 :].lstrip()
+    values_match = re.match(r"VALUES\b", remainder, re.IGNORECASE)
+    if values_match is None:
+        return table, columns, [], False
+    rows, row_count_known = _parse_values_rows(remainder[values_match.end() :])
+    return table, columns, rows, row_count_known
 
 
 def _row_target_seq(
@@ -373,13 +444,16 @@ def _row_target_seq(
     return None, False
 
 
-def _stable_row_hash(
-    table: str, columns: Sequence[str], values: Sequence[object]
-) -> str:
-    payload = json.dumps(
-        [table, list(columns), list(values)],
+def _stable_row_hash(table: str, columns: Sequence[str], raw_tuple: str) -> str:
+    """Hash UTF-8/surrogateescape SQL with CRLF and CR canonically mapped to LF."""
+    normalized_tuple = raw_tuple.replace("\r\n", "\n").replace("\r", "\n")
+    context = json.dumps(
+        [table.casefold(), [column.casefold() for column in columns]],
         ensure_ascii=False,
         separators=(",", ":"),
+    )
+    payload = (
+        "steel.bkv-original-sql-tuple.v1\n" + context + "\n" + normalized_tuple
     ).encode("utf-8", errors="surrogateescape")
     return hashlib.sha256(payload).hexdigest()
 
@@ -407,7 +481,14 @@ def filter_sql_dump(
         rows_by_seq={},
         rows_by_table={table: [] for table in _SQL_TABLES},
         rejected_rows=[],
-        counts={table: {"accepted": 0, "rejected": 0} for table in _SQL_TABLES},
+        counts={
+            table: {
+                "accepted": 0,
+                "rejected": 0,
+                "statementRejectedRowsUnknown": 0,
+            }
+            for table in _SQL_TABLES
+        },
     )
     schemas: dict[str, _SqlTableSchema] = {}
     retained_relationships: dict[tuple[str, str], dict[object, int | None]] = {}
@@ -431,12 +512,15 @@ def filter_sql_dump(
             inserted = _parse_insert(statement)
             if inserted is None:
                 continue
-            table, explicit_columns, token_rows = inserted
+            table, explicit_columns, sql_rows, row_count_known = inserted
             if table not in _SQL_TABLES:
+                continue
+            if not row_count_known:
+                result.counts[table]["statementRejectedRowsUnknown"] += 1
                 continue
             schema = schemas.get(table)
             if schema is None:
-                for _tokens in token_rows or [[]]:
+                for _sql_row in sql_rows:
                     reject(table, "schema_unknown")
                 continue
             columns = (
@@ -446,9 +530,11 @@ def filter_sql_dump(
             if not columns or any(
                 column.casefold() not in schema_names for column in columns
             ):
-                reject(table, "malformed_insert")
+                for _sql_row in sql_rows:
+                    reject(table, "malformed_insert")
                 continue
-            for tokens in token_rows:
+            for sql_row in sql_rows:
+                tokens = sql_row.tokens
                 if len(tokens) != len(columns):
                     reject(table, "malformed_insert")
                     continue
@@ -501,7 +587,7 @@ def filter_sql_dump(
                 normalized_row["legacySeqNo"] = target_seq
                 normalized_row["legacyTable"] = table
                 normalized_row["originalRowHash"] = _stable_row_hash(
-                    table, columns, values
+                    table, columns, sql_row.raw_text
                 )
                 result.rows_by_table[table].append(normalized_row)
                 result.rows_by_seq.setdefault(target_seq, []).append(normalized_row)

@@ -146,7 +146,14 @@ INSERT INTO `diameter` VALUES
         self.assertRegex(
             result.rows_by_table["diameter"][0]["originalRowHash"], r"^[0-9a-f]{64}$"
         )
-        self.assertEqual(result.counts["defect"], {"accepted": 1, "rejected": 2})
+        self.assertEqual(
+            result.counts["defect"],
+            {
+                "accepted": 1,
+                "rejected": 2,
+                "statementRejectedRowsUnknown": 0,
+            },
+        )
 
     def test_rejects_unproven_diameter_association_and_invalid_physical_values(self):
         fixture = rb"""
@@ -221,7 +228,14 @@ INSERT INTO `diameter` VALUES (1, 71, 12.0), (2, 72, 13.0), (3, 999, 14.0);
 
         self.assertEqual(len(result.rows_by_table["diameter"]), 1)
         self.assertEqual(result.rows_by_table["diameter"][0]["legacySeqNo"], 1_893_700)
-        self.assertEqual(result.counts["diameter"], {"accepted": 1, "rejected": 2})
+        self.assertEqual(
+            result.counts["diameter"],
+            {
+                "accepted": 1,
+                "rejected": 2,
+                "statementRejectedRowsUnknown": 0,
+            },
+        )
         self.assertTrue(result.diameter_complete)
 
     def test_parses_doubled_quote_escaping_without_losing_row_boundaries(self):
@@ -252,6 +266,67 @@ INSERT INTO `allexcel` VALUES
                     subject.InventoryLimitError, "compression ratio"
                 ):
                     subject.filter_database_zip(database_zip, root / "normalized")
+
+    def test_create_table_accepts_mysql_options_after_balanced_closing_paren(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (
+  `Width` double DEFAULT NULL,
+  `SeqNo` bigint(20) NOT NULL,
+  PRIMARY KEY (`SeqNo`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='legacy ) table';
+INSERT INTO `allexcel` VALUES (12.5, 1893700);
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+        self.assertEqual(result.rows_by_table["allexcel"][0]["SeqNo"], 1_893_700)
+        self.assertEqual(result.rows_by_table["allexcel"][0]["Width"], 12.5)
+
+    def test_invalid_explicit_columns_reject_each_safely_counted_values_row(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text, PRIMARY KEY (`SeqNo`));
+INSERT INTO `allexcel` (`SeqNo`, `UnknownColumn`) VALUES
+  (1893700, 'one'), (1893701, 'two'), (1893702, 'three');
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+        self.assertEqual(result.counts["allexcel"]["rejected"], 3)
+        self.assertEqual(
+            [row["reason"] for row in result.rejected_rows],
+            ["malformed_insert", "malformed_insert", "malformed_insert"],
+        )
+        self.assertEqual(result.counts["allexcel"]["statementRejectedRowsUnknown"], 0)
+
+    def test_unparseable_values_records_unknown_rejected_row_count(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, PRIMARY KEY (`SeqNo`));
+INSERT INTO `allexcel` (`UnknownColumn`) VALUES (1893700), broken tuple;
+"""
+        result = subject.filter_sql_dump(io.BytesIO(fixture), subject.TARGET_SEQ_NOS)
+
+        self.assertEqual(result.counts["allexcel"]["rejected"], 0)
+        self.assertEqual(result.counts["allexcel"]["statementRejectedRowsUnknown"], 1)
+        self.assertEqual(result.rejected_rows, [])
+
+    def test_original_row_hash_preserves_literal_spelling_and_ignores_chunks(self):
+        fixture = rb"""
+CREATE TABLE `allexcel` (`SeqNo` bigint, `Width` double, PRIMARY KEY (`SeqNo`));
+INSERT INTO `allexcel` VALUES (1893700, 1.0), (1893700, 1.00);
+"""
+        contiguous = subject.filter_sql_dump(
+            io.BytesIO(fixture), subject.TARGET_SEQ_NOS
+        )
+        chunked = subject.filter_sql_dump(
+            _ChunkedCrcStream(fixture, chunk_size=1), subject.TARGET_SEQ_NOS
+        )
+
+        contiguous_hashes = [
+            row["originalRowHash"] for row in contiguous.rows_by_table["allexcel"]
+        ]
+        chunked_hashes = [
+            row["originalRowHash"] for row in chunked.rows_by_table["allexcel"]
+        ]
+        self.assertNotEqual(contiguous_hashes[0], contiguous_hashes[1])
+        self.assertEqual(chunked_hashes, contiguous_hashes)
 
 
 class MemberPolicyTests(unittest.TestCase):
