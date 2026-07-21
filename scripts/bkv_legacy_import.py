@@ -120,6 +120,55 @@ class StageFailedError(RuntimeError):
         super().__init__(f"{message}; failedEvidencePath={failed_evidence_path}")
 
 
+class _QuarantineWriter:
+    def __init__(self, path: Path):
+        self.path = path
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode) or is_reparse_point(path):
+                raise ValueError("quarantine must be a regular non-reparse file")
+            self._file = os.fdopen(descriptor, "wb", buffering=0)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self.count = 0
+
+    @property
+    def closed(self) -> bool:
+        return self._file.closed
+
+    def append(self, document: dict[str, object]) -> None:
+        if self.closed:
+            raise ValueError("quarantine evidence handle is closed")
+        if is_reparse_point(self.path) or not self.path.is_file():
+            raise ValueError("quarantine path changed or became a reparse point")
+        payload = (
+            json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        if len(payload) > 8192:
+            raise InventoryLimitError("failed quarantine evidence exceeds 8192 bytes")
+        self._file.write(payload)
+        self._file.flush()
+        os.fsync(self._file.fileno())
+        if is_reparse_point(self.path) or not self.path.is_file():
+            raise ValueError("quarantine path changed after evidence write")
+        self.count += 1
+
+    def sync(self) -> None:
+        if not self.closed:
+            self._file.flush()
+            os.fsync(self._file.fileno())
+
+    def close(self) -> None:
+        if not self.closed:
+            self.sync()
+            self._file.close()
+
+
 @dataclass(frozen=True)
 class FileSnapshot:
     device: int
@@ -2867,23 +2916,6 @@ def _copy_verified_file(source: Path, destination: Path, max_bytes: int) -> dict
     return {"size": total, "sha256": digest.hexdigest()}
 
 
-def _present_seq_nos_from_incoming(incoming: Path) -> list[int]:
-    present: set[int] = set()
-    artifacts = incoming / "artifacts"
-    if not artifacts.is_dir() or is_reparse_point(artifacts):
-        return []
-    for camera_number in range(1, 7):
-        camera = artifacts / f"camera{camera_number}"
-        if not camera.is_dir() or is_reparse_point(camera):
-            continue
-        for candidate in camera.iterdir():
-            if candidate.name.isdecimal():
-                seq_no = int(candidate.name)
-                if seq_no in TARGET_SEQ_NOS:
-                    present.add(seq_no)
-    return sorted(present)
-
-
 def _bounded_utf8_text(value: object, max_bytes: int) -> str:
     encoded = str(value).encode("utf-8", errors="replace")
     if len(encoded) <= max_bytes:
@@ -2891,11 +2923,102 @@ def _bounded_utf8_text(value: object, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def _unavailable_file_evidence(error: object) -> dict[str, object]:
+    return {
+        "path": None,
+        "size": None,
+        "sha256": None,
+        "evidenceStatus": "unavailable",
+        "error": _bounded_utf8_text(error, 1024),
+    }
+
+
+def _failed_file_evidence(
+    path: Path, relative: str, *, max_bytes: int = MAX_STAGE_ARTIFACT_BYTES
+) -> dict[str, object]:
+    if is_reparse_point(path) or not path.is_file():
+        return _unavailable_file_evidence(f"file unavailable: {relative}")
+    snapshot = _file_snapshot(path)
+    digest = _sha256_file(
+        path,
+        max_bytes=max_bytes,
+        deadline=time.monotonic() + STAGE_TIMEOUT_SECONDS,
+    )
+    _assert_snapshot(path, snapshot)
+    if is_reparse_point(path):
+        raise ValueError(f"file evidence became a reparse point: {relative}")
+    return {
+        "path": relative,
+        "size": snapshot.size,
+        "sha256": digest,
+        "evidenceStatus": "verified",
+        "error": None,
+    }
+
+
+def _empty_camera_inventory() -> dict[str, dict[str, object]]:
+    return {
+        str(number): {
+            "cameraNumber": number,
+            "artifactCount": 0,
+            "seqNos": [],
+            "countsByKind": {"2d": 0, "3d": 0, "metadata": 0},
+        }
+        for number in range(1, 7)
+    }
+
+
+def _collect_failed_artifacts(
+    incoming: Path,
+    candidates: object,
+) -> tuple[list[dict[str, object]], dict[str, dict[str, object]]]:
+    artifacts: list[dict[str, object]] = []
+    cameras = _empty_camera_inventory()
+    if not isinstance(candidates, list):
+        return artifacts, cameras
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("path"), str):
+            continue
+        relative = str(candidate["path"])
+        path = _stage_path(incoming, relative)
+        parts = PurePosixPath(relative).parts
+        if len(parts) < 5 or re.fullmatch(r"camera([1-6])", parts[1]) is None:
+            raise ValueError(f"invalid failed artifact path: {relative}")
+        camera_number = int(parts[1][6:])
+        if not parts[2].isdecimal() or int(parts[2]) not in TARGET_SEQ_NOS:
+            raise ValueError(f"invalid failed artifact SeqNo path: {relative}")
+        kind = parts[3]
+        if kind not in ("2d", "3d", "metadata"):
+            raise ValueError(f"invalid failed artifact kind path: {relative}")
+        try:
+            _verify_named_file(path, candidate, "failed artifact candidate")
+        except (OSError, ValueError, InventoryLimitError):
+            continue
+        evidence = dict(candidate)
+        evidence["evidenceStatus"] = "verified"
+        evidence["error"] = None
+        artifacts.append(evidence)
+        camera = cameras[str(camera_number)]
+        camera["artifactCount"] = int(camera["artifactCount"]) + 1
+        seq_nos = camera["seqNos"]
+        assert isinstance(seq_nos, list)
+        if int(parts[2]) not in seq_nos:
+            seq_nos.append(int(parts[2]))
+        counts = camera["countsByKind"]
+        assert isinstance(counts, dict)
+        counts[kind] = int(counts[kind]) + 1
+    for camera in cameras.values():
+        camera["seqNos"] = sorted(camera["seqNos"])
+    return artifacts, cameras
+
+
 def _publish_failed_stage(
     incoming: Path,
     output: Path,
     batch_id: str,
     error: BaseException,
+    quarantine_writer: _QuarantineWriter,
+    context: dict[str, object],
 ) -> Path:
     if not incoming.is_dir() or is_reparse_point(incoming):
         raise RuntimeError("cannot preserve failed stage evidence") from error
@@ -2904,32 +3027,113 @@ def _publish_failed_stage(
         "schema": "steel.bkv-stage-quarantine.v1",
         "reason": _bounded_utf8_text(type(error).__name__, 128),
         "message": _bounded_utf8_text(error, 4096),
+        "code": _bounded_utf8_text(context.get("code", "stage_failed"), 128),
+        "stage": _bounded_utf8_text(context.get("stage", "unknown"), 128),
     }
-    payload = (json.dumps(evidence, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-    if len(payload) > 8192:
-        raise InventoryLimitError("failed quarantine evidence exceeds 8192 bytes")
     quarantine = incoming / "quarantine.jsonl"
-    with quarantine.open("ab") as quarantine_output:
-        quarantine_output.write(payload)
-        quarantine_output.flush()
-        os.fsync(quarantine_output.fileno())
-    quarantine_evidence = {
-        "path": "quarantine.jsonl",
-        "size": quarantine.stat().st_size,
-        "sha256": _sha256_file(
-            quarantine,
-            max_bytes=MAX_MANIFEST_BYTES,
-            deadline=time.monotonic() + STAGE_TIMEOUT_SECONDS,
-        ),
-    }
+    quarantine_writer.append(evidence)
+    quarantine_writer.close()
+    quarantine_evidence = _failed_file_evidence(
+        quarantine, "quarantine.jsonl", max_bytes=MAX_MANIFEST_BYTES
+    )
+    artifacts, camera_inventory = _collect_failed_artifacts(
+        incoming, context.get("artifacts")
+    )
+    present_seq_nos = sorted({int(item["seqNo"]) for item in artifacts})
+    inventory = context.get("inventory")
+    source_archives: dict[str, dict[str, object]] = {}
+    inventory_archives = inventory.get("archives") if isinstance(inventory, dict) else None
+    for archive_part in ("database-zip", "image-part1", "image-part2"):
+        archive_evidence = (
+            inventory_archives.get(archive_part)
+            if isinstance(inventory_archives, dict)
+            else None
+        )
+        verified_archive: dict[str, object] | None = None
+        if isinstance(archive_evidence, dict) and isinstance(
+            archive_evidence.get("path"), str
+        ):
+            try:
+                archive_path = Path(str(archive_evidence["path"])).resolve(strict=True)
+                _verify_named_file(
+                    archive_path,
+                    archive_evidence,
+                    f"failed source archive {archive_part}",
+                    max_bytes=MAX_INPUT_ARCHIVE_BYTES,
+                )
+                verified_archive = {
+                    "path": str(archive_path),
+                    "size": archive_evidence.get("size"),
+                    "sha256": archive_evidence.get("sha256"),
+                    "integrity": archive_evidence.get("integrityStatus", "verified"),
+                    "evidenceStatus": "verified",
+                    "error": None,
+                }
+            except (OSError, ValueError, InventoryLimitError):
+                verified_archive = None
+        if verified_archive is not None:
+            source_archives[archive_part] = verified_archive
+        else:
+            unavailable = _unavailable_file_evidence(error)
+            unavailable["integrity"] = None
+            source_archives[archive_part] = unavailable
+    source_inventory_path = incoming / "source" / "inventory.json"
+    source_inventory = _failed_file_evidence(
+        source_inventory_path,
+        "source/inventory.json",
+        max_bytes=MAX_MANIFEST_BYTES,
+    )
+    normalized: list[dict[str, object]] = []
+    for table in _SQL_TABLES:
+        relative = f"normalized/{table}.jsonl"
+        normalized.append(
+            {"table": table, **_failed_file_evidence(incoming / relative, relative)}
+        )
+    entries = inventory.get("entries") if isinstance(inventory, dict) else None
+    database_statuses = [
+        str(entry.get("integrityStatus"))
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("archivePart") == "database-zip"
+    ] if isinstance(entries, list) else []
+    rejected_entries = 0
+    statistics = inventory.get("statistics") if isinstance(inventory, dict) else None
+    if isinstance(statistics, dict):
+        for statistic in statistics.values():
+            rejected = statistic.get("rejected") if isinstance(statistic, dict) else None
+            if isinstance(rejected, int) and not isinstance(rejected, bool) and rejected >= 0:
+                rejected_entries += rejected
     failed_manifest = {
         "schema": "steel.bkv-import-manifest.v1",
         "batchId": batch_id,
         "status": "failed",
         "importEligible": False,
         "seqNos": list(TARGET_SEQ_NOS),
-        "presentSeqNos": _present_seq_nos_from_incoming(incoming),
+        "presentSeqNos": present_seq_nos,
         "targetCoverageComplete": False,
+        "coverage": {
+            "complete": False,
+            "presentSeqNos": present_seq_nos,
+            "missingSeqNos": [
+                seq_no for seq_no in TARGET_SEQ_NOS if seq_no not in present_seq_nos
+            ],
+        },
+        "sourceInventory": source_inventory,
+        "sourceArchives": source_archives,
+        "databaseIntegrity": {
+            "statuses": database_statuses,
+            "allInventoryMembersVerified": False,
+            "normalizedGenerationVerified": False,
+            "crcFailed": "crc-failed" in database_statuses,
+            "evidenceStatus": "failed",
+        },
+        "counts": {
+            "acceptedArtifacts": len(artifacts),
+            "rejectedEntries": rejected_entries,
+            "quarantineEntries": quarantine_writer.count,
+        },
+        "cameraInventory": camera_inventory,
+        "normalized": normalized,
+        "artifacts": artifacts,
         "failure": evidence,
         "quarantine": quarantine_evidence,
     }
@@ -2946,6 +3150,40 @@ def _publish_failed_stage(
     _fsync_directory(output)
     _verify_staged_batch(failed, allow_failed=True)
     return failed
+
+
+def _verify_manifest_file_evidence(
+    batch: Path,
+    evidence: object,
+    label: str,
+    *,
+    max_bytes: int,
+    external: bool = False,
+) -> Path | None:
+    if not isinstance(evidence, dict):
+        raise ValueError(f"{label} evidence must be an object")
+    status = evidence.get("evidenceStatus")
+    if status == "unavailable":
+        if (
+            evidence.get("path") is not None
+            or evidence.get("size") is not None
+            or evidence.get("sha256") is not None
+            or not isinstance(evidence.get("error"), str)
+        ):
+            raise ValueError(f"{label} unavailable evidence must use explicit nulls")
+        return None
+    if status != "verified" or evidence.get("error") is not None:
+        raise ValueError(f"{label} evidence status is invalid")
+    relative_or_path = evidence.get("path")
+    if not isinstance(relative_or_path, str):
+        raise ValueError(f"{label} verified evidence lacks a path")
+    path = (
+        Path(relative_or_path).resolve(strict=True)
+        if external
+        else _stage_path(batch, relative_or_path)
+    )
+    _verify_named_file(path, evidence, label, max_bytes=max_bytes)
+    return path
 
 
 def _verify_staged_batch(
@@ -2973,12 +3211,13 @@ def _verify_staged_batch(
         or any(seq_no not in TARGET_SEQ_NOS for seq_no in present_seq_nos)
     ):
         raise ValueError("staged manifest presentSeqNos is invalid")
+    expected_eligible = status == "ready"
+    if manifest.get("importEligible") != expected_eligible:
+        raise ValueError("staged manifest importEligible does not match status")
+    if status == "failed" and not allow_failed:
+        raise ValueError("failed staged batch is not canonical")
+    failure = manifest.get("failure")
     if status == "failed":
-        if not allow_failed:
-            raise ValueError("failed staged batch is not canonical")
-        if manifest.get("importEligible") is not False:
-            raise ValueError("failed staged batch must set importEligible=false")
-        failure = manifest.get("failure")
         if (
             not isinstance(failure, dict)
             or failure.get("schema") != "steel.bkv-stage-quarantine.v1"
@@ -2986,52 +3225,47 @@ def _verify_staged_batch(
             or len(failure["reason"].encode("utf-8")) > 128
             or not isinstance(failure.get("message"), str)
             or len(failure["message"].encode("utf-8")) > 4096
+            or not isinstance(failure.get("code"), str)
+            or not isinstance(failure.get("stage"), str)
         ):
             raise ValueError("failed staged batch has invalid bounded failure evidence")
-        quarantine_evidence = manifest.get("quarantine")
-        if not isinstance(quarantine_evidence, dict):
-            raise ValueError("failed staged batch lacks quarantine evidence")
-        relative = quarantine_evidence.get("path")
-        if relative != "quarantine.jsonl":
-            raise ValueError("failed quarantine path is invalid")
-        _verify_named_file(
-            _stage_path(batch, relative),
-            quarantine_evidence,
-            "failed quarantine evidence",
-            max_bytes=MAX_MANIFEST_BYTES,
-        )
-        return manifest
-    if manifest.get("importEligible") != (status == "ready"):
-        raise ValueError("staged manifest importEligible does not match status")
+    elif failure is not None:
+        raise ValueError("non-failed staged batch must use failure=null")
+
     source_inventory = manifest.get("sourceInventory")
-    _verify_named_file(
-        batch / "source" / "inventory.json",
+    _verify_manifest_file_evidence(
+        batch,
         source_inventory,
         "source inventory",
         max_bytes=MAX_MANIFEST_BYTES,
     )
     archives = manifest.get("sourceArchives")
-    if not isinstance(archives, dict):
-        raise ValueError("staged manifest sourceArchives must be an object")
+    if not isinstance(archives, dict) or set(archives) != {
+        "database-zip", "image-part1", "image-part2"
+    }:
+        raise ValueError("staged manifest must declare exactly three source archives")
     for archive_part in ("database-zip", "image-part1", "image-part2"):
         evidence = archives.get(archive_part)
-        if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
-            raise ValueError(f"missing source archive evidence: {archive_part}")
-        _verify_named_file(
-            Path(str(evidence["path"])).resolve(strict=True),
+        if not isinstance(evidence, dict) or "integrity" not in evidence:
+            raise ValueError(f"invalid source archive evidence: {archive_part}")
+        _verify_manifest_file_evidence(
+            batch,
             evidence,
             f"source archive {archive_part}",
             max_bytes=MAX_INPUT_ARCHIVE_BYTES,
+            external=True,
         )
     normalized = manifest.get("normalized")
     if not isinstance(normalized, list) or len(normalized) != len(_SQL_TABLES):
         raise ValueError("staged manifest must declare five normalized files")
+    if {item.get("table") for item in normalized if isinstance(item, dict)} != set(
+        _SQL_TABLES
+    ):
+        raise ValueError("normalized evidence must name exactly five tables")
     for evidence in normalized:
-        if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
-            raise ValueError("invalid normalized file evidence")
-        relative = str(evidence["path"])
-        path = _stage_path(batch, relative)
-        _verify_named_file(path, evidence, "normalized file")
+        _verify_manifest_file_evidence(
+            batch, evidence, "normalized file", max_bytes=MAX_STAGE_ARTIFACT_BYTES
+        )
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list):
         raise ValueError("staged manifest artifacts must be an array")
@@ -3047,7 +3281,9 @@ def _verify_staged_batch(
         seen.add(collision_key)
         path = _stage_path(batch, relative)
         try:
-            _verify_named_file(path, evidence, "artifact")
+            _verify_manifest_file_evidence(
+                batch, evidence, "artifact", max_bytes=MAX_STAGE_ARTIFACT_BYTES
+            )
         except ValueError as error:
             if "hash mismatch" in str(error):
                 raise ValueError(f"artifact hash mismatch: {path}") from error
@@ -3057,9 +3293,60 @@ def _verify_staged_batch(
             raise InventoryLimitError(
                 f"staged artifact total exceeds MAX_STAGE_TOTAL_BYTES={MAX_STAGE_TOTAL_BYTES}"
             )
-    quarantine = batch / "quarantine.jsonl"
-    if is_reparse_point(quarantine) or not quarantine.is_file():
-        raise ValueError("staged batch lacks a regular quarantine.jsonl")
+    camera_inventory = manifest.get("cameraInventory")
+    if not isinstance(camera_inventory, dict) or set(camera_inventory) != {
+        str(number) for number in range(1, 7)
+    }:
+        raise ValueError("cameraInventory must contain all six cameras")
+    for number in range(1, 7):
+        camera = camera_inventory[str(number)]
+        if (
+            not isinstance(camera, dict)
+            or camera.get("cameraNumber") != number
+            or isinstance(camera.get("artifactCount"), bool)
+            or not isinstance(camera.get("artifactCount"), int)
+            or not isinstance(camera.get("seqNos"), list)
+            or not isinstance(camera.get("countsByKind"), dict)
+        ):
+            raise ValueError(f"invalid camera inventory: {number}")
+    database_integrity = manifest.get("databaseIntegrity")
+    if not isinstance(database_integrity, dict) or not all(
+        key in database_integrity
+        for key in (
+            "statuses", "allInventoryMembersVerified",
+            "normalizedGenerationVerified", "crcFailed", "evidenceStatus"
+        )
+    ):
+        raise ValueError("invalid databaseIntegrity flags")
+    counts = manifest.get("counts")
+    if not isinstance(counts, dict):
+        raise ValueError("staged manifest counts must be an object")
+    for key in ("acceptedArtifacts", "rejectedEntries", "quarantineEntries"):
+        value = counts.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"invalid staged count: {key}")
+    if counts["acceptedArtifacts"] != len(artifacts):
+        raise ValueError("acceptedArtifacts does not match artifact evidence")
+    coverage = manifest.get("coverage")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("presentSeqNos") != present_seq_nos
+        or coverage.get("complete") != manifest.get("targetCoverageComplete")
+        or coverage.get("missingSeqNos")
+        != [seq_no for seq_no in TARGET_SEQ_NOS if seq_no not in present_seq_nos]
+    ):
+        raise ValueError("invalid staged coverage evidence")
+    quarantine_evidence = manifest.get("quarantine")
+    quarantine_path = _verify_manifest_file_evidence(
+        batch,
+        quarantine_evidence,
+        "quarantine evidence",
+        max_bytes=MAX_MANIFEST_BYTES,
+    )
+    if quarantine_path != batch / "quarantine.jsonl":
+        raise ValueError("quarantine evidence path is invalid")
+    if status == "failed" and counts["quarantineEntries"] < 1:
+        raise ValueError("failed stage must contain quarantine evidence")
     return manifest
 
 
@@ -3085,7 +3372,7 @@ def _verify_current_inputs(
         _verify_named_file(generation / f"{table}.jsonl", evidence, "normalized input")
 
 
-def stage_batch(
+def _stage_batch_into(
     *,
     inventory_manifest: os.PathLike[str] | str,
     normalized_output: os.PathLike[str] | str,
@@ -3093,9 +3380,14 @@ def stage_batch(
     batch_id: str,
     unrar: os.PathLike[str] | str | None = None,
     runner: Callable[..., subprocess.CompletedProcess[bytes]] | None = None,
+    incoming: Path,
+    quarantine_writer: _QuarantineWriter,
+    failure_context: dict[str, object],
 ) -> Path:
+    failure_context["stage"] = "inventory"
     inventory_path = _resolve_input(inventory_manifest, "inventory manifest")
     inventory = _load_json_document(inventory_path, "inventory manifest")
+    failure_context["inventory"] = inventory
     if inventory.get("schema") != MANIFEST_SCHEMA:
         raise ValueError("invalid inventory manifest schema")
     if inventory.get("batchId") != batch_id:
@@ -3106,6 +3398,7 @@ def stage_batch(
     }:
         raise ValueError("inventory must name exactly three source archives")
     archive_paths: dict[str, Path] = {}
+    failure_context["stage"] = "source-archives"
     for archive_part, evidence in archives.items():
         if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
             raise ValueError(f"invalid archive evidence: {archive_part}")
@@ -3118,9 +3411,12 @@ def stage_batch(
             f"source archive {archive_part}",
             max_bytes=MAX_INPUT_ARCHIVE_BYTES,
         )
+    failure_context["stage"] = "normalized-pointer"
     normalized_root = Path(normalized_output).resolve(strict=True)
     generation = resolve_sql_output(normalized_root)
+    failure_context["stage"] = "unrar"
     unrar_path = locate_unrar(unrar)
+    failure_context["stage"] = "output-overlap"
     final = _validate_output_path(
         Path(output_root),
         batch_id,
@@ -3144,17 +3440,22 @@ def stage_batch(
         )
         return final
 
-    incoming = Path(tempfile.mkdtemp(prefix=f"{batch_id}.incoming-", dir=output))
-    incoming = incoming.resolve(strict=True)
     try:
+        failure_context["stage"] = "source-inventory"
         (incoming / "source").mkdir()
         source_inventory_evidence = _copy_verified_file(
             inventory_path, incoming / "source" / "inventory.json", MAX_MANIFEST_BYTES
         )
         source_inventory_evidence.update(
-            {"path": "source/inventory.json", "originalPath": str(inventory_path)}
+            {
+                "path": "source/inventory.json",
+                "originalPath": str(inventory_path),
+                "evidenceStatus": "verified",
+                "error": None,
+            }
         )
 
+        failure_context["stage"] = "normalized-copy"
         normalized_evidence: list[dict[str, object]] = []
         for table in _SQL_TABLES:
             source = generation / f"{table}.jsonl"
@@ -3162,11 +3463,20 @@ def stage_batch(
             evidence = _copy_verified_file(
                 source, _stage_path(incoming, relative), MAX_STAGE_ARTIFACT_BYTES
             )
-            normalized_evidence.append({"table": table, "path": relative, **evidence})
+            normalized_evidence.append(
+                {
+                    "table": table,
+                    "path": relative,
+                    "evidenceStatus": "verified",
+                    "error": None,
+                    **evidence,
+                }
+            )
         # Re-resolve the pointer and re-hash its generation after every copy.
         if resolve_sql_output(normalized_root) != generation:
             raise RuntimeError("SQL normalized generation changed during staging")
 
+        failure_context["stage"] = "coverage"
         entries = inventory.get("entries")
         if not isinstance(entries, list):
             raise ValueError("inventory entries must be an array")
@@ -3200,6 +3510,7 @@ def stage_batch(
                 )
 
         artifact_evidence: list[dict[str, object]] = []
+        failure_context["artifacts"] = artifact_evidence
         camera_inventory: dict[str, dict[str, object]] = {
             str(number): {
                 "cameraNumber": number,
@@ -3209,6 +3520,7 @@ def stage_batch(
             }
             for number in range(1, 7)
         }
+        failure_context["stage"] = "extraction"
         with _stable_archive_inputs(tuple(archive_paths.values())) as working:
             for archive_part, evidence in archives.items():
                 assert isinstance(evidence, dict)
@@ -3239,6 +3551,8 @@ def stage_batch(
                     "memberPath": member,
                     "archivePart": archive_part,
                     **metadata,
+                    "evidenceStatus": "verified",
+                    "error": None,
                     **evidence,
                 }
                 artifact_evidence.append(artifact)
@@ -3290,10 +3604,23 @@ def stage_batch(
             int(camera["artifactCount"]) > 0
             for camera in camera_inventory.values()
         )
-        quarantine = incoming / "quarantine.jsonl"
-        with quarantine.open("xb") as output_file:
-            output_file.flush()
-            os.fsync(output_file.fileno())
+        quarantine_writer.sync()
+        quarantine_path = incoming / "quarantine.jsonl"
+        quarantine_evidence = _failed_file_evidence(
+            quarantine_path, "quarantine.jsonl", max_bytes=MAX_MANIFEST_BYTES
+        )
+        manifest_archives = {
+            archive_part: {
+                "path": str(archive_paths[archive_part]),
+                "size": evidence.get("size"),
+                "sha256": evidence.get("sha256"),
+                "integrity": "verified",
+                "evidenceStatus": "verified",
+                "error": None,
+            }
+            for archive_part, evidence in archives.items()
+            if isinstance(evidence, dict)
+        }
         manifest = {
             "schema": "steel.bkv-import-manifest.v1",
             "batchId": batch_id,
@@ -3306,33 +3633,110 @@ def stage_batch(
             "seqNos": list(TARGET_SEQ_NOS),
             "presentSeqNos": seq_nos,
             "targetCoverageComplete": target_coverage_complete,
+            "coverage": {
+                "complete": target_coverage_complete,
+                "presentSeqNos": seq_nos,
+                "missingSeqNos": [
+                    seq_no for seq_no in TARGET_SEQ_NOS if seq_no not in seq_nos
+                ],
+            },
             "sourceInventory": source_inventory_evidence,
-            "sourceArchives": archives,
+            "sourceArchives": manifest_archives,
             "databaseIntegrity": {
                 "statuses": database_statuses,
                 "allInventoryMembersVerified": database_verified,
                 "normalizedGenerationVerified": True,
                 "crcFailed": "crc-failed" in database_statuses,
+                "evidenceStatus": "verified",
             },
             "counts": {
                 "acceptedArtifacts": len(artifact_evidence),
                 "rejectedEntries": rejected,
+                "quarantineEntries": quarantine_writer.count,
             },
             "cameraInventory": camera_inventory,
             "normalized": normalized_evidence,
             "artifacts": artifact_evidence,
+            "failure": None,
+            "quarantine": quarantine_evidence,
         }
+        failure_context["stage"] = "validation"
         _write_json_atomic(incoming / "manifest.json", manifest)
         _verify_staged_batch(incoming)
         if final.exists() or is_reparse_point(final):
             raise FileExistsError(f"batch-id collision during publish: {final}")
+        quarantine_writer.close()
         os.rename(incoming, final)
         _fsync_directory(output)
         _verify_staged_batch(final)
         return final
     except BaseException as error:
-        failed = _publish_failed_stage(incoming, output, batch_id, error)
+        raise
+
+
+def stage_batch(
+    *,
+    inventory_manifest: os.PathLike[str] | str,
+    normalized_output: os.PathLike[str] | str,
+    output_root: os.PathLike[str] | str,
+    batch_id: str,
+    unrar: os.PathLike[str] | str | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]] | None = None,
+) -> Path:
+    # Only the path syntax boundary is evaluated before the evidence channel
+    # exists. All untrusted manifests, sources, pointers, and executables are
+    # handled inside the unified failure publication scope below.
+    final = _validate_output_path(Path(output_root), batch_id, ())
+    output = final.parent
+    output.mkdir(parents=True, exist_ok=True)
+    for existing_path in _existing_chain(output):
+        if is_reparse_point(existing_path):
+            raise ValueError(f"output path contains a reparse point: {existing_path}")
+    incoming = Path(
+        tempfile.mkdtemp(prefix=f"{batch_id}.incoming-", dir=output)
+    ).resolve(strict=True)
+    quarantine_writer = _QuarantineWriter(incoming / "quarantine.jsonl")
+    context: dict[str, object] = {
+        "stage": "initialization",
+        "code": "stage_failed",
+        "inventory": None,
+    }
+    try:
+        result = _stage_batch_into(
+            inventory_manifest=inventory_manifest,
+            normalized_output=normalized_output,
+            output_root=output_root,
+            batch_id=batch_id,
+            unrar=unrar,
+            runner=runner,
+            incoming=incoming,
+            quarantine_writer=quarantine_writer,
+            failure_context=context,
+        )
+        if incoming.exists():
+            quarantine_writer.close()
+            resolved_incoming = incoming.resolve(strict=True)
+            if resolved_incoming.parent != output or not resolved_incoming.name.startswith(
+                f"{batch_id}.incoming-"
+            ):
+                raise ValueError("refusing to clean an untrusted incoming directory")
+            shutil.rmtree(resolved_incoming)
+            _fsync_directory(output)
+        return result
+    except BaseException as error:
+        if isinstance(error, StageFailedError):
+            raise
+        failed = _publish_failed_stage(
+            incoming,
+            output,
+            batch_id,
+            error,
+            quarantine_writer,
+            context,
+        )
         raise StageFailedError("BKV stage failed", failed) from error
+    finally:
+        quarantine_writer.close()
 
 
 def batch_is_importable(

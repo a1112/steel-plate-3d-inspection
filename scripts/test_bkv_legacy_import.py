@@ -1181,6 +1181,7 @@ class ExtractionTests(unittest.TestCase):
         self.assertFalse(any("*" in argument for command, _ in self.commands for argument in command))
 
         manifest = json.loads((batch / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(manifest), self._complete_manifest_fields())
         self.assertEqual(manifest["schema"], "steel.bkv-import-manifest.v1")
         self.assertEqual(manifest["status"], "ready")
         self.assertEqual(manifest["seqNos"], list(subject.TARGET_SEQ_NOS))
@@ -1273,18 +1274,21 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(len(self.commands), first_command_count)
 
         (batch / "artifacts/camera1/1893700/2d/one.jpg").write_bytes(b"tampered")
-        with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
+        with self.assertRaises(subject.StageFailedError) as raised:
             self._stage()
+        self._assert_complete_failed_contract(raised.exception.failed_evidence_path)
 
     def test_same_batch_id_with_changed_source_archive_is_a_collision(self):
         self._stage()
         self.part1.write_bytes(b"changed!")
-        with self.assertRaisesRegex(ValueError, "source archive.*mismatch"):
+        with self.assertRaises(subject.StageFailedError) as raised:
             self._stage()
+        self._assert_complete_failed_contract(raised.exception.failed_evidence_path)
 
     def test_batch_output_may_not_overlap_supplied_normalized_output(self):
-        with self.assertRaisesRegex(ValueError, "overlaps"):
+        with self.assertRaises(subject.StageFailedError) as raised:
             self._stage(output_root=self.normalized / "nested-batches")
+        self._assert_complete_failed_contract(raised.exception.failed_evidence_path)
 
     def test_extraction_failure_is_atomically_preserved_as_failed_evidence(self):
         def short_runner(command, **kwargs):
@@ -1360,6 +1364,140 @@ class ExtractionTests(unittest.TestCase):
         self.assertLessEqual(len(payload), 8_192)
         document = json.loads(payload.decode("utf-8"))
         self.assertEqual(document["reason"], "RuntimeError")
+
+    def _assert_complete_failed_contract(self, failed):
+        manifest = subject._verify_staged_batch(failed, allow_failed=True)
+        self.assertEqual(set(manifest), self._complete_manifest_fields())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertFalse(manifest["importEligible"])
+        self.assertEqual(manifest["seqNos"], list(subject.TARGET_SEQ_NOS))
+        self.assertEqual(set(manifest["sourceArchives"]), {
+            "database-zip", "image-part1", "image-part2"
+        })
+        self.assertEqual(set(manifest["cameraInventory"]), {
+            str(number) for number in range(1, 7)
+        })
+        self.assertIn("databaseIntegrity", manifest)
+        self.assertIn("counts", manifest)
+        self.assertIn("artifacts", manifest)
+        self.assertIn("coverage", manifest)
+        self.assertEqual(manifest["counts"]["quarantineEntries"], 1)
+        self.assertIn("code", manifest["failure"])
+        self.assertIn("stage", manifest["failure"])
+        return manifest
+
+    def _complete_manifest_fields(self):
+        return {
+            "schema", "batchId", "status", "importEligible", "seqNos",
+            "presentSeqNos", "targetCoverageComplete", "coverage",
+            "sourceInventory", "sourceArchives", "databaseIntegrity", "counts",
+            "cameraInventory", "normalized", "artifacts", "failure", "quarantine",
+        }
+
+    def test_invalid_inventory_schema_is_preserved_before_source_resolution(self):
+        inventory = json.loads(self.inventory_path.read_text(encoding="utf-8"))
+        inventory["schema"] = "invalid.schema"
+        self.inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+
+        with self.assertRaises(subject.StageFailedError) as raised:
+            self._stage()
+        self.assertEqual(self.commands, [])
+        self.assertFalse((self.output_root / "batch-001").exists())
+        manifest = self._assert_complete_failed_contract(
+            raised.exception.failed_evidence_path
+        )
+        self.assertEqual(manifest["failure"]["stage"], "inventory")
+
+    def test_missing_inventory_file_publishes_complete_failed_evidence(self):
+        self.inventory_path.unlink()
+        with self.assertRaises(subject.StageFailedError) as raised:
+            self._stage()
+        manifest = self._assert_complete_failed_contract(
+            raised.exception.failed_evidence_path
+        )
+        self.assertEqual(manifest["failure"]["stage"], "inventory")
+        self.assertIsNone(manifest["sourceInventory"]["sha256"])
+        self.assertEqual(manifest["sourceInventory"]["evidenceStatus"], "unavailable")
+
+    def test_missing_source_publishes_failed_evidence(self):
+        self.part1.unlink()
+        with self.assertRaises(subject.StageFailedError) as raised:
+            self._stage()
+        manifest = self._assert_complete_failed_contract(
+            raised.exception.failed_evidence_path
+        )
+        source = manifest["sourceArchives"]["image-part1"]
+        self.assertIsNone(source["size"])
+        self.assertIsNone(source["sha256"])
+        self.assertEqual(source["evidenceStatus"], "unavailable")
+
+    def test_bad_normalized_pointer_publishes_failed_evidence(self):
+        (self.normalized / "normalized.current.json").write_text("{}", encoding="utf-8")
+        with self.assertRaises(subject.StageFailedError) as raised:
+            self._stage()
+        self._assert_complete_failed_contract(raised.exception.failed_evidence_path)
+
+    def test_missing_unrar_publishes_failed_evidence(self):
+        self.unrar.unlink()
+        with self.assertRaises(subject.StageFailedError) as raised:
+            self._stage()
+        self._assert_complete_failed_contract(raised.exception.failed_evidence_path)
+
+    def test_precreated_quarantine_is_rejected_before_unrar_runs(self):
+        real_mkdtemp = tempfile.mkdtemp
+
+        def precreate_quarantine(*args, **kwargs):
+            incoming = Path(real_mkdtemp(*args, **kwargs))
+            (incoming / "quarantine.jsonl").write_bytes(b"attacker")
+            return str(incoming)
+
+        with mock.patch.object(
+            subject.tempfile, "mkdtemp", side_effect=precreate_quarantine
+        ):
+            with self.assertRaises(FileExistsError):
+                self._stage()
+        self.assertEqual(self.commands, [])
+        self.assertFalse((self.output_root / "batch-001").exists())
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
+    def test_quarantine_symlink_never_writes_outside_incoming(self):
+        outside = self.root / "outside.txt"
+        outside.write_bytes(b"outside-safe")
+        real_mkdtemp = tempfile.mkdtemp
+
+        def symlink_quarantine(*args, **kwargs):
+            incoming = Path(real_mkdtemp(*args, **kwargs))
+            try:
+                os.symlink(outside, incoming / "quarantine.jsonl")
+            except OSError as error:
+                self.skipTest(f"symlink unavailable: {error}")
+            return str(incoming)
+
+        with mock.patch.object(
+            subject.tempfile, "mkdtemp", side_effect=symlink_quarantine
+        ):
+            with self.assertRaises((FileExistsError, ValueError)):
+                self._stage()
+        self.assertEqual(outside.read_bytes(), b"outside-safe")
+        self.assertEqual(self.commands, [])
+
+    def test_failed_verifier_checks_artifact_hashes_without_early_return(self):
+        self._use_complete_target_coverage()
+
+        def fail_after_first(command, **kwargs):
+            if self.commands:
+                raise RuntimeError("stop after one verified artifact")
+            return self._runner(command, **kwargs)
+
+        with self.assertRaises(subject.StageFailedError) as raised:
+            self._stage(runner=fail_after_first)
+        failed = raised.exception.failed_evidence_path
+        manifest = self._assert_complete_failed_contract(failed)
+        self.assertEqual(len(manifest["artifacts"]), 1)
+        artifact = failed / Path(*PurePosixPath(manifest["artifacts"][0]["path"]).parts)
+        artifact.write_bytes(b"tampered")
+        with self.assertRaisesRegex(ValueError, "artifact.*mismatch"):
+            subject._verify_staged_batch(failed, allow_failed=True)
 
     def test_partial_database_requires_explicit_operator_review(self):
         self._write_inventory(database_integrity="crc-failed")
