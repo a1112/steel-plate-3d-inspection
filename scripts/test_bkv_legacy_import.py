@@ -595,7 +595,7 @@ INSERT INTO `allexcel` VALUES (1893700, 'first');"""
             original_pointer = pointer_path.read_bytes()
             pointer["files"]["allexcel"]["count"] += 1
             pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "count mismatch"):
+            with self.assertRaisesRegex(ValueError, "count mismatch|accepted count"):
                 subject.resolve_sql_output(output)
             pointer_path.write_bytes(original_pointer)
 
@@ -1046,6 +1046,14 @@ class ExtractionTests(unittest.TestCase):
             io.BytesIO(
                 b"CREATE TABLE `allexcel` (`SeqNo` bigint);"
                 b"INSERT INTO `allexcel` VALUES (1893700);"
+                b"CREATE TABLE `checkrecord` (`SeqNo` bigint);"
+                b"INSERT INTO `checkrecord` VALUES (1893700);"
+                b"CREATE TABLE `defect` (`SeqNo` bigint);"
+                b"INSERT INTO `defect` VALUES (1893700);"
+                b"CREATE TABLE `defectclass` (`SeqNo` bigint);"
+                b"INSERT INTO `defectclass` VALUES (1893700);"
+                b"CREATE TABLE `diameter` (`SeqNo` bigint);"
+                b"INSERT INTO `diameter` VALUES (1893700);"
             ),
             subject.TARGET_SEQ_NOS,
             output_dir=self.normalized,
@@ -1128,13 +1136,15 @@ class ExtractionTests(unittest.TestCase):
         self.inventory_path.write_text(json.dumps(document), encoding="utf-8")
 
     def _use_complete_target_coverage(self):
-        for index, seq_no in enumerate(subject.TARGET_SEQ_NOS):
-            camera = index % 6 + 1
-            member = (
-                f"image_copy/CamImageSource{camera}/{seq_no}/2D/"
-                f"coverage-{seq_no}.jpg"
-            )
-            self.payloads.setdefault(member, f"jpeg-{camera}-{seq_no}".encode("ascii"))
+        for seq_no in subject.TARGET_SEQ_NOS:
+            for camera in range(1, 7):
+                member = (
+                    f"image_copy/CamImageSource{camera}/{seq_no}/2D/"
+                    f"coverage-{seq_no}.jpg"
+                )
+                self.payloads.setdefault(
+                    member, f"jpeg-{camera}-{seq_no}".encode("ascii")
+                )
         self._write_inventory()
 
     def _runner(self, command, **kwargs):
@@ -1390,7 +1400,8 @@ class ExtractionTests(unittest.TestCase):
         return {
             "schema", "batchId", "status", "importEligible", "seqNos",
             "presentSeqNos", "targetCoverageComplete", "coverage",
-            "sourceInventory", "sourceArchives", "databaseIntegrity", "counts",
+            "sourceInventory", "normalizationEvidence", "sourceArchives",
+            "databaseIntegrity", "counts",
             "cameraInventory", "normalized", "artifacts", "failure", "quarantine",
         }
 
@@ -1498,6 +1509,106 @@ class ExtractionTests(unittest.TestCase):
         artifact.write_bytes(b"tampered")
         with self.assertRaisesRegex(ValueError, "artifact.*mismatch"):
             subject._verify_staged_batch(failed, allow_failed=True)
+
+    def _rewrite_manifest(self, batch, mutate):
+        path = batch / "manifest.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        mutate(manifest)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest
+
+    def _refresh_file_evidence(self, evidence, path):
+        payload = path.read_bytes()
+        evidence["size"] = len(payload)
+        evidence["sha256"] = hashlib.sha256(payload).hexdigest()
+
+    def test_semantic_verifier_recomputes_camera_inventory_and_coverage(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+
+        def forge(manifest):
+            manifest["cameraInventory"]["1"]["artifactCount"] += 1
+            manifest["coverage"]["complete"] = False
+            manifest["targetCoverageComplete"] = False
+
+        self._rewrite_manifest(batch, forge)
+        with self.assertRaisesRegex(ValueError, "cameraInventory|coverage"):
+            subject._verify_staged_batch(batch)
+
+    def test_semantic_verifier_rejects_deleted_and_unmanifested_artifacts(self):
+        self._use_complete_target_coverage()
+        deleted_batch = self._stage()
+        first = json.loads(
+            (deleted_batch / "manifest.json").read_text(encoding="utf-8")
+        )["artifacts"][0]
+        (deleted_batch / Path(*PurePosixPath(first["path"]).parts)).unlink()
+        with self.assertRaises(ValueError):
+            subject._verify_staged_batch(deleted_batch)
+
+        self.tearDown()
+        self.setUp()
+        self._use_complete_target_coverage()
+        added_batch = self._stage()
+        extra = added_batch / "artifacts/camera1/1893700/2d/unmanifested.jpg"
+        extra.write_bytes(b"extra")
+        with self.assertRaisesRegex(ValueError, "unmanifested|artifact set"):
+            subject._verify_staged_batch(added_batch)
+
+    def test_semantic_verifier_rejects_camera_move_even_if_manifest_path_is_changed(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        manifest_path = batch / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        artifact = next(item for item in manifest["artifacts"] if item["cameraNumber"] == 1)
+        old = batch / Path(*PurePosixPath(artifact["path"]).parts)
+        new_relative = artifact["path"].replace("artifacts/camera1/", "artifacts/camera2/", 1)
+        new = batch / Path(*PurePosixPath(new_relative).parts)
+        new.parent.mkdir(parents=True, exist_ok=True)
+        old.rename(new)
+        artifact["path"] = new_relative
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "camera|inventory member"):
+            subject._verify_staged_batch(batch)
+
+    def test_semantic_verifier_rejects_normalized_rewrite_with_forged_manifest_hash(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        normalized = batch / "normalized/allexcel.jsonl"
+        normalized.write_bytes(normalized.read_bytes() + b'{}\n')
+
+        def forge(manifest):
+            evidence = next(item for item in manifest["normalized"] if item["table"] == "allexcel")
+            self._refresh_file_evidence(evidence, normalized)
+
+        self._rewrite_manifest(batch, forge)
+        with self.assertRaisesRegex(ValueError, "count mismatch|pointer"):
+            subject._verify_staged_batch(batch)
+
+    def test_semantic_verifier_rejects_replaced_source_inventory_with_forged_hash(self):
+        self._use_complete_target_coverage()
+        batch = self._stage()
+        inventory_path = batch / "source/inventory.json"
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        inventory["archives"]["image-part1"]["sha256"] = "0" * 64
+        inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+
+        def forge(manifest):
+            self._refresh_file_evidence(manifest["sourceInventory"], inventory_path)
+
+        self._rewrite_manifest(batch, forge)
+        with self.assertRaisesRegex(ValueError, "source archive|inventory"):
+            subject._verify_staged_batch(batch)
+
+    def test_importability_uses_derived_coverage_not_forged_ready_status(self):
+        batch = self._stage()
+
+        def forge(manifest):
+            manifest["status"] = "ready"
+            manifest["importEligible"] = True
+
+        self._rewrite_manifest(batch, forge)
+        with self.assertRaisesRegex(ValueError, "ready|coverage"):
+            subject.batch_is_importable(batch)
 
     def test_partial_database_requires_explicit_operator_review(self):
         self._write_inventory(database_integrity="crc-failed")

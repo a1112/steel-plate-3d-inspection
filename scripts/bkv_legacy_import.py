@@ -840,7 +840,7 @@ def _sql_file_evidence(path: Path, count: int) -> dict[str, object]:
 def _publish_sql_output(
     incoming: Path,
     output_root: Path,
-    counts: dict[str, dict[str, int]],
+    result: SqlDumpResult,
 ) -> Path:
     """Publish an immutable generation, then atomically switch its small pointer."""
     output_root = _strict_sql_output_root(output_root, create=False)
@@ -857,11 +857,17 @@ def _publish_sql_output(
         path = generation / f"{table}.jsonl"
         if not path.is_file() or is_reparse_point(path):
             raise ValueError(f"generation file is missing or unsafe: {path}")
-        files[table] = _sql_file_evidence(path, counts[table]["accepted"])
+        files[table] = _sql_file_evidence(path, result.counts[table]["accepted"])
     pointer = {
         "schema": "steel.bkv-sql-current.v1",
         "generation": f"normalized-generations/{generation.name}",
         "files": files,
+        "resultEvidence": {
+            "integrity": result.integrity,
+            "diameterComplete": result.diameter_complete,
+            "parseRejectedStatements": result.parse_rejected_statements,
+            "counts": result.counts,
+        },
     }
     payload = (
         json.dumps(pointer, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -925,6 +931,33 @@ def _validate_sql_current_pointer(pointer: object) -> dict[str, object]:
             raise ValueError(
                 f"invalid SQL current pointer: sha256 must be lowercase hex: {table}"
             )
+    result_evidence = pointer.get("resultEvidence")
+    if not isinstance(result_evidence, dict):
+        raise ValueError("invalid SQL current pointer: resultEvidence is required")
+    if result_evidence.get("integrity") not in (
+        "ok", "partial-parse-error", "partial-crc-error"
+    ):
+        raise ValueError("invalid SQL current pointer: result integrity")
+    if not isinstance(result_evidence.get("diameterComplete"), bool):
+        raise ValueError("invalid SQL current pointer: diameterComplete")
+    parse_rejected = result_evidence.get("parseRejectedStatements")
+    if isinstance(parse_rejected, bool) or not isinstance(parse_rejected, int) or parse_rejected < 0:
+        raise ValueError("invalid SQL current pointer: parseRejectedStatements")
+    result_counts = result_evidence.get("counts")
+    if not isinstance(result_counts, dict) or set(result_counts) != set(_SQL_TABLES):
+        raise ValueError("invalid SQL current pointer: result counts")
+    for table in _SQL_TABLES:
+        table_counts = result_counts[table]
+        if not isinstance(table_counts, dict):
+            raise ValueError(f"invalid SQL current pointer: counts for {table}")
+        for key in ("accepted", "rejected", "statementRejectedRowsUnknown"):
+            value = table_counts.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"invalid SQL current pointer: {table} {key}")
+        file_evidence = files[table]
+        assert isinstance(file_evidence, dict)
+        if table_counts["accepted"] != file_evidence["count"]:
+            raise ValueError(f"invalid SQL current pointer: accepted count {table}")
     return pointer
 
 
@@ -1432,7 +1465,7 @@ def filter_sql_dump(
                 writers.clear()
                 assert incoming is not None
                 _fsync_directory(incoming)
-                _publish_sql_output(incoming, output_destination, result.counts)
+                _publish_sql_output(incoming, output_destination, result)
                 incoming = None
         finally:
             for writer in writers.values():
@@ -2963,6 +2996,10 @@ def _empty_camera_inventory() -> dict[str, dict[str, object]]:
             "artifactCount": 0,
             "seqNos": [],
             "countsByKind": {"2d": 0, "3d": 0, "metadata": 0},
+            "matrix": {
+                str(seq_no): {"2d": 0, "3d": 0, "metadata": 0}
+                for seq_no in TARGET_SEQ_NOS
+            },
         }
         for number in range(1, 7)
     }
@@ -3007,6 +3044,9 @@ def _collect_failed_artifacts(
         counts = camera["countsByKind"]
         assert isinstance(counts, dict)
         counts[kind] = int(counts[kind]) + 1
+        matrix = camera["matrix"]
+        assert isinstance(matrix, dict)
+        matrix[str(int(parts[2]))][kind] += 1
     for camera in cameras.values():
         camera["seqNos"] = sorted(camera["seqNos"])
     return artifacts, cameras
@@ -3039,8 +3079,22 @@ def _publish_failed_stage(
     artifacts, camera_inventory = _collect_failed_artifacts(
         incoming, context.get("artifacts")
     )
+    accepted_paths = {str(item["path"]) for item in artifacts}
+    artifact_root = incoming / "artifacts"
+    if artifact_root.is_dir() and not is_reparse_point(artifact_root):
+        for path in artifact_root.rglob("*"):
+            if is_reparse_point(path):
+                raise ValueError(f"failed artifact tree contains a reparse point: {path}")
+            if path.is_file() and path.relative_to(incoming).as_posix() not in accepted_paths:
+                path.unlink()
     present_seq_nos = sorted({int(item["seqNo"]) for item in artifacts})
     inventory = context.get("inventory")
+    source_inventory_path = incoming / "source" / "inventory.json"
+    source_inventory = _failed_file_evidence(
+        source_inventory_path,
+        "source/inventory.json",
+        max_bytes=MAX_MANIFEST_BYTES,
+    )
     source_archives: dict[str, dict[str, object]] = {}
     inventory_archives = inventory.get("archives") if isinstance(inventory, dict) else None
     for archive_part in ("database-zip", "image-part1", "image-part2"):
@@ -3050,7 +3104,9 @@ def _publish_failed_stage(
             else None
         )
         verified_archive: dict[str, object] | None = None
-        if isinstance(archive_evidence, dict) and isinstance(
+        if source_inventory.get("evidenceStatus") == "verified" and isinstance(
+            archive_evidence, dict
+        ) and isinstance(
             archive_evidence.get("path"), str
         ):
             try:
@@ -3065,6 +3121,8 @@ def _publish_failed_stage(
                     "path": str(archive_path),
                     "size": archive_evidence.get("size"),
                     "sha256": archive_evidence.get("sha256"),
+                    "fileIdentity": archive_evidence.get("fileIdentity"),
+                    "mtimeNs": archive_evidence.get("mtimeNs"),
                     "integrity": archive_evidence.get("integrityStatus", "verified"),
                     "evidenceStatus": "verified",
                     "error": None,
@@ -3076,18 +3134,32 @@ def _publish_failed_stage(
         else:
             unavailable = _unavailable_file_evidence(error)
             unavailable["integrity"] = None
+            unavailable["fileIdentity"] = None
+            unavailable["mtimeNs"] = None
             source_archives[archive_part] = unavailable
-    source_inventory_path = incoming / "source" / "inventory.json"
-    source_inventory = _failed_file_evidence(
-        source_inventory_path,
-        "source/inventory.json",
+    normalization_evidence = _failed_file_evidence(
+        incoming / "source" / "normalized.current.json",
+        "source/normalized.current.json",
         max_bytes=MAX_MANIFEST_BYTES,
+    )
+    pointer_document = context.get("normalizationPointer")
+    pointer_files = (
+        pointer_document.get("files") if isinstance(pointer_document, dict) else None
     )
     normalized: list[dict[str, object]] = []
     for table in _SQL_TABLES:
         relative = f"normalized/{table}.jsonl"
+        file_evidence = _failed_file_evidence(incoming / relative, relative)
         normalized.append(
-            {"table": table, **_failed_file_evidence(incoming / relative, relative)}
+            {
+                "table": table,
+                "count": (
+                    pointer_files[table]["count"]
+                    if isinstance(pointer_files, dict) and table in pointer_files
+                    else None
+                ),
+                **file_evidence,
+            }
         )
     entries = inventory.get("entries") if isinstance(inventory, dict) else None
     database_statuses = [
@@ -3095,6 +3167,20 @@ def _publish_failed_stage(
         for entry in entries
         if isinstance(entry, dict) and entry.get("archivePart") == "database-zip"
     ] if isinstance(entries, list) else []
+    database_members = [
+        {
+            key: entry.get(key)
+            for key in (
+                "memberPath", "size", "sha256", "integrityStatus",
+                "integrityEvidence",
+            )
+        }
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("archivePart") == "database-zip"
+    ] if isinstance(entries, list) else []
+    if source_inventory.get("evidenceStatus") != "verified":
+        database_statuses = []
+        database_members = []
     rejected_entries = 0
     statistics = inventory.get("statistics") if isinstance(inventory, dict) else None
     if isinstance(statistics, dict):
@@ -3102,6 +3188,33 @@ def _publish_failed_stage(
             rejected = statistic.get("rejected") if isinstance(statistic, dict) else None
             if isinstance(rejected, int) and not isinstance(rejected, bool) and rejected >= 0:
                 rejected_entries += rejected
+    result_evidence = (
+        pointer_document.get("resultEvidence")
+        if isinstance(pointer_document, dict)
+        and normalization_evidence.get("evidenceStatus") == "verified"
+        else None
+    )
+    result_counts = (
+        result_evidence.get("counts") if isinstance(result_evidence, dict) else None
+    )
+    normalized_rows_by_table = {
+        table: (
+            int(next(item for item in normalized if item["table"] == table)["count"])
+            if next(item for item in normalized if item["table"] == table).get(
+                "evidenceStatus"
+            ) == "verified"
+            else 0
+        )
+        for table in _SQL_TABLES
+    }
+    normalized_rejected = sum(
+        int(result_counts[table]["rejected"])
+        + int(result_counts[table]["statementRejectedRowsUnknown"])
+        for table in _SQL_TABLES
+    ) if isinstance(result_counts, dict) else 0
+    normalized_files_verified = all(
+        item.get("evidenceStatus") == "verified" for item in normalized
+    ) and normalization_evidence.get("evidenceStatus") == "verified"
     failed_manifest = {
         "schema": "steel.bkv-import-manifest.v1",
         "batchId": batch_id,
@@ -3116,20 +3229,56 @@ def _publish_failed_stage(
             "missingSeqNos": [
                 seq_no for seq_no in TARGET_SEQ_NOS if seq_no not in present_seq_nos
             ],
+            "missingCameraSeq": [
+                {"cameraNumber": number, "seqNo": seq_no}
+                for number in range(1, 7)
+                for seq_no in TARGET_SEQ_NOS
+                if sum(
+                    int(value)
+                    for value in camera_inventory[str(number)]["matrix"][str(seq_no)].values()
+                ) == 0
+            ],
         },
         "sourceInventory": source_inventory,
+        "normalizationEvidence": normalization_evidence,
         "sourceArchives": source_archives,
         "databaseIntegrity": {
             "statuses": database_statuses,
-            "allInventoryMembersVerified": False,
-            "normalizedGenerationVerified": False,
+            "sourceMembers": database_members,
+            "allInventoryMembersVerified": bool(database_statuses) and all(
+                item == "ok" for item in database_statuses
+            ),
+            "normalizedGenerationVerified": normalized_files_verified,
             "crcFailed": "crc-failed" in database_statuses,
-            "evidenceStatus": "failed",
+            "evidenceStatus": (
+                "verified"
+                if source_inventory.get("evidenceStatus") == "verified"
+                and normalization_evidence.get("evidenceStatus") == "verified"
+                else "failed"
+            ),
+            "normalizationIntegrity": (
+                result_evidence.get("integrity")
+                if isinstance(result_evidence, dict)
+                else None
+            ),
+            "diameterComplete": (
+                result_evidence.get("diameterComplete")
+                if isinstance(result_evidence, dict)
+                else None
+            ),
+            "parseRejectedStatements": (
+                result_evidence.get("parseRejectedStatements")
+                if isinstance(result_evidence, dict)
+                else None
+            ),
         },
         "counts": {
             "acceptedArtifacts": len(artifacts),
             "rejectedEntries": rejected_entries,
             "quarantineEntries": quarantine_writer.count,
+            "acceptedNormalizedRows": sum(normalized_rows_by_table.values()),
+            "rejectedNormalizedRows": normalized_rejected,
+            "normalizedRowsByTable": normalized_rows_by_table,
         },
         "cameraInventory": camera_inventory,
         "normalized": normalized,
@@ -3233,12 +3382,21 @@ def _verify_staged_batch(
         raise ValueError("non-failed staged batch must use failure=null")
 
     source_inventory = manifest.get("sourceInventory")
-    _verify_manifest_file_evidence(
+    source_inventory_path = _verify_manifest_file_evidence(
         batch,
         source_inventory,
         "source inventory",
         max_bytes=MAX_MANIFEST_BYTES,
     )
+    inventory_document: dict[str, object] | None = None
+    if source_inventory_path is not None:
+        inventory_document = _load_json_document(
+            source_inventory_path, "staged source inventory"
+        )
+        if inventory_document.get("schema") != MANIFEST_SCHEMA:
+            raise ValueError("staged source inventory schema mismatch")
+        if inventory_document.get("batchId") != manifest.get("batchId"):
+            raise ValueError("staged source inventory batchId mismatch")
     archives = manifest.get("sourceArchives")
     if not isinstance(archives, dict) or set(archives) != {
         "database-zip", "image-part1", "image-part2"
@@ -3246,14 +3404,58 @@ def _verify_staged_batch(
         raise ValueError("staged manifest must declare exactly three source archives")
     for archive_part in ("database-zip", "image-part1", "image-part2"):
         evidence = archives.get(archive_part)
-        if not isinstance(evidence, dict) or "integrity" not in evidence:
+        if not isinstance(evidence, dict) or not all(
+            key in evidence
+            for key in ("integrity", "fileIdentity", "mtimeNs")
+        ):
             raise ValueError(f"invalid source archive evidence: {archive_part}")
-        _verify_manifest_file_evidence(
+        verified_archive_path = _verify_manifest_file_evidence(
             batch,
             evidence,
             f"source archive {archive_part}",
             max_bytes=MAX_INPUT_ARCHIVE_BYTES,
             external=True,
+        )
+        if inventory_document is not None:
+            inventory_archives = inventory_document.get("archives")
+            expected = (
+                inventory_archives.get(archive_part)
+                if isinstance(inventory_archives, dict)
+                else None
+            )
+            if not isinstance(expected, dict):
+                raise ValueError(f"source inventory archive missing: {archive_part}")
+            if verified_archive_path is None:
+                if status != "failed":
+                    raise ValueError(f"source archive unavailable: {archive_part}")
+            else:
+                if (
+                    str(verified_archive_path) != expected.get("path")
+                    or evidence.get("size") != expected.get("size")
+                    or evidence.get("sha256") != expected.get("sha256")
+                    or evidence.get("fileIdentity") != expected.get("fileIdentity")
+                    or evidence.get("mtimeNs") != expected.get("mtimeNs")
+                ):
+                    raise ValueError(f"source archive inventory mismatch: {archive_part}")
+        elif evidence.get("evidenceStatus") == "unavailable" and (
+            evidence.get("fileIdentity") is not None
+            or evidence.get("mtimeNs") is not None
+            or evidence.get("integrity") is not None
+        ):
+            raise ValueError(f"unavailable source archive evidence is not null: {archive_part}")
+
+    normalization_pointer_path = _verify_manifest_file_evidence(
+        batch,
+        manifest.get("normalizationEvidence"),
+        "normalization pointer evidence",
+        max_bytes=MAX_MANIFEST_BYTES,
+    )
+    normalization_pointer: dict[str, object] | None = None
+    if normalization_pointer_path is not None:
+        normalization_pointer = _validate_sql_current_pointer(
+            _load_json_document(
+                normalization_pointer_path, "staged normalization pointer"
+            )
         )
     normalized = manifest.get("normalized")
     if not isinstance(normalized, list) or len(normalized) != len(_SQL_TABLES):
@@ -3262,15 +3464,41 @@ def _verify_staged_batch(
         _SQL_TABLES
     ):
         raise ValueError("normalized evidence must name exactly five tables")
+    normalized_counts: dict[str, int] = {}
+    normalized_available: set[str] = set()
     for evidence in normalized:
-        _verify_manifest_file_evidence(
+        normalized_path = _verify_manifest_file_evidence(
             batch, evidence, "normalized file", max_bytes=MAX_STAGE_ARTIFACT_BYTES
         )
+        table = str(evidence["table"])
+        if normalized_path is None:
+            if status != "failed":
+                raise ValueError(f"normalized file unavailable: {table}")
+            normalized_counts[table] = 0
+            continue
+        if normalization_pointer is None:
+            raise ValueError("normalized files lack their bound pointer evidence")
+        pointer_files = normalization_pointer["files"]
+        assert isinstance(pointer_files, dict)
+        pointer_evidence = pointer_files[table]
+        assert isinstance(pointer_evidence, dict)
+        actual = _sql_file_evidence(normalized_path, int(pointer_evidence["count"]))
+        if actual != {
+            "sha256": pointer_evidence["sha256"],
+            "size": pointer_evidence["size"],
+            "count": pointer_evidence["count"],
+        }:
+            raise ValueError(f"normalized pointer evidence mismatch: {table}")
+        if evidence.get("count") != actual["count"]:
+            raise ValueError(f"normalized manifest count mismatch: {table}")
+        normalized_counts[table] = int(actual["count"])
+        normalized_available.add(table)
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list):
         raise ValueError("staged manifest artifacts must be an array")
     total = 0
     seen: set[str] = set()
+    declared_artifact_paths: set[str] = set()
     for evidence in artifacts:
         if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
             raise ValueError("invalid artifact evidence")
@@ -3279,6 +3507,7 @@ def _verify_staged_batch(
         if collision_key in seen:
             raise ValueError(f"duplicate staged artifact path: {relative}")
         seen.add(collision_key)
+        declared_artifact_paths.add(relative)
         path = _stage_path(batch, relative)
         try:
             _verify_manifest_file_evidence(
@@ -3293,6 +3522,64 @@ def _verify_staged_batch(
             raise InventoryLimitError(
                 f"staged artifact total exceeds MAX_STAGE_TOTAL_BYTES={MAX_STAGE_TOTAL_BYTES}"
             )
+    disk_artifact_paths: set[str] = set()
+    artifact_root = batch / "artifacts"
+    if artifact_root.is_dir() and not is_reparse_point(artifact_root):
+        for path in artifact_root.rglob("*"):
+            if is_reparse_point(path):
+                raise ValueError(f"artifact tree contains a reparse point: {path}")
+            if path.is_file():
+                disk_artifact_paths.add(path.relative_to(batch).as_posix())
+    if disk_artifact_paths != declared_artifact_paths:
+        raise ValueError("artifact set contains deleted or unmanifested files")
+
+    derived_camera_inventory = _empty_camera_inventory()
+    inventory_members = {}
+    if inventory_document is not None:
+        inventory_entries = inventory_document.get("entries")
+        if not isinstance(inventory_entries, list):
+            raise ValueError("source inventory entries must be an array")
+        inventory_members = {
+            str(entry.get("memberPath")): entry
+            for entry in inventory_entries
+            if isinstance(entry, dict) and entry.get("cameraNumber") is not None
+        }
+    for evidence in artifacts:
+        assert isinstance(evidence, dict)
+        relative = str(evidence["path"])
+        parts = PurePosixPath(relative).parts
+        camera_match = re.fullmatch(r"camera([1-6])", parts[1]) if len(parts) == 5 else None
+        if (
+            camera_match is None
+            or not parts[2].isdecimal()
+            or int(parts[2]) not in TARGET_SEQ_NOS
+            or parts[3] not in ("2d", "3d", "metadata")
+        ):
+            raise ValueError(f"invalid artifact semantic path: {relative}")
+        camera_number = int(camera_match.group(1))
+        seq_no = int(parts[2])
+        if evidence.get("cameraNumber") != camera_number or evidence.get("seqNo") != seq_no:
+            raise ValueError(f"artifact camera/SeqNo mismatch: {relative}")
+        if inventory_document is not None:
+            member = evidence.get("memberPath")
+            inventory_entry = inventory_members.get(str(member))
+            if not isinstance(inventory_entry, dict):
+                raise ValueError(f"artifact lacks source inventory member: {relative}")
+            if _artifact_relative_path(inventory_entry) != relative:
+                raise ValueError(f"artifact path conflicts with source inventory member: {relative}")
+        camera = derived_camera_inventory[str(camera_number)]
+        camera["artifactCount"] = int(camera["artifactCount"]) + 1
+        camera_seq_nos = camera["seqNos"]
+        assert isinstance(camera_seq_nos, list)
+        if seq_no not in camera_seq_nos:
+            camera_seq_nos.append(seq_no)
+        counts_by_kind = camera["countsByKind"]
+        matrix = camera["matrix"]
+        assert isinstance(counts_by_kind, dict) and isinstance(matrix, dict)
+        counts_by_kind[parts[3]] = int(counts_by_kind[parts[3]]) + 1
+        matrix[str(seq_no)][parts[3]] += 1
+    for camera in derived_camera_inventory.values():
+        camera["seqNos"] = sorted(camera["seqNos"])
     camera_inventory = manifest.get("cameraInventory")
     if not isinstance(camera_inventory, dict) or set(camera_inventory) != {
         str(number) for number in range(1, 7)
@@ -3309,33 +3596,151 @@ def _verify_staged_batch(
             or not isinstance(camera.get("countsByKind"), dict)
         ):
             raise ValueError(f"invalid camera inventory: {number}")
-    database_integrity = manifest.get("databaseIntegrity")
-    if not isinstance(database_integrity, dict) or not all(
-        key in database_integrity
-        for key in (
-            "statuses", "allInventoryMembersVerified",
-            "normalizedGenerationVerified", "crcFailed", "evidenceStatus"
+    if camera_inventory != derived_camera_inventory:
+        raise ValueError("cameraInventory does not match artifact disk evidence")
+    derived_present_seq_nos = sorted(
+        {
+            int(evidence["seqNo"])
+            for evidence in artifacts
+            if isinstance(evidence, dict)
+        }
+    )
+    if present_seq_nos != derived_present_seq_nos:
+        raise ValueError("presentSeqNos does not match artifact disk evidence")
+    missing_camera_seq = [
+        {"cameraNumber": number, "seqNo": seq_no}
+        for number in range(1, 7)
+        for seq_no in TARGET_SEQ_NOS
+        if sum(
+            int(value)
+            for value in derived_camera_inventory[str(number)]["matrix"][str(seq_no)].values()
+        ) == 0
+    ]
+    derived_coverage = {
+        "complete": (
+            derived_present_seq_nos == list(TARGET_SEQ_NOS)
+            and not missing_camera_seq
+        ),
+        "presentSeqNos": derived_present_seq_nos,
+        "missingSeqNos": [
+            seq_no for seq_no in TARGET_SEQ_NOS if seq_no not in derived_present_seq_nos
+        ],
+        "missingCameraSeq": missing_camera_seq,
+    }
+    if manifest.get("coverage") != derived_coverage:
+        raise ValueError("coverage does not match artifact disk evidence")
+    if manifest.get("targetCoverageComplete") != derived_coverage["complete"]:
+        raise ValueError("targetCoverageComplete does not match disk evidence")
+
+    inventory_entries = (
+        inventory_document.get("entries") if isinstance(inventory_document, dict) else []
+    )
+    if not isinstance(inventory_entries, list):
+        raise ValueError("source inventory entries must be an array")
+    database_entries = [
+        entry
+        for entry in inventory_entries
+        if isinstance(entry, dict) and entry.get("archivePart") == "database-zip"
+    ]
+    database_statuses = [str(entry.get("integrityStatus")) for entry in database_entries]
+    database_members = [
+        {
+            key: entry.get(key)
+            for key in (
+                "memberPath", "size", "sha256", "integrityStatus",
+                "integrityEvidence",
+            )
+        }
+        for entry in database_entries
+    ]
+    source_database_complete = bool(database_statuses) and all(
+        item == "ok" for item in database_statuses
+    )
+    result_evidence = (
+        normalization_pointer.get("resultEvidence")
+        if isinstance(normalization_pointer, dict)
+        else None
+    )
+    result_counts = (
+        result_evidence.get("counts") if isinstance(result_evidence, dict) else None
+    )
+    rejected_normalized = (
+        sum(
+            int(result_counts[table]["rejected"])
+            + int(result_counts[table]["statementRejectedRowsUnknown"])
+            for table in _SQL_TABLES
         )
-    ):
-        raise ValueError("invalid databaseIntegrity flags")
+        if isinstance(result_counts, dict)
+        else 0
+    )
+    normalization_generation_verified = normalized_available == set(_SQL_TABLES)
+    normalization_complete = (
+        normalization_generation_verified
+        and isinstance(result_evidence, dict)
+        and result_evidence.get("integrity") == "ok"
+        and result_evidence.get("diameterComplete") is True
+        and result_evidence.get("parseRejectedStatements") == 0
+        and rejected_normalized == 0
+    )
+    derived_database_integrity = {
+        "statuses": database_statuses,
+        "sourceMembers": database_members,
+        "allInventoryMembersVerified": source_database_complete,
+        "normalizedGenerationVerified": normalization_generation_verified,
+        "crcFailed": "crc-failed" in database_statuses,
+        "evidenceStatus": (
+            "verified"
+            if inventory_document is not None and normalization_pointer is not None
+            else "failed"
+        ),
+        "normalizationIntegrity": (
+            result_evidence.get("integrity")
+            if isinstance(result_evidence, dict)
+            else None
+        ),
+        "diameterComplete": (
+            result_evidence.get("diameterComplete")
+            if isinstance(result_evidence, dict)
+            else None
+        ),
+        "parseRejectedStatements": (
+            result_evidence.get("parseRejectedStatements")
+            if isinstance(result_evidence, dict)
+            else None
+        ),
+    }
+    if manifest.get("databaseIntegrity") != derived_database_integrity:
+        raise ValueError("databaseIntegrity does not match source and normalized evidence")
     counts = manifest.get("counts")
     if not isinstance(counts, dict):
         raise ValueError("staged manifest counts must be an object")
-    for key in ("acceptedArtifacts", "rejectedEntries", "quarantineEntries"):
+    for key in (
+        "acceptedArtifacts", "rejectedEntries", "quarantineEntries",
+        "acceptedNormalizedRows", "rejectedNormalizedRows",
+    ):
         value = counts.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"invalid staged count: {key}")
-    if counts["acceptedArtifacts"] != len(artifacts):
-        raise ValueError("acceptedArtifacts does not match artifact evidence")
-    coverage = manifest.get("coverage")
-    if (
-        not isinstance(coverage, dict)
-        or coverage.get("presentSeqNos") != present_seq_nos
-        or coverage.get("complete") != manifest.get("targetCoverageComplete")
-        or coverage.get("missingSeqNos")
-        != [seq_no for seq_no in TARGET_SEQ_NOS if seq_no not in present_seq_nos]
-    ):
-        raise ValueError("invalid staged coverage evidence")
+    statistics = (
+        inventory_document.get("statistics")
+        if isinstance(inventory_document, dict)
+        else None
+    )
+    rejected_inventory = 0
+    if isinstance(statistics, dict):
+        for statistic in statistics.values():
+            if isinstance(statistic, dict):
+                rejected_inventory += int(statistic.get("rejected", 0))
+    expected_counts_without_quarantine = {
+        "acceptedArtifacts": len(artifacts),
+        "rejectedEntries": rejected_inventory,
+        "acceptedNormalizedRows": sum(normalized_counts.values()),
+        "rejectedNormalizedRows": rejected_normalized,
+        "normalizedRowsByTable": normalized_counts,
+    }
+    for key, value in expected_counts_without_quarantine.items():
+        if counts.get(key) != value:
+            raise ValueError(f"staged count does not match disk evidence: {key}")
     quarantine_evidence = manifest.get("quarantine")
     quarantine_path = _verify_manifest_file_evidence(
         batch,
@@ -3345,8 +3750,25 @@ def _verify_staged_batch(
     )
     if quarantine_path != batch / "quarantine.jsonl":
         raise ValueError("quarantine evidence path is invalid")
-    if status == "failed" and counts["quarantineEntries"] < 1:
+    quarantine_lines = quarantine_path.read_text(encoding="utf-8").splitlines()
+    for line in quarantine_lines:
+        if line:
+            json.loads(line)
+    if counts["quarantineEntries"] != len(quarantine_lines):
+        raise ValueError("quarantineEntries does not match disk evidence")
+    if status == "failed" and not quarantine_lines:
         raise ValueError("failed stage must contain quarantine evidence")
+    derived_ready = (
+        source_database_complete
+        and normalization_complete
+        and bool(derived_coverage["complete"])
+    )
+    if status != "failed":
+        expected_status = "ready" if derived_ready else "partial"
+        if status != expected_status:
+            raise ValueError(f"{status} status conflicts with derived {expected_status} evidence")
+        if manifest.get("importEligible") != derived_ready:
+            raise ValueError("importEligible conflicts with derived evidence")
     return manifest
 
 
@@ -3414,6 +3836,12 @@ def _stage_batch_into(
     failure_context["stage"] = "normalized-pointer"
     normalized_root = Path(normalized_output).resolve(strict=True)
     generation = resolve_sql_output(normalized_root)
+    pointer_document = _validate_sql_current_pointer(
+        _load_json_document(
+            normalized_root / "normalized.current.json", "SQL current pointer"
+        )
+    )
+    failure_context["normalizationPointer"] = pointer_document
     failure_context["stage"] = "unrar"
     unrar_path = locate_unrar(unrar)
     failure_context["stage"] = "output-overlap"
@@ -3454,6 +3882,18 @@ def _stage_batch_into(
                 "error": None,
             }
         )
+        normalization_pointer_evidence = _copy_verified_file(
+            normalized_root / "normalized.current.json",
+            incoming / "source" / "normalized.current.json",
+            MAX_MANIFEST_BYTES,
+        )
+        normalization_pointer_evidence.update(
+            {
+                "path": "source/normalized.current.json",
+                "evidenceStatus": "verified",
+                "error": None,
+            }
+        )
 
         failure_context["stage"] = "normalized-copy"
         normalized_evidence: list[dict[str, object]] = []
@@ -3466,6 +3906,7 @@ def _stage_batch_into(
             normalized_evidence.append(
                 {
                     "table": table,
+                    "count": pointer_document["files"][table]["count"],
                     "path": relative,
                     "evidenceStatus": "verified",
                     "error": None,
@@ -3511,15 +3952,7 @@ def _stage_batch_into(
 
         artifact_evidence: list[dict[str, object]] = []
         failure_context["artifacts"] = artifact_evidence
-        camera_inventory: dict[str, dict[str, object]] = {
-            str(number): {
-                "cameraNumber": number,
-                "artifactCount": 0,
-                "seqNos": [],
-                "countsByKind": {"2d": 0, "3d": 0, "metadata": 0},
-            }
-            for number in range(1, 7)
-        }
+        camera_inventory = _empty_camera_inventory()
         failure_context["stage"] = "extraction"
         with _stable_archive_inputs(tuple(archive_paths.values())) as working:
             for archive_part, evidence in archives.items():
@@ -3566,6 +3999,9 @@ def _stage_batch_into(
                 counts_by_kind = camera["countsByKind"]
                 assert isinstance(counts_by_kind, dict)
                 counts_by_kind[destination_kind] = int(counts_by_kind[destination_kind]) + 1
+                matrix = camera["matrix"]
+                assert isinstance(matrix, dict)
+                matrix[str(metadata["seqNo"])][destination_kind] += 1
             for archive_part, evidence in archives.items():
                 assert isinstance(evidence, dict)
                 _verify_named_file(
@@ -3586,6 +4022,24 @@ def _stage_batch_into(
         database_verified = bool(database_entries) and all(
             status == "ok" for status in database_statuses
         )
+        result_evidence = pointer_document["resultEvidence"]
+        assert isinstance(result_evidence, dict)
+        result_counts = result_evidence["counts"]
+        assert isinstance(result_counts, dict)
+        normalized_accepted = sum(
+            int(result_counts[table]["accepted"]) for table in _SQL_TABLES
+        )
+        normalized_rejected = sum(
+            int(result_counts[table]["rejected"])
+            + int(result_counts[table]["statementRejectedRowsUnknown"])
+            for table in _SQL_TABLES
+        )
+        normalization_complete = (
+            result_evidence["integrity"] == "ok"
+            and result_evidence["diameterComplete"] is True
+            and result_evidence["parseRejectedStatements"] == 0
+            and normalized_rejected == 0
+        )
         statistics = inventory.get("statistics")
         if not isinstance(statistics, dict):
             raise ValueError("inventory statistics must be an object")
@@ -3600,9 +4054,17 @@ def _stage_batch_into(
         seq_nos = sorted({int(item["seqNo"]) for item in artifact_evidence})
         if any(seq_no not in TARGET_SEQ_NOS for seq_no in seq_nos):
             raise ValueError("staged artifact contains an unapproved SeqNo")
-        target_coverage_complete = seq_nos == list(TARGET_SEQ_NOS) and all(
-            int(camera["artifactCount"]) > 0
-            for camera in camera_inventory.values()
+        missing_camera_seq = [
+            {"cameraNumber": number, "seqNo": seq_no}
+            for number in range(1, 7)
+            for seq_no in TARGET_SEQ_NOS
+            if sum(
+                int(value)
+                for value in camera_inventory[str(number)]["matrix"][str(seq_no)].values()
+            ) == 0
+        ]
+        target_coverage_complete = (
+            seq_nos == list(TARGET_SEQ_NOS) and not missing_camera_seq
         )
         quarantine_writer.sync()
         quarantine_path = incoming / "quarantine.jsonl"
@@ -3614,6 +4076,8 @@ def _stage_batch_into(
                 "path": str(archive_paths[archive_part]),
                 "size": evidence.get("size"),
                 "sha256": evidence.get("sha256"),
+                "fileIdentity": evidence.get("fileIdentity"),
+                "mtimeNs": evidence.get("mtimeNs"),
                 "integrity": "verified",
                 "evidenceStatus": "verified",
                 "error": None,
@@ -3626,10 +4090,12 @@ def _stage_batch_into(
             "batchId": batch_id,
             "status": (
                 "ready"
-                if database_verified and target_coverage_complete
+                if database_verified and target_coverage_complete and normalization_complete
                 else "partial"
             ),
-            "importEligible": database_verified and target_coverage_complete,
+            "importEligible": (
+                database_verified and target_coverage_complete and normalization_complete
+            ),
             "seqNos": list(TARGET_SEQ_NOS),
             "presentSeqNos": seq_nos,
             "targetCoverageComplete": target_coverage_complete,
@@ -3639,20 +4105,43 @@ def _stage_batch_into(
                 "missingSeqNos": [
                     seq_no for seq_no in TARGET_SEQ_NOS if seq_no not in seq_nos
                 ],
+                "missingCameraSeq": missing_camera_seq,
             },
             "sourceInventory": source_inventory_evidence,
+            "normalizationEvidence": normalization_pointer_evidence,
             "sourceArchives": manifest_archives,
             "databaseIntegrity": {
                 "statuses": database_statuses,
+                "sourceMembers": [
+                    {
+                        key: entry.get(key)
+                        for key in (
+                            "memberPath", "size", "sha256", "integrityStatus",
+                            "integrityEvidence",
+                        )
+                    }
+                    for entry in database_entries
+                ],
                 "allInventoryMembersVerified": database_verified,
                 "normalizedGenerationVerified": True,
                 "crcFailed": "crc-failed" in database_statuses,
                 "evidenceStatus": "verified",
+                "normalizationIntegrity": result_evidence["integrity"],
+                "diameterComplete": result_evidence["diameterComplete"],
+                "parseRejectedStatements": result_evidence[
+                    "parseRejectedStatements"
+                ],
             },
             "counts": {
                 "acceptedArtifacts": len(artifact_evidence),
                 "rejectedEntries": rejected,
                 "quarantineEntries": quarantine_writer.count,
+                "acceptedNormalizedRows": normalized_accepted,
+                "rejectedNormalizedRows": normalized_rejected,
+                "normalizedRowsByTable": {
+                    table: int(result_counts[table]["accepted"])
+                    for table in _SQL_TABLES
+                },
             },
             "cameraInventory": camera_inventory,
             "normalized": normalized_evidence,
