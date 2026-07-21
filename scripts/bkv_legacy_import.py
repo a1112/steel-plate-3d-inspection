@@ -497,40 +497,140 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _publish_sql_output(incoming: Path, destination: Path) -> None:
-    """Publish a complete five-file directory and restore the old one on failure."""
-    backup: Path | None = None
-    published = False
-    try:
-        if destination.exists():
-            backup = destination.with_name(
-                f".{destination.name}.backup-{os.getpid()}-{time.time_ns()}"
-            )
-            os.replace(destination, backup)
-            _fsync_directory(destination.parent)
-        os.replace(incoming, destination)
-        published = True
-        _fsync_directory(destination.parent)
-    except BaseException:
-        failed_publish: Path | None = None
-        if backup is not None and backup.exists():
-            if destination.exists():
-                failed_publish = destination.with_name(
-                    f".{destination.name}.failed-{os.getpid()}-{time.time_ns()}"
+def _replace_sql_current_pointer(temporary: Path, current: Path) -> None:
+    os.replace(temporary, current)
+
+
+def _sql_file_evidence(path: Path, count: int) -> dict[str, object]:
+    digest = hashlib.sha256()
+    size = 0
+    actual_count = 0
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(_IO_CHUNK_BYTES), b""):
+            size += len(chunk)
+            if size > MAX_SQL_NORMALIZED_BYTES:
+                raise SqlDumpLimitError(
+                    "normalized bytes exceed "
+                    f"MAX_SQL_NORMALIZED_BYTES={MAX_SQL_NORMALIZED_BYTES}"
                 )
-                os.replace(destination, failed_publish)
-            os.replace(backup, destination)
-            try:
-                _fsync_directory(destination.parent)
-            except BaseException:
-                pass
-            if failed_publish is not None:
-                shutil.rmtree(failed_publish, ignore_errors=True)
-        elif published and destination.exists():
-            shutil.rmtree(destination, ignore_errors=True)
-        raise
-    if backup is not None:
-        shutil.rmtree(backup, ignore_errors=True)
+            digest.update(chunk)
+            actual_count += chunk.count(b"\n")
+    if actual_count != count:
+        raise ValueError(
+            f"SQL generation count mismatch: expected {count}, got {actual_count}: {path}"
+        )
+    return {"sha256": digest.hexdigest(), "size": size, "count": actual_count}
+
+
+def _publish_sql_output(
+    incoming: Path,
+    output_root: Path,
+    counts: dict[str, dict[str, int]],
+) -> Path:
+    """Publish an immutable generation, then atomically switch its small pointer."""
+    generations_root = output_root / "normalized-generations"
+    generation = generations_root / (
+        f"generation-{time.time_ns()}-{os.getpid()}-{incoming.name.rsplit('-', 1)[-1]}"
+    )
+    os.replace(incoming, generation)
+    _fsync_directory(generations_root)
+    files: dict[str, dict[str, object]] = {}
+    for table in _SQL_TABLES:
+        path = generation / f"{table}.jsonl"
+        if not path.is_file() or is_reparse_point(path):
+            raise ValueError(f"generation file is missing or unsafe: {path}")
+        files[table] = _sql_file_evidence(path, counts[table]["accepted"])
+    pointer = {
+        "schema": "steel.bkv-sql-current.v1",
+        "generation": f"normalized-generations/{generation.name}",
+        "files": files,
+    }
+    payload = (
+        json.dumps(pointer, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    temporary_pointer: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".normalized.current.",
+            suffix=".tmp",
+            dir=output_root,
+            delete=False,
+        ) as output:
+            temporary_pointer = Path(output.name)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        _fsync_directory(output_root)
+        current = output_root / "normalized.current.json"
+        _replace_sql_current_pointer(temporary_pointer, current)
+        temporary_pointer = None
+        _fsync_directory(output_root)
+    finally:
+        if temporary_pointer is not None:
+            temporary_pointer.unlink(missing_ok=True)
+    return generation
+
+
+def resolve_sql_output(output_root: os.PathLike[str] | str) -> Path:
+    """Resolve and verify the immutable generation named by the current pointer."""
+    root = Path(output_root).resolve(strict=True)
+    pointer_path = root / "normalized.current.json"
+    if is_reparse_point(pointer_path):
+        raise ValueError("SQL current pointer may not be a reparse point")
+    payload = pointer_path.read_bytes()
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise SqlDumpLimitError("SQL current pointer exceeds MAX_MANIFEST_BYTES")
+    pointer = json.loads(payload)
+    if pointer.get("schema") != "steel.bkv-sql-current.v1":
+        raise ValueError("unsupported SQL current pointer schema")
+    relative = pointer.get("generation")
+    if not isinstance(relative, str):
+        raise ValueError("SQL current generation is missing")
+    normalized = normalize_member(relative)
+    if normalized != relative:
+        raise ValueError("unsafe SQL generation path")
+    parts = PurePosixPath(relative).parts
+    if len(parts) != 2 or parts[0] != "normalized-generations":
+        raise ValueError("SQL generation must be below normalized-generations")
+    generation = (root / Path(*parts)).resolve(strict=True)
+    generations_root = (root / "normalized-generations").resolve(strict=True)
+    if generation.parent != generations_root or is_reparse_point(generation):
+        raise ValueError("SQL generation escaped normalized-generations")
+    files = pointer.get("files")
+    if not isinstance(files, dict) or set(files) != set(_SQL_TABLES):
+        raise ValueError("SQL current pointer must describe exactly five tables")
+    for table in _SQL_TABLES:
+        evidence = files[table]
+        if not isinstance(evidence, dict):
+            raise ValueError(f"invalid SQL file evidence: {table}")
+        path = generation / f"{table}.jsonl"
+        actual = _sql_file_evidence(path, int(evidence.get("count", -1)))
+        if evidence.get("size") != actual["size"]:
+            raise ValueError(f"SQL generation size mismatch: {table}")
+        if evidence.get("sha256") != actual["sha256"]:
+            raise ValueError(f"SQL generation hash mismatch: {table}")
+        if not isinstance(evidence.get("count"), int) or evidence["count"] < 0:
+            raise ValueError(f"SQL generation count is invalid: {table}")
+    return generation
+
+
+def cleanup_orphan_sql_generations(output_root: os.PathLike[str] | str) -> None:
+    """Explicitly remove orphan generations; never called by the publish path."""
+    root = Path(output_root).resolve(strict=True)
+    current = (
+        resolve_sql_output(root)
+        if (root / "normalized.current.json").is_file()
+        else None
+    )
+    generations_root = (root / "normalized-generations").resolve(strict=True)
+    for candidate in generations_root.iterdir():
+        if is_reparse_point(candidate):
+            raise ValueError(f"refusing to clean reparse generation: {candidate}")
+        if current is not None and candidate.resolve() == current:
+            continue
+        if candidate.name.startswith(("generation-", ".incoming-")):
+            shutil.rmtree(candidate)
 
 
 def _target_table_mentioned(statement: str) -> str | None:
@@ -578,16 +678,16 @@ def filter_sql_dump(
     sample_rows = 0
     sample_bytes = 0
     unknown_statement_rows = False
-    diameter_unproven = False
+    diameter_rejected_or_incomplete = False
     output_destination = Path(output_dir) if output_dir is not None else None
     incoming: Path | None = None
     writers: dict[str, BinaryIO] = {}
 
     def reject(table: str, reason: str) -> None:
-        nonlocal diameter_unproven
+        nonlocal diameter_rejected_or_incomplete
         result.counts[table]["rejected"] += 1
-        if table == "diameter" and reason == "relationship_unproven":
-            diameter_unproven = True
+        if table == "diameter":
+            diameter_rejected_or_incomplete = True
         if len(result.rejected_rows) >= MAX_SQL_REJECTED_ROWS:
             raise SqlDumpLimitError(
                 f"rejected rows exceed MAX_SQL_REJECTED_ROWS={MAX_SQL_REJECTED_ROWS}"
@@ -704,11 +804,13 @@ def filter_sql_dump(
         pending_bytes = 0
         try:
             if output_destination is not None:
-                output_destination.parent.mkdir(parents=True, exist_ok=True)
+                output_destination.mkdir(parents=True, exist_ok=True)
+                generations_root = output_destination / "normalized-generations"
+                generations_root.mkdir(parents=True, exist_ok=True)
                 incoming = Path(
                     tempfile.mkdtemp(
-                        prefix=f".{output_destination.name}.incoming-",
-                        dir=output_destination.parent,
+                        prefix=".incoming-",
+                        dir=generations_root,
                     )
                 )
                 writers = {
@@ -908,7 +1010,7 @@ def filter_sql_dump(
             result.diameter_complete = (
                 result.integrity == "ok"
                 and not unknown_statement_rows
-                and not diameter_unproven
+                and not diameter_rejected_or_incomplete
                 and diameter_relationship_proven
             )
             if output_destination is not None:
@@ -919,7 +1021,7 @@ def filter_sql_dump(
                 writers.clear()
                 assert incoming is not None
                 _fsync_directory(incoming)
-                _publish_sql_output(incoming, output_destination)
+                _publish_sql_output(incoming, output_destination, result.counts)
                 incoming = None
         finally:
             for writer in writers.values():

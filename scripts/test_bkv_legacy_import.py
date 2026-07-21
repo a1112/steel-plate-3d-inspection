@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import io
 import json
@@ -185,7 +186,10 @@ INSERT INTO `allexcel` VALUES (1893700, 'abc');
             result = subject.filter_sql_dump(
                 io.BytesIO(fixture), subject.TARGET_SEQ_NOS, output_dir=output
             )
-            line = json.loads((output / "allexcel.jsonl").read_text(encoding="utf-8"))
+            generation = subject.resolve_sql_output(output)
+            line = json.loads(
+                (generation / "allexcel.jsonl").read_text(encoding="utf-8")
+            )
             self.assertEqual(line, result.rows_by_table["allexcel"][0])
 
         with mock.patch.object(subject, "MAX_SQL_FIELD_BYTES", 2):
@@ -210,7 +214,8 @@ INSERT INTO `allexcel` VALUES (1893700, 'abc');
             self.assertEqual(set(result.rows_by_seq), {1_893_700, 1_893_710})
             self.assertEqual(result.integrity, "ok")
             self.assertFalse(result.diameter_complete)
-            self.assertTrue((root / "normalized" / "diameter.jsonl").is_file())
+            generation = subject.resolve_sql_output(root / "normalized")
+            self.assertTrue((generation / "diameter.jsonl").is_file())
 
     def test_foreign_key_requires_a_retained_parent_relationship(self):
         fixture = rb"""
@@ -377,6 +382,53 @@ INSERT INTO `diameter` (`UnknownColumn`) VALUES (1893700), broken tuple;
         self.assertFalse(result.diameter_complete)
         self.assertEqual(result.counts["diameter"]["statementRejectedRowsUnknown"], 1)
 
+    def test_any_known_diameter_row_rejection_makes_diameter_incomplete(self):
+        cases = (
+            (
+                "malformed_insert",
+                rb"""CREATE TABLE `diameter` (`SeqNo` bigint, `Measurement` double);
+INSERT INTO `diameter` VALUES (1893700);""",
+                None,
+            ),
+            (
+                "non_finite_numeric",
+                rb"""CREATE TABLE `diameter` (`SeqNo` bigint, `Measurement` double);
+INSERT INTO `diameter` VALUES (1893700, 1e309);""",
+                None,
+            ),
+            (
+                "negative_physical_dimension",
+                rb"""CREATE TABLE `diameter` (`SeqNo` bigint, `Measurement` double);
+INSERT INTO `diameter` VALUES (1893700, -1.0);""",
+                None,
+            ),
+            (
+                "invalid_text_encoding",
+                b"CREATE TABLE `diameter` (`SeqNo` bigint, `Note` text);"
+                b"INSERT INTO `diameter` VALUES (1893700, 'bad\xff');",
+                None,
+            ),
+            (
+                "field_too_long",
+                rb"""CREATE TABLE `diameter` (`SeqNo` bigint, `Note` text);
+INSERT INTO `diameter` VALUES (1893700, 'long');""",
+                3,
+            ),
+        )
+        for reason, fixture, field_limit in cases:
+            with self.subTest(reason=reason):
+                patcher = (
+                    mock.patch.object(subject, "MAX_SQL_FIELD_BYTES", field_limit)
+                    if field_limit is not None
+                    else contextlib.nullcontext()
+                )
+                with patcher:
+                    result = subject.filter_sql_dump(
+                        io.BytesIO(fixture), subject.TARGET_SEQ_NOS
+                    )
+                self.assertEqual(result.rejected_rows[-1]["reason"], reason)
+                self.assertFalse(result.diameter_complete)
+
     def test_production_output_streams_with_small_sample_instead_of_full_rows(self):
         fixture = rb"""
 CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text);
@@ -393,9 +445,12 @@ INSERT INTO `allexcel` VALUES (1893700, 'one'), (1893710, 'two');
                     )
             self.assertEqual(result.counts["allexcel"]["accepted"], 2)
             self.assertLessEqual(sum(map(len, result.rows_by_table.values())), 1)
+            generation = subject.resolve_sql_output(output)
             self.assertEqual(
                 len(
-                    (output / "allexcel.jsonl").read_text(encoding="utf-8").splitlines()
+                    (generation / "allexcel.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
                 ),
                 2,
             )
@@ -431,27 +486,46 @@ INSERT INTO `diameter` VALUES (71);
                 subject.filter_sql_dump(io.BytesIO(pending), subject.TARGET_SEQ_NOS)
 
     def test_jsonl_publish_is_atomic_and_invalid_surrogate_is_quarantined(self):
-        valid = rb"""
+        first = rb"""
 CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text);
-INSERT INTO `allexcel` VALUES (1893700, 'new');
+INSERT INTO `allexcel` VALUES (1893700, 'first');
 """
+        second = first.replace(b"first", b"second")
         invalid = (
             b"CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text);"
             b"INSERT INTO `allexcel` VALUES (1893700, 'bad\xff');"
         )
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "normalized"
-            output.mkdir()
-            old = output / "allexcel.jsonl"
-            old.write_text("old\n", encoding="utf-8")
+            subject.filter_sql_dump(
+                io.BytesIO(first), subject.TARGET_SEQ_NOS, output_dir=output
+            )
+            pointer_path = output / "normalized.current.json"
+            old_pointer = pointer_path.read_bytes()
+            old_generation = subject.resolve_sql_output(output)
             with mock.patch.object(
-                subject, "_publish_sql_output", side_effect=OSError("publish failed")
+                subject,
+                "_replace_sql_current_pointer",
+                side_effect=OSError("pointer replace failed"),
             ):
-                with self.assertRaisesRegex(OSError, "publish failed"):
+                with self.assertRaisesRegex(OSError, "pointer replace failed"):
                     subject.filter_sql_dump(
-                        io.BytesIO(valid), subject.TARGET_SEQ_NOS, output_dir=output
+                        io.BytesIO(second), subject.TARGET_SEQ_NOS, output_dir=output
                     )
-            self.assertEqual(old.read_text(encoding="utf-8"), "old\n")
+            self.assertEqual(pointer_path.read_bytes(), old_pointer)
+            self.assertEqual(subject.resolve_sql_output(output), old_generation)
+            self.assertIn(
+                '"first"',
+                (old_generation / "allexcel.jsonl").read_text(encoding="utf-8"),
+            )
+            self.assertGreaterEqual(
+                len(list((output / "normalized-generations").iterdir())), 2
+            )
+            subject.cleanup_orphan_sql_generations(output)
+            self.assertEqual(
+                list((output / "normalized-generations").iterdir()),
+                [old_generation],
+            )
 
             result = subject.filter_sql_dump(
                 io.BytesIO(invalid), subject.TARGET_SEQ_NOS
@@ -473,28 +547,80 @@ INSERT INTO `allexcel` VALUES (1893700);
                 )
             self.assertGreaterEqual(fsync_directory.call_count, 2)
 
-    def test_publish_fsync_failure_rolls_back_previous_directory(self):
-        fixture = rb"""
-CREATE TABLE `allexcel` (`SeqNo` bigint);
-INSERT INTO `allexcel` VALUES (1893700);
-"""
+    def test_generation_pointer_switches_once_and_verifies_file_hashes(self):
+        first = rb"""CREATE TABLE `allexcel` (`SeqNo` bigint, `Note` text);
+INSERT INTO `allexcel` VALUES (1893700, 'first');"""
+        second = first.replace(b"first", b"second")
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "normalized"
-            output.mkdir()
-            old = output / "allexcel.jsonl"
-            old.write_text("old\n", encoding="utf-8")
+            subject.filter_sql_dump(
+                io.BytesIO(first), subject.TARGET_SEQ_NOS, output_dir=output
+            )
+            old_generation = subject.resolve_sql_output(output)
+            original_replace = subject._replace_sql_current_pointer
             with mock.patch.object(
                 subject,
-                "_fsync_directory",
-                side_effect=[None, OSError("directory fsync failed")],
+                "_replace_sql_current_pointer",
+                wraps=original_replace,
+            ) as replace_pointer:
+                subject.filter_sql_dump(
+                    io.BytesIO(second), subject.TARGET_SEQ_NOS, output_dir=output
+                )
+            self.assertEqual(replace_pointer.call_count, 1)
+            current_generation = subject.resolve_sql_output(output)
+            self.assertNotEqual(current_generation, old_generation)
+            self.assertTrue(old_generation.is_dir())
+            pointer = json.loads(
+                (output / "normalized.current.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(pointer["schema"], "steel.bkv-sql-current.v1")
+            self.assertEqual(set(pointer["files"]), set(subject._SQL_TABLES))
+            for table, evidence in pointer["files"].items():
+                payload = (current_generation / f"{table}.jsonl").read_bytes()
+                self.assertEqual(
+                    evidence["sha256"], hashlib.sha256(payload).hexdigest()
+                )
+                self.assertEqual(evidence["size"], len(payload))
+                self.assertEqual(evidence["count"], 1 if table == "allexcel" else 0)
+
+            pointer_path = output / "normalized.current.json"
+            original_pointer = pointer_path.read_bytes()
+            pointer["files"]["allexcel"]["count"] += 1
+            pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "count mismatch"):
+                subject.resolve_sql_output(output)
+            pointer_path.write_bytes(original_pointer)
+
+            current_file = current_generation / "allexcel.jsonl"
+            original_payload = current_file.read_bytes()
+            current_file.write_bytes(
+                bytes([original_payload[0] ^ 1]) + original_payload[1:]
+            )
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                subject.resolve_sql_output(output)
+
+    def test_first_publish_failure_has_no_partial_pointer_and_orphan_is_cleanable(self):
+        fixture = rb"""CREATE TABLE `allexcel` (`SeqNo` bigint);
+INSERT INTO `allexcel` VALUES (1893700);"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "normalized"
+            with mock.patch.object(
+                subject,
+                "_replace_sql_current_pointer",
+                side_effect=OSError("simulated process interruption"),
             ):
-                with self.assertRaisesRegex(OSError, "directory fsync failed"):
+                with self.assertRaisesRegex(OSError, "process interruption"):
                     subject.filter_sql_dump(
                         io.BytesIO(fixture),
                         subject.TARGET_SEQ_NOS,
                         output_dir=output,
                     )
-            self.assertEqual(old.read_text(encoding="utf-8"), "old\n")
+            self.assertFalse((output / "normalized.current.json").exists())
+            self.assertEqual(
+                len(list((output / "normalized-generations").iterdir())), 1
+            )
+            subject.cleanup_orphan_sql_generations(output)
+            self.assertEqual(list((output / "normalized-generations").iterdir()), [])
 
     def test_schema_qualified_tables_and_unsupported_target_syntax(self):
         fixture = rb"""
