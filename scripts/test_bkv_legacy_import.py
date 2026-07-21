@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import stat
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -37,6 +38,13 @@ CRC32: ABCDEF01
 类型: 文件
 大小: 24
 CRC32: 12345678
+"""
+
+RAR_LISTING_PART2 = """Name: image_copy/CamImageSource5/1893701/2D/part2.jpg
+Type: File
+Size: 31
+CRC32: 55555555
+Attributes: ..A....
 """
 
 
@@ -129,7 +137,7 @@ class InventoryTests(unittest.TestCase):
         self.assertIn("-cfg-", command)
         self.assertEqual(kwargs["timeout"], subject.UNRAR_TIMEOUT_SECONDS)
         archive = Path(command[-1])
-        listing = RAR_LISTING if archive == self.part1.resolve() else ""
+        listing = RAR_LISTING if archive == self.part1.resolve() else RAR_LISTING_PART2
         return subprocess.CompletedProcess(command, 0, listing, "")
 
     def test_inventory_is_atomic_deterministic_and_has_required_evidence(self):
@@ -188,6 +196,14 @@ class InventoryTests(unittest.TestCase):
             manifest["statistics"]["database-zip"],
             {"recordsSeen": 1, "accepted": 1, "rejected": 0},
         )
+        self.assertEqual(
+            manifest["statistics"]["image-part2"],
+            {"recordsSeen": 1, "accepted": 1, "rejected": 0},
+        )
+        part2_entry = next(
+            entry for entry in manifest["entries"] if entry["archivePart"] == "image-part2"
+        )
+        self.assertEqual(part2_entry["cameraNumber"], 5)
 
     def test_zip_crc_failure_is_recorded_not_reported_ok(self):
         original_open = zipfile.ZipFile.open
@@ -337,6 +353,18 @@ Target: ../../escape.jpg
             )
 
     def test_inventory_limits_are_fail_closed(self):
+        with mock.patch.object(subject, "MAX_INPUT_ARCHIVE_TOTAL_BYTES", 1):
+            with self.assertRaisesRegex(subject.InventoryLimitError, "input archive bytes"):
+                subject.inventory_archives(
+                    database_zip=self.database_zip,
+                    image_part1=self.part1,
+                    image_part2=self.part2,
+                    output_root=self.root / "input-limit-output",
+                    batch_id="input-limit",
+                    unrar=self.unrar,
+                    runner=self._runner,
+                )
+
         with mock.patch.object(subject, "MAX_ZIP_MEMBERS", 0):
             with self.assertRaisesRegex(subject.InventoryLimitError, "ZIP member count"):
                 subject.inventory_archives(
@@ -433,28 +461,37 @@ Target: ../../escape.jpg
             )
 
     def test_archive_change_during_inventory_is_rejected(self):
-        changed = False
+        replacement_blocked = False
 
         def mutating_runner(command, **kwargs):
-            nonlocal changed
-            if not changed:
-                self.part1.write_bytes(b"changed-during-listing")
-                changed = True
-            return subprocess.CompletedProcess(command, 0, RAR_LISTING, "")
+            nonlocal replacement_blocked
+            archive = Path(command[-1])
+            if archive == self.part1.resolve():
+                replacement = self.root / "replacement.rar"
+                replacement.write_bytes(b"replacement"[: self.part1.stat().st_size])
+                original = self.part1.stat()
+                os.utime(
+                    replacement,
+                    ns=(original.st_atime_ns, original.st_mtime_ns),
+                )
+                try:
+                    os.replace(replacement, self.part1)
+                except PermissionError:
+                    replacement_blocked = True
+                return subprocess.CompletedProcess(command, 0, RAR_LISTING, "")
+            return subprocess.CompletedProcess(command, 0, RAR_LISTING_PART2, "")
 
-        with self.assertRaisesRegex(RuntimeError, "changed during inventory"):
-            subject.inventory_archives(
-                database_zip=self.database_zip,
-                image_part1=self.part1,
-                image_part2=self.part2,
-                output_root=self.root / "changed-output",
-                batch_id="changed",
-                unrar=self.unrar,
-                runner=mutating_runner,
-            )
-        self.assertFalse(
-            (self.root / "changed-output" / "changed" / subject.MANIFEST_NAME).exists()
+        subject.inventory_archives(
+            database_zip=self.database_zip,
+            image_part1=self.part1,
+            image_part2=self.part2,
+            output_root=self.root / "changed-output",
+            batch_id="changed",
+            unrar=self.unrar,
+            runner=mutating_runner,
         )
+        if os.name == "nt":
+            self.assertTrue(replacement_blocked, "Windows input lock allowed replacement")
 
     def test_windows_casefold_collisions_are_rejected(self):
         collision_listing = """Name: image_copy/CamImageSource1/1893700/2D/A.jpg
@@ -495,6 +532,138 @@ Size: 12
                 runner=self._runner,
             )
 
+    def test_two_rar_volumes_merge_unique_and_identical_duplicate_members(self):
+        shared = "image_copy/CamImageSource4/1893705/3D/shared.d3img"
+        first_listing = f"""Name: image_copy/CamImageSource1/1893700/2D/one.jpg
+Type: File
+Size: 11
+CRC32: 11111111
+Attributes: ..A....
+
+Name: {shared}
+Type: File
+Size: 44
+Attributes: ..A....
+"""
+        second_listing = f"""名称: {shared}
+类型: 文件
+大小: 44
+CRC32: ABCDEF12
+属性: ..A....
+
+名称: image_copy/CamImageSource6/1893710/2D/six.jpg
+类型: 文件
+大小: 66
+CRC32: 66666666
+属性: ..A....
+"""
+
+        def two_volume_runner(command, **kwargs):
+            listing = first_listing if Path(command[-1]) == self.part1.resolve() else second_listing
+            return subprocess.CompletedProcess(command, 0, listing, "")
+
+        manifest_path = subject.inventory_archives(
+            database_zip=self.database_zip,
+            image_part1=self.part1,
+            image_part2=self.part2,
+            output_root=self.root / "two-volume-output",
+            batch_id="two-volume",
+            unrar=self.unrar,
+            runner=two_volume_runner,
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        image_entries = [entry for entry in manifest["entries"] if entry["seqNo"]]
+        self.assertEqual(len(image_entries), 3)
+        shared_entry = next(entry for entry in image_entries if entry["memberPath"] == shared)
+        self.assertEqual(shared_entry["archiveParts"], ["image-part1", "image-part2"])
+        self.assertEqual(shared_entry["archiveMetadata"]["crc32"], "ABCDEF12")
+        self.assertEqual(manifest["statistics"]["image-part1"]["accepted"], 2)
+        self.assertEqual(manifest["statistics"]["image-part2"]["accepted"], 2)
+
+        conflicts = (
+            second_listing.replace("大小: 44", "大小: 45"),
+            second_listing.replace("属性: ..A....", "属性: ..D....", 1),
+        )
+        for index, conflicting_listing in enumerate(conflicts):
+            with self.subTest(conflict=index):
+                def conflict_runner(command, **kwargs):
+                    listing = (
+                        first_listing
+                        if Path(command[-1]) == self.part1.resolve()
+                        else conflicting_listing
+                    )
+                    return subprocess.CompletedProcess(command, 0, listing, "")
+
+                with self.assertRaisesRegex(ValueError, "conflicting duplicate"):
+                    subject.inventory_archives(
+                        database_zip=self.database_zip,
+                        image_part1=self.part1,
+                        image_part2=self.part2,
+                        output_root=self.root / f"conflict-output-{index}",
+                        batch_id=f"conflict-{index}",
+                        unrar=self.unrar,
+                        runner=conflict_runner,
+                    )
+
+        first_with_crc = first_listing.replace(
+            "Size: 44\nAttributes:", "Size: 44\nCRC32: ABCDEF12\nAttributes:"
+        )
+        second_crc_conflict = second_listing.replace("ABCDEF12", "DEADBEEF")
+
+        def crc_conflict_runner(command, **kwargs):
+            listing = (
+                first_with_crc
+                if Path(command[-1]) == self.part1.resolve()
+                else second_crc_conflict
+            )
+            return subprocess.CompletedProcess(command, 0, listing, "")
+
+        with self.assertRaisesRegex(ValueError, "conflicting duplicate"):
+            subject.inventory_archives(
+                database_zip=self.database_zip,
+                image_part1=self.part1,
+                image_part2=self.part2,
+                output_root=self.root / "crc-conflict-output",
+                batch_id="crc-conflict",
+                unrar=self.unrar,
+                runner=crc_conflict_runner,
+            )
+
+    def test_zip_eocd_central_directory_limits_and_deadline(self):
+        with mock.patch.object(subject, "MAX_ZIP_CENTRAL_DIRECTORY_RECORDS", 0):
+            with self.assertRaisesRegex(subject.InventoryLimitError, "record count"):
+                subject._inspect_zip_structure(self.database_zip)
+
+        with mock.patch.object(subject, "MAX_ZIP_CENTRAL_DIRECTORY_BYTES", 1):
+            with self.assertRaisesRegex(subject.InventoryLimitError, "central directory bytes"):
+                subject._inspect_zip_structure(self.database_zip)
+
+        malformed = self.root / "malformed-eocd.zip"
+        malformed.write_bytes(b"not-a-zip")
+        with self.assertRaisesRegex(zipfile.BadZipFile, "EOCD"):
+            subject._inspect_zip_structure(malformed)
+
+        sentinel = self.root / "zip64-sentinel.zip"
+        sentinel.write_bytes(
+            struct.pack(
+                "<4s4H2LH",
+                b"PK\x05\x06",
+                0,
+                0,
+                0xFFFF,
+                0xFFFF,
+                0xFFFFFFFF,
+                0xFFFFFFFF,
+                0,
+            )
+        )
+        with self.assertRaisesRegex(zipfile.BadZipFile, "ZIP64"):
+            subject._inspect_zip_structure(sentinel)
+
+        with mock.patch.object(subject, "ZIP_INVENTORY_TIMEOUT_SECONDS", -1):
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                subject._inventory_zip(self.database_zip)
+
 
 @unittest.skipUnless(
     os.name == "nt"
@@ -527,15 +696,59 @@ class RealUnrarSmokeTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(created.returncode, 0, created.stderr)
-            output = subject._run_unrar_listing(
-                Path(r"C:\Program Files\WinRAR\UnRAR.exe"), archive_path
-            )
+            with subject._stable_archive_inputs((archive_path,)) as working:
+                output = subject._run_unrar_listing(
+                    Path(r"C:\Program Files\WinRAR\UnRAR.exe"),
+                    working[archive_path],
+                )
             records = subject._parse_unrar_listing(output)
             entries, statistics = subject._records_to_rar_entries(
                 records, "image-part1"
             )
             self.assertEqual([entry["memberPath"] for entry in entries], [member])
             self.assertGreaterEqual(statistics["recordsSeen"], 1)
+
+
+@unittest.skipUnless(
+    os.environ.get("BKV_SUPPLIED_ARCHIVE_DIR")
+    and Path(r"C:\Program Files\WinRAR\UnRAR.exe").is_file(),
+    "set BKV_SUPPLIED_ARCHIVE_DIR for supplied read-only archive smoke",
+)
+class SuppliedArchiveSmokeTests(unittest.TestCase):
+    def test_both_supplied_rar_volumes_have_unique_target_members_and_six_cameras(self):
+        root = Path(os.environ["BKV_SUPPLIED_ARCHIVE_DIR"])
+        unrar = Path(r"C:\Program Files\WinRAR\UnRAR.exe")
+        first_entries, first_stats = subject._inventory_rar(
+            root / "image_copy.part1.rar", "image-part1", unrar, None
+        )
+        second_entries, second_stats = subject._inventory_rar(
+            root / "image_copy.part2.rar", "image-part2", unrar, None
+        )
+        first = {entry["memberPath"] for entry in first_entries}
+        second = {entry["memberPath"] for entry in second_entries}
+        union = first | second
+        cameras = {
+            entry["cameraNumber"] for entry in [*first_entries, *second_entries]
+        }
+        self.assertTrue(first - second)
+        self.assertTrue(second - first)
+        self.assertTrue(union)
+        self.assertEqual(cameras, set(range(1, 7)))
+        print(
+            json.dumps(
+                {
+                    "part1": first_stats,
+                    "part2": second_stats,
+                    "part1Unique": len(first - second),
+                    "part2Unique": len(second - first),
+                    "overlap": len(first & second),
+                    "union": len(union),
+                    "cameras": sorted(cameras),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -30,20 +30,36 @@ binary and verify its approved Authenticode publisher and/or SHA-256 out of band
 This command inventories only: it does not extract files, execute SQL, or mutate
 the current database. It invokes technical listing with `-cfg-`, accepts verified
 English and Chinese field names, and fails closed on non-empty unstructured
-output. Only the first multipart RAR volume is listed; both volumes are hashed
-and stability-checked. ZIP CRC/read failures remain explicit evidence in the
-manifest, and RAR members remain `listed-unverified` until a later staging step
-hashes their extracted contents. Per-archive `recordsSeen`, `accepted`, and
-`rejected` counts are included in the manifest.
+output. Both multipart RAR volumes are listed independently because each can
+contain unique members. Normalized paths are merged; a duplicate is accepted
+only when every metadata value supplied by both volumes agrees, with a CRC or
+attribute supplied by only one volume retained as additional evidence. Unique
+members retain their source `archivePart`, while duplicates list both
+`archiveParts`. ZIP CRC/read failures remain explicit evidence in the manifest,
+and RAR members remain `listed-unverified` until a later staging step hashes
+their extracted contents. Per-volume `recordsSeen`, `accepted`, and `rejected`
+counts are included in the manifest.
 
-Untrusted input is bounded by the constants in `bkv_legacy_import.py`: 100,000
-ZIP members, 64 GiB per ZIP member, 128 GiB cumulative ZIP uncompressed bytes,
-a 1,000:1 maximum compression ratio, 1,000,000 RAR listing records, 64 MiB total
-UnRAR stdout/stderr, a 300-second UnRAR timeout, and a 128 MiB manifest. Exceeding
-any limit is an explicit failure. Windows ADS/control/trailing-dot names, reserved
-device names, case-insensitive collisions, links, traversal, and reparse output
-paths are rejected. Archive identity, size, and nanosecond mtime are compared
-before and after inventory so a changed input is not published.
+Untrusted input is bounded by the constants in `bkv_legacy_import.py`: 4 GiB
+combined source archive bytes, 100,000 ZIP members/central-directory records,
+256 MiB of central-directory data, 1 MiB of ZIP64 EOCD data, 2 GiB per ZIP
+member, 4 GiB cumulative ZIP uncompressed
+bytes, a 100:1 maximum compression ratio, and a 300-second total ZIP inventory
+deadline. These limits are based on the supplied 125,238,751-byte ZIP containing
+one 771,923,996-byte SQL member. RAR limits are 1,000,000 listing records, 64 MiB
+combined UnRAR stdout/stderr, and a 300-second process timeout; the manifest is
+limited to 128 MiB. EOCD/ZIP64 metadata is read with a bounded tail read before
+`ZipFile` construction; multi-disk, malformed, inconsistent, or oversized
+central directories fail closed. Exceeding any limit is an explicit failure.
+
+Windows ADS/control/trailing-dot names, reserved device names, case-insensitive
+collisions, links, traversal, and reparse output paths are rejected. On Windows,
+all three inputs are held through `CreateFileW` handles that allow other readers
+but deny write/delete sharing for the complete hash + ZIP + two-volume UnRAR
+inventory. On other platforms, verified copies are made in a space-preflighted
+controlled temporary directory and removed after publication. The manifest's
+archive hashes therefore describe the same locked/snapshotted bytes that were
+inventoried, rather than a later path read.
 
 The output root and its ancestors must be provisioned with trusted ACLs that
 prevent untrusted local users from replacing directories during the run. The

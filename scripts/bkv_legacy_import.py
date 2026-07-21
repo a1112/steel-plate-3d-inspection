@@ -4,16 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
 import hashlib
 import io
 import json
 import locale
 import os
 import re
+import shutil
 import stat
+import struct
 import subprocess
 import tempfile
 import threading
+import time
 import unicodedata
 import zipfile
 from dataclasses import dataclass
@@ -25,14 +30,20 @@ TARGET_SEQ_NOS = tuple(range(1_893_700, 1_893_711))
 MANIFEST_NAME = "manifest.inventory.json"
 MANIFEST_SCHEMA = "steel.bkv-archive-inventory.v1"
 MAX_ZIP_MEMBERS = 100_000
-MAX_ZIP_MEMBER_BYTES = 64 * 1024 * 1024 * 1024
-MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 128 * 1024 * 1024 * 1024
-MAX_ZIP_COMPRESSION_RATIO = 1_000
+MAX_ZIP_CENTRAL_DIRECTORY_RECORDS = 100_000
+MAX_ZIP_CENTRAL_DIRECTORY_BYTES = 256 * 1024 * 1024
+MAX_ZIP64_EOCD_BYTES = 1024 * 1024
+MAX_INPUT_ARCHIVE_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+MAX_ZIP_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+MAX_ZIP_COMPRESSION_RATIO = 100
+ZIP_INVENTORY_TIMEOUT_SECONDS = 300
 MAX_RAR_LISTING_RECORDS = 1_000_000
 MAX_UNRAR_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 128 * 1024 * 1024
 UNRAR_TIMEOUT_SECONDS = 300
 _IO_CHUNK_BYTES = 64 * 1024
+_ZIP_EOCD_SEARCH_BYTES = 65_557
 _BATCH_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _IMAGE_MEMBER = re.compile(
     r"image_copy/CamImageSource(?P<camera>[1-6])/(?P<seq>\d+)/"
@@ -59,6 +70,19 @@ _UNRAR_KEY_ALIASES = {
     "redirection": "redirection",
     "重定向": "redirection",
     "crc32": "crc32",
+    "pack-crc32": "packCrc32",
+    "attributes": "attributes",
+    "属性": "attributes",
+    "packed size": "packedSize",
+    "打包大小": "packedSize",
+    "ratio": "ratio",
+    "压缩率": "ratio",
+    "modified": "modified",
+    "已修改": "modified",
+    "host os": "hostOS",
+    "压缩平台": "hostOS",
+    "compression": "compression",
+    "压缩": "compression",
 }
 
 
@@ -151,6 +175,79 @@ def _file_snapshot(path: Path) -> FileSnapshot:
 def _assert_snapshot(path: Path, expected: FileSnapshot) -> None:
     if _file_snapshot(path) != expected:
         raise RuntimeError(f"input archive changed during inventory: {path}")
+
+
+@contextlib.contextmanager
+def _stable_archive_inputs(
+    paths: Sequence[Path],
+) -> Iterable[dict[Path, Path]]:
+    """Hold Windows read locks, or use verified controlled snapshots elsewhere."""
+    total_size = sum(path.stat().st_size for path in paths)
+    if total_size > MAX_INPUT_ARCHIVE_TOTAL_BYTES:
+        raise InventoryLimitError(
+            f"input archive bytes {total_size} exceed "
+            f"MAX_INPUT_ARCHIVE_TOTAL_BYTES={MAX_INPUT_ARCHIVE_TOTAL_BYTES}"
+        )
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        invalid_handle = ctypes.c_void_p(-1).value
+        handles: list[int] = []
+        try:
+            for path in paths:
+                handle = create_file(
+                    str(path),
+                    0x80000000,  # GENERIC_READ
+                    0x00000001,  # FILE_SHARE_READ; deny concurrent write/delete
+                    None,
+                    3,  # OPEN_EXISTING
+                    0x08000080,  # FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL
+                    None,
+                )
+                if handle == invalid_handle:
+                    error = ctypes.get_last_error()
+                    raise OSError(error, f"cannot lock input archive for stable read: {path}")
+                handles.append(handle)
+            yield {path: path for path in paths}
+        finally:
+            for handle in reversed(handles):
+                close_handle(handle)
+        return
+
+    temp_parent = Path(tempfile.gettempdir())
+    required_free = total_size + 256 * 1024 * 1024
+    if shutil.disk_usage(temp_parent).free < required_free:
+        raise InventoryLimitError(
+            f"controlled snapshot requires {required_free} free bytes under {temp_parent}"
+        )
+    with tempfile.TemporaryDirectory(prefix="bkv-inventory-snapshot-", dir=temp_parent) as root:
+        snapshot_root = Path(root)
+        mapping: dict[Path, Path] = {}
+        for index, path in enumerate(paths):
+            before = _file_snapshot(path)
+            before_hash = _sha256_file(path)
+            destination = snapshot_root / f"{index}-{path.name}"
+            shutil.copyfile(path, destination)
+            destination_hash = _sha256_file(destination)
+            after_hash = _sha256_file(path)
+            _assert_snapshot(path, before)
+            if before_hash != after_hash or before_hash != destination_hash:
+                raise RuntimeError(f"input archive changed while creating snapshot: {path}")
+            mapping[path] = destination
+        yield mapping
 
 
 def is_reparse_point(path: Path) -> bool:
@@ -277,18 +374,144 @@ def _base_entry(
     }
 
 
+def _check_zip_deadline(deadline: float) -> None:
+    if time.monotonic() > deadline:
+        raise TimeoutError(
+            f"ZIP inventory deadline exceeded ({ZIP_INVENTORY_TIMEOUT_SECONDS} seconds)"
+        )
+
+
+def _inspect_zip_structure(path: Path, deadline: float | None = None) -> dict[str, int]:
+    if deadline is None:
+        deadline = time.monotonic() + ZIP_INVENTORY_TIMEOUT_SECONDS
+    _check_zip_deadline(deadline)
+    file_size = path.stat().st_size
+    tail_size = min(file_size, _ZIP_EOCD_SEARCH_BYTES)
+    with path.open("rb") as source:
+        source.seek(file_size - tail_size)
+        tail = source.read(tail_size)
+        _check_zip_deadline(deadline)
+        marker = tail.rfind(b"PK\x05\x06")
+        if marker < 0 or len(tail) - marker < 22:
+            raise zipfile.BadZipFile("ZIP EOCD record is missing or truncated")
+        eocd = struct.unpack("<4s4H2LH", tail[marker : marker + 22])
+        (
+            _,
+            disk_number,
+            central_disk,
+            disk_records,
+            total_records,
+            central_size,
+            central_offset,
+            comment_size,
+        ) = eocd
+        eocd_offset = file_size - tail_size + marker
+        if eocd_offset + 22 + comment_size != file_size:
+            raise zipfile.BadZipFile("ZIP EOCD comment length or trailing data is invalid")
+        if disk_number != 0 or central_disk != 0 or disk_records != total_records:
+            raise zipfile.BadZipFile("multi-disk ZIP archives are not supported")
+
+        sentinel = (
+            total_records == 0xFFFF
+            or central_size == 0xFFFFFFFF
+            or central_offset == 0xFFFFFFFF
+        )
+        central_boundary = eocd_offset
+        if sentinel:
+            locator_offset = eocd_offset - 20
+            if locator_offset < 0:
+                raise zipfile.BadZipFile("ZIP64 locator is missing")
+            source.seek(locator_offset)
+            locator = source.read(20)
+            if len(locator) != 20 or locator[:4] != b"PK\x06\x07":
+                raise zipfile.BadZipFile("ZIP64 locator is missing or malformed")
+            _, zip64_disk, zip64_offset, total_disks = struct.unpack("<4sLQL", locator)
+            if zip64_disk != 0 or total_disks != 1:
+                raise zipfile.BadZipFile("multi-disk ZIP64 archives are not supported")
+            if zip64_offset >= locator_offset:
+                raise zipfile.BadZipFile("ZIP64 EOCD offset is invalid")
+            source.seek(zip64_offset)
+            fixed = source.read(56)
+            if len(fixed) != 56 or fixed[:4] != b"PK\x06\x06":
+                raise zipfile.BadZipFile("ZIP64 EOCD is missing or malformed")
+            values = struct.unpack("<4sQ2H2L4Q", fixed)
+            record_bytes = values[1] + 12
+            if record_bytes > MAX_ZIP64_EOCD_BYTES:
+                raise InventoryLimitError(
+                    f"ZIP64 EOCD bytes {record_bytes} exceed "
+                    f"MAX_ZIP64_EOCD_BYTES={MAX_ZIP64_EOCD_BYTES}"
+                )
+            (
+                _,
+                _,
+                _,
+                _,
+                zip64_disk_number,
+                zip64_central_disk,
+                zip64_disk_records,
+                total_records,
+                central_size,
+                central_offset,
+            ) = values
+            if (
+                zip64_disk_number != 0
+                or zip64_central_disk != 0
+                or zip64_disk_records != total_records
+            ):
+                raise zipfile.BadZipFile("multi-disk ZIP64 archives are not supported")
+            if zip64_offset + record_bytes > locator_offset:
+                raise zipfile.BadZipFile("ZIP64 EOCD overlaps its locator")
+            central_boundary = zip64_offset
+
+        if total_records > MAX_ZIP_MEMBERS:
+            raise InventoryLimitError(
+                f"ZIP member count {total_records} exceeds "
+                f"MAX_ZIP_MEMBERS={MAX_ZIP_MEMBERS}"
+            )
+        if total_records > MAX_ZIP_CENTRAL_DIRECTORY_RECORDS:
+            raise InventoryLimitError(
+                f"ZIP central directory record count {total_records} exceeds "
+                f"MAX_ZIP_CENTRAL_DIRECTORY_RECORDS={MAX_ZIP_CENTRAL_DIRECTORY_RECORDS}"
+            )
+        if central_size > MAX_ZIP_CENTRAL_DIRECTORY_BYTES:
+            raise InventoryLimitError(
+                f"ZIP central directory bytes {central_size} exceeds "
+                f"MAX_ZIP_CENTRAL_DIRECTORY_BYTES={MAX_ZIP_CENTRAL_DIRECTORY_BYTES}"
+            )
+        if central_offset + central_size > central_boundary:
+            raise zipfile.BadZipFile("ZIP central directory range is invalid")
+        if total_records:
+            source.seek(central_offset)
+            if source.read(4) != b"PK\x01\x02":
+                raise zipfile.BadZipFile("ZIP central directory signature is invalid")
+    _check_zip_deadline(deadline)
+    return {
+        "records": int(total_records),
+        "centralDirectoryBytes": int(central_size),
+    }
+
+
 def _inventory_zip(
     path: Path,
 ) -> tuple[list[dict[str, object]], dict[str, int]]:
+    deadline = time.monotonic() + ZIP_INVENTORY_TIMEOUT_SECONDS
+    structure = _inspect_zip_structure(path, deadline)
+    _check_zip_deadline(deadline)
     entries: list[dict[str, object]] = []
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
+        _check_zip_deadline(deadline)
+        if len(infos) != structure["records"]:
+            raise zipfile.BadZipFile(
+                "ZIP central directory record count changed during parsing"
+            )
         if len(infos) > MAX_ZIP_MEMBERS:
             raise InventoryLimitError(
                 f"ZIP member count {len(infos)} exceeds MAX_ZIP_MEMBERS={MAX_ZIP_MEMBERS}"
             )
         total_declared = 0
         for info in infos:
+            _check_zip_deadline(deadline)
             if info.file_size > MAX_ZIP_MEMBER_BYTES:
                 raise InventoryLimitError(
                     f"ZIP member bytes {info.file_size} exceeds "
@@ -315,6 +538,7 @@ def _inventory_zip(
 
         actual_total = 0
         for info in sorted(infos, key=lambda item: item.filename):
+            _check_zip_deadline(deadline)
             if info.is_dir():
                 continue
             member = normalize_member(info.filename)
@@ -330,6 +554,7 @@ def _inventory_zip(
                 with archive.open(info, "r") as source:
                     actual_member = 0
                     for chunk in iter(lambda: source.read(_IO_CHUNK_BYTES), b""):
+                        _check_zip_deadline(deadline)
                         actual_member += len(chunk)
                         actual_total += len(chunk)
                         if actual_member > MAX_ZIP_MEMBER_BYTES:
@@ -347,6 +572,8 @@ def _inventory_zip(
                 member_sha256: str | None = digest.hexdigest()
             except InventoryLimitError:
                 raise
+            except TimeoutError:
+                raise
             except (zipfile.BadZipFile, RuntimeError, OSError) as error:
                 member_sha256 = None
                 status = "crc-failed" if "CRC" in str(error).upper() else "read-failed"
@@ -361,6 +588,7 @@ def _inventory_zip(
                     integrity_evidence=evidence,
                 )
             )
+    _check_zip_deadline(deadline)
     statistics = {
         "recordsSeen": len([info for info in infos if not info.is_dir()]),
         "accepted": len(entries),
@@ -570,6 +798,23 @@ def _records_to_rar_entries(
             ),
         )
         entry.update(metadata)
+        entry["archiveParts"] = [archive_part]
+        entry["archiveMetadata"] = {
+            "type": "file",
+            "size": size,
+            "crc32": record.get("crc32", "").upper() or None,
+            "attributes": record.get("attributes"),
+            "modified": record.get("modified"),
+            "hostOS": record.get("hostOS"),
+            "compression": record.get("compression"),
+        }
+        entry["volumeMetadata"] = {
+            archive_part: {
+                "packedSize": record.get("packedSize"),
+                "ratio": record.get("ratio"),
+                "packCrc32": record.get("packCrc32"),
+            }
+        }
         entries.append(entry)
         statistics["accepted"] += 1
     return entries, statistics
@@ -588,11 +833,61 @@ def _inventory_rar(
     return _records_to_rar_entries(records, archive_part)
 
 
-def _archive_evidence(path: Path, snapshot: FileSnapshot) -> dict[str, object]:
-    digest = _sha256_file(path)
-    _assert_snapshot(path, snapshot)
+def _merge_rar_entries(
+    first: Sequence[dict[str, object]],
+    second: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for entry in [*first, *second]:
+        member = str(entry["memberPath"])
+        previous = merged.get(member)
+        if previous is None:
+            merged[member] = entry
+            continue
+        previous_metadata = previous.get("archiveMetadata")
+        current_metadata = entry.get("archiveMetadata")
+        assert isinstance(previous_metadata, dict) and isinstance(current_metadata, dict)
+        for key in previous_metadata.keys() | current_metadata.keys():
+            previous_value = previous_metadata.get(key)
+            current_value = current_metadata.get(key)
+            if (
+                previous_value is not None
+                and current_value is not None
+                and previous_value != current_value
+            ):
+                raise ValueError(
+                    f"conflicting duplicate RAR member metadata for {member}: "
+                    f"{key}={previous_value!r} != {current_value!r}"
+                )
+            if previous_value is None and current_value is not None:
+                previous_metadata[key] = current_value
+        if previous_metadata.get("crc32"):
+            previous["integrityEvidence"] = (
+                f"UnRAR CRC32={previous_metadata['crc32']}"
+            )
+        previous_volume_metadata = previous.get("volumeMetadata")
+        current_volume_metadata = entry.get("volumeMetadata")
+        assert isinstance(previous_volume_metadata, dict)
+        assert isinstance(current_volume_metadata, dict)
+        previous_volume_metadata.update(current_volume_metadata)
+        previous_parts = previous["archiveParts"]
+        current_parts = entry["archiveParts"]
+        assert isinstance(previous_parts, list) and isinstance(current_parts, list)
+        for archive_part in current_parts:
+            if archive_part not in previous_parts:
+                previous_parts.append(archive_part)
+    return list(merged.values())
+
+
+def _archive_evidence(
+    inventory_path: Path,
+    snapshot: FileSnapshot,
+    source_path: Path,
+) -> dict[str, object]:
+    digest = _sha256_file(inventory_path)
+    _assert_snapshot(inventory_path, snapshot)
     return {
-        "path": str(path),
+        "path": str(source_path),
         "size": snapshot.size,
         "sha256": digest,
         "fileIdentity": f"{snapshot.device}:{snapshot.inode}",
@@ -681,44 +976,61 @@ def inventory_archives(
     unrar_path = locate_unrar(unrar)
     batch_root = _validate_output_path(Path(output_root), batch_id, inputs)
 
-    snapshots = {path: _file_snapshot(path) for path in inputs}
-    archives = {
-        "database-zip": _archive_evidence(database, snapshots[database]),
-        "image-part1": _archive_evidence(part1, snapshots[part1]),
-        "image-part2": _archive_evidence(part2, snapshots[part2]),
-    }
-    entries, zip_statistics = _inventory_zip(database)
-    rar_entries, rar_statistics = _inventory_rar(
-        part1, "image-part1", unrar_path, runner
-    )
-    entries.extend(rar_entries)
-    _assert_casefold_unique(entries)
-    for path in inputs:
-        _assert_snapshot(path, snapshots[path])
-    entries.sort(key=lambda item: (str(item["archivePart"]), str(item["memberPath"])))
-    manifest = {
-        "schema": MANIFEST_SCHEMA,
-        "batchId": batch_id,
-        "archives": archives,
-        "statistics": {
-            "database-zip": zip_statistics,
-            "image-part1": rar_statistics,
-            "image-part2": {"recordsSeen": 0, "accepted": 0, "rejected": 0},
-        },
-        "entries": entries,
-    }
+    with _stable_archive_inputs(inputs) as working:
+        working_database = working[database]
+        working_part1 = working[part1]
+        working_part2 = working[part2]
+        snapshots = {path: _file_snapshot(path) for path in working.values()}
+        archives = {
+            "database-zip": _archive_evidence(
+                working_database, snapshots[working_database], database
+            ),
+            "image-part1": _archive_evidence(
+                working_part1, snapshots[working_part1], part1
+            ),
+            "image-part2": _archive_evidence(
+                working_part2, snapshots[working_part2], part2
+            ),
+        }
+        database_entries, zip_statistics = _inventory_zip(working_database)
+        first_entries, first_statistics = _inventory_rar(
+            working_part1, "image-part1", unrar_path, runner
+        )
+        second_entries, second_statistics = _inventory_rar(
+            working_part2, "image-part2", unrar_path, runner
+        )
+        image_entries = _merge_rar_entries(first_entries, second_entries)
+        entries = [*database_entries, *image_entries]
+        _assert_casefold_unique(entries)
+        for path, snapshot in snapshots.items():
+            _assert_snapshot(path, snapshot)
+        entries.sort(
+            key=lambda item: (str(item["archivePart"]), str(item["memberPath"]))
+        )
+        manifest = {
+            "schema": MANIFEST_SCHEMA,
+            "batchId": batch_id,
+            "archives": archives,
+            "statistics": {
+                "database-zip": zip_statistics,
+                "image-part1": first_statistics,
+                "image-part2": second_statistics,
+            },
+            "entries": entries,
+        }
 
-    batch_root.mkdir(parents=True, exist_ok=True)
-    for candidate in _existing_chain(batch_root):
-        if is_reparse_point(candidate):
-            raise ValueError(f"output path contains a reparse point: {candidate}")
-    destination = batch_root / MANIFEST_NAME
-    def assert_inputs_unchanged() -> None:
-        for path in inputs:
-            _assert_snapshot(path, snapshots[path])
+        batch_root.mkdir(parents=True, exist_ok=True)
+        for candidate in _existing_chain(batch_root):
+            if is_reparse_point(candidate):
+                raise ValueError(f"output path contains a reparse point: {candidate}")
+        destination = batch_root / MANIFEST_NAME
 
-    _write_json_atomic(destination, manifest, pre_publish=assert_inputs_unchanged)
-    return destination
+        def assert_inputs_unchanged() -> None:
+            for path, snapshot in snapshots.items():
+                _assert_snapshot(path, snapshot)
+
+        _write_json_atomic(destination, manifest, pre_publish=assert_inputs_unchanged)
+        return destination
 
 
 def _build_parser() -> argparse.ArgumentParser:
