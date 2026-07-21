@@ -1654,10 +1654,10 @@ fn load_bkv_deterministic_inspection_map(
             })?;
         let check_row = checkrecord.2.iter().find(|row| row.seq_no == seq_no);
         let material_legacy_id = material_row.legacy_id.as_str();
-        let inspection_legacy_id = check_row
-            .map(|row| row.legacy_id.as_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(material_legacy_id);
+        let inspection_legacy_id = bkv_parent_inspection_legacy_id(
+            check_row.map(|row| Some(row.legacy_id.clone())),
+            material_legacy_id,
+        );
         let material_id = bkv_deterministic_id(
             batch_id,
             "material",
@@ -1676,13 +1676,14 @@ fn load_bkv_deterministic_inspection_map(
             batch_id,
             "production-inspection",
             "checkrecord",
-            inspection_legacy_id,
+            &inspection_legacy_id,
             "normalized/checkrecord.jsonl",
         );
-        let occurred_at = check_row
-            .and_then(|row| row.occurred_at.clone())
-            .or_else(|| material_row.occurred_at.clone())
-            .unwrap_or_else(|| seq_no.to_string());
+        let occurred_at = bkv_parent_occurred_at(
+            check_row.map(|row| row.occurred_at.clone()),
+            material_row.occurred_at.clone(),
+            seq_no,
+        );
         let row_refs = parsed
             .iter()
             .flat_map(|(table, relative, rows)| {
@@ -2812,6 +2813,28 @@ fn bkv_row_text(row: &Value, names: &[&str]) -> Option<String> {
     })
 }
 
+fn bkv_parent_inspection_legacy_id(
+    check_row_legacy_id: Option<Option<String>>,
+    material_legacy_id: &str,
+) -> String {
+    check_row_legacy_id
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| material_legacy_id.to_string())
+}
+
+fn bkv_parent_occurred_at(
+    check_row_time: Option<Option<String>>,
+    material_row_time: Option<String>,
+    seq_no: i64,
+) -> String {
+    match check_row_time {
+        Some(check_time) => check_time,
+        None => material_row_time,
+    }
+    .unwrap_or_else(|| seq_no.to_string())
+}
+
 fn bkv_row_number(row: &Value, names: &[&str]) -> Option<f64> {
     bkv_row_value(row, names).and_then(|value| {
         value
@@ -2903,7 +2926,7 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
             )
         })?;
         let check_rows = rows_for("checkrecord", *seq_no);
-        let check_row = check_rows.first().copied().unwrap_or(material_row);
+        let check_row = check_rows.first().copied();
         let legacy_id = bkv_row_text(
             material_row,
             &["id", "allexcelid", "recordid", "originalRowHash"],
@@ -2928,8 +2951,10 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
             &batch.batch_id,
             "production-inspection",
             "checkrecord",
-            &bkv_row_text(check_row, &["id", "checkrecordid", "originalRowHash"])
-                .unwrap_or_else(|| legacy_id.clone()),
+            &bkv_parent_inspection_legacy_id(
+                check_row.map(|row| bkv_row_text(row, &["id", "checkrecordid", "originalRowHash"])),
+                &legacy_id,
+            ),
             "normalized/checkrecord.jsonl",
         );
         let provenance_rows = batch
@@ -3035,11 +3060,19 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
                 &["steelgrade", "steeltype", "grade", "material"],
             )
             .unwrap_or_else(|| "legacy-unknown".to_string()),
-            occurred_at: bkv_row_text(
-                check_row,
-                &["time", "checktime", "datetime", "detecttime", "createdat"],
-            )
-            .unwrap_or_else(|| seq_no.to_string()),
+            occurred_at: bkv_parent_occurred_at(
+                check_row.map(|row| {
+                    bkv_row_text(
+                        row,
+                        &["time", "checktime", "datetime", "detecttime", "createdat"],
+                    )
+                }),
+                bkv_row_text(
+                    material_row,
+                    &["time", "checktime", "datetime", "detecttime", "createdat"],
+                ),
+                *seq_no,
+            ),
             raw_payload: {
                 let payload = json!({
                 "source": "bkv",
@@ -5149,6 +5182,90 @@ mod tests {
         (runtime, database, root)
     }
 
+    fn imported_bkv_replay_fixture_with_missing_check_time(
+        name: &str,
+    ) -> (Runtime, db::AppDatabase, PathBuf) {
+        let root = bkv_test_root(name);
+        let manifest_path = write_bkv_replay_test_batch(&root);
+        let batch_dir = manifest_path.parent().unwrap();
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let allexcel_path = batch_dir.join("normalized/allexcel.jsonl");
+        let mut allexcel_rows = fs::read_to_string(&allexcel_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        allexcel_rows[0]["time"] = json!("must-not-be-used");
+        let allexcel_payload = allexcel_rows
+            .iter()
+            .map(|row| format!("{}\n", row))
+            .collect::<String>();
+        fs::write(&allexcel_path, &allexcel_payload).unwrap();
+        let checkrecord_payload = format!(
+            "{}\n",
+            json!({
+                "legacySeqNo":BKV_TARGET_SEQ_NOS[0],
+                "legacyTable":"checkrecord",
+                "id":"check-without-time",
+                "originalRowHash":"9".repeat(64)
+            })
+        );
+        fs::write(
+            batch_dir.join("normalized/checkrecord.jsonl"),
+            &checkrecord_payload,
+        )
+        .unwrap();
+        for (table, payload, count) in [
+            ("allexcel", allexcel_payload.as_str(), 11u64),
+            ("checkrecord", checkrecord_payload.as_str(), 1u64),
+        ] {
+            let item = manifest["normalized"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|item| item["table"] == table)
+                .unwrap();
+            item["size"] = json!(payload.len());
+            item["sha256"] = json!(bkv_sha256(payload.as_bytes()));
+            item["count"] = json!(count);
+        }
+        manifest["batchContentId"] = json!("0".repeat(64));
+        manifest["contentId"] = manifest["batchContentId"].clone();
+        let content_id = bkv_batch_content_id(&manifest).unwrap();
+        manifest["batchContentId"] = json!(content_id);
+        manifest["contentId"] = manifest["batchContentId"].clone();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(
+            batch_dir.join("publication.json"),
+            serde_json::to_vec(&json!({
+                "schema":"steel.bkv-publication.v1",
+                "state":"committed",
+                "batchId":"batch-001",
+                "contentId":manifest["contentId"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let runtime = Runtime::new().unwrap();
+        let database = runtime
+            .block_on(db::open_database_url(
+                "sqlite::memory:".to_string(),
+                PathBuf::from(":memory:"),
+            ))
+            .unwrap();
+        let verified = load_bkv_batch(&root, &manifest_path, false).unwrap();
+        let batch = bkv_validated_to_db(&verified).unwrap();
+        runtime
+            .block_on(db::import_bkv_batch(
+                &database.connection,
+                batch,
+                "bkv-test",
+            ))
+            .unwrap();
+        (runtime, database, root)
+    }
+
     #[test]
     fn bkv_runtime_health_requires_six_verified_offline_channels() {
         let (runtime, database, root) = imported_bkv_replay_fixture("runtime-health");
@@ -5160,6 +5277,50 @@ mod tests {
         assert_eq!(health.replay_index, 0);
         assert_eq!(health.replay_status, "ready");
         assert_eq!(health.artifacts.len(), 66);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_checkrecord_without_time_uses_seq_no_in_full_and_compact_paths() {
+        let (runtime, database, root) =
+            imported_bkv_replay_fixture_with_missing_check_time("check-time-fallback");
+        let selection = runtime
+            .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
+            .unwrap();
+        let expected_time = BKV_TARGET_SEQ_NOS[0].to_string();
+        let imported = runtime
+            .block_on(db::find_production_inspection(
+                &database.connection,
+                &selection.inspection_id,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported.started_at, expected_time);
+        assert_eq!(imported.finished_at, expected_time);
+        let replay = runtime
+            .block_on(load_bkv_replay_runtime(&database.connection, &root))
+            .unwrap();
+        assert_eq!(
+            replay
+                .deterministic_inspections
+                .get(&BKV_TARGET_SEQ_NOS[0])
+                .unwrap()
+                .started_at,
+            expected_time
+        );
+        assert_eq!(
+            runtime
+                .block_on(bkv_status_value(&database.connection, &root))
+                .unwrap()["active"],
+            json!(true)
+        );
+        assert!(runtime
+            .block_on(selected_bkv_inspection_exact(
+                &database.connection,
+                &replay.deterministic_inspections,
+            ))
+            .unwrap()
+            .is_some());
         fs::remove_dir_all(root).ok();
     }
 
