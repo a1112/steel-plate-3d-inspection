@@ -100,10 +100,12 @@ fn bkv_valid_sha256(value: &str) -> bool {
 
 fn bkv_valid_batch_id(value: &str) -> bool {
     !value.is_empty()
+        && value != "."
+        && value != ".."
         && value.as_bytes().len() <= 117
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn bkv_hash_file(path: &Path, max_bytes: u64) -> Result<(String, u64, Vec<u8>), BkvRejection> {
@@ -1507,6 +1509,23 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
     })
 }
 
+fn bkv_final_db_batch(
+    verified: &BkvValidatedBatch,
+    final_verification: &BkvValidatedBatch,
+) -> Result<db::BkvImportBatch, BkvRejection> {
+    if final_verification.batch_id != verified.batch_id
+        || final_verification.content_id != verified.content_id
+        || final_verification.status != verified.status
+        || final_verification.semantic_digest != verified.semantic_digest
+    {
+        return Err(BkvRejection::new(
+            "bkv_manifest_changed",
+            "batch semantics changed before transaction",
+        ));
+    }
+    bkv_validated_to_db(final_verification)
+}
+
 fn bkv_rejection_response(error: BkvRejection) -> Vec<u8> {
     let status = match error.code {
         "bkv_root_invalid" | "bkv_manifest_unavailable" | "bkv_file_unavailable" => {
@@ -1652,30 +1671,17 @@ pub(super) fn bkv_import_response(state: &ServiceState, body: &str, actor: &str)
         Ok(batch) => batch,
         Err(error) => return bkv_rejection_response(error),
     };
-    let db_batch = match bkv_validated_to_db(&verified) {
-        Ok(batch) => batch,
-        Err(error) => return bkv_rejection_response(error),
-    };
+    if let Err(error) = bkv_validated_to_db(&verified) {
+        return bkv_rejection_response(error);
+    }
     let final_verification = match load_bkv_batch(&root, &manifest_path, reviewed) {
         Ok(batch) => batch,
         Err(error) => return bkv_rejection_response(error),
     };
-    let persisted_semantic_digest = serde_json::from_str::<Value>(&db_batch.manifest_json)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("semanticDigest")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    if final_verification.content_id != db_batch.content_id
-        || persisted_semantic_digest.as_deref() != Some(final_verification.semantic_digest.as_str())
-    {
-        return bkv_rejection_response(BkvRejection::new(
-            "bkv_manifest_changed",
-            "batch changed before transaction",
-        ));
-    }
+    let db_batch = match bkv_final_db_batch(&verified, &final_verification) {
+        Ok(batch) => batch,
+        Err(error) => return bkv_rejection_response(error),
+    };
     match state.runtime.block_on(db::import_bkv_batch(
         &state.database.connection,
         db_batch,
@@ -3231,6 +3237,9 @@ mod tests {
     fn bkv_batch_id_fits_the_app_config_key_contract() {
         assert!(bkv_valid_batch_id(&"a".repeat(117)));
         assert!(!bkv_valid_batch_id(&"a".repeat(118)));
+        assert!(bkv_valid_batch_id("batch.001"));
+        assert!(!bkv_valid_batch_id("."));
+        assert!(!bkv_valid_batch_id(".."));
         assert!(!bkv_valid_batch_id("unsafe/path"));
     }
 
@@ -3344,6 +3353,74 @@ mod tests {
             .artifacts
             .iter()
             .any(|artifact| artifact.relative_path.ends_with("one.jpg")));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_final_manifest_identity_is_built_from_the_third_verification() {
+        let root = bkv_test_root("final-manifest-identity");
+        let manifest_path = write_bkv_test_batch(&root, "ready", false);
+        let second = load_bkv_batch(&root, &manifest_path, false).unwrap();
+        let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let third = load_bkv_batch(&root, &manifest_path, false).unwrap();
+        assert_eq!(second.semantic_digest, third.semantic_digest);
+        assert_ne!(second.manifest_sha256, third.manifest_sha256);
+        let final_db = bkv_final_db_batch(&second, &third).unwrap();
+        let summary: Value = serde_json::from_str(&final_db.manifest_json).unwrap();
+        assert_eq!(
+            summary.get("manifestSha256").and_then(Value::as_str),
+            Some(third.manifest_sha256.as_str())
+        );
+        load_bkv_serving_index(
+            &root,
+            &manifest_path,
+            &third.batch_id,
+            &third.content_id,
+            &third.semantic_digest,
+            &third.manifest_sha256,
+            &third.publication_sha256,
+        )
+        .expect("final manifest identity must remain serviceable");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_final_publication_identity_is_built_from_the_third_verification() {
+        let root = bkv_test_root("final-publication-identity");
+        let manifest_path = write_bkv_test_batch(&root, "ready", false);
+        let second = load_bkv_batch(&root, &manifest_path, false).unwrap();
+        let publication_path = root.join("batch-001/publication.json");
+        let publication: Value =
+            serde_json::from_slice(&fs::read(&publication_path).unwrap()).unwrap();
+        fs::write(
+            &publication_path,
+            serde_json::to_string_pretty(&publication).unwrap(),
+        )
+        .unwrap();
+        let third = load_bkv_batch(&root, &manifest_path, false).unwrap();
+        assert_eq!(second.semantic_digest, third.semantic_digest);
+        assert_ne!(second.publication_sha256, third.publication_sha256);
+        let final_db = bkv_final_db_batch(&second, &third).unwrap();
+        let summary: Value = serde_json::from_str(&final_db.manifest_json).unwrap();
+        assert_eq!(
+            summary.get("publicationSha256").and_then(Value::as_str),
+            Some(third.publication_sha256.as_str())
+        );
+        load_bkv_serving_index(
+            &root,
+            &manifest_path,
+            &third.batch_id,
+            &third.content_id,
+            &third.semantic_digest,
+            &third.manifest_sha256,
+            &third.publication_sha256,
+        )
+        .expect("final publication identity must remain serviceable");
         fs::remove_dir_all(root).ok();
     }
 

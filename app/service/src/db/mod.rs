@@ -3689,10 +3689,11 @@ pub async fn import_bkv_batch(
 ) -> Result<BkvImportResult, DbErr> {
     if batch.batch_id.as_bytes().len() > 117
         || batch.batch_id.is_empty()
+        || matches!(batch.batch_id.as_str(), "." | "..")
         || !batch
             .batch_id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(DbErr::Custom("bkv_batch_id_invalid".to_string()));
     }
