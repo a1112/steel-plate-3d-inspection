@@ -4,6 +4,29 @@ These scripts keep the four runtime boundaries independent.
 
 Environment templates live in `config/env`.
 
+## BKV legacy archive inventory
+
+Inventory the untrusted legacy database ZIP and multipart image RARs before any
+staging or import. The command resolves all paths, invokes an explicitly located
+`UnRAR.exe`, rejects unsafe archive member paths and output reparse points, and
+atomically writes `<output-root>/<batch-id>/manifest.inventory.json`:
+
+```powershell
+python scripts/bkv_legacy_import.py inventory `
+  --database-zip 'E:\legacy\database.zip' `
+  --image-part1 'E:\legacy\image_copy.part1.rar' `
+  --image-part2 'E:\legacy\image_copy.part2.rar' `
+  --output-root 'E:\bkv-data' `
+  --batch-id 'legacy-1893700-1893710' `
+  --unrar 'C:\Program Files\WinRAR\UnRAR.exe'
+```
+
+`--unrar` may be omitted when `UNRAR_EXE` is set or `UnRAR.exe` is installed in
+the standard WinRAR location. This command inventories only: it does not extract
+files, execute SQL, or mutate the current database. ZIP CRC/read failures remain
+explicit evidence in the manifest, and RAR members remain `listed-unverified`
+until a later staging step hashes their extracted contents.
+
 ## Windows production service
 
 The Release runtime contains one SCM host, `service\steel-runtime-supervisor.exe`, for the capture provider, trigger gateway, and Rust service. Its contract is ordered application-level readiness, strict business drain, bounded whole-stack stop/restart, child-process-tree cleanup, live managed-log rotation, and atomic restart-budget state publication. The non-elevated regression proves RuntimeRoot/StateRoot isolation, source/layout/config fail-closed cases, Trigger-then-Service drain (including timeout cases), `inFlight` convergence, 50 MiB online rotation, `.1` through `.5` retention, persisted budget exhaustion, and stable-runtime recovery of `StateRoot\service\supervisor-status.json`; the install-related PowerShell files parse, the static versioned-install policy passes, and the Supervisor Release target compiles. These checks still do not prove real SCM transitions, effective target-machine ACLs, signed-package installation, power-loss recovery, or a database migration transaction.
