@@ -2469,7 +2469,25 @@ fn production_capture_image_value_for_bkv(
     root: &Path,
     file: &db::entities::capture_file::Model,
 ) -> Option<Value> {
-    let mut artifact = bkv_client_artifact_value(state, root, &file.path)?;
+    let batch_id = file.path.strip_prefix("bkv://")?.split_once('/')?.0;
+    let index = load_active_bkv_serving_index(state, root, batch_id)?;
+    production_capture_image_value_for_bkv_index(&index, batch_id, file)
+}
+
+fn production_capture_image_value_for_bkv_index(
+    index: &production_tasks::BkvServingIndex,
+    batch_id: &str,
+    file: &db::entities::capture_file::Model,
+) -> Option<Value> {
+    production_capture_image_value_for_bkv_artifacts(&index.artifacts, batch_id, file)
+}
+
+fn production_capture_image_value_for_bkv_artifacts(
+    artifacts: &[production_tasks::BkvServingArtifact],
+    batch_id: &str,
+    file: &db::entities::capture_file::Model,
+) -> Option<Value> {
+    let mut artifact = bkv_client_artifact_value_from_artifacts(artifacts, batch_id, &file.path)?;
     let object = artifact.as_object_mut()?;
     object.insert("id".to_string(), json!(file.id));
     object.insert("cameraId".to_string(), json!(file.camera_id));
@@ -2479,7 +2497,8 @@ fn production_capture_image_value_for_bkv(
     object.insert("fileType".to_string(), json!(file.file_type));
     object.insert("createdAt".to_string(), json!(file.created_at));
     if !file.metadata_path.trim().is_empty() {
-        let metadata = bkv_client_artifact_value(state, root, &file.metadata_path)?;
+        let metadata =
+            bkv_client_artifact_value_from_artifacts(artifacts, batch_id, &file.metadata_path)?;
         object.insert(
             "metadataArtifactRef".to_string(),
             metadata.get("artifactRef").cloned().unwrap_or(Value::Null),
@@ -2613,23 +2632,79 @@ fn selected_bkv_inspection_for_view(
     }
 }
 
+struct BkvSnapshotSelection {
+    inspection: db::entities::production_inspection::Model,
+    batch_id: String,
+    artifacts: Vec<production_tasks::BkvServingArtifact>,
+}
+
+fn selected_bkv_snapshot_selection(
+    state: &ServiceState,
+) -> Result<Option<BkvSnapshotSelection>, production_tasks::BkvRejection> {
+    match production_tasks::configured_bkv_root() {
+        Ok(root) => {
+            let replay =
+                state
+                    .runtime
+                    .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
+                        &state.database.connection,
+                        &root,
+                        Some(Instant::now() + Duration::from_millis(1_500)),
+                    ))?;
+            let selected =
+                state
+                    .runtime
+                    .block_on(production_tasks::selected_bkv_inspection_exact(
+                        &state.database.connection,
+                        &replay.deterministic_inspections,
+                    ))?;
+            Ok(selected.map(|inspection| BkvSnapshotSelection {
+                inspection,
+                batch_id: replay.batch_id,
+                artifacts: replay.artifacts,
+            }))
+        }
+        Err(error) => {
+            #[cfg(test)]
+            {
+                let _ = error;
+                let selected = state.runtime.block_on(
+                    production_tasks::selected_bkv_inspection_unverified_test(
+                        &state.database.connection,
+                    ),
+                )?;
+                Ok(selected.map(|inspection| {
+                    let batch_id = serde_json::from_str::<Value>(&inspection.raw_payload)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("batchId")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    BkvSnapshotSelection {
+                        inspection,
+                        batch_id,
+                        artifacts: Vec::new(),
+                    }
+                }))
+            }
+            #[cfg(not(test))]
+            {
+                Err(error)
+            }
+        }
+    }
+}
+
 fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>, String> {
-    let _bkv_command_guard = if state.capture.provider == CaptureProvider::Bkv {
-        Some(
-            state
-                .production_command_lock
-                .lock()
-                .map_err(|_| "production_command_lock_poisoned".to_string())?,
-        )
+    let selected_bkv_snapshot = if state.capture.provider == CaptureProvider::Bkv {
+        selected_bkv_snapshot_selection(state).map_err(|error| error.code.to_string())?
     } else {
         None
     };
-    let selected_bkv_inspection = if state.capture.provider == CaptureProvider::Bkv {
-        selected_bkv_inspection_for_view(state).map_err(|error| error.code.to_string())?
-    } else {
-        None
-    };
-    if state.capture.provider == CaptureProvider::Bkv && selected_bkv_inspection.is_none() {
+    if state.capture.provider == CaptureProvider::Bkv && selected_bkv_snapshot.is_none() {
         return Ok(Some(
             json!({
                 "currentPlate": {
@@ -2653,9 +2728,50 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             .to_string(),
         ));
     }
-    let bkv_binding = selected_bkv_inspection
+    // Runtime/index verification may hash many artifacts. Perform that bounded verification
+    // before entering the short command fence; snapshot assembly below uses only verified
+    // serving-index metadata and database rows.
+    let _bkv_command_guard = if state.capture.provider == CaptureProvider::Bkv {
+        Some(
+            state
+                .production_command_lock
+                .lock()
+                .map_err(|_| "production_command_lock_poisoned".to_string())?,
+        )
+    } else {
+        None
+    };
+    if let Some(selection) = selected_bkv_snapshot.as_ref() {
+        let binding = serde_json::from_str::<Value>(&selection.inspection.raw_payload)
+            .map_err(|_| "bkv_selected_inspection_invalid".to_string())?;
+        let content_id = binding
+            .get("contentId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "bkv_selected_inspection_invalid".to_string())?;
+        let active = state
+            .runtime
+            .block_on(db::get_config(
+                &state.database.connection,
+                "bkv.active-batch",
+            ))
+            .map_err(|_| "bkv_status_unavailable".to_string())?
+            .and_then(|value| serde_json::from_str::<Value>(&value.value).ok())
+            .ok_or_else(|| "bkv_active_batch_missing".to_string())?;
+        if !bkv_batch_is_active(&active, &selection.batch_id, content_id) {
+            return Err("bkv_active_batch_changed".to_string());
+        }
+    }
+    let bkv_binding = selected_bkv_snapshot.as_ref().and_then(|selection| {
+        serde_json::from_str::<Value>(&selection.inspection.raw_payload).ok()
+    });
+    let bkv_batch_id = selected_bkv_snapshot
         .as_ref()
-        .and_then(|inspection| serde_json::from_str::<Value>(&inspection.raw_payload).ok());
+        .map(|selection| selection.batch_id.clone());
+    let bkv_expected_artifacts = selected_bkv_snapshot
+        .as_ref()
+        .map(|selection| selection.artifacts.clone())
+        .unwrap_or_default();
+    let selected_bkv_inspection = selected_bkv_snapshot.map(|selection| selection.inspection);
     let inspections = if state.capture.provider == CaptureProvider::Bkv {
         vec![selected_bkv_inspection
             .expect("BKV selected inspection is guarded before snapshot assembly")]
@@ -2715,14 +2831,14 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             .collect::<Vec<_>>();
         let (legacy_capture_images, bkv_artifacts) =
             if state.capture.provider == CaptureProvider::Bkv {
-                let root = production_tasks::configured_bkv_root().ok();
                 let artifacts = files
                     .iter()
                     .map(|file| {
-                        if !file.path.starts_with("bkv://") {
-                            return None;
-                        }
-                        production_capture_image_value_for_bkv(state, root.as_deref()?, file)
+                        production_capture_image_value_for_bkv_artifacts(
+                            &bkv_expected_artifacts,
+                            bkv_batch_id.as_deref()?,
+                            file,
+                        )
                     })
                     .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| "bkv_artifact_unavailable".to_string())?;
@@ -12282,6 +12398,39 @@ fn bkv_batch_is_active(active: &Value, batch_id: &str, content_id: &str) -> bool
         && active.get("contentId").and_then(Value::as_str) == Some(content_id)
 }
 
+fn bkv_token_is_still_active(state: &ServiceState, token: &str) -> bool {
+    let Some((batch_id, _)) = token
+        .strip_prefix("bkv://")
+        .and_then(|value| value.split_once('/'))
+    else {
+        return false;
+    };
+    let imported = state
+        .runtime
+        .block_on(db::get_config(
+            &state.database.connection,
+            &format!("bkv.batch.{batch_id}"),
+        ))
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<Value>(&value.value).ok());
+    let active = state
+        .runtime
+        .block_on(db::get_config(
+            &state.database.connection,
+            "bkv.active-batch",
+        ))
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<Value>(&value.value).ok());
+    imported
+        .as_ref()
+        .and_then(|value| value.get("contentId"))
+        .and_then(Value::as_str)
+        .zip(active.as_ref())
+        .is_some_and(|(content_id, active)| bkv_batch_is_active(active, batch_id, content_id))
+}
+
 fn bkv_allowlisted_artifact<'a>(
     index: &'a production_tasks::BkvServingIndex,
     relative: &str,
@@ -12294,10 +12443,32 @@ fn bkv_allowlisted_artifact<'a>(
 
 static BKV_SERVING_CACHE: OnceLock<Mutex<HashMap<String, production_tasks::BkvServingIndex>>> =
     OnceLock::new();
+const BKV_CLIENT_SERVING_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const BKV_CLIENT_HASH_BUFFER_BYTES: usize = 64 * 1024;
+const BKV_CLIENT_READ_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+thread_local! {
+    static BKV_CLIENT_FILE_HASH_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BKV_CLIENT_INDEX_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn bkv_artifact_too_large_response() -> Vec<u8> {
+    http_response(
+        "413 Content Too Large",
+        "application/json; charset=utf-8",
+        r#"{"code":"bkv_artifact_too_large","error":"bkv_artifact_too_large"}"#,
+    )
+}
 
 fn read_bkv_verified_file(path: &Path, expected_size: u64, expected_hash: &str) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    BKV_CLIENT_FILE_HASH_READS.with(|count| count.set(count.get() + 1));
     let before = fs::symlink_metadata(path).ok()?;
-    if file_component_is_link(path) || !before.is_file() || before.len() != expected_size {
+    if expected_size > BKV_CLIENT_SERVING_MAX_BYTES
+        || file_component_is_link(path)
+        || !before.is_file()
+        || before.len() != expected_size
+    {
         return None;
     }
     let mut options = fs::OpenOptions::new();
@@ -12309,16 +12480,29 @@ fn read_bkv_verified_file(path: &Path, expected_size: u64, expected_hash: &str) 
     #[cfg(target_os = "macos")]
     options.custom_flags(0x0000_0100);
     let mut file = options.open(path).ok()?;
-    let mut bytes = Vec::with_capacity(expected_size.min(32 * 1024 * 1024) as usize);
-    (&mut file)
-        .take(expected_size.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .ok()?;
+    let deadline = Instant::now() + BKV_CLIENT_READ_DEADLINE;
+    let mut bytes = Vec::with_capacity(expected_size as usize);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; BKV_CLIENT_HASH_BUFFER_BYTES];
+    while bytes.len() as u64 <= expected_size {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) as u64 > expected_size {
+            return None;
+        }
+        digest.update(&buffer[..read]);
+        bytes.extend_from_slice(&buffer[..read]);
+    }
     let after = file.metadata().ok()?;
     if bytes.len() as u64 != expected_size
         || after.len() != expected_size
         || file_component_is_link(path)
-        || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
+        || format!("{:x}", digest.finalize()) != expected_hash
     {
         return None;
     }
@@ -12329,22 +12513,13 @@ fn read_bkv_verified_file(path: &Path, expected_size: u64, expected_hash: &str) 
     Some(bytes)
 }
 
-fn resolve_bkv_file_at_root(
+fn load_active_bkv_serving_index(
     state: &ServiceState,
     root: &Path,
-    token: &str,
-) -> Option<(PathBuf, Vec<u8>)> {
-    let value = token.strip_prefix("bkv://")?;
-    let (batch_id, relative) = value.split_once('/')?;
-    if batch_id.is_empty()
-        || relative.is_empty()
-        || Path::new(relative).is_absolute()
-        || Path::new(relative)
-            .components()
-            .any(|part| !matches!(part, std::path::Component::Normal(_)))
-    {
-        return None;
-    }
+    batch_id: &str,
+) -> Option<production_tasks::BkvServingIndex> {
+    #[cfg(test)]
+    BKV_CLIENT_INDEX_LOADS.with(|count| count.set(count.get() + 1));
     let imported = state
         .runtime
         .block_on(db::get_config(
@@ -12403,65 +12578,60 @@ fn resolve_bkv_file_at_root(
             .or_insert(refreshed)
             .clone()
     };
-    let artifact = bkv_allowlisted_artifact(&index, relative)?;
-    let path = production_tasks::resolve_bkv_serving_path(&index, artifact).ok()?;
-    let bytes = read_bkv_verified_file(&path, artifact.size, &artifact.sha256)?;
-    Some((path, bytes))
+    Some(index)
 }
 
-fn bkv_client_artifact_value(state: &ServiceState, root: &Path, token: &str) -> Option<Value> {
+fn resolve_bkv_artifact_at_root(
+    state: &ServiceState,
+    root: &Path,
+    token: &str,
+) -> Option<(PathBuf, production_tasks::BkvServingArtifact)> {
     let value = token.strip_prefix("bkv://")?;
     let (batch_id, relative) = value.split_once('/')?;
-    let (_, bytes) = resolve_bkv_file_at_root(state, root, token)?;
-    let imported = state
-        .runtime
-        .block_on(db::get_config(
-            &state.database.connection,
-            &format!("bkv.batch.{batch_id}"),
-        ))
-        .ok()
-        .flatten()?;
-    let imported: Value = serde_json::from_str(&imported.value).ok()?;
-    let summary = imported.get("summary")?;
-    let manifest_relative = summary.get("manifestPath").and_then(Value::as_str)?;
-    if manifest_relative != format!("{batch_id}/manifest.json") {
-        return None;
-    }
-    let manifest_path = root.join(manifest_relative);
-    let metadata = fs::symlink_metadata(&manifest_path).ok()?;
-    if file_component_is_link(&manifest_path)
-        || !metadata.is_file()
-        || metadata.len() > 16 * 1024 * 1024
+    if relative.is_empty()
+        || Path::new(relative).is_absolute()
+        || Path::new(relative)
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
     {
         return None;
     }
-    let manifest_hash = summary.get("manifestSha256").and_then(Value::as_str)?;
-    let manifest_bytes = read_bkv_verified_file(&manifest_path, metadata.len(), manifest_hash)?;
-    let manifest: Value = serde_json::from_slice(&manifest_bytes).ok()?;
-    let artifact = manifest
-        .get("artifacts")
-        .and_then(Value::as_array)?
+    let index = load_active_bkv_serving_index(state, root, batch_id)?;
+    let artifact = bkv_allowlisted_artifact(&index, relative)?.clone();
+    let path = production_tasks::resolve_bkv_serving_path(&index, &artifact).ok()?;
+    Some((path, artifact))
+}
+
+fn bkv_client_artifact_value_from_index(
+    index: &production_tasks::BkvServingIndex,
+    batch_id: &str,
+    token: &str,
+) -> Option<Value> {
+    bkv_client_artifact_value_from_artifacts(&index.artifacts, batch_id, token)
+}
+
+fn bkv_client_artifact_value_from_artifacts(
+    artifacts: &[production_tasks::BkvServingArtifact],
+    batch_id: &str,
+    token: &str,
+) -> Option<Value> {
+    let value = token.strip_prefix("bkv://")?;
+    let (token_batch_id, relative) = value.split_once('/')?;
+    if token_batch_id != batch_id {
+        return None;
+    }
+    let artifact = artifacts
         .iter()
-        .find(|artifact| artifact.get("path").and_then(Value::as_str) == Some(relative))?;
-    let expected_size = artifact.get("size").and_then(Value::as_u64)?;
-    let expected_hash = artifact.get("sha256").and_then(Value::as_str)?;
-    if expected_size != bytes.len() as u64
-        || expected_hash != format!("{:x}", Sha256::digest(&bytes))
-    {
-        return None;
-    }
-    let extension = artifact
-        .get("extension")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let depth_decode = if extension.eq_ignore_ascii_case(".d3img") {
-        let evidence = artifact.get("depthDecode")?.clone();
-        let status = evidence.get("status").and_then(Value::as_str)?;
-        let reason = evidence.get("reason").and_then(Value::as_str)?;
-        if !matches!(status, "decoded" | "unsupported" | "invalid") || reason.trim().is_empty() {
-            return None;
-        }
-        evidence
+        .find(|artifact| artifact.relative_path == relative)?;
+    let depth_decode = if relative.to_ascii_lowercase().ends_with(".d3img") {
+        json!({
+            "status":"unsupported",
+            "reason":"no_evidenced_decoder",
+            "probeSchema":"steel.bkv-d3img-probe.v1",
+            "parserVersion":"1",
+            "originalSha256":artifact.sha256,
+            "decoderAvailable":false
+        })
     } else {
         Value::Null
     };
@@ -12473,13 +12643,20 @@ fn bkv_client_artifact_value(state: &ServiceState, root: &Path, token: &str) -> 
         "source":"bkv",
         "sourceBadge":"BKV 离线回放",
         "offline":true,
-        "sha256":expected_hash,
-        "size":expected_size,
-        "cameraNumber":artifact.get("cameraNumber"),
-        "legacySeqNo":artifact.get("seqNo"),
-        "kind":artifact.get("kind"),
+        "sha256":artifact.sha256,
+        "size":artifact.size,
+        "cameraNumber":artifact.camera_number,
+        "legacySeqNo":artifact.seq_no,
+        "kind":artifact.kind,
         "depthDecode":depth_decode
     }))
+}
+
+fn bkv_client_artifact_value(state: &ServiceState, root: &Path, token: &str) -> Option<Value> {
+    let value = token.strip_prefix("bkv://")?;
+    let (batch_id, _) = value.split_once('/')?;
+    let index = load_active_bkv_serving_index(state, root, batch_id)?;
+    bkv_client_artifact_value_from_index(&index, batch_id, token)
 }
 
 fn decorate_bkv_capture_response(state: &ServiceState, root: &Path, response: Vec<u8>) -> Vec<u8> {
@@ -12513,6 +12690,13 @@ fn decorate_bkv_capture_response(state: &ServiceState, root: &Path, response: Ve
             r#"{"code":"bkv_artifact_response_invalid","error":"bkv_artifact_response_invalid"}"#,
         );
     };
+    let Some(index) = load_active_bkv_serving_index(state, root, &batch_id) else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            r#"{"code":"bkv_artifact_unavailable","error":"bkv_artifact_unavailable"}"#,
+        );
+    };
     let mut client_artifacts = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let Some(relative) = artifact.get("path").and_then(Value::as_str) else {
@@ -12527,7 +12711,8 @@ fn decorate_bkv_capture_response(state: &ServiceState, root: &Path, response: Ve
         } else {
             format!("bkv://{batch_id}/{relative}")
         };
-        let Some(mut client) = bkv_client_artifact_value(state, root, &token) else {
+        let Some(mut client) = bkv_client_artifact_value_from_index(&index, &batch_id, &token)
+        else {
             return http_response(
                 "503 Service Unavailable",
                 "application/json; charset=utf-8",
@@ -12594,22 +12779,8 @@ fn production_file_response_with_bkv_root(
         );
     };
     let bkv_path = path_value.starts_with("bkv://");
-    let _bkv_active_guard = if bkv_path {
-        match state.production_command_lock.lock() {
-            Ok(guard) => Some(guard),
-            Err(_) => {
-                return http_response(
-                    "503 Service Unavailable",
-                    "application/json; charset=utf-8",
-                    "{\"error\":\"production_command_lock_poisoned\"}",
-                )
-            }
-        }
-    } else {
-        None
-    };
     let resolved_bkv = if bkv_path {
-        bkv_root.and_then(|root| resolve_bkv_file_at_root(state, root, &path_value))
+        bkv_root.and_then(|root| resolve_bkv_artifact_at_root(state, root, &path_value))
     } else {
         None
     };
@@ -12627,10 +12798,42 @@ fn production_file_response_with_bkv_root(
             "{\"error\":\"path_not_allowed\"}",
         );
     }
-    match resolved_bkv
-        .map(|(_, bytes)| bytes)
-        .or_else(|| fs::read(&path).ok())
+    let _bkv_active_guard = if bkv_path {
+        match state.production_command_lock.lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                return http_response(
+                    "503 Service Unavailable",
+                    "application/json; charset=utf-8",
+                    "{\"error\":\"production_command_lock_poisoned\"}",
+                )
+            }
+        }
+    } else {
+        None
+    };
+    if bkv_path && !bkv_token_is_still_active(state, &path_value) {
+        return http_response(
+            "403 Forbidden",
+            "application/json; charset=utf-8",
+            "{\"error\":\"path_not_allowed\"}",
+        );
+    }
+    if resolved_bkv
+        .as_ref()
+        .is_some_and(|(_, artifact)| artifact.size > BKV_CLIENT_SERVING_MAX_BYTES)
     {
+        return bkv_artifact_too_large_response();
+    }
+    drop(_bkv_active_guard);
+    let body = if bkv_path {
+        resolved_bkv.and_then(|(path, artifact)| {
+            read_bkv_verified_file(&path, artifact.size, &artifact.sha256)
+        })
+    } else {
+        fs::read(&path).ok()
+    };
+    match body {
         Some(body) => {
             http_bytes_response_with_headers("200 OK", content_type_for_path(&path), &body, &[])
         }
@@ -17983,6 +18186,23 @@ mod tests {
         assert!(read_bkv_verified_file(&path, bytes.len() as u64, &"0".repeat(64)).is_none());
         assert!(read_bkv_verified_file(&path, bytes.len() as u64 + 1, &hash).is_none());
         fs::remove_file(path).ok();
+
+        let oversized = env::temp_dir().join(format!("steel-bkv-oversized-{nonce}.bin"));
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(BKV_CLIENT_SERVING_MAX_BYTES + 1)
+            .unwrap();
+        assert!(read_bkv_verified_file(
+            &oversized,
+            BKV_CLIENT_SERVING_MAX_BYTES + 1,
+            &"0".repeat(64),
+        )
+        .is_none());
+        let rejection = response_json(bkv_artifact_too_large_response());
+        assert_eq!(rejection["code"], "bkv_artifact_too_large");
+        assert!(response_text(bkv_artifact_too_large_response())
+            .starts_with("HTTP/1.1 413 Content Too Large"));
+        fs::remove_file(oversized).ok();
     }
 
     #[cfg(unix)]
@@ -18125,7 +18345,13 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let (token, artifact_path) = write_bkv_client_file_fixture(&state, &root);
 
+        let hash_reads_before = BKV_CLIENT_FILE_HASH_READS.with(std::cell::Cell::get);
         let artifact = bkv_client_artifact_value(&state, &root, &token).expect("active artifact");
+        assert_eq!(
+            BKV_CLIENT_FILE_HASH_READS.with(std::cell::Cell::get),
+            hash_reads_before,
+            "DTO decoration must not open or hash artifact payloads"
+        );
         assert_eq!(artifact["artifactRef"], token);
         assert_eq!(artifact["url"], production_file_url(&token));
         assert!(artifact["url"]
@@ -18135,6 +18361,16 @@ mod tests {
         assert_eq!(artifact["legacySeqNo"], 1_893_700);
         assert_eq!(artifact["depthDecode"]["status"], "unsupported");
         assert_eq!(artifact["depthDecode"]["reason"], "no_evidenced_decoder");
+        assert_eq!(
+            artifact["depthDecode"]["probeSchema"],
+            "steel.bkv-d3img-probe.v1"
+        );
+        assert_eq!(artifact["depthDecode"]["parserVersion"], "1");
+        assert_eq!(
+            artifact["depthDecode"]["originalSha256"],
+            artifact["sha256"]
+        );
+        assert_eq!(artifact["depthDecode"]["decoderAvailable"], false);
         assert!(artifact.get("localPath").is_none());
         let routed = production_file_response_with_bkv_root(
             &state,
@@ -18165,6 +18401,7 @@ mod tests {
         assert_eq!(capture["sourceBadge"], "BKV 离线回放");
         assert_eq!(capture["depthDecode"]["reason"], "no_evidenced_decoder");
         assert!(capture.get("path").is_none());
+        let index_loads_before = BKV_CLIENT_INDEX_LOADS.with(std::cell::Cell::get);
         let decorated = decorate_bkv_capture_response(
             &state,
             &root,
@@ -18173,12 +18410,21 @@ mod tests {
                 "application/json; charset=utf-8",
                 &json!({
                     "code":0,"source":"bkv","provider":"bkv","batchId":"batch-client",
-                    "artifacts":[{"path":"artifacts/camera1/1893700/3d/0000.d3img","verified":true}]
+                    "artifacts":[
+                        {"path":"artifacts/camera1/1893700/3d/0000.d3img","verified":true},
+                        {"path":"artifacts/camera1/1893700/3d/0000.d3img","verified":true}
+                    ]
                 })
                 .to_string(),
             ),
         );
         let decorated = response_json(decorated);
+        assert_eq!(
+            BKV_CLIENT_INDEX_LOADS.with(std::cell::Cell::get) - index_loads_before,
+            1,
+            "multi-artifact decoration must load the serving index once"
+        );
+        assert_eq!(decorated["artifacts"].as_array().unwrap().len(), 2);
         assert_eq!(decorated["sourceBadge"], "BKV 离线回放");
         assert_eq!(decorated["artifacts"][0]["artifactRef"], token);
         assert!(decorated["artifacts"][0].get("path").is_none());
@@ -18199,7 +18445,13 @@ mod tests {
             use std::os::unix::fs::symlink;
             fs::remove_file(&artifact_path).unwrap();
             symlink(&outside, &artifact_path).unwrap();
-            assert!(bkv_client_artifact_value(&state, &root, &token).is_none());
+            assert!(bkv_client_artifact_value(&state, &root, &token).is_some());
+            assert!(response_text(production_file_response_with_bkv_root(
+                &state,
+                &format!("path={}", url_encode_component(&token)),
+                Some(&root),
+            ))
+            .starts_with("HTTP/1.1 403 Forbidden"));
             fs::remove_file(&artifact_path).unwrap();
             fs::write(&artifact_path, b"legacy-depth").unwrap();
         }
@@ -18210,7 +18462,13 @@ mod tests {
             match symlink_file(&outside, &artifact_path) {
                 Ok(()) => {
                     assert!(file_component_is_link(&artifact_path));
-                    assert!(bkv_client_artifact_value(&state, &root, &token).is_none());
+                    assert!(bkv_client_artifact_value(&state, &root, &token).is_some());
+                    assert!(response_text(production_file_response_with_bkv_root(
+                        &state,
+                        &format!("path={}", url_encode_component(&token)),
+                        Some(&root),
+                    ))
+                    .starts_with("HTTP/1.1 403 Forbidden"));
                     fs::remove_file(&artifact_path).unwrap();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
@@ -18220,7 +18478,13 @@ mod tests {
         }
 
         fs::write(&artifact_path, b"changed-depth").unwrap();
-        assert!(bkv_client_artifact_value(&state, &root, &token).is_none());
+        assert!(bkv_client_artifact_value(&state, &root, &token).is_some());
+        assert!(response_text(production_file_response_with_bkv_root(
+            &state,
+            &format!("path={}", url_encode_component(&token)),
+            Some(&root),
+        ))
+        .starts_with("HTTP/1.1 404 Not Found"));
         fs::write(&artifact_path, b"legacy-depth").unwrap();
         state
             .runtime
@@ -18236,24 +18500,28 @@ mod tests {
     }
 
     #[test]
-    fn bkv_active_switch_cannot_interleave_with_an_inflight_file_response() {
+    fn bkv_file_identity_fence_releases_before_bounded_payload_io() {
         let state = Arc::new(production_test_state());
         let active = Arc::new(Mutex::new("batch-a".to_string()));
         let entered = Arc::new(std::sync::Barrier::new(2));
+        let switched = Arc::new(std::sync::Barrier::new(2));
         let observed = Arc::new(Mutex::new(Vec::new()));
 
         let response_state = Arc::clone(&state);
         let response_active = Arc::clone(&active);
         let response_entered = Arc::clone(&entered);
+        let response_switched = Arc::clone(&switched);
         let response_observed = Arc::clone(&observed);
         let response = std::thread::spawn(move || {
-            let _guard = response_state.production_command_lock.lock().unwrap();
-            response_observed
-                .lock()
-                .unwrap()
-                .push(response_active.lock().unwrap().clone());
+            {
+                let _guard = response_state.production_command_lock.lock().unwrap();
+                response_observed
+                    .lock()
+                    .unwrap()
+                    .push(response_active.lock().unwrap().clone());
+            }
             response_entered.wait();
-            std::thread::sleep(Duration::from_millis(25));
+            response_switched.wait();
             response_observed
                 .lock()
                 .unwrap()
@@ -18262,13 +18530,15 @@ mod tests {
         entered.wait();
         let switch_state = Arc::clone(&state);
         let switch_active = Arc::clone(&active);
+        let switch_switched = Arc::clone(&switched);
         let switch = std::thread::spawn(move || {
             let _guard = switch_state.production_command_lock.lock().unwrap();
             *switch_active.lock().unwrap() = "batch-b".to_string();
+            switch_switched.wait();
         });
         response.join().unwrap();
         switch.join().unwrap();
-        assert_eq!(&*observed.lock().unwrap(), &["batch-a", "batch-a"]);
+        assert_eq!(&*observed.lock().unwrap(), &["batch-a", "batch-b"]);
         assert_eq!(&*active.lock().unwrap(), "batch-b");
     }
 

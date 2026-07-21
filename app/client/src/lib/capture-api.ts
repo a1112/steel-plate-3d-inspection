@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   createAdminHeaders,
   getInspectionServiceOrigin,
+  parseBkvCaptureStatus,
   readAdminErrorMessage,
 } from "../services/inspection-api";
 
@@ -1248,26 +1249,12 @@ function parseCaptureHealth(value: unknown): CaptureHealth {
   }
 
   if (value.provider === "bkv") {
-    const channels = value.channels;
-    const validChannels =
-      Array.isArray(channels) &&
-      channels.length === 6 &&
-      channels.every(
-        (channel, offset): channel is BkvOfflineChannel =>
-          isRecord(channel) &&
-          channel.index === offset + 1 &&
-          channel.status === "offline" &&
-          channel.source === "bkv",
-      );
+    const core = parseBkvCaptureStatus(value);
     if (
       typeof value.service !== "string" ||
       typeof value.time !== "string" ||
-      value.status !== "bkv-offline" ||
-      value.sdkRequired !== false ||
-      value.sdkReady !== null ||
       value.connected !== false ||
-      value.cameraCount !== 6 ||
-      !validChannels
+      (value.replay !== undefined && core.replay === undefined)
     ) {
       throw new Error("invalid BKV capture health response");
     }
@@ -1280,11 +1267,10 @@ function parseCaptureHealth(value: unknown): CaptureHealth {
       sdkReady: null,
       connected: false,
       cameraCount: 6,
-      channels,
-      ...(typeof value.batchId === "string" ? { batchId: value.batchId } : {}),
-      ...(typeof value.contentId === "string"
-        ? { contentId: value.contentId }
-        : {}),
+      channels: core.channels,
+      ...(core.batchId ? { batchId: core.batchId } : {}),
+      ...(core.contentId ? { contentId: core.contentId } : {}),
+      ...(core.replay ? { replay: core.replay } : {}),
     };
   }
 

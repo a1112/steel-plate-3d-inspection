@@ -670,6 +670,10 @@ export type BkvSourceBadge = 'BKV 离线回放';
 export type BkvDepthDecode = {
   status: 'decoded' | 'unsupported' | 'invalid';
   reason: string;
+  probeSchema: 'steel.bkv-d3img-probe.v1';
+  parserVersion: string;
+  originalSha256: string;
+  decoderAvailable: boolean;
   previewArtifactRef?: string;
   depthArtifactRef?: string;
   metadataArtifactRef?: string;
@@ -1186,6 +1190,126 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+const BKV_TOTAL = 11;
+const BKV_FIRST_SEQ_NO = 1_893_700;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const BKV_BATCH_ID_PATTERN = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,117}$/;
+
+function isSafeIntegerIn(value: unknown, min: number, max: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+
+export function parseBkvReplayState(value: unknown): BkvReplayState {
+  if (!isRecord(value)
+    || !isSafeIntegerIn(value.index, 0, BKV_TOTAL)
+    || value.total !== BKV_TOTAL
+    || !isSafeIntegerIn(value.version, value.index, Number.MAX_SAFE_INTEGER)) {
+    throw new Error('BKV replay state is invalid');
+  }
+  const expectedStatus = value.index === 0
+    ? 'ready'
+    : value.index === BKV_TOTAL ? 'completed' : 'replaying';
+  const expectedSeqNo = value.index === 0 ? undefined : BKV_FIRST_SEQ_NO + value.index - 1;
+  if (value.status !== expectedStatus
+    || (expectedSeqNo === undefined
+      ? value.legacySeqNo !== undefined && value.legacySeqNo !== null
+      : value.legacySeqNo !== expectedSeqNo)
+    || (value.previousIndex !== undefined
+      && !isSafeIntegerIn(value.previousIndex, 0, value.index))) {
+    throw new Error('BKV replay state contradicts its index');
+  }
+  return {
+    ...(typeof value.previousIndex === 'number' ? { previousIndex: value.previousIndex } : {}),
+    index: value.index,
+    total: BKV_TOTAL,
+    status: expectedStatus,
+    version: value.version,
+    ...(expectedSeqNo === undefined ? {} : { legacySeqNo: expectedSeqNo }),
+  };
+}
+
+function parseBkvIdentity(value: unknown, label: string): { batchId: string; contentId: string } {
+  if (!isRecord(value)
+    || typeof value.batchId !== 'string'
+    || !BKV_BATCH_ID_PATTERN.test(value.batchId)
+    || typeof value.contentId !== 'string'
+    || !SHA256_PATTERN.test(value.contentId)) {
+    throw new Error(`BKV ${label} identity is invalid`);
+  }
+  return { batchId: value.batchId, contentId: value.contentId };
+}
+
+export function parseBkvStatus(value: unknown): BkvStatus {
+  if (!isRecord(value) || value.code !== 0 || typeof value.active !== 'boolean'
+    || value.provider !== 'bkv' || value.source !== 'bkv'
+    || value.sourceBadge !== 'BKV 离线回放' || value.offline !== true) {
+    throw new Error('BKV status response is invalid');
+  }
+  if (!value.active) {
+    if (value.activeBatch !== undefined || value.batch !== undefined || value.replay !== undefined) {
+      throw new Error('BKV inactive status contains active state');
+    }
+    return {
+      code: 0, active: false, provider: 'bkv', source: 'bkv',
+      sourceBadge: 'BKV 离线回放', offline: true,
+    };
+  }
+  const activeBatch = parseBkvIdentity(value.activeBatch, 'active batch');
+  const batchIdentity = parseBkvIdentity(value.batch, 'batch');
+  if (activeBatch.batchId !== batchIdentity.batchId
+    || activeBatch.contentId !== batchIdentity.contentId
+    || !isRecord(value.batch)
+    || value.batch.status !== 'ready') {
+    throw new Error('BKV status batch binding is invalid');
+  }
+  let counts: Record<string, number> | undefined;
+  if (value.batch.counts !== undefined && value.batch.counts !== null) {
+    if (!isRecord(value.batch.counts)) {
+      throw new Error('BKV status counts are invalid');
+    }
+    counts = {};
+    for (const [key, count] of Object.entries(value.batch.counts)) {
+      if (!isSafeIntegerIn(count, 0, Number.MAX_SAFE_INTEGER)) {
+        throw new Error('BKV status counts are invalid');
+      }
+      counts[key] = count;
+    }
+  }
+  const replay = parseBkvReplayState(value.replay);
+  return {
+    code: 0, active: true, provider: 'bkv', source: 'bkv',
+    sourceBadge: 'BKV 离线回放', offline: true,
+    activeBatch,
+    batch: { ...batchIdentity, status: 'ready', ...(counts ? { counts } : {}) },
+    replay,
+  };
+}
+
+export function parseBkvCaptureStatus(value: unknown): BkvCaptureStatus {
+  if (!isRecord(value) || value.provider !== 'bkv' || value.status !== 'bkv-offline'
+    || value.sdkRequired !== false || value.sdkReady !== null || value.cameraCount !== 6
+    || !Array.isArray(value.channels) || value.channels.length !== 6) {
+    throw new Error('BKV capture status is invalid');
+  }
+  const channels = value.channels.map((channel, offset) => {
+    if (!isRecord(channel) || channel.index !== offset + 1
+      || channel.status !== 'offline' || channel.source !== 'bkv') {
+      throw new Error('BKV capture channels are invalid');
+    }
+    return { index: offset + 1, status: 'offline' as const, source: 'bkv' as const };
+  });
+  const hasIdentity = value.batchId !== undefined || value.contentId !== undefined;
+  const identity = hasIdentity
+    ? parseBkvIdentity({ batchId: value.batchId, contentId: value.contentId }, 'capture')
+    : undefined;
+  const replay = value.replay === undefined ? undefined : parseBkvReplayState(value.replay);
+  return {
+    provider: 'bkv', status: 'bkv-offline', sdkRequired: false, sdkReady: null,
+    cameraCount: 6, channels,
+    ...(identity ?? {}), ...(replay ? { replay } : {}),
+  };
+}
+
 function isInspectionSnapshotShape(value: unknown): value is InspectionSnapshot & Record<string, unknown> {
   return isRecord(value)
     && isRecord(value.currentPlate)
@@ -1205,43 +1329,68 @@ function isInspectionSnapshotShape(value: unknown): value is InspectionSnapshot 
     ));
 }
 
-function isBkvDepthDecode(value: unknown): value is BkvDepthDecode {
-  return isRecord(value)
-    && (value.status === 'decoded' || value.status === 'unsupported' || value.status === 'invalid')
-    && typeof value.reason === 'string'
-    && value.reason.trim().length > 0;
+function parseBkvDepthDecode(value: unknown, artifactSha256: string): BkvDepthDecode {
+  if (!isRecord(value)
+    || value.probeSchema !== 'steel.bkv-d3img-probe.v1'
+    || value.parserVersion !== '1'
+    || value.originalSha256 !== artifactSha256
+    || typeof value.decoderAvailable !== 'boolean'
+    || (value.status !== 'decoded' && value.status !== 'unsupported' && value.status !== 'invalid')
+    || typeof value.reason !== 'string' || value.reason.trim().length === 0
+    || (value.status === 'unsupported'
+      && (value.decoderAvailable !== false || value.reason !== 'no_evidenced_decoder'))
+    || (value.status === 'decoded' && value.decoderAvailable !== true)) {
+    throw new Error('BKV d3img decode evidence is invalid');
+  }
+  return {
+    status: value.status, reason: value.reason,
+    probeSchema: 'steel.bkv-d3img-probe.v1', parserVersion: '1',
+    originalSha256: artifactSha256, decoderAvailable: value.decoderAvailable,
+    ...(typeof value.previewArtifactRef === 'string' ? { previewArtifactRef: value.previewArtifactRef } : {}),
+    ...(typeof value.depthArtifactRef === 'string' ? { depthArtifactRef: value.depthArtifactRef } : {}),
+    ...(typeof value.metadataArtifactRef === 'string' ? { metadataArtifactRef: value.metadataArtifactRef } : {}),
+  };
 }
 
-function isBkvArtifact(value: unknown): value is BkvArtifact {
-  if (!isRecord(value)) {
-    return false;
-  }
+export function parseBkvArtifact(value: unknown): BkvArtifact {
+  if (!isRecord(value)) throw new Error('BKV artifact is invalid');
   const relativePath = typeof value.relativePath === 'string' ? value.relativePath : '';
-  const depthDecodeValid = relativePath.toLowerCase().endsWith('.d3img')
-    ? isBkvDepthDecode(value.depthDecode)
-    : value.depthDecode === null || isBkvDepthDecode(value.depthDecode);
-  return typeof value.artifactRef === 'string'
-    && value.artifactRef.startsWith('bkv://')
-    && relativePath.startsWith('artifacts/')
-    && typeof value.url === 'string'
-    && value.url.startsWith('/api/production/file?')
-    && value.authenticated === true
-    && value.source === 'bkv'
-    && value.sourceBadge === 'BKV 离线回放'
-    && value.offline === true
-    && typeof value.sha256 === 'string'
-    && /^[0-9a-f]{64}$/.test(value.sha256)
-    && typeof value.size === 'number'
-    && Number.isSafeInteger(value.size)
-    && value.size >= 0
-    && typeof value.cameraNumber === 'number'
-    && Number.isInteger(value.cameraNumber)
-    && value.cameraNumber >= 1
-    && value.cameraNumber <= 6
-    && typeof value.legacySeqNo === 'number'
-    && Number.isInteger(value.legacySeqNo)
-    && typeof value.kind === 'string'
-    && depthDecodeValid;
+  const artifactRef = typeof value.artifactRef === 'string' ? value.artifactRef : '';
+  const refMatch = /^bkv:\/\/([^/]+)\/(artifacts\/.+)$/.exec(artifactRef);
+  const artifactUrl = typeof value.url === 'string' ? value.url : '';
+  let artifactUrlValid = false;
+  if (artifactUrl) {
+    try {
+      const parsedUrl = new URL(artifactUrl, 'http://bkv.invalid');
+      artifactUrlValid = parsedUrl.pathname === '/api/production/file'
+        && parsedUrl.searchParams.get('path') === value.artifactRef;
+    } catch {
+      artifactUrlValid = false;
+    }
+  }
+  if (!refMatch || !BKV_BATCH_ID_PATTERN.test(refMatch[1]) || refMatch[2] !== relativePath
+    || relativePath.includes('..') || relativePath.includes('\\')
+    || !artifactUrlValid
+    || value.authenticated !== true || value.source !== 'bkv'
+    || value.sourceBadge !== 'BKV 离线回放' || value.offline !== true
+    || typeof value.sha256 !== 'string' || !SHA256_PATTERN.test(value.sha256)
+    || !isSafeIntegerIn(value.size, 0, Number.MAX_SAFE_INTEGER)
+    || !isSafeIntegerIn(value.cameraNumber, 1, 6)
+    || !isSafeIntegerIn(value.legacySeqNo, BKV_FIRST_SEQ_NO, BKV_FIRST_SEQ_NO + BKV_TOTAL - 1)
+    || typeof value.kind !== 'string' || value.kind.trim().length === 0) {
+    throw new Error('BKV artifact is invalid');
+  }
+  const isDepth = relativePath.toLowerCase().endsWith('.d3img');
+  const depthDecode = isDepth
+    ? parseBkvDepthDecode(value.depthDecode, value.sha256)
+    : value.depthDecode === null ? null : (() => { throw new Error('BKV artifact decode evidence is unexpected'); })();
+  return {
+    artifactRef: artifactRef as `bkv://${string}`, relativePath,
+    url: artifactUrl, authenticated: true, source: 'bkv', sourceBadge: 'BKV 离线回放', offline: true,
+    sha256: value.sha256, size: value.size, cameraNumber: value.cameraNumber,
+    legacySeqNo: value.legacySeqNo, kind: value.kind,
+    ...(value.verified === true ? { verified: true } : {}), depthDecode,
+  };
 }
 
 function isBkvPlateInspection(
@@ -1249,7 +1398,7 @@ function isBkvPlateInspection(
 ): value is PlateInspection & { bkvArtifacts: BkvArtifact[] } {
   return isRecord(value)
     && Array.isArray(value.bkvArtifacts)
-    && value.bkvArtifacts.every(isBkvArtifact);
+    && value.bkvArtifacts.every((artifact) => { try { parseBkvArtifact(artifact); return true; } catch { return false; } });
 }
 
 function normalizeInspectionSnapshot(snapshot: unknown, origin: string): InspectionSnapshotResponse {
@@ -1258,13 +1407,44 @@ function normalizeInspectionSnapshot(snapshot: unknown, origin: string): Inspect
   }
   if (snapshot.provider === 'bkv') {
     const bkvInspections = snapshot.inspections;
+    const selected = snapshot.source === 'bkv';
     if ((snapshot.source !== 'bkv' && snapshot.source !== 'bkv-offline')
       || snapshot.offline !== true
       || snapshot.sourceBadge !== 'BKV 离线回放'
       || !Array.isArray(snapshot.bkvArtifacts)
-      || !snapshot.bkvArtifacts.every(isBkvArtifact)
-      || !bkvInspections.every(isBkvPlateInspection)) {
+      || !snapshot.bkvArtifacts.every((artifact) => { try { parseBkvArtifact(artifact); return true; } catch { return false; } })
+      || !bkvInspections.every(isBkvPlateInspection)
+      || (selected && (bkvInspections.length !== 1 || snapshot.records.length !== 1))
+      || (!selected && (bkvInspections.length !== 0 || snapshot.bkvArtifacts.length !== 0))) {
       throw new Error('BKV inspection snapshot shape is invalid');
+    }
+    let identity: { batchId: string; contentId: string } | undefined;
+    let legacySeqNo: number | undefined;
+    let replay: BkvReplayState | undefined;
+    if (selected) {
+      identity = parseBkvIdentity(
+        { batchId: snapshot.batchId, contentId: snapshot.contentId },
+        'snapshot',
+      );
+      if (!isSafeIntegerIn(snapshot.legacySeqNo, BKV_FIRST_SEQ_NO, BKV_FIRST_SEQ_NO + BKV_TOTAL - 1)
+        || snapshot.currentPlate.plateNo !== bkvInspections[0].plate.plateNo) {
+        throw new Error('BKV snapshot selection binding is invalid');
+      }
+      legacySeqNo = snapshot.legacySeqNo;
+      const prefix = `bkv://${identity.batchId}/`;
+      if (![...snapshot.bkvArtifacts, ...bkvInspections[0].bkvArtifacts]
+        .every((artifact) => artifact.artifactRef.startsWith(prefix))) {
+        throw new Error('BKV snapshot artifact binding is invalid');
+      }
+      if (snapshot.replay !== undefined) {
+        replay = parseBkvReplayState(snapshot.replay);
+        if (replay.legacySeqNo !== legacySeqNo) {
+          throw new Error('BKV snapshot replay selection is invalid');
+        }
+      }
+    } else if (snapshot.batchId !== undefined || snapshot.contentId !== undefined
+      || snapshot.legacySeqNo !== undefined || snapshot.replay !== undefined) {
+      throw new Error('BKV offline snapshot contains a selection');
     }
     return {
       ...snapshot,
@@ -1272,22 +1452,25 @@ function normalizeInspectionSnapshot(snapshot: unknown, origin: string): Inspect
       source: snapshot.source,
       sourceBadge: 'BKV 离线回放',
       offline: true,
+      ...(identity ?? {}),
+      ...(legacySeqNo === undefined ? {} : { legacySeqNo }),
+      ...(replay ? { replay } : {}),
       defects: snapshot.defects.map((defect) => withPreviewImage(defect, false, origin)),
       captureImages: [],
       inspections: bkvInspections.map((inspection) => ({
         ...inspection,
         defects: inspection.defects.map((defect) => withPreviewImage(defect, false, origin)),
         captureImages: [],
-        bkvArtifacts: inspection.bkvArtifacts.map((artifact) => ({
-          ...artifact,
-          url: normalizeServiceUrl(artifact.url, origin),
-        })),
+        bkvArtifacts: inspection.bkvArtifacts.map((raw) => {
+          const artifact = parseBkvArtifact(raw);
+          return { ...artifact, url: normalizeServiceUrl(artifact.url, origin) };
+        }),
         source: 'bkv',
       })),
-      bkvArtifacts: snapshot.bkvArtifacts.map((artifact) => ({
-        ...artifact,
-        url: normalizeServiceUrl(artifact.url, origin),
-      })),
+      bkvArtifacts: snapshot.bkvArtifacts.map((raw) => {
+        const artifact = parseBkvArtifact(raw);
+        return { ...artifact, url: normalizeServiceUrl(artifact.url, origin) };
+      }),
     };
   }
   // Static fixtures are allowed only for an explicitly identified demo/test
@@ -1336,16 +1519,14 @@ export async function fetchBkvStatus(signal?: AbortSignal): Promise<BkvStatus> {
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, 'BKV 离线回放状态接口异常'));
   }
-  return response.json() as Promise<BkvStatus>;
+  return parseBkvStatus(await response.json());
 }
 
 export async function fetchBkvArtifact(
   artifact: BkvArtifact,
   signal?: AbortSignal,
 ): Promise<Blob> {
-  if (!artifact.artifactRef.startsWith('bkv://')) {
-    throw new Error('BKV artifact reference is invalid');
-  }
+  artifact = parseBkvArtifact(artifact);
   const origin = getInspectionServiceOrigin(getStoredConnectionConfig());
   const query = new URLSearchParams({ path: artifact.artifactRef });
   const response = await fetch(`${origin}/api/production/file?${query.toString()}`, {
@@ -1355,11 +1536,30 @@ export async function fetchBkvArtifact(
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, 'BKV 离线数据文件读取失败'));
   }
-  const blob = await response.blob();
-  if (blob.size !== artifact.size) {
+  const contentType = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase();
+  const extension = artifact.relativePath.split('.').pop()?.toLowerCase() ?? '';
+  const imageExpected = ['jpg', 'jpeg', 'png', 'bmp', 'webp'].includes(extension);
+  if (contentType === 'text/html' || contentType.startsWith('text/')
+    || (imageExpected && !contentType.startsWith('image/'))
+    || (extension === 'd3img' && contentType !== 'application/octet-stream')) {
+    throw new Error('BKV artifact content type mismatch');
+  }
+  const contentLength = response.headers.get('content-length');
+  if (contentLength !== null && Number(contentLength) !== artifact.size) {
     throw new Error('BKV artifact size mismatch');
   }
-  return blob;
+  const buffer = await response.arrayBuffer();
+  if (buffer.byteLength !== artifact.size) throw new Error('BKV artifact size mismatch');
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', buffer));
+  const expected = artifact.sha256;
+  let mismatch = expected.length ^ 64;
+  for (let index = 0; index < digest.length; index += 1) {
+    const actualPair = digest[index].toString(16).padStart(2, '0');
+    mismatch |= actualPair.charCodeAt(0) ^ expected.charCodeAt(index * 2);
+    mismatch |= actualPair.charCodeAt(1) ^ expected.charCodeAt(index * 2 + 1);
+  }
+  if (mismatch !== 0) throw new Error('BKV artifact hash mismatch');
+  return new Blob([buffer], { type: contentType || 'application/octet-stream' });
 }
 
 export async function fetchProductionStatus(signal?: AbortSignal): Promise<ProductionStatus> {

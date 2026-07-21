@@ -13,6 +13,7 @@ import {
   fetchInspectionSnapshot,
   fetchBkvStatus,
   fetchBkvArtifact,
+  parseBkvArtifact,
   fetchServiceHealthDetails,
   issueInspectionReportArchive,
   startProductionSteelIn,
@@ -128,6 +129,10 @@ describe('persistent production command client', () => {
       depthDecode: {
         status: 'unsupported',
         reason: 'no_evidenced_decoder',
+        probeSchema: 'steel.bkv-d3img-probe.v1',
+        parserVersion: '1',
+        originalSha256: 'b'.repeat(64),
+        decoderAvailable: false,
       },
     };
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
@@ -136,6 +141,8 @@ describe('persistent production command client', () => {
       source: 'bkv',
       sourceBadge: 'BKV 离线回放',
       offline: true,
+      batchId: 'batch-001',
+      contentId: 'a'.repeat(64),
       legacySeqNo: 1_893_700,
       records: fixture.records.slice(0, 1),
       captureImages: [{
@@ -182,8 +189,32 @@ describe('persistent production command client', () => {
       depthDecode: {
         status: 'unsupported',
         reason: 'no_evidenced_decoder',
+        probeSchema: 'steel.bkv-d3img-probe.v1',
+        parserVersion: '1',
+        originalSha256: 'b'.repeat(64),
+        decoderAvailable: false,
       },
     });
+  });
+
+  it('rejects malformed BKV status identities and contradictory replay states', async () => {
+    const valid = {
+      code: 0, active: true, provider: 'bkv', source: 'bkv',
+      sourceBadge: 'BKV 离线回放', offline: true,
+      activeBatch: { batchId: 'batch-001', contentId: 'a'.repeat(64) },
+      batch: { batchId: 'batch-001', contentId: 'a'.repeat(64), status: 'ready' },
+      replay: { index: 3, total: 11, status: 'replaying', version: 3, legacySeqNo: 1_893_702 },
+    };
+    for (const malformed of [
+      { ...valid, activeBatch: { ...valid.activeBatch, contentId: 'not-a-sha' } },
+      { ...valid, batch: { ...valid.batch, batchId: 'other-batch' } },
+      { ...valid, replay: { ...valid.replay, status: 'ready' } },
+      { ...valid, replay: { ...valid.replay, legacySeqNo: 1_893_700 } },
+      { ...valid, replay: { ...valid.replay, version: 2 } },
+    ]) {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(malformed)));
+      await expect(fetchBkvStatus()).rejects.toThrow(/BKV/i);
+    }
   });
 
   it('hydrates readCaptureSnapshot as six offline BKV channels from runtime responses', async () => {
@@ -205,6 +236,9 @@ describe('persistent production command client', () => {
           connected: false,
           cameraCount: 6,
           channels,
+          batchId: 'batch-001',
+          contentId: 'a'.repeat(64),
+          replay: { index: 3, total: 11, status: 'replaying', version: 3, legacySeqNo: 1_893_702 },
         }));
       }
       if (url.endsWith('/api/cameras')) {
@@ -253,6 +287,7 @@ describe('persistent production command client', () => {
     const snapshot = await readCaptureSnapshot();
 
     expect(snapshot.health?.provider).toBe('bkv');
+    expect(snapshot.health?.provider === 'bkv' ? snapshot.health.replay?.index : null).toBe(3);
     expect(snapshot.statuses).toHaveLength(6);
     expect(snapshot.statuses.map((status) => status.ip)).toEqual(
       Array.from({ length: 6 }, (_, offset) => `bkv://camera-${offset + 1}`),
@@ -280,6 +315,22 @@ describe('persistent production command client', () => {
     expect(result).not.toHaveProperty('localPath');
   });
 
+  it('rejects forged d3img decode evidence that is not bound to the artifact hash', () => {
+    expect(() => parseBkvArtifact({
+      artifactRef: 'bkv://batch-001/artifacts/camera1/1893700/3d/0000.d3img',
+      relativePath: 'artifacts/camera1/1893700/3d/0000.d3img',
+      url: '/api/production/file?path=bkv%3A%2F%2Fbatch-001%2Fartifacts%2Fcamera1%2F1893700%2F3d%2F0000.d3img', authenticated: true,
+      source: 'bkv', sourceBadge: 'BKV 离线回放', offline: true,
+      sha256: 'a'.repeat(64), size: 12, cameraNumber: 1,
+      legacySeqNo: 1_893_700, kind: '3d',
+      depthDecode: {
+        status: 'unsupported', reason: 'no_evidenced_decoder',
+        probeSchema: 'steel.bkv-d3img-probe.v1', parserVersion: '1',
+        originalSha256: 'b'.repeat(64), decoderAvailable: false,
+      },
+    })).toThrow(/decode evidence/i);
+  });
+
   it('reads BKV artifact URLs with the authenticated records session', async () => {
     window.localStorage.setItem(
       'steel-inspection-admin-session',
@@ -293,12 +344,12 @@ describe('persistent production command client', () => {
     const artifact = {
       artifactRef: 'bkv://batch-001/artifacts/camera1/1893700/2d/0000.jpg',
       relativePath: 'artifacts/camera1/1893700/2d/0000.jpg',
-      url: '/api/production/file?path=ignored',
+      url: '/api/production/file?path=bkv%3A%2F%2Fbatch-001%2Fartifacts%2Fcamera1%2F1893700%2F2d%2F0000.jpg',
       authenticated: true,
       source: 'bkv',
       sourceBadge: 'BKV 离线回放',
       offline: true,
-      sha256: 'c'.repeat(64),
+      sha256: '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a',
       size: 4,
       cameraNumber: 1,
       legacySeqNo: 1_893_700,
@@ -324,6 +375,26 @@ describe('persistent production command client', () => {
         signal: undefined,
       },
     );
+  });
+
+  it('rejects same-size BKV hash mismatches and HTML success bodies', async () => {
+    const artifact = {
+      artifactRef: 'bkv://batch-001/artifacts/camera1/1893700/2d/0000.jpg',
+      relativePath: 'artifacts/camera1/1893700/2d/0000.jpg',
+      url: '/api/production/file?path=bkv%3A%2F%2Fbatch-001%2Fartifacts%2Fcamera1%2F1893700%2F2d%2F0000.jpg', authenticated: true,
+      source: 'bkv', sourceBadge: 'BKV 离线回放', offline: true,
+      sha256: '0'.repeat(64), size: 4, cameraNumber: 1,
+      legacySeqNo: 1_893_700, kind: '2d', depthDecode: null,
+    } satisfies BkvArtifact;
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), {
+      status: 200, headers: { 'Content-Type': 'image/jpeg' },
+    })));
+    await expect(fetchBkvArtifact(artifact)).rejects.toThrow(/hash mismatch/i);
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<h1>proxy error</h1>', {
+      status: 200, headers: { 'Content-Type': 'text/html' },
+    })));
+    await expect(fetchBkvArtifact({ ...artifact, size: 20 })).rejects.toThrow(/content type/i);
   });
 
   it('issues and queries immutable inspection report archives through the admin API', async () => {
