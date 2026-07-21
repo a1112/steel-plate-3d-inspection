@@ -4201,6 +4201,15 @@ def _verify_staged_batch(
         source_database_complete
         and normalization_complete
         and bool(derived_coverage["complete"])
+        and all(
+            artifact.get("extension") != ".d3img"
+            or (
+                isinstance(artifact.get("depthDecode"), dict)
+                and artifact["depthDecode"].get("status") != "invalid"
+            )
+            for artifact in artifacts
+            if isinstance(artifact, dict)
+        )
     )
     if status != "failed":
         expected_status = "ready" if derived_ready else "partial"
@@ -4562,7 +4571,20 @@ def _stage_batch_into(
             for archive_part, evidence in archives.items()
             if isinstance(evidence, dict)
         }
-        ready = database_verified and target_coverage_complete and normalization_complete
+        depth_files_valid = all(
+            artifact.get("extension") != ".d3img"
+            or (
+                isinstance(artifact.get("depthDecode"), dict)
+                and artifact["depthDecode"].get("status") != "invalid"
+            )
+            for artifact in artifact_evidence
+        )
+        ready = (
+            database_verified
+            and target_coverage_complete
+            and normalization_complete
+            and depth_files_valid
+        )
         batch_content_id = _compute_batch_content_id(
             source_archives=manifest_archives,
             normalization_sha256=normalization_pointer_evidence["sha256"],

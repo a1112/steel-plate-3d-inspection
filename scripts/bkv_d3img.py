@@ -16,6 +16,7 @@ import json
 import math
 import os
 import stat
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -41,6 +42,10 @@ class UnsupportedFormatError(D3ImageError):
 
 class InvalidContractError(D3ImageError):
     """Raised when an evidence contract is internally unsafe or unsupported."""
+
+
+class OutputCollisionError(D3ImageError):
+    """Raised before an output alias can replace the probed source."""
 
 
 @dataclass(frozen=True)
@@ -212,7 +217,27 @@ def decode_d3img(
     )
 
 
-def _write_json_atomic(path: Path, document: Mapping[str, object]) -> None:
+def _reject_output_alias(input_path: Path, output_path: Path) -> None:
+    source = input_path.resolve(strict=True)
+    destination = output_path.resolve(strict=False)
+    if source == destination:
+        raise OutputCollisionError("output_aliases_input")
+    try:
+        same_file = output_path.exists() and os.path.samefile(source, output_path)
+    except OSError as error:
+        raise OutputCollisionError("output_identity_unverifiable") from error
+    if same_file:
+        raise OutputCollisionError("output_aliases_input")
+
+
+def _write_json_atomic(
+    path: Path,
+    document: Mapping[str, object],
+    *,
+    protected_input: Path | None = None,
+) -> None:
+    if protected_input is not None:
+        _reject_output_alias(protected_input, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(
         "utf-8"
@@ -224,6 +249,8 @@ def _write_json_atomic(path: Path, document: Mapping[str, object]) -> None:
             writer.write(payload)
             writer.flush()
             os.fsync(writer.fileno())
+        if protected_input is not None:
+            _reject_output_alias(protected_input, path)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -243,7 +270,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command != "probe":
         return 2
     try:
+        _reject_output_alias(arguments.input, arguments.json)
         result = probe_d3img(arguments.input)
+    except OutputCollisionError as error:
+        print(str(error), file=sys.stderr)
+        return 2
     except OSError as error:
         result = D3ImageProbe(
             schema=PROBE_SCHEMA,
@@ -258,7 +289,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         document["diagnostic"] = str(error)[:1024]
     else:
         document = result.to_document()
-    _write_json_atomic(arguments.json, document)
+    try:
+        _write_json_atomic(
+            arguments.json, document, protected_input=arguments.input
+        )
+    except OutputCollisionError as error:
+        print(str(error), file=sys.stderr)
+        return 2
     print(json.dumps(document, ensure_ascii=False, sort_keys=True))
     return 0 if result.status == "decoded" else 2
 

@@ -84,4 +84,5 @@ Cam3 10 组、Cam4 11 组、Cam5 7 组、Cam6 11 组。所有列出的真实文�
 当前 `scripts/bkv_d3img.py probe` 对已观察 magic 返回稳定结构化证据；未知 magic
 返回 `unsupported_magic`，截断输入返回 `invalid/truncated_header`。迁移 manifest 对
 每个 `.d3img` 保存 `depthDecode.status`、reason、探针 schema/parser 和原文件哈希，
-批次复验会校验这些字段，因而不会把 unsupported 文件误报为 decoded。
+批次复验会校验这些字段，因而不会把 unsupported 文件误报为 decoded。`unsupported`
+保留原件并按既定兼容策略处理；`invalid` 则强制批次为 `partial`、要求复核且不可直接导入。

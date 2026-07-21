@@ -1,11 +1,13 @@
 import json
 import math
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 import bkv_d3img as subject
 import bkv_legacy_import as legacy_import
+import test_bkv_legacy_import as legacy_tests
 
 
 class D3ImageProbeTests(unittest.TestCase):
@@ -80,6 +82,26 @@ class D3ImageProbeTests(unittest.TestCase):
         self.assertEqual(document["schema"], "steel.bkv-d3img-probe.v1")
         self.assertEqual(document["status"], "unsupported")
 
+    def test_cli_never_overwrites_input_via_same_path_or_relative_alias(self):
+        source = self.write("legacy.d3img", b"3DImg\0" + b"source-bytes")
+        original = source.read_bytes()
+        aliases = [source, self.root / "child" / ".." / source.name]
+        (self.root / "child").mkdir()
+        hardlink = self.root / "hardlink.d3img"
+        try:
+            os.link(source, hardlink)
+        except OSError:
+            pass
+        else:
+            aliases.append(hardlink)
+        for output in aliases:
+            with self.subTest(output=output):
+                result = subject.main(
+                    ["probe", "--input", str(source), "--json", str(output)]
+                )
+                self.assertEqual(result, 2)
+                self.assertEqual(source.read_bytes(), original)
+
     def test_staging_diagnostic_uses_manifest_status_vocabulary(self):
         source = self.write("legacy.d3img", b"3DImg\0" + b"\0" * 64)
         diagnostic = legacy_import._depth_decode_evidence(source)
@@ -113,6 +135,84 @@ class D3ImageProbeTests(unittest.TestCase):
         changed["depthDecode"] = {"status": "decoded", "reason": "future-contract"}
         second = legacy_import._compute_batch_content_id(artifacts=[changed], **arguments)
         self.assertNotEqual(first, second)
+
+    def _stage_fixture(self, *, depth_payload=b"depth-one"):
+        fixture = legacy_tests.ExtractionTests(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        key = "image_copy/CamImageSource1/1893700/3D/one.d3img"
+        fixture.payloads[key] = depth_payload
+        fixture._use_complete_target_coverage()
+        return fixture, fixture._stage()
+
+    def test_invalid_depth_forces_partial_but_unsupported_can_remain_ready(self):
+        _, unsupported_batch = self._stage_fixture(depth_payload=b"depth-one")
+        unsupported = json.loads(
+            (unsupported_batch / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(unsupported["status"], "ready")
+        self.assertEqual(
+            next(
+                item["depthDecode"]["status"]
+                for item in unsupported["artifacts"]
+                if item["extension"] == ".d3img"
+            ),
+            "unsupported",
+        )
+
+        fixture, invalid_batch = self._stage_fixture(depth_payload=b"3DI")
+        invalid = json.loads(
+            (invalid_batch / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(invalid["status"], "partial")
+        self.assertFalse(invalid["importEligible"])
+        self.assertTrue(invalid["reviewRequired"])
+        self.assertFalse(
+            legacy_import.batch_is_importable(
+                invalid_batch,
+                expected_content_id=invalid["batchContentId"],
+                **fixture._deep_kwargs(),
+            )
+        )
+
+    def test_batch_verifier_rejects_all_depth_diagnostic_tampering(self):
+        _, batch = self._stage_fixture()
+        manifest_path = batch / "manifest.json"
+        base_manifest_bytes = manifest_path.read_bytes()
+        base = json.loads(base_manifest_bytes)
+        depth = next(item for item in base["artifacts"] if item["extension"] == ".d3img")
+        depth_path = batch / Path(depth["path"])
+        base_depth_bytes = depth_path.read_bytes()
+
+        mutations = {
+            "status": lambda manifest: next(
+                item for item in manifest["artifacts"] if item["extension"] == ".d3img"
+            )["depthDecode"].update(status="decoded"),
+            "reason": lambda manifest: next(
+                item for item in manifest["artifacts"] if item["extension"] == ".d3img"
+            )["depthDecode"].update(reason="forged"),
+            "parserVersion": lambda manifest: next(
+                item for item in manifest["artifacts"] if item["extension"] == ".d3img"
+            )["depthDecode"].update(parserVersion="forged/99"),
+            "originalSha256": lambda manifest: next(
+                item for item in manifest["artifacts"] if item["extension"] == ".d3img"
+            )["depthDecode"].update(originalSha256="0" * 64),
+            "non-depth injection": lambda manifest: next(
+                item for item in manifest["artifacts"] if item["extension"] == ".jpg"
+            ).update(depthDecode=dict(depth["depthDecode"])),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                manifest = json.loads(base_manifest_bytes)
+                mutate(manifest)
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    legacy_import._verify_staged_batch(batch, deep_source=False)
+                manifest_path.write_bytes(base_manifest_bytes)
+
+        depth_path.write_bytes(base_depth_bytes + b"tampered")
+        with self.assertRaises(ValueError):
+            legacy_import._verify_staged_batch(batch, deep_source=False)
 
 
 if __name__ == "__main__":
