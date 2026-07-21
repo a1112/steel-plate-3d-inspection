@@ -826,7 +826,7 @@ INSERT INTO `allexcel` VALUES (1893700);"""
                 subject.cleanup_orphan_sql_generations(output)
             self.assertEqual(list(external_generation.iterdir()), [])
 
-    def test_backtick_keyword_columns_and_escaped_backticks_are_not_constraints(self):
+    def test_backtick_keyword_columns_and_index_prefixes_are_distinguished(self):
         fixture = rb"""
 CREATE TABLE `allexcel` (
   `Key` bigint,
@@ -835,16 +835,23 @@ CREATE TABLE `allexcel` (
   `Constraint` text,
   `Check` text,
   `Foreign` text,
+  `FULLTEXT` text,
+  `SPATIAL` geometry,
   `Key``Part` text,
   `SeqNo` bigint,
   PRIMARY KEY (`Key`),
   UNIQUE KEY `uq_unique` (`Unique`),
   KEY `idx_constraint` (`Constraint`),
   INDEX `idx_foreign` (`Foreign`),
+  FULLTEXT KEY `ft_key` (`FULLTEXT`),
+  FULLTEXT INDEX `ft_index` (`FULLTEXT`),
+  SPATIAL KEY `sp_key` (`SPATIAL`),
+  SPATIAL INDEX `sp_index` (`SPATIAL`),
   CHECK (`Check` IS NOT NULL)
 );
 INSERT INTO `allexcel` VALUES
-  (71, 'primary', 'unique', 'constraint', 'check', 'foreign', 'escaped', 1893700);
+  (71, 'primary', 'unique', 'constraint', 'check', 'foreign', 'fulltext', 'spatial',
+   'escaped', 1893700);
 CREATE TABLE `diameter` (
   `Foreign` bigint,
   FOREIGN KEY (`Foreign`) REFERENCES `allexcel` (`Key`)
@@ -862,6 +869,8 @@ INSERT INTO `diameter` VALUES (71);
                 parent["Constraint"],
                 parent["Check"],
                 parent["Foreign"],
+                parent["FULLTEXT"],
+                parent["SPATIAL"],
                 parent["Key`Part"],
                 parent["SeqNo"],
             ],
@@ -872,6 +881,8 @@ INSERT INTO `diameter` VALUES (71);
                 "constraint",
                 "check",
                 "foreign",
+                "fulltext",
+                "spatial",
                 "escaped",
                 1_893_700,
             ],

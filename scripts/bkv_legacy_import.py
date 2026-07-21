@@ -310,6 +310,7 @@ def _is_unquoted_table_constraint(definition: str) -> bool:
         r"PRIMARY\s+KEY\b",
         r"FOREIGN\s+KEY\b",
         r"UNIQUE\b(?:\s+(?:KEY|INDEX)\b)?",
+        r"(?:FULLTEXT|SPATIAL)\s+(?:KEY|INDEX)\b",
         r"KEY\b",
         r"INDEX\b",
         r"CONSTRAINT\b",
