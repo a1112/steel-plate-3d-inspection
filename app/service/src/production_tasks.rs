@@ -100,7 +100,7 @@ fn bkv_valid_sha256(value: &str) -> bool {
 
 fn bkv_valid_batch_id(value: &str) -> bool {
     !value.is_empty()
-        && value.as_bytes().len() <= 118
+        && value.as_bytes().len() <= 117
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -3229,8 +3229,8 @@ mod tests {
 
     #[test]
     fn bkv_batch_id_fits_the_app_config_key_contract() {
-        assert!(bkv_valid_batch_id(&"a".repeat(118)));
-        assert!(!bkv_valid_batch_id(&"a".repeat(119)));
+        assert!(bkv_valid_batch_id(&"a".repeat(117)));
+        assert!(!bkv_valid_batch_id(&"a".repeat(118)));
         assert!(!bkv_valid_batch_id("unsafe/path"));
     }
 

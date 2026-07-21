@@ -3687,7 +3687,7 @@ pub async fn import_bkv_batch(
     batch: BkvImportBatch,
     actor: &str,
 ) -> Result<BkvImportResult, DbErr> {
-    if batch.batch_id.as_bytes().len() > 118
+    if batch.batch_id.as_bytes().len() > 117
         || batch.batch_id.is_empty()
         || !batch
             .batch_id
@@ -3715,19 +3715,41 @@ pub async fn import_bkv_batch(
         .await?
     {
         let value: Value = serde_json::from_str(&existing.value)
-            .map_err(|error| DbErr::Custom(format!("bkv_import_state_invalid: {error}")))?;
+            .map_err(|_| DbErr::Custom("bkv_batch_id_collision".to_string()))?;
         if value.get("contentId").and_then(Value::as_str) != Some(batch.content_id.as_str()) {
             return Err(DbErr::Custom("bkv_batch_id_collision".to_string()));
         }
-        let persisted_digest = value
-            .pointer("/summary/semanticDigest")
-            .and_then(Value::as_str);
         let incoming_summary: Value = serde_json::from_str(&batch.manifest_json)
             .map_err(|_| DbErr::Custom("bkv_batch_id_collision".to_string()))?;
-        let incoming_digest = incoming_summary
-            .get("semanticDigest")
-            .and_then(Value::as_str);
-        if persisted_digest.is_none() || persisted_digest != incoming_digest {
+        let persisted_summary = value
+            .get("summary")
+            .and_then(Value::as_object)
+            .ok_or_else(|| DbErr::Custom("bkv_batch_id_collision".to_string()))?;
+        let incoming_object = incoming_summary
+            .as_object()
+            .ok_or_else(|| DbErr::Custom("bkv_batch_id_collision".to_string()))?;
+        let identity_fields = [
+            "batchId",
+            "contentId",
+            "semanticDigest",
+            "manifestSha256",
+            "publicationSha256",
+            "manifestPath",
+        ];
+        if identity_fields.iter().any(|field| {
+            persisted_summary
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_none()
+                || persisted_summary.get(*field).and_then(Value::as_str)
+                    != incoming_object.get(*field).and_then(Value::as_str)
+        }) || incoming_object.get("batchId").and_then(Value::as_str)
+            != Some(batch.batch_id.as_str())
+            || incoming_object.get("contentId").and_then(Value::as_str)
+                != Some(batch.content_id.as_str())
+            || incoming_object.get("manifestPath").and_then(Value::as_str)
+                != Some(format!("{}/manifest.json", batch.batch_id).as_str())
+        {
             return Err(DbErr::Custom("bkv_batch_id_collision".to_string()));
         }
         let counts: BkvImportCounts =
@@ -3775,6 +3797,24 @@ pub async fn import_bkv_batch(
             already_imported: true,
             counts,
         });
+    }
+    let incoming_summary: Value = serde_json::from_str(&batch.manifest_json)
+        .map_err(|_| DbErr::Custom("bkv_import_summary_invalid".to_string()))?;
+    if incoming_summary.get("batchId").and_then(Value::as_str) != Some(batch.batch_id.as_str())
+        || incoming_summary.get("contentId").and_then(Value::as_str)
+            != Some(batch.content_id.as_str())
+        || incoming_summary.get("manifestPath").and_then(Value::as_str)
+            != Some(format!("{}/manifest.json", batch.batch_id).as_str())
+        || ["semanticDigest", "manifestSha256", "publicationSha256"]
+            .iter()
+            .any(|field| {
+                incoming_summary
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.len() != 64)
+            })
+    {
+        return Err(DbErr::Custom("bkv_import_summary_invalid".to_string()));
     }
     if batch
         .materials
@@ -5438,11 +5478,23 @@ mod bkv_import_tests {
         }
     }
 
+    fn import_summary(batch_id: &str, content_id: &str) -> String {
+        json!({
+            "batchId":batch_id,
+            "contentId":content_id,
+            "semanticDigest":"d".repeat(64),
+            "manifestPath":format!("{batch_id}/manifest.json"),
+            "manifestSha256":"e".repeat(64),
+            "publicationSha256":"f".repeat(64)
+        })
+        .to_string()
+    }
+
     fn batch() -> BkvImportBatch {
         BkvImportBatch {
             batch_id: "batch-001".to_string(),
             content_id: "a".repeat(64),
-            manifest_json: json!({"semanticDigest":"d".repeat(64)}).to_string(),
+            manifest_json: import_summary("batch-001", &"a".repeat(64)),
             status: "ready".to_string(),
             materials: (1_893_700..=1_893_710).map(material).collect(),
             artifacts: vec![BkvImportArtifact {
@@ -5584,12 +5636,25 @@ mod bkv_import_tests {
                     .await
                     .expect("database");
             let mut valid = batch();
-            valid.batch_id = "a".repeat(118);
+            valid.batch_id = "a".repeat(117);
+            valid.manifest_json = import_summary(&valid.batch_id, &valid.content_id);
             import_bkv_batch(&database.connection, valid, "tester")
                 .await
                 .unwrap();
+            let keys = app_config::Entity::find()
+                .all(&database.connection)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|config| config.key)
+                .filter(|key| key.starts_with("bkv."))
+                .collect::<Vec<_>>();
+            assert!(keys.iter().any(|key| key.starts_with("bkv.batch.")));
+            assert!(keys.iter().any(|key| key.starts_with("bkv.replay.")));
+            assert!(keys.iter().any(|key| key == "bkv.active-batch"));
+            assert!(keys.iter().all(|key| key.as_bytes().len() <= 128));
             let mut invalid = batch();
-            invalid.batch_id = "b".repeat(119);
+            invalid.batch_id = "b".repeat(118);
             let error = import_bkv_batch(&database.connection, invalid, "tester")
                 .await
                 .unwrap_err();
@@ -5750,6 +5815,7 @@ mod bkv_import_tests {
             let mut second = batch();
             second.batch_id = "batch-002".to_string();
             second.content_id = "c".repeat(64);
+            second.manifest_json = import_summary("batch-002", &second.content_id);
             for material in &mut second.materials {
                 material.material_id.push_str("-two");
                 material.steel_plate_id.push_str("-two");
@@ -5817,7 +5883,7 @@ mod bkv_import_tests {
     }
 
     #[test]
-    fn bkv_existing_batch_with_changed_semantics_is_rejected_without_reactivation() {
+    fn bkv_existing_batch_with_changed_serving_identity_is_rejected_without_reactivation() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let database =
@@ -5830,6 +5896,7 @@ mod bkv_import_tests {
             let mut second = batch();
             second.batch_id = "batch-002".to_string();
             second.content_id = "c".repeat(64);
+            second.manifest_json = import_summary("batch-002", &second.content_id);
             for material in &mut second.materials {
                 material.material_id.push_str("-two");
                 material.steel_plate_id.push_str("-two");
@@ -5842,13 +5909,52 @@ mod bkv_import_tests {
             import_bkv_batch(&database.connection, second, "tester")
                 .await
                 .unwrap();
-
-            let mut changed = batch();
-            changed.manifest_json = json!({"semanticDigest":"e".repeat(64)}).to_string();
-            let error = import_bkv_batch(&database.connection, changed, "attacker")
+            let replay_before = get_config(&database.connection, "bkv.replay.batch-001")
                 .await
-                .unwrap_err();
-            assert!(matches!(error, DbErr::Custom(message) if message == "bkv_batch_id_collision"));
+                .unwrap()
+                .unwrap()
+                .value;
+
+            for field in [
+                "semanticDigest",
+                "manifestSha256",
+                "publicationSha256",
+                "manifestPath",
+            ] {
+                let mut changed = batch();
+                let mut summary: Value = serde_json::from_str(&changed.manifest_json).unwrap();
+                summary[field] = if field == "manifestPath" {
+                    json!("batch-001/other-manifest.json")
+                } else {
+                    json!("9".repeat(64))
+                };
+                changed.manifest_json = summary.to_string();
+                let error = import_bkv_batch(&database.connection, changed, "attacker")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, DbErr::Custom(message) if message == "bkv_batch_id_collision")
+                );
+            }
+            for field in [
+                "batchId",
+                "contentId",
+                "semanticDigest",
+                "manifestSha256",
+                "publicationSha256",
+                "manifestPath",
+            ] {
+                let mut changed = batch();
+                let mut summary: Value = serde_json::from_str(&changed.manifest_json).unwrap();
+                summary.as_object_mut().unwrap().remove(field);
+                changed.manifest_json = summary.to_string();
+                let error = import_bkv_batch(&database.connection, changed, "attacker")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, DbErr::Custom(message) if message == "bkv_batch_id_collision")
+                );
+            }
             let active: Value = serde_json::from_str(
                 &get_config(&database.connection, "bkv.active-batch")
                     .await
@@ -5860,6 +5966,38 @@ mod bkv_import_tests {
             assert_eq!(
                 active.get("batchId").and_then(Value::as_str),
                 Some("batch-002")
+            );
+            assert_eq!(
+                active.get("contentId").and_then(Value::as_str),
+                Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+            );
+            let batch_b: Value = serde_json::from_str(
+                &get_config(&database.connection, "bkv.batch.batch-002")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .value,
+            )
+            .unwrap();
+            assert_eq!(
+                batch_b
+                    .pointer("/summary/manifestPath")
+                    .and_then(Value::as_str),
+                Some("batch-002/manifest.json")
+            );
+            assert!(audit_log::Entity::find()
+                .filter(audit_log::Column::Actor.eq("attacker"))
+                .all(&database.connection)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                get_config(&database.connection, "bkv.replay.batch-001")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .value,
+                replay_before
             );
         });
     }
