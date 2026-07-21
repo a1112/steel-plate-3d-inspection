@@ -6,6 +6,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as UnixMetadataExt, OpenOptionsExt as UnixOpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
@@ -67,6 +69,22 @@ pub(super) struct BkvValidatedBatch {
     pub normalized: Vec<BkvNormalizedFile>,
     pub artifacts: Vec<BkvArtifact>,
     pub semantic_digest: String,
+    pub manifest_sha256: String,
+    pub publication_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BkvServingArtifact {
+    pub relative_path: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BkvServingIndex {
+    pub identity: String,
+    pub batch_dir: PathBuf,
+    pub artifacts: Vec<BkvServingArtifact>,
 }
 
 pub(super) fn bkv_sha256(bytes: &[u8]) -> String {
@@ -78,6 +96,14 @@ fn bkv_valid_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn bkv_valid_batch_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.as_bytes().len() <= 118
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn bkv_hash_file(path: &Path, max_bytes: u64) -> Result<(String, u64, Vec<u8>), BkvRejection> {
@@ -97,6 +123,10 @@ fn bkv_hash_file(path: &Path, max_bytes: u64) -> Result<(String, u64, Vec<u8>), 
     options.read(true);
     #[cfg(windows)]
     options.custom_flags(0x0020_0000);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(0x0002_0000);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(0x0000_0100);
     let mut file = options.open(path).map_err(|error| {
         BkvRejection::new(
             "bkv_file_unavailable",
@@ -134,6 +164,13 @@ fn bkv_hash_file(path: &Path, max_bytes: u64) -> Result<(String, u64, Vec<u8>), 
         return Err(BkvRejection::new(
             "bkv_file_changed",
             "file changed while being read",
+        ));
+    }
+    #[cfg(unix)]
+    if after.dev() != metadata.dev() || after.ino() != metadata.ino() {
+        return Err(BkvRejection::new(
+            "bkv_file_changed",
+            "file identity changed while being read",
         ));
     }
     Ok((format!("{:x}", digest.finalize()), total, bytes))
@@ -402,7 +439,7 @@ pub(super) fn load_bkv_batch(
             "manifest must be <root>/<batch-id>/manifest.json",
         ));
     }
-    let (_, _, bytes) = bkv_hash_file(&manifest_path, BKV_MAX_MANIFEST_BYTES)?;
+    let (manifest_sha256, _, bytes) = bkv_hash_file(&manifest_path, BKV_MAX_MANIFEST_BYTES)?;
     let mut manifest: Value = serde_json::from_slice(&bytes).map_err(|error| {
         BkvRejection::new(
             "bkv_manifest_invalid_json",
@@ -420,9 +457,13 @@ pub(super) fn load_bkv_batch(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if batch_id.is_empty()
-        || batch_dir.file_name().and_then(|value| value.to_str()) != Some(batch_id.as_str())
-    {
+    if !bkv_valid_batch_id(&batch_id) {
+        return Err(BkvRejection::new(
+            "bkv_batch_id_invalid",
+            "batchId violates the app_config key contract",
+        ));
+    }
+    if batch_dir.file_name().and_then(|value| value.to_str()) != Some(batch_id.as_str()) {
         return Err(BkvRejection::new(
             "bkv_manifest_batch_mismatch",
             "batchId/path mismatch",
@@ -568,7 +609,8 @@ pub(super) fn load_bkv_batch(
         ));
     }
     let publication_path = bkv_resolve_batch_file(batch_dir, "publication.json")?;
-    let (_, _, publication_bytes) = bkv_hash_file(&publication_path, BKV_MAX_MANIFEST_BYTES)?;
+    let (publication_sha256, _, publication_bytes) =
+        bkv_hash_file(&publication_path, BKV_MAX_MANIFEST_BYTES)?;
     let publication: Value = serde_json::from_slice(&publication_bytes).map_err(|error| {
         BkvRejection::new(
             "bkv_batch_not_committed",
@@ -820,7 +862,148 @@ pub(super) fn load_bkv_batch(
         normalized: normalized_files,
         artifacts,
         semantic_digest,
+        manifest_sha256,
+        publication_sha256,
     })
+}
+
+pub(super) fn load_bkv_serving_index(
+    configured_root: &Path,
+    manifest_path: &Path,
+    expected_batch_id: &str,
+    expected_content_id: &str,
+    expected_semantic_digest: &str,
+    expected_manifest_sha256: &str,
+    expected_publication_sha256: &str,
+) -> Result<BkvServingIndex, BkvRejection> {
+    if !configured_root.is_absolute() || !bkv_valid_batch_id(expected_batch_id) {
+        return Err(BkvRejection::new(
+            "bkv_root_invalid",
+            "invalid serving root",
+        ));
+    }
+    let root = fs::canonicalize(configured_root)
+        .map_err(|_| BkvRejection::new("bkv_root_invalid", "serving root unavailable"))?;
+    for component in [
+        configured_root,
+        manifest_path.parent().unwrap_or(manifest_path),
+        manifest_path,
+    ] {
+        let metadata = fs::symlink_metadata(component)
+            .map_err(|_| BkvRejection::new("bkv_file_unavailable", "serving path unavailable"))?;
+        if bkv_metadata_is_reparse(&metadata) {
+            return Err(BkvRejection::new(
+                "bkv_file_link_rejected",
+                "serving reparse path rejected",
+            ));
+        }
+    }
+    let manifest_path = fs::canonicalize(manifest_path)
+        .map_err(|_| BkvRejection::new("bkv_manifest_unavailable", "manifest unavailable"))?;
+    let batch_dir = manifest_path
+        .parent()
+        .ok_or_else(|| BkvRejection::new("bkv_manifest_outside_root", "manifest parent missing"))?;
+    if batch_dir.parent() != Some(root.as_path())
+        || batch_dir.file_name().and_then(|value| value.to_str()) != Some(expected_batch_id)
+        || manifest_path.file_name().and_then(|value| value.to_str()) != Some("manifest.json")
+    {
+        return Err(BkvRejection::new(
+            "bkv_manifest_outside_root",
+            "serving manifest path invalid",
+        ));
+    }
+    let (manifest_sha256, _, manifest_bytes) =
+        bkv_hash_file(&manifest_path, BKV_MAX_MANIFEST_BYTES)?;
+    if manifest_sha256 != expected_manifest_sha256 {
+        return Err(BkvRejection::new(
+            "bkv_manifest_changed",
+            "manifest hash changed",
+        ));
+    }
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| BkvRejection::new("bkv_manifest_invalid_json", "manifest JSON invalid"))?;
+    if manifest.get("schema").and_then(Value::as_str) != Some("steel.bkv-import-manifest.v1")
+        || manifest.get("batchId").and_then(Value::as_str) != Some(expected_batch_id)
+        || manifest.get("batchContentId").and_then(Value::as_str) != Some(expected_content_id)
+        || manifest.get("contentId").and_then(Value::as_str) != Some(expected_content_id)
+    {
+        return Err(BkvRejection::new(
+            "bkv_manifest_changed",
+            "manifest binding changed",
+        ));
+    }
+    let publication_path = batch_dir.join("publication.json");
+    let (publication_sha256, _, publication_bytes) =
+        bkv_hash_file(&publication_path, BKV_MAX_MANIFEST_BYTES)?;
+    if publication_sha256 != expected_publication_sha256 {
+        return Err(BkvRejection::new(
+            "bkv_manifest_changed",
+            "publication hash changed",
+        ));
+    }
+    let publication: Value = serde_json::from_slice(&publication_bytes)
+        .map_err(|_| BkvRejection::new("bkv_batch_not_committed", "publication JSON invalid"))?;
+    if publication.get("schema").and_then(Value::as_str) != Some("steel.bkv-publication.v1")
+        || publication.get("state").and_then(Value::as_str) != Some("committed")
+        || publication.get("batchId").and_then(Value::as_str) != Some(expected_batch_id)
+        || publication.get("contentId").and_then(Value::as_str) != Some(expected_content_id)
+    {
+        return Err(BkvRejection::new(
+            "bkv_batch_not_committed",
+            "publication binding changed",
+        ));
+    }
+    let evidence = manifest
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BkvRejection::new("bkv_manifest_invalid", "artifact list missing"))?;
+    if evidence.len() > BKV_MAX_ARTIFACTS {
+        return Err(BkvRejection::new(
+            "bkv_artifact_limit_exceeded",
+            "artifact count limit exceeded",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut artifacts = Vec::with_capacity(evidence.len());
+    for item in evidence {
+        let relative_path = item.get("path").and_then(Value::as_str).unwrap_or_default();
+        let sha256 = item
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let size = item.get("size").and_then(Value::as_u64);
+        if !bkv_safe_relative(relative_path)
+            || !relative_path.starts_with("artifacts/")
+            || !bkv_valid_sha256(sha256)
+            || size.is_none()
+            || !seen.insert(relative_path.to_string())
+        {
+            return Err(BkvRejection::new(
+                "bkv_manifest_invalid",
+                "artifact allowlist invalid",
+            ));
+        }
+        artifacts.push(BkvServingArtifact {
+            relative_path: relative_path.to_string(),
+            sha256: sha256.to_string(),
+            size: size.unwrap_or_default(),
+        });
+    }
+    Ok(BkvServingIndex {
+        identity: format!(
+            "{}:{expected_batch_id}:{expected_content_id}:{expected_semantic_digest}:{manifest_sha256}:{publication_sha256}",
+            batch_dir.display()
+        ),
+        batch_dir: batch_dir.to_path_buf(),
+        artifacts,
+    })
+}
+
+pub(super) fn resolve_bkv_serving_path(
+    index: &BkvServingIndex,
+    artifact: &BkvServingArtifact,
+) -> Result<PathBuf, BkvRejection> {
+    bkv_resolve_batch_file(&index.batch_dir, &artifact.relative_path)
 }
 
 fn bkv_row_value<'a>(row: &'a Value, names: &[&str]) -> Option<&'a Value> {
@@ -1176,7 +1359,7 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
         .iter()
         .filter(|file| file.table == "defect")
     {
-        for row in &file.rows {
+        for (line, row) in file.rows.iter().enumerate() {
             let seq_no = row
                 .get("legacySeqNo")
                 .and_then(Value::as_i64)
@@ -1243,6 +1426,24 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
             } else {
                 mapped_severity
             };
+            let provenance_json = json!({
+                "source":"bkv","batchId":batch.batch_id,"contentId":batch.content_id,
+                "rowRef": {
+                    "t":"defect","k":legacy_id,"h":row.get("originalRowHash"),
+                    "p":file.relative_path,"l":line + 1
+                },
+                "legacyClassId":class_id,
+                "legacyName":original_name,
+                "legacySeverity":legacy_severity,
+                "legacyClassName":mapped_class_name
+            })
+            .to_string();
+            if provenance_json.len() > BKV_MAX_PERSISTED_JSON_BYTES {
+                return Err(BkvRejection::new(
+                    "bkv_persisted_json_too_large",
+                    "BKV defect provenance exceeds storage contract",
+                ));
+            }
             defects.push(db::BkvImportDefect {
                 id: bkv_deterministic_id(
                     &batch.batch_id,
@@ -1263,17 +1464,7 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
                 height_mm,
                 depth_mm,
                 confidence,
-                provenance_json: json!({
-                    "source":"bkv","batchId":batch.batch_id,"contentId":batch.content_id,
-                    "legacyTable":"defect","legacyId":legacy_id,"sourcePath":file.relative_path,
-                    "originalRowHash":row.get("originalRowHash"),
-                    "legacyDefectClassId":class_id,
-                    "legacyDefectName":original_name,
-                    "legacySeverity":legacy_severity,
-                    "legacyDefectClassRow":mapped_class_name,
-                    "legacyRow":row
-                })
-                .to_string(),
+                provenance_json,
             });
         }
     }
@@ -1283,6 +1474,8 @@ fn bkv_validated_to_db(batch: &BkvValidatedBatch) -> Result<db::BkvImportBatch, 
         "status": batch.status,
         "semanticDigest": batch.semantic_digest,
         "manifestPath": format!("{}/manifest.json", batch.batch_id),
+        "manifestSha256": batch.manifest_sha256,
+        "publicationSha256": batch.publication_sha256,
         "counts": {
             "normalizedFiles": batch.normalized.len(),
             "normalizedRows": batch.normalized.iter().map(|file| file.rows.len()).sum::<usize>(),
@@ -2979,7 +3172,9 @@ mod tests {
             .iter_mut()
             .find(|file| file.table == "defect")
             .unwrap();
-        defect_file.rows.push(defect_row("7", "legacy-pit"));
+        let mut large_legacy_row = defect_row("7", "legacy-pit");
+        large_legacy_row["unusedLegacyBlob"] = json!("x".repeat(65_536));
+        defect_file.rows.push(large_legacy_row);
         defect_file.rows.push(defect_row("99", "神秘缺陷"));
         let imported = bkv_validated_to_db(&batch).unwrap();
         assert_eq!(imported.defects[0].defect_type, "pit");
@@ -2987,6 +3182,10 @@ mod tests {
         assert_eq!(imported.defects[1].severity, "review");
         assert!(imported.defects[1].provenance_json.contains("神秘缺陷"));
         assert!(imported.defects[0].provenance_json.contains("凹坑"));
+        assert!(imported.defects[0].provenance_json.len() < 60 * 1024);
+        assert!(!imported.defects[0]
+            .provenance_json
+            .contains(&"x".repeat(1024)));
         fs::remove_dir_all(root).ok();
     }
 
@@ -3026,6 +3225,13 @@ mod tests {
             assert_eq!(canonical, expected);
             assert_eq!(legacy, input);
         }
+    }
+
+    #[test]
+    fn bkv_batch_id_fits_the_app_config_key_contract() {
+        assert!(bkv_valid_batch_id(&"a".repeat(118)));
+        assert!(!bkv_valid_batch_id(&"a".repeat(119)));
+        assert!(!bkv_valid_batch_id("unsafe/path"));
     }
 
     #[test]
@@ -3106,6 +3312,39 @@ mod tests {
         );
         fs::remove_dir_all(root).ok();
         fs::remove_file(outside).ok();
+    }
+
+    #[test]
+    fn bkv_serving_index_reads_only_manifest_and_publication() {
+        let root = bkv_test_root("serving-index");
+        let manifest = write_bkv_test_batch(&root, "ready", false);
+        let imported = load_bkv_batch(&root, &manifest, false).unwrap();
+        fs::write(
+            root.join("batch-001/normalized/allexcel.jsonl"),
+            b"corrupted-but-not-opened",
+        )
+        .unwrap();
+        fs::write(
+            root.join("batch-001/artifacts/camera1/1893700/metadata/camera.dat"),
+            b"corrupted-other-artifact",
+        )
+        .unwrap();
+        let index = load_bkv_serving_index(
+            &root,
+            &manifest,
+            &imported.batch_id,
+            &imported.content_id,
+            &imported.semantic_digest,
+            &imported.manifest_sha256,
+            &imported.publication_sha256,
+        )
+        .expect("serving validation must not open JSONL or artifacts");
+        assert_eq!(index.artifacts.len(), 2);
+        assert!(index
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.relative_path.ends_with("one.jpg")));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

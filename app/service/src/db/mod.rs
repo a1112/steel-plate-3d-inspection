@@ -3687,6 +3687,27 @@ pub async fn import_bkv_batch(
     batch: BkvImportBatch,
     actor: &str,
 ) -> Result<BkvImportResult, DbErr> {
+    if batch.batch_id.as_bytes().len() > 118
+        || batch.batch_id.is_empty()
+        || !batch
+            .batch_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(DbErr::Custom("bkv_batch_id_invalid".to_string()));
+    }
+    if batch.manifest_json.len() > 60 * 1024
+        || batch
+            .materials
+            .iter()
+            .any(|material| material.raw_payload.len() > 60 * 1024)
+        || batch
+            .defects
+            .iter()
+            .any(|defect| defect.provenance_json.len() > 60 * 1024)
+    {
+        return Err(DbErr::Custom("bkv_persisted_json_too_large".to_string()));
+    }
     let config_key = format!("bkv.batch.{}", batch.batch_id);
     if let Some(existing) = app_config::Entity::find()
         .filter(app_config::Column::Key.eq(&config_key))
@@ -3837,7 +3858,7 @@ pub async fn import_bkv_batch(
             id: Set(material.session_id.clone()),
             material_id: Set(material.material_id.clone()),
             source: Set("bkv".to_string()),
-            status: Set("completed".to_string()),
+            status: Set("finished".to_string()),
             control_mode: Set("offline-replay".to_string()),
             trigger_mode: Set("bkv".to_string()),
             steel_type: Set(material.steel_grade.clone()),
@@ -3858,12 +3879,7 @@ pub async fn import_bkv_batch(
             id: Set(material.inspection_id.clone()),
             material_id: Set(material.material_id.clone()),
             session_id: Set(material.session_id.clone()),
-            status: Set(if defect_count == 0 {
-                "completed"
-            } else {
-                "defect"
-            }
-            .to_string()),
+            status: Set("completed".to_string()),
             storage_root: Set(String::new()),
             summary_path: Set(String::new()),
             started_at: Set(material.occurred_at.clone()),
@@ -5508,6 +5524,76 @@ mod bkv_import_tests {
                 .await
                 .unwrap()
                 .is_some());
+            assert!(latest_open_material_session(&database.connection)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(material_session::Entity::find()
+                .all(&database.connection)
+                .await
+                .unwrap()
+                .iter()
+                .all(|session| session.status == "finished" && !session.finished_at.is_empty()));
+            assert!(production_inspection::Entity::find()
+                .all(&database.connection)
+                .await
+                .unwrap()
+                .iter()
+                .all(|inspection| inspection.status == "completed"));
+            assert_eq!(
+                count_inspection_records_before(&database.connection, 1)
+                    .await
+                    .unwrap(),
+                11
+            );
+        });
+    }
+
+    #[test]
+    fn bkv_import_rejects_mysql_text_boundary_before_writing() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            let mut invalid = batch();
+            invalid.defects[0].provenance_json = "x".repeat(65_536);
+            let error = import_bkv_batch(&database.connection, invalid, "tester")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, DbErr::Custom(message) if message == "bkv_persisted_json_too_large")
+            );
+            assert_eq!(
+                production_defect::Entity::find()
+                    .count(&database.connection)
+                    .await
+                    .unwrap(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn bkv_batch_id_enforces_app_config_key_capacity() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            let mut valid = batch();
+            valid.batch_id = "a".repeat(118);
+            import_bkv_batch(&database.connection, valid, "tester")
+                .await
+                .unwrap();
+            let mut invalid = batch();
+            invalid.batch_id = "b".repeat(119);
+            let error = import_bkv_batch(&database.connection, invalid, "tester")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, DbErr::Custom(message) if message == "bkv_batch_id_invalid"));
         });
     }
 

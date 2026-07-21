@@ -8,12 +8,14 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as UnixMetadataExt, OpenOptionsExt as UnixOpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
@@ -11864,14 +11866,17 @@ fn bkv_batch_is_active(active: &Value, batch_id: &str, content_id: &str) -> bool
 }
 
 fn bkv_allowlisted_artifact<'a>(
-    batch: &'a production_tasks::BkvValidatedBatch,
+    index: &'a production_tasks::BkvServingIndex,
     relative: &str,
-) -> Option<&'a production_tasks::BkvArtifact> {
-    batch
+) -> Option<&'a production_tasks::BkvServingArtifact> {
+    index
         .artifacts
         .iter()
         .find(|artifact| artifact.relative_path == relative)
 }
+
+static BKV_SERVING_CACHE: OnceLock<Mutex<HashMap<String, production_tasks::BkvServingIndex>>> =
+    OnceLock::new();
 
 fn read_bkv_verified_file(path: &Path, expected_size: u64, expected_hash: &str) -> Option<Vec<u8>> {
     let before = fs::symlink_metadata(path).ok()?;
@@ -11882,6 +11887,10 @@ fn read_bkv_verified_file(path: &Path, expected_size: u64, expected_hash: &str) 
     options.read(true);
     #[cfg(windows)]
     options.custom_flags(0x0020_0000);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(0x0002_0000);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(0x0000_0100);
     let mut file = options.open(path).ok()?;
     let mut bytes = Vec::with_capacity(expected_size.min(32 * 1024 * 1024) as usize);
     (&mut file)
@@ -11894,6 +11903,10 @@ fn read_bkv_verified_file(path: &Path, expected_size: u64, expected_hash: &str) 
         || file_component_is_link(path)
         || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
     {
+        return None;
+    }
+    #[cfg(unix)]
+    if after.dev() != before.dev() || after.ino() != before.ino() {
         return None;
     }
     Some(bytes)
@@ -11948,20 +11961,32 @@ fn resolve_bkv_file(state: &ServiceState, token: &str) -> Option<(PathBuf, Vec<u
         return None;
     }
     let manifest_path = root.join(manifest_relative);
-    let reviewed_partial = summary.get("status").and_then(Value::as_str) == Some("partial");
-    let validated =
-        production_tasks::load_bkv_batch(&root, &manifest_path, reviewed_partial).ok()?;
-    if validated.batch_id != batch_id
-        || validated.content_id != content_id
-        || summary.get("semanticDigest").and_then(Value::as_str)
-            != Some(validated.semantic_digest.as_str())
-    {
-        return None;
-    }
-    let artifact = bkv_allowlisted_artifact(&validated, relative)?;
-    let expected_size = artifact.evidence.get("size").and_then(Value::as_u64)?;
-    let bytes = read_bkv_verified_file(&artifact.path, expected_size, &artifact.sha256)?;
-    Some((artifact.path.clone(), bytes))
+    let semantic_digest = summary.get("semanticDigest").and_then(Value::as_str)?;
+    let manifest_sha256 = summary.get("manifestSha256").and_then(Value::as_str)?;
+    let publication_sha256 = summary.get("publicationSha256").and_then(Value::as_str)?;
+    let refreshed = production_tasks::load_bkv_serving_index(
+        &root,
+        &manifest_path,
+        batch_id,
+        content_id,
+        semantic_digest,
+        manifest_sha256,
+        publication_sha256,
+    )
+    .ok()?;
+    let cache = BKV_SERVING_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let index = {
+        let mut cache = cache.lock().ok()?;
+        cache.retain(|identity, _| identity == &refreshed.identity);
+        cache
+            .entry(refreshed.identity.clone())
+            .or_insert(refreshed)
+            .clone()
+    };
+    let artifact = bkv_allowlisted_artifact(&index, relative)?;
+    let path = production_tasks::resolve_bkv_serving_path(&index, artifact).ok()?;
+    let bytes = read_bkv_verified_file(&path, artifact.size, &artifact.sha256)?;
+    Some((path, bytes))
 }
 
 fn production_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
@@ -11973,6 +11998,20 @@ fn production_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
         );
     };
     let bkv_path = path_value.starts_with("bkv://");
+    let _bkv_active_guard = if bkv_path {
+        match state.production_command_lock.lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                return http_response(
+                    "503 Service Unavailable",
+                    "application/json; charset=utf-8",
+                    "{\"error\":\"production_command_lock_poisoned\"}",
+                )
+            }
+        }
+    } else {
+        None
+    };
     let resolved_bkv = if bkv_path {
         resolve_bkv_file(state, &path_value)
     } else {
@@ -17252,25 +17291,15 @@ mod tests {
 
     #[test]
     fn bkv_file_allowlist_excludes_manifest_normalized_and_quarantine_paths() {
-        let artifact = production_tasks::BkvArtifact {
-            path: PathBuf::from("allowed.d3img"),
+        let artifact = production_tasks::BkvServingArtifact {
             relative_path: "artifacts/c1/1893700/allowed.d3img".to_string(),
-            member_path: "legacy/allowed.d3img".to_string(),
             sha256: "a".repeat(64),
-            camera_number: 1,
-            seq_no: 1_893_700,
-            kind: "3d".to_string(),
-            extension: ".d3img".to_string(),
-            evidence: json!({"size":1}),
+            size: 1,
         };
-        let batch = production_tasks::BkvValidatedBatch {
-            batch_id: "batch-001".to_string(),
-            content_id: "b".repeat(64),
-            status: "ready".to_string(),
-            seq_nos: vec![1_893_700],
-            normalized: vec![],
+        let batch = production_tasks::BkvServingIndex {
+            identity: "identity".to_string(),
+            batch_dir: PathBuf::from("batch-001"),
             artifacts: vec![artifact],
-            semantic_digest: "c".repeat(64),
         };
         assert!(bkv_allowlisted_artifact(&batch, "artifacts/c1/1893700/allowed.d3img").is_some());
         for forbidden in [
@@ -17301,12 +17330,68 @@ mod tests {
         fs::remove_file(path).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bkv_file_read_rejects_symlink_targets_with_no_follow() {
+        use std::os::unix::fs::symlink;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("steel-bkv-link-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.bin");
+        let link = root.join("link.bin");
+        fs::write(&target, b"verified").unwrap();
+        symlink(&target, &link).unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"verified"));
+        assert!(read_bkv_verified_file(&link, 8, &hash).is_none());
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn bkv_file_serving_policy_is_explicitly_active_batch_only() {
         let active = json!({"batchId":"batch-001","contentId":"a".repeat(64)});
         assert!(bkv_batch_is_active(&active, "batch-001", &"a".repeat(64)));
         assert!(!bkv_batch_is_active(&active, "batch-002", &"a".repeat(64)));
         assert!(!bkv_batch_is_active(&active, "batch-001", &"b".repeat(64)));
+    }
+
+    #[test]
+    fn bkv_active_switch_cannot_interleave_with_an_inflight_file_response() {
+        let state = Arc::new(production_test_state());
+        let active = Arc::new(Mutex::new("batch-a".to_string()));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        let response_state = Arc::clone(&state);
+        let response_active = Arc::clone(&active);
+        let response_entered = Arc::clone(&entered);
+        let response_observed = Arc::clone(&observed);
+        let response = std::thread::spawn(move || {
+            let _guard = response_state.production_command_lock.lock().unwrap();
+            response_observed
+                .lock()
+                .unwrap()
+                .push(response_active.lock().unwrap().clone());
+            response_entered.wait();
+            std::thread::sleep(Duration::from_millis(25));
+            response_observed
+                .lock()
+                .unwrap()
+                .push(response_active.lock().unwrap().clone());
+        });
+        entered.wait();
+        let switch_state = Arc::clone(&state);
+        let switch_active = Arc::clone(&active);
+        let switch = std::thread::spawn(move || {
+            let _guard = switch_state.production_command_lock.lock().unwrap();
+            *switch_active.lock().unwrap() = "batch-b".to_string();
+        });
+        response.join().unwrap();
+        switch.join().unwrap();
+        assert_eq!(&*observed.lock().unwrap(), &["batch-a", "batch-a"]);
+        assert_eq!(&*active.lock().unwrap(), "batch-b");
     }
 
     fn production_test_state() -> ServiceState {
