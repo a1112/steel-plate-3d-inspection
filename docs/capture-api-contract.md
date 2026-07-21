@@ -49,6 +49,9 @@ same contradictory or stale state instead of falling back to an unrelated real
 inspection. Capture responses include a bounded `inspection` DTO with its ID,
 status, capture/defect counts, batch/content/SeqNo binding, and minimal BKV
 provenance; raw database payloads and local unrestricted paths are not exposed.
+The selected inspection is derived from the active manifest's normalized rows
+using the same deterministic import ID formula, then fetched by its exact primary
+key. Replay never scans a recent-record window or the production inspection table.
 After item 11 the state is `completed`; another capture returns HTTP 409 with
 `bkv_replay_completed` until `POST /api/bkv/replay/reset` is authorized and
 called. Production snapshot/status prefers the selected imported inspection only

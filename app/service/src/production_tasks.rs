@@ -1169,9 +1169,18 @@ async fn bkv_validate_replay_state(
         .and_then(Value::as_i64)
         .filter(|value| *value >= index as i64)
         .ok_or_else(|| BkvRejection::new("bkv_replay_state_invalid", "replay version invalid"))?;
-    let selected_seq = replay.get("selectedLegacySeqNo").and_then(Value::as_i64);
-    let selected_id = replay
-        .get("selectedInspectionId")
+    let selected_seq_value = replay.get("selectedLegacySeqNo");
+    let selected_id_value = replay.get("selectedInspectionId");
+    if selected_seq_value.is_some_and(|value| !value.is_null() && !value.is_i64())
+        || selected_id_value.is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err(BkvRejection::new(
+            "bkv_replay_state_invalid",
+            "selected replay fields have invalid types",
+        ));
+    }
+    let selected_seq = selected_seq_value.and_then(Value::as_i64);
+    let selected_id = selected_id_value
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -1413,26 +1422,31 @@ pub(super) async fn advance_bkv_replay(
             "selected SeqNo does not contain six channels",
         ));
     }
-    let inspections = db::list_recent_production_inspections(connection, 10_000)
+    let reviewed_partial = batch_config.get("status").and_then(Value::as_str) == Some("partial");
+    let verified = load_bkv_batch(configured_root, &manifest_path, reviewed_partial)?;
+    if verified.batch_id != runtime.batch_id || verified.content_id != runtime.content_id {
+        return Err(BkvRejection::new(
+            "bkv_manifest_changed",
+            "active manifest binding changed before replay selection",
+        ));
+    }
+    let deterministic_batch = bkv_validated_to_db(&verified)?;
+    let expected_inspection_id = deterministic_batch
+        .materials
+        .iter()
+        .find(|material| material.seq_no == legacy_seq_no)
+        .map(|material| material.inspection_id.as_str())
+        .ok_or_else(|| {
+            BkvRejection::new(
+                "bkv_imported_data_unavailable",
+                "deterministic inspection mapping is missing",
+            )
+        })?;
+    let inspection = db::find_production_inspection(connection, expected_inspection_id)
         .await
         .map_err(|_| {
             BkvRejection::new("bkv_imported_data_unavailable", "inspection lookup failed")
-        })?;
-    let inspection = inspections
-        .into_iter()
-        .find(|inspection| {
-            serde_json::from_str::<Value>(&inspection.raw_payload)
-                .ok()
-                .map(|payload| {
-                    payload.get("source").and_then(Value::as_str) == Some("bkv")
-                        && payload.get("batchId").and_then(Value::as_str)
-                            == Some(runtime.batch_id.as_str())
-                        && payload.get("contentId").and_then(Value::as_str)
-                            == Some(runtime.content_id.as_str())
-                        && payload.get("legacySeqNo").and_then(Value::as_i64) == Some(legacy_seq_no)
-                })
-                .unwrap_or(false)
-        })
+        })?
         .ok_or_else(|| {
             BkvRejection::new(
                 "bkv_imported_data_unavailable",
@@ -3855,6 +3869,7 @@ mod tests {
         for invalid in [
             json!({"batchId":"batch-001","contentId":content_id,"index":0,"status":"replaying","version":0}),
             json!({"batchId":"batch-001","contentId":content_id,"index":0,"status":"ready","version":0,"selectedLegacySeqNo":1893700,"selectedInspectionId":"unexpected"}),
+            json!({"batchId":"batch-001","contentId":content_id,"index":0,"status":"ready","version":0,"selectedLegacySeqNo":"wrong-type","selectedInspectionId":7}),
             json!({"batchId":"batch-001","contentId":content_id,"index":1,"status":"replaying","version":0,"selectedLegacySeqNo":1893700,"selectedInspectionId":"missing"}),
             json!({"batchId":"batch-001","contentId":content_id,"index":11,"status":"replaying","version":11,"selectedLegacySeqNo":1893710,"selectedInspectionId":"missing"}),
         ] {
@@ -3880,6 +3895,42 @@ mod tests {
                 "bkv_replay_state_invalid"
             );
         }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn bkv_replay_uses_exact_deterministic_inspection_id_beyond_recent_windows() {
+        let (runtime, database, root) = imported_bkv_replay_fixture("exact-inspection-id");
+        runtime
+            .block_on(
+                database.connection.execute(Statement::from_string(
+                    DbBackend::Sqlite,
+                    r#"
+                WITH RECURSIVE seq(value) AS (
+                    VALUES(1) UNION ALL SELECT value + 1 FROM seq WHERE value < 10001
+                )
+                INSERT INTO production_inspection (
+                    id, material_id, session_id, status, storage_root, summary_path,
+                    started_at, finished_at, capture_count, defect_count, raw_payload
+                )
+                SELECT
+                    printf('newer-%05d', value), printf('REAL-%05d', value),
+                    printf('real-session-%05d', value), 'completed', '', '',
+                    '9999-12-31T23:59:59Z', '9999-12-31T23:59:59Z', 0, 0,
+                    '{"source":"real"}'
+                FROM seq
+                "#
+                    .to_string(),
+                )),
+            )
+            .unwrap();
+        let selected = runtime
+            .block_on(advance_bkv_replay(&database.connection, &root, "bkv-test"))
+            .unwrap();
+        assert_eq!(selected.legacy_seq_no, 1_893_700);
+        assert_eq!(selected.inspection.legacy_seq_no, 1_893_700);
+        assert_eq!(selected.inspection.provenance["source"], "bkv");
+        assert!(!selected.inspection.id.starts_with("newer-"));
         fs::remove_dir_all(root).ok();
     }
 
