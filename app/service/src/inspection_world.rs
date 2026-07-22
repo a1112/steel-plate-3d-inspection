@@ -1,9 +1,13 @@
+use image::{imageops, DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
+use std::io::Cursor;
+use std::path::PathBuf;
 
 const DEFAULT_TILE_SIZE: u32 = 512;
+pub const MISSING_TILE_COLOR: [u8; 3] = [16, 20, 24];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,12 +69,21 @@ pub struct PixelRect {
 
 impl PixelRect {
     pub fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn from_edges(left: u32, right: u32, top: u32, bottom: u32) -> Result<Self, WorldError> {
-        let width = right.checked_sub(left).ok_or(WorldError::InvalidRectangle)?;
-        let height = bottom.checked_sub(top).ok_or(WorldError::InvalidRectangle)?;
+        let width = right
+            .checked_sub(left)
+            .ok_or(WorldError::InvalidRectangle)?;
+        let height = bottom
+            .checked_sub(top)
+            .ok_or(WorldError::InvalidRectangle)?;
         Ok(Self::new(left, top, width, height))
     }
 }
@@ -87,6 +100,13 @@ pub struct InspectionWorld {
 
 impl InspectionWorld {
     pub fn new(specs: Vec<CameraSpec>) -> Result<Self, WorldError> {
+        Self::with_tile_size(specs, DEFAULT_TILE_SIZE)
+    }
+
+    pub fn with_tile_size(specs: Vec<CameraSpec>, tile_size: u32) -> Result<Self, WorldError> {
+        if tile_size == 0 {
+            return Err(WorldError::InvalidTileSize);
+        }
         let mut camera_ids = HashSet::new();
         let mut offset_x = 0_u32;
         let mut world_height = 0_u32;
@@ -100,11 +120,20 @@ impl InspectionWorld {
                 return Err(WorldError::InvalidCameraDimensions(spec.camera_id));
             }
             if spec.orientation != CameraOrientation::identity() {
-                return Err(WorldError::UnsupportedOrientation { camera_id: spec.camera_id });
+                return Err(WorldError::UnsupportedOrientation {
+                    camera_id: spec.camera_id,
+                });
             }
+            let frame_extent = spec
+                .frame_numbers
+                .iter()
+                .max()
+                .copied()
+                .and_then(|frame| frame.checked_add(1))
+                .ok_or(WorldError::DimensionOverflow)?;
             let height = spec
                 .frame_height
-                .checked_mul(spec.frame_numbers.len() as u32)
+                .checked_mul(frame_extent)
                 .ok_or(WorldError::DimensionOverflow)?;
             cameras.push(CameraWorld {
                 camera_id: spec.camera_id,
@@ -124,15 +153,17 @@ impl InspectionWorld {
 
         let mut max_level = 0_u8;
         let mut longest_side = offset_x.max(world_height);
-        while longest_side > DEFAULT_TILE_SIZE {
+        while longest_side > 1 {
             longest_side = longest_side.div_ceil(2);
-            max_level = max_level.checked_add(1).ok_or(WorldError::DimensionOverflow)?;
+            max_level = max_level
+                .checked_add(1)
+                .ok_or(WorldError::DimensionOverflow)?;
         }
 
         Ok(Self {
             width: offset_x,
             height: world_height,
-            tile_size: DEFAULT_TILE_SIZE,
+            tile_size,
             max_level,
             cameras,
         })
@@ -150,7 +181,10 @@ impl InspectionWorld {
             .find(|camera| camera.camera_id == camera_id)
             .ok_or(WorldError::UnknownCamera(camera_id))?;
         if !camera.frame_numbers.contains(&image_index) {
-            return Err(WorldError::UnknownFrame { camera_id, image_index });
+            return Err(WorldError::UnknownFrame {
+                camera_id,
+                image_index,
+            });
         }
         let x = camera
             .offset_x
@@ -166,12 +200,148 @@ impl InspectionWorld {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TileFormat {
+    Jpeg,
+    Png,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TileRequest {
+    pub level: u8,
+    pub tile_x: u32,
+    pub tile_y: u32,
+    pub format: TileFormat,
+}
+
+impl TileRequest {
+    pub fn new(level: u8, tile_x: u32, tile_y: u32, format: TileFormat) -> Self {
+        Self {
+            level,
+            tile_x,
+            tile_y,
+            format,
+        }
+    }
+}
+
+pub fn compose_tile<F>(
+    world: &InspectionWorld,
+    request: TileRequest,
+    mut resolve: F,
+) -> Result<Vec<u8>, WorldError>
+where
+    F: FnMut(u32, u32) -> Result<Option<PathBuf>, WorldError>,
+{
+    if request.level > world.max_level {
+        return Err(WorldError::TileOutOfBounds);
+    }
+    let scale = 1_u32
+        .checked_shl(request.level as u32)
+        .ok_or(WorldError::DimensionOverflow)?;
+    let tile_span = world
+        .tile_size
+        .checked_mul(scale)
+        .ok_or(WorldError::DimensionOverflow)?;
+    let start_x = request
+        .tile_x
+        .checked_mul(tile_span)
+        .ok_or(WorldError::DimensionOverflow)?;
+    let start_y = request
+        .tile_y
+        .checked_mul(tile_span)
+        .ok_or(WorldError::DimensionOverflow)?;
+    if start_x >= world.width || start_y >= world.height {
+        return Err(WorldError::TileOutOfBounds);
+    }
+    let source_width = tile_span.min(world.width - start_x);
+    let source_height = tile_span.min(world.height - start_y);
+    let output_width = source_width.div_ceil(scale);
+    let output_height = source_height.div_ceil(scale);
+    let mut output = RgbImage::from_pixel(output_width, output_height, Rgb(MISSING_TILE_COLOR));
+
+    for camera in &world.cameras {
+        let camera_left = camera.offset_x;
+        let camera_right = camera_left
+            .checked_add(camera.width)
+            .ok_or(WorldError::DimensionOverflow)?;
+        if camera_right <= start_x || camera_left >= start_x + source_width {
+            continue;
+        }
+        for frame_number in &camera.frame_numbers {
+            let frame_top = frame_number
+                .checked_mul(camera.frame_height)
+                .ok_or(WorldError::DimensionOverflow)?;
+            let frame_bottom = frame_top
+                .checked_add(camera.frame_height)
+                .ok_or(WorldError::DimensionOverflow)?;
+            if frame_bottom <= start_y || frame_top >= start_y + source_height {
+                continue;
+            }
+            let Some(path) = resolve(camera.camera_id, *frame_number)? else {
+                continue;
+            };
+            let source = image::open(&path)
+                .map_err(|error| WorldError::Image(format!("{}: {error}", path.display())))?
+                .to_rgb8();
+            if source.dimensions() != (camera.frame_width, camera.frame_height) {
+                return Err(WorldError::Image(format!(
+                    "camera {} frame {} expected {}x{}, found {}x{}",
+                    camera.camera_id,
+                    frame_number,
+                    camera.frame_width,
+                    camera.frame_height,
+                    source.width(),
+                    source.height(),
+                )));
+            }
+
+            let intersection_left = camera_left.max(start_x);
+            let intersection_top = frame_top.max(start_y);
+            let intersection_right = camera_right.min(start_x + source_width);
+            let intersection_bottom = frame_bottom.min(start_y + source_height);
+            let crop_x = intersection_left - camera_left;
+            let crop_y = intersection_top - frame_top;
+            let crop_width = intersection_right - intersection_left;
+            let crop_height = intersection_bottom - intersection_top;
+            let resized_width = crop_width.div_ceil(scale);
+            let resized_height = crop_height.div_ceil(scale);
+            let cropped = source
+                .view(crop_x, crop_y, crop_width, crop_height)
+                .to_image();
+            let resized = imageops::resize(
+                &cropped,
+                resized_width,
+                resized_height,
+                imageops::FilterType::Nearest,
+            );
+            let output_x = (intersection_left - start_x) / scale;
+            let output_y = (intersection_top - start_y) / scale;
+            imageops::replace(&mut output, &resized, output_x.into(), output_y.into());
+        }
+    }
+
+    let mut encoded = Cursor::new(Vec::new());
+    let format = match request.format {
+        TileFormat::Jpeg => ImageFormat::Jpeg,
+        TileFormat::Png => ImageFormat::Png,
+    };
+    DynamicImage::ImageRgb8(output)
+        .write_to(&mut encoded, format)
+        .map_err(|error| WorldError::Image(error.to_string()))?;
+    Ok(encoded.into_inner())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorldError {
+    Artifact(String),
     DimensionOverflow,
     DuplicateCamera(u32),
     InvalidCameraDimensions(u32),
     InvalidRectangle,
+    InvalidTileSize,
+    Image(String),
+    TileOutOfBounds,
     UnknownCamera(u32),
     UnknownFrame { camera_id: u32, image_index: u32 },
     UnsupportedOrientation { camera_id: u32 },
@@ -188,6 +358,12 @@ impl Error for WorldError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn camera(camera_id: u32, width: u32, frame_height: u32, frame_count: u32) -> CameraSpec {
         CameraSpec {
@@ -199,6 +375,37 @@ mod tests {
         }
     }
 
+    fn temp_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("steel-world-{name}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn solid_frame(
+        root: &std::path::Path,
+        name: &str,
+        width: u32,
+        height: u32,
+        color: [u8; 3],
+    ) -> PathBuf {
+        let path = root.join(name);
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, Rgb(color)))
+            .save_with_format(&path, ImageFormat::Png)
+            .unwrap();
+        path
+    }
+
+    fn decode_png(bytes: &[u8]) -> RgbImage {
+        image::load(Cursor::new(bytes), ImageFormat::Png)
+            .unwrap()
+            .to_rgb8()
+    }
+
     #[test]
     fn joins_camera_widths_and_uses_tallest_camera_height() {
         let world = InspectionWorld::new(vec![
@@ -208,7 +415,8 @@ mod tests {
             camera(4, 541, 1024, 21),
             camera(5, 692, 1024, 21),
             camera(6, 677, 1024, 21),
-        ]).unwrap();
+        ])
+        .unwrap();
 
         assert_eq!(world.width, 3_870);
         assert_eq!(world.height, 21_504);
@@ -217,10 +425,8 @@ mod tests {
 
     #[test]
     fn shorter_camera_keeps_offset_and_empty_tail() {
-        let world = InspectionWorld::new(vec![
-            camera(1, 100, 16, 3),
-            camera(2, 80, 16, 1),
-        ]).unwrap();
+        let world =
+            InspectionWorld::new(vec![camera(1, 100, 16, 3), camera(2, 80, 16, 1)]).unwrap();
 
         assert_eq!(world.height, 48);
         assert_eq!(world.cameras[1].offset_x, 100);
@@ -239,10 +445,8 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_camera_ids() {
-        let error = InspectionWorld::new(vec![
-            camera(1, 100, 16, 2),
-            camera(1, 100, 16, 2),
-        ]).unwrap_err();
+        let error =
+            InspectionWorld::new(vec![camera(1, 100, 16, 2), camera(1, 100, 16, 2)]).unwrap_err();
 
         assert_eq!(error, WorldError::DuplicateCamera(1));
     }
@@ -256,5 +460,139 @@ mod tests {
             InspectionWorld::new(vec![rotated]).unwrap_err(),
             WorldError::UnsupportedOrientation { camera_id: 1 }
         );
+    }
+
+    #[test]
+    fn composes_tile_across_adjacent_frames_without_a_seam() {
+        let root = temp_root("frames");
+        let top = solid_frame(&root, "top.png", 4, 2, [255, 0, 0]);
+        let bottom = solid_frame(&root, "bottom.png", 4, 2, [0, 255, 0]);
+        let world = InspectionWorld::with_tile_size(vec![camera(1, 4, 2, 2)], 4).unwrap();
+
+        let bytes = compose_tile(
+            &world,
+            TileRequest::new(0, 0, 0, TileFormat::Png),
+            |_, frame| {
+                Ok(Some(if frame == 0 {
+                    top.clone()
+                } else {
+                    bottom.clone()
+                }))
+            },
+        )
+        .unwrap();
+        let tile = decode_png(&bytes);
+        assert_eq!(tile.dimensions(), (4, 4));
+        assert_eq!(tile.get_pixel(1, 1).0, [255, 0, 0]);
+        assert_eq!(tile.get_pixel(1, 2).0, [0, 255, 0]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composes_tile_across_adjacent_cameras_in_configured_order() {
+        let root = temp_root("cameras");
+        let left = solid_frame(&root, "left.png", 2, 2, [10, 20, 30]);
+        let right = solid_frame(&root, "right.png", 2, 2, [200, 210, 220]);
+        let world =
+            InspectionWorld::with_tile_size(vec![camera(1, 2, 2, 1), camera(2, 2, 2, 1)], 4)
+                .unwrap();
+
+        let bytes = compose_tile(
+            &world,
+            TileRequest::new(0, 0, 0, TileFormat::Png),
+            |camera, _| {
+                Ok(Some(if camera == 1 {
+                    left.clone()
+                } else {
+                    right.clone()
+                }))
+            },
+        )
+        .unwrap();
+        let tile = decode_png(&bytes);
+        assert_eq!(tile.get_pixel(1, 0).0, [10, 20, 30]);
+        assert_eq!(tile.get_pixel(2, 0).0, [200, 210, 220]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composes_level_one_in_the_same_content_order() {
+        let root = temp_root("level-one");
+        let top = solid_frame(&root, "top.png", 4, 2, [255, 0, 0]);
+        let bottom = solid_frame(&root, "bottom.png", 4, 2, [0, 255, 0]);
+        let world = InspectionWorld::with_tile_size(vec![camera(1, 4, 2, 2)], 4).unwrap();
+
+        let bytes = compose_tile(
+            &world,
+            TileRequest::new(1, 0, 0, TileFormat::Png),
+            |_, frame| {
+                Ok(Some(if frame == 0 {
+                    top.clone()
+                } else {
+                    bottom.clone()
+                }))
+            },
+        )
+        .unwrap();
+        let tile = decode_png(&bytes);
+        assert_eq!(tile.dimensions(), (2, 2));
+        assert_eq!(tile.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(tile.get_pixel(0, 1).0, [0, 255, 0]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composes_missing_frame_as_blank_without_shifting_later_frames() {
+        let root = temp_root("missing");
+        let first = solid_frame(&root, "first.png", 2, 2, [255, 0, 0]);
+        let third = solid_frame(&root, "third.png", 2, 2, [0, 0, 255]);
+        let world = InspectionWorld::with_tile_size(vec![camera(1, 2, 2, 3)], 6).unwrap();
+
+        let bytes = compose_tile(
+            &world,
+            TileRequest::new(0, 0, 0, TileFormat::Png),
+            |_, frame| {
+                Ok(match frame {
+                    0 => Some(first.clone()),
+                    2 => Some(third.clone()),
+                    _ => None,
+                })
+            },
+        )
+        .unwrap();
+        let tile = decode_png(&bytes);
+        assert_eq!(tile.dimensions(), (2, 6));
+        assert_eq!(tile.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(tile.get_pixel(0, 2).0, MISSING_TILE_COLOR);
+        assert_eq!(tile.get_pixel(0, 4).0, [0, 0, 255]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composes_only_sources_intersecting_requested_tile() {
+        let root = temp_root("bounded");
+        let allowed = solid_frame(&root, "allowed.png", 2, 2, [1, 2, 3]);
+        let world =
+            InspectionWorld::with_tile_size(vec![camera(1, 2, 2, 1), camera(2, 2, 2, 1)], 2)
+                .unwrap();
+        let mut calls = HashMap::<u32, usize>::new();
+
+        compose_tile(
+            &world,
+            TileRequest::new(0, 0, 0, TileFormat::Png),
+            |camera, _| {
+                *calls.entry(camera).or_default() += 1;
+                if camera == 1 {
+                    Ok(Some(allowed.clone()))
+                } else {
+                    Err(WorldError::Artifact("forbidden".into()))
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(&1), Some(&1));
+        assert_eq!(calls.get(&2), None);
+        fs::remove_dir_all(root).unwrap();
     }
 }

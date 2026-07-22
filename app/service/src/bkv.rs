@@ -1,6 +1,9 @@
+use crate::inspection_world::{
+    compose_tile, CameraOrientation, CameraSpec, InspectionWorld, TileRequest, WorldError,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -11,6 +14,41 @@ const CURSOR_SCHEMA: &str = "bkv-replay-cursor-v1";
 const EXPECTED_FIRST_SEQUENCE: u64 = 1_893_700;
 const EXPECTED_MATERIALS: usize = 11;
 const EXPECTED_CAMERAS: usize = 6;
+const TILE_CACHE_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TileCacheKey {
+    legacy_sequence: u64,
+    request: TileRequest,
+}
+
+#[derive(Debug, Default)]
+struct TileCache {
+    entries: HashMap<TileCacheKey, Vec<u8>>,
+    order: VecDeque<TileCacheKey>,
+}
+
+impl TileCache {
+    fn get(&self, key: &TileCacheKey) -> Option<Vec<u8>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: TileCacheKey, bytes: Vec<u8>) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key, bytes);
+            return;
+        }
+        while self.entries.len() >= TILE_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.entries.insert(key, bytes);
+    }
+}
 
 #[derive(Debug)]
 pub struct BkvManager {
@@ -20,6 +58,7 @@ pub struct BkvManager {
     materials: Vec<Value>,
     files: HashMap<String, PathBuf>,
     cursor: Mutex<usize>,
+    tile_cache: Mutex<TileCache>,
 }
 
 impl BkvManager {
@@ -94,6 +133,7 @@ impl BkvManager {
             materials,
             files,
             cursor: Mutex::new(cursor),
+            tile_cache: Mutex::new(TileCache::default()),
         })
     }
 
@@ -135,6 +175,84 @@ impl BkvManager {
             .get(&normalized)
             .cloned()
             .ok_or_else(|| "BKV artifact is not present in the manifest whitelist".to_string())
+    }
+
+    pub fn inspection_tile(
+        &self,
+        legacy_sequence: u64,
+        request: TileRequest,
+    ) -> Result<Vec<u8>, String> {
+        let key = TileCacheKey {
+            legacy_sequence,
+            request,
+        };
+        if let Some(bytes) = self
+            .tile_cache
+            .lock()
+            .map_err(|_| "BKV tile cache lock poisoned".to_string())?
+            .get(&key)
+        {
+            return Ok(bytes);
+        }
+
+        let material = self
+            .materials
+            .iter()
+            .find(|item| item.get("legacySeqNo").and_then(Value::as_u64) == Some(legacy_sequence))
+            .ok_or_else(|| format!("BKV material {legacy_sequence} is unavailable"))?;
+        let cameras = material
+            .get("cameras")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("BKV material {legacy_sequence} cameras are unavailable"))?;
+        let mut specs = Vec::with_capacity(cameras.len());
+        let mut sources = HashMap::<(u32, u32), String>::new();
+        for camera in cameras {
+            let camera_id = json_u32(camera, "cameraId", "camera")?;
+            let frame_width = json_u32(camera, "frameWidth", "camera")?;
+            let frame_height = json_u32(camera, "frameHeight", "camera")?;
+            let frames = camera
+                .get("twoDFrames")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("BKV camera {camera_id} twoDFrames are unavailable"))?;
+            let mut frame_numbers = Vec::with_capacity(frames.len());
+            for frame in frames {
+                let frame_number = json_u32(frame, "frameNo", "frame")?;
+                let relative = frame.get("path").and_then(Value::as_str).ok_or_else(|| {
+                    format!("BKV camera {camera_id} frame {frame_number} path is missing")
+                })?;
+                frame_numbers.push(frame_number);
+                sources.insert((camera_id, frame_number), relative.to_string());
+            }
+            specs.push(CameraSpec {
+                camera_id,
+                frame_width,
+                frame_height,
+                frame_numbers,
+                orientation: serde_json::from_value::<CameraOrientation>(
+                    camera.get("orientation").cloned().unwrap_or(Value::Null),
+                )
+                .map_err(|error| {
+                    format!("BKV camera {camera_id} orientation is invalid: {error}")
+                })?,
+            });
+        }
+        let world = InspectionWorld::new(specs).map_err(|error| error.to_string())?;
+        let bytes = compose_tile(&world, request, |camera_id, frame_number| {
+            let relative = sources.get(&(camera_id, frame_number)).ok_or_else(|| {
+                WorldError::Artifact(format!(
+                    "camera {camera_id} frame {frame_number} is not in the manifest"
+                ))
+            })?;
+            self.resolve_artifact(relative)
+                .map(Some)
+                .map_err(WorldError::Artifact)
+        })
+        .map_err(|error| error.to_string())?;
+        self.tile_cache
+            .lock()
+            .map_err(|_| "BKV tile cache lock poisoned".to_string())?
+            .insert(key, bytes.clone());
+        Ok(bytes)
     }
 
     pub fn capture_next(&self) -> Result<Option<Value>, String> {
@@ -464,6 +582,8 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::BkvManager;
+    use crate::inspection_world::{TileFormat, TileRequest};
+    use image::{codecs::jpeg::JpegEncoder, Rgb, RgbImage};
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -489,6 +609,15 @@ mod tests {
         json!({"path": relative.replace('\\', "/"), "size": contents.len(), "sha256": hash})
     }
 
+    fn jpeg_bytes(color: [u8; 3]) -> Vec<u8> {
+        let image = RgbImage::from_pixel(2, 2, Rgb(color));
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 95)
+            .encode_image(&image)
+            .unwrap();
+        bytes
+    }
+
     fn fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
         let root = temp_root(name);
         let mut materials = Vec::new();
@@ -496,10 +625,18 @@ mod tests {
             let legacy = 1_893_700 + offset;
             let mut cameras = Vec::new();
             for camera in 1..=6 {
-                let jpg = artifact(&root, &format!("images/{legacy}/{camera}/0000.jpg"), b"jpg");
+                let jpg_bytes = jpeg_bytes([camera as u8 * 20, 10, 5]);
+                let jpg = artifact(
+                    &root,
+                    &format!("images/{legacy}/{camera}/0000.jpg"),
+                    &jpg_bytes,
+                );
                 let npz = artifact(&root, &format!("npz/{legacy}/{camera}/0000.npz"), b"npz");
                 cameras.push(json!({
-                    "cameraId": camera, "mode": "offline-file", "twoDFrameCount": 1,
+                    "cameraId": camera, "mode": "offline-file",
+                    "frameWidth": 2, "frameHeight": 2,
+                    "orientation": {"frameOrder": "ascending", "rotation": 0, "flipX": false, "flipY": false},
+                    "twoDFrameCount": 1,
                     "npzFrameCount": 1,
                     "twoDFrames": [{"frameNo": 0, "path": jpg["path"], "size": jpg["size"], "sha256": jpg["sha256"]}],
                     "npzFrames": [{"frameNo": 0, "path": npz["path"], "size": npz["size"], "sha256": npz["sha256"]}]
@@ -628,6 +765,42 @@ mod tests {
     }
 
     #[test]
+    fn inspection_tile_uses_manifest_sources_and_bounded_cache() {
+        let (root, manifest, cursor) = fixture("tile-cache");
+        let manager = BkvManager::load(&root, &manifest, &cursor).unwrap();
+        let request = TileRequest::new(0, 0, 0, TileFormat::Jpeg);
+
+        let first = manager.inspection_tile(1_893_700, request).unwrap();
+        let decoded = image::load_from_memory(&first).unwrap();
+        assert_eq!(decoded.width(), 12);
+        assert_eq!(decoded.height(), 2);
+
+        fs::write(
+            root.join("images/1893700/1/0000.jpg"),
+            b"corrupt after cache fill",
+        )
+        .unwrap();
+        let cached = manager.inspection_tile(1_893_700, request).unwrap();
+        assert_eq!(cached, first);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspection_tile_rejects_unsupported_manifest_orientation() {
+        let (root, manifest, cursor) = fixture("tile-orientation");
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["materials"][0]["cameras"][0]["orientation"]["rotation"] = json!(90);
+        fs::write(&manifest, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let manager = BkvManager::load(&root, &manifest, &cursor).unwrap();
+
+        let error = manager
+            .inspection_tile(1_893_700, TileRequest::new(0, 0, 0, TileFormat::Png))
+            .unwrap_err();
+        assert!(error.contains("UnsupportedOrientation"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_wrong_cardinality_hash_and_path_escape() {
         let (root, manifest, cursor) = fixture("reject");
         let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
@@ -638,7 +811,10 @@ mod tests {
             .contains("11 materials"));
 
         let (root2, manifest2, cursor2) = fixture("hash");
-        fs::write(root2.join("images/1893700/1/0000.jpg"), b"bad").unwrap();
+        let image_path = root2.join("images/1893700/1/0000.jpg");
+        let mut corrupted = fs::read(&image_path).unwrap();
+        corrupted[0] ^= 0xff;
+        fs::write(&image_path, corrupted).unwrap();
         assert!(BkvManager::load(&root2, &manifest2, &cursor2)
             .unwrap_err()
             .contains("hash mismatch"));
@@ -654,4 +830,12 @@ mod tests {
         fs::remove_dir_all(root2).unwrap();
         fs::remove_dir_all(root3).unwrap();
     }
+}
+
+fn json_u32(value: &Value, key: &str, label: &str) -> Result<u32, String> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+        .ok_or_else(|| format!("BKV {label} {key} is invalid"))
 }
