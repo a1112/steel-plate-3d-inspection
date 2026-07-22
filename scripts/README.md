@@ -4,6 +4,31 @@ These scripts keep the four runtime boundaries independent.
 
 Environment templates live in `config/env`.
 
+## BKV offline runtime manifest
+
+After converting legacy `.d3img` files and building the six-camera previews, build the
+strict runtime manifest consumed by the formal `bkv` provider:
+
+```powershell
+python scripts/build_bkv_runtime_manifest.py `
+  --data-root D:\Project\steel-plate-3d-inspection\tmp\legacy-bkv
+```
+
+The default contract selects `checkrecord.ID` 1893700 through 1893710, requires all
+11 material identities and six offline camera directories, proves exact JPEG/NPZ
+frame coverage, verifies NPZ hashes, and requires the unfolded, cylinder, and stitch
+summary preview artifacts for every material. Defects are associated only through
+`defect.SeqNo -> checkrecord.SeqNo`; rows selected merely because their old `ID`
+falls in the range are recorded under `quarantine` and are never replayed as defects.
+Non-positive legacy dimensions are emitted as `null`. Output is written atomically to
+`bkv-runtime-manifest.json`, with paths contained beneath the supplied data root.
+
+Run its contract tests with:
+
+```powershell
+python -m unittest scripts.test_bkv_runtime_manifest -v
+```
+
 ## Windows production service
 
 The Release runtime contains one SCM host, `service\steel-runtime-supervisor.exe`, for the capture provider, trigger gateway, and Rust service. Its contract is ordered application-level readiness, strict business drain, bounded whole-stack stop/restart, child-process-tree cleanup, live managed-log rotation, and atomic restart-budget state publication. The non-elevated regression proves RuntimeRoot/StateRoot isolation, source/layout/config fail-closed cases, Trigger-then-Service drain (including timeout cases), `inFlight` convergence, 50 MiB online rotation, `.1` through `.5` retention, persisted budget exhaustion, and stable-runtime recovery of `StateRoot\service\supervisor-status.json`; the install-related PowerShell files parse, the static versioned-install policy passes, and the Supervisor Release target compiles. These checks still do not prove real SCM transitions, effective target-machine ACLs, signed-package installation, power-loss recovery, or a database migration transaction.
