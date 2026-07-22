@@ -6,6 +6,7 @@ import heightMapBottomImage from '../assets/plate-surfaces/height-map-bottom.png
 import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
 import type { CaptureImageItem, DefectItem, DefectType } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
+import { createSequentialCameraLanes, type CameraDisplayLane } from '../lib/camera-display';
 import { barSurfaceFileUrl, type BarSurfaceCamera, type BarSurfaceMesh } from '../services/bar-surface-api';
 import { clampPreviewPositionM, DEFAULT_PLATE_LENGTH_M, type SurfaceDisplayMode } from '../state/inspection-ui';
 import { Panel } from './Panel';
@@ -23,6 +24,7 @@ interface PlateMapProps {
   artifactMode?: 'production' | 'demo';
   inspectionId?: string;
   captureImages?: CaptureImageItem[];
+  cameraLanes?: CameraDisplayLane[];
   surfaceMesh?: BarSurfaceMesh | null;
   surfaceCameras?: BarSurfaceCamera[];
   artifactStatus?: string;
@@ -66,12 +68,7 @@ const MAX_PLATE_3D_YAW = 0.5;
 const MIN_PLATE_3D_ZOOM = 0.72;
 const MAX_PLATE_3D_ZOOM = 2.2;
 const PLATE_3D_ZOOM_STEP = 0.12;
-const BAR_CAMERA_COUNT = 8;
-const BAR_CAMERA_LANES = Array.from({ length: BAR_CAMERA_COUNT }, (_, index) => ({
-  index,
-  label: `camera${index + 1}`,
-  shortLabel: `C${index + 1}`,
-}));
+const DEFAULT_CAMERA_LANES = createSequentialCameraLanes(8);
 
 function clampPercent(value: number, min = 0, max = 100) {
   return Math.max(min, Math.min(max, value));
@@ -94,28 +91,28 @@ function getDefectCircumferenceRatio(defect: DefectItem) {
   return Math.max(0, Math.min(0.999, (defect.yOffsetMm + 1.5) / 3));
 }
 
-function getDefectCameraIndex(defect: DefectItem) {
+function getDefectCameraIndex(defect: DefectItem, cameraCount = DEFAULT_CAMERA_LANES.length) {
   const explicitCamera = defect as DefectItem & { camera?: number; cameraName?: string };
   const explicitIndex = explicitCamera.cameraIndex ?? explicitCamera.camera;
-  if (typeof explicitIndex === 'number' && Number.isFinite(explicitIndex) && explicitIndex >= 1 && explicitIndex <= BAR_CAMERA_COUNT) {
+  if (typeof explicitIndex === 'number' && Number.isFinite(explicitIndex) && explicitIndex >= 1 && explicitIndex <= cameraCount) {
     return Math.round(explicitIndex) - 1;
   }
-  const parsed = String(explicitCamera.cameraId ?? explicitCamera.cameraName ?? '').match(/(?:camera|cam|相机)\s*([1-8])/i);
+  const parsed = String(explicitCamera.cameraId ?? explicitCamera.cameraName ?? '').match(/(?:camera|cam|相机)\s*(\d+)/i);
   if (parsed) {
-    return Number(parsed[1]) - 1;
+    return Math.max(0, Math.min(cameraCount - 1, Number(parsed[1]) - 1));
   }
-  return Math.min(BAR_CAMERA_COUNT - 1, Math.floor(getDefectCircumferenceRatio(defect) * BAR_CAMERA_COUNT));
+  return Math.min(cameraCount - 1, Math.floor(getDefectCircumferenceRatio(defect) * cameraCount));
 }
 
-function getDefectCameraLabel(defect: DefectItem) {
-  return BAR_CAMERA_LANES[getDefectCameraIndex(defect)]?.label ?? 'camera1';
+function getDefectCameraLabel(defect: DefectItem, cameraLanes = DEFAULT_CAMERA_LANES) {
+  return cameraLanes[getDefectCameraIndex(defect, cameraLanes.length)]?.cameraId ?? cameraLanes[0]?.cameraId ?? 'camera1';
 }
 
-function getDefectUnfoldedTopPercent(defect: DefectItem) {
-  const cameraIndex = getDefectCameraIndex(defect);
-  const localRatio = getDefectCircumferenceRatio(defect) * BAR_CAMERA_COUNT - cameraIndex;
+function getDefectUnfoldedTopPercent(defect: DefectItem, cameraCount = DEFAULT_CAMERA_LANES.length) {
+  const cameraIndex = getDefectCameraIndex(defect, cameraCount);
+  const localRatio = getDefectCircumferenceRatio(defect) * cameraCount - cameraIndex;
   const safeLocalRatio = Math.max(0.14, Math.min(0.86, Number.isFinite(localRatio) ? localRatio : 0.5));
-  return ((cameraIndex + safeLocalRatio) / BAR_CAMERA_COUNT) * 100;
+  return ((cameraIndex + safeLocalRatio) / cameraCount) * 100;
 }
 
 function yOffsetToPercentValue(offset: number) {
@@ -357,6 +354,7 @@ function BarUnfoldedMap({
   orientation,
   surfaceCameras,
   captureImages,
+  cameraLanes,
 }: {
   defects: DefectItem[];
   defectTypes: DefectType[];
@@ -371,13 +369,14 @@ function BarUnfoldedMap({
   orientation: UnfoldOrientation;
   surfaceCameras: BarSurfaceCamera[];
   captureImages: CaptureImageItem[];
+  cameraLanes: CameraDisplayLane[];
 }) {
   const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
   const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
   const hoveredDefect = defects.find((defect) => defect.id === hoveredDefectId) ?? null;
   const hoveredType = hoveredDefect ? defectTypes.find((type) => type.id === hoveredDefect.typeId) : null;
   const hoveredXPercent = hoveredDefect ? getDefectLengthPercent(hoveredDefect, plateLengthM) : 0;
-  const hoveredYPercent = hoveredDefect ? getDefectUnfoldedTopPercent(hoveredDefect) : 0;
+  const hoveredYPercent = hoveredDefect ? getDefectUnfoldedTopPercent(hoveredDefect, cameraLanes.length) : 0;
   const captureImageByCamera = useMemo(() => {
     const images = new Map<string, CaptureImageItem>();
     captureImages
@@ -394,39 +393,39 @@ function BarUnfoldedMap({
   }, [captureImages]);
 
   return (
-    <div className={`bar-unfolded-map orientation-${orientation} ${expandedCamera ? 'camera-expanded' : ''}`} data-testid="bar-unfolded-map" data-orientation={orientation} data-expanded-camera={expandedCamera || undefined}>
+    <div className={`bar-unfolded-map orientation-${orientation} ${expandedCamera ? 'camera-expanded' : ''}`} data-testid="bar-unfolded-map" data-orientation={orientation} data-expanded-camera={expandedCamera || undefined} style={{ '--camera-count': cameraLanes.length } as CSSProperties}>
       <div
         className="bar-unfolded-canvas"
         role="region"
         tabIndex={0}
-        aria-label="8 相机圆周展开缺陷图"
+        aria-label={`${cameraLanes.length} 相机圆周展开缺陷图`}
         style={{ '--preview-position': `${previewPercent}%` } as CSSProperties}
         onKeyDown={onDefectNavigationKeyDown}
         onWheel={onDefectNavigationWheel}
       >
         <div className="bar-camera-bands">
-          {BAR_CAMERA_LANES.map((lane) => {
-            const camera = surfaceCameras.find((item) => item.name.toLowerCase() === lane.label);
+          {cameraLanes.map((lane) => {
+            const camera = surfaceCameras.find((item) => item.name.toLowerCase() === lane.cameraId);
             const preview = camera?.relative.intensityPreview || camera?.latest.intensityPreview || '';
-            const captureImage = captureImageByCamera.get(lane.label);
+            const captureImage = captureImageByCamera.get(lane.cameraId);
             const source = preview ? barSurfaceFileUrl(preview) : captureImage?.url || '';
-            const expanded = expandedCamera === lane.label;
+            const expanded = expandedCamera === lane.cameraId;
             return <div
-              key={lane.label}
+              key={lane.cameraId}
               className={`bar-camera-band ${source ? 'has-production-image' : ''} ${expanded ? 'is-expanded' : ''} ${expandedCamera && !expanded ? 'is-collapsed' : ''}`}
               role="button"
               tabIndex={0}
-              aria-label={`${lane.label} 采集图像${expanded ? '，已展开，双击恢复' : '，双击展开'}`}
-              title={expanded ? '双击恢复 8 相机展开图' : `双击展开 ${lane.label}；悬停查看采集轮廓`}
-              onDoubleClick={() => setExpandedCamera((current) => current === lane.label ? null : lane.label)}
+              aria-label={`${lane.cameraId} 采集图像${expanded ? '，已展开，双击恢复' : '，双击展开'}`}
+              title={expanded ? `双击恢复 ${cameraLanes.length} 相机展开图` : `双击展开 ${lane.cameraId}；悬停查看采集轮廓`}
+              onDoubleClick={() => setExpandedCamera((current) => current === lane.cameraId ? null : lane.cameraId)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
                   event.preventDefault();
-                  setExpandedCamera((current) => current === lane.label ? null : lane.label);
+                  setExpandedCamera((current) => current === lane.cameraId ? null : lane.cameraId);
                 }
               }}
             >
-              {source ? <CameraBandImage src={source} label={lane.label} orientation={orientation} cropBlackBorders={!preview} /> : null}
+              {source ? <CameraBandImage src={source} label={lane.cameraId} orientation={orientation} cropBlackBorders={!preview} /> : null}
               <span>{lane.shortLabel}</span>
             </div>;
           })}
@@ -450,13 +449,13 @@ function BarUnfoldedMap({
               key={defect.id}
               type="button"
               className={`defect-marker ${type.shape} ${defect.id === selectedDefectId ? 'selected' : ''}`}
-              aria-label={`${defect.typeLabel}，${getDefectCameraLabel(defect)}，距头${defect.distanceHeadMm}mm`}
+              aria-label={`${defect.typeLabel}，${getDefectCameraLabel(defect, cameraLanes)}，距头${defect.distanceHeadMm}mm`}
               style={{
-                left: `${orientation === 'horizontal' ? getDefectLengthPercent(defect, plateLengthM) : getDefectUnfoldedTopPercent(defect)}%`,
-                top: `${orientation === 'horizontal' ? getDefectUnfoldedTopPercent(defect) : getDefectLengthPercent(defect, plateLengthM)}%`,
+                left: `${orientation === 'horizontal' ? getDefectLengthPercent(defect, plateLengthM) : getDefectUnfoldedTopPercent(defect, cameraLanes.length)}%`,
+                top: `${orientation === 'horizontal' ? getDefectUnfoldedTopPercent(defect, cameraLanes.length) : getDefectLengthPercent(defect, plateLengthM)}%`,
                 backgroundColor: type.color,
               }}
-              title={`${defect.typeLabel} ${getDefectCameraLabel(defect)} ${defect.distanceHeadMm}mm`}
+              title={`${defect.typeLabel} ${getDefectCameraLabel(defect, cameraLanes)} ${defect.distanceHeadMm}mm`}
               onClick={() => onSelectDefect(defect.id)}
               onMouseEnter={() => onHoverDefect(defect.id)}
               onMouseLeave={() => onHoverDefect(null)}
@@ -1170,6 +1169,7 @@ export function PlateMap({
   artifactMode = 'production',
   inspectionId,
   captureImages = [],
+  cameraLanes = DEFAULT_CAMERA_LANES,
   surfaceMesh,
   surfaceCameras = [],
   artifactStatus,
@@ -1189,7 +1189,7 @@ export function PlateMap({
   const [unfoldOrientation, setUnfoldOrientation] = useState<UnfoldOrientation>('horizontal');
   const productionCameraImageCount = surfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
   const capturedCameraImageCount = new Set(captureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
-  const displayedCameraImageCount = Math.min(BAR_CAMERA_COUNT, Math.max(productionCameraImageCount, capturedCameraImageCount));
+  const displayedCameraImageCount = Math.min(cameraLanes.length, Math.max(productionCameraImageCount, capturedCameraImageCount));
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
   const selectRelativeDefect = (step: number) => {
     if (defects.length === 0) {
@@ -1266,7 +1266,7 @@ export function PlateMap({
       {integratedToolbar ? null : <div className={`record-artifact-provenance ${artifactMode}`} role="note">
         {artifactMode === 'demo'
           ? '演示/测试数据：允许使用内置表面与模拟点云，不代表当前生产结果。'
-          : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；实际相机图像 ${displayedCameraImageCount}/8 路（自动裁剪黑边）。`}
+          : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；实际相机图像 ${displayedCameraImageCount}/${cameraLanes.length} 路（自动裁剪黑边）。`}
       </div>}
       {viewMode === '2d' ? (
         <div className="unfold-orientation-switch" role="group" aria-label="二维展开方向">
@@ -1317,6 +1317,11 @@ export function PlateMap({
           surfaceMesh={surfaceMesh}
           artifactStatus={artifactStatus}
         />
+      ) : cameraLanes.length === 0 ? (
+        <div className="production-artifact-empty" role="status">
+          <strong>未配置 2D 相机</strong>
+          <span>请先提供有序相机参数，再显示采集图像。</span>
+        </div>
       ) : (
         <div className={`bar-unfolded-layout orientation-${unfoldOrientation}`}>
           <BarUnfoldedMap
@@ -1333,6 +1338,7 @@ export function PlateMap({
             orientation={unfoldOrientation}
             surfaceCameras={surfaceCameras}
             captureImages={captureImages}
+            cameraLanes={cameraLanes}
           />
           <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} orientation={unfoldOrientation} />
         </div>

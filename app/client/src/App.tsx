@@ -65,6 +65,7 @@ import {
   readSystemNetworkSnapshot,
   type SystemNetworkSnapshot,
 } from './lib/capture-api';
+import { createSequentialCameraLanes } from './lib/camera-display';
 import { BrandHeader } from './components/BrandHeader';
 import { AppFooter } from './components/AppFooter';
 import { AlarmAnalysis, type AnalysisViewMode } from './components/AlarmAnalysis';
@@ -95,6 +96,7 @@ import './styles/theme-system.css';
 const REPORT_PAGE_SIZE = 8;
 const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
 const UNKNOWN_SERVICE_ENDPOINT = 'unknown';
+const ONLINE_CAMERA_LANES = createSequentialCameraLanes(8);
 
 export function formatStorageBytes(value?: number | null) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
@@ -1079,6 +1081,7 @@ function InspectionDashboard({
                   artifactMode={artifactMode}
                   inspectionId={activeInspection?.inspectionId}
                   captureImages={activeSnapshot.captureImages ?? []}
+                  cameraLanes={ONLINE_CAMERA_LANES}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
                   surfaceCameras={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameras : undefined}
                   artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}

@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType } from '../data/inspection';
+import { createSequentialCameraLanes } from '../lib/camera-display';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { cameraBandRotationRadians, PlateMap as ProductionPlateMap } from './PlateMap';
 
@@ -20,6 +21,55 @@ describe('line-scan image orientation', () => {
   it('keeps acquisition rows vertical and rotates them toward the right in horizontal mode', () => {
     expect(cameraBandRotationRadians('vertical')).toBe(0);
     expect(cameraBandRotationRadians('horizontal')).toBe(-Math.PI / 2);
+  });
+});
+
+describe('parameterized camera lanes', () => {
+  it('keeps exactly six configured camera slots even when every image is missing', () => {
+    render(
+      <PlateMap
+        defectTypes={defectTypes}
+        defects={[]}
+        defectTypeCounts={{}}
+        hiddenTypeIds={new Set()}
+        selectedDefectId={null}
+        surfaceMode="all"
+        previewPositionM={0}
+        cameraLanes={createSequentialCameraLanes(6)}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('region', { name: '6 相机圆周展开缺陷图' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /采集图像/ })).toHaveLength(6);
+    expect(screen.getByText('C6')).toBeInTheDocument();
+    expect(screen.queryByText('C7')).not.toBeInTheDocument();
+    expect(screen.queryByText('C8')).not.toBeInTheDocument();
+  });
+
+  it('shows an explicit empty state instead of a zero-camera canvas', () => {
+    render(
+      <PlateMap
+        defectTypes={defectTypes}
+        defects={[]}
+        defectTypeCounts={{}}
+        hiddenTypeIds={new Set()}
+        selectedDefectId={null}
+        surfaceMode="all"
+        previewPositionM={0}
+        cameraLanes={[]}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('status')).toHaveTextContent('未配置 2D 相机');
+    expect(screen.queryByRole('region', { name: /相机圆周展开缺陷图/ })).not.toBeInTheDocument();
   });
 });
 
