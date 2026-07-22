@@ -78,6 +78,8 @@ import { DefectFilterPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { BarSurfaceApp } from './components/BarSurfaceApp';
+import { BkvCompatibilityApp } from './components/BkvCompatibilityApp';
+import { fetchBkvStatus, type BkvStatus } from './services/bkv-api';
 import {
   fetchBarSurfaceManifest,
   fetchBarSurfaceMesh,
@@ -198,6 +200,19 @@ export default function App() {
 
   const [snapshot, setSnapshot] = useState<InspectionSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [bkvStatus, setBkvStatus] = useState<BkvStatus | null>(null);
+  const [bkvProbeComplete, setBkvProbeComplete] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchBkvStatus(controller.signal)
+      .then(setBkvStatus)
+      .catch(() => setBkvStatus(null))
+      .finally(() => {
+        if (!controller.signal.aborted) setBkvProbeComplete(true);
+      });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -215,7 +230,17 @@ export default function App() {
     return () => controller.abort();
   }, []);
 
-  if (!snapshot) {
+  if (bkvStatus?.provider === 'bkv' && bkvStatus.ready) {
+    const theme = readStoredTheme();
+    const themeStyle = readStoredThemeStyle();
+    return (
+      <div className={`app-shell theme-${theme} style-${themeStyle} bkv-provider-shell`}>
+        <BkvCompatibilityApp status={bkvStatus} />
+      </div>
+    );
+  }
+
+  if (!bkvProbeComplete || !snapshot) {
     const loadingTheme = readStoredTheme();
     const loadingThemeStyle = readStoredThemeStyle();
     return (
