@@ -622,7 +622,52 @@ describe('InspectionWorldCanvas', () => {
     await waitFor(() => expect(canvas.getAttribute('data-view-x')).not.toBe(initialX));
   });
 
-  it('revokes tiles that leave the prefetched viewport', async () => {
+  it('keeps the previous LOD visible until replacement tiles have decoded', async () => {
+    let resize: ResizeObserverCallback | undefined;
+    vi.stubGlobal('ResizeObserver', class ResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resize = callback; }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    const images: Array<{ onload: null | (() => void); onerror: null | (() => void) }> = [];
+    class ManualImage {
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(_value: string) { images.push(this); }
+    }
+    vi.stubGlobal('Image', ManualImage);
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const canvas = screen.getByTestId('inspection-world-canvas') as HTMLCanvasElement;
+    const viewport = inspectionViewport(canvas);
+    installNativeScrollTo(viewport);
+    Object.defineProperties(viewport, {
+      clientWidth: { configurable: true, value: 300 },
+      clientHeight: { configurable: true, value: 256 },
+    });
+
+    await act(async () => resize?.([], {} as ResizeObserver));
+    await waitFor(() => expect(images.length).toBeGreaterThan(0));
+    await act(async () => images.forEach((image) => image.onload?.()));
+    await waitFor(() => expect(Number(canvas.getAttribute('data-loaded-tiles'))).toBeGreaterThan(0));
+    const context = canvas.getContext('2d')!;
+    const drawImage = vi.mocked(context.drawImage);
+    drawImage.mockClear();
+
+    await act(async () => {
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -800, ctrlKey: true, clientX: 150, clientY: 128,
+        bubbles: true, cancelable: true,
+      }));
+    });
+
+    await waitFor(() => expect(canvas).toHaveAttribute('data-level', '0'));
+    await waitFor(() => expect(vi.mocked(fetchInspectionWorldTile).mock.calls
+      .some(([, tile]) => tile.level === 0)).toBe(true));
+    expect(drawImage).toHaveBeenCalled();
+  });
+
+  it('retains recently departed tiles for a smooth LOD transition', async () => {
     const revoke = vi.fn();
     class LoadedImage {
       onload: null | (() => void) = null;
@@ -639,11 +684,12 @@ describe('InspectionWorldCanvas', () => {
 
     rerender(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} focusDefectId={2019096} />);
 
-    await waitFor(() => expect(revoke).toHaveBeenCalled());
-    expect(Number(canvas.getAttribute('data-cached-tiles'))).toBeLessThan(30);
+    await waitFor(() => expect(Number(canvas.getAttribute('data-cached-tiles'))).toBeGreaterThan(4));
+    expect(revoke).not.toHaveBeenCalled();
+    expect(Number(canvas.getAttribute('data-cached-tiles'))).toBeLessThanOrEqual(48);
   });
 
-  it('detaches late image callbacks and refreshes cache count on eviction and unmount', async () => {
+  it('keeps recent callbacks for fallback, then detaches them after failure or unmount', async () => {
     const animationFrames: FrameRequestCallback[] = [];
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
       animationFrames.push(callback);
@@ -676,11 +722,14 @@ describe('InspectionWorldCanvas', () => {
       animationFrames.splice(0).forEach((callback) => callback(0));
     });
 
+    expect(revoke).not.toHaveBeenCalled();
+    expect(Number(canvas.getAttribute('data-cached-tiles'))).toBe(4);
+    expect(departedImage.onload).not.toBeNull();
+    expect(departedImage.onerror).not.toBeNull();
+    act(() => lateDepartedError?.());
     await waitFor(() => expect(revoke).toHaveBeenCalled());
-    await waitFor(() => expect(Number(canvas.getAttribute('data-cached-tiles'))).toBe(2));
     expect(departedImage.onload).toBeNull();
     expect(departedImage.onerror).toBeNull();
-    act(() => lateDepartedError?.());
     expect(screen.getByRole('status')).not.toHaveTextContent('瓦片读取失败');
 
     const retainedImage = images.find((image) => image.onerror != null);

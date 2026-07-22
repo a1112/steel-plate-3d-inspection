@@ -21,11 +21,12 @@ type Props = {
 };
 
 type ViewState = { scrollLeft: number; scrollTop: number; scale: number };
-type TileEntry = { tile: WorldTile; image: HTMLImageElement; loaded: boolean };
+type TileEntry = { tile: WorldTile; image: HTMLImageElement; loaded: boolean; lastUsed: number };
 type PendingTileRequest = { token: symbol; controller: AbortController };
 
 const DEFAULT_WIDTH = 1000;
 const DEFAULT_HEIGHT = 600;
+const TILE_CACHE_LIMIT = 48;
 
 function fitWidthScale(worldWidth: number, viewportWidth: number) {
   return viewportWidth / Math.max(1, worldWidth);
@@ -53,6 +54,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   const activeTileKeys = useRef(new Set<string>());
   const committedTileKeys = useRef(new Set<string>());
   const pending = useRef(new Map<string, PendingTileRequest>());
+  const cacheClock = useRef(0);
   const drag = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const scrollFrame = useRef<number | null>(null);
   const pendingScroll = useRef<{ scrollLeft: number; scrollTop: number } | null>(null);
@@ -95,6 +97,21 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
         return { ...current, scrollLeft, scrollTop };
       });
     });
+  }, []);
+
+  const evictInactiveTiles = useCallback(() => {
+    if (tileCache.current.size <= TILE_CACHE_LIMIT) return false;
+    const candidates = [...tileCache.current.entries()]
+      .filter(([key]) => !activeTileKeys.current.has(key))
+      .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
+    let removed = false;
+    for (const [key, entry] of candidates) {
+      if (tileCache.current.size <= TILE_CACHE_LIMIT) break;
+      disposeTileEntry(entry);
+      tileCache.current.delete(key);
+      removed = true;
+    }
+    return removed;
   }, []);
 
   useEffect(() => {
@@ -205,22 +222,20 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     const committedKeys = new Set(visibleTileKeys);
     committedTileKeys.current = committedKeys;
     activeTileKeys.current = new Set(committedKeys);
+    committedKeys.forEach((key) => {
+      const entry = tileCache.current.get(key);
+      if (entry) entry.lastUsed = ++cacheClock.current;
+    });
   }, [visibleTileKeys]);
 
   useEffect(() => {
-    let removedEntry = false;
-    tileCache.current.forEach((entry, key) => {
-      if (visibleTileKeys.has(key)) return;
-      disposeTileEntry(entry);
-      tileCache.current.delete(key);
-      removedEntry = true;
-    });
+    const removedEntry = evictInactiveTiles();
     setFailedKeys((current) => {
       const retained = new Set([...current].filter((key) => visibleTileKeys.has(key)));
       return retained.size === current.size ? current : retained;
     });
     if (removedEntry) setRevision((value) => value + 1);
-  }, [visibleTileKeys]);
+  }, [evictInactiveTiles, visibleTileKeys]);
 
   useEffect(() => {
     if (!failedKeys.size) return;
@@ -247,21 +262,23 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
             return;
           }
           const image = new Image();
-          const entry: TileEntry = { tile: worldTile, image, loaded: false };
+          const entry: TileEntry = { tile: worldTile, image, loaded: false, lastUsed: ++cacheClock.current };
           image.onload = () => {
-            if (tileCache.current.get(key) !== entry || !activeTileKeys.current.has(key)) return;
+            if (tileCache.current.get(key) !== entry) return;
             entry.loaded = true;
+            evictInactiveTiles();
             setRevision((value) => value + 1);
           };
           image.onerror = () => {
-            if (tileCache.current.get(key) !== entry || !activeTileKeys.current.has(key)) return;
+            if (tileCache.current.get(key) !== entry) return;
             tileCache.current.delete(key);
             disposeTileEntry(entry);
-            setFailedKeys((current) => new Set(current).add(key));
+            if (activeTileKeys.current.has(key)) setFailedKeys((current) => new Set(current).add(key));
             setRevision((value) => value + 1);
           };
           tileCache.current.set(key, entry);
           image.src = worldTile.url;
+          evictInactiveTiles();
           setRevision((value) => value + 1);
         })
         .catch(() => {
@@ -348,6 +365,20 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     context.fillStyle = '#07111c';
     context.fillRect(0, 0, size.width, size.height);
     const span = meta.world.tileSize * 2 ** level;
+    const fallbackEntries = [...tileCache.current.values()].filter((entry) => entry.loaded && entry.tile.level !== level);
+    const fallbackLevelDistance = fallbackEntries.reduce(
+      (nearest, entry) => Math.min(nearest, Math.abs(entry.tile.level - level)),
+      Number.POSITIVE_INFINITY,
+    );
+    for (const entry of fallbackEntries) {
+      if (Math.abs(entry.tile.level - level) !== fallbackLevelDistance) continue;
+      const fallbackSpan = meta.world.tileSize * 2 ** entry.tile.level;
+      const screenX = entry.tile.x * fallbackSpan * view.scale - view.scrollLeft;
+      const screenY = entry.tile.y * fallbackSpan * view.scale - view.scrollTop;
+      const screenSize = fallbackSpan * view.scale;
+      if (screenX + screenSize < 0 || screenX > size.width || screenY + screenSize < 0 || screenY > size.height) continue;
+      context.drawImage(entry.image, screenX, screenY, screenSize, screenSize);
+    }
     for (const tile of visibleTiles) {
       const key = `${recordId}:${tile.level}:${tile.x}:${tile.y}`;
       const screenX = tile.x * span * view.scale - view.scrollLeft;
