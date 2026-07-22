@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { StrictMode } from 'react';
+import { StrictMode, Suspense, startTransition, useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fetchInspectionWorldTile, type InspectionWorldDefect, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { InspectionWorldCanvas } from './InspectionWorldCanvas';
@@ -299,6 +299,85 @@ describe('InspectionWorldCanvas', () => {
     expect(retained?.[2]?.aborted).toBe(false);
     expect(departed?.[2]?.aborted).toBe(true);
     expect(canvasTileCalls(0, 1)).toBe(1);
+  });
+
+  it('does not publish tile keys from a concurrent render that is discarded by Suspense', async () => {
+    class LoadedImage {
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(_value: string) { queueMicrotask(() => this.onload?.()); }
+    }
+    vi.stubGlobal('Image', LoadedImage);
+    const resolveTiles: Array<() => void> = [];
+    vi.mocked(fetchInspectionWorldTile).mockImplementation((_record, tile) => new Promise((resolve) => {
+      resolveTiles.push(() => resolve({ ...tile, url: `blob:${tile.level}-${tile.x}-${tile.y}`, revoke: vi.fn() }));
+    }));
+    const suspendedForever = new Promise<never>(() => undefined);
+    let setDiscarded: ((value: boolean) => void) | undefined;
+    function SuspendForever(): never { throw suspendedForever; }
+    function ConcurrentHarness() {
+      const [discarded, setDiscardedState] = useState(false);
+      setDiscarded = setDiscardedState;
+      return <Suspense fallback={<div>loading discarded world</div>}>
+        <InspectionWorldCanvas
+          recordId={discarded ? 'discarded-record' : '1893700'}
+          meta={discarded ? { ...meta, recordId: 'discarded-record' } : meta}
+          defects={defects}
+        />
+        {discarded ? <SuspendForever /> : null}
+      </Suspense>;
+    }
+    render(<ConcurrentHarness />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    await waitFor(() => expect(resolveTiles.length).toBeGreaterThan(0));
+    const initialRequestCount = vi.mocked(fetchInspectionWorldTile).mock.calls.length;
+
+    act(() => {
+      startTransition(() => setDiscarded?.(true));
+    });
+    expect(canvas).toHaveAccessibleName('1893700 检测图像世界');
+    expect(fetchInspectionWorldTile).toHaveBeenCalledTimes(initialRequestCount);
+
+    await act(async () => {
+      resolveTiles.splice(0).forEach((resolve) => resolve());
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(Number(canvas.getAttribute('data-loaded-tiles'))).toBeGreaterThan(0));
+  });
+
+  it('ignores a delayed tile rejection after that tile leaves the committed active ring', async () => {
+    const animationFrames: FrameRequestCallback[] = [];
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      animationFrames.push(callback);
+      return animationFrames.length;
+    });
+    class NonSignalingAbortController {
+      signal = { aborted: false } as AbortSignal;
+      abort() {}
+    }
+    vi.stubGlobal('AbortController', NonSignalingAbortController);
+    const rejectTiles = new Map<string, (error: Error) => void>();
+    vi.mocked(fetchInspectionWorldTile).mockImplementation((_record, tile) => new Promise((_resolve, reject) => {
+      rejectTiles.set(`${tile.x}:${tile.y}`, reject);
+    }));
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const viewport = screen.getByTestId('inspection-world-viewport');
+    await waitFor(() => expect(rejectTiles.has('0:0')).toBe(true));
+
+    viewport.scrollTop = 2_400;
+    fireEvent.scroll(viewport);
+    await act(async () => {
+      animationFrames.splice(0).forEach((callback) => callback(0));
+    });
+    await waitFor(() => expect(rejectTiles.has('0:4')).toBe(true));
+
+    await act(async () => {
+      rejectTiles.get('0:0')?.(new Error('late departed failure'));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole('status')).not.toHaveTextContent('瓦片读取失败');
   });
 
   it('restores native scroll and fit-width scale when switching records', async () => {
@@ -614,6 +693,37 @@ describe('InspectionWorldCanvas', () => {
 
     await waitFor(() => expect(viewport.scrollTop).not.toBe(firstScrollTop));
     expect(screen.getByTestId('inspection-world-canvas')).toHaveAttribute('data-view-scale', firstScale);
+  });
+
+  it('does not refocus when polling supplies a fresh but equivalent defects array', async () => {
+    const { rerender } = render(<InspectionWorldCanvas
+      recordId="1893700"
+      meta={meta}
+      defects={defects}
+      focusDefectId={2019096}
+    />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    await waitFor(() => expect(viewport.scrollTop).toBeGreaterThan(1_000));
+
+    viewport.scrollTop = 1_000;
+    fireEvent.scroll(viewport);
+    await waitFor(() => expect(canvas).toHaveAttribute('data-view-y', '250.000'));
+    const equivalentDefects = defects.map((defect) => ({
+      ...defect,
+      worldRect: defect.worldRect ? { ...defect.worldRect } : null,
+    }));
+
+    rerender(<InspectionWorldCanvas
+      recordId="1893700"
+      meta={meta}
+      defects={equivalentDefects}
+      focusDefectId={2019096}
+    />);
+    await act(async () => Promise.resolve());
+
+    expect(viewport.scrollTop).toBe(1_000);
+    expect(canvas).toHaveAttribute('data-view-y', '250.000');
   });
 });
 
