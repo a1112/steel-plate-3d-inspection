@@ -1,6 +1,7 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fetchBkvArtifactBlobUrl, fetchBkvMaterials, type BkvMaterial } from '../services/bkv-api';
+import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { BkvCompatibilityApp } from './BkvCompatibilityApp';
 
 const { material } = vi.hoisted(() => ({ material: {
@@ -43,11 +44,40 @@ vi.mock('../services/bkv-api', async () => {
   };
 });
 
+vi.mock('../services/inspection-world-api', async () => {
+  const actual = await vi.importActual<typeof import('../services/inspection-world-api')>('../services/inspection-world-api');
+  return {
+    ...actual,
+    fetchInspectionWorldMeta: vi.fn(),
+    fetchInspectionWorldDefects: vi.fn(),
+    fetchInspectionWorldTile: vi.fn(),
+  };
+});
+
+const worldMeta: InspectionWorldMeta = {
+  schema: 'steel.inspection-world.meta.v1', provider: 'bkv', recordId: '1893700', sourceFrameCount: 126,
+  world: {
+    width: 3870, height: 21504, tileSize: 512, maxLevel: 15,
+    cameras: material.cameras.map((camera, index) => ({
+      cameraId: camera.cameraId, offsetX: index * 600, width: index === 5 ? 870 : 600, height: 21504,
+      frameWidth: index === 5 ? 870 : 600, frameHeight: 1024,
+      frameNumbers: Array.from({ length: 21 }, (__, frame) => frame),
+      orientation: { frameOrder: 'ascending', rotation: 0, flipX: false, flipY: false },
+    })),
+  },
+};
+
 describe('BkvCompatibilityApp', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(fetchBkvMaterials).mockResolvedValue([material, { ...material, legacySeqNo: 1893701, steelId: 'STEEL-B' }]);
     vi.mocked(fetchBkvArtifactBlobUrl).mockImplementation(async (path: string) => `blob:${path}`);
+    vi.mocked(fetchInspectionWorldMeta).mockResolvedValue(worldMeta);
+    vi.mocked(fetchInspectionWorldDefects).mockResolvedValue({
+      schema: 'steel.inspection-world.defects.v1', provider: 'bkv', recordId: '1893700',
+      defects: [{ id: 2019096, className: '轧折', cameraId: 2, imageIndex: 12, locatable: true, worldRect: { x: 700, y: 13145, width: 10, height: 10 } }],
+    });
+    vi.mocked(fetchInspectionWorldTile).mockImplementation(async (_record, tile) => ({ ...tile, url: `blob:tile-${tile.level}-${tile.x}-${tile.y}`, revoke: vi.fn() }));
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null);
   });
 
@@ -63,13 +93,13 @@ describe('BkvCompatibilityApp', () => {
     expect(screen.getByText('真实相机在线 0')).toBeInTheDocument();
     expect(screen.getByRole('combobox')).toHaveValue('1893700');
     expect(screen.getByText('轧折')).toBeInTheDocument();
-    expect(await screen.findAllByAltText(/离线二维图/)).toHaveLength(6);
-    expect(screen.getByTestId('bkv-camera-strip')).toHaveAttribute('data-camera-count', '6');
-    expect(screen.getAllByTestId('bkv-camera-lane')).toHaveLength(6);
+    expect(await screen.findByRole('img', { name: '1893700 检测图像世界' })).toBeInTheDocument();
+    expect(screen.getAllByTestId('inspection-world-camera')).toHaveLength(6);
     expect(screen.getByText('C1')).toBeInTheDocument();
     expect(screen.getByText('C6')).toBeInTheDocument();
     expect(screen.queryByText('C7')).not.toBeInTheDocument();
     expect(screen.queryByText('连接相机')).not.toBeInTheDocument();
+    expect(fetchBkvArtifactBlobUrl).not.toHaveBeenCalledWith(expect.stringContaining('camera-'), expect.anything());
 
     fireEvent.click(screen.getByRole('button', { name: 'JIT 平铺展开' }));
     expect(await screen.findByAltText('1893700 JIT 平铺展开')).toHaveAttribute('src', 'blob:unwrapped.png');
@@ -77,7 +107,7 @@ describe('BkvCompatibilityApp', () => {
     await waitFor(() => expect(screen.getByLabelText('1893700 BKV 圆柱三维预览')).toBeInTheDocument());
   });
 
-  it('retains a configured BKV camera lane when its 2D frame is missing', async () => {
+  it('retains configured world coordinates when a manifest source frame is missing', async () => {
     vi.mocked(fetchBkvMaterials).mockResolvedValueOnce([{
       ...material,
       cameras: material.cameras.map((camera, index) => index === 2 ? { ...camera, twoDFrameCount: 0, twoDFrames: [] } : camera),
@@ -88,27 +118,22 @@ describe('BkvCompatibilityApp', () => {
       nextIndex: 0, nextLegacySeqNo: 1893700, completed: false,
     }} />);
 
-    const lanes = await screen.findAllByTestId('bkv-camera-lane');
-    expect(lanes).toHaveLength(6);
-    expect(within(lanes[2]).getByText('C3')).toBeInTheDocument();
-    expect(within(lanes[2]).getByText('无 2D 帧')).toBeInTheDocument();
+    expect(await screen.findByRole('img', { name: '1893700 检测图像世界' })).toBeInTheDocument();
+    expect(screen.getAllByTestId('inspection-world-camera')).toHaveLength(6);
+    expect(screen.getByText('C3')).toBeInTheDocument();
   });
 
-  it('isolates one camera read failure without hiding the other five lanes', async () => {
-    vi.mocked(fetchBkvArtifactBlobUrl).mockImplementation(async (path: string) => {
-      if (path === 'camera-3.jpg') throw new Error('broken camera frame');
-      return `blob:${path}`;
-    });
+  it('focuses the database defect in the same tiled world', async () => {
     render(<BkvCompatibilityApp status={{
       provider: 'bkv', ready: true, mode: 'offline-replay-no-camera-hardware', cameraMode: 'offline-file',
       cameraCount: 6, physicalCamerasOnline: 0, batchId: 'legacy-1893700-1893710', materialCount: 11,
       nextIndex: 0, nextLegacySeqNo: 1893700, completed: false,
     }} />);
 
-    expect(await screen.findAllByAltText(/离线二维图/)).toHaveLength(5);
-    const lanes = screen.getAllByTestId('bkv-camera-lane');
-    expect(within(lanes[2]).getByText('读取失败')).toBeInTheDocument();
-    expect(within(lanes[5]).getByAltText('相机 6 离线二维图')).toHaveAttribute('src', 'blob:camera-6.jpg');
+    const canvas = await screen.findByTestId('inspection-world-canvas');
+    const initialY = canvas.getAttribute('data-view-y');
+    fireEvent.click(screen.getByRole('button', { name: /轧折/ }));
+    await waitFor(() => expect(canvas.getAttribute('data-view-y')).not.toBe(initialY));
   });
 
   it('shows completed state and allows an explicit reset without hardware controls', async () => {
@@ -129,6 +154,6 @@ describe('BkvCompatibilityApp', () => {
       nextIndex: 0, nextLegacySeqNo: 1893700, completed: false,
     }} />);
     expect(await screen.findByText('相机参数异常：清单 6 路，运行参数 8 路')).toBeInTheDocument();
-    expect(screen.getAllByTestId('bkv-camera-lane')).toHaveLength(6);
+    expect(screen.getAllByTestId('inspection-world-camera')).toHaveLength(6);
   });
 });

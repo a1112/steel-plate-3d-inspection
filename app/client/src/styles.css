@@ -15096,20 +15096,32 @@ button {
   gap: 6px;
 }
 
-.bkv-defect-list article {
+.bkv-defect-list article,
+.bkv-defect-list button {
   padding: 8px;
   display: grid;
   gap: 3px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface-subtle);
+  color: inherit;
+  text-align: left;
 }
 
-.bkv-defect-list article strong {
+.bkv-defect-list button { cursor: pointer; }
+
+.bkv-defect-list button.active {
+  border-color: var(--cyan);
+  background: var(--blue-soft);
+}
+
+.bkv-defect-list article strong,
+.bkv-defect-list button strong {
   color: var(--amber);
 }
 
 .bkv-defect-list article span,
+.bkv-defect-list button span,
 .bkv-defect-list p {
   color: var(--muted);
   font-size: 11px;
@@ -15279,6 +15291,12 @@ button {
   overflow: hidden;
   background: #07111c;
   user-select: none;
+}
+
+.bkv-inspection-world {
+  min-height: min(70vh, 720px);
+  height: calc(100vh - 260px);
+  border: 1px solid var(--line);
 }
 
 .inspection-world-viewport canvas {

@@ -1,6 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Images, RotateCcw, ShieldOff, StepForward } from 'lucide-react';
-import { normalizeCameraDisplayLanes } from '../lib/camera-display';
 import {
   fetchBkvArtifactBlobUrl,
   fetchBkvCylinder,
@@ -11,6 +10,13 @@ import {
   type BkvMaterial,
   type BkvStatus,
 } from '../services/bkv-api';
+import {
+  fetchInspectionWorldDefects,
+  fetchInspectionWorldMeta,
+  type InspectionWorldDefect,
+  type InspectionWorldMeta,
+} from '../services/inspection-world-api';
+import { InspectionWorldCanvas } from './InspectionWorldCanvas';
 
 type ViewMode = '2d' | 'unwrapped' | 'cylinder';
 
@@ -67,6 +73,9 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
   const [blobUrls, setBlobUrls] = useState<Record<string, string>>({});
   const [failedPaths, setFailedPaths] = useState<Set<string>>(new Set());
   const [cylinder, setCylinder] = useState<BkvCylinderPreview | null>(null);
+  const [worldMeta, setWorldMeta] = useState<InspectionWorldMeta | null>(null);
+  const [worldDefects, setWorldDefects] = useState<InspectionWorldDefect[]>([]);
+  const [focusDefectId, setFocusDefectId] = useState<string | number | null>(null);
   const [message, setMessage] = useState('正在读取经过校验的旧系统数据…');
   const [busy, setBusy] = useState(false);
 
@@ -90,18 +99,34 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
     () => materials.find((material) => material.legacySeqNo === selectedSequence) ?? materials[0] ?? null,
     [materials, selectedSequence],
   );
-  const cameraLanes = useMemo(
-    () => normalizeCameraDisplayLanes(selected?.cameras.map((camera) => `camera${camera.cameraId}`) ?? []),
-    [selected],
-  );
   const configuredCameraCount = selected?.cameras.length ?? status.cameraCount;
+
+  useEffect(() => {
+    if (!selected || viewMode !== '2d') return;
+    const controller = new AbortController();
+    setWorldMeta(null);
+    setWorldDefects([]);
+    setFocusDefectId(null);
+    Promise.all([
+      fetchInspectionWorldMeta(String(selected.legacySeqNo), controller.signal),
+      fetchInspectionWorldDefects(String(selected.legacySeqNo), controller.signal),
+    ])
+      .then(([meta, defectPayload]) => {
+        if (controller.signal.aborted) return;
+        setWorldMeta(meta);
+        setWorldDefects(defectPayload.defects);
+        setMessage(`已载入 ${meta.world.cameras.length} 路、${meta.sourceFrameCount} 帧检测图像世界`);
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) setMessage(error instanceof Error ? error.message : '检测图像世界读取失败');
+      });
+    return () => controller.abort();
+  }, [selected, viewMode]);
 
   useEffect(() => {
     if (!selected) return;
     const controller = new AbortController();
-    const paths = viewMode === '2d'
-      ? selected.cameras.map((camera) => camera.twoDFrames[0]?.path).filter((path): path is string => Boolean(path))
-      : viewMode === 'unwrapped'
+    const paths = viewMode === 'unwrapped'
         ? [selected.artifacts.unwrapped.path]
         : [];
     Promise.all(paths.map(async (path) => {
@@ -222,33 +247,34 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
           <h3>关联缺陷 {selected.defects.length}</h3>
           <div className="bkv-defect-list">
             {selected.defects.length ? selected.defects.map((defect) => (
-              <article key={defect.legacyDefectId}>
+              <button
+                type="button"
+                key={defect.legacyDefectId}
+                className={String(focusDefectId) === String(defect.legacyDefectId) ? 'active' : ''}
+                onClick={() => {
+                  setViewMode('2d');
+                  setFocusDefectId(defect.legacyDefectId);
+                }}
+              >
                 <strong>{defect.className}</strong>
                 <span>相机 {defect.cameraId} · 置信度 {defect.confidence}%</span>
-              </article>
+              </button>
             )) : <p>该材料无可验证关联缺陷</p>}
           </div>
         </aside>
 
         <section className="bkv-visual-panel">
-          {viewMode === '2d' ? <div
-            className="bkv-camera-strip"
-            data-testid="bkv-camera-strip"
-            data-camera-count={cameraLanes.length}
-            style={{ '--camera-count': cameraLanes.length } as CSSProperties}
-          >
-            {cameraLanes.map((lane, index) => {
-              const camera = selected.cameras[index];
-              const path = camera.twoDFrames[0]?.path;
-              return <figure key={lane.cameraId} data-testid="bkv-camera-lane" data-camera-id={lane.cameraId}>
-                <div className="bkv-camera-lane-label"><strong>{lane.shortLabel}</strong><span>{lane.label}</span></div>
-                {path && blobUrls[path]
-                  ? <img src={blobUrls[path]} alt={`相机 ${camera.cameraId} 离线二维图`} />
-                  : <div className="bkv-image-loading">{path ? failedPaths.has(path) ? '读取失败' : '读取中' : '无 2D 帧'}</div>}
-                <figcaption>2D {camera.twoDFrameCount} / NPZ {camera.npzFrameCount}</figcaption>
-              </figure>;
-            })}
-          </div> : null}
+          {viewMode === '2d' ? (
+            worldMeta
+              ? <InspectionWorldCanvas
+                className="bkv-inspection-world"
+                recordId={String(selected.legacySeqNo)}
+                meta={worldMeta}
+                defects={worldDefects}
+                focusDefectId={focusDefectId}
+              />
+              : <div className="bkv-image-loading">正在读取检测图像世界…</div>
+          ) : null}
           {viewMode === 'unwrapped' ? (
             blobUrls[selected.artifacts.unwrapped.path]
               ? <img className="bkv-unwrapped" src={blobUrls[selected.artifacts.unwrapped.path]} alt={`${selected.legacySeqNo} JIT 平铺展开`} />
