@@ -21,6 +21,21 @@ const meta: InspectionWorldMeta = {
   },
 };
 
+const secondMeta: InspectionWorldMeta = {
+  ...meta,
+  recordId: '1893701',
+  world: {
+    ...meta.world,
+    width: 800,
+    cameras: meta.world.cameras.map((camera, index) => ({
+      ...camera,
+      offsetX: index * (800 / 6),
+      width: 800 / 6,
+      frameWidth: 800 / 6,
+    })),
+  },
+};
+
 const defects: InspectionWorldDefect[] = [
   { id: 2019096, className: '轧折', cameraId: 1, imageIndex: 12, locatable: true, worldRect: { x: 73, y: 13145, width: 10, height: 10 } },
   { id: 2, className: '不可定位', locatable: false, worldRect: null },
@@ -39,7 +54,6 @@ function installNativeScrollTo(viewport: HTMLDivElement) {
       : optionsOrX;
     if (options.left != null) viewport.scrollLeft = options.left;
     if (options.top != null) viewport.scrollTop = options.top;
-    viewport.dispatchEvent(new Event('scroll'));
   }) as typeof viewport.scrollTo;
 }
 
@@ -55,6 +69,7 @@ describe('InspectionWorldCanvas', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('requests only visible tiles and exposes configured camera boundaries', async () => {
@@ -81,8 +96,10 @@ describe('InspectionWorldCanvas', () => {
     await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
   });
 
-  it('uses a native scroll viewport with a scaled lightweight world spacer', () => {
+  it('uses a native scroll viewport with a scaled lightweight world spacer', async () => {
+    vi.mocked(fetchInspectionWorldTile).mockImplementation(() => new Promise(() => undefined));
     render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
 
     expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-scroll-mode', 'native');
     expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({
@@ -114,12 +131,17 @@ describe('InspectionWorldCanvas', () => {
     const canvas = screen.getByTestId('inspection-world-canvas');
     const viewport = inspectionViewport(canvas);
     installNativeScrollTo(viewport);
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: 120, top: 80, right: 1120, bottom: 680,
+      x: 120, y: 80, width: 1000, height: 600,
+      toJSON: () => undefined,
+    });
     const initialScale = Number(canvas.getAttribute('data-view-scale'));
     const wheel = new WheelEvent('wheel', {
       deltaY: -400,
       ctrlKey: true,
-      clientX: 500,
-      clientY: 300,
+      clientX: 620,
+      clientY: 380,
       bubbles: true,
       cancelable: true,
     });
@@ -148,8 +170,13 @@ describe('InspectionWorldCanvas', () => {
     const initialMaximumTileY = Math.max(...vi.mocked(fetchInspectionWorldTile).mock.calls.map(([, tile]) => tile.y));
     vi.mocked(fetchInspectionWorldTile).mockClear();
 
+    viewport.scrollTop = 1_000;
+    fireEvent.scroll(viewport);
+    viewport.scrollTop = 6_000;
+    fireEvent.scroll(viewport);
     viewport.scrollTop = 12_000;
     fireEvent.scroll(viewport);
+    expect(animationFrames).toHaveLength(1);
     await act(async () => {
       animationFrames.splice(0).forEach((callback) => callback(0));
     });
@@ -181,12 +208,16 @@ describe('InspectionWorldCanvas', () => {
     });
     await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).not.toBeCloseTo(1000 / 600, 3));
 
-    rerender(<InspectionWorldCanvas recordId="1893701" meta={{ ...meta, recordId: '1893701' }} defects={defects} />);
+    rerender(<InspectionWorldCanvas recordId="1893701" meta={secondMeta} defects={defects} />);
 
     await waitFor(() => expect(viewport.scrollLeft).toBe(0));
     expect(viewport.scrollTop).toBe(0);
     expect(canvas).toHaveAttribute('data-view-y', '0.000');
-    expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(1000 / 600, 3);
+    expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(1000 / 800, 3);
+    expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({
+      width: '1000px',
+      height: '26880px',
+    });
   });
 
   it('draws a tile after its blob image finishes loading', async () => {
@@ -229,17 +260,35 @@ describe('InspectionWorldCanvas', () => {
   });
 
   it('changes LOD on Ctrl+wheel zoom and pans with pointer dragging', async () => {
+    const animationFrames: FrameRequestCallback[] = [];
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      animationFrames.push(callback);
+      return animationFrames.length;
+    });
     render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
     const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    installNativeScrollTo(viewport);
     await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
     const initialScale = canvas.getAttribute('data-view-scale');
-    const initialX = canvas.getAttribute('data-view-x');
 
     fireEvent.wheel(canvas, { deltaY: -500, ctrlKey: true, clientX: 500, clientY: 300 });
     await waitFor(() => expect(canvas.getAttribute('data-view-scale')).not.toBe(initialScale));
+    await act(async () => {
+      animationFrames.splice(0).forEach((callback) => callback(0));
+    });
+    const initialX = canvas.getAttribute('data-view-x');
+    const initialScrollLeft = viewport.scrollLeft;
     fireEvent.pointerDown(canvas, { pointerId: 1, clientX: 500, clientY: 300 });
     fireEvent.pointerMove(canvas, { pointerId: 1, clientX: 450, clientY: 300 });
     fireEvent.pointerUp(canvas, { pointerId: 1, clientX: 450, clientY: 300 });
+    expect(viewport.scrollLeft).not.toBe(initialScrollLeft);
+    animationFrames.splice(0);
+    fireEvent.scroll(viewport);
+    expect(animationFrames).toHaveLength(1);
+    await act(async () => {
+      animationFrames.splice(0).forEach((callback) => callback(0));
+    });
     await waitFor(() => expect(canvas.getAttribute('data-view-x')).not.toBe(initialX));
   });
 
