@@ -12112,6 +12112,146 @@ fn bkv_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
     }
 }
 
+fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({"code": 503, "error": "inspection_world_provider_unavailable"}).to_string(),
+        );
+    };
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &manager.inspection_world_records().to_string(),
+    )
+}
+
+fn inspection_world_record_sequence(query: &str) -> Result<u64, Vec<u8>> {
+    query_value(query, "recordId")
+        .or_else(|| query_value(query, "legacySeqNo"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code": 400, "error": "inspection_world_record_required"}).to_string(),
+            )
+        })
+}
+
+fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return bkv_inactive_response();
+    };
+    let sequence = match inspection_world_record_sequence(query) {
+        Ok(sequence) => sequence,
+        Err(response) => return response,
+    };
+    match manager.inspection_world_meta(sequence) {
+        Ok(meta) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &meta.to_string(),
+        ),
+        Err(error) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error})
+                .to_string(),
+        ),
+    }
+}
+
+fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return bkv_inactive_response();
+    };
+    let sequence = match inspection_world_record_sequence(query) {
+        Ok(sequence) => sequence,
+        Err(response) => return response,
+    };
+    match manager.inspection_world_defects(sequence) {
+        Ok(defects) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &defects.to_string(),
+        ),
+        Err(error) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error})
+                .to_string(),
+        ),
+    }
+}
+
+fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return bkv_inactive_response();
+    };
+    let sequence = match inspection_world_record_sequence(query) {
+        Ok(sequence) => sequence,
+        Err(response) => return response,
+    };
+    let parse = |key: &str| query_value(query, key).and_then(|value| value.parse::<u32>().ok());
+    let Some(level) = parse("level").and_then(|value| u8::try_from(value).ok()) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "inspection_world_level_required"}).to_string(),
+        );
+    };
+    let (Some(tile_x), Some(tile_y)) = (parse("x"), parse("y")) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "inspection_world_tile_coordinates_required"})
+                .to_string(),
+        );
+    };
+    let format = match query_value(query, "format").as_deref().unwrap_or("jpeg") {
+        "jpeg" | "jpg" => crate::inspection_world::TileFormat::Jpeg,
+        "png" => crate::inspection_world::TileFormat::Png,
+        _ => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code": 400, "error": "inspection_world_tile_format_invalid"}).to_string(),
+            )
+        }
+    };
+    let request = crate::inspection_world::TileRequest::new(level, tile_x, tile_y, format);
+    match manager.inspection_tile(sequence, request) {
+        Ok(bytes) => {
+            let level_header = level.to_string();
+            let x_header = tile_x.to_string();
+            let y_header = tile_y.to_string();
+            http_bytes_response_with_headers(
+                "200 OK",
+                if matches!(format, crate::inspection_world::TileFormat::Png) {
+                    "image/png"
+                } else {
+                    "image/jpeg"
+                },
+                &bytes,
+                &[
+                    ("Cache-Control", "private, max-age=300"),
+                    ("X-World-Level", &level_header),
+                    ("X-World-Tile-X", &x_header),
+                    ("X-World-Tile-Y", &y_header),
+                ],
+            )
+        }
+        Err(error) => http_response(
+            "422 Unprocessable Entity",
+            "application/json; charset=utf-8",
+            &json!({"code": 422, "error": "inspection_world_tile_failed", "detail": error})
+                .to_string(),
+        ),
+    }
+}
+
 fn bkv_next_response(state: &ServiceState) -> Vec<u8> {
     let Some(manager) = state.bkv.as_ref() else {
         return bkv_inactive_response();
@@ -17040,6 +17180,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("GET", "/api/bkv/materials") => bkv_materials_response(&state),
         ("GET", "/api/bkv/material") => bkv_material_response(&state, query),
         ("GET", "/api/bkv/file") => bkv_file_response(&state, query),
+        ("GET", "/api/inspection-world/records") => inspection_world_records_response(&state),
+        ("GET", "/api/inspection-world/meta") => inspection_world_meta_response(&state, query),
+        ("GET", "/api/inspection-world/defects") => inspection_world_defects_response(&state, query),
+        ("GET", "/api/inspection-world/tile") => inspection_world_tile_response(&state, query),
         ("POST", "/api/bkv/replay/next") => bkv_next_response(&state),
         ("POST", "/api/bkv/replay/reset") => bkv_reset_response(&state),
         ("GET", "/api/algorithm/bar-surface/latest") => algorithm_latest_response(),

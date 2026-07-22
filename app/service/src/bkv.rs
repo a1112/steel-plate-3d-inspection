@@ -1,5 +1,6 @@
 use crate::inspection_world::{
-    compose_tile, CameraOrientation, CameraSpec, InspectionWorld, TileRequest, WorldError,
+    compose_tile, CameraOrientation, CameraSpec, InspectionWorld, PixelRect, TileRequest,
+    WorldError,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -195,48 +196,8 @@ impl BkvManager {
             return Ok(bytes);
         }
 
-        let material = self
-            .materials
-            .iter()
-            .find(|item| item.get("legacySeqNo").and_then(Value::as_u64) == Some(legacy_sequence))
-            .ok_or_else(|| format!("BKV material {legacy_sequence} is unavailable"))?;
-        let cameras = material
-            .get("cameras")
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("BKV material {legacy_sequence} cameras are unavailable"))?;
-        let mut specs = Vec::with_capacity(cameras.len());
-        let mut sources = HashMap::<(u32, u32), String>::new();
-        for camera in cameras {
-            let camera_id = json_u32(camera, "cameraId", "camera")?;
-            let frame_width = json_u32(camera, "frameWidth", "camera")?;
-            let frame_height = json_u32(camera, "frameHeight", "camera")?;
-            let frames = camera
-                .get("twoDFrames")
-                .and_then(Value::as_array)
-                .ok_or_else(|| format!("BKV camera {camera_id} twoDFrames are unavailable"))?;
-            let mut frame_numbers = Vec::with_capacity(frames.len());
-            for frame in frames {
-                let frame_number = json_u32(frame, "frameNo", "frame")?;
-                let relative = frame.get("path").and_then(Value::as_str).ok_or_else(|| {
-                    format!("BKV camera {camera_id} frame {frame_number} path is missing")
-                })?;
-                frame_numbers.push(frame_number);
-                sources.insert((camera_id, frame_number), relative.to_string());
-            }
-            specs.push(CameraSpec {
-                camera_id,
-                frame_width,
-                frame_height,
-                frame_numbers,
-                orientation: serde_json::from_value::<CameraOrientation>(
-                    camera.get("orientation").cloned().unwrap_or(Value::Null),
-                )
-                .map_err(|error| {
-                    format!("BKV camera {camera_id} orientation is invalid: {error}")
-                })?,
-            });
-        }
-        let world = InspectionWorld::new(specs).map_err(|error| error.to_string())?;
+        let material = self.material_ref(legacy_sequence)?;
+        let (world, sources) = build_inspection_world(material)?;
         let bytes = compose_tile(&world, request, |camera_id, frame_number| {
             let relative = sources.get(&(camera_id, frame_number)).ok_or_else(|| {
                 WorldError::Artifact(format!(
@@ -253,6 +214,112 @@ impl BkvManager {
             .map_err(|_| "BKV tile cache lock poisoned".to_string())?
             .insert(key, bytes.clone());
         Ok(bytes)
+    }
+
+    pub fn inspection_world_records(&self) -> Value {
+        let records = self
+            .materials
+            .iter()
+            .map(|material| {
+                let sequence = material.get("legacySeqNo").cloned().unwrap_or(Value::Null);
+                json!({
+                    "recordId": sequence.as_u64().map(|value| value.to_string()),
+                    "legacySeqNo": sequence,
+                    "steelId": material.get("steelId").cloned().unwrap_or(Value::Null),
+                    "steelType": material.get("steelType").cloned().unwrap_or(Value::Null),
+                    "lengthMm": material.get("lengthMm").cloned().unwrap_or(Value::Null),
+                    "inspectionTime": material.get("inspectionTime").cloned().unwrap_or(Value::Null),
+                    "defectCount": material.get("defects").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "schema": "steel.inspection-world.records.v1",
+            "provider": "bkv",
+            "records": records,
+        })
+    }
+
+    pub fn inspection_world_meta(&self, legacy_sequence: u64) -> Result<Value, String> {
+        let material = self.material_ref(legacy_sequence)?;
+        let (world, _) = build_inspection_world(material)?;
+        let source_frame_count = world
+            .cameras
+            .iter()
+            .map(|camera| camera.frame_numbers.len())
+            .sum::<usize>();
+        Ok(json!({
+            "schema": "steel.inspection-world.meta.v1",
+            "provider": "bkv",
+            "recordId": legacy_sequence.to_string(),
+            "legacySeqNo": legacy_sequence,
+            "sourceFrameCount": source_frame_count,
+            "world": world,
+        }))
+    }
+
+    pub fn inspection_world_defects(&self, legacy_sequence: u64) -> Result<Value, String> {
+        let material = self.material_ref(legacy_sequence)?;
+        let (world, _) = build_inspection_world(material)?;
+        let defects = material
+            .get("defects")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|defect| {
+                let camera_id = defect
+                    .get("cameraId")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+                let image_index = defect
+                    .get("imageIndex")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+                let image_rect = defect.get("imageRect2d");
+                let local = image_rect.and_then(|rect| {
+                    Some(
+                        PixelRect::from_edges(
+                            json_u32(rect, "left", "defect rectangle").ok()?,
+                            json_u32(rect, "right", "defect rectangle").ok()?,
+                            json_u32(rect, "top", "defect rectangle").ok()?,
+                            json_u32(rect, "bottom", "defect rectangle").ok()?,
+                        )
+                        .ok()?,
+                    )
+                });
+                let world_rect = camera_id
+                    .zip(image_index)
+                    .zip(local)
+                    .and_then(|((camera, frame), rect)| world.map_defect(camera, frame, rect).ok());
+                json!({
+                    "id": defect.get("legacyDefectId").cloned().unwrap_or(Value::Null),
+                    "className": defect.get("className").cloned().unwrap_or(Value::Null),
+                    "grade": defect.get("grade").cloned().unwrap_or(Value::Null),
+                    "confidence": defect.get("confidence").cloned().unwrap_or(Value::Null),
+                    "cameraId": camera_id,
+                    "imageIndex": image_index,
+                    "locatable": world_rect.is_some(),
+                    "worldRect": world_rect,
+                    "trace": {
+                        "imageRect2d": image_rect.cloned().unwrap_or(Value::Null),
+                        "steelRect2d": defect.get("steelRect2d").cloned().unwrap_or(Value::Null),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "schema": "steel.inspection-world.defects.v1",
+            "provider": "bkv",
+            "recordId": legacy_sequence.to_string(),
+            "defects": defects,
+        }))
+    }
+
+    fn material_ref(&self, legacy_sequence: u64) -> Result<&Value, String> {
+        self.materials
+            .iter()
+            .find(|item| item.get("legacySeqNo").and_then(Value::as_u64) == Some(legacy_sequence))
+            .ok_or_else(|| format!("BKV material {legacy_sequence} is unavailable"))
     }
 
     pub fn capture_next(&self) -> Result<Option<Value>, String> {
@@ -649,7 +716,16 @@ mod tests {
                 "steelType": "37Mn/2",
                 "lengthMm": 12096.0,
                 "wallThicknessMm": null,
-                "defects": [],
+                "defects": if offset == 0 { json!([{
+                    "legacyDefectId": 2019096,
+                    "cameraId": 1,
+                    "imageIndex": 0,
+                    "className": "轧折",
+                    "grade": 16,
+                    "confidence": 51,
+                    "imageRect2d": {"left": 0, "right": 1, "top": 0, "bottom": 1},
+                    "steelRect2d": {"left": 100, "right": 101, "top": 200, "bottom": 201}
+                }]) } else { json!([]) },
                 "cameras": cameras,
                 "artifacts": {
                     "unwrapped": artifact(&root, &format!("preview/{legacy}/unwrapped.png"), b"png"),
@@ -801,6 +877,32 @@ mod tests {
     }
 
     #[test]
+    fn exposes_unified_world_metadata_and_defect_coordinates() {
+        let (root, manifest, cursor) = fixture("world-contract");
+        let manager = BkvManager::load(&root, &manifest, &cursor).unwrap();
+
+        let records = manager.inspection_world_records();
+        assert_eq!(records["schema"], "steel.inspection-world.records.v1");
+        assert_eq!(records["provider"], "bkv");
+        assert_eq!(records["records"].as_array().unwrap().len(), 11);
+
+        let meta = manager.inspection_world_meta(1_893_700).unwrap();
+        assert_eq!(meta["schema"], "steel.inspection-world.meta.v1");
+        assert_eq!(meta["world"]["width"], 12);
+        assert_eq!(meta["world"]["height"], 2);
+        assert_eq!(meta["sourceFrameCount"], 6);
+        assert_eq!(meta["world"]["cameras"].as_array().unwrap().len(), 6);
+
+        let defects = manager.inspection_world_defects(1_893_700).unwrap();
+        assert_eq!(defects["schema"], "steel.inspection-world.defects.v1");
+        assert_eq!(defects["defects"][0]["locatable"], true);
+        assert_eq!(defects["defects"][0]["worldRect"]["x"], 0);
+        assert_eq!(defects["defects"][0]["worldRect"]["y"], 0);
+        assert_eq!(defects["defects"][0]["trace"]["steelRect2d"]["top"], 200);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_wrong_cardinality_hash_and_path_escape() {
         let (root, manifest, cursor) = fixture("reject");
         let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
@@ -838,4 +940,49 @@ fn json_u32(value: &Value, key: &str, label: &str) -> Result<u32, String> {
         .and_then(Value::as_u64)
         .and_then(|number| u32::try_from(number).ok())
         .ok_or_else(|| format!("BKV {label} {key} is invalid"))
+}
+
+fn build_inspection_world(
+    material: &Value,
+) -> Result<(InspectionWorld, HashMap<(u32, u32), String>), String> {
+    let legacy_sequence = material
+        .get("legacySeqNo")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let cameras = material
+        .get("cameras")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("BKV material {legacy_sequence} cameras are unavailable"))?;
+    let mut specs = Vec::with_capacity(cameras.len());
+    let mut sources = HashMap::<(u32, u32), String>::new();
+    for camera in cameras {
+        let camera_id = json_u32(camera, "cameraId", "camera")?;
+        let frame_width = json_u32(camera, "frameWidth", "camera")?;
+        let frame_height = json_u32(camera, "frameHeight", "camera")?;
+        let frames = camera
+            .get("twoDFrames")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("BKV camera {camera_id} twoDFrames are unavailable"))?;
+        let mut frame_numbers = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let frame_number = json_u32(frame, "frameNo", "frame")?;
+            let relative = frame.get("path").and_then(Value::as_str).ok_or_else(|| {
+                format!("BKV camera {camera_id} frame {frame_number} path is missing")
+            })?;
+            frame_numbers.push(frame_number);
+            sources.insert((camera_id, frame_number), relative.to_string());
+        }
+        specs.push(CameraSpec {
+            camera_id,
+            frame_width,
+            frame_height,
+            frame_numbers,
+            orientation: serde_json::from_value::<CameraOrientation>(
+                camera.get("orientation").cloned().unwrap_or(Value::Null),
+            )
+            .map_err(|error| format!("BKV camera {camera_id} orientation is invalid: {error}"))?,
+        });
+    }
+    let world = InspectionWorld::new(specs).map_err(|error| error.to_string())?;
+    Ok((world, sources))
 }
