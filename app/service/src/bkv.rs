@@ -15,7 +15,6 @@ const EXPECTED_CAMERAS: usize = 6;
 #[derive(Debug)]
 pub struct BkvManager {
     root: PathBuf,
-    manifest_path: PathBuf,
     cursor_path: PathBuf,
     batch_id: String,
     materials: Vec<Value>,
@@ -90,7 +89,6 @@ impl BkvManager {
         let cursor = load_cursor(&cursor_path, &batch_id, materials.len())?;
         Ok(Self {
             root,
-            manifest_path,
             cursor_path,
             batch_id,
             materials,
@@ -117,8 +115,6 @@ impl BkvManager {
             "nextIndex": next_index,
             "nextLegacySeqNo": self.materials.get(next_index).and_then(|item| item.get("legacySeqNo")).cloned(),
             "completed": next_index >= self.materials.len(),
-            "manifestPath": self.manifest_path.display().to_string(),
-            "dataRoot": self.root.display().to_string(),
         })
     }
 
@@ -452,7 +448,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file =
         fs::File::open(path).map_err(|error| format!("BKV artifact open failed: {error}"))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
@@ -553,6 +549,20 @@ mod tests {
         assert_eq!(status["ready"], true);
         assert_eq!(status["cameraMode"], "offline-file");
         assert_eq!(status["cameraCount"], 6);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_hash_validation_does_not_consume_the_thread_stack() {
+        let (root, manifest, cursor) = fixture("small-stack");
+        let worker_root = root.clone();
+        let worker = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                BkvManager::load(&worker_root, &manifest, &cursor).map(|manager| manager.status())
+            })
+            .unwrap();
+        assert_eq!(worker.join().unwrap().unwrap()["ready"], true);
         fs::remove_dir_all(root).unwrap();
     }
 

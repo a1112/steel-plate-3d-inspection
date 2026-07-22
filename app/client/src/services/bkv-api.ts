@@ -12,8 +12,6 @@ export type BkvStatus = {
   nextIndex: number;
   nextLegacySeqNo: number | null;
   completed: boolean;
-  manifestPath?: string;
-  dataRoot?: string;
 };
 
 export type BkvArtifact = {

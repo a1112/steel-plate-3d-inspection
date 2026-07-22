@@ -5455,9 +5455,6 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("GET", "/api/admin/database/backup")
         | ("GET", "/api/admin/database/integrity")
         | ("GET", "/api/admin/diagnostics") => Some("admin.overview"),
-        ("GET", "/api/bkv/materials") | ("GET", "/api/bkv/material") | ("GET", "/api/bkv/file") => {
-            Some("admin.records")
-        }
         ("POST", "/api/bkv/replay/next") | ("POST", "/api/bkv/replay/reset") => {
             Some("admin.services")
         }
@@ -19083,6 +19080,11 @@ mod tests {
         }
         assert!(!is_bkv_hardware_mutation("GET", "/api/bkv/material"));
         assert!(!is_bkv_hardware_mutation("POST", "/api/bkv/replay/next"));
+        assert_eq!(permission_for_route("GET", "/api/bkv/file"), None);
+        assert_eq!(
+            permission_for_route("POST", "/api/bkv/replay/reset"),
+            Some("admin.services")
+        );
         let response = response_text(bkv_hardware_operation_forbidden_response());
         assert!(response.starts_with("HTTP/1.1 409 Conflict"));
         assert!(response.contains("bkv_hardware_operation_forbidden"));
