@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { StrictMode } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fetchInspectionWorldTile, type InspectionWorldDefect, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { InspectionWorldCanvas } from './InspectionWorldCanvas';
 
@@ -51,6 +51,10 @@ describe('InspectionWorldCanvas', () => {
       clearRect: vi.fn(), fillRect: vi.fn(), drawImage: vi.fn(), strokeRect: vi.fn(), fillText: vi.fn(),
       save: vi.fn(), restore: vi.fn(), setTransform: vi.fn(),
     } as unknown as CanvasRenderingContext2D);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('requests only visible tiles and exposes configured camera boundaries', async () => {
