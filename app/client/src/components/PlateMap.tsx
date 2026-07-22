@@ -8,9 +8,11 @@ import type { CaptureImageItem, DefectItem, DefectType } from '../data/inspectio
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import { createSequentialCameraLanes, type CameraDisplayLane } from '../lib/camera-display';
 import { barSurfaceFileUrl, type BarSurfaceCamera, type BarSurfaceMesh } from '../services/bar-surface-api';
+import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, type InspectionWorldDefect, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { clampPreviewPositionM, DEFAULT_PLATE_LENGTH_M, type SurfaceDisplayMode } from '../state/inspection-ui';
 import { Panel } from './Panel';
 import { ProductionArtifactView } from './ProductionArtifactView';
+import { InspectionWorldCanvas } from './InspectionWorldCanvas';
 
 interface PlateMapProps {
   defectTypes: DefectType[];
@@ -1187,10 +1189,53 @@ export function PlateMap({
   const setViewMode = onViewModeChange ?? setLocalViewMode;
   const [hoveredDefectId, setHoveredDefectId] = useState<string | null>(null);
   const [unfoldOrientation, setUnfoldOrientation] = useState<UnfoldOrientation>('horizontal');
+  const [persistedWorld, setPersistedWorld] = useState<{
+    recordId: string;
+    meta: InspectionWorldMeta;
+    defects: InspectionWorldDefect[];
+  } | null>(null);
+  const [worldUnavailable, setWorldUnavailable] = useState(false);
   const productionCameraImageCount = surfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
   const capturedCameraImageCount = new Set(captureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
   const displayedCameraImageCount = Math.min(cameraLanes.length, Math.max(productionCameraImageCount, capturedCameraImageCount));
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
+  useEffect(() => {
+    setPersistedWorld(null);
+    setWorldUnavailable(false);
+    if (artifactMode !== 'production' || !inspectionId || viewMode !== '2d') return;
+    const controller = new AbortController();
+    const refresh = async () => {
+      try {
+        const meta = await fetchInspectionWorldMeta(inspectionId, controller.signal);
+        if (controller.signal.aborted) return;
+        setWorldUnavailable(false);
+        setPersistedWorld((current) => ({
+          recordId: inspectionId,
+          meta,
+          defects: current?.recordId === inspectionId ? current.defects : [],
+        }));
+        try {
+          const defectPayload = await fetchInspectionWorldDefects(inspectionId, controller.signal);
+          if (!controller.signal.aborted) {
+            setPersistedWorld((current) => current?.recordId === inspectionId
+              ? { ...current, defects: defectPayload.defects }
+              : current);
+          }
+        } catch {
+          // Image-world availability is independent from optional defect overlays.
+        }
+      } catch {
+        if (!controller.signal.aborted) setWorldUnavailable(true);
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [artifactMode, inspectionId, viewMode]);
+  const activePersistedWorld = persistedWorld?.recordId === inspectionId ? persistedWorld : null;
   const selectRelativeDefect = (step: number) => {
     if (defects.length === 0) {
       return;
@@ -1268,7 +1313,7 @@ export function PlateMap({
           ? '演示/测试数据：允许使用内置表面与模拟点云，不代表当前生产结果。'
           : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；实际相机图像 ${displayedCameraImageCount}/${cameraLanes.length} 路（自动裁剪黑边）。`}
       </div>}
-      {viewMode === '2d' ? (
+      {viewMode === '2d' && !activePersistedWorld ? (
         <div className="unfold-orientation-switch" role="group" aria-label="二维展开方向">
           <button type="button" className={unfoldOrientation === 'horizontal' ? 'active' : ''} aria-pressed={unfoldOrientation === 'horizontal'} onClick={() => setUnfoldOrientation('horizontal')}>横向</button>
           <button type="button" className={unfoldOrientation === 'vertical' ? 'active' : ''} aria-pressed={unfoldOrientation === 'vertical'} onClick={() => setUnfoldOrientation('vertical')}>纵向</button>
@@ -1317,6 +1362,15 @@ export function PlateMap({
           surfaceMesh={surfaceMesh}
           artifactStatus={artifactStatus}
         />
+      ) : activePersistedWorld ? (
+        <InspectionWorldCanvas
+          key={`${activePersistedWorld.recordId}:${activePersistedWorld.meta.sourceFrameCount}:${activePersistedWorld.meta.world.width}:${activePersistedWorld.meta.world.height}`}
+          className="online-inspection-world"
+          recordId={activePersistedWorld.recordId}
+          meta={activePersistedWorld.meta}
+          defects={activePersistedWorld.defects}
+          focusDefectId={selectedDefectId}
+        />
       ) : cameraLanes.length === 0 ? (
         <div className="production-artifact-empty" role="status">
           <strong>未配置 2D 相机</strong>
@@ -1324,6 +1378,7 @@ export function PlateMap({
         </div>
       ) : (
         <div className={`bar-unfolded-layout orientation-${unfoldOrientation}`}>
+          {artifactMode === 'production' && worldUnavailable ? <span className="live-preview-badge">实时预览</span> : null}
           <BarUnfoldedMap
             defects={defects}
             defectTypes={defectTypes}

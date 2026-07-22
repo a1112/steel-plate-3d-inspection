@@ -64,6 +64,32 @@ Run browser verification against an already started BKV service and client with:
 scripts/test-runtime-ui-smoke.ps1 -ExpectBkv
 ```
 
+The 2D viewer consumes one provider-neutral, on-demand image-world contract:
+`/api/inspection-world/records`, `/meta`, `/defects`, and `/tile`. BKV mode builds
+six camera columns from the manifest JPEG frames (C1 through C6, frame order
+ascending, rotation 0, no flips). The browser requests only visible/prefetched
+tiles and does not prebuild a giant stitched bitmap. `-ExpectBkv` verifies actual
+Canvas pixels, bounded tile requests, defect focus, and the retained JIT/3D tabs.
+
+When BKV is disabled, the same routes use production inspection tables. Records
+come from `production_inspection`; intensity frames are sorted by their original
+`capture_file.sequence_no` and then assigned dense zero-based world rows, so one-based
+or gapped business sequences still render without blank seams. The original-to-world
+row map is retained for defect lookup. Defects come
+from `production_defect`. An online defect is locatable either through the unified
+`cameraId` + zero-based `imageIndex` + `imageRect2d` fields, or through the current
+production `camera_id` + `artifacts.cameraId/sequenceNo/roi` evidence. Millimetre-only
+geometry remains trace metadata and is never guessed into pixels. Capture paths
+are canonicalized beneath the inspection `storage_root`, and the indexed world is
+cached by the production record revision so each tile does not rescan every source
+image. A selected online record without persisted intensity frames keeps the
+existing eight-camera view, visibly labelled `实时预览`; the client polls and upgrades
+that view when the first frame or later frames become durable. Production database
+selection and failure behavior remain unchanged:
+MySQL must be selected through `STEEL_DATABASE_ENGINE=mysql` and
+`STEEL_DATABASE_URL`; these image-world routes do not introduce SQLite or BKV
+fallback.
+
 ## Windows production service
 
 The Release runtime contains one SCM host, `service\steel-runtime-supervisor.exe`, for the capture provider, trigger gateway, and Rust service. Its contract is ordered application-level readiness, strict business drain, bounded whole-stack stop/restart, child-process-tree cleanup, live managed-log rotation, and atomic restart-budget state publication. The non-elevated regression proves RuntimeRoot/StateRoot isolation, source/layout/config fail-closed cases, Trigger-then-Service drain (including timeout cases), `inFlight` convergence, 50 MiB online rotation, `.1` through `.5` retention, persisted budget exhaustion, and stable-runtime recovery of `StateRoot\service\supervisor-status.json`; the install-related PowerShell files parse, the static versioned-install policy passes, and the Supervisor Release target compiles. These checks still do not prove real SCM transitions, effective target-machine ACLs, signed-package installation, power-loss recovery, or a database migration transaction.

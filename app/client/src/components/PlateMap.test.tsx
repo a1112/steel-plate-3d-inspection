@@ -1,10 +1,40 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import type { ComponentProps } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType } from '../data/inspection';
 import { createSequentialCameraLanes } from '../lib/camera-display';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
+import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { cameraBandRotationRadians, PlateMap as ProductionPlateMap } from './PlateMap';
+
+vi.mock('../services/inspection-world-api', async () => {
+  const actual = await vi.importActual<typeof import('../services/inspection-world-api')>('../services/inspection-world-api');
+  return {
+    ...actual,
+    fetchInspectionWorldMeta: vi.fn(),
+    fetchInspectionWorldDefects: vi.fn(),
+    fetchInspectionWorldTile: vi.fn(),
+  };
+});
+
+const onlineWorldMeta: InspectionWorldMeta = {
+  schema: 'steel.inspection-world.meta.v1', provider: 'online', recordId: 'INS-WORLD-1', sourceFrameCount: 8,
+  world: {
+    width: 800, height: 1024, tileSize: 512, maxLevel: 10,
+    cameras: Array.from({ length: 8 }, (_, index) => ({
+      cameraId: index + 1, offsetX: index * 100, width: 100, height: 1024,
+      frameWidth: 100, frameHeight: 1024, frameNumbers: [0],
+      orientation: { frameOrder: 'ascending', rotation: 0, flipX: false, flipY: false },
+    })),
+  },
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(fetchInspectionWorldMeta).mockRejectedValue(new Error('no persisted world'));
+  vi.mocked(fetchInspectionWorldDefects).mockRejectedValue(new Error('no persisted world'));
+  vi.mocked(fetchInspectionWorldTile).mockImplementation(async (_record, tile) => ({ ...tile, url: 'blob:online-world', revoke: vi.fn() }));
+});
 
 // These legacy interaction cases intentionally exercise the bundled demo/test
 // visualization. Production behavior is covered separately below.
@@ -70,6 +100,74 @@ describe('parameterized camera lanes', () => {
 
     expect(screen.getByRole('status')).toHaveTextContent('未配置 2D 相机');
     expect(screen.queryByRole('region', { name: /相机圆周展开缺陷图/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('online inspection world compatibility', () => {
+  const common = {
+    defectTypes,
+    defects: [],
+    defectTypeCounts: {},
+    hiddenTypeIds: new Set<string>(),
+    selectedDefectId: null,
+    surfaceMode: 'all' as const,
+    previewPositionM: 0,
+    cameraLanes: createSequentialCameraLanes(8),
+    onToggleType: vi.fn(),
+    onSurfaceModeChange: vi.fn(),
+    onPreviewPositionChange: vi.fn(),
+    onSelectDefect: vi.fn(),
+  };
+
+  it('uses the shared tiled Canvas for a persisted online inspection world', async () => {
+    const context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      clearRect: vi.fn(), fillRect: vi.fn(), drawImage: vi.fn(), strokeRect: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    vi.mocked(fetchInspectionWorldMeta).mockResolvedValue(onlineWorldMeta);
+    vi.mocked(fetchInspectionWorldDefects).mockResolvedValue({
+      schema: 'steel.inspection-world.defects.v1', provider: 'online', recordId: 'INS-WORLD-1', defects: [],
+    });
+
+    render(<ProductionPlateMap {...common} artifactMode="production" inspectionId="INS-WORLD-1" />);
+
+    expect(await screen.findByTestId('inspection-world-canvas')).toBeInTheDocument();
+    expect(screen.getAllByTestId('inspection-world-camera')).toHaveLength(8);
+    expect(screen.queryByText('实时预览')).not.toBeInTheDocument();
+    context.mockRestore();
+  });
+
+  it('labels the existing camera bands as a live preview when no world is persisted', async () => {
+    render(<ProductionPlateMap {...common} artifactMode="production" inspectionId="INS-LIVE-1" />);
+
+    expect(await screen.findByText('实时预览')).toBeInTheDocument();
+    expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
+    expect(screen.getByTestId('bar-unfolded-map')).toBeInTheDocument();
+  });
+
+  it('upgrades a live preview when the first persisted frame becomes available', async () => {
+    vi.useFakeTimers();
+    const context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      clearRect: vi.fn(), fillRect: vi.fn(), drawImage: vi.fn(), strokeRect: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    try {
+      vi.mocked(fetchInspectionWorldMeta)
+        .mockRejectedValueOnce(new Error('no frames yet'))
+        .mockResolvedValue(onlineWorldMeta);
+      vi.mocked(fetchInspectionWorldDefects).mockResolvedValue({
+        schema: 'steel.inspection-world.defects.v1', provider: 'online', recordId: 'INS-WORLD-1', defects: [],
+      });
+      render(<ProductionPlateMap {...common} artifactMode="production" inspectionId="INS-WORLD-1" />);
+      await act(async () => { await Promise.resolve(); });
+      expect(screen.getByText('实时预览')).toBeInTheDocument();
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+
+      expect(screen.getByTestId('inspection-world-canvas')).toBeInTheDocument();
+      expect(fetchInspectionWorldMeta).toHaveBeenCalledTimes(2);
+    } finally {
+      context.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
 

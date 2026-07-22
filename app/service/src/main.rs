@@ -232,6 +232,7 @@ struct ServiceState {
     production_task_wakeup_generation: Mutex<u64>,
     production_task_worker_status: Mutex<ProductionTaskWorkerStatus>,
     production_task_sequence: AtomicU64,
+    inspection_world_cache: Mutex<HashMap<String, OnlineInspectionWorldCacheEntry>>,
     runtime_admission: Mutex<RuntimeAdmissionState>,
     runtime_drain_token: Vec<u8>,
     trigger_gateway_origin: String,
@@ -12113,24 +12114,266 @@ fn bkv_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
 }
 
 fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
-    let Some(manager) = state.bkv.as_ref() else {
+    if let Some(manager) = state.bkv.as_ref() {
         return http_response(
-            "503 Service Unavailable",
+            "200 OK",
             "application/json; charset=utf-8",
-            &json!({"code": 503, "error": "inspection_world_provider_unavailable"}).to_string(),
+            &manager.inspection_world_records().to_string(),
         );
+    }
+    let records = match state.runtime.block_on(db::list_recent_production_inspections(
+        &state.database.connection,
+        200,
+    )) {
+        Ok(records) => records,
+        Err(error) => {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code": 503, "error": "inspection_world_database_unavailable", "detail": error.to_string()}).to_string(),
+            )
+        }
     };
     http_response(
         "200 OK",
         "application/json; charset=utf-8",
-        &manager.inspection_world_records().to_string(),
+        &json!({
+            "schema": "steel.inspection-world.records.v1",
+            "provider": "online",
+            "records": records.into_iter().map(|record| json!({
+                "recordId": record.id,
+                "steelId": record.material_id,
+                "inspectionTime": if record.finished_at.is_empty() { record.started_at } else { record.finished_at },
+                "defectCount": record.defect_count,
+            })).collect::<Vec<_>>()
+        }).to_string(),
     )
 }
 
-fn inspection_world_record_sequence(query: &str) -> Result<u64, Vec<u8>> {
+#[derive(Clone)]
+struct OnlineInspectionWorld {
+    world: inspection_world::InspectionWorld,
+    frames: HashMap<(u32, u32), PathBuf>,
+    sequence_ordinals: HashMap<(u32, u32), u32>,
+    defects: Vec<db::entities::production_defect::Model>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct OnlineInspectionWorldRevision {
+    capture_count: i32,
+    defect_count: i32,
+    status: String,
+    finished_at: String,
+    storage_root: String,
+    rows: db::InspectionWorldRevision,
+}
+
+struct OnlineInspectionWorldCacheEntry {
+    revision: OnlineInspectionWorldRevision,
+    world: Arc<OnlineInspectionWorld>,
+    checked_at: Instant,
+}
+
+fn numeric_camera_id(value: &str) -> Option<u32> {
+    let digits = value
+        .trim()
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    digits
+        .parse::<u32>()
+        .ok()
+        .filter(|camera_id| *camera_id > 0)
+}
+
+fn online_capture_path(
+    inspection: &db::entities::production_inspection::Model,
+    value: &str,
+) -> Result<PathBuf, String> {
+    if inspection.storage_root.trim().is_empty() {
+        return Err(format!(
+            "online inspection {} has no storage root",
+            inspection.id
+        ));
+    }
+    let root = fs::canonicalize(&inspection.storage_root).map_err(|error| {
+        format!(
+            "online inspection {} storage root {} is unavailable: {error}",
+            inspection.id, inspection.storage_root
+        )
+    })?;
+    let path = PathBuf::from(value);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|error| format!("{}: {error}", candidate.display()))?;
+    if !canonical.starts_with(&root) {
+        return Err(format!(
+            "capture path {} is outside inspection storage root {}",
+            canonical.display(),
+            root.display()
+        ));
+    }
+    if !canonical.is_file() {
+        return Err(format!(
+            "capture path {} is not a file",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn load_online_inspection_world(
+    state: &ServiceState,
+    record_id: &str,
+) -> Result<Arc<OnlineInspectionWorld>, String> {
+    {
+        let cache = state
+            .inspection_world_cache
+            .lock()
+            .map_err(|_| "inspection world cache lock poisoned".to_string())?;
+        if let Some(entry) = cache
+            .get(record_id)
+            .filter(|entry| entry.checked_at.elapsed() < Duration::from_secs(2))
+        {
+            return Ok(Arc::clone(&entry.world));
+        }
+    }
+    let inspection = state
+        .runtime
+        .block_on(db::find_production_inspection(
+            &state.database.connection,
+            record_id,
+        ))
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("online inspection {record_id} not found"))?;
+    let rows = state
+        .runtime
+        .block_on(db::inspection_world_revision(
+            &state.database.connection,
+            record_id,
+        ))
+        .map_err(|error| error.to_string())?;
+    let revision = OnlineInspectionWorldRevision {
+        capture_count: inspection.capture_count,
+        defect_count: inspection.defect_count,
+        status: inspection.status.clone(),
+        finished_at: inspection.finished_at.clone(),
+        storage_root: inspection.storage_root.clone(),
+        rows,
+    };
+    let mut cache = state
+        .inspection_world_cache
+        .lock()
+        .map_err(|_| "inspection world cache lock poisoned".to_string())?;
+    if let Some(entry) = cache.get_mut(record_id) {
+        if entry.revision == revision {
+            entry.checked_at = Instant::now();
+            return Ok(Arc::clone(&entry.world));
+        }
+    }
+    let captures = state
+        .runtime
+        .block_on(db::capture_files_for_inspection(
+            &state.database.connection,
+            record_id,
+        ))
+        .map_err(|error| error.to_string())?;
+    let defects = state
+        .runtime
+        .block_on(db::production_defects_for_inspection(
+            &state.database.connection,
+            record_id,
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut grouped: HashMap<u32, Vec<db::entities::capture_file::Model>> = HashMap::new();
+    for capture in captures {
+        if !capture.data_name.eq_ignore_ascii_case("intensity") {
+            continue;
+        }
+        let Some(camera_id) = numeric_camera_id(&capture.camera_id) else {
+            continue;
+        };
+        grouped.entry(camera_id).or_default().push(capture);
+    }
+    if grouped.is_empty() {
+        return Err(format!(
+            "online inspection {record_id} has no persisted intensity frames"
+        ));
+    }
+    let mut camera_ids = grouped.keys().copied().collect::<Vec<_>>();
+    camera_ids.sort_unstable();
+    let mut specs = Vec::with_capacity(camera_ids.len());
+    let mut frames = HashMap::new();
+    let mut sequence_ordinals = HashMap::new();
+    for camera_id in camera_ids {
+        let rows = grouped.get_mut(&camera_id).expect("camera group");
+        rows.sort_by_key(|row| row.sequence_no);
+        let mut dimensions = None;
+        for (ordinal, row) in rows.iter().enumerate() {
+            let sequence = u32::try_from(row.sequence_no).map_err(|_| {
+                format!(
+                    "camera {camera_id} has negative sequence {}",
+                    row.sequence_no
+                )
+            })?;
+            let image_index = u32::try_from(ordinal)
+                .map_err(|_| format!("camera {camera_id} has too many frames"))?;
+            let path = online_capture_path(&inspection, &row.path)?;
+            let current = image::image_dimensions(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            if dimensions
+                .replace(current)
+                .is_some_and(|expected| expected != current)
+            {
+                return Err(format!(
+                    "camera {camera_id} intensity dimensions are inconsistent"
+                ));
+            }
+            frames.insert((camera_id, image_index), path);
+            sequence_ordinals.insert((camera_id, sequence), image_index);
+        }
+        let (frame_width, frame_height) = dimensions.expect("non-empty capture group");
+        specs.push(inspection_world::CameraSpec {
+            camera_id,
+            frame_width,
+            frame_height,
+            frame_numbers: (0..rows.len() as u32).collect(),
+            orientation: inspection_world::CameraOrientation::identity(),
+        });
+    }
+    let world = inspection_world::InspectionWorld::new(specs).map_err(|error| error.to_string())?;
+    let online = Arc::new(OnlineInspectionWorld {
+        world,
+        frames,
+        sequence_ordinals,
+        defects,
+    });
+    if cache.len() >= 16 && !cache.contains_key(record_id) {
+        cache.clear();
+    }
+    cache.insert(
+        record_id.to_string(),
+        OnlineInspectionWorldCacheEntry {
+            revision,
+            world: Arc::clone(&online),
+            checked_at: Instant::now(),
+        },
+    );
+    Ok(online)
+}
+
+fn inspection_world_record_id(query: &str) -> Result<String, Vec<u8>> {
     query_value(query, "recordId")
         .or_else(|| query_value(query, "legacySeqNo"))
-        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             http_response(
                 "400 Bad Request",
@@ -12141,18 +12384,43 @@ fn inspection_world_record_sequence(query: &str) -> Result<u64, Vec<u8>> {
 }
 
 fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> {
-    let Some(manager) = state.bkv.as_ref() else {
-        return bkv_inactive_response();
-    };
-    let sequence = match inspection_world_record_sequence(query) {
-        Ok(sequence) => sequence,
+    let record_id = match inspection_world_record_id(query) {
+        Ok(record_id) => record_id,
         Err(response) => return response,
     };
-    match manager.inspection_world_meta(sequence) {
-        Ok(meta) => http_response(
+    if let Some(manager) = state.bkv.as_ref() {
+        let Ok(sequence) = record_id.parse::<u64>() else {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code": 400, "error": "inspection_world_record_invalid"}).to_string(),
+            );
+        };
+        return match manager.inspection_world_meta(sequence) {
+            Ok(meta) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &meta.to_string(),
+            ),
+            Err(error) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error}).to_string(),
+            ),
+        };
+    }
+    match load_online_inspection_world(state, &record_id) {
+        Ok(online) => http_response(
             "200 OK",
             "application/json; charset=utf-8",
-            &meta.to_string(),
+            &json!({
+                "schema": "steel.inspection-world.meta.v1",
+                "provider": "online",
+                "recordId": record_id,
+                "sourceFrameCount": online.frames.len(),
+                "world": online.world,
+            })
+            .to_string(),
         ),
         Err(error) => http_response(
             "404 Not Found",
@@ -12164,19 +12432,123 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
 }
 
 fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u8> {
-    let Some(manager) = state.bkv.as_ref() else {
-        return bkv_inactive_response();
-    };
-    let sequence = match inspection_world_record_sequence(query) {
-        Ok(sequence) => sequence,
+    let record_id = match inspection_world_record_id(query) {
+        Ok(record_id) => record_id,
         Err(response) => return response,
     };
-    match manager.inspection_world_defects(sequence) {
-        Ok(defects) => http_response(
-            "200 OK",
-            "application/json; charset=utf-8",
-            &defects.to_string(),
-        ),
+    if let Some(manager) = state.bkv.as_ref() {
+        let Ok(sequence) = record_id.parse::<u64>() else {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code": 400, "error": "inspection_world_record_invalid"}).to_string(),
+            );
+        };
+        return match manager.inspection_world_defects(sequence) {
+            Ok(defects) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &defects.to_string(),
+            ),
+            Err(error) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error}).to_string(),
+            ),
+        };
+    }
+    match load_online_inspection_world(state, &record_id) {
+        Ok(online) => {
+            let defects = online
+                .defects
+                .iter()
+                .map(|defect| {
+                    let geometry =
+                        serde_json::from_str::<Value>(&defect.geometry_json).unwrap_or(Value::Null);
+                    let artifacts = geometry.get("artifacts");
+                    let parse_camera = |value: &Value| {
+                        value
+                            .as_u64()
+                            .map(|value| value as u32)
+                            .or_else(|| value.as_str().and_then(numeric_camera_id))
+                    };
+                    let camera_id = geometry
+                        .get("cameraId")
+                        .and_then(parse_camera)
+                        .or_else(|| {
+                            artifacts
+                                .and_then(|value| value.get("cameraId"))
+                                .and_then(parse_camera)
+                        })
+                        .or_else(|| numeric_camera_id(&defect.camera_id));
+                    let explicit_image_index = geometry
+                        .get("imageIndex")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as u32);
+                    let artifact_sequence = artifacts
+                        .and_then(|value| value.get("sequenceNo"))
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok());
+                    let image_index = explicit_image_index.or_else(|| {
+                        camera_id
+                            .zip(artifact_sequence)
+                            .and_then(|key| online.sequence_ordinals.get(&key).copied())
+                    });
+                    let image_rect_value = geometry
+                        .get("imageRect2d")
+                        .or_else(|| artifacts.and_then(|value| value.get("roi")));
+                    let image_rect = image_rect_value.and_then(|rect| {
+                        Some(inspection_world::PixelRect::new(
+                            u32::try_from(rect.get("x")?.as_u64()?).ok()?,
+                            u32::try_from(rect.get("y")?.as_u64()?).ok()?,
+                            u32::try_from(rect.get("width")?.as_u64()?).ok()?,
+                            u32::try_from(rect.get("height")?.as_u64()?).ok()?,
+                        ))
+                    });
+                    let world_rect = camera_id.zip(image_index).zip(image_rect).and_then(
+                        |((camera_id, image_index), rect)| {
+                            online.world.map_defect(camera_id, image_index, rect).ok()
+                        },
+                    );
+                    let grade = match defect.severity.trim().to_ascii_lowercase().as_str() {
+                        "severe" | "critical" => 3,
+                        "moderate" | "warning" => 2,
+                        _ => 1,
+                    };
+                    json!({
+                        "id": defect.id,
+                        "className": defect.defect_type,
+                        "grade": grade,
+                        "confidence": defect.confidence,
+                        "cameraId": camera_id,
+                        "imageIndex": image_index,
+                        "locatable": world_rect.is_some(),
+                        "worldRect": world_rect,
+                        "trace": {
+                            "xMm": defect.x_mm,
+                            "yMm": defect.y_mm,
+                            "zMm": defect.z_mm,
+                            "widthMm": defect.width_mm,
+                            "heightMm": defect.height_mm,
+                            "depthMm": defect.depth_mm,
+                            "severity": defect.severity,
+                            "geometry": geometry,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "schema": "steel.inspection-world.defects.v1",
+                    "provider": "online",
+                    "recordId": record_id,
+                    "defects": defects,
+                })
+                .to_string(),
+            )
+        }
         Err(error) => http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -12187,11 +12559,8 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
 }
 
 fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> {
-    let Some(manager) = state.bkv.as_ref() else {
-        return bkv_inactive_response();
-    };
-    let sequence = match inspection_world_record_sequence(query) {
-        Ok(sequence) => sequence,
+    let record_id = match inspection_world_record_id(query) {
+        Ok(record_id) => record_id,
         Err(response) => return response,
     };
     let parse = |key: &str| query_value(query, key).and_then(|value| value.parse::<u32>().ok());
@@ -12222,7 +12591,20 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
         }
     };
     let request = crate::inspection_world::TileRequest::new(level, tile_x, tile_y, format);
-    match manager.inspection_tile(sequence, request) {
+    let result = if let Some(manager) = state.bkv.as_ref() {
+        record_id
+            .parse::<u64>()
+            .map_err(|_| "inspection world record invalid".to_string())
+            .and_then(|sequence| manager.inspection_tile(sequence, request))
+    } else {
+        load_online_inspection_world(state, &record_id).and_then(|online| {
+            inspection_world::compose_tile(&online.world, request, |camera_id, image_index| {
+                Ok(online.frames.get(&(camera_id, image_index)).cloned())
+            })
+            .map_err(|error| error.to_string())
+        })
+    };
+    match result {
         Ok(bytes) => {
             let level_header = level.to_string();
             let x_header = tile_x.to_string();
@@ -17488,6 +17870,7 @@ fn main() -> std::io::Result<()> {
         production_task_wakeup_generation: Mutex::new(0),
         production_task_worker_status: Mutex::new(ProductionTaskWorkerStatus::default()),
         production_task_sequence: AtomicU64::new(0),
+        inspection_world_cache: Mutex::new(HashMap::new()),
         runtime_admission: Mutex::new(RuntimeAdmissionState::default()),
         runtime_drain_token: env::var("TRIGGER_OPERATOR_TOKEN")
             .unwrap_or_default()
@@ -17600,6 +17983,7 @@ mod tests {
             production_task_wakeup_generation: Mutex::new(0),
             production_task_worker_status: Mutex::new(ProductionTaskWorkerStatus::default()),
             production_task_sequence: AtomicU64::new(0),
+            inspection_world_cache: Mutex::new(HashMap::new()),
             runtime_admission: Mutex::new(RuntimeAdmissionState::default()),
             runtime_drain_token: b"operator-0123456789abcdef-ABCDEF!".to_vec(),
             trigger_gateway_origin: "disabled".to_string(),
@@ -22871,5 +23255,267 @@ mod tests {
         let too_long =
             validate_admin_identifier(&"a".repeat(ADMIN_ID_MAX_LEN + 1), "role.id").unwrap_err();
         assert!(too_long.contains("长度不能超过"));
+    }
+
+    #[test]
+    fn inspection_world_http_uses_online_production_records_without_bkv() {
+        let state = production_test_state();
+        let image_root = std::env::temp_dir().join(format!(
+            "steel-online-world-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        fs::create_dir_all(&image_root).expect("online world image root");
+        insert_production_record(
+            &state,
+            "INSP-WORLD-1",
+            "MAT-WORLD-1",
+            "SESSION-WORLD-1",
+            "finished",
+            "algorithm-complete",
+            "2026-07-22T12:00:00Z",
+        );
+        state
+            .runtime
+            .block_on(db::upsert_production_inspection(
+                &state.database.connection,
+                db::ProductionInspectionInput {
+                    id: "INSP-WORLD-1".to_string(),
+                    material_id: "MAT-WORLD-1".to_string(),
+                    session_id: "SESSION-WORLD-1".to_string(),
+                    status: "algorithm-complete".to_string(),
+                    storage_root: image_root.display().to_string(),
+                    summary_path: production_test_summary_path("INSP-WORLD-1"),
+                    started_at: "1".to_string(),
+                    finished_at: "2026-07-22T12:00:00Z".to_string(),
+                    capture_count: 8,
+                    defect_count: 2,
+                    raw_payload: "{}".to_string(),
+                },
+            ))
+            .expect("online inspection storage root update");
+
+        let records = response_json(inspection_world_records_response(&state));
+
+        assert_eq!(records["schema"], "steel.inspection-world.records.v1");
+        assert_eq!(records["provider"], "online");
+        assert_eq!(records["records"][0]["recordId"], "INSP-WORLD-1");
+        assert_eq!(records["records"][0]["steelId"], "MAT-WORLD-1");
+
+        for camera_id in 1..=8 {
+            let path = image_root.join(format!("camera-{camera_id}.png"));
+            image::RgbImage::from_pixel(32, 48, image::Rgb([camera_id as u8 * 20, 80, 100]))
+                .save(&path)
+                .expect("online intensity fixture");
+            state
+                .runtime
+                .block_on(db::append_capture_file(
+                    &state.database.connection,
+                    db::CaptureFileInput {
+                        inspection_id: "INSP-WORLD-1".to_string(),
+                        session_id: "SESSION-WORLD-1".to_string(),
+                        material_id: "MAT-WORLD-1".to_string(),
+                        camera_id: format!("camera{camera_id}"),
+                        camera_ip: format!("192.168.10{camera_id}.100"),
+                        data_name: "intensity".to_string(),
+                        sequence_no: 10,
+                        file_type: "png".to_string(),
+                        path: path
+                            .file_name()
+                            .expect("online capture file name")
+                            .to_string_lossy()
+                            .to_string(),
+                        metadata_path: String::new(),
+                    },
+                ))
+                .expect("online capture fixture");
+        }
+        for (id, geometry_json) in [
+            (
+                "ONLINE-LOCATABLE",
+                json!({
+                    "cameraIndex": 1,
+                    "artifacts": {
+                        "cameraId": "camera1",
+                        "sequenceNo": 10,
+                        "roi": { "x": 3, "y": 4, "width": 5, "height": 6 }
+                    }
+                }),
+            ),
+            ("ONLINE-MM-ONLY", json!({ "xMm": 12.5, "yMm": 30.0 })),
+        ] {
+            state
+                .runtime
+                .block_on(db::append_production_defect(
+                    &state.database.connection,
+                    db::ProductionDefectInput {
+                        inspection_id: "INSP-WORLD-1".to_string(),
+                        material_id: "MAT-WORLD-1".to_string(),
+                        camera_id: "camera1".to_string(),
+                        defect_type: id.to_string(),
+                        severity: "minor".to_string(),
+                        x_mm: 12.5,
+                        y_mm: 30.0,
+                        z_mm: 0.0,
+                        width_mm: 1.0,
+                        height_mm: 2.0,
+                        depth_mm: 0.2,
+                        confidence: 0.9,
+                        geometry_json: geometry_json.to_string(),
+                    },
+                ))
+                .expect("online defect fixture");
+        }
+
+        let meta = response_json(inspection_world_meta_response(
+            &state,
+            "recordId=INSP-WORLD-1",
+        ));
+        assert_eq!(meta["provider"], "online");
+        assert_eq!(meta["sourceFrameCount"], 8);
+        assert_eq!(meta["world"]["cameras"].as_array().map(Vec::len), Some(8));
+        assert_eq!(meta["world"]["cameras"][0]["frameNumbers"], json!([0]));
+
+        let defects = response_json(inspection_world_defects_response(
+            &state,
+            "recordId=INSP-WORLD-1",
+        ));
+        assert_eq!(defects["provider"], "online");
+        let defects = defects["defects"].as_array().expect("online defects");
+        assert!(defects
+            .iter()
+            .any(|defect| defect["className"] == "ONLINE-LOCATABLE"
+                && defect["locatable"] == true
+                && defect["imageIndex"] == 0
+                && defect["worldRect"]["y"] == 4));
+        assert!(defects
+            .iter()
+            .any(|defect| defect["className"] == "ONLINE-MM-ONLY" && defect["locatable"] == false));
+
+        image::RgbImage::from_pixel(32, 48, image::Rgb([220, 80, 100]))
+            .save(image_root.join("camera-1-seq-20.png"))
+            .expect("later online intensity fixture");
+        state
+            .runtime
+            .block_on(db::append_capture_file(
+                &state.database.connection,
+                db::CaptureFileInput {
+                    inspection_id: "INSP-WORLD-1".to_string(),
+                    session_id: "SESSION-WORLD-1".to_string(),
+                    material_id: "MAT-WORLD-1".to_string(),
+                    camera_id: "camera1".to_string(),
+                    camera_ip: "192.168.101.100".to_string(),
+                    data_name: "intensity".to_string(),
+                    sequence_no: 20,
+                    file_type: "png".to_string(),
+                    path: "camera-1-seq-20.png".to_string(),
+                    metadata_path: String::new(),
+                },
+            ))
+            .expect("later online capture");
+        state
+            .runtime
+            .block_on(db::append_production_defect(
+                &state.database.connection,
+                db::ProductionDefectInput {
+                    inspection_id: "INSP-WORLD-1".to_string(),
+                    material_id: "MAT-WORLD-1".to_string(),
+                    camera_id: "camera1".to_string(),
+                    defect_type: "ONLINE-LATE".to_string(),
+                    severity: "minor".to_string(),
+                    x_mm: 0.0,
+                    y_mm: 0.0,
+                    z_mm: 0.0,
+                    width_mm: 1.0,
+                    height_mm: 1.0,
+                    depth_mm: 0.0,
+                    confidence: 0.8,
+                    geometry_json: json!({
+                        "artifacts": {
+                            "cameraId": "camera1",
+                            "sequenceNo": 20,
+                            "roi": { "x": 2, "y": 4, "width": 3, "height": 5 }
+                        }
+                    })
+                    .to_string(),
+                },
+            ))
+            .expect("later online defect");
+        state
+            .inspection_world_cache
+            .lock()
+            .expect("inspection world cache")
+            .get_mut("INSP-WORLD-1")
+            .expect("cached online world")
+            .checked_at = Instant::now() - Duration::from_secs(3);
+
+        let refreshed_meta = response_json(inspection_world_meta_response(
+            &state,
+            "recordId=INSP-WORLD-1",
+        ));
+        assert_eq!(refreshed_meta["sourceFrameCount"], 9);
+        assert_eq!(
+            refreshed_meta["world"]["cameras"][0]["frameNumbers"],
+            json!([0, 1])
+        );
+        assert_eq!(refreshed_meta["world"]["cameras"][0]["height"], 96);
+        let refreshed_defects = response_json(inspection_world_defects_response(
+            &state,
+            "recordId=INSP-WORLD-1",
+        ));
+        assert!(refreshed_defects["defects"]
+            .as_array()
+            .expect("refreshed online defects")
+            .iter()
+            .any(|defect| defect["className"] == "ONLINE-LATE"
+                && defect["imageIndex"] == 1
+                && defect["worldRect"]["y"] == 52));
+
+        let tile = inspection_world_tile_response(
+            &state,
+            "recordId=INSP-WORLD-1&level=0&x=0&y=0&format=png",
+        );
+        let separator = tile
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("tile headers");
+        assert!(String::from_utf8_lossy(&tile[..separator]).contains("Content-Type: image/png"));
+        image::load_from_memory(&tile[separator + 4..]).expect("decodable online tile");
+
+        fs::remove_dir_all(&image_root).expect("remove online world image root");
+    }
+
+    #[test]
+    fn online_capture_path_rejects_files_outside_the_inspection_storage_root() {
+        let base = std::env::temp_dir().join(format!(
+            "steel-online-world-path-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let root = base.join("record");
+        fs::create_dir_all(&root).expect("online path root");
+        let outside = base.join("outside.png");
+        image::RgbImage::new(1, 1)
+            .save(&outside)
+            .expect("outside fixture");
+        let inspection = db::entities::production_inspection::Model {
+            id: "INSP-PATH".to_string(),
+            material_id: "MAT-PATH".to_string(),
+            session_id: "SESSION-PATH".to_string(),
+            status: "running".to_string(),
+            storage_root: root.display().to_string(),
+            summary_path: String::new(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            capture_count: 1,
+            defect_count: 0,
+            raw_payload: "{}".to_string(),
+        };
+
+        let error = online_capture_path(&inspection, "../outside.png")
+            .expect_err("path traversal must be rejected");
+
+        assert!(error.contains("outside inspection storage root"));
+        fs::remove_dir_all(base).expect("remove online path fixture");
     }
 }

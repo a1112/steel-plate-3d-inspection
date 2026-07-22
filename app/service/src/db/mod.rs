@@ -3118,6 +3118,52 @@ pub async fn production_defects_for_inspection(
         .await
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectionWorldRevision {
+    pub capture_count: u64,
+    pub latest_capture: String,
+    pub defect_count: u64,
+    pub latest_defect: String,
+}
+
+pub async fn inspection_world_revision(
+    connection: &DatabaseConnection,
+    inspection_id: &str,
+) -> Result<InspectionWorldRevision, DbErr> {
+    let capture_filter = capture_file::Column::InspectionId.eq(inspection_id);
+    let defect_filter = production_defect::Column::InspectionId.eq(inspection_id);
+    let capture_count = capture_file::Entity::find()
+        .filter(capture_filter.clone())
+        .count(connection)
+        .await?;
+    let latest_capture = capture_file::Entity::find()
+        .filter(capture_filter)
+        .order_by_desc(capture_file::Column::CreatedAt)
+        .order_by_desc(capture_file::Column::Id)
+        .one(connection)
+        .await?
+        .map(|row| format!("{}:{}", row.created_at, row.id))
+        .unwrap_or_default();
+    let defect_count = production_defect::Entity::find()
+        .filter(defect_filter.clone())
+        .count(connection)
+        .await?;
+    let latest_defect = production_defect::Entity::find()
+        .filter(defect_filter)
+        .order_by_desc(production_defect::Column::CreatedAt)
+        .order_by_desc(production_defect::Column::Id)
+        .one(connection)
+        .await?
+        .map(|row| format!("{}:{}", row.created_at, row.id))
+        .unwrap_or_default();
+    Ok(InspectionWorldRevision {
+        capture_count,
+        latest_capture,
+        defect_count,
+        latest_defect,
+    })
+}
+
 async fn insert_production_defect<C>(
     connection: &C,
     input: ProductionDefectInput,

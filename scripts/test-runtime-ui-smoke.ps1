@@ -365,15 +365,31 @@ const standardChecks = [
 
 const bkvChecks = [
   {
-    id: 'bkv-2d-camera-strip',
+    id: 'bkv-2d-inspection-world',
     url: appUrl('terminal'),
-    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', 'C1', 'C6', '\u771f\u5b9e\u76f8\u673a\u5728\u7ebf 0', '\u786c\u4ef6\u63a7\u5236\u5df2\u7981\u7528'],
+    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', '126 \u5e27\u68c0\u6d4b\u56fe\u50cf\u4e16\u754c', 'C1', 'C6', '\u771f\u5b9e\u76f8\u673a\u5728\u7ebf 0', '\u786c\u4ef6\u63a7\u5236\u5df2\u7981\u7528'],
     requiredExpressions: [
-      'document.querySelector(".bkv-camera-strip")?.getAttribute("data-camera-count") === "6"',
-      'document.querySelectorAll("[data-testid=bkv-camera-lane]").length === 6',
-      '[...document.querySelectorAll(".bkv-camera-strip img")].filter((image) => image.naturalWidth > 0).length === 6',
-      '![...document.querySelectorAll("[data-testid=bkv-camera-lane]")].some((lane) => lane.innerText.includes("C7"))',
+      'document.querySelectorAll("[data-testid=inspection-world-canvas]").length === 1',
+      'document.querySelectorAll("[data-testid=inspection-world-camera]").length === 6',
+      'Number(document.querySelector("[data-testid=inspection-world-canvas]")?.getAttribute("data-loaded-tiles")) > 0',
+      'document.querySelector(".bkv-camera-strip") === null && document.querySelectorAll("[data-testid=bkv-camera-lane]").length === 0',
+      '![...document.querySelectorAll("[data-testid=inspection-world-camera]")].some((lane) => lane.innerText.includes("C7"))',
+      '(() => { const count = performance.getEntriesByType("resource").filter((entry) => entry.name.includes("/api/inspection-world/tile")).length; return count > 0 && count < 126; })()',
+      '(() => { const canvas = document.querySelector("[data-testid=inspection-world-canvas]"); if (!canvas) return false; const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data; for (let index = 0; index < data.length; index += 64) { const r = data[index], g = data[index + 1], b = data[index + 2]; if (r > 32 && Math.abs(r - g) < 6 && Math.abs(g - b) < 6) return true; } return false; })()',
       '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
+    ],
+  },
+  {
+    id: 'bkv-defect-focus',
+    url: appUrl('terminal'),
+    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '126 \u5e27\u68c0\u6d4b\u56fe\u50cf\u4e16\u754c', '\u8f67\u6298'],
+    clickSelector: '.bkv-defect-list button',
+    afterClickText: ['\u8f67\u6298', 'C1', 'C6'],
+    requiredExpressions: [
+      'Number(document.querySelector("[data-testid=inspection-world-canvas]")?.getAttribute("data-view-y")) > 10000',
+      'document.querySelector("[data-testid=inspection-world-canvas]")?.getAttribute("data-locatable-defects") === "1"',
+      'Number(document.querySelector("[data-testid=inspection-world-canvas]")?.getAttribute("data-loaded-tiles")) > 0',
+      '(() => { const canvas = document.querySelector("[data-testid=inspection-world-canvas]"); if (!canvas) return false; const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data; for (let index = 0; index < data.length; index += 64) { const r = data[index], g = data[index + 1], b = data[index + 2]; if (r > 32 && Math.abs(r - g) < 6 && Math.abs(g - b) < 6) return true; } return false; })()',
     ],
   },
   {
@@ -394,7 +410,7 @@ const bkvChecks = [
     clickSelector: '.bkv-view-tabs button:nth-child(3)',
     afterClickText: ['\u5706\u67f1 3D', '\u672a\u6807\u5b9a\u9884\u89c8'],
     requiredExpressions: [
-      'document.querySelectorAll(".bkv-camera-strip img").length === 0 && document.querySelector(".bkv-visual-panel canvas") !== null',
+      'document.querySelector(".bkv-camera-strip") === null && document.querySelector(".bkv-visual-panel canvas") !== null',
       '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
     ],
   },

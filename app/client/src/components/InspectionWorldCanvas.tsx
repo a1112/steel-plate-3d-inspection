@@ -22,12 +22,8 @@ const DEFAULT_WIDTH = 1000;
 const DEFAULT_HEIGHT = 600;
 
 function initialView(meta: InspectionWorldMeta, width: number, height: number): ViewState {
-  const scale = fitWorldScale(meta.world.width, meta.world.height, width, height);
-  return {
-    x: (meta.world.width - width / scale) / 2,
-    y: (meta.world.height - height / scale) / 2,
-    scale,
-  };
+  const scale = Math.min(8, width / Math.max(1, meta.world.width));
+  return { x: 0, y: 0, scale };
 }
 
 function lodForScale(scale: number, maxLevel: number) {
@@ -38,13 +34,14 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const tileCache = useRef(new Map<string, TileEntry>());
-  const pending = useRef(new Set<string>());
+  const pending = useRef(new Map<string, symbol>());
   const drag = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const previousRecord = useRef(recordId);
+  const measured = useRef(false);
   const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
   const [view, setView] = useState(() => initialView(meta, DEFAULT_WIDTH, DEFAULT_HEIGHT));
   const [failedKeys, setFailedKeys] = useState<Set<string>>(new Set());
-  const [, setRevision] = useState(0);
+  const [revision, setRevision] = useState(0);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -54,6 +51,10 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       const width = Math.max(1, Math.round(bounds.width || DEFAULT_WIDTH));
       const height = Math.max(1, Math.round(bounds.height || DEFAULT_HEIGHT));
       setSize({ width, height });
+      if (!measured.current) {
+        measured.current = true;
+        setView(initialView(meta, width, height));
+      }
     };
     update();
     const observer = new ResizeObserver(update);
@@ -87,11 +88,33 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   }), [level, meta.world.height, meta.world.tileSize, meta.world.width, size.height, size.width, view.scale, view.x, view.y]);
 
   useEffect(() => {
+    const visibleKeys = new Set(visibleTiles.map((tile) => `${recordId}:${tile.level}:${tile.x}:${tile.y}`));
+    tileCache.current.forEach((entry, key) => {
+      if (visibleKeys.has(key)) return;
+      entry.tile.revoke();
+      tileCache.current.delete(key);
+    });
+    setFailedKeys((current) => {
+      const retained = new Set([...current].filter((key) => visibleKeys.has(key)));
+      return retained.size === current.size ? current : retained;
+    });
+  }, [recordId, visibleTiles]);
+
+  useEffect(() => {
+    if (!failedKeys.size) return;
+    const retry = window.setTimeout(() => setFailedKeys(new Set()), 5000);
+    return () => window.clearTimeout(retry);
+  }, [failedKeys]);
+
+  useEffect(() => {
     const controller = new AbortController();
+    const ownedRequests = new Map<string, symbol>();
     for (const tile of visibleTiles) {
       const key = `${recordId}:${tile.level}:${tile.x}:${tile.y}`;
       if (tileCache.current.has(key) || pending.current.has(key) || failedKeys.has(key)) continue;
-      pending.current.add(key);
+      const requestToken = Symbol(key);
+      pending.current.set(key, requestToken);
+      ownedRequests.set(key, requestToken);
       fetchInspectionWorldTile(recordId, { ...tile, format: 'jpeg' }, controller.signal)
         .then((worldTile) => {
           if (controller.signal.aborted) {
@@ -105,6 +128,10 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
             setRevision((value) => value + 1);
           };
           image.onerror = () => {
+            if (tileCache.current.get(key) === entry) {
+              tileCache.current.delete(key);
+              worldTile.revoke();
+            }
             setFailedKeys((current) => new Set(current).add(key));
             setRevision((value) => value + 1);
           };
@@ -115,15 +142,24 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
         .catch(() => {
           if (!controller.signal.aborted) setFailedKeys((current) => new Set(current).add(key));
         })
-        .finally(() => pending.current.delete(key));
+        .finally(() => {
+          if (pending.current.get(key) === requestToken) pending.current.delete(key);
+        });
     }
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      ownedRequests.forEach((requestToken, key) => {
+        if (pending.current.get(key) === requestToken) pending.current.delete(key);
+      });
+    };
   }, [failedKeys, recordId, visibleTiles]);
 
   const locatableDefects = useMemo(
     () => defects.filter((defect) => defect.locatable && defect.worldRect),
     [defects],
   );
+  const loadedTileCount = visibleTiles.filter((tile) => tileCache.current
+    .get(`${recordId}:${tile.level}:${tile.x}:${tile.y}`)?.loaded).length;
 
   useEffect(() => {
     if (focusDefectId == null) return;
@@ -178,7 +214,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
         Math.max(3, rect.height * view.scale),
       );
     }
-  }, [failedKeys, level, locatableDefects, meta.world.cameras, meta.world.tileSize, recordId, size.height, size.width, view.scale, view.x, view.y, visibleTiles]);
+  }, [failedKeys, level, locatableDefects, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.x, view.y, visibleTiles]);
 
   const onWheel = (event: WheelEvent<HTMLCanvasElement>) => {
     event.preventDefault();
@@ -219,7 +255,10 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       data-level={level}
       data-view-x={view.x.toFixed(3)}
       data-view-y={view.y.toFixed(3)}
+      data-view-scale={view.scale.toFixed(6)}
       data-locatable-defects={locatableDefects.length}
+      data-loaded-tiles={loadedTileCount}
+      data-cached-tiles={tileCache.current.size}
       onWheel={onWheel}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -230,7 +269,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       {meta.world.cameras.map((camera) => <span
         key={camera.cameraId}
         data-testid="inspection-world-camera"
-        style={{ left: `${camera.offsetX / meta.world.width * 100}%`, width: `${camera.width / meta.world.width * 100}%` }}
+        style={{ left: `${(camera.offsetX - view.x) * view.scale}px`, width: `${camera.width * view.scale}px` }}
       >C{camera.cameraId}</span>)}
     </div>
     <div className="inspection-world-tile-status" role="status">
