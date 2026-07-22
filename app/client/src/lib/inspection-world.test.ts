@@ -1,0 +1,51 @@
+import { describe, expect, it } from 'vitest';
+import {
+  clampWorldScale,
+  fitWorldScale,
+  focusWorldRect,
+  getVisibleWorldTiles,
+  screenPointToWorld,
+} from './inspection-world';
+
+describe('inspection world viewport math', () => {
+  it('fits the complete world and clamps interactive zoom', () => {
+    expect(fitWorldScale(4000, 20000, 1000, 800)).toBeCloseTo(0.04);
+    expect(clampWorldScale(0.001, 0.02, 8)).toBe(0.02);
+    expect(clampWorldScale(20, 0.02, 8)).toBe(8);
+  });
+
+  it('converts a screen point through the current world viewport', () => {
+    expect(screenPointToWorld({ x: 200, y: 100 }, { x: 1000, y: 2000, scale: 0.5 })).toEqual({ x: 1400, y: 2200 });
+  });
+
+  it('returns visible and one-ring prefetched tiles at the requested LOD', () => {
+    const tiles = getVisibleWorldTiles({
+      worldWidth: 4096,
+      worldHeight: 21504,
+      tileSize: 512,
+      level: 2,
+      viewport: { x: 0, y: 4096, width: 1000, height: 800 },
+      prefetch: 1,
+    });
+    expect(tiles).toContainEqual({ level: 2, x: 0, y: 1 });
+    expect(tiles).toContainEqual({ level: 2, x: 1, y: 2 });
+    expect(tiles.every((tile) => tile.x >= 0 && tile.y >= 0)).toBe(true);
+  });
+
+  it('clamps partial edge tiles to valid world tile coordinates', () => {
+    const tiles = getVisibleWorldTiles({
+      worldWidth: 1000,
+      worldHeight: 700,
+      tileSize: 512,
+      level: 0,
+      viewport: { x: 800, y: 500, width: 400, height: 400 },
+      prefetch: 0,
+    });
+    expect(tiles).toEqual([{ level: 0, x: 1, y: 0 }, { level: 0, x: 1, y: 1 }]);
+  });
+
+  it('centres a defect rectangle with bounded padding', () => {
+    expect(focusWorldRect({ x: 473, y: 13145, width: 10, height: 10 }, 1000, 600, 20))
+      .toEqual({ x: -22, y: 12850, width: 1000, height: 600 });
+  });
+});
