@@ -313,6 +313,8 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     focusedRect?.width,
     focusedRect?.x,
     focusedRect?.y,
+    size.height,
+    size.width,
     worldRevision,
   ]);
 

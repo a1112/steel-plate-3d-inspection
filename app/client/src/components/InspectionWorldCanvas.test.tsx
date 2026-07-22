@@ -695,6 +695,48 @@ describe('InspectionWorldCanvas', () => {
     expect(screen.getByTestId('inspection-world-canvas')).toHaveAttribute('data-view-scale', firstScale);
   });
 
+  it('recomputes the active defect focus after measuring and resizing the viewport', async () => {
+    let resize: ResizeObserverCallback | undefined;
+    vi.stubGlobal('ResizeObserver', class ResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resize = callback; }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    const focusedDefect: InspectionWorldDefect = {
+      id: 'measured-focus', className: '测量聚焦', locatable: true,
+      worldRect: { x: 100, y: 1_000, width: 400, height: 200 },
+    };
+    render(<InspectionWorldCanvas
+      recordId="1893700"
+      meta={meta}
+      defects={[focusedDefect]}
+      focusDefectId="measured-focus"
+    />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+
+    Object.defineProperties(viewport, {
+      clientWidth: { configurable: true, value: 1_200 },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    await act(async () => resize?.([], {} as ResizeObserver));
+
+    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(2, 6));
+    expect(viewport.scrollLeft).toBeCloseTo(0, 6);
+    expect(viewport.scrollTop).toBeCloseTo(2_000, 6);
+
+    Object.defineProperties(viewport, {
+      clientWidth: { configurable: true, value: 900 },
+      clientHeight: { configurable: true, value: 900 },
+    });
+    await act(async () => resize?.([], {} as ResizeObserver));
+
+    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(1.875, 6));
+    expect(viewport.scrollLeft).toBeCloseTo(112.5, 6);
+    expect(viewport.scrollTop).toBeCloseTo(1_612.5, 6);
+  });
+
   it('does not refocus when polling supplies a fresh but equivalent defects array', async () => {
     const { rerender } = render(<InspectionWorldCanvas
       recordId="1893700"
