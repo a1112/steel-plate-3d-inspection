@@ -63,6 +63,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   const measured = useRef(false);
   const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
   const [view, setView] = useState(() => initialView(meta, DEFAULT_WIDTH));
+  const interactionView = useRef(view);
   const [failedKeys, setFailedKeys] = useState<Set<string>>(new Set());
   const [revision, setRevision] = useState(0);
   const [focusScrollRevision, setFocusScrollRevision] = useState(0);
@@ -78,9 +79,16 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       scrollFrame.current = null;
       const host = hostRef.current;
       if (!host) return;
+      const scrollLeft = host.scrollLeft;
+      const scrollTop = host.scrollTop;
+      interactionView.current = {
+        ...interactionView.current,
+        scrollLeft,
+        scrollTop,
+      };
       setView((current) => {
-        if (current.scrollLeft === host.scrollLeft && current.scrollTop === host.scrollTop) return current;
-        return { ...current, scrollLeft: host.scrollLeft, scrollTop: host.scrollTop };
+        if (current.scrollLeft === scrollLeft && current.scrollTop === scrollTop) return current;
+        return { ...current, scrollLeft, scrollTop };
       });
     });
   }, []);
@@ -95,17 +103,21 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       setSize({ width, height });
       if (!measured.current) {
         measured.current = true;
-        setView(initialView(metaRef.current, width));
+        const nextView = initialView(metaRef.current, width);
+        interactionView.current = nextView;
+        setView(nextView);
       } else if (fitWidthMode.current) {
-        setView((current) => {
-          const scale = fitWidthScale(metaRef.current.world.width, width);
-          if (scale === current.scale) return current;
-          pendingScroll.current = {
-            scrollLeft: (host.scrollLeft / current.scale) * scale,
-            scrollTop: (host.scrollTop / current.scale) * scale,
+        const current = interactionView.current;
+        const scale = fitWidthScale(metaRef.current.world.width, width);
+        if (scale !== current.scale) {
+          const targetScroll = {
+            scrollLeft: (current.scrollLeft / current.scale) * scale,
+            scrollTop: (current.scrollTop / current.scale) * scale,
           };
-          return { ...current, scale };
-        });
+          pendingScroll.current = targetScroll;
+          interactionView.current = { ...current, ...targetScroll, scale };
+          setView((state) => ({ ...state, scale }));
+        }
       }
     };
     update();
@@ -125,7 +137,9 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     drag.current = null;
     fitWidthMode.current = true;
     setFailedKeys(new Set());
-    setView(initialView(meta, size.width));
+    const nextView = initialView(meta, size.width);
+    interactionView.current = nextView;
+    setView(nextView);
     const host = hostRef.current;
     if (host) {
       host.scrollLeft = 0;
@@ -280,6 +294,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       scrollLeft: Math.max(0, (defect.worldRect.x + defect.worldRect.width / 2) * targetScale - size.width / 2),
       scrollTop: Math.max(0, (defect.worldRect.y + defect.worldRect.height / 2) * targetScale - size.height / 2),
     };
+    interactionView.current = { ...interactionView.current, ...pendingScroll.current, scale: targetScale };
     setView((current) => ({ ...current, scale: targetScale }));
     setFocusScrollRevision((current) => current + 1);
   }, [focusDefectId, locatableDefects, meta.world.height, meta.world.width, size.height, size.width]);
@@ -342,28 +357,26 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       const bounds = canvas.getBoundingClientRect();
       const pointerX = event.clientX - bounds.left;
       const pointerY = event.clientY - bounds.top;
-      setView((current) => {
-        const minimum = fitWidthScale(meta.world.width, size.width);
-        const scale = clampWorldScale(current.scale * Math.exp(-event.deltaY * 0.001), minimum, 8);
-        if (scale === current.scale) {
-          pendingScroll.current = null;
-          return current;
-        }
-        fitWidthMode.current = false;
-        const baseScroll = pendingScroll.current ?? {
-          scrollLeft: hostRef.current?.scrollLeft ?? current.scrollLeft,
-          scrollTop: hostRef.current?.scrollTop ?? current.scrollTop,
-        };
-        pendingScroll.current = scrollPositionForZoom({
-          scrollLeft: baseScroll.scrollLeft,
-          scrollTop: baseScroll.scrollTop,
-          pointerX,
-          pointerY,
-          oldScale: current.scale,
-          newScale: scale,
-        });
-        return { ...current, scale };
+      const current = interactionView.current;
+      const minimum = fitWidthScale(meta.world.width, size.width);
+      const scale = clampWorldScale(current.scale * Math.exp(-event.deltaY * 0.001), minimum, 8);
+      if (scale === current.scale) return;
+      fitWidthMode.current = false;
+      const baseScroll = pendingScroll.current ?? {
+        scrollLeft: hostRef.current?.scrollLeft ?? current.scrollLeft,
+        scrollTop: hostRef.current?.scrollTop ?? current.scrollTop,
+      };
+      const targetScroll = scrollPositionForZoom({
+        scrollLeft: baseScroll.scrollLeft,
+        scrollTop: baseScroll.scrollTop,
+        pointerX,
+        pointerY,
+        oldScale: current.scale,
+        newScale: scale,
       });
+      pendingScroll.current = targetScroll;
+      interactionView.current = { ...targetScroll, scale };
+      setView((state) => ({ ...state, scale }));
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
     return () => canvas.removeEventListener('wheel', onWheel);

@@ -188,6 +188,59 @@ describe('InspectionWorldCanvas', () => {
     expect(viewport.scrollTop).toBeCloseTo(300 * (finalScale / initialScale - 1), 3);
   });
 
+  it('applies one Ctrl+wheel anchor exactly once when StrictMode replays state updates', async () => {
+    render(<StrictMode><InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} /></StrictMode>);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    installNativeScrollTo(viewport);
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, right: 1000, bottom: 600,
+      x: 0, y: 0, width: 1000, height: 600,
+      toJSON: () => undefined,
+    });
+    const initialScale = Number(canvas.getAttribute('data-view-scale'));
+
+    await act(async () => {
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -100, ctrlKey: true, clientX: 500, clientY: 300,
+        bubbles: true, cancelable: true,
+      }));
+    });
+
+    const finalScale = Number(canvas.getAttribute('data-view-scale'));
+    expect(finalScale).toBeCloseTo(initialScale * Math.exp(0.1), 5);
+    expect(viewport.scrollLeft).toBeCloseTo(500 * (finalScale / initialScale - 1), 3);
+    expect(viewport.scrollTop).toBeCloseTo(300 * (finalScale / initialScale - 1), 3);
+  });
+
+  it('retains a queued anchor when a later batched Ctrl+wheel event is clamped at maximum', async () => {
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    installNativeScrollTo(viewport);
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, right: 1000, bottom: 600,
+      x: 0, y: 0, width: 1000, height: 600,
+      toJSON: () => undefined,
+    });
+    const initialScale = Number(canvas.getAttribute('data-view-scale'));
+
+    await act(async () => {
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -10_000, ctrlKey: true, clientX: 500, clientY: 300,
+        bubbles: true, cancelable: true,
+      }));
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -100, ctrlKey: true, clientX: 500, clientY: 300,
+        bubbles: true, cancelable: true,
+      }));
+    });
+
+    expect(Number(canvas.getAttribute('data-view-scale'))).toBe(8);
+    expect(viewport.scrollLeft).toBeCloseTo(500 * (8 / initialScale - 1), 3);
+    expect(viewport.scrollTop).toBeCloseTo(300 * (8 / initialScale - 1), 3);
+  });
+
   it('virtualizes tile requests from coalesced native scroll position', async () => {
     const animationFrames: FrameRequestCallback[] = [];
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
