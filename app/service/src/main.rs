@@ -20,6 +20,7 @@ mod bkv;
 mod calibration_operations;
 mod controlled_process;
 mod db;
+mod inspection_world;
 mod production_tasks;
 
 #[derive(Clone)]
