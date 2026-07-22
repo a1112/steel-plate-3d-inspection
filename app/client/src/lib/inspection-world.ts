@@ -4,6 +4,48 @@ export type WorldViewTransform = { x: number; y: number; scale: number };
 export type WorldViewport = { x: number; y: number; width: number; height: number };
 export type VisibleWorldTile = { level: number; x: number; y: number };
 
+function finiteNonnegative(value: number) {
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+export function scaledWorldExtent(
+  worldWidth: number,
+  worldHeight: number,
+  scale: number,
+  viewportWidth: number,
+  viewportHeight: number,
+) {
+  const safeScale = finiteNonnegative(scale);
+  const scaledWidth = finiteNonnegative(finiteNonnegative(worldWidth) * safeScale);
+  const scaledHeight = finiteNonnegative(finiteNonnegative(worldHeight) * safeScale);
+  return {
+    width: Math.max(finiteNonnegative(viewportWidth), scaledWidth),
+    height: Math.max(finiteNonnegative(viewportHeight), scaledHeight),
+  };
+}
+
+export function scrollPositionForZoom(input: {
+  scrollLeft: number;
+  scrollTop: number;
+  pointerX: number;
+  pointerY: number;
+  oldScale: number;
+  newScale: number;
+}) {
+  const scrollLeft = finiteNonnegative(input.scrollLeft);
+  const scrollTop = finiteNonnegative(input.scrollTop);
+  const pointerX = finiteNonnegative(input.pointerX);
+  const pointerY = finiteNonnegative(input.pointerY);
+  const oldScale = Number.isFinite(input.oldScale) && input.oldScale > 0 ? input.oldScale : 1;
+  const newScale = finiteNonnegative(input.newScale);
+  const worldX = finiteNonnegative((scrollLeft + pointerX) / oldScale);
+  const worldY = finiteNonnegative((scrollTop + pointerY) / oldScale);
+  return {
+    scrollLeft: finiteNonnegative(worldX * newScale - pointerX),
+    scrollTop: finiteNonnegative(worldY * newScale - pointerY),
+  };
+}
+
 export function fitWorldScale(worldWidth: number, worldHeight: number, viewportWidth: number, viewportHeight: number) {
   if (worldWidth <= 0 || worldHeight <= 0 || viewportWidth <= 0 || viewportHeight <= 0) return 1;
   return Math.min(viewportWidth / worldWidth, viewportHeight / worldHeight);

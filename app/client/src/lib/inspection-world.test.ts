@@ -4,6 +4,8 @@ import {
   fitWorldScale,
   focusWorldRect,
   getVisibleWorldTiles,
+  scaledWorldExtent,
+  scrollPositionForZoom,
   screenPointToWorld,
 } from './inspection-world';
 
@@ -47,5 +49,37 @@ describe('inspection world viewport math', () => {
   it('centres a defect rectangle with bounded padding', () => {
     expect(focusWorldRect({ x: 473, y: 13145, width: 10, height: 10 }, 1000, 600, 20))
       .toEqual({ x: -22, y: 12850, width: 1000, height: 600 });
+  });
+
+  it('uses the scaled world as native scroll extent without shrinking below the viewport', () => {
+    expect(scaledWorldExtent(600, 21504, 1000 / 600, 1000, 600)).toEqual({
+      width: 1000,
+      height: 35840,
+    });
+    expect(scaledWorldExtent(600, 100, 1, 1000, 600)).toEqual({ width: 1000, height: 600 });
+  });
+
+  it('keeps the world point below the pointer when zoom changes', () => {
+    expect(scrollPositionForZoom({
+      scrollLeft: 0,
+      scrollTop: 400,
+      pointerX: 250,
+      pointerY: 200,
+      oldScale: 1,
+      newScale: 2,
+    })).toEqual({ scrollLeft: 250, scrollTop: 1000 });
+  });
+
+  it('keeps malformed scroll math finite and nonnegative', () => {
+    expect(scaledWorldExtent(Number.POSITIVE_INFINITY, -1, Number.NaN, 1000, 600))
+      .toEqual({ width: 1000, height: 600 });
+    expect(scrollPositionForZoom({
+      scrollLeft: -10,
+      scrollTop: Number.NaN,
+      pointerX: Number.POSITIVE_INFINITY,
+      pointerY: -20,
+      oldScale: 0,
+      newScale: Number.NaN,
+    })).toEqual({ scrollLeft: 0, scrollTop: 0 });
   });
 });
