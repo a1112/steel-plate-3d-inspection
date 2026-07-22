@@ -292,10 +292,47 @@ async function createPage(cdp) {
   async function wheel(selector, { deltaX = 0, deltaY = 0, ctrlKey = false } = {}) {
     const selectorJson = JSON.stringify(selector);
     await waitForExpression(`!!document.querySelector(${selectorJson})`);
-    const point = await evaluate(`(() => {
-      const bounds = document.querySelector(${selectorJson}).getBoundingClientRect();
-      return { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
+    const point = await evaluate(`(async () => {
+      const target = document.querySelector(${selectorJson});
+      const measure = () => {
+        const bounds = target.getBoundingClientRect();
+        const left = Math.max(0, bounds.left);
+        const top = Math.max(0, bounds.top);
+        const right = Math.min(window.innerWidth, bounds.right);
+        const bottom = Math.min(window.innerHeight, bounds.bottom);
+        return { bounds, left, top, right, bottom };
+      };
+      let visible = measure();
+      if (visible.right - visible.left < 2 || visible.bottom - visible.top < 2) {
+        target.scrollIntoView({ block: 'center', inline: 'center' });
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        visible = measure();
+      }
+      const x = visible.left + (visible.right - visible.left) / 2;
+      const y = visible.top + (visible.bottom - visible.top) / 2;
+      const hit = document.elementFromPoint(x, y);
+      return {
+        x,
+        y,
+        intersection: {
+          left: visible.left,
+          top: visible.top,
+          right: visible.right,
+          bottom: visible.bottom,
+        },
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        insideTarget: x >= visible.bounds.left && x <= visible.bounds.right
+          && y >= visible.bounds.top && y <= visible.bounds.bottom,
+        insideViewport: x >= 0 && x < window.innerWidth && y >= 0 && y < window.innerHeight,
+        hitTarget: hit === target || target.contains(hit),
+      };
     })()`);
+    const intersectionWidth = point.intersection.right - point.intersection.left;
+    const intersectionHeight = point.intersection.bottom - point.intersection.top;
+    if (intersectionWidth < 2 || intersectionHeight < 2
+      || !point.insideTarget || !point.insideViewport || !point.hitTarget) {
+      throw new Error(`Wheel target is not visibly hittable: ${JSON.stringify(point)}`);
+    }
     await cdp.send('Input.dispatchMouseEvent', {
       type: 'mouseMoved',
       x: point.x,
@@ -309,6 +346,7 @@ async function createPage(cdp) {
       deltaY,
       modifiers: ctrlKey ? 2 : 0,
     }, sessionId);
+    return point;
   }
 
   return { sessionId, evaluate, waitForExpression, waitForText, navigate, screenshot, click, wheel };
@@ -319,9 +357,22 @@ async function runBkvNativeScrollChecks(page, result) {
   const canvasSelector = '[data-testid="inspection-world-canvas"]';
 
   async function requireEventually(id, expression) {
-    const value = await page.waitForExpression(expression);
-    result.checks.push({ kind: 'interaction', id, ok: true, value });
-    return value;
+    try {
+      const value = await page.waitForExpression(expression);
+      result.checks.push({ kind: 'interaction', id, ok: true, value });
+      return value;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      result.checks.push({
+        kind: 'interaction',
+        id,
+        ok: false,
+        error: message.startsWith('Timed out waiting for expression:')
+          ? 'condition not met before interaction timeout'
+          : message.slice(0, 240),
+      });
+      throw error;
+    }
   }
 
   const initial = await requireEventually('native-scroll-initial-fit', `(() => {
@@ -334,6 +385,8 @@ async function runBkvNativeScrollChecks(page, result) {
     const firstBounds = cameras[0].getBoundingClientRect();
     const lastBounds = cameras[cameras.length - 1].getBoundingClientRect();
     const scale = Number(canvas.getAttribute('data-view-scale'));
+    const tileResources = performance.getEntriesByType('resource')
+      .filter((entry) => entry.name.includes('/api/inspection-world/tile'));
     const value = {
       record: canvas.getAttribute('aria-label'),
       selectValue: document.querySelector('.bkv-toolbar select')?.value || '',
@@ -348,6 +401,8 @@ async function runBkvNativeScrollChecks(page, result) {
       spacerHeight: spacer.getBoundingClientRect().height,
       scale,
       viewY: Number(canvas.getAttribute('data-view-y')),
+      tileRequestBaseline: tileResources.length,
+      tileRequestUniqueBaseline: [...new Set(tileResources.map((entry) => entry.name))],
       camerasFit: Math.abs(firstBounds.left - canvasBounds.left) <= 2
         && Math.abs(lastBounds.right - canvasBounds.right) <= 2
         && cameras.every((camera) => {
@@ -376,7 +431,8 @@ async function runBkvNativeScrollChecks(page, result) {
     }, { once: true });
     return true;
   })()`);
-  await page.wheel(canvasSelector, { deltaY: 640 });
+  const plainWheelPoint = await page.wheel(canvasSelector, { deltaY: 640 });
+  result.checks.push({ kind: 'interaction', id: 'plain-wheel-visible-target', ok: true, value: plainWheelPoint });
   const plainWheel = await requireEventually('plain-wheel-scrolls-without-zoom', `(() => {
     const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
     const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
@@ -410,7 +466,8 @@ async function runBkvNativeScrollChecks(page, result) {
     }, { once: true });
     return true;
   })()`);
-  await page.wheel(canvasSelector, { deltaY: -420, ctrlKey: true });
+  const ctrlWheelPoint = await page.wheel(canvasSelector, { deltaY: -420, ctrlKey: true });
+  result.checks.push({ kind: 'interaction', id: 'ctrl-wheel-visible-target', ok: true, value: ctrlWheelPoint });
   const ctrlWheel = await requireEventually('ctrl-wheel-zooms-without-page-navigation', `(() => {
     const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
     const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
@@ -450,27 +507,34 @@ async function runBkvNativeScrollChecks(page, result) {
     const status = document.querySelector('.inspection-world-tile-status')?.textContent || '';
     const visibleMatch = status.match(/(\\d+)\\s*\u4e2a\u53ef\u89c1\u74e6\u7247/);
     if (!viewport || !canvas || !visibleMatch) return false;
-    const requestedTiles = new Set(
-      performance.getEntriesByType('resource')
-        .filter((entry) => entry.name.includes('/api/inspection-world/tile'))
-        .map((entry) => entry.name)
-    ).size;
+    const tileResources = performance.getEntriesByType('resource')
+      .filter((entry) => entry.name.includes('/api/inspection-world/tile'));
+    const requestedTiles = tileResources.length - window.__steelInspectionWorldSmoke.initial.tileRequestBaseline;
+    const uniqueNames = new Set(tileResources.map((entry) => entry.name));
+    const baselineNames = new Set(window.__steelInspectionWorldSmoke.initial.tileRequestUniqueBaseline);
+    const uniqueRequestedTiles = [...uniqueNames].filter((name) => !baselineNames.has(name)).length;
+    const visibleTiles = Number(visibleMatch[1]);
+    const cachedTiles = Number(canvas.getAttribute('data-cached-tiles'));
+    const requestBudget = Math.min(64, Math.max(24, (visibleTiles + cachedTiles) * 2));
     const value = {
       scrollTop: viewport.scrollTop,
       viewY: Number(canvas.getAttribute('data-view-y')),
-      visibleTiles: Number(visibleMatch[1]),
+      visibleTiles,
       loadedTiles: Number(canvas.getAttribute('data-loaded-tiles')),
-      cachedTiles: Number(canvas.getAttribute('data-cached-tiles')),
+      cachedTiles,
       requestedTiles,
+      uniqueRequestedTiles,
+      requestBudget,
     };
     return value.viewY > window.__steelInspectionWorldSmoke.beforeDeepViewY
       && value.visibleTiles > 0 && value.visibleTiles < 126
       && value.loadedTiles > 0 && value.loadedTiles < 126
       && value.cachedTiles > 0 && value.cachedTiles < 126
-      && value.requestedTiles > 0 && value.requestedTiles < 126
+      && value.requestedTiles > 0 && value.requestedTiles <= value.requestBudget
       ? value
       : false;
   })()`);
+  // Additive diagnostic artifact: steel.runtime.ui-smoke.v1 consumers ignore unknown fields.
   result.interactionScreenshots = [await page.screenshot('bkv-2d-deep-scroll')];
 
   await page.evaluate(`(() => {
