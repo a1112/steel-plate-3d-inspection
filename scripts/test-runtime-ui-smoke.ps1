@@ -375,12 +375,121 @@ async function runBkvNativeScrollChecks(page, result) {
     }
   }
 
+  async function performWheel(id, options) {
+    try {
+      const point = await page.wheel(canvasSelector, options);
+      result.checks.push({ kind: 'interaction', id, ok: true, value: point });
+      return point;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      result.checks.push({ kind: 'interaction', id, ok: false, error: message.slice(0, 240) });
+      throw error;
+    }
+  }
+
+  async function requireTileFetchQuiescence() {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    try {
+      while (Date.now() < deadline) {
+        const beforeFrames = await page.evaluate(`(() => {
+          const probe = window.__steelInspectionTileFetchProbe;
+          return probe ? { total: probe.total, pending: probe.pending } : null;
+        })()`);
+        if (beforeFrames?.pending === 0) {
+          const afterFrames = await page.evaluate(`(async () => {
+            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const probe = window.__steelInspectionTileFetchProbe;
+            return probe ? { total: probe.total, pending: probe.pending } : null;
+          })()`);
+          await delay(250);
+          const afterInterval = await page.evaluate(`(() => {
+            const probe = window.__steelInspectionTileFetchProbe;
+            return probe ? { total: probe.total, pending: probe.pending } : null;
+          })()`);
+          last = { beforeFrames, afterFrames, afterInterval };
+          if (afterFrames?.pending === 0
+            && afterInterval?.pending === 0
+            && beforeFrames.total === afterFrames.total
+            && afterFrames.total === afterInterval.total) {
+            await page.evaluate(`(() => {
+              window.__steelInspectionTileFetchProbe.quiescentTotal = ${afterInterval.total};
+              return true;
+            })()`);
+            result.checks.push({
+              kind: 'interaction',
+              id: 'deep-scroll-tile-fetches-quiescent',
+              ok: true,
+              value: { total: afterInterval.total, pending: 0, stableFrames: 2, stableIntervalMs: 250 },
+            });
+            return afterInterval;
+          }
+        }
+        await delay(100);
+      }
+      throw new Error(`tile fetches did not become quiescent; last=${JSON.stringify(last)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      result.checks.push({
+        kind: 'interaction',
+        id: 'deep-scroll-tile-fetches-quiescent',
+        ok: false,
+        error: message.slice(0, 240),
+      });
+      throw error;
+    }
+  }
+
+  await requireEventually('tile-fetch-probe-installed', `(() => {
+    let probe = window.__steelInspectionTileFetchProbe;
+    if (!probe) {
+      const originalFetch = window.fetch;
+      probe = {
+        total: 0,
+        pending: 0,
+        counts: Object.create(null),
+        originalFetch,
+        wrappedFetch: null,
+      };
+      probe.wrappedFetch = function (...args) {
+        const input = args[0];
+        const url = typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input?.url || String(input);
+        if (!url.includes('/api/inspection-world/tile')) {
+          return Reflect.apply(probe.originalFetch, this, args);
+        }
+        probe.total += 1;
+        probe.pending += 1;
+        probe.counts[url] = (probe.counts[url] || 0) + 1;
+        let response;
+        try {
+          response = Reflect.apply(probe.originalFetch, this, args);
+        } catch (error) {
+          probe.pending -= 1;
+          throw error;
+        }
+        return Promise.resolve(response).finally(() => {
+          probe.pending -= 1;
+        });
+      };
+      window.__steelInspectionTileFetchProbe = probe;
+    }
+    if (window.fetch !== probe.wrappedFetch) window.fetch = probe.wrappedFetch;
+    return window.fetch === probe.wrappedFetch
+      ? { installed: true, total: probe.total, pending: probe.pending }
+      : false;
+  })()`);
+
   const initial = await requireEventually('native-scroll-initial-fit', `(() => {
     const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
     const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
     const spacer = document.querySelector('[data-testid="inspection-world-scroll-space"]');
     const cameras = [...document.querySelectorAll('[data-testid="inspection-world-camera"]')];
-    if (!viewport || !canvas || !spacer || cameras.length !== 6) return false;
+    const fetchProbe = window.__steelInspectionTileFetchProbe;
+    if (!viewport || !canvas || !spacer || cameras.length !== 6 || !fetchProbe || fetchProbe.pending !== 0) return false;
     const canvasBounds = canvas.getBoundingClientRect();
     const firstBounds = cameras[0].getBoundingClientRect();
     const lastBounds = cameras[cameras.length - 1].getBoundingClientRect();
@@ -403,6 +512,8 @@ async function runBkvNativeScrollChecks(page, result) {
       viewY: Number(canvas.getAttribute('data-view-y')),
       tileRequestBaseline: tileResources.length,
       tileRequestUniqueBaseline: [...new Set(tileResources.map((entry) => entry.name))],
+      tileFetchBaseline: fetchProbe.total,
+      tileFetchUniqueBaseline: Object.keys(fetchProbe.counts),
       camerasFit: Math.abs(firstBounds.left - canvasBounds.left) <= 2
         && Math.abs(lastBounds.right - canvasBounds.right) <= 2
         && cameras.every((camera) => {
@@ -431,8 +542,7 @@ async function runBkvNativeScrollChecks(page, result) {
     }, { once: true });
     return true;
   })()`);
-  const plainWheelPoint = await page.wheel(canvasSelector, { deltaY: 640 });
-  result.checks.push({ kind: 'interaction', id: 'plain-wheel-visible-target', ok: true, value: plainWheelPoint });
+  await performWheel('plain-wheel-visible-target', { deltaY: 640 });
   const plainWheel = await requireEventually('plain-wheel-scrolls-without-zoom', `(() => {
     const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
     const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
@@ -466,8 +576,7 @@ async function runBkvNativeScrollChecks(page, result) {
     }, { once: true });
     return true;
   })()`);
-  const ctrlWheelPoint = await page.wheel(canvasSelector, { deltaY: -420, ctrlKey: true });
-  result.checks.push({ kind: 'interaction', id: 'ctrl-wheel-visible-target', ok: true, value: ctrlWheelPoint });
+  await performWheel('ctrl-wheel-visible-target', { deltaY: -420, ctrlKey: true });
   const ctrlWheel = await requireEventually('ctrl-wheel-zooms-without-page-navigation', `(() => {
     const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
     const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
@@ -501,6 +610,16 @@ async function runBkvNativeScrollChecks(page, result) {
     viewport.dispatchEvent(new Event('scroll'));
     return true;
   })()`);
+  await requireEventually('deep-scroll-position-loaded', `(() => {
+    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
+    if (!canvas) return false;
+    const viewY = Number(canvas.getAttribute('data-view-y'));
+    const loadedTiles = Number(canvas.getAttribute('data-loaded-tiles'));
+    return viewY > window.__steelInspectionWorldSmoke.beforeDeepViewY && loadedTiles > 0
+      ? { viewY, loadedTiles }
+      : false;
+  })()`);
+  await requireTileFetchQuiescence();
   const deepScroll = await requireEventually('deep-scroll-keeps-tile-work-bounded', `(() => {
     const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
     const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
@@ -509,10 +628,18 @@ async function runBkvNativeScrollChecks(page, result) {
     if (!viewport || !canvas || !visibleMatch) return false;
     const tileResources = performance.getEntriesByType('resource')
       .filter((entry) => entry.name.includes('/api/inspection-world/tile'));
-    const requestedTiles = tileResources.length - window.__steelInspectionWorldSmoke.initial.tileRequestBaseline;
-    const uniqueNames = new Set(tileResources.map((entry) => entry.name));
-    const baselineNames = new Set(window.__steelInspectionWorldSmoke.initial.tileRequestUniqueBaseline);
-    const uniqueRequestedTiles = [...uniqueNames].filter((name) => !baselineNames.has(name)).length;
+    const fetchProbe = window.__steelInspectionTileFetchProbe;
+    if (!fetchProbe) return false;
+    const requestedTiles = fetchProbe.total - window.__steelInspectionWorldSmoke.initial.tileFetchBaseline;
+    const baselineFetchNames = new Set(window.__steelInspectionWorldSmoke.initial.tileFetchUniqueBaseline);
+    const uniqueRequestedTiles = Object.keys(fetchProbe.counts)
+      .filter((name) => !baselineFetchNames.has(name)).length;
+    const completedResourceTiles = tileResources.length
+      - window.__steelInspectionWorldSmoke.initial.tileRequestBaseline;
+    const uniqueResourceNames = new Set(tileResources.map((entry) => entry.name));
+    const baselineResourceNames = new Set(window.__steelInspectionWorldSmoke.initial.tileRequestUniqueBaseline);
+    const uniqueCompletedResourceTiles = [...uniqueResourceNames]
+      .filter((name) => !baselineResourceNames.has(name)).length;
     const visibleTiles = Number(visibleMatch[1]);
     const cachedTiles = Number(canvas.getAttribute('data-cached-tiles'));
     const requestBudget = Math.min(64, Math.max(24, (visibleTiles + cachedTiles) * 2));
@@ -524,6 +651,9 @@ async function runBkvNativeScrollChecks(page, result) {
       cachedTiles,
       requestedTiles,
       uniqueRequestedTiles,
+      pendingTiles: fetchProbe.pending,
+      completedResourceTiles,
+      uniqueCompletedResourceTiles,
       requestBudget,
     };
     return value.viewY > window.__steelInspectionWorldSmoke.beforeDeepViewY
@@ -531,6 +661,8 @@ async function runBkvNativeScrollChecks(page, result) {
       && value.loadedTiles > 0 && value.loadedTiles < 126
       && value.cachedTiles > 0 && value.cachedTiles < 126
       && value.requestedTiles > 0 && value.requestedTiles <= value.requestBudget
+      && value.pendingTiles === 0
+      && fetchProbe.total === fetchProbe.quiescentTotal
       ? value
       : false;
   })()`);
