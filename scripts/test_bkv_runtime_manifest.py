@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image
+
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,10 +39,26 @@ class BkvRuntimeManifestTests(unittest.TestCase):
             {"ID": 10, "SeqNo": 1010, "SteelID": "STEEL-A", "SteelType": "37Mn/2", "RcvLen": 12000, "Radius": 233.5, "DefectNum": 1, "DefectTime": "2025-01-02 03:04:05", "WallThick": 0},
             {"ID": 11, "SeqNo": 1011, "SteelID": "STEEL-B", "SteelType": "37Mn/2", "RcvLen": -1, "Radius": 232.2, "DefectNum": 0, "DefectTime": "2025-01-02 03:05:05", "WallThick": 12.5},
         ])
-        defect_fields = ["ID", "CamNo", "DefectNo", "SeqNo", "Class", "Grade", "Confidence", "DefectCycle", "AreaSteel3D", "DepthSteel3D", "ImgIndex"]
+        defect_fields = [
+            "ID", "CamNo", "DefectNo", "SeqNo", "Class", "Grade", "Confidence",
+            "DefectCycle", "AreaSteel3D", "DepthSteel3D", "ImgIndex",
+            "LeftImg2D", "RightImg2D", "TopImg2D", "BottomImg2D",
+            "LeftSteel2D", "RightSteel2D", "TopSteel2D", "BottomSteel2D",
+        ]
         _write_csv(self.extract / "defect.csv", defect_fields, [
-            {"ID": 99, "CamNo": 2, "DefectNo": 7, "SeqNo": 1010, "Class": 16, "Grade": 2, "Confidence": 88, "DefectCycle": 1000, "AreaSteel3D": 3, "DepthSteel3D": -7, "ImgIndex": 4},
-            {"ID": 10, "CamNo": 3, "DefectNo": 8, "SeqNo": 9999, "Class": 7, "Grade": 1, "Confidence": 70, "DefectCycle": 1000, "AreaSteel3D": 4, "DepthSteel3D": -6, "ImgIndex": 5},
+            {
+                "ID": 99, "CamNo": 2, "DefectNo": 7, "SeqNo": 1010,
+                "Class": 16, "Grade": 2, "Confidence": 88, "DefectCycle": 1000,
+                "AreaSteel3D": 3, "DepthSteel3D": -7, "ImgIndex": 4,
+                "LeftImg2D": 3, "RightImg2D": 9, "TopImg2D": 5, "BottomImg2D": 11,
+                "LeftSteel2D": 3003, "RightSteel2D": 3009,
+                "TopSteel2D": 4005, "BottomSteel2D": 4011,
+            },
+            {
+                "ID": 10, "CamNo": 3, "DefectNo": 8, "SeqNo": 9999,
+                "Class": 7, "Grade": 1, "Confidence": 70, "DefectCycle": 1000,
+                "AreaSteel3D": 4, "DepthSteel3D": -6, "ImgIndex": 5,
+            },
         ])
         _write_csv(self.extract / "defectclass.csv", ["ID", "ClassNo", "ClassName", "Red", "Green", "Blue", "Warn", "Parent"], [
             {"ID": 7, "ClassNo": 7, "ClassName": "外折", "Red": 255, "Green": 0, "Blue": 0, "Warn": 0, "Parent": ""},
@@ -51,17 +69,19 @@ class BkvRuntimeManifestTests(unittest.TestCase):
         entries = []
         for material in (10, 11):
             for camera in range(1, 7):
-                image = self.images / f"CamImageSource{camera}" / str(material) / "2D" / "0000.jpg"
-                image.parent.mkdir(parents=True, exist_ok=True)
-                image.write_bytes(b"jpeg" + bytes([material, camera]))
-                artifact = self.npz / f"CamImageSource{camera}" / str(material) / "3D" / "0000.npz"
-                artifact.parent.mkdir(parents=True, exist_ok=True)
-                artifact.write_bytes(b"npz" + bytes([material, camera]))
-                entries.append({
-                    "status": "ok", "camera_id": camera, "legacy_seq_no": material,
-                    "frame_no": 0, "output_relative_path": artifact.relative_to(self.npz).as_posix(),
-                    "output_sha256": _sha256(artifact),
-                })
+                for frame_no in (4, 5):
+                    image = self.images / f"CamImageSource{camera}" / str(material) / "2D" / f"{frame_no:04d}.jpg"
+                    image.parent.mkdir(parents=True, exist_ok=True)
+                    Image.new("L", (32, 16), material + camera + frame_no).save(image, format="JPEG")
+                    artifact = self.npz / f"CamImageSource{camera}" / str(material) / "3D" / f"{frame_no:04d}.npz"
+                    artifact.parent.mkdir(parents=True, exist_ok=True)
+                    artifact.write_bytes(b"npz" + bytes([material, camera, frame_no]))
+                    entries.append({
+                        "status": "ok", "camera_id": camera, "legacy_seq_no": material,
+                        "frame_no": frame_no,
+                        "output_relative_path": artifact.relative_to(self.npz).as_posix(),
+                        "output_sha256": _sha256(artifact),
+                    })
             preview = self.previews / str(material)
             preview.mkdir(parents=True)
             (preview / "unwrapped-height.png").write_bytes(b"png" + bytes([material]))
@@ -98,7 +118,18 @@ class BkvRuntimeManifestTests(unittest.TestCase):
         self.assertEqual(first["wallThicknessMm"], None)
         self.assertEqual(manifest["materials"][1]["lengthMm"], None)
         self.assertEqual(len(first["cameras"]), 6)
-        self.assertTrue(all(camera["twoDFrameCount"] == 1 and camera["npzFrameCount"] == 1 for camera in first["cameras"]))
+        self.assertTrue(all(camera["twoDFrameCount"] == 2 and camera["npzFrameCount"] == 2 for camera in first["cameras"]))
+        self.assertEqual(first["cameras"][0]["frameWidth"], 32)
+        self.assertEqual(first["cameras"][0]["frameHeight"], 16)
+        self.assertEqual(first["cameras"][0]["orientation"], {
+            "frameOrder": "ascending", "rotation": 0,
+            "flipX": False, "flipY": False,
+        })
+        self.assertEqual(first["defects"][0]["imageIndex"], 4)
+        self.assertEqual(first["defects"][0]["imageRect2d"], {
+            "left": 3, "right": 9, "top": 5, "bottom": 11,
+        })
+        self.assertEqual(first["defects"][0]["steelRect2d"]["top"], 4005)
         self.assertEqual(manifest["quarantine"]["unassociatedDefects"][0]["ID"], "10")
         self.assertEqual(manifest["quarantine"]["conflictingAllExcelRows"][0]["SteelID"], "CONFLICT")
         self.assertEqual(json.loads(self.output.read_text(encoding="utf-8")), manifest)
@@ -122,9 +153,9 @@ class BkvRuntimeManifestTests(unittest.TestCase):
 
     def test_rejects_missing_camera_preview_and_npz_coverage(self) -> None:
         cases = (
-            (self.images / "CamImageSource6" / "10" / "2D" / "0000.jpg", "camera 6"),
+            (self.images / "CamImageSource6" / "10" / "2D" / "0004.jpg", "camera 6"),
             (self.previews / "10" / "unwrapped-height.png", "preview"),
-            (self.npz / "CamImageSource6" / "10" / "3D" / "0000.npz", "NPZ"),
+            (self.npz / "CamImageSource6" / "10" / "3D" / "0004.npz", "NPZ"),
         )
         for path, message in cases:
             with self.subTest(path=path):
@@ -141,6 +172,21 @@ class BkvRuntimeManifestTests(unittest.TestCase):
         manifest["entries"][0]["output_relative_path"] = "../escape.npz"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "escapes"):
+            self._build()
+
+    def test_rejects_mixed_frame_sizes_inside_one_camera(self) -> None:
+        frame = self.images / "CamImageSource2" / "10" / "2D" / "0005.jpg"
+        Image.new("L", (31, 16), 0).save(frame, format="JPEG")
+        with self.assertRaisesRegex(ValueError, "frame size.*camera 2"):
+            self._build()
+
+    def test_rejects_defect_image_index_outside_camera_frames(self) -> None:
+        path = self.extract / "defect.csv"
+        with path.open(encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle))
+        rows[0]["ImgIndex"] = "6"
+        _write_csv(path, list(rows[0]), rows)
+        with self.assertRaisesRegex(ValueError, "defect 99.*frame 6.*camera 2"):
             self._build()
 
 

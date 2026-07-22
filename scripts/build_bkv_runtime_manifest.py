@@ -13,6 +13,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 
 SCHEMA = "bkv-runtime-v1"
 
@@ -188,6 +190,18 @@ def build_runtime_manifest(
             "grade": _int(row.get("Grade"), "defect.Grade"),
             "confidence": _int(row.get("Confidence"), "defect.Confidence"),
             "imageIndex": _int(row.get("ImgIndex"), "defect.ImgIndex"),
+            "imageRect2d": {
+                "left": _int(row.get("LeftImg2D"), "defect.LeftImg2D"),
+                "right": _int(row.get("RightImg2D"), "defect.RightImg2D"),
+                "top": _int(row.get("TopImg2D"), "defect.TopImg2D"),
+                "bottom": _int(row.get("BottomImg2D"), "defect.BottomImg2D"),
+            },
+            "steelRect2d": {
+                "left": _int(row.get("LeftSteel2D"), "defect.LeftSteel2D"),
+                "right": _int(row.get("RightSteel2D"), "defect.RightSteel2D"),
+                "top": _int(row.get("TopSteel2D"), "defect.TopSteel2D"),
+                "bottom": _int(row.get("BottomSteel2D"), "defect.BottomSteel2D"),
+            },
             "area3d": _positive_float_or_none(row.get("AreaSteel3D")),
             "depth3d": _positive_float_or_none(row.get("DepthSteel3D")),
         })
@@ -206,6 +220,15 @@ def build_runtime_manifest(
                 {"frameNo": _int(path.stem, "2D frame filename"), **_artifact(data_root, path, "2D frame")}
                 for path in image_paths
             ]
+            with Image.open(image_paths[0]) as first_image:
+                frame_width, frame_height = first_image.size
+            for image_path in image_paths[1:]:
+                with Image.open(image_path) as image:
+                    if image.size != (frame_width, frame_height):
+                        raise ValueError(
+                            f"frame size mismatch for material {material}, camera {camera}: "
+                            f"expected {frame_width}x{frame_height}, found {image.width}x{image.height} at {image_path.name}"
+                        )
             npz_frames = npz_by_camera.get((material, camera), [])
             if not npz_frames:
                 raise ValueError(f"missing NPZ coverage for material {material}, camera {camera}")
@@ -216,11 +239,33 @@ def build_runtime_manifest(
             cameras.append({
                 "cameraId": camera,
                 "mode": "offline-file",
+                "frameWidth": frame_width,
+                "frameHeight": frame_height,
+                "orientation": {
+                    "frameOrder": "ascending",
+                    "rotation": 0,
+                    "flipX": False,
+                    "flipY": False,
+                },
                 "twoDFrameCount": len(two_d_frames),
                 "npzFrameCount": len(npz_frames),
                 "twoDFrames": two_d_frames,
                 "npzFrames": npz_frames,
             })
+        camera_frames = {
+            camera["cameraId"]: {frame["frameNo"] for frame in camera["twoDFrames"]}
+            for camera in cameras
+        }
+        for defect in defects_by_material.get(material, []):
+            camera_id = defect["cameraId"]
+            image_index = defect["imageIndex"]
+            if camera_id not in camera_frames:
+                raise ValueError(f"defect {defect['legacyDefectId']} references unknown camera {camera_id}")
+            if image_index not in camera_frames[camera_id]:
+                raise ValueError(
+                    f"defect {defect['legacyDefectId']} references frame {image_index} "
+                    f"outside camera {camera_id} frame set"
+                )
         preview_dir = preview_root / str(material)
         artifacts = {
             "unwrapped": _artifact(data_root, preview_dir / "unwrapped-height.png", "preview unwrapped artifact"),
