@@ -15271,3 +15271,52 @@ button {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+.inspection-world-viewport {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 420px;
+  overflow: hidden;
+  background: #07111c;
+  user-select: none;
+}
+
+.inspection-world-viewport canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  touch-action: none;
+}
+
+.inspection-world-viewport canvas:active { cursor: grabbing; }
+
+.inspection-world-camera-labels {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 28px;
+  pointer-events: none;
+}
+
+.inspection-world-camera-labels span {
+  position: absolute;
+  top: 0;
+  box-sizing: border-box;
+  padding: 5px 8px;
+  border-left: 1px solid rgba(0, 193, 255, .65);
+  color: #56d7ff;
+  font: 700 12px/18px ui-monospace, monospace;
+  background: rgba(4, 16, 27, .72);
+}
+
+.inspection-world-tile-status {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  padding: 3px 7px;
+  border-radius: 4px;
+  color: #8da8bd;
+  background: rgba(3, 12, 20, .76);
+  font-size: 11px;
+  pointer-events: none;
+}
