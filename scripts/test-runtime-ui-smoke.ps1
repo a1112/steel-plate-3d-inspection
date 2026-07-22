@@ -289,7 +289,253 @@ async function createPage(cdp) {
     await evaluate(`document.querySelector(${selectorJson}).click(); true`);
   }
 
-  return { sessionId, evaluate, waitForExpression, waitForText, navigate, screenshot, click };
+  async function wheel(selector, { deltaX = 0, deltaY = 0, ctrlKey = false } = {}) {
+    const selectorJson = JSON.stringify(selector);
+    await waitForExpression(`!!document.querySelector(${selectorJson})`);
+    const point = await evaluate(`(() => {
+      const bounds = document.querySelector(${selectorJson}).getBoundingClientRect();
+      return { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
+    })()`);
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: point.x,
+      y: point.y,
+    }, sessionId);
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x: point.x,
+      y: point.y,
+      deltaX,
+      deltaY,
+      modifiers: ctrlKey ? 2 : 0,
+    }, sessionId);
+  }
+
+  return { sessionId, evaluate, waitForExpression, waitForText, navigate, screenshot, click, wheel };
+}
+
+async function runBkvNativeScrollChecks(page, result) {
+  const viewportSelector = '[data-testid="inspection-world-viewport"]';
+  const canvasSelector = '[data-testid="inspection-world-canvas"]';
+
+  async function requireEventually(id, expression) {
+    const value = await page.waitForExpression(expression);
+    result.checks.push({ kind: 'interaction', id, ok: true, value });
+    return value;
+  }
+
+  const initial = await requireEventually('native-scroll-initial-fit', `(() => {
+    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
+    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
+    const spacer = document.querySelector('[data-testid="inspection-world-scroll-space"]');
+    const cameras = [...document.querySelectorAll('[data-testid="inspection-world-camera"]')];
+    if (!viewport || !canvas || !spacer || cameras.length !== 6) return false;
+    const canvasBounds = canvas.getBoundingClientRect();
+    const firstBounds = cameras[0].getBoundingClientRect();
+    const lastBounds = cameras[cameras.length - 1].getBoundingClientRect();
+    const scale = Number(canvas.getAttribute('data-view-scale'));
+    const value = {
+      record: canvas.getAttribute('aria-label'),
+      selectValue: document.querySelector('.bkv-toolbar select')?.value || '',
+      scrollMode: viewport.getAttribute('data-scroll-mode'),
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop,
+      scrollWidth: viewport.scrollWidth,
+      scrollHeight: viewport.scrollHeight,
+      clientWidth: viewport.clientWidth,
+      clientHeight: viewport.clientHeight,
+      spacerWidth: spacer.getBoundingClientRect().width,
+      spacerHeight: spacer.getBoundingClientRect().height,
+      scale,
+      viewY: Number(canvas.getAttribute('data-view-y')),
+      camerasFit: Math.abs(firstBounds.left - canvasBounds.left) <= 2
+        && Math.abs(lastBounds.right - canvasBounds.right) <= 2
+        && cameras.every((camera) => {
+          const bounds = camera.getBoundingClientRect();
+          return bounds.left >= canvasBounds.left - 2 && bounds.right <= canvasBounds.right + 2;
+        }),
+    };
+    window.__steelInspectionWorldSmoke = { initial: value };
+    return value.scrollMode === 'native'
+      && value.scrollHeight > value.clientHeight
+      && value.scrollLeft === 0
+      && value.scrollTop === 0
+      && value.scrollWidth <= value.clientWidth + 2
+      && value.spacerWidth <= value.clientWidth + 2
+      && value.scale > 0
+      && value.viewY === 0
+      && value.camerasFit
+      ? value
+      : false;
+  })()`);
+
+  await page.evaluate(`(() => {
+    window.__steelInspectionWorldSmoke.plainWheel = { defaultPrevented: null };
+    document.addEventListener('wheel', (event) => {
+      window.__steelInspectionWorldSmoke.plainWheel.defaultPrevented = event.defaultPrevented;
+    }, { once: true });
+    return true;
+  })()`);
+  await page.wheel(canvasSelector, { deltaY: 640 });
+  const plainWheel = await requireEventually('plain-wheel-scrolls-without-zoom', `(() => {
+    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
+    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
+    const smoke = window.__steelInspectionWorldSmoke;
+    if (!viewport || !canvas || !smoke) return false;
+    const value = {
+      scrollTop: viewport.scrollTop,
+      viewY: Number(canvas.getAttribute('data-view-y')),
+      scale: Number(canvas.getAttribute('data-view-scale')),
+      defaultPrevented: smoke.plainWheel?.defaultPrevented,
+    };
+    smoke.plainWheel = value;
+    return value.scrollTop > 0
+      && value.viewY > smoke.initial.viewY
+      && Math.abs(value.scale - smoke.initial.scale) < 0.000001
+      && value.defaultPrevented === false
+      ? value
+      : false;
+  })()`);
+
+  await page.evaluate(`(() => {
+    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
+    window.__steelInspectionWorldSmoke.ctrlWheel = {
+      defaultPrevented: null,
+      pageScrollY: window.scrollY,
+      viewportScrollTop: viewport?.scrollTop ?? -1,
+      visualScale: window.visualViewport?.scale ?? 1,
+    };
+    document.addEventListener('wheel', (event) => {
+      window.__steelInspectionWorldSmoke.ctrlWheel.defaultPrevented = event.defaultPrevented;
+    }, { once: true });
+    return true;
+  })()`);
+  await page.wheel(canvasSelector, { deltaY: -420, ctrlKey: true });
+  const ctrlWheel = await requireEventually('ctrl-wheel-zooms-without-page-navigation', `(() => {
+    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
+    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
+    const smoke = window.__steelInspectionWorldSmoke;
+    if (!viewport || !canvas || !smoke) return false;
+    const value = {
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop,
+      scale: Number(canvas.getAttribute('data-view-scale')),
+      loadedTiles: Number(canvas.getAttribute('data-loaded-tiles')),
+      defaultPrevented: smoke.ctrlWheel?.defaultPrevented,
+      pageScrollY: window.scrollY,
+      visualScale: window.visualViewport?.scale ?? 1,
+    };
+    return value.scale > smoke.plainWheel.scale
+      && value.loadedTiles > 0
+      && value.defaultPrevented === true
+      && value.pageScrollY === smoke.ctrlWheel.pageScrollY
+      && value.visualScale === smoke.ctrlWheel.visualScale
+      ? value
+      : false;
+  })()`);
+
+  await page.evaluate(`(() => {
+    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
+    if (!viewport) return false;
+    window.__steelInspectionWorldSmoke.beforeDeepViewY = Number(
+      document.querySelector(${JSON.stringify(canvasSelector)})?.getAttribute('data-view-y') || 0
+    );
+    viewport.scrollTop = Math.floor((viewport.scrollHeight - viewport.clientHeight) * 0.78);
+    viewport.dispatchEvent(new Event('scroll'));
+    return true;
+  })()`);
+  const deepScroll = await requireEventually('deep-scroll-keeps-tile-work-bounded', `(() => {
+    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
+    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
+    const status = document.querySelector('.inspection-world-tile-status')?.textContent || '';
+    const visibleMatch = status.match(/(\\d+)\\s*\u4e2a\u53ef\u89c1\u74e6\u7247/);
+    if (!viewport || !canvas || !visibleMatch) return false;
+    const requestedTiles = new Set(
+      performance.getEntriesByType('resource')
+        .filter((entry) => entry.name.includes('/api/inspection-world/tile'))
+        .map((entry) => entry.name)
+    ).size;
+    const value = {
+      scrollTop: viewport.scrollTop,
+      viewY: Number(canvas.getAttribute('data-view-y')),
+      visibleTiles: Number(visibleMatch[1]),
+      loadedTiles: Number(canvas.getAttribute('data-loaded-tiles')),
+      cachedTiles: Number(canvas.getAttribute('data-cached-tiles')),
+      requestedTiles,
+    };
+    return value.viewY > window.__steelInspectionWorldSmoke.beforeDeepViewY
+      && value.visibleTiles > 0 && value.visibleTiles < 126
+      && value.loadedTiles > 0 && value.loadedTiles < 126
+      && value.cachedTiles > 0 && value.cachedTiles < 126
+      && value.requestedTiles > 0 && value.requestedTiles < 126
+      ? value
+      : false;
+  })()`);
+  result.interactionScreenshots = [await page.screenshot('bkv-2d-deep-scroll')];
+
+  await page.evaluate(`(() => {
+    const select = document.querySelector('.bkv-toolbar select');
+    if (!select) return false;
+    const firstValue = window.__steelInspectionWorldSmoke.initial.selectValue;
+    const next = [...select.options].find((option) => option.value !== firstValue);
+    if (!next) return false;
+    select.value = next.value;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`);
+  const switched = await requireEventually('record-switch-restores-top-fit-width', `(() => {
+    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
+    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
+    const spacer = document.querySelector('[data-testid="inspection-world-scroll-space"]');
+    const cameras = [...document.querySelectorAll('[data-testid="inspection-world-camera"]')];
+    if (!viewport || !canvas || !spacer || cameras.length !== 6) return false;
+    const canvasBounds = canvas.getBoundingClientRect();
+    const firstBounds = cameras[0].getBoundingClientRect();
+    const lastBounds = cameras[cameras.length - 1].getBoundingClientRect();
+    const value = {
+      record: canvas.getAttribute('aria-label'),
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop,
+      scrollWidth: viewport.scrollWidth,
+      clientWidth: viewport.clientWidth,
+      spacerWidth: spacer.getBoundingClientRect().width,
+      spacerHeight: spacer.getBoundingClientRect().height,
+      scale: Number(canvas.getAttribute('data-view-scale')),
+      viewY: Number(canvas.getAttribute('data-view-y')),
+      loadedTiles: Number(canvas.getAttribute('data-loaded-tiles')),
+      camerasFit: Math.abs(firstBounds.left - canvasBounds.left) <= 2
+        && Math.abs(lastBounds.right - canvasBounds.right) <= 2,
+    };
+    return value.record !== window.__steelInspectionWorldSmoke.initial.record
+      && value.scrollLeft === 0 && value.scrollTop === 0 && value.viewY === 0
+      && value.scrollWidth <= value.clientWidth + 2
+      && value.spacerWidth <= value.clientWidth + 2
+      && value.spacerHeight > viewport.clientHeight
+      && value.scale > 0 && value.loadedTiles > 0 && value.camerasFit
+      ? value
+      : false;
+  })()`);
+
+  await page.evaluate(`(() => {
+    const select = document.querySelector('.bkv-toolbar select');
+    if (!select) return false;
+    select.value = window.__steelInspectionWorldSmoke.initial.selectValue;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`);
+  await requireEventually('record-switch-restores-first-record', `(() => {
+    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
+    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
+    return viewport && canvas
+      && canvas.getAttribute('aria-label') === window.__steelInspectionWorldSmoke.initial.record
+      && viewport.scrollLeft === 0 && viewport.scrollTop === 0
+      && Number(canvas.getAttribute('data-view-y')) === 0
+      && Number(canvas.getAttribute('data-loaded-tiles')) > 0
+      ? { record: canvas.getAttribute('aria-label'), scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop }
+      : false;
+  })()`);
+
+  return { initial, plainWheel, ctrlWheel, deepScroll, switched };
 }
 
 async function runPageCheck(page, check) {
@@ -318,6 +564,10 @@ async function runPageCheck(page, check) {
     for (const expression of check.requiredExpressions || []) {
       await page.waitForExpression(expression);
       result.checks.push({ kind: 'expression', expression, ok: true });
+    }
+
+    if (check.runInteraction) {
+      await check.runInteraction(page, result);
     }
 
     text = await page.evaluate('document.body ? document.body.innerText : ""');
@@ -378,6 +628,7 @@ const bkvChecks = [
       '(() => { const canvas = document.querySelector("[data-testid=inspection-world-canvas]"); if (!canvas) return false; const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data; for (let index = 0; index < data.length; index += 64) { const r = data[index], g = data[index + 1], b = data[index + 2]; if (r > 32 && Math.abs(r - g) < 6 && Math.abs(g - b) < 6) return true; } return false; })()',
       '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
     ],
+    runInteraction: runBkvNativeScrollChecks,
   },
   {
     id: 'bkv-defect-focus',
