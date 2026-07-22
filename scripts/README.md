@@ -101,6 +101,8 @@ The converter writes one compressed `bkv-depth-v1` `.npz` per source frame and p
 
 `manifest.json` provides one-to-one source/output paths, hashes, shapes, valid-point statistics, and errors. Every NPZ is re-opened with `allow_pickle=False` and validated before atomic publication. A nonzero command exit means at least one selected frame failed and the batch must not be marked complete.
 
+Add `--save-png` only when RGBA grayscale previews are needed for manual review. PNG files are optional evidence; BKV replay consumes the NPZ artifacts.
+
 ## Eight-Camera Headless Stack
 
 For the current eight-camera hardware setup, use the stack starter to launch the headless provider, apply the active `current-8-time-trigger` profile, and preserve the vendor/device-side time-trigger parameters:

@@ -84,6 +84,25 @@ class BkvD3ImgConversionTests(unittest.TestCase):
             with self.assertRaisesRegex(D3ImgFormatError, "file size mismatch"):
                 parse_depth(source)
 
+    def test_convert_file_can_write_optional_rgba_preview(self) -> None:
+        from PIL import Image
+        from scripts.convert_bkv_d3img import convert_file
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "CamImageSource1" / "1893700" / "3D" / "0001.d3img"
+            output = root / "output" / "CamImageSource1" / "1893700" / "3D" / "0001.npz"
+            preview = output.with_suffix(".png")
+            write_fixture(source, np.array([[1.0, 2.0, SENTINEL]], dtype=np.float32))
+
+            record = convert_file(source, output, preview_output=preview)
+
+            self.assertEqual(record["preview_path"], str(preview))
+            with Image.open(preview) as image:
+                self.assertEqual(image.mode, "RGBA")
+                self.assertEqual(image.size, (3, 1))
+                self.assertEqual(image.getpixel((2, 0))[3], 0)
+
     def test_convert_batch_filters_range_and_writes_validated_manifest(self) -> None:
         from scripts.convert_bkv_d3img import convert_batch
 
@@ -131,6 +150,27 @@ class BkvD3ImgConversionTests(unittest.TestCase):
             with np.load(first_output, allow_pickle=False) as artifact:
                 self.assertEqual(str(artifact["format_version"]), "bkv-depth-v1")
             self.assertEqual(list(output_root.rglob("*.tmp")), [])
+
+    def test_convert_batch_exposes_optional_png_flag(self) -> None:
+        from scripts.convert_bkv_d3img import convert_batch, parse_args
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "source"
+            output_root = root / "output"
+            source = source_root / "CamImageSource1" / "1893700" / "3D" / "0001.d3img"
+            write_fixture(source, np.array([[1.0, SENTINEL]], dtype=np.float32))
+
+            args = parse_args(["--src-dir", str(source_root), "--out-dir", str(output_root), "--save-png"])
+            self.assertTrue(args.save_png)
+            manifest = convert_batch(source_root, output_root, save_png=True)
+
+            preview = output_root / "CamImageSource1" / "1893700" / "3D" / "0001.png"
+            self.assertTrue(preview.is_file())
+            self.assertEqual(
+                manifest["entries"][0]["preview_relative_path"],
+                "CamImageSource1/1893700/3D/0001.png",
+            )
 
 
 if __name__ == "__main__":

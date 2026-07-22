@@ -104,11 +104,35 @@ def validate_artifact(
             raise D3ImgFormatError("NPZ valid point count mismatch")
 
 
+def write_preview_atomic(path: Path, depth: np.ndarray, valid_mask: np.ndarray) -> None:
+    from PIL import Image
+
+    grayscale = np.zeros(depth.shape, dtype=np.uint8)
+    valid_values = depth[valid_mask]
+    if valid_values.size:
+        minimum = float(valid_values.min())
+        maximum = float(valid_values.max())
+        if maximum > minimum:
+            normalized = np.clip((depth - minimum) / (maximum - minimum), 0.0, 1.0)
+            grayscale[valid_mask] = (normalized[valid_mask] * 255.0 + 0.5).astype(np.uint8)
+    rgba = np.repeat(grayscale[:, :, None], 4, axis=2)
+    rgba[:, :, 3] = valid_mask.astype(np.uint8) * 255
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        Image.fromarray(rgba, mode="RGBA").save(temporary, format="PNG")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def convert_file(
     source: Path,
     output: Path,
     *,
     sentinel: np.float32 = INVALID_SENTINEL,
+    preview_output: Path | None = None,
 ) -> dict[str, Any]:
     source = Path(source)
     output = Path(output)
@@ -145,6 +169,10 @@ def convert_file(
     finally:
         temporary.unlink(missing_ok=True)
 
+    if preview_output is not None:
+        preview_output = Path(preview_output)
+        write_preview_atomic(preview_output, depth, valid_mask)
+
     valid_values = depth[valid_mask]
     return {
         "status": "ok",
@@ -158,6 +186,7 @@ def convert_file(
         "valid_max": float(valid_values.max()) if valid_values.size else None,
         "source_sha256": source_sha256,
         "output_sha256": sha256_file(output),
+        "preview_path": str(preview_output) if preview_output is not None else None,
     }
 
 
@@ -208,6 +237,7 @@ def convert_batch(
     seq_start: int | None = None,
     seq_end: int | None = None,
     sentinel: np.float32 = INVALID_SENTINEL,
+    save_png: bool = False,
 ) -> dict[str, Any]:
     source_root = Path(source_root).resolve()
     output_root = Path(output_root).resolve()
@@ -218,8 +248,14 @@ def convert_batch(
         source_relative = source.relative_to(source_root)
         output_relative = source_relative.with_suffix(".npz")
         output = output_root / output_relative
+        preview_relative = source_relative.with_suffix(".png") if save_png else None
         try:
-            record = convert_file(source, output, sentinel=sentinel)
+            record = convert_file(
+                source,
+                output,
+                sentinel=sentinel,
+                preview_output=output_root / preview_relative if preview_relative is not None else None,
+            )
         except Exception as exc:
             record = {
                 "status": "error",
@@ -228,6 +264,8 @@ def convert_batch(
             }
         record["source_relative_path"] = source_relative.as_posix()
         record["output_relative_path"] = output_relative.as_posix()
+        record.pop("preview_path", None)
+        record["preview_relative_path"] = preview_relative.as_posix() if preview_relative is not None else None
         entries.append(record)
 
     ok_count = sum(entry["status"] == "ok" for entry in entries)
@@ -239,6 +277,7 @@ def convert_batch(
             "seq_start": seq_start,
             "seq_end": seq_end,
             "invalid_sentinel": float(sentinel),
+            "save_png": save_png,
         },
         "files_scanned": len(files),
         "ok": ok_count,
@@ -256,6 +295,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seq-start", type=int, default=None, help="First legacy sequence number, inclusive")
     parser.add_argument("--seq-end", type=int, default=None, help="Last legacy sequence number, inclusive")
     parser.add_argument("--sentinel", type=float, default=float(INVALID_SENTINEL), help="Legacy invalid depth value")
+    parser.add_argument("--save-png", action="store_true", help="Also write RGBA depth previews for manual review")
     return parser.parse_args(argv)
 
 
@@ -267,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         seq_start=args.seq_start,
         seq_end=args.seq_end,
         sentinel=np.float32(args.sentinel),
+        save_png=args.save_png,
     )
     print(
         json.dumps(
