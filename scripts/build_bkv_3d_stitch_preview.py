@@ -28,6 +28,7 @@ class StitchResult:
     depth: np.ndarray
     valid_mask: np.ndarray
     frame_ids: list[int]
+    camera_frame_ids: dict[int, list[int]]
     camera_ids: list[int]
     seam_columns: list[int]
     camera_offsets: dict[int, float]
@@ -64,12 +65,9 @@ def discover_frame_paths(root: Path, sequence: int) -> dict[int, dict[int, Path]
                 frames[int(path.stem)] = path
         discovered[camera] = frames
 
-    reference = set(discovered[CAMERA_IDS[0]])
-    if not reference:
-        raise PreviewInputError(f"no frames found for sequence {sequence}")
-    for camera in CAMERA_IDS[1:]:
-        if set(discovered[camera]) != reference:
-            raise PreviewInputError(f"camera frame sets differ for sequence {sequence}")
+    for camera in CAMERA_IDS:
+        if not discovered[camera]:
+            raise PreviewInputError(f"camera {camera} has no frames for sequence {sequence}")
     return discovered
 
 
@@ -126,7 +124,7 @@ def stitch_sequence(
         raise ValueError("preview sample dimensions must be positive")
     root = Path(root)
     discovered = discover_frame_paths(root, sequence)
-    frame_ids = sorted(discovered[CAMERA_IDS[0]])
+    frame_ids = sorted(set().union(*(set(frames) for frames in discovered.values())))
     camera_depths: list[np.ndarray] = []
     camera_masks: list[np.ndarray] = []
     camera_offsets: dict[int, float] = {}
@@ -136,7 +134,11 @@ def stitch_sequence(
         sampled_frames: list[np.ndarray] = []
         sampled_masks: list[np.ndarray] = []
         for frame in frame_ids:
-            path = discovered[camera][frame]
+            path = discovered[camera].get(frame)
+            if path is None:
+                sampled_frames.append(np.zeros((rows_per_frame, cols_per_camera), dtype=np.float32))
+                sampled_masks.append(np.zeros((rows_per_frame, cols_per_camera), dtype=np.bool_))
+                continue
             depth, mask = load_sampled_frame(
                 path,
                 camera=camera,
@@ -166,6 +168,7 @@ def stitch_sequence(
         depth=depth,
         valid_mask=valid_mask,
         frame_ids=frame_ids,
+        camera_frame_ids={camera: sorted(discovered[camera]) for camera in CAMERA_IDS},
         camera_ids=list(CAMERA_IDS),
         seam_columns=seam_columns,
         camera_offsets=camera_offsets,
@@ -298,7 +301,8 @@ def build_preview(
         "source_root": str(source_root),
         "camera_ids": result.camera_ids,
         "frame_ids": result.frame_ids,
-        "frames_per_camera": len(result.frame_ids),
+        "frame_ids_per_camera": {str(key): value for key, value in result.camera_frame_ids.items()},
+        "frames_per_camera": {str(key): len(value) for key, value in result.camera_frame_ids.items()},
         "input_count": len(inputs),
         "inputs": inputs,
         "preview_shape": [int(result.depth.shape[0]), int(result.depth.shape[1])],

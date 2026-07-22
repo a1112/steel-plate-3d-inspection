@@ -4,7 +4,8 @@ param(
   [string]$BrowserPath = "",
   [int]$TimeoutSec = 30,
   [int]$ViewportWidth = 1882,
-  [int]$ViewportHeight = 994
+  [int]$ViewportHeight = 994,
+  [switch]$ExpectBkv
 )
 
 $ErrorActionPreference = "Stop"
@@ -114,6 +115,7 @@ const screenshotDir = process.env.STEEL_UI_SMOKE_SCREENSHOT_DIR;
 const timeoutMs = Number(process.env.STEEL_UI_SMOKE_TIMEOUT_MS || 30000);
 const viewportWidth = Number(process.env.STEEL_UI_SMOKE_VIEWPORT_WIDTH || 1882);
 const viewportHeight = Number(process.env.STEEL_UI_SMOKE_VIEWPORT_HEIGHT || 994);
+const expectBkv = process.env.STEEL_UI_SMOKE_EXPECT_BKV === '1';
 
 function appUrl(app) {
   const url = new URL(clientOrigin);
@@ -335,7 +337,7 @@ async function runPageCheck(page, check) {
   return result;
 }
 
-const checks = [
+const standardChecks = [
   {
     id: 'terminal',
     url: appUrl('terminal'),
@@ -360,6 +362,33 @@ const checks = [
     ],
   },
 ];
+
+const bkvChecks = [
+  {
+    id: 'bkv-unwrapped',
+    url: appUrl('terminal'),
+    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', '\u771f\u5b9e\u76f8\u673a\u5728\u7ebf 0', '\u786c\u4ef6\u63a7\u5236\u5df2\u7981\u7528'],
+    clickSelector: '.bkv-view-tabs button:nth-child(2)',
+    afterClickText: ['JIT \u5e73\u94fa\u5c55\u5f00', '\u672a\u6807\u5b9a\u9884\u89c8'],
+    requiredExpressions: [
+      'document.querySelector("img.bkv-unwrapped")?.naturalWidth > 0',
+      '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
+    ],
+  },
+  {
+    id: 'bkv-cylinder',
+    url: appUrl('terminal'),
+    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', '\u771f\u5b9e\u76f8\u673a\u5728\u7ebf 0', '\u786c\u4ef6\u63a7\u5236\u5df2\u7981\u7528'],
+    clickSelector: '.bkv-view-tabs button:nth-child(3)',
+    afterClickText: ['\u5706\u67f1 3D', '\u672a\u6807\u5b9a\u9884\u89c8'],
+    requiredExpressions: [
+      'document.querySelectorAll(".bkv-camera-grid img").length === 0 && document.querySelector(".bkv-visual-panel canvas") !== null',
+      '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
+    ],
+  },
+];
+
+const checks = expectBkv ? bkvChecks : standardChecks;
 
 await fs.mkdir(screenshotDir, { recursive: true });
 const cdp = await createCdpClient();
@@ -413,6 +442,7 @@ try {
   $env:STEEL_UI_SMOKE_TIMEOUT_MS = [string]($TimeoutSec * 1000)
   $env:STEEL_UI_SMOKE_VIEWPORT_WIDTH = [string]$ViewportWidth
   $env:STEEL_UI_SMOKE_VIEWPORT_HEIGHT = [string]$ViewportHeight
+  $env:STEEL_UI_SMOKE_EXPECT_BKV = if ($ExpectBkv) { "1" } else { "0" }
 
   $Output = & node $NodePath 2>&1
   $ExitCode = $LASTEXITCODE

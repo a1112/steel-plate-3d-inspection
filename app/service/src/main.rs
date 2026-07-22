@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
 mod artifact_cleanup;
+mod bkv;
 mod calibration_operations;
 mod controlled_process;
 mod db;
@@ -166,6 +167,7 @@ enum CaptureProvider {
     HeadlessCpp,
     ExternalApi,
     Simulated,
+    Bkv,
 }
 
 impl CaptureProvider {
@@ -173,6 +175,7 @@ impl CaptureProvider {
         match value.trim().to_ascii_lowercase().as_str() {
             "external" | "external-api" | "api" => Self::ExternalApi,
             "sim" | "simulated" | "simulation" => Self::Simulated,
+            "bkv" | "legacy-offline" | "offline-bkv" => Self::Bkv,
             _ => Self::HeadlessCpp,
         }
     }
@@ -188,6 +191,7 @@ impl CaptureProvider {
             Self::HeadlessCpp => "headless-cpp",
             Self::ExternalApi => "external-api",
             Self::Simulated => "simulated",
+            Self::Bkv => "bkv",
         }
     }
 
@@ -196,7 +200,11 @@ impl CaptureProvider {
     }
 
     fn uses_local_api(&self) -> bool {
-        !matches!(self, Self::Simulated)
+        !matches!(self, Self::Simulated | Self::Bkv)
+    }
+
+    fn is_embedded(&self) -> bool {
+        matches!(self, Self::Simulated | Self::Bkv)
     }
 }
 
@@ -213,6 +221,7 @@ struct ServiceState {
     fallback_snapshot_json: Arc<String>,
     config_json: Mutex<String>,
     capture: Arc<CaptureServiceManager>,
+    bkv: Option<Arc<bkv::BkvManager>>,
     database: db::AppDatabase,
     runtime: Runtime,
     production_command_lock: Mutex<()>,
@@ -343,22 +352,22 @@ struct CaptureLifecycleState {
 
 impl CaptureLifecycleState {
     fn new(provider: CaptureProvider) -> Self {
-        let autostart = provider == CaptureProvider::Simulated
+        let autostart = provider.is_embedded()
             || (provider.is_managed()
                 && env::var("STEEL_CAPTURE_SERVICE_AUTOSTART").as_deref() != Ok("0"));
         Self {
-            phase: if provider == CaptureProvider::Simulated {
+            phase: if provider.is_embedded() {
                 "ready"
             } else if autostart {
                 "starting"
             } else {
                 "stopped"
             },
-            desired_running: provider == CaptureProvider::Simulated || autostart,
+            desired_running: provider.is_embedded() || autostart,
             autostart,
             pid: None,
             started_at: None,
-            ready_at: (provider == CaptureProvider::Simulated).then(current_time_millis),
+            ready_at: provider.is_embedded().then(current_time_millis),
             last_exit_at: None,
             last_exit_code: None,
             last_error: String::new(),
@@ -1294,7 +1303,7 @@ impl CaptureServiceManager {
             return;
         }
 
-        if self.provider == CaptureProvider::Simulated {
+        if self.provider.is_embedded() {
             if let Ok(mut lifecycle) = self.lifecycle.lock() {
                 lifecycle.phase = if lifecycle.desired_running {
                     "ready"
@@ -1505,7 +1514,7 @@ impl CaptureServiceManager {
             lifecycle.next_restart_at = None;
             lifecycle.last_error.clear();
         }
-        if self.provider == CaptureProvider::Simulated {
+        if self.provider.is_embedded() {
             self.supervisor_tick();
             return true;
         }
@@ -1522,7 +1531,7 @@ impl CaptureServiceManager {
             lifecycle.phase = "stopping";
             lifecycle.next_restart_at = None;
         }
-        if self.provider == CaptureProvider::Simulated {
+        if self.provider.is_embedded() {
             self.supervisor_tick();
             return true;
         }
@@ -1596,6 +1605,7 @@ impl CaptureServiceManager {
             CaptureProvider::HeadlessCpp => !exe.is_empty(),
             CaptureProvider::ExternalApi => true,
             CaptureProvider::Simulated => false,
+            CaptureProvider::Bkv => false,
         };
         json!({
             "name": "capture-service",
@@ -3081,6 +3091,27 @@ fn capture_health_component(state: &ServiceState) -> (bool, Value) {
         );
     }
 
+    if state.capture.provider == CaptureProvider::Bkv {
+        let ready = state.bkv.is_some() && state.capture.is_running();
+        return (
+            ready,
+            json!({
+                "ok": ready,
+                "status": if ready { "offline-replay-ready" } else { "unavailable" },
+                "provider": "bkv",
+                "managed": false,
+                "apiReachable": true,
+                "sdkRequired": false,
+                "sdkReady": Value::Null,
+                "physicalCamerasOnline": 0,
+                "offlineCameraFiles": if ready { 6 } else { 0 },
+                "latencyMs": 0,
+                "reason": if ready { Value::Null } else { json!("bkv_manifest_unavailable") },
+                "lifecycle": lifecycle
+            }),
+        );
+    }
+
     let started = Instant::now();
     let response = state
         .capture
@@ -3248,6 +3279,24 @@ fn storage_health_component_with_timeout(state: &ServiceState, timeout: Duration
                 "httpStatus": Value::Null,
                 "latencyMs": 0,
                 "reason": Value::Null
+            }),
+        );
+    }
+
+    if state.capture.provider == CaptureProvider::Bkv {
+        let ready = state.bkv.is_some();
+        return (
+            ready,
+            json!({
+                "ok": ready,
+                "status": if ready { "bkv-data-verified" } else { "unavailable" },
+                "provider": "bkv",
+                "simulated": false,
+                "apiReachable": true,
+                "queueRequired": false,
+                "offlineReadOnly": true,
+                "reason": if ready { Value::Null } else { json!("bkv_manifest_unavailable") },
+                "latencyMs": 0
             }),
         );
     }
@@ -3884,6 +3933,18 @@ fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
             }),
         );
     }
+    if state.capture.provider == CaptureProvider::Bkv {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "readyContribution": true,
+                "status": "bkv-precomputed-artifacts",
+                "required": false,
+                "reason": Value::Null
+            }),
+        );
+    }
     let (config_ok, config_detail, config) = algorithm_config_health();
     let (paths_ok, paths) = algorithm_runtime_paths_health();
     let acceptance_bundle = configured_algorithm_acceptance_report();
@@ -3943,6 +4004,19 @@ fn production_policy_health_component(state: &ServiceState) -> (bool, Value) {
                 "required": !allowed,
                 "syntheticFixturesAllowed": allowed,
                 "reason": if allowed { Value::Null } else { json!("production_simulated_provider_forbidden") }
+            }),
+        );
+    }
+    if state.capture.provider == CaptureProvider::Bkv {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "readyContribution": true,
+                "status": "bkv-compatibility-isolated",
+                "required": false,
+                "syntheticFixturesAllowed": false,
+                "reason": Value::Null
             }),
         );
     }
@@ -5381,6 +5455,9 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("GET", "/api/admin/database/backup")
         | ("GET", "/api/admin/database/integrity")
         | ("GET", "/api/admin/diagnostics") => Some("admin.overview"),
+        ("POST", "/api/bkv/replay/next") | ("POST", "/api/bkv/replay/reset") => {
+            Some("admin.services")
+        }
         ("POST", "/api/admin/database/maintenance") => Some("admin.services"),
         ("GET", "/api/config")
         | ("GET", "/api/config/capture")
@@ -10447,6 +10524,42 @@ fn write_production_capture_once_response(
     body: &str,
     actor: &str,
 ) -> Vec<u8> {
+    if state.capture.provider == CaptureProvider::Bkv {
+        let Some(manager) = state.bkv.as_ref() else {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code": 503, "error": "bkv_manifest_unavailable"}).to_string(),
+            );
+        };
+        return match manager.capture_next() {
+            Ok(Some(summary)) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 0,
+                    "materialId": summary.get("materialId").cloned().unwrap_or(Value::Null),
+                    "sessionId": summary.get("sessionId").cloned().unwrap_or(Value::Null),
+                    "legacySeqNo": summary.get("legacySeqNo").cloned().unwrap_or(Value::Null),
+                    "provider": summary,
+                    "record": {"persisted": true, "storage": "bkv-runtime-state"}
+                })
+                .to_string(),
+            ),
+            Ok(None) => http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({"code": 409, "error": "bkv_replay_completed", "status": manager.status()})
+                    .to_string(),
+            ),
+            Err(error) => http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"code": 500, "error": "bkv_capture_persist_failed", "detail": error})
+                    .to_string(),
+            ),
+        };
+    }
     let payload = match serde_json::from_str::<Value>(body.trim()) {
         Ok(value) => value,
         Err(error) => {
@@ -11865,6 +11978,180 @@ fn production_file_response(query: &str) -> Vec<u8> {
             "404 Not Found",
             "application/json; charset=utf-8",
             &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
+        ),
+    }
+}
+
+fn is_bkv_hardware_mutation(method: &str, path: &str) -> bool {
+    if !matches!(method, "POST" | "DELETE" | "PUT" | "PATCH") {
+        return false;
+    }
+    path == "/api/config/capture"
+        || path == "/api/admin/cameras"
+        || path.starts_with("/api/admin/services/capture/")
+        || path.starts_with("/api/capture/start")
+        || path.starts_with("/api/capture/stop")
+        || path.starts_with("/api/capture/restart")
+        || path.starts_with("/api/capture/continuous")
+        || path.starts_with("/api/capture/preset")
+        || path.starts_with("/api/capture/preview")
+        || path.starts_with("/api/capture/depth-map")
+        || path.starts_with("/api/preview/")
+        || path.starts_with("/api/camera/")
+        || path.starts_with("/api/cameras/")
+        || path.starts_with("/api/config/camera-")
+        || path.starts_with("/api/param")
+        || path.starts_with("/api/calibration/")
+        || path.starts_with("/api/roi/")
+        || path.starts_with("/api/stream/")
+}
+
+fn bkv_hardware_operation_forbidden_response() -> Vec<u8> {
+    http_response(
+        "409 Conflict",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 409,
+            "error": "bkv_hardware_operation_forbidden",
+            "provider": "bkv",
+            "message": "BKV compatibility mode is offline and cannot mutate camera hardware"
+        })
+        .to_string(),
+    )
+}
+
+fn bkv_inactive_response() -> Vec<u8> {
+    http_response(
+        "404 Not Found",
+        "application/json; charset=utf-8",
+        &json!({"code": 404, "error": "bkv_mode_inactive"}).to_string(),
+    )
+}
+
+fn bkv_status_response(state: &ServiceState) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return bkv_inactive_response();
+    };
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &manager.status().to_string(),
+    )
+}
+
+fn bkv_materials_response(state: &ServiceState) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return bkv_inactive_response();
+    };
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({"provider": "bkv", "materials": manager.materials()}).to_string(),
+    )
+}
+
+fn bkv_material_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return bkv_inactive_response();
+    };
+    let Some(sequence) = query_value(query, "legacySeqNo")
+        .or_else(|| query_value(query, "sequence"))
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "bkv_legacy_sequence_required"}).to_string(),
+        );
+    };
+    match manager.material(sequence) {
+        Some(material) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({"provider": "bkv", "material": material}).to_string(),
+        ),
+        None => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({"code": 404, "error": "bkv_material_not_found"}).to_string(),
+        ),
+    }
+}
+
+fn bkv_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return bkv_inactive_response();
+    };
+    let Some(relative) = query_value(query, "path") else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "bkv_path_required"}).to_string(),
+        );
+    };
+    match manager.resolve_artifact(&relative) {
+        Ok(path) => match fs::read(&path) {
+            Ok(body) => http_bytes_response_with_headers(
+                "200 OK",
+                content_type_for_path(&path),
+                &body,
+                &[("Cache-Control", "private, max-age=300")],
+            ),
+            Err(error) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({"code": 404, "error": "bkv_artifact_unavailable", "detail": error.to_string()}).to_string(),
+            ),
+        },
+        Err(error) => http_response(
+            "403 Forbidden",
+            "application/json; charset=utf-8",
+            &json!({"code": 403, "error": "bkv_artifact_not_allowed", "detail": error}).to_string(),
+        ),
+    }
+}
+
+fn bkv_next_response(state: &ServiceState) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return bkv_inactive_response();
+    };
+    match manager.capture_next() {
+        Ok(capture) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 0,
+                "provider": "bkv",
+                "completed": capture.is_none(),
+                "capture": capture,
+                "status": manager.status()
+            })
+            .to_string(),
+        ),
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code": 500, "error": "bkv_cursor_persist_failed", "detail": error})
+                .to_string(),
+        ),
+    }
+}
+
+fn bkv_reset_response(state: &ServiceState) -> Vec<u8> {
+    let Some(manager) = state.bkv.as_ref() else {
+        return bkv_inactive_response();
+    };
+    match manager.reset() {
+        Ok(()) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({"code": 0, "provider": "bkv", "status": manager.status()}).to_string(),
+        ),
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code": 500, "error": "bkv_cursor_persist_failed", "detail": error})
+                .to_string(),
         ),
     }
 }
@@ -16703,6 +16990,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         .as_ref()
         .map(|session| session.user_id.as_str())
         .unwrap_or("admin");
+    if state.capture.provider == CaptureProvider::Bkv && is_bkv_hardware_mutation(method, path) {
+        let _ = stream.write_all(&bkv_hardware_operation_forbidden_response());
+        return;
+    }
     let _runtime_admission_guard = match enter_runtime_admission(&state, method, path) {
         Ok(guard) => guard,
         Err(response) => {
@@ -16744,6 +17035,12 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             "application/json; charset=utf-8",
             &state.capture.status_json(),
         ),
+        ("GET", "/api/bkv/status") => bkv_status_response(&state),
+        ("GET", "/api/bkv/materials") => bkv_materials_response(&state),
+        ("GET", "/api/bkv/material") => bkv_material_response(&state, query),
+        ("GET", "/api/bkv/file") => bkv_file_response(&state, query),
+        ("POST", "/api/bkv/replay/next") => bkv_next_response(&state),
+        ("POST", "/api/bkv/replay/reset") => bkv_reset_response(&state),
         ("GET", "/api/algorithm/bar-surface/latest") => algorithm_latest_response(),
         ("GET", "/api/algorithm/bar-surface/manifest") => algorithm_manifest_response(query),
         ("GET", "/api/algorithm/bar-surface/file") => algorithm_file_response(query),
@@ -16977,6 +17274,26 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
     let _ = stream.write_all(&response);
 }
 
+fn configured_bkv_manager(
+    provider: CaptureProvider,
+) -> Result<Option<Arc<bkv::BkvManager>>, String> {
+    if provider != CaptureProvider::Bkv {
+        return Ok(None);
+    }
+    let root = env::var("STEEL_BKV_DATA_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("tmp").join("legacy-bkv"));
+    let manifest = env::var("STEEL_BKV_MANIFEST_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("bkv-runtime-manifest.json"));
+    let cursor = env::var("STEEL_BKV_CURSOR_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("runtime-state").join("replay.json"));
+    bkv::BkvManager::load(&root, &manifest, &cursor)
+        .map(Arc::new)
+        .map(Some)
+}
+
 fn main() -> std::io::Result<()> {
     let port = env::var("INSPECTION_SERVICE_PORT")
         .ok()
@@ -17003,6 +17320,8 @@ fn main() -> std::io::Result<()> {
     }
     let capture_port = capture_port();
     let capture_manager = Arc::new(CaptureServiceManager::new(capture_port));
+    let bkv_manager = configured_bkv_manager(capture_manager.provider)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     CaptureServiceManager::start_supervisor(&capture_manager);
     let config_json = runtime
         .block_on(db::get_config(&database.connection, "capture"))
@@ -17014,6 +17333,7 @@ fn main() -> std::io::Result<()> {
         fallback_snapshot_json: Arc::new(build_snapshot_json()),
         config_json: Mutex::new(config_json),
         capture: Arc::clone(&capture_manager),
+        bkv: bkv_manager,
         database,
         runtime,
         production_command_lock: Mutex::new(()),
@@ -17125,6 +17445,7 @@ mod tests {
                 simulated_capture_mode: Mutex::new("continuous".to_string()),
                 simulated_continuous_line_rate: Mutex::new(300.0),
             }),
+            bkv: None,
             database,
             runtime,
             production_command_lock: Mutex::new(()),
@@ -18731,6 +19052,42 @@ mod tests {
             CaptureProvider::from_env_value("simulated"),
             CaptureProvider::Simulated
         );
+        assert_eq!(CaptureProvider::from_env_value("bkv"), CaptureProvider::Bkv);
+        assert_eq!(
+            CaptureProvider::from_env_value("legacy-offline"),
+            CaptureProvider::Bkv
+        );
+        let lifecycle = CaptureLifecycleState::new(CaptureProvider::Bkv);
+        assert_eq!(lifecycle.phase, "ready");
+        assert!(lifecycle.desired_running);
+        assert!(!CaptureProvider::Bkv.is_managed());
+        assert!(!CaptureProvider::Bkv.uses_local_api());
+    }
+
+    #[test]
+    fn bkv_mode_fences_hardware_mutations_but_not_reads_or_replay() {
+        for path in [
+            "/api/capture/start",
+            "/api/capture/continuous-test",
+            "/api/camera/connect-all",
+            "/api/param",
+            "/api/calibration/apply-all",
+            "/api/roi/load",
+            "/api/stream/start",
+            "/api/admin/cameras",
+        ] {
+            assert!(is_bkv_hardware_mutation("POST", path), "{path}");
+        }
+        assert!(!is_bkv_hardware_mutation("GET", "/api/bkv/material"));
+        assert!(!is_bkv_hardware_mutation("POST", "/api/bkv/replay/next"));
+        assert_eq!(permission_for_route("GET", "/api/bkv/file"), None);
+        assert_eq!(
+            permission_for_route("POST", "/api/bkv/replay/reset"),
+            Some("admin.services")
+        );
+        let response = response_text(bkv_hardware_operation_forbidden_response());
+        assert!(response.starts_with("HTTP/1.1 409 Conflict"));
+        assert!(response.contains("bkv_hardware_operation_forbidden"));
     }
 
     #[test]

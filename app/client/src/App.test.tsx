@@ -26,6 +26,30 @@ describe('storage capacity warning presentation', () => {
   });
 });
 
+describe('App BKV provider selection', () => {
+  it('switches only when the service explicitly reports a ready bkv provider', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/bkv/status')) {
+        return new Response(JSON.stringify({
+          provider: 'bkv', ready: true, mode: 'offline-replay-no-camera-hardware', cameraMode: 'offline-file',
+          cameraCount: 6, physicalCamerasOnline: 0, batchId: 'legacy-1893700-1893710', materialCount: 11,
+          nextIndex: 0, nextLegacySeqNo: 1893700, completed: false,
+        }), { status: 200 });
+      }
+      if (url.includes('/api/bkv/materials')) {
+        return new Response(JSON.stringify({ provider: 'bkv', materials: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+    expect(await screen.findByRole('heading', { name: 'BKV 离线回放' })).toBeInTheDocument();
+    expect(screen.getByText('真实相机在线 0')).toBeInTheDocument();
+    expect(screen.queryByText('钢管3D表面检测系统')).not.toBeInTheDocument();
+  });
+});
+
 describe('App online severity filters', () => {
   beforeEach(() => {
     vi.stubGlobal(

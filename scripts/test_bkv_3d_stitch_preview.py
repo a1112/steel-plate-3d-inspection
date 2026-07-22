@@ -65,15 +65,32 @@ class Bkv3DStitchPreviewTests(unittest.TestCase):
                 mask = result.valid_mask[:, camera_index * 3 : (camera_index + 1) * 3]
                 self.assertAlmostEqual(float(np.median(sector[mask])), 0.0, places=5)
 
-    def test_stitch_sequence_rejects_mismatched_frame_sets(self) -> None:
-        from scripts.build_bkv_3d_stitch_preview import PreviewInputError, stitch_sequence
+    def test_stitch_sequence_preserves_missing_tail_frame_as_transparent_gap(self) -> None:
+        from scripts.build_bkv_3d_stitch_preview import stitch_sequence
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             write_sequence(root)
             (root / "CamImageSource6" / "1893700" / "3D" / "0002.npz").unlink()
 
-            with self.assertRaisesRegex(PreviewInputError, "frame sets differ"):
+            result = stitch_sequence(root, 1_893_700, rows_per_frame=4, cols_per_camera=3)
+
+            self.assertEqual(result.depth.shape, (8, 18))
+            self.assertEqual(result.frame_ids, [1, 2])
+            self.assertEqual(result.camera_frame_ids[6], [1])
+            self.assertFalse(result.valid_mask[4:, 15:18].any())
+            self.assertEqual(len(result.source_paths), 11)
+
+    def test_stitch_sequence_rejects_camera_without_any_frames(self) -> None:
+        from scripts.build_bkv_3d_stitch_preview import PreviewInputError, stitch_sequence
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_sequence(root)
+            for path in (root / "CamImageSource6" / "1893700" / "3D").glob("*.npz"):
+                path.unlink()
+
+            with self.assertRaisesRegex(PreviewInputError, "camera 6 has no frames"):
                 stitch_sequence(root, 1_893_700, rows_per_frame=4, cols_per_camera=3)
 
     def test_build_preview_writes_traceable_uncalibrated_artifacts(self) -> None:

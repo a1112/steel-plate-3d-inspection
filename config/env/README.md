@@ -7,6 +7,7 @@ Copy one of these files to a local `.env` file or pass it directly with `-EnvFil
 - `headless-cpp.env.example`: Rust starts and supervises the headless C++ capture provider.
 - `external-api.env.example`: Rust connects to an already running capture API process.
 - `simulated.env.example`: Rust uses the eight-camera simulation fallback.
+- `bkv.env.example`: Rust uses the validated 11-material BKV offline replay batch and starts no camera process.
 - `simulated-mysql.env.example`: development MySQL primary with explicit SQLite fallback.
 - `simulated-postgres.env.example`: development PostgreSQL primary with explicit SQLite fallback.
 - `trigger-gateway.env.example`: standalone trigger gateway from `app/trigger` forwards L2/PLC/API steel events to the Rust production API.

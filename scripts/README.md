@@ -4,6 +4,66 @@ These scripts keep the four runtime boundaries independent.
 
 Environment templates live in `config/env`.
 
+## BKV offline runtime manifest
+
+After converting legacy `.d3img` files and building the six-camera previews, build the
+strict runtime manifest consumed by the formal `bkv` provider:
+
+```powershell
+python scripts/build_bkv_runtime_manifest.py `
+  --data-root D:\Project\steel-plate-3d-inspection\tmp\legacy-bkv
+```
+
+The default contract selects `checkrecord.ID` 1893700 through 1893710, requires all
+11 material identities and six offline camera directories, proves exact JPEG/NPZ
+frame coverage, verifies NPZ hashes, and requires the unfolded, cylinder, and stitch
+summary preview artifacts for every material. Defects are associated only through
+`defect.SeqNo -> checkrecord.SeqNo`; rows selected merely because their old `ID`
+falls in the range are recorded under `quarantine` and are never replayed as defects.
+Non-positive legacy dimensions are emitted as `null`. Output is written atomically to
+`bkv-runtime-manifest.json`, with paths contained beneath the supplied data root.
+
+Run its contract tests with:
+
+```powershell
+python -m unittest scripts.test_bkv_runtime_manifest -v
+```
+
+Start the service and client in BKV mode after copying
+`config/env/bkv.env.example` to a machine-local file and correcting its absolute
+data paths:
+
+```powershell
+scripts/run-service.ps1 -EnvFile config/env/bkv.env.example
+scripts/run-client-dev.ps1 -EnvFile config/env/client.env.example
+```
+
+The client switches to the dedicated compatibility workspace only when
+`GET /api/bkv/status` explicitly returns a ready `provider=bkv`. Read-only material
+and whitelisted artifact endpoints are local display APIs, matching the existing
+inspection snapshot policy. Advancing or resetting the durable replay cursor still
+requires an authenticated `admin.services` session. In BKV mode camera lifecycle,
+parameter, stream, calibration, ROI, and continuous-capture mutations return the
+stable `bkv_hardware_operation_forbidden` error.
+
+The replay exits naturally after item 11: capture-once and replay-next then report
+`bkv_replay_completed`/`completed=true` without wrapping to the first item. Reset is
+always explicit:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:4873/api/bkv/replay/reset `
+  -Headers @{ Authorization = "Bearer <admin.services token>" } `
+  -ContentType application/json `
+  -Body '{}'
+```
+
+Run browser verification against an already started BKV service and client with:
+
+```powershell
+scripts/test-runtime-ui-smoke.ps1 -ExpectBkv
+```
+
 ## Windows production service
 
 The Release runtime contains one SCM host, `service\steel-runtime-supervisor.exe`, for the capture provider, trigger gateway, and Rust service. Its contract is ordered application-level readiness, strict business drain, bounded whole-stack stop/restart, child-process-tree cleanup, live managed-log rotation, and atomic restart-budget state publication. The non-elevated regression proves RuntimeRoot/StateRoot isolation, source/layout/config fail-closed cases, Trigger-then-Service drain (including timeout cases), `inFlight` convergence, 50 MiB online rotation, `.1` through `.5` retention, persisted budget exhaustion, and stable-runtime recovery of `StateRoot\service\supervisor-status.json`; the install-related PowerShell files parse, the static versioned-install policy passes, and the Supervisor Release target compiles. These checks still do not prove real SCM transitions, effective target-machine ACLs, signed-package installation, power-loss recovery, or a database migration transaction.
