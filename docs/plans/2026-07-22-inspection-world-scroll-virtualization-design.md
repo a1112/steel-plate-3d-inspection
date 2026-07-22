@@ -34,11 +34,11 @@ The camera labels, defect overlays, and tile positions use the same scroll-deriv
       tile status
 ```
 
-The stage remains aligned to the scroll viewport by translating it to the current scroll offset. The spacer has no image content and therefore has negligible rendering cost.
+The stage remains aligned through CSS sticky positioning at the scroll viewport's top-left corner; it is not translated on each scroll update. The spacer has no image content and therefore has negligible rendering cost.
 
 ## Data flow
 
-1. Measure the viewport excluding visible scrollbar gutters.
+1. Measure the viewport excluding visible scrollbar gutters. Tile selection, fetch, and drawing begin only after that measurement is committed.
 2. Compute fit-width scale from `viewportWidth / world.width`.
 3. Set spacer dimensions to `world.width * scale` and `world.height * scale`, never smaller than the viewport.
 4. Read native `scrollLeft/scrollTop`; convert them to world origin by dividing by scale.
@@ -58,8 +58,8 @@ The stage remains aligned to the scroll viewport by translating it to the curren
 
 ## Error and edge handling
 
-- Invalid or zero measurements fall back to the current 1000×600 defaults.
-- Scale stays between fit-width and the existing maximum of 8.
+- Invalid or zero measurements reported by `ResizeObserver` fall back to 1000×600; when `ResizeObserver` is unavailable, the synchronous bounding-box measurement uses the same fallback so rendering cannot remain blank.
+- Initial and record-reset scale is the literal fit-width value, without an upper cap. Interactive Ctrl+wheel scale stays between fit-width and `max(8, fit-width)`, so narrow worlds remain filled rather than shrinking below the viewport width.
 - At fit-width, horizontal scroll is reset to zero.
 - If a record has a shorter world than the viewport, the spacer fills the viewport without producing negative scroll ranges.
 - Failed tiles retain the existing visible error state and retry behavior.

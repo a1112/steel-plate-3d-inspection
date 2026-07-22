@@ -28,7 +28,7 @@ const DEFAULT_WIDTH = 1000;
 const DEFAULT_HEIGHT = 600;
 
 function fitWidthScale(worldWidth: number, viewportWidth: number) {
-  return Math.min(8, viewportWidth / Math.max(1, worldWidth));
+  return viewportWidth / Math.max(1, worldWidth);
 }
 
 function initialView(meta: InspectionWorldMeta, width: number): ViewState {
@@ -61,6 +61,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   const metaRef = useRef(meta);
   const measured = useRef(false);
   const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
+  const [viewportMeasured, setViewportMeasured] = useState(false);
   const [view, setView] = useState(() => initialView(meta, DEFAULT_WIDTH));
   const interactionView = useRef(view);
   const [failedKeys, setFailedKeys] = useState<Set<string>>(new Set());
@@ -99,10 +100,14 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
-    const update = () => {
+    const hasResizeObserver = typeof ResizeObserver === 'function';
+    const update = (allowFallback: boolean) => {
       const bounds = host.getBoundingClientRect();
-      const width = Math.max(1, Math.round(host.clientWidth || bounds.width || DEFAULT_WIDTH));
-      const height = Math.max(1, Math.round(host.clientHeight || bounds.height || DEFAULT_HEIGHT));
+      const measuredWidth = host.clientWidth || bounds.width;
+      const measuredHeight = host.clientHeight || bounds.height;
+      if (!allowFallback && (!measuredWidth || !measuredHeight)) return;
+      const width = Math.max(1, Math.round(measuredWidth || DEFAULT_WIDTH));
+      const height = Math.max(1, Math.round(measuredHeight || DEFAULT_HEIGHT));
       setSize({ width, height });
       if (!measured.current) {
         measured.current = true;
@@ -122,9 +127,11 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
           setView((state) => ({ ...state, scale }));
         }
       }
+      setViewportMeasured(true);
     };
-    update();
-    const observer = new ResizeObserver(update);
+    update(!hasResizeObserver);
+    if (!hasResizeObserver) return;
+    const observer = new ResizeObserver(() => update(true));
     observer.observe(host);
     return () => observer.disconnect();
   }, []);
@@ -178,14 +185,17 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     () => scaledWorldExtent(meta.world.width, meta.world.height, view.scale, size.width, size.height),
     [meta.world.height, meta.world.width, size.height, size.width, view.scale],
   );
-  const visibleTiles = useMemo(() => getVisibleWorldTiles({
-    worldWidth: meta.world.width,
-    worldHeight: meta.world.height,
-    tileSize: meta.world.tileSize,
-    level,
-    viewport: { x: viewX, y: viewY, width: size.width / view.scale, height: size.height / view.scale },
-    prefetch: 1,
-  }), [level, meta.world.height, meta.world.tileSize, meta.world.width, size.height, size.width, view.scale, viewX, viewY]);
+  const visibleTiles = useMemo(() => {
+    if (!viewportMeasured) return [];
+    return getVisibleWorldTiles({
+      worldWidth: meta.world.width,
+      worldHeight: meta.world.height,
+      tileSize: meta.world.tileSize,
+      level,
+      viewport: { x: viewX, y: viewY, width: size.width / view.scale, height: size.height / view.scale },
+      prefetch: 1,
+    });
+  }, [level, meta.world.height, meta.world.tileSize, meta.world.width, size.height, size.width, view.scale, viewX, viewY, viewportMeasured]);
   const visibleTileKeys = useMemo(
     () => new Set(visibleTiles.map((tile) => `${recordId}:${tile.level}:${tile.x}:${tile.y}`)),
     [recordId, visibleTiles],
@@ -333,6 +343,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     if (!canvas) return;
     const context = canvas.getContext('2d');
     if (!context) return;
+    if (!viewportMeasured) return;
     context.clearRect(0, 0, size.width, size.height);
     context.fillStyle = '#07111c';
     context.fillRect(0, 0, size.width, size.height);
@@ -365,7 +376,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
         Math.max(3, rect.height * view.scale),
       );
     }
-  }, [failedKeys, level, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, visibleDefects, visibleTiles]);
+  }, [failedKeys, level, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -378,7 +389,11 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       const pointerY = event.clientY - bounds.top;
       const current = interactionView.current;
       const minimum = fitWidthScale(meta.world.width, size.width);
-      const scale = clampWorldScale(current.scale * Math.exp(-event.deltaY * 0.001), minimum, 8);
+      const scale = clampWorldScale(
+        current.scale * Math.exp(-event.deltaY * 0.001),
+        minimum,
+        Math.max(8, minimum),
+      );
       if (scale === current.scale) return;
       fitWidthMode.current = false;
       const baseScroll = pendingScroll.current ?? {

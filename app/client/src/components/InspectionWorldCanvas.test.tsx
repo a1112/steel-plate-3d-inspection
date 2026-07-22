@@ -60,6 +60,12 @@ function installNativeScrollTo(viewport: HTMLDivElement) {
 describe('InspectionWorldCanvas', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal('ResizeObserver', class ResizeObserver {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe() { this.callback([], this); }
+      unobserve() {}
+      disconnect() {}
+    });
     vi.mocked(fetchInspectionWorldTile).mockImplementation(async (_record, tile) => ({ ...tile, url: `blob:${tile.level}-${tile.x}-${tile.y}`, revoke: vi.fn() }));
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
       clearRect: vi.fn(), fillRect: vi.fn(), drawImage: vi.fn(), strokeRect: vi.fn(), fillText: vi.fn(),
@@ -82,6 +88,34 @@ describe('InspectionWorldCanvas', () => {
     expect(screen.getByTestId('inspection-world-canvas')).toHaveAttribute('data-locatable-defects', '1');
     await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
     expect(vi.mocked(fetchInspectionWorldTile).mock.calls.length).toBeLessThan(126);
+  });
+
+  it('waits for the committed viewport measurement before selecting and fetching tiles', async () => {
+    let resize: ResizeObserverCallback | undefined;
+    vi.stubGlobal('ResizeObserver', class ResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resize = callback; }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const viewport = screen.getByTestId('inspection-world-viewport');
+
+    expect(fetchInspectionWorldTile).not.toHaveBeenCalled();
+
+    Object.defineProperties(viewport, {
+      clientWidth: { configurable: true, value: 300 },
+      clientHeight: { configurable: true, value: 256 },
+    });
+    await act(async () => resize?.([], {} as ResizeObserver));
+    await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
+
+    expect(vi.mocked(fetchInspectionWorldTile).mock.calls.map(([, tile]) => ({
+      level: tile.level, x: tile.x, y: tile.y,
+    }))).toEqual([
+      { level: 1, x: 0, y: 0 },
+      { level: 1, x: 0, y: 1 },
+    ]);
   });
 
   it('opens at the first frame with all cameras filling the viewport width', async () => {
@@ -434,6 +468,36 @@ describe('InspectionWorldCanvas', () => {
     expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({ width: '1000px' });
   });
 
+  it('uses literal fit-width for narrow worlds on initial view and record reset', async () => {
+    const narrowMeta: InspectionWorldMeta = {
+      ...meta,
+      recordId: 'narrow-100',
+      world: { ...meta.world, width: 100 },
+    };
+    const narrowerMeta: InspectionWorldMeta = {
+      ...narrowMeta,
+      recordId: 'narrow-50',
+      world: { ...narrowMeta.world, width: 50 },
+    };
+    const { rerender } = render(<InspectionWorldCanvas
+      recordId="narrow-100"
+      meta={narrowMeta}
+      defects={[]}
+    />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+
+    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(10, 6));
+    canvas.dispatchEvent(new WheelEvent('wheel', {
+      deltaY: 10_000, ctrlKey: true, clientX: 500, clientY: 300,
+      bubbles: true, cancelable: true,
+    }));
+    expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(10, 6);
+
+    rerender(<InspectionWorldCanvas recordId="narrow-50" meta={narrowerMeta} defects={[]} />);
+    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(20, 6));
+    expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({ width: '1000px' });
+  });
+
   it('recomputes fit-width on resize until the user zooms, then preserves user zoom', async () => {
     let resize: ResizeObserverCallback | undefined;
     vi.stubGlobal('ResizeObserver', class ResizeObserver {
@@ -482,7 +546,7 @@ describe('InspectionWorldCanvas', () => {
     />);
 
     await waitFor(() => expect(Number(screen.getByTestId('inspection-world-canvas')
-      .getAttribute('data-view-scale'))).toBeCloseTo(8, 6));
+      .getAttribute('data-view-scale'))).toBeCloseTo(10, 6));
     expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({ width: '1000px' });
   });
 
