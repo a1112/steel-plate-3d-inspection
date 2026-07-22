@@ -365,6 +365,18 @@ const standardChecks = [
 
 const bkvChecks = [
   {
+    id: 'bkv-2d-camera-strip',
+    url: appUrl('terminal'),
+    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', 'C1', 'C6', '\u771f\u5b9e\u76f8\u673a\u5728\u7ebf 0', '\u786c\u4ef6\u63a7\u5236\u5df2\u7981\u7528'],
+    requiredExpressions: [
+      'document.querySelector(".bkv-camera-strip")?.getAttribute("data-camera-count") === "6"',
+      'document.querySelectorAll("[data-testid=bkv-camera-lane]").length === 6',
+      '[...document.querySelectorAll(".bkv-camera-strip img")].filter((image) => image.naturalWidth > 0).length === 6',
+      '![...document.querySelectorAll("[data-testid=bkv-camera-lane]")].some((lane) => lane.innerText.includes("C7"))',
+      '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
+    ],
+  },
+  {
     id: 'bkv-unwrapped',
     url: appUrl('terminal'),
     requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', '\u771f\u5b9e\u76f8\u673a\u5728\u7ebf 0', '\u786c\u4ef6\u63a7\u5236\u5df2\u7981\u7528'],
@@ -382,7 +394,7 @@ const bkvChecks = [
     clickSelector: '.bkv-view-tabs button:nth-child(3)',
     afterClickText: ['\u5706\u67f1 3D', '\u672a\u6807\u5b9a\u9884\u89c8'],
     requiredExpressions: [
-      'document.querySelectorAll(".bkv-camera-grid img").length === 0 && document.querySelector(".bkv-visual-panel canvas") !== null',
+      'document.querySelectorAll(".bkv-camera-strip img").length === 0 && document.querySelector(".bkv-visual-panel canvas") !== null',
       '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
     ],
   },

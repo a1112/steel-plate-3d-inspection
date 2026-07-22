@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fetchBkvArtifactBlobUrl, fetchBkvMaterials } from '../services/bkv-api';
+import { fetchBkvArtifactBlobUrl, fetchBkvMaterials, type BkvMaterial } from '../services/bkv-api';
 import { BkvCompatibilityApp } from './BkvCompatibilityApp';
 
 const { material } = vi.hoisted(() => ({ material: {
@@ -26,7 +26,7 @@ const { material } = vi.hoisted(() => ({ material: {
     cylinder: { path: 'cylinder.json', size: 3, sha256: 'd'.repeat(64) },
     summary: { path: 'summary.json', size: 3, sha256: 'e'.repeat(64) },
   },
-} }));
+} satisfies BkvMaterial }));
 
 vi.mock('../services/bkv-api', async () => {
   const actual = await vi.importActual<typeof import('../services/bkv-api')>('../services/bkv-api');
