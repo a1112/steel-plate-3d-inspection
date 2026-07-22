@@ -85,6 +85,22 @@ Equivalent env-file mode:
 scripts/run-service.ps1 -EnvFile config/env/external-api.env.example
 ```
 
+### BKV legacy depth conversion
+
+Convert the isolated legacy `.d3img` frames into the standard offline replay format before enabling a BKV data batch:
+
+```powershell
+python scripts/convert_bkv_d3img.py `
+  --src-dir tmp/legacy-bkv/image_copy2/image_copy `
+  --out-dir tmp/legacy-bkv/bkv-standard-v1 `
+  --seq-start 1893700 `
+  --seq-end 1893710
+```
+
+The converter writes one compressed `bkv-depth-v1` `.npz` per source frame and preserves the `CamImageSourceN/<legacy-sequence>/3D/<frame>` hierarchy. Each artifact contains `depth` (`float32`), `valid_mask` (`bool`), identifiers, the invalid sentinel, source SHA-256, `coordinate_space=legacy-camera-raw`, and `unit=legacy-unknown`. The unknown unit is intentional until authoritative legacy format evidence is available; consumers must not silently interpret it as millimetres.
+
+`manifest.json` provides one-to-one source/output paths, hashes, shapes, valid-point statistics, and errors. Every NPZ is re-opened with `allow_pickle=False` and validated before atomic publication. A nonzero command exit means at least one selected frame failed and the batch must not be marked complete.
+
 ## Eight-Camera Headless Stack
 
 For the current eight-camera hardware setup, use the stack starter to launch the headless provider, apply the active `current-8-time-trigger` profile, and preserve the vendor/device-side time-trigger parameters:
