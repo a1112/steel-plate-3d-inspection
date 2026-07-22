@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { Box, Images, RotateCcw, ShieldOff, StepForward } from 'lucide-react';
+import { normalizeCameraDisplayLanes } from '../lib/camera-display';
 import {
   fetchBkvArtifactBlobUrl,
   fetchBkvCylinder,
@@ -64,6 +65,7 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
   const [selectedSequence, setSelectedSequence] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('2d');
   const [blobUrls, setBlobUrls] = useState<Record<string, string>>({});
+  const [failedPaths, setFailedPaths] = useState<Set<string>>(new Set());
   const [cylinder, setCylinder] = useState<BkvCylinderPreview | null>(null);
   const [message, setMessage] = useState('正在读取经过校验的旧系统数据…');
   const [busy, setBusy] = useState(false);
@@ -88,6 +90,11 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
     () => materials.find((material) => material.legacySeqNo === selectedSequence) ?? materials[0] ?? null,
     [materials, selectedSequence],
   );
+  const cameraLanes = useMemo(
+    () => normalizeCameraDisplayLanes(selected?.cameras.map((camera) => `camera${camera.cameraId}`) ?? []),
+    [selected],
+  );
+  const configuredCameraCount = selected?.cameras.length ?? status.cameraCount;
 
   useEffect(() => {
     if (!selected) return;
@@ -97,14 +104,24 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
       : viewMode === 'unwrapped'
         ? [selected.artifacts.unwrapped.path]
         : [];
-    Promise.all(paths.map(async (path) => [path, await fetchBkvArtifactBlobUrl(path, controller.signal)] as const))
+    Promise.all(paths.map(async (path) => {
+      try {
+        return { path, url: await fetchBkvArtifactBlobUrl(path, controller.signal) };
+      } catch {
+        return { path, url: null };
+      }
+    }))
       .then((entries) => {
+        if (controller.signal.aborted) return;
         setBlobUrls((previous) => {
           Object.values(previous).forEach((url) => {
             if (url.startsWith('blob:') && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url);
           });
-          return Object.fromEntries(entries);
+          return Object.fromEntries(entries.filter((entry) => entry.url).map((entry) => [entry.path, entry.url as string]));
         });
+        const failures = new Set(entries.filter((entry) => !entry.url).map((entry) => entry.path));
+        setFailedPaths(failures);
+        if (failures.size > 0) setMessage(`${failures.size} 路 BKV 图像读取失败，其余相机继续显示`);
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) setMessage(error instanceof Error ? error.message : 'BKV 图像读取失败');
@@ -158,7 +175,7 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
           <h1>BKV 离线回放</h1>
         </div>
         <div className="bkv-header-status">
-          <strong>6/6 离线数据</strong>
+          <strong>{configuredCameraCount}/{status.cameraCount} 离线数据</strong>
           <span>真实相机在线 0</span>
           <span>批次 {status.batchId}</span>
         </div>
@@ -182,6 +199,11 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
       </section>
 
       {status.completed ? <div className="bkv-completed">本批次回放已完成</div> : null}
+      {selected && configuredCameraCount !== status.cameraCount ? (
+        <div className="bkv-parameter-warning" role="alert">
+          相机参数异常：清单 {configuredCameraCount} 路，运行参数 {status.cameraCount} 路
+        </div>
+      ) : null}
       <div className="bkv-message" role="status">{message}</div>
 
       {selected ? <div className="bkv-workspace">
@@ -209,12 +231,21 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
         </aside>
 
         <section className="bkv-visual-panel">
-          {viewMode === '2d' ? <div className="bkv-camera-grid">
-            {selected.cameras.map((camera) => {
+          {viewMode === '2d' ? <div
+            className="bkv-camera-strip"
+            data-testid="bkv-camera-strip"
+            data-camera-count={cameraLanes.length}
+            style={{ '--camera-count': cameraLanes.length } as CSSProperties}
+          >
+            {cameraLanes.map((lane, index) => {
+              const camera = selected.cameras[index];
               const path = camera.twoDFrames[0]?.path;
-              return <figure key={camera.cameraId}>
-                {path && blobUrls[path] ? <img src={blobUrls[path]} alt={`相机 ${camera.cameraId} 离线二维图`} /> : <div className="bkv-image-loading">读取中</div>}
-                <figcaption>离线相机 {camera.cameraId} · 2D {camera.twoDFrameCount} / NPZ {camera.npzFrameCount}</figcaption>
+              return <figure key={lane.cameraId} data-testid="bkv-camera-lane" data-camera-id={lane.cameraId}>
+                <div className="bkv-camera-lane-label"><strong>{lane.shortLabel}</strong><span>{lane.label}</span></div>
+                {path && blobUrls[path]
+                  ? <img src={blobUrls[path]} alt={`相机 ${camera.cameraId} 离线二维图`} />
+                  : <div className="bkv-image-loading">{path ? failedPaths.has(path) ? '读取失败' : '读取中' : '无 2D 帧'}</div>}
+                <figcaption>2D {camera.twoDFrameCount} / NPZ {camera.npzFrameCount}</figcaption>
               </figure>;
             })}
           </div> : null}
