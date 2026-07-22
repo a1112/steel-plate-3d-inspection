@@ -102,6 +102,8 @@ describe('InspectionWorldCanvas', () => {
     await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
 
     expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-scroll-mode', 'native');
+    expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('tabindex', '0');
+    expect(screen.getByTestId('inspection-world-viewport')).toHaveAccessibleName('1893700 检测图像滚动视图');
     expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({
       width: '1000px',
       height: '35840px',
@@ -155,6 +157,35 @@ describe('InspectionWorldCanvas', () => {
     const nextScale = Number(canvas.getAttribute('data-view-scale'));
     expect(viewport.scrollLeft).toBeCloseTo(500 * (nextScale / initialScale - 1), 3);
     expect(viewport.scrollTop).toBeCloseTo(300 * (nextScale / initialScale - 1), 3);
+  });
+
+  it('chains rapid Ctrl+wheel events from the pending anchored scroll position', async () => {
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    installNativeScrollTo(viewport);
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, right: 1000, bottom: 600,
+      x: 0, y: 0, width: 1000, height: 600,
+      toJSON: () => undefined,
+    });
+    const initialScale = Number(canvas.getAttribute('data-view-scale'));
+
+    await act(async () => {
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -100, ctrlKey: true, clientX: 500, clientY: 300,
+        bubbles: true, cancelable: true,
+      }));
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -100, ctrlKey: true, clientX: 500, clientY: 300,
+        bubbles: true, cancelable: true,
+      }));
+    });
+
+    const finalScale = Number(canvas.getAttribute('data-view-scale'));
+    expect(finalScale).toBeCloseTo(initialScale * Math.exp(0.2), 5);
+    expect(viewport.scrollLeft).toBeCloseTo(500 * (finalScale / initialScale - 1), 3);
+    expect(viewport.scrollTop).toBeCloseTo(300 * (finalScale / initialScale - 1), 3);
   });
 
   it('virtualizes tile requests from coalesced native scroll position', async () => {
@@ -271,6 +302,58 @@ describe('InspectionWorldCanvas', () => {
     expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({ width: '1000px' });
   });
 
+  it('recomputes fit-width on resize until the user zooms, then preserves user zoom', async () => {
+    let resize: ResizeObserverCallback | undefined;
+    vi.stubGlobal('ResizeObserver', class ResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resize = callback; }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    installNativeScrollTo(viewport);
+
+    Object.defineProperty(viewport, 'clientWidth', { configurable: true, value: 1_200 });
+    await act(async () => resize?.([], {} as ResizeObserver));
+    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(2, 6));
+
+    await act(async () => {
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -200, ctrlKey: true, clientX: 500, clientY: 300,
+        bubbles: true, cancelable: true,
+      }));
+    });
+    const userScale = Number(canvas.getAttribute('data-view-scale'));
+    expect(userScale).toBeGreaterThan(2);
+
+    Object.defineProperty(viewport, 'clientWidth', { configurable: true, value: 800 });
+    await act(async () => resize?.([], {} as ResizeObserver));
+    expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(userScale, 6);
+  });
+
+  it('keeps large-defect focus at or above fit-width scale', async () => {
+    const narrowMeta: InspectionWorldMeta = {
+      ...meta,
+      world: { ...meta.world, width: 100 },
+    };
+    const largeDefect: InspectionWorldDefect = {
+      id: 'large', className: '大型区域', cameraId: 1, imageIndex: 0, locatable: true,
+      worldRect: { x: 0, y: 500, width: 100, height: 20_000 },
+    };
+    render(<InspectionWorldCanvas
+      recordId="1893700"
+      meta={narrowMeta}
+      defects={[largeDefect]}
+      focusDefectId="large"
+    />);
+
+    await waitFor(() => expect(Number(screen.getByTestId('inspection-world-canvas')
+      .getAttribute('data-view-scale'))).toBeCloseTo(8, 6));
+    expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({ width: '1000px' });
+  });
+
   it('draws a tile after its blob image finishes loading', async () => {
     const drawImage = vi.fn();
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
@@ -362,6 +445,78 @@ describe('InspectionWorldCanvas', () => {
 
     await waitFor(() => expect(revoke).toHaveBeenCalled());
     expect(Number(canvas.getAttribute('data-cached-tiles'))).toBeLessThan(30);
+  });
+
+  it('detaches late image callbacks and refreshes cache count on eviction and unmount', async () => {
+    const animationFrames: FrameRequestCallback[] = [];
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      animationFrames.push(callback);
+      return animationFrames.length;
+    });
+    const images: DelayedImage[] = [];
+    class DelayedImage {
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(_value: string) { images.push(this); }
+    }
+    vi.stubGlobal('Image', DelayedImage);
+    const revoke = vi.fn();
+    let requests = 0;
+    vi.mocked(fetchInspectionWorldTile).mockImplementation(async (_record, tile) => {
+      requests += 1;
+      if (requests > 4) return new Promise(() => undefined);
+      return { ...tile, url: `blob:${tile.level}-${tile.x}-${tile.y}`, revoke };
+    });
+    const { unmount } = render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    await waitFor(() => expect(Number(canvas.getAttribute('data-cached-tiles'))).toBe(4));
+    const departedImage = images[0];
+    const lateDepartedError = departedImage.onerror;
+
+    viewport.scrollTop = 2_400;
+    fireEvent.scroll(viewport);
+    await act(async () => {
+      animationFrames.splice(0).forEach((callback) => callback(0));
+    });
+
+    await waitFor(() => expect(revoke).toHaveBeenCalled());
+    await waitFor(() => expect(Number(canvas.getAttribute('data-cached-tiles'))).toBe(2));
+    expect(departedImage.onload).toBeNull();
+    expect(departedImage.onerror).toBeNull();
+    act(() => lateDepartedError?.());
+    expect(screen.getByRole('status')).not.toHaveTextContent('瓦片读取失败');
+
+    const retainedImage = images.find((image) => image.onerror != null);
+    const lateRetainedError = retainedImage?.onerror;
+    unmount();
+    expect(retainedImage?.onload).toBeNull();
+    expect(retainedImage?.onerror).toBeNull();
+    expect(() => lateRetainedError?.()).not.toThrow();
+  });
+
+  it('draws defect overlays only near the current world viewport', async () => {
+    const strokeRect = vi.fn();
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      clearRect: vi.fn(), fillRect: vi.fn(), drawImage: vi.fn(), strokeRect, fillText: vi.fn(),
+      save: vi.fn(), restore: vi.fn(), setTransform: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    vi.mocked(fetchInspectionWorldTile).mockImplementation(() => new Promise(() => undefined));
+    const visibleDefect: InspectionWorldDefect = {
+      id: 'visible', className: '可见', locatable: true,
+      worldRect: { x: 50, y: 100, width: 10, height: 10 },
+    };
+    const farDefects: InspectionWorldDefect[] = Array.from({ length: 100 }, (_, index) => ({
+      id: `far-${index}`, className: '远处', locatable: true,
+      worldRect: { x: 50, y: 2_000 + index * 100, width: 10, height: 10 },
+    }));
+
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={[visibleDefect, ...farDefects]} />);
+    await waitFor(() => expect(strokeRect).toHaveBeenCalled());
+
+    expect(strokeRect).toHaveBeenCalledTimes(1);
+    expect(strokeRect.mock.calls[0][1]).toBeGreaterThanOrEqual(-32);
+    expect(strokeRect.mock.calls[0][1]).toBeLessThanOrEqual(632);
   });
 
   it('focuses a locatable defect and reports a failed tile without shifting the world', async () => {

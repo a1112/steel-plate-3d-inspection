@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   clampWorldScale,
-  fitWorldScale,
   getVisibleWorldTiles,
   scaledWorldExtent,
   scrollPositionForZoom,
@@ -28,9 +27,19 @@ type PendingTileRequest = { token: symbol; controller: AbortController };
 const DEFAULT_WIDTH = 1000;
 const DEFAULT_HEIGHT = 600;
 
-function initialView(meta: InspectionWorldMeta, width: number, height: number): ViewState {
-  const scale = Math.min(8, width / Math.max(1, meta.world.width));
+function fitWidthScale(worldWidth: number, viewportWidth: number) {
+  return Math.min(8, viewportWidth / Math.max(1, worldWidth));
+}
+
+function initialView(meta: InspectionWorldMeta, width: number): ViewState {
+  const scale = fitWidthScale(meta.world.width, width);
   return { scrollLeft: 0, scrollTop: 0, scale };
+}
+
+function disposeTileEntry(entry: TileEntry) {
+  entry.image.onload = null;
+  entry.image.onerror = null;
+  entry.tile.revoke();
 }
 
 function lodForScale(scale: number, maxLevel: number) {
@@ -41,13 +50,19 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const tileCache = useRef(new Map<string, TileEntry>());
+  const activeTileKeys = useRef(new Set<string>());
+  const renderedTileKeys = useRef(new Set<string>());
   const pending = useRef(new Map<string, PendingTileRequest>());
   const drag = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const scrollFrame = useRef<number | null>(null);
   const pendingScroll = useRef<{ scrollLeft: number; scrollTop: number } | null>(null);
+  const fitWidthMode = useRef(true);
+  const lifecycleGeneration = useRef(0);
+  const metaRef = useRef(meta);
+  metaRef.current = meta;
   const measured = useRef(false);
   const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
-  const [view, setView] = useState(() => initialView(meta, DEFAULT_WIDTH, DEFAULT_HEIGHT));
+  const [view, setView] = useState(() => initialView(meta, DEFAULT_WIDTH));
   const [failedKeys, setFailedKeys] = useState<Set<string>>(new Set());
   const [revision, setRevision] = useState(0);
   const [focusScrollRevision, setFocusScrollRevision] = useState(0);
@@ -80,7 +95,17 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       setSize({ width, height });
       if (!measured.current) {
         measured.current = true;
-        setView(initialView(meta, width, height));
+        setView(initialView(metaRef.current, width));
+      } else if (fitWidthMode.current) {
+        setView((current) => {
+          const scale = fitWidthScale(metaRef.current.world.width, width);
+          if (scale === current.scale) return current;
+          pendingScroll.current = {
+            scrollLeft: (host.scrollLeft / current.scale) * scale,
+            scrollTop: (host.scrollTop / current.scale) * scale,
+          };
+          return { ...current, scale };
+        });
       }
     };
     update();
@@ -92,14 +117,15 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   useEffect(() => {
     if (previousWorldRevision.current === worldRevision) return;
     previousWorldRevision.current = worldRevision;
-    tileCache.current.forEach((entry) => entry.tile.revoke());
+    tileCache.current.forEach(disposeTileEntry);
     tileCache.current.clear();
     pending.current.forEach((request) => request.controller.abort());
     pending.current.clear();
     pendingScroll.current = null;
     drag.current = null;
+    fitWidthMode.current = true;
     setFailedKeys(new Set());
-    setView(initialView(meta, size.width, size.height));
+    setView(initialView(meta, size.width));
     const host = hostRef.current;
     if (host) {
       host.scrollLeft = 0;
@@ -108,15 +134,24 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     }
   }, [meta, scheduleScrollRead, size.height, size.width, worldRevision]);
 
-  useEffect(() => () => {
-    tileCache.current.forEach((entry) => entry.tile.revoke());
-    tileCache.current.clear();
-    pending.current.forEach((request) => request.controller.abort());
-    pending.current.clear();
-    if (scrollFrame.current != null) {
-      window.cancelAnimationFrame(scrollFrame.current);
-      scrollFrame.current = null;
-    }
+  useEffect(() => {
+    const generation = lifecycleGeneration.current + 1;
+    lifecycleGeneration.current = generation;
+    activeTileKeys.current = new Set(renderedTileKeys.current);
+    return () => {
+      tileCache.current.forEach(disposeTileEntry);
+      tileCache.current.clear();
+      activeTileKeys.current.clear();
+      if (scrollFrame.current != null) {
+        window.cancelAnimationFrame(scrollFrame.current);
+        scrollFrame.current = null;
+      }
+      queueMicrotask(() => {
+        if (lifecycleGeneration.current !== generation) return;
+        pending.current.forEach((request) => request.controller.abort());
+        pending.current.clear();
+      });
+    };
   }, []);
 
   const level = lodForScale(view.scale, meta.world.maxLevel);
@@ -134,19 +169,27 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     viewport: { x: viewX, y: viewY, width: size.width / view.scale, height: size.height / view.scale },
     prefetch: 1,
   }), [level, meta.world.height, meta.world.tileSize, meta.world.width, size.height, size.width, view.scale, viewX, viewY]);
+  const visibleTileKeys = useMemo(
+    () => new Set(visibleTiles.map((tile) => `${recordId}:${tile.level}:${tile.x}:${tile.y}`)),
+    [recordId, visibleTiles],
+  );
+  renderedTileKeys.current = visibleTileKeys;
+  activeTileKeys.current = new Set(visibleTileKeys);
 
   useEffect(() => {
-    const visibleKeys = new Set(visibleTiles.map((tile) => `${recordId}:${tile.level}:${tile.x}:${tile.y}`));
+    let removedEntry = false;
     tileCache.current.forEach((entry, key) => {
-      if (visibleKeys.has(key)) return;
-      entry.tile.revoke();
+      if (visibleTileKeys.has(key)) return;
+      disposeTileEntry(entry);
       tileCache.current.delete(key);
+      removedEntry = true;
     });
     setFailedKeys((current) => {
-      const retained = new Set([...current].filter((key) => visibleKeys.has(key)));
+      const retained = new Set([...current].filter((key) => visibleTileKeys.has(key)));
       return retained.size === current.size ? current : retained;
     });
-  }, [recordId, visibleTiles]);
+    if (removedEntry) setRevision((value) => value + 1);
+  }, [visibleTileKeys]);
 
   useEffect(() => {
     if (!failedKeys.size) return;
@@ -155,9 +198,9 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   }, [failedKeys]);
 
   useEffect(() => {
-    const activeKeys = new Set(visibleTiles.map((tile) => `${recordId}:${tile.level}:${tile.x}:${tile.y}`));
+    activeTileKeys.current = new Set(visibleTileKeys);
     pending.current.forEach((request, key) => {
-      if (activeKeys.has(key)) return;
+      if (visibleTileKeys.has(key)) return;
       request.controller.abort();
       pending.current.delete(key);
     });
@@ -169,26 +212,26 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       pending.current.set(key, { token: requestToken, controller });
       fetchInspectionWorldTile(recordId, { ...tile, format: 'jpeg' }, controller.signal)
         .then((worldTile) => {
-          if (controller.signal.aborted) {
+          if (controller.signal.aborted || !activeTileKeys.current.has(key)) {
             worldTile.revoke();
             return;
           }
           const image = new Image();
           const entry: TileEntry = { tile: worldTile, image, loaded: false };
           image.onload = () => {
+            if (tileCache.current.get(key) !== entry || !activeTileKeys.current.has(key)) return;
             entry.loaded = true;
             setRevision((value) => value + 1);
           };
           image.onerror = () => {
-            if (tileCache.current.get(key) === entry) {
-              tileCache.current.delete(key);
-              worldTile.revoke();
-            }
+            if (tileCache.current.get(key) !== entry || !activeTileKeys.current.has(key)) return;
+            tileCache.current.delete(key);
+            disposeTileEntry(entry);
             setFailedKeys((current) => new Set(current).add(key));
             setRevision((value) => value + 1);
           };
-          image.src = worldTile.url;
           tileCache.current.set(key, entry);
+          image.src = worldTile.url;
           setRevision((value) => value + 1);
         })
         .catch(() => {
@@ -198,12 +241,27 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
           if (pending.current.get(key)?.token === requestToken) pending.current.delete(key);
         });
     }
-  }, [failedKeys, recordId, visibleTiles]);
+    // Lifecycle cleanup owns cancellation; this cleanup intentionally preserves
+    // overlapping per-key requests while allowing StrictMode to replay setup.
+    return () => undefined;
+  }, [failedKeys, recordId, visibleTileKeys, visibleTiles]);
 
   const locatableDefects = useMemo(
     () => defects.filter((defect) => defect.locatable && defect.worldRect),
     [defects],
   );
+  const visibleDefects = useMemo(() => {
+    const margin = 32 / view.scale;
+    const left = viewX - margin;
+    const top = viewY - margin;
+    const right = viewX + size.width / view.scale + margin;
+    const bottom = viewY + size.height / view.scale + margin;
+    return locatableDefects.filter((defect) => {
+      const rect = defect.worldRect!;
+      return rect.x + rect.width >= left && rect.x <= right
+        && rect.y + rect.height >= top && rect.y <= bottom;
+    });
+  }, [locatableDefects, size.height, size.width, view.scale, viewX, viewY]);
   const loadedTileCount = visibleTiles.filter((tile) => tileCache.current
     .get(`${recordId}:${tile.level}:${tile.x}:${tile.y}`)?.loaded).length;
 
@@ -211,11 +269,13 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     if (focusDefectId == null) return;
     const defect = locatableDefects.find((item) => String(item.id) === String(focusDefectId));
     if (!defect?.worldRect) return;
+    const minimumScale = fitWidthScale(meta.world.width, size.width);
     const targetScale = clampWorldScale(
       Math.min(size.width / (defect.worldRect.width + 80), size.height / (defect.worldRect.height + 80)),
-      fitWorldScale(meta.world.width, meta.world.height, size.width, size.height),
-      4,
+      minimumScale,
+      Math.max(4, minimumScale),
     );
+    fitWidthMode.current = false;
     pendingScroll.current = {
       scrollLeft: Math.max(0, (defect.worldRect.x + defect.worldRect.width / 2) * targetScale - size.width / 2),
       scrollTop: Math.max(0, (defect.worldRect.y + defect.worldRect.height / 2) * targetScale - size.height / 2),
@@ -262,7 +322,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     }
     context.strokeStyle = '#ffb020';
     context.lineWidth = 2;
-    for (const defect of locatableDefects) {
+    for (const defect of visibleDefects) {
       const rect = defect.worldRect!;
       context.strokeRect(
         rect.x * view.scale - view.scrollLeft,
@@ -271,7 +331,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
         Math.max(3, rect.height * view.scale),
       );
     }
-  }, [failedKeys, level, locatableDefects, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, visibleTiles]);
+  }, [failedKeys, level, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, visibleDefects, visibleTiles]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -283,15 +343,20 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
       const pointerX = event.clientX - bounds.left;
       const pointerY = event.clientY - bounds.top;
       setView((current) => {
-        const minimum = Math.min(8, size.width / Math.max(1, meta.world.width));
+        const minimum = fitWidthScale(meta.world.width, size.width);
         const scale = clampWorldScale(current.scale * Math.exp(-event.deltaY * 0.001), minimum, 8);
         if (scale === current.scale) {
           pendingScroll.current = null;
           return current;
         }
-        pendingScroll.current = scrollPositionForZoom({
+        fitWidthMode.current = false;
+        const baseScroll = pendingScroll.current ?? {
           scrollLeft: hostRef.current?.scrollLeft ?? current.scrollLeft,
           scrollTop: hostRef.current?.scrollTop ?? current.scrollTop,
+        };
+        pendingScroll.current = scrollPositionForZoom({
+          scrollLeft: baseScroll.scrollLeft,
+          scrollTop: baseScroll.scrollTop,
           pointerX,
           pointerY,
           oldScale: current.scale,
@@ -328,6 +393,8 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     className={`inspection-world-viewport ${className}`.trim()}
     data-testid="inspection-world-viewport"
     data-scroll-mode="native"
+    tabIndex={0}
+    aria-label={`${recordId} 检测图像滚动视图`}
     onScroll={scheduleScrollRead}
   >
     <div
