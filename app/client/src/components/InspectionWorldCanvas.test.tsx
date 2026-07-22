@@ -188,6 +188,35 @@ describe('InspectionWorldCanvas', () => {
     expect(laterTileYs.length).toBeLessThan(30);
   });
 
+  it('keeps overlapping pending tiles while aborting only requests that leave the active ring', async () => {
+    const animationFrames: FrameRequestCallback[] = [];
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      animationFrames.push(callback);
+      return animationFrames.length;
+    });
+    vi.mocked(fetchInspectionWorldTile).mockImplementation(() => new Promise(() => undefined));
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const viewport = screen.getByTestId('inspection-world-viewport');
+    await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
+
+    const initialCalls = [...vi.mocked(fetchInspectionWorldTile).mock.calls];
+    const retained = initialCalls.find(([, tile]) => tile.x === 0 && tile.y === 1);
+    const departed = initialCalls.find(([, tile]) => tile.x === 0 && tile.y === 0);
+    expect(retained).toBeDefined();
+    expect(departed).toBeDefined();
+
+    viewport.scrollTop = 2_400;
+    fireEvent.scroll(viewport);
+    await act(async () => {
+      animationFrames.splice(0).forEach((callback) => callback(0));
+    });
+    await waitFor(() => expect(canvasTileCalls(0, 4)).toBeGreaterThan(0));
+
+    expect(retained?.[2]?.aborted).toBe(false);
+    expect(departed?.[2]?.aborted).toBe(true);
+    expect(canvasTileCalls(0, 1)).toBe(1);
+  });
+
   it('restores native scroll and fit-width scale when switching records', async () => {
     const { rerender } = render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
     const canvas = screen.getByTestId('inspection-world-canvas');
@@ -218,6 +247,28 @@ describe('InspectionWorldCanvas', () => {
       width: '1000px',
       height: '26880px',
     });
+  });
+
+  it('does not zoom out below fit-width scale', async () => {
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    installNativeScrollTo(viewport);
+    const fitWidthScale = 1000 / 600;
+
+    await act(async () => {
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: 10_000,
+        ctrlKey: true,
+        clientX: 500,
+        clientY: 300,
+        bubbles: true,
+        cancelable: true,
+      }));
+    });
+
+    expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(fitWidthScale, 6);
+    expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({ width: '1000px' });
   });
 
   it('draws a tile after its blob image finishes loading', async () => {
@@ -325,4 +376,40 @@ describe('InspectionWorldCanvas', () => {
     rerender(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} focusDefectId={2019096} />);
     await waitFor(() => expect(canvas.getAttribute('data-view-y')).not.toBe(initialY));
   });
+
+  it('scrolls to a second same-sized defect even when the focus zoom is unchanged', async () => {
+    const sameSizedDefects: InspectionWorldDefect[] = [
+      { id: 'first', className: '第一处', cameraId: 1, imageIndex: 2, locatable: true, worldRect: { x: 20, y: 2_000, width: 10, height: 10 } },
+      { id: 'second', className: '第二处', cameraId: 2, imageIndex: 8, locatable: true, worldRect: { x: 140, y: 8_000, width: 10, height: 10 } },
+    ];
+    const { rerender } = render(
+      <InspectionWorldCanvas recordId="1893700" meta={meta} defects={sameSizedDefects} />,
+    );
+    const viewport = screen.getByTestId('inspection-world-viewport');
+
+    rerender(<InspectionWorldCanvas
+      recordId="1893700"
+      meta={meta}
+      defects={sameSizedDefects}
+      focusDefectId="first"
+    />);
+    await waitFor(() => expect(viewport.scrollTop).toBeGreaterThan(0));
+    const firstScrollTop = viewport.scrollTop;
+    const firstScale = screen.getByTestId('inspection-world-canvas').getAttribute('data-view-scale');
+
+    rerender(<InspectionWorldCanvas
+      recordId="1893700"
+      meta={meta}
+      defects={sameSizedDefects}
+      focusDefectId="second"
+    />);
+
+    await waitFor(() => expect(viewport.scrollTop).not.toBe(firstScrollTop));
+    expect(screen.getByTestId('inspection-world-canvas')).toHaveAttribute('data-view-scale', firstScale);
+  });
 });
+
+function canvasTileCalls(x: number, y: number) {
+  return vi.mocked(fetchInspectionWorldTile).mock.calls
+    .filter(([, tile]) => tile.x === x && tile.y === y).length;
+}
