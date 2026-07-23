@@ -141,6 +141,8 @@ type RecordBoundSurfaceArtifact = {
   cameras?: BarSurfaceCamera[];
 };
 
+type TerminalViewMode = 'auto' | 'online' | 'bkv';
+
 function buildUnknownService(name: string, endpoint: string): ServiceStatusPanelItem {
   return {
     name,
@@ -171,6 +173,19 @@ function readAppMode() {
     return 'terminal';
   }
   return 'terminal';
+}
+
+function readTerminalViewMode(): TerminalViewMode {
+  if (typeof window === 'undefined') return 'auto';
+  const view = new URLSearchParams(window.location.search).get('view');
+  return view === 'online' || view === 'bkv' ? view : 'auto';
+}
+
+function writeTerminalViewMode(view: Exclude<TerminalViewMode, 'auto'>) {
+  if (typeof window === 'undefined') return;
+  const url = new URL(window.location.href);
+  url.searchParams.set('view', view);
+  window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
 }
 
 function downloadTextFile(filename: string, content: string, mimeType = 'text/plain;charset=utf-8') {
@@ -204,6 +219,12 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [bkvStatus, setBkvStatus] = useState<BkvStatus | null>(null);
   const [bkvProbeComplete, setBkvProbeComplete] = useState(false);
+  const [terminalViewMode, setTerminalViewMode] = useState<TerminalViewMode>(readTerminalViewMode);
+
+  const selectTerminalView = (view: Exclude<TerminalViewMode, 'auto'>) => {
+    writeTerminalViewMode(view);
+    setTerminalViewMode(view);
+  };
 
   useEffect(() => {
     const controller = new AbortController();
@@ -232,7 +253,10 @@ export default function App() {
     return () => controller.abort();
   }, []);
 
-  if (bkvStatus?.provider === 'bkv' && bkvStatus.ready) {
+  const bkvAvailable = bkvStatus?.provider === 'bkv' && bkvStatus.ready;
+  const showBkvReplay = bkvAvailable && terminalViewMode !== 'online';
+
+  if (showBkvReplay) {
     const theme = readStoredTheme();
     const themeStyle = readStoredThemeStyle();
     return (
@@ -240,7 +264,10 @@ export default function App() {
         <BkvCompatibilityApp status={bkvStatus} />
         <AppFooter
           activeNav="online"
-          bkvReplay={{ available: true, active: true }}
+          terminalViews={{
+            online: { available: true, active: false, onOpen: () => selectTerminalView('online') },
+            bkv: { available: true, active: true, onOpen: () => selectTerminalView('bkv') },
+          }}
           onNavChange={() => undefined}
           onSettingsOpen={() => notify({
             title: '配置中心',
@@ -266,15 +293,26 @@ export default function App() {
     );
   }
 
-  return <InspectionDashboard snapshot={snapshot} onSnapshotChange={setSnapshot} />;
+  return (
+    <InspectionDashboard
+      snapshot={snapshot}
+      bkvAvailable={bkvAvailable}
+      onSnapshotChange={setSnapshot}
+      onTerminalViewChange={selectTerminalView}
+    />
+  );
 }
 
 function InspectionDashboard({
   snapshot,
+  bkvAvailable,
   onSnapshotChange,
+  onTerminalViewChange,
 }: {
   snapshot: InspectionSnapshot;
+  bkvAvailable: boolean;
   onSnapshotChange: (snapshot: InspectionSnapshot) => void;
+  onTerminalViewChange: (view: 'online' | 'bkv') => void;
 }) {
   const [appMode] = useState(readAppMode);
   const [uiState, setUiState] = useState(() => createInitialUiState(snapshot));
@@ -1253,7 +1291,10 @@ function InspectionDashboard({
       )}
       <AppFooter
         activeNav={uiState.activeNav}
-        bkvReplay={{ available: false, active: false }}
+        terminalViews={{
+          online: { available: true, active: true, onOpen: () => onTerminalViewChange('online') },
+          bkv: { available: bkvAvailable, active: false, onOpen: () => onTerminalViewChange('bkv') },
+        }}
         flowVisible={inspectionFlowVisible}
         onFlowToggle={() => setInspectionFlowVisible((current) => !current)}
         analysis={selectedOnlineDefect ? {

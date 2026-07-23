@@ -28,6 +28,7 @@ describe('storage capacity warning presentation', () => {
 
 describe('App BKV provider selection', () => {
   it('switches only when the service explicitly reports a ready bkv provider', async () => {
+    window.history.replaceState(null, '', '/?app=terminal');
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/api/bkv/status')) {
@@ -52,11 +53,24 @@ describe('App BKV provider selection', () => {
     expect(replayItem).toBeEnabled();
     expect(replayItem).toHaveAttribute('aria-current', 'page');
     expect(screen.queryByText('钢管3D表面检测系统')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('menuitem', { name: '在线检测' }));
+    expect(await screen.findByText('钢管3D表面检测系统')).toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get('view')).toBe('online');
+
+    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
+    expect(screen.getByRole('menuitem', { name: '在线检测' })).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('menuitem', { name: '离线回放' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('menuitem', { name: '离线回放' }));
+
+    expect(await screen.findByRole('heading', { name: 'BKV 离线回放' })).toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get('view')).toBe('bkv');
   });
 });
 
 describe('App online severity filters', () => {
   beforeEach(() => {
+    window.history.replaceState(null, '', '/?app=terminal');
     vi.stubGlobal(
       'fetch',
       vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
