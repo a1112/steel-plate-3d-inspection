@@ -17,6 +17,7 @@ type Props = {
   meta: InspectionWorldMeta;
   defects: InspectionWorldDefect[];
   focusDefectId?: string | number | null;
+  focusDefectRevision?: number;
   className?: string;
 };
 
@@ -47,7 +48,14 @@ function lodForScale(scale: number, maxLevel: number) {
   return Math.max(0, Math.min(maxLevel, Math.round(Math.log2(1 / Math.max(scale, Number.EPSILON)))));
 }
 
-export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, className = '' }: Props) {
+export function InspectionWorldCanvas({
+  recordId,
+  meta,
+  defects,
+  focusDefectId,
+  focusDefectRevision = 0,
+  className = '',
+}: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const tileCache = useRef(new Map<string, TileEntry>());
@@ -59,6 +67,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   const scrollFrame = useRef<number | null>(null);
   const pendingScroll = useRef<{ scrollLeft: number; scrollTop: number } | null>(null);
   const fitWidthMode = useRef(true);
+  const consumedFocusRequest = useRef<string | null>(null);
   const lifecycleGeneration = useRef(0);
   const metaRef = useRef(meta);
   const measured = useRef(false);
@@ -319,7 +328,10 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
   const focusedRect = focusedDefect?.worldRect;
 
   useEffect(() => {
-    if (!focusedRect) return;
+    if (!focusedRect || !viewportMeasured) return;
+    const requestKey = `${worldRevision}:${String(focusDefectId)}:${focusDefectRevision}`;
+    if (consumedFocusRequest.current === requestKey) return;
+    consumedFocusRequest.current = requestKey;
     const minimumScale = fitWidthScale(meta.world.width, size.width);
     const targetScale = clampWorldScale(
       Math.min(size.width / (focusedRect.width + 80), size.height / (focusedRect.height + 80)),
@@ -336,12 +348,12 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     setFocusScrollRevision((current) => current + 1);
   }, [
     focusDefectId,
+    focusDefectRevision,
     focusedRect?.height,
     focusedRect?.width,
     focusedRect?.x,
     focusedRect?.y,
-    size.height,
-    size.width,
+    viewportMeasured,
     worldRevision,
   ]);
 

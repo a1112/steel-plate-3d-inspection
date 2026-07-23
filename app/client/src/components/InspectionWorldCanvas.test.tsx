@@ -808,7 +808,7 @@ describe('InspectionWorldCanvas', () => {
     expect(screen.getByTestId('inspection-world-canvas')).toHaveAttribute('data-view-scale', firstScale);
   });
 
-  it('recomputes the active defect focus after measuring and resizing the viewport', async () => {
+  it('keeps manual zoom after a focused defect when the viewport is remeasured', async () => {
     let resize: ResizeObserverCallback | undefined;
     vi.stubGlobal('ResizeObserver', class ResizeObserver {
       constructor(callback: ResizeObserverCallback) { resize = callback; }
@@ -818,9 +818,9 @@ describe('InspectionWorldCanvas', () => {
     });
     const focusedDefect: InspectionWorldDefect = {
       id: 'measured-focus', className: '测量聚焦', locatable: true,
-      worldRect: { x: 100, y: 1_000, width: 400, height: 200 },
+      worldRect: { x: 100, y: 1_000, width: 10, height: 10 },
     };
-    render(<InspectionWorldCanvas
+    const { rerender } = render(<InspectionWorldCanvas
       recordId="1893700"
       meta={meta}
       defects={[focusedDefect]}
@@ -835,9 +835,16 @@ describe('InspectionWorldCanvas', () => {
     });
     await act(async () => resize?.([], {} as ResizeObserver));
 
-    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(2, 6));
-    expect(viewport.scrollLeft).toBeCloseTo(0, 6);
-    expect(viewport.scrollTop).toBeCloseTo(2_000, 6);
+    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(4, 6));
+
+    await act(async () => {
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: 200, ctrlKey: true, clientX: 600, clientY: 200,
+        bubbles: true, cancelable: true,
+      }));
+    });
+    const manualScale = Number(canvas.getAttribute('data-view-scale'));
+    expect(manualScale).toBeLessThan(4);
 
     Object.defineProperties(viewport, {
       clientWidth: { configurable: true, value: 900 },
@@ -845,9 +852,16 @@ describe('InspectionWorldCanvas', () => {
     });
     await act(async () => resize?.([], {} as ResizeObserver));
 
-    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(1.875, 6));
-    expect(viewport.scrollLeft).toBeCloseTo(112.5, 6);
-    expect(viewport.scrollTop).toBeCloseTo(1_612.5, 6);
+    expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(manualScale, 6);
+
+    rerender(<InspectionWorldCanvas
+      recordId="1893700"
+      meta={meta}
+      defects={[focusedDefect]}
+      focusDefectId="measured-focus"
+      focusDefectRevision={1}
+    />);
+    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(4, 6));
   });
 
   it('does not refocus when polling supplies a fresh but equivalent defects array', async () => {
