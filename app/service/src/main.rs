@@ -12566,16 +12566,35 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
             );
         };
         return match store.records() {
-            Ok(records) => http_response(
-                "200 OK",
-                "application/json; charset=utf-8",
-                &json!({
-                    "schema": "steel.inspection-world.records.v1",
-                    "provider": "bkv",
-                    "records": records,
-                })
-                .to_string(),
-            ),
+            Ok(records) => {
+                let camera_count = store.configured_cameras().len();
+                let sequence_range = records
+                    .iter()
+                    .filter_map(|record| record.legacy_seq_no)
+                    .fold(None::<(u64, u64)>, |range, sequence| match range {
+                        Some((minimum, maximum)) => {
+                            Some((minimum.min(sequence), maximum.max(sequence)))
+                        }
+                        None => Some((sequence, sequence)),
+                    });
+                let batch_id = sequence_range
+                    .map(|(minimum, maximum)| format!("legacy-{minimum}-{maximum}"))
+                    .unwrap_or_else(|| "无离线批次".to_string());
+                let ready = !records.is_empty();
+                http_response(
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "schema": "steel.inspection-world.records.v1",
+                        "provider": "bkv",
+                        "ready": ready,
+                        "cameraCount": camera_count,
+                        "batchId": batch_id,
+                        "records": records,
+                    })
+                    .to_string(),
+                )
+            }
             Err(error) => http_response(
                 "503 Service Unavailable",
                 "application/json; charset=utf-8",
@@ -24361,7 +24380,7 @@ mod tests {
                 INSERT INTO production_inspection VALUES (
                     '10', 'bkv-10', 'STEEL-10', '2025-09-26 03:36:17',
                     'legacy-imported', 1, 6, 'record-hash', 'records/10',
-                    '{"steelType":"37Mn/2","lengthMm":12096}'
+                    '{"steelType":"37Mn/2","lengthMm":12096,"outerDiameterLegacyValue":233.664,"wallThicknessMm":12.5}'
                 );
                 INSERT INTO production_defect VALUES (
                     '10-100', '10', 'C1', 4, '轧折', 1, 51,
@@ -24419,8 +24438,15 @@ mod tests {
 
         let records = response_json(inspection_world_records_response(&state));
         assert_eq!(records["provider"], "bkv");
+        assert_eq!(records["ready"], true);
+        assert_eq!(records["cameraCount"], 6);
+        assert_eq!(records["batchId"], "legacy-10-10");
         assert_eq!(records["records"][0]["recordId"], "10");
+        assert_eq!(records["records"][0]["legacySeqNo"], 10);
         assert_eq!(records["records"][0]["cameraCount"], 6);
+        assert_eq!(records["records"][0]["outerDiameterMm"], 233.664);
+        assert_eq!(records["records"][0]["wallThicknessMm"], 12.5);
+        assert_eq!(records["records"][0]["sourceHash"], "record-hash");
 
         let meta = response_json(inspection_world_meta_response(&state, "recordId=10"));
         assert_eq!(meta["provider"], "bkv");
@@ -24444,6 +24470,29 @@ mod tests {
             .position(|bytes| bytes == b"\r\n\r\n")
             .expect("tile headers");
         image::load_from_memory(&tile[separator + 4..]).expect("converted tile image");
+        fs::remove_dir_all(root).expect("remove converted fixture");
+    }
+
+    #[test]
+    fn inspection_world_http_reports_an_empty_converted_store_as_not_ready() {
+        let (root, store) = converted_world_fixture();
+        let connection =
+            rusqlite::Connection::open(root.join("catalog.db")).expect("converted catalog");
+        connection
+            .execute("DELETE FROM production_inspection", [])
+            .expect("empty converted catalog");
+        drop(connection);
+        let mut state =
+            production_test_state_with_provider(CaptureProvider::Bkv, "simulated://capture");
+        state.standard_record_store = Some(Arc::new(store));
+
+        let records = response_json(inspection_world_records_response(&state));
+
+        assert_eq!(records["provider"], "bkv");
+        assert_eq!(records["ready"], false);
+        assert_eq!(records["cameraCount"], 6);
+        assert_eq!(records["batchId"], "无离线批次");
+        assert_eq!(records["records"], json!([]));
         fs::remove_dir_all(root).expect("remove converted fixture");
     }
 

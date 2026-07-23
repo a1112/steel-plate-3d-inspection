@@ -38,13 +38,20 @@ export type InspectionWorldRecord = {
   steelId?: string;
   steelType?: string;
   lengthMm?: number | null;
+  outerDiameterMm?: number | null;
+  wallThicknessMm?: number | null;
   inspectionTime?: string;
   defectCount: number;
+  cameraCount?: number;
+  sourceHash?: string;
 };
 
 export type InspectionWorldRecords = {
   schema: 'steel.inspection-world.records.v1';
   provider: InspectionWorldProvider;
+  ready?: boolean;
+  cameraCount?: number;
+  batchId?: string;
   records: InspectionWorldRecord[];
 };
 

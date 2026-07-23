@@ -19,12 +19,16 @@ pub struct ConfiguredCamera {
 #[serde(rename_all = "camelCase")]
 pub struct InspectionRecordDto {
     pub record_id: String,
+    pub legacy_seq_no: Option<u64>,
     pub steel_id: String,
     pub steel_type: Option<String>,
     pub length_mm: Option<f64>,
+    pub outer_diameter_mm: Option<f64>,
+    pub wall_thickness_mm: Option<f64>,
     pub inspection_time: Option<String>,
     pub defect_count: i64,
     pub camera_count: usize,
+    pub source_hash: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -184,17 +188,24 @@ impl ConvertedLocalStore {
         }
         let record_path: String = row.get(9)?;
         self.validate_record_path(&record_path)?;
+        let record_id: String = row.get(0)?;
         Ok(InspectionRecordDto {
-            record_id: row.get(0)?,
+            legacy_seq_no: record_id.parse::<u64>().ok(),
+            record_id,
             steel_id: row.get(1)?,
             inspection_time: row.get(2)?,
             defect_count: row.get(5)?,
             camera_count,
+            source_hash: row.get(4)?,
             steel_type: metadata
                 .get("steelType")
                 .and_then(Value::as_str)
                 .map(str::to_string),
             length_mm: metadata.get("lengthMm").and_then(Value::as_f64),
+            outer_diameter_mm: metadata
+                .get("outerDiameterLegacyValue")
+                .and_then(Value::as_f64),
+            wall_thickness_mm: metadata.get("wallThicknessMm").and_then(Value::as_f64),
         })
     }
 
@@ -402,7 +413,10 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct Fixture {
         root: PathBuf,
@@ -423,12 +437,13 @@ mod tests {
 
     fn fixture() -> Fixture {
         let root = std::env::temp_dir().join(format!(
-            "steel-standard-store-{}-{}",
+            "steel-standard-store-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
-                .as_nanos()
+                .as_nanos(),
+            FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         ));
         let records = root.join("records").join("10");
         fs::create_dir_all(&records).expect("record root");
@@ -484,7 +499,7 @@ mod tests {
                 INSERT INTO production_inspection VALUES (
                     '10', 'bkv-10', 'STEEL-10', '2025-09-26 03:36:17',
                     'legacy-imported', 1, 6, 'record-hash', 'records/10',
-                    '{"steelType":"37Mn/2","lengthMm":12096}'
+                    '{"steelType":"37Mn/2","lengthMm":12096,"outerDiameterLegacyValue":233.664,"wallThicknessMm":12.5}'
                 );
                 INSERT INTO production_defect VALUES (
                     '10-100', '10', 'C1', 4, '轧折', 1, 51,
@@ -536,12 +551,16 @@ mod tests {
             fixture.store.records().expect("records"),
             vec![InspectionRecordDto {
                 record_id: "10".to_string(),
+                legacy_seq_no: Some(10),
                 steel_id: "STEEL-10".to_string(),
                 steel_type: Some("37Mn/2".to_string()),
                 length_mm: Some(12096.0),
+                outer_diameter_mm: Some(233.664),
+                wall_thickness_mm: Some(12.5),
                 inspection_time: Some("2025-09-26 03:36:17".to_string()),
                 defect_count: 1,
                 camera_count: 6,
+                source_hash: "record-hash".to_string(),
             }]
         );
         let defects = fixture.store.defects("10").expect("defects");
