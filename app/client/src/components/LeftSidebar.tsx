@@ -21,6 +21,7 @@ function createSingleRecordSearchPatch(field: RecordSearchField, value: string):
 }
 
 interface LeftSidebarProps {
+  runtimeMode?: 'online' | 'bkv';
   plate: SteelPlate;
   summary: InspectionSummary;
   records: InspectionRecord[];
@@ -59,6 +60,7 @@ function SidebarAlertCard({ summary }: { summary: InspectionSummary }) {
 }
 
 export function LeftSidebar({
+  runtimeMode = 'online',
   plate,
   summary,
   records,
@@ -110,7 +112,13 @@ export function LeftSidebar({
   };
 
   return (
-    <aside className="left-column">
+    <aside className={`left-column runtime-${runtimeMode}`}>
+      {runtimeMode === 'bkv' ? (
+        <div className="sidebar-data-source" role="note">
+          <strong>BKV 离线数据</strong>
+          <span>旧系统记录 · 只读观察</span>
+        </div>
+      ) : null}
       <SidebarAlertCard summary={summary} />
 
       <Panel title="钢管信息" className="plate-info-panel" headerless>
@@ -217,7 +225,7 @@ export function LeftSidebar({
                     <td>{record.time}</td>
                     <td>{record.plateNo}</td>
                     <td className={record.status === 'detecting' ? 'detecting' : 'completed'}>
-                      {record.status === 'detecting' ? '检测中' : '已完成'}
+                      {record.status === 'detecting' ? '检测中' : runtimeMode === 'bkv' ? '旧记录' : '已完成'}
                     </td>
                     <td>{record.defectCount}</td>
                   </tr>
@@ -244,7 +252,7 @@ export function LeftSidebar({
           </header>
           <dl>
             <div><dt>检测时间</dt><dd>{hoveredRecord.record.time}</dd></div>
-            <div><dt>记录状态</dt><dd className={hoveredRecord.record.status}>{hoveredRecord.record.status === 'detecting' ? '检测中' : '已完成'}</dd></div>
+            <div><dt>记录状态</dt><dd className={hoveredRecord.record.status}>{hoveredRecord.record.status === 'detecting' ? '检测中' : runtimeMode === 'bkv' ? 'BKV 旧记录' : '已完成'}</dd></div>
             <div><dt>缺陷总数</dt><dd>{hoveredRecord.record.defectCount}</dd></div>
             <div><dt>采集产物</dt><dd>{hoveredInspection?.captureImages?.length ?? 0} 件</dd></div>
             <div><dt>规格/钢种</dt><dd>{hoveredInspection?.plate.steelGrade || '—'}</dd></div>

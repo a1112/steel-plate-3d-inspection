@@ -27,10 +27,12 @@ describe('storage capacity warning presentation', () => {
 });
 
 describe('App BKV provider selection', () => {
-  it('switches only when the service explicitly reports a ready bkv provider', async () => {
+  it('renders ready BKV data inside the shared dashboard without online hardware polling', async () => {
     window.history.replaceState(null, '', '/?app=terminal');
+    const requestedUrls: string[] = [];
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
+      requestedUrls.push(url);
       if (url.includes('/api/bkv/status')) {
         return new Response(JSON.stringify({
           provider: 'bkv', ready: true, mode: 'offline-replay-no-camera-hardware', cameraMode: 'offline-file',
@@ -39,31 +41,104 @@ describe('App BKV provider selection', () => {
         }), { status: 200 });
       }
       if (url.includes('/api/bkv/materials')) {
-        return new Response(JSON.stringify({ provider: 'bkv', materials: [] }), { status: 200 });
+        return new Response(JSON.stringify({
+          provider: 'bkv',
+          materials: [{
+            legacySeqNo: 1893700,
+            legacyCheckRecordSeqNo: 661700,
+            steelId: '253B09401250925A12004328',
+            steelType: '37Mn/2',
+            lengthMm: 12096,
+            outerDiameterLegacyValue: 233.664,
+            wallThicknessMm: null,
+            inspectionTime: '2025-09-26 03:36:17',
+            defects: [{
+              legacyDefectId: 706831,
+              cameraId: 1,
+              classNo: 1,
+              className: '轧折',
+              grade: 2,
+              confidence: 0.51,
+              imageRect2d: { left: 20, top: 40, right: 60, bottom: 100 },
+              steelRect2d: { left: 20, top: 40, right: 60, bottom: 100 },
+            }],
+            cameras: [],
+            artifacts: {
+              unwrapped: { path: 'preview/unwrapped.png', size: 1, sha256: 'a'.repeat(64) },
+              cylinder: { path: 'preview/cylinder.json', size: 1, sha256: 'b'.repeat(64) },
+              summary: { path: 'preview/summary.json', size: 1, sha256: 'c'.repeat(64) },
+            },
+          }],
+        }), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/meta')) {
+        return new Response(JSON.stringify({
+          schema: 'steel.inspection-world.meta.v1',
+          provider: 'bkv',
+          recordId: '1893700',
+          sourceFrameCount: 6,
+          world: {
+            width: 600,
+            height: 1024,
+            tileSize: 512,
+            maxLevel: 10,
+            cameras: Array.from({ length: 6 }, (_, index) => ({
+              cameraId: index + 1,
+              frameWidth: 100,
+              frameHeight: 1024,
+              frameNumbers: [0],
+              orientation: { rotation: 0, flipX: false, flipY: false, frameOrder: 'ascending' },
+              width: 100,
+              height: 1024,
+              offsetX: index * 100,
+            })),
+          },
+        }), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/defects')) {
+        return new Response(JSON.stringify({
+          schema: 'steel.inspection-world.defects.v1',
+          provider: 'bkv',
+          recordId: '1893700',
+          defects: [],
+        }), { status: 200 });
       }
       return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
     }));
 
     render(<App />);
-    expect(await screen.findByRole('heading', { name: 'BKV 离线回放' })).toBeInTheDocument();
-    expect(screen.getByText('真实相机在线 0')).toBeInTheDocument();
+    expect(await screen.findByText('钢管3D表面检测系统')).toBeInTheDocument();
+    expect(screen.getByText('BKV 模式')).toBeInTheDocument();
+    expect(screen.getByText('离线数据')).toBeInTheDocument();
+    expect(screen.getByText('6/6')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '检测记录' })).toBeInTheDocument();
+    expect(screen.getAllByText('253B09401250925A12004328').length).toBeGreaterThan(0);
+    expect(screen.getByText('BKV 离线数据')).toBeInTheDocument();
+    expect(screen.getAllByText('轧折').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('heading', { name: 'BKV 离线回放' })).not.toBeInTheDocument();
+    expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
+    expect(requestedUrls.some((url) => url.includes('/api/inspection/snapshot'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/capture/health'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/trigger/status'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/inspection-world/meta') && url.includes('1893700'))).toBe(true);
+
     const moreButton = screen.getByRole('button', { name: '更多功能' });
     fireEvent.click(moreButton);
     const replayItem = screen.getByRole('menuitem', { name: '离线回放' });
     expect(replayItem).toBeEnabled();
     expect(replayItem).toHaveAttribute('aria-current', 'page');
-    expect(screen.queryByText('钢管3D表面检测系统')).not.toBeInTheDocument();
+    expect(screen.getByText('钢管3D表面检测系统')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('menuitem', { name: '在线检测' }));
-    expect(await screen.findByText('钢管3D表面检测系统')).toBeInTheDocument();
     expect(new URLSearchParams(window.location.search).get('view')).toBe('online');
+    expect(await screen.findByText('模式不匹配')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
     expect(screen.getByRole('menuitem', { name: '在线检测' })).toHaveAttribute('aria-current', 'page');
     expect(screen.getByRole('menuitem', { name: '离线回放' })).toBeEnabled();
     fireEvent.click(screen.getByRole('menuitem', { name: '离线回放' }));
 
-    expect(await screen.findByRole('heading', { name: 'BKV 离线回放' })).toBeInTheDocument();
+    expect(await screen.findByText('BKV 模式')).toBeInTheDocument();
     expect(new URLSearchParams(window.location.search).get('view')).toBe('bkv');
   });
 });

@@ -79,8 +79,8 @@ import { DefectFilterPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { BarSurfaceApp } from './components/BarSurfaceApp';
-import { BkvCompatibilityApp } from './components/BkvCompatibilityApp';
-import { fetchBkvStatus, type BkvStatus } from './services/bkv-api';
+import { buildBkvInspectionSnapshot } from './lib/bkv-inspection-adapter';
+import { fetchBkvMaterials, fetchBkvStatus, type BkvStatus } from './services/bkv-api';
 import {
   fetchBarSurfaceManifest,
   fetchBarSurfaceMesh,
@@ -97,6 +97,7 @@ const REPORT_PAGE_SIZE = 8;
 const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
 const UNKNOWN_SERVICE_ENDPOINT = 'unknown';
 const ONLINE_CAMERA_LANES = createSequentialCameraLanes(8);
+const BKV_CAMERA_LANES = createSequentialCameraLanes(6);
 
 export function formatStorageBytes(value?: number | null) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
@@ -237,47 +238,35 @@ export default function App() {
     return () => controller.abort();
   }, []);
 
+  const bkvAvailable = bkvStatus?.provider === 'bkv' && bkvStatus.ready;
+  const resolvedTerminalMode: Exclude<TerminalViewMode, 'auto'> =
+    terminalViewMode === 'online'
+      ? 'online'
+      : terminalViewMode === 'bkv'
+        ? 'bkv'
+        : bkvAvailable
+          ? 'bkv'
+          : 'online';
+
   useEffect(() => {
+    if (!bkvProbeComplete) return;
     const controller = new AbortController();
-    fetchInspectionSnapshot(controller.signal)
+    setSnapshot(null);
+    setLoadError(null);
+    const loadSnapshot = resolvedTerminalMode === 'bkv'
+      ? fetchBkvMaterials(controller.signal).then(buildBkvInspectionSnapshot)
+      : fetchInspectionSnapshot(controller.signal);
+    loadSnapshot
       .then((nextSnapshot) => {
-        setSnapshot(nextSnapshot);
-        setLoadError(null);
+        if (!controller.signal.aborted) setSnapshot(nextSnapshot);
       })
       .catch((error: unknown) => {
-        if (controller.signal.aborted) {
-          return;
+        if (!controller.signal.aborted) {
+          setLoadError(error instanceof Error ? error.message : '后台数据接口不可用');
         }
-        setLoadError(error instanceof Error ? error.message : '后台数据接口不可用');
       });
     return () => controller.abort();
-  }, []);
-
-  const bkvAvailable = bkvStatus?.provider === 'bkv' && bkvStatus.ready;
-  const showBkvReplay = bkvAvailable && terminalViewMode !== 'online';
-
-  if (showBkvReplay) {
-    const theme = readStoredTheme();
-    const themeStyle = readStoredThemeStyle();
-    return (
-      <div className={`app-shell theme-${theme} style-${themeStyle} bkv-provider-shell`}>
-        <BkvCompatibilityApp status={bkvStatus} />
-        <AppFooter
-          activeNav="online"
-          terminalViews={{
-            online: { available: true, active: false, onOpen: () => selectTerminalView('online') },
-            bkv: { available: true, active: true, onOpen: () => selectTerminalView('bkv') },
-          }}
-          onNavChange={() => undefined}
-          onSettingsOpen={() => notify({
-            title: '配置中心',
-            message: 'BKV 离线模式不连接在线检测配置',
-            tone: 'info',
-          })}
-        />
-      </div>
-    );
-  }
+  }, [bkvProbeComplete, resolvedTerminalMode]);
 
   if (!bkvProbeComplete || !snapshot) {
     const loadingTheme = readStoredTheme();
@@ -295,8 +284,16 @@ export default function App() {
 
   return (
     <InspectionDashboard
+      key={resolvedTerminalMode}
       snapshot={snapshot}
       bkvAvailable={bkvAvailable}
+      terminalMode={resolvedTerminalMode}
+      bkvStatus={bkvStatus}
+      modeMismatchMessage={
+        resolvedTerminalMode === 'online' && bkvAvailable
+          ? '当前采集源为 BKV，在线相机模式不可用'
+          : undefined
+      }
       onSnapshotChange={setSnapshot}
       onTerminalViewChange={selectTerminalView}
     />
@@ -306,11 +303,17 @@ export default function App() {
 function InspectionDashboard({
   snapshot,
   bkvAvailable,
+  terminalMode,
+  bkvStatus,
+  modeMismatchMessage,
   onSnapshotChange,
   onTerminalViewChange,
 }: {
   snapshot: InspectionSnapshot;
   bkvAvailable: boolean;
+  terminalMode: 'online' | 'bkv';
+  bkvStatus: BkvStatus | null;
+  modeMismatchMessage?: string;
   onSnapshotChange: (snapshot: InspectionSnapshot) => void;
   onTerminalViewChange: (view: 'online' | 'bkv') => void;
 }) {
@@ -394,6 +397,7 @@ function InspectionDashboard({
   }, []);
 
   useEffect(() => {
+    if (terminalMode !== 'online') return;
     const controller = new AbortController();
     fetchConnectionConfig(controller.signal)
       .then((config) => {
@@ -406,9 +410,10 @@ function InspectionDashboard({
         }
       });
     return () => controller.abort();
-  }, []);
+  }, [terminalMode]);
 
   useEffect(() => {
+    if (terminalMode !== 'online') return;
     const controller = new AbortController();
     fetchInspectionSettings(controller.signal)
       .then((settings) => {
@@ -422,7 +427,7 @@ function InspectionDashboard({
         }
       });
     return () => controller.abort();
-  }, []);
+  }, [terminalMode]);
 
   useEffect(() => {
     if (!settingsModalOpen) {
@@ -438,6 +443,7 @@ function InspectionDashboard({
   }, [settingsModalOpen]);
 
   useEffect(() => {
+    if (terminalMode !== 'online') return;
     let cancelled = false;
     const refreshCapture = async () => {
       try {
@@ -457,9 +463,10 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [terminalMode]);
 
   useEffect(() => {
+    if (terminalMode !== 'online') return;
     let cancelled = false;
     let inFlight = false;
     const refreshSnapshot = async () => {
@@ -492,9 +499,10 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [onSnapshotChange, snapshotTracking]);
+  }, [onSnapshotChange, snapshotTracking, terminalMode]);
 
   useEffect(() => {
+    if (terminalMode !== 'online') return;
     let cancelled = false;
     let requestInFlight = false;
     const refreshNetwork = async () => {
@@ -531,9 +539,10 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [terminalMode]);
 
   useEffect(() => {
+    if (terminalMode !== 'online') return;
     let cancelled = false;
     let inFlight = false;
 
@@ -673,7 +682,7 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [terminalMode]);
 
   const activeSnapshot = useMemo(() => getPlateInspectionSnapshot(snapshot, uiState.selectedRecordId), [snapshot, uiState.selectedRecordId]);
   const activeInspection = useMemo(
@@ -686,6 +695,15 @@ function InspectionDashboard({
     const inspectionId = activeInspection?.inspectionId?.trim() || '';
     const materialId = activeSnapshot.currentPlate.plateNo;
     const recordSummaryPath = activeInspection?.summaryPath?.trim() || '';
+    if (terminalMode === 'bkv') {
+      setRecordBoundSurface({
+        inspectionId,
+        loading: false,
+        mesh: null,
+        status: 'BKV 离线记录使用检测图像世界瓦片',
+      });
+      return;
+    }
     if (artifactMode === 'demo') {
       setRecordBoundSurface({
         inspectionId,
@@ -788,7 +806,7 @@ function InspectionDashboard({
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeSnapshot.currentPlate.plateNo, artifactMode]);
+  }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeSnapshot.currentPlate.plateNo, artifactMode, terminalMode]);
 
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
   const currentPlateDefects = useMemo(
@@ -802,8 +820,9 @@ function InspectionDashboard({
   const activeSummary = useMemo(() => summarizeDefects(currentPlateDefects), [currentPlateDefects]);
   const baseDeviceStatus = useMemo(() => getDeviceStatusWithOperation(activeSnapshot.status, operationState), [activeSnapshot.status, operationState]);
   const serviceAlarmCount = useMemo(() => {
+    if (terminalMode === 'bkv') return 0;
     return Object.values(serviceStatus).reduce((count, service) => count + (service.state === 'offline' || service.state === 'warning' ? 1 : 0), 0);
-  }, [serviceStatus]);
+  }, [serviceStatus, terminalMode]);
   const deviceStatus = useMemo(
     () => ({
       ...baseDeviceStatus,
@@ -855,6 +874,11 @@ function InspectionDashboard({
   const reportInspectionId = reportMetadata.inspectionIds.length === 1 ? reportMetadata.inspectionIds[0] : '';
 
   useEffect(() => {
+    if (terminalMode !== 'online') {
+      setReportArchives([]);
+      setReportArchiveStatus('BKV 离线记录不使用在线归档');
+      return;
+    }
     if (uiState.activeNav !== 'report' || !reportInspectionId) {
       setReportArchives([]);
       setReportArchiveStatus('请选择单个生产检测记录');
@@ -878,7 +902,7 @@ function InspectionDashboard({
     return () => {
       cancelled = true;
     };
-  }, [reportInspectionId, uiState.activeNav]);
+  }, [reportInspectionId, terminalMode, uiState.activeNav]);
   const filteredRecords = useMemo(
     () => filterInspectionRecords(snapshot.records, snapshot.inspections, recordSearchFilters),
     [snapshot.records, snapshot.inspections, recordSearchFilters],
@@ -1096,6 +1120,17 @@ function InspectionDashboard({
         trigger={triggerGatewayStatus}
         services={serviceStatus}
         activeNav={uiState.activeNav}
+        runtimeMode={terminalMode === 'bkv' && bkvStatus ? {
+          kind: 'bkv',
+          cameraCount: bkvStatus.cameraCount,
+          availableCameraCount: bkvStatus.cameraCount,
+          batchId: bkvStatus.batchId,
+          dataReady: bkvStatus.ready,
+          detail: `${bkvStatus.materialCount} 支旧检测记录已就绪`,
+        } : {
+          kind: 'online',
+          mismatchMessage: modeMismatchMessage,
+        }}
         analysisCollapse={uiState.activeNav === 'online' ? {
           collapsed: analysisCollapsed,
           onToggle: () => setAnalysisCollapsed((current) => !current),
@@ -1106,6 +1141,7 @@ function InspectionDashboard({
       {uiState.activeNav === 'online' ? (
         <div className="online-workspace">
           <LeftSidebar
+            runtimeMode={terminalMode}
             plate={activeSnapshot.currentPlate}
             summary={activeSummary}
             records={filteredRecords}
@@ -1133,28 +1169,36 @@ function InspectionDashboard({
                   artifactMode={artifactMode}
                   inspectionId={activeInspection?.inspectionId}
                   captureImages={activeSnapshot.captureImages ?? []}
-                  cameraLanes={ONLINE_CAMERA_LANES}
+                  cameraLanes={terminalMode === 'bkv' ? BKV_CAMERA_LANES : ONLINE_CAMERA_LANES}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
                   surfaceCameras={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameras : undefined}
                   artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
                   viewMode={plateMapViewMode}
                   integratedToolbar
                   toolbarExtra={
-                    <>
-                      <div className="snapshot-follow-summary" aria-label="检测数据状态">
-                        <i className={snapshotTracking === 'latest' ? 'live' : 'history'} />
-                        <strong>{snapshotTracking === 'latest' ? '实时跟随最新检测' : `固定查看 ${activeSnapshot.currentPlate.plateNo}`}</strong>
-                        <span>{snapshotSyncState} · 每 8 秒刷新</span>
+                    terminalMode === 'bkv' ? (
+                      <div className="snapshot-follow-summary bkv-record-summary" aria-label="BKV 检测数据状态">
+                        <i className="history" />
+                        <strong>BKV 离线记录</strong>
+                        <span>旧序号 {activeInspection?.inspectionId ?? '--'} · 批次 {bkvStatus?.batchId ?? '--'}</span>
                       </div>
-                      <div className="snapshot-follow-actions" role="group" aria-label="检测记录跟随模式">
-                        <button type="button" className={snapshotTracking === 'latest' ? 'active' : ''} onClick={followLatestSnapshot}>
-                          跟随最新
-                        </button>
-                        <button type="button" className={snapshotTracking === 'history' ? 'active' : ''} onClick={() => setSnapshotTracking('history')}>
-                          固定当前
-                        </button>
-                      </div>
-                    </>
+                    ) : (
+                      <>
+                        <div className="snapshot-follow-summary" aria-label="检测数据状态">
+                          <i className={snapshotTracking === 'latest' ? 'live' : 'history'} />
+                          <strong>{snapshotTracking === 'latest' ? '实时跟随最新检测' : `固定查看 ${activeSnapshot.currentPlate.plateNo}`}</strong>
+                          <span>{snapshotSyncState} · 每 8 秒刷新</span>
+                        </div>
+                        <div className="snapshot-follow-actions" role="group" aria-label="检测记录跟随模式">
+                          <button type="button" className={snapshotTracking === 'latest' ? 'active' : ''} onClick={followLatestSnapshot}>
+                            跟随最新
+                          </button>
+                          <button type="button" className={snapshotTracking === 'history' ? 'active' : ''} onClick={() => setSnapshotTracking('history')}>
+                            固定当前
+                          </button>
+                        </div>
+                      </>
+                    )
                   }
                   onToggleType={(typeId) =>
                     setUiState((current) => ({
@@ -1296,8 +1340,8 @@ function InspectionDashboard({
       <AppFooter
         activeNav={uiState.activeNav}
         terminalViews={{
-          online: { available: true, active: true, onOpen: () => onTerminalViewChange('online') },
-          bkv: { available: bkvAvailable, active: false, onOpen: () => onTerminalViewChange('bkv') },
+          online: { available: true, active: terminalMode === 'online', onOpen: () => onTerminalViewChange('online') },
+          bkv: { available: bkvAvailable, active: terminalMode === 'bkv', onOpen: () => onTerminalViewChange('bkv') },
         }}
         flowVisible={inspectionFlowVisible}
         onFlowToggle={() => setInspectionFlowVisible((current) => !current)}

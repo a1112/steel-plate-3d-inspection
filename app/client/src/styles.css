@@ -1891,6 +1891,25 @@ button {
   grid-template-rows: auto auto auto minmax(0, 1fr);
 }
 
+.sidebar-data-source {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid rgba(12, 166, 232, 0.28);
+  border-radius: 6px;
+  background: rgba(12, 166, 232, 0.08);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.sidebar-data-source strong {
+  color: #079bd5;
+  font-size: 12px;
+}
+
 .center-column {
   grid-template-rows: minmax(0, 1fr) minmax(150px, 0.25fr);
 }
