@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ParameterManagementApp } from './ParameterManagementApp';
 
@@ -487,6 +487,81 @@ const adminLoginSessions = [
   },
 ];
 
+const adminRuntimeProfile = {
+  schema: 'steel.runtime-profile.admin.v1',
+  activeProfile: {
+    schema: 'steel.runtime-profile.public.v1',
+    profileId: 'bkv-6',
+    displayName: 'BKV 六相机离线转换',
+    provider: 'bkv',
+    dataSource: 'converted-local',
+    cameraConnection: 'none',
+    cameraCount: 6,
+    cameras: Array.from({ length: 6 }, (_, index) => ({
+      id: `C${index + 1}`,
+      displayOrder: index + 1,
+      sourceCameraId: index + 1,
+      role: `legacy-${index + 1}`,
+    })),
+    configHash: 'active-hash',
+    capabilities: {
+      directCamera: false,
+      captureManagement: false,
+      reconstruction: false,
+      offlineReplay: true,
+    },
+  },
+  savedProfile: {
+    schema: 'steel.runtime-profile.v1',
+    id: 'bkv-6',
+    displayName: 'BKV 六相机离线转换',
+    provider: 'bkv',
+    dataSource: 'converted-local',
+    cameraConnection: 'none',
+    cameraCount: 6,
+    cameras: Array.from({ length: 6 }, (_, index) => ({
+      id: `C${index + 1}`,
+      displayOrder: index + 1,
+      sourceCameraId: index + 1,
+      role: `legacy-${index + 1}`,
+      sourceDirectory: `camera-${index + 1}`,
+    })),
+    storage: {
+      sourceRoot: 'tmp/legacy-bkv',
+      convertedRoot: 'target/data/bkv-converted',
+      catalogPath: 'target/data/bkv-converted/catalog.db',
+      converterOrigin: 'http://127.0.0.1:4893',
+    },
+    capabilities: {
+      directCamera: false,
+      captureManagement: false,
+      reconstruction: false,
+      offlineReplay: true,
+    },
+  },
+  activeConfigHash: 'active-hash',
+  savedConfigHash: 'active-hash',
+  restartRequired: false,
+};
+
+const adminBkvImportStatus = {
+  schema: 'steel.bkv-import-service.v1',
+  ready: true,
+  profileId: 'bkv-6',
+  cameraCount: 6,
+  latestJob: {
+    id: 'job-1',
+    status: 'completed_with_errors',
+    totalRecords: 11,
+    convertedRecords: 10,
+    skippedRecords: 0,
+    quarantinedRecords: 1,
+    startedAt: '2026-07-23T10:00:00Z',
+    completedAt: '2026-07-23T10:01:00Z',
+    failureDetails: [{ error: 'fixture failure' }],
+  },
+};
+
 describe('ParameterManagementApp', () => {
   const fetchMock = vi.fn();
   const storage = new Map<string, string>();
@@ -502,6 +577,9 @@ describe('ParameterManagementApp', () => {
   let captureConfigFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
   let saveCameraFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
   let saveRoleFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
+  let sessionPermissionsOverride: string[] | null = null;
+  let runtimeProfileValidationFailure = false;
+  let failBkvImportStatus = false;
 
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -517,6 +595,9 @@ describe('ParameterManagementApp', () => {
     captureConfigFailureResponse = null;
     saveCameraFailureResponse = null;
     saveRoleFailureResponse = null;
+    sessionPermissionsOverride = null;
+    runtimeProfileValidationFailure = false;
+    failBkvImportStatus = false;
     storage.clear();
     storage.set('steel-inspection-admin-session', JSON.stringify(adminSession));
     Object.defineProperty(window, 'localStorage', {
@@ -541,11 +622,14 @@ describe('ParameterManagementApp', () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes('/api/admin/auth/me')) {
+        const session = sessionPermissionsOverride
+          ? { ...adminSession, user: { ...adminSession.user, permissions: sessionPermissionsOverride } }
+          : adminSession;
         return {
           ok: true,
           json: async () => forcePasswordChangeLogin
-            ? { ...adminSession, user: { ...adminSession.user, mustChangePassword: true } }
-            : adminSession,
+            ? { ...session, user: { ...session.user, mustChangePassword: true } }
+            : session,
         };
       }
       if (url.includes('/api/admin/auth/login')) {
@@ -674,6 +758,66 @@ describe('ParameterManagementApp', () => {
       }
       if (url.includes('/api/admin/services')) {
         return { ok: true, json: async () => adminServices };
+      }
+      if (url.includes('/api/admin/runtime-profile/validate')) {
+        if (runtimeProfileValidationFailure) {
+          return {
+            ok: false,
+            status: 400,
+            json: async () => ({
+              code: 400,
+              error: 'runtime_profile_invalid',
+              detail: 'cameraCount 必须与 cameras 一致',
+            }),
+          };
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            valid: true,
+            profileId: 'bkv-6',
+            activeConfigHash: 'active-hash',
+            savedConfigHash: 'saved-hash',
+            restartRequired: true,
+          }),
+        };
+      }
+      if (url.includes('/api/admin/runtime-profile') && init?.method === 'POST') {
+        return {
+          ok: true,
+          json: async () => ({
+            saved: true,
+            profileId: 'bkv-6',
+            activeConfigHash: 'active-hash',
+            savedConfigHash: 'saved-hash',
+            restartRequired: true,
+          }),
+        };
+      }
+      if (url.includes('/api/admin/runtime-profile')) {
+        return { ok: true, json: async () => adminRuntimeProfile };
+      }
+      if (url.includes('/api/admin/bkv-import/jobs/retry')) {
+        return {
+          ok: true,
+          json: async () => ({ job_id: 'job-1', status: 'completed', converted_records: 1 }),
+        };
+      }
+      if (url.includes('/api/admin/bkv-import/jobs') && init?.method === 'POST') {
+        return {
+          ok: true,
+          json: async () => ({ job_id: 'job-2', status: 'completed', converted_records: 11 }),
+        };
+      }
+      if (url.includes('/api/admin/bkv-import/jobs')) {
+        if (failBkvImportStatus) {
+          return {
+            ok: false,
+            status: 503,
+            json: async () => ({ error: 'bkv_converter_unavailable' }),
+          };
+        }
+        return { ok: true, json: async () => adminBkvImportStatus };
       }
       if (url.includes('/api/admin/security/policy') && init?.method === 'POST') {
         const body = JSON.parse(String(init.body));
@@ -1932,5 +2076,84 @@ describe('ParameterManagementApp', () => {
     fireEvent.click(screen.getByRole('button', { name: /保存相机/ }));
 
     expect(await screen.findByText('相机配置保存失败：camera.exposureUs 必须在 1..1000000 范围内')).toBeInTheDocument();
+  });
+
+  it('renders the six-camera BKV runtime mode and converter progress in system config', async () => {
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    const panel = await screen.findByTestId('runtime-profile-management');
+    expect(within(panel).getByText('运行模式与数据转换')).toBeInTheDocument();
+    expect(within(panel).getByText('BKV 六相机离线转换')).toBeInTheDocument();
+    expect(within(panel).getByText('6 个相机')).toBeInTheDocument();
+    for (const camera of ['C1', 'C2', 'C3', 'C4', 'C5', 'C6']) {
+      expect(within(panel).getByText(camera)).toBeInTheDocument();
+    }
+    expect(within(panel).queryByText('C7')).not.toBeInTheDocument();
+    expect(within(panel).queryByText('C8')).not.toBeInTheDocument();
+    expect(within(panel).getByText('10 / 11 已转换')).toBeInTheDocument();
+    expect(within(panel).getByText('隔离 1')).toBeInTheDocument();
+  });
+
+  it('keeps runtime configuration editable when the optional converter status is unavailable', async () => {
+    failBkvImportStatus = true;
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    const panel = await screen.findByTestId('runtime-profile-management');
+    expect(await within(panel).findByText('BKV 六相机离线转换')).toBeInTheDocument();
+    expect(within(panel).getByLabelText('BKV 源目录')).toBeEnabled();
+    expect(within(panel).getByText('转换服务状态暂不可用')).toBeInTheDocument();
+  });
+
+  it('validates and saves runtime configuration with a persistent restart message', async () => {
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    const sourceInput = await screen.findByLabelText('BKV 源目录');
+    fireEvent.change(sourceInput, { target: { value: 'tmp/legacy-bkv-new' } });
+    fireEvent.click(screen.getByRole('button', { name: '校验运行配置' }));
+    expect(await screen.findByText('配置校验通过')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '保存运行配置' }));
+    expect(await screen.findByText('配置已保存，重启后生效')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4873/api/admin/runtime-profile',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it('shows validation details and does not save an invalid runtime profile', async () => {
+    runtimeProfileValidationFailure = true;
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(await screen.findByRole('button', { name: '校验运行配置' }));
+    expect(await screen.findByText('运行配置校验失败：cameraCount 必须与 cameras 一致')).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) => String(url).endsWith('/api/admin/runtime-profile') && init?.method === 'POST',
+      ),
+    ).toBe(false);
+  });
+
+  it('starts and retries BKV converter jobs while hiding config from unauthorized users', async () => {
+    const { unmount } = render(<ParameterManagementApp />);
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(await screen.findByRole('button', { name: '启动转换' }));
+    expect(await screen.findByText('转换任务已启动')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '重试任务' }));
+    expect(await screen.findByText('转换任务已重试')).toBeInTheDocument();
+    unmount();
+
+    sessionPermissionsOverride = ['admin.overview'];
+    render(<ParameterManagementApp />);
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '配置' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('runtime-profile-management')).not.toBeInTheDocument();
   });
 });

@@ -92,6 +92,7 @@ import {
   type DatabaseInfo,
 } from '../services/inspection-api';
 import { Panel } from './Panel';
+import { RuntimeProfileManagementPanel } from './RuntimeProfileManagementPanel';
 
 type JsonToken = {
   value: string;
@@ -2182,6 +2183,8 @@ export function ParameterManagementApp() {
 
       {activeSection === 'config' ? (
       <section className="parameter-grid parameter-config-grid">
+        <RuntimeProfileManagementPanel canEdit={authSession.user.permissions.includes('admin.config')} />
+
         <Panel title="相机配置" className="parameter-card parameter-camera-editor-card">
           <div className="admin-camera-form">
             <label>

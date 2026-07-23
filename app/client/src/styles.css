@@ -5851,26 +5851,33 @@ button {
 
 .parameter-config-grid {
   grid-template-columns: minmax(320px, 0.8fr) minmax(260px, 0.7fr) minmax(0, 1fr);
-  grid-template-rows: minmax(150px, 0.5fr) minmax(220px, 0.72fr) minmax(220px, 0.86fr) minmax(220px, 0.92fr);
+  grid-template-rows: auto minmax(150px, 0.5fr) minmax(220px, 0.72fr) minmax(220px, 0.86fr) minmax(220px, 0.92fr);
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.runtime-profile-management {
+  grid-column: 1 / -1;
+  grid-row: 1;
 }
 
 .parameter-camera-editor-card {
-  grid-row: 1 / 5;
+  grid-row: 2 / 6;
 }
 
 .parameter-camera-list-card {
   grid-column: 2;
-  grid-row: 1;
+  grid-row: 2;
 }
 
 .parameter-config-revision-card {
   grid-column: 2 / 4;
-  grid-row: 2;
+  grid-row: 3;
 }
 
 .parameter-inspection-settings-card {
   grid-column: 3;
-  grid-row: 1;
+  grid-row: 2;
 }
 
 .parameter-rules-grid {
@@ -5897,14 +5904,166 @@ button {
   gap: 10px;
 }
 
+.runtime-profile-card .panel-body {
+  display: grid;
+  gap: 12px;
+}
+
+.runtime-profile-summary,
+.bkv-import-status {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.runtime-profile-summary > div,
+.bkv-import-status > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.runtime-profile-summary span,
+.bkv-import-status span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.runtime-profile-summary strong,
+.bkv-import-status strong {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-profile-summary em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.runtime-profile-camera-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 6px;
+}
+
+.runtime-profile-camera-grid > div {
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+}
+
+.runtime-profile-camera-grid span,
+.runtime-profile-camera-grid em {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-profile-storage-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.runtime-profile-storage-form label {
+  display: grid;
+  gap: 5px;
+}
+
+.runtime-profile-storage-form label > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.runtime-profile-storage-form input {
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-input);
+}
+
+.runtime-profile-storage-form input:focus {
+  border-color: var(--blue);
+  outline: none;
+}
+
+.runtime-profile-actions,
+.bkv-import-actions {
+  display: flex !important;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px !important;
+}
+
+.runtime-profile-actions button,
+.bkv-import-actions button {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--blue);
+  border-radius: 7px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.runtime-profile-actions button:disabled,
+.bkv-import-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.runtime-profile-actions button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.runtime-profile-restart-notice,
+.runtime-profile-message {
+  padding: 8px 10px;
+  border: 1px solid var(--amber);
+  border-radius: 7px;
+  color: var(--amber);
+  background: rgba(255, 191, 38, 0.09);
+}
+
+.runtime-profile-message.error {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(255, 51, 51, 0.08);
+}
+
+@media (max-width: 900px) {
+  .runtime-profile-summary,
+  .bkv-import-status,
+  .runtime-profile-storage-form {
+    grid-template-columns: 1fr;
+  }
+}
+
 .parameter-connection-editor {
   grid-column: 2;
-  grid-row: 3 / 5;
+  grid-row: 4 / 6;
 }
 
 .parameter-capture-editor {
   grid-column: 3;
-  grid-row: 3 / 5;
+  grid-row: 4 / 6;
 }
 
 .parameter-audit-grid {

@@ -906,7 +906,10 @@ export function getTriggerGatewayOrigin() {
 
 export async function readAdminErrorMessage(response: Response, fallback: string) {
   try {
-    const payload = (await response.json()) as { error?: string; message?: string };
+    const payload = (await response.json()) as { detail?: string; error?: string; message?: string };
+    if (payload.detail) {
+      return `${fallback}：${payload.detail}`;
+    }
     if (payload.message) {
       return `${fallback}：${payload.message}`;
     }
