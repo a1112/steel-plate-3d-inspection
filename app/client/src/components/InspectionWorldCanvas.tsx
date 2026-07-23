@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   clampWorldScale,
-  getVisibleWorldTiles,
+  getVisibleCameraTiles,
   scaledWorldExtent,
   scrollPositionForZoom,
 } from '../lib/inspection-world';
@@ -213,18 +213,23 @@ export function InspectionWorldCanvas({
   );
   const visibleTiles = useMemo(() => {
     if (!viewportMeasured) return [];
-    return getVisibleWorldTiles({
-      worldWidth: meta.world.width,
-      worldHeight: meta.world.height,
+    return getVisibleCameraTiles({
+      cameras: meta.world.cameras,
       tileSize: meta.world.tileSize,
       level,
       viewport: { x: viewX, y: viewY, width: size.width / view.scale, height: size.height / view.scale },
       prefetch: 1,
     });
-  }, [level, meta.world.height, meta.world.tileSize, meta.world.width, size.height, size.width, view.scale, viewX, viewY, viewportMeasured]);
+  }, [level, meta.world.cameras, meta.world.tileSize, size.height, size.width, view.scale, viewX, viewY, viewportMeasured]);
   const visibleTileKeys = useMemo(
-    () => new Set(visibleTiles.map((tile) => `${recordId}:${tile.level}:${tile.x}:${tile.y}`)),
+    () => new Set(visibleTiles.map((tile) => (
+      `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`
+    ))),
     [recordId, visibleTiles],
+  );
+  const cameraById = useMemo(
+    () => new Map(meta.world.cameras.map((camera) => [camera.cameraId, camera])),
+    [meta.world.cameras],
   );
 
   useLayoutEffect(() => {
@@ -259,7 +264,7 @@ export function InspectionWorldCanvas({
       pending.current.delete(key);
     });
     for (const tile of visibleTiles) {
-      const key = `${recordId}:${tile.level}:${tile.x}:${tile.y}`;
+      const key = `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`;
       if (tileCache.current.has(key) || pending.current.has(key) || failedKeys.has(key)) continue;
       const controller = new AbortController();
       const requestToken = Symbol(key);
@@ -321,7 +326,7 @@ export function InspectionWorldCanvas({
     });
   }, [locatableDefects, size.height, size.width, view.scale, viewX, viewY]);
   const loadedTileCount = visibleTiles.filter((tile) => tileCache.current
-    .get(`${recordId}:${tile.level}:${tile.x}:${tile.y}`)?.loaded).length;
+    .get(`${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`)?.loaded).length;
   const focusedDefect = focusDefectId == null
     ? undefined
     : locatableDefects.find((item) => String(item.id) === String(focusDefectId));
@@ -384,23 +389,29 @@ export function InspectionWorldCanvas({
     );
     for (const entry of fallbackEntries) {
       if (Math.abs(entry.tile.level - level) !== fallbackLevelDistance) continue;
+      const camera = cameraById.get(entry.tile.cameraId);
+      if (!camera) continue;
       const fallbackSpan = meta.world.tileSize * 2 ** entry.tile.level;
-      const screenX = entry.tile.x * fallbackSpan * view.scale - view.scrollLeft;
+      const screenX = (camera.offsetX + entry.tile.x * fallbackSpan) * view.scale - view.scrollLeft;
       const screenY = entry.tile.y * fallbackSpan * view.scale - view.scrollTop;
-      const screenSize = fallbackSpan * view.scale;
-      if (screenX + screenSize < 0 || screenX > size.width || screenY + screenSize < 0 || screenY > size.height) continue;
-      context.drawImage(entry.image, screenX, screenY, screenSize, screenSize);
+      const screenWidth = Math.min(fallbackSpan, camera.width - entry.tile.x * fallbackSpan) * view.scale;
+      const screenHeight = Math.min(fallbackSpan, camera.height - entry.tile.y * fallbackSpan) * view.scale;
+      if (screenX + screenWidth < 0 || screenX > size.width || screenY + screenHeight < 0 || screenY > size.height) continue;
+      context.drawImage(entry.image, screenX, screenY, screenWidth, screenHeight);
     }
     for (const tile of visibleTiles) {
-      const key = `${recordId}:${tile.level}:${tile.x}:${tile.y}`;
-      const screenX = tile.x * span * view.scale - view.scrollLeft;
+      const key = `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`;
+      const camera = cameraById.get(tile.cameraId);
+      if (!camera) continue;
+      const screenX = (camera.offsetX + tile.x * span) * view.scale - view.scrollLeft;
       const screenY = tile.y * span * view.scale - view.scrollTop;
-      const screenSize = span * view.scale;
+      const screenWidth = Math.min(span, camera.width - tile.x * span) * view.scale;
+      const screenHeight = Math.min(span, camera.height - tile.y * span) * view.scale;
       const entry = tileCache.current.get(key);
-      if (entry?.loaded) context.drawImage(entry.image, screenX, screenY, screenSize, screenSize);
+      if (entry?.loaded) context.drawImage(entry.image, screenX, screenY, screenWidth, screenHeight);
       else if (failedKeys.has(key)) {
         context.fillStyle = '#24181d';
-        context.fillRect(screenX, screenY, screenSize, screenSize);
+        context.fillRect(screenX, screenY, screenWidth, screenHeight);
       }
     }
     context.fillStyle = 'rgba(0, 193, 255, .65)';
@@ -419,7 +430,7 @@ export function InspectionWorldCanvas({
         Math.max(3, rect.height * view.scale),
       );
     }
-  }, [failedKeys, level, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
+  }, [cameraById, failedKeys, level, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
 
   useEffect(() => {
     const canvas = canvasRef.current;

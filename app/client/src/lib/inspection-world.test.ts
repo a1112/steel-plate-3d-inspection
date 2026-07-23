@@ -3,6 +3,7 @@ import {
   clampWorldScale,
   fitWorldScale,
   focusWorldRect,
+  getVisibleCameraTiles,
   getVisibleWorldTiles,
   scaledWorldExtent,
   scrollPositionForZoom,
@@ -44,6 +45,25 @@ describe('inspection world viewport math', () => {
       prefetch: 0,
     });
     expect(tiles).toEqual([{ level: 0, x: 1, y: 0 }, { level: 0, x: 1, y: 1 }]);
+  });
+
+  it('selects camera-local tiles without crossing real-width camera boundaries', () => {
+    const tiles = getVisibleCameraTiles({
+      cameras: [
+        { cameraId: 1, offsetX: 0, width: 682, height: 21504 },
+        { cameraId: 2, offsetX: 682, width: 646, height: 20738 },
+      ],
+      tileSize: 512,
+      level: 0,
+      viewport: { x: 640, y: 0, width: 120, height: 400 },
+      prefetch: 0,
+    });
+
+    expect(tiles).toEqual([
+      { cameraId: 1, level: 0, x: 1, y: 0 },
+      { cameraId: 2, level: 0, x: 0, y: 0 },
+    ]);
+    expect(tiles.every((tile) => tile.x * 512 < (tile.cameraId === 1 ? 682 : 646))).toBe(true);
   });
 
   it('centres a defect rectangle with bounded padding', () => {

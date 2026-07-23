@@ -9,6 +9,10 @@ export type InspectionWorldCamera = {
   offsetX: number;
   width: number;
   height: number;
+  rawHeight?: number;
+  headOffsetY?: number;
+  aligned?: boolean;
+  alignmentConfidenceMilli?: number;
   frameWidth: number;
   frameHeight: number;
   frameNumbers: number[];
@@ -73,6 +77,7 @@ export type InspectionWorldDefects = {
 };
 
 export type WorldTileRequest = {
+  cameraId: number;
   level: number;
   x: number;
   y: number;
@@ -129,6 +134,7 @@ export async function fetchInspectionWorldTile(
   const format = request.format ?? 'jpeg';
   const params = new URLSearchParams({
     recordId,
+    cameraId: String(request.cameraId),
     level: String(request.level),
     x: String(request.x),
     y: String(request.y),

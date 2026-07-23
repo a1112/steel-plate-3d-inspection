@@ -36,6 +36,21 @@ const secondMeta: InspectionWorldMeta = {
   },
 };
 
+const realWidthMeta: InspectionWorldMeta = {
+  ...meta,
+  world: {
+    ...meta.world,
+    width: 3870,
+    cameras: [682, 646, 632, 541, 692, 677].map((width, index, widths) => ({
+      ...meta.world.cameras[index],
+      offsetX: widths.slice(0, index).reduce((sum, current) => sum + current, 0),
+      width,
+      frameWidth: width,
+      height: 21504 - index * 100,
+    })),
+  },
+};
+
 const defects: InspectionWorldDefect[] = [
   { id: 2019096, className: '轧折', cameraId: 1, imageIndex: 12, locatable: true, worldRect: { x: 73, y: 13145, width: 10, height: 10 } },
   { id: 2, className: '不可定位', locatable: false, worldRect: null },
@@ -90,6 +105,21 @@ describe('InspectionWorldCanvas', () => {
     expect(vi.mocked(fetchInspectionWorldTile).mock.calls.length).toBeLessThan(126);
   });
 
+  it('uses cumulative real camera widths for dividers and camera-local tile requests', async () => {
+    render(<InspectionWorldCanvas recordId="1893700" meta={realWidthMeta} defects={[]} />);
+    const scale = 1000 / 3870;
+    const cameras = screen.getAllByTestId('inspection-world-camera');
+
+    expect(Number.parseFloat(cameras[0].style.left)).toBeCloseTo(0, 6);
+    expect(Number.parseFloat(cameras[0].style.width)).toBeCloseTo(682 * scale, 6);
+    expect(Number.parseFloat(cameras[1].style.left)).toBeCloseTo(682 * scale, 6);
+    expect(Number.parseFloat(cameras[3].style.left)).toBeCloseTo((682 + 646 + 632) * scale, 6);
+    await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
+    expect(vi.mocked(fetchInspectionWorldTile).mock.calls.every(([, tile]) => (
+      Number.isInteger(tile.cameraId) && tile.cameraId >= 1 && tile.cameraId <= 6
+    ))).toBe(true);
+  });
+
   it('waits for the committed viewport measurement before selecting and fetching tiles', async () => {
     let resize: ResizeObserverCallback | undefined;
     vi.stubGlobal('ResizeObserver', class ResizeObserver {
@@ -111,11 +141,11 @@ describe('InspectionWorldCanvas', () => {
     await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
 
     expect(vi.mocked(fetchInspectionWorldTile).mock.calls.map(([, tile]) => ({
-      level: tile.level, x: tile.x, y: tile.y,
-    }))).toEqual([
-      { level: 1, x: 0, y: 0 },
-      { level: 1, x: 0, y: 1 },
-    ]);
+      cameraId: tile.cameraId, level: tile.level, x: tile.x, y: tile.y,
+    }))).toEqual(meta.world.cameras.flatMap((camera) => [
+      { cameraId: camera.cameraId, level: 1, x: 0, y: 0 },
+      { cameraId: camera.cameraId, level: 1, x: 0, y: 1 },
+    ]));
   });
 
   it('opens at the first frame with all cameras filling the viewport width', async () => {
@@ -318,8 +348,8 @@ describe('InspectionWorldCanvas', () => {
     await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
 
     const initialCalls = [...vi.mocked(fetchInspectionWorldTile).mock.calls];
-    const retained = initialCalls.find(([, tile]) => tile.x === 0 && tile.y === 1);
-    const departed = initialCalls.find(([, tile]) => tile.x === 0 && tile.y === 0);
+    const retained = initialCalls.find(([, tile]) => tile.cameraId === 1 && tile.x === 0 && tile.y === 1);
+    const departed = initialCalls.find(([, tile]) => tile.cameraId === 1 && tile.x === 0 && tile.y === 0);
     expect(retained).toBeDefined();
     expect(departed).toBeDefined();
 
@@ -328,11 +358,11 @@ describe('InspectionWorldCanvas', () => {
     await act(async () => {
       animationFrames.splice(0).forEach((callback) => callback(0));
     });
-    await waitFor(() => expect(canvasTileCalls(0, 4)).toBeGreaterThan(0));
+    await waitFor(() => expect(canvasTileCalls(0, 4, 1)).toBeGreaterThan(0));
 
     expect(retained?.[2]?.aborted).toBe(false);
     expect(departed?.[2]?.aborted).toBe(true);
-    expect(canvasTileCalls(0, 1)).toBe(1);
+    expect(canvasTileCalls(0, 1, 1)).toBe(1);
   });
 
   it('does not publish tile keys from a concurrent render that is discarded by Suspense', async () => {
@@ -896,7 +926,8 @@ describe('InspectionWorldCanvas', () => {
   });
 });
 
-function canvasTileCalls(x: number, y: number) {
+function canvasTileCalls(x: number, y: number, cameraId?: number) {
   return vi.mocked(fetchInspectionWorldTile).mock.calls
-    .filter(([, tile]) => tile.x === x && tile.y === y).length;
+    .filter(([, tile]) => tile.x === x && tile.y === y
+      && (cameraId == null || tile.cameraId === cameraId)).length;
 }

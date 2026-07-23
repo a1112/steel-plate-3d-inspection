@@ -3,6 +3,13 @@ import type { WorldRect } from '../services/inspection-world-api';
 export type WorldViewTransform = { x: number; y: number; scale: number };
 export type WorldViewport = { x: number; y: number; width: number; height: number };
 export type VisibleWorldTile = { level: number; x: number; y: number };
+export type VisibleCameraTile = VisibleWorldTile & { cameraId: number };
+export type CameraWorldBounds = {
+  cameraId: number;
+  offsetX: number;
+  width: number;
+  height: number;
+};
 
 function finiteNonnegative(value: number) {
   return Number.isFinite(value) && value >= 0 ? value : 0;
@@ -82,6 +89,52 @@ export function getVisibleWorldTiles(input: {
   const tiles: VisibleWorldTile[] = [];
   for (let x = startX; x <= endX; x += 1) {
     for (let y = startY; y <= endY; y += 1) tiles.push({ level: input.level, x, y });
+  }
+  return tiles;
+}
+
+export function getVisibleCameraTiles(input: {
+  cameras: CameraWorldBounds[];
+  tileSize: number;
+  level: number;
+  viewport: WorldViewport;
+  prefetch?: number;
+}): VisibleCameraTile[] {
+  const span = input.tileSize * 2 ** input.level;
+  const prefetch = Math.max(0, Math.floor(input.prefetch ?? 0));
+  const margin = prefetch * span;
+  const viewportRight = input.viewport.x + input.viewport.width;
+  const viewportBottom = input.viewport.y + input.viewport.height;
+  const tiles: VisibleCameraTile[] = [];
+
+  for (const camera of input.cameras) {
+    const cameraRight = camera.offsetX + camera.width;
+    if (
+      cameraRight < input.viewport.x - margin
+      || camera.offsetX > viewportRight + margin
+      || camera.height < input.viewport.y - margin
+      || viewportBottom + margin < 0
+    ) {
+      continue;
+    }
+    const localLeft = Math.max(0, input.viewport.x - camera.offsetX);
+    const localRight = Math.min(camera.width, viewportRight - camera.offsetX);
+    const localTop = Math.max(0, input.viewport.y);
+    const localBottom = Math.min(camera.height, viewportBottom);
+    const localViewport = {
+      x: Math.max(0, localLeft),
+      y: Math.max(0, localTop),
+      width: Math.max(1, localRight - localLeft),
+      height: Math.max(1, localBottom - localTop),
+    };
+    tiles.push(...getVisibleWorldTiles({
+      worldWidth: camera.width,
+      worldHeight: camera.height,
+      tileSize: input.tileSize,
+      level: input.level,
+      viewport: localViewport,
+      prefetch,
+    }).map((tile) => ({ ...tile, cameraId: camera.cameraId })));
   }
   return tiles;
 }

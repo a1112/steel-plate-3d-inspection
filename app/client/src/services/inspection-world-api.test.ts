@@ -38,9 +38,16 @@ describe('inspection world API', () => {
 
   it('creates and explicitly revokes a requested tile blob URL', async () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(new Blob(['tile'], { type: 'image/jpeg' })));
-    const tile = await fetchInspectionWorldTile('1893700', { level: 2, x: 3, y: 4, format: 'jpeg' });
+    const tile = await fetchInspectionWorldTile('1893700', {
+      cameraId: 5,
+      level: 2,
+      x: 3,
+      y: 4,
+      format: 'jpeg',
+    });
 
-    expect(String(vi.mocked(fetch).mock.calls[0][0])).toContain('recordId=1893700&level=2&x=3&y=4&format=jpeg');
+    expect(String(vi.mocked(fetch).mock.calls[0][0]))
+      .toContain('recordId=1893700&cameraId=5&level=2&x=3&y=4&format=jpeg');
     expect(tile.url).toBe('blob:world-tile');
     tile.revoke();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:world-tile');
