@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import {
   clampWorldScale,
   getVisibleCameraTiles,
+  lodForScaleWithHysteresis,
   scaledWorldExtent,
   scrollPositionForZoom,
 } from '../lib/inspection-world';
@@ -44,10 +45,6 @@ function disposeTileEntry(entry: TileEntry) {
   entry.tile.revoke();
 }
 
-function lodForScale(scale: number, maxLevel: number) {
-  return Math.max(0, Math.min(maxLevel, Math.round(Math.log2(1 / Math.max(scale, Number.EPSILON)))));
-}
-
 export function InspectionWorldCanvas({
   recordId,
   meta,
@@ -74,6 +71,9 @@ export function InspectionWorldCanvas({
   const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
   const [viewportMeasured, setViewportMeasured] = useState(false);
   const [view, setView] = useState(() => initialView(meta, DEFAULT_WIDTH));
+  const [level, setLevel] = useState(() => (
+    lodForScaleWithHysteresis(view.scale, meta.world.maxLevel)
+  ));
   const interactionView = useRef(view);
   const [failedKeys, setFailedKeys] = useState<Set<string>>(new Set());
   const [revision, setRevision] = useState(0);
@@ -110,6 +110,10 @@ export function InspectionWorldCanvas({
 
   const evictInactiveTiles = useCallback(() => {
     if (tileCache.current.size <= TILE_CACHE_LIMIT) return false;
+    const currentCoverageReady = [...activeTileKeys.current].every(
+      (key) => tileCache.current.get(key)?.loaded,
+    );
+    if (!currentCoverageReady) return false;
     const candidates = [...tileCache.current.entries()]
       .filter(([key]) => !activeTileKeys.current.has(key))
       .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
@@ -150,7 +154,7 @@ export function InspectionWorldCanvas({
           };
           pendingScroll.current = targetScroll;
           interactionView.current = { ...current, ...targetScroll, scale };
-          setView((state) => ({ ...state, scale }));
+          setView((state) => ({ ...state, ...targetScroll, scale }));
         }
       }
       setViewportMeasured(true);
@@ -204,7 +208,12 @@ export function InspectionWorldCanvas({
     };
   }, []);
 
-  const level = lodForScale(view.scale, meta.world.maxLevel);
+  useLayoutEffect(() => {
+    setLevel((current) => (
+      lodForScaleWithHysteresis(view.scale, meta.world.maxLevel, current)
+    ));
+  }, [meta.world.maxLevel, view.scale]);
+
   const viewX = view.scrollLeft / view.scale;
   const viewY = view.scrollTop / view.scale;
   const extent = useMemo(
@@ -344,12 +353,13 @@ export function InspectionWorldCanvas({
       Math.max(4, minimumScale),
     );
     fitWidthMode.current = false;
-    pendingScroll.current = {
+    const targetScroll = {
       scrollLeft: Math.max(0, (focusedRect.x + focusedRect.width / 2) * targetScale - size.width / 2),
       scrollTop: Math.max(0, (focusedRect.y + focusedRect.height / 2) * targetScale - size.height / 2),
     };
-    interactionView.current = { ...interactionView.current, ...pendingScroll.current, scale: targetScale };
-    setView((current) => ({ ...current, scale: targetScale }));
+    pendingScroll.current = targetScroll;
+    interactionView.current = { ...interactionView.current, ...targetScroll, scale: targetScale };
+    setView((current) => ({ ...current, ...targetScroll, scale: targetScale }));
     setFocusScrollRevision((current) => current + 1);
   }, [
     focusDefectId,
@@ -464,7 +474,7 @@ export function InspectionWorldCanvas({
       });
       pendingScroll.current = targetScroll;
       interactionView.current = { ...targetScroll, scale };
-      setView((state) => ({ ...state, scale }));
+      setView((state) => ({ ...state, ...targetScroll, scale }));
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
     return () => canvas.removeEventListener('wheel', onWheel);

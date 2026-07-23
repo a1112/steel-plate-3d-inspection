@@ -62,6 +62,24 @@ export function clampWorldScale(scale: number, minimum: number, maximum: number)
   return Math.min(maximum, Math.max(minimum, scale));
 }
 
+export function lodForScaleWithHysteresis(
+  scale: number,
+  maxLevel: number,
+  currentLevel?: number,
+  hysteresis = 0.15,
+) {
+  const boundedMax = Math.max(0, Math.floor(maxLevel));
+  const rawLevel = Math.log2(1 / Math.max(scale, Number.EPSILON));
+  if (currentLevel == null || !Number.isFinite(currentLevel)) {
+    return Math.max(0, Math.min(boundedMax, Math.round(rawLevel)));
+  }
+  let level = Math.max(0, Math.min(boundedMax, Math.round(currentLevel)));
+  const band = Math.max(0, hysteresis);
+  while (level > 0 && rawLevel < level - 0.5 - band) level -= 1;
+  while (level < boundedMax && rawLevel > level + 0.5 + band) level += 1;
+  return level;
+}
+
 export function screenPointToWorld(point: { x: number; y: number }, transform: WorldViewTransform) {
   return {
     x: transform.x + point.x / transform.scale,

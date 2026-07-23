@@ -5,6 +5,7 @@ import {
   focusWorldRect,
   getVisibleCameraTiles,
   getVisibleWorldTiles,
+  lodForScaleWithHysteresis,
   scaledWorldExtent,
   scrollPositionForZoom,
   screenPointToWorld,
@@ -45,6 +46,13 @@ describe('inspection world viewport math', () => {
       prefetch: 0,
     });
     expect(tiles).toEqual([{ level: 0, x: 1, y: 0 }, { level: 0, x: 1, y: 1 }]);
+  });
+
+  it('keeps the current LOD inside a hysteresis band around the nearest-level threshold', () => {
+    expect(lodForScaleWithHysteresis(0.36, 15, 2)).toBe(2);
+    expect(lodForScaleWithHysteresis(0.45, 15, 2)).toBe(1);
+    expect(lodForScaleWithHysteresis(0.32, 15, 1)).toBe(1);
+    expect(lodForScaleWithHysteresis(0.28, 15, 1)).toBe(2);
   });
 
   it('selects camera-local tiles without crossing real-width camera boundaries', () => {

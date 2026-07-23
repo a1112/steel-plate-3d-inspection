@@ -138,11 +138,15 @@ describe('InspectionWorldCanvas', () => {
       clientHeight: { configurable: true, value: 256 },
     });
     await act(async () => resize?.([], {} as ResizeObserver));
-    await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByTestId('inspection-world-canvas')).toHaveAttribute('data-level', '1'));
 
-    expect(vi.mocked(fetchInspectionWorldTile).mock.calls.map(([, tile]) => ({
-      cameraId: tile.cameraId, level: tile.level, x: tile.x, y: tile.y,
-    }))).toEqual(meta.world.cameras.flatMap((camera) => [
+    const committedLevelCalls = vi.mocked(fetchInspectionWorldTile).mock.calls
+      .map(([, tile]) => tile)
+      .filter((tile) => tile.level === 1)
+      .map((tile) => ({
+        cameraId: tile.cameraId, level: tile.level, x: tile.x, y: tile.y,
+      }));
+    expect(committedLevelCalls).toEqual(meta.world.cameras.flatMap((camera) => [
       { cameraId: camera.cameraId, level: 1, x: 0, y: 0 },
       { cameraId: camera.cameraId, level: 1, x: 0, y: 1 },
     ]));
@@ -221,6 +225,37 @@ describe('InspectionWorldCanvas', () => {
     const nextScale = Number(canvas.getAttribute('data-view-scale'));
     expect(viewport.scrollLeft).toBeCloseTo(500 * (nextScale / initialScale - 1), 3);
     expect(viewport.scrollTop).toBeCloseTo(300 * (nextScale / initialScale - 1), 3);
+  });
+
+  it('commits the zoom scale and anchored world position in the same render', async () => {
+    const animationFrames: FrameRequestCallback[] = [];
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      animationFrames.push(callback);
+      return animationFrames.length;
+    });
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    installNativeScrollTo(viewport);
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, right: 1000, bottom: 600,
+      x: 0, y: 0, width: 1000, height: 600,
+      toJSON: () => undefined,
+    });
+
+    await act(async () => {
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -400, ctrlKey: true, clientX: 500, clientY: 300,
+        bubbles: true, cancelable: true,
+      }));
+    });
+
+    const scale = Number(canvas.getAttribute('data-view-scale'));
+    expect(viewport.scrollLeft).toBeGreaterThan(0);
+    expect(Number(canvas.getAttribute('data-view-x')))
+      .toBeCloseTo(viewport.scrollLeft / scale, 3);
+    expect(Number(canvas.getAttribute('data-view-y')))
+      .toBeCloseTo(viewport.scrollTop / scale, 3);
   });
 
   it('chains rapid Ctrl+wheel events from the pending anchored scroll position', async () => {
@@ -695,6 +730,60 @@ describe('InspectionWorldCanvas', () => {
     await waitFor(() => expect(vi.mocked(fetchInspectionWorldTile).mock.calls
       .some(([, tile]) => tile.level === 0)).toBe(true));
     expect(drawImage).toHaveBeenCalled();
+  });
+
+  it('does not evict a full previous LOD cache before replacement images decode', async () => {
+    let decodeImmediately = true;
+    class ControlledImage {
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(_value: string) {
+        if (decodeImmediately) queueMicrotask(() => this.onload?.());
+      }
+    }
+    vi.stubGlobal('Image', ControlledImage);
+    const revoke = vi.fn();
+    vi.mocked(fetchInspectionWorldTile).mockImplementation(async (_record, tile) => ({
+      ...tile,
+      url: `blob:${tile.cameraId}-${tile.level}-${tile.x}-${tile.y}`,
+      revoke,
+    }));
+    const manyCameraMeta: InspectionWorldMeta = {
+      ...meta,
+      world: {
+        ...meta.world,
+        width: 4_800,
+        height: 2_048,
+        cameras: Array.from({ length: 48 }, (_, index) => ({
+          ...meta.world.cameras[0],
+          cameraId: index + 1,
+          offsetX: index * 100,
+          width: 100,
+          frameWidth: 100,
+          height: 2_048,
+        })),
+      },
+    };
+    render(<InspectionWorldCanvas recordId="full-cache" meta={manyCameraMeta} defects={[]} />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = inspectionViewport(canvas);
+    installNativeScrollTo(viewport);
+    await waitFor(() => expect(canvas).toHaveAttribute('data-cached-tiles', '48'));
+    await waitFor(() => expect(canvas).toHaveAttribute('data-loaded-tiles', '48'));
+    revoke.mockClear();
+    decodeImmediately = false;
+
+    await act(async () => {
+      canvas.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -900, ctrlKey: true, clientX: 500, clientY: 300,
+        bubbles: true, cancelable: true,
+      }));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(vi.mocked(fetchInspectionWorldTile).mock.calls
+      .some(([, tile]) => tile.level === 1)).toBe(true));
+
+    expect(revoke).not.toHaveBeenCalled();
   });
 
   it('retains recently departed tiles for a smooth LOD transition', async () => {
