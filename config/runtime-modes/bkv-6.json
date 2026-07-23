@@ -1,0 +1,65 @@
+{
+  "schema": "steel.runtime-profile.v1",
+  "id": "bkv-6",
+  "displayName": "BKV 六相机离线转换",
+  "provider": "bkv",
+  "dataSource": "converted-local",
+  "cameraConnection": "none",
+  "cameraCount": 6,
+  "cameras": [
+    {
+      "id": "C1",
+      "displayOrder": 1,
+      "sourceCameraId": 1,
+      "role": "legacy-array-1",
+      "sourceDirectory": "image_copy2/image_copy/CamImageSource1"
+    },
+    {
+      "id": "C2",
+      "displayOrder": 2,
+      "sourceCameraId": 2,
+      "role": "legacy-array-2",
+      "sourceDirectory": "image_copy2/image_copy/CamImageSource2"
+    },
+    {
+      "id": "C3",
+      "displayOrder": 3,
+      "sourceCameraId": 3,
+      "role": "legacy-array-3",
+      "sourceDirectory": "image_copy2/image_copy/CamImageSource3"
+    },
+    {
+      "id": "C4",
+      "displayOrder": 4,
+      "sourceCameraId": 4,
+      "role": "legacy-array-4",
+      "sourceDirectory": "image_copy2/image_copy/CamImageSource4"
+    },
+    {
+      "id": "C5",
+      "displayOrder": 5,
+      "sourceCameraId": 5,
+      "role": "legacy-array-5",
+      "sourceDirectory": "image_copy2/image_copy/CamImageSource5"
+    },
+    {
+      "id": "C6",
+      "displayOrder": 6,
+      "sourceCameraId": 6,
+      "role": "legacy-array-6",
+      "sourceDirectory": "image_copy2/image_copy/CamImageSource6"
+    }
+  ],
+  "storage": {
+    "sourceRoot": "tmp/legacy-bkv",
+    "convertedRoot": "target/data/bkv-converted",
+    "catalogPath": "target/data/bkv-converted/catalog.db",
+    "converterOrigin": "http://127.0.0.1:4893"
+  },
+  "capabilities": {
+    "directCamera": false,
+    "captureManagement": false,
+    "reconstruction": false,
+    "offlineReplay": true
+  }
+}

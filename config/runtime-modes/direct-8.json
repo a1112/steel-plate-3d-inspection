@@ -1,0 +1,27 @@
+{
+  "schema": "steel.runtime-profile.v1",
+  "id": "direct-8",
+  "displayName": "八相机直连生产",
+  "provider": "headless-cpp",
+  "dataSource": "online-production",
+  "cameraConnection": "headless-cpp",
+  "cameraCount": 8,
+  "captureProfile": "config/capture/profiles/current-8-time-trigger/profile.json",
+  "cameras": [
+    { "id": "C1", "displayOrder": 1, "sourceCameraId": 1, "role": "array-1" },
+    { "id": "C2", "displayOrder": 2, "sourceCameraId": 2, "role": "array-2" },
+    { "id": "C3", "displayOrder": 3, "sourceCameraId": 3, "role": "array-3" },
+    { "id": "C4", "displayOrder": 4, "sourceCameraId": 4, "role": "array-4" },
+    { "id": "C5", "displayOrder": 5, "sourceCameraId": 5, "role": "array-5" },
+    { "id": "C6", "displayOrder": 6, "sourceCameraId": 6, "role": "array-6" },
+    { "id": "C7", "displayOrder": 7, "sourceCameraId": 7, "role": "array-7" },
+    { "id": "C8", "displayOrder": 8, "sourceCameraId": 8, "role": "array-8" }
+  ],
+  "storage": {},
+  "capabilities": {
+    "directCamera": true,
+    "captureManagement": true,
+    "reconstruction": true,
+    "offlineReplay": false
+  }
+}

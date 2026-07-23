@@ -22,6 +22,7 @@ mod controlled_process;
 mod db;
 mod inspection_world;
 mod production_tasks;
+mod runtime_profile;
 
 #[derive(Clone)]
 struct DefectType {
@@ -238,6 +239,7 @@ struct ServiceState {
     trigger_gateway_origin: String,
     trigger_health_required: bool,
     runtime_profile: String,
+    runtime_config: Arc<runtime_profile::RuntimeProfile>,
     algorithm_mode: String,
     algorithm_mock_defect_count: String,
     sessions: Mutex<HashMap<String, AdminSession>>,
@@ -17874,6 +17876,25 @@ fn main() -> std::io::Result<()> {
     }
     let capture_port = capture_port();
     let capture_manager = Arc::new(CaptureServiceManager::new(capture_port));
+    let project_config_path = env::var("STEEL_PROJECT_CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("config").join("project.json"));
+    let runtime_config = runtime_profile::RuntimeProfile::load(
+        &project_config_path,
+        &workspace_root(),
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if runtime_config.provider != capture_manager.provider.as_str() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "runtime_profile_provider_mismatch: profile {} requires {}, configured {}",
+                runtime_config.id,
+                runtime_config.provider,
+                capture_manager.provider.as_str()
+            ),
+        ));
+    }
     let bkv_manager = configured_bkv_manager(capture_manager.provider)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     CaptureServiceManager::start_supervisor(&capture_manager);
@@ -17906,6 +17927,7 @@ fn main() -> std::io::Result<()> {
         trigger_health_required: trigger_health_required(),
         runtime_profile: env::var("STEEL_RUNTIME_PROFILE")
             .unwrap_or_else(|_| "production".to_string()),
+        runtime_config: Arc::new(runtime_config),
         algorithm_mode: env::var("STEEL_ALGORITHM_MODE")
             .unwrap_or_else(|_| "production".to_string()),
         algorithm_mock_defect_count: env::var("BAR_SURFACE_MOCK_DEFECT_COUNT")
@@ -18016,6 +18038,10 @@ mod tests {
             trigger_gateway_origin: "disabled".to_string(),
             trigger_health_required: false,
             runtime_profile: "test".to_string(),
+            runtime_config: Arc::new(runtime_profile::RuntimeProfile::test_profile(
+                provider.as_str(),
+                if provider == CaptureProvider::Bkv { 6 } else { 8 },
+            )),
             algorithm_mode: "demo".to_string(),
             algorithm_mock_defect_count: "0".to_string(),
             sessions: Mutex::new(HashMap::new()),
