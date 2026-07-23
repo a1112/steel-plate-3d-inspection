@@ -27,6 +27,33 @@ function renderHeader(overrides: Partial<ComponentProps<typeof BrandHeader>> = {
 }
 
 describe('BrandHeader', () => {
+  it('shows BKV data status without online hardware or service alarms', () => {
+    renderHeader({
+      runtimeMode: {
+        kind: 'bkv',
+        cameraCount: 6,
+        availableCameraCount: 6,
+        batchId: 'legacy-1893700-1893710',
+        dataReady: true,
+        detail: 'BKV 数据已就绪',
+      },
+    });
+
+    expect(screen.getByText('BKV 模式')).toBeInTheDocument();
+    expect(screen.getByText('离线回放')).toBeInTheDocument();
+    expect(screen.getByText('离线数据')).toBeInTheDocument();
+    expect(screen.getByText('6/6')).toBeInTheDocument();
+    expect(screen.getByText('legacy-1893700-1893710')).toBeInTheDocument();
+    expect(screen.getByText('数据就绪')).toBeInTheDocument();
+    expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
+    expect(screen.queryByText('报级器网口')).not.toBeInTheDocument();
+    expect(screen.queryByText('编码器')).not.toBeInTheDocument();
+    expect(screen.queryByText('PLC')).not.toBeInTheDocument();
+    expect(screen.queryByText('L2')).not.toBeInTheDocument();
+    expect(screen.queryByText('触发网关')).not.toBeInTheDocument();
+    expect(screen.queryByText('服务异常')).not.toBeInTheDocument();
+  });
+
   it('places the online analysis collapse control immediately before minimize', () => {
     const onToggle = vi.fn();
     renderHeader({ analysisCollapse: { collapsed: false, onToggle } });

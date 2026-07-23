@@ -9,6 +9,17 @@ import { NotificationCenter } from './NotificationCenter';
 import { TopNav, type NavKey } from './TopNav';
 import { WindowControls } from './WindowControls';
 
+export type HeaderRuntimeMode =
+  | { kind: 'online'; mismatchMessage?: string }
+  | {
+      kind: 'bkv';
+      cameraCount: number;
+      availableCameraCount: number;
+      batchId: string;
+      dataReady: boolean;
+      detail: string;
+    };
+
 interface BrandHeaderProps {
   status: DeviceStatus;
   theme: ThemeMode;
@@ -17,6 +28,7 @@ interface BrandHeaderProps {
   trigger?: TriggerGatewayStatus | null;
   services?: ServiceStatusPanel;
   activeNav: NavKey;
+  runtimeMode?: HeaderRuntimeMode;
   analysisCollapse?: {
     collapsed: boolean;
     onToggle: () => void;
@@ -674,6 +686,7 @@ export function BrandHeader({
   trigger,
   services,
   activeNav,
+  runtimeMode = { kind: 'online' },
   analysisCollapse,
   onNavChange,
   onDragMouseDown,
@@ -793,8 +806,29 @@ export function BrandHeader({
         <div className="system-title">钢管3D表面检测系统</div>
       </div>
 
-      <div className="brand-status">
-        <StatusBlock className="trigger-header-status" label="触发状态" value={triggerValue} tone={trigger ? (triggerHealthy ? 'ok' : 'warning') : 'warning'} title={triggerTitle} />
+      <div className={`brand-status ${runtimeMode.kind === 'bkv' ? 'bkv-runtime-status' : 'online-runtime-status'}`}>
+        {runtimeMode.kind === 'bkv' ? (
+          <>
+            <StatusBlock className="bkv-mode-status" label="BKV 模式" value="离线回放" title={runtimeMode.detail} />
+            <StatusBlock className="bkv-data-status" label="离线数据" value={`${runtimeMode.availableCameraCount}/${runtimeMode.cameraCount}`} title={runtimeMode.detail} />
+            <StatusBlock className="bkv-batch-status" label="批次" value={runtimeMode.batchId} title={runtimeMode.batchId} />
+            <StatusBlock
+              className="bkv-ready-status"
+              label="检测数据"
+              value={runtimeMode.dataReady ? '数据就绪' : '数据异常'}
+              tone={runtimeMode.dataReady ? 'ok' : 'error'}
+              title={runtimeMode.detail}
+            />
+          </>
+        ) : (
+          <>
+        <StatusBlock
+          className="trigger-header-status"
+          label={runtimeMode.mismatchMessage ? '采集模式' : '触发状态'}
+          value={runtimeMode.mismatchMessage ? '模式不匹配' : triggerValue}
+          tone={runtimeMode.mismatchMessage ? 'warning' : trigger ? (triggerHealthy ? 'ok' : 'warning') : 'warning'}
+          title={runtimeMode.mismatchMessage || triggerTitle}
+        />
         <div className="port-status-stack" data-testid="hardware-status-stack">
           <div ref={receiverWrapRef} className="camera-status-wrap receiver-status-wrap" data-no-drag onMouseDown={(event) => event.stopPropagation()}>
             <button
@@ -874,6 +908,8 @@ export function BrandHeader({
           <i />
           <span>{serviceIssueCount > 0 ? '服务异常' : '运行中'}</span>
         </div>
+          </>
+        )}
         <NotificationCenter embedded />
       </div>
 

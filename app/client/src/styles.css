@@ -1008,6 +1008,34 @@ button {
   line-height: 1;
 }
 
+.brand-status.bkv-runtime-status > .status-block {
+  display: grid;
+  min-width: 70px;
+  height: 32px;
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  align-items: center;
+  gap: 0;
+  padding: 2px 8px;
+  border: 1px solid rgba(0, 166, 255, 0.32);
+  border-radius: 4px;
+  background: rgba(0, 70, 112, 0.2);
+  line-height: 1;
+}
+
+.brand-status.bkv-runtime-status > .bkv-mode-status {
+  border-color: rgba(0, 201, 255, 0.58);
+  background: rgba(0, 133, 191, 0.2);
+}
+
+.brand-status.bkv-runtime-status > .bkv-batch-status {
+  max-width: 190px;
+}
+
+.bkv-batch-status strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .trigger-header-status span {
   color: var(--text-muted);
   font-size: 9px;
