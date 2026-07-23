@@ -1096,6 +1096,10 @@ function InspectionDashboard({
         trigger={triggerGatewayStatus}
         services={serviceStatus}
         activeNav={uiState.activeNav}
+        analysisCollapse={uiState.activeNav === 'online' ? {
+          collapsed: analysisCollapsed,
+          onToggle: () => setAnalysisCollapsed((current) => !current),
+        } : undefined}
         onNavChange={(activeNav) => setState({ activeNav })}
         onDragMouseDown={(event) => void handleTitlebarMouseDown(event)}
       />

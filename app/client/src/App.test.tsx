@@ -143,6 +143,23 @@ describe('App online severity filters', () => {
     expect(screen.getByRole('group', { name: '显示视图切换' })).toBeInTheDocument();
   });
 
+  it('collapses the lower analysis area from the window controls without a footer duplicate', async () => {
+    const { container } = render(<App />);
+
+    const collapse = await screen.findByRole('button', { name: '收起缺陷分析区' });
+    expect(collapse).toBe(container.querySelector('.window-controls .window-analysis-collapse'));
+    expect(screen.getAllByRole('button', { name: '收起缺陷分析区' })).toHaveLength(1);
+    expect(container.querySelector('.app-footer-collapse')).not.toBeInTheDocument();
+
+    fireEvent.click(collapse);
+    expect(container.querySelector('.center-column')).toHaveClass('analysis-collapsed');
+    const expand = screen.getByRole('button', { name: '展开缺陷分析区' });
+    expect(expand).toHaveAttribute('aria-expanded', 'false');
+
+    fireEvent.click(expand);
+    expect(container.querySelector('.center-column')).not.toHaveClass('analysis-collapsed');
+  });
+
   it('keeps offline replay visible but disabled outside BKV mode', async () => {
     render(<App />);
 

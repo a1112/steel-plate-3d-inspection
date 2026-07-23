@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Box, ChevronDown, ChevronUp, Database, History, Monitor, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
+import { Box, Database, History, Monitor, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import {
@@ -172,15 +172,6 @@ export function AppFooter({
               </button>
             ))}
           </div>
-          <button
-            type="button"
-            className="app-footer-collapse"
-            aria-label={activeAnalysis.collapsed ? '展开缺陷分析区' : '收起缺陷分析区'}
-            aria-expanded={!activeAnalysis.collapsed}
-            onClick={() => activeAnalysis.onCollapsedChange(!activeAnalysis.collapsed)}
-          >
-            {activeAnalysis.collapsed ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
-          </button>
         </div>
       ) : (
         <div className="app-footer-context" aria-label="系统工具栏">

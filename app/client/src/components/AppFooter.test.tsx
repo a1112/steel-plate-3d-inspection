@@ -154,7 +154,7 @@ describe('AppFooter', () => {
     expect(onFlowToggle).toHaveBeenCalledTimes(1);
   });
 
-  it('moves defect details and both view switchers into the online footer', () => {
+  it('keeps defect view switchers in the footer without a duplicate collapse control', () => {
     const onSurfaceViewModeChange = vi.fn();
     const onAnalysisViewModeChange = vi.fn();
     const onCollapsedChange = vi.fn();
@@ -165,7 +165,7 @@ describe('AppFooter', () => {
           defect,
           surfaceViewMode: '2d',
           analysisViewMode: 'overview',
-          collapsed: false,
+          collapsed: true,
           onSurfaceViewModeChange,
           onAnalysisViewModeChange,
           onCollapsedChange,
@@ -179,10 +179,11 @@ describe('AppFooter', () => {
     expect(screen.getByLabelText('选中缺陷分析工具')).toHaveTextContent('0.42×0.36×0.12mm');
     fireEvent.click(screen.getByRole('button', { name: '3D' }));
     fireEvent.click(screen.getByRole('button', { name: '局部点云' }));
-    fireEvent.click(screen.getByRole('button', { name: '收起缺陷分析区' }));
 
     expect(onSurfaceViewModeChange).toHaveBeenCalledWith('3d');
     expect(onAnalysisViewModeChange).toHaveBeenCalledWith('point-cloud');
-    expect(onCollapsedChange).toHaveBeenCalledWith(true);
+    expect(onCollapsedChange).toHaveBeenCalledWith(false);
+    expect(screen.queryByRole('button', { name: '收起缺陷分析区' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '展开缺陷分析区' })).not.toBeInTheDocument();
   });
 });
