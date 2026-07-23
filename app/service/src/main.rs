@@ -237,6 +237,8 @@ struct ServiceState {
     production_task_worker_status: Mutex<ProductionTaskWorkerStatus>,
     production_task_sequence: AtomicU64,
     inspection_world_cache: Mutex<HashMap<String, OnlineInspectionWorldCacheEntry>>,
+    converted_inspection_world_cache:
+        Mutex<HashMap<String, ConvertedInspectionWorldCacheEntry>>,
     runtime_admission: Mutex<RuntimeAdmissionState>,
     runtime_drain_token: Vec<u8>,
     trigger_gateway_origin: String,
@@ -12869,17 +12871,26 @@ fn load_online_inspection_world(
 fn load_converted_inspection_world(
     state: &ServiceState,
     record_id: &str,
-) -> Result<ConvertedInspectionWorld, String> {
+) -> Result<Arc<ConvertedInspectionWorld>, String> {
     let store = state
         .standard_record_store
         .as_ref()
         .ok_or_else(|| "converted record store unavailable".to_string())?;
-    if store
+    let record = store
         .record(record_id)
         .map_err(|error| error.to_string())?
-        .is_none()
+        .ok_or_else(|| format!("converted inspection {record_id} not found"))?;
     {
-        return Err(format!("converted inspection {record_id} not found"));
+        let cache = state
+            .converted_inspection_world_cache
+            .lock()
+            .map_err(|_| "converted inspection world cache lock poisoned".to_string())?;
+        if let Some(entry) = cache
+            .get(record_id)
+            .filter(|entry| entry.source_hash == record.source_hash)
+        {
+            return Ok(Arc::clone(&entry.world));
+        }
     }
     let captures = store
         .capture_files(record_id)
@@ -12953,12 +12964,27 @@ fn load_converted_inspection_world(
     }
     let world = inspection_world::InspectionWorld::with_alignments(specs)
         .map_err(|error| error.to_string())?;
-    Ok(ConvertedInspectionWorld {
+    let converted = Arc::new(ConvertedInspectionWorld {
         world,
         frames,
         sequence_ordinals,
         defects,
-    })
+    });
+    let mut cache = state
+        .converted_inspection_world_cache
+        .lock()
+        .map_err(|_| "converted inspection world cache lock poisoned".to_string())?;
+    if cache.len() >= 16 && !cache.contains_key(record_id) {
+        cache.clear();
+    }
+    cache.insert(
+        record_id.to_string(),
+        ConvertedInspectionWorldCacheEntry {
+            source_hash: record.source_hash,
+            world: Arc::clone(&converted),
+        },
+    );
+    Ok(converted)
 }
 
 fn inspection_world_record_id(query: &str) -> Result<String, Vec<u8>> {
@@ -18566,6 +18592,11 @@ struct ConvertedInspectionWorld {
     defects: Vec<standard_record_store::InspectionDefectDto>,
 }
 
+struct ConvertedInspectionWorldCacheEntry {
+    source_hash: String,
+    world: Arc<ConvertedInspectionWorld>,
+}
+
 fn configured_standard_record_store(
     profile: &runtime_profile::RuntimeProfile,
 ) -> Option<Arc<standard_record_store::ConvertedLocalStore>> {
@@ -18663,6 +18694,7 @@ fn main() -> std::io::Result<()> {
         production_task_worker_status: Mutex::new(ProductionTaskWorkerStatus::default()),
         production_task_sequence: AtomicU64::new(0),
         inspection_world_cache: Mutex::new(HashMap::new()),
+        converted_inspection_world_cache: Mutex::new(HashMap::new()),
         runtime_admission: Mutex::new(RuntimeAdmissionState::default()),
         runtime_drain_token: env::var("TRIGGER_OPERATOR_TOKEN")
             .unwrap_or_default()
@@ -18778,6 +18810,7 @@ mod tests {
             production_task_worker_status: Mutex::new(ProductionTaskWorkerStatus::default()),
             production_task_sequence: AtomicU64::new(0),
             inspection_world_cache: Mutex::new(HashMap::new()),
+            converted_inspection_world_cache: Mutex::new(HashMap::new()),
             runtime_admission: Mutex::new(RuntimeAdmissionState::default()),
             runtime_drain_token: b"operator-0123456789abcdef-ABCDEF!".to_vec(),
             trigger_gateway_origin: "disabled".to_string(),
@@ -24470,6 +24503,33 @@ mod tests {
             .position(|bytes| bytes == b"\r\n\r\n")
             .expect("tile headers");
         image::load_from_memory(&tile[separator + 4..]).expect("converted tile image");
+        fs::remove_dir_all(root).expect("remove converted fixture");
+    }
+
+    #[test]
+    fn converted_inspection_world_cache_reuses_matching_source_revision() {
+        let (root, store) = converted_world_fixture();
+        let mut state =
+            production_test_state_with_provider(CaptureProvider::Bkv, "simulated://capture");
+        state.standard_record_store = Some(Arc::new(store));
+
+        let first = load_converted_inspection_world(&state, "10").expect("first converted world");
+        let second = load_converted_inspection_world(&state, "10").expect("cached converted world");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let connection =
+            rusqlite::Connection::open(root.join("catalog.db")).expect("converted catalog");
+        connection
+            .execute(
+                "UPDATE production_inspection SET source_hash = 'record-hash-v2' WHERE id = '10'",
+                [],
+            )
+            .expect("change converted revision");
+        drop(connection);
+
+        let refreshed =
+            load_converted_inspection_world(&state, "10").expect("refreshed converted world");
+        assert!(!Arc::ptr_eq(&first, &refreshed));
         fs::remove_dir_all(root).expect("remove converted fixture");
     }
 
