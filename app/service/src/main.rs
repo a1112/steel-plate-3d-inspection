@@ -5507,7 +5507,13 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("GET", "/api/admin/alarm-rules")
         | ("POST", "/api/admin/alarm-rules")
         | ("GET", "/api/admin/external-integrations")
-        | ("POST", "/api/admin/external-integrations") => Some("admin.config"),
+        | ("POST", "/api/admin/external-integrations")
+        | ("GET", "/api/admin/runtime-profile")
+        | ("POST", "/api/admin/runtime-profile/validate")
+        | ("POST", "/api/admin/runtime-profile")
+        | ("GET", "/api/admin/bkv-import/jobs")
+        | ("POST", "/api/admin/bkv-import/jobs")
+        | ("POST", "/api/admin/bkv-import/jobs/retry") => Some("admin.config"),
         ("GET", "/api/admin/config/revisions")
         | ("GET", "/api/admin/config/revisions/detail")
         | ("POST", "/api/admin/config/revisions/restore") => Some("admin.config"),
@@ -12083,6 +12089,368 @@ fn runtime_profile_response(state: &ServiceState) -> Vec<u8> {
     )
 }
 
+fn runtime_profile_candidate(body: &str) -> Result<Value, String> {
+    if body.trim().is_empty() || body.len() > CONFIG_JSON_MAX_BYTES {
+        return Err("runtime profile request is empty or too large".to_string());
+    }
+    let payload: Value = serde_json::from_str(body)
+        .map_err(|error| format!("runtime profile request JSON invalid: {error}"))?;
+    payload
+        .get("profile")
+        .cloned()
+        .or_else(|| {
+            (payload.get("schema").and_then(Value::as_str)
+                == Some("steel.runtime-profile.v1"))
+            .then_some(payload)
+        })
+        .ok_or_else(|| "runtime profile request must contain profile".to_string())
+}
+
+fn saved_runtime_profile(
+    state: &ServiceState,
+) -> Result<(Value, runtime_profile::RuntimeProfile), String> {
+    let bytes = fs::read(&state.runtime_config.profile_path)
+        .map_err(|error| format!("saved runtime profile read failed: {error}"))?;
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("saved runtime profile JSON invalid: {error}"))?;
+    let root = state
+        .runtime_config
+        .project_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "runtime project path has no configuration root".to_string())?;
+    let loaded = runtime_profile::RuntimeProfile::load(
+        &state.runtime_config.project_path,
+        root,
+    )?;
+    Ok((value, loaded))
+}
+
+fn read_admin_runtime_profile_response(state: &ServiceState) -> Vec<u8> {
+    match saved_runtime_profile(state) {
+        Ok((saved, loaded)) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "schema": "steel.runtime-profile.admin.v1",
+                "activeProfile": state.runtime_config.public_value(),
+                "savedProfile": saved,
+                "activeConfigHash": state.runtime_config.config_hash,
+                "savedConfigHash": loaded.config_hash,
+                "restartRequired": loaded.config_hash != state.runtime_config.config_hash,
+            })
+            .to_string(),
+        ),
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code": 500, "error": "runtime_profile_read_failed", "detail": error}).to_string(),
+        ),
+    }
+}
+
+fn validate_admin_runtime_profile_response(state: &ServiceState, body: &str) -> Vec<u8> {
+    let candidate = match runtime_profile_candidate(body) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error}).to_string(),
+            )
+        }
+    };
+    match state.runtime_config.validate_candidate(&candidate) {
+        Ok((_, saved_hash)) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "valid": true,
+                "profileId": state.runtime_config.id,
+                "activeConfigHash": state.runtime_config.config_hash,
+                "savedConfigHash": saved_hash,
+                "restartRequired": saved_hash != state.runtime_config.config_hash,
+            })
+            .to_string(),
+        ),
+        Err(error) => http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error}).to_string(),
+        ),
+    }
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "runtime profile path has no parent".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "runtime profile filename is invalid".to_string())?;
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.tmp",
+        current_time_millis()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| format!("runtime profile temporary create failed: {error}"))?;
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|error| format!("runtime profile write failed: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("runtime profile sync failed: {error}"))?;
+        drop(file);
+        replace_existing_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_existing_file(source: &Path, target: &Path) -> Result<(), String> {
+    fs::rename(source, target)
+        .map_err(|error| format!("runtime profile publish failed: {error}"))
+}
+
+#[cfg(windows)]
+fn replace_existing_file(source: &Path, target: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(format!(
+            "runtime profile publish failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn save_admin_runtime_profile_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let candidate = match runtime_profile_candidate(body) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error}).to_string(),
+            )
+        }
+    };
+    let (bytes, saved_hash) = match state.runtime_config.validate_candidate(&candidate) {
+        Ok(validated) => validated,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error}).to_string(),
+            )
+        }
+    };
+    let previous = match fs::read(&state.runtime_config.profile_path) {
+        Ok(previous) => previous,
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"code": 500, "error": "runtime_profile_read_failed", "detail": error.to_string()}).to_string(),
+            )
+        }
+    };
+    if let Err(error) = write_bytes_atomic(&state.runtime_config.profile_path, &bytes) {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code": 500, "error": "runtime_profile_save_failed", "detail": error}).to_string(),
+        );
+    }
+    let value = String::from_utf8_lossy(&bytes).to_string();
+    if let Err(error) = state.runtime.block_on(db::append_config_revision(
+        &state.database.connection,
+        "runtime-profile",
+        &value,
+        actor,
+        "save",
+    )) {
+        let _ = write_bytes_atomic(&state.runtime_config.profile_path, &previous);
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code": 500, "error": "runtime_profile_revision_failed", "detail": error.to_string()}).to_string(),
+        );
+    }
+    let _ = state.runtime.block_on(db::append_audit_log(
+        &state.database.connection,
+        actor,
+        "runtime-profile.update",
+        &state.runtime_config.id,
+        "保存运行模式配置；服务重启后生效",
+        "warning",
+    ));
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "saved": true,
+            "profileId": state.runtime_config.id,
+            "restartRequired": saved_hash != state.runtime_config.config_hash,
+            "activeConfigHash": state.runtime_config.config_hash,
+            "savedConfigHash": saved_hash,
+        })
+        .to_string(),
+    )
+}
+
+fn bkv_converter_origin(state: &ServiceState) -> Result<&str, Vec<u8>> {
+    let origin = state.runtime_config.storage.converter_origin.trim();
+    let authority_only = origin.strip_prefix("http://").is_some_and(|value| {
+        !value.is_empty()
+            && !value.contains(['/', '?', '#', '@'])
+    });
+    let (host, _) = health_http_origin_endpoint(origin).map_err(|_| {
+        http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "converter_origin_invalid"}).to_string(),
+        )
+    })?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !loopback || !authority_only {
+        return Err(http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "converter_origin_not_loopback"}).to_string(),
+        ));
+    }
+    Ok(origin)
+}
+
+fn bkv_converter_proxy_response(
+    state: &ServiceState,
+    method: &str,
+    path: &str,
+) -> Vec<u8> {
+    let origin = match bkv_converter_origin(state) {
+        Ok(origin) => origin,
+        Err(response) => return response,
+    };
+    match bounded_local_http_request(
+        origin,
+        method,
+        path,
+        "",
+        Duration::from_secs(3),
+        &[],
+    ) {
+        Ok(response) if (200..300).contains(&response.status_code) => {
+            http_bytes_response_with_headers(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &response.body,
+                &[],
+            )
+        }
+        Ok(response) => http_response(
+            "502 Bad Gateway",
+            "application/json; charset=utf-8",
+            &json!({"code": 502, "error": "bkv_converter_rejected_request", "status": response.status_code}).to_string(),
+        ),
+        Err(error) => http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({"code": 503, "error": "bkv_converter_unavailable", "detail": error.as_str()}).to_string(),
+        ),
+    }
+}
+
+fn read_admin_bkv_import_jobs_response(state: &ServiceState) -> Vec<u8> {
+    bkv_converter_proxy_response(state, "GET", "/status")
+}
+
+fn start_admin_bkv_import_job_response(state: &ServiceState, actor: &str) -> Vec<u8> {
+    let response = bkv_converter_proxy_response(state, "POST", "/start");
+    if response.starts_with(b"HTTP/1.1 200 OK") {
+        let _ = state.runtime.block_on(db::append_audit_log(
+            &state.database.connection,
+            actor,
+            "bkv-import.start",
+            &state.runtime_config.id,
+            "启动 BKV 标准化转换任务",
+            "warning",
+        ));
+    }
+    response
+}
+
+fn retry_admin_bkv_import_job_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let job_id = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|payload| payload.get("jobId").and_then(Value::as_str).map(str::to_string))
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        });
+    let Some(job_id) = job_id else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "bkv_import_job_id_invalid"}).to_string(),
+        );
+    };
+    let response =
+        bkv_converter_proxy_response(state, "POST", &format!("/retry/{job_id}"));
+    if response.starts_with(b"HTTP/1.1 200 OK") {
+        let _ = state.runtime.block_on(db::append_audit_log(
+            &state.database.connection,
+            actor,
+            "bkv-import.retry",
+            &job_id,
+            "重试 BKV 标准化转换任务",
+            "warning",
+        ));
+    }
+    response
+}
+
 fn bkv_hardware_operation_forbidden_response() -> Vec<u8> {
     http_response(
         "409 Conflict",
@@ -17687,6 +18055,12 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "DELETE", "path": "/api/admin/auth/sessions", "scope": "auth" },
             { "method": "GET", "path": "/api/admin/services", "scope": "admin" },
             { "method": "GET", "path": "/api/admin/diagnostics", "scope": "admin" },
+            { "method": "GET", "path": "/api/admin/runtime-profile", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/runtime-profile/validate", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/runtime-profile", "scope": "admin-config" },
+            { "method": "GET", "path": "/api/admin/bkv-import/jobs", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/bkv-import/jobs", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/bkv-import/jobs/retry", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/services/capture/start", "scope": "admin" },
             { "method": "POST", "path": "/api/admin/services/capture/stop", "scope": "admin" },
             { "method": "POST", "path": "/api/admin/services/capture/restart", "scope": "admin" },
@@ -17918,6 +18292,22 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("GET", "/api/admin/services") => read_admin_services_response(&state),
         ("GET", "/api/admin/diagnostics") => read_admin_diagnostics_response(&state),
+        ("GET", "/api/admin/runtime-profile") => read_admin_runtime_profile_response(&state),
+        ("POST", "/api/admin/runtime-profile/validate") => {
+            validate_admin_runtime_profile_response(&state, body)
+        }
+        ("POST", "/api/admin/runtime-profile") => {
+            save_admin_runtime_profile_response(&state, body, actor)
+        }
+        ("GET", "/api/admin/bkv-import/jobs") => {
+            read_admin_bkv_import_jobs_response(&state)
+        }
+        ("POST", "/api/admin/bkv-import/jobs") => {
+            start_admin_bkv_import_job_response(&state, actor)
+        }
+        ("POST", "/api/admin/bkv-import/jobs/retry") => {
+            retry_admin_bkv_import_job_response(&state, body, actor)
+        }
         ("POST", "/api/admin/services/capture/start") => start_capture_service_response(&state, actor),
         ("POST", "/api/admin/services/capture/stop") => stop_capture_service_response(&state, actor),
         ("POST", "/api/admin/services/capture/restart") => {
@@ -20047,6 +20437,224 @@ mod tests {
                 !serialized.contains(private_field),
                 "public profile leaked {private_field}"
             );
+        }
+    }
+
+    fn admin_runtime_profile_fixture() -> (PathBuf, runtime_profile::RuntimeProfile, Value) {
+        let root = std::env::temp_dir().join(format!(
+            "steel-admin-runtime-profile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = root.join("config");
+        fs::create_dir_all(config.join("runtime-modes")).expect("runtime config root");
+        let project_path = config.join("project.json");
+        let profile_path = config.join("runtime-modes").join("bkv-6.json");
+        let profile = json!({
+            "schema": "steel.runtime-profile.v1",
+            "id": "bkv-6",
+            "displayName": "BKV 六相机离线转换",
+            "provider": "bkv",
+            "dataSource": "converted-local",
+            "cameraConnection": "none",
+            "cameraCount": 6,
+            "cameras": (1..=6).map(|camera| json!({
+                "id": format!("C{camera}"),
+                "displayOrder": camera,
+                "sourceCameraId": camera,
+                "role": format!("legacy-{camera}"),
+                "sourceDirectory": format!("camera-{camera}")
+            })).collect::<Vec<_>>(),
+            "storage": {
+                "sourceRoot": "legacy",
+                "convertedRoot": "converted",
+                "catalogPath": "converted/catalog.db",
+                "converterOrigin": "http://127.0.0.1:4893"
+            },
+            "capabilities": {
+                "directCamera": false,
+                "captureManagement": false,
+                "reconstruction": false,
+                "offlineReplay": true
+            }
+        });
+        fs::write(
+            &project_path,
+            serde_json::to_vec(&json!({
+                "schema": "steel.project-config.v1",
+                "activeRuntimeProfile": "config/runtime-modes/bkv-6.json"
+            }))
+            .expect("project JSON"),
+        )
+        .expect("project config");
+        fs::write(
+            &profile_path,
+            serde_json::to_vec_pretty(&profile).expect("profile JSON"),
+        )
+        .expect("runtime profile");
+        let loaded =
+            runtime_profile::RuntimeProfile::load(&project_path, &root).expect("runtime profile");
+        (root, loaded, profile)
+    }
+
+    #[test]
+    fn admin_runtime_profile_validates_saves_revision_and_requires_restart() {
+        let (root, loaded, mut profile) = admin_runtime_profile_fixture();
+        let mut state = production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
+        state.runtime_config = Arc::new(loaded);
+
+        let read = response_json(read_admin_runtime_profile_response(&state));
+        assert_eq!(read["activeProfile"]["profileId"], "bkv-6");
+        assert_eq!(read["savedProfile"]["cameraCount"], 6);
+
+        profile["displayName"] = json!("BKV 六相机标准化转换");
+        let body = json!({"profile": profile}).to_string();
+        let validated =
+            response_json(validate_admin_runtime_profile_response(&state, &body));
+        assert_eq!(validated["valid"], true);
+        assert_eq!(validated["restartRequired"], true);
+
+        let saved = response_json(save_admin_runtime_profile_response(
+            &state,
+            &body,
+            "admin",
+        ));
+        assert_eq!(saved["saved"], true);
+        assert_eq!(saved["profileId"], "bkv-6");
+        assert_eq!(saved["restartRequired"], true);
+        assert_eq!(
+            state.runtime_config.display_name,
+            "BKV 六相机离线转换",
+            "active runtime must not hot reload"
+        );
+        assert_ne!(saved["activeConfigHash"], saved["savedConfigHash"]);
+        let revisions = state
+            .runtime
+            .block_on(db::list_config_revisions(
+                &state.database.connection,
+                Some("runtime-profile".to_string()),
+                10,
+            ))
+            .expect("runtime profile revisions");
+        assert_eq!(revisions.len(), 1);
+        let audit = state
+            .runtime
+            .block_on(state.database.connection.query_one(Statement::from_string(
+                state.database.connection.get_database_backend(),
+                "SELECT action FROM audit_log WHERE action = 'runtime-profile.update'".to_string(),
+            )))
+            .expect("audit query");
+        assert!(audit.is_some());
+        fs::remove_dir_all(root).expect("remove runtime fixture");
+    }
+
+    #[test]
+    fn admin_runtime_profile_rejects_invalid_topology_paths_capabilities_and_origin() {
+        let (root, loaded, profile) = admin_runtime_profile_fixture();
+        let mut state = production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
+        state.runtime_config = Arc::new(loaded);
+        let mut invalid = Vec::new();
+        let mut camera_count = profile.clone();
+        camera_count["cameraCount"] = json!(8);
+        invalid.push(camera_count);
+        let mut duplicate = profile.clone();
+        duplicate["cameras"][1]["id"] = json!("C1");
+        invalid.push(duplicate);
+        let mut escaped = profile.clone();
+        escaped["storage"]["convertedRoot"] = json!("../outside");
+        invalid.push(escaped);
+        let mut direct = profile.clone();
+        direct["capabilities"]["directCamera"] = json!(true);
+        invalid.push(direct);
+        let mut remote = profile;
+        remote["storage"]["converterOrigin"] = json!("http://192.168.1.20:4893");
+        invalid.push(remote);
+
+        for candidate in invalid {
+            let response = response_text(validate_admin_runtime_profile_response(
+                &state,
+                &json!({"profile": candidate}).to_string(),
+            ));
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove runtime fixture");
+    }
+
+    #[test]
+    fn admin_bkv_import_routes_proxy_only_the_configured_loopback_service() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("converter listener");
+        let port = listener.local_addr().expect("converter address").port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().expect("converter request");
+                let mut buffer = [0_u8; 4096];
+                let count = stream.read(&mut buffer).expect("converter request bytes");
+                let request = String::from_utf8_lossy(&buffer[..count]);
+                let line = request.lines().next().unwrap_or_default();
+                let body = if line.starts_with("GET /status ") {
+                    json!({"schema":"steel.bkv-import-service.v1","latestJob":{"id":"job-1","status":"completed"}})
+                } else if line.starts_with("POST /start ") {
+                    json!({"job_id":"job-2","status":"completed","converted_records":2})
+                } else if line.starts_with("POST /retry/job-1 ") {
+                    json!({"job_id":"job-1","status":"completed","converted_records":1})
+                } else {
+                    json!({"error":"unexpected_request","line":line})
+                };
+                let encoded = body.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    encoded.len(),
+                    encoded
+                )
+                .expect("converter response");
+            }
+        });
+        let mut state = production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
+        let mut profile = (*state.runtime_config).clone();
+        profile.storage.converter_origin = format!("http://127.0.0.1:{port}");
+        state.runtime_config = Arc::new(profile);
+
+        assert_eq!(
+            response_json(read_admin_bkv_import_jobs_response(&state))["latestJob"]["id"],
+            "job-1"
+        );
+        assert_eq!(
+            response_json(start_admin_bkv_import_job_response(&state, "admin"))["job_id"],
+            "job-2"
+        );
+        assert_eq!(
+            response_json(retry_admin_bkv_import_job_response(
+                &state,
+                r#"{"jobId":"job-1"}"#,
+                "admin",
+            ))["job_id"],
+            "job-1"
+        );
+        server.join().expect("converter server");
+
+        let mut remote_profile = (*state.runtime_config).clone();
+        remote_profile.storage.converter_origin = "http://192.168.1.20:4893".to_string();
+        state.runtime_config = Arc::new(remote_profile);
+        let rejected = response_text(read_admin_bkv_import_jobs_response(&state));
+        assert!(rejected.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(rejected.contains("converter_origin_not_loopback"));
+
+        for (method, path) in [
+            ("GET", "/api/admin/runtime-profile"),
+            ("POST", "/api/admin/runtime-profile/validate"),
+            ("POST", "/api/admin/runtime-profile"),
+            ("GET", "/api/admin/bkv-import/jobs"),
+            ("POST", "/api/admin/bkv-import/jobs"),
+            ("POST", "/api/admin/bkv-import/jobs/retry"),
+        ] {
+            assert_eq!(permission_for_route(method, path), Some("admin.config"));
         }
     }
 

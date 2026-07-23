@@ -52,6 +52,36 @@ calibration, capture-service, capture-configuration, production-capture, or
 reconstruction state. Read-only status endpoints and BKV offline replay remain
 available.
 
+Administrators with `admin.config` can inspect, validate, and save the selected
+profile through:
+
+```http
+GET  /api/admin/runtime-profile
+POST /api/admin/runtime-profile/validate
+POST /api/admin/runtime-profile
+```
+
+The POST body is `{ "profile": <steel.runtime-profile.v1> }`. Saving is atomic,
+creates a `runtime-profile` configuration revision and a
+`runtime-profile.update` audit event, and returns both active and saved
+configuration hashes. It never changes the in-memory runtime profile; a
+successful change reports `restartRequired:true` until the service restarts.
+Invalid topology, duplicate mappings, escaping paths, incompatible capabilities,
+and non-loopback converter origins are rejected before writing.
+
+The same permission protects the converter-management proxy:
+
+```http
+GET  /api/admin/bkv-import/jobs
+POST /api/admin/bkv-import/jobs
+POST /api/admin/bkv-import/jobs/retry
+```
+
+These routes map only to the configured loopback converter's `/status`, `/start`,
+and `/retry/<job-id>` endpoints with bounded timeouts. The Rust service rejects
+remote origins, arbitrary converter paths, and unsafe retry identifiers; it does
+not proxy converter file or business-record endpoints.
+
 ## Health
 
 ```http

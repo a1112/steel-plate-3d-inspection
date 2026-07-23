@@ -182,6 +182,42 @@ impl RuntimeProfile {
         self.cameras.len()
     }
 
+    pub fn validate_candidate(&self, candidate: &Value) -> Result<(Vec<u8>, String), String> {
+        let allowed_root = self
+            .project_path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "runtime project path has no configuration root".to_string())?;
+        let allowed_root = fs::canonicalize(allowed_root)
+            .map_err(|error| format!("runtime configuration root unavailable: {error}"))?;
+        let document: RuntimeProfileDocument = serde_json::from_value(candidate.clone())
+            .map_err(|error| format!("runtime profile JSON invalid: {error}"))?;
+        if document.id != self.id {
+            return Err("runtime profile id cannot change in-place".to_string());
+        }
+        validate_profile(&document, &allowed_root)?;
+        let profile_bytes = serde_json::to_vec_pretty(candidate)
+            .map_err(|error| format!("runtime profile serialization failed: {error}"))?;
+        let project_bytes = fs::read(&self.project_path)
+            .map_err(|error| format!("project config read failed: {error}"))?;
+        let mut hasher = Sha256::new();
+        hasher.update(project_bytes);
+        hasher.update([0]);
+        hasher.update(&profile_bytes);
+        if let Some(relative) = document.capture_profile.as_deref() {
+            let capture_path =
+                contained_existing_file(&allowed_root, relative, "capture profile")?;
+            let capture_bytes = fs::read(&capture_path)
+                .map_err(|error| format!("capture profile read failed: {error}"))?;
+            validate_capture_profile(&document, &capture_bytes)?;
+            hasher.update([0]);
+            hasher.update(capture_bytes);
+        } else if document.camera_connection == "headless-cpp" {
+            return Err("direct runtime profile requires captureProfile".to_string());
+        }
+        Ok((profile_bytes, format!("{:x}", hasher.finalize())))
+    }
+
     pub fn allows(&self, capability: RuntimeCapability) -> bool {
         match capability {
             RuntimeCapability::DirectCamera => self.capabilities.direct_camera,
@@ -332,6 +368,35 @@ fn validate_profile(
     {
         return Err("converted-local profile requires source, converted, and catalog paths".into());
     }
+    if document.data_source == "converted-local" {
+        validate_loopback_origin(&document.storage.converter_origin)?;
+    }
+    Ok(())
+}
+
+fn validate_loopback_origin(value: &str) -> Result<(), String> {
+    let authority = value
+        .strip_prefix("http://")
+        .filter(|_| !value.contains(['?', '#']))
+        .and_then(|rest| (!rest.contains('/')).then_some(rest))
+        .ok_or_else(|| "storage converterOrigin must be a loopback HTTP origin".to_string())?;
+    if authority.contains('@') {
+        return Err("storage converterOrigin must be a loopback HTTP origin".to_string());
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| "storage converterOrigin requires an explicit port".to_string())?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "storage converterOrigin port is invalid".to_string())?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !loopback || port == 0 {
+        return Err("storage converterOrigin must be a loopback HTTP origin".to_string());
+    }
     Ok(())
 }
 
@@ -472,7 +537,8 @@ mod tests {
             "storage": {
                 "sourceRoot": "source",
                 "convertedRoot": "converted",
-                "catalogPath": "converted/catalog.db"
+                "catalogPath": "converted/catalog.db",
+                "converterOrigin": "http://127.0.0.1:4893"
             },
             "capabilities": {
                 "directCamera": false,
