@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { DefectItem } from '../data/inspection';
+import type { RuntimeDashboardMode } from '../lib/runtime-dashboard-mode';
 import { AppFooter } from './AppFooter';
 
 const defect: DefectItem = {
@@ -23,6 +24,17 @@ const defect: DefectItem = {
   previewImageUrl: '',
 };
 
+const bkvDashboardMode: RuntimeDashboardMode = {
+  kind: 'bkv',
+  cameraCount: 6,
+  requestsOnlineServices: false,
+  requestsStandardRecords: true,
+  showsHardwareStatus: false,
+  showsCaptureManagement: false,
+  showsReconstruction: false,
+  supportsOfflineReplay: true,
+};
+
 describe('AppFooter', () => {
   it('groups the non-business entries in the footer', () => {
     render(<AppFooter activeNav="online" onNavChange={vi.fn()} onSettingsOpen={vi.fn()} />);
@@ -37,12 +49,7 @@ describe('AppFooter', () => {
     render(
       <AppFooter
         activeNav="online"
-        capabilities={{
-          directCamera: false,
-          captureManagement: false,
-          reconstruction: false,
-          offlineReplay: true,
-        }}
+        dashboardMode={bkvDashboardMode}
         onNavChange={vi.fn()}
         onSettingsOpen={vi.fn()}
       />,

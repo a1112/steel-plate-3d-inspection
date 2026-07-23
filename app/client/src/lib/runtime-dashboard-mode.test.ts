@@ -1,0 +1,74 @@
+import { describe, expect, it } from 'vitest';
+import type { PublicRuntimeProfile } from '../services/runtime-profile-api';
+import { createRuntimeDashboardMode } from './runtime-dashboard-mode';
+
+const bkvProfile: PublicRuntimeProfile = {
+  schema: 'steel.runtime-profile.public.v1',
+  profileId: 'bkv-6',
+  displayName: 'BKV 六相机标准离线仓库',
+  provider: 'bkv',
+  dataSource: 'converted-local',
+  cameraConnection: 'none',
+  cameraCount: 6,
+  cameras: [],
+  configHash: 'bkv-hash',
+  capabilities: {
+    directCamera: false,
+    captureManagement: false,
+    reconstruction: false,
+    offlineReplay: true,
+  },
+};
+
+const directProfile: PublicRuntimeProfile = {
+  ...bkvProfile,
+  profileId: 'direct-8',
+  displayName: '八相机在线直连',
+  provider: 'headless-cpp',
+  dataSource: 'mysql',
+  cameraConnection: 'headless-cpp',
+  cameraCount: 8,
+  configHash: 'direct-hash',
+  capabilities: {
+    directCamera: true,
+    captureManagement: true,
+    reconstruction: true,
+    offlineReplay: false,
+  },
+};
+
+describe('runtime dashboard mode', () => {
+  it('makes converted-local BKV the exclusive standard-record dashboard mode', () => {
+    expect(createRuntimeDashboardMode(bkvProfile)).toMatchObject({
+      kind: 'bkv',
+      cameraCount: 6,
+      requestsOnlineServices: false,
+      requestsStandardRecords: true,
+      showsHardwareStatus: false,
+      showsCaptureManagement: false,
+      showsReconstruction: false,
+    });
+  });
+
+  it('keeps direct-camera mode on online services and hardware tools', () => {
+    expect(createRuntimeDashboardMode(directProfile)).toMatchObject({
+      kind: 'direct',
+      cameraCount: 8,
+      requestsOnlineServices: true,
+      requestsStandardRecords: false,
+      showsHardwareStatus: true,
+      showsCaptureManagement: true,
+      showsReconstruction: true,
+    });
+  });
+
+  it('rejects a converted-local profile that enables direct-camera capabilities', () => {
+    expect(() => createRuntimeDashboardMode({
+      ...bkvProfile,
+      capabilities: {
+        ...bkvProfile.capabilities,
+        directCamera: true,
+      },
+    })).toThrow('运行配置的 BKV 数据源与直连相机能力冲突');
+  });
+});

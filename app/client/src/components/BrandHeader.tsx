@@ -5,20 +5,18 @@ import ustbLogo from '../assets/USTB.png';
 import type { DeviceStatus, ThemeMode } from '../data/inspection';
 import type { TriggerGatewayStatus } from '../services/inspection-api';
 import type { CaptureCameraStatus, CaptureSnapshot, SystemNetworkRateInterface, SystemNetworkRateSnapshot } from '../lib/capture-api';
+import type { RuntimeDashboardMode } from '../lib/runtime-dashboard-mode';
 import { NotificationCenter } from './NotificationCenter';
 import { TopNav, type NavKey } from './TopNav';
 import { WindowControls } from './WindowControls';
 
-export type HeaderRuntimeMode =
-  | { kind: 'online'; mismatchMessage?: string }
-  | {
-      kind: 'bkv';
-      cameraCount: number;
-      availableCameraCount: number;
-      batchId: string;
-      dataReady: boolean;
-      detail: string;
-    };
+export type BkvHeaderData = {
+  cameraCount: number;
+  availableCameraCount: number;
+  batchId: string;
+  dataReady: boolean;
+  detail: string;
+};
 
 interface BrandHeaderProps {
   status: DeviceStatus;
@@ -29,7 +27,8 @@ interface BrandHeaderProps {
   trigger?: TriggerGatewayStatus | null;
   services?: ServiceStatusPanel;
   activeNav: NavKey;
-  runtimeMode?: HeaderRuntimeMode;
+  dashboardMode?: RuntimeDashboardMode;
+  bkvData?: BkvHeaderData;
   analysisCollapse?: {
     collapsed: boolean;
     onToggle: () => void;
@@ -37,6 +36,17 @@ interface BrandHeaderProps {
   onNavChange: (next: NavKey) => void;
   onDragMouseDown: (event: MouseEvent<HTMLElement>) => void;
 }
+
+const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
+  kind: 'direct',
+  cameraCount: 8,
+  requestsOnlineServices: true,
+  requestsStandardRecords: false,
+  showsHardwareStatus: true,
+  showsCaptureManagement: true,
+  showsReconstruction: true,
+  supportsOfflineReplay: false,
+};
 
 type ServiceConnectionState = 'online' | 'warning' | 'offline';
 
@@ -695,7 +705,8 @@ export function BrandHeader({
   trigger,
   services,
   activeNav,
-  runtimeMode = { kind: 'online' },
+  dashboardMode = DEFAULT_DIRECT_DASHBOARD_MODE,
+  bkvData,
   analysisCollapse,
   onNavChange,
   onDragMouseDown,
@@ -821,28 +832,28 @@ export function BrandHeader({
         <div className="system-title">钢管3D表面检测系统</div>
       </div>
 
-      <div className={`brand-status ${runtimeMode.kind === 'bkv' ? 'bkv-runtime-status' : 'online-runtime-status'}`}>
-        {runtimeMode.kind === 'bkv' ? (
+      <div className={`brand-status ${dashboardMode.kind === 'bkv' ? 'bkv-runtime-status' : 'online-runtime-status'}`}>
+        {dashboardMode.kind === 'bkv' ? (
           <>
-            <StatusBlock className="bkv-mode-status" label="BKV 模式" value="离线回放" title={runtimeMode.detail} />
-            <StatusBlock className="bkv-data-status" label="离线数据" value={`${runtimeMode.availableCameraCount}/${runtimeMode.cameraCount}`} title={runtimeMode.detail} />
-            <StatusBlock className="bkv-batch-status" label="批次" value={runtimeMode.batchId} title={runtimeMode.batchId} />
+            <StatusBlock className="bkv-mode-status" label="BKV 模式" value="离线回放" title={bkvData?.detail ?? '正在读取 BKV 标准离线仓库'} />
+            <StatusBlock className="bkv-data-status" label="离线数据" value={`${bkvData?.availableCameraCount ?? 0}/${bkvData?.cameraCount ?? dashboardMode.cameraCount}`} title={bkvData?.detail} />
+            <StatusBlock className="bkv-batch-status" label="批次" value={bkvData?.batchId ?? '读取中'} title={bkvData?.batchId} />
             <StatusBlock
               className="bkv-ready-status"
               label="检测数据"
-              value={runtimeMode.dataReady ? '数据就绪' : '数据异常'}
-              tone={runtimeMode.dataReady ? 'ok' : 'error'}
-              title={runtimeMode.detail}
+              value={bkvData?.dataReady ? '数据就绪' : '数据异常'}
+              tone={bkvData?.dataReady ? 'ok' : 'error'}
+              title={bkvData?.detail}
             />
           </>
         ) : (
           <>
         <StatusBlock
           className="trigger-header-status"
-          label={runtimeMode.mismatchMessage ? '采集模式' : '触发状态'}
-          value={runtimeMode.mismatchMessage ? '模式不匹配' : triggerValue}
-          tone={runtimeMode.mismatchMessage ? 'warning' : trigger ? (triggerHealthy ? 'ok' : 'warning') : 'warning'}
-          title={runtimeMode.mismatchMessage || triggerTitle}
+          label="触发状态"
+          value={triggerValue}
+          tone={trigger ? (triggerHealthy ? 'ok' : 'warning') : 'warning'}
+          title={triggerTitle}
         />
         <div className="port-status-stack" data-testid="hardware-status-stack">
           <div ref={receiverWrapRef} className="camera-status-wrap receiver-status-wrap" data-no-drag onMouseDown={(event) => event.stopPropagation()}>
@@ -935,7 +946,7 @@ export function BrandHeader({
           <Cpu size={13} />
           <Activity size={13} />
         </div>
-        <WindowControls analysisCollapse={analysisCollapse} />
+        <WindowControls analysisCollapse={dashboardMode.kind === 'direct' ? analysisCollapse : undefined} />
       </div>
     </header>
   );

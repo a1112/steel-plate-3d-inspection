@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import type { DeviceStatus } from '../data/inspection';
+import type { RuntimeDashboardMode } from '../lib/runtime-dashboard-mode';
 import { BrandHeader } from './BrandHeader';
 
 const status: DeviceStatus = {
@@ -13,12 +14,35 @@ const status: DeviceStatus = {
   alarmCount: 1,
 };
 
+const directDashboardMode: RuntimeDashboardMode = {
+  kind: 'direct',
+  cameraCount: 8,
+  requestsOnlineServices: true,
+  requestsStandardRecords: false,
+  showsHardwareStatus: true,
+  showsCaptureManagement: true,
+  showsReconstruction: true,
+  supportsOfflineReplay: false,
+};
+
+const bkvDashboardMode: RuntimeDashboardMode = {
+  kind: 'bkv',
+  cameraCount: 6,
+  requestsOnlineServices: false,
+  requestsStandardRecords: true,
+  showsHardwareStatus: false,
+  showsCaptureManagement: false,
+  showsReconstruction: false,
+  supportsOfflineReplay: true,
+};
+
 function renderHeader(overrides: Partial<ComponentProps<typeof BrandHeader>> = {}) {
   return render(
     <BrandHeader
       status={status}
       theme="dark"
       activeNav="online"
+      dashboardMode={directDashboardMode}
       onNavChange={vi.fn()}
       onDragMouseDown={vi.fn()}
       {...overrides}
@@ -29,8 +53,8 @@ function renderHeader(overrides: Partial<ComponentProps<typeof BrandHeader>> = {
 describe('BrandHeader', () => {
   it('shows BKV data status without online hardware or service alarms', () => {
     renderHeader({
-      runtimeMode: {
-        kind: 'bkv',
+      dashboardMode: bkvDashboardMode,
+      bkvData: {
         cameraCount: 6,
         availableCameraCount: 6,
         batchId: 'legacy-1893700-1893710',

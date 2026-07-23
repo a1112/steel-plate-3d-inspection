@@ -79,8 +79,15 @@ import { DefectFilterPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { BarSurfaceApp } from './components/BarSurfaceApp';
-import { buildBkvInspectionSnapshot } from './lib/bkv-inspection-adapter';
-import { fetchBkvMaterials, fetchBkvStatus, type BkvStatus } from './services/bkv-api';
+import {
+  buildStandardBkvInspectionSnapshot,
+  mergeStandardBkvDefects,
+} from './lib/bkv-inspection-adapter';
+import {
+  fetchInspectionWorldDefects,
+  fetchInspectionWorldRecords,
+  type InspectionWorldRecords,
+} from './services/inspection-world-api';
 import {
   fetchBarSurfaceManifest,
   fetchBarSurfaceMesh,
@@ -95,6 +102,10 @@ import {
   fetchRuntimeProfile,
   type PublicRuntimeProfile,
 } from './services/runtime-profile-api';
+import {
+  createRuntimeDashboardMode,
+  type RuntimeDashboardMode,
+} from './lib/runtime-dashboard-mode';
 import './styles.css';
 import './styles/theme-system.css';
 
@@ -145,7 +156,6 @@ type RecordBoundSurfaceArtifact = {
   cameras?: BarSurfaceCamera[];
 };
 
-type TerminalViewMode = 'auto' | 'online' | 'bkv';
 type AppMode = AppRoute;
 
 function buildUnknownService(name: string, endpoint: string): ServiceStatusPanelItem {
@@ -171,13 +181,7 @@ function readAppMode(): AppMode {
   return resolveAppRoute(window.location.search, window.location.hash);
 }
 
-function readTerminalViewMode(): TerminalViewMode {
-  if (typeof window === 'undefined') return 'auto';
-  const view = new URLSearchParams(window.location.search).get('view');
-  return view === 'online' || view === 'bkv' ? view : 'auto';
-}
-
-function writeTerminalViewMode(view: Exclude<TerminalViewMode, 'auto'>) {
+function writeTerminalViewMode(view: 'online' | 'bkv') {
   if (typeof window === 'undefined') return;
   const url = new URL(window.location.href);
   url.searchParams.set('view', view);
@@ -224,9 +228,10 @@ export default function App() {
     if (!runtimeProfile || typeof window === 'undefined') {
       return;
     }
+    const dashboardMode = createRuntimeDashboardMode(runtimeProfile);
     const directOnlyRouteBlocked =
-      (requestedAppMode === 'capture' && !runtimeProfile.capabilities.captureManagement)
-      || (requestedAppMode === 'bar-surface' && !runtimeProfile.capabilities.reconstruction);
+      (requestedAppMode === 'capture' && !dashboardMode.showsCaptureManagement)
+      || (requestedAppMode === 'bar-surface' && !dashboardMode.showsReconstruction);
     if (!directOnlyRouteBlocked) {
       return;
     }
@@ -247,9 +252,10 @@ export default function App() {
     );
   }
 
-  const blockedLabel = requestedAppMode === 'capture' && !runtimeProfile.capabilities.captureManagement
+  const dashboardMode = createRuntimeDashboardMode(runtimeProfile);
+  const blockedLabel = requestedAppMode === 'capture' && !dashboardMode.showsCaptureManagement
     ? '采集管理'
-    : requestedAppMode === 'bar-surface' && !runtimeProfile.capabilities.reconstruction
+    : requestedAppMode === 'bar-surface' && !dashboardMode.showsReconstruction
       ? '3D 重建'
       : null;
   const appMode = blockedLabel ? 'terminal' : requestedAppMode;
@@ -257,6 +263,7 @@ export default function App() {
   return (
     <ConfiguredApp
       runtimeProfile={runtimeProfile}
+      dashboardMode={dashboardMode}
       appMode={appMode}
       capabilityMessage={blockedLabel ? `当前运行模式不支持${blockedLabel}，已返回检测终端` : undefined}
     />
@@ -265,10 +272,12 @@ export default function App() {
 
 function ConfiguredApp({
   runtimeProfile,
+  dashboardMode,
   appMode,
   capabilityMessage,
 }: {
   runtimeProfile: PublicRuntimeProfile;
+  dashboardMode: RuntimeDashboardMode;
   appMode: AppMode;
   capabilityMessage?: string;
 }) {
@@ -285,49 +294,21 @@ function ConfiguredApp({
 
   const [snapshot, setSnapshot] = useState<InspectionSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [bkvStatus, setBkvStatus] = useState<BkvStatus | null>(null);
-  const [bkvProbeComplete, setBkvProbeComplete] = useState(false);
-  const [bkvProbeRevision, setBkvProbeRevision] = useState(0);
-  const [terminalViewMode, setTerminalViewMode] = useState<TerminalViewMode>(readTerminalViewMode);
-
-  const selectTerminalView = (view: Exclude<TerminalViewMode, 'auto'>) => {
-    writeTerminalViewMode(view);
-    setTerminalViewMode(view);
-  };
+  const [bkvRecords, setBkvRecords] = useState<InspectionWorldRecords | null>(null);
+  const [loadRevision, setLoadRevision] = useState(0);
+  const resolvedTerminalMode = dashboardMode.kind === 'bkv' ? 'bkv' : 'online';
 
   useEffect(() => {
-    const controller = new AbortController();
-    setBkvProbeComplete(false);
-    fetchBkvStatus(controller.signal)
-      .then(setBkvStatus)
-      .catch(() => setBkvStatus(null))
-      .finally(() => {
-        if (!controller.signal.aborted) setBkvProbeComplete(true);
-      });
-    return () => controller.abort();
-  }, [bkvProbeRevision]);
-
-  const bkvAvailable = bkvStatus?.provider === 'bkv' && bkvStatus.ready;
-  const resolvedTerminalMode: Exclude<TerminalViewMode, 'auto'> =
-    terminalViewMode === 'online'
-      ? 'online'
-      : terminalViewMode === 'bkv'
-        ? 'bkv'
-        : bkvAvailable
-          ? 'bkv'
-          : 'online';
-
-  useEffect(() => {
-    if (!bkvProbeComplete) return;
     const controller = new AbortController();
     setSnapshot(null);
     setLoadError(null);
-    if (resolvedTerminalMode === 'bkv' && !bkvAvailable) {
-      setLoadError('当前检测服务未提供可用的 BKV 兼容数据');
-      return () => controller.abort();
-    }
-    const loadSnapshot = resolvedTerminalMode === 'bkv'
-      ? fetchBkvMaterials(controller.signal).then(buildBkvInspectionSnapshot)
+    setBkvRecords(null);
+    writeTerminalViewMode(resolvedTerminalMode);
+    const loadSnapshot = dashboardMode.requestsStandardRecords
+      ? fetchInspectionWorldRecords(controller.signal).then((records) => {
+        setBkvRecords(records);
+        return buildStandardBkvInspectionSnapshot(records);
+      })
       : fetchInspectionSnapshot(controller.signal);
     loadSnapshot
       .then((nextSnapshot) => {
@@ -339,21 +320,26 @@ function ConfiguredApp({
         }
       });
     return () => controller.abort();
-  }, [bkvAvailable, bkvProbeComplete, resolvedTerminalMode]);
+  }, [dashboardMode.requestsStandardRecords, loadRevision, resolvedTerminalMode]);
 
   const retryBkvLoad = () => {
     setSnapshot(null);
     setLoadError(null);
-    setBkvStatus(null);
-    setBkvProbeComplete(false);
-    setBkvProbeRevision((current) => current + 1);
+    setBkvRecords(null);
+    setLoadRevision((current) => current + 1);
   };
 
-  if (bkvProbeComplete && resolvedTerminalMode === 'bkv' && loadError) {
+  if (resolvedTerminalMode === 'bkv' && loadError) {
     const theme = readStoredTheme();
     const themeStyle = readStoredThemeStyle();
-    const status = buildBkvInspectionSnapshot([]).status;
-    const bkvDetected = Boolean(bkvStatus);
+    const status = buildStandardBkvInspectionSnapshot({
+      schema: 'steel.inspection-world.records.v1',
+      provider: 'bkv',
+      ready: false,
+      cameraCount: dashboardMode.cameraCount,
+      batchId: '无离线批次',
+      records: [],
+    }).status;
     return (
       <div className={`app-shell theme-${theme} style-${themeStyle} bkv-mode-error-shell`}>
         <BrandHeader
@@ -361,11 +347,11 @@ function ConfiguredApp({
           theme={theme}
           expectedCameraCount={runtimeProfile.cameraCount}
           activeNav="online"
-          runtimeMode={{
-            kind: 'bkv',
-            cameraCount: runtimeProfile.cameraCount,
+          dashboardMode={dashboardMode}
+          bkvData={{
+            cameraCount: dashboardMode.cameraCount,
             availableCameraCount: 0,
-            batchId: bkvStatus?.batchId ?? '未连接',
+            batchId: bkvRecords?.batchId ?? '未连接',
             dataReady: false,
             detail: loadError,
           }}
@@ -375,16 +361,16 @@ function ConfiguredApp({
         <main className="mode-error-workspace">
           <section className="mode-error-panel" role="alert">
             <span>BKV 兼容模式</span>
-            <h1>{bkvDetected ? 'BKV 数据读取失败' : 'BKV 模式不可用'}</h1>
+            <h1>BKV 数据读取失败</h1>
             <p>{loadError}</p>
             <button type="button" onClick={retryBkvLoad}>重新检查 BKV 数据</button>
           </section>
         </main>
         <AppFooter
           activeNav="online"
-          capabilities={runtimeProfile.capabilities}
+          dashboardMode={dashboardMode}
           terminalViews={{
-            online: { available: true, active: false, onOpen: () => selectTerminalView('online') },
+            online: { available: false, active: false },
             bkv: { available: true, active: true, onOpen: retryBkvLoad },
           }}
           onNavChange={() => undefined}
@@ -394,7 +380,7 @@ function ConfiguredApp({
     );
   }
 
-  if (!bkvProbeComplete || !snapshot) {
+  if (!snapshot) {
     const loadingTheme = readStoredTheme();
     const loadingThemeStyle = readStoredThemeStyle();
     return (
@@ -413,17 +399,10 @@ function ConfiguredApp({
       key={resolvedTerminalMode}
       snapshot={snapshot}
       runtimeProfile={runtimeProfile}
-      bkvAvailable={bkvAvailable}
-      terminalMode={resolvedTerminalMode}
-      bkvStatus={bkvStatus}
-      modeMismatchMessage={
-        resolvedTerminalMode === 'online' && bkvAvailable
-          ? '当前采集源为 BKV，在线相机模式不可用'
-          : undefined
-      }
+      dashboardMode={dashboardMode}
+      bkvRecords={bkvRecords}
       capabilityMessage={capabilityMessage}
       onSnapshotChange={setSnapshot}
-      onTerminalViewChange={selectTerminalView}
     />
   );
 }
@@ -431,24 +410,19 @@ function ConfiguredApp({
 function InspectionDashboard({
   snapshot,
   runtimeProfile,
-  bkvAvailable,
-  terminalMode,
-  bkvStatus,
-  modeMismatchMessage,
+  dashboardMode,
+  bkvRecords,
   capabilityMessage,
   onSnapshotChange,
-  onTerminalViewChange,
 }: {
   snapshot: InspectionSnapshot;
   runtimeProfile: PublicRuntimeProfile;
-  bkvAvailable: boolean;
-  terminalMode: 'online' | 'bkv';
-  bkvStatus: BkvStatus | null;
-  modeMismatchMessage?: string;
+  dashboardMode: RuntimeDashboardMode;
+  bkvRecords: InspectionWorldRecords | null;
   capabilityMessage?: string;
   onSnapshotChange: (snapshot: InspectionSnapshot) => void;
-  onTerminalViewChange: (view: 'online' | 'bkv') => void;
 }) {
+  const terminalMode = dashboardMode.kind === 'bkv' ? 'bkv' : 'online';
   const [appMode] = useState(readAppMode);
   const [uiState, setUiState] = useState(() => createInitialUiState(snapshot));
 
@@ -827,6 +801,24 @@ function InspectionDashboard({
     [activeSnapshot.currentPlate.plateNo, snapshot.inspections],
   );
   const artifactMode: 'production' | 'demo' = snapshot.source === 'demo' || snapshot.source === 'test' ? 'demo' : 'production';
+  const loadedBkvDefectRecordsRef = useRef(new Set<string>());
+
+  useEffect(() => {
+    if (dashboardMode.kind !== 'bkv') return;
+    const recordId = activeInspection?.inspectionId?.trim();
+    if (!recordId || loadedBkvDefectRecordsRef.current.has(recordId)) return;
+    const controller = new AbortController();
+    fetchInspectionWorldDefects(recordId, controller.signal)
+      .then((payload) => {
+        if (controller.signal.aborted) return;
+        loadedBkvDefectRecordsRef.current.add(recordId);
+        onSnapshotChange(mergeStandardBkvDefects(snapshot, recordId, payload));
+      })
+      .catch(() => {
+        // A record-local world or defect failure must not start online fallback polling.
+      });
+    return () => controller.abort();
+  }, [activeInspection?.inspectionId, dashboardMode.kind]);
 
   useEffect(() => {
     const inspectionId = activeInspection?.inspectionId?.trim() || '';
@@ -1271,17 +1263,16 @@ function InspectionDashboard({
         trigger={triggerGatewayStatus}
         services={serviceStatus}
         activeNav={uiState.activeNav}
-        runtimeMode={terminalMode === 'bkv' && bkvStatus ? {
-          kind: 'bkv',
-          cameraCount: bkvStatus.cameraCount,
-          availableCameraCount: bkvStatus.cameraCount,
-          batchId: bkvStatus.batchId,
-          dataReady: bkvStatus.ready,
-          detail: `${bkvStatus.materialCount} 支旧检测记录已就绪`,
-        } : {
-          kind: 'online',
-          mismatchMessage: modeMismatchMessage,
-        }}
+        dashboardMode={dashboardMode}
+        bkvData={dashboardMode.kind === 'bkv' ? {
+          cameraCount: bkvRecords?.cameraCount ?? dashboardMode.cameraCount,
+          availableCameraCount: bkvRecords?.ready ? (bkvRecords.cameraCount ?? dashboardMode.cameraCount) : 0,
+          batchId: bkvRecords?.batchId ?? '读取中',
+          dataReady: bkvRecords?.ready === true,
+          detail: bkvRecords?.ready
+            ? `${bkvRecords.records.length} 支标准离线检测记录已就绪`
+            : 'BKV 标准离线仓库暂无可用记录',
+        } : undefined}
         analysisCollapse={uiState.activeNav === 'online' ? {
           collapsed: analysisCollapsed,
           onToggle: () => setAnalysisCollapsed((current) => !current),
@@ -1335,7 +1326,7 @@ function InspectionDashboard({
                       <div className="snapshot-follow-summary bkv-record-summary" aria-label="BKV 检测数据状态">
                         <i className="history" />
                         <strong>BKV 离线记录</strong>
-                        <span>旧序号 {activeInspection?.inspectionId ?? '--'} · 批次 {bkvStatus?.batchId ?? '--'}</span>
+                        <span>旧序号 {activeInspection?.inspectionId ?? '--'} · 批次 {bkvRecords?.batchId ?? '--'}</span>
                       </div>
                     ) : (
                       <>
@@ -1501,10 +1492,10 @@ function InspectionDashboard({
       )}
       <AppFooter
         activeNav={uiState.activeNav}
-        capabilities={runtimeProfile.capabilities}
+        dashboardMode={dashboardMode}
         terminalViews={{
-          online: { available: true, active: terminalMode === 'online', onOpen: () => onTerminalViewChange('online') },
-          bkv: { available: bkvAvailable, active: terminalMode === 'bkv', onOpen: () => onTerminalViewChange('bkv') },
+          online: { available: dashboardMode.kind === 'direct', active: dashboardMode.kind === 'direct' },
+          bkv: { available: dashboardMode.kind === 'bkv', active: dashboardMode.kind === 'bkv' },
         }}
         flowVisible={inspectionFlowVisible}
         onFlowToggle={() => setInspectionFlowVisible((current) => !current)}

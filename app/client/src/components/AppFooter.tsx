@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Box, Database, History, Monitor, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
+import type { RuntimeDashboardMode } from '../lib/runtime-dashboard-mode';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import {
   openBarSurfaceWindow,
@@ -8,7 +9,6 @@ import {
   openParameterManagementWindow,
 } from '../lib/app-windows';
 import { notify } from '../state/notifications';
-import type { RuntimeCapabilities } from '../services/runtime-profile-api';
 import type { AnalysisViewMode } from './AlarmAnalysis';
 import type { PlateMapViewMode } from './PlateMap';
 import type { NavKey } from './TopNav';
@@ -45,8 +45,19 @@ interface AppFooterProps {
   onParameterManagementOpen?: () => unknown;
   onCaptureManagementOpen?: () => unknown;
   onBarSurfaceOpen?: () => unknown;
-  capabilities?: RuntimeCapabilities;
+  dashboardMode?: RuntimeDashboardMode;
 }
+
+const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
+  kind: 'direct',
+  cameraCount: 8,
+  requestsOnlineServices: true,
+  requestsStandardRecords: false,
+  showsHardwareStatus: true,
+  showsCaptureManagement: true,
+  showsReconstruction: true,
+  supportsOfflineReplay: false,
+};
 
 const surfaceViewOptions: Array<{ id: PlateMapViewMode; label: string }> = [
   { id: '2d', label: '2D' },
@@ -80,12 +91,7 @@ export function AppFooter({
   onParameterManagementOpen = openParameterManagementWindow,
   onCaptureManagementOpen = openCaptureManagementWindow,
   onBarSurfaceOpen = openBarSurfaceWindow,
-  capabilities = {
-    directCamera: true,
-    captureManagement: true,
-    reconstruction: true,
-    offlineReplay: false,
-  },
+  dashboardMode = DEFAULT_DIRECT_DASHBOARD_MODE,
 }: AppFooterProps) {
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
@@ -218,13 +224,13 @@ export function AppFooter({
           <Database size={15} />
           <span>后台管理</span>
         </button>
-        {capabilities.captureManagement ? (
+        {dashboardMode.showsCaptureManagement ? (
           <button type="button" onClick={() => void runWindowAction('采集管理', onCaptureManagementOpen)}>
             <MonitorCog size={15} />
             <span>采集管理</span>
           </button>
         ) : null}
-        {capabilities.reconstruction ? (
+        {dashboardMode.showsReconstruction ? (
           <button type="button" onClick={() => void runWindowAction('3D 重建', onBarSurfaceOpen)}>
             <Box size={15} />
             <span>3D 重建</span>

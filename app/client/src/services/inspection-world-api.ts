@@ -107,7 +107,21 @@ export type WorldTileRequest = {
 export type WorldTile = WorldTileRequest & { url: string; revoke: () => void };
 
 async function readJson<T>(response: Response, fallback: string): Promise<T> {
-  if (!response.ok) throw new Error(`${fallback} (HTTP ${response.status})`);
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const payload = await response.json() as {
+        detail?: unknown;
+        message?: unknown;
+        error?: unknown;
+      };
+      const candidate = payload.detail ?? payload.message ?? payload.error;
+      if (typeof candidate === 'string' && candidate.trim()) detail = candidate.trim();
+    } catch {
+      // Preserve the HTTP fallback when an error body is absent or not JSON.
+    }
+    throw new Error(`${fallback}${detail ? `：${detail}` : ''} (HTTP ${response.status})`);
+  }
   return response.json() as Promise<T>;
 }
 

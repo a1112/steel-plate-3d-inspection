@@ -49,6 +49,39 @@ const directRuntimeProfile = {
   },
 };
 
+const bkvRecordsPayload = {
+  schema: 'steel.inspection-world.records.v1',
+  provider: 'bkv',
+  ready: true,
+  cameraCount: 6,
+  batchId: 'legacy-1893700-1893710',
+  records: [{
+    recordId: '1893700',
+    legacySeqNo: 1893700,
+    steelId: '253B09401250925A12004328',
+    steelType: '37Mn/2',
+    lengthMm: 12096,
+    outerDiameterMm: 233.664,
+    wallThicknessMm: null,
+    inspectionTime: '2025-09-26 03:36:17',
+    defectCount: 1,
+    cameraCount: 6,
+    sourceHash: 'record-hash-1893700',
+  }, {
+    recordId: '1893701',
+    legacySeqNo: 1893701,
+    steelId: '253B09401250925A12004329',
+    steelType: '37Mn/2',
+    lengthMm: 12096,
+    outerDiameterMm: 232.939,
+    wallThicknessMm: null,
+    inspectionTime: '2025-09-26 03:40:36',
+    defectCount: 0,
+    cameraCount: 6,
+    sourceHash: 'record-hash-1893701',
+  }],
+};
+
 function getDefectTableRows(container: HTMLElement) {
   return Array.from(container.querySelectorAll('.defect-table tbody tr')).map((row) => row.textContent?.trim() ?? '');
 }
@@ -99,59 +132,8 @@ describe('App BKV provider selection', () => {
       if (url.includes('/api/runtime-profile')) {
         return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
       }
-      if (url.includes('/api/bkv/status')) {
-        return new Response(JSON.stringify({
-          provider: 'bkv', ready: true, mode: 'offline-replay-no-camera-hardware', cameraMode: 'offline-file',
-          cameraCount: 6, physicalCamerasOnline: 0, batchId: 'legacy-1893700-1893710', materialCount: 11,
-          nextIndex: 0, nextLegacySeqNo: 1893700, completed: false,
-        }), { status: 200 });
-      }
-      if (url.includes('/api/bkv/materials')) {
-        return new Response(JSON.stringify({
-          provider: 'bkv',
-          materials: [{
-            legacySeqNo: 1893700,
-            legacyCheckRecordSeqNo: 661700,
-            steelId: '253B09401250925A12004328',
-            steelType: '37Mn/2',
-            lengthMm: 12096,
-            outerDiameterLegacyValue: 233.664,
-            wallThicknessMm: null,
-            inspectionTime: '2025-09-26 03:36:17',
-            defects: [{
-              legacyDefectId: 706831,
-              cameraId: 1,
-              classNo: 1,
-              className: '轧折',
-              grade: 2,
-              confidence: 0.51,
-              imageRect2d: { left: 20, top: 40, right: 60, bottom: 100 },
-              steelRect2d: { left: 20, top: 40, right: 60, bottom: 100 },
-            }],
-            cameras: [],
-            artifacts: {
-              unwrapped: { path: 'preview/unwrapped.png', size: 1, sha256: 'a'.repeat(64) },
-              cylinder: { path: 'preview/cylinder.json', size: 1, sha256: 'b'.repeat(64) },
-              summary: { path: 'preview/summary.json', size: 1, sha256: 'c'.repeat(64) },
-            },
-          }, {
-            legacySeqNo: 1893701,
-            legacyCheckRecordSeqNo: 661701,
-            steelId: '253B09401250925A12004329',
-            steelType: '37Mn/2',
-            lengthMm: 12096,
-            outerDiameterLegacyValue: 232.939,
-            wallThicknessMm: null,
-            inspectionTime: '2025-09-26 03:40:36',
-            defects: [],
-            cameras: [],
-            artifacts: {
-              unwrapped: { path: 'preview/unwrapped-2.png', size: 1, sha256: 'd'.repeat(64) },
-              cylinder: { path: 'preview/cylinder-2.json', size: 1, sha256: 'e'.repeat(64) },
-              summary: { path: 'preview/summary-2.json', size: 1, sha256: 'f'.repeat(64) },
-            },
-          }],
-        }), { status: 200 });
+      if (url.includes('/api/inspection-world/records')) {
+        return new Response(JSON.stringify(bkvRecordsPayload), { status: 200 });
       }
       if (url.includes('/api/inspection-world/meta')) {
         const recordId = new URL(url).searchParams.get('recordId') ?? '1893700';
@@ -207,7 +189,7 @@ describe('App BKV provider selection', () => {
     expect(screen.getByText('来源：旧 BKV 文件')).toBeInTheDocument();
     expect(screen.getByText(/BKV 离线数据/)).toBeInTheDocument();
     expect(screen.getByText('硬件控制已禁用')).toBeInTheDocument();
-    expect(screen.getAllByText('轧折').length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('轧折')).length).toBeGreaterThan(0);
     expect(screen.getByText('BKV 离线记录')).toBeInTheDocument();
     expect(screen.queryByText('实时跟随最新检测')).not.toBeInTheDocument();
     expect(screen.queryByText(/每 8 秒刷新/)).not.toBeInTheDocument();
@@ -216,11 +198,15 @@ describe('App BKV provider selection', () => {
     expect(screen.queryByRole('button', { name: '采集管理' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '3D 重建' })).not.toBeInTheDocument();
     expect(requestedUrls.some((url) => url.includes('/api/inspection/snapshot'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/inspection-world/records'))).toBe(true);
+    expect(requestedUrls.some((url) => url.includes('/api/bkv/status'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/bkv/materials'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/capture/health'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/trigger/status'))).toBe(false);
     expect(await screen.findByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
     await waitFor(() => {
       expect(requestedUrls.some((url) => url.includes('/api/inspection-world/meta') && url.includes('1893700'))).toBe(true);
+      expect(requestedUrls.some((url) => url.includes('/api/inspection-world/defects') && url.includes('1893700'))).toBe(true);
     });
     const canvas = await screen.findByTestId('inspection-world-canvas');
     await waitFor(() => expect(canvas).toHaveAttribute('data-locatable-defects', '1'));
@@ -246,17 +232,8 @@ describe('App BKV provider selection', () => {
     expect(replayItem).toHaveAttribute('aria-current', 'page');
     expect(screen.getByText('钢管3D表面检测系统')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('menuitem', { name: '在线检测' }));
-    expect(new URLSearchParams(window.location.search).get('view')).toBe('online');
-    expect(await screen.findByText('模式不匹配')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
-    expect(screen.getByRole('menuitem', { name: '在线检测' })).toHaveAttribute('aria-current', 'page');
-    expect(screen.getByRole('menuitem', { name: '离线回放' })).toBeEnabled();
-    fireEvent.click(screen.getByRole('menuitem', { name: '离线回放' }));
-
-    expect(await screen.findByText('BKV 模式')).toBeInTheDocument();
-    expect(new URLSearchParams(window.location.search).get('view')).toBe('bkv');
+    expect(screen.getByRole('menuitem', { name: '在线检测' })).toBeDisabled();
+    expect(new URLSearchParams(window.location.search).get('view')).not.toBe('online');
   });
 
   it('keeps the unified BKV shell when explicitly selected BKV data is unavailable', async () => {
@@ -268,15 +245,15 @@ describe('App BKV provider selection', () => {
       if (url.includes('/api/runtime-profile')) {
         return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
       }
-      if (url.includes('/api/bkv/status')) {
-        return new Response(null, { status: 404 });
+      if (url.includes('/api/inspection-world/records')) {
+        return new Response(JSON.stringify({ message: 'standard store unavailable' }), { status: 503 });
       }
       return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
     }));
 
     render(<App />);
 
-    expect(await screen.findByRole('heading', { name: 'BKV 模式不可用' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'BKV 数据读取失败' })).toBeInTheDocument();
     expect(screen.getByText('钢管3D表面检测系统')).toBeInTheDocument();
     expect(screen.getByText('BKV 模式')).toBeInTheDocument();
     expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
@@ -288,22 +265,15 @@ describe('App BKV provider selection', () => {
     expect(screen.getByRole('menuitem', { name: '离线回放' })).toHaveAttribute('aria-current', 'page');
   });
 
-  it('shows a mode-local failure when the BKV material database cannot be read', async () => {
+  it('shows a mode-local failure when the standard BKV record store cannot be read', async () => {
     window.history.replaceState(null, '', '/?app=terminal&view=bkv');
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/api/runtime-profile')) {
         return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
       }
-      if (url.includes('/api/bkv/status')) {
-        return new Response(JSON.stringify({
-          provider: 'bkv', ready: true, mode: 'offline-replay-no-camera-hardware', cameraMode: 'offline-file',
-          cameraCount: 6, physicalCamerasOnline: 0, batchId: 'legacy-1893700-1893710', materialCount: 11,
-          nextIndex: 0, nextLegacySeqNo: 1893700, completed: false,
-        }), { status: 200 });
-      }
-      if (url.includes('/api/bkv/materials')) {
-        return new Response(JSON.stringify({ message: 'legacy database locked' }), { status: 500 });
+      if (url.includes('/api/inspection-world/records')) {
+        return new Response(JSON.stringify({ message: 'converted catalog locked' }), { status: 503 });
       }
       return new Response(null, { status: 503 });
     }));
@@ -311,7 +281,7 @@ describe('App BKV provider selection', () => {
     render(<App />);
 
     expect(await screen.findByRole('heading', { name: 'BKV 数据读取失败' })).toBeInTheDocument();
-    expect(screen.getByText(/legacy database locked/)).toBeInTheDocument();
+    expect(screen.getByText(/converted catalog locked/)).toBeInTheDocument();
     expect(screen.getByText('BKV 模式')).toBeInTheDocument();
     expect(screen.getByText('数据异常')).toBeInTheDocument();
     expect(screen.queryByText(/服务异常/)).not.toBeInTheDocument();
@@ -450,23 +420,13 @@ describe('App runtime capability routing', () => {
       if (url.includes('/api/runtime-profile')) {
         return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
       }
-      if (url.includes('/api/bkv/status')) {
+      if (url.includes('/api/inspection-world/records')) {
         return new Response(JSON.stringify({
-          provider: 'bkv',
-          ready: true,
-          mode: 'offline-replay-no-camera-hardware',
-          cameraMode: 'offline-file',
-          cameraCount: 6,
-          physicalCamerasOnline: 0,
-          batchId: 'legacy-1893700-1893710',
-          materialCount: 0,
-          nextIndex: 0,
-          nextLegacySeqNo: null,
-          completed: true,
+          ...bkvRecordsPayload,
+          ready: false,
+          batchId: '无离线批次',
+          records: [],
         }), { status: 200 });
-      }
-      if (url.includes('/api/bkv/materials')) {
-        return new Response(JSON.stringify({ provider: 'bkv', materials: [] }), { status: 200 });
       }
       return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
     }));
@@ -478,15 +438,43 @@ describe('App runtime capability routing', () => {
     expect(screen.queryByRole('heading', { name: label })).not.toBeInTheDocument();
   });
 
-  it('keeps direct-only deep links available for an eight-camera direct profile', async () => {
-    window.history.replaceState(null, '', '/?app=capture');
+  it('normalizes an online deep link back to the configured BKV terminal', async () => {
+    window.history.replaceState(null, '', '/?app=terminal&view=online');
+    const requestedUrls: string[] = [];
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/records')) {
+        return new Response(JSON.stringify({
+          ...bkvRecordsPayload,
+          ready: false,
+          batchId: '无离线批次',
+          records: [],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText('BKV 模式')).toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get('view')).toBe('bkv');
+    expect(requestedUrls.some((url) => url.includes('/api/inspection/snapshot'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/bkv/status'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/bkv/status'))).toBe(false);
+  });
+
+  it('keeps direct-only deep links available for an eight-camera direct profile', async () => {
+    window.history.replaceState(null, '', '/?app=capture');
+    const requestedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedUrls.push(url);
       if (url.includes('/api/runtime-profile')) {
         return new Response(JSON.stringify(directRuntimeProfile), { status: 200 });
-      }
-      if (url.includes('/api/bkv/status')) {
-        return new Response(null, { status: 404 });
       }
       return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
     }));
@@ -495,5 +483,8 @@ describe('App runtime capability routing', () => {
 
     expect((await screen.findAllByText('采集管理')).length).toBeGreaterThan(0);
     expect(screen.queryByText(/当前运行模式不支持/)).not.toBeInTheDocument();
+    expect(requestedUrls.some((url) => url.includes('/api/bkv/status'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/bkv/materials'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/inspection-world/records'))).toBe(false);
   });
 });
