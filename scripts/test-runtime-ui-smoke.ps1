@@ -393,13 +393,37 @@ async function runBkvNativeScrollChecks(page, result) {
   })()`);
   await page.click('button[aria-label="\u66f4\u591a\u529f\u80fd"]');
   await requireEventually('bkv-offline-replay-entry-enabled', `(() => {
-    const item = document.querySelector('[role="menuitem"]');
+    const items = [...document.querySelectorAll('[role="menuitem"]')];
+    const online = items.find((item) => item.textContent.includes('\u5728\u7ebf\u68c0\u6d4b'));
+    const item = items.find((entry) => entry.textContent.includes('\u79bb\u7ebf\u56de\u653e'));
     return item && item.textContent.includes('\u79bb\u7ebf\u56de\u653e')
+      && online && !online.disabled
       && !item.disabled && item.getAttribute('aria-current') === 'page'
-      ? { label: item.textContent.trim(), active: true }
+      ? { online: online.textContent.trim(), bkv: item.textContent.trim(), active: true }
       : false;
   })()`);
-  await page.click('[role="menuitem"]');
+  result.interactionScreenshots = [await page.screenshot('bkv-terminal-view-menu')];
+  await page.click('.app-footer-more-menu button:first-of-type');
+  await requireEventually('switches-from-bkv-to-original-online-view', `(() => {
+    const heading = document.body?.innerText.includes('\u94a2\u7ba13D\u8868\u9762\u68c0\u6d4b\u7cfb\u7edf');
+    const view = new URLSearchParams(window.location.search).get('view');
+    return heading && view === 'online' ? { view, heading: true } : false;
+  })()`);
+  await page.click('button[aria-label="\u66f4\u591a\u529f\u80fd"]');
+  await requireEventually('online-footer-keeps-bkv-entry-enabled', `(() => {
+    const items = [...document.querySelectorAll('[role="menuitem"]')];
+    const online = items.find((item) => item.textContent.includes('\u5728\u7ebf\u68c0\u6d4b'));
+    const bkv = items.find((item) => item.textContent.includes('\u79bb\u7ebf\u56de\u653e'));
+    return online?.getAttribute('aria-current') === 'page' && bkv && !bkv.disabled
+      ? { onlineActive: true, bkvEnabled: true }
+      : false;
+  })()`);
+  await page.click('.app-footer-more-menu button:nth-of-type(2)');
+  await requireEventually('switches-back-to-bkv-replay', `(() => {
+    const heading = document.body?.innerText.includes('BKV \u79bb\u7ebf\u56de\u653e');
+    const view = new URLSearchParams(window.location.search).get('view');
+    return heading && view === 'bkv' ? { view, heading: true } : false;
+  })()`);
 
   async function requireTileFetchQuiescence() {
     const deadline = Date.now() + timeoutMs;
@@ -681,7 +705,7 @@ async function runBkvNativeScrollChecks(page, result) {
       : false;
   })()`);
   // Additive diagnostic artifact: steel.runtime.ui-smoke.v1 consumers ignore unknown fields.
-  result.interactionScreenshots = [await page.screenshot('bkv-2d-deep-scroll')];
+  result.interactionScreenshots.push(await page.screenshot('bkv-2d-deep-scroll'));
 
   await page.evaluate(`(() => {
     const select = document.querySelector('.bkv-toolbar select');
