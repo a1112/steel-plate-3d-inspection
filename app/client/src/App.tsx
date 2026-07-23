@@ -90,6 +90,7 @@ import {
 import { InspectionFlowTool } from './components/InspectionFlowTool';
 import { StandaloneWindowTitlebar } from './components/StandaloneWindowTitlebar';
 import { inferNotificationTone, notify } from './state/notifications';
+import { resolveAppRoute, type AppRoute } from './lib/app-windows';
 import {
   fetchRuntimeProfile,
   type PublicRuntimeProfile,
@@ -145,7 +146,7 @@ type RecordBoundSurfaceArtifact = {
 };
 
 type TerminalViewMode = 'auto' | 'online' | 'bkv';
-type AppMode = 'terminal' | 'capture' | 'parameters' | 'bar-surface';
+type AppMode = AppRoute;
 
 function buildUnknownService(name: string, endpoint: string): ServiceStatusPanelItem {
   return {
@@ -167,16 +168,7 @@ function readAppMode(): AppMode {
   if (typeof window === 'undefined') {
     return 'terminal';
   }
-  const queryParams = new URLSearchParams(window.location.search);
-  const hashParams = new URLSearchParams(window.location.hash.replace(/^#\??/, ''));
-  const app = queryParams.get('app') ?? hashParams.get('app');
-  if (app === 'capture' || app === 'parameters' || app === 'bar-surface' || app === 'bar' || app === '3d' || app === 'reconstruction') {
-    return app === 'bar' || app === '3d' || app === 'reconstruction' ? 'bar-surface' : app;
-  }
-  if (app === 'terminal' || app === 'inspection' || app === 'dashboard') {
-    return 'terminal';
-  }
-  return 'terminal';
+  return resolveAppRoute(window.location.search, window.location.hash);
 }
 
 function readTerminalViewMode(): TerminalViewMode {

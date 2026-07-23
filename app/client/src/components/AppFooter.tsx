@@ -126,8 +126,18 @@ export function AppFooter({
   };
   const runWindowAction = async (label: string, action: () => unknown) => {
     try {
-      await action();
-      notify({ title: '独立窗口', message: `已打开${label}窗口`, tone: 'success' });
+      const result = await action();
+      const navigated = Boolean(
+        result
+        && typeof result === 'object'
+        && 'presentation' in result
+        && result.presentation === 'navigation',
+      );
+      notify({
+        title: navigated ? '页面跳转' : '独立窗口',
+        message: navigated ? `正在进入${label}` : `已打开${label}窗口`,
+        tone: 'success',
+      });
     } catch (error) {
       notify({
         title: `${label}打开失败`,

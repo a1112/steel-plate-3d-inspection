@@ -260,7 +260,11 @@ export function SettingsPage({
                   <Save size={16} />
                   保存连接
                 </button>
-                <button type="button" onClick={() => void openParameterManagementWindow()}>
+                <button
+                  type="button"
+                  title="浏览器中同页进入，桌面端打开独立窗口"
+                  onClick={() => void openParameterManagementWindow()}
+                >
                   <Server size={16} />
                   参数管理
                 </button>

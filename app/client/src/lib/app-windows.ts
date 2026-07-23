@@ -1,10 +1,12 @@
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
 export type AppWindowKind = 'capture' | 'parameters' | 'bar-surface';
+export type AppRoute = 'terminal' | AppWindowKind;
 
 export type AppWindowResult = {
   opened: boolean;
   label: string;
+  presentation: 'window' | 'navigation';
   error?: string | null;
 };
 
@@ -23,19 +25,32 @@ const windowDefinitions: Record<AppWindowKind, {
   capture: {
     browserName: 'capture-management',
     title: '采集管理',
-    url: '/#app=capture',
+    url: '/?app=capture',
   },
   parameters: {
     browserName: 'parameter-management',
     title: '后台管理',
-    url: '/#app=parameters',
+    url: '/?app=parameters',
   },
   'bar-surface': {
     browserName: 'bar-surface',
     title: '3D 重建工作台',
-    url: '/#app=bar-surface',
+    url: '/?app=bar-surface',
   },
 };
+
+export function resolveAppRoute(search: string, hash: string): AppRoute {
+  const queryParams = new URLSearchParams(search);
+  const hashParams = new URLSearchParams(hash.replace(/^#\??/, ''));
+  const app = queryParams.get('app') ?? hashParams.get('app');
+  if (app === 'capture' || app === 'parameters' || app === 'bar-surface') {
+    return app;
+  }
+  if (app === 'bar' || app === '3d' || app === 'reconstruction') {
+    return 'bar-surface';
+  }
+  return 'terminal';
+}
 
 export async function openAppWindow(kind: AppWindowKind): Promise<AppWindowResult> {
   const definition = windowDefinitions[kind];
@@ -44,7 +59,7 @@ export async function openAppWindow(kind: AppWindowKind): Promise<AppWindowResul
     if (existing) {
       await existing.show();
       await existing.setFocus();
-      return { opened: true, label: definition.browserName };
+      return { opened: true, label: definition.browserName, presentation: 'window' };
     }
 
     const appWindow = new WebviewWindow(definition.browserName, {
@@ -66,13 +81,14 @@ export async function openAppWindow(kind: AppWindowKind): Promise<AppWindowResul
       void appWindow.once('tauri://created', () => resolve());
       void appWindow.once('tauri://error', (event) => reject(new Error(String(event.payload))));
     });
-    return { opened: true, label: definition.browserName };
+    return { opened: true, label: definition.browserName, presentation: 'window' };
   }
 
-  window.open(definition.url, definition.browserName, 'popup,width=1480,height=900');
+  window.location.assign(definition.url);
   return {
     opened: true,
     label: `browser-${definition.browserName}`,
+    presentation: 'navigation',
   };
 }
 

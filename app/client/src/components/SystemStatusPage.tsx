@@ -2512,19 +2512,19 @@ export function SystemStatusPage({
 
   const openIndependentManager = async () => {
     try {
-      await openCaptureManagementWindow();
-      setTerminalMessage('已打开独立采集管理窗口');
+      const result = await openCaptureManagementWindow();
+      setTerminalMessage(result.presentation === 'navigation' ? '正在进入采集管理' : '已打开独立采集管理窗口');
     } catch (error) {
-      setTerminalMessage(error instanceof Error ? error.message : '独立采集管理窗口打开失败');
+      setTerminalMessage(error instanceof Error ? error.message : '采集管理打开失败');
     }
   };
 
   const openBarSurfaceWorkbench = async () => {
     try {
-      await openBarSurfaceWindow();
-      setTerminalMessage('已打开独立 3D 重建窗口');
+      const result = await openBarSurfaceWindow();
+      setTerminalMessage(result.presentation === 'navigation' ? '正在进入 3D 重建工作台' : '已打开独立 3D 重建窗口');
     } catch (error) {
-      setTerminalMessage(error instanceof Error ? error.message : '独立 3D 重建窗口打开失败');
+      setTerminalMessage(error instanceof Error ? error.message : '3D 重建工作台打开失败');
     }
   };
 
@@ -2620,7 +2620,7 @@ export function SystemStatusPage({
           <div className="capture-terminal-entry-actions">
             <button type="button" className="primary" onClick={() => void openIndependentManager()}>
               <ArrowRight size={16} />
-              打开独立采集管理
+              打开采集管理
             </button>
             <button type="button" onClick={() => setEmbeddedManager(true)}>
               <Gauge size={16} />
@@ -2648,7 +2648,7 @@ export function SystemStatusPage({
             </div>
             <div>
               <dt>终端显示</dt>
-              <dd>轻量概览，完整管理在独立应用</dd>
+              <dd>轻量概览，完整管理在专用界面</dd>
             </div>
           </dl>
           {terminalMessage ? <strong className="capture-terminal-message">{terminalMessage}</strong> : null}
