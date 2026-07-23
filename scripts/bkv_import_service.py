@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -86,6 +87,23 @@ def _atomic_json(path: Path, payload: Any) -> None:
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def _replace_directory_with_retry(
+    source: Path,
+    destination: Path,
+    *,
+    attempts: int = 4,
+) -> None:
+    """Preserve atomic publication while tolerating brief Windows file locks."""
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(0.05 * (2**attempt))
 
 
 def _read_json(path: Path, label: str) -> dict[str, Any]:
@@ -707,10 +725,10 @@ class BkvImportService:
                     / inspection_id
                 )
                 replaced_destination.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(destination, replaced_destination)
-                os.replace(stage, destination)
+                _replace_directory_with_retry(destination, replaced_destination)
+                _replace_directory_with_retry(stage, destination)
         else:
-            os.replace(stage, destination)
+            _replace_directory_with_retry(stage, destination)
 
         record = _read_json(destination / "record.json", "standard record")
         defects = _read_json(
@@ -828,7 +846,7 @@ class BkvImportService:
             if destination.exists():
                 shutil.rmtree(destination)
             if replaced_destination is not None and replaced_destination.exists():
-                os.replace(replaced_destination, destination)
+                _replace_directory_with_retry(replaced_destination, destination)
             raise
 
     def _write_import_record(

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 import numpy as np
@@ -299,6 +301,32 @@ class BkvImportServiceTests(unittest.TestCase):
         resumed = self._service().retry_failed(job_id)
         self.assertEqual(resumed.status, "completed")
         self.assertEqual(resumed.converted_records, 2)
+        self.assertTrue((self.target / "records" / "10" / "record.json").is_file())
+
+    def test_retries_a_transient_windows_directory_publish_lock(self) -> None:
+        real_replace = os.replace
+        publish_attempts = 0
+
+        def flaky_replace(source, destination):
+            nonlocal publish_attempts
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                source_path.name == "10"
+                and destination_path == self.target / "records" / "10"
+            ):
+                publish_attempts += 1
+                if publish_attempts == 1:
+                    raise PermissionError(5, "fixture transient directory lock")
+            return real_replace(source, destination)
+
+        with patch("scripts.bkv_import_service.os.replace", side_effect=flaky_replace):
+            result = self._service().run_once()
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.converted_records, 2)
+        self.assertEqual(result.quarantined_records, 0)
+        self.assertGreaterEqual(publish_attempts, 2)
         self.assertTrue((self.target / "records" / "10" / "record.json").is_file())
 
     def test_job_ledger_records_hash_progress_timestamps_and_failures(self) -> None:
