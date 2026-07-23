@@ -536,7 +536,7 @@ async function runBkvNativeScrollChecks(page, result) {
       .filter((entry) => entry.name.includes('/api/inspection-world/tile'));
     const value = {
       record: canvas.getAttribute('aria-label'),
-      selectValue: document.querySelector('.bkv-toolbar select')?.value || '',
+      recordSequence: document.querySelector('[data-testid="bkv-record-row"][aria-current="true"]')?.getAttribute('data-sequence') || '',
       scrollMode: viewport.getAttribute('data-scroll-mode'),
       scrollLeft: viewport.scrollLeft,
       scrollTop: viewport.scrollTop,
@@ -708,13 +708,11 @@ async function runBkvNativeScrollChecks(page, result) {
   result.interactionScreenshots.push(await page.screenshot('bkv-2d-deep-scroll'));
 
   await page.evaluate(`(() => {
-    const select = document.querySelector('.bkv-toolbar select');
-    if (!select) return false;
-    const firstValue = window.__steelInspectionWorldSmoke.initial.selectValue;
-    const next = [...select.options].find((option) => option.value !== firstValue);
+    const firstValue = window.__steelInspectionWorldSmoke.initial.recordSequence;
+    const next = [...document.querySelectorAll('[data-testid="bkv-record-row"]')]
+      .find((row) => row.getAttribute('data-sequence') !== firstValue);
     if (!next) return false;
-    select.value = next.value;
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    next.click();
     return true;
   })()`);
   const switched = await requireEventually('record-switch-restores-top-fit-width', `(() => {
@@ -751,10 +749,11 @@ async function runBkvNativeScrollChecks(page, result) {
   })()`);
 
   await page.evaluate(`(() => {
-    const select = document.querySelector('.bkv-toolbar select');
-    if (!select) return false;
-    select.value = window.__steelInspectionWorldSmoke.initial.selectValue;
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    const firstValue = window.__steelInspectionWorldSmoke.initial.recordSequence;
+    const first = [...document.querySelectorAll('[data-testid="bkv-record-row"]')]
+      .find((row) => row.getAttribute('data-sequence') === firstValue);
+    if (!first) return false;
+    first.click();
     return true;
   })()`);
   await requireEventually('record-switch-restores-first-record', `(() => {

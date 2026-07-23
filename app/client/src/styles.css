@@ -15014,29 +15014,16 @@ button {
   margin-top: 8px;
   padding: 8px 12px;
   display: flex;
-  align-items: end;
+  align-items: center;
   gap: 16px;
 }
 
-.bkv-toolbar label {
-  min-width: 315px;
-  display: grid;
-  gap: 4px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.bkv-toolbar select,
 .bkv-toolbar button {
   min-height: 32px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface-input);
   color: var(--text);
-}
-
-.bkv-toolbar select {
-  padding: 0 9px;
 }
 
 .bkv-view-tabs,
@@ -15092,6 +15079,9 @@ button {
 
 .bkv-material-panel {
   padding: 14px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   border-right: 1px solid var(--line);
   background: var(--panel-soft);
 }
@@ -15199,6 +15189,84 @@ button {
 .bkv-defect-list p {
   color: var(--muted);
   font-size: 11px;
+}
+
+.bkv-records-panel {
+  min-height: 0;
+  margin-top: 10px;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+}
+
+.bkv-records-panel h3 {
+  margin-top: 0;
+}
+
+.bkv-record-table {
+  min-height: 92px;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-input);
+}
+
+.bkv-record-table-header,
+.bkv-record-table button {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.bkv-record-table-header {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.bkv-record-table button {
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.bkv-record-table button:last-child {
+  border-bottom: 0;
+}
+
+.bkv-record-table button:hover {
+  background: var(--surface-subtle);
+}
+
+.bkv-record-table button.active {
+  background: var(--blue-soft);
+  color: var(--cyan);
+  box-shadow: inset 3px 0 0 var(--cyan);
+}
+
+.bkv-record-table button span {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bkv-record-table button strong {
+  overflow: hidden;
+  font-size: 10px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .bkv-visual-panel {

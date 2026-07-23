@@ -207,11 +207,6 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
       </header>
 
       <section className="bkv-toolbar">
-        <label>旧系统钢管
-          <select value={selected?.legacySeqNo ?? ''} onChange={(event) => setSelectedSequence(Number(event.target.value))}>
-            {materials.map((material) => <option key={material.legacySeqNo} value={material.legacySeqNo}>{material.legacySeqNo} · {material.steelId}</option>)}
-          </select>
-        </label>
         <div className="bkv-view-tabs" role="group" aria-label="BKV 显示模式">
           <button className={viewMode === '2d' ? 'active' : ''} onClick={() => setViewMode('2d')}><Images size={16} />二维原图</button>
           <button className={viewMode === 'unwrapped' ? 'active' : ''} onClick={() => setViewMode('unwrapped')}>JIT 平铺展开</button>
@@ -261,6 +256,33 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
               </button>
             )) : <p>该材料无可验证关联缺陷</p>}
           </div>
+          <section className="bkv-records-panel" aria-labelledby="bkv-records-heading">
+            <h3 id="bkv-records-heading">检测记录 {materials.length}</h3>
+            <div className="bkv-record-table" aria-label="旧系统检测记录">
+              <div className="bkv-record-table-header" aria-hidden="true">
+                <span>旧序号</span>
+                <span>钢管号</span>
+              </div>
+              {materials.map((material) => {
+                const isCurrent = material.legacySeqNo === selected.legacySeqNo;
+                return (
+                  <button
+                    type="button"
+                    key={material.legacySeqNo}
+                    className={isCurrent ? 'active' : ''}
+                    aria-current={isCurrent ? 'true' : undefined}
+                    aria-label={`选择旧记录 ${material.legacySeqNo} ${material.steelId}`}
+                    data-testid="bkv-record-row"
+                    data-sequence={material.legacySeqNo}
+                    onClick={() => setSelectedSequence(material.legacySeqNo)}
+                  >
+                    <span>{material.legacySeqNo}</span>
+                    <strong title={material.steelId}>{material.steelId}</strong>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
         </aside>
 
         <section className="bkv-visual-panel">

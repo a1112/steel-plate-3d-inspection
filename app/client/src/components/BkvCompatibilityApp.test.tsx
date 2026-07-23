@@ -91,7 +91,9 @@ describe('BkvCompatibilityApp', () => {
     expect(await screen.findByText('BKV 离线回放')).toBeInTheDocument();
     expect(screen.getByText('6/6 离线数据')).toBeInTheDocument();
     expect(screen.getByText('真实相机在线 0')).toBeInTheDocument();
-    expect(screen.getByRole('combobox')).toHaveValue('1893700');
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '检测记录 2' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '选择旧记录 1893700 253B09401250925A12004328' })).toHaveAttribute('aria-current', 'true');
     expect(screen.getByText('轧折')).toBeInTheDocument();
     expect(await screen.findByRole('img', { name: '1893700 检测图像世界' })).toBeInTheDocument();
     expect(screen.getAllByTestId('inspection-world-camera')).toHaveLength(6);
@@ -101,10 +103,14 @@ describe('BkvCompatibilityApp', () => {
     expect(screen.queryByText('连接相机')).not.toBeInTheDocument();
     expect(fetchBkvArtifactBlobUrl).not.toHaveBeenCalledWith(expect.stringContaining('camera-'), expect.anything());
 
+    fireEvent.click(screen.getByRole('button', { name: '选择旧记录 1893701 STEEL-B' }));
+    expect(await screen.findByRole('heading', { name: 'STEEL-B' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '选择旧记录 1893701 STEEL-B' })).toHaveAttribute('aria-current', 'true');
+
     fireEvent.click(screen.getByRole('button', { name: 'JIT 平铺展开' }));
-    expect(await screen.findByAltText('1893700 JIT 平铺展开')).toHaveAttribute('src', 'blob:unwrapped.png');
+    expect(await screen.findByAltText('1893701 JIT 平铺展开')).toHaveAttribute('src', 'blob:unwrapped.png');
     fireEvent.click(screen.getByRole('button', { name: '圆柱 3D' }));
-    await waitFor(() => expect(screen.getByLabelText('1893700 BKV 圆柱三维预览')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('1893701 BKV 圆柱三维预览')).toBeInTheDocument());
   });
 
   it('retains configured world coordinates when a manifest source frame is missing', async () => {
