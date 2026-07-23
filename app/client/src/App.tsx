@@ -220,6 +220,7 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [bkvStatus, setBkvStatus] = useState<BkvStatus | null>(null);
   const [bkvProbeComplete, setBkvProbeComplete] = useState(false);
+  const [bkvProbeRevision, setBkvProbeRevision] = useState(0);
   const [terminalViewMode, setTerminalViewMode] = useState<TerminalViewMode>(readTerminalViewMode);
 
   const selectTerminalView = (view: Exclude<TerminalViewMode, 'auto'>) => {
@@ -229,6 +230,7 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController();
+    setBkvProbeComplete(false);
     fetchBkvStatus(controller.signal)
       .then(setBkvStatus)
       .catch(() => setBkvStatus(null))
@@ -236,7 +238,7 @@ export default function App() {
         if (!controller.signal.aborted) setBkvProbeComplete(true);
       });
     return () => controller.abort();
-  }, []);
+  }, [bkvProbeRevision]);
 
   const bkvAvailable = bkvStatus?.provider === 'bkv' && bkvStatus.ready;
   const resolvedTerminalMode: Exclude<TerminalViewMode, 'auto'> =
@@ -253,6 +255,10 @@ export default function App() {
     const controller = new AbortController();
     setSnapshot(null);
     setLoadError(null);
+    if (resolvedTerminalMode === 'bkv' && !bkvAvailable) {
+      setLoadError('当前检测服务未提供可用的 BKV 兼容数据');
+      return () => controller.abort();
+    }
     const loadSnapshot = resolvedTerminalMode === 'bkv'
       ? fetchBkvMaterials(controller.signal).then(buildBkvInspectionSnapshot)
       : fetchInspectionSnapshot(controller.signal);
@@ -266,7 +272,58 @@ export default function App() {
         }
       });
     return () => controller.abort();
-  }, [bkvProbeComplete, resolvedTerminalMode]);
+  }, [bkvAvailable, bkvProbeComplete, resolvedTerminalMode]);
+
+  const retryBkvLoad = () => {
+    setSnapshot(null);
+    setLoadError(null);
+    setBkvStatus(null);
+    setBkvProbeComplete(false);
+    setBkvProbeRevision((current) => current + 1);
+  };
+
+  if (bkvProbeComplete && resolvedTerminalMode === 'bkv' && loadError) {
+    const theme = readStoredTheme();
+    const themeStyle = readStoredThemeStyle();
+    const status = buildBkvInspectionSnapshot([]).status;
+    const bkvDetected = Boolean(bkvStatus);
+    return (
+      <div className={`app-shell theme-${theme} style-${themeStyle} bkv-mode-error-shell`}>
+        <BrandHeader
+          status={status}
+          theme={theme}
+          activeNav="online"
+          runtimeMode={{
+            kind: 'bkv',
+            cameraCount: bkvStatus?.cameraCount ?? 6,
+            availableCameraCount: 0,
+            batchId: bkvStatus?.batchId ?? '未连接',
+            dataReady: false,
+            detail: loadError,
+          }}
+          onNavChange={() => undefined}
+          onDragMouseDown={() => undefined}
+        />
+        <main className="mode-error-workspace">
+          <section className="mode-error-panel" role="alert">
+            <span>BKV 兼容模式</span>
+            <h1>{bkvDetected ? 'BKV 数据读取失败' : 'BKV 模式不可用'}</h1>
+            <p>{loadError}</p>
+            <button type="button" onClick={retryBkvLoad}>重新检查 BKV 数据</button>
+          </section>
+        </main>
+        <AppFooter
+          activeNav="online"
+          terminalViews={{
+            online: { available: true, active: false, onOpen: () => selectTerminalView('online') },
+            bkv: { available: true, active: true, onOpen: retryBkvLoad },
+          }}
+          onNavChange={() => undefined}
+          onSettingsOpen={() => undefined}
+        />
+      </div>
+    );
+  }
 
   if (!bkvProbeComplete || !snapshot) {
     const loadingTheme = readStoredTheme();

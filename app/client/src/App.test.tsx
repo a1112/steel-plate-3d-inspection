@@ -168,6 +168,58 @@ describe('App BKV provider selection', () => {
     expect(await screen.findByText('BKV 模式')).toBeInTheDocument();
     expect(new URLSearchParams(window.location.search).get('view')).toBe('bkv');
   });
+
+  it('keeps the unified BKV shell when explicitly selected BKV data is unavailable', async () => {
+    window.history.replaceState(null, '', '/?app=terminal&view=bkv');
+    const requestedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes('/api/bkv/status')) {
+        return new Response(null, { status: 404 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'BKV 模式不可用' })).toBeInTheDocument();
+    expect(screen.getByText('钢管3D表面检测系统')).toBeInTheDocument();
+    expect(screen.getByText('BKV 模式')).toBeInTheDocument();
+    expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
+    expect(screen.queryByText(/服务异常/)).not.toBeInTheDocument();
+    expect(requestedUrls.some((url) => url.includes('/api/inspection/snapshot'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/bkv/materials'))).toBe(false);
+
+    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
+    expect(screen.getByRole('menuitem', { name: '离线回放' })).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('shows a mode-local failure when the BKV material database cannot be read', async () => {
+    window.history.replaceState(null, '', '/?app=terminal&view=bkv');
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/bkv/status')) {
+        return new Response(JSON.stringify({
+          provider: 'bkv', ready: true, mode: 'offline-replay-no-camera-hardware', cameraMode: 'offline-file',
+          cameraCount: 6, physicalCamerasOnline: 0, batchId: 'legacy-1893700-1893710', materialCount: 11,
+          nextIndex: 0, nextLegacySeqNo: 1893700, completed: false,
+        }), { status: 200 });
+      }
+      if (url.includes('/api/bkv/materials')) {
+        return new Response(JSON.stringify({ message: 'legacy database locked' }), { status: 500 });
+      }
+      return new Response(null, { status: 503 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'BKV 数据读取失败' })).toBeInTheDocument();
+    expect(screen.getByText(/legacy database locked/)).toBeInTheDocument();
+    expect(screen.getByText('BKV 模式')).toBeInTheDocument();
+    expect(screen.getByText('数据异常')).toBeInTheDocument();
+    expect(screen.queryByText(/服务异常/)).not.toBeInTheDocument();
+  });
 });
 
 describe('App online severity filters', () => {

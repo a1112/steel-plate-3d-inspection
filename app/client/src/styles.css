@@ -1929,6 +1929,51 @@ button {
   font-weight: 600;
 }
 
+.mode-error-workspace {
+  display: grid;
+  min-height: 0;
+  place-items: center;
+  padding: 20px;
+}
+
+.mode-error-panel {
+  width: min(560px, calc(100vw - 40px));
+  padding: 28px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--panel-bg);
+  box-shadow: var(--panel-shadow);
+  text-align: center;
+}
+
+.mode-error-panel > span {
+  color: #079bd5;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.mode-error-panel h1 {
+  margin: 8px 0;
+  color: var(--text-primary);
+  font-size: 22px;
+}
+
+.mode-error-panel p {
+  margin: 0 0 18px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.mode-error-panel button {
+  min-height: 32px;
+  padding: 0 14px;
+  border: 1px solid #079bd5;
+  border-radius: 6px;
+  background: #079bd5;
+  color: #fff;
+  cursor: pointer;
+}
+
 .center-column {
   grid-template-rows: minmax(0, 1fr) minmax(150px, 0.25fr);
 }
