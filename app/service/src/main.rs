@@ -12010,6 +12010,76 @@ fn is_bkv_hardware_mutation(method: &str, path: &str) -> bool {
         || path.starts_with("/api/stream/")
 }
 
+fn runtime_capability_for_route(
+    method: &str,
+    path: &str,
+) -> Option<runtime_profile::RuntimeCapability> {
+    use runtime_profile::RuntimeCapability;
+
+    if !matches!(method, "POST" | "DELETE" | "PUT" | "PATCH") {
+        return None;
+    }
+    if path == "/api/algorithm/bar-surface/run"
+        || path == "/api/algorithm/bar-surface/calibration/fit"
+        || path == "/api/production/algorithm/run"
+    {
+        return Some(RuntimeCapability::Reconstruction);
+    }
+    if path == "/api/admin/cameras"
+        || path.starts_with("/api/camera/")
+        || path.starts_with("/api/cameras/")
+        || path.starts_with("/api/config/camera-")
+        || path.starts_with("/api/param")
+        || path.starts_with("/api/calibration/")
+        || path.starts_with("/api/roi/")
+        || path.starts_with("/api/stream/")
+        || path.starts_with("/api/preview/")
+        || path.starts_with("/api/capture/preview")
+        || path.starts_with("/api/capture/depth-map")
+    {
+        return Some(RuntimeCapability::DirectCamera);
+    }
+    if path == "/api/config/capture"
+        || path == "/api/production/capture-once"
+        || path.starts_with("/api/admin/services/capture/")
+        || path.starts_with("/api/capture/")
+    {
+        return Some(RuntimeCapability::CaptureManagement);
+    }
+    None
+}
+
+fn runtime_capability_guard_response(
+    state: &ServiceState,
+    method: &str,
+    path: &str,
+) -> Option<Vec<u8>> {
+    let capability = runtime_capability_for_route(method, path)?;
+    if state.runtime_config.allows(capability) {
+        return None;
+    }
+    Some(http_response(
+        "409 Conflict",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 409,
+            "error": "runtime_capability_unavailable",
+            "capability": capability.as_str(),
+            "profileId": state.runtime_config.id,
+            "message": "The active runtime profile does not provide this capability"
+        })
+        .to_string(),
+    ))
+}
+
+fn runtime_profile_response(state: &ServiceState) -> Vec<u8> {
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &state.runtime_config.public_value().to_string(),
+    )
+}
+
 fn bkv_hardware_operation_forbidden_response() -> Vec<u8> {
     http_response(
         "409 Conflict",
@@ -17542,8 +17612,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         .as_ref()
         .map(|session| session.user_id.as_str())
         .unwrap_or("admin");
-    if state.capture.provider == CaptureProvider::Bkv && is_bkv_hardware_mutation(method, path) {
-        let _ = stream.write_all(&bkv_hardware_operation_forbidden_response());
+    if let Some(response) = runtime_capability_guard_response(&state, method, path) {
+        let _ = stream.write_all(&response);
         return;
     }
     let _runtime_admission_guard = match enter_runtime_admission(&state, method, path) {
@@ -17573,6 +17643,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             service_health_response(&state, health_endpoint.expect("health endpoint guard"))
         }
         ("GET", "/api/system/network") => system_network_status_response(),
+        ("GET", "/api/runtime-profile") => runtime_profile_response(&state),
         ("GET", "/api/services") => http_response(
             "200 OK",
             "application/json; charset=utf-8",
@@ -19670,6 +19741,74 @@ mod tests {
         let response = response_text(bkv_hardware_operation_forbidden_response());
         assert!(response.starts_with("HTTP/1.1 409 Conflict"));
         assert!(response.contains("bkv_hardware_operation_forbidden"));
+    }
+
+    #[test]
+    fn runtime_profile_endpoint_returns_only_sanitized_public_capabilities() {
+        let state =
+            production_test_state_with_provider(CaptureProvider::Bkv, "simulated://capture");
+        let response = response_text(runtime_profile_response(&state));
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body: Value = serde_json::from_str(
+            response
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .expect("runtime profile response body"),
+        )
+        .expect("runtime profile JSON");
+
+        assert_eq!(body["schema"], "steel.runtime-profile.public.v1");
+        assert_eq!(body["profileId"], "test-bkv-6");
+        assert_eq!(body["cameraCount"], 6);
+        assert_eq!(body["cameras"].as_array().map(Vec::len), Some(6));
+        assert_eq!(body["capabilities"]["directCamera"], false);
+        assert_eq!(body["capabilities"]["captureManagement"], false);
+        assert_eq!(body["capabilities"]["reconstruction"], false);
+        assert_eq!(body["capabilities"]["offlineReplay"], true);
+
+        let serialized = body.to_string();
+        for private_field in [
+            "storage",
+            "sourceRoot",
+            "convertedRoot",
+            "catalogPath",
+            "converterOrigin",
+            "sourceDirectory",
+            "projectPath",
+            "profilePath",
+            "captureProfile",
+        ] {
+            assert!(
+                !serialized.contains(private_field),
+                "public profile leaked {private_field}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_direct_profile_rejects_capture_and_reconstruction_mutations() {
+        let state =
+            production_test_state_with_provider(CaptureProvider::Bkv, "simulated://capture");
+        for (path, capability) in [
+            ("/api/capture/start", "captureManagement"),
+            ("/api/camera/connect-all", "directCamera"),
+            ("/api/algorithm/bar-surface/run", "reconstruction"),
+        ] {
+            let response = runtime_capability_guard_response(&state, "POST", path)
+                .unwrap_or_else(|| panic!("{path} was not guarded"));
+            let text = response_text(response);
+            assert!(text.starts_with("HTTP/1.1 409 Conflict"), "{path}");
+            assert!(text.contains("runtime_capability_unavailable"), "{path}");
+            assert!(text.contains(capability), "{path}");
+            assert!(text.contains("test-bkv-6"), "{path}");
+        }
+
+        assert!(
+            runtime_capability_guard_response(&state, "POST", "/api/bkv/replay/next").is_none()
+        );
+        assert!(
+            runtime_capability_guard_response(&state, "GET", "/api/capture/lifecycle").is_none()
+        );
     }
 
     #[test]

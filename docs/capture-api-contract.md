@@ -16,6 +16,42 @@ $env:CAPTURE_SERVICE_ORIGIN='http://127.0.0.1:4317'
 
 The Tauri client must not consume this API directly. It calls the Rust service, and the Rust service proxies only an explicit allowlist while preserving provider status codes, content types, and error bodies. Provider failure must never be reported as simulated success unless `STEEL_CAPTURE_PROVIDER=simulated` was explicitly selected.
 
+## Runtime profile and capability fencing
+
+The Rust service loads `config/project.json` and its selected
+`steel.runtime-profile.v1` document at startup. Configuration changes are
+validated when saved but become active only after the service restarts. The
+configured profile provider must match `STEEL_CAPTURE_PROVIDER`; a mismatch is a
+startup error rather than an implicit fallback.
+
+```http
+GET /api/runtime-profile
+```
+
+Returns `steel.runtime-profile.public.v1` with the active profile identity,
+provider, data-source type, ordered camera identities, configuration hash, and
+the `directCamera`, `captureManagement`, `reconstruction`, and `offlineReplay`
+capability flags. This response is public operational metadata. It never
+contains filesystem roots, converter origins, capture-profile paths, camera
+source directories, credentials, or secrets.
+
+Mutation routes that require an unavailable capability fail closed before they
+reach a provider or reconstruction process:
+
+```json
+{
+  "code": 409,
+  "error": "runtime_capability_unavailable",
+  "capability": "captureManagement",
+  "profileId": "bkv-6"
+}
+```
+
+In particular, the non-direct BKV profile cannot mutate camera, stream, ROI,
+calibration, capture-service, capture-configuration, production-capture, or
+reconstruction state. Read-only status endpoints and BKV offline replay remain
+available.
+
 ## Health
 
 ```http

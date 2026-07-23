@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
@@ -87,6 +88,23 @@ pub struct RuntimeCapabilities {
     pub offline_replay: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeCapability {
+    DirectCamera,
+    CaptureManagement,
+    Reconstruction,
+}
+
+impl RuntimeCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectCamera => "directCamera",
+            Self::CaptureManagement => "captureManagement",
+            Self::Reconstruction => "reconstruction",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeProfile {
     pub id: String,
@@ -162,6 +180,34 @@ impl RuntimeProfile {
 
     pub fn camera_count(&self) -> usize {
         self.cameras.len()
+    }
+
+    pub fn allows(&self, capability: RuntimeCapability) -> bool {
+        match capability {
+            RuntimeCapability::DirectCamera => self.capabilities.direct_camera,
+            RuntimeCapability::CaptureManagement => self.capabilities.capture_management,
+            RuntimeCapability::Reconstruction => self.capabilities.reconstruction,
+        }
+    }
+
+    pub fn public_value(&self) -> Value {
+        json!({
+            "schema": "steel.runtime-profile.public.v1",
+            "profileId": self.id,
+            "displayName": self.display_name,
+            "provider": self.provider,
+            "dataSource": self.data_source,
+            "cameraConnection": self.camera_connection,
+            "cameraCount": self.camera_count(),
+            "cameras": self.cameras.iter().map(|camera| json!({
+                "id": camera.id,
+                "displayOrder": camera.display_order,
+                "sourceCameraId": camera.source_camera_id,
+                "role": camera.role,
+            })).collect::<Vec<_>>(),
+            "configHash": self.config_hash,
+            "capabilities": self.capabilities,
+        })
     }
 
     #[cfg(test)]
