@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Box, ChevronDown, ChevronUp, Database, History, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
+import { Box, ChevronDown, ChevronUp, Database, History, Monitor, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import {
@@ -22,16 +22,21 @@ interface FooterAnalysisContext {
   onCollapsedChange: (collapsed: boolean) => void;
 }
 
-interface FooterBkvReplayEntry {
+interface FooterTerminalViewEntry {
   available: boolean;
   active?: boolean;
   onOpen?: () => void;
 }
 
+interface FooterTerminalViews {
+  online: FooterTerminalViewEntry;
+  bkv: FooterTerminalViewEntry;
+}
+
 interface AppFooterProps {
   activeNav: NavKey;
   analysis?: FooterAnalysisContext | null;
-  bkvReplay?: FooterBkvReplayEntry;
+  terminalViews?: FooterTerminalViews;
   flowVisible?: boolean;
   onFlowToggle?: () => void;
   onNavChange: (next: NavKey) => void;
@@ -54,6 +59,11 @@ const analysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
   { id: 'profile', label: '剖面' },
 ];
 
+const defaultTerminalViews: FooterTerminalViews = {
+  online: { available: true, active: true },
+  bkv: { available: false, active: false },
+};
+
 function getDefectSizeLabel(defect: DefectItem) {
   return `${defect.widthMm.toFixed(2)}×${defect.heightMm.toFixed(2)}×${Math.abs(defect.depthMm).toFixed(2)}mm`;
 }
@@ -61,7 +71,7 @@ function getDefectSizeLabel(defect: DefectItem) {
 export function AppFooter({
   activeNav,
   analysis,
-  bkvReplay = { available: false },
+  terminalViews = defaultTerminalViews,
   flowVisible = false,
   onFlowToggle,
   onSettingsOpen,
@@ -95,9 +105,9 @@ export function AppFooter({
     };
   }, [moreMenuOpen]);
 
-  const openBkvReplay = () => {
-    if (!bkvReplay.available) return;
-    bkvReplay.onOpen?.();
+  const openTerminalView = (entry: FooterTerminalViewEntry) => {
+    if (!entry.available) return;
+    entry.onOpen?.();
     setMoreMenuOpen(false);
   };
   const changeAnalysisView = (next: AnalysisViewMode) => {
@@ -210,7 +220,7 @@ export function AppFooter({
         <div className="app-footer-more" ref={moreMenuRef}>
           <button
             type="button"
-            className={moreMenuOpen || bkvReplay.active ? 'active' : ''}
+            className={moreMenuOpen || terminalViews.online.active || terminalViews.bkv.active ? 'active' : ''}
             aria-label="更多功能"
             aria-haspopup="menu"
             aria-expanded={moreMenuOpen}
@@ -224,15 +234,26 @@ export function AppFooter({
               <button
                 type="button"
                 role="menuitem"
-                className={bkvReplay.active ? 'active' : ''}
-                aria-current={bkvReplay.active ? 'page' : undefined}
-                disabled={!bkvReplay.available}
-                onClick={openBkvReplay}
+                className={terminalViews.online.active ? 'active' : ''}
+                aria-current={terminalViews.online.active ? 'page' : undefined}
+                disabled={!terminalViews.online.available}
+                onClick={() => openTerminalView(terminalViews.online)}
+              >
+                <Monitor size={15} />
+                <span>在线检测</span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className={terminalViews.bkv.active ? 'active' : ''}
+                aria-current={terminalViews.bkv.active ? 'page' : undefined}
+                disabled={!terminalViews.bkv.available}
+                onClick={() => openTerminalView(terminalViews.bkv)}
               >
                 <History size={15} />
                 <span>离线回放</span>
               </button>
-              {!bkvReplay.available ? <small>仅 BKV 模式可用</small> : null}
+              {!terminalViews.bkv.available ? <small>仅 BKV 模式可用</small> : null}
             </div>
           ) : null}
         </div>

@@ -34,11 +34,15 @@ describe('AppFooter', () => {
   });
 
   it('opens the more menu and disables offline replay outside BKV mode', () => {
-    const onOpen = vi.fn();
+    const onOnlineOpen = vi.fn();
+    const onBkvOpen = vi.fn();
     render(
       <AppFooter
         activeNav="online"
-        bkvReplay={{ available: false, active: false, onOpen }}
+        terminalViews={{
+          online: { available: true, active: true, onOpen: onOnlineOpen },
+          bkv: { available: false, active: false, onOpen: onBkvOpen },
+        }}
         onNavChange={vi.fn()}
         onSettingsOpen={vi.fn()}
       />,
@@ -49,28 +53,36 @@ describe('AppFooter', () => {
     fireEvent.click(moreButton);
 
     expect(moreButton).toHaveAttribute('aria-expanded', 'true');
+    const onlineItem = screen.getByRole('menuitem', { name: '在线检测' });
     const replayItem = screen.getByRole('menuitem', { name: '离线回放' });
+    expect(onlineItem).toBeEnabled();
+    expect(onlineItem).toHaveAttribute('aria-current', 'page');
     expect(replayItem).toBeDisabled();
     expect(screen.getByText('仅 BKV 模式可用')).toBeInTheDocument();
     fireEvent.click(replayItem);
-    expect(onOpen).not.toHaveBeenCalled();
+    expect(onOnlineOpen).not.toHaveBeenCalled();
+    expect(onBkvOpen).not.toHaveBeenCalled();
   });
 
-  it('opens BKV replay from the enabled more menu', () => {
-    const onOpen = vi.fn();
+  it('opens the original online inspection view from BKV mode', () => {
+    const onOnlineOpen = vi.fn();
     render(
       <AppFooter
         activeNav="online"
-        bkvReplay={{ available: true, active: false, onOpen }}
+        terminalViews={{
+          online: { available: true, active: false, onOpen: onOnlineOpen },
+          bkv: { available: true, active: true, onOpen: vi.fn() },
+        }}
         onNavChange={vi.fn()}
         onSettingsOpen={vi.fn()}
       />,
     );
 
     fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
-    fireEvent.click(screen.getByRole('menuitem', { name: '离线回放' }));
+    expect(screen.getByRole('menuitem', { name: '离线回放' })).toHaveAttribute('aria-current', 'page');
+    fireEvent.click(screen.getByRole('menuitem', { name: '在线检测' }));
 
-    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onOnlineOpen).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
   });
 
@@ -78,7 +90,10 @@ describe('AppFooter', () => {
     render(
       <AppFooter
         activeNav="online"
-        bkvReplay={{ available: true, active: false, onOpen: vi.fn() }}
+        terminalViews={{
+          online: { available: true, active: false, onOpen: vi.fn() },
+          bkv: { available: true, active: true, onOpen: vi.fn() },
+        }}
         onNavChange={vi.fn()}
         onSettingsOpen={vi.fn()}
       />,
