@@ -5,6 +5,7 @@ import { createEmptyCaptureSnapshot, type CaptureSnapshot } from '../lib/capture
 import { createInitialOperationState, type OperationState } from '../state/operations';
 import {
   CaptureManagementApp,
+  SystemStatusPage,
   mergeCaptureLogEvents,
   prependBoundedCaptureLog,
 } from './SystemStatusPage';
@@ -80,6 +81,29 @@ function renderCaptureManagement(
     />,
   );
 }
+
+it('does not expose capture management or reconstruction in a non-direct runtime', () => {
+  render(
+    <SystemStatusPage
+      status={deviceStatus}
+      operation={createInitialOperationState()}
+      capture={createEmptyCaptureSnapshot(null)}
+      capabilities={{
+        directCamera: false,
+        captureManagement: false,
+        reconstruction: false,
+        offlineReplay: true,
+      }}
+      cameraCount={6}
+      onAction={vi.fn()}
+    />,
+  );
+
+  expect(screen.getByRole('heading', { name: '离线运行状态' })).toBeInTheDocument();
+  expect(screen.getByText('6 路配置相机')).toBeInTheDocument();
+  expect(screen.queryByText('采集管理')).not.toBeInTheDocument();
+  expect(screen.queryByText('3D 重建')).not.toBeInTheDocument();
+});
 
 describe('CaptureManagementApp production trigger flow', () => {
   let fetchMock: ReturnType<typeof vi.fn>;

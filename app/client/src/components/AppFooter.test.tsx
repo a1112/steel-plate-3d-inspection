@@ -33,6 +33,26 @@ describe('AppFooter', () => {
     expect(screen.getByRole('button', { name: '3D 重建' })).toBeInTheDocument();
   });
 
+  it('hides direct-camera tools in BKV mode while keeping backend management visible', () => {
+    render(
+      <AppFooter
+        activeNav="online"
+        capabilities={{
+          directCamera: false,
+          captureManagement: false,
+          reconstruction: false,
+          offlineReplay: true,
+        }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: '后台管理' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '采集管理' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '3D 重建' })).not.toBeInTheDocument();
+  });
+
   it('opens the more menu and disables offline replay outside BKV mode', () => {
     const onOnlineOpen = vi.fn();
     const onBkvOpen = vi.fn();

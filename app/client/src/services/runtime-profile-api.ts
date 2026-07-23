@@ -125,6 +125,17 @@ async function requestAdminJson<T>(
   return response.json() as Promise<T>;
 }
 
+export async function fetchRuntimeProfile(signal?: AbortSignal): Promise<PublicRuntimeProfile> {
+  const response = await fetch(`${getInspectionServiceOrigin()}/api/runtime-profile`, {
+    signal,
+    headers: { Accept: 'application/json' },
+  });
+  if (!response.ok) {
+    throw new Error(`运行配置读取失败：${response.status}`);
+  }
+  return response.json() as Promise<PublicRuntimeProfile>;
+}
+
 export function fetchAdminRuntimeProfile(signal?: AbortSignal) {
   return requestAdminJson<AdminRuntimeProfileState>(
     '/api/admin/runtime-profile',

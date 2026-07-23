@@ -56,6 +56,7 @@ type ContinuousDraft = {
 
 type CaptureAdvancedOperationsProps = {
   cameraIps: string[];
+  expectedCameraCount?: number;
   profiles: CaptureProfilesStatus | null;
   storage: CaptureStorageStatus | null;
   cameraStatuses?: CaptureCameraStatus[];
@@ -145,6 +146,7 @@ export function createSafeCaptureProfileDraft(
   cameraIps: string[],
   storageRoot: string,
   cameraRoots: CaptureCameraStorageRoot[],
+  expectedCameraCount = cameraIps.length,
 ): CaptureProfileDocument {
   const normalizedName = name.trim() || 'new-capture-profile';
   const rootByIp = new Map(cameraRoots.map((item) => [item.ip, item.root]));
@@ -158,7 +160,7 @@ export function createSafeCaptureProfileDraft(
     cameraParamDir: `config/camera-params/${normalizedName}`,
     startupMode: 'manual',
     autoConnect: false,
-    expectedCameras: ips.length || 6,
+    expectedCameras: ips.length || expectedCameraCount,
     devType: -1,
     changeStorage: false,
     applySoftTrigger: false,
@@ -212,6 +214,7 @@ function summaryTone(summary: CaptureContinuousTestSummary) {
 
 export function CaptureAdvancedOperations({
   cameraIps,
+  expectedCameraCount = cameraIps.length,
   profiles,
   storage,
   cameraStatuses = [],
@@ -343,6 +346,7 @@ export function CaptureAdvancedOperations({
       normalizedIps,
       storage?.root || 'H:/',
       cameraRoots,
+      expectedCameraCount,
     );
     setProfileName(draft.name);
     setProfileJson(JSON.stringify(draft, null, 2));
@@ -680,10 +684,10 @@ export function CaptureAdvancedOperations({
             <span>Profile JSON</span>
             <textarea value={profileJson} onChange={(event) => setProfileJson(event.target.value)} spellCheck={false} />
           </label>
-          <section className="capture-profile-camera-editor" aria-label="Profile 8 相机结构化编辑器">
+          <section className="capture-profile-camera-editor" aria-label={`Profile ${expectedCameraCount} 相机结构化编辑器`}>
             <header>
               <div>
-                <strong>8 相机结构化配置</strong>
+                <strong>{expectedCameraCount} 相机结构化配置</strong>
                 <span>字段变更立即同步到上方 Profile JSON；原始 JSON 手工修改后需重新读取。</span>
               </div>
               <div className="capture-operation-actions">

@@ -90,14 +90,16 @@ import {
 import { InspectionFlowTool } from './components/InspectionFlowTool';
 import { StandaloneWindowTitlebar } from './components/StandaloneWindowTitlebar';
 import { inferNotificationTone, notify } from './state/notifications';
+import {
+  fetchRuntimeProfile,
+  type PublicRuntimeProfile,
+} from './services/runtime-profile-api';
 import './styles.css';
 import './styles/theme-system.css';
 
 const REPORT_PAGE_SIZE = 8;
 const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
 const UNKNOWN_SERVICE_ENDPOINT = 'unknown';
-const ONLINE_CAMERA_LANES = createSequentialCameraLanes(8);
-const BKV_CAMERA_LANES = createSequentialCameraLanes(6);
 
 export function formatStorageBytes(value?: number | null) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
@@ -143,6 +145,7 @@ type RecordBoundSurfaceArtifact = {
 };
 
 type TerminalViewMode = 'auto' | 'online' | 'bkv';
+type AppMode = 'terminal' | 'capture' | 'parameters' | 'bar-surface';
 
 function buildUnknownService(name: string, endpoint: string): ServiceStatusPanelItem {
   return {
@@ -160,7 +163,7 @@ function readViewportSize() {
   return { width: window.innerWidth, height: window.innerHeight };
 }
 
-function readAppMode() {
+function readAppMode(): AppMode {
   if (typeof window === 'undefined') {
     return 'terminal';
   }
@@ -204,14 +207,86 @@ function filterDefectsBySelectedSeverities(defects: DefectItem[], selectedSeveri
 }
 
 export default function App() {
-  const appMode = readAppMode();
+  const [runtimeProfile, setRuntimeProfile] = useState<PublicRuntimeProfile | null>(null);
+  const [runtimeProfileError, setRuntimeProfileError] = useState('');
+  const requestedAppMode = readAppMode();
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchRuntimeProfile(controller.signal)
+      .then((profile) => {
+        if (!controller.signal.aborted) {
+          setRuntimeProfile(profile);
+          setRuntimeProfileError('');
+        }
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setRuntimeProfileError(error instanceof Error ? error.message : '运行配置读取失败');
+        }
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (!runtimeProfile || typeof window === 'undefined') {
+      return;
+    }
+    const directOnlyRouteBlocked =
+      (requestedAppMode === 'capture' && !runtimeProfile.capabilities.captureManagement)
+      || (requestedAppMode === 'bar-surface' && !runtimeProfile.capabilities.reconstruction);
+    if (!directOnlyRouteBlocked) {
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set('app', 'terminal');
+    window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+  }, [requestedAppMode, runtimeProfile]);
+
+  if (!runtimeProfile) {
+    return (
+      <div className="app-shell app-loading-shell">
+        <section className="app-loading-panel" role="status" aria-live="polite">
+          <span>运行模式</span>
+          <h1>{runtimeProfileError ? '运行配置不可用' : '正在读取运行配置'}</h1>
+          <p>{runtimeProfileError || '正在确认相机拓扑与可用功能…'}</p>
+        </section>
+      </div>
+    );
+  }
+
+  const blockedLabel = requestedAppMode === 'capture' && !runtimeProfile.capabilities.captureManagement
+    ? '采集管理'
+    : requestedAppMode === 'bar-surface' && !runtimeProfile.capabilities.reconstruction
+      ? '3D 重建'
+      : null;
+  const appMode = blockedLabel ? 'terminal' : requestedAppMode;
+
+  return (
+    <ConfiguredApp
+      runtimeProfile={runtimeProfile}
+      appMode={appMode}
+      capabilityMessage={blockedLabel ? `当前运行模式不支持${blockedLabel}，已返回检测终端` : undefined}
+    />
+  );
+}
+
+function ConfiguredApp({
+  runtimeProfile,
+  appMode,
+  capabilityMessage,
+}: {
+  runtimeProfile: PublicRuntimeProfile;
+  appMode: AppMode;
+  capabilityMessage?: string;
+}) {
   if (appMode === 'bar-surface') {
     const theme = readStoredTheme();
     const themeStyle = readStoredThemeStyle();
     return (
       <div className={`app-shell theme-${theme} style-${themeStyle} standalone-tool-shell bar-surface-standalone-shell`}>
         <StandaloneWindowTitlebar kind="bar-surface" title="3D 重建工作台" />
-        <BarSurfaceApp />
+        <BarSurfaceApp expectedCameraCount={runtimeProfile.cameraCount} />
       </div>
     );
   }
@@ -292,10 +367,11 @@ export default function App() {
         <BrandHeader
           status={status}
           theme={theme}
+          expectedCameraCount={runtimeProfile.cameraCount}
           activeNav="online"
           runtimeMode={{
             kind: 'bkv',
-            cameraCount: bkvStatus?.cameraCount ?? 6,
+            cameraCount: runtimeProfile.cameraCount,
             availableCameraCount: 0,
             batchId: bkvStatus?.batchId ?? '未连接',
             dataReady: false,
@@ -314,6 +390,7 @@ export default function App() {
         </main>
         <AppFooter
           activeNav="online"
+          capabilities={runtimeProfile.capabilities}
           terminalViews={{
             online: { available: true, active: false, onOpen: () => selectTerminalView('online') },
             bkv: { available: true, active: true, onOpen: retryBkvLoad },
@@ -343,6 +420,7 @@ export default function App() {
     <InspectionDashboard
       key={resolvedTerminalMode}
       snapshot={snapshot}
+      runtimeProfile={runtimeProfile}
       bkvAvailable={bkvAvailable}
       terminalMode={resolvedTerminalMode}
       bkvStatus={bkvStatus}
@@ -351,6 +429,7 @@ export default function App() {
           ? '当前采集源为 BKV，在线相机模式不可用'
           : undefined
       }
+      capabilityMessage={capabilityMessage}
       onSnapshotChange={setSnapshot}
       onTerminalViewChange={selectTerminalView}
     />
@@ -359,18 +438,22 @@ export default function App() {
 
 function InspectionDashboard({
   snapshot,
+  runtimeProfile,
   bkvAvailable,
   terminalMode,
   bkvStatus,
   modeMismatchMessage,
+  capabilityMessage,
   onSnapshotChange,
   onTerminalViewChange,
 }: {
   snapshot: InspectionSnapshot;
+  runtimeProfile: PublicRuntimeProfile;
   bkvAvailable: boolean;
   terminalMode: 'online' | 'bkv';
   bkvStatus: BkvStatus | null;
   modeMismatchMessage?: string;
+  capabilityMessage?: string;
   onSnapshotChange: (snapshot: InspectionSnapshot) => void;
   onTerminalViewChange: (view: 'online' | 'bkv') => void;
 }) {
@@ -449,6 +532,7 @@ function InspectionDashboard({
   const previousNetworkSnapshotRef = useRef<SystemNetworkSnapshot | null>(null);
   const windowApi = useMemo(() => getTauriWindowApi(), []);
   const responsiveClassName = getResponsiveProfileClassName(getResponsiveProfile(viewportSize));
+  const runtimeCameraLanes = createSequentialCameraLanes(runtimeProfile.cameraCount);
 
   useEffect(() => {
     const handleResize = () => setViewportSize(readViewportSize());
@@ -1165,6 +1249,7 @@ function InspectionDashboard({
             status={deviceStatus}
             operation={operationState}
             capture={captureSnapshot}
+            expectedCameraCount={runtimeProfile.cameraCount}
             onAction={handleSystemAction}
             className="standalone-capture-manager"
           />
@@ -1188,6 +1273,7 @@ function InspectionDashboard({
       <BrandHeader
         status={deviceStatus}
         theme={uiState.theme}
+        expectedCameraCount={runtimeProfile.cameraCount}
         capture={captureSnapshot}
         network={networkSnapshot}
         trigger={triggerGatewayStatus}
@@ -1211,6 +1297,9 @@ function InspectionDashboard({
         onNavChange={(activeNav) => setState({ activeNav })}
         onDragMouseDown={(event) => void handleTitlebarMouseDown(event)}
       />
+      {capabilityMessage ? (
+        <div className="runtime-capability-message" role="status">{capabilityMessage}</div>
+      ) : null}
       {uiState.activeNav === 'online' ? (
         <div className="online-workspace">
           <LeftSidebar
@@ -1243,7 +1332,7 @@ function InspectionDashboard({
                   artifactMode={artifactMode}
                   inspectionId={activeInspection?.inspectionId}
                   captureImages={activeSnapshot.captureImages ?? []}
-                  cameraLanes={terminalMode === 'bkv' ? BKV_CAMERA_LANES : ONLINE_CAMERA_LANES}
+                  cameraLanes={runtimeCameraLanes}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
                   surfaceCameras={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameras : undefined}
                   artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
@@ -1407,12 +1496,20 @@ function InspectionDashboard({
           ) : uiState.activeNav === 'alarms' ? (
             <AlarmCenter />
           ) : (
-            <SystemStatusPage status={deviceStatus} operation={operationState} capture={captureSnapshot} onAction={handleSystemAction} />
+            <SystemStatusPage
+              status={deviceStatus}
+              operation={operationState}
+              capture={captureSnapshot}
+              capabilities={runtimeProfile.capabilities}
+              cameraCount={runtimeProfile.cameraCount}
+              onAction={handleSystemAction}
+            />
           )}
         </>
       )}
       <AppFooter
         activeNav={uiState.activeNav}
+        capabilities={runtimeProfile.capabilities}
         terminalViews={{
           online: { available: true, active: terminalMode === 'online', onOpen: () => onTerminalViewChange('online') },
           bkv: { available: bkvAvailable, active: terminalMode === 'bkv', onOpen: () => onTerminalViewChange('bkv') },

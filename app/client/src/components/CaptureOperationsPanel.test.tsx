@@ -72,6 +72,22 @@ beforeEach(() => {
 });
 
 describe('CaptureOperationsPanel', () => {
+  it('uses the configured camera count when the active camera list is temporarily empty', async () => {
+    render(<CaptureOperationsPanel cameraIps={[]} expectedCameraCount={8} />);
+
+    await screen.findByText('当前：current-6-soft-trigger');
+    fireEvent.click(
+      screen.getByLabelText('我确认应用会改变相机当前运行参数，并可能连接设备'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: '应用 Profile' }));
+
+    await waitFor(() => {
+      expect(api.applyCaptureProfile).toHaveBeenCalledWith(
+        expect.objectContaining({ expectedCameras: 8 }),
+      );
+    });
+  });
+
   it('shows provider profile/storage queue state and applies a safe profile', async () => {
     render(
       <CaptureOperationsPanel

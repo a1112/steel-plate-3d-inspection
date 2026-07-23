@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   fetchAdminBkvImportJobs,
   fetchAdminRuntimeProfile,
+  fetchRuntimeProfile,
   retryAdminBkvImportJob,
   saveAdminRuntimeProfile,
   startAdminBkvImportJob,
@@ -57,6 +58,33 @@ describe('runtime profile admin API', () => {
           permissions: ['admin.config'],
         },
       }),
+    );
+  });
+
+  it('reads the public runtime profile without admin credentials', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        schema: 'steel.runtime-profile.public.v1',
+        profileId: 'bkv-6',
+        displayName: profile.displayName,
+        provider: 'bkv',
+        dataSource: 'converted-local',
+        cameraConnection: 'none',
+        cameraCount: 6,
+        cameras: profile.cameras,
+        configHash: 'active',
+        capabilities: profile.capabilities,
+      }),
+    });
+
+    const runtime = await fetchRuntimeProfile();
+
+    expect(runtime.cameraCount).toBe(6);
+    expect(runtime.cameras.map((camera) => camera.id)).toEqual(['C1', 'C2', 'C3', 'C4', 'C5', 'C6']);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4873/api/runtime-profile',
+      expect.objectContaining({ headers: { Accept: 'application/json' } }),
     );
   });
 

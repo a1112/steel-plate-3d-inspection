@@ -23,6 +23,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DeviceStatus } from '../data/inspection';
 import { openBarSurfaceWindow, openCaptureManagementWindow } from '../lib/app-windows';
+import type { RuntimeCapabilities } from '../services/runtime-profile-api';
 import {
   captureProductionOnce,
   fetchProductionStatus,
@@ -550,12 +551,14 @@ export function CaptureManagementApp({
   status,
   operation,
   capture,
+  expectedCameraCount = capture.config?.cameras.length ?? capture.statuses.length,
   onAction,
   className = '',
 }: {
   status: DeviceStatus;
   operation: OperationState;
   capture: CaptureSnapshot;
+  expectedCameraCount?: number;
   onAction: (action: SystemAction) => void;
   className?: string;
 }) {
@@ -1287,7 +1290,7 @@ export function CaptureManagementApp({
         captureProductionOnce({
           ...productionPayload(),
           rounds: 1,
-          expectedCameras: 8,
+          expectedCameras: expectedCameraCount,
           lines: 1000,
           width: 0,
           timeoutMs: 8000,
@@ -2208,6 +2211,7 @@ export function CaptureManagementApp({
               <CaptureOperationsPanel
                 cameraIps={localConfig.cameras.filter((camera) => camera.enabled).map((camera) => camera.ip)}
                 cameraStatuses={overviewStatuses}
+                expectedCameraCount={expectedCameraCount}
               />
             </section>
           ) : activeView === 'logs' ? (
@@ -2451,11 +2455,21 @@ export function SystemStatusPage({
   status,
   operation,
   capture,
+  capabilities = {
+    directCamera: true,
+    captureManagement: true,
+    reconstruction: true,
+    offlineReplay: false,
+  },
+  cameraCount = capture.config?.cameras.length ?? capture.statuses.length,
   onAction,
 }: {
   status: DeviceStatus;
   operation: OperationState;
   capture: CaptureSnapshot;
+  expectedCameraCount?: number;
+  capabilities?: RuntimeCapabilities;
+  cameraCount?: number;
   onAction: (action: SystemAction) => void;
 }) {
   const [embeddedManager, setEmbeddedManager] = useState(true);
@@ -2482,6 +2496,19 @@ export function SystemStatusPage({
     [capture.logs, operation.events],
   );
   const simulationMode = isSimulationCapture(capture);
+
+  if (!capabilities.captureManagement) {
+    return (
+      <main className="workspace-page capture-terminal-page runtime-capability-summary">
+        <section className="mode-error-panel">
+          <span>当前运行模式</span>
+          <h1>离线运行状态</h1>
+          <p>{cameraCount} 路配置相机</p>
+          <p>当前数据源不直接连接相机，硬件采集与三维重建功能未加载。</p>
+        </section>
+      </main>
+    );
+  }
 
   const openIndependentManager = async () => {
     try {
@@ -2536,6 +2563,7 @@ export function SystemStatusPage({
           status={status}
           operation={operation}
           capture={capture}
+          expectedCameraCount={cameraCount}
           onAction={onAction}
           className="embedded-capture-manager"
         />
@@ -2598,10 +2626,12 @@ export function SystemStatusPage({
               <Gauge size={16} />
               内嵌真实管理界面
             </button>
-            <button type="button" onClick={openBarSurfaceWorkbench}>
-              <Box size={16} />
-              3D 重建工作台
-            </button>
+            {capabilities.reconstruction ? (
+              <button type="button" onClick={openBarSurfaceWorkbench}>
+                <Box size={16} />
+                3D 重建工作台
+              </button>
+            ) : null}
             <button type="button" onClick={() => onAction('self-check')}>
               <RefreshCw size={16} />
               刷新终端状态

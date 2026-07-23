@@ -73,9 +73,11 @@ function resultSummary(result: CaptureBatchOperationResult) {
 export function CaptureOperationsPanel({
   cameraIps,
   cameraStatuses = [],
+  expectedCameraCount = cameraIps.length,
 }: {
   cameraIps: string[];
   cameraStatuses?: CaptureCameraStatus[];
+  expectedCameraCount?: number;
 }) {
   const normalizedIps = useMemo(
     () => Array.from(new Set(cameraIps.map((ip) => ip.trim()).filter(Boolean))),
@@ -196,7 +198,7 @@ export function CaptureOperationsPanel({
       () =>
         applyCaptureProfile({
           name: selectedProfile,
-          expectedCameras: normalizedIps.length || 6,
+          expectedCameras: normalizedIps.length || expectedCameraCount,
           autoConnect,
           loadCameraParams: loadParamsOnApply,
           saveToDevice: false,
@@ -300,7 +302,7 @@ export function CaptureOperationsPanel({
           <header>
             <Link size={17} />
             <div>
-              <strong>8 相机连接</strong>
+              <strong>{expectedCameraCount} 相机连接</strong>
               <span>{normalizedIps.length || 0} 个配置地址</span>
             </div>
           </header>
@@ -482,6 +484,7 @@ export function CaptureOperationsPanel({
       <CaptureAdvancedOperations
         cameraIps={normalizedIps}
         cameraStatuses={cameraStatuses}
+        expectedCameraCount={expectedCameraCount}
         profiles={profiles}
         storage={storage}
         onProfilesChange={setProfiles}

@@ -98,6 +98,17 @@ describe('BrandHeader', () => {
     expect(screen.getByText('192.168.20.103')).toBeInTheDocument();
   });
 
+  it('limits online camera status to the configured camera count', () => {
+    renderHeader({ expectedCameraCount: 6 });
+
+    const cameraStatusButton = screen.getByRole('button', { name: '相机状态，在线 5 路，异常 1 路' });
+    fireEvent.click(cameraStatusButton);
+
+    expect(screen.getByText('192.168.20.106')).toBeInTheDocument();
+    expect(screen.queryByText('192.168.20.107')).not.toBeInTheDocument();
+    expect(screen.queryByText('192.168.20.108')).not.toBeInTheDocument();
+  });
+
   it('keeps configuration controls out of the business header and renders one notification entry', () => {
     renderHeader();
 

@@ -23,6 +23,7 @@ export type HeaderRuntimeMode =
 interface BrandHeaderProps {
   status: DeviceStatus;
   theme: ThemeMode;
+  expectedCameraCount?: number;
   capture?: CaptureSnapshot;
   network?: SystemNetworkRateSnapshot | null;
   trigger?: TriggerGatewayStatus | null;
@@ -119,7 +120,7 @@ type ReceiverNetworkTotals = {
 };
 
 const cameraStations = Array.from({ length: 8 }, (_, index) => `${index + 1}号采集相机`);
-const REAL_CAMERA_LIMIT = 8;
+const DEFAULT_CAMERA_COUNT = 8;
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -297,6 +298,7 @@ function createNetworkMonitorPlaceholder(network: SystemNetworkRateSnapshot): Re
 function createReceiverDetailsFromCapture(
   capture: CaptureSnapshot | undefined,
   network?: SystemNetworkRateSnapshot | null,
+  expectedCameraCount = DEFAULT_CAMERA_COUNT,
 ): ReceiverDetail[] {
   const realtimeDetails = createReceiverDetailsFromNetwork(network);
   if (realtimeDetails.length) {
@@ -322,7 +324,8 @@ function createReceiverDetailsFromCapture(
   const health = capture.health;
   const apiOk = Boolean(health) && !capture.error;
   const sdkOk = Boolean(health?.sdkReady);
-  const cameraLinks = capture.statuses.slice(0, REAL_CAMERA_LIMIT).map((camera, index): ReceiverDetail => ({
+  const cameraLimit = Math.max(1, Math.floor(expectedCameraCount));
+  const cameraLinks = capture.statuses.slice(0, cameraLimit).map((camera, index): ReceiverDetail => ({
     index: index + 3,
     channel: `${camera.name || `camera${index + 1}`} 链路`,
     ip: camera.ip || '--',
@@ -358,15 +361,20 @@ function createReceiverDetailsFromCapture(
       bandwidthMbps: 0,
     },
     ...cameraLinks,
-  ].slice(0, 8);
+  ].slice(0, cameraLimit + 2);
 }
 
-function createCameraDetailsFromCapture(capture: CaptureSnapshot | undefined, fallbackPorts: Port[]): CameraDetail[] {
+function createCameraDetailsFromCapture(
+  capture: CaptureSnapshot | undefined,
+  fallbackPorts: Port[],
+  expectedCameraCount: number,
+): CameraDetail[] {
+  const cameraLimit = Math.max(1, Math.floor(expectedCameraCount));
   if (!capture?.statuses.length) {
-    return createCameraDetails(fallbackPorts);
+    return createCameraDetails(fallbackPorts.slice(0, cameraLimit));
   }
 
-  return capture.statuses.slice(0, REAL_CAMERA_LIMIT).map((camera, index) => ({
+  return capture.statuses.slice(0, cameraLimit).map((camera, index) => ({
     index: index + 1,
     station: cameraStation(camera, index),
     ip: camera.ip || '--',
@@ -681,6 +689,7 @@ function SystemStatusDetailPanel({ status }: { status: DeviceStatus }) {
 export function BrandHeader({
   status,
   theme,
+  expectedCameraCount = DEFAULT_CAMERA_COUNT,
   capture,
   network,
   trigger,
@@ -701,7 +710,10 @@ export function BrandHeader({
   const receiverWrapRef = useRef<HTMLDivElement>(null);
   const cameraWrapRef = useRef<HTMLDivElement>(null);
   const systemWrapRef = useRef<HTMLDivElement>(null);
-  const receiverDetails = useMemo(() => createReceiverDetailsFromCapture(capture, network), [capture, network]);
+  const receiverDetails = useMemo(
+    () => createReceiverDetailsFromCapture(capture, network, expectedCameraCount),
+    [capture, expectedCameraCount, network],
+  );
   const receiverRealtime = receiverDetails.some((detail) => detail.realtime);
   const receiverPorts = useMemo(
     () =>
@@ -712,7 +724,10 @@ export function BrandHeader({
       })),
     [receiverDetails],
   );
-  const cameraDetails = useMemo(() => createCameraDetailsFromCapture(capture, status.cameraPorts), [capture, status.cameraPorts]);
+  const cameraDetails = useMemo(
+    () => createCameraDetailsFromCapture(capture, status.cameraPorts, expectedCameraCount),
+    [capture, expectedCameraCount, status.cameraPorts],
+  );
   const cameraPorts = useMemo(
     () =>
       cameraDetails.map((camera) => ({

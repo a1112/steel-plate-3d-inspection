@@ -674,10 +674,12 @@ function BarSurfaceModelPanel({
   manifest,
   mesh,
   meshError,
+  expectedCameraCount,
 }: {
   manifest: BarSurfaceManifest;
   mesh: BarSurfaceMesh | null;
   meshError: string | null;
+  expectedCameraCount: number;
 }) {
   const [yaw, setYaw] = useState(-0.55);
   const [pitch, setPitch] = useState(-0.18);
@@ -756,7 +758,7 @@ function BarSurfaceModelPanel({
       <header className="bar-surface-panel-header">
         <div>
           <span>3D 重建</span>
-          <strong>8 相机闭合表面 + 2D 贴图</strong>
+          <strong>{expectedCameraCount} 相机闭合表面 + 2D 贴图</strong>
         </div>
         <div className="bar-surface-icon-row">
           <div className="bar-surface-view-switch" role="tablist" aria-label="模型显示模式">
@@ -993,6 +995,7 @@ function BarSurfaceCameraTile({ camera }: { camera: BarSurfaceCamera }) {
 
 function BarSurfaceCalibrationPanel({
   manifest,
+  expectedCameraCount,
   fitReport,
   activeCalibration,
   busy,
@@ -1007,6 +1010,7 @@ function BarSurfaceCalibrationPanel({
   onRunWithCalibration,
 }: {
   manifest: BarSurfaceManifest;
+  expectedCameraCount: number;
   fitReport: BarSurfaceCalibrationFitReport | null;
   activeCalibration: ActiveCaptureCalibration | null;
   busy: boolean;
@@ -1062,7 +1066,7 @@ function BarSurfaceCalibrationPanel({
           </div>
           <div>
             <dt>最新拟合</dt>
-            <dd>{fitReport ? `${fitReport.cameraCount ?? 0}/${fitReport.expectedCameras ?? 8}，相比 ${metricText(beforeResidual)} -> ${metricText(afterResidual)}` : '未运行'}</dd>
+            <dd>{fitReport ? `${fitReport.cameraCount ?? 0}/${fitReport.expectedCameras ?? expectedCameraCount}，相比 ${metricText(beforeResidual)} -> ${metricText(afterResidual)}` : '未运行'}</dd>
           </div>
           <div>
             <dt>修正 XML</dt>
@@ -1151,6 +1155,7 @@ function BarSurfaceCalibrationPanel({
 function BarSurfaceHeader({
   latest,
   manifest,
+  expectedCameraCount,
   productionStatus,
   captureMaterials,
   selectedMaterialId,
@@ -1173,6 +1178,7 @@ function BarSurfaceHeader({
 }: {
   latest: BarSurfaceLatestResponse | null;
   manifest: BarSurfaceManifest | null;
+  expectedCameraCount: number;
   productionStatus: BarSurfaceProductionStatus | null;
   captureMaterials: BarSurfaceCaptureMaterial[];
   selectedMaterialId: string;
@@ -1222,7 +1228,7 @@ function BarSurfaceHeader({
           </div>
           <div>
             <span>相机</span>
-            <strong>{manifest ? `${manifest.cameraCount}/8` : '-'}</strong>
+            <strong>{manifest ? `${manifest.cameraCount}/${expectedCameraCount}` : '-'}</strong>
           </div>
           <div>
             <span>算法数据</span>
@@ -1270,7 +1276,7 @@ function BarSurfaceHeader({
               {captureMaterials.length === 0 ? <option value="">暂无采集流水</option> : null}
               {captureMaterials.map((item) => (
                 <option key={item.materialId} value={item.materialId}>
-                  {item.materialId} · {item.cameraCount}/8 · {item.minDepthFrames} 帧
+                  {item.materialId} · {item.cameraCount}/{expectedCameraCount} · {item.minDepthFrames} 帧
                 </option>
               ))}
             </select>
@@ -1334,7 +1340,7 @@ function BarSurfaceHeader({
   );
 }
 
-export function BarSurfaceApp() {
+export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount?: number }) {
   const [latest, setLatest] = useState<BarSurfaceLatestResponse | null>(null);
   const [mesh, setMesh] = useState<BarSurfaceMesh | null>(null);
   const [captureMaterials, setCaptureMaterials] = useState<BarSurfaceCaptureMaterial[]>([]);
@@ -1782,7 +1788,7 @@ export function BarSurfaceApp() {
 
   const handleCalibrationFit = async () => {
     setCalibrationBusy(true);
-    setCalibrationMessage('正在采集 8 相机标定帧；检测到有效圆形标定物且质量门通过后将自动修正并激活…');
+    setCalibrationMessage(`正在采集 ${expectedCameraCount} 相机标定帧；检测到有效圆形标定物且质量门通过后将自动修正并激活…`);
     setLoadError(null);
     try {
       const calibrationPath = latest?.manifest.calibration?.path || '';
@@ -1791,7 +1797,7 @@ export function BarSurfaceApp() {
         rows: '250,500,750',
         maxPointsPerCamera: 2400,
         maxShiftMm: 5,
-        expectedCameras: 8,
+        expectedCameras: expectedCameraCount,
         autoActivate: true,
         profile: 'current-8-time-trigger',
         onTaskStatus: (task) => setActiveTask(task),
@@ -1800,15 +1806,15 @@ export function BarSurfaceApp() {
       const before = payload.result.fitBefore?.meanAbsResidual;
       const after = payload.result.fitAfter?.meanAbsResidual;
       if (!payload.result.targetDetection?.detected) {
-        setCalibrationMessage(`8 相机采集完成，但未检测到有效标定物：${payload.result.targetDetection?.reasons?.join('、') || '无有效圆形轮廓'}；未生成或激活修正。`);
+        setCalibrationMessage(`${expectedCameraCount} 相机采集完成，但未检测到有效标定物：${payload.result.targetDetection?.reasons?.join('、') || '无有效圆形轮廓'}；未生成或激活修正。`);
       } else if (!payload.result.correctionAccepted) {
         setCalibrationMessage(`已检测到标定物，但修正质量门未通过：${payload.result.correctionQuality?.reasons?.join('、') || '拟合改善不足'}；未激活。`);
       } else if (payload.autoActivation?.activated) {
         const status = await readActiveCaptureCalibration('current-8-time-trigger');
         setActiveCalibration(status);
-        setCalibrationMessage(`8 相机自动标定修正已激活：${payload.autoActivation.version || status.activeCalibration?.version || '新版本'}，残差 ${metricText(before)} -> ${metricText(after)}；未写入相机设备。`);
+        setCalibrationMessage(`${expectedCameraCount} 相机自动标定修正已激活：${payload.autoActivation.version || status.activeCalibration?.version || '新版本'}，残差 ${metricText(before)} -> ${metricText(after)}；未写入相机设备。`);
       } else {
-        setCalibrationMessage(`8 相机标定拟合完成：${payload.result.cameraCount ?? 0}/8，残差 ${metricText(before)} -> ${metricText(after)}；自动激活未执行。`);
+        setCalibrationMessage(`${expectedCameraCount} 相机标定拟合完成：${payload.result.cameraCount ?? 0}/${expectedCameraCount}，残差 ${metricText(before)} -> ${metricText(after)}；自动激活未执行。`);
       }
     } catch (error) {
       setCalibrationMessage(error instanceof Error ? error.message : '自动标定修正失败');
@@ -1865,6 +1871,7 @@ export function BarSurfaceApp() {
       <BarSurfaceHeader
         latest={latest}
         manifest={manifest}
+        expectedCameraCount={expectedCameraCount}
         productionStatus={productionStatus}
         captureMaterials={captureMaterials}
         selectedMaterialId={selectedMaterialId}
@@ -1899,6 +1906,7 @@ export function BarSurfaceApp() {
         <>
           <BarSurfaceCalibrationPanel
             manifest={manifest}
+            expectedCameraCount={expectedCameraCount}
             fitReport={calibrationFitReport}
             activeCalibration={activeCalibration}
             busy={calibrationBusy || calibrationActivationBusy || running}
@@ -1917,7 +1925,7 @@ export function BarSurfaceApp() {
             <header className="bar-surface-panel-header">
               <div>
                 <span>2D 平铺</span>
-                <strong>8 相机最新裁剪图</strong>
+                <strong>{expectedCameraCount} 相机最新裁剪图</strong>
               </div>
               <div className="bar-surface-icon-row">
                 <ImageIcon size={18} />
@@ -1934,7 +1942,12 @@ export function BarSurfaceApp() {
               ))}
             </div>
           </div>
-            <BarSurfaceModelPanel manifest={manifest} mesh={mesh} meshError={meshError} />
+            <BarSurfaceModelPanel
+              manifest={manifest}
+              mesh={mesh}
+              meshError={meshError}
+              expectedCameraCount={expectedCameraCount}
+            />
           </section>
         </>
       ) : (

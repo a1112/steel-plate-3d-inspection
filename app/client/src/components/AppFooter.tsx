@@ -8,6 +8,7 @@ import {
   openParameterManagementWindow,
 } from '../lib/app-windows';
 import { notify } from '../state/notifications';
+import type { RuntimeCapabilities } from '../services/runtime-profile-api';
 import type { AnalysisViewMode } from './AlarmAnalysis';
 import type { PlateMapViewMode } from './PlateMap';
 import type { NavKey } from './TopNav';
@@ -44,6 +45,7 @@ interface AppFooterProps {
   onParameterManagementOpen?: () => unknown;
   onCaptureManagementOpen?: () => unknown;
   onBarSurfaceOpen?: () => unknown;
+  capabilities?: RuntimeCapabilities;
 }
 
 const surfaceViewOptions: Array<{ id: PlateMapViewMode; label: string }> = [
@@ -78,6 +80,12 @@ export function AppFooter({
   onParameterManagementOpen = openParameterManagementWindow,
   onCaptureManagementOpen = openCaptureManagementWindow,
   onBarSurfaceOpen = openBarSurfaceWindow,
+  capabilities = {
+    directCamera: true,
+    captureManagement: true,
+    reconstruction: true,
+    offlineReplay: false,
+  },
 }: AppFooterProps) {
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
@@ -200,14 +208,18 @@ export function AppFooter({
           <Database size={15} />
           <span>后台管理</span>
         </button>
-        <button type="button" onClick={() => void runWindowAction('采集管理', onCaptureManagementOpen)}>
-          <MonitorCog size={15} />
-          <span>采集管理</span>
-        </button>
-        <button type="button" onClick={() => void runWindowAction('3D 重建', onBarSurfaceOpen)}>
-          <Box size={15} />
-          <span>3D 重建</span>
-        </button>
+        {capabilities.captureManagement ? (
+          <button type="button" onClick={() => void runWindowAction('采集管理', onCaptureManagementOpen)}>
+            <MonitorCog size={15} />
+            <span>采集管理</span>
+          </button>
+        ) : null}
+        {capabilities.reconstruction ? (
+          <button type="button" onClick={() => void runWindowAction('3D 重建', onBarSurfaceOpen)}>
+            <Box size={15} />
+            <span>3D 重建</span>
+          </button>
+        ) : null}
         <div className="app-footer-more" ref={moreMenuRef}>
           <button
             type="button"

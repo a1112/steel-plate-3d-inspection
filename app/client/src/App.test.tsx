@@ -3,6 +3,52 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App, { formatStorageBytes, formatStorageWarning } from './App';
 import { getMockInspectionSnapshot } from './data/inspection';
 
+const bkvRuntimeProfile = {
+  schema: 'steel.runtime-profile.public.v1',
+  profileId: 'bkv-6',
+  displayName: 'BKV 六相机离线转换',
+  provider: 'bkv',
+  dataSource: 'converted-local',
+  cameraConnection: 'none',
+  cameraCount: 6,
+  cameras: Array.from({ length: 6 }, (_, index) => ({
+    id: `C${index + 1}`,
+    displayOrder: index + 1,
+    sourceCameraId: index + 1,
+    role: `legacy-${index + 1}`,
+  })),
+  configHash: 'bkv-active',
+  capabilities: {
+    directCamera: false,
+    captureManagement: false,
+    reconstruction: false,
+    offlineReplay: true,
+  },
+};
+
+const directRuntimeProfile = {
+  ...bkvRuntimeProfile,
+  profileId: 'direct-8',
+  displayName: '八相机在线直连',
+  provider: 'direct',
+  dataSource: 'online',
+  cameraConnection: 'headless-cpp',
+  cameraCount: 8,
+  cameras: Array.from({ length: 8 }, (_, index) => ({
+    id: `C${index + 1}`,
+    displayOrder: index + 1,
+    sourceCameraId: index + 1,
+    role: `camera-${index + 1}`,
+  })),
+  configHash: 'direct-active',
+  capabilities: {
+    directCamera: true,
+    captureManagement: true,
+    reconstruction: true,
+    offlineReplay: false,
+  },
+};
+
 function getDefectTableRows(container: HTMLElement) {
   return Array.from(container.querySelectorAll('.defect-table tbody tr')).map((row) => row.textContent?.trim() ?? '');
 }
@@ -50,6 +96,9 @@ describe('App BKV provider selection', () => {
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       requestedUrls.push(url);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
+      }
       if (url.includes('/api/bkv/status')) {
         return new Response(JSON.stringify({
           provider: 'bkv', ready: true, mode: 'offline-replay-no-camera-hardware', cameraMode: 'offline-file',
@@ -164,11 +213,15 @@ describe('App BKV provider selection', () => {
     expect(screen.queryByText(/每 8 秒刷新/)).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'BKV 离线回放' })).not.toBeInTheDocument();
     expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '采集管理' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '3D 重建' })).not.toBeInTheDocument();
     expect(requestedUrls.some((url) => url.includes('/api/inspection/snapshot'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/capture/health'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/trigger/status'))).toBe(false);
-    expect(requestedUrls.some((url) => url.includes('/api/inspection-world/meta') && url.includes('1893700'))).toBe(true);
     expect(await screen.findByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
+    await waitFor(() => {
+      expect(requestedUrls.some((url) => url.includes('/api/inspection-world/meta') && url.includes('1893700'))).toBe(true);
+    });
     const canvas = await screen.findByTestId('inspection-world-canvas');
     await waitFor(() => expect(canvas).toHaveAttribute('data-locatable-defects', '1'));
     expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(1000 / 600, 6);
@@ -212,6 +265,9 @@ describe('App BKV provider selection', () => {
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       requestedUrls.push(url);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
+      }
       if (url.includes('/api/bkv/status')) {
         return new Response(null, { status: 404 });
       }
@@ -236,6 +292,9 @@ describe('App BKV provider selection', () => {
     window.history.replaceState(null, '', '/?app=terminal&view=bkv');
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
+      }
       if (url.includes('/api/bkv/status')) {
         return new Response(JSON.stringify({
           provider: 'bkv', ready: true, mode: 'offline-replay-no-camera-hardware', cameraMode: 'offline-file',
@@ -266,6 +325,12 @@ describe('App online severity filters', () => {
       'fetch',
       vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
         const url = String(input);
+        if (url.includes('/api/runtime-profile')) {
+          return {
+            ok: true,
+            json: async () => directRuntimeProfile,
+          };
+        }
         if (url.includes('/api/inspection/settings')) {
           return {
             ok: true,
@@ -371,5 +436,64 @@ describe('App online severity filters', () => {
     expect(screen.getByRole('button', { name: '凹坑类别过滤，当前3项' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '严重等级过滤，当前4项' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '本钢管统计' })).not.toBeInTheDocument();
+  });
+});
+
+describe('App runtime capability routing', () => {
+  it.each([
+    ['capture', '采集管理'],
+    ['bar-surface', '3D 重建'],
+  ])('redirects the %s deep link to the terminal when BKV disables %s', async (app, label) => {
+    window.history.replaceState(null, '', `/?app=${app}`);
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
+      }
+      if (url.includes('/api/bkv/status')) {
+        return new Response(JSON.stringify({
+          provider: 'bkv',
+          ready: true,
+          mode: 'offline-replay-no-camera-hardware',
+          cameraMode: 'offline-file',
+          cameraCount: 6,
+          physicalCamerasOnline: 0,
+          batchId: 'legacy-1893700-1893710',
+          materialCount: 0,
+          nextIndex: 0,
+          nextLegacySeqNo: null,
+          completed: true,
+        }), { status: 200 });
+      }
+      if (url.includes('/api/bkv/materials')) {
+        return new Response(JSON.stringify({ provider: 'bkv', materials: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText(`当前运行模式不支持${label}，已返回检测终端`)).toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get('app')).toBe('terminal');
+    expect(screen.queryByRole('heading', { name: label })).not.toBeInTheDocument();
+  });
+
+  it('keeps direct-only deep links available for an eight-camera direct profile', async () => {
+    window.history.replaceState(null, '', '/?app=capture');
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(directRuntimeProfile), { status: 200 });
+      }
+      if (url.includes('/api/bkv/status')) {
+        return new Response(null, { status: 404 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+
+    expect((await screen.findAllByText('采集管理')).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/当前运行模式不支持/)).not.toBeInTheDocument();
   });
 });
