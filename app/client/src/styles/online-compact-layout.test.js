@@ -74,14 +74,14 @@ describe('compact online detection layout CSS contract', () => {
   });
 
   it('keeps the expanded analysis area short and the collapsed layout single-row', () => {
-    expectDeclaration('.center-column', 'grid-template-rows', 'minmax(0, 1fr) minmax(160px, 0.5fr)');
-    expectDeclaration('.theme-dark .center-column', 'grid-template-rows', 'minmax(0, 1fr) minmax(160px, 0.5fr)');
+    expectDeclaration('.center-column', 'grid-template-rows', 'minmax(0, 1fr) minmax(150px, 0.25fr)');
+    expectDeclaration('.theme-dark .center-column', 'grid-template-rows', 'minmax(0, 1fr) minmax(150px, 0.25fr)');
     expectDeclaration('.center-column.analysis-collapsed', 'grid-template-rows', 'minmax(0, 1fr)');
 
     const centerRows = ruleBlocks('.center-column')
       .map((block) => declaration(block, 'grid-template-rows'))
       .filter(Boolean);
-    expect(centerRows).toContain('minmax(0, 1fr) minmax(140px, 0.45fr)');
+    expect(centerRows).toContain('minmax(0, 1fr) minmax(120px, 0.2fr)');
     expect(centerRows.every((rows) => !rows.includes('220px') && !rows.includes('240px'))).toBe(true);
 
     expectDeclaration('.window-controls .window-analysis-collapse', 'border-right', '1px solid var(--line)');

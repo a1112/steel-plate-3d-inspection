@@ -1864,7 +1864,7 @@ button {
 }
 
 .center-column {
-  grid-template-rows: minmax(0, 1fr) minmax(160px, 0.5fr);
+  grid-template-rows: minmax(0, 1fr) minmax(150px, 0.25fr);
 }
 
 .right-column {
@@ -8256,7 +8256,7 @@ button {
   }
 
   .center-column {
-    grid-template-rows: minmax(0, 1fr) minmax(140px, 0.45fr);
+    grid-template-rows: minmax(0, 1fr) minmax(120px, 0.2fr);
   }
 
   .right-column {
@@ -8629,7 +8629,7 @@ button {
 
 .theme-dark .center-column {
   gap: 8px;
-  grid-template-rows: minmax(0, 1fr) minmax(160px, 0.5fr);
+  grid-template-rows: minmax(0, 1fr) minmax(150px, 0.25fr);
 }
 
 .theme-dark .right-column {

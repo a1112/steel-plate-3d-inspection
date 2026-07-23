@@ -351,7 +351,7 @@ export function AlarmAnalysis({
     widthProfile: ChartPoint[];
     status: string;
   }>({ pointCloud: null, lengthProfile: [], widthProfile: [], status: '' });
-  const isCollapsed = selectedDefect ? Boolean(collapsed) : false;
+  const isCollapsed = Boolean(collapsed);
   const panelClassName = `alarm-analysis-panel analysis-view-${viewMode}`;
 
   useEffect(() => {

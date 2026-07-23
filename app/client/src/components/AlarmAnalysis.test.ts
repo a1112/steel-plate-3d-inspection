@@ -123,6 +123,19 @@ describe('AlarmAnalysis', () => {
     expect(screen.queryByRole('heading', { name: '灰度图' })).not.toBeInTheDocument();
   });
 
+  it('fully collapses the empty lower information area without a selected defect', () => {
+    const { container } = render(createElement(AlarmAnalysis, {
+      selectedDefect: null,
+      heightProfile: [],
+      captureImages: [],
+      headerless: true,
+      collapsed: true,
+    }));
+
+    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByText('当前钢管暂无缺陷')).not.toBeInTheDocument();
+  });
+
   it('adds horizontal drag and wheel zoom controls to the point cloud', () => {
     render(createElement(AlarmAnalysis, { selectedDefect: defect, heightProfile: points, headerless: true, artifactMode: 'demo' }));
 
