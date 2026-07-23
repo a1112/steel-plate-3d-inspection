@@ -19,6 +19,28 @@ from PIL import Image
 SCHEMA = "bkv-runtime-v1"
 
 
+def load_verified_runtime_manifest(
+    path: Path, *, expected_cameras: int
+) -> dict[str, Any]:
+    """Load the provider manifest with its stable top-level identity gates."""
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid BKV runtime manifest: {path}: {error}") from error
+    if not isinstance(manifest, dict) or manifest.get("schema") != SCHEMA:
+        raise ValueError(f"BKV runtime manifest schema must be {SCHEMA}")
+    if int(manifest.get("cameraCount", 0)) != expected_cameras:
+        raise ValueError(
+            f"BKV runtime manifest must declare {expected_cameras} cameras"
+        )
+    materials = manifest.get("materials")
+    if not isinstance(materials, list):
+        raise ValueError("BKV runtime manifest materials must be an array")
+    if int(manifest.get("materialCount", -1)) != len(materials):
+        raise ValueError("BKV runtime manifest material count mismatch")
+    return manifest
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:

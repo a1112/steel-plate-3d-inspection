@@ -7,7 +7,7 @@ Environment templates live in `config/env`.
 ## BKV offline runtime manifest
 
 After converting legacy `.d3img` files and building the six-camera previews, build the
-strict runtime manifest consumed by the formal `bkv` provider:
+strict read-only source manifest consumed by the BKV import service:
 
 ```powershell
 python scripts/build_bkv_runtime_manifest.py `
@@ -29,6 +29,52 @@ Run its contract tests with:
 python -m unittest scripts.test_bkv_runtime_manifest -v
 ```
 
+## BKV standard-store import service
+
+The runtime does not treat the legacy manifest or image directories as the
+business record store. The independent importer reads the active
+`config/project.json` profile, verifies the six configured cameras and every
+JPEG/NPZ size, hash, frame identity, and NPZ camera/material/frame identity, then
+publishes normalized records beneath the profile's `storage.convertedRoot`.
+
+```powershell
+python scripts/bkv_import_service.py --project config/project.json --once
+python scripts/bkv_import_service.py --project config/project.json --status
+python scripts/bkv_import_service.py --project config/project.json --retry <job-id>
+python scripts/bkv_import_service.py --project config/project.json --serve --port 4893
+```
+
+The service exposes only `GET /health`, `GET /status`, `POST /start`, and
+`POST /retry/<job-id>` on the configured loopback interface. It does not serve
+business records or arbitrary files.
+
+```text
+<convertedRoot>/
+  catalog.db
+  records/<inspectionId>/
+    record.json
+    source-provenance.json
+    cameras/C1..C6/frames/<sequence>/intensity.jpg
+    cameras/C1..C6/frames/<sequence>/depth.npz
+    defects/defects.json
+  imports/.staging/<jobId>/<inspectionId>/
+  imports/quarantine/<jobId>-<inspectionId>.json
+```
+
+`catalog.db` contains an import job/record ledger and normalized
+`material_session`, `production_inspection`, `production_defect`, and
+`capture_file` indexes. Publication uses same-volume staging and atomic directory
+rename, followed by one SQLite transaction per record. Re-running an identical
+source/configuration is idempotent. Invalid or incomplete records are quarantined;
+C7/C8 are never synthesized. Source files are opened read-only and are never
+renamed, rewritten, or timestamp-adjusted.
+
+Run the importer contract tests with:
+
+```powershell
+python -m unittest scripts.test_bkv_import_service -v
+```
+
 Start the service and client in BKV mode after copying
 `config/env/bkv.env.example` to a machine-local file and correcting its absolute
 data paths:
@@ -38,13 +84,14 @@ scripts/run-service.ps1 -EnvFile config/env/bkv.env.example
 scripts/run-client-dev.ps1 -EnvFile config/env/client.env.example
 ```
 
-The client switches to the dedicated compatibility workspace only when
-`GET /api/bkv/status` explicitly returns a ready `provider=bkv`. Read-only material
-and whitelisted artifact endpoints are local display APIs, matching the existing
-inspection snapshot policy. Advancing or resetting the durable replay cursor still
-requires an authenticated `admin.services` session. In BKV mode camera lifecycle,
-parameter, stream, calibration, ROI, and continuous-capture mutations return the
-stable `bkv_hardware_operation_forbidden` error.
+The client switches to compatibility behavior from the sanitized
+`GET /api/runtime-profile` capabilities. Read-only material and whitelisted
+artifact endpoints are local display APIs, matching the existing inspection
+snapshot policy. Advancing or resetting the durable replay cursor still requires
+an authenticated `admin.services` session. When the active profile lacks direct
+camera capabilities, camera lifecycle, parameter, stream, calibration, ROI,
+continuous-capture, and reconstruction mutations return the stable
+`runtime_capability_unavailable` error.
 
 The replay exits naturally after item 11: capture-once and replay-next then report
 `bkv_replay_completed`/`completed=true` without wrapping to the first item. Reset is

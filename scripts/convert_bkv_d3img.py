@@ -104,6 +104,39 @@ def validate_artifact(
             raise D3ImgFormatError("NPZ valid point count mismatch")
 
 
+def validate_artifact_identity(
+    path: Path,
+    *,
+    expected_camera_id: int,
+    expected_legacy_seq_no: int,
+    expected_frame_no: int,
+) -> None:
+    """Validate the stable identity fields needed by downstream importers."""
+    try:
+        artifact = np.load(path, allow_pickle=False)
+    except (OSError, ValueError) as error:
+        raise D3ImgFormatError(f"NPZ artifact cannot be opened: {path}: {error}") from error
+    with artifact:
+        if set(artifact.files) != NPZ_FIELDS:
+            raise D3ImgFormatError(f"NPZ field mismatch: {sorted(artifact.files)}")
+        if str(artifact["format_version"]) != FORMAT_VERSION:
+            raise D3ImgFormatError("NPZ format version mismatch")
+        identity = (
+            int(artifact["camera_id"]),
+            int(artifact["legacy_seq_no"]),
+            int(artifact["frame_no"]),
+        )
+        expected = (
+            expected_camera_id,
+            expected_legacy_seq_no,
+            expected_frame_no,
+        )
+        if identity != expected:
+            raise D3ImgFormatError(
+                f"NPZ identity mismatch: found {identity}, expected {expected}"
+            )
+
+
 def write_preview_atomic(path: Path, depth: np.ndarray, valid_mask: np.ndarray) -> None:
     from PIL import Image
 
