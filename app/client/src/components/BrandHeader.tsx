@@ -17,6 +17,10 @@ interface BrandHeaderProps {
   trigger?: TriggerGatewayStatus | null;
   services?: ServiceStatusPanel;
   activeNav: NavKey;
+  analysisCollapse?: {
+    collapsed: boolean;
+    onToggle: () => void;
+  };
   onNavChange: (next: NavKey) => void;
   onDragMouseDown: (event: MouseEvent<HTMLElement>) => void;
 }
@@ -670,6 +674,7 @@ export function BrandHeader({
   trigger,
   services,
   activeNav,
+  analysisCollapse,
   onNavChange,
   onDragMouseDown,
 }: BrandHeaderProps) {
@@ -879,7 +884,7 @@ export function BrandHeader({
           <Cpu size={13} />
           <Activity size={13} />
         </div>
-        <WindowControls />
+        <WindowControls analysisCollapse={analysisCollapse} />
       </div>
     </header>
   );

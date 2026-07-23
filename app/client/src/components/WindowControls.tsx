@@ -1,8 +1,15 @@
-import { Copy, Minus, Square, X } from 'lucide-react';
+import { ChevronDown, ChevronUp, Copy, Minus, Square, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { getTauriWindowApi } from '../lib/tauri-window';
 
-export function WindowControls() {
+interface WindowControlsProps {
+  analysisCollapse?: {
+    collapsed: boolean;
+    onToggle: () => void;
+  };
+}
+
+export function WindowControls({ analysisCollapse }: WindowControlsProps) {
   const windowApi = useMemo(() => getTauriWindowApi(), []);
   const [isMaximized, setIsMaximized] = useState(false);
 
@@ -38,6 +45,17 @@ export function WindowControls() {
 
   return (
     <div className="window-controls" data-no-drag>
+      {analysisCollapse ? (
+        <button
+          type="button"
+          className="window-analysis-collapse"
+          aria-label={analysisCollapse.collapsed ? '展开缺陷分析区' : '收起缺陷分析区'}
+          aria-expanded={!analysisCollapse.collapsed}
+          onClick={analysisCollapse.onToggle}
+        >
+          {analysisCollapse.collapsed ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        </button>
+      ) : null}
       <button type="button" title="最小化" onClick={() => void windowApi.minimize().catch(() => {})}>
         <Minus size={14} />
       </button>

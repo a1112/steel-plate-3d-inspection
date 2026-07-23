@@ -27,6 +27,25 @@ function renderHeader(overrides: Partial<ComponentProps<typeof BrandHeader>> = {
 }
 
 describe('BrandHeader', () => {
+  it('places the online analysis collapse control immediately before minimize', () => {
+    const onToggle = vi.fn();
+    renderHeader({ analysisCollapse: { collapsed: false, onToggle } });
+
+    const collapse = screen.getByRole('button', { name: '收起缺陷分析区' });
+    expect(collapse).toHaveAttribute('aria-expanded', 'true');
+    expect(collapse.nextElementSibling).toBe(screen.getByTitle('最小化'));
+
+    fireEvent.click(collapse);
+    expect(onToggle).toHaveBeenCalledOnce();
+  });
+
+  it('does not show an analysis collapse control without online analysis context', () => {
+    renderHeader();
+
+    expect(screen.queryByRole('button', { name: '收起缺陷分析区' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '展开缺陷分析区' })).not.toBeInTheDocument();
+  });
+
   it('does not render the removed partner brand mark in the window header', () => {
     const removedBrandText = '\u9996\u94a2\u96c6\u56e2';
     renderHeader();
