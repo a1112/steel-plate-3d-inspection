@@ -68,14 +68,31 @@ describe('App BKV provider selection', () => {
               cylinder: { path: 'preview/cylinder.json', size: 1, sha256: 'b'.repeat(64) },
               summary: { path: 'preview/summary.json', size: 1, sha256: 'c'.repeat(64) },
             },
+          }, {
+            legacySeqNo: 1893701,
+            legacyCheckRecordSeqNo: 661701,
+            steelId: '253B09401250925A12004329',
+            steelType: '37Mn/2',
+            lengthMm: 12096,
+            outerDiameterLegacyValue: 232.939,
+            wallThicknessMm: null,
+            inspectionTime: '2025-09-26 03:40:36',
+            defects: [],
+            cameras: [],
+            artifacts: {
+              unwrapped: { path: 'preview/unwrapped-2.png', size: 1, sha256: 'd'.repeat(64) },
+              cylinder: { path: 'preview/cylinder-2.json', size: 1, sha256: 'e'.repeat(64) },
+              summary: { path: 'preview/summary-2.json', size: 1, sha256: 'f'.repeat(64) },
+            },
           }],
         }), { status: 200 });
       }
       if (url.includes('/api/inspection-world/meta')) {
+        const recordId = new URL(url).searchParams.get('recordId') ?? '1893700';
         return new Response(JSON.stringify({
           schema: 'steel.inspection-world.meta.v1',
           provider: 'bkv',
-          recordId: '1893700',
+          recordId,
           sourceFrameCount: 6,
           world: {
             width: 600,
@@ -96,10 +113,11 @@ describe('App BKV provider selection', () => {
         }), { status: 200 });
       }
       if (url.includes('/api/inspection-world/defects')) {
+        const recordId = new URL(url).searchParams.get('recordId') ?? '1893700';
         return new Response(JSON.stringify({
           schema: 'steel.inspection-world.defects.v1',
           provider: 'bkv',
-          recordId: '1893700',
+          recordId,
           defects: [],
         }), { status: 200 });
       }
@@ -113,14 +131,23 @@ describe('App BKV provider selection', () => {
     expect(screen.getByText('6/6')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '检测记录' })).toBeInTheDocument();
     expect(screen.getAllByText('253B09401250925A12004328').length).toBeGreaterThan(0);
-    expect(screen.getByText('BKV 离线数据')).toBeInTheDocument();
+    expect(screen.getByText('来源：旧 BKV 文件')).toBeInTheDocument();
+    expect(screen.getByText(/BKV 离线数据/)).toBeInTheDocument();
+    expect(screen.getByText('硬件控制已禁用')).toBeInTheDocument();
     expect(screen.getAllByText('轧折').length).toBeGreaterThan(0);
+    expect(screen.getByText('BKV 离线记录')).toBeInTheDocument();
+    expect(screen.queryByText('实时跟随最新检测')).not.toBeInTheDocument();
+    expect(screen.queryByText(/每 8 秒刷新/)).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'BKV 离线回放' })).not.toBeInTheDocument();
     expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
     expect(requestedUrls.some((url) => url.includes('/api/inspection/snapshot'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/capture/health'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/trigger/status'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/inspection-world/meta') && url.includes('1893700'))).toBe(true);
+    expect(await screen.findByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
+
+    fireEvent.click(screen.getByText('253B09401250925A12004329'));
+    expect(await screen.findByLabelText('1893701 检测图像滚动视图')).toHaveAttribute('data-record-id', '1893701');
 
     const moreButton = screen.getByRole('button', { name: '更多功能' });
     fireEvent.click(moreButton);

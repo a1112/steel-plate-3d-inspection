@@ -1905,9 +1905,28 @@ button {
   font-size: 11px;
 }
 
+.sidebar-data-source > div {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
 .sidebar-data-source strong {
   color: #079bd5;
   font-size: 12px;
+}
+
+.sidebar-data-source span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-data-source > b {
+  flex: 0 0 auto;
+  color: #b56a00;
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .center-column {

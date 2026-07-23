@@ -115,8 +115,11 @@ export function LeftSidebar({
     <aside className={`left-column runtime-${runtimeMode}`}>
       {runtimeMode === 'bkv' ? (
         <div className="sidebar-data-source" role="note">
-          <strong>BKV 离线数据</strong>
-          <span>旧系统记录 · 只读观察</span>
+          <div>
+            <strong>来源：旧 BKV 文件</strong>
+            <span>BKV 离线数据 · 只读观察</span>
+          </div>
+          <b>硬件控制已禁用</b>
         </div>
       ) : null}
       <SidebarAlertCard summary={summary} />

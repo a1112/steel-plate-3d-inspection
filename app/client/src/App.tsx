@@ -349,7 +349,7 @@ function InspectionDashboard({
   const [plateMapViewMode, setPlateMapViewMode] = useState<PlateMapViewMode>('2d');
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [inspectionFlowVisible, setInspectionFlowVisible] = useState(false);
-  const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>('latest');
+  const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>(terminalMode === 'bkv' ? 'history' : 'latest');
   const [snapshotSyncState, setSnapshotSyncState] = useState('等待实时同步');
   const [captureSnapshot, setCaptureSnapshot] = useState(() => createEmptyCaptureSnapshot('capture service pending'));
   const [recordBoundSurface, setRecordBoundSurface] = useState<RecordBoundSurfaceArtifact>({

@@ -470,6 +470,7 @@ export function InspectionWorldCanvas({ recordId, meta, defects, focusDefectId, 
     ref={hostRef}
     className={`inspection-world-viewport ${className}`.trim()}
     data-testid="inspection-world-viewport"
+    data-record-id={recordId}
     data-scroll-mode="native"
     tabIndex={0}
     aria-label={`${recordId} 检测图像滚动视图`}
