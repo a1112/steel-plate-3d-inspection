@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
+use crate::standard_record_store::InspectionRecordStore;
 
 mod artifact_cleanup;
 mod bkv;
@@ -23,6 +24,7 @@ mod db;
 mod inspection_world;
 mod production_tasks;
 mod runtime_profile;
+mod standard_record_store;
 
 #[derive(Clone)]
 struct DefectType {
@@ -224,6 +226,7 @@ struct ServiceState {
     config_json: Mutex<String>,
     capture: Arc<CaptureServiceManager>,
     bkv: Option<Arc<bkv::BkvManager>>,
+    standard_record_store: Option<Arc<standard_record_store::ConvertedLocalStore>>,
     database: db::AppDatabase,
     runtime: Runtime,
     production_command_lock: Mutex<()>,
@@ -12186,6 +12189,32 @@ fn bkv_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
 }
 
 fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
+    if state.runtime_config.data_source == "converted-local" {
+        let Some(store) = state.standard_record_store.as_ref() else {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code": 503, "error": "converted_record_store_unavailable"}).to_string(),
+            );
+        };
+        return match store.records() {
+            Ok(records) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "schema": "steel.inspection-world.records.v1",
+                    "provider": "bkv",
+                    "records": records,
+                })
+                .to_string(),
+            ),
+            Err(error) => http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code": 503, "error": "converted_record_store_invalid", "detail": error.to_string()}).to_string(),
+            ),
+        };
+    }
     if let Some(manager) = state.bkv.as_ref() {
         return http_response(
             "200 OK",
@@ -12450,6 +12479,101 @@ fn load_online_inspection_world(
     Ok(online)
 }
 
+fn load_converted_inspection_world(
+    state: &ServiceState,
+    record_id: &str,
+) -> Result<ConvertedInspectionWorld, String> {
+    let store = state
+        .standard_record_store
+        .as_ref()
+        .ok_or_else(|| "converted record store unavailable".to_string())?;
+    if store
+        .record(record_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err(format!("converted inspection {record_id} not found"));
+    }
+    let captures = store
+        .capture_files(record_id)
+        .map_err(|error| error.to_string())?;
+    let defects = store.defects(record_id).map_err(|error| error.to_string())?;
+    let mut grouped: HashMap<String, Vec<standard_record_store::CaptureFileDto>> =
+        HashMap::new();
+    for capture in captures {
+        if capture.kind.eq_ignore_ascii_case("intensity") {
+            grouped
+                .entry(capture.camera_id.clone())
+                .or_default()
+                .push(capture);
+        }
+    }
+    let configured = store.configured_cameras();
+    if grouped.len() != configured.len()
+        || configured
+            .iter()
+            .any(|camera| !grouped.contains_key(&camera.id))
+    {
+        return Err(format!(
+            "converted inspection {record_id} does not cover all configured cameras"
+        ));
+    }
+    let mut specs = Vec::with_capacity(configured.len());
+    let mut frames = HashMap::new();
+    let mut sequence_ordinals = HashMap::new();
+    for camera in configured {
+        let rows = grouped
+            .get_mut(&camera.id)
+            .ok_or_else(|| format!("converted camera {} unavailable", camera.id))?;
+        rows.sort_by_key(|row| row.sequence_no);
+        let mut dimensions = None;
+        let mut alignment_frames = Vec::with_capacity(rows.len());
+        for (ordinal, row) in rows.iter().enumerate() {
+            let image_index =
+                u32::try_from(ordinal).map_err(|_| "too many converted frames".to_string())?;
+            let current = image::image_dimensions(&row.path)
+                .map_err(|error| format!("{}: {error}", row.path.display()))?;
+            if dimensions
+                .replace(current)
+                .is_some_and(|expected| expected != current)
+            {
+                return Err(format!(
+                    "camera {} intensity dimensions are inconsistent",
+                    camera.id
+                ));
+            }
+            alignment_frames.push((image_index, row.path.clone()));
+            frames.insert((camera.source_camera_id, image_index), row.path.clone());
+            sequence_ordinals.insert(
+                (camera.source_camera_id, row.sequence_no),
+                image_index,
+            );
+        }
+        let (frame_width, frame_height) =
+            dimensions.ok_or_else(|| format!("camera {} has no intensity frames", camera.id))?;
+        let alignment = inspection_world::detect_camera_head(&alignment_frames)
+            .map_err(|error| error.to_string())?;
+        specs.push((
+            inspection_world::CameraSpec {
+                camera_id: camera.source_camera_id,
+                frame_width,
+                frame_height,
+                frame_numbers: (0..rows.len() as u32).collect(),
+                orientation: inspection_world::CameraOrientation::identity(),
+            },
+            alignment,
+        ));
+    }
+    let world = inspection_world::InspectionWorld::with_alignments(specs)
+        .map_err(|error| error.to_string())?;
+    Ok(ConvertedInspectionWorld {
+        world,
+        frames,
+        sequence_ordinals,
+        defects,
+    })
+}
+
 fn inspection_world_record_id(query: &str) -> Result<String, Vec<u8>> {
     query_value(query, "recordId")
         .or_else(|| query_value(query, "legacySeqNo"))
@@ -12468,6 +12592,28 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
+    if state.runtime_config.data_source == "converted-local" {
+        return match load_converted_inspection_world(state, &record_id) {
+            Ok(converted) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "schema": "steel.inspection-world.meta.v1",
+                    "provider": "bkv",
+                    "recordId": record_id,
+                    "legacySeqNo": record_id.parse::<u64>().ok(),
+                    "sourceFrameCount": converted.frames.len(),
+                    "world": converted.world,
+                })
+                .to_string(),
+            ),
+            Err(error) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error}).to_string(),
+            ),
+        };
+    }
     if let Some(manager) = state.bkv.as_ref() {
         let Ok(sequence) = record_id.parse::<u64>() else {
             return http_response(
@@ -12516,6 +12662,78 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
+    if state.runtime_config.data_source == "converted-local" {
+        return match load_converted_inspection_world(state, &record_id) {
+            Ok(converted) => {
+                let defects = converted
+                    .defects
+                    .iter()
+                    .map(|defect| {
+                        let camera_id = numeric_camera_id(&defect.camera_id);
+                        let image_index = camera_id.and_then(|camera_id| {
+                            converted
+                                .sequence_ordinals
+                                .get(&(camera_id, defect.sequence_no))
+                                .copied()
+                        });
+                        let local_rect = defect
+                            .artifacts
+                            .get("imageRect2d")
+                            .and_then(|rect| {
+                                Some(
+                                    inspection_world::PixelRect::from_edges(
+                                        u32::try_from(rect.get("left")?.as_u64()?).ok()?,
+                                        u32::try_from(rect.get("right")?.as_u64()?).ok()?,
+                                        u32::try_from(rect.get("top")?.as_u64()?).ok()?,
+                                        u32::try_from(rect.get("bottom")?.as_u64()?).ok()?,
+                                    )
+                                    .ok()?,
+                                )
+                            });
+                        let world_rect =
+                            camera_id.zip(image_index).zip(local_rect).and_then(
+                                |((camera_id, image_index), rect)| {
+                                    converted
+                                        .world
+                                        .map_defect(camera_id, image_index, rect)
+                                        .ok()
+                                },
+                            );
+                        json!({
+                            "id": defect.id,
+                            "className": defect.defect_type,
+                            "grade": defect.severity,
+                            "confidence": defect.confidence,
+                            "cameraId": camera_id,
+                            "imageIndex": image_index,
+                            "locatable": world_rect.is_some(),
+                            "worldRect": world_rect,
+                            "trace": {
+                                "sequenceNo": defect.sequence_no,
+                                "artifacts": defect.artifacts,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                http_response(
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "schema": "steel.inspection-world.defects.v1",
+                        "provider": "bkv",
+                        "recordId": record_id,
+                        "defects": defects,
+                    })
+                    .to_string(),
+                )
+            }
+            Err(error) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error}).to_string(),
+            ),
+        };
+    }
     if let Some(manager) = state.bkv.as_ref() {
         let Ok(sequence) = record_id.parse::<u64>() else {
             return http_response(
@@ -12684,7 +12902,18 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
         tile_y,
         format,
     );
-    let result = if let Some(manager) = state.bkv.as_ref() {
+    let result = if state.runtime_config.data_source == "converted-local" {
+        load_converted_inspection_world(state, &record_id).and_then(|converted| {
+            inspection_world::compose_camera_tile(
+                &converted.world,
+                request,
+                |camera_id, image_index| {
+                    Ok(converted.frames.get(&(camera_id, image_index)).cloned())
+                },
+            )
+            .map_err(|error| error.to_string())
+        })
+    } else if let Some(manager) = state.bkv.as_ref() {
         record_id
             .parse::<u64>()
             .map_err(|_| "inspection world record invalid".to_string())
@@ -17921,6 +18150,39 @@ fn configured_bkv_manager(
         .map(Some)
 }
 
+struct ConvertedInspectionWorld {
+    world: inspection_world::InspectionWorld,
+    frames: HashMap<(u32, u32), PathBuf>,
+    sequence_ordinals: HashMap<(u32, u32), u32>,
+    defects: Vec<standard_record_store::InspectionDefectDto>,
+}
+
+fn configured_standard_record_store(
+    profile: &runtime_profile::RuntimeProfile,
+) -> Option<Arc<standard_record_store::ConvertedLocalStore>> {
+    if profile.data_source != "converted-local" {
+        return None;
+    }
+    let root = workspace_root().join(&profile.storage.converted_root);
+    let catalog = workspace_root().join(&profile.storage.catalog_path);
+    let cameras = profile
+        .cameras
+        .iter()
+        .map(|camera| standard_record_store::ConfiguredCamera {
+            id: camera.id.clone(),
+            display_order: camera.display_order,
+            source_camera_id: u32::try_from(camera.source_camera_id).unwrap_or(0),
+        })
+        .collect();
+    match standard_record_store::ConvertedLocalStore::open(&root, &catalog, cameras) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(error) => {
+            eprintln!("converted record store is not ready: {error}");
+            None
+        }
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let port = env::var("INSPECTION_SERVICE_PORT")
         .ok()
@@ -17968,6 +18230,7 @@ fn main() -> std::io::Result<()> {
     }
     let bkv_manager = configured_bkv_manager(capture_manager.provider)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let standard_record_store = configured_standard_record_store(&runtime_config);
     CaptureServiceManager::start_supervisor(&capture_manager);
     let config_json = runtime
         .block_on(db::get_config(&database.connection, "capture"))
@@ -17980,6 +18243,7 @@ fn main() -> std::io::Result<()> {
         config_json: Mutex::new(config_json),
         capture: Arc::clone(&capture_manager),
         bkv: bkv_manager,
+        standard_record_store,
         database,
         runtime,
         production_command_lock: Mutex::new(()),
@@ -18094,6 +18358,7 @@ mod tests {
                 simulated_continuous_line_rate: Mutex::new(300.0),
             }),
             bkv: None,
+            standard_record_store: None,
             database,
             runtime,
             production_command_lock: Mutex::new(()),
@@ -23447,6 +23712,131 @@ mod tests {
         let too_long =
             validate_admin_identifier(&"a".repeat(ADMIN_ID_MAX_LEN + 1), "role.id").unwrap_err();
         assert!(too_long.contains("长度不能超过"));
+    }
+
+    fn converted_world_fixture() -> (
+        PathBuf,
+        standard_record_store::ConvertedLocalStore,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "steel-converted-world-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let record_root = root.join("records").join("10");
+        fs::create_dir_all(&record_root).expect("converted record root");
+        fs::write(record_root.join("record.json"), "{}").expect("converted record marker");
+        let catalog = root.join("catalog.db");
+        let connection = rusqlite::Connection::open(&catalog).expect("converted catalog");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE production_inspection (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    material_id TEXT NOT NULL, inspection_time TEXT,
+                    status TEXT NOT NULL, defect_count INTEGER NOT NULL,
+                    camera_count INTEGER NOT NULL, source_hash TEXT NOT NULL,
+                    record_path TEXT NOT NULL, metadata_json TEXT NOT NULL
+                );
+                CREATE TABLE production_defect (
+                    id TEXT PRIMARY KEY, inspection_id TEXT NOT NULL,
+                    camera_id TEXT NOT NULL, sequence_no INTEGER NOT NULL,
+                    defect_type TEXT NOT NULL, severity INTEGER,
+                    confidence REAL, artifacts_json TEXT NOT NULL
+                );
+                CREATE TABLE capture_file (
+                    id TEXT PRIMARY KEY, inspection_id TEXT NOT NULL,
+                    camera_id TEXT NOT NULL, sequence_no INTEGER NOT NULL,
+                    kind TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL
+                );
+                INSERT INTO production_inspection VALUES (
+                    '10', 'bkv-10', 'STEEL-10', '2025-09-26 03:36:17',
+                    'legacy-imported', 1, 6, 'record-hash', 'records/10',
+                    '{"steelType":"37Mn/2","lengthMm":12096}'
+                );
+                INSERT INTO production_defect VALUES (
+                    '10-100', '10', 'C1', 4, '轧折', 1, 51,
+                    '{"imageRect2d":{"left":0,"right":2,"top":0,"bottom":1}}'
+                );
+                "#,
+            )
+            .expect("converted fixture schema");
+        for camera_id in 1..=6 {
+            let relative =
+                format!("records/10/cameras/C{camera_id}/frames/000004/intensity.jpg");
+            let path = root.join(&relative);
+            fs::create_dir_all(path.parent().expect("frame parent")).expect("frame parent");
+            image::RgbImage::from_pixel(32, 48, image::Rgb([camera_id as u8 * 20, 80, 100]))
+                .save(&path)
+                .expect("converted intensity");
+            let mut digest = Sha256::new();
+            digest.update(fs::read(&path).expect("intensity bytes"));
+            connection
+                .execute(
+                    "INSERT INTO capture_file VALUES (?, '10', ?, 4, 'intensity', ?, ?, ?)",
+                    rusqlite::params![
+                        format!("10-C{camera_id}-4-intensity"),
+                        format!("C{camera_id}"),
+                        relative,
+                        path.metadata().expect("intensity metadata").len(),
+                        format!("{:x}", digest.finalize()),
+                    ],
+                )
+                .expect("capture file");
+        }
+        drop(connection);
+        let store = standard_record_store::ConvertedLocalStore::open(
+            &root,
+            &catalog,
+            (1..=6)
+                .map(|camera_id| standard_record_store::ConfiguredCamera {
+                    id: format!("C{camera_id}"),
+                    display_order: camera_id,
+                    source_camera_id: camera_id as u32,
+                })
+                .collect(),
+        )
+        .expect("converted store");
+        (root, store)
+    }
+
+    #[test]
+    fn inspection_world_http_reads_converted_store_without_legacy_manager() {
+        let (root, store) = converted_world_fixture();
+        let mut state =
+            production_test_state_with_provider(CaptureProvider::Bkv, "simulated://capture");
+        state.standard_record_store = Some(Arc::new(store));
+        assert!(state.bkv.is_none(), "legacy manager must not be required");
+
+        let records = response_json(inspection_world_records_response(&state));
+        assert_eq!(records["provider"], "bkv");
+        assert_eq!(records["records"][0]["recordId"], "10");
+        assert_eq!(records["records"][0]["cameraCount"], 6);
+
+        let meta = response_json(inspection_world_meta_response(&state, "recordId=10"));
+        assert_eq!(meta["provider"], "bkv");
+        assert_eq!(meta["world"]["cameras"].as_array().map(Vec::len), Some(6));
+        assert_eq!(meta["world"]["cameras"][0]["frameNumbers"], json!([0]));
+
+        let defects =
+            response_json(inspection_world_defects_response(&state, "recordId=10"));
+        assert_eq!(defects["provider"], "bkv");
+        assert_eq!(defects["defects"][0]["className"], "轧折");
+        assert_eq!(defects["defects"][0]["cameraId"], 1);
+        assert_eq!(defects["defects"][0]["imageIndex"], 0);
+        assert_eq!(defects["defects"][0]["locatable"], true);
+
+        let tile = inspection_world_tile_response(
+            &state,
+            "recordId=10&cameraId=1&level=0&x=0&y=0&format=png",
+        );
+        let separator = tile
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("tile headers");
+        image::load_from_memory(&tile[separator + 4..]).expect("converted tile image");
+        fs::remove_dir_all(root).expect("remove converted fixture");
     }
 
     #[test]
