@@ -310,8 +310,7 @@ button {
   font-weight: 850;
 }
 
-.app-footer-view-group button,
-.app-footer-collapse {
+.app-footer-view-group button {
   height: 24px;
   min-width: 32px;
   display: inline-grid;
@@ -329,20 +328,6 @@ button {
 
 .app-footer-view-group button:hover,
 .app-footer-view-group button.active {
-  color: #fff;
-  background: var(--blue);
-}
-
-.app-footer-collapse {
-  flex: 0 0 30px;
-  width: 30px;
-  padding: 0;
-  border: 1px solid var(--line);
-  background: var(--panel-soft);
-}
-
-.app-footer-collapse:hover {
-  border-color: var(--blue);
   color: #fff;
   background: var(--blue);
 }
@@ -1366,6 +1351,10 @@ button {
   background: var(--blue-soft);
 }
 
+.window-controls .window-analysis-collapse {
+  border-right: 1px solid var(--line);
+}
+
 .window-controls .window-close:hover {
   color: #fff;
   background: var(--red);
@@ -1875,7 +1864,7 @@ button {
 }
 
 .center-column {
-  grid-template-rows: minmax(0, 1.15fr) minmax(240px, 0.85fr);
+  grid-template-rows: minmax(0, 1fr) minmax(160px, 0.5fr);
 }
 
 .right-column {
@@ -8267,7 +8256,7 @@ button {
   }
 
   .center-column {
-    grid-template-rows: minmax(0, 1.15fr) minmax(220px, 0.85fr);
+    grid-template-rows: minmax(0, 1fr) minmax(140px, 0.45fr);
   }
 
   .right-column {
@@ -8640,7 +8629,7 @@ button {
 
 .theme-dark .center-column {
   gap: 8px;
-  grid-template-rows: minmax(0, 1.12fr) minmax(238px, 0.88fr);
+  grid-template-rows: minmax(0, 1fr) minmax(160px, 0.5fr);
 }
 
 .theme-dark .right-column {

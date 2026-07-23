@@ -73,6 +73,21 @@ describe('compact online detection layout CSS contract', () => {
     expectDeclaration('.severity-filter-inline', 'height', '24px');
   });
 
+  it('keeps the expanded analysis area short and the collapsed layout single-row', () => {
+    expectDeclaration('.center-column', 'grid-template-rows', 'minmax(0, 1fr) minmax(160px, 0.5fr)');
+    expectDeclaration('.theme-dark .center-column', 'grid-template-rows', 'minmax(0, 1fr) minmax(160px, 0.5fr)');
+    expectDeclaration('.center-column.analysis-collapsed', 'grid-template-rows', 'minmax(0, 1fr)');
+
+    const centerRows = ruleBlocks('.center-column')
+      .map((block) => declaration(block, 'grid-template-rows'))
+      .filter(Boolean);
+    expect(centerRows).toContain('minmax(0, 1fr) minmax(140px, 0.45fr)');
+    expect(centerRows.every((rows) => !rows.includes('220px') && !rows.includes('240px'))).toBe(true);
+
+    expectDeclaration('.window-controls .window-analysis-collapse', 'border-right', '1px solid var(--line)');
+    expect(stylesCss).not.toContain('.app-footer-collapse');
+  });
+
   it('preserves compact defect filter sizing across every themed style cascade', () => {
     const selector = ".app-shell[class*='style-'] .defect-filter-panel .panel-body";
     expectDeclaration(selector, 'height', 'auto');
