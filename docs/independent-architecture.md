@@ -57,6 +57,27 @@ Tauri/React client.
 - Does not call the capture SDK or the capture terminal directly.
 - Does not link `nvt_lvm_sdk.lib` or ship `nvt_lvm_sdk.dll`; camera SDK files belong to the capture provider runtime.
 
+### BKV conversion service
+
+`scripts/bkv_import_service.py` is the independent adapter for old BKV files. It
+loads `config/project.json`, follows `activeRuntimeProfile`, and accepts only a
+non-direct `converted-local` six-camera profile. The legacy root is read-only:
+each JPEG/NPZ path, size, hash, camera identity, material identity, frame number,
+and defect association is verified before publication.
+
+The converter writes to the profile's `storage.convertedRoot` through
+same-volume staging and atomic directory rename. Its `catalog.db` indexes the
+standard record contract and `records/<inspectionId>` contains `record.json`,
+source provenance, C1-C6 camera-local JPEG/NPZ frames, and defects. A bounded
+retry covers transient Windows locks at the atomic publish boundary; invalid
+records remain quarantined and interrupted jobs can be retried. Re-importing an
+unchanged source/configuration skips already published records.
+
+Rust reads BKV records, defects, metadata, and tiles from this converted store.
+The old manifest is not the business-query repository. BKV runtime state uses
+its own SQLite files and must not connect to the online MySQL production
+adapter; conversely, a direct profile does not open the converted BKV catalog.
+
 ### Production algorithm qualification boundary
 
 The reconstruction implementation is not trusted merely because the process exits successfully. Production trust is split across four immutable inputs:
@@ -80,6 +101,18 @@ The Rust service reads these environment variables:
 
 - `STEEL_CAPTURE_PROVIDER=simulated`
   Rust does not connect to a local capture API and uses the simulated eight-camera fallback.
+
+- `STEEL_CAPTURE_PROVIDER=bkv`
+  Rust starts no camera SDK process. `config/project.json` must select the
+  six-camera BKV profile, and the converter must have published its standard
+  store before records are available. Capture management and 3D reconstruction
+  capabilities remain unavailable; offline replay and backend configuration
+  remain available.
+
+Runtime profile saves are validated and written atomically, but the active
+in-memory profile never changes mid-process. `restartRequired:true` means the
+Rust service must be restarted before the new topology, storage roots, or
+capability set is active.
 
 The capture API address is configured with:
 

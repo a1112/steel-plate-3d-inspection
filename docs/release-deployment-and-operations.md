@@ -347,6 +347,38 @@ Supervisor 回归至少包括：正常启动/停止、单子进程异常、Super
 - `system-health` 活动告警：生产服务每 10 秒同步一次健康异常；同一异常持续期间只应有一个开放 episode。恢复后由 `system-health-monitor` 自动确认并解除；若故障再次发生，必须出现新的报警 ID。若健康状态已恢复但告警仍未闭环，按数据库/监视线程故障处理。
 - 触发重放/时间窗异常：检查 NTP/PTP、来源地址和 nonce；不得长期放宽时间窗代替修复时钟。
 
+### 9.4 BKV 六相机离线模式
+
+1. 在 `config/project.json` 中选择 `config/runtime-modes/bkv-6.json`，并让
+   `STEEL_PROJECT_CONFIG_PATH` 指向同一项目文件、`STEEL_CAPTURE_PROVIDER=bkv`。
+   配置保存只更新磁盘版本；后台返回 `restartRequired:true` 后必须重启 Rust
+   服务，不能把已保存配置误认为当前已生效配置。
+2. 将旧 BKV 数据作为只读源放在 profile 的 `storage.sourceRoot`。先运行
+   `python scripts/bkv_import_service.py --project config/project.json --once`；
+   常驻管理模式使用 `--serve --port 4893`，只允许绑定 loopback。后台管理页
+   通过受限代理查看任务、启动和重试，不接受浏览器提交的任意本地路径。
+3. 标准输出固定在 `storage.convertedRoot`：`catalog.db` 加
+   `records/<inspectionId>/record.json`、`source-provenance.json`、
+   `cameras/C1..C6/frames/<sequence>/{intensity.jpg,depth.npz}` 和
+   `defects/defects.json`。导入使用 `.staging` 后同卷原子发布；校验失败进入
+   `imports/quarantine`，中断任务按原 job ID 重试。Windows 短暂目录占用会在
+   原子 rename 边界进行有界退避重试，持续失败仍隔离并保留错误。
+4. 重跑同一 source/config hash 必须得到全部 `skipped`。运维审计至少核对
+   记录范围、每条 C1-C6、JPEG 可解码、NPZ schema/相机/材料/帧身份、缺陷帧
+   关联、来源 SHA-256，以及 catalog 中没有 `staging` 业务记录。
+5. BKV 的业务记录只读 converted catalog；服务运行状态使用本地 SQLite，
+   `STEEL_DATABASE_ENGINE=sqlite` 且 `STEEL_DATABASE_FALLBACK=none`。不得配置
+   在线 MySQL 连接。在线直连 profile 则继续使用其 MySQL/采集链路，不得打开
+   BKV converted root。
+6. BKV 不启动相机 SDK，也不显示采集管理和 3D 重建；离线回放与后台管理保留。
+   直接访问这些禁用深链会回到检测终端并显示能力提示。浏览器中的后台/工具
+   入口在当前页跳转，Tauri 桌面端仍使用受管独立窗口。
+
+当前工程数据审计（2026-07-23）覆盖旧序号 1893700–1893710：11 条记录、
+6 路相机、2,592 个 capture file（1,296 JPEG + 1,296 NPZ）、2 条缺陷；最终
+幂等任务为 0 converted / 11 skipped / 0 quarantined。该结果是本地转换完整性
+证据，不替代正式生产发布、真实相机或质量算法验收。
+
 ## 10. 升级、回滚和卸载
 
 版本化载荷、数据库 contract/账本、持久升级 journal、SCM 激活指针、崩溃恢复和逐 phase 故障注入的规范见 [`atomic-upgrade-and-database-migration-design.md`](atomic-upgrade-and-database-migration-design.md)。在该设计的 U1–U4 验收未全部完成前，不能把当前 `-Upgrade` 的进程内 catch 回滚描述为断电安全的生产升级事务。
