@@ -20,6 +20,7 @@ type Props = {
   focusDefectId?: string | number | null;
   focusDefectRevision?: number;
   className?: string;
+  onFirstPaint?: () => void;
 };
 
 type ViewState = { scrollLeft: number; scrollTop: number; scale: number };
@@ -52,6 +53,7 @@ export function InspectionWorldCanvas({
   focusDefectId,
   focusDefectRevision = 0,
   className = '',
+  onFirstPaint,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -67,6 +69,8 @@ export function InspectionWorldCanvas({
   const consumedFocusRequest = useRef<string | null>(null);
   const lifecycleGeneration = useRef(0);
   const metaRef = useRef(meta);
+  const onFirstPaintRef = useRef(onFirstPaint);
+  const firstPaintReported = useRef(false);
   const measured = useRef(false);
   const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
   const [viewportMeasured, setViewportMeasured] = useState(false);
@@ -87,6 +91,10 @@ export function InspectionWorldCanvas({
   useLayoutEffect(() => {
     metaRef.current = meta;
   }, [meta]);
+
+  useLayoutEffect(() => {
+    onFirstPaintRef.current = onFirstPaint;
+  }, [onFirstPaint]);
 
   const scheduleScrollRead = useCallback(() => {
     if (scrollFrame.current != null) return;
@@ -169,6 +177,7 @@ export function InspectionWorldCanvas({
   useEffect(() => {
     if (previousWorldRevision.current === worldRevision) return;
     previousWorldRevision.current = worldRevision;
+    firstPaintReported.current = false;
     tileCache.current.forEach(disposeTileEntry);
     tileCache.current.clear();
     pending.current.forEach((request) => request.controller.abort());
@@ -391,6 +400,7 @@ export function InspectionWorldCanvas({
     context.clearRect(0, 0, size.width, size.height);
     context.fillStyle = '#07111c';
     context.fillRect(0, 0, size.width, size.height);
+    let paintedTile = false;
     const span = meta.world.tileSize * 2 ** level;
     const fallbackEntries = [...tileCache.current.values()].filter((entry) => entry.loaded && entry.tile.level !== level);
     const fallbackLevelDistance = fallbackEntries.reduce(
@@ -408,6 +418,7 @@ export function InspectionWorldCanvas({
       const screenHeight = Math.min(fallbackSpan, camera.height - entry.tile.y * fallbackSpan) * view.scale;
       if (screenX + screenWidth < 0 || screenX > size.width || screenY + screenHeight < 0 || screenY > size.height) continue;
       context.drawImage(entry.image, screenX, screenY, screenWidth, screenHeight);
+      paintedTile = true;
     }
     for (const tile of visibleTiles) {
       const key = `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`;
@@ -418,7 +429,10 @@ export function InspectionWorldCanvas({
       const screenWidth = Math.min(span, camera.width - tile.x * span) * view.scale;
       const screenHeight = Math.min(span, camera.height - tile.y * span) * view.scale;
       const entry = tileCache.current.get(key);
-      if (entry?.loaded) context.drawImage(entry.image, screenX, screenY, screenWidth, screenHeight);
+      if (entry?.loaded) {
+        context.drawImage(entry.image, screenX, screenY, screenWidth, screenHeight);
+        paintedTile = true;
+      }
       else if (failedKeys.has(key)) {
         context.fillStyle = '#24181d';
         context.fillRect(screenX, screenY, screenWidth, screenHeight);
@@ -439,6 +453,10 @@ export function InspectionWorldCanvas({
         Math.max(3, rect.width * view.scale),
         Math.max(3, rect.height * view.scale),
       );
+    }
+    if (paintedTile && !firstPaintReported.current) {
+      firstPaintReported.current = true;
+      onFirstPaintRef.current?.();
     }
   }, [cameraById, failedKeys, level, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
 

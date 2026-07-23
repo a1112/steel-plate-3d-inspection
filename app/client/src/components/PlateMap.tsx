@@ -29,6 +29,7 @@ interface PlateMapProps {
   plateLengthM?: number;
   artifactMode?: 'production' | 'demo';
   inspectionId?: string;
+  requireInspectionWorld?: boolean;
   captureImages?: CaptureImageItem[];
   cameraLanes?: CameraDisplayLane[];
   surfaceMesh?: BarSurfaceMesh | null;
@@ -52,6 +53,11 @@ const surfaceModeOptions: { id: SurfaceDisplayMode; label: string }[] = [
 
 export type PlateMapViewMode = '2d' | '3d' | 'point-cloud';
 type UnfoldOrientation = 'horizontal' | 'vertical';
+type DisplayWorld = {
+  recordId: string;
+  meta: InspectionWorldMeta;
+  defects: InspectionWorldDefect[];
+};
 
 export function cameraBandRotationRadians(orientation: UnfoldOrientation) {
   // Line-scan frames store the camera cross-section on X and acquisition
@@ -1175,6 +1181,7 @@ export function PlateMap({
   plateLengthM = DEFAULT_PLATE_LENGTH_M,
   artifactMode = 'production',
   inspectionId,
+  requireInspectionWorld = false,
   captureImages = [],
   cameraLanes = DEFAULT_CAMERA_LANES,
   surfaceMesh,
@@ -1194,43 +1201,84 @@ export function PlateMap({
   const setViewMode = onViewModeChange ?? setLocalViewMode;
   const [hoveredDefectId, setHoveredDefectId] = useState<string | null>(null);
   const [unfoldOrientation, setUnfoldOrientation] = useState<UnfoldOrientation>('horizontal');
-  const [persistedWorld, setPersistedWorld] = useState<{
-    recordId: string;
-    meta: InspectionWorldMeta;
-    defects: InspectionWorldDefect[];
-  } | null>(null);
+  const [displayedWorld, setDisplayedWorld] = useState<DisplayWorld | null>(null);
+  const displayedWorldRef = useRef<DisplayWorld | null>(null);
+  const [pendingWorld, setPendingWorld] = useState<DisplayWorld | null>(null);
+  const [worldLoading, setWorldLoading] = useState(false);
   const [worldUnavailable, setWorldUnavailable] = useState(false);
+  const [worldError, setWorldError] = useState('');
   const productionCameraImageCount = surfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
   const capturedCameraImageCount = new Set(captureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
   const displayedCameraImageCount = Math.min(cameraLanes.length, Math.max(productionCameraImageCount, capturedCameraImageCount));
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
   useEffect(() => {
-    setPersistedWorld(null);
+    displayedWorldRef.current = displayedWorld;
+  }, [displayedWorld]);
+  useEffect(() => {
     setWorldUnavailable(false);
-    if (artifactMode !== 'production' || !inspectionId || viewMode !== '2d') return;
+    setWorldError('');
+    setPendingWorld(null);
+    if (artifactMode !== 'production' || viewMode !== '2d') return;
+    if (!inspectionId) {
+      setWorldLoading(false);
+      return;
+    }
+    setWorldLoading(true);
     const controller = new AbortController();
     const refresh = async () => {
       try {
         const meta = await fetchInspectionWorldMeta(inspectionId, controller.signal);
         if (controller.signal.aborted) return;
         setWorldUnavailable(false);
-        setPersistedWorld((current) => ({
-          recordId: inspectionId,
-          meta,
-          defects: current?.recordId === inspectionId ? current.defects : [],
-        }));
+        setWorldError('');
+        const current = displayedWorldRef.current;
+        const sameDisplayedWorld = current?.recordId === inspectionId
+          && current.meta.sourceFrameCount === meta.sourceFrameCount
+          && current.meta.world.width === meta.world.width
+          && current.meta.world.height === meta.world.height;
+        if (sameDisplayedWorld) {
+          const next = { ...current, meta };
+          displayedWorldRef.current = next;
+          setDisplayedWorld(next);
+          setWorldLoading(false);
+        } else {
+          setPendingWorld({
+            recordId: inspectionId,
+            meta,
+            defects: [],
+          });
+        }
         try {
           const defectPayload = await fetchInspectionWorldDefects(inspectionId, controller.signal);
           if (!controller.signal.aborted) {
-            setPersistedWorld((current) => current?.recordId === inspectionId
-              ? { ...current, defects: defectPayload.defects }
-              : current);
+            if (sameDisplayedWorld) {
+              setDisplayedWorld((displayed) => {
+                if (displayed?.recordId !== inspectionId) return displayed;
+                const next = { ...displayed, defects: defectPayload.defects };
+                displayedWorldRef.current = next;
+                return next;
+              });
+            } else {
+              setPendingWorld((pending) => pending?.recordId === inspectionId
+                ? { ...pending, defects: defectPayload.defects }
+                : pending);
+              setDisplayedWorld((displayed) => {
+                if (displayed?.recordId !== inspectionId) return displayed;
+                const next = { ...displayed, defects: defectPayload.defects };
+                displayedWorldRef.current = next;
+                return next;
+              });
+            }
           }
         } catch {
           // Image-world availability is independent from optional defect overlays.
         }
-      } catch {
-        if (!controller.signal.aborted) setWorldUnavailable(true);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setWorldUnavailable(true);
+          setWorldLoading(false);
+          setWorldError(error instanceof Error ? error.message : '检测图像世界读取失败');
+        }
       }
     };
     void refresh();
@@ -1240,7 +1288,17 @@ export function PlateMap({
       window.clearInterval(timer);
     };
   }, [artifactMode, inspectionId, viewMode]);
-  const activePersistedWorld = persistedWorld?.recordId === inspectionId ? persistedWorld : null;
+  const activePendingWorld = pendingWorld?.recordId === inspectionId ? pendingWorld : null;
+  const shouldRenderWorldStack = viewMode === '2d' && (
+    displayedWorld !== null
+    || activePendingWorld !== null
+    || requireInspectionWorld
+  );
+  const switchingWorld = Boolean(
+    displayedWorld
+    && inspectionId
+    && displayedWorld.recordId !== inspectionId,
+  );
   const selectRelativeDefect = (step: number) => {
     if (defects.length === 0) {
       return;
@@ -1318,7 +1376,7 @@ export function PlateMap({
           ? '演示/测试数据：允许使用内置表面与模拟点云，不代表当前生产结果。'
           : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；实际相机图像 ${displayedCameraImageCount}/${cameraLanes.length} 路（自动裁剪黑边）。`}
       </div>}
-      {viewMode === '2d' && !activePersistedWorld ? (
+      {viewMode === '2d' && !shouldRenderWorldStack ? (
         <div className="unfold-orientation-switch" role="group" aria-label="二维展开方向">
           <button type="button" className={unfoldOrientation === 'horizontal' ? 'active' : ''} aria-pressed={unfoldOrientation === 'horizontal'} onClick={() => setUnfoldOrientation('horizontal')}>横向</button>
           <button type="button" className={unfoldOrientation === 'vertical' ? 'active' : ''} aria-pressed={unfoldOrientation === 'vertical'} onClick={() => setUnfoldOrientation('vertical')}>纵向</button>
@@ -1367,16 +1425,55 @@ export function PlateMap({
           surfaceMesh={surfaceMesh}
           artifactStatus={artifactStatus}
         />
-      ) : activePersistedWorld ? (
-        <InspectionWorldCanvas
-          key={`${activePersistedWorld.recordId}:${activePersistedWorld.meta.sourceFrameCount}:${activePersistedWorld.meta.world.width}:${activePersistedWorld.meta.world.height}`}
-          className="online-inspection-world"
-          recordId={activePersistedWorld.recordId}
-          meta={activePersistedWorld.meta}
-          defects={activePersistedWorld.defects}
-          focusDefectId={worldFocusRequest?.defectId ?? null}
-          focusDefectRevision={worldFocusRequest?.revision}
-        />
+      ) : shouldRenderWorldStack ? (
+        <div className="inspection-world-stack" data-testid="inspection-world-stack">
+          {displayedWorld ? <InspectionWorldCanvas
+            key={`displayed:${displayedWorld.recordId}:${displayedWorld.meta.sourceFrameCount}:${displayedWorld.meta.world.width}:${displayedWorld.meta.world.height}`}
+            className="online-inspection-world inspection-world-displayed"
+            recordId={displayedWorld.recordId}
+            meta={displayedWorld.meta}
+            defects={displayedWorld.defects}
+            focusDefectId={displayedWorld.recordId === inspectionId
+              ? worldFocusRequest?.defectId ?? null
+              : null}
+            focusDefectRevision={worldFocusRequest?.revision}
+          /> : null}
+          {activePendingWorld ? <InspectionWorldCanvas
+            key={`pending:${activePendingWorld.recordId}:${activePendingWorld.meta.sourceFrameCount}:${activePendingWorld.meta.world.width}:${activePendingWorld.meta.world.height}`}
+            className="online-inspection-world inspection-world-preparing"
+            recordId={activePendingWorld.recordId}
+            meta={activePendingWorld.meta}
+            defects={activePendingWorld.defects}
+            focusDefectId={worldFocusRequest?.defectId ?? null}
+            focusDefectRevision={worldFocusRequest?.revision}
+            onFirstPaint={() => {
+              displayedWorldRef.current = activePendingWorld;
+              setDisplayedWorld(activePendingWorld);
+              setPendingWorld((current) => current === activePendingWorld ? null : current);
+              setWorldLoading(false);
+              setWorldError('');
+            }}
+          /> : null}
+          {!displayedWorld ? <div
+            className="inspection-world-loading-skeleton"
+            role="status"
+            aria-label={inspectionId ? '正在加载 BKV 检测图像世界' : '暂无 BKV 检测记录'}
+          >
+            <strong>{inspectionId ? '正在加载检测图像…' : '暂无 BKV 检测记录'}</strong>
+            <span>{inspectionId ? '正在准备相机瓦片，首个画面完成后自动显示。' : '标准离线仓库当前没有可显示的检测记录。'}</span>
+          </div> : null}
+          {displayedWorld && (worldLoading || (switchingWorld && !worldError)) ? <div
+            className="inspection-world-switch-overlay"
+            role="status"
+            aria-label="正在切换 BKV 检测记录"
+          >
+            正在准备记录 {inspectionId}…
+          </div> : null}
+          {worldError ? <div className="inspection-world-record-error" role="alert">
+            <strong>当前记录图像读取失败</strong>
+            <span>{worldError}</span>
+          </div> : null}
+        </div>
       ) : cameraLanes.length === 0 ? (
         <div className="production-artifact-empty" role="status">
           <strong>未配置 2D 相机</strong>

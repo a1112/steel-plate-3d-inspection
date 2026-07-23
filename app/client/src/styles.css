@@ -15706,6 +15706,72 @@ button {
   min-height: 0;
 }
 
+.inspection-world-stack {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 420px;
+  overflow: hidden;
+  background: #07111c;
+}
+
+.inspection-world-stack > .inspection-world-displayed {
+  height: 100%;
+}
+
+.inspection-world-stack > .inspection-world-preparing {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.inspection-world-loading-skeleton,
+.inspection-world-switch-overlay,
+.inspection-world-record-error {
+  position: absolute;
+  z-index: 5;
+  display: grid;
+  place-content: center;
+  gap: 6px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.inspection-world-loading-skeleton {
+  inset: 0;
+  color: #b9cddd;
+  background:
+    linear-gradient(90deg, transparent, rgba(51, 153, 214, .08), transparent),
+    #07111c;
+}
+
+.inspection-world-loading-skeleton span,
+.inspection-world-record-error span {
+  color: #7895aa;
+  font-size: 12px;
+}
+
+.inspection-world-switch-overlay {
+  top: 10px;
+  right: 12px;
+  padding: 6px 10px;
+  border: 1px solid rgba(0, 193, 255, .34);
+  border-radius: 5px;
+  color: #9fdfff;
+  background: rgba(3, 18, 30, .88);
+  font-size: 12px;
+}
+
+.inspection-world-record-error {
+  inset: auto 12px 12px;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 122, 91, .42);
+  border-radius: 5px;
+  color: #ffb29e;
+  background: rgba(42, 15, 16, .9);
+}
+
 .inspection-world-scroll-space {
   position: relative;
   min-width: 100%;

@@ -634,6 +634,45 @@ describe('InspectionWorldCanvas', () => {
     expect(Number(screen.getByTestId('inspection-world-canvas').getAttribute('data-loaded-tiles'))).toBeGreaterThan(0);
   });
 
+  it('reports the first paint once, after a decoded tile has actually been drawn', async () => {
+    const images: Array<{ onload: null | (() => void) }> = [];
+    class ManualImage {
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(_value: string) { images.push(this); }
+    }
+    vi.stubGlobal('Image', ManualImage);
+    const onFirstPaint = vi.fn();
+
+    const { rerender } = render(
+      <InspectionWorldCanvas
+        recordId="1893700"
+        meta={meta}
+        defects={defects}
+        onFirstPaint={onFirstPaint}
+      />,
+    );
+
+    await waitFor(() => expect(images.length).toBeGreaterThan(0));
+    expect(onFirstPaint).not.toHaveBeenCalled();
+
+    await act(async () => images[0].onload?.());
+    await waitFor(() => expect(onFirstPaint).toHaveBeenCalledTimes(1));
+
+    await act(async () => images.slice(1).forEach((image) => image.onload?.()));
+    rerender(
+      <InspectionWorldCanvas
+        recordId="1893700"
+        meta={meta}
+        defects={[...defects]}
+        onFirstPaint={onFirstPaint}
+      />,
+    );
+    await act(async () => Promise.resolve());
+
+    expect(onFirstPaint).toHaveBeenCalledTimes(1);
+  });
+
   it('restarts tiles cancelled by the StrictMode effect cleanup', async () => {
     class LoadedImage {
       onload: null | (() => void) = null;

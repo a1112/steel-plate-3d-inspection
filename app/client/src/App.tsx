@@ -1314,6 +1314,7 @@ function InspectionDashboard({
                   plateLengthM={activePlateLengthM}
                   artifactMode={artifactMode}
                   inspectionId={activeInspection?.inspectionId}
+                  requireInspectionWorld={dashboardMode.kind === 'bkv'}
                   captureImages={activeSnapshot.captureImages ?? []}
                   cameraLanes={runtimeCameraLanes}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}

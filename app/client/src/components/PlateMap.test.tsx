@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType } from '../data/inspection';
@@ -168,6 +168,90 @@ describe('online inspection world compatibility', () => {
       context.mockRestore();
       vi.useRealTimers();
     }
+  });
+
+  it('shows only a BKV world loading state while the first record metadata is pending', () => {
+    vi.mocked(fetchInspectionWorldMeta).mockImplementation(() => new Promise(() => undefined));
+
+    render(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        inspectionId="1893700"
+        requireInspectionWorld
+      />,
+    );
+
+    expect(screen.getByRole('status', {
+      name: '正在加载 BKV 检测图像世界',
+    })).toBeInTheDocument();
+    expect(screen.queryByTestId('bar-unfolded-map')).not.toBeInTheDocument();
+  });
+
+  it('keeps the painted record visible until the next record paints its first tile', async () => {
+    const images: Array<{ onload: null | (() => void) }> = [];
+    class ManualImage {
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(_value: string) { images.push(this); }
+    }
+    vi.stubGlobal('Image', ManualImage);
+    vi.stubGlobal('ResizeObserver', class ResizeObserver {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe() { this.callback([], this); }
+      unobserve() {}
+      disconnect() {}
+    });
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      clearRect: vi.fn(), fillRect: vi.fn(), drawImage: vi.fn(), strokeRect: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    vi.mocked(fetchInspectionWorldMeta).mockImplementation(async (recordId) => ({
+      ...onlineWorldMeta,
+      recordId,
+    }));
+    vi.mocked(fetchInspectionWorldDefects).mockImplementation(async (recordId) => ({
+      schema: 'steel.inspection-world.defects.v1',
+      provider: 'bkv',
+      recordId,
+      defects: [],
+    }));
+
+    const { rerender } = render(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        inspectionId="1893700"
+        requireInspectionWorld
+      />,
+    );
+    await act(async () => Promise.resolve());
+    await act(async () => images.forEach((image) => image.onload?.()));
+    await screen.findByTestId('inspection-world-canvas');
+    expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
+
+    const previousImageCount = images.length;
+    rerender(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        inspectionId="1893701"
+        requireInspectionWorld
+      />,
+    );
+
+    expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
+    expect(screen.getByRole('status', {
+      name: '正在切换 BKV 检测记录',
+    })).toBeInTheDocument();
+    await waitFor(() => expect(images.length).toBeGreaterThan(previousImageCount));
+
+    await act(async () => images.slice(previousImageCount).forEach((image) => image.onload?.()));
+    await waitFor(() => {
+      expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893701');
+    });
+    expect(screen.queryByRole('status', {
+      name: '正在切换 BKV 检测记录',
+    })).not.toBeInTheDocument();
   });
 });
 
