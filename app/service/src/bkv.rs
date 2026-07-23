@@ -1,6 +1,6 @@
 use crate::inspection_world::{
-    compose_tile, CameraOrientation, CameraSpec, InspectionWorld, PixelRect, TileRequest,
-    WorldError,
+    compose_tile, detect_camera_head, CameraOrientation, CameraSpec, InspectionWorld, PixelRect,
+    TileRequest, WorldError,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -197,7 +197,8 @@ impl BkvManager {
         }
 
         let material = self.material_ref(legacy_sequence)?;
-        let (world, sources) = build_inspection_world(material)?;
+        let (world, sources) =
+            build_inspection_world(material, |relative| self.resolve_artifact(relative))?;
         let bytes = compose_tile(&world, request, |camera_id, frame_number| {
             let relative = sources.get(&(camera_id, frame_number)).ok_or_else(|| {
                 WorldError::Artifact(format!(
@@ -242,7 +243,8 @@ impl BkvManager {
 
     pub fn inspection_world_meta(&self, legacy_sequence: u64) -> Result<Value, String> {
         let material = self.material_ref(legacy_sequence)?;
-        let (world, _) = build_inspection_world(material)?;
+        let (world, _) =
+            build_inspection_world(material, |relative| self.resolve_artifact(relative))?;
         let source_frame_count = world
             .cameras
             .iter()
@@ -260,7 +262,8 @@ impl BkvManager {
 
     pub fn inspection_world_defects(&self, legacy_sequence: u64) -> Result<Value, String> {
         let material = self.material_ref(legacy_sequence)?;
-        let (world, _) = build_inspection_world(material)?;
+        let (world, _) =
+            build_inspection_world(material, |relative| self.resolve_artifact(relative))?;
         let defects = material
             .get("defects")
             .and_then(Value::as_array)
@@ -685,6 +688,37 @@ mod tests {
         bytes
     }
 
+    fn head_jpeg_bytes(width: u32, height: u32, head_y: u32) -> Vec<u8> {
+        let mut image = RgbImage::from_pixel(width, height, Rgb([0, 0, 0]));
+        for y in head_y..height {
+            for x in width / 5..width {
+                let texture = ((x + y) % 17) as u8;
+                image.put_pixel(x, y, Rgb([78 + texture, 94 + texture, 110 + texture]));
+            }
+        }
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 95)
+            .encode_image(&image)
+            .unwrap();
+        bytes
+    }
+
+    fn replace_manifest_frame(
+        root: &Path,
+        camera: &mut Value,
+        width: u32,
+        height: u32,
+        head_y: u32,
+    ) {
+        let bytes = head_jpeg_bytes(width, height, head_y);
+        let relative = camera["twoDFrames"][0]["path"].as_str().unwrap();
+        fs::write(root.join(relative), &bytes).unwrap();
+        camera["frameWidth"] = json!(width);
+        camera["frameHeight"] = json!(height);
+        camera["twoDFrames"][0]["size"] = json!(bytes.len());
+        camera["twoDFrames"][0]["sha256"] = json!(format!("{:x}", Sha256::digest(&bytes)));
+    }
+
     fn fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
         let root = temp_root(name);
         let mut materials = Vec::new();
@@ -903,6 +937,32 @@ mod tests {
     }
 
     #[test]
+    fn exposes_real_camera_widths_and_aligned_head_coordinates() {
+        let (root, manifest, cursor) = fixture("aligned-world-contract");
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        let material = &mut value["materials"][0];
+        replace_manifest_frame(&root, &mut material["cameras"][0], 8, 40, 12);
+        replace_manifest_frame(&root, &mut material["cameras"][1], 12, 40, 20);
+        material["defects"][0]["imageRect2d"] =
+            json!({"left": 1, "right": 3, "top": 14, "bottom": 16});
+        fs::write(&manifest, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let manager = BkvManager::load(&root, &manifest, &cursor).unwrap();
+
+        let meta = manager.inspection_world_meta(1_893_700).unwrap();
+        assert_eq!(meta["world"]["cameras"][0]["width"], 8);
+        assert_eq!(meta["world"]["cameras"][0]["offsetX"], 0);
+        assert_eq!(meta["world"]["cameras"][0]["headOffsetY"], 12);
+        assert_eq!(meta["world"]["cameras"][1]["width"], 12);
+        assert_eq!(meta["world"]["cameras"][1]["offsetX"], 8);
+        assert_eq!(meta["world"]["cameras"][1]["headOffsetY"], 20);
+
+        let defects = manager.inspection_world_defects(1_893_700).unwrap();
+        assert_eq!(defects["defects"][0]["worldRect"]["x"], 1);
+        assert_eq!(defects["defects"][0]["worldRect"]["y"], 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_wrong_cardinality_hash_and_path_escape() {
         let (root, manifest, cursor) = fixture("reject");
         let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
@@ -942,9 +1002,13 @@ fn json_u32(value: &Value, key: &str, label: &str) -> Result<u32, String> {
         .ok_or_else(|| format!("BKV {label} {key} is invalid"))
 }
 
-fn build_inspection_world(
+fn build_inspection_world<F>(
     material: &Value,
-) -> Result<(InspectionWorld, HashMap<(u32, u32), String>), String> {
+    mut resolve: F,
+) -> Result<(InspectionWorld, HashMap<(u32, u32), String>), String>
+where
+    F: FnMut(&str) -> Result<PathBuf, String>,
+{
     let legacy_sequence = material
         .get("legacySeqNo")
         .and_then(Value::as_u64)
@@ -964,6 +1028,7 @@ fn build_inspection_world(
             .and_then(Value::as_array)
             .ok_or_else(|| format!("BKV camera {camera_id} twoDFrames are unavailable"))?;
         let mut frame_numbers = Vec::with_capacity(frames.len());
+        let mut alignment_frames = Vec::with_capacity(frames.len());
         for frame in frames {
             let frame_number = json_u32(frame, "frameNo", "frame")?;
             let relative = frame.get("path").and_then(Value::as_str).ok_or_else(|| {
@@ -971,18 +1036,25 @@ fn build_inspection_world(
             })?;
             frame_numbers.push(frame_number);
             sources.insert((camera_id, frame_number), relative.to_string());
+            alignment_frames.push((frame_number, resolve(relative)?));
         }
-        specs.push(CameraSpec {
-            camera_id,
-            frame_width,
-            frame_height,
-            frame_numbers,
-            orientation: serde_json::from_value::<CameraOrientation>(
-                camera.get("orientation").cloned().unwrap_or(Value::Null),
-            )
-            .map_err(|error| format!("BKV camera {camera_id} orientation is invalid: {error}"))?,
-        });
+        let alignment = detect_camera_head(&alignment_frames).map_err(|error| error.to_string())?;
+        specs.push((
+            CameraSpec {
+                camera_id,
+                frame_width,
+                frame_height,
+                frame_numbers,
+                orientation: serde_json::from_value::<CameraOrientation>(
+                    camera.get("orientation").cloned().unwrap_or(Value::Null),
+                )
+                .map_err(|error| {
+                    format!("BKV camera {camera_id} orientation is invalid: {error}")
+                })?,
+            },
+            alignment,
+        ));
     }
-    let world = InspectionWorld::new(specs).map_err(|error| error.to_string())?;
+    let world = InspectionWorld::with_alignments(specs).map_err(|error| error.to_string())?;
     Ok((world, sources))
 }

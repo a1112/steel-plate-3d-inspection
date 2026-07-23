@@ -12317,6 +12317,7 @@ fn load_online_inspection_world(
         let rows = grouped.get_mut(&camera_id).expect("camera group");
         rows.sort_by_key(|row| row.sequence_no);
         let mut dimensions = None;
+        let mut alignment_frames = Vec::with_capacity(rows.len());
         for (ordinal, row) in rows.iter().enumerate() {
             let sequence = u32::try_from(row.sequence_no).map_err(|_| {
                 format!(
@@ -12337,19 +12338,26 @@ fn load_online_inspection_world(
                     "camera {camera_id} intensity dimensions are inconsistent"
                 ));
             }
+            alignment_frames.push((image_index, path.clone()));
             frames.insert((camera_id, image_index), path);
             sequence_ordinals.insert((camera_id, sequence), image_index);
         }
         let (frame_width, frame_height) = dimensions.expect("non-empty capture group");
-        specs.push(inspection_world::CameraSpec {
-            camera_id,
-            frame_width,
-            frame_height,
-            frame_numbers: (0..rows.len() as u32).collect(),
-            orientation: inspection_world::CameraOrientation::identity(),
-        });
+        let alignment = inspection_world::detect_camera_head(&alignment_frames)
+            .map_err(|error| error.to_string())?;
+        specs.push((
+            inspection_world::CameraSpec {
+                camera_id,
+                frame_width,
+                frame_height,
+                frame_numbers: (0..rows.len() as u32).collect(),
+                orientation: inspection_world::CameraOrientation::identity(),
+            },
+            alignment,
+        ));
     }
-    let world = inspection_world::InspectionWorld::new(specs).map_err(|error| error.to_string())?;
+    let world = inspection_world::InspectionWorld::with_alignments(specs)
+        .map_err(|error| error.to_string())?;
     let online = Arc::new(OnlineInspectionWorld {
         world,
         frames,
@@ -23304,9 +23312,18 @@ mod tests {
 
         for camera_id in 1..=8 {
             let path = image_root.join(format!("camera-{camera_id}.png"));
-            image::RgbImage::from_pixel(32, 48, image::Rgb([camera_id as u8 * 20, 80, 100]))
-                .save(&path)
-                .expect("online intensity fixture");
+            let mut frame = image::RgbImage::from_pixel(32, 48, image::Rgb([0, 0, 0]));
+            let head_y = if camera_id == 1 { 2 } else { 0 };
+            for y in head_y..48 {
+                for x in 0..32 {
+                    frame.put_pixel(
+                        x,
+                        y,
+                        image::Rgb([camera_id as u8 * 20, 80, 100]),
+                    );
+                }
+            }
+            frame.save(&path).expect("online intensity fixture");
             state
                 .runtime
                 .block_on(db::append_capture_file(
@@ -23375,6 +23392,7 @@ mod tests {
         assert_eq!(meta["sourceFrameCount"], 8);
         assert_eq!(meta["world"]["cameras"].as_array().map(Vec::len), Some(8));
         assert_eq!(meta["world"]["cameras"][0]["frameNumbers"], json!([0]));
+        assert_eq!(meta["world"]["cameras"][0]["headOffsetY"], 2);
 
         let defects = response_json(inspection_world_defects_response(
             &state,
@@ -23387,7 +23405,7 @@ mod tests {
             .any(|defect| defect["className"] == "ONLINE-LOCATABLE"
                 && defect["locatable"] == true
                 && defect["imageIndex"] == 0
-                && defect["worldRect"]["y"] == 4));
+                && defect["worldRect"]["y"] == 2));
         assert!(defects
             .iter()
             .any(|defect| defect["className"] == "ONLINE-MM-ONLY" && defect["locatable"] == false));
@@ -23458,7 +23476,7 @@ mod tests {
             refreshed_meta["world"]["cameras"][0]["frameNumbers"],
             json!([0, 1])
         );
-        assert_eq!(refreshed_meta["world"]["cameras"][0]["height"], 96);
+        assert_eq!(refreshed_meta["world"]["cameras"][0]["height"], 94);
         let refreshed_defects = response_json(inspection_world_defects_response(
             &state,
             "recordId=INSP-WORLD-1",
@@ -23469,7 +23487,7 @@ mod tests {
             .iter()
             .any(|defect| defect["className"] == "ONLINE-LATE"
                 && defect["imageIndex"] == 1
-                && defect["worldRect"]["y"] == 52));
+                && defect["worldRect"]["y"] == 50));
 
         let tile = inspection_world_tile_response(
             &state,

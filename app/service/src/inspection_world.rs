@@ -75,7 +75,7 @@ pub fn detect_camera_head(frames: &[(u32, PathBuf)]) -> Result<CameraAlignment, 
         }
         background_samples.sort_unstable();
         let background = background_samples
-            .get(background_samples.len().saturating_sub(1) / 4)
+            .get(background_samples.len().saturating_sub(1) / 20)
             .copied()
             .unwrap_or(0);
         let threshold = MIN_LUMA.max(background.saturating_add(BACKGROUND_DELTA));
@@ -308,9 +308,12 @@ impl InspectionWorld {
         let frame_y = image_index
             .checked_mul(camera.frame_height)
             .ok_or(WorldError::DimensionOverflow)?;
-        let y = frame_y
+        let raw_y = frame_y
             .checked_add(local.y)
             .ok_or(WorldError::DimensionOverflow)?;
+        let y = raw_y
+            .checked_sub(camera.head_offset_y)
+            .ok_or(WorldError::InvalidRectangle)?;
         Ok(PixelRect::new(x, y, local.width, local.height))
     }
 }
