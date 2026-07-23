@@ -18760,6 +18760,8 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, Set, Statement};
 
+    static CONVERTED_WORLD_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     fn production_test_state() -> ServiceState {
         production_test_state_with_provider(CaptureProvider::Simulated, "simulated://capture")
     }
@@ -24378,10 +24380,12 @@ mod tests {
         PathBuf,
         standard_record_store::ConvertedLocalStore,
     ) {
+        let sequence = CONVERTED_WORLD_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "steel-converted-world-{}-{}",
+            "steel-converted-world-{}-{}-{}",
             std::process::id(),
-            current_time_millis()
+            current_time_millis(),
+            sequence
         ));
         let record_root = root.join("records").join("10");
         fs::create_dir_all(&record_root).expect("converted record root");
