@@ -14952,14 +14952,20 @@ button {
 /* Formal BKV provider: intentionally isolated from physical-camera production controls. */
 .bkv-provider-shell {
   min-height: 100vh;
-  overflow: auto;
+  overflow: hidden;
   background: radial-gradient(circle at 70% 0%, rgba(0, 177, 255, 0.12), transparent 40%), var(--bg);
 }
 
 .bkv-app-shell {
-  min-height: 100vh;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
   padding: 12px;
   color: var(--text);
+}
+
+.bkv-provider-shell .bkv-workspace {
+  min-height: calc(100vh - 208px);
 }
 
 .bkv-header,

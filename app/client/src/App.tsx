@@ -238,6 +238,16 @@ export default function App() {
     return (
       <div className={`app-shell theme-${theme} style-${themeStyle} bkv-provider-shell`}>
         <BkvCompatibilityApp status={bkvStatus} />
+        <AppFooter
+          activeNav="online"
+          bkvReplay={{ available: true, active: true }}
+          onNavChange={() => undefined}
+          onSettingsOpen={() => notify({
+            title: '配置中心',
+            message: 'BKV 离线模式不连接在线检测配置',
+            tone: 'info',
+          })}
+        />
       </div>
     );
   }
@@ -1243,6 +1253,7 @@ function InspectionDashboard({
       )}
       <AppFooter
         activeNav={uiState.activeNav}
+        bkvReplay={{ available: false, active: false }}
         flowVisible={inspectionFlowVisible}
         onFlowToggle={() => setInspectionFlowVisible((current) => !current)}
         analysis={selectedOnlineDefect ? {

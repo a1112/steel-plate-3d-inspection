@@ -46,6 +46,11 @@ describe('App BKV provider selection', () => {
     render(<App />);
     expect(await screen.findByRole('heading', { name: 'BKV 离线回放' })).toBeInTheDocument();
     expect(screen.getByText('真实相机在线 0')).toBeInTheDocument();
+    const moreButton = screen.getByRole('button', { name: '更多功能' });
+    fireEvent.click(moreButton);
+    const replayItem = screen.getByRole('menuitem', { name: '离线回放' });
+    expect(replayItem).toBeEnabled();
+    expect(replayItem).toHaveAttribute('aria-current', 'page');
     expect(screen.queryByText('钢管3D表面检测系统')).not.toBeInTheDocument();
   });
 });
@@ -122,6 +127,16 @@ describe('App online severity filters', () => {
     expect(screen.queryByRole('status', { name: '检测数据实时跟随状态' })).not.toBeInTheDocument();
     expect(screen.getByRole('group', { name: '检测记录跟随模式' })).toBeInTheDocument();
     expect(screen.getByRole('group', { name: '显示视图切换' })).toBeInTheDocument();
+  });
+
+  it('keeps offline replay visible but disabled outside BKV mode', async () => {
+    render(<App />);
+
+    const moreButton = await screen.findByRole('button', { name: '更多功能' });
+    fireEvent.click(moreButton);
+
+    expect(screen.getByRole('menuitem', { name: '离线回放' })).toBeDisabled();
+    expect(screen.getByText('仅 BKV 模式可用')).toBeInTheDocument();
   });
 
   it('places defect filters before the list without a duplicate counts panel', async () => {
