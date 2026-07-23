@@ -76,6 +76,7 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
   const [worldMeta, setWorldMeta] = useState<InspectionWorldMeta | null>(null);
   const [worldDefects, setWorldDefects] = useState<InspectionWorldDefect[]>([]);
   const [focusDefectId, setFocusDefectId] = useState<string | number | null>(null);
+  const [focusDefectRevision, setFocusDefectRevision] = useState(0);
   const [message, setMessage] = useState('正在读取经过校验的旧系统数据…');
   const [busy, setBusy] = useState(false);
 
@@ -249,6 +250,7 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
                 onClick={() => {
                   setViewMode('2d');
                   setFocusDefectId(defect.legacyDefectId);
+                  setFocusDefectRevision((current) => current + 1);
                 }}
               >
                 <strong>{defect.className}</strong>
@@ -294,6 +296,7 @@ export function BkvCompatibilityApp({ status: initialStatus }: { status: BkvStat
                 meta={worldMeta}
                 defects={worldDefects}
                 focusDefectId={focusDefectId}
+                focusDefectRevision={focusDefectRevision}
               />
               : <div className="bkv-image-loading">正在读取检测图像世界…</div>
           ) : null}

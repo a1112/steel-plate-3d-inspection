@@ -20,6 +20,10 @@ interface PlateMapProps {
   defectTypeCounts: Record<string, number>;
   hiddenTypeIds: Set<string>;
   selectedDefectId: string | null;
+  worldFocusRequest?: {
+    defectId: string | null;
+    revision: number;
+  };
   surfaceMode: SurfaceDisplayMode;
   previewPositionM: number;
   plateLengthM?: number;
@@ -1165,6 +1169,7 @@ export function PlateMap({
   defectTypeCounts,
   hiddenTypeIds,
   selectedDefectId,
+  worldFocusRequest,
   surfaceMode,
   previewPositionM,
   plateLengthM = DEFAULT_PLATE_LENGTH_M,
@@ -1369,7 +1374,8 @@ export function PlateMap({
           recordId={activePersistedWorld.recordId}
           meta={activePersistedWorld.meta}
           defects={activePersistedWorld.defects}
-          focusDefectId={selectedDefectId}
+          focusDefectId={worldFocusRequest?.defectId ?? null}
+          focusDefectRevision={worldFocusRequest?.revision}
         />
       ) : cameraLanes.length === 0 ? (
         <div className="production-artifact-empty" role="status">

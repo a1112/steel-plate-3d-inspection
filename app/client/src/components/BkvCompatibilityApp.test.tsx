@@ -70,6 +70,12 @@ const worldMeta: InspectionWorldMeta = {
 describe('BkvCompatibilityApp', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal('ResizeObserver', class ResizeObserver {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe() { this.callback([], this); }
+      unobserve() {}
+      disconnect() {}
+    });
     vi.mocked(fetchBkvMaterials).mockResolvedValue([material, { ...material, legacySeqNo: 1893701, steelId: 'STEEL-B' }]);
     vi.mocked(fetchBkvArtifactBlobUrl).mockImplementation(async (path: string) => `blob:${path}`);
     vi.mocked(fetchInspectionWorldMeta).mockResolvedValue(worldMeta);

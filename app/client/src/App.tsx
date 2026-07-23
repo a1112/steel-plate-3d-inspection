@@ -404,6 +404,10 @@ function InspectionDashboard({
   const [analysisCollapsed, setAnalysisCollapsed] = useState(false);
   const [analysisViewMode, setAnalysisViewMode] = useState<AnalysisViewMode>('overview');
   const [plateMapViewMode, setPlateMapViewMode] = useState<PlateMapViewMode>('2d');
+  const [worldFocusRequest, setWorldFocusRequest] = useState({
+    defectId: null as string | null,
+    revision: 0,
+  });
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [inspectionFlowVisible, setInspectionFlowVisible] = useState(false);
   const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>(terminalMode === 'bkv' ? 'history' : 'latest');
@@ -1000,18 +1004,30 @@ function InspectionDashboard({
       setSnapshotTracking(defect.plateNo === latestPlateNo ? 'latest' : 'history');
     }
     setUiState((current) => selectDefect(current, allDefects, defectId));
+    setWorldFocusRequest((current) => ({
+      defectId,
+      revision: current.revision + 1,
+    }));
   };
 
   const selectRecordByPlateNo = (plateNo: string) => {
     const latestPlateNo = snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo;
     setSnapshotTracking(plateNo === latestPlateNo ? 'latest' : 'history');
     setUiState((current) => selectRecord(current, snapshot, plateNo));
+    setWorldFocusRequest((current) => ({
+      defectId: null,
+      revision: current.revision + 1,
+    }));
   };
 
   const followLatestSnapshot = () => {
     const latestPlateNo = snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo;
     setSnapshotTracking('latest');
     setUiState((current) => selectRecord(current, snapshot, latestPlateNo));
+    setWorldFocusRequest((current) => ({
+      defectId: null,
+      revision: current.revision + 1,
+    }));
   };
 
   const updateOnlineFilters = (patch: Partial<ReportFilters>) => {
@@ -1220,6 +1236,7 @@ function InspectionDashboard({
                   defectTypeCounts={defectTypeCounts}
                   hiddenTypeIds={uiState.hiddenDefectTypeIds}
                   selectedDefectId={selectedOnlineDefectId}
+                  worldFocusRequest={worldFocusRequest}
                   surfaceMode={uiState.surfaceDisplayMode}
                   previewPositionM={uiState.previewPositionM}
                   plateLengthM={activePlateLengthM}

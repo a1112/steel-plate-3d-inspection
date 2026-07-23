@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App, { formatStorageBytes, formatStorageWarning } from './App';
 import { getMockInspectionSnapshot } from './data/inspection';
@@ -6,6 +6,23 @@ import { getMockInspectionSnapshot } from './data/inspection';
 function getDefectTableRows(container: HTMLElement) {
   return Array.from(container.querySelectorAll('.defect-table tbody tr')).map((row) => row.textContent?.trim() ?? '');
 }
+
+beforeEach(() => {
+  vi.stubGlobal('ResizeObserver', class ResizeObserver {
+    constructor(private readonly callback: ResizeObserverCallback) {}
+    observe(target: Element) {
+      this.callback([{
+        target,
+        contentRect: target.getBoundingClientRect(),
+        borderBoxSize: [],
+        contentBoxSize: [],
+        devicePixelContentBoxSize: [],
+      }], this);
+    }
+    unobserve() {}
+    disconnect() {}
+  });
+});
 
 describe('storage capacity warning presentation', () => {
   it('shows remaining capacity, percentage, and estimated production time', () => {
@@ -118,13 +135,20 @@ describe('App BKV provider selection', () => {
           schema: 'steel.inspection-world.defects.v1',
           provider: 'bkv',
           recordId,
-          defects: [],
+          defects: recordId === '1893700' ? [{
+            id: 706831,
+            className: '轧折',
+            cameraId: 1,
+            imageIndex: 0,
+            locatable: true,
+            worldRect: { x: 20, y: 40, width: 40, height: 60 },
+          }] : [],
         }), { status: 200 });
       }
       return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
     }));
 
-    render(<App />);
+    const { container } = render(<App />);
     expect(await screen.findByText('钢管3D表面检测系统')).toBeInTheDocument();
     expect(screen.getByText('BKV 模式')).toBeInTheDocument();
     expect(screen.getByText('离线数据')).toBeInTheDocument();
@@ -145,6 +169,19 @@ describe('App BKV provider selection', () => {
     expect(requestedUrls.some((url) => url.includes('/api/trigger/status'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/inspection-world/meta') && url.includes('1893700'))).toBe(true);
     expect(await screen.findByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
+    const canvas = await screen.findByTestId('inspection-world-canvas');
+    await waitFor(() => expect(canvas).toHaveAttribute('data-locatable-defects', '1'));
+    expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(1000 / 600, 6);
+
+    const selectedDefectRow = container.querySelector('.defect-table tbody tr');
+    expect(selectedDefectRow).not.toBeNull();
+    fireEvent.click(selectedDefectRow!);
+    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(4, 6));
+
+    fireEvent.wheel(canvas, { deltaY: 200, ctrlKey: true, clientX: 500, clientY: 300 });
+    expect(Number(canvas.getAttribute('data-view-scale'))).toBeLessThan(4);
+    fireEvent.click(selectedDefectRow!);
+    await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(4, 6));
 
     fireEvent.click(screen.getByText('253B09401250925A12004329'));
     expect(await screen.findByLabelText('1893701 检测图像滚动视图')).toHaveAttribute('data-record-id', '1893701');
