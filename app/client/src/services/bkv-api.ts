@@ -31,6 +31,13 @@ export type BkvCamera = {
   npzFrames: BkvFrame[];
 };
 
+export type BkvPixelRect = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
+
 export type BkvDefect = {
   legacyDefectId: number;
   defectNo?: number;
@@ -42,6 +49,8 @@ export type BkvDefect = {
   imageIndex?: number;
   area3d?: number | null;
   depth3d?: number | null;
+  imageRect2d?: BkvPixelRect;
+  steelRect2d?: BkvPixelRect;
 };
 
 export type BkvMaterial = {
