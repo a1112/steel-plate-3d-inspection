@@ -186,8 +186,8 @@ describe('App BKV provider selection', () => {
     expect(screen.getByText('6/6')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '检测记录' })).toBeInTheDocument();
     expect(screen.getAllByText('253B09401250925A12004328').length).toBeGreaterThan(0);
-    expect(screen.getByText('来源：旧 BKV 文件')).toBeInTheDocument();
-    expect(screen.getByText(/BKV 离线数据/)).toBeInTheDocument();
+    expect(screen.getByText('来源：BKV 标准离线仓库')).toBeInTheDocument();
+    expect(screen.getByText(/转换后标准数据/)).toBeInTheDocument();
     expect(screen.getByText('硬件控制已禁用')).toBeInTheDocument();
     expect((await screen.findAllByText('轧折')).length).toBeGreaterThan(0);
     expect(screen.getByText('BKV 离线记录')).toBeInTheDocument();
@@ -203,6 +203,7 @@ describe('App BKV provider selection', () => {
     expect(requestedUrls.some((url) => url.includes('/api/bkv/materials'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/capture/health'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/trigger/status'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('converter'))).toBe(false);
     expect(await screen.findByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
     await waitFor(() => {
       expect(requestedUrls.some((url) => url.includes('/api/inspection-world/meta') && url.includes('1893700'))).toBe(true);
@@ -283,7 +284,41 @@ describe('App BKV provider selection', () => {
     expect(await screen.findByRole('heading', { name: 'BKV 数据读取失败' })).toBeInTheDocument();
     expect(screen.getByText(/converted catalog locked/)).toBeInTheDocument();
     expect(screen.getByText('BKV 模式')).toBeInTheDocument();
-    expect(screen.getByText('数据异常')).toBeInTheDocument();
+    expect(screen.getByText('BKV 数据异常')).toBeInTheDocument();
+    expect(screen.queryByText(/服务异常/)).not.toBeInTheDocument();
+  });
+
+  it('keeps BKV store health ready when only the selected record world is missing', async () => {
+    window.history.replaceState(null, '', '/?app=terminal&view=bkv');
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/records')) {
+        return new Response(JSON.stringify(bkvRecordsPayload), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/meta')) {
+        return new Response(JSON.stringify({ message: 'record world not found' }), { status: 404 });
+      }
+      if (url.includes('/api/inspection-world/defects')) {
+        const recordId = new URL(url).searchParams.get('recordId') ?? '1893700';
+        return new Response(JSON.stringify({
+          schema: 'steel.inspection-world.defects.v1',
+          provider: 'bkv',
+          recordId,
+          defects: [],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText('数据就绪')).toBeInTheDocument();
+    expect(await screen.findByRole('alert')).toHaveTextContent('当前记录图像读取失败');
+    expect(screen.getByRole('alert')).toHaveTextContent('record world not found');
+    expect(screen.queryByText('BKV 数据异常')).not.toBeInTheDocument();
     expect(screen.queryByText(/服务异常/)).not.toBeInTheDocument();
   });
 });

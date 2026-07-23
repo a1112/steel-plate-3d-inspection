@@ -25,7 +25,7 @@ const summary: InspectionSummary = {
   bySurface: { top: 5, bottom: 7 },
 };
 
-function SidebarHarness() {
+function SidebarHarness({ runtimeMode = 'online' }: { runtimeMode?: 'online' | 'bkv' }) {
   const [filters, setFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
   const filteredRecords = records.filter((record) => {
     if (filters.serialNo && !record.id.includes(filters.serialNo)) {
@@ -42,6 +42,7 @@ function SidebarHarness() {
 
   return (
     <LeftSidebar
+      runtimeMode={runtimeMode}
       plate={plate}
       summary={summary}
       records={filteredRecords}
@@ -92,5 +93,12 @@ describe('LeftSidebar', () => {
     expect(
       screen.getByText((_, element) => element?.classList.contains('record-search-count') === true && element.textContent === '匹配 1 / 2'),
     ).toBeInTheDocument();
+  });
+
+  it('identifies BKV records as coming from the standard offline store', () => {
+    render(<SidebarHarness runtimeMode="bkv" />);
+
+    expect(screen.getByText('来源：BKV 标准离线仓库')).toBeInTheDocument();
+    expect(screen.queryByText('来源：旧 BKV 文件')).not.toBeInTheDocument();
   });
 });

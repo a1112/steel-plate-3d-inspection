@@ -58,8 +58,7 @@ describe('BrandHeader', () => {
         cameraCount: 6,
         availableCameraCount: 6,
         batchId: 'legacy-1893700-1893710',
-        dataReady: true,
-        detail: 'BKV 数据已就绪',
+        health: { state: 'ready', detail: 'BKV 标准离线仓库已就绪' },
       },
     });
 
@@ -76,6 +75,22 @@ describe('BrandHeader', () => {
     expect(screen.queryByText('L2')).not.toBeInTheDocument();
     expect(screen.queryByText('触发网关')).not.toBeInTheDocument();
     expect(screen.queryByText('服务异常')).not.toBeInTheDocument();
+  });
+
+  it('reports a standard-store failure as BKV data abnormal without service alarms', () => {
+    renderHeader({
+      dashboardMode: bkvDashboardMode,
+      bkvData: {
+        cameraCount: 6,
+        availableCameraCount: 0,
+        batchId: '未连接',
+        health: { state: 'store-error', detail: 'converted catalog locked' },
+      },
+    });
+
+    expect(screen.getByText('BKV 数据异常')).toHaveAttribute('title', 'converted catalog locked');
+    expect(screen.queryByText('服务异常')).not.toBeInTheDocument();
+    expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
   });
 
   it('places the online analysis collapse control immediately before minimize', () => {
@@ -354,6 +369,7 @@ describe('BrandHeader', () => {
     expect(screen.getByText('异常')).toBeInTheDocument();
     expect(screen.getByText('离线')).toBeInTheDocument();
     expect(screen.getAllByText('在线')[0]).toBeInTheDocument();
+    expect(screen.getByText('服务异常')).toBeInTheDocument();
 
     expect(screen.queryByRole('button', { name: '系统报警 1 项，服务异常 2 项' })).not.toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: '打开消息通知' })).toHaveLength(1);

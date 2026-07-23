@@ -10,12 +10,16 @@ import { NotificationCenter } from './NotificationCenter';
 import { TopNav, type NavKey } from './TopNav';
 import { WindowControls } from './WindowControls';
 
+export type BkvDataHealth =
+  | { state: 'loading'; detail: string }
+  | { state: 'ready'; detail: string }
+  | { state: 'store-error'; detail: string };
+
 export type BkvHeaderData = {
   cameraCount: number;
   availableCameraCount: number;
   batchId: string;
-  dataReady: boolean;
-  detail: string;
+  health: BkvDataHealth;
 };
 
 interface BrandHeaderProps {
@@ -717,6 +721,20 @@ export function BrandHeader({
     triggerGateway: makeUnknownService('触发网关'),
   };
   const logoSrc = theme === 'light' ? ustbLogo : ustbLogoDark;
+  const bkvHealth = bkvData?.health ?? {
+    state: 'loading',
+    detail: '正在读取 BKV 标准离线仓库',
+  };
+  const bkvHealthValue = bkvHealth.state === 'ready'
+    ? '数据就绪'
+    : bkvHealth.state === 'store-error'
+      ? 'BKV 数据异常'
+      : '读取中';
+  const bkvHealthTone = bkvHealth.state === 'ready'
+    ? 'ok'
+    : bkvHealth.state === 'store-error'
+      ? 'error'
+      : 'warning';
   const [activeDetail, setActiveDetail] = useState<'receiver' | 'camera' | 'system' | null>(null);
   const receiverWrapRef = useRef<HTMLDivElement>(null);
   const cameraWrapRef = useRef<HTMLDivElement>(null);
@@ -835,15 +853,15 @@ export function BrandHeader({
       <div className={`brand-status ${dashboardMode.kind === 'bkv' ? 'bkv-runtime-status' : 'online-runtime-status'}`}>
         {dashboardMode.kind === 'bkv' ? (
           <>
-            <StatusBlock className="bkv-mode-status" label="BKV 模式" value="离线回放" title={bkvData?.detail ?? '正在读取 BKV 标准离线仓库'} />
-            <StatusBlock className="bkv-data-status" label="离线数据" value={`${bkvData?.availableCameraCount ?? 0}/${bkvData?.cameraCount ?? dashboardMode.cameraCount}`} title={bkvData?.detail} />
+            <StatusBlock className="bkv-mode-status" label="BKV 模式" value="离线回放" title={bkvHealth.detail} />
+            <StatusBlock className="bkv-data-status" label="离线数据" value={`${bkvData?.availableCameraCount ?? 0}/${bkvData?.cameraCount ?? dashboardMode.cameraCount}`} title={bkvHealth.detail} />
             <StatusBlock className="bkv-batch-status" label="批次" value={bkvData?.batchId ?? '读取中'} title={bkvData?.batchId} />
             <StatusBlock
               className="bkv-ready-status"
               label="检测数据"
-              value={bkvData?.dataReady ? '数据就绪' : '数据异常'}
-              tone={bkvData?.dataReady ? 'ok' : 'error'}
-              title={bkvData?.detail}
+              value={bkvHealthValue}
+              tone={bkvHealthTone}
+              title={bkvHealth.detail}
             />
           </>
         ) : (

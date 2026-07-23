@@ -66,7 +66,7 @@ import {
   type SystemNetworkSnapshot,
 } from './lib/capture-api';
 import { createSequentialCameraLanes } from './lib/camera-display';
-import { BrandHeader } from './components/BrandHeader';
+import { BrandHeader, type BkvDataHealth } from './components/BrandHeader';
 import { AppFooter } from './components/AppFooter';
 import { AlarmAnalysis, type AnalysisViewMode } from './components/AlarmAnalysis';
 import { AlarmCenter } from './components/AlarmCenter';
@@ -295,6 +295,10 @@ function ConfiguredApp({
   const [snapshot, setSnapshot] = useState<InspectionSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [bkvRecords, setBkvRecords] = useState<InspectionWorldRecords | null>(null);
+  const [bkvDataHealth, setBkvDataHealth] = useState<BkvDataHealth>({
+    state: 'loading',
+    detail: '正在读取 BKV 标准离线仓库',
+  });
   const [loadRevision, setLoadRevision] = useState(0);
   const resolvedTerminalMode = dashboardMode.kind === 'bkv' ? 'bkv' : 'online';
 
@@ -303,10 +307,25 @@ function ConfiguredApp({
     setSnapshot(null);
     setLoadError(null);
     setBkvRecords(null);
+    if (dashboardMode.requestsStandardRecords) {
+      setBkvDataHealth({
+        state: 'loading',
+        detail: '正在读取 BKV 标准离线仓库',
+      });
+    }
     writeTerminalViewMode(resolvedTerminalMode);
     const loadSnapshot = dashboardMode.requestsStandardRecords
       ? fetchInspectionWorldRecords(controller.signal).then((records) => {
+        if (controller.signal.aborted) {
+          throw new DOMException('BKV record load aborted', 'AbortError');
+        }
         setBkvRecords(records);
+        setBkvDataHealth({
+          state: 'ready',
+          detail: records.records.length
+            ? `${records.records.length} 支标准离线检测记录已就绪`
+            : 'BKV 标准离线仓库可读，暂无检测记录',
+        });
         return buildStandardBkvInspectionSnapshot(records);
       })
       : fetchInspectionSnapshot(controller.signal);
@@ -316,7 +335,11 @@ function ConfiguredApp({
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          setLoadError(error instanceof Error ? error.message : '后台数据接口不可用');
+          const detail = error instanceof Error ? error.message : '后台数据接口不可用';
+          setLoadError(detail);
+          if (dashboardMode.requestsStandardRecords) {
+            setBkvDataHealth({ state: 'store-error', detail });
+          }
         }
       });
     return () => controller.abort();
@@ -326,6 +349,10 @@ function ConfiguredApp({
     setSnapshot(null);
     setLoadError(null);
     setBkvRecords(null);
+    setBkvDataHealth({
+      state: 'loading',
+      detail: '正在读取 BKV 标准离线仓库',
+    });
     setLoadRevision((current) => current + 1);
   };
 
@@ -352,8 +379,7 @@ function ConfiguredApp({
             cameraCount: dashboardMode.cameraCount,
             availableCameraCount: 0,
             batchId: bkvRecords?.batchId ?? '未连接',
-            dataReady: false,
-            detail: loadError,
+            health: bkvDataHealth,
           }}
           onNavChange={() => undefined}
           onDragMouseDown={() => undefined}
@@ -401,6 +427,7 @@ function ConfiguredApp({
       runtimeProfile={runtimeProfile}
       dashboardMode={dashboardMode}
       bkvRecords={bkvRecords}
+      bkvDataHealth={bkvDataHealth}
       capabilityMessage={capabilityMessage}
       onSnapshotChange={setSnapshot}
     />
@@ -412,6 +439,7 @@ function InspectionDashboard({
   runtimeProfile,
   dashboardMode,
   bkvRecords,
+  bkvDataHealth,
   capabilityMessage,
   onSnapshotChange,
 }: {
@@ -419,6 +447,7 @@ function InspectionDashboard({
   runtimeProfile: PublicRuntimeProfile;
   dashboardMode: RuntimeDashboardMode;
   bkvRecords: InspectionWorldRecords | null;
+  bkvDataHealth: BkvDataHealth;
   capabilityMessage?: string;
   onSnapshotChange: (snapshot: InspectionSnapshot) => void;
 }) {
@@ -1268,10 +1297,7 @@ function InspectionDashboard({
           cameraCount: bkvRecords?.cameraCount ?? dashboardMode.cameraCount,
           availableCameraCount: bkvRecords?.ready ? (bkvRecords.cameraCount ?? dashboardMode.cameraCount) : 0,
           batchId: bkvRecords?.batchId ?? '读取中',
-          dataReady: bkvRecords?.ready === true,
-          detail: bkvRecords?.ready
-            ? `${bkvRecords.records.length} 支标准离线检测记录已就绪`
-            : 'BKV 标准离线仓库暂无可用记录',
+          health: bkvDataHealth,
         } : undefined}
         analysisCollapse={uiState.activeNav === 'online' ? {
           collapsed: analysisCollapsed,

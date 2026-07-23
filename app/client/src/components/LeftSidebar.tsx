@@ -116,8 +116,8 @@ export function LeftSidebar({
       {runtimeMode === 'bkv' ? (
         <div className="sidebar-data-source" role="note">
           <div>
-            <strong>来源：旧 BKV 文件</strong>
-            <span>BKV 离线数据 · 只读观察</span>
+            <strong>来源：BKV 标准离线仓库</strong>
+            <span>转换后标准数据 · 只读观察</span>
           </div>
           <b>硬件控制已禁用</b>
         </div>
