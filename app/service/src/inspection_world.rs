@@ -1,6 +1,6 @@
 use image::{imageops, DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io::Cursor;
@@ -36,6 +36,86 @@ impl CameraOrientation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraAlignment {
+    pub aligned: bool,
+    pub head_offset_y: u32,
+    pub confidence_milli: u16,
+}
+
+impl CameraAlignment {
+    pub fn unaligned() -> Self {
+        Self {
+            aligned: false,
+            head_offset_y: 0,
+            confidence_milli: 0,
+        }
+    }
+}
+
+pub fn detect_camera_head(frames: &[(u32, PathBuf)]) -> Result<CameraAlignment, WorldError> {
+    const SAMPLE_STEP: usize = 4;
+    const BACKGROUND_ROWS: u32 = 32;
+    const MIN_LUMA: u8 = 35;
+    const BACKGROUND_DELTA: u8 = 18;
+    const MIN_FOREGROUND_OCCUPANCY: f32 = 0.12;
+    const STABLE_ROWS: usize = 8;
+
+    let mut stable_run = VecDeque::with_capacity(STABLE_ROWS);
+    for (frame_number, path) in frames {
+        let image = image::open(path)
+            .map_err(|error| WorldError::Image(format!("{}: {error}", path.display())))?
+            .to_luma8();
+        let mut background_samples = Vec::new();
+        for y in 0..BACKGROUND_ROWS.min(image.height()) {
+            for x in (0..image.width()).step_by(SAMPLE_STEP) {
+                background_samples.push(image.get_pixel(x, y).0[0]);
+            }
+        }
+        background_samples.sort_unstable();
+        let background = background_samples
+            .get(background_samples.len().saturating_sub(1) / 4)
+            .copied()
+            .unwrap_or(0);
+        let threshold = MIN_LUMA.max(background.saturating_add(BACKGROUND_DELTA));
+
+        for y in 0..image.height() {
+            let mut foreground = 0_usize;
+            let mut samples = 0_usize;
+            for x in (0..image.width()).step_by(SAMPLE_STEP) {
+                foreground += usize::from(image.get_pixel(x, y).0[0] > threshold);
+                samples += 1;
+            }
+            let occupancy = foreground as f32 / samples.max(1) as f32;
+            if occupancy >= MIN_FOREGROUND_OCCUPANCY {
+                if stable_run.len() == STABLE_ROWS {
+                    stable_run.pop_front();
+                }
+                stable_run.push_back(occupancy);
+                if stable_run.len() == STABLE_ROWS {
+                    let local_head = y + 1 - STABLE_ROWS as u32;
+                    let head_offset_y = frame_number
+                        .checked_mul(image.height())
+                        .and_then(|offset| offset.checked_add(local_head))
+                        .ok_or(WorldError::DimensionOverflow)?;
+                    let average = stable_run.iter().copied().sum::<f32>() / STABLE_ROWS as f32;
+                    let confidence_milli = ((average / 0.8).clamp(0.0, 1.0) * 1000.0)
+                        .round() as u16;
+                    return Ok(CameraAlignment {
+                        aligned: true,
+                        head_offset_y,
+                        confidence_milli,
+                    });
+                }
+            } else {
+                stable_run.clear();
+            }
+        }
+    }
+    Ok(CameraAlignment::unaligned())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CameraSpec {
     pub camera_id: u32,
@@ -52,6 +132,10 @@ pub struct CameraWorld {
     pub offset_x: u32,
     pub width: u32,
     pub height: u32,
+    pub raw_height: u32,
+    pub head_offset_y: u32,
+    pub aligned: bool,
+    pub alignment_confidence_milli: u16,
     pub frame_width: u32,
     pub frame_height: u32,
     pub frame_numbers: Vec<u32>,
@@ -104,6 +188,25 @@ impl InspectionWorld {
     }
 
     pub fn with_tile_size(specs: Vec<CameraSpec>, tile_size: u32) -> Result<Self, WorldError> {
+        Self::with_tile_size_and_alignments(
+            specs
+                .into_iter()
+                .map(|spec| (spec, CameraAlignment::unaligned()))
+                .collect(),
+            tile_size,
+        )
+    }
+
+    pub fn with_alignments(
+        specs: Vec<(CameraSpec, CameraAlignment)>,
+    ) -> Result<Self, WorldError> {
+        Self::with_tile_size_and_alignments(specs, DEFAULT_TILE_SIZE)
+    }
+
+    pub fn with_tile_size_and_alignments(
+        specs: Vec<(CameraSpec, CameraAlignment)>,
+        tile_size: u32,
+    ) -> Result<Self, WorldError> {
         if tile_size == 0 {
             return Err(WorldError::InvalidTileSize);
         }
@@ -112,7 +215,7 @@ impl InspectionWorld {
         let mut world_height = 0_u32;
         let mut cameras = Vec::with_capacity(specs.len());
 
-        for spec in specs {
+        for (spec, alignment) in specs {
             if !camera_ids.insert(spec.camera_id) {
                 return Err(WorldError::DuplicateCamera(spec.camera_id));
             }
@@ -131,15 +234,27 @@ impl InspectionWorld {
                 .copied()
                 .and_then(|frame| frame.checked_add(1))
                 .ok_or(WorldError::DimensionOverflow)?;
-            let height = spec
+            let raw_height = spec
                 .frame_height
                 .checked_mul(frame_extent)
                 .ok_or(WorldError::DimensionOverflow)?;
+            let head_offset_y = if alignment.aligned {
+                alignment.head_offset_y
+            } else {
+                0
+            };
+            let height = raw_height
+                .checked_sub(head_offset_y)
+                .ok_or(WorldError::InvalidHeadOffset(spec.camera_id))?;
             cameras.push(CameraWorld {
                 camera_id: spec.camera_id,
                 offset_x,
                 width: spec.frame_width,
                 height,
+                raw_height,
+                head_offset_y,
+                aligned: alignment.aligned,
+                alignment_confidence_milli: alignment.confidence_milli,
                 frame_width: spec.frame_width,
                 frame_height: spec.frame_height,
                 frame_numbers: spec.frame_numbers,
@@ -338,6 +453,7 @@ pub enum WorldError {
     DimensionOverflow,
     DuplicateCamera(u32),
     InvalidCameraDimensions(u32),
+    InvalidHeadOffset(u32),
     InvalidRectangle,
     InvalidTileSize,
     Image(String),
@@ -400,6 +516,35 @@ mod tests {
         path
     }
 
+    fn head_frame(
+        root: &std::path::Path,
+        name: &str,
+        width: u32,
+        height: u32,
+        head_y: Option<u32>,
+        noise_rows: &[u32],
+    ) -> PathBuf {
+        let mut image = RgbImage::from_pixel(width, height, Rgb([0, 0, 0]));
+        for row in noise_rows {
+            if *row < height {
+                image.put_pixel(width / 2, *row, Rgb([240, 240, 240]));
+            }
+        }
+        if let Some(head_y) = head_y {
+            for y in head_y..height {
+                for x in width / 5..width {
+                    let texture = ((x + y) % 17) as u8;
+                    image.put_pixel(x, y, Rgb([72 + texture, 88 + texture, 104 + texture]));
+                }
+            }
+        }
+        let path = root.join(name);
+        DynamicImage::ImageRgb8(image)
+            .save_with_format(&path, ImageFormat::Png)
+            .unwrap();
+        path
+    }
+
     fn decode_png(bytes: &[u8]) -> RgbImage {
         image::load(Cursor::new(bytes), ImageFormat::Png)
             .unwrap()
@@ -421,6 +566,69 @@ mod tests {
         assert_eq!(world.width, 3_870);
         assert_eq!(world.height, 21_504);
         assert_eq!(world.cameras[5].offset_x, 3_193);
+    }
+
+    #[test]
+    fn aligned_world_keeps_real_widths_and_crops_each_camera_head() {
+        let world = InspectionWorld::with_alignments(vec![
+            (
+                camera(1, 68, 100, 3),
+                CameraAlignment {
+                    aligned: true,
+                    head_offset_y: 12,
+                    confidence_milli: 900,
+                },
+            ),
+            (
+                camera(2, 54, 100, 2),
+                CameraAlignment {
+                    aligned: true,
+                    head_offset_y: 28,
+                    confidence_milli: 850,
+                },
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(world.width, 122);
+        assert_eq!(world.height, 288);
+        assert_eq!(world.cameras[0].offset_x, 0);
+        assert_eq!(world.cameras[0].width, 68);
+        assert_eq!(world.cameras[0].raw_height, 300);
+        assert_eq!(world.cameras[0].height, 288);
+        assert_eq!(world.cameras[0].head_offset_y, 12);
+        assert!(world.cameras[0].aligned);
+        assert_eq!(world.cameras[1].offset_x, 68);
+        assert_eq!(world.cameras[1].width, 54);
+        assert_eq!(world.cameras[1].raw_height, 200);
+        assert_eq!(world.cameras[1].height, 172);
+    }
+
+    #[test]
+    fn detects_stable_camera_head_after_leading_background() {
+        let root = temp_root("head-detection");
+        let first = head_frame(&root, "first.png", 80, 64, None, &[4, 17, 31]);
+        let second = head_frame(&root, "second.png", 80, 64, Some(19), &[2, 8]);
+
+        let alignment = detect_camera_head(&[(0, first), (1, second)]).unwrap();
+
+        assert!(alignment.aligned);
+        assert_eq!(alignment.head_offset_y, 83);
+        assert!(alignment.confidence_milli >= 700);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn leaves_all_background_camera_unaligned_despite_isolated_noise() {
+        let root = temp_root("head-noise");
+        let frame = head_frame(&root, "noise.png", 80, 64, None, &[3, 9, 15, 27, 45]);
+
+        let alignment = detect_camera_head(&[(0, frame)]).unwrap();
+
+        assert!(!alignment.aligned);
+        assert_eq!(alignment.head_offset_y, 0);
+        assert_eq!(alignment.confidence_milli, 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
