@@ -326,6 +326,7 @@ pub enum TileFormat {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TileRequest {
+    pub camera_id: u32,
     pub level: u8,
     pub tile_x: u32,
     pub tile_y: u32,
@@ -335,12 +336,130 @@ pub struct TileRequest {
 impl TileRequest {
     pub fn new(level: u8, tile_x: u32, tile_y: u32, format: TileFormat) -> Self {
         Self {
+            camera_id: 0,
             level,
             tile_x,
             tile_y,
             format,
         }
     }
+
+    pub fn for_camera(
+        camera_id: u32,
+        level: u8,
+        tile_x: u32,
+        tile_y: u32,
+        format: TileFormat,
+    ) -> Self {
+        Self {
+            camera_id,
+            level,
+            tile_x,
+            tile_y,
+            format,
+        }
+    }
+}
+
+pub fn compose_camera_tile<F>(
+    world: &InspectionWorld,
+    request: TileRequest,
+    mut resolve: F,
+) -> Result<Vec<u8>, WorldError>
+where
+    F: FnMut(u32, u32) -> Result<Option<PathBuf>, WorldError>,
+{
+    if request.level > world.max_level {
+        return Err(WorldError::TileOutOfBounds);
+    }
+    let camera = world
+        .cameras
+        .iter()
+        .find(|camera| camera.camera_id == request.camera_id)
+        .ok_or(WorldError::UnknownCamera(request.camera_id))?;
+    let scale = 1_u32
+        .checked_shl(request.level as u32)
+        .ok_or(WorldError::DimensionOverflow)?;
+    let tile_span = world
+        .tile_size
+        .checked_mul(scale)
+        .ok_or(WorldError::DimensionOverflow)?;
+    let start_x = request
+        .tile_x
+        .checked_mul(tile_span)
+        .ok_or(WorldError::DimensionOverflow)?;
+    let display_start_y = request
+        .tile_y
+        .checked_mul(tile_span)
+        .ok_or(WorldError::DimensionOverflow)?;
+    if start_x >= camera.width || display_start_y >= camera.height {
+        return Err(WorldError::TileOutOfBounds);
+    }
+    let source_width = tile_span.min(camera.width - start_x);
+    let source_height = tile_span.min(camera.height - display_start_y);
+    let raw_start_y = display_start_y
+        .checked_add(camera.head_offset_y)
+        .ok_or(WorldError::DimensionOverflow)?;
+    let output_width = source_width.div_ceil(scale);
+    let output_height = source_height.div_ceil(scale);
+    let mut output = RgbImage::from_pixel(output_width, output_height, Rgb(MISSING_TILE_COLOR));
+
+    for frame_number in &camera.frame_numbers {
+        let frame_top = frame_number
+            .checked_mul(camera.frame_height)
+            .ok_or(WorldError::DimensionOverflow)?;
+        let frame_bottom = frame_top
+            .checked_add(camera.frame_height)
+            .ok_or(WorldError::DimensionOverflow)?;
+        if frame_bottom <= raw_start_y || frame_top >= raw_start_y + source_height {
+            continue;
+        }
+        let Some(path) = resolve(camera.camera_id, *frame_number)? else {
+            continue;
+        };
+        let source = image::open(&path)
+            .map_err(|error| WorldError::Image(format!("{}: {error}", path.display())))?
+            .to_rgb8();
+        if source.dimensions() != (camera.frame_width, camera.frame_height) {
+            return Err(WorldError::Image(format!(
+                "camera {} frame {} expected {}x{}, found {}x{}",
+                camera.camera_id,
+                frame_number,
+                camera.frame_width,
+                camera.frame_height,
+                source.width(),
+                source.height(),
+            )));
+        }
+
+        let intersection_top = frame_top.max(raw_start_y);
+        let intersection_bottom = frame_bottom.min(raw_start_y + source_height);
+        let crop_y = intersection_top - frame_top;
+        let crop_height = intersection_bottom - intersection_top;
+        let resized_width = source_width.div_ceil(scale);
+        let resized_height = crop_height.div_ceil(scale);
+        let cropped = source
+            .view(start_x, crop_y, source_width, crop_height)
+            .to_image();
+        let resized = imageops::resize(
+            &cropped,
+            resized_width,
+            resized_height,
+            imageops::FilterType::Nearest,
+        );
+        let output_y = (intersection_top - raw_start_y) / scale;
+        imageops::replace(&mut output, &resized, 0, output_y.into());
+    }
+
+    let mut encoded = Cursor::new(Vec::new());
+    let format = match request.format {
+        TileFormat::Jpeg => ImageFormat::Jpeg,
+        TileFormat::Png => ImageFormat::Png,
+    };
+    DynamicImage::ImageRgb8(output)
+        .write_to(&mut encoded, format)
+        .map_err(|error| WorldError::Image(error.to_string()))?;
+    Ok(encoded.into_inner())
 }
 
 pub fn compose_tile<F>(
@@ -723,6 +842,75 @@ mod tests {
         let tile = decode_png(&bytes);
         assert_eq!(tile.get_pixel(1, 0).0, [10, 20, 30]);
         assert_eq!(tile.get_pixel(2, 0).0, [200, 210, 220]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn camera_local_tile_never_resolves_an_adjacent_camera() {
+        let root = temp_root("camera-local-isolation");
+        let left = solid_frame(&root, "left.png", 5, 4, [10, 20, 30]);
+        let world =
+            InspectionWorld::with_tile_size(vec![camera(1, 5, 4, 1), camera(2, 7, 4, 1)], 8)
+                .unwrap();
+        let mut calls = HashMap::<u32, usize>::new();
+
+        let bytes = compose_camera_tile(
+            &world,
+            TileRequest::for_camera(1, 0, 0, 0, TileFormat::Png),
+            |camera, _| {
+                *calls.entry(camera).or_default() += 1;
+                if camera == 1 {
+                    Ok(Some(left.clone()))
+                } else {
+                    Err(WorldError::Artifact("adjacent camera read".into()))
+                }
+            },
+        )
+        .unwrap();
+        let tile = decode_png(&bytes);
+
+        assert_eq!(tile.dimensions(), (5, 4));
+        assert_eq!(calls.get(&1), Some(&1));
+        assert_eq!(calls.get(&2), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn camera_local_tile_zero_starts_at_detected_raw_head_row() {
+        let root = temp_root("camera-local-head");
+        let mut source = RgbImage::from_pixel(4, 8, Rgb([255, 0, 0]));
+        for y in 2..8 {
+            for x in 0..4 {
+                source.put_pixel(x, y, Rgb([0, 255, 0]));
+            }
+        }
+        let source_path = root.join("aligned.png");
+        DynamicImage::ImageRgb8(source)
+            .save_with_format(&source_path, ImageFormat::Png)
+            .unwrap();
+        let world = InspectionWorld::with_tile_size_and_alignments(
+            vec![(
+                camera(1, 4, 8, 1),
+                CameraAlignment {
+                    aligned: true,
+                    head_offset_y: 2,
+                    confidence_milli: 900,
+                },
+            )],
+            8,
+        )
+        .unwrap();
+
+        let bytes = compose_camera_tile(
+            &world,
+            TileRequest::for_camera(1, 0, 0, 0, TileFormat::Png),
+            |_, _| Ok(Some(source_path.clone())),
+        )
+        .unwrap();
+        let tile = decode_png(&bytes);
+
+        assert_eq!(tile.dimensions(), (4, 6));
+        assert_eq!(tile.get_pixel(1, 0).0, [0, 255, 0]);
         fs::remove_dir_all(root).unwrap();
     }
 

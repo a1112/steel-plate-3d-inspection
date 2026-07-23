@@ -1,6 +1,6 @@
 use crate::inspection_world::{
-    compose_tile, detect_camera_head, CameraOrientation, CameraSpec, InspectionWorld, PixelRect,
-    TileRequest, WorldError,
+    compose_camera_tile, detect_camera_head, CameraOrientation, CameraSpec, InspectionWorld,
+    PixelRect, TileRequest, WorldError,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -199,7 +199,7 @@ impl BkvManager {
         let material = self.material_ref(legacy_sequence)?;
         let (world, sources) =
             build_inspection_world(material, |relative| self.resolve_artifact(relative))?;
-        let bytes = compose_tile(&world, request, |camera_id, frame_number| {
+        let bytes = compose_camera_tile(&world, request, |camera_id, frame_number| {
             let relative = sources.get(&(camera_id, frame_number)).ok_or_else(|| {
                 WorldError::Artifact(format!(
                     "camera {camera_id} frame {frame_number} is not in the manifest"
@@ -878,11 +878,11 @@ mod tests {
     fn inspection_tile_uses_manifest_sources_and_bounded_cache() {
         let (root, manifest, cursor) = fixture("tile-cache");
         let manager = BkvManager::load(&root, &manifest, &cursor).unwrap();
-        let request = TileRequest::new(0, 0, 0, TileFormat::Jpeg);
+        let request = TileRequest::for_camera(1, 0, 0, 0, TileFormat::Jpeg);
 
         let first = manager.inspection_tile(1_893_700, request).unwrap();
         let decoded = image::load_from_memory(&first).unwrap();
-        assert_eq!(decoded.width(), 12);
+        assert_eq!(decoded.width(), 2);
         assert_eq!(decoded.height(), 2);
 
         fs::write(
@@ -904,7 +904,10 @@ mod tests {
         let manager = BkvManager::load(&root, &manifest, &cursor).unwrap();
 
         let error = manager
-            .inspection_tile(1_893_700, TileRequest::new(0, 0, 0, TileFormat::Png))
+            .inspection_tile(
+                1_893_700,
+                TileRequest::for_camera(1, 0, 0, 0, TileFormat::Png),
+            )
             .unwrap_err();
         assert!(error.contains("UnsupportedOrientation"));
         fs::remove_dir_all(root).unwrap();

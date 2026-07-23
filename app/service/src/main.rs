@@ -12572,6 +12572,13 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
         Err(response) => return response,
     };
     let parse = |key: &str| query_value(query, key).and_then(|value| value.parse::<u32>().ok());
+    let Some(camera_id) = parse("cameraId") else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "inspection_world_camera_required"}).to_string(),
+        );
+    };
     let Some(level) = parse("level").and_then(|value| u8::try_from(value).ok()) else {
         return http_response(
             "400 Bad Request",
@@ -12598,7 +12605,13 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
             )
         }
     };
-    let request = crate::inspection_world::TileRequest::new(level, tile_x, tile_y, format);
+    let request = crate::inspection_world::TileRequest::for_camera(
+        camera_id,
+        level,
+        tile_x,
+        tile_y,
+        format,
+    );
     let result = if let Some(manager) = state.bkv.as_ref() {
         record_id
             .parse::<u64>()
@@ -12606,15 +12619,20 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
             .and_then(|sequence| manager.inspection_tile(sequence, request))
     } else {
         load_online_inspection_world(state, &record_id).and_then(|online| {
-            inspection_world::compose_tile(&online.world, request, |camera_id, image_index| {
-                Ok(online.frames.get(&(camera_id, image_index)).cloned())
-            })
+            inspection_world::compose_camera_tile(
+                &online.world,
+                request,
+                |camera_id, image_index| {
+                    Ok(online.frames.get(&(camera_id, image_index)).cloned())
+                },
+            )
             .map_err(|error| error.to_string())
         })
     };
     match result {
         Ok(bytes) => {
             let level_header = level.to_string();
+            let camera_header = camera_id.to_string();
             let x_header = tile_x.to_string();
             let y_header = tile_y.to_string();
             http_bytes_response_with_headers(
@@ -12627,6 +12645,7 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
                 &bytes,
                 &[
                     ("Cache-Control", "private, max-age=300"),
+                    ("X-World-Camera-Id", &camera_header),
                     ("X-World-Level", &level_header),
                     ("X-World-Tile-X", &x_header),
                     ("X-World-Tile-Y", &y_header),
@@ -23489,9 +23508,18 @@ mod tests {
                 && defect["imageIndex"] == 1
                 && defect["worldRect"]["y"] == 50));
 
-        let tile = inspection_world_tile_response(
+        let missing_camera = response_json(inspection_world_tile_response(
             &state,
             "recordId=INSP-WORLD-1&level=0&x=0&y=0&format=png",
+        ));
+        assert_eq!(
+            missing_camera["error"],
+            "inspection_world_camera_required"
+        );
+
+        let tile = inspection_world_tile_response(
+            &state,
+            "recordId=INSP-WORLD-1&cameraId=1&level=0&x=0&y=0&format=png",
         );
         let separator = tile
             .windows(4)
