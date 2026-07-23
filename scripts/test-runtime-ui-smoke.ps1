@@ -387,6 +387,20 @@ async function runBkvNativeScrollChecks(page, result) {
     }
   }
 
+  await requireEventually('bkv-footer-more-entry-visible', `(() => {
+    const more = document.querySelector('button[aria-label="\u66f4\u591a\u529f\u80fd"]');
+    return more ? { expanded: more.getAttribute('aria-expanded') } : false;
+  })()`);
+  await page.click('button[aria-label="\u66f4\u591a\u529f\u80fd"]');
+  await requireEventually('bkv-offline-replay-entry-enabled', `(() => {
+    const item = document.querySelector('[role="menuitem"]');
+    return item && item.textContent.includes('\u79bb\u7ebf\u56de\u653e')
+      && !item.disabled && item.getAttribute('aria-current') === 'page'
+      ? { label: item.textContent.trim(), active: true }
+      : false;
+  })()`);
+  await page.click('[role="menuitem"]');
+
   async function requireTileFetchQuiescence() {
     const deadline = Date.now() + timeoutMs;
     let last = null;
