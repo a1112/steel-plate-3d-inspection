@@ -73,7 +73,20 @@ export type InspectionWorldDefect = {
   imageIndex?: number | null;
   locatable: boolean;
   worldRect?: WorldRect | null;
-  trace?: Record<string, unknown>;
+  trace?: {
+    sequenceNo?: number;
+    artifacts?: {
+      classNo?: number | string;
+      imageRect2d?: {
+        left?: number;
+        top?: number;
+        right?: number;
+        bottom?: number;
+      };
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
 };
 
 export type InspectionWorldDefects = {
