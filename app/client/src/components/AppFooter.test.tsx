@@ -33,6 +33,67 @@ describe('AppFooter', () => {
     expect(screen.getByRole('button', { name: '3D 重建' })).toBeInTheDocument();
   });
 
+  it('opens the more menu and disables offline replay outside BKV mode', () => {
+    const onOpen = vi.fn();
+    render(
+      <AppFooter
+        activeNav="online"
+        bkvReplay={{ available: false, active: false, onOpen }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    const moreButton = screen.getByRole('button', { name: '更多功能' });
+    expect(moreButton).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(moreButton);
+
+    expect(moreButton).toHaveAttribute('aria-expanded', 'true');
+    const replayItem = screen.getByRole('menuitem', { name: '离线回放' });
+    expect(replayItem).toBeDisabled();
+    expect(screen.getByText('仅 BKV 模式可用')).toBeInTheDocument();
+    fireEvent.click(replayItem);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('opens BKV replay from the enabled more menu', () => {
+    const onOpen = vi.fn();
+    render(
+      <AppFooter
+        activeNav="online"
+        bkvReplay={{ available: true, active: false, onOpen }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '离线回放' }));
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+  });
+
+  it('closes the more menu when Escape is pressed', () => {
+    render(
+      <AppFooter
+        activeNav="online"
+        bkvReplay={{ available: true, active: false, onOpen: vi.fn() }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    const moreButton = screen.getByRole('button', { name: '更多功能' });
+    fireEvent.click(moreButton);
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(moreButton).toHaveAttribute('aria-expanded', 'false');
+  });
+
   it('opens management tools through independent-window callbacks', () => {
     const onSettingsOpen = vi.fn();
     const onParameterManagementOpen = vi.fn();

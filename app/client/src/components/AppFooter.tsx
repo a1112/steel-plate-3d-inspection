@@ -1,4 +1,5 @@
-import { Box, ChevronDown, ChevronUp, Database, MonitorCog, Play, Settings2 } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Box, ChevronDown, ChevronUp, Database, History, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import {
@@ -21,9 +22,16 @@ interface FooterAnalysisContext {
   onCollapsedChange: (collapsed: boolean) => void;
 }
 
+interface FooterBkvReplayEntry {
+  available: boolean;
+  active?: boolean;
+  onOpen?: () => void;
+}
+
 interface AppFooterProps {
   activeNav: NavKey;
   analysis?: FooterAnalysisContext | null;
+  bkvReplay?: FooterBkvReplayEntry;
   flowVisible?: boolean;
   onFlowToggle?: () => void;
   onNavChange: (next: NavKey) => void;
@@ -53,6 +61,7 @@ function getDefectSizeLabel(defect: DefectItem) {
 export function AppFooter({
   activeNav,
   analysis,
+  bkvReplay = { available: false },
   flowVisible = false,
   onFlowToggle,
   onSettingsOpen,
@@ -60,7 +69,37 @@ export function AppFooter({
   onCaptureManagementOpen = openCaptureManagementWindow,
   onBarSurfaceOpen = openBarSurfaceWindow,
 }: AppFooterProps) {
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
   const activeAnalysis = activeNav === 'online' ? analysis : null;
+
+  useEffect(() => {
+    if (!moreMenuOpen) return;
+
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!moreMenuRef.current?.contains(event.target as Node)) {
+        setMoreMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMoreMenuOpen(false);
+      }
+    };
+
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [moreMenuOpen]);
+
+  const openBkvReplay = () => {
+    if (!bkvReplay.available) return;
+    bkvReplay.onOpen?.();
+    setMoreMenuOpen(false);
+  };
   const changeAnalysisView = (next: AnalysisViewMode) => {
     activeAnalysis?.onAnalysisViewModeChange(next);
     if (activeAnalysis?.collapsed) {
@@ -168,6 +207,35 @@ export function AppFooter({
           <Box size={15} />
           <span>3D 重建</span>
         </button>
+        <div className="app-footer-more" ref={moreMenuRef}>
+          <button
+            type="button"
+            className={moreMenuOpen || bkvReplay.active ? 'active' : ''}
+            aria-label="更多功能"
+            aria-haspopup="menu"
+            aria-expanded={moreMenuOpen}
+            onClick={() => setMoreMenuOpen((open) => !open)}
+          >
+            <MoreHorizontal size={15} />
+            <span>更多</span>
+          </button>
+          {moreMenuOpen ? (
+            <div className="app-footer-more-menu" role="menu" aria-label="更多功能菜单">
+              <button
+                type="button"
+                role="menuitem"
+                className={bkvReplay.active ? 'active' : ''}
+                aria-current={bkvReplay.active ? 'page' : undefined}
+                disabled={!bkvReplay.available}
+                onClick={openBkvReplay}
+              >
+                <History size={15} />
+                <span>离线回放</span>
+              </button>
+              {!bkvReplay.available ? <small>仅 BKV 模式可用</small> : null}
+            </div>
+          ) : null}
+        </div>
       </nav>
     </footer>
   );

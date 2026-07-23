@@ -168,6 +168,59 @@ button {
   background: var(--blue-soft);
 }
 
+.app-footer-more {
+  position: relative;
+}
+
+.app-footer-more-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 40;
+  width: 188px;
+  padding: 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--surface-overlay);
+  box-shadow: var(--floating-shadow);
+  backdrop-filter: var(--popup-backdrop-filter);
+}
+
+.app-footer-nav .app-footer-more-menu button {
+  width: 100%;
+  height: 34px;
+  justify-content: flex-start;
+  padding: 0 9px;
+  border: 0;
+  color: var(--text);
+  background: transparent;
+}
+
+.app-footer-nav .app-footer-more-menu button:hover,
+.app-footer-nav .app-footer-more-menu button.active {
+  color: var(--accent-text);
+  background: var(--blue-soft);
+}
+
+.app-footer-nav .app-footer-more-menu button:disabled {
+  color: var(--faint);
+  background: transparent;
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.app-footer-nav .app-footer-more-menu button span {
+  display: inline;
+}
+
+.app-footer-more-menu small {
+  display: block;
+  padding: 2px 9px 3px 29px;
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1.25;
+}
+
 .app-footer-flow-button {
   height: 30px;
   flex: 0 0 auto;
