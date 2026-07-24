@@ -136,6 +136,79 @@ selection and failure behavior remain unchanged:
 MySQL must be selected through `STEEL_DATABASE_ENGINE=mysql` and
 `STEEL_DATABASE_URL`; these image-world routes do not introduce SQLite or BKV
 fallback.
+## BKV legacy archive inventory
+
+Inventory the untrusted legacy database ZIP and multipart image RARs before any
+staging or import. The command resolves all paths, invokes an explicitly located
+`UnRAR.exe`, rejects unsafe archive member paths and output reparse points, and
+atomically writes `<output-root>/<batch-id>/manifest.inventory.json`:
+
+```powershell
+python scripts/bkv_legacy_import.py inventory `
+  --database-zip 'E:\legacy\database.zip' `
+  --image-part1 'E:\legacy\image_copy.part1.rar' `
+  --image-part2 'E:\legacy\image_copy.part2.rar' `
+  --output-root 'E:\bkv-data' `
+  --batch-id 'legacy-1893700-1893710' `
+  --unrar 'C:\Program Files\WinRAR\UnRAR.exe'
+```
+
+`--unrar` may be omitted when `UNRAR_EXE` is set or `UnRAR.exe` is installed in
+the fixed `%ProgramFiles%\WinRAR` or `%ProgramFiles(x86)%\WinRAR` location. An
+explicit argument or `UNRAR_EXE` value must be absolute; PATH lookup is never
+used. Production deployment should bind this path to a reviewed WinRAR/UnRAR
+binary and verify its approved Authenticode publisher and/or SHA-256 out of band.
+
+This command inventories only: it does not extract files, execute SQL, or mutate
+the current database. It invokes technical listing with `-cfg-`, accepts verified
+English and Chinese field names, and fails closed on non-empty unstructured
+output. Both multipart RAR volumes are listed independently because each can
+contain unique members. Normalized paths are merged; a duplicate is accepted
+only when every metadata value supplied by both volumes agrees, with a CRC or
+attribute supplied by only one volume retained as additional evidence. Unique
+members retain their source `archivePart`, while duplicates list both
+`archiveParts`. ZIP CRC/read failures remain explicit evidence in the manifest,
+and RAR members remain `listed-unverified` until a later staging step hashes
+their extracted contents. Per-volume `recordsSeen`, `accepted`, and `rejected`
+counts are included in the manifest.
+
+Untrusted input is bounded by the constants in `bkv_legacy_import.py`: 4 GiB
+combined source archive bytes, 100,000 ZIP members/central-directory records,
+256 MiB of central-directory data, 1 MiB of ZIP64 EOCD data, 2 GiB per ZIP
+member, 4 GiB cumulative ZIP uncompressed
+bytes, a 100:1 maximum compression ratio, and a 300-second total ZIP inventory
+deadline. These limits are based on the supplied 125,238,751-byte ZIP containing
+one 771,923,996-byte SQL member. RAR limits are 1,000,000 listing records, 64 MiB
+combined UnRAR stdout/stderr, and a 300-second process timeout; the manifest is
+limited to 128 MiB. EOCD/ZIP64 metadata is read with a bounded tail read before
+`ZipFile` construction; multi-disk, malformed, inconsistent, or oversized
+central directories fail closed. Exceeding any limit is an explicit failure.
+ZIP64 is accepted only in the standard fixed layout: the 56-byte ZIP64 EOCD must
+be immediately adjacent to its locator, and the locator target must be exactly
+that same record. Extensible/gapped or dual-record interpretations are rejected
+instead of allowing the preflight and Python `zipfile` to consume different
+metadata.
+
+Windows ADS/control/trailing-dot names, reserved device names, case-insensitive
+collisions, links, traversal, and reparse output paths are rejected. On Windows,
+all three inputs are first held through `CreateFileW` handles that allow other
+readers but deny write/delete sharing. Per-file and cumulative source-size limits
+are then rechecked from those locked handles before the complete hash + ZIP +
+two-volume UnRAR inventory. Hash loops have byte quotas and a 600-second snapshot
+deadline. On other platforms, verified copies are made in a space-preflighted
+controlled temporary directory; preflight reserves the full 4 GiB permitted
+input total plus 256 MiB rather than trusting initial file sizes. Copies use
+counted streams; per-file/cumulative
+limits and the deadline are checked during copying and again from completed
+snapshot files. Snapshots are removed after publication. The manifest's archive
+hashes therefore describe the same locked/snapshotted bytes that were inventoried,
+rather than a later path read.
+
+The output root and its ancestors must be provisioned with trusted ACLs that
+prevent untrusted local users from replacing directories during the run. The
+tool rechecks ancestors and the final manifest before and after atomic replace,
+but filesystem checks alone cannot completely defeat a concurrent attacker who
+already has write or reparse privileges in that tree.
 
 ## Windows production service
 
