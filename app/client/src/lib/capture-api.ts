@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   createAdminHeaders,
   getInspectionServiceOrigin,
+  parseBkvCaptureStatus,
   readAdminErrorMessage,
 } from "../services/inspection-api";
 
@@ -24,9 +25,18 @@ export type CaptureCamera = {
   configured?: boolean;
 };
 
-export type CaptureHealth = {
+export type PhysicalCaptureProvider = "headless-cpp" | "external-api" | "simulated";
+
+export type BkvOfflineChannel = {
+  index: number;
+  status: "offline";
+  source: "bkv";
+};
+
+export type PhysicalCaptureHealth = {
   service: string;
   time: string;
+  provider?: PhysicalCaptureProvider;
   sdkReady: boolean;
   sdkCode: number;
   sdkVersion?: string;
@@ -36,6 +46,33 @@ export type CaptureHealth = {
   driverName?: string;
   cameraCount?: number;
 };
+
+export type BkvCaptureHealth = {
+  service: string;
+  time: string;
+  provider: "bkv";
+  status: "bkv-offline";
+  sdkRequired: false;
+  sdkReady: null;
+  connected: false;
+  cameraCount: 6;
+  channels: BkvOfflineChannel[];
+  driverId?: never;
+  sdkVersion?: never;
+  sdkCode?: never;
+  ip?: never;
+  batchId?: string;
+  contentId?: string;
+  replay?: {
+    index: number;
+    total: number;
+    status: "ready" | "replaying" | "completed";
+    version: number;
+    legacySeqNo?: number;
+  };
+};
+
+export type CaptureHealth = PhysicalCaptureHealth | BkvCaptureHealth;
 
 export type CaptureCameraStatus = {
   connected: boolean;
@@ -1202,13 +1239,148 @@ function hydrateSnapshot(
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseCaptureHealth(value: unknown): CaptureHealth {
+  if (!isRecord(value)) {
+    throw new Error("invalid capture health response");
+  }
+
+  if (value.provider === "bkv") {
+    const core = parseBkvCaptureStatus(value);
+    if (
+      typeof value.service !== "string" ||
+      typeof value.time !== "string" ||
+      value.connected !== false ||
+      (value.replay !== undefined && core.replay === undefined)
+    ) {
+      throw new Error("invalid BKV capture health response");
+    }
+    return {
+      service: value.service,
+      time: value.time,
+      provider: "bkv",
+      status: "bkv-offline",
+      sdkRequired: false,
+      sdkReady: null,
+      connected: false,
+      cameraCount: 6,
+      channels: core.channels,
+      ...(core.batchId ? { batchId: core.batchId } : {}),
+      ...(core.contentId ? { contentId: core.contentId } : {}),
+      ...(core.replay ? { replay: core.replay } : {}),
+    };
+  }
+
+  if (
+    typeof value.service !== "string" ||
+    typeof value.time !== "string" ||
+    (value.provider !== undefined &&
+      value.provider !== "headless-cpp" &&
+      value.provider !== "external-api" &&
+      value.provider !== "simulated") ||
+    typeof value.sdkReady !== "boolean" ||
+    typeof value.sdkCode !== "number" ||
+    typeof value.connected !== "boolean" ||
+    typeof value.ip !== "string"
+  ) {
+    throw new Error("invalid physical capture health response");
+  }
+  return {
+    service: value.service,
+    time: value.time,
+    ...(value.provider !== undefined ? { provider: value.provider } : {}),
+    sdkReady: value.sdkReady,
+    sdkCode: value.sdkCode,
+    ...(typeof value.sdkVersion === "string"
+      ? { sdkVersion: value.sdkVersion }
+      : {}),
+    connected: value.connected,
+    ip: value.ip,
+    ...(typeof value.driverId === "string" ? { driverId: value.driverId } : {}),
+    ...(typeof value.driverName === "string"
+      ? { driverName: value.driverName }
+      : {}),
+    ...(typeof value.cameraCount === "number"
+      ? { cameraCount: value.cameraCount }
+      : {}),
+  };
+}
+
+function createBkvOfflineSnapshot(
+  health: BkvCaptureHealth,
+  logs: CaptureLogEvent[],
+): CaptureSnapshot {
+  const driver: CaptureDriverInfo = {
+    id: "bkv-offline",
+    name: "BKV legacy offline replay",
+    vendor: "BKV",
+    transport: "offline",
+    sdkVersion: "not-required",
+    supportedModels: ["BKV legacy offline channel"],
+    features: ["offline-replay"],
+  };
+  const cameras: CaptureCamera[] = health.channels.map((channel) => ({
+    ip: `bkv://camera-${channel.index}`,
+    model: "BKV legacy offline channel",
+    sn: `BKV-${channel.index}`,
+    driverId: driver.id,
+    source: "bkv",
+    configured: true,
+  }));
+  const cameraConfigs: CaptureCameraConfig[] = health.channels.map((channel) => ({
+    id: `bkv-camera-${channel.index}`,
+    name: `BKV camera ${channel.index}`,
+    ip: `bkv://camera-${channel.index}`,
+    driverId: driver.id,
+    modelHint: "BKV legacy offline channel",
+    role: `offline-${channel.index}`,
+    enabled: false,
+    triggerMode: "offline",
+    exposureUs: 0,
+    gain: 0,
+    depthLines: 0,
+    outputPath: "",
+  }));
+  const statuses: CaptureCameraStatus[] = cameraConfigs.map((camera) => ({
+    ...createStatusFromConfig(camera),
+    acquisitionState: "offline",
+    sdkStatus: "not-required",
+    error: null,
+  }));
+
+  return hydrateSnapshot({
+    health,
+    driver,
+    config: {
+      id: "bkv-offline",
+      name: "BKV legacy offline replay",
+      applied: true,
+      updatedAt: health.time,
+      cameras: cameraConfigs,
+    },
+    cameras,
+    status: statuses[0] ?? null,
+    statuses,
+    capabilities: {
+      driver,
+      controls: [],
+      parameters: [],
+      api: [],
+    },
+    logs,
+  });
+}
+
 export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
   const [configResult, health, camerasResult, status, statusesResult, logsResult] =
     await Promise.all([
       readAdminJson<ServiceConfigResponse>("/api/config").catch(
         (): ServiceConfigResponse => ({}),
       ),
-      readJson<CaptureHealth>("/api/capture/health"),
+      readJson<unknown>("/api/capture/health").then(parseCaptureHealth),
       readJson<{ cameras: CaptureCamera[] }>("/api/cameras"),
       readJson<CaptureCameraStatus>("/api/camera/status"),
       readJson<{ statuses: CaptureCameraStatus[] }>(
@@ -1218,6 +1390,15 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
         () => ({ events: [] }),
       ),
     ]);
+
+  const logs = logsResult.events.map((event) => ({
+    ...event,
+    source: event.source ?? "provider-log" as const,
+    cameraIp: event.cameraIp ?? null,
+  }));
+  if (health.provider === "bkv") {
+    return createBkvOfflineSnapshot(health, logs);
+  }
 
   const config = {
     ...createDefaultCaptureConfig(),
@@ -1276,11 +1457,7 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
     cameras,
     status,
     statuses,
-    logs: logsResult.events.map((event) => ({
-      ...event,
-      source: event.source ?? "provider-log",
-      cameraIp: event.cameraIp ?? null,
-    })),
+    logs,
   });
 }
 

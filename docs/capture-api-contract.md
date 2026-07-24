@@ -81,6 +81,85 @@ These routes map only to the configured loopback converter's `/status`, `/start`
 and `/retry/<job-id>` endpoints with bounded timeouts. The Rust service rejects
 remote origins, arbitrary converter paths, and unsafe retry identifiers; it does
 not proxy converter file or business-record endpoints.
+## BKV Offline Replay Provider
+
+`STEEL_CAPTURE_PROVIDER=bkv` selects an explicit no-camera compatibility mode in
+the Rust service. It does not start, supervise, probe, or proxy the C++ capture
+service, and it never claims that a vendor SDK or physical camera is ready.
+`STEEL_BKV_DATA_ROOT` must be an absolute path containing the active, previously
+imported BKV batch.
+
+Layered readiness revalidates the active batch/content/replay binding, committed
+manifest and publication hashes, every allowlisted artifact size and SHA-256,
+and exact channel coverage 1 through 6. Artifact verification stats the expected
+size before opening the file, rejects artifacts above 1 GiB or batches above
+64 GiB, and streams SHA-256 through a fixed 64 KiB buffer under the readiness
+deadline. Every independent runtime or status request reopens and rehashes this
+evidence; file size and modification time are never a cross-request trust cache.
+One readiness aggregation performs one runtime verification and shares that
+immutable result between its capture and storage components. Runtime verification
+is process-wide single-flight per serving identity, so concurrent callers cannot
+multiply artifact hash work. Waiting for that identity lock remains subject to the
+caller's verification deadline and returns `bkv_verification_timeout` without
+waiting for the current verifier to finish. Each streamed artifact and
+deterministic mapping file is opened with
+no-follow semantics; Windows opens the reparse point and compares volume/file ID,
+while Unix uses `O_NOFOLLOW`. The service compares the opened handle with the path
+again after streaming and fails closed on a link, reparse point, replacement, or
+identity change. A valid provider reports
+`status=bkv-offline`, `sdkRequired=false`, `sdkReady=null`, and six channels with
+`status=offline`. BKV storage health reports the validated offline root with
+`queueRequired=false` and `queueAccepting=null`; there is no capture writer queue
+in this mode. Missing, changed, linked, out-of-root, or inactive artifacts close
+readiness with a stable `bkv_*` reason.
+
+For replay indexes above zero, readiness and status do not reload or transform
+the full normalized batch. The verified serving index streams each manifest-
+declared normalized JSONL file under the same deadline, verifies its same-handle
+size/SHA-256, identity, and row count, and retains only compact fields needed for
+the fixed 11-item expected parent map. Each entry contains the trusted inspection,
+material, and session IDs, timestamps, status, capture/defect counts, restricted
+path fields, and exact normalized raw binding. Counts come from the verified
+manifest artifact map and verified defect rows, never from the database parent's
+own raw payload. Capture-once still performs its immediate full-batch revalidation
+before advancing replay and holds the same serving-identity single-flight lock
+through that verification.
+
+`POST /api/production/capture-once` advances the active batch in the fixed
+legacy order `1893700` through `1893710`. The response is imported evidence,
+not a new physical capture: `source=bkv`, `offline=true`, `cameraCount=6`, the
+selected `legacySeqNo`, imported inspection/capture/defect rows, and safe
+`bkv://` artifact tokens with sizes and SHA-256 values verified immediately
+before advancement. Imported capture and defect children must be the exact
+deterministic ID set for that inspection and every persisted business/provenance
+field must match the normalized manifest; missing, extra, or modified children
+fail closed. The parent `production_inspection` must also exactly match its
+deterministic ID, material/session IDs, completed status, start/finish time,
+capture/defect counts, empty unrestricted path fields, and normalized raw BKV
+binding; missing, extra, or modified parent evidence fails closed for advancement,
+status, and snapshot reads. Replay advancement uses a transaction and
+compare-and-swap over the persisted version/index while holding the production
+command boundary.
+The replay state is fail-closed: index 0 is `ready` with no selected fields,
+indexes 1 through 10 are `replaying`, and index 11 is `completed`; every
+nonzero index must name the preceding fixed SeqNo and an imported inspection
+whose stored provenance matches `source=bkv`, the active batch/content IDs, and
+that SeqNo. Health, BKV status, production status, and snapshot reads reject the
+same contradictory or stale state instead of falling back to an unrelated real
+inspection. Capture responses include a bounded `inspection` DTO with its ID,
+status, capture/defect counts, batch/content/SeqNo binding, and minimal BKV
+provenance; raw database payloads and local unrestricted paths are not exposed.
+The selected inspection is derived from the active manifest's normalized rows
+using the same deterministic import ID formula, then fetched by its exact primary
+key. Replay never scans a recent-record window or the production inspection table.
+After item 11 the state is `completed`; another capture returns HTTP 409 with
+`bkv_replay_completed` until `POST /api/bkv/replay/reset` is authorized and
+called. Production snapshot/status prefers the selected imported inspection only
+under the BKV provider. Real and simulated provider ordering is unchanged.
+`GET /api/bkv/status` returns `active:true` only after the same active, batch,
+replay, manifest, artifact, deterministic inspection, and JSON checks succeed;
+missing, malformed, contradictory, or unreadable active dependencies return a
+stable non-200 `bkv_*` error and are never converted into null status fields.
 
 ## Health
 
