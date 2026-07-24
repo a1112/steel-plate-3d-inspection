@@ -111,6 +111,35 @@ describe('persistent production command client', () => {
     );
   });
 
+  it('accepts only ready or explicitly reviewed partial BKV batches', async () => {
+    const base = {
+      code: 0, active: true, provider: 'bkv', source: 'bkv',
+      sourceBadge: 'BKV 离线回放', offline: true,
+      activeBatch: { batchId: 'batch-001', contentId: 'a'.repeat(64) },
+      replay: { index: 1, total: 11, status: 'replaying', version: 1, legacySeqNo: 1_893_700 },
+    };
+    const reviewedPartial = {
+      ...base,
+      batch: {
+        batchId: 'batch-001', contentId: 'a'.repeat(64), status: 'partial',
+        operatorReviewedPartial: true,
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(reviewedPartial)));
+    await expect(fetchBkvStatus()).resolves.toMatchObject({
+      batch: { status: 'partial', operatorReviewedPartial: true },
+    });
+
+    for (const batch of [
+      { ...reviewedPartial.batch, operatorReviewedPartial: false },
+      { ...reviewedPartial.batch, operatorReviewedPartial: undefined },
+      { ...reviewedPartial.batch, status: 'failed', operatorReviewedPartial: true },
+    ]) {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ ...base, batch })));
+      await expect(fetchBkvStatus()).rejects.toThrow(/BKV/i);
+    }
+  });
+
   it('normalizes only authenticated service URLs while retaining safe BKV artifact refs', async () => {
     const fixture = getMockInspectionSnapshot();
     const depthArtifact: BkvArtifact = {
@@ -130,7 +159,7 @@ describe('persistent production command client', () => {
         status: 'unsupported',
         reason: 'no_evidenced_decoder',
         probeSchema: 'steel.bkv-d3img-probe.v1',
-        parserVersion: '1',
+        parserVersion: 'bkv-d3img-probe/1',
         originalSha256: 'b'.repeat(64),
         decoderAvailable: false,
       },
@@ -190,7 +219,7 @@ describe('persistent production command client', () => {
         status: 'unsupported',
         reason: 'no_evidenced_decoder',
         probeSchema: 'steel.bkv-d3img-probe.v1',
-        parserVersion: '1',
+        parserVersion: 'bkv-d3img-probe/1',
         originalSha256: 'b'.repeat(64),
         decoderAvailable: false,
       },
@@ -325,10 +354,36 @@ describe('persistent production command client', () => {
       legacySeqNo: 1_893_700, kind: '3d',
       depthDecode: {
         status: 'unsupported', reason: 'no_evidenced_decoder',
-        probeSchema: 'steel.bkv-d3img-probe.v1', parserVersion: '1',
+        probeSchema: 'steel.bkv-d3img-probe.v1', parserVersion: 'bkv-d3img-probe/1',
         originalSha256: 'b'.repeat(64), decoderAvailable: false,
       },
     })).toThrow(/decode evidence/i);
+  });
+
+  it('preserves manifest-authored unsupported and invalid d3img reasons', () => {
+    const base = {
+      artifactRef: 'bkv://batch-001/artifacts/camera1/1893700/3d/0000.d3img',
+      relativePath: 'artifacts/camera1/1893700/3d/0000.d3img',
+      url: '/api/production/file?path=bkv%3A%2F%2Fbatch-001%2Fartifacts%2Fcamera1%2F1893700%2F3d%2F0000.d3img',
+      authenticated: true, source: 'bkv', sourceBadge: 'BKV 离线回放', offline: true,
+      sha256: 'a'.repeat(64), size: 12, cameraNumber: 1,
+      legacySeqNo: 1_893_700, kind: '3d',
+    };
+    for (const depthDecode of [
+      {
+        status: 'unsupported', reason: 'legacy_probe_unavailable',
+        probeSchema: 'steel.bkv-d3img-probe.v1', parserVersion: 'bkv-d3img-probe/1',
+        originalSha256: 'a'.repeat(64), decoderAvailable: false,
+      },
+      {
+        status: 'invalid', reason: 'truncated_depth_header',
+        probeSchema: 'steel.bkv-d3img-probe.v1', parserVersion: 'bkv-d3img-probe/1',
+        originalSha256: 'a'.repeat(64), decoderAvailable: false,
+      },
+    ]) {
+      expect(parseBkvArtifact({ ...base, depthDecode }).depthDecode?.reason)
+        .toBe(depthDecode.reason);
+    }
   });
 
   it('reads BKV artifact URLs with the authenticated records session', async () => {

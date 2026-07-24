@@ -732,7 +732,8 @@ export type BkvStatus = {
   batch?: {
     batchId: string;
     contentId: string;
-    status: string;
+    status: 'ready' | 'partial';
+    operatorReviewedPartial?: true;
     counts?: Record<string, number>;
   };
   replay?: BkvReplayState;
@@ -1256,10 +1257,13 @@ export function parseBkvStatus(value: unknown): BkvStatus {
   }
   const activeBatch = parseBkvIdentity(value.activeBatch, 'active batch');
   const batchIdentity = parseBkvIdentity(value.batch, 'batch');
+  const batchStatus = isRecord(value.batch) ? value.batch.status : undefined;
+  const reviewedPartial = isRecord(value.batch) ? value.batch.operatorReviewedPartial : undefined;
   if (activeBatch.batchId !== batchIdentity.batchId
     || activeBatch.contentId !== batchIdentity.contentId
-    || !isRecord(value.batch)
-    || value.batch.status !== 'ready') {
+    || (batchStatus !== 'ready' && batchStatus !== 'partial')
+    || (batchStatus === 'partial' && reviewedPartial !== true)
+    || (batchStatus === 'ready' && reviewedPartial !== undefined)) {
     throw new Error('BKV status batch binding is invalid');
   }
   let counts: Record<string, number> | undefined;
@@ -1280,7 +1284,12 @@ export function parseBkvStatus(value: unknown): BkvStatus {
     code: 0, active: true, provider: 'bkv', source: 'bkv',
     sourceBadge: 'BKV 离线回放', offline: true,
     activeBatch,
-    batch: { ...batchIdentity, status: 'ready', ...(counts ? { counts } : {}) },
+    batch: {
+      ...batchIdentity,
+      status: batchStatus,
+      ...(batchStatus === 'partial' ? { operatorReviewedPartial: true as const } : {}),
+      ...(counts ? { counts } : {}),
+    },
     replay,
   };
 }
@@ -1332,19 +1341,19 @@ function isInspectionSnapshotShape(value: unknown): value is InspectionSnapshot 
 function parseBkvDepthDecode(value: unknown, artifactSha256: string): BkvDepthDecode {
   if (!isRecord(value)
     || value.probeSchema !== 'steel.bkv-d3img-probe.v1'
-    || value.parserVersion !== '1'
+    || value.parserVersion !== 'bkv-d3img-probe/1'
     || value.originalSha256 !== artifactSha256
     || typeof value.decoderAvailable !== 'boolean'
     || (value.status !== 'decoded' && value.status !== 'unsupported' && value.status !== 'invalid')
     || typeof value.reason !== 'string' || value.reason.trim().length === 0
-    || (value.status === 'unsupported'
-      && (value.decoderAvailable !== false || value.reason !== 'no_evidenced_decoder'))
+    || ((value.status === 'unsupported' || value.status === 'invalid')
+      && value.decoderAvailable !== false)
     || (value.status === 'decoded' && value.decoderAvailable !== true)) {
     throw new Error('BKV d3img decode evidence is invalid');
   }
   return {
     status: value.status, reason: value.reason,
-    probeSchema: 'steel.bkv-d3img-probe.v1', parserVersion: '1',
+    probeSchema: 'steel.bkv-d3img-probe.v1', parserVersion: 'bkv-d3img-probe/1',
     originalSha256: artifactSha256, decoderAvailable: value.decoderAvailable,
     ...(typeof value.previewArtifactRef === 'string' ? { previewArtifactRef: value.previewArtifactRef } : {}),
     ...(typeof value.depthArtifactRef === 'string' ? { depthArtifactRef: value.depthArtifactRef } : {}),
