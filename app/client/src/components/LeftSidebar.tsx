@@ -193,13 +193,18 @@ export function LeftSidebar({
               重置
             </button>
           </div>
-          <div className="record-search-count">
-            匹配 <strong>{filteredCount}</strong> / {totalCount}
-          </div>
         </form>
       </Panel>
 
-      <Panel title="检测记录" className="records-panel">
+      <Panel
+        title="检测记录"
+        className="records-panel"
+        action={(
+          <div className="record-search-count">
+            匹配 <strong>{filteredCount}</strong> / {totalCount}
+          </div>
+        )}
+      >
         <div className="records-table-wrap">
           <table className="records-table">
             <thead>

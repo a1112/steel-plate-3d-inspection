@@ -1803,7 +1803,10 @@ button {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 34px;
+  min-height: 40px;
+  padding: 0 12px 0 10px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 248, 252, 0.94));
 }
 
 .integrated-map-tools .plate-map-actions,
@@ -1889,6 +1892,10 @@ button {
 
 .left-column {
   grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.left-column.runtime-bkv {
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
 }
 
 .sidebar-data-source {
@@ -2230,8 +2237,8 @@ button {
   width: 100%;
   min-height: 0;
   display: grid;
-  grid-template-rows: 34px 30px auto;
-  gap: 10px;
+  grid-template-rows: 30px 28px;
+  gap: 6px;
 }
 
 .record-search-condition {
@@ -2314,11 +2321,14 @@ button {
 }
 
 .record-search-count {
-  align-self: end;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
   text-align: right;
+  white-space: nowrap;
 }
 
 .record-search-count strong {
@@ -7940,6 +7950,10 @@ button {
   grid-template-rows: auto auto auto minmax(0, 1fr);
 }
 
+.density-dense .left-column.runtime-bkv {
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+}
+
 .record-bound-defect-image {
   width: 100%;
   height: calc(100% - 26px);
@@ -7992,8 +8006,8 @@ button {
 }
 
 .density-dense .record-search-form {
-  grid-template-rows: 28px 25px auto;
-  gap: 7px;
+  grid-template-rows: 25px 25px;
+  gap: 5px;
 }
 
 .density-dense .record-search-condition {
@@ -8547,8 +8561,8 @@ button {
   }
 
   .record-search-form {
-    grid-template-rows: 28px 25px auto;
-    gap: 7px;
+    grid-template-rows: 25px 25px;
+    gap: 5px;
   }
 
   .record-search-condition {
@@ -8972,6 +8986,14 @@ button {
   border-radius: 1px;
   background: linear-gradient(180deg, #44e5ff, #0079ff);
   box-shadow: 0 0 10px rgba(0, 196, 255, 0.9);
+}
+
+.theme-dark .integrated-map-tools {
+  min-height: 34px;
+  border-bottom-color: rgba(0, 154, 255, 0.3);
+  background:
+    linear-gradient(90deg, rgba(0, 112, 190, 0.32), rgba(0, 28, 56, 0.08)),
+    rgba(0, 22, 44, 0.58);
 }
 
 .theme-dark .panel-body {
@@ -14655,6 +14677,8 @@ button {
 .density-dense .plate-map-panel.integrated-toolbar .panel-body,
 .plate-map-panel.integrated-toolbar .panel-body {
   grid-template-rows: auto minmax(0, 1fr) 24px;
+  gap: 0;
+  padding: 0;
 }
 
 .theme-dark .plate-map-panel.integrated-toolbar.view-mode-3d .panel-body,

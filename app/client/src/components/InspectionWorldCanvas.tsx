@@ -30,6 +30,7 @@ type PendingTileRequest = { token: symbol; controller: AbortController };
 const DEFAULT_WIDTH = 1000;
 const DEFAULT_HEIGHT = 600;
 const TILE_CACHE_LIMIT = 48;
+const WORLD_TOP_GUTTER_PX = 28;
 
 function fitWidthScale(worldWidth: number, viewportWidth: number) {
   return viewportWidth / Math.max(1, worldWidth);
@@ -225,20 +226,25 @@ export function InspectionWorldCanvas({
 
   const viewX = view.scrollLeft / view.scale;
   const viewY = view.scrollTop / view.scale;
-  const extent = useMemo(
+  const visibleWorldY = Math.max(0, (view.scrollTop - WORLD_TOP_GUTTER_PX) / view.scale);
+  const baseExtent = useMemo(
     () => scaledWorldExtent(meta.world.width, meta.world.height, view.scale, size.width, size.height),
     [meta.world.height, meta.world.width, size.height, size.width, view.scale],
   );
+  const extent = useMemo(() => ({
+    width: baseExtent.width,
+    height: Math.max(size.height, meta.world.height * view.scale + WORLD_TOP_GUTTER_PX),
+  }), [baseExtent.width, meta.world.height, size.height, view.scale]);
   const visibleTiles = useMemo(() => {
     if (!viewportMeasured) return [];
     return getVisibleCameraTiles({
       cameras: meta.world.cameras,
       tileSize: meta.world.tileSize,
       level,
-      viewport: { x: viewX, y: viewY, width: size.width / view.scale, height: size.height / view.scale },
+      viewport: { x: viewX, y: visibleWorldY, width: size.width / view.scale, height: size.height / view.scale },
       prefetch: 1,
     });
-  }, [level, meta.world.cameras, meta.world.tileSize, size.height, size.width, view.scale, viewX, viewY, viewportMeasured]);
+  }, [level, meta.world.cameras, meta.world.tileSize, size.height, size.width, view.scale, viewX, viewportMeasured, visibleWorldY]);
   const visibleTileKeys = useMemo(
     () => new Set(visibleTiles.map((tile) => (
       `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`
@@ -334,15 +340,15 @@ export function InspectionWorldCanvas({
   const visibleDefects = useMemo(() => {
     const margin = 32 / view.scale;
     const left = viewX - margin;
-    const top = viewY - margin;
+    const top = visibleWorldY - margin;
     const right = viewX + size.width / view.scale + margin;
-    const bottom = viewY + size.height / view.scale + margin;
+    const bottom = visibleWorldY + size.height / view.scale + margin;
     return locatableDefects.filter((defect) => {
       const rect = defect.worldRect!;
       return rect.x + rect.width >= left && rect.x <= right
         && rect.y + rect.height >= top && rect.y <= bottom;
     });
-  }, [locatableDefects, size.height, size.width, view.scale, viewX, viewY]);
+  }, [locatableDefects, size.height, size.width, view.scale, viewX, visibleWorldY]);
   const loadedTileCount = visibleTiles.filter((tile) => tileCache.current
     .get(`${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`)?.loaded).length;
   const focusedDefect = focusDefectId == null
@@ -364,7 +370,7 @@ export function InspectionWorldCanvas({
     fitWidthMode.current = false;
     const targetScroll = {
       scrollLeft: Math.max(0, (focusedRect.x + focusedRect.width / 2) * targetScale - size.width / 2),
-      scrollTop: Math.max(0, (focusedRect.y + focusedRect.height / 2) * targetScale - size.height / 2),
+      scrollTop: Math.max(0, (focusedRect.y + focusedRect.height / 2) * targetScale + WORLD_TOP_GUTTER_PX - size.height / 2),
     };
     pendingScroll.current = targetScroll;
     interactionView.current = { ...interactionView.current, ...targetScroll, scale: targetScale };
@@ -413,7 +419,7 @@ export function InspectionWorldCanvas({
       if (!camera) continue;
       const fallbackSpan = meta.world.tileSize * 2 ** entry.tile.level;
       const screenX = (camera.offsetX + entry.tile.x * fallbackSpan) * view.scale - view.scrollLeft;
-      const screenY = entry.tile.y * fallbackSpan * view.scale - view.scrollTop;
+      const screenY = entry.tile.y * fallbackSpan * view.scale + WORLD_TOP_GUTTER_PX - view.scrollTop;
       const screenWidth = Math.min(fallbackSpan, camera.width - entry.tile.x * fallbackSpan) * view.scale;
       const screenHeight = Math.min(fallbackSpan, camera.height - entry.tile.y * fallbackSpan) * view.scale;
       if (screenX + screenWidth < 0 || screenX > size.width || screenY + screenHeight < 0 || screenY > size.height) continue;
@@ -425,7 +431,7 @@ export function InspectionWorldCanvas({
       const camera = cameraById.get(tile.cameraId);
       if (!camera) continue;
       const screenX = (camera.offsetX + tile.x * span) * view.scale - view.scrollLeft;
-      const screenY = tile.y * span * view.scale - view.scrollTop;
+      const screenY = tile.y * span * view.scale + WORLD_TOP_GUTTER_PX - view.scrollTop;
       const screenWidth = Math.min(span, camera.width - tile.x * span) * view.scale;
       const screenHeight = Math.min(span, camera.height - tile.y * span) * view.scale;
       const entry = tileCache.current.get(key);
@@ -439,9 +445,10 @@ export function InspectionWorldCanvas({
       }
     }
     context.fillStyle = 'rgba(0, 193, 255, .65)';
+    const dividerTop = Math.max(0, WORLD_TOP_GUTTER_PX - view.scrollTop);
     for (const camera of meta.world.cameras) {
       const x = camera.offsetX * view.scale - view.scrollLeft;
-      context.fillRect(x, 0, 1, size.height);
+      context.fillRect(x, dividerTop, 1, Math.max(0, size.height - dividerTop));
     }
     context.strokeStyle = '#ffb020';
     context.lineWidth = 2;
@@ -449,7 +456,7 @@ export function InspectionWorldCanvas({
       const rect = defect.worldRect!;
       context.strokeRect(
         rect.x * view.scale - view.scrollLeft,
-        rect.y * view.scale - view.scrollTop,
+        rect.y * view.scale + WORLD_TOP_GUTTER_PX - view.scrollTop,
         Math.max(3, rect.width * view.scale),
         Math.max(3, rect.height * view.scale),
       );
@@ -490,6 +497,14 @@ export function InspectionWorldCanvas({
         oldScale: current.scale,
         newScale: scale,
       });
+      const pointerWorldY = Math.max(
+        0,
+        (baseScroll.scrollTop + pointerY - WORLD_TOP_GUTTER_PX) / current.scale,
+      );
+      targetScroll.scrollTop = Math.max(
+        0,
+        pointerWorldY * scale + WORLD_TOP_GUTTER_PX - pointerY,
+      );
       pendingScroll.current = targetScroll;
       interactionView.current = { ...targetScroll, scale };
       setView((state) => ({ ...state, ...targetScroll, scale }));
@@ -523,6 +538,7 @@ export function InspectionWorldCanvas({
     data-testid="inspection-world-viewport"
     data-record-id={recordId}
     data-scroll-mode="native"
+    data-top-gutter={WORLD_TOP_GUTTER_PX}
     tabIndex={0}
     aria-label={`${recordId} 检测图像滚动视图`}
     onScroll={scheduleScrollRead}

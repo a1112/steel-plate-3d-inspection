@@ -170,11 +170,12 @@ describe('InspectionWorldCanvas', () => {
     await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
 
     expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-scroll-mode', 'native');
+    expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-top-gutter', '28');
     expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('tabindex', '0');
     expect(screen.getByTestId('inspection-world-viewport')).toHaveAccessibleName('1893700 检测图像滚动视图');
     expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({
       width: '1000px',
-      height: '35840px',
+      height: '35868px',
     });
   });
 
@@ -224,7 +225,7 @@ describe('InspectionWorldCanvas', () => {
     await waitFor(() => expect(Number(canvas.getAttribute('data-view-scale'))).not.toBe(initialScale));
     const nextScale = Number(canvas.getAttribute('data-view-scale'));
     expect(viewport.scrollLeft).toBeCloseTo(500 * (nextScale / initialScale - 1), 3);
-    expect(viewport.scrollTop).toBeCloseTo(300 * (nextScale / initialScale - 1), 3);
+    expect(viewport.scrollTop).toBeCloseTo((300 - 28) * (nextScale / initialScale - 1), 3);
   });
 
   it('commits the zoom scale and anchored world position in the same render', async () => {
@@ -284,7 +285,7 @@ describe('InspectionWorldCanvas', () => {
     const finalScale = Number(canvas.getAttribute('data-view-scale'));
     expect(finalScale).toBeCloseTo(initialScale * Math.exp(0.2), 5);
     expect(viewport.scrollLeft).toBeCloseTo(500 * (finalScale / initialScale - 1), 3);
-    expect(viewport.scrollTop).toBeCloseTo(300 * (finalScale / initialScale - 1), 3);
+    expect(viewport.scrollTop).toBeCloseTo((300 - 28) * (finalScale / initialScale - 1), 3);
   });
 
   it('applies one Ctrl+wheel anchor exactly once when StrictMode replays state updates', async () => {
@@ -309,7 +310,7 @@ describe('InspectionWorldCanvas', () => {
     const finalScale = Number(canvas.getAttribute('data-view-scale'));
     expect(finalScale).toBeCloseTo(initialScale * Math.exp(0.1), 5);
     expect(viewport.scrollLeft).toBeCloseTo(500 * (finalScale / initialScale - 1), 3);
-    expect(viewport.scrollTop).toBeCloseTo(300 * (finalScale / initialScale - 1), 3);
+    expect(viewport.scrollTop).toBeCloseTo((300 - 28) * (finalScale / initialScale - 1), 3);
   });
 
   it('retains a queued anchor when a later batched Ctrl+wheel event is clamped at maximum', async () => {
@@ -337,7 +338,7 @@ describe('InspectionWorldCanvas', () => {
 
     expect(Number(canvas.getAttribute('data-view-scale'))).toBe(8);
     expect(viewport.scrollLeft).toBeCloseTo(500 * (8 / initialScale - 1), 3);
-    expect(viewport.scrollTop).toBeCloseTo(300 * (8 / initialScale - 1), 3);
+    expect(viewport.scrollTop).toBeCloseTo((300 - 28) * (8 / initialScale - 1), 3);
   });
 
   it('virtualizes tile requests from coalesced native scroll position', async () => {
@@ -507,7 +508,7 @@ describe('InspectionWorldCanvas', () => {
     expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(1000 / 800, 3);
     expect(screen.getByTestId('inspection-world-scroll-space')).toHaveStyle({
       width: '1000px',
-      height: '26880px',
+      height: '26908px',
     });
   });
 

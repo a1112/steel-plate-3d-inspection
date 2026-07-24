@@ -376,6 +376,22 @@
   height: 100%;
 }
 
+.app-shell[class*='style-'] .plate-map-panel.integrated-toolbar .panel-body {
+  padding: 0;
+}
+
+.app-shell[class*='style-'] .plate-map-panel.integrated-toolbar .integrated-map-tools {
+  height: 38px;
+  min-height: 38px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-soft) 74%, transparent);
+}
+
+.app-shell[class*='style-'] .left-column.runtime-bkv .record-search-panel .panel-body {
+  padding: 7px 8px 8px;
+}
+
 .app-shell[class*='style-'] :is(
   .record-search-field-select,
   .record-search-form input,
