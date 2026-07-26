@@ -263,6 +263,7 @@ struct ServiceState {
     trigger_health_required: bool,
     runtime_profile: String,
     runtime_config: Arc<runtime_profile::RuntimeProfile>,
+    site_configs: site_config::SiteConfigStore,
     algorithm_mode: String,
     algorithm_mock_defect_count: String,
     sessions: Mutex<HashMap<String, AdminSession>>,
@@ -6307,6 +6308,14 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("GET", "/api/admin/runtime-profile")
         | ("POST", "/api/admin/runtime-profile/validate")
         | ("POST", "/api/admin/runtime-profile")
+        | ("GET", "/api/admin/site-configs")
+        | ("GET", "/api/admin/site-configs/detail")
+        | ("POST", "/api/admin/site-configs")
+        | ("POST", "/api/admin/site-configs/clone")
+        | ("PATCH", "/api/admin/site-configs")
+        | ("DELETE", "/api/admin/site-configs")
+        | ("POST", "/api/admin/site-configs/check")
+        | ("POST", "/api/admin/site-configs/activate")
         | ("GET", "/api/admin/bkv-import/jobs")
         | ("POST", "/api/admin/bkv-import/jobs")
         | ("POST", "/api/admin/bkv-import/jobs/retry") => Some("admin.config"),
@@ -13906,6 +13915,444 @@ fn save_admin_runtime_profile_response(
     )
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSiteConfigRequest {
+    id: String,
+    display_name: String,
+    mode: site_config::SiteMode,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloneSiteConfigRequest {
+    source_id: String,
+    id: String,
+    display_name: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSiteConfigRequest {
+    id: String,
+    display_name: Option<String>,
+    mode: Option<site_config::SiteMode>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckSiteConfigRequest {
+    id: String,
+    depth: site_config::CheckDepth,
+}
+
+#[derive(serde::Deserialize)]
+struct ActivateSiteConfigRequest {
+    id: String,
+}
+
+fn site_config_request<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, Vec<u8>> {
+    if body.trim().is_empty() || body.len() > CONFIG_JSON_MAX_BYTES {
+        return Err(http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 400,
+                "error": "site_config_request_invalid",
+                "detail": "site configuration request is empty or too large"
+            })
+            .to_string(),
+        ));
+    }
+    serde_json::from_str(body).map_err(|error| {
+        http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 400,
+                "error": "site_config_request_invalid",
+                "detail": error.to_string()
+            })
+            .to_string(),
+        )
+    })
+}
+
+fn site_config_error(status: &str, error: &str, detail: impl Into<String>) -> Vec<u8> {
+    let code = status
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(500);
+    http_response(
+        status,
+        "application/json; charset=utf-8",
+        &json!({
+            "code": code,
+            "error": error,
+            "detail": detail.into()
+        })
+        .to_string(),
+    )
+}
+
+fn site_config_summary(
+    state: &ServiceState,
+    package: &site_config::SiteConfigPackage,
+    pending_site_id: Option<&str>,
+) -> Value {
+    let report = state
+        .site_configs
+        .check(&package.document.id, site_config::CheckDepth::Default)
+        .ok();
+    let checks = report
+        .as_ref()
+        .map(|value| value.checks.as_slice())
+        .unwrap_or(&[]);
+    json!({
+        "id": package.document.id,
+        "displayName": package.document.display_name,
+        "mode": package.document.mode,
+        "cameraCount": package.camera_count(),
+        "active": package.document.id == state.runtime_config.site_id,
+        "pending": pending_site_id == Some(package.document.id.as_str()),
+        "restartRequired": pending_site_id.is_some(),
+        "availability": {
+            "normal": checks.iter().filter(|item| item.status == site_config::CheckStatus::Normal).count(),
+            "warning": checks.iter().filter(|item| item.status == site_config::CheckStatus::Warning).count(),
+            "error": checks.iter().filter(|item| item.status == site_config::CheckStatus::Error).count(),
+            "blocking": checks.iter().filter(|item| item.blocking).count(),
+            "checkedAt": report.as_ref().map(|value| value.checked_at)
+        }
+    })
+}
+
+fn current_site_selection(
+    state: &ServiceState,
+) -> Result<site_config::ProjectSiteSelection, String> {
+    state
+        .site_configs
+        .project_selection(&state.runtime_config.project_path)
+}
+
+fn append_site_config_audit(
+    state: &ServiceState,
+    actor: &str,
+    action: &str,
+    target: &str,
+    detail: &str,
+) {
+    let _ = state.runtime.block_on(db::append_audit_log(
+        &state.database.connection,
+        actor,
+        action,
+        target,
+        detail,
+        "warning",
+    ));
+}
+
+fn read_admin_site_configs_response(state: &ServiceState) -> Vec<u8> {
+    let selection = current_site_selection(state).ok();
+    let pending_site_id = selection.as_ref().and_then(|value| {
+        value
+            .pending_restart
+            .then(|| value.selected_site_id.as_deref())
+            .flatten()
+    });
+    match state.site_configs.list() {
+        Ok(packages) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "schema": "steel.site-config-list.v1",
+                "activeSiteId": state.runtime_config.site_id,
+                "pendingSiteId": pending_site_id,
+                "restartRequired": selection.as_ref().is_some_and(|value| value.pending_restart),
+                "sites": packages.iter().map(|package| {
+                    site_config_summary(state, package, pending_site_id)
+                }).collect::<Vec<_>>()
+            })
+            .to_string(),
+        ),
+        Err(error) => site_config_error(
+            "500 Internal Server Error",
+            "site_config_list_failed",
+            error,
+        ),
+    }
+}
+
+fn read_admin_site_config_detail_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let Some(id) = query_value(query, "id").filter(|value| !value.trim().is_empty()) else {
+        return site_config_error(
+            "400 Bad Request",
+            "site_config_id_required",
+            "site configuration id is required",
+        );
+    };
+    match state.site_configs.get(&id) {
+        Ok(package) => {
+            let selection = current_site_selection(state).ok();
+            let pending_site_id = selection.as_ref().and_then(|value| {
+                value
+                    .pending_restart
+                    .then(|| value.selected_site_id.as_deref())
+                    .flatten()
+            });
+            let report = state
+                .site_configs
+                .check(&id, site_config::CheckDepth::Default)
+                .ok();
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "schema": "steel.site-config-detail.v1",
+                    "site": site_config_summary(state, &package, pending_site_id),
+                    "document": package.document,
+                    "report": report
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => site_config_error("404 Not Found", "site_config_not_found", error),
+    }
+}
+
+fn create_admin_site_config_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let request: CreateSiteConfigRequest = match site_config_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.site_configs.create(site_config::CreateSiteConfig {
+        id: request.id,
+        display_name: request.display_name,
+        mode: request.mode,
+    }) {
+        Ok(package) => {
+            append_site_config_audit(
+                state,
+                actor,
+                "site-config.create",
+                &package.document.id,
+                "新建现场配置",
+            );
+            http_response(
+                "201 Created",
+                "application/json; charset=utf-8",
+                &json!({
+                    "created": true,
+                    "site": site_config_summary(state, &package, None)
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => site_config_error("400 Bad Request", "site_config_create_failed", error),
+    }
+}
+
+fn clone_admin_site_config_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let request: CloneSiteConfigRequest = match site_config_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.site_configs.clone_site(
+        &request.source_id,
+        &request.id,
+        &request.display_name,
+    ) {
+        Ok(package) => {
+            append_site_config_audit(
+                state,
+                actor,
+                "site-config.clone",
+                &package.document.id,
+                &format!("从 {} 复制现场配置", request.source_id),
+            );
+            http_response(
+                "201 Created",
+                "application/json; charset=utf-8",
+                &json!({
+                    "created": true,
+                    "site": site_config_summary(state, &package, None)
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => site_config_error("400 Bad Request", "site_config_clone_failed", error),
+    }
+}
+
+fn update_admin_site_config_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let request: UpdateSiteConfigRequest = match site_config_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.site_configs.update_metadata(
+        &request.id,
+        site_config::UpdateSiteMetadata {
+            display_name: request.display_name,
+            mode: request.mode,
+        },
+    ) {
+        Ok(package) => {
+            append_site_config_audit(
+                state,
+                actor,
+                "site-config.update",
+                &package.document.id,
+                "更新现场配置名称",
+            );
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "saved": true,
+                    "site": site_config_summary(state, &package, None)
+                })
+                .to_string(),
+            )
+        }
+        Err(error) if error.contains("mode cannot change") => site_config_error(
+            "400 Bad Request",
+            "site_config_mode_immutable",
+            error,
+        ),
+        Err(error) => site_config_error("400 Bad Request", "site_config_update_failed", error),
+    }
+}
+
+fn delete_admin_site_config_response(
+    state: &ServiceState,
+    query: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let Some(id) = query_value(query, "id").filter(|value| !value.trim().is_empty()) else {
+        return site_config_error(
+            "400 Bad Request",
+            "site_config_id_required",
+            "site configuration id is required",
+        );
+    };
+    let pending = current_site_selection(state).ok().and_then(|selection| {
+        selection
+            .pending_restart
+            .then_some(selection.selected_site_id)
+            .flatten()
+    });
+    if id == state.runtime_config.site_id || pending.as_deref() == Some(id.as_str()) {
+        return site_config_error(
+            "409 Conflict",
+            "site_config_in_use",
+            "active or pending site configuration cannot be deleted",
+        );
+    }
+    match state.site_configs.delete(&id) {
+        Ok(()) => {
+            append_site_config_audit(
+                state,
+                actor,
+                "site-config.delete",
+                &id,
+                "删除现场配置",
+            );
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({"deleted": true, "id": id}).to_string(),
+            )
+        }
+        Err(error) => site_config_error("404 Not Found", "site_config_delete_failed", error),
+    }
+}
+
+fn check_admin_site_config_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let request: CheckSiteConfigRequest = match site_config_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.site_configs.check(&request.id, request.depth) {
+        Ok(report) => {
+            append_site_config_audit(
+                state,
+                actor,
+                "site-config.check",
+                &request.id,
+                "检查现场配置可用性",
+            );
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "schema": "steel.site-config-check.v1",
+                    "report": report
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => site_config_error("400 Bad Request", "site_config_check_failed", error),
+    }
+}
+
+fn activate_admin_site_config_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let request: ActivateSiteConfigRequest = match site_config_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state
+        .site_configs
+        .activate(&state.runtime_config.project_path, &request.id)
+    {
+        Ok(selection) => {
+            append_site_config_audit(
+                state,
+                actor,
+                "site-config.activate",
+                &request.id,
+                "切换现场配置；服务重启后生效",
+            );
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "activated": true,
+                    "activeSiteId": state.runtime_config.site_id,
+                    "pendingSiteId": selection.selected_site_id,
+                    "restartRequired": selection.pending_restart
+                })
+                .to_string(),
+            )
+        }
+        Err(error) if error.contains("blocking availability") => site_config_error(
+            "409 Conflict",
+            "site_config_unavailable",
+            error,
+        ),
+        Err(error) => site_config_error("400 Bad Request", "site_config_activate_failed", error),
+    }
+}
+
 fn bkv_converter_origin(state: &ServiceState) -> Result<&str, Vec<u8>> {
     let origin = state.runtime_config.storage.converter_origin.trim();
     let authority_only = origin.strip_prefix("http://").is_some_and(|value| {
@@ -19598,6 +20045,51 @@ fn delete_admin_record_response(state: &ServiceState, query: &str, actor: &str) 
     }
 }
 
+fn admin_site_configuration_overview_value(state: &ServiceState) -> Value {
+    let selection = current_site_selection(state).ok();
+    let pending_site_id = selection.as_ref().and_then(|value| {
+        value
+            .pending_restart
+            .then(|| value.selected_site_id.as_deref())
+            .flatten()
+    });
+    let report = state
+        .site_configs
+        .check(
+            &state.runtime_config.site_id,
+            site_config::CheckDepth::Default,
+        )
+        .ok();
+    let checks = report
+        .as_ref()
+        .map(|value| value.checks.as_slice())
+        .unwrap_or(&[]);
+    let pending = pending_site_id
+        .and_then(|id| state.site_configs.get(id).ok())
+        .map(|package| site_config_summary(state, &package, pending_site_id));
+    json!({
+        "active": {
+            "id": state.runtime_config.site_id,
+            "displayName": state.runtime_config.site_display_name,
+            "mode": state.runtime_config.site_mode,
+            "provider": state.runtime_config.provider,
+            "dataSource": state.runtime_config.data_source,
+            "cameraCount": state.runtime_config.camera_count(),
+            "configHash": state.runtime_config.config_hash,
+            "compatibility": state.runtime_config.site_compatibility
+        },
+        "pending": pending,
+        "restartRequired": selection.as_ref().is_some_and(|value| value.pending_restart),
+        "checkSummary": {
+            "normal": checks.iter().filter(|item| item.status == site_config::CheckStatus::Normal).count(),
+            "warning": checks.iter().filter(|item| item.status == site_config::CheckStatus::Warning).count(),
+            "error": checks.iter().filter(|item| item.status == site_config::CheckStatus::Error).count(),
+            "blocking": checks.iter().filter(|item| item.blocking).count(),
+            "checkedAt": report.as_ref().map(|value| value.checked_at)
+        }
+    })
+}
+
 fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
     let overview = match state
         .runtime
@@ -19632,8 +20124,10 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     let metrics = overview.metrics;
+    let site_configuration = admin_site_configuration_overview_value(state);
     let mut body = json!({
         "updatedAt": current_time_string(),
+        "siteConfiguration": site_configuration,
         "service": {
             "name": "steel-inspection-service",
             "role": "api-config-capture-orchestrator",
@@ -19746,6 +20240,14 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "GET", "path": "/api/admin/runtime-profile", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/runtime-profile/validate", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/runtime-profile", "scope": "admin-config" },
+            { "method": "GET", "path": "/api/admin/site-configs", "scope": "admin-config" },
+            { "method": "GET", "path": "/api/admin/site-configs/detail", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/site-configs", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/site-configs/clone", "scope": "admin-config" },
+            { "method": "PATCH", "path": "/api/admin/site-configs", "scope": "admin-config" },
+            { "method": "DELETE", "path": "/api/admin/site-configs", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/site-configs/check", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/site-configs/activate", "scope": "admin-config" },
             { "method": "GET", "path": "/api/admin/bkv-import/jobs", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/bkv-import/jobs", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/bkv-import/jobs/retry", "scope": "admin-config" },
@@ -20108,6 +20610,28 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("POST", "/api/admin/runtime-profile") => {
             save_admin_runtime_profile_response(&state, body, actor)
         }
+        ("GET", "/api/admin/site-configs") => read_admin_site_configs_response(&state),
+        ("GET", "/api/admin/site-configs/detail") => {
+            read_admin_site_config_detail_response(&state, query)
+        }
+        ("POST", "/api/admin/site-configs") => {
+            create_admin_site_config_response(&state, body, actor)
+        }
+        ("POST", "/api/admin/site-configs/clone") => {
+            clone_admin_site_config_response(&state, body, actor)
+        }
+        ("PATCH", "/api/admin/site-configs") => {
+            update_admin_site_config_response(&state, body, actor)
+        }
+        ("DELETE", "/api/admin/site-configs") => {
+            delete_admin_site_config_response(&state, query, actor)
+        }
+        ("POST", "/api/admin/site-configs/check") => {
+            check_admin_site_config_response(&state, body, actor)
+        }
+        ("POST", "/api/admin/site-configs/activate") => {
+            activate_admin_site_config_response(&state, body, actor)
+        }
         ("GET", "/api/admin/bkv-import/jobs") => {
             read_admin_bkv_import_jobs_response(&state)
         }
@@ -20437,6 +20961,13 @@ fn main() -> std::io::Result<()> {
     let project_config_path = env::var("STEEL_PROJECT_CONFIG_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("config").join("project.json"));
+    let site_configs = site_config::SiteConfigStore::new(
+        project_config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("config"))
+            .join("sites"),
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let runtime_config = runtime_profile::RuntimeProfile::load_for_startup(
         &project_config_path,
         &workspace_root(),
@@ -20496,6 +21027,7 @@ fn main() -> std::io::Result<()> {
         runtime_profile: env::var("STEEL_RUNTIME_PROFILE")
             .unwrap_or_else(|_| "production".to_string()),
         runtime_config: Arc::new(runtime_config),
+        site_configs,
         algorithm_mode: env::var("STEEL_ALGORITHM_MODE")
             .unwrap_or_else(|_| "production".to_string()),
         algorithm_mock_defect_count: env::var("BAR_SURFACE_MOCK_DEFECT_COUNT")
@@ -20556,6 +21088,7 @@ mod tests {
     use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, Set, Statement};
 
     static CONVERTED_WORLD_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static SITE_CONFIG_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn bkv_import_mutations_require_admin_services_permission() {
@@ -21509,6 +22042,11 @@ mod tests {
         provider: CaptureProvider,
         origin: &str,
     ) -> ServiceState {
+        let site_config_root = std::env::temp_dir().join(format!(
+            "steel-test-state-sites-{}-{}",
+            std::process::id(),
+            SITE_CONFIG_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         ServiceState {
             fallback_snapshot_json: Arc::new(build_snapshot_json()),
             config_json: Mutex::new(String::new()),
@@ -21546,6 +22084,8 @@ mod tests {
                 provider.as_str(),
                 if provider == CaptureProvider::Bkv { 6 } else { 8 },
             )),
+            site_configs: site_config::SiteConfigStore::new(site_config_root)
+                .expect("test site config store"),
             algorithm_mode: "demo".to_string(),
             algorithm_mock_defect_count: "0".to_string(),
             sessions: Mutex::new(HashMap::new()),
@@ -23362,6 +23902,160 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).expect("remove runtime fixture");
+    }
+
+    fn admin_site_config_fixture() -> (PathBuf, ServiceState) {
+        let root = std::env::temp_dir().join(format!(
+            "steel-admin-site-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = root.join("config");
+        let store =
+            site_config::SiteConfigStore::new(config.join("sites")).expect("site config store");
+        store
+            .create(site_config::CreateSiteConfig {
+                id: "bkv-current".to_string(),
+                display_name: "BKV 当前现场".to_string(),
+                mode: site_config::SiteMode::Bkv,
+            })
+            .expect("current site");
+        let project = config.join("project.json");
+        fs::write(
+            &project,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "steel.project-config.v1",
+                "activeSiteConfig": "config/sites/bkv-current/site.json",
+                "pendingRestart": false
+            }))
+            .expect("project JSON"),
+        )
+        .expect("project config");
+        let loaded =
+            runtime_profile::RuntimeProfile::load(&project, &root).expect("runtime profile");
+        let mut state =
+            production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
+        state.runtime_config = Arc::new(loaded);
+        state.site_configs = store;
+        (root, state)
+    }
+
+    #[test]
+    fn admin_site_config_routes_require_config_permission() {
+        for (method, path) in [
+            ("GET", "/api/admin/site-configs"),
+            ("GET", "/api/admin/site-configs/detail"),
+            ("POST", "/api/admin/site-configs"),
+            ("POST", "/api/admin/site-configs/clone"),
+            ("PATCH", "/api/admin/site-configs"),
+            ("DELETE", "/api/admin/site-configs"),
+            ("POST", "/api/admin/site-configs/check"),
+            ("POST", "/api/admin/site-configs/activate"),
+        ] {
+            assert_eq!(
+                permission_for_route(method, path),
+                Some("admin.config"),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_site_config_create_check_and_activate_are_restart_only() {
+        let (root, state) = admin_site_config_fixture();
+        let created = response_json(create_admin_site_config_response(
+            &state,
+            &json!({
+                "id": "bkv-next",
+                "displayName": "BKV 下一现场",
+                "mode": "bkv"
+            })
+            .to_string(),
+            "admin",
+        ));
+        assert_eq!(created["site"]["id"], "bkv-next");
+        assert_eq!(created["site"]["mode"], "bkv");
+
+        let checked = response_json(check_admin_site_config_response(
+            &state,
+            &json!({"id": "bkv-next", "depth": "default"}).to_string(),
+            "admin",
+        ));
+        assert_eq!(checked["report"]["siteId"], "bkv-next");
+        assert_eq!(checked["report"]["depth"], "default");
+
+        let activated = response_json(activate_admin_site_config_response(
+            &state,
+            &json!({"id": "bkv-next"}).to_string(),
+            "admin",
+        ));
+        assert_eq!(activated["restartRequired"], true);
+        assert_eq!(activated["pendingSiteId"], "bkv-next");
+        assert_eq!(state.runtime_config.site_id, "bkv-current");
+
+        let listed = response_json(read_admin_site_configs_response(&state));
+        let sites = listed["sites"].as_array().expect("site list");
+        assert!(sites
+            .iter()
+            .any(|site| site["id"] == "bkv-current" && site["active"] == true));
+        assert!(sites
+            .iter()
+            .any(|site| site["id"] == "bkv-next" && site["pending"] == true));
+        fs::remove_dir_all(root).expect("remove site fixture");
+    }
+
+    #[test]
+    fn admin_site_config_rejects_mode_updates_and_active_deletion() {
+        let (root, state) = admin_site_config_fixture();
+        let update = response_text(update_admin_site_config_response(
+            &state,
+            &json!({
+                "id": "bkv-current",
+                "displayName": "非法切换",
+                "mode": "direct-camera"
+            })
+            .to_string(),
+            "admin",
+        ));
+        assert!(update.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(update.contains("site_config_mode_immutable"));
+
+        let delete = response_text(delete_admin_site_config_response(
+            &state,
+            "id=bkv-current",
+            "admin",
+        ));
+        assert!(delete.starts_with("HTTP/1.1 409 Conflict"));
+        assert!(delete.contains("site_config_in_use"));
+        fs::remove_dir_all(root).expect("remove site fixture");
+    }
+
+    #[test]
+    fn admin_overview_reports_site_configuration_availability() {
+        let (root, state) = admin_site_config_fixture();
+
+        let overview = response_json(admin_overview_response(&state));
+
+        assert_eq!(
+            overview["siteConfiguration"]["active"]["id"],
+            "bkv-current"
+        );
+        assert_eq!(overview["siteConfiguration"]["active"]["mode"], "bkv");
+        assert_eq!(
+            overview["siteConfiguration"]["active"]["cameraCount"],
+            6
+        );
+        assert_eq!(
+            overview["siteConfiguration"]["restartRequired"],
+            false
+        );
+        assert!(overview["siteConfiguration"]["checkSummary"]["normal"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        fs::remove_dir_all(root).expect("remove site fixture");
     }
 
     #[test]

@@ -34,6 +34,16 @@ pub struct SiteConfigPackage {
     pub document: SiteConfigDocument,
 }
 
+impl SiteConfigPackage {
+    pub fn camera_count(&self) -> usize {
+        fs::read(self.root.join(&self.document.runtime_profile))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("cameraCount").and_then(Value::as_u64))
+            .unwrap_or_default() as usize
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ActiveSiteResolution {
     pub project_path: PathBuf,
@@ -45,6 +55,12 @@ pub struct ActiveSiteResolution {
     pub site_mode: SiteMode,
     pub pending_restart: bool,
     pub compatibility: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectSiteSelection {
+    pub selected_site_id: Option<String>,
+    pub pending_restart: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,6 +377,76 @@ impl SiteConfigStore {
             depth,
             checked_at: current_time_millis()?,
             checks,
+        })
+    }
+
+    pub fn project_selection(&self, project_path: &Path) -> Result<ProjectSiteSelection, String> {
+        let bytes = fs::read(project_path)
+            .map_err(|error| format!("project configuration read failed: {error}"))?;
+        let project: ProjectConfigDocument = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("project configuration JSON invalid: {error}"))?;
+        if project.schema != PROJECT_CONFIG_SCHEMA {
+            return Err(format!(
+                "project configuration schema must be {PROJECT_CONFIG_SCHEMA}"
+            ));
+        }
+        let selected_site_id = project
+            .active_site_config
+            .as_deref()
+            .and_then(|relative| Path::new(relative).parent())
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .map(str::to_string);
+        Ok(ProjectSiteSelection {
+            selected_site_id,
+            pending_restart: project.pending_restart,
+        })
+    }
+
+    pub fn activate(&self, project_path: &Path, id: &str) -> Result<ProjectSiteSelection, String> {
+        let report = self.check(id, CheckDepth::Default)?;
+        if report.has_blocking_errors() {
+            return Err("site config has blocking availability errors".to_string());
+        }
+        let package = self.get(id)?;
+        let project_parent = project_path
+            .parent()
+            .ok_or_else(|| "project configuration has no parent".to_string())?;
+        let allowed_root = project_parent
+            .parent()
+            .ok_or_else(|| "project configuration has no allowed root".to_string())?;
+        let allowed_root = fs::canonicalize(allowed_root)
+            .map_err(|error| format!("project allowed root unavailable: {error}"))?;
+        let site_path = fs::canonicalize(package.root.join("site.json"))
+            .map_err(|error| format!("site config path unavailable: {error}"))?;
+        let relative = site_path
+            .strip_prefix(&allowed_root)
+            .map_err(|_| "site config must remain beneath the project allowed root".to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let bytes = fs::read(project_path)
+            .map_err(|error| format!("project configuration read failed: {error}"))?;
+        let mut project: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("project configuration JSON invalid: {error}"))?;
+        let object = project
+            .as_object_mut()
+            .ok_or_else(|| "project configuration must be a JSON object".to_string())?;
+        if object.get("schema").and_then(Value::as_str) != Some(PROJECT_CONFIG_SCHEMA) {
+            return Err(format!(
+                "project configuration schema must be {PROJECT_CONFIG_SCHEMA}"
+            ));
+        }
+        if let Some(previous) = object.get("activeSiteConfig").cloned() {
+            object.insert("previousActiveSiteConfig".to_string(), previous);
+        }
+        object.insert("activeSiteConfig".to_string(), Value::String(relative));
+        object.remove("activeRuntimeProfile");
+        object.insert("pendingRestart".to_string(), Value::Bool(true));
+        write_json_atomic(project_path, &project)?;
+        Ok(ProjectSiteSelection {
+            selected_site_id: Some(id.to_string()),
+            pending_restart: true,
         })
     }
 }
@@ -765,14 +851,14 @@ fn runtime_template(id: &str, display_name: &str, mode: &SiteMode) -> Value {
     let provider = if mode == &SiteMode::Bkv {
         "bkv"
     } else {
-        "camera"
+        "headless-cpp"
     };
     let camera_connection = if mode == &SiteMode::Bkv {
         "none"
     } else {
         "headless-cpp"
     };
-    json!({
+    let mut template = json!({
         "schema": "steel.runtime-profile.v1",
         "id": id,
         "displayName": display_name,
@@ -806,7 +892,11 @@ fn runtime_template(id: &str, display_name: &str, mode: &SiteMode) -> Value {
             "reconstruction": mode == &SiteMode::DirectCamera,
             "offlineReplay": mode == &SiteMode::Bkv
         }
-    })
+    });
+    if mode == &SiteMode::DirectCamera {
+        template["captureProfile"] = Value::String(format!("config/sites/{id}/capture.json"));
+    }
+    template
 }
 
 fn capture_template(mode: &SiteMode) -> Value {
@@ -827,6 +917,7 @@ mod tests {
         CheckDepth, CreateSiteConfig, SiteConfigCheck, SiteConfigPackage, SiteConfigProbe,
         SiteConfigStore, SiteMode, UpdateSiteMetadata,
     };
+    use crate::runtime_profile::RuntimeProfile;
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
@@ -1030,5 +1121,35 @@ mod tests {
             .expect("deep check");
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn created_direct_site_is_a_loadable_eight_camera_runtime() {
+        let fixture = SiteConfigFixture::new();
+        fixture.create_direct("direct-eight");
+        let project = fixture.root.join("config/project.json");
+        let sites_root = fixture.root.join("config/sites");
+        fs::create_dir_all(&sites_root).expect("sites root");
+        let created = fixture
+            .store
+            .get("direct-eight")
+            .expect("direct site package");
+        let target = sites_root.join("direct-eight");
+        super::copy_directory(&created.root, &target).expect("copy site below config root");
+        fs::write(
+            &project,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "steel.project-config.v1",
+                "activeSiteConfig": "config/sites/direct-eight/site.json",
+                "pendingRestart": false
+            }))
+            .expect("project JSON"),
+        )
+        .expect("project config");
+
+        let runtime = RuntimeProfile::load(&project, &fixture.root).expect("direct runtime");
+
+        assert_eq!(runtime.camera_count(), 8);
+        assert_eq!(runtime.site_mode, SiteMode::DirectCamera);
     }
 }
