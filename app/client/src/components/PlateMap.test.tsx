@@ -80,6 +80,40 @@ describe('parameterized camera lanes', () => {
     expect(screen.queryByText('C8')).not.toBeInTheDocument();
   });
 
+  it('maps BKV CamImageSource identities into all six main-view camera bands', () => {
+    render(
+      <PlateMap
+        defectTypes={defectTypes}
+        defects={[]}
+        defectTypeCounts={{}}
+        hiddenTypeIds={new Set()}
+        selectedDefectId={null}
+        surfaceMode="all"
+        previewPositionM={0}
+        cameraLanes={createSequentialCameraLanes(6)}
+        captureImages={Array.from({ length: 6 }, (_, index) => ({
+          id: `bkv-camera-${index + 1}`,
+          cameraId: `camera${index + 1}`,
+          cameraIp: `CamImageSource${index + 1}`,
+          dataName: 'intensity',
+          sequenceNo: 0,
+          fileType: 'bmp',
+          path: `\\\\10.5.241.17\\CamImageSource${index + 1}\\1902352\\2D\\0000.bmp`,
+          url: `http://127.0.0.1:4873/api/bkv-online/image?camera=${index + 1}&seq=1902352&index=0&kind=2d`,
+          createdAt: '2026-07-24 20:18:19',
+        }))}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+    expect(screen.getByLabelText('camera1 实际裁剪图')).toBeInTheDocument();
+    expect(screen.getByLabelText('camera6 实际裁剪图')).toBeInTheDocument();
+  });
+
   it('shows an explicit empty state instead of a zero-camera canvas', () => {
     render(
       <PlateMap

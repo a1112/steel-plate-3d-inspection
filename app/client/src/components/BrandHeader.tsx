@@ -33,6 +33,7 @@ interface BrandHeaderProps {
   activeNav: NavKey;
   dashboardMode?: RuntimeDashboardMode;
   bkvData?: BkvHeaderData;
+  onBkvConversionStatusOpen?: () => void;
   analysisCollapse?: {
     collapsed: boolean;
     onToggle: () => void;
@@ -711,6 +712,7 @@ export function BrandHeader({
   activeNav,
   dashboardMode = DEFAULT_DIRECT_DASHBOARD_MODE,
   bkvData,
+  onBkvConversionStatusOpen,
   analysisCollapse,
   onNavChange,
   onDragMouseDown,
@@ -850,7 +852,7 @@ export function BrandHeader({
         <div className="system-title">钢管3D表面检测系统</div>
       </div>
 
-      <div className={`brand-status ${dashboardMode.kind === 'bkv' ? 'bkv-runtime-status' : 'online-runtime-status'}`}>
+      <div className={`brand-status ${dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online' ? 'bkv-runtime-status' : 'online-runtime-status'}`}>
         {dashboardMode.kind === 'bkv' ? (
           <>
             <StatusBlock className="bkv-mode-status" label="BKV 模式" value="离线回放" title={bkvHealth.detail} />
@@ -863,6 +865,32 @@ export function BrandHeader({
               tone={bkvHealthTone}
               title={bkvHealth.detail}
             />
+          </>
+        ) : dashboardMode.kind === 'bkv-online' ? (
+          <>
+            <StatusBlock className="bkv-mode-status" label="BKV 模式" value="在线转换" title={bkvHealth.detail} />
+            <StatusBlock
+              className="bkv-data-status"
+              label="共享图像"
+              value={`${bkvData?.availableCameraCount ?? 0}/${bkvData?.cameraCount ?? dashboardMode.cameraCount}`}
+              title={bkvHealth.detail}
+            />
+            <StatusBlock
+              className="bkv-batch-status"
+              label="最新记录"
+              value={bkvData?.batchId ?? '读取中'}
+              title={bkvData?.batchId}
+            />
+            <button
+              type="button"
+              className="bkv-conversion-status-open"
+              onClick={onBkvConversionStatusOpen}
+              data-no-drag
+            >
+              <Activity size={15} />
+              <span>数据转换</span>
+              <strong className={bkvHealthTone}>{bkvHealthValue}</strong>
+            </button>
           </>
         ) : (
           <>

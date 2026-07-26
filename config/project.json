@@ -1,4 +1,4 @@
 {
   "schema": "steel.project-config.v1",
-  "activeRuntimeProfile": "config/runtime-modes/bkv-6.json"
+  "activeRuntimeProfile": "config/runtime-modes/bkv-online-6.json"
 }

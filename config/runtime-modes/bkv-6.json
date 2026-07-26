@@ -56,6 +56,19 @@
     "catalogPath": "target/data/bkv-converted/catalog.db",
     "converterOrigin": "http://127.0.0.1:4893"
   },
+  "capture": {
+    "enabled": false,
+    "autostart": false
+  },
+  "algorithm": {
+    "enabled": false,
+    "autoProcessLatest": false,
+    "processor": "",
+    "configPath": "",
+    "outputRoot": "",
+    "timingLog": "processing-times.jsonl",
+    "maxFramesPerCamera": 64
+  },
   "capabilities": {
     "directCamera": false,
     "captureManagement": false,

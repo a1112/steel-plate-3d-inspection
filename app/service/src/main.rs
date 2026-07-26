@@ -22,6 +22,7 @@ use crate::standard_record_store::InspectionRecordStore;
 
 mod artifact_cleanup;
 mod bkv;
+mod bkv_online;
 mod calibration_operations;
 mod controlled_process;
 mod db;
@@ -194,6 +195,16 @@ impl CaptureProvider {
             .unwrap_or(Self::HeadlessCpp)
     }
 
+    fn from_runtime_profile(profile: &runtime_profile::RuntimeProfile) -> Result<Self, String> {
+        match profile.provider.trim().to_ascii_lowercase().as_str() {
+            "headless-cpp" => Ok(Self::HeadlessCpp),
+            "external-api" => Ok(Self::ExternalApi),
+            "simulated" => Ok(Self::Simulated),
+            "bkv" => Ok(Self::Bkv),
+            other => Err(format!("unsupported runtime capture provider: {other}")),
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             Self::HeadlessCpp => "headless-cpp",
@@ -230,6 +241,7 @@ struct ServiceState {
     config_json: Mutex<String>,
     capture: Arc<CaptureServiceManager>,
     bkv: Option<Arc<bkv::BkvManager>>,
+    bkv_online: Option<bkv_online::BkvSource>,
     standard_record_store: Option<Arc<standard_record_store::ConvertedLocalStore>>,
     database: db::AppDatabase,
     runtime: Runtime,
@@ -368,19 +380,27 @@ impl CaptureLifecycleState {
         let autostart = provider.is_embedded()
             || (provider.is_managed()
                 && env::var("STEEL_CAPTURE_SERVICE_AUTOSTART").as_deref() != Ok("0"));
+        Self::with_policy(provider, true, autostart)
+    }
+
+    fn with_policy(provider: CaptureProvider, enabled: bool, autostart: bool) -> Self {
+        let autostart = enabled && autostart;
+        let embedded_ready = enabled && provider.is_embedded();
         Self {
-            phase: if provider.is_embedded() {
+            phase: if !enabled {
+                "disabled"
+            } else if provider.is_embedded() {
                 "ready"
             } else if autostart {
                 "starting"
             } else {
                 "stopped"
             },
-            desired_running: provider.is_embedded() || autostart,
+            desired_running: embedded_ready || autostart,
             autostart,
             pid: None,
             started_at: None,
-            ready_at: provider.is_embedded().then(current_time_millis),
+            ready_at: embedded_ready.then(current_time_millis),
             last_exit_at: None,
             last_exit_code: None,
             last_error: String::new(),
@@ -1175,7 +1195,10 @@ fn default_capture_cameras_value() -> Value {
 }
 
 fn build_config_json(capture_port: u16) -> String {
-    let provider = CaptureProvider::from_env();
+    build_config_json_for(capture_port, CaptureProvider::from_env())
+}
+
+fn build_config_json_for(capture_port: u16, provider: CaptureProvider) -> String {
     let origin = capture_origin(capture_port);
     json!({
         "service": {
@@ -1211,8 +1234,11 @@ fn simulated_provider_string_field(payload: &Value, keys: &[&str]) -> String {
 }
 
 impl CaptureServiceManager {
-    fn new(port: u16) -> Self {
-        let provider = CaptureProvider::from_env();
+    fn new(
+        port: u16,
+        provider: CaptureProvider,
+        capture: &runtime_profile::RuntimeCapture,
+    ) -> Self {
         let origin = capture_origin(port);
         let host = capture_host_from_origin(&origin).unwrap_or_else(|| "127.0.0.1".to_string());
         let port = capture_port_from_origin(&origin).unwrap_or(port);
@@ -1222,7 +1248,11 @@ impl CaptureServiceManager {
             origin,
             provider,
             process: Mutex::new(None),
-            lifecycle: Mutex::new(CaptureLifecycleState::new(provider)),
+            lifecycle: Mutex::new(CaptureLifecycleState::with_policy(
+                provider,
+                capture.enabled,
+                capture.autostart,
+            )),
             supervisor_shutdown: AtomicBool::new(false),
             simulated_capture_mode: Mutex::new("continuous".to_string()),
             simulated_continuous_line_rate: Mutex::new(300.0),
@@ -3801,21 +3831,24 @@ fn capture_health_component_with_bkv_runtime(
     }
 
     if state.capture.provider == CaptureProvider::Bkv {
-        let ready = state.bkv.is_some() && state.capture.is_running();
+        let offline_ready = state.bkv.is_some();
+        let online_ready = state.bkv_online.is_some();
+        let ready = (offline_ready || online_ready) && state.capture.is_running();
         return (
             ready,
             json!({
                 "ok": ready,
-                "status": if ready { "offline-replay-ready" } else { "unavailable" },
+                "status": if online_ready { "online-conversion-ready" } else if offline_ready { "offline-replay-ready" } else { "unavailable" },
                 "provider": "bkv",
                 "managed": false,
                 "apiReachable": true,
                 "sdkRequired": false,
                 "sdkReady": Value::Null,
                 "physicalCamerasOnline": 0,
-                "offlineCameraFiles": if ready { 6 } else { 0 },
+                "offlineCameraFiles": if offline_ready { 6 } else { 0 },
+                "onlineImageShares": if online_ready { 6 } else { 0 },
                 "latencyMs": 0,
-                "reason": if ready { Value::Null } else { json!("bkv_manifest_unavailable") },
+                "reason": if ready { Value::Null } else { json!("bkv_source_unavailable") },
                 "lifecycle": lifecycle
             }),
         );
@@ -4030,18 +4063,20 @@ fn storage_health_component_with_timeout_and_bkv_runtime(
     }
 
     if state.capture.provider == CaptureProvider::Bkv {
-        let ready = state.bkv.is_some();
+        let offline_ready = state.bkv.is_some();
+        let online_ready = state.bkv_online.is_some();
+        let ready = offline_ready || online_ready;
         return (
             ready,
             json!({
                 "ok": ready,
-                "status": if ready { "bkv-data-verified" } else { "unavailable" },
+                "status": if online_ready { "bkv-online-shares-readable" } else if offline_ready { "bkv-data-verified" } else { "unavailable" },
                 "provider": "bkv",
                 "simulated": false,
                 "apiReachable": true,
                 "queueRequired": false,
                 "offlineReadOnly": true,
-                "reason": if ready { Value::Null } else { json!("bkv_manifest_unavailable") },
+                "reason": if ready { Value::Null } else { json!("bkv_source_unavailable") },
                 "latencyMs": 0
             }),
         );
@@ -14096,6 +14131,25 @@ fn bkv_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
 }
 
 fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
+    if state.runtime_config.data_source == "bkv-online-mysql" {
+        return match state
+            .bkv_online
+            .as_ref()
+            .ok_or_else(|| "BKV online source is unavailable".to_string())
+            .and_then(bkv_online::BkvSource::inspection_world_records)
+        {
+            Ok(records) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &records.to_string(),
+            ),
+            Err(error) => http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code": 503, "error": "inspection_world_source_unavailable", "detail": error}).to_string(),
+            ),
+        };
+    }
     if state.runtime_config.data_source == "converted-local" {
         let Some(store) = state.standard_record_store.as_ref() else {
             return http_response(
@@ -14542,6 +14596,25 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
+    if state.runtime_config.data_source == "bkv-online-mysql" {
+        return match state
+            .bkv_online
+            .as_ref()
+            .ok_or_else(|| "BKV online source is unavailable".to_string())
+            .and_then(|source| source.inspection_world_meta(&record_id))
+        {
+            Ok(meta) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &meta.to_string(),
+            ),
+            Err(error) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error}).to_string(),
+            ),
+        };
+    }
     if state.runtime_config.data_source == "converted-local" {
         return match load_converted_inspection_world(state, &record_id) {
             Ok(converted) => http_response(
@@ -14612,6 +14685,25 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
+    if state.runtime_config.data_source == "bkv-online-mysql" {
+        return match state
+            .bkv_online
+            .as_ref()
+            .ok_or_else(|| "BKV online source is unavailable".to_string())
+            .and_then(|source| source.inspection_world_defects(&record_id))
+        {
+            Ok(defects) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &defects.to_string(),
+            ),
+            Err(error) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error}).to_string(),
+            ),
+        };
+    }
     if state.runtime_config.data_source == "converted-local" {
         return match load_converted_inspection_world(state, &record_id) {
             Ok(converted) => {
@@ -14852,7 +14944,13 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
         tile_y,
         format,
     );
-    let result = if state.runtime_config.data_source == "converted-local" {
+    let result = if state.runtime_config.data_source == "bkv-online-mysql" {
+        state
+            .bkv_online
+            .as_ref()
+            .ok_or_else(|| "BKV online source is unavailable".to_string())
+            .and_then(|source| source.inspection_world_tile(&record_id, request))
+    } else if state.runtime_config.data_source == "converted-local" {
         load_converted_inspection_world(state, &record_id).and_then(|converted| {
             inspection_world::compose_camera_tile(
                 &converted.world,
@@ -19704,6 +19802,8 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/config/capture", "scope": "config" },
             { "method": "GET", "path": "/api/inspection/settings", "scope": "inspection" },
             { "method": "GET", "path": "/api/inspection/snapshot", "scope": "inspection" },
+            { "method": "GET", "path": "/api/bkv-online/status", "scope": "inspection" },
+            { "method": "GET", "path": "/api/bkv-online/image", "scope": "inspection" },
             { "method": "GET", "path": "/api/alarms", "scope": "alarm" },
             { "method": "POST", "path": "/api/alarms/acknowledge", "scope": "admin.records" },
             { "method": "POST", "path": "/api/alarms/resolve", "scope": "admin.records" },
@@ -19762,6 +19862,88 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
         "application/json; charset=utf-8",
         &body.to_string(),
     )
+}
+
+fn bkv_online_image_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let Some(source) = state.bkv_online.as_ref() else {
+        return http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({ "error": "bkv_online_source_disabled" }).to_string(),
+        );
+    };
+    let Some(camera) = query_value(query, "camera").and_then(|value| value.parse().ok()) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "error": "invalid_bkv_online_image_request", "detail": "camera_required" })
+                .to_string(),
+        );
+    };
+    let Some(sequence) = query_value(query, "seq").and_then(|value| value.parse().ok()) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "error": "invalid_bkv_online_image_request", "detail": "sequence_required" })
+                .to_string(),
+        );
+    };
+    let Some(image_index) = query_value(query, "index").and_then(|value| value.parse().ok()) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({
+                "error": "invalid_bkv_online_image_request",
+                "detail": "image_index_required"
+            })
+            .to_string(),
+        );
+    };
+    let kind = query_value(query, "kind").unwrap_or_else(|| "2d".to_string());
+
+    match source.image(camera, sequence, image_index, &kind) {
+        Ok(image) => http_bytes_response_with_headers(
+            "200 OK",
+            image.content_type,
+            &image.bytes,
+            &[
+                ("Cache-Control", "private, max-age=60"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+        ),
+        Err(bkv_online::BkvImageError::InvalidRequest(detail)) => http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "error": "invalid_bkv_online_image_request", "detail": detail }).to_string(),
+        ),
+        Err(bkv_online::BkvImageError::NotFound) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({ "error": "bkv_online_image_not_found" }).to_string(),
+        ),
+        Err(bkv_online::BkvImageError::InvalidFormat(detail)) => http_response(
+            "422 Unprocessable Entity",
+            "application/json; charset=utf-8",
+            &json!({ "error": "invalid_bkv_online_image_format", "detail": detail }).to_string(),
+        ),
+        Err(bkv_online::BkvImageError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({ "error": "bkv_online_image_not_found" }).to_string(),
+            )
+        }
+        Err(bkv_online::BkvImageError::Io(error)) => {
+            eprintln!("BKV online image read failed: {}", error.kind());
+            http_response(
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &json!({ "error": "bkv_online_image_read_failed" }).to_string(),
+            )
+        }
+    }
 }
 
 fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
@@ -19866,6 +20048,22 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("GET", "/api/bkv/materials") => bkv_materials_response(&state),
         ("GET", "/api/bkv/material") => bkv_material_response(&state, query),
         ("GET", "/api/bkv/file") => bkv_file_response(&state, query),
+        ("GET", "/api/bkv-online/status") => {
+            if let Some(source) = state.bkv_online.as_ref() {
+                http_response(
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &state.runtime.block_on(source.status_json()),
+                )
+            } else {
+                http_response(
+                    "404 Not Found",
+                    "application/json; charset=utf-8",
+                    &json!({ "error": "bkv_online_source_disabled" }).to_string(),
+                )
+            }
+        }
+        ("GET", "/api/bkv-online/image") => bkv_online_image_response(&state, query),
         ("GET", "/api/inspection-world/records") => inspection_world_records_response(&state),
         ("GET", "/api/inspection-world/meta") => inspection_world_meta_response(&state, query),
         ("GET", "/api/inspection-world/defects") => inspection_world_defects_response(&state, query),
@@ -20073,6 +20271,24 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             calibration_operations::mutation_response(&state, path, body, actor)
         }
         ("GET", "/api/inspection/snapshot") => {
+            if let Some(source) = state.bkv_online.as_ref() {
+                match state.runtime.block_on(source.snapshot_json()) {
+                    Ok(payload) => http_response(
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        &payload,
+                    ),
+                    Err(error) => http_response(
+                        "503 Service Unavailable",
+                        "application/json; charset=utf-8",
+                        &json!({
+                            "error": "bkv_online_snapshot_unavailable",
+                            "detail": error.to_string()
+                        })
+                        .to_string(),
+                    ),
+                }
+            } else {
             match build_production_snapshot_json(&state) {
                 Ok(Some(payload)) => http_response(
                     "200 OK",
@@ -20111,6 +20327,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
                     ),
                 ),
             }
+            }
         }
         _ if is_trigger_gateway_proxy_route(method, path) => {
             trigger_gateway_proxy_http_response(&state, method, raw_path, body, actor)
@@ -20132,8 +20349,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
 
 fn configured_bkv_manager(
     provider: CaptureProvider,
+    profile: &runtime_profile::RuntimeProfile,
 ) -> Result<Option<Arc<bkv::BkvManager>>, String> {
-    if provider != CaptureProvider::Bkv {
+    if provider != CaptureProvider::Bkv || profile.data_source != "converted-local" {
         return Ok(None);
     }
     let root = env::var("STEEL_BKV_DATA_ROOT")
@@ -20212,8 +20430,6 @@ fn main() -> std::io::Result<()> {
             "marked {recovered_calibration_operations} interrupted calibration operation(s) as needs-reconciliation; no operation was replayed"
         );
     }
-    let capture_port = capture_port();
-    let capture_manager = Arc::new(CaptureServiceManager::new(capture_port));
     let project_config_path = env::var("STEEL_PROJECT_CONFIG_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("config").join("project.json"));
@@ -20222,18 +20438,24 @@ fn main() -> std::io::Result<()> {
         &workspace_root(),
     )
     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if runtime_config.provider != capture_manager.provider.as_str() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "runtime_profile_provider_mismatch: profile {} requires {}, configured {}",
-                runtime_config.id,
-                runtime_config.provider,
-                capture_manager.provider.as_str()
-            ),
-        ));
+    let capture_provider = CaptureProvider::from_runtime_profile(&runtime_config)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let capture_port = capture_port();
+    let capture_manager = Arc::new(CaptureServiceManager::new(
+        capture_port,
+        capture_provider,
+        &runtime_config.capture,
+    ));
+    let bkv_online = runtime
+        .block_on(bkv_online::BkvSource::from_env(&runtime_config))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+    if let Some(source) = bkv_online.as_ref() {
+        runtime
+            .block_on(source.initialize())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+        source.start_refresh_loop(runtime.handle());
     }
-    let bkv_manager = configured_bkv_manager(capture_manager.provider)
+    let bkv_manager = configured_bkv_manager(capture_manager.provider, &runtime_config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let standard_record_store = configured_standard_record_store(&runtime_config);
     CaptureServiceManager::start_supervisor(&capture_manager);
@@ -20242,12 +20464,13 @@ fn main() -> std::io::Result<()> {
         .ok()
         .flatten()
         .map(|config| config.value)
-        .unwrap_or_else(|| build_config_json(capture_port));
+        .unwrap_or_else(|| build_config_json_for(capture_port, capture_provider));
     let state = Arc::new(ServiceState {
         fallback_snapshot_json: Arc::new(build_snapshot_json()),
         config_json: Mutex::new(config_json),
         capture: Arc::clone(&capture_manager),
         bkv: bkv_manager,
+        bkv_online,
         standard_record_store,
         database,
         runtime,
@@ -20289,6 +20512,9 @@ fn main() -> std::io::Result<()> {
         "database adapter {} (requested {})",
         state.database.engine, state.database.requested_engine
     );
+    if state.bkv_online.is_some() {
+        println!("BKV online conversion source enabled (read-only MySQL and image shares)");
+    }
     if state.database.fallback_active {
         println!("database running in explicit non-production SQLite fallback mode");
     }
@@ -21294,6 +21520,7 @@ mod tests {
                 simulated_continuous_line_rate: Mutex::new(300.0),
             }),
             bkv: None,
+            bkv_online: None,
             standard_record_store: None,
             database,
             runtime,

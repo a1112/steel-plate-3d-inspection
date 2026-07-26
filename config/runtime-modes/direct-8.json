@@ -18,6 +18,19 @@
     { "id": "C8", "displayOrder": 8, "sourceCameraId": 8, "role": "array-8" }
   ],
   "storage": {},
+  "capture": {
+    "enabled": true,
+    "autostart": true
+  },
+  "algorithm": {
+    "enabled": true,
+    "autoProcessLatest": false,
+    "processor": "bar-surface-defect-detector",
+    "configPath": "config/algorithm/bar-surface-production.json",
+    "outputRoot": "D:\\steel-inspection\\algorithm-data",
+    "timingLog": "processing-times.jsonl",
+    "maxFramesPerCamera": 24
+  },
   "capabilities": {
     "directCamera": true,
     "captureManagement": true,

@@ -1,7 +1,7 @@
 import type { PublicRuntimeProfile } from '../services/runtime-profile-api';
 
 export type RuntimeDashboardMode = {
-  kind: 'bkv' | 'direct';
+  kind: 'bkv' | 'bkv-online' | 'direct';
   cameraCount: number;
   requestsOnlineServices: boolean;
   requestsStandardRecords: boolean;
@@ -28,6 +28,18 @@ export function createRuntimeDashboardMode(
       showsCaptureManagement: false,
       showsReconstruction: false,
       supportsOfflineReplay: true,
+    });
+  }
+  if (profile.dataSource === 'bkv-online-mysql') {
+    return Object.freeze({
+      kind: 'bkv-online',
+      cameraCount: profile.cameraCount,
+      requestsOnlineServices: false,
+      requestsStandardRecords: false,
+      showsHardwareStatus: false,
+      showsCaptureManagement: false,
+      showsReconstruction: false,
+      supportsOfflineReplay: false,
     });
   }
   return Object.freeze({

@@ -94,10 +94,13 @@ pub fn detect_camera_head(frames: &[(u32, PathBuf)]) -> Result<CameraAlignment, 
                 }
                 stable_run.push_back(occupancy);
                 if stable_run.len() == STABLE_ROWS {
-                    let local_head = y + 1 - STABLE_ROWS as u32;
-                    let head_offset_y = frame_number
+                    let global_row = frame_number
                         .checked_mul(image.height())
-                        .and_then(|offset| offset.checked_add(local_head))
+                        .and_then(|offset| offset.checked_add(y))
+                        .ok_or(WorldError::DimensionOverflow)?;
+                    let head_offset_y = global_row
+                        .checked_add(1)
+                        .and_then(|row| row.checked_sub(STABLE_ROWS as u32))
                         .ok_or(WorldError::DimensionOverflow)?;
                     let average = stable_run.iter().copied().sum::<f32>() / STABLE_ROWS as f32;
                     let confidence_milli = ((average / 0.8).clamp(0.0, 1.0) * 1000.0)
@@ -737,6 +740,19 @@ mod tests {
         assert!(alignment.aligned);
         assert_eq!(alignment.head_offset_y, 83);
         assert!(alignment.confidence_milli >= 700);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_camera_head_when_stable_rows_cross_a_frame_boundary() {
+        let root = temp_root("head-cross-frame");
+        let first = head_frame(&root, "first.png", 80, 64, Some(57), &[]);
+        let second = head_frame(&root, "second.png", 80, 64, Some(0), &[]);
+
+        let alignment = detect_camera_head(&[(0, first), (1, second)]).unwrap();
+
+        assert!(alignment.aligned);
+        assert_eq!(alignment.head_offset_y, 57);
         fs::remove_dir_all(root).unwrap();
     }
 

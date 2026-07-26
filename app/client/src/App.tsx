@@ -96,6 +96,7 @@ import {
 } from './services/bar-surface-api';
 import { InspectionFlowTool } from './components/InspectionFlowTool';
 import { StandaloneWindowTitlebar } from './components/StandaloneWindowTitlebar';
+import { BkvConversionStatusDialog } from './components/BkvConversionStatusDialog';
 import { inferNotificationTone, notify } from './state/notifications';
 import { resolveAppRoute, type AppRoute } from './lib/app-windows';
 import {
@@ -307,10 +308,12 @@ function ConfiguredApp({
     setSnapshot(null);
     setLoadError(null);
     setBkvRecords(null);
-    if (dashboardMode.requestsStandardRecords) {
+    if (dashboardMode.requestsStandardRecords || dashboardMode.kind === 'bkv-online') {
       setBkvDataHealth({
         state: 'loading',
-        detail: '正在读取 BKV 标准离线仓库',
+        detail: dashboardMode.kind === 'bkv-online'
+          ? '正在连接 BKV MySQL 与六个共享图像目录'
+          : '正在读取 BKV 标准离线仓库',
       });
     }
     writeTerminalViewMode(resolvedTerminalMode);
@@ -331,19 +334,27 @@ function ConfiguredApp({
       : fetchInspectionSnapshot(controller.signal);
     loadSnapshot
       .then((nextSnapshot) => {
-        if (!controller.signal.aborted) setSnapshot(nextSnapshot);
+        if (!controller.signal.aborted) {
+          setSnapshot(nextSnapshot);
+          if (dashboardMode.kind === 'bkv-online') {
+            setBkvDataHealth({
+              state: 'ready',
+              detail: `${nextSnapshot.records.length} 条在线记录、${nextSnapshot.captureImages?.length ?? 0} 路实际图像已就绪`,
+            });
+          }
+        }
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
           const detail = error instanceof Error ? error.message : '后台数据接口不可用';
           setLoadError(detail);
-          if (dashboardMode.requestsStandardRecords) {
+          if (dashboardMode.requestsStandardRecords || dashboardMode.kind === 'bkv-online') {
             setBkvDataHealth({ state: 'store-error', detail });
           }
         }
       });
     return () => controller.abort();
-  }, [dashboardMode.requestsStandardRecords, loadRevision, resolvedTerminalMode]);
+  }, [dashboardMode.kind, dashboardMode.requestsStandardRecords, loadRevision, resolvedTerminalMode]);
 
   const retryBkvLoad = () => {
     setSnapshot(null);
@@ -487,6 +498,7 @@ function InspectionDashboard({
     revision: 0,
   });
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [bkvConversionStatusOpen, setBkvConversionStatusOpen] = useState(false);
   const [inspectionFlowVisible, setInspectionFlowVisible] = useState(false);
   const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>(terminalMode === 'bkv' ? 'history' : 'latest');
   const [snapshotSyncState, setSnapshotSyncState] = useState('等待实时同步');
@@ -1298,7 +1310,15 @@ function InspectionDashboard({
           availableCameraCount: bkvRecords?.ready ? (bkvRecords.cameraCount ?? dashboardMode.cameraCount) : 0,
           batchId: bkvRecords?.batchId ?? '读取中',
           health: bkvDataHealth,
+        } : dashboardMode.kind === 'bkv-online' ? {
+          cameraCount: dashboardMode.cameraCount,
+          availableCameraCount: new Set((snapshot.captureImages ?? []).map((image) => image.cameraId)).size,
+          batchId: snapshot.records[0]?.id.replace(/^bkv-/, '') ?? '读取中',
+          health: bkvDataHealth,
         } : undefined}
+        onBkvConversionStatusOpen={dashboardMode.kind === 'bkv-online'
+          ? () => setBkvConversionStatusOpen(true)
+          : undefined}
         analysisCollapse={uiState.activeNav === 'online' ? {
           collapsed: analysisCollapsed,
           onToggle: () => setAnalysisCollapsed((current) => !current),
@@ -1308,6 +1328,12 @@ function InspectionDashboard({
       />
       {capabilityMessage ? (
         <div className="runtime-capability-message" role="status">{capabilityMessage}</div>
+      ) : null}
+      {bkvConversionStatusOpen ? (
+        <BkvConversionStatusDialog
+          snapshot={snapshot}
+          onClose={() => setBkvConversionStatusOpen(false)}
+        />
       ) : null}
       {uiState.activeNav === 'online' ? (
         <div className="online-workspace">
@@ -1340,7 +1366,7 @@ function InspectionDashboard({
                   plateLengthM={activePlateLengthM}
                   artifactMode={artifactMode}
                   inspectionId={activeInspection?.inspectionId}
-                  requireInspectionWorld={dashboardMode.kind === 'bkv'}
+                  requireInspectionWorld={dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online'}
                   captureImages={activeSnapshot.captureImages ?? []}
                   cameraLanes={runtimeCameraLanes}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
@@ -1521,7 +1547,7 @@ function InspectionDashboard({
         activeNav={uiState.activeNav}
         dashboardMode={dashboardMode}
         terminalViews={{
-          online: { available: dashboardMode.kind === 'direct', active: dashboardMode.kind === 'direct' },
+          online: { available: dashboardMode.kind !== 'bkv', active: dashboardMode.kind !== 'bkv' },
           bkv: { available: dashboardMode.kind === 'bkv', active: dashboardMode.kind === 'bkv' },
         }}
         flowVisible={inspectionFlowVisible}

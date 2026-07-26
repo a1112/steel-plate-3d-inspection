@@ -394,9 +394,18 @@ function BarUnfoldedMap({
     captureImages
       .filter((image) => image.dataName.toLowerCase() === 'intensity')
       .forEach((image) => {
-        const pathMatch = image.path.match(/camera(\d+)/i);
-        const ipMatch = image.cameraId.match(/\.10(\d)\./);
-        const cameraName = pathMatch ? `camera${Number(pathMatch[1])}` : ipMatch ? `camera${Number(ipMatch[1])}` : '';
+        const identityMatch = [
+          image.cameraId,
+          image.cameraIp,
+          image.path,
+        ].map((value) => value.match(/(?:camera|camimagesource)[-_ ]?(\d+)/i))
+          .find((match): match is RegExpMatchArray => Boolean(match));
+        const legacyIpMatch = image.cameraId.match(/\.10(\d)\./);
+        const cameraName = identityMatch
+          ? `camera${Number(identityMatch[1])}`
+          : legacyIpMatch
+            ? `camera${Number(legacyIpMatch[1])}`
+            : '';
         if (!cameraName) return;
         const current = images.get(cameraName);
         if (!current || image.sequenceNo > current.sequenceNo) images.set(cameraName, image);

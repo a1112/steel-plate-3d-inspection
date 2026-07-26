@@ -31,6 +31,10 @@ struct RuntimeProfileDocument {
     cameras: Vec<RuntimeCamera>,
     #[serde(default)]
     storage: RuntimeStorage,
+    #[serde(default)]
+    capture: Option<RuntimeCapture>,
+    #[serde(default)]
+    algorithm: RuntimeAlgorithm,
     capabilities: RuntimeCapabilities,
 }
 
@@ -81,6 +85,86 @@ pub struct RuntimeStorage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RuntimeCapture {
+    pub enabled: bool,
+    pub autostart: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeAlgorithm {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_process_latest: bool,
+    #[serde(default)]
+    pub processor: String,
+    #[serde(default)]
+    pub config_path: String,
+    #[serde(default)]
+    pub output_root: String,
+    #[serde(default = "default_timing_log")]
+    pub timing_log: String,
+    #[serde(default = "default_max_frames_per_camera")]
+    pub max_frames_per_camera: usize,
+    #[serde(default)]
+    pub source_data: RuntimeSourceDataPersistence,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSourceDataPersistence {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_source_data_directory")]
+    pub directory: String,
+    #[serde(default = "default_source_record_limit")]
+    pub record_limit: usize,
+}
+
+impl Default for RuntimeSourceDataPersistence {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: default_source_data_directory(),
+            record_limit: default_source_record_limit(),
+        }
+    }
+}
+
+impl Default for RuntimeAlgorithm {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_process_latest: false,
+            processor: String::new(),
+            config_path: String::new(),
+            output_root: String::new(),
+            timing_log: default_timing_log(),
+            max_frames_per_camera: default_max_frames_per_camera(),
+            source_data: RuntimeSourceDataPersistence::default(),
+        }
+    }
+}
+
+fn default_timing_log() -> String {
+    "processing-times.jsonl".to_string()
+}
+
+fn default_max_frames_per_camera() -> usize {
+    64
+}
+
+fn default_source_data_directory() -> String {
+    "source-data/mysql".to_string()
+}
+
+fn default_source_record_limit() -> usize {
+    500
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeCapabilities {
     pub direct_camera: bool,
     pub capture_management: bool,
@@ -114,6 +198,8 @@ pub struct RuntimeProfile {
     pub camera_connection: String,
     pub cameras: Vec<RuntimeCamera>,
     pub storage: RuntimeStorage,
+    pub capture: RuntimeCapture,
+    pub algorithm: RuntimeAlgorithm,
     pub capabilities: RuntimeCapabilities,
     pub capture_profile: Option<String>,
     pub config_hash: String,
@@ -161,7 +247,16 @@ impl RuntimeProfile {
         } else if document.camera_connection == "headless-cpp" {
             return Err("direct runtime profile requires captureProfile".to_string());
         }
+        if document.algorithm.enabled {
+            let algorithm_path =
+                contained_existing_file(&allowed_root, &document.algorithm.config_path, "algorithm config")?;
+            let algorithm_bytes = fs::read(&algorithm_path)
+                .map_err(|error| format!("algorithm config read failed: {error}"))?;
+            hasher.update([0]);
+            hasher.update(algorithm_bytes);
+        }
 
+        let capture = resolved_capture(&document);
         Ok(Self {
             id: document.id,
             display_name: document.display_name,
@@ -170,6 +265,8 @@ impl RuntimeProfile {
             camera_connection: document.camera_connection,
             cameras: document.cameras,
             storage: document.storage,
+            capture,
+            algorithm: document.algorithm,
             capabilities: document.capabilities,
             capture_profile: document.capture_profile,
             config_hash: format!("{:x}", hasher.finalize()),
@@ -215,6 +312,14 @@ impl RuntimeProfile {
         } else if document.camera_connection == "headless-cpp" {
             return Err("direct runtime profile requires captureProfile".to_string());
         }
+        if document.algorithm.enabled {
+            let algorithm_path =
+                contained_existing_file(&allowed_root, &document.algorithm.config_path, "algorithm config")?;
+            let algorithm_bytes = fs::read(&algorithm_path)
+                .map_err(|error| format!("algorithm config read failed: {error}"))?;
+            hasher.update([0]);
+            hasher.update(algorithm_bytes);
+        }
         Ok((profile_bytes, format!("{:x}", hasher.finalize())))
     }
 
@@ -242,6 +347,8 @@ impl RuntimeProfile {
                 "role": camera.role,
             })).collect::<Vec<_>>(),
             "configHash": self.config_hash,
+            "capture": self.capture,
+            "algorithm": self.algorithm,
             "capabilities": self.capabilities,
         })
     }
@@ -273,6 +380,11 @@ impl RuntimeProfile {
                 })
                 .collect(),
             storage: RuntimeStorage::default(),
+            capture: RuntimeCapture {
+                enabled: direct,
+                autostart: direct,
+            },
+            algorithm: RuntimeAlgorithm::default(),
             capabilities: RuntimeCapabilities {
                 direct_camera: direct,
                 capture_management: direct,
@@ -321,6 +433,7 @@ fn validate_profile(
         }
     }
 
+    let capture = resolved_capture(document);
     match document.camera_connection.as_str() {
         "none" => {
             if document.capabilities.direct_camera
@@ -335,6 +448,12 @@ fn validate_profile(
             if document.provider != "bkv" {
                 return Err("cameraConnection=none currently requires provider=bkv".to_string());
             }
+            if capture.enabled || capture.autostart {
+                return Err(
+                    "cameraConnection=none requires capture.enabled=false and capture.autostart=false"
+                        .to_string(),
+                );
+            }
         }
         "headless-cpp" => {
             if !document.capabilities.direct_camera
@@ -343,6 +462,12 @@ fn validate_profile(
                 return Err(
                     "headless-cpp runtime profile requires direct camera capabilities".to_string(),
                 );
+            }
+            if !capture.enabled {
+                return Err("headless-cpp runtime profile requires capture.enabled=true".to_string());
+            }
+            if capture.autostart && !capture.enabled {
+                return Err("capture.autostart requires capture.enabled=true".to_string());
             }
         }
         other => return Err(format!("unsupported cameraConnection: {other}")),
@@ -371,7 +496,64 @@ fn validate_profile(
     if document.data_source == "converted-local" {
         validate_loopback_origin(&document.storage.converter_origin)?;
     }
+    if document.algorithm.enabled {
+        if document.algorithm.processor.trim().is_empty() {
+            return Err("enabled algorithm pipeline requires processor".to_string());
+        }
+        if document.algorithm.config_path.trim().is_empty() {
+            return Err("enabled algorithm pipeline requires configPath".to_string());
+        }
+        let _ = contained_existing_file(
+            allowed_root,
+            &document.algorithm.config_path,
+            "algorithm config",
+        )?;
+        let output_root = Path::new(document.algorithm.output_root.trim());
+        if !output_root.is_absolute()
+            || output_root.parent().is_none()
+            || output_root.parent().is_some_and(|parent| parent.parent().is_none())
+        {
+            return Err(
+                "enabled algorithm pipeline outputRoot must be an absolute non-volume-root path"
+                    .to_string(),
+            );
+        }
+        validate_relative_path(&document.algorithm.timing_log, "algorithm timingLog")?;
+        if document.algorithm.max_frames_per_camera == 0
+            || document.algorithm.max_frames_per_camera > 512
+        {
+            return Err("algorithm maxFramesPerCamera must be between 1 and 512".to_string());
+        }
+        if document.algorithm.source_data.enabled {
+            validate_relative_path(
+                &document.algorithm.source_data.directory,
+                "algorithm sourceData directory",
+            )?;
+            if document.algorithm.source_data.directory.trim().is_empty() {
+                return Err("algorithm sourceData directory cannot be empty".to_string());
+            }
+            if document.algorithm.source_data.record_limit == 0
+                || document.algorithm.source_data.record_limit > 2_000
+            {
+                return Err(
+                    "algorithm sourceData recordLimit must be between 1 and 2000".to_string(),
+                );
+            }
+        }
+    } else if document.algorithm.auto_process_latest {
+        return Err("algorithm autoProcessLatest requires algorithm.enabled=true".to_string());
+    }
     Ok(())
+}
+
+fn resolved_capture(document: &RuntimeProfileDocument) -> RuntimeCapture {
+    document.capture.clone().unwrap_or_else(|| {
+        let enabled = document.camera_connection == "headless-cpp";
+        RuntimeCapture {
+            enabled,
+            autostart: enabled,
+        }
+    })
 }
 
 fn validate_loopback_origin(value: &str) -> Result<(), String> {

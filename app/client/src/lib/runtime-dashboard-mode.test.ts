@@ -37,6 +37,13 @@ const directProfile: PublicRuntimeProfile = {
   },
 };
 
+const bkvOnlineProfile: PublicRuntimeProfile = {
+  ...bkvProfile,
+  profileId: 'bkv-online-6',
+  displayName: 'BKV 六相机在线转换',
+  dataSource: 'bkv-online-mysql',
+};
+
 describe('runtime dashboard mode', () => {
   it('makes converted-local BKV the exclusive standard-record dashboard mode', () => {
     expect(createRuntimeDashboardMode(bkvProfile)).toMatchObject({
@@ -59,6 +66,18 @@ describe('runtime dashboard mode', () => {
       showsHardwareStatus: true,
       showsCaptureManagement: true,
       showsReconstruction: true,
+    });
+  });
+
+  it('keeps BKV online conversion on the live dashboard without hardware controls', () => {
+    expect(createRuntimeDashboardMode(bkvOnlineProfile)).toMatchObject({
+      kind: 'bkv-online',
+      cameraCount: 6,
+      requestsOnlineServices: false,
+      requestsStandardRecords: false,
+      showsHardwareStatus: false,
+      showsCaptureManagement: false,
+      showsReconstruction: false,
     });
   });
 

@@ -851,9 +851,11 @@ To serve a built frontend without Vite:
 scripts/run-client-static.ps1 -Port 1432
 ```
 
-## Tauri Desktop Only
+## Tauri Desktop
 
-Start the Rust service separately, then run:
+The development launcher builds and starts the Rust API when port 4873 is not
+already healthy, waits for readiness, starts Vite/Tauri, and stops only the API
+process that it owns:
 
 ```powershell
 scripts/run-tauri-dev.ps1 -ServicePort 4873
@@ -862,10 +864,13 @@ scripts/run-tauri-dev.ps1 -ServicePort 4873
 Equivalent env-file mode:
 
 ```powershell
-scripts/run-tauri-dev.ps1 -EnvFile config/env/client.env.example
+scripts/run-tauri-dev.ps1 -EnvFile config/bkv-online.env.local
 ```
 
-Tauri dev starts only the Vite frontend through `app/client/src-tauri/tauri.conf.json`; it does not start the Rust service.
+Use `-SkipServiceBuild` after an explicit service build. The launcher uses the
+local Cargo cache by default; on a machine with an empty cache, use
+`-AllowNetworkDependencyFetch` once. `-NoService` keeps the previous frontend-only
+behavior when the API lifecycle is managed elsewhere.
 
 Desktop development is not installation evidence. The locked no-bundle Release completed in 56.64 seconds and produced `target/cargo/release/steel-plate-3d-inspection-tauri.exe` at 23,113,728 bytes with production devtools feature count zero. Tauri selects the WebView2 offline installer, per-machine NSIS mode, no downgrades, and the formal publisher. Formal `build-client.ps1 -Tauri` requires a certificate SHA-1 thumbprint and HTTPS timestamp URL; missing signing inputs fail closed, while `-AllowUnsignedDesktopBundle` is development-only. The EXE is `NotSigned`, depends on `VCRUNTIME140.dll`, and does not close the MSI/NSIS gate.
 

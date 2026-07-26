@@ -8,12 +8,20 @@ Copy one of these files to a local `.env` file or pass it directly with `-EnvFil
 - `external-api.env.example`: Rust connects to an already running capture API process.
 - `simulated.env.example`: Rust uses the eight-camera simulation fallback.
 - `bkv.env.example`: Rust uses the validated 11-material BKV offline replay batch and starts no camera process.
+- `bkv-online.env.example`: Rust continuously converts the latest BKV MySQL records and reads actual 2D/3D images from six read-only network shares.
 - `simulated-mysql.env.example`: development MySQL primary with explicit SQLite fallback.
 - `simulated-postgres.env.example`: development PostgreSQL primary with explicit SQLite fallback.
 - `trigger-gateway.env.example`: standalone trigger gateway from `app/trigger` forwards L2/PLC/API steel events to the Rust production API.
 - `runtime-service.env.example`: non-secret baseline for the unified `SteelInspectionRuntime` Windows service. The installer writes the active `runtime-service.env` beside this template.
 
 Formal readiness requires the gateway at `TRIGGER_GATEWAY_ORIGIN` by default. Set `STEEL_TRIGGER_HEALTH_REQUIRED=0` only for an explicit development/service-only run.
+
+Runtime behavior has one non-secret source of truth: the active file under
+`config/runtime-modes`. Its `dataSource`, `capture`, and `algorithm` sections
+select the source adapter, whether capture is permitted/autostarted, and where
+algorithm products and timings are written. Environment files provide
+connection details and secrets only; they do not switch BKV online mode or
+override capture policy.
 
 Non-production database adapters are `sqlite`, `mysql`, and `postgres`. Select
 one with `STEEL_DATABASE_ENGINE` or supply `STEEL_DATABASE_URL`. To opt into

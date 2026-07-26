@@ -1,0 +1,83 @@
+{
+  "schema": "steel.runtime-profile.v1",
+  "id": "bkv-online-6",
+  "displayName": "BKV 六相机在线转换",
+  "provider": "bkv",
+  "dataSource": "bkv-online-mysql",
+  "cameraConnection": "none",
+  "cameraCount": 6,
+  "cameras": [
+    {
+      "id": "C1",
+      "displayOrder": 1,
+      "sourceCameraId": 1,
+      "role": "legacy-array-1",
+      "sourceDirectory": "CamImageSource1"
+    },
+    {
+      "id": "C2",
+      "displayOrder": 2,
+      "sourceCameraId": 2,
+      "role": "legacy-array-2",
+      "sourceDirectory": "CamImageSource2"
+    },
+    {
+      "id": "C3",
+      "displayOrder": 3,
+      "sourceCameraId": 3,
+      "role": "legacy-array-3",
+      "sourceDirectory": "CamImageSource3"
+    },
+    {
+      "id": "C4",
+      "displayOrder": 4,
+      "sourceCameraId": 4,
+      "role": "legacy-array-4",
+      "sourceDirectory": "CamImageSource4"
+    },
+    {
+      "id": "C5",
+      "displayOrder": 5,
+      "sourceCameraId": 5,
+      "role": "legacy-array-5",
+      "sourceDirectory": "CamImageSource5"
+    },
+    {
+      "id": "C6",
+      "displayOrder": 6,
+      "sourceCameraId": 6,
+      "role": "legacy-array-6",
+      "sourceDirectory": "CamImageSource6"
+    }
+  ],
+  "storage": {
+    "sourceRoot": "",
+    "convertedRoot": "",
+    "catalogPath": "",
+    "converterOrigin": ""
+  },
+  "capture": {
+    "enabled": false,
+    "autostart": false
+  },
+  "algorithm": {
+    "enabled": true,
+    "autoProcessLatest": true,
+    "processor": "bkv-inspection-world-v1",
+    "configPath": "config/algorithm/bkv-inspection-world-6.json",
+    "outputRoot": "D:\\steel-inspection\\algorithm-data",
+    "timingLog": "processing-times.jsonl",
+    "maxFramesPerCamera": 64,
+    "sourceData": {
+      "enabled": true,
+      "directory": "source-data/mysql",
+      "recordLimit": 500
+    }
+  },
+  "capabilities": {
+    "directCamera": false,
+    "captureManagement": false,
+    "reconstruction": false,
+    "offlineReplay": true
+  }
+}
