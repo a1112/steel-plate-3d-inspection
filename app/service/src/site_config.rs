@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SITE_CONFIG_SCHEMA: &str = "steel.site-config.v1";
+const PROJECT_CONFIG_SCHEMA: &str = "steel.project-config.v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -31,6 +32,31 @@ pub struct SiteConfigDocument {
 pub struct SiteConfigPackage {
     pub root: PathBuf,
     pub document: SiteConfigDocument,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveSiteResolution {
+    pub project_path: PathBuf,
+    pub project_bytes: Vec<u8>,
+    pub site_bytes: Option<Vec<u8>>,
+    pub runtime_profile_path: PathBuf,
+    pub site_id: String,
+    pub site_display_name: String,
+    pub site_mode: SiteMode,
+    pub pending_restart: bool,
+    pub compatibility: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectConfigDocument {
+    schema: String,
+    #[serde(default)]
+    active_site_config: Option<String>,
+    #[serde(default)]
+    active_runtime_profile: Option<String>,
+    #[serde(default)]
+    pending_restart: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -339,6 +365,109 @@ impl SiteConfigStore {
     }
 }
 
+pub fn resolve_active_site(
+    project_path: &Path,
+    allowed_root: &Path,
+) -> Result<ActiveSiteResolution, String> {
+    let allowed_root = fs::canonicalize(allowed_root).map_err(|error| {
+        format!(
+            "site config allowed root is unavailable ({}): {error}",
+            allowed_root.display()
+        )
+    })?;
+    let project_path =
+        contained_existing_file(&allowed_root, project_path, "project configuration")?;
+    let project_bytes = fs::read(&project_path)
+        .map_err(|error| format!("project configuration read failed: {error}"))?;
+    let project: ProjectConfigDocument = serde_json::from_slice(&project_bytes)
+        .map_err(|error| format!("project configuration JSON invalid: {error}"))?;
+    if project.schema != PROJECT_CONFIG_SCHEMA {
+        return Err(format!(
+            "project configuration schema must be {PROJECT_CONFIG_SCHEMA}"
+        ));
+    }
+
+    if let Some(relative) = project.active_site_config.as_deref() {
+        let site_path = contained_existing_file(&allowed_root, relative, "active site config")?;
+        let site_root = site_path
+            .parent()
+            .ok_or_else(|| "active site config has no parent".to_string())?;
+        let site_bytes = fs::read(&site_path)
+            .map_err(|error| format!("active site config read failed: {error}"))?;
+        let document: SiteConfigDocument = serde_json::from_slice(&site_bytes)
+            .map_err(|error| format!("active site config JSON invalid: {error}"))?;
+        if document.schema != SITE_CONFIG_SCHEMA {
+            return Err(format!("site config schema must be {SITE_CONFIG_SCHEMA}"));
+        }
+        validate_site_id(&document.id)?;
+        let runtime_profile_path =
+            contained_existing_file(site_root, &document.runtime_profile, "site runtime profile")?;
+        return Ok(ActiveSiteResolution {
+            project_path,
+            project_bytes,
+            site_bytes: Some(site_bytes),
+            runtime_profile_path,
+            site_id: document.id,
+            site_display_name: document.display_name,
+            site_mode: document.mode,
+            pending_restart: project.pending_restart,
+            compatibility: false,
+        });
+    }
+
+    let relative = project.active_runtime_profile.as_deref().ok_or_else(|| {
+        "project configuration requires activeSiteConfig or activeRuntimeProfile".to_string()
+    })?;
+    let runtime_profile_path =
+        contained_existing_file(&allowed_root, relative, "legacy runtime profile")?;
+    let runtime_bytes = fs::read(&runtime_profile_path)
+        .map_err(|error| format!("legacy runtime profile read failed: {error}"))?;
+    let runtime: Value = serde_json::from_slice(&runtime_bytes)
+        .map_err(|error| format!("legacy runtime profile JSON invalid: {error}"))?;
+    let site_id = runtime
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "legacy runtime profile id is missing".to_string())?
+        .to_string();
+    let site_display_name = runtime
+        .get("displayName")
+        .and_then(Value::as_str)
+        .unwrap_or(&site_id)
+        .to_string();
+    let site_mode = if runtime.get("provider").and_then(Value::as_str) == Some("bkv") {
+        SiteMode::Bkv
+    } else {
+        SiteMode::DirectCamera
+    };
+    Ok(ActiveSiteResolution {
+        project_path,
+        project_bytes,
+        site_bytes: None,
+        runtime_profile_path,
+        site_id,
+        site_display_name,
+        site_mode,
+        pending_restart: project.pending_restart,
+        compatibility: true,
+    })
+}
+
+pub fn mark_project_applied(project_path: &Path) -> Result<(), String> {
+    let bytes = fs::read(project_path)
+        .map_err(|error| format!("project configuration read failed: {error}"))?;
+    let mut project: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("project configuration JSON invalid: {error}"))?;
+    if project.get("pendingRestart").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let object = project
+        .as_object_mut()
+        .ok_or_else(|| "project configuration must be a JSON object".to_string())?;
+    object.insert("pendingRestart".to_string(), Value::Bool(false));
+    write_json_atomic(project_path, &project)
+}
+
 fn check_json_reference(
     package: &SiteConfigPackage,
     relative: &str,
@@ -509,6 +638,25 @@ fn contained_existing_directory(
     Ok(resolved)
 }
 
+fn contained_existing_file(
+    allowed_root: &Path,
+    candidate: impl AsRef<Path>,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let candidate = candidate.as_ref();
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        allowed_root.join(candidate)
+    };
+    let resolved = fs::canonicalize(&joined)
+        .map_err(|error| format!("{label} is unavailable ({}): {error}", joined.display()))?;
+    if !resolved.starts_with(allowed_root) || !resolved.is_file() {
+        return Err(format!("{label} must be a file beneath the allowed root"));
+    }
+    Ok(resolved)
+}
+
 fn read_site_document(path: &Path) -> Result<SiteConfigDocument, String> {
     let bytes = fs::read(path).map_err(|error| format!("site config read failed: {error}"))?;
     let document: SiteConfigDocument = serde_json::from_slice(&bytes)
@@ -629,7 +777,7 @@ fn runtime_template(id: &str, display_name: &str, mode: &SiteMode) -> Value {
         "id": id,
         "displayName": display_name,
         "provider": provider,
-        "dataSource": if mode == &SiteMode::Bkv { "converted-local" } else { "online-production" },
+        "dataSource": if mode == &SiteMode::Bkv { "bkv-online-mysql" } else { "online-production" },
         "cameraConnection": camera_connection,
         "cameraCount": camera_count,
         "cameras": (1..=camera_count).map(|camera| json!({

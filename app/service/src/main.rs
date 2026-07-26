@@ -20437,7 +20437,7 @@ fn main() -> std::io::Result<()> {
     let project_config_path = env::var("STEEL_PROJECT_CONFIG_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("config").join("project.json"));
-    let runtime_config = runtime_profile::RuntimeProfile::load(
+    let runtime_config = runtime_profile::RuntimeProfile::load_for_startup(
         &project_config_path,
         &workspace_root(),
     )

@@ -1,0 +1,13 @@
+{
+  "schema": "steel.site-connection.v1",
+  "provider": "bkv",
+  "dataSource": "bkv-online-mysql",
+  "configurationSource": "environment",
+  "requiredEnvironment": [
+    "STEEL_BKV_MYSQL_HOST",
+    "STEEL_BKV_MYSQL_DATABASE",
+    "STEEL_BKV_MYSQL_USER",
+    "STEEL_BKV_MYSQL_PASSWORD",
+    "STEEL_BKV_IMAGE_ROOT"
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "schema": "steel.capture.profile.v1",
+  "expectedCameras": 6,
+  "cameras": [
+    {
+      "cameraIndex": 1,
+      "enabled": false
+    },
+    {
+      "cameraIndex": 2,
+      "enabled": false
+    },
+    {
+      "cameraIndex": 3,
+      "enabled": false
+    },
+    {
+      "cameraIndex": 4,
+      "enabled": false
+    },
+    {
+      "cameraIndex": 5,
+      "enabled": false
+    },
+    {
+      "cameraIndex": 6,
+      "enabled": false
+    }
+  ]
+}

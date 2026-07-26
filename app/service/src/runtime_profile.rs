@@ -1,3 +1,4 @@
+use crate::site_config::{mark_project_applied, resolve_active_site, SiteMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -5,16 +6,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-const PROJECT_SCHEMA: &str = "steel.project-config.v1";
 const RUNTIME_PROFILE_SCHEMA: &str = "steel.runtime-profile.v1";
 const CAPTURE_PROFILE_SCHEMA: &str = "steel.capture.profile.v1";
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProjectConfig {
-    schema: String,
-    active_runtime_profile: String,
-}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,6 +184,11 @@ impl RuntimeCapability {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeProfile {
+    pub site_id: String,
+    pub site_display_name: String,
+    pub site_mode: SiteMode,
+    pub site_compatibility: bool,
+    pub pending_restart: bool,
     pub id: String,
     pub display_name: String,
     pub provider: String,
@@ -209,23 +207,26 @@ pub struct RuntimeProfile {
 
 impl RuntimeProfile {
     pub fn load(project_path: &Path, allowed_root: &Path) -> Result<Self, String> {
+        Self::load_internal(project_path, allowed_root, false)
+    }
+
+    pub fn load_for_startup(project_path: &Path, allowed_root: &Path) -> Result<Self, String> {
+        Self::load_internal(project_path, allowed_root, true)
+    }
+
+    fn load_internal(
+        project_path: &Path,
+        allowed_root: &Path,
+        mark_applied: bool,
+    ) -> Result<Self, String> {
         let allowed_root = fs::canonicalize(allowed_root).map_err(|error| {
             format!(
                 "runtime profile allowed root is unavailable ({}): {error}",
                 allowed_root.display()
             )
         })?;
-        let project_path = contained_existing_file(&allowed_root, project_path, "project config")?;
-        let project_bytes = fs::read(&project_path)
-            .map_err(|error| format!("project config read failed: {error}"))?;
-        let project: ProjectConfig = serde_json::from_slice(&project_bytes)
-            .map_err(|error| format!("project config JSON invalid: {error}"))?;
-        if project.schema != PROJECT_SCHEMA {
-            return Err(format!("project config schema must be {PROJECT_SCHEMA}"));
-        }
-
-        let profile_path =
-            contained_existing_file(&allowed_root, &project.active_runtime_profile, "runtime profile")?;
+        let active_site = resolve_active_site(project_path, &allowed_root)?;
+        let profile_path = active_site.runtime_profile_path.clone();
         let profile_bytes = fs::read(&profile_path)
             .map_err(|error| format!("runtime profile read failed: {error}"))?;
         let document: RuntimeProfileDocument = serde_json::from_slice(&profile_bytes)
@@ -233,7 +234,11 @@ impl RuntimeProfile {
         validate_profile(&document, &allowed_root)?;
 
         let mut hasher = Sha256::new();
-        hasher.update(&project_bytes);
+        hasher.update(hashable_project_bytes(&active_site.project_bytes)?);
+        if let Some(site_bytes) = active_site.site_bytes.as_ref() {
+            hasher.update([0]);
+            hasher.update(site_bytes);
+        }
         hasher.update([0]);
         hasher.update(&profile_bytes);
 
@@ -257,7 +262,15 @@ impl RuntimeProfile {
         }
 
         let capture = resolved_capture(&document);
+        if mark_applied && active_site.pending_restart {
+            mark_project_applied(&active_site.project_path)?;
+        }
         Ok(Self {
+            site_id: active_site.site_id,
+            site_display_name: active_site.site_display_name,
+            site_mode: active_site.site_mode,
+            site_compatibility: active_site.compatibility,
+            pending_restart: active_site.pending_restart && !mark_applied,
             id: document.id,
             display_name: document.display_name,
             provider: document.provider,
@@ -270,7 +283,7 @@ impl RuntimeProfile {
             capabilities: document.capabilities,
             capture_profile: document.capture_profile,
             config_hash: format!("{:x}", hasher.finalize()),
-            project_path,
+            project_path: active_site.project_path,
             profile_path,
         })
     }
@@ -334,6 +347,11 @@ impl RuntimeProfile {
     pub fn public_value(&self) -> Value {
         json!({
             "schema": "steel.runtime-profile.public.v1",
+            "siteId": self.site_id,
+            "siteDisplayName": self.site_display_name,
+            "siteMode": self.site_mode,
+            "siteCompatibility": self.site_compatibility,
+            "pendingRestart": self.pending_restart,
             "profileId": self.id,
             "displayName": self.display_name,
             "provider": self.provider,
@@ -357,6 +375,15 @@ impl RuntimeProfile {
     pub fn test_profile(provider: &str, camera_count: usize) -> Self {
         let direct = provider != "bkv";
         Self {
+            site_id: format!("test-{provider}-{camera_count}"),
+            site_display_name: "test site".to_string(),
+            site_mode: if direct {
+                SiteMode::DirectCamera
+            } else {
+                SiteMode::Bkv
+            },
+            site_compatibility: false,
+            pending_restart: false,
             id: format!("test-{provider}-{camera_count}"),
             display_name: "test runtime".to_string(),
             provider: provider.to_string(),
@@ -397,6 +424,16 @@ impl RuntimeProfile {
             profile_path: PathBuf::new(),
         }
     }
+}
+
+fn hashable_project_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut project: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("project config JSON invalid: {error}"))?;
+    if let Some(object) = project.as_object_mut() {
+        object.insert("pendingRestart".to_string(), Value::Bool(false));
+    }
+    serde_json::to_vec(&project)
+        .map_err(|error| format!("project config serialization failed: {error}"))
 }
 
 fn validate_profile(
@@ -644,6 +681,7 @@ fn contained_existing_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::site_config::{CreateSiteConfig, SiteConfigStore, SiteMode};
     use serde_json::{json, Value};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -805,5 +843,133 @@ mod tests {
         escaped["storage"]["convertedRoot"] = json!("../outside");
         let escaped_fixture = fixture(escaped, None);
         assert!(RuntimeProfile::load(&escaped_fixture.project, &escaped_fixture.root).is_err());
+    }
+
+    #[test]
+    fn loads_runtime_profile_relative_to_the_active_site_manifest() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-runtime-site-{}-{stamp}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+        let store =
+            SiteConfigStore::new(config_root.join("sites")).expect("site configuration store");
+        store
+            .create(CreateSiteConfig {
+                id: "bkv-default".to_string(),
+                display_name: "BKV 六相机现场".to_string(),
+                mode: SiteMode::Bkv,
+            })
+            .expect("site package");
+        let project = config_root.join("project.json");
+        write_json(
+            &project,
+            &json!({
+                "schema": "steel.project-config.v1",
+                "activeSiteConfig": "config/sites/bkv-default/site.json",
+                "pendingRestart": false
+            }),
+        );
+
+        let loaded = RuntimeProfile::load(&project, &root).expect("site runtime");
+
+        assert_eq!(loaded.site_id, "bkv-default");
+        assert_eq!(loaded.site_display_name, "BKV 六相机现场");
+        assert_eq!(loaded.site_mode, SiteMode::Bkv);
+        assert_eq!(loaded.camera_count(), 6);
+        assert!(!loaded.site_compatibility);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn marks_active_runtime_profile_projects_as_legacy_compatibility_sites() {
+        let fixture = fixture(bkv_profile(), None);
+        fs::create_dir_all(fixture.root.join("source")).expect("source root");
+        fs::create_dir_all(fixture.root.join("converted")).expect("converted root");
+
+        let loaded = RuntimeProfile::load(&fixture.project, &fixture.root).expect("legacy runtime");
+
+        assert!(loaded.site_compatibility);
+        assert_eq!(loaded.site_id, "bkv-6");
+        assert_eq!(loaded.site_mode, SiteMode::Bkv);
+    }
+
+    #[test]
+    fn accepts_a_project_path_relative_to_the_allowed_root() {
+        let fixture = fixture(bkv_profile(), None);
+        fs::create_dir_all(fixture.root.join("source")).expect("source root");
+        fs::create_dir_all(fixture.root.join("converted")).expect("converted root");
+        let relative_project = fixture
+            .project
+            .strip_prefix(&fixture.root)
+            .expect("relative project");
+
+        let loaded =
+            RuntimeProfile::load(relative_project, &fixture.root).expect("relative project");
+
+        assert_eq!(loaded.site_id, "bkv-6");
+    }
+
+    #[test]
+    fn checked_in_project_uses_the_bkv_six_camera_site_package() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace");
+
+        let loaded = RuntimeProfile::load(
+            &workspace.join("config/project.json"),
+            &workspace,
+        )
+        .expect("checked-in runtime");
+
+        assert_eq!(loaded.site_id, "bkv-default");
+        assert_eq!(loaded.site_mode, SiteMode::Bkv);
+        assert_eq!(loaded.camera_count(), 6);
+        assert!(!loaded.site_compatibility);
+    }
+
+    #[test]
+    fn successful_startup_clears_the_pending_restart_marker() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-runtime-restart-{}-{stamp}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+        let store =
+            SiteConfigStore::new(config_root.join("sites")).expect("site configuration store");
+        store
+            .create(CreateSiteConfig {
+                id: "bkv-restart".to_string(),
+                display_name: "BKV 重启现场".to_string(),
+                mode: SiteMode::Bkv,
+            })
+            .expect("site package");
+        let project = config_root.join("project.json");
+        write_json(
+            &project,
+            &json!({
+                "schema": "steel.project-config.v1",
+                "activeSiteConfig": "config/sites/bkv-restart/site.json",
+                "pendingRestart": true
+            }),
+        );
+
+        let loaded = RuntimeProfile::load_for_startup(&project, &root).expect("site runtime");
+        let persisted: Value =
+            serde_json::from_slice(&fs::read(&project).expect("project bytes"))
+                .expect("project JSON");
+
+        assert!(!loaded.pending_restart);
+        assert_eq!(persisted["pendingRestart"], false);
+        let _ = fs::remove_dir_all(root);
     }
 }

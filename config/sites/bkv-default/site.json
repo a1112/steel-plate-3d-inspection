@@ -1,0 +1,9 @@
+{
+  "schema": "steel.site-config.v1",
+  "id": "bkv-default",
+  "displayName": "BKV 六相机标准现场",
+  "mode": "bkv",
+  "runtimeProfile": "runtime.json",
+  "connectionConfig": "connection.json",
+  "captureConfig": "capture.json"
+}
