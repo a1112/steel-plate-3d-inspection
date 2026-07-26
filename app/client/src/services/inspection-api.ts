@@ -239,6 +239,32 @@ export type AdminApiRoute = {
 
 export type AdminOverview = {
   updatedAt: string;
+  siteConfiguration?: {
+    active: {
+      id: string;
+      displayName: string;
+      mode: 'bkv' | 'direct-camera' | string;
+      provider: string;
+      dataSource: string;
+      cameraCount: number;
+      configHash: string;
+      compatibility: boolean;
+    };
+    pending?: {
+      id: string;
+      displayName: string;
+      mode: 'bkv' | 'direct-camera' | string;
+      cameraCount: number;
+    } | null;
+    restartRequired: boolean;
+    checkSummary: {
+      normal: number;
+      warning: number;
+      error: number;
+      blocking: number;
+      checkedAt?: number | null;
+    };
+  };
   service: {
     name: string;
     role: string;
