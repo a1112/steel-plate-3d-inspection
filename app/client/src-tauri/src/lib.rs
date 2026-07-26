@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use tauri::Manager;
 
+mod app_resource_usage;
+use app_resource_usage::app_resource_usage;
+
 const CAPTURE_MANAGEMENT_WINDOW: &str = "capture-management";
 const PARAMETER_MANAGEMENT_WINDOW: &str = "parameter-management";
 const BAR_SURFACE_WINDOW: &str = "bar-surface";
@@ -276,7 +279,8 @@ pub fn run() {
             choose_local_directory,
             save_binary_file_with_dialog,
             open_local_path,
-            read_local_text_file
+            read_local_text_file,
+            app_resource_usage
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { DefectItem } from '../data/inspection';
+import type { AppResourceUsage } from '../lib/app-resource-usage';
 import type { RuntimeDashboardMode } from '../lib/runtime-dashboard-mode';
 import { AppFooter } from './AppFooter';
 
@@ -35,7 +36,72 @@ const bkvDashboardMode: RuntimeDashboardMode = {
   supportsOfflineReplay: true,
 };
 
+const fullResourceUsage: AppResourceUsage = {
+  cpuUsage: 12.36,
+  memoryUsed: 448_790_528,
+  memoryTotal: 16 * 1024 * 1024 * 1024,
+  memoryPercent: 2.61,
+  processCount: 5,
+  pythonMemoryUsed: 128 * 1024 * 1024,
+  rustMemoryUsed: 64 * 1024 * 1024,
+  webviewMemoryUsed: 200 * 1024 * 1024,
+  nodeMemoryUsed: 0,
+  tauriMemoryUsed: 36 * 1024 * 1024,
+  otherMemoryUsed: 0,
+  largestProcessName: 'msedgewebview2.exe',
+  largestProcessMemoryUsed: 200 * 1024 * 1024,
+  sampledAtMs: Date.UTC(2026, 6, 26, 12, 0, 0),
+  source: 'tauri',
+  precision: 'full',
+};
+
 describe('AppFooter', () => {
+  it('shows compact full-desktop resource usage with runtime details', () => {
+    render(
+      <AppFooter
+        activeNav="online"
+        resourceUsage={fullResourceUsage}
+        resourceUsageStale={false}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    const monitor = screen.getByLabelText('应用性能：完整桌面应用');
+    expect(monitor).toHaveTextContent('CPU 12.4%');
+    expect(monitor).toHaveTextContent('内存 428.0 MB');
+    expect(monitor).toHaveTextContent('5 进程');
+    expect(monitor).toHaveAttribute('title', expect.stringContaining('WebView: 200.0 MB'));
+    expect(monitor).toHaveAttribute('title', expect.stringContaining('最大进程: msedgewebview2.exe'));
+  });
+
+  it('labels browser fallback metrics and unavailable snapshots accurately', () => {
+    const { rerender } = render(
+      <AppFooter
+        activeNav="online"
+        resourceUsage={{ ...fullResourceUsage, source: 'service', precision: 'degraded' }}
+        resourceUsageStale
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText('应用性能：浏览器服务进程，数据暂时无法更新')).toBeInTheDocument();
+
+    rerender(
+      <AppFooter
+        activeNav="online"
+        resourceUsage={null}
+        resourceUsageStale
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+    const unavailable = screen.getByLabelText('应用性能：等待采样，数据暂时无法更新');
+    expect(unavailable).toHaveTextContent('CPU --');
+    expect(unavailable).toHaveTextContent('内存 --');
+  });
+
   it('groups the non-business entries in the footer', () => {
     render(<AppFooter activeNav="online" onNavChange={vi.fn()} onSettingsOpen={vi.fn()} />);
 

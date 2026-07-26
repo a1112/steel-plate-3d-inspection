@@ -21,6 +21,7 @@ use tokio::runtime::Runtime;
 use crate::standard_record_store::InspectionRecordStore;
 
 mod artifact_cleanup;
+mod app_resource_usage;
 mod bkv;
 mod bkv_online;
 mod calibration_operations;
@@ -19718,6 +19719,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "GET", "path": "/api/health/details", "scope": "service" },
             { "method": "GET", "path": "/api/services", "scope": "service" },
             { "method": "GET", "path": "/api/system/network", "scope": "service" },
+            { "method": "GET", "path": "/api/system/resources", "scope": "service" },
             { "method": "GET", "path": "/api/trigger/status", "scope": "trigger-proxy" },
             { "method": "GET", "path": "/api/trigger/mode", "scope": "trigger-proxy" },
             { "method": "POST", "path": "/api/trigger/mode", "scope": "trigger-proxy" },
@@ -20023,6 +20025,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             service_health_response(&state, health_endpoint.expect("health endpoint guard"))
         }
         ("GET", "/api/system/network") => system_network_status_response(),
+        ("GET", "/api/system/resources") => app_resource_usage::app_resource_usage_response(),
         ("GET", "/api/runtime-profile") => runtime_profile_response(&state),
         ("GET", "/api/services") => http_response(
             "200 OK",

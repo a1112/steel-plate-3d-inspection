@@ -118,6 +118,7 @@ button {
 
 .app-footer-context {
   min-width: 0;
+  flex: 1 1 auto;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -134,6 +135,43 @@ button {
   color: var(--text);
   font-size: 12px;
   text-overflow: ellipsis;
+}
+
+.app-footer-performance {
+  height: 28px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.app-footer-performance > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+}
+
+.app-footer-performance b {
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.app-footer-performance strong {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.app-footer-performance.stale {
+  border-style: dashed;
+  opacity: 0.78;
 }
 
 .app-footer-nav {
@@ -348,6 +386,10 @@ button {
 
   .app-footer-flow-button {
     padding: 0 7px;
+  }
+
+  .app-footer-process-count {
+    display: none;
   }
 }
 

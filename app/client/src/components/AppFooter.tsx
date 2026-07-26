@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { Box, Database, History, Monitor, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
+import {
+  formatResourceBreakdown,
+  formatResourceBytes,
+  formatResourcePercent,
+  type AppResourceUsage,
+} from '../lib/app-resource-usage';
 import type { RuntimeDashboardMode } from '../lib/runtime-dashboard-mode';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import {
@@ -46,6 +52,8 @@ interface AppFooterProps {
   onCaptureManagementOpen?: () => unknown;
   onBarSurfaceOpen?: () => unknown;
   dashboardMode?: RuntimeDashboardMode;
+  resourceUsage?: AppResourceUsage | null;
+  resourceUsageStale?: boolean;
 }
 
 const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
@@ -92,10 +100,24 @@ export function AppFooter({
   onCaptureManagementOpen = openCaptureManagementWindow,
   onBarSurfaceOpen = openBarSurfaceWindow,
   dashboardMode = DEFAULT_DIRECT_DASHBOARD_MODE,
+  resourceUsage = null,
+  resourceUsageStale = false,
 }: AppFooterProps) {
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const activeAnalysis = activeNav === 'online' ? analysis : null;
+  const resourceSourceLabel = resourceUsage
+    ? resourceUsage.precision === 'full' ? '完整桌面应用' : '浏览器服务进程'
+    : '等待采样';
+  const resourceAriaLabel = `应用性能：${resourceSourceLabel}${resourceUsageStale ? '，数据暂时无法更新' : ''}`;
+  const resourceTitle = resourceUsage
+    ? [
+      `来源：${resourceSourceLabel}${resourceUsageStale ? '（暂时无法更新，显示最近快照）' : ''}`,
+      `采样时间：${new Date(resourceUsage.sampledAtMs).toLocaleString()}`,
+      `应用内存占系统：${formatResourcePercent(resourceUsage.memoryPercent)}`,
+      `进程明细：${formatResourceBreakdown(resourceUsage)}`,
+    ].join('\n')
+    : `来源：${resourceSourceLabel}${resourceUsageStale ? '（暂时无法更新）' : ''}`;
 
   useEffect(() => {
     if (!moreMenuOpen) return;
@@ -203,6 +225,17 @@ export function AppFooter({
           <strong>钢管 3D 表面检测平台</strong>
         </div>
       )}
+      <div
+        className={`app-footer-performance ${resourceUsageStale ? 'stale' : ''}`}
+        aria-label={resourceAriaLabel}
+        title={resourceTitle}
+      >
+        <span><b>CPU</b> <strong>{formatResourcePercent(resourceUsage?.cpuUsage)}</strong></span>
+        <span><b>内存</b> <strong>{formatResourceBytes(resourceUsage?.memoryUsed)}</strong></span>
+        <span className="app-footer-process-count">
+          <strong>{resourceUsage ? resourceUsage.processCount : '--'}</strong> 进程
+        </span>
+      </div>
       {onFlowToggle ? (
         <button
           type="button"

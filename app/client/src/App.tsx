@@ -37,6 +37,10 @@ import { emptyRecordSearchFilters, filterInspectionRecords } from './state/recor
 import type { RecordSearchFilters } from './state/record-search';
 import { getResponsiveProfile, getResponsiveProfileClassName } from './state/responsive-layout';
 import {
+  useAppResourceUsage,
+  type AppResourceUsageState,
+} from './hooks/use-app-resource-usage';
+import {
   createDefaultConnectionConfig,
   fetchConnectionConfig,
   fetchServiceHealthDetails,
@@ -302,6 +306,7 @@ function ConfiguredApp({
   });
   const [loadRevision, setLoadRevision] = useState(0);
   const resolvedTerminalMode = dashboardMode.kind === 'bkv' ? 'bkv' : 'online';
+  const resourceUsageState = useAppResourceUsage();
 
   useEffect(() => {
     const controller = new AbortController();
@@ -406,6 +411,8 @@ function ConfiguredApp({
         <AppFooter
           activeNav="online"
           dashboardMode={dashboardMode}
+          resourceUsage={resourceUsageState.usage}
+          resourceUsageStale={resourceUsageState.stale}
           terminalViews={{
             online: { available: false, active: false },
             bkv: { available: true, active: true, onOpen: retryBkvLoad },
@@ -440,6 +447,7 @@ function ConfiguredApp({
       bkvRecords={bkvRecords}
       bkvDataHealth={bkvDataHealth}
       capabilityMessage={capabilityMessage}
+      resourceUsageState={resourceUsageState}
       onSnapshotChange={setSnapshot}
     />
   );
@@ -452,6 +460,7 @@ function InspectionDashboard({
   bkvRecords,
   bkvDataHealth,
   capabilityMessage,
+  resourceUsageState,
   onSnapshotChange,
 }: {
   snapshot: InspectionSnapshot;
@@ -460,6 +469,7 @@ function InspectionDashboard({
   bkvRecords: InspectionWorldRecords | null;
   bkvDataHealth: BkvDataHealth;
   capabilityMessage?: string;
+  resourceUsageState: AppResourceUsageState;
   onSnapshotChange: (snapshot: InspectionSnapshot) => void;
 }) {
   const terminalMode = dashboardMode.kind === 'bkv' ? 'bkv' : 'online';
@@ -1546,6 +1556,8 @@ function InspectionDashboard({
       <AppFooter
         activeNav={uiState.activeNav}
         dashboardMode={dashboardMode}
+        resourceUsage={resourceUsageState.usage}
+        resourceUsageStale={resourceUsageState.stale}
         terminalViews={{
           online: { available: dashboardMode.kind !== 'bkv', active: dashboardMode.kind !== 'bkv' },
           bkv: { available: dashboardMode.kind === 'bkv', active: dashboardMode.kind === 'bkv' },
