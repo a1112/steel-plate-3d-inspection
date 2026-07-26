@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SITE_CONFIG_SCHEMA: &str = "steel.site-config.v1";
@@ -45,9 +46,98 @@ pub struct UpdateSiteMetadata {
     pub mode: Option<SiteMode>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckDepth {
+    Default,
+    Deep,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckStatus {
+    Normal,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteConfigCheck {
+    pub id: String,
+    pub label: String,
+    pub status: CheckStatus,
+    pub message: String,
+    pub blocking: bool,
+}
+
+impl SiteConfigCheck {
+    fn normal(id: &str, label: &str, message: impl Into<String>) -> Self {
+        Self {
+            id: id.to_string(),
+            label: label.to_string(),
+            status: CheckStatus::Normal,
+            message: message.into(),
+            blocking: false,
+        }
+    }
+
+    fn warning(id: &str, label: &str, message: impl Into<String>) -> Self {
+        Self {
+            id: id.to_string(),
+            label: label.to_string(),
+            status: CheckStatus::Warning,
+            message: message.into(),
+            blocking: false,
+        }
+    }
+
+    fn blocking(id: &str, label: &str, message: impl Into<String>) -> Self {
+        Self {
+            id: id.to_string(),
+            label: label.to_string(),
+            status: CheckStatus::Error,
+            message: message.into(),
+            blocking: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteConfigCheckReport {
+    pub site_id: String,
+    pub depth: CheckDepth,
+    pub checked_at: u64,
+    pub checks: Vec<SiteConfigCheck>,
+}
+
+impl SiteConfigCheckReport {
+    pub fn has_blocking_errors(&self) -> bool {
+        self.checks.iter().any(|item| item.blocking)
+    }
+}
+
+pub trait SiteConfigProbe: Send + Sync {
+    fn check(&self, package: &SiteConfigPackage) -> Vec<SiteConfigCheck>;
+}
+
+struct NoopSiteConfigProbe;
+
+impl SiteConfigProbe for NoopSiteConfigProbe {
+    fn check(&self, package: &SiteConfigPackage) -> Vec<SiteConfigCheck> {
+        vec![SiteConfigCheck::warning(
+            "deep.probe",
+            "深度探测",
+            format!("{} 尚未配置设备深度探测器", package.document.display_name),
+        )]
+    }
+}
+
+#[derive(Clone)]
 pub struct SiteConfigStore {
     root: PathBuf,
+    probe: Arc<dyn SiteConfigProbe>,
 }
 
 impl SiteConfigStore {
@@ -56,7 +146,15 @@ impl SiteConfigStore {
             .map_err(|error| format!("site config root create failed: {error}"))?;
         let root = fs::canonicalize(&root)
             .map_err(|error| format!("site config root unavailable: {error}"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            probe: Arc::new(NoopSiteConfigProbe),
+        })
+    }
+
+    pub fn with_probe(mut self, probe: Arc<dyn SiteConfigProbe>) -> Self {
+        self.probe = probe;
+        self
     }
 
     pub fn list(&self) -> Result<Vec<SiteConfigPackage>, String> {
@@ -189,6 +287,197 @@ impl SiteConfigStore {
         fs::remove_dir_all(package.root)
             .map_err(|error| format!("site config delete failed: {error}"))
     }
+
+    pub fn check(&self, id: &str, depth: CheckDepth) -> Result<SiteConfigCheckReport, String> {
+        let package = self.get(id)?;
+        let mut checks = Vec::new();
+        checks.push(SiteConfigCheck::normal(
+            "site.schema",
+            "现场配置结构",
+            format!("Schema {}", package.document.schema),
+        ));
+
+        let runtime = check_json_reference(
+            &package,
+            &package.document.runtime_profile,
+            "runtime.profile",
+            "运行配置",
+            &mut checks,
+        );
+        let _connection = check_json_reference(
+            &package,
+            &package.document.connection_config,
+            "connection.config",
+            "连接配置",
+            &mut checks,
+        );
+        let capture = check_json_reference(
+            &package,
+            &package.document.capture_config,
+            "capture.config",
+            "采集配置",
+            &mut checks,
+        );
+
+        match package.document.mode {
+            SiteMode::Bkv => check_bkv_configuration(runtime.as_ref(), &mut checks),
+            SiteMode::DirectCamera => {
+                check_direct_configuration(runtime.as_ref(), capture.as_ref(), &mut checks)
+            }
+        }
+
+        if depth == CheckDepth::Deep {
+            checks.extend(self.probe.check(&package));
+        }
+
+        Ok(SiteConfigCheckReport {
+            site_id: package.document.id,
+            depth,
+            checked_at: current_time_millis()?,
+            checks,
+        })
+    }
+}
+
+fn check_json_reference(
+    package: &SiteConfigPackage,
+    relative: &str,
+    id: &str,
+    label: &str,
+    checks: &mut Vec<SiteConfigCheck>,
+) -> Option<Value> {
+    let candidate = package.root.join(relative);
+    let resolved = match fs::canonicalize(&candidate) {
+        Ok(path) if path.starts_with(&package.root) && path.is_file() => path,
+        Ok(_) => {
+            checks.push(SiteConfigCheck::blocking(
+                id,
+                label,
+                "引用文件必须位于现场配置目录内",
+            ));
+            return None;
+        }
+        Err(error) => {
+            checks.push(SiteConfigCheck::blocking(
+                id,
+                label,
+                format!("引用文件不可用：{error}"),
+            ));
+            return None;
+        }
+    };
+    let value = match fs::read(&resolved)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string())
+        }) {
+        Ok(value) => value,
+        Err(error) => {
+            checks.push(SiteConfigCheck::blocking(
+                id,
+                label,
+                format!("JSON 无法读取：{error}"),
+            ));
+            return None;
+        }
+    };
+    checks.push(SiteConfigCheck::normal(
+        id,
+        label,
+        format!("{} 可读取", resolved.display()),
+    ));
+    Some(value)
+}
+
+fn check_bkv_configuration(runtime: Option<&Value>, checks: &mut Vec<SiteConfigCheck>) {
+    let data_source = runtime
+        .and_then(|value| value.get("dataSource"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if data_source.is_empty() {
+        checks.push(SiteConfigCheck::blocking(
+            "bkv.dataSource",
+            "BKV 数据源",
+            "未配置 BKV 数据来源",
+        ));
+    } else {
+        checks.push(SiteConfigCheck::normal(
+            "bkv.dataSource",
+            "BKV 数据源",
+            data_source,
+        ));
+    }
+
+    let converted_root = runtime
+        .and_then(|value| value.pointer("/storage/convertedRoot"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if converted_root.is_empty() {
+        checks.push(SiteConfigCheck::warning(
+            "storage.convertedRoot",
+            "标准数据目录",
+            "尚未设置标准数据目录",
+        ));
+    } else {
+        checks.push(SiteConfigCheck::normal(
+            "storage.convertedRoot",
+            "标准数据目录",
+            converted_root,
+        ));
+    }
+}
+
+fn check_direct_configuration(
+    runtime: Option<&Value>,
+    capture: Option<&Value>,
+    checks: &mut Vec<SiteConfigCheck>,
+) {
+    let runtime_count = runtime
+        .and_then(|value| value.get("cameraCount"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize;
+    let runtime_cameras = runtime
+        .and_then(|value| value.get("cameras"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let expected = capture
+        .and_then(|value| value.get("expectedCameras"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize;
+    let capture_cameras = capture
+        .and_then(|value| value.get("cameras"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    if runtime_count == 0
+        || runtime_count != runtime_cameras
+        || runtime_count != expected
+        || runtime_count != capture_cameras
+    {
+        checks.push(SiteConfigCheck::blocking(
+            "camera.mapping",
+            "相机数量与映射",
+            format!(
+                "运行配置 {runtime_count}/{runtime_cameras}，采集配置 {expected}/{capture_cameras}"
+            ),
+        ));
+    } else {
+        checks.push(SiteConfigCheck::normal(
+            "camera.mapping",
+            "相机数量与映射",
+            format!("{runtime_count} 个相机映射一致"),
+        ));
+    }
+}
+
+fn current_time_millis() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|error| format!("site config clock failed: {error}"))
 }
 
 fn validate_site_id(id: &str) -> Result<(), String> {
@@ -386,9 +675,15 @@ fn capture_template(mode: &SiteMode) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateSiteConfig, SiteConfigStore, SiteMode, UpdateSiteMetadata};
+    use super::{
+        CheckDepth, CreateSiteConfig, SiteConfigCheck, SiteConfigPackage, SiteConfigProbe,
+        SiteConfigStore, SiteMode, UpdateSiteMetadata,
+    };
+    use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct SiteConfigFixture {
@@ -417,6 +712,16 @@ mod tests {
                     mode: SiteMode::Bkv,
                 })
                 .expect("BKV site");
+        }
+
+        fn create_direct(&self, id: &str) {
+            self.store
+                .create(CreateSiteConfig {
+                    id: id.to_string(),
+                    display_name: "直连八相机".to_string(),
+                    mode: SiteMode::DirectCamera,
+                })
+                .expect("direct site");
         }
     }
 
@@ -488,5 +793,94 @@ mod tests {
 
         fixture.store.delete("bkv-west").expect("delete clone");
         assert_eq!(fixture.store.list().expect("list sites").len(), 1);
+    }
+
+    #[test]
+    fn default_bkv_check_reports_required_data_source_and_storage() {
+        let fixture = SiteConfigFixture::new();
+        fixture.create_bkv("bkv-east");
+
+        let report = fixture
+            .store
+            .check("bkv-east", CheckDepth::Default)
+            .expect("default check");
+
+        assert!(report.checks.iter().any(|item| item.id == "bkv.dataSource"));
+        assert!(report
+            .checks
+            .iter()
+            .any(|item| item.id == "storage.convertedRoot"));
+        assert!(!report.checks.iter().any(|item| item.id == "camera.devices"));
+    }
+
+    #[test]
+    fn direct_check_requires_capture_and_camera_mapping() {
+        let fixture = SiteConfigFixture::new();
+        fixture.create_direct("line-eight");
+        let package = fixture.store.get("line-eight").expect("direct site");
+        fs::write(
+            package.root.join("capture.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "steel.capture.profile.v1",
+                "expectedCameras": 7,
+                "cameras": []
+            }))
+            .expect("capture JSON"),
+        )
+        .expect("break capture mapping");
+
+        let report = fixture
+            .store
+            .check("line-eight", CheckDepth::Default)
+            .expect("default check");
+
+        assert!(report.has_blocking_errors());
+        assert!(report
+            .checks
+            .iter()
+            .any(|item| item.id == "camera.mapping" && item.blocking));
+    }
+
+    struct ProbeSpy {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SiteConfigProbe for ProbeSpy {
+        fn check(&self, _package: &SiteConfigPackage) -> Vec<SiteConfigCheck> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn default_checks_do_not_run_deep_probes() {
+        let fixture = SiteConfigFixture::new();
+        fixture.create_bkv("bkv-east");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = fixture.store.clone().with_probe(Arc::new(ProbeSpy {
+            calls: Arc::clone(&calls),
+        }));
+
+        store
+            .check("bkv-east", CheckDepth::Default)
+            .expect("default check");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn deep_checks_invoke_the_mode_probe_once() {
+        let fixture = SiteConfigFixture::new();
+        fixture.create_bkv("bkv-east");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = fixture.store.clone().with_probe(Arc::new(ProbeSpy {
+            calls: Arc::clone(&calls),
+        }));
+
+        store
+            .check("bkv-east", CheckDepth::Deep)
+            .expect("deep check");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }
