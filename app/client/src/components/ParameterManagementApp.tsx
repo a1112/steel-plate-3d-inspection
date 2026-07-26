@@ -92,7 +92,7 @@ import {
   type DatabaseInfo,
 } from '../services/inspection-api';
 import { Panel } from './Panel';
-import { RuntimeProfileManagementPanel } from './RuntimeProfileManagementPanel';
+import { GlobalConfigurationPanel } from './GlobalConfigurationPanel';
 
 type JsonToken = {
   value: string;
@@ -495,7 +495,7 @@ function createDefaultExternalIntegrationsDraft(): AdminExternalIntegrations {
   };
 }
 
-type ParameterSection = 'overview' | 'services' | 'data' | 'config' | 'rules' | 'users' | 'permissions' | 'audit' | 'security';
+type ParameterSection = 'overview' | 'services' | 'data' | 'global-config' | 'config' | 'rules' | 'users' | 'permissions' | 'audit' | 'security';
 type ExternalIntegrationKey = 'plc' | 'l2' | 'mes';
 const RECORD_PAGE_SIZE = 8;
 const AUDIT_PAGE_SIZE = 8;
@@ -1433,6 +1433,7 @@ export function ParameterManagementApp() {
     { id: 'overview', label: '总览' },
     { id: 'services', label: '服务' },
     { id: 'data', label: '数据' },
+    { id: 'global-config', label: '全局配置' },
     { id: 'config', label: '配置' },
     { id: 'rules', label: '规则' },
     { id: 'users', label: '账号' },
@@ -1444,6 +1445,7 @@ export function ParameterManagementApp() {
     overview: 'admin.overview',
     services: 'admin.services',
     data: 'admin.records',
+    'global-config': 'admin.config',
     config: 'admin.config',
     rules: 'admin.config',
     users: 'admin.users',
@@ -2183,8 +2185,6 @@ export function ParameterManagementApp() {
 
       {activeSection === 'config' ? (
       <section className="parameter-grid parameter-config-grid">
-        <RuntimeProfileManagementPanel canEdit={authSession.user.permissions.includes('admin.config')} />
-
         <Panel title="相机配置" className="parameter-card parameter-camera-editor-card">
           <div className="admin-camera-form">
             <label>
@@ -2412,6 +2412,12 @@ export function ParameterManagementApp() {
           <JsonCodeEditor label="采集配置 JSON" value={captureConfig} onChange={setCaptureConfig} />
         </Panel>
       </section>
+      ) : null}
+
+      {activeSection === 'global-config' ? (
+        <GlobalConfigurationPanel
+          canEdit={authSession.user.permissions.includes('admin.config')}
+        />
       ) : null}
 
       {activeSection === 'rules' ? (

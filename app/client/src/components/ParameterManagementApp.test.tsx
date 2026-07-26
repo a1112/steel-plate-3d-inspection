@@ -759,6 +759,78 @@ describe('ParameterManagementApp', () => {
       if (url.includes('/api/admin/services')) {
         return { ok: true, json: async () => adminServices };
       }
+      if (url.includes('/api/admin/site-configs/detail')) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema: 'steel.site-config-detail.v1',
+            site: {
+              id: 'bkv-default',
+              displayName: 'BKV 六相机现场',
+              mode: 'bkv',
+              cameraCount: 6,
+              active: true,
+              pending: false,
+              restartRequired: false,
+              availability: {
+                normal: 4,
+                warning: 0,
+                error: 0,
+                blocking: 0,
+                checkedAt: 1,
+              },
+            },
+            document: {
+              schema: 'steel.site-config.v1',
+              id: 'bkv-default',
+              displayName: 'BKV 六相机现场',
+              mode: 'bkv',
+              runtimeProfile: 'runtime.json',
+              connectionConfig: 'connection.json',
+              captureConfig: 'capture.json',
+            },
+            report: {
+              siteId: 'bkv-default',
+              depth: 'default',
+              checkedAt: 1,
+              checks: [{
+                id: 'site.schema',
+                label: '现场配置结构',
+                status: 'normal',
+                message: '结构正常',
+                blocking: false,
+              }],
+            },
+          }),
+        };
+      }
+      if (url.includes('/api/admin/site-configs')) {
+        return {
+          ok: true,
+          json: async () => ({
+            schema: 'steel.site-config-list.v1',
+            activeSiteId: 'bkv-default',
+            pendingSiteId: null,
+            restartRequired: false,
+            sites: [{
+              id: 'bkv-default',
+              displayName: 'BKV 六相机现场',
+              mode: 'bkv',
+              cameraCount: 6,
+              active: true,
+              pending: false,
+              restartRequired: false,
+              availability: {
+                normal: 4,
+                warning: 0,
+                error: 0,
+                blocking: 0,
+                checkedAt: 1,
+              },
+            }],
+          }),
+        };
+      }
       if (url.includes('/api/admin/runtime-profile/validate')) {
         if (runtimeProfileValidationFailure) {
           return {
@@ -2083,6 +2155,8 @@ describe('ParameterManagementApp', () => {
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    expect(screen.queryByTestId('runtime-profile-management')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '全局配置' }));
     const panel = await screen.findByTestId('runtime-profile-management');
     expect(within(panel).getByText('运行模式与数据转换')).toBeInTheDocument();
     expect(within(panel).getByText('BKV 六相机离线转换')).toBeInTheDocument();
@@ -2101,7 +2175,7 @@ describe('ParameterManagementApp', () => {
     render(<ParameterManagementApp />);
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '全局配置' }));
     const panel = await screen.findByTestId('runtime-profile-management');
     expect(await within(panel).findByText('BKV 六相机离线转换')).toBeInTheDocument();
     expect(within(panel).getByLabelText('BKV 源目录')).toBeEnabled();
@@ -2112,7 +2186,7 @@ describe('ParameterManagementApp', () => {
     render(<ParameterManagementApp />);
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '全局配置' }));
     const sourceInput = await screen.findByLabelText('BKV 源目录');
     fireEvent.change(sourceInput, { target: { value: 'tmp/legacy-bkv-new' } });
     fireEvent.click(screen.getByRole('button', { name: '校验运行配置' }));
@@ -2130,7 +2204,7 @@ describe('ParameterManagementApp', () => {
     render(<ParameterManagementApp />);
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '全局配置' }));
     fireEvent.click(await screen.findByRole('button', { name: '校验运行配置' }));
     expect(await screen.findByText('运行配置校验失败：cameraCount 必须与 cameras 一致')).toBeInTheDocument();
     expect(
@@ -2143,7 +2217,7 @@ describe('ParameterManagementApp', () => {
   it('starts and retries BKV converter jobs while hiding config from unauthorized users', async () => {
     const { unmount } = render(<ParameterManagementApp />);
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '全局配置' }));
     fireEvent.click(await screen.findByRole('button', { name: '启动转换' }));
     expect(await screen.findByText('转换任务已启动')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '重试任务' }));
@@ -2154,6 +2228,16 @@ describe('ParameterManagementApp', () => {
     render(<ParameterManagementApp />);
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '配置' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '全局配置' })).not.toBeInTheDocument();
     expect(screen.queryByTestId('runtime-profile-management')).not.toBeInTheDocument();
+  });
+
+  it('opens global site configuration from the management navigation', async () => {
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '全局配置' }));
+
+    expect(await screen.findByTestId('global-configuration-panel')).toBeInTheDocument();
   });
 });

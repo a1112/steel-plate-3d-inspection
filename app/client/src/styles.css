@@ -5905,33 +5905,32 @@ button {
 
 .parameter-config-grid {
   grid-template-columns: minmax(320px, 0.8fr) minmax(260px, 0.7fr) minmax(0, 1fr);
-  grid-template-rows: auto minmax(150px, 0.5fr) minmax(220px, 0.72fr) minmax(220px, 0.86fr) minmax(220px, 0.92fr);
+  grid-template-rows: minmax(150px, 0.5fr) minmax(220px, 0.72fr) minmax(220px, 0.86fr) minmax(220px, 0.92fr);
   overflow: auto;
   padding-right: 4px;
 }
 
 .runtime-profile-management {
   grid-column: 1 / -1;
-  grid-row: 1;
 }
 
 .parameter-camera-editor-card {
-  grid-row: 2 / 6;
+  grid-row: 1 / 5;
 }
 
 .parameter-camera-list-card {
   grid-column: 2;
-  grid-row: 2;
+  grid-row: 1;
 }
 
 .parameter-config-revision-card {
   grid-column: 2 / 4;
-  grid-row: 3;
+  grid-row: 2;
 }
 
 .parameter-inspection-settings-card {
   grid-column: 3;
-  grid-row: 2;
+  grid-row: 1;
 }
 
 .parameter-rules-grid {
@@ -6102,22 +6101,442 @@ button {
   background: rgba(255, 51, 51, 0.08);
 }
 
+.global-configuration-panel {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(520px, 1fr) auto;
+  gap: 10px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.global-configuration-card {
+  min-height: 520px;
+}
+
+.global-configuration-card > .panel-body {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+}
+
+.site-config-toolbar,
+.site-config-actions,
+.site-config-checks > header > div:last-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.site-config-toolbar button,
+.site-config-actions button,
+.site-config-checks button,
+.site-config-name-field button {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  color: var(--text);
+  background: var(--surface-input);
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.site-config-toolbar button:hover,
+.site-config-actions button:hover,
+.site-config-checks button:hover,
+.site-config-name-field button:hover {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+
+.site-config-toolbar button:disabled,
+.site-config-actions button:disabled,
+.site-config-checks button:disabled,
+.site-config-name-field button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.site-config-actions button.primary {
+  border-color: var(--blue);
+  color: #fff;
+  background: var(--blue);
+}
+
+.site-config-intro {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.site-config-intro > div:first-child {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.site-config-intro span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.site-config-restart-notice,
+.site-config-blocking-notice,
+.site-config-message {
+  padding: 7px 10px;
+  border: 1px solid var(--amber);
+  border-radius: 7px;
+  color: var(--amber);
+  background: rgba(255, 191, 38, 0.09);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.site-config-message.error,
+.site-config-blocking-notice {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(255, 51, 51, 0.08);
+}
+
+.site-config-workspace {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(230px, 290px) minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+}
+
+.site-config-list,
+.site-config-detail-area {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.site-config-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+}
+
+.site-config-list > button {
+  width: 100%;
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text);
+  background: var(--surface-input);
+  text-align: left;
+  cursor: pointer;
+}
+
+.site-config-list > button:hover,
+.site-config-list > button.selected {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.site-config-list > button > span:first-child,
+.site-config-list-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.site-config-list strong,
+.site-config-list em,
+.site-config-list small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.site-config-list em,
+.site-config-list small {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.site-config-list-meta > span,
+.site-config-state-tags {
+  display: flex;
+  gap: 4px;
+}
+
+.site-config-list b,
+.site-config-state-tags b {
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.site-config-list b.active,
+.site-config-state-tags b.active {
+  color: var(--green);
+  background: rgba(34, 197, 94, 0.12);
+}
+
+.site-config-list b.pending,
+.site-config-state-tags b.pending {
+  color: var(--amber);
+  background: rgba(255, 191, 38, 0.12);
+}
+
+.site-config-detail-area {
+  padding: 12px;
+}
+
+.site-config-detail,
+.site-config-form {
+  min-height: 100%;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+.site-config-detail-header,
+.site-config-form > header,
+.site-config-checks > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.site-config-detail-header > div:first-child,
+.site-config-form > header > div,
+.site-config-checks > header > div:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.site-config-detail-header span,
+.site-config-form > header span,
+.site-config-checks > header span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.site-config-detail-header strong,
+.site-config-form > header strong {
+  font-size: 17px;
+}
+
+.site-config-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.site-config-facts > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-input);
+}
+
+.site-config-facts span,
+.site-config-facts em {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.site-config-name-field {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.site-config-name-field > span,
+.site-config-form-grid label > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.site-config-name-field input,
+.site-config-form-grid input,
+.site-config-form-grid select {
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  background: var(--surface-input);
+}
+
+.site-config-name-field input:focus,
+.site-config-form-grid input:focus,
+.site-config-form-grid select:focus {
+  border-color: var(--blue);
+  outline: none;
+}
+
+.site-config-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.site-config-form-grid label {
+  display: grid;
+  gap: 5px;
+}
+
+.site-config-form-grid label:last-child {
+  grid-column: 1 / -1;
+}
+
+.site-config-checks {
+  min-height: 0;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.site-config-check-list {
+  display: grid;
+  gap: 6px;
+}
+
+.site-config-check-list > div:not(.admin-empty-state) {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 42px minmax(120px, 0.4fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-left: 3px solid var(--green);
+  background: var(--panel-soft);
+}
+
+.site-config-check-list > div.status-warning {
+  border-left-color: var(--amber);
+}
+
+.site-config-check-list > div.status-error {
+  border-left-color: var(--red);
+}
+
+.site-config-check-list span,
+.site-config-check-list em,
+.site-config-check-list b {
+  font-size: 11px;
+  font-style: normal;
+}
+
+.site-config-check-list em {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.site-config-check-list b {
+  color: var(--red);
+}
+
+.site-config-actions {
+  justify-content: flex-end;
+}
+
+.site-config-compatibility-detail {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.site-config-compatibility-detail > summary {
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.site-config-compatibility-detail[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.site-config-compatibility-detail .runtime-profile-management {
+  grid-column: auto;
+  padding: 10px;
+}
+
 @media (max-width: 900px) {
   .runtime-profile-summary,
   .bkv-import-status,
   .runtime-profile-storage-form {
     grid-template-columns: 1fr;
   }
+
+  .site-config-workspace {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+
+  .site-config-list {
+    max-height: 220px;
+  }
+
+  .site-config-facts,
+  .site-config-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .site-config-form-grid label:last-child {
+    grid-column: auto;
+  }
+
+  .site-config-check-list > div:not(.admin-empty-state) {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .site-config-check-list em {
+    grid-column: 1 / -1;
+  }
 }
 
 .parameter-connection-editor {
   grid-column: 2;
-  grid-row: 4 / 6;
+  grid-row: 3 / 5;
 }
 
 .parameter-capture-editor {
   grid-column: 3;
-  grid-row: 4 / 6;
+  grid-row: 3 / 5;
 }
 
 .parameter-audit-grid {
