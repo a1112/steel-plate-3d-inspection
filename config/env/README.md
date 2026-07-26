@@ -16,12 +16,27 @@ Copy one of these files to a local `.env` file or pass it directly with `-EnvFil
 
 Formal readiness requires the gateway at `TRIGGER_GATEWAY_ORIGIN` by default. Set `STEEL_TRIGGER_HEALTH_REQUIRED=0` only for an explicit development/service-only run.
 
-Runtime behavior has one non-secret source of truth: the active file under
-`config/runtime-modes`. Its `dataSource`, `capture`, and `algorithm` sections
-select the source adapter, whether capture is permitted/autostarted, and where
-algorithm products and timings are written. Environment files provide
-connection details and secrets only; they do not switch BKV online mode or
-override capture policy.
+Runtime behavior has one non-secret source of truth: `config/project.json`
+selects a site package under `config/sites`. The selected package's
+`runtime.json` defines the source adapter, camera count, capabilities, capture
+policy, and algorithm product paths. Its `connection.json` and `capture.json`
+hold the corresponding non-secret site settings. Files under
+`config/runtime-modes` are retained as compatibility/import templates and are
+not the active configuration pointer.
+
+Environment files provide deployment-local connection details and secrets;
+they do not change the selected site mode or override its capability policy.
+The mode (`bkv` or `direct`) is fixed when the site package is created and
+cannot be edited later. Activate and validate packages from **后台管理 ->
+全局配置**. Activation sets `pendingRestart` in `config/project.json`; restart
+the Rust service before treating the new package as active.
+
+The checked-in `bkv-default` site uses the six-camera online MySQL conversion
+profile. Copy `bkv-online.env.example` to an ignored local env file and provide
+the approved database/share credentials before starting that profile.
+`bkv.env.example` describes offline replay connection values, but it does not
+replace the active site package; select an offline BKV package first when using
+that template.
 
 Non-production database adapters are `sqlite`, `mysql`, and `postgres`. Select
 one with `STEEL_DATABASE_ENGINE` or supply `STEEL_DATABASE_URL`. To opt into

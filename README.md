@@ -51,6 +51,34 @@ The release, two-stage installation, offline prerequisites, supervisor acceptanc
 
 Choose an environment template from [config/env](config/env), or pass values on the command line.
 
+### Site configuration
+
+The active installation is selected by `config/project.json`. Its
+`activeSiteConfig` points to a package under `config/sites/<site-id>`:
+
+- `site.json` identifies the site and fixes its mode (`bkv` or `direct`);
+- `runtime.json` defines the provider, camera count and capabilities;
+- `connection.json` contains non-secret connection settings;
+- `capture.json` contains capture-side settings used by direct-camera sites.
+
+Create, clone, check and switch packages from **后台管理 -> 全局配置**. The mode is
+chosen when a package is created and is immutable afterwards because it changes
+which configuration modules and runtime services are available. BKV sites hide
+direct-camera capture and 3D-reconstruction management; direct-camera sites
+expose only the capabilities enabled by their runtime profile.
+
+Run the availability check before activation. It validates package structure,
+referenced files, mode/capability consistency, camera mapping and required
+connection fields. Activation updates the project pointer and sets
+`pendingRestart`; it does not hot-swap the running service. Restart the Rust
+service to load the selected package. The administration overview shows both
+the running package and any pending restart so operators can confirm whether
+the switch has taken effect.
+
+Files under `config/runtime-modes` remain compatibility/import templates for
+older deployments. New site selection and editing start from `config/project.json`
+and the selected `config/sites` package.
+
 For local macOS/Linux development without cameras, start the Rust service,
 independent trigger gateway, and operator client together in explicit
 eight-camera simulation mode:
