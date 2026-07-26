@@ -15,7 +15,7 @@ vi.mock('../services/bkv-online-api', () => ({
     recordCount: 500,
     previewImageCount: 6,
     latestRecord: {
-      id: 'bkv-1902341',
+      id: '1902341',
       plateNo: 'STEEL-1 / 1902341',
       time: '18:38',
       defectCount: 0,

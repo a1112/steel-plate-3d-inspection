@@ -58,7 +58,7 @@ D:\steel-inspection\algorithm-data\
     mysql\
       latest-500.json
   runs\
-    bkv-<SeqNo>\
+    <SeqNo>\
       inspection-world-v1\
         manifest.json
         source-record.json

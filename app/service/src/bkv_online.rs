@@ -188,7 +188,7 @@ fn parse_bkv_record_sequence(record_id: &str) -> Result<i64, String> {
 }
 
 fn canonical_bkv_record_id(sequence: i64) -> String {
-    format!("bkv-{sequence}")
+    sequence.to_string()
 }
 
 fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1012,7 +1012,7 @@ impl BkvSource {
                     "defects": record_defects,
                     "heightProfile": [],
                     "captureImages": capture_images,
-                    "inspectionId": format!("bkv-{}", record.seq_no),
+                    "inspectionId": canonical_bkv_record_id(record.seq_no),
                     "summaryPath": "",
                     "captureSummaryPath": "",
                     "source": "bkv-online-mysql"
@@ -1032,7 +1032,7 @@ impl BkvSource {
             .iter()
             .map(|record| {
                 json!({
-                    "id": format!("bkv-{}", record.seq_no),
+                    "id": canonical_bkv_record_id(record.seq_no),
                     "time": time_label(&record.detected_at),
                     "plateNo": display_material_id(record),
                     "status": if record.complete { "completed" } else { "detecting" },
@@ -1684,29 +1684,32 @@ mod tests {
     }
 
     #[test]
-    fn legacy_record_has_a_stable_unique_display_id() {
+    fn record_sequence_uses_a_bare_canonical_id() {
         assert_eq!(display_material_id(&sample_record()), "PIPE-001 / 42");
         assert_eq!(time_label("2026-07-24 15:01:02"), "15:01");
+        assert_eq!(canonical_bkv_record_id(42), "42");
+        assert_eq!(parse_bkv_record_sequence("42"), Ok(42));
+        assert_eq!(parse_bkv_record_sequence("bkv-42"), Ok(42));
     }
 
     #[test]
     fn automatic_processing_skips_the_incomplete_latest_record() {
         let snapshot = json!({
             "records": [
-                {"id": "bkv-44", "status": "detecting"},
-                {"id": "bkv-43", "status": "completed"},
-                {"id": "bkv-42", "status": "completed"}
+                {"id": "44", "status": "detecting"},
+                {"id": "43", "status": "completed"},
+                {"id": "42", "status": "completed"}
             ]
         });
-        assert_eq!(latest_completed_record_id(&snapshot), Some("bkv-43"));
+        assert_eq!(latest_completed_record_id(&snapshot), Some("43"));
     }
 
     #[test]
     fn source_record_snapshot_keeps_mysql_record_and_defects_together() {
         let snapshot = json!({
-            "records": [{"id": "bkv-43", "status": "completed", "defectCount": 1}],
+            "records": [{"id": "43", "status": "completed", "defectCount": 1}],
             "inspections": [{
-                "inspectionId": "bkv-43",
+                "inspectionId": "43",
                 "plate": {"plateNo": "PIPE-43"},
                 "defects": [{"id": 7}]
             }],
@@ -1714,7 +1717,7 @@ mod tests {
             "sync": {"refreshedAtMs": 123}
         });
         let exported = source_record_snapshot(&snapshot, 43, "ncdtube").expect("source snapshot");
-        assert_eq!(exported["record"]["id"], json!("bkv-43"));
+        assert_eq!(exported["record"]["id"], json!("43"));
         assert_eq!(exported["inspection"]["defects"][0]["id"], json!(7));
         assert_eq!(exported["database"], json!("ncdtube"));
     }

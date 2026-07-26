@@ -1313,7 +1313,7 @@ function InspectionDashboard({
         } : dashboardMode.kind === 'bkv-online' ? {
           cameraCount: dashboardMode.cameraCount,
           availableCameraCount: new Set((snapshot.captureImages ?? []).map((image) => image.cameraId)).size,
-          batchId: snapshot.records[0]?.id.replace(/^bkv-/, '') ?? '读取中',
+          batchId: snapshot.records[0]?.id ?? '读取中',
           health: bkvDataHealth,
         } : undefined}
         onBkvConversionStatusOpen={dashboardMode.kind === 'bkv-online'
@@ -1379,7 +1379,7 @@ function InspectionDashboard({
                       <div className="snapshot-follow-summary bkv-record-summary" aria-label="BKV 检测数据状态">
                         <i className="history" />
                         <strong>BKV 离线记录</strong>
-                        <span>旧序号 {activeInspection?.inspectionId ?? '--'} · 批次 {bkvRecords?.batchId ?? '--'}</span>
+                        <span>流水号 {activeInspection?.inspectionId ?? '--'} · 批次 {bkvRecords?.batchId ?? '--'}</span>
                       </div>
                     ) : (
                       <>
