@@ -20075,6 +20075,7 @@ fn admin_site_configuration_overview_value(state: &ServiceState) -> Value {
             "provider": state.runtime_config.provider,
             "dataSource": state.runtime_config.data_source,
             "cameraCount": state.runtime_config.camera_count(),
+            "capabilities": state.runtime_config.capabilities,
             "configHash": state.runtime_config.config_hash,
             "compatibility": state.runtime_config.site_compatibility
         },
@@ -24047,6 +24048,14 @@ mod tests {
         assert_eq!(
             overview["siteConfiguration"]["active"]["cameraCount"],
             6
+        );
+        assert_eq!(
+            overview["siteConfiguration"]["active"]["capabilities"]["directCamera"],
+            false
+        );
+        assert_eq!(
+            overview["siteConfiguration"]["active"]["capabilities"]["offlineReplay"],
+            true
         );
         assert_eq!(
             overview["siteConfiguration"]["restartRequired"],

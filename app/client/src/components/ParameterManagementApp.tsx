@@ -93,6 +93,7 @@ import {
 } from '../services/inspection-api';
 import { Panel } from './Panel';
 import { GlobalConfigurationPanel } from './GlobalConfigurationPanel';
+import { checkSiteConfig } from '../services/site-config-api';
 
 type JsonToken = {
   value: string;
@@ -496,6 +497,63 @@ function createDefaultExternalIntegrationsDraft(): AdminExternalIntegrations {
 }
 
 type ParameterSection = 'overview' | 'services' | 'data' | 'global-config' | 'config' | 'rules' | 'users' | 'permissions' | 'audit' | 'security';
+type ConfigurationModuleId =
+  | 'conversion'
+  | 'data-source'
+  | 'storage'
+  | 'camera-map'
+  | 'algorithm'
+  | 'cameras'
+  | 'capture'
+  | 'trigger'
+  | 'plc'
+  | 'reconstruction'
+  | 'versions';
+
+type ConfigurationModule = {
+  id: ConfigurationModuleId;
+  label: string;
+  description: string;
+};
+
+type ActiveSiteConfiguration = NonNullable<AdminOverview['siteConfiguration']>['active'];
+
+const CONFIGURATION_MODULES: Record<ConfigurationModuleId, ConfigurationModule> = {
+  conversion: { id: 'conversion', label: '数据转换', description: '旧 BKV 数据转换与兼容状态' },
+  'data-source': { id: 'data-source', label: '数据源', description: '离线数据源与连接参数' },
+  storage: { id: 'storage', label: '存储配置', description: '标准数据与目录数据库位置' },
+  'camera-map': { id: 'camera-map', label: '相机映射', description: 'BKV 源相机到显示相机的映射' },
+  algorithm: { id: 'algorithm', label: '检测算法', description: '检测阈值与数据保留策略' },
+  cameras: { id: 'cameras', label: '相机直连', description: '相机驱动、网络与曝光参数' },
+  capture: { id: 'capture', label: '采集管理', description: '直连相机采集服务参数' },
+  trigger: { id: 'trigger', label: '触发配置', description: '编码器与线扫触发参数' },
+  plc: { id: 'plc', label: 'PLC 通讯', description: '现场控制连接参数' },
+  reconstruction: { id: 'reconstruction', label: '3D 重建', description: '点云与表面重建能力' },
+  versions: { id: 'versions', label: '配置版本', description: '历史配置预览与恢复' },
+};
+
+function configurationModulesForSite(site?: ActiveSiteConfiguration) {
+  if (site?.mode === 'direct-camera') {
+    const moduleIds: ConfigurationModuleId[] = [];
+    if (site.capabilities?.directCamera) moduleIds.push('cameras');
+    if (site.capabilities?.captureManagement) {
+      moduleIds.push('capture', 'trigger', 'plc');
+    }
+    moduleIds.push('storage', 'algorithm');
+    if (site.capabilities?.reconstruction) moduleIds.push('reconstruction');
+    moduleIds.push('versions');
+    return moduleIds.map((id) => CONFIGURATION_MODULES[id]);
+  }
+  return [
+    'conversion',
+    'data-source',
+    'storage',
+    'camera-map',
+    'algorithm',
+    'versions',
+  ].map((id) => CONFIGURATION_MODULES[id as ConfigurationModuleId]);
+}
+
 type ExternalIntegrationKey = 'plc' | 'l2' | 'mes';
 const RECORD_PAGE_SIZE = 8;
 const AUDIT_PAGE_SIZE = 8;
@@ -570,6 +628,7 @@ export function ParameterManagementApp() {
   const [recordPage, setRecordPage] = useState<AdminInspectionRecordPage | null>(null);
   const [selectedRecordDetail, setSelectedRecordDetail] = useState<AdminInspectionRecordDetail | null>(null);
   const [activeSection, setActiveSection] = useState<ParameterSection>('overview');
+  const [activeConfigurationModule, setActiveConfigurationModule] = useState<ConfigurationModuleId>('conversion');
   const [userDraft, setUserDraft] = useState<AdminUserInput>(() => createEmptyUserDraft());
   const [roleDraft, setRoleDraft] = useState<AdminRoleInput>(() => createEmptyRoleDraft());
   const [cameraDraft, setCameraDraft] = useState<AdminCameraConfigInput>(() => createEmptyCameraDraft());
@@ -1419,6 +1478,19 @@ export function ParameterManagementApp() {
     }
   };
 
+  const checkActiveSiteConfiguration = async () => {
+    const site = adminOverview?.siteConfiguration?.active;
+    if (!site) return;
+    setMessage('正在检查现场配置');
+    try {
+      await checkSiteConfig(site.id, 'default');
+      setAdminOverview(await fetchAdminOverview());
+      setMessage('现场配置检查完成');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '现场配置检查失败');
+    }
+  };
+
   const tableRows = adminOverview?.database.tables ?? [];
   const totalRows = tableRows.reduce((sum, table) => sum + table.rows, 0);
   const captureRunning = adminOverview?.service.capture.running ?? false;
@@ -1429,6 +1501,13 @@ export function ParameterManagementApp() {
     : adminDiagnostics?.status === 'normal'
       ? 'normal'
       : 'warning';
+  const siteConfiguration = adminOverview?.siteConfiguration;
+  const visibleConfigurationModules = configurationModulesForSite(siteConfiguration?.active);
+  const selectedConfigurationModule = visibleConfigurationModules.some(
+    (module) => module.id === activeConfigurationModule,
+  )
+    ? activeConfigurationModule
+    : visibleConfigurationModules[0]?.id ?? 'algorithm';
   const allTabs: Array<{ id: ParameterSection; label: string }> = [
     { id: 'overview', label: '总览' },
     { id: 'services', label: '服务' },
@@ -1639,6 +1718,63 @@ export function ParameterManagementApp() {
 
       {activeSection === 'overview' ? (
       <section className="parameter-grid parameter-overview-grid">
+        <div
+          className="site-configuration-overview"
+          data-testid="site-configuration-overview"
+        >
+          <Panel title="现场配置" className="parameter-card site-configuration-overview-card">
+            <div className="site-configuration-overview-cards">
+              <div>
+                <span>当前现场</span>
+                <strong>{siteConfiguration?.active.displayName ?? '尚未加载'}</strong>
+                <div className="site-configuration-overview-meta">
+                  <em>{siteConfiguration?.active.mode === 'direct-camera' ? '相机直连模式' : 'BKV 模式'}</em>
+                  <em>{siteConfiguration?.active.dataSource ?? '-'}</em>
+                  <em>{siteConfiguration?.active.cameraCount ?? 0} 个相机</em>
+                </div>
+                {siteConfiguration?.pending ? (
+                  <b>待切换：{siteConfiguration.pending.displayName}</b>
+                ) : null}
+              </div>
+              <div>
+                <span>配置可用性</span>
+                <div className="site-configuration-overview-meta">
+                  <strong>正常 {siteConfiguration?.checkSummary.normal ?? 0}</strong>
+                  <strong>关注 {siteConfiguration?.checkSummary.warning ?? 0}</strong>
+                  <strong>错误 {siteConfiguration?.checkSummary.error ?? 0}</strong>
+                  <strong>阻断 {siteConfiguration?.checkSummary.blocking ?? 0}</strong>
+                </div>
+                <em>
+                  {siteConfiguration?.restartRequired
+                    ? '配置已切换，等待服务重启'
+                    : '当前配置已生效'}
+                </em>
+                <b>
+                  最近检查：
+                  {siteConfiguration?.checkSummary.checkedAt
+                    ? formatTimestamp(String(siteConfiguration.checkSummary.checkedAt))
+                    : '尚未检查'}
+                </b>
+              </div>
+            </div>
+            <div className="site-configuration-overview-actions">
+              <button
+                type="button"
+                disabled={!siteConfiguration?.active}
+                onClick={() => void checkActiveSiteConfiguration()}
+              >
+                检查配置
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveSection('global-config')}
+              >
+                进入全局配置
+              </button>
+            </div>
+          </Panel>
+        </div>
+
         <Panel title="服务概览" className="parameter-card parameter-service-card">
           <dl className="parameter-facts">
             <div>
@@ -2184,7 +2320,32 @@ export function ParameterManagementApp() {
       ) : null}
 
       {activeSection === 'config' ? (
-      <section className="parameter-grid parameter-config-grid">
+      <section className="parameter-config-workspace">
+        <aside
+          className="parameter-config-module-nav"
+          data-testid="configuration-module-navigation"
+        >
+          <div>
+            <span>当前现场</span>
+            <strong>{siteConfiguration?.active.displayName ?? '尚未加载'}</strong>
+            <em>{siteConfiguration?.active.mode === 'direct-camera' ? '相机直连模式' : 'BKV 模式'}</em>
+          </div>
+          {visibleConfigurationModules.map((module) => (
+            <button
+              key={module.id}
+              type="button"
+              aria-label={module.label}
+              className={selectedConfigurationModule === module.id ? 'active' : ''}
+              onClick={() => setActiveConfigurationModule(module.id)}
+            >
+              <strong>{module.label}</strong>
+              <span>{module.description}</span>
+            </button>
+          ))}
+        </aside>
+        <section className="parameter-config-module-detail">
+        {selectedConfigurationModule === 'cameras' ? (
+        <div className="parameter-config-camera-module">
         <Panel title="相机配置" className="parameter-card parameter-camera-editor-card">
           <div className="admin-camera-form">
             <label>
@@ -2261,7 +2422,10 @@ export function ParameterManagementApp() {
             ))}
           </div>
         </Panel>
+        </div>
+        ) : null}
 
+        {selectedConfigurationModule === 'algorithm' ? (
         <Panel title="检测规则" className="parameter-card parameter-inspection-settings-card">
           <div className="admin-inspection-settings-form">
             <label>
@@ -2355,7 +2519,9 @@ export function ParameterManagementApp() {
             </div>
           </div>
         </Panel>
+        ) : null}
 
+        {selectedConfigurationModule === 'versions' ? (
         <Panel title="配置版本" className="parameter-card parameter-config-revision-card">
           <div className="admin-config-revision-list">
             {configRevisions.length === 0 ? (
@@ -2389,7 +2555,9 @@ export function ParameterManagementApp() {
             </div>
           ) : null}
         </Panel>
+        ) : null}
 
+        {selectedConfigurationModule === 'data-source' || selectedConfigurationModule === 'plc' ? (
         <Panel title="连接配置 JSON" className="parameter-editor-card parameter-connection-editor">
           <div className="parameter-editor-toolbar">
             <ServerCog size={18} />
@@ -2400,7 +2568,9 @@ export function ParameterManagementApp() {
           </div>
           <JsonCodeEditor label="连接配置 JSON" value={connectionConfigText} onChange={setConnectionConfigText} />
         </Panel>
+        ) : null}
 
+        {selectedConfigurationModule === 'capture' ? (
         <Panel title="采集配置 JSON" className="parameter-editor-card parameter-capture-editor">
           <div className="parameter-editor-toolbar">
             <Database size={18} />
@@ -2411,6 +2581,56 @@ export function ParameterManagementApp() {
           </div>
           <JsonCodeEditor label="采集配置 JSON" value={captureConfig} onChange={setCaptureConfig} />
         </Panel>
+        ) : null}
+
+        {selectedConfigurationModule === 'conversion' ? (
+          <Panel title="BKV 数据转换" className="parameter-card parameter-config-info-card">
+            <div className="parameter-config-module-info">
+              <strong>当前使用独立 BKV 转换服务</strong>
+              <span>转换目录、任务进度与兼容参数统一在“全局配置”的运行配置兼容编辑器中维护。</span>
+              <button type="button" onClick={() => setActiveSection('global-config')}>进入全局配置</button>
+            </div>
+          </Panel>
+        ) : null}
+
+        {selectedConfigurationModule === 'storage' ? (
+          <Panel title="存储配置" className="parameter-card parameter-config-info-card">
+            <div className="parameter-config-module-info">
+              <strong>{siteConfiguration?.active.mode === 'bkv' ? '标准数据与转换目录' : '在线检测数据目录'}</strong>
+              <span>存储位置属于现场配置包；请在全局配置中选择现场后进行兼容参数维护。</span>
+              <button type="button" onClick={() => setActiveSection('global-config')}>进入全局配置</button>
+            </div>
+          </Panel>
+        ) : null}
+
+        {selectedConfigurationModule === 'camera-map' ? (
+          <Panel title="BKV 相机映射" className="parameter-card parameter-config-info-card">
+            <div className="parameter-config-module-info">
+              <strong>{siteConfiguration?.active.cameraCount ?? 0} 个显示相机</strong>
+              <span>映射由活动现场配置包的 runtime.json 管理，不使用在线相机目录。</span>
+              <button type="button" onClick={() => setActiveSection('global-config')}>查看现场配置</button>
+            </div>
+          </Panel>
+        ) : null}
+
+        {selectedConfigurationModule === 'trigger' ? (
+          <Panel title="触发配置" className="parameter-card parameter-config-info-card">
+            <div className="parameter-config-module-info">
+              <strong>线扫触发与编码器参数</strong>
+              <span>触发参数由直连采集服务和现场配置共同提供，保存后随采集服务重新加载。</span>
+            </div>
+          </Panel>
+        ) : null}
+
+        {selectedConfigurationModule === 'reconstruction' ? (
+          <Panel title="3D 重建" className="parameter-card parameter-config-info-card">
+            <div className="parameter-config-module-info">
+              <strong>当前现场已启用 3D 重建能力</strong>
+              <span>重建服务参数由当前直连现场配置包管理。</span>
+            </div>
+          </Panel>
+        ) : null}
+        </section>
       </section>
       ) : null}
 

@@ -5874,7 +5874,87 @@ button {
 }
 
 .parameter-overview-grid {
-  grid-template-rows: minmax(0, 1fr);
+  grid-template-columns: repeat(4, minmax(220px, 1fr));
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.site-configuration-overview {
+  grid-column: 1 / -1;
+}
+
+.site-configuration-overview-card .panel-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.site-configuration-overview-cards {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.site-configuration-overview-cards > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.site-configuration-overview-cards span,
+.site-configuration-overview-cards em,
+.site-configuration-overview-cards b {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.site-configuration-overview-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.site-configuration-overview-meta > * {
+  padding-right: 8px;
+  border-right: 1px solid var(--line);
+}
+
+.site-configuration-overview-meta > *:last-child {
+  padding-right: 0;
+  border-right: 0;
+}
+
+.site-configuration-overview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.site-configuration-overview-actions button {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--blue);
+  border-radius: 7px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.site-configuration-overview-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .parameter-services-grid {
@@ -5903,34 +5983,128 @@ button {
   grid-template-rows: minmax(0, 1fr);
 }
 
-.parameter-config-grid {
-  grid-template-columns: minmax(320px, 0.8fr) minmax(260px, 0.7fr) minmax(0, 1fr);
-  grid-template-rows: minmax(150px, 0.5fr) minmax(220px, 0.72fr) minmax(220px, 0.86fr) minmax(220px, 0.92fr);
-  overflow: auto;
-  padding-right: 4px;
-}
-
 .runtime-profile-management {
   grid-column: 1 / -1;
 }
 
-.parameter-camera-editor-card {
-  grid-row: 1 / 5;
+.parameter-config-workspace {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(210px, 260px) minmax(0, 1fr);
+  gap: 12px;
+  overflow: hidden;
 }
 
-.parameter-camera-list-card {
-  grid-column: 2;
-  grid-row: 1;
+.parameter-config-module-nav,
+.parameter-config-module-detail {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
 }
 
-.parameter-config-revision-card {
-  grid-column: 2 / 4;
-  grid-row: 2;
+.parameter-config-module-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
 }
 
-.parameter-inspection-settings-card {
-  grid-column: 3;
-  grid-row: 1;
+.parameter-config-module-nav > div {
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.parameter-config-module-nav > div span,
+.parameter-config-module-nav > div em {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.parameter-config-module-nav > button {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.parameter-config-module-nav > button:hover,
+.parameter-config-module-nav > button.active {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.parameter-config-module-nav > button.active strong {
+  color: var(--blue);
+}
+
+.parameter-config-module-nav > button span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.parameter-config-module-detail {
+  padding: 10px;
+}
+
+.parameter-config-module-detail > .panel,
+.parameter-config-module-detail > .parameter-editor-card {
+  min-height: 100%;
+}
+
+.parameter-config-camera-module {
+  min-height: 100%;
+  display: grid;
+  grid-template-columns: minmax(320px, 0.9fr) minmax(260px, 1.1fr);
+  gap: 10px;
+}
+
+.parameter-config-camera-module > .panel {
+  min-height: 0;
+}
+
+.parameter-config-module-detail > .parameter-editor-card {
+  min-height: 520px;
+}
+
+.parameter-config-module-info {
+  min-height: 260px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.parameter-config-module-info strong {
+  color: var(--text);
+  font-size: 18px;
+}
+
+.parameter-config-module-info button {
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--blue);
+  border-radius: 7px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-weight: 900;
+  cursor: pointer;
 }
 
 .parameter-rules-grid {
@@ -6502,6 +6676,55 @@ button {
     grid-template-columns: 1fr;
   }
 
+  .parameter-overview-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+    overflow: auto;
+  }
+
+  .site-configuration-overview {
+    grid-column: auto;
+  }
+
+  .site-configuration-overview-card .panel-body,
+  .site-configuration-overview-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .site-configuration-overview-actions {
+    justify-content: stretch;
+  }
+
+  .site-configuration-overview-actions button {
+    flex: 1 1 140px;
+  }
+
+  .parameter-config-workspace {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+
+  .parameter-config-module-nav {
+    max-height: 250px;
+  }
+
+  .parameter-config-module-detail {
+    min-height: 520px;
+    overflow: visible;
+  }
+
+  .parameter-config-camera-module {
+    grid-template-columns: 1fr;
+  }
+
+  .parameter-editor-toolbar,
+  .admin-camera-actions,
+  .admin-inspection-settings-actions,
+  .runtime-profile-actions,
+  .bkv-import-actions {
+    flex-wrap: wrap;
+  }
+
   .site-config-workspace {
     grid-template-columns: 1fr;
     overflow: auto;
@@ -6527,16 +6750,6 @@ button {
   .site-config-check-list em {
     grid-column: 1 / -1;
   }
-}
-
-.parameter-connection-editor {
-  grid-column: 2;
-  grid-row: 3 / 5;
-}
-
-.parameter-capture-editor {
-  grid-column: 3;
-  grid-row: 3 / 5;
 }
 
 .parameter-audit-grid {

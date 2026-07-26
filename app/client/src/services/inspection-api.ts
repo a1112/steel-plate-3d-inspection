@@ -247,6 +247,12 @@ export type AdminOverview = {
       provider: string;
       dataSource: string;
       cameraCount: number;
+      capabilities: {
+        directCamera: boolean;
+        captureManagement: boolean;
+        reconstruction: boolean;
+        offlineReplay: boolean;
+      };
       configHash: string;
       compatibility: boolean;
     };

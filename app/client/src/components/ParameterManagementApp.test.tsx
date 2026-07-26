@@ -17,6 +17,33 @@ const adminSession = {
 
 const adminOverview = {
   updatedAt: '1782879112730',
+  siteConfiguration: {
+    active: {
+      id: 'bkv-default',
+      displayName: 'BKV 六相机现场',
+      mode: 'bkv',
+      provider: 'bkv',
+      dataSource: 'legacy-bkv',
+      cameraCount: 6,
+      capabilities: {
+        directCamera: false,
+        captureManagement: false,
+        reconstruction: false,
+        offlineReplay: true,
+      },
+      configHash: 'bkv-config-hash',
+      compatibility: true,
+    },
+    pending: null,
+    restartRequired: false,
+    checkSummary: {
+      normal: 5,
+      warning: 1,
+      error: 0,
+      blocking: 0,
+      checkedAt: 1782879112730,
+    },
+  },
   service: {
     name: 'steel-inspection-service',
     role: 'api-config-capture-orchestrator',
@@ -88,6 +115,28 @@ const adminOverview = {
     { method: 'POST', path: '/api/config/capture', scope: 'config' },
   ],
 };
+
+function setAdminOverviewSiteMode(mode: 'bkv' | 'direct-camera') {
+  const direct = mode === 'direct-camera';
+  Object.assign(adminOverview.siteConfiguration.active, {
+    id: direct ? 'direct-default' : 'bkv-default',
+    displayName: direct ? '八相机直连现场' : 'BKV 六相机现场',
+    mode,
+    provider: direct ? 'headless-cpp' : 'bkv',
+    dataSource: direct ? 'line-scan-camera' : 'legacy-bkv',
+    cameraCount: direct ? 8 : 6,
+    capabilities: {
+      directCamera: direct,
+      captureManagement: direct,
+      reconstruction: direct,
+      offlineReplay: !direct,
+    },
+    configHash: direct ? 'direct-config-hash' : 'bkv-config-hash',
+    compatibility: !direct,
+  });
+  adminOverview.siteConfiguration.pending = null;
+  adminOverview.siteConfiguration.restartRequired = false;
+}
 
 const adminRecordPage = {
   total: 10,
@@ -598,6 +647,7 @@ describe('ParameterManagementApp', () => {
     sessionPermissionsOverride = null;
     runtimeProfileValidationFailure = false;
     failBkvImportStatus = false;
+    setAdminOverviewSiteMode('bkv');
     storage.clear();
     storage.set('steel-inspection-admin-session', JSON.stringify(adminSession));
     Object.defineProperty(window, 'localStorage', {
@@ -1117,6 +1167,7 @@ describe('ParameterManagementApp', () => {
   });
 
   it('renders backend overview and switches to config and audit management sections', async () => {
+    setAdminOverviewSiteMode('direct-camera');
     const { container } = render(<ParameterManagementApp />);
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
@@ -1169,18 +1220,23 @@ describe('ParameterManagementApp', () => {
     expect(await screen.findByText('数据库维护完成，释放 2.0 KB')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
-    expect(screen.getByText('连接配置 JSON')).toBeInTheDocument();
-    expect(screen.getByText('配置版本')).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: '检测规则' })).toBeInTheDocument();
-    expect(screen.getAllByText('保存').length).toBeGreaterThan(0);
     expect(screen.getByText('1 号采集相机')).toBeInTheDocument();
-    expect(container.querySelectorAll('.json-code-editor')).toHaveLength(2);
-    expect(container.querySelectorAll('.json-code-gutter')).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole('button', { name: '采集管理' }));
+    expect(screen.getByText('采集配置 JSON')).toBeInTheDocument();
+    expect(container.querySelectorAll('.json-code-editor')).toHaveLength(1);
+    expect(container.querySelectorAll('.json-code-gutter')).toHaveLength(1);
     expect(container.querySelectorAll('.json-token-key').length).toBeGreaterThan(0);
     expect(container.querySelectorAll('.json-token-string').length).toBeGreaterThan(0);
     expect(container.querySelectorAll('.json-token-punctuation').length).toBeGreaterThan(0);
-    expect(container.querySelectorAll('.json-token-boolean, .json-token-number').length).toBeGreaterThan(0);
+    expect(container.querySelectorAll('.json-token-punctuation').length).toBeGreaterThan(0);
 
+    fireEvent.click(screen.getByRole('button', { name: 'PLC 通讯' }));
+    expect(screen.getByText('连接配置 JSON')).toBeInTheDocument();
+    expect(container.querySelectorAll('.json-code-editor')).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('button', { name: '检测算法' }));
+    expect(screen.getByRole('heading', { name: '检测规则' })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('后台严重深度阈值'), { target: { value: '0.16' } });
     fireEvent.click(screen.getByRole('button', { name: /保存规则/ }));
     await waitFor(() => {
@@ -1193,6 +1249,9 @@ describe('ParameterManagementApp', () => {
       );
     });
     expect(await screen.findByText('检测规则已保存')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '配置版本' }));
+    expect(screen.getByRole('heading', { name: '配置版本' })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '审计' }));
     expect(screen.getByText('服务启动并完成 SQLite/SeaORM 初始化')).toBeInTheDocument();
@@ -1311,40 +1370,45 @@ describe('ParameterManagementApp', () => {
 
   it('keeps JSON config syntax highlighting when optional login sessions are unavailable', async () => {
     failLoginSessions = true;
+    setAdminOverviewSiteMode('direct-camera');
     const { container } = render(<ParameterManagementApp />);
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '采集管理' }));
 
     await waitFor(() => {
       expect((screen.getByLabelText('采集配置 JSON') as HTMLTextAreaElement).value).toContain('"service"');
     });
     expect(screen.queryByText('登录会话接口异常：404')).not.toBeInTheDocument();
-    expect(container.querySelectorAll('.json-code-editor')).toHaveLength(2);
-    expect(container.querySelectorAll('.json-code-input')).toHaveLength(2);
+    expect(container.querySelectorAll('.json-code-editor')).toHaveLength(1);
+    expect(container.querySelectorAll('.json-code-input')).toHaveLength(1);
     expect(container.querySelectorAll('.json-token-key').length).toBeGreaterThan(0);
     expect(container.querySelectorAll('.json-token-string').length).toBeGreaterThan(0);
-    expect(container.querySelectorAll('.json-token-number, .json-token-boolean').length).toBeGreaterThan(0);
+    expect(container.querySelectorAll('.json-token-punctuation').length).toBeGreaterThan(0);
   });
 
   it('keeps JSON config syntax highlighting when diagnostics are unavailable', async () => {
     failDiagnostics = true;
+    setAdminOverviewSiteMode('direct-camera');
     const { container } = render(<ParameterManagementApp />);
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '采集管理' }));
 
     await waitFor(() => {
       expect((screen.getByLabelText('采集配置 JSON') as HTMLTextAreaElement).value).toContain('"service"');
     });
     expect(screen.getByText('参数已同步')).toBeInTheDocument();
-    expect(container.querySelectorAll('.json-code-editor')).toHaveLength(2);
+    expect(container.querySelectorAll('.json-code-editor')).toHaveLength(1);
     expect(container.querySelectorAll('.json-token-key').length).toBeGreaterThan(0);
     expect(container.querySelectorAll('.json-token-string').length).toBeGreaterThan(0);
-    expect(container.querySelectorAll('.json-token-number, .json-token-boolean').length).toBeGreaterThan(0);
+    expect(container.querySelectorAll('.json-token-punctuation').length).toBeGreaterThan(0);
   });
 
   it('shows backend schema validation details when capture JSON save is rejected', async () => {
+    setAdminOverviewSiteMode('direct-camera');
     captureConfigFailureResponse = {
       status: 400,
       payload: {
@@ -1357,6 +1421,7 @@ describe('ParameterManagementApp', () => {
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '采集管理' }));
     fireEvent.change(screen.getByLabelText('采集配置 JSON'), {
       target: {
         value: JSON.stringify({
@@ -1387,6 +1452,7 @@ describe('ParameterManagementApp', () => {
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '数据源' }));
     const connectionEditor = screen.getByLabelText('连接配置 JSON') as HTMLTextAreaElement;
     await waitFor(() => {
       expect(connectionEditor.value).toContain('"port": 4873');
@@ -1500,6 +1566,7 @@ describe('ParameterManagementApp', () => {
   });
 
   it('deletes managed users, roles, and cameras through protected backend APIs', async () => {
+    setAdminOverviewSiteMode('direct-camera');
     render(<ParameterManagementApp />);
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
@@ -2031,6 +2098,7 @@ describe('ParameterManagementApp', () => {
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '配置版本' }));
     const restoreButtons = await screen.findAllByRole('button', { name: '恢复' });
     fireEvent.click(restoreButtons[0]);
 
@@ -2051,6 +2119,7 @@ describe('ParameterManagementApp', () => {
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '配置版本' }));
     const restoreButtons = await screen.findAllByRole('button', { name: '恢复' });
     fireEvent.click(restoreButtons[4]);
 
@@ -2078,6 +2147,7 @@ describe('ParameterManagementApp', () => {
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '配置版本' }));
     const previewButtons = await screen.findAllByRole('button', { name: '预览' });
     fireEvent.click(previewButtons[0]);
 
@@ -2090,10 +2160,11 @@ describe('ParameterManagementApp', () => {
     expect(await screen.findByText('已加载 capture 配置版本预览')).toBeInTheDocument();
     expect(screen.getByText('新增 1 / 删除 0 / 变更 1')).toBeInTheDocument();
     expect(screen.getByLabelText('配置版本预览 JSON')).toHaveAttribute('readonly');
-    expect(container.querySelectorAll('.json-code-editor')).toHaveLength(3);
+    expect(container.querySelectorAll('.json-code-editor')).toHaveLength(1);
   });
 
   it('saves camera configuration through the backend management API', async () => {
+    setAdminOverviewSiteMode('direct-camera');
     render(<ParameterManagementApp />);
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
@@ -2129,6 +2200,7 @@ describe('ParameterManagementApp', () => {
   });
 
   it('shows backend camera validation details when camera save is rejected', async () => {
+    setAdminOverviewSiteMode('direct-camera');
     saveCameraFailureResponse = {
       status: 400,
       payload: {
@@ -2148,6 +2220,92 @@ describe('ParameterManagementApp', () => {
     fireEvent.click(screen.getByRole('button', { name: /保存相机/ }));
 
     expect(await screen.findByText('相机配置保存失败：camera.exposureUs 必须在 1..1000000 范围内')).toBeInTheDocument();
+  });
+
+  it('shows active site availability on overview and runs only the default check', async () => {
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    const sitePanel = screen.getByTestId('site-configuration-overview');
+    expect(within(sitePanel).getByText('BKV 六相机现场')).toBeInTheDocument();
+    expect(within(sitePanel).getByText('BKV 模式')).toBeInTheDocument();
+    expect(within(sitePanel).getByText('legacy-bkv')).toBeInTheDocument();
+    expect(within(sitePanel).getByText('6 个相机')).toBeInTheDocument();
+    expect(within(sitePanel).getByText('正常 5')).toBeInTheDocument();
+    expect(within(sitePanel).getByText('关注 1')).toBeInTheDocument();
+    expect(within(sitePanel).getByText('阻断 0')).toBeInTheDocument();
+    expect(within(sitePanel).getByText('当前配置已生效')).toBeInTheDocument();
+
+    fireEvent.click(within(sitePanel).getByRole('button', { name: '检查配置' }));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/api/admin/site-configs/check'),
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ id: 'bkv-default', depth: 'default' }),
+        }),
+      );
+    });
+    const checkCalls = fetchMock.mock.calls.filter(
+      ([url]) => String(url).includes('/api/admin/site-configs/check'),
+    );
+    expect(checkCalls).toHaveLength(1);
+    expect(String(checkCalls[0][1]?.body)).not.toContain('"deep"');
+
+    fireEvent.click(within(sitePanel).getByRole('button', { name: '进入全局配置' }));
+    expect(await screen.findByTestId('global-configuration-panel')).toBeInTheDocument();
+  });
+
+  it('shows only BKV configuration modules advertised by the active site', async () => {
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+
+    const navigation = screen.getByTestId('configuration-module-navigation');
+    for (const label of ['数据转换', '数据源', '存储配置', '相机映射', '检测算法', '配置版本']) {
+      expect(within(navigation).getByRole('button', { name: label })).toBeInTheDocument();
+    }
+    for (const label of ['相机直连', '采集管理', '3D 重建']) {
+      expect(within(navigation).queryByRole('button', { name: label })).not.toBeInTheDocument();
+    }
+    expect(screen.queryByText('相机配置')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('采集配置 JSON')).not.toBeInTheDocument();
+
+    fireEvent.click(within(navigation).getByRole('button', { name: '数据源' }));
+    expect(screen.getByLabelText('连接配置 JSON')).toBeInTheDocument();
+    expect(screen.queryByLabelText('采集配置 JSON')).not.toBeInTheDocument();
+    expect(document.querySelectorAll('.json-code-editor')).toHaveLength(1);
+
+    fireEvent.click(within(navigation).getByRole('button', { name: '检测算法' }));
+    expect(screen.getByLabelText('后台严重深度阈值')).toBeInTheDocument();
+    expect(screen.queryByLabelText('连接配置 JSON')).not.toBeInTheDocument();
+  });
+
+  it('shows direct-camera modules and mounts only the selected editor', async () => {
+    setAdminOverviewSiteMode('direct-camera');
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '配置' }));
+
+    const navigation = screen.getByTestId('configuration-module-navigation');
+    for (const label of ['相机直连', '采集管理', '触发配置', 'PLC 通讯', '存储配置', '检测算法', '3D 重建', '配置版本']) {
+      expect(within(navigation).getByRole('button', { name: label })).toBeInTheDocument();
+    }
+    expect(screen.getByText('相机配置')).toBeInTheDocument();
+    expect(screen.queryByLabelText('采集配置 JSON')).not.toBeInTheDocument();
+
+    fireEvent.click(within(navigation).getByRole('button', { name: '采集管理' }));
+    expect(screen.getByLabelText('采集配置 JSON')).toBeInTheDocument();
+    expect(screen.queryByLabelText('连接配置 JSON')).not.toBeInTheDocument();
+    expect(screen.queryByText('相机配置')).not.toBeInTheDocument();
+    expect(document.querySelectorAll('.json-code-editor')).toHaveLength(1);
+
+    fireEvent.click(within(navigation).getByRole('button', { name: 'PLC 通讯' }));
+    expect(screen.getByLabelText('连接配置 JSON')).toBeInTheDocument();
+    expect(screen.queryByLabelText('采集配置 JSON')).not.toBeInTheDocument();
+    expect(document.querySelectorAll('.json-code-editor')).toHaveLength(1);
   });
 
   it('renders the six-camera BKV runtime mode and converter progress in system config', async () => {
