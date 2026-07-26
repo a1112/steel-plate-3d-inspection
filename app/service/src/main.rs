@@ -30,6 +30,7 @@ mod db;
 mod inspection_world;
 mod production_tasks;
 mod runtime_profile;
+mod site_config;
 mod standard_record_store;
 
 #[derive(Clone)]
