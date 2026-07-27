@@ -6321,6 +6321,9 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("DELETE", "/api/admin/site-configs")
         | ("POST", "/api/admin/site-configs/check")
         | ("POST", "/api/admin/site-configs/activate")
+        | ("GET", "/api/admin/site-configs/machine-default")
+        | ("PUT", "/api/admin/site-configs/machine-default")
+        | ("DELETE", "/api/admin/site-configs/machine-default")
         | ("GET", "/api/admin/bkv-import/jobs")
         | ("POST", "/api/admin/bkv-import/jobs")
         | ("POST", "/api/admin/bkv-import/jobs/retry") => Some("admin.config"),
@@ -13956,6 +13959,11 @@ struct ActivateSiteConfigRequest {
     id: String,
 }
 
+#[derive(serde::Deserialize)]
+struct SetMachineDefaultSiteRequest {
+    id: String,
+}
+
 fn site_config_request<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, Vec<u8>> {
     if body.trim().is_empty() || body.len() > CONFIG_JSON_MAX_BYTES {
         return Err(http_response(
@@ -14356,6 +14364,136 @@ fn activate_admin_site_config_response(
         ),
         Err(error) => site_config_error("400 Bad Request", "site_config_activate_failed", error),
     }
+}
+
+fn machine_site_selection_value(state: &ServiceState) -> Value {
+    let machine_default = state.machine_site_store.read_default_site_id();
+    let writable = state.machine_site_store.writable();
+    let selection = if state.environment_site_id.is_some() {
+        machine_site_config::select_site(machine_site_config::SiteSelectionInput {
+            environment_site_id: state.environment_site_id.clone(),
+            machine_default_site_id: None,
+            repository_default_site_id: state.repository_default_site_id.clone(),
+        })
+    } else {
+        machine_default
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|machine_default_site_id| {
+                machine_site_config::select_site(machine_site_config::SiteSelectionInput {
+                    environment_site_id: None,
+                    machine_default_site_id: machine_default_site_id.clone(),
+                    repository_default_site_id: state.repository_default_site_id.clone(),
+                })
+            })
+    };
+    let machine_default_error = machine_default
+        .as_ref()
+        .err()
+        .cloned()
+        .or_else(|| writable.as_ref().err().cloned());
+    let effective_site_id = selection.as_ref().ok().map(|value| value.site_id.as_str());
+    json!({
+        "schema": "steel.machine-site-selection.v1",
+        "machineName": state.machine_name,
+        "environmentSiteId": state.environment_site_id,
+        "environmentOverrideActive": state.environment_site_id.is_some(),
+        "machineDefaultSiteId": machine_default.ok().flatten(),
+        "repositoryDefaultSiteId": state.repository_default_site_id,
+        "effectiveStartupSiteId": effective_site_id,
+        "runningSiteId": state.runtime_config.site_id,
+        "selectionSource": selection.as_ref().ok().map(|value| value.source),
+        "restartRequired": effective_site_id
+            .map(|value| machine_site_config::restart_required(value, &state.runtime_config.site_id)),
+        "machineDefaultWritable": writable.unwrap_or(false),
+        "machineDefaultError": machine_default_error
+    })
+}
+
+fn read_machine_site_selection_response(state: &ServiceState) -> Vec<u8> {
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &machine_site_selection_value(state).to_string(),
+    )
+}
+
+fn set_machine_default_site_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    if state.environment_site_id.is_some() {
+        return site_config_error(
+            "409 Conflict",
+            "site_config_environment_override_active",
+            "machine default cannot change while STEEL_SITE_CONFIG_ID is active",
+        );
+    }
+    let request: SetMachineDefaultSiteRequest = match site_config_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let report = match state
+        .site_configs
+        .check(&request.id, site_config::CheckDepth::Default)
+    {
+        Ok(report) => report,
+        Err(error) => {
+            return site_config_error(
+                "400 Bad Request",
+                "site_config_machine_default_failed",
+                error,
+            )
+        }
+    };
+    if report.has_blocking_errors() {
+        return site_config_error(
+            "409 Conflict",
+            "site_config_unavailable",
+            "site config has blocking availability errors",
+        );
+    }
+    if let Err(error) = state.machine_site_store.write_default_site_id(&request.id) {
+        return site_config_error(
+            "500 Internal Server Error",
+            "site_config_machine_default_write_failed",
+            error,
+        );
+    }
+    append_site_config_audit(
+        state,
+        actor,
+        "site-config.machine-default.set",
+        &request.id,
+        "设置当前电脑默认现场配置；服务重启后生效",
+    );
+    read_machine_site_selection_response(state)
+}
+
+fn clear_machine_default_site_response(state: &ServiceState, actor: &str) -> Vec<u8> {
+    if state.environment_site_id.is_some() {
+        return site_config_error(
+            "409 Conflict",
+            "site_config_environment_override_active",
+            "machine default cannot change while STEEL_SITE_CONFIG_ID is active",
+        );
+    }
+    if let Err(error) = state.machine_site_store.clear_default_site_id() {
+        return site_config_error(
+            "500 Internal Server Error",
+            "site_config_machine_default_clear_failed",
+            error,
+        );
+    }
+    append_site_config_audit(
+        state,
+        actor,
+        "site-config.machine-default.clear",
+        &state.repository_default_site_id,
+        "清除当前电脑默认现场配置；服务重启后回退到仓库默认",
+    );
+    read_machine_site_selection_response(state)
 }
 
 fn bkv_converter_origin(state: &ServiceState) -> Result<&str, Vec<u8>> {
@@ -20254,6 +20392,9 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "DELETE", "path": "/api/admin/site-configs", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/site-configs/check", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/site-configs/activate", "scope": "admin-config" },
+            { "method": "GET", "path": "/api/admin/site-configs/machine-default", "scope": "admin-config" },
+            { "method": "PUT", "path": "/api/admin/site-configs/machine-default", "scope": "admin-config" },
+            { "method": "DELETE", "path": "/api/admin/site-configs/machine-default", "scope": "admin-config" },
             { "method": "GET", "path": "/api/admin/bkv-import/jobs", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/bkv-import/jobs", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/bkv-import/jobs/retry", "scope": "admin-config" },
@@ -20638,6 +20779,15 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("POST", "/api/admin/site-configs/activate") => {
             activate_admin_site_config_response(&state, body, actor)
         }
+        ("GET", "/api/admin/site-configs/machine-default") => {
+            read_machine_site_selection_response(&state)
+        }
+        ("PUT", "/api/admin/site-configs/machine-default") => {
+            set_machine_default_site_response(&state, body, actor)
+        }
+        ("DELETE", "/api/admin/site-configs/machine-default") => {
+            clear_machine_default_site_response(&state, actor)
+        }
         ("GET", "/api/admin/bkv-import/jobs") => {
             read_admin_bkv_import_jobs_response(&state)
         }
@@ -21000,9 +21150,13 @@ fn main() -> std::io::Result<()> {
         }
     };
     let machine_site_store = machine_site_config::system_machine_site_store();
-    let machine_default_site_id = machine_site_store
-        .read_default_site_id()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let machine_default_site_id = if environment_site_id.is_some() {
+        None
+    } else {
+        machine_site_store
+            .read_default_site_id()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+    };
     let effective_site_selection = machine_site_config::select_site(
         machine_site_config::SiteSelectionInput {
             environment_site_id: environment_site_id.clone(),
@@ -24012,6 +24166,9 @@ mod tests {
             ("DELETE", "/api/admin/site-configs"),
             ("POST", "/api/admin/site-configs/check"),
             ("POST", "/api/admin/site-configs/activate"),
+            ("GET", "/api/admin/site-configs/machine-default"),
+            ("PUT", "/api/admin/site-configs/machine-default"),
+            ("DELETE", "/api/admin/site-configs/machine-default"),
         ] {
             assert_eq!(
                 permission_for_route(method, path),
@@ -24121,6 +24278,87 @@ mod tests {
         assert!(overview["siteConfiguration"]["checkSummary"]["normal"]
             .as_u64()
             .is_some_and(|count| count > 0));
+        fs::remove_dir_all(root).expect("remove site fixture");
+    }
+
+    #[test]
+    fn machine_default_status_and_mutations_are_restart_only() {
+        let (root, mut state) = admin_site_config_fixture();
+        state.machine_name = "LCX_ACE".to_string();
+        state.repository_default_site_id = "bkv-current".to_string();
+        state
+            .site_configs
+            .create(site_config::CreateSiteConfig {
+                id: "bkv-next".to_string(),
+                display_name: "BKV 下一现场".to_string(),
+                mode: site_config::SiteMode::Bkv,
+            })
+            .expect("next site");
+        let project_before =
+            fs::read(&state.runtime_config.project_path).expect("project before mutation");
+
+        let initial = response_json(read_machine_site_selection_response(&state));
+        assert_eq!(initial["machineName"], "LCX_ACE");
+        assert_eq!(initial["repositoryDefaultSiteId"], "bkv-current");
+        assert_eq!(initial["runningSiteId"], "bkv-current");
+        assert_eq!(initial["selectionSource"], "repository");
+        assert_eq!(initial["restartRequired"], false);
+        assert_eq!(initial["machineDefaultWritable"], true);
+
+        let selected = response_json(set_machine_default_site_response(
+            &state,
+            &json!({"id": "bkv-next"}).to_string(),
+            "admin",
+        ));
+        assert_eq!(selected["machineDefaultSiteId"], "bkv-next");
+        assert_eq!(selected["effectiveStartupSiteId"], "bkv-next");
+        assert_eq!(selected["runningSiteId"], "bkv-current");
+        assert_eq!(selected["selectionSource"], "registry");
+        assert_eq!(selected["restartRequired"], true);
+        assert_eq!(state.runtime_config.site_id, "bkv-current");
+        assert_eq!(
+            fs::read(&state.runtime_config.project_path).expect("project after mutation"),
+            project_before,
+            "machine selection must not change project.json"
+        );
+
+        let cleared = response_json(clear_machine_default_site_response(&state, "admin"));
+        assert_eq!(cleared["machineDefaultSiteId"], Value::Null);
+        assert_eq!(cleared["effectiveStartupSiteId"], "bkv-current");
+        assert_eq!(cleared["selectionSource"], "repository");
+        assert_eq!(cleared["restartRequired"], false);
+
+        let actions = state
+            .runtime
+            .block_on(state.database.connection.query_all(Statement::from_string(
+                state.database.connection.get_database_backend(),
+                "SELECT action FROM audit_log WHERE action LIKE 'site-config.machine-default.%' ORDER BY action".to_string(),
+            )))
+            .expect("machine default audit query");
+        assert_eq!(actions.len(), 2);
+        fs::remove_dir_all(root).expect("remove site fixture");
+    }
+
+    #[test]
+    fn environment_override_blocks_machine_default_mutation() {
+        let (root, mut state) = admin_site_config_fixture();
+        state.environment_site_id = Some("bkv-current".to_string());
+
+        let response = response_text(set_machine_default_site_response(
+            &state,
+            &json!({"id": "bkv-current"}).to_string(),
+            "admin",
+        ));
+
+        assert!(response.starts_with("HTTP/1.1 409 Conflict"));
+        assert!(response.contains("site_config_environment_override_active"));
+        assert_eq!(
+            state
+                .machine_site_store
+                .read_default_site_id()
+                .expect("machine store"),
+            None
+        );
         fs::remove_dir_all(root).expect("remove site fixture");
     }
 
