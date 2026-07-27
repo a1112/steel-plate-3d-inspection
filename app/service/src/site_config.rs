@@ -1,13 +1,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SITE_CONFIG_SCHEMA: &str = "steel.site-config.v1";
 const PROJECT_CONFIG_SCHEMA: &str = "steel.project-config.v1";
+const MAX_ARCHIVE_COMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 128;
+const MAX_ARCHIVE_PATH_LENGTH: usize = 240;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -337,6 +342,14 @@ impl SiteConfigStore {
 
     pub fn check(&self, id: &str, depth: CheckDepth) -> Result<SiteConfigCheckReport, String> {
         let package = self.get(id)?;
+        self.check_package(&package, depth)
+    }
+
+    fn check_package(
+        &self,
+        package: &SiteConfigPackage,
+        depth: CheckDepth,
+    ) -> Result<SiteConfigCheckReport, String> {
         let mut checks = Vec::new();
         checks.push(SiteConfigCheck::normal(
             "site.schema",
@@ -392,11 +405,175 @@ impl SiteConfigStore {
         }
 
         Ok(SiteConfigCheckReport {
-            site_id: package.document.id,
+            site_id: package.document.id.clone(),
             depth,
             checked_at: current_time_millis()?,
             checks,
         })
+    }
+
+    pub fn export_archive(&self, id: &str) -> Result<Vec<u8>, String> {
+        let package = self.get(id)?;
+        let mut entries = Vec::new();
+        collect_archive_entries(&package.root, &package.root, &mut entries)?;
+        if entries.len() > MAX_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "site archive exceeds {MAX_ARCHIVE_ENTRIES} entries"
+            ));
+        }
+        let total_size = entries.iter().try_fold(0_u64, |total, (_, path)| {
+            let size = fs::metadata(path)
+                .map_err(|error| format!("site archive metadata failed: {error}"))?
+                .len();
+            total
+                .checked_add(size)
+                .ok_or_else(|| "site archive size overflow".to_string())
+        })?;
+        if total_size > MAX_ARCHIVE_UNCOMPRESSED_BYTES {
+            return Err("site archive uncompressed size exceeds limit".to_string());
+        }
+
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o600);
+        for (name, path) in entries {
+            writer
+                .start_file(&name, options)
+                .map_err(|error| format!("site archive entry create failed: {error}"))?;
+            let mut file = fs::File::open(&path)
+                .map_err(|error| format!("site archive file open failed: {error}"))?;
+            std::io::copy(&mut file, &mut writer)
+                .map_err(|error| format!("site archive file write failed: {error}"))?;
+        }
+        let bytes = writer
+            .finish()
+            .map_err(|error| format!("site archive finish failed: {error}"))?
+            .into_inner();
+        if bytes.len() > MAX_ARCHIVE_COMPRESSED_BYTES {
+            return Err("site archive compressed size exceeds limit".to_string());
+        }
+        Ok(bytes)
+    }
+
+    pub fn import_archive(&self, bytes: &[u8]) -> Result<SiteConfigPackage, String> {
+        if bytes.is_empty() || bytes.len() > MAX_ARCHIVE_COMPRESSED_BYTES {
+            return Err("site archive compressed size is invalid".to_string());
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+            .map_err(|error| format!("site archive is invalid: {error}"))?;
+        if archive.len() == 0 || archive.len() > MAX_ARCHIVE_ENTRIES {
+            return Err("site archive entry count is invalid".to_string());
+        }
+
+        let stamp = current_time_millis()?;
+        let temporary = self
+            .root
+            .join(format!(".site-import-{stamp}-{}.tmp", std::process::id()));
+        fs::create_dir(&temporary)
+            .map_err(|error| format!("site archive temporary directory failed: {error}"))?;
+        let result = (|| {
+            let mut names = HashSet::new();
+            let mut total_size = 0_u64;
+            for index in 0..archive.len() {
+                let mut entry = archive
+                    .by_index(index)
+                    .map_err(|error| format!("site archive entry read failed: {error}"))?;
+                let raw_name = entry.name();
+                if raw_name.len() > MAX_ARCHIVE_PATH_LENGTH || raw_name.contains('\\') {
+                    return Err("site archive entry path is invalid".to_string());
+                }
+                let relative = entry
+                    .enclosed_name()
+                    .ok_or_else(|| "site archive entry escapes package root".to_string())?;
+                if relative.as_os_str().is_empty() {
+                    return Err("site archive entry path is empty".to_string());
+                }
+                let normalized = relative
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase();
+                if !names.insert(normalized) {
+                    return Err("site archive contains duplicate entries".to_string());
+                }
+                if let Some(mode) = entry.unix_mode() {
+                    let file_type = mode & 0o170000;
+                    if file_type != 0
+                        && file_type != 0o100000
+                        && file_type != 0o040000
+                    {
+                        return Err(
+                            "site archive contains a link or special filesystem entry".to_string()
+                        );
+                    }
+                }
+                let target = temporary.join(&relative);
+                if entry.is_dir() {
+                    fs::create_dir_all(&target).map_err(|error| {
+                        format!("site archive directory extraction failed: {error}")
+                    })?;
+                    continue;
+                }
+                total_size = total_size
+                    .checked_add(entry.size())
+                    .ok_or_else(|| "site archive size overflow".to_string())?;
+                if total_size > MAX_ARCHIVE_UNCOMPRESSED_BYTES {
+                    return Err("site archive uncompressed size exceeds limit".to_string());
+                }
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        format!("site archive parent extraction failed: {error}")
+                    })?;
+                }
+                let mut output = fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&target)
+                    .map_err(|error| format!("site archive file extraction failed: {error}"))?;
+                let copied = std::io::copy(
+                    &mut entry.by_ref().take(MAX_ARCHIVE_UNCOMPRESSED_BYTES + 1),
+                    &mut output,
+                )
+                .map_err(|error| format!("site archive file extraction failed: {error}"))?;
+                if copied != entry.size() || copied > MAX_ARCHIVE_UNCOMPRESSED_BYTES {
+                    return Err("site archive entry size is invalid".to_string());
+                }
+            }
+
+            let document = read_site_document(&temporary.join("site.json"))?;
+            validate_site_id(&document.id)?;
+            let destination = self.root.join(&document.id);
+            if destination.exists() {
+                return Err("site config already exists".to_string());
+            }
+            let package = SiteConfigPackage {
+                root: fs::canonicalize(&temporary).map_err(|error| {
+                    format!("site archive temporary directory unavailable: {error}")
+                })?,
+                document,
+            };
+            let report = self.check_package(&package, CheckDepth::Default)?;
+            if report.has_blocking_errors() {
+                let details = report
+                    .checks
+                    .iter()
+                    .filter(|check| check.blocking)
+                    .map(|check| check.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "site archive configuration check failed: {details}"
+                ));
+            }
+            fs::rename(&temporary, &destination)
+                .map_err(|error| format!("site archive publish failed: {error}"))?;
+            self.get(&package.document.id)
+        })();
+        if temporary.exists() {
+            let _ = fs::remove_dir_all(&temporary);
+        }
+        result
     }
 
     pub fn project_selection(&self, project_path: &Path) -> Result<ProjectSiteSelection, String> {
@@ -764,6 +941,58 @@ fn check_direct_configuration(
     }
 }
 
+fn collect_archive_entries(
+    package_root: &Path,
+    directory: &Path,
+    entries: &mut Vec<(String, PathBuf)>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory)
+        .map_err(|error| format!("site archive directory read failed: {error}"))?
+    {
+        let entry =
+            entry.map_err(|error| format!("site archive directory entry failed: {error}"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("site archive metadata failed: {error}"))?;
+        if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+            return Err("site archive cannot contain links or reparse points".to_string());
+        }
+        if metadata.is_dir() {
+            collect_archive_entries(package_root, &path, entries)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err("site archive cannot contain special filesystem entries".to_string());
+        }
+        let relative = path
+            .strip_prefix(package_root)
+            .map_err(|_| "site archive file escapes package root".to_string())?;
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if name.is_empty() || name.len() > MAX_ARCHIVE_PATH_LENGTH {
+            return Err("site archive entry path is invalid".to_string());
+        }
+        entries.push((name, path));
+        if entries.len() > MAX_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "site archive exceeds {MAX_ARCHIVE_ENTRIES} entries"
+            ));
+        }
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
 fn current_time_millis() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1046,6 +1275,7 @@ mod tests {
     use crate::runtime_profile::RuntimeProfile;
     use serde_json::json;
     use std::fs;
+    use std::io::{Cursor, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1135,6 +1365,17 @@ mod tests {
         }
     }
 
+    fn archive_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            writer.start_file(*name, options).expect("ZIP entry");
+            writer.write_all(bytes).expect("ZIP bytes");
+        }
+        writer.finish().expect("ZIP finish").into_inner()
+    }
+
     #[test]
     fn package_rejects_an_algorithm_reference_outside_its_directory() {
         let fixture = SiteConfigFixture::new();
@@ -1182,6 +1423,91 @@ mod tests {
             fs::read(cloned.root.join("algorithm.json")).expect("cloned algorithm"),
             cloned_algorithm
         );
+    }
+
+    #[test]
+    fn site_archive_round_trip_preserves_all_files_and_plaintext_credentials() {
+        let source = SiteConfigFixture::new();
+        source.create_bkv("bkv-export");
+        let package = source.store.get("bkv-export").expect("source site");
+        fs::write(
+            package.root.join("connection.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "steel.site-connection.v1",
+                "username": "operator",
+                "password": "committed-internal-password"
+            }))
+            .expect("connection JSON"),
+        )
+        .expect("connection config");
+        fs::write(source.root.join("sibling-secret.txt"), b"must-not-export")
+            .expect("sibling file");
+
+        let archive = source
+            .store
+            .export_archive("bkv-export")
+            .expect("export archive");
+        let destination = SiteConfigFixture::new();
+        let imported = destination
+            .store
+            .import_archive(&archive)
+            .expect("import archive");
+
+        assert_eq!(imported.document.id, "bkv-export");
+        assert_eq!(
+            fs::read_to_string(imported.root.join("connection.json"))
+                .expect("imported connection"),
+            fs::read_to_string(package.root.join("connection.json")).expect("source connection")
+        );
+        assert!(!imported.root.join("sibling-secret.txt").exists());
+    }
+
+    #[test]
+    fn site_archive_import_rejects_an_existing_destination() {
+        let source = SiteConfigFixture::new();
+        source.create_bkv("bkv-existing");
+        let archive = source
+            .store
+            .export_archive("bkv-existing")
+            .expect("export archive");
+        let destination = SiteConfigFixture::new();
+        destination.create_bkv("bkv-existing");
+
+        let error = destination
+            .store
+            .import_archive(&archive)
+            .expect_err("existing destination must be preserved");
+
+        assert!(error.contains("already exists"));
+    }
+
+    #[test]
+    fn site_archive_import_rejects_unsafe_and_duplicate_entries_without_residue() {
+        let fixture = SiteConfigFixture::new();
+        let escaping = archive_with_entries(&[("../escape.json", b"{}")]);
+        let duplicate = archive_with_entries(&[
+            ("site.json", br#"{"schema":"steel.site-config.v1"}"#),
+            ("SITE.JSON", br#"{"schema":"steel.site-config.v1"}"#),
+        ]);
+
+        let escape_error = fixture
+            .store
+            .import_archive(&escaping)
+            .expect_err("path escape must fail");
+        let duplicate_error = fixture
+            .store
+            .import_archive(&duplicate)
+            .expect_err("duplicate entry must fail");
+
+        assert!(escape_error.contains("escapes package root"));
+        assert!(duplicate_error.contains("duplicate"));
+        assert!(fs::read_dir(&fixture.root)
+            .expect("site root")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".site-import-")));
     }
 
     #[test]

@@ -15,6 +15,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 ctrlc = "3"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

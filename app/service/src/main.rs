@@ -3395,7 +3395,7 @@ fn http_response_with_headers(
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect::<String>();
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Authorization, Idempotency-Key\r\n{extra_header_lines}Connection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PATCH, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Authorization, Idempotency-Key\r\n{extra_header_lines}Connection: close\r\n\r\n{}",
         body.as_bytes().len(),
         body
     )
@@ -3413,7 +3413,7 @@ fn http_bytes_response_with_headers(
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect::<String>();
     let mut response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Authorization, Idempotency-Key\r\n{extra_header_lines}Connection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PATCH, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Authorization, Idempotency-Key\r\n{extra_header_lines}Connection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -6181,7 +6181,7 @@ fn header_end_index(bytes: &[u8]) -> Option<usize> {
         .map(|index| index + 4)
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Option<String> {
+fn read_http_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
@@ -6203,11 +6203,11 @@ fn read_http_request(stream: &mut TcpStream) -> Option<String> {
             bytes.truncate(total_length);
             break;
         }
-        if total_length > 1024 * 1024 {
+        if total_length > 17 * 1024 * 1024 {
             return None;
         }
     }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some(bytes)
 }
 
 fn bearer_token(request: &str) -> Option<String> {
@@ -6321,6 +6321,8 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("DELETE", "/api/admin/site-configs")
         | ("POST", "/api/admin/site-configs/check")
         | ("POST", "/api/admin/site-configs/activate")
+        | ("POST", "/api/admin/site-configs/import")
+        | ("GET", "/api/admin/site-configs/export")
         | ("GET", "/api/admin/site-configs/machine-default")
         | ("PUT", "/api/admin/site-configs/machine-default")
         | ("DELETE", "/api/admin/site-configs/machine-default")
@@ -14366,6 +14368,92 @@ fn activate_admin_site_config_response(
     }
 }
 
+fn import_admin_site_config_response(
+    state: &ServiceState,
+    request: &str,
+    body: &[u8],
+    actor: &str,
+) -> Vec<u8> {
+    let content_type_header = request_header(request, "Content-Type").unwrap_or_default();
+    let content_type = content_type_header
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if !content_type.eq_ignore_ascii_case("application/zip") {
+        return site_config_error(
+            "415 Unsupported Media Type",
+            "site_config_import_content_type_invalid",
+            "site configuration import requires application/zip",
+        );
+    }
+    match state.site_configs.import_archive(body) {
+        Ok(package) => {
+            append_site_config_audit(
+                state,
+                actor,
+                "site-config.import",
+                &package.document.id,
+                "导入完整现场配置包；归档包含明文连接凭据",
+            );
+            http_response(
+                "201 Created",
+                "application/json; charset=utf-8",
+                &json!({
+                    "imported": true,
+                    "site": site_config_summary(state, &package, None),
+                    "containsPlaintextCredentials": true
+                })
+                .to_string(),
+            )
+        }
+        Err(error) if error.contains("already exists") => {
+            site_config_error("409 Conflict", "site_config_import_conflict", error)
+        }
+        Err(error) => site_config_error(
+            "400 Bad Request",
+            "site_config_import_failed",
+            error,
+        ),
+    }
+}
+
+fn export_admin_site_config_response(
+    state: &ServiceState,
+    query: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let Some(id) = query_value(query, "id").filter(|value| !value.trim().is_empty()) else {
+        return site_config_error(
+            "400 Bad Request",
+            "site_config_id_required",
+            "site configuration id is required",
+        );
+    };
+    match state.site_configs.export_archive(&id) {
+        Ok(archive) => {
+            append_site_config_audit(
+                state,
+                actor,
+                "site-config.export",
+                &id,
+                "导出完整现场配置包；归档包含明文连接凭据",
+            );
+            let disposition = format!("attachment; filename=\"{id}.zip\"");
+            http_bytes_response_with_headers(
+                "200 OK",
+                "application/zip",
+                &archive,
+                &[
+                    ("Content-Disposition", disposition.as_str()),
+                    ("X-Content-Type-Options", "nosniff"),
+                ],
+            )
+        }
+        Err(error) => site_config_error("404 Not Found", "site_config_export_failed", error),
+    }
+}
+
 fn machine_site_selection_value(state: &ServiceState) -> Value {
     let machine_default = state.machine_site_store.read_default_site_id();
     let writable = state.machine_site_store.writable();
@@ -20392,6 +20480,8 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "DELETE", "path": "/api/admin/site-configs", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/site-configs/check", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/site-configs/activate", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/site-configs/import", "scope": "admin-config" },
+            { "method": "GET", "path": "/api/admin/site-configs/export", "scope": "admin-config" },
             { "method": "GET", "path": "/api/admin/site-configs/machine-default", "scope": "admin-config" },
             { "method": "PUT", "path": "/api/admin/site-configs/machine-default", "scope": "admin-config" },
             { "method": "DELETE", "path": "/api/admin/site-configs/machine-default", "scope": "admin-config" },
@@ -20600,10 +20690,17 @@ fn bkv_online_image_response(state: &ServiceState, query: &str) -> Vec<u8> {
 
 fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
     let peer = stream.peer_addr().ok();
-    let request = match read_http_request(&mut stream) {
+    let request_bytes = match read_http_request(&mut stream) {
         Some(request) => request,
         None => return,
     };
+    let Some(header_end) = header_end_index(&request_bytes) else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&request_bytes[..header_end]).into_owned();
+    let body_bytes = &request_bytes[header_end..];
+    let body_text = String::from_utf8_lossy(body_bytes).into_owned();
+    let body = body_text.as_str();
     let mut parts = request
         .lines()
         .next()
@@ -20612,10 +20709,6 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
     let method = parts.next().unwrap_or_default();
     let raw_path = parts.next().unwrap_or_default();
     let (path, query) = split_path_and_query(raw_path);
-    let body = request
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or_default();
     if !request_origin_allowed(&request, method) {
         append_origin_audit(&state, &request, method, path);
         let _ = stream.write_all(&auth_failure("403 Forbidden", 403, "origin_not_allowed"));
@@ -20778,6 +20871,12 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("POST", "/api/admin/site-configs/activate") => {
             activate_admin_site_config_response(&state, body, actor)
+        }
+        ("POST", "/api/admin/site-configs/import") => {
+            import_admin_site_config_response(&state, &request, body_bytes, actor)
+        }
+        ("GET", "/api/admin/site-configs/export") => {
+            export_admin_site_config_response(&state, query, actor)
         }
         ("GET", "/api/admin/site-configs/machine-default") => {
             read_machine_site_selection_response(&state)
@@ -24166,6 +24265,8 @@ mod tests {
             ("DELETE", "/api/admin/site-configs"),
             ("POST", "/api/admin/site-configs/check"),
             ("POST", "/api/admin/site-configs/activate"),
+            ("POST", "/api/admin/site-configs/import"),
+            ("GET", "/api/admin/site-configs/export"),
             ("GET", "/api/admin/site-configs/machine-default"),
             ("PUT", "/api/admin/site-configs/machine-default"),
             ("DELETE", "/api/admin/site-configs/machine-default"),
@@ -24176,6 +24277,41 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    #[test]
+    fn admin_site_config_export_is_binary_and_import_round_trips_the_package() {
+        let (root, state) = admin_site_config_fixture();
+        let exported =
+            export_admin_site_config_response(&state, "id=bkv-current", "admin");
+        let separator = exported
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response separator")
+            + 4;
+        let headers = String::from_utf8_lossy(&exported[..separator]);
+        let archive = exported[separator..].to_vec();
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Type: application/zip"));
+        assert!(headers.contains("attachment; filename=\"bkv-current.zip\""));
+        assert!(archive.starts_with(b"PK"));
+
+        state
+            .site_configs
+            .delete("bkv-current")
+            .expect("remove exported package");
+        let imported = response_json(import_admin_site_config_response(
+            &state,
+            "POST /api/admin/site-configs/import HTTP/1.1\r\nContent-Type: application/zip\r\n\r\n",
+            &archive,
+            "admin",
+        ));
+        assert_eq!(imported["imported"], true);
+        assert_eq!(imported["site"]["id"], "bkv-current");
+        assert_eq!(imported["containsPlaintextCredentials"], true);
+        assert!(state.site_configs.get("bkv-current").is_ok());
+        fs::remove_dir_all(root).expect("remove site fixture");
     }
 
     #[test]
