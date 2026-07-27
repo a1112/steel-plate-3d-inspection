@@ -1,4 +1,7 @@
-use crate::site_config::{mark_project_applied, resolve_active_site, SiteMode};
+use crate::machine_site_config::{EffectiveSiteSelection, SiteSelectionSource};
+use crate::site_config::{
+    mark_project_applied, resolve_active_site, resolve_site_by_id, SiteMode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -188,6 +191,7 @@ pub struct RuntimeProfile {
     pub site_display_name: String,
     pub site_mode: SiteMode,
     pub site_compatibility: bool,
+    pub site_selection_source: SiteSelectionSource,
     pub pending_restart: bool,
     pub id: String,
     pub display_name: String,
@@ -207,17 +211,26 @@ pub struct RuntimeProfile {
 
 impl RuntimeProfile {
     pub fn load(project_path: &Path, allowed_root: &Path) -> Result<Self, String> {
-        Self::load_internal(project_path, allowed_root, false)
+        Self::load_internal(project_path, allowed_root, false, None)
     }
 
     pub fn load_for_startup(project_path: &Path, allowed_root: &Path) -> Result<Self, String> {
-        Self::load_internal(project_path, allowed_root, true)
+        Self::load_internal(project_path, allowed_root, true, None)
+    }
+
+    pub fn load_for_startup_selection(
+        project_path: &Path,
+        allowed_root: &Path,
+        selection: EffectiveSiteSelection,
+    ) -> Result<Self, String> {
+        Self::load_internal(project_path, allowed_root, true, Some(selection))
     }
 
     fn load_internal(
         project_path: &Path,
         allowed_root: &Path,
         mark_applied: bool,
+        selection: Option<EffectiveSiteSelection>,
     ) -> Result<Self, String> {
         let allowed_root = fs::canonicalize(allowed_root).map_err(|error| {
             format!(
@@ -225,7 +238,16 @@ impl RuntimeProfile {
                 allowed_root.display()
             )
         })?;
-        let active_site = resolve_active_site(project_path, &allowed_root)?;
+        let (active_site, site_selection_source) = match selection {
+            Some(selection) => (
+                resolve_site_by_id(project_path, &allowed_root, &selection.site_id)?,
+                selection.source,
+            ),
+            None => (
+                resolve_active_site(project_path, &allowed_root)?,
+                SiteSelectionSource::Repository,
+            ),
+        };
         let profile_path = active_site.runtime_profile_path.clone();
         let profile_bytes = fs::read(&profile_path)
             .map_err(|error| format!("runtime profile read failed: {error}"))?;
@@ -234,7 +256,12 @@ impl RuntimeProfile {
         validate_profile(&document, &allowed_root)?;
 
         let mut hasher = Sha256::new();
-        hasher.update(hashable_project_bytes(&active_site.project_bytes)?);
+        if site_selection_source == SiteSelectionSource::Repository {
+            hasher.update(hashable_project_bytes(&active_site.project_bytes)?);
+        } else {
+            hasher.update(b"machine-site-selection");
+            hasher.update(active_site.site_id.as_bytes());
+        }
         if let Some(site_bytes) = active_site.site_bytes.as_ref() {
             hasher.update([0]);
             hasher.update(site_bytes);
@@ -262,7 +289,10 @@ impl RuntimeProfile {
         }
 
         let capture = resolved_capture(&document);
-        if mark_applied && active_site.pending_restart {
+        if mark_applied
+            && site_selection_source == SiteSelectionSource::Repository
+            && active_site.pending_restart
+        {
             mark_project_applied(&active_site.project_path)?;
         }
         Ok(Self {
@@ -270,7 +300,9 @@ impl RuntimeProfile {
             site_display_name: active_site.site_display_name,
             site_mode: active_site.site_mode,
             site_compatibility: active_site.compatibility,
-            pending_restart: active_site.pending_restart && !mark_applied,
+            site_selection_source,
+            pending_restart: active_site.pending_restart
+                && (!mark_applied || site_selection_source != SiteSelectionSource::Repository),
             id: document.id,
             display_name: document.display_name,
             provider: document.provider,
@@ -351,6 +383,7 @@ impl RuntimeProfile {
             "siteDisplayName": self.site_display_name,
             "siteMode": self.site_mode,
             "siteCompatibility": self.site_compatibility,
+            "siteSelectionSource": self.site_selection_source,
             "pendingRestart": self.pending_restart,
             "profileId": self.id,
             "displayName": self.display_name,
@@ -383,6 +416,7 @@ impl RuntimeProfile {
                 SiteMode::Bkv
             },
             site_compatibility: false,
+            site_selection_source: SiteSelectionSource::Repository,
             pending_restart: false,
             id: format!("test-{provider}-{camera_count}"),
             display_name: "test runtime".to_string(),
@@ -970,6 +1004,58 @@ mod tests {
 
         assert!(!loaded.pending_restart);
         assert_eq!(persisted["pendingRestart"], false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_selection_loads_the_explicit_site_and_exposes_its_source() {
+        use crate::machine_site_config::{EffectiveSiteSelection, SiteSelectionSource};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-runtime-selection-{}-{stamp}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+        let store =
+            SiteConfigStore::new(config_root.join("sites")).expect("site configuration store");
+        for id in ["repo-site", "registry-site"] {
+            store
+                .create(CreateSiteConfig {
+                    id: id.to_string(),
+                    display_name: id.to_string(),
+                    mode: SiteMode::Bkv,
+                })
+                .expect("site package");
+        }
+        let project = config_root.join("project.json");
+        write_json(
+            &project,
+            &json!({
+                "schema": "steel.project-config.v1",
+                "activeSiteConfig": "config/sites/repo-site/site.json",
+                "pendingRestart": false
+            }),
+        );
+
+        let loaded = RuntimeProfile::load_for_startup_selection(
+            &project,
+            &root,
+            EffectiveSiteSelection {
+                site_id: "registry-site".to_string(),
+                source: SiteSelectionSource::Registry,
+            },
+        )
+        .expect("selected site runtime");
+
+        assert_eq!(loaded.site_id, "registry-site");
+        assert_eq!(
+            loaded.public_value()["siteSelectionSource"],
+            json!("registry")
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

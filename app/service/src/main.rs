@@ -265,6 +265,10 @@ struct ServiceState {
     runtime_profile: String,
     runtime_config: Arc<runtime_profile::RuntimeProfile>,
     site_configs: site_config::SiteConfigStore,
+    machine_site_store: Arc<dyn machine_site_config::MachineSiteStore>,
+    machine_name: String,
+    environment_site_id: Option<String>,
+    repository_default_site_id: String,
     algorithm_mode: String,
     algorithm_mock_defect_count: String,
     sessions: Mutex<HashMap<String, AdminSession>>,
@@ -20970,9 +20974,47 @@ fn main() -> std::io::Result<()> {
             .join("sites"),
     )
     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let runtime_config = runtime_profile::RuntimeProfile::load_for_startup(
+    let repository_default_site_id = site_configs
+        .project_selection(&project_config_path)
+        .ok()
+        .and_then(|selection| selection.selected_site_id)
+        .or_else(|| {
+            site_config::resolve_active_site(&project_config_path, &workspace_root())
+                .ok()
+                .map(|selection| selection.site_id)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "repository default site configuration is missing",
+            )
+        })?;
+    let environment_site_id = match env::var(machine_site_config::SITE_ID_ENV) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "STEEL_SITE_CONFIG_ID is not valid Unicode",
+            ))
+        }
+    };
+    let machine_site_store = machine_site_config::system_machine_site_store();
+    let machine_default_site_id = machine_site_store
+        .read_default_site_id()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let effective_site_selection = machine_site_config::select_site(
+        machine_site_config::SiteSelectionInput {
+            environment_site_id: environment_site_id.clone(),
+            machine_default_site_id,
+            repository_default_site_id: repository_default_site_id.clone(),
+        },
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let runtime_config = runtime_profile::RuntimeProfile::load_for_startup_selection(
         &project_config_path,
         &workspace_root(),
+        effective_site_selection,
     )
     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let capture_provider = CaptureProvider::from_runtime_profile(&runtime_config)
@@ -21030,6 +21072,10 @@ fn main() -> std::io::Result<()> {
             .unwrap_or_else(|_| "production".to_string()),
         runtime_config: Arc::new(runtime_config),
         site_configs,
+        machine_site_store,
+        machine_name: machine_site_config::machine_name(),
+        environment_site_id,
+        repository_default_site_id,
         algorithm_mode: env::var("STEEL_ALGORITHM_MODE")
             .unwrap_or_else(|_| "production".to_string()),
         algorithm_mock_defect_count: env::var("BAR_SURFACE_MOCK_DEFECT_COUNT")
@@ -22088,6 +22134,16 @@ mod tests {
             )),
             site_configs: site_config::SiteConfigStore::new(site_config_root)
                 .expect("test site config store"),
+            machine_site_store: Arc::new(
+                machine_site_config::MemoryMachineSiteStore::default(),
+            ),
+            machine_name: "TEST-HOST".to_string(),
+            environment_site_id: None,
+            repository_default_site_id: if provider == CaptureProvider::Bkv {
+                "test-bkv-6".to_string()
+            } else {
+                "test-simulated-8".to_string()
+            },
             algorithm_mode: "demo".to_string(),
             algorithm_mock_defect_count: "0".to_string(),
             sessions: Mutex::new(HashMap::new()),

@@ -539,6 +539,63 @@ pub fn resolve_active_site(
     })
 }
 
+pub fn resolve_site_by_id(
+    project_path: &Path,
+    allowed_root: &Path,
+    id: &str,
+) -> Result<ActiveSiteResolution, String> {
+    validate_site_id(id)?;
+    let allowed_root = fs::canonicalize(allowed_root).map_err(|error| {
+        format!(
+            "site config allowed root is unavailable ({}): {error}",
+            allowed_root.display()
+        )
+    })?;
+    let project_path =
+        contained_existing_file(&allowed_root, project_path, "project configuration")?;
+    let project_bytes = fs::read(&project_path)
+        .map_err(|error| format!("project configuration read failed: {error}"))?;
+    let project: ProjectConfigDocument = serde_json::from_slice(&project_bytes)
+        .map_err(|error| format!("project configuration JSON invalid: {error}"))?;
+    if project.schema != PROJECT_CONFIG_SCHEMA {
+        return Err(format!(
+            "project configuration schema must be {PROJECT_CONFIG_SCHEMA}"
+        ));
+    }
+    let config_root = project_path
+        .parent()
+        .ok_or_else(|| "project configuration has no parent".to_string())?;
+    let site_path = config_root.join("sites").join(id).join("site.json");
+    let site_path = contained_existing_file(&allowed_root, &site_path, "selected site config")
+        .map_err(|error| format!("selected site {id} is unavailable: {error}"))?;
+    let site_root = site_path
+        .parent()
+        .ok_or_else(|| "selected site config has no parent".to_string())?;
+    let site_bytes = fs::read(&site_path)
+        .map_err(|error| format!("selected site config read failed: {error}"))?;
+    let document: SiteConfigDocument = serde_json::from_slice(&site_bytes)
+        .map_err(|error| format!("selected site config JSON invalid: {error}"))?;
+    if document.schema != SITE_CONFIG_SCHEMA {
+        return Err(format!("site config schema must be {SITE_CONFIG_SCHEMA}"));
+    }
+    if document.id != id {
+        return Err("selected site directory and document id differ".to_string());
+    }
+    let runtime_profile_path =
+        contained_existing_file(site_root, &document.runtime_profile, "site runtime profile")?;
+    Ok(ActiveSiteResolution {
+        project_path,
+        project_bytes,
+        site_bytes: Some(site_bytes),
+        runtime_profile_path,
+        site_id: document.id,
+        site_display_name: document.display_name,
+        site_mode: document.mode,
+        pending_restart: project.pending_restart,
+        compatibility: false,
+    })
+}
+
 pub fn mark_project_applied(project_path: &Path) -> Result<(), String> {
     let bytes = fs::read(project_path)
         .map_err(|error| format!("project configuration read failed: {error}"))?;
@@ -914,8 +971,8 @@ fn capture_template(mode: &SiteMode) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckDepth, CreateSiteConfig, SiteConfigCheck, SiteConfigPackage, SiteConfigProbe,
-        SiteConfigStore, SiteMode, UpdateSiteMetadata,
+        resolve_site_by_id, CheckDepth, CreateSiteConfig, SiteConfigCheck, SiteConfigPackage,
+        SiteConfigProbe, SiteConfigStore, SiteMode, UpdateSiteMetadata,
     };
     use crate::runtime_profile::RuntimeProfile;
     use serde_json::json;
@@ -1151,5 +1208,75 @@ mod tests {
 
         assert_eq!(runtime.camera_count(), 8);
         assert_eq!(runtime.site_mode, SiteMode::DirectCamera);
+    }
+
+    #[test]
+    fn explicit_site_id_resolves_inside_the_project_site_root() {
+        let fixture = SiteConfigFixture::new();
+        let config_root = fixture.root.join("config");
+        let store =
+            SiteConfigStore::new(config_root.join("sites")).expect("project site store");
+        store
+            .create(CreateSiteConfig {
+                id: "repo-site".to_string(),
+                display_name: "仓库现场".to_string(),
+                mode: SiteMode::Bkv,
+            })
+            .expect("repo site");
+        store
+            .create(CreateSiteConfig {
+                id: "registry-site".to_string(),
+                display_name: "本机现场".to_string(),
+                mode: SiteMode::Bkv,
+            })
+            .expect("registry site");
+        let project = config_root.join("project.json");
+        fs::write(
+            &project,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "steel.project-config.v1",
+                "activeSiteConfig": "config/sites/repo-site/site.json",
+                "pendingRestart": false
+            }))
+            .expect("project JSON"),
+        )
+        .expect("project config");
+
+        let resolved =
+            resolve_site_by_id(&project, &fixture.root, "registry-site").expect("explicit site");
+
+        assert_eq!(resolved.site_id, "registry-site");
+        assert_eq!(resolved.site_display_name, "本机现场");
+    }
+
+    #[test]
+    fn explicit_missing_site_id_does_not_fall_back_to_project() {
+        let fixture = SiteConfigFixture::new();
+        let config_root = fixture.root.join("config");
+        let store =
+            SiteConfigStore::new(config_root.join("sites")).expect("project site store");
+        store
+            .create(CreateSiteConfig {
+                id: "repo-site".to_string(),
+                display_name: "仓库现场".to_string(),
+                mode: SiteMode::Bkv,
+            })
+            .expect("repo site");
+        let project = config_root.join("project.json");
+        fs::write(
+            &project,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "steel.project-config.v1",
+                "activeSiteConfig": "config/sites/repo-site/site.json",
+                "pendingRestart": false
+            }))
+            .expect("project JSON"),
+        )
+        .expect("project config");
+
+        let error = resolve_site_by_id(&project, &fixture.root, "missing-site")
+            .expect_err("missing explicit site must fail");
+
+        assert!(error.contains("missing-site"));
     }
 }

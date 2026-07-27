@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub const SITE_ID_ENV: &str = "STEEL_SITE_CONFIG_ID";
 
@@ -28,6 +28,17 @@ pub trait MachineSiteStore: Send + Sync {
     fn write_default_site_id(&self, id: &str) -> Result<(), String>;
     fn clear_default_site_id(&self) -> Result<(), String>;
     fn writable(&self) -> Result<bool, String>;
+}
+
+pub fn system_machine_site_store() -> Arc<dyn MachineSiteStore> {
+    #[cfg(windows)]
+    {
+        Arc::new(WindowsMachineSiteStore)
+    }
+    #[cfg(not(windows))]
+    {
+        Arc::new(UnsupportedMachineSiteStore)
+    }
 }
 
 #[derive(Default)]
