@@ -253,7 +253,14 @@ impl RuntimeProfile {
             .map_err(|error| format!("runtime profile read failed: {error}"))?;
         let document: RuntimeProfileDocument = serde_json::from_slice(&profile_bytes)
             .map_err(|error| format!("runtime profile JSON invalid: {error}"))?;
-        validate_profile(&document, &allowed_root)?;
+        let configuration_root = if active_site.compatibility {
+            allowed_root.as_path()
+        } else {
+            profile_path
+                .parent()
+                .ok_or_else(|| "runtime profile path has no site directory".to_string())?
+        };
+        validate_profile(&document, &allowed_root, configuration_root)?;
 
         let mut hasher = Sha256::new();
         if site_selection_source == SiteSelectionSource::Repository {
@@ -270,7 +277,8 @@ impl RuntimeProfile {
         hasher.update(&profile_bytes);
 
         if let Some(relative) = document.capture_profile.as_deref() {
-            let capture_path = contained_existing_file(&allowed_root, relative, "capture profile")?;
+            let capture_path =
+                contained_existing_file(configuration_root, relative, "capture profile")?;
             let capture_bytes = fs::read(&capture_path)
                 .map_err(|error| format!("capture profile read failed: {error}"))?;
             validate_capture_profile(&document, &capture_bytes)?;
@@ -280,8 +288,11 @@ impl RuntimeProfile {
             return Err("direct runtime profile requires captureProfile".to_string());
         }
         if document.algorithm.enabled {
-            let algorithm_path =
-                contained_existing_file(&allowed_root, &document.algorithm.config_path, "algorithm config")?;
+            let algorithm_path = contained_existing_file(
+                configuration_root,
+                &document.algorithm.config_path,
+                "algorithm config",
+            )?;
             let algorithm_bytes = fs::read(&algorithm_path)
                 .map_err(|error| format!("algorithm config read failed: {error}"))?;
             hasher.update([0]);
@@ -337,7 +348,14 @@ impl RuntimeProfile {
         if document.id != self.id {
             return Err("runtime profile id cannot change in-place".to_string());
         }
-        validate_profile(&document, &allowed_root)?;
+        let configuration_root = if self.site_compatibility {
+            allowed_root.as_path()
+        } else {
+            self.profile_path
+                .parent()
+                .ok_or_else(|| "runtime profile path has no site directory".to_string())?
+        };
+        validate_profile(&document, &allowed_root, configuration_root)?;
         let profile_bytes = serde_json::to_vec_pretty(candidate)
             .map_err(|error| format!("runtime profile serialization failed: {error}"))?;
         let project_bytes = fs::read(&self.project_path)
@@ -348,7 +366,7 @@ impl RuntimeProfile {
         hasher.update(&profile_bytes);
         if let Some(relative) = document.capture_profile.as_deref() {
             let capture_path =
-                contained_existing_file(&allowed_root, relative, "capture profile")?;
+                contained_existing_file(configuration_root, relative, "capture profile")?;
             let capture_bytes = fs::read(&capture_path)
                 .map_err(|error| format!("capture profile read failed: {error}"))?;
             validate_capture_profile(&document, &capture_bytes)?;
@@ -358,8 +376,11 @@ impl RuntimeProfile {
             return Err("direct runtime profile requires captureProfile".to_string());
         }
         if document.algorithm.enabled {
-            let algorithm_path =
-                contained_existing_file(&allowed_root, &document.algorithm.config_path, "algorithm config")?;
+            let algorithm_path = contained_existing_file(
+                configuration_root,
+                &document.algorithm.config_path,
+                "algorithm config",
+            )?;
             let algorithm_bytes = fs::read(&algorithm_path)
                 .map_err(|error| format!("algorithm config read failed: {error}"))?;
             hasher.update([0]);
@@ -473,6 +494,7 @@ fn hashable_project_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
 fn validate_profile(
     document: &RuntimeProfileDocument,
     allowed_root: &Path,
+    configuration_root: &Path,
 ) -> Result<(), String> {
     if document.schema != RUNTIME_PROFILE_SCHEMA {
         return Err(format!(
@@ -575,7 +597,7 @@ fn validate_profile(
             return Err("enabled algorithm pipeline requires configPath".to_string());
         }
         let _ = contained_existing_file(
-            allowed_root,
+            configuration_root,
             &document.algorithm.config_path,
             "algorithm config",
         )?;

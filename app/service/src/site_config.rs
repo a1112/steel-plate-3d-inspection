@@ -26,6 +26,8 @@ pub struct SiteConfigDocument {
     pub runtime_profile: String,
     pub connection_config: String,
     pub capture_config: String,
+    pub algorithm_config: String,
+    pub mapping_config: String,
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +244,8 @@ impl SiteConfigStore {
                 runtime_profile: "runtime.json".to_string(),
                 connection_config: "connection.json".to_string(),
                 capture_config: "capture.json".to_string(),
+                algorithm_config: "algorithm.json".to_string(),
+                mapping_config: "mapping.json".to_string(),
             };
             write_json_atomic(&root.join("site.json"), &document)?;
             write_json_atomic(
@@ -250,13 +254,14 @@ impl SiteConfigStore {
             )?;
             write_json_atomic(
                 &root.join("connection.json"),
-                &json!({
-                    "mode": if request.mode == SiteMode::Bkv { "online" } else { "device" },
-                    "host": "127.0.0.1",
-                    "port": 4873
-                }),
+                &connection_template(&request.mode),
             )?;
             write_json_atomic(&root.join("capture.json"), &capture_template(&request.mode))?;
+            write_json_atomic(
+                &root.join("algorithm.json"),
+                &algorithm_template(&request.mode),
+            )?;
+            write_json_atomic(&root.join("mapping.json"), &mapping_template(&request.mode))?;
             Ok(SiteConfigPackage {
                 root: root.clone(),
                 document,
@@ -358,6 +363,20 @@ impl SiteConfigStore {
             &package.document.capture_config,
             "capture.config",
             "采集配置",
+            &mut checks,
+        );
+        let _algorithm = check_json_reference(
+            &package,
+            &package.document.algorithm_config,
+            "algorithm.config",
+            "算法配置",
+            &mut checks,
+        );
+        let _mapping = check_json_reference(
+            &package,
+            &package.document.mapping_config,
+            "mapping.config",
+            "字段与缺陷映射",
             &mut checks,
         );
 
@@ -941,7 +960,8 @@ fn runtime_template(id: &str, display_name: &str, mode: &SiteMode) -> Value {
             "autostart": false
         },
         "algorithm": {
-            "enabled": false
+            "enabled": false,
+            "configPath": "algorithm.json"
         },
         "capabilities": {
             "directCamera": mode == &SiteMode::DirectCamera,
@@ -951,9 +971,23 @@ fn runtime_template(id: &str, display_name: &str, mode: &SiteMode) -> Value {
         }
     });
     if mode == &SiteMode::DirectCamera {
-        template["captureProfile"] = Value::String(format!("config/sites/{id}/capture.json"));
+        template["captureProfile"] = Value::String("capture.json".to_string());
     }
     template
+}
+
+fn connection_template(mode: &SiteMode) -> Value {
+    json!({
+        "schema": "steel.site-connection.v1",
+        "provider": if mode == &SiteMode::Bkv { "bkv" } else { "headless-cpp" },
+        "dataSource": if mode == &SiteMode::Bkv { "bkv-online-mysql" } else { "online-production" },
+        "host": "127.0.0.1",
+        "port": if mode == &SiteMode::Bkv { 3306 } else { 4873 },
+        "database": "",
+        "username": "",
+        "password": "",
+        "imageRoot": ""
+    })
 }
 
 fn capture_template(mode: &SiteMode) -> Value {
@@ -965,6 +999,41 @@ fn capture_template(mode: &SiteMode) -> Value {
             "cameraIndex": camera,
             "enabled": mode == &SiteMode::DirectCamera
         })).collect::<Vec<_>>()
+    })
+}
+
+fn algorithm_template(mode: &SiteMode) -> Value {
+    let camera_count = if mode == &SiteMode::Bkv { 6 } else { 8 };
+    json!({
+        "schema": "steel.source-processing-config.v1",
+        "processor": if mode == &SiteMode::Bkv {
+            "bkv-inspection-world-v1"
+        } else {
+            "bar-surface-3d-v1"
+        },
+        "processorVersion": "1.0.0",
+        "input": {
+            "cameraCount": camera_count
+        },
+        "inspectionWorld": {
+            "tileSize": 512,
+            "detectHeadAlignment": true,
+            "cacheTiles": true
+        }
+    })
+}
+
+fn mapping_template(mode: &SiteMode) -> Value {
+    let camera_count = if mode == &SiteMode::Bkv { 6 } else { 8 };
+    json!({
+        "schema": "steel.site-mapping.v1",
+        "cameras": (1..=camera_count).map(|camera| json!({
+            "id": format!("C{camera}"),
+            "displayOrder": camera,
+            "sourceCameraId": camera
+        })).collect::<Vec<_>>(),
+        "fields": {},
+        "defects": {}
     })
 }
 
@@ -1043,6 +1112,76 @@ mod tests {
         assert!(created.root.join("runtime.json").is_file());
         assert!(created.root.join("connection.json").is_file());
         assert!(created.root.join("capture.json").is_file());
+    }
+
+    #[test]
+    fn created_bkv_package_is_complete_and_self_contained() {
+        let fixture = SiteConfigFixture::new();
+        fixture.create_bkv("bkv-complete");
+        let package = fixture.store.get("bkv-complete").expect("BKV site");
+
+        for file_name in [
+            "site.json",
+            "runtime.json",
+            "connection.json",
+            "capture.json",
+            "algorithm.json",
+            "mapping.json",
+        ] {
+            assert!(
+                package.root.join(file_name).is_file(),
+                "{file_name} must be owned by the site package"
+            );
+        }
+    }
+
+    #[test]
+    fn package_rejects_an_algorithm_reference_outside_its_directory() {
+        let fixture = SiteConfigFixture::new();
+        fixture.create_bkv("bkv-contained");
+        let package = fixture.store.get("bkv-contained").expect("BKV site");
+        fs::write(fixture.root.join("outside.json"), b"{}").expect("outside config");
+        let mut site: serde_json::Value = serde_json::from_slice(
+            &fs::read(package.root.join("site.json")).expect("site config"),
+        )
+        .expect("site JSON");
+        site["algorithmConfig"] = json!("../outside.json");
+        fs::write(
+            package.root.join("site.json"),
+            serde_json::to_vec_pretty(&site).expect("site JSON"),
+        )
+        .expect("site config");
+
+        let report = fixture
+            .store
+            .check("bkv-contained", CheckDepth::Default)
+            .expect("configuration check");
+
+        assert!(report
+            .checks
+            .iter()
+            .any(|item| item.id == "algorithm.config" && item.blocking));
+    }
+
+    #[test]
+    fn cloned_package_owns_independent_configuration_files() {
+        let fixture = SiteConfigFixture::new();
+        fixture.create_bkv("bkv-source");
+        let cloned = fixture
+            .store
+            .clone_site("bkv-source", "bkv-clone", "BKV 克隆")
+            .expect("clone site");
+        let source = fixture.store.get("bkv-source").expect("source site");
+        let cloned_algorithm =
+            fs::read(cloned.root.join("algorithm.json")).expect("cloned algorithm");
+
+        fs::write(source.root.join("algorithm.json"), b"{\"changed\":true}")
+            .expect("change source");
+
+        assert_eq!(
+            fs::read(cloned.root.join("algorithm.json")).expect("cloned algorithm"),
+            cloned_algorithm
+        );
     }
 
     #[test]

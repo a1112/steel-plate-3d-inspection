@@ -64,7 +64,7 @@
     "enabled": true,
     "autoProcessLatest": true,
     "processor": "bkv-inspection-world-v1",
-    "configPath": "config/algorithm/bkv-inspection-world-6.json",
+    "configPath": "algorithm.json",
     "outputRoot": "D:\\steel-inspection\\algorithm-data",
     "timingLog": "processing-times.jsonl",
     "maxFramesPerCamera": 64,
