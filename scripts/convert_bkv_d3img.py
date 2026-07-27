@@ -10,6 +10,7 @@ import os
 import re
 import struct
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -17,8 +18,9 @@ import numpy as np
 
 
 FORMAT_VERSION = "bkv-depth-v1"
-MAGIC_PREFIX = b"3DImg"
+MAGIC = b"3DImg\0"
 HEADER_SIZE = 84
+HEADER_STRUCT = struct.Struct("<6sh5if5i3B29s")
 INVALID_SENTINEL = np.float32(-1_000_000.0)
 MAX_SIDE = 20_000
 MAX_POINTS = 2_000_000_000
@@ -38,6 +40,39 @@ NPZ_FIELDS = {
 
 class D3ImgFormatError(ValueError):
     """Raised when a legacy frame fails strict structural validation."""
+
+
+@dataclass(frozen=True)
+class D3ImgHeader:
+    """Little-endian MSVC layout written by the legacy DAT3DHEADER writer."""
+
+    tag: bytes
+    head_size: int
+    steel_no: int
+    image_index: int
+    image_sequence: int
+    width: int
+    height: int
+    scale_x: float
+    left: int
+    right: int
+    start_length: int
+    end_length: int
+    start_position: int
+    camera_number: int
+    data_type: int
+    pixel_size: int
+    reserve: bytes
+
+
+@dataclass(frozen=True)
+class ParsedD3Img:
+    header: D3ImgHeader
+    depth: np.ndarray
+
+
+if HEADER_STRUCT.size != HEADER_SIZE:
+    raise RuntimeError(f"DAT3DHEADER layout is {HEADER_STRUCT.size} bytes, expected {HEADER_SIZE}")
 
 
 def sha256_file(path: Path) -> str:
@@ -61,25 +96,67 @@ def parse_identifiers(source: Path) -> tuple[int, int, int]:
     return int(camera_match.group(1)), int(seq_dir), int(source.stem)
 
 
-def parse_depth(source: Path) -> np.ndarray:
-    data = source.read_bytes()
+def parse_header(data: bytes) -> D3ImgHeader:
     if len(data) < HEADER_SIZE:
         raise D3ImgFormatError(f"file is shorter than {HEADER_SIZE}-byte header")
-    if not data.startswith(MAGIC_PREFIX):
+    values = HEADER_STRUCT.unpack_from(data)
+    header = D3ImgHeader(
+        tag=values[0],
+        head_size=values[1],
+        steel_no=values[2],
+        image_index=values[3],
+        image_sequence=values[4],
+        width=values[5],
+        height=values[6],
+        scale_x=values[7],
+        left=values[8],
+        right=values[9],
+        start_length=values[10],
+        end_length=values[11],
+        start_position=values[12],
+        camera_number=values[13],
+        data_type=values[14],
+        pixel_size=values[15],
+        reserve=values[16],
+    )
+    if header.tag != MAGIC:
         raise D3ImgFormatError("unexpected d3img magic")
-
-    height = struct.unpack_from("<I", data, 20)[0]
-    width = struct.unpack_from("<I", data, 24)[0]
-    if not (1 <= height <= MAX_SIDE and 1 <= width <= MAX_SIDE):
-        raise D3ImgFormatError(f"invalid dimensions: {height}x{width}")
-    if width * height > MAX_POINTS:
-        raise D3ImgFormatError(f"point count exceeds limit: {width * height}")
-
-    expected_size = HEADER_SIZE + width * height * 4
+    if header.head_size != HEADER_SIZE:
+        raise D3ImgFormatError(
+            f"unexpected d3img header size: {header.head_size}, expected {HEADER_SIZE}"
+        )
+    if not (1 <= header.width <= MAX_SIDE and 1 <= header.height <= MAX_SIDE):
+        raise D3ImgFormatError(f"invalid dimensions: {header.width}x{header.height}")
+    if header.width * header.height > MAX_POINTS:
+        raise D3ImgFormatError(
+            f"point count exceeds limit: {header.width * header.height}"
+        )
+    if header.pixel_size != 4:
+        raise D3ImgFormatError(
+            f"unexpected d3img pixel size: {header.pixel_size}, expected 4"
+        )
+    expected_size = header.head_size + header.width * header.height * header.pixel_size
     if len(data) != expected_size:
         raise D3ImgFormatError(f"file size mismatch: got {len(data)}, expected {expected_size}")
+    return header
 
-    return np.frombuffer(data, dtype="<f4", count=width * height, offset=HEADER_SIZE).reshape(height, width)
+
+def parse_d3img(source: Path) -> ParsedD3Img:
+    data = Path(source).read_bytes()
+    header = parse_header(data)
+    depth = np.frombuffer(
+        data,
+        dtype="<f4",
+        count=header.width * header.height,
+        offset=header.head_size,
+    ).reshape(header.height, header.width)
+    return ParsedD3Img(header=header, depth=depth)
+
+
+def parse_depth(source: Path) -> np.ndarray:
+    """Compatibility wrapper returning only the row-major float32 depth matrix."""
+
+    return parse_d3img(source).depth
 
 
 def validate_artifact(
@@ -170,7 +247,7 @@ def convert_file(
     source = Path(source)
     output = Path(output)
     camera_id, legacy_seq_no, frame_no = parse_identifiers(source)
-    depth = parse_depth(source)
+    depth = parse_d3img(source).depth
     valid_mask = np.isfinite(depth) & (depth != sentinel)
     source_sha256 = sha256_file(source)
     valid_points = int(valid_mask.sum())

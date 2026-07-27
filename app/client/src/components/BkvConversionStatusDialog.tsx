@@ -164,6 +164,14 @@ export function BkvConversionStatusDialog({
           <div><dt>记录时间</dt><dd>{status?.latestRecord?.time || '--'}</dd></div>
           <div><dt>刷新周期</dt><dd>{status ? `${status.refreshIntervalMs / 1_000} 秒` : '--'}</dd></div>
           <div><dt>最近成功</dt><dd>{formatStatusTime(status?.lastSuccessAtMs ?? 0)}</dd></div>
+          <div>
+            <dt>图像缓存</dt>
+            <dd>
+              {status?.imageCache
+                ? `${status.imageCache.entries} 项 / 命中 ${status.imageCache.hits}`
+                : '--'}
+            </dd>
+          </div>
         </dl>
 
         <div className="bkv-conversion-preview-heading">
@@ -179,7 +187,12 @@ export function BkvConversionStatusDialog({
             {previewImages.map((image) => (
               <figure key={image.id}>
                 <div>
-                  <img src={image.url} alt={`${image.label} 实际${image.kind}图像`} />
+                  <img
+                    src={image.url}
+                    alt={`${image.label} 实际${image.kind}图像`}
+                    loading="lazy"
+                    decoding="async"
+                  />
                   <span>{image.kind}</span>
                 </div>
                 <figcaption>

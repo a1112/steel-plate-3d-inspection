@@ -15360,6 +15360,75 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
     }
 }
 
+fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let record_id = match inspection_world_record_id(query) {
+        Ok(record_id) => record_id,
+        Err(response) => return response,
+    };
+    if state.runtime_config.data_source != "bkv-online-mysql" {
+        return http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 404,
+                "error": "inspection_world_surface_unavailable",
+                "detail": "D3IMG surface conversion is available in BKV online mode",
+            })
+            .to_string(),
+        );
+    }
+    if query_value(query, "format").as_deref() == Some("binary") {
+        return match state
+            .bkv_online
+            .as_ref()
+            .ok_or_else(|| "BKV online source is unavailable".to_string())
+            .and_then(|source| source.inspection_world_surface_binary(&record_id))
+        {
+            Ok(surface) => http_bytes_response_with_headers(
+                "200 OK",
+                "application/vnd.steel.bsmesh",
+                surface.as_slice(),
+                &[
+                    ("Cache-Control", "private, max-age=300, stale-while-revalidate=60"),
+                    ("X-Content-Type-Options", "nosniff"),
+                ],
+            ),
+            Err(error) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 404,
+                    "error": "inspection_world_surface_unavailable",
+                    "detail": error,
+                })
+                .to_string(),
+            ),
+        };
+    }
+    match state
+        .bkv_online
+        .as_ref()
+        .ok_or_else(|| "BKV online source is unavailable".to_string())
+        .and_then(|source| source.inspection_world_surface(&record_id))
+    {
+        Ok(surface) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &surface.to_string(),
+        ),
+        Err(error) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 404,
+                "error": "inspection_world_surface_unavailable",
+                "detail": error,
+            })
+            .to_string(),
+        ),
+    }
+}
+
 fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u8> {
     let record_id = match inspection_world_record_id(query) {
         Ok(record_id) => record_id,
@@ -20644,15 +20713,20 @@ fn bkv_online_image_response(state: &ServiceState, query: &str) -> Vec<u8> {
     let kind = query_value(query, "kind").unwrap_or_else(|| "2d".to_string());
 
     match source.image(camera, sequence, image_index, &kind) {
-        Ok(image) => http_bytes_response_with_headers(
-            "200 OK",
-            image.content_type,
-            &image.bytes,
-            &[
-                ("Cache-Control", "private, max-age=60"),
-                ("X-Content-Type-Options", "nosniff"),
-            ],
-        ),
+        Ok(image) => {
+            let cache_status = if image.cache_hit { "HIT" } else { "MISS" };
+            http_bytes_response_with_headers(
+                "200 OK",
+                image.content_type,
+                image.bytes.as_slice(),
+                &[
+                    ("Cache-Control", "private, max-age=300, stale-while-revalidate=60"),
+                    ("X-BKV-Image-Cache", cache_status),
+                    ("Access-Control-Expose-Headers", "X-BKV-Image-Cache, Content-Length"),
+                    ("X-Content-Type-Options", "nosniff"),
+                ],
+            )
+        }
         Err(bkv_online::BkvImageError::InvalidRequest(detail)) => http_response(
             "400 Bad Request",
             "application/json; charset=utf-8",
@@ -20812,6 +20886,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("GET", "/api/bkv-online/image") => bkv_online_image_response(&state, query),
         ("GET", "/api/inspection-world/records") => inspection_world_records_response(&state),
         ("GET", "/api/inspection-world/meta") => inspection_world_meta_response(&state, query),
+        ("GET", "/api/inspection-world/surface") => inspection_world_surface_response(&state, query),
         ("GET", "/api/inspection-world/defects") => inspection_world_defects_response(&state, query),
         ("GET", "/api/inspection-world/tile") => inspection_world_tile_response(&state, query),
         ("POST", "/api/bkv/replay/next") => bkv_next_response(&state),

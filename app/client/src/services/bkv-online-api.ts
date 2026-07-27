@@ -9,6 +9,15 @@ export type BkvOnlineStatus = {
   recordLimit: number;
   recordCount: number;
   previewImageCount: number;
+  imageCache?: {
+    entries: number;
+    bytes: number;
+    hits: number;
+    misses: number;
+    evictions: number;
+    maxEntries: number;
+    maxBytes: number;
+  };
   latestRecord?: {
     id?: string;
     plateNo?: string;

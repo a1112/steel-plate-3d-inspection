@@ -338,6 +338,8 @@ function CameraBandImage({
       }
     };
     image.crossOrigin = 'anonymous';
+    image.decoding = 'async';
+    image.fetchPriority = 'high';
     image.onload = draw;
     image.src = src;
     const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(draw) : null;

@@ -3,9 +3,36 @@ import {
   fetchInspectionWorldDefects,
   fetchInspectionWorldMeta,
   fetchInspectionWorldRecords,
+  fetchInspectionWorldSurface,
   fetchInspectionWorldTile,
   type InspectionWorldRecords,
 } from './inspection-world-api';
+
+function bsmeshFixture() {
+  const vertexCount = 2;
+  const indexCount = 3;
+  const byteLength = 40 + vertexCount * 3 * 4 + vertexCount * 2 * 4
+    + vertexCount * 3 * 4 + indexCount * 4 + vertexCount * 2;
+  const buffer = new ArrayBuffer(byteLength);
+  const bytes = new Uint8Array(buffer);
+  bytes.set(Array.from('BSMESH01', (value) => value.charCodeAt(0)), 0);
+  const view = new DataView(buffer);
+  [1, vertexCount, indexCount, 0x02 | 0x04, 2, 1, 6, 0]
+    .forEach((value, index) => view.setUint32(8 + index * 4, value, true));
+  let offset = 40;
+  new Float32Array(buffer, offset, vertexCount * 3).set([0, 1, 0, 1, 1, 0]);
+  offset += vertexCount * 3 * 4;
+  new Float32Array(buffer, offset, vertexCount * 2).set([0, 0, 1, 0]);
+  offset += vertexCount * 2 * 4;
+  new Float32Array(buffer, offset, vertexCount * 3).set([0, 1, 1, 1, 0, 0]);
+  offset += vertexCount * 3 * 4;
+  new Uint32Array(buffer, offset, indexCount).set([0, 1, 0]);
+  offset += indexCount * 4;
+  new Uint8Array(buffer, offset, vertexCount).set([1, 1]);
+  offset += vertexCount;
+  new Uint8Array(buffer, offset, vertexCount).set([0, 0]);
+  return buffer;
+}
 
 describe('inspection world API', () => {
   beforeEach(() => {
@@ -70,6 +97,23 @@ describe('inspection world API', () => {
     expect(tile.url).toBe('blob:world-tile');
     tile.revoke();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:world-tile');
+  });
+
+  it('loads a record-bound D3IMG surface mesh', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(bsmeshFixture(), {
+      headers: { 'Content-Type': 'application/vnd.steel.bsmesh' },
+    }));
+
+    const surface = await fetchInspectionWorldSurface('1908293');
+    const cached = await fetchInspectionWorldSurface('1908293');
+
+    expect(surface.coordinateUnit).toBe('legacy-unknown');
+    expect(surface.positions).toHaveLength(6);
+    expect(surface.source).toBe('bkv-bsmesh');
+    expect(cached).toBe(surface);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(String(vi.mocked(fetch).mock.calls[0][0]))
+      .toContain('/api/inspection-world/surface?recordId=1908293&format=binary');
   });
 
   it('rejects an invalid world schema instead of rendering ambiguous data', async () => {

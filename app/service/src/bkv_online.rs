@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,8 +26,14 @@ const DEFAULT_DATABASE: &str = "ncdtube";
 const DEFAULT_RECORD_LIMIT: usize = 500;
 const DEFAULT_DEFECT_WINDOW: usize = 5_000;
 const DEFAULT_REFRESH_INTERVAL_MS: usize = 5_000;
-const BKV_D3_HEADER_MIN_BYTES: usize = 84;
+const BKV_D3_HEADER_BYTES: usize = 84;
 const BKV_IMAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const BKV_D3_INVALID_DEPTH: f32 = -1_000_000.0;
+const BKV_DEPTH_SURFACE_ROWS: usize = 128;
+const BKV_DEPTH_SURFACE_COLS_PER_CAMERA: usize = 32;
+const BKV_DEPTH_SURFACE_MAX_FRAMES_PER_CAMERA: usize = 16;
+const BKV_IMAGE_CACHE_MAX_ENTRIES: usize = 64;
+const BKV_IMAGE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct BkvSource {
@@ -41,6 +47,7 @@ pub struct BkvSource {
     refresh_interval: Duration,
     refresh_state: Arc<RwLock<BkvRefreshState>>,
     inspection_world_cache: Arc<Mutex<HashMap<i64, Arc<BkvOnlineInspectionWorld>>>>,
+    image_cache: Arc<Mutex<BkvImageCache>>,
     inspection_world_build_lock: Arc<Mutex<()>>,
     processing_log_lock: Arc<Mutex<()>>,
     auto_processing: Arc<AtomicBool>,
@@ -62,7 +69,106 @@ struct BkvOnlineInspectionWorld {
     world: InspectionWorld,
     frames: HashMap<(u32, u32), PathBuf>,
     source_frame_count: usize,
+    depth_surface: Option<Value>,
+    depth_surface_binary: Option<Arc<Vec<u8>>>,
+    depth_source_frame_count: usize,
+    depth_error: Option<String>,
     run_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BkvImageCacheKey {
+    camera: usize,
+    sequence: i64,
+    image_index: i64,
+    kind: &'static str,
+}
+
+#[derive(Clone)]
+struct BkvImageCacheEntry {
+    source_bytes: u64,
+    source_modified_ns: u128,
+    bytes: Arc<Vec<u8>>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct BkvImageCache {
+    entries: HashMap<BkvImageCacheKey, BkvImageCacheEntry>,
+    bytes: usize,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl BkvImageCache {
+    fn get(
+        &mut self,
+        key: &BkvImageCacheKey,
+        source_bytes: u64,
+        source_modified_ns: u128,
+    ) -> Option<Arc<Vec<u8>>> {
+        self.clock = self.clock.saturating_add(1);
+        let stale = self.entries.get(key).is_some_and(|entry| {
+            entry.source_bytes != source_bytes || entry.source_modified_ns != source_modified_ns
+        });
+        if stale {
+            if let Some(entry) = self.entries.remove(key) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes.len());
+            }
+        }
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_used = self.clock;
+            self.hits = self.hits.saturating_add(1);
+            return Some(Arc::clone(&entry.bytes));
+        }
+        self.misses = self.misses.saturating_add(1);
+        None
+    }
+
+    fn insert(
+        &mut self,
+        key: BkvImageCacheKey,
+        source_bytes: u64,
+        source_modified_ns: u128,
+        bytes: Arc<Vec<u8>>,
+    ) {
+        if bytes.len() > BKV_IMAGE_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes.len());
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= BKV_IMAGE_CACHE_MAX_ENTRIES
+                || self.bytes.saturating_add(bytes.len()) > BKV_IMAGE_CACHE_MAX_BYTES)
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes.len());
+                self.evictions = self.evictions.saturating_add(1);
+            }
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        self.entries.insert(
+            key,
+            BkvImageCacheEntry {
+                source_bytes,
+                source_modified_ns,
+                bytes,
+                last_used: self.clock,
+            },
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -100,7 +206,8 @@ struct BkvDefect {
 
 pub struct BkvImage {
     pub content_type: &'static str,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<Vec<u8>>,
+    pub cache_hit: bool,
 }
 
 #[derive(Debug)]
@@ -312,6 +419,7 @@ impl BkvSource {
             ) as u64),
             refresh_state: Arc::new(RwLock::new(BkvRefreshState::default())),
             inspection_world_cache: Arc::new(Mutex::new(HashMap::new())),
+            image_cache: Arc::new(Mutex::new(BkvImageCache::default())),
             inspection_world_build_lock: Arc::new(Mutex::new(())),
             processing_log_lock: Arc::new(Mutex::new(())),
             auto_processing: Arc::new(AtomicBool::new(false)),
@@ -373,6 +481,22 @@ impl BkvSource {
             .and_then(Value::as_array)
             .and_then(|records| records.first())
             .cloned();
+        let image_cache = self
+            .image_cache
+            .lock()
+            .ok()
+            .map(|cache| {
+                json!({
+                    "entries": cache.entries.len(),
+                    "bytes": cache.bytes,
+                    "hits": cache.hits,
+                    "misses": cache.misses,
+                    "evictions": cache.evictions,
+                    "maxEntries": BKV_IMAGE_CACHE_MAX_ENTRIES,
+                    "maxBytes": BKV_IMAGE_CACHE_MAX_BYTES,
+                })
+            })
+            .unwrap_or_else(|| json!({"error": "cache_lock_failed"}));
         json!({
             "enabled": true,
             "running": true,
@@ -386,6 +510,7 @@ impl BkvSource {
                 "path": self.source_catalog_path().map(|path| path.display().to_string())
             },
             "previewImageCount": preview_image_count,
+            "imageCache": image_cache,
             "latestRecord": latest_record,
             "refreshIntervalMs": self.refresh_interval.as_millis(),
             "refreshAttempts": state.attempts,
@@ -464,12 +589,53 @@ impl BkvSource {
             "legacySeqNo": sequence,
             "sourceFrameCount": processed.source_frame_count,
             "world": processed.world,
+            "depthSurface": {
+                "available": processed.depth_surface.is_some(),
+                "sourceFrameCount": processed.depth_source_frame_count,
+                "path": processed.run_dir.as_ref()
+                    .filter(|_| processed.depth_surface.is_some())
+                    .map(|path| path.join("surface-mesh.json").display().to_string()),
+                "binaryPath": processed.run_dir.as_ref()
+                    .filter(|_| processed.depth_surface_binary.is_some())
+                    .map(|path| path.join("surface-mesh.bsmesh").display().to_string()),
+                "parametersPath": processed.run_dir.as_ref()
+                    .filter(|_| processed.depth_surface.is_some())
+                    .map(|path| path.join("reconstruction-parameters.json").display().to_string()),
+                "error": processed.depth_error,
+                "coordinateUnit": "legacy-unknown",
+                "calibrated": false,
+            },
             "processing": {
                 "processor": self.algorithm.processor,
                 "revision": processed.revision,
                 "outputPath": processed.run_dir.as_ref().map(|path| path.display().to_string()),
             }
         }))
+    }
+
+    pub fn inspection_world_surface(&self, record_id: &str) -> Result<Value, String> {
+        let sequence = parse_bkv_record_sequence(record_id)?;
+        let processed = self.load_inspection_world(&canonical_bkv_record_id(sequence))?;
+        processed.depth_surface.clone().ok_or_else(|| {
+            processed
+                .depth_error
+                .clone()
+                .unwrap_or_else(|| "BKV D3IMG surface is unavailable".to_string())
+        })
+    }
+
+    pub fn inspection_world_surface_binary(
+        &self,
+        record_id: &str,
+    ) -> Result<Arc<Vec<u8>>, String> {
+        let sequence = parse_bkv_record_sequence(record_id)?;
+        let processed = self.load_inspection_world(&canonical_bkv_record_id(sequence))?;
+        processed.depth_surface_binary.clone().ok_or_else(|| {
+            processed
+                .depth_error
+                .clone()
+                .unwrap_or_else(|| "BKV D3IMG binary surface is unavailable".to_string())
+        })
     }
 
     pub fn inspection_world_defects(&self, record_id: &str) -> Result<Value, String> {
@@ -619,6 +785,7 @@ impl BkvSource {
         let mut revision_hasher = Sha256::new();
         let mut frames = HashMap::new();
         let mut camera_inputs = Vec::new();
+        let mut depth_inputs = Vec::new();
         let frame_limit = self.algorithm.max_frames_per_camera.clamp(1, 512);
         for (camera, root) in self.cameras.iter().zip(self.image_roots.iter()) {
             let camera_id = u32::try_from(camera.source_camera_id)
@@ -683,6 +850,48 @@ impl BkvSource {
                 alignment_frames,
                 image_dir,
             ));
+
+            let depth_dir = root.join(sequence.to_string()).join("3D");
+            let mut depth_candidates = fs::read_dir(&depth_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let is_d3img = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("d3img"));
+                    let frame = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .and_then(|stem| stem.parse::<u32>().ok());
+                    (is_d3img && frame.is_some()).then_some((frame?, path))
+                })
+                .collect::<Vec<_>>();
+            depth_candidates.sort_by_key(|(frame, _)| *frame);
+            depth_candidates.truncate(frame_limit);
+            let depth_candidates = evenly_sample_frame_paths(
+                depth_candidates,
+                BKV_DEPTH_SURFACE_MAX_FRAMES_PER_CAMERA,
+            );
+            revision_hasher.update(b"d3img");
+            revision_hasher.update(camera_id.to_le_bytes());
+            revision_hasher.update(depth_candidates.len().to_le_bytes());
+            for (frame, path) in &depth_candidates {
+                let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                    .map(|value| value.as_millis())
+                    .unwrap_or_default();
+                revision_hasher.update(frame.to_le_bytes());
+                revision_hasher.update(metadata.len().to_le_bytes());
+                revision_hasher.update(modified.to_le_bytes());
+            }
+            depth_inputs.push((camera_id, depth_candidates, depth_dir));
         }
         let revision = format!("{:x}", revision_hasher.finalize());
         let matching_cached = {
@@ -702,6 +911,10 @@ impl BkvSource {
                 world: cached.world.clone(),
                 frames: cached.frames.clone(),
                 source_frame_count: cached.source_frame_count,
+                depth_surface: cached.depth_surface.clone(),
+                depth_surface_binary: cached.depth_surface_binary.clone(),
+                depth_source_frame_count: cached.depth_source_frame_count,
+                depth_error: cached.depth_error.clone(),
                 run_dir: cached.run_dir.clone(),
             });
             self.inspection_world_cache
@@ -732,14 +945,29 @@ impl BkvSource {
         let align_ms = align_started.elapsed().as_millis();
         let world = InspectionWorld::with_alignments(specs).map_err(|error| error.to_string())?;
         let source_frame_count = frames.len();
+        let depth_started = Instant::now();
+        let (depth_surface, depth_surface_binary, depth_source_frame_count, depth_error) =
+            match build_d3img_surface(sequence, &depth_inputs) {
+                Ok((surface, count)) => match encode_d3img_surface_bsmesh(&surface) {
+                    Ok(binary) => (Some(surface), Some(Arc::new(binary)), count, None),
+                    Err(error) => (None, None, 0, Some(error)),
+                },
+                Err(error) => (None, None, 0, Some(error)),
+            };
+        let depth_ms = depth_started.elapsed().as_millis();
         let run_dir = self.persist_processed_world(
             sequence,
             &revision,
             &world,
             &source_cameras,
             source_frame_count,
+            depth_surface.as_ref(),
+            depth_surface_binary.as_ref().map(|bytes| bytes.as_slice()),
+            depth_source_frame_count,
+            depth_error.as_deref(),
             discover_ms,
             align_ms,
+            depth_ms,
             total_started.elapsed().as_millis(),
         )?;
         let processed = Arc::new(BkvOnlineInspectionWorld {
@@ -748,6 +976,10 @@ impl BkvSource {
             world,
             frames,
             source_frame_count,
+            depth_surface,
+            depth_surface_binary,
+            depth_source_frame_count,
+            depth_error,
             run_dir,
         });
         self.inspection_world_cache
@@ -764,8 +996,13 @@ impl BkvSource {
         world: &InspectionWorld,
         cameras: &[Value],
         source_frame_count: usize,
+        depth_surface: Option<&Value>,
+        depth_surface_binary: Option<&[u8]>,
+        depth_source_frame_count: usize,
+        depth_error: Option<&str>,
         discover_ms: u128,
         align_ms: u128,
+        depth_ms: u128,
         elapsed_before_persist_ms: u128,
     ) -> Result<Option<PathBuf>, String> {
         if !self.algorithm.enabled {
@@ -790,11 +1027,32 @@ impl BkvSource {
             "sourceFrameCount": source_frame_count,
             "world": world,
             "cameras": cameras,
+            "depthSurface": {
+                "available": depth_surface.is_some(),
+                "schema": depth_surface.and_then(|surface| surface.get("schema")),
+                "path": depth_surface.map(|_| "surface-mesh.json"),
+                "binary": depth_surface_binary.map(|_| "surface-mesh.bsmesh"),
+                "parameters": depth_surface.map(|_| "reconstruction-parameters.json"),
+                "sourceFrameCount": depth_source_frame_count,
+                "coordinateUnit": "legacy-unknown",
+                "calibrated": false,
+                "error": depth_error,
+            },
             "algorithmConfig": self.algorithm.config_path,
             "sourceRecord": self.algorithm.source_data.enabled.then_some("source-record.json"),
             "createdAtMs": current_time_millis(),
         });
         write_json_atomic(&run_dir.join("manifest.json"), &manifest)?;
+        if let Some(surface) = depth_surface {
+            write_json_atomic(&run_dir.join("surface-mesh.json"), surface)?;
+            write_json_atomic(
+                &run_dir.join("reconstruction-parameters.json"),
+                &d3img_reconstruction_parameters(surface),
+            )?;
+        }
+        if let Some(binary) = depth_surface_binary {
+            write_bytes_atomic(&run_dir.join("surface-mesh.bsmesh"), binary)?;
+        }
         if self.algorithm.source_data.enabled {
             let snapshot = self.cached_snapshot_value()?;
             let source_record = source_record_snapshot(&snapshot, sequence, &self.database)?;
@@ -811,6 +1069,7 @@ impl BkvSource {
             "phases": {
                 "discoverMs": discover_ms,
                 "alignMs": align_ms,
+                "depthMs": depth_ms,
                 "persistMs": persist_ms,
             },
             "elapsedMs": elapsed_before_persist_ms + persist_ms,
@@ -931,30 +1190,64 @@ impl BkvSource {
         }
         let root = &self.image_roots[camera - 1];
         let file_name = format!("{image_index:04}");
-        match kind {
-            "2d" | "intensity" => {
-                let path = root
-                    .join(sequence.to_string())
+        let (normalized_kind, path) = match kind {
+            "2d" | "intensity" => (
+                "2d",
+                root.join(sequence.to_string())
                     .join("2D")
-                    .join(format!("{file_name}.bmp"));
-                Ok(BkvImage {
-                    content_type: "image/bmp",
-                    bytes: read_bounded_file(&path)?,
-                })
-            }
-            "3d" | "depth" => {
-                let path = root
-                    .join(sequence.to_string())
+                    .join(format!("{file_name}.bmp")),
+            ),
+            "3d" | "depth" => (
+                "depth",
+                root.join(sequence.to_string())
                     .join("3D")
-                    .join(format!("{file_name}.d3img"));
-                let raw = read_bounded_file(&path)?;
-                Ok(BkvImage {
-                    content_type: "image/bmp",
-                    bytes: d3img_to_bmp(&raw)?,
-                })
-            }
-            _ => Err(BkvImageError::InvalidRequest("unsupported_image_kind")),
+                    .join(format!("{file_name}.d3img")),
+            ),
+            _ => return Err(BkvImageError::InvalidRequest("unsupported_image_kind")),
+        };
+        let metadata = fs::metadata(&path)?;
+        if !metadata.is_file() {
+            return Err(BkvImageError::InvalidFormat("image_not_regular_file"));
         }
+        let source_modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let key = BkvImageCacheKey {
+            camera,
+            sequence,
+            image_index,
+            kind: normalized_kind,
+        };
+        if let Ok(mut cache) = self.image_cache.lock() {
+            if let Some(bytes) = cache.get(&key, metadata.len(), source_modified_ns) {
+                return Ok(BkvImage {
+                    content_type: "image/bmp",
+                    bytes,
+                    cache_hit: true,
+                });
+            }
+        }
+        let bytes = Arc::new(if normalized_kind == "2d" {
+            read_bounded_file(&path)?
+        } else {
+            d3img_to_bmp(&read_bounded_file(&path)?)?
+        });
+        if let Ok(mut cache) = self.image_cache.lock() {
+            cache.insert(
+                key,
+                metadata.len(),
+                source_modified_ns,
+                Arc::clone(&bytes),
+            );
+        }
+        Ok(BkvImage {
+            content_type: "image/bmp",
+            bytes,
+            cache_hit: false,
+        })
     }
 
     async fn snapshot_value(&self) -> Result<Value, DbErr> {
@@ -1475,37 +1768,655 @@ fn read_bounded_file(path: &Path) -> Result<Vec<u8>, BkvImageError> {
     Ok(fs::read(path)?)
 }
 
-fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+fn read_i16_le(bytes: &[u8], offset: usize) -> Option<i16> {
     let value = bytes.get(offset..offset + 2)?;
-    Some(u16::from_le_bytes([value[0], value[1]]))
+    Some(i16::from_le_bytes([value[0], value[1]]))
 }
 
-fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+fn read_i32_le(bytes: &[u8], offset: usize) -> Option<i32> {
     let value = bytes.get(offset..offset + 4)?;
-    Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+    Some(i32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
-fn d3img_to_bmp(bytes: &[u8]) -> Result<Vec<u8>, BkvImageError> {
-    if bytes.len() < BKV_D3_HEADER_MIN_BYTES || bytes.get(..6) != Some(b"3DImg\0") {
+fn read_f32_le(bytes: &[u8], offset: usize) -> Option<f32> {
+    let value = bytes.get(offset..offset + 4)?;
+    Some(f32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+struct D3ImgHeader {
+    tag: [u8; 6],
+    head_size: i16,
+    steel_no: i32,
+    image_index: i32,
+    image_sequence: i32,
+    width: i32,
+    height: i32,
+    scale_x: f32,
+    left: i32,
+    right: i32,
+    start_length: i32,
+    end_length: i32,
+    start_position: i32,
+    camera_number: u8,
+    data_type: u8,
+    pixel_size: u8,
+    reserve: [u8; 29],
+}
+
+fn parse_d3img_header(bytes: &[u8]) -> Result<D3ImgHeader, BkvImageError> {
+    parse_d3img_header_with_file_len(bytes, bytes.len())
+}
+
+fn parse_d3img_header_with_file_len(
+    bytes: &[u8],
+    file_len: usize,
+) -> Result<D3ImgHeader, BkvImageError> {
+    if bytes.len() < BKV_D3_HEADER_BYTES {
         return Err(BkvImageError::InvalidFormat("invalid_d3img_header"));
     }
-    let header_size = read_u16_le(bytes, 6)
-        .map(usize::from)
-        .ok_or(BkvImageError::InvalidFormat("invalid_d3img_header_size"))?;
-    let width =
-        read_u32_le(bytes, 20).ok_or(BkvImageError::InvalidFormat("invalid_d3img_width"))?;
-    let height =
-        read_u32_le(bytes, 24).ok_or(BkvImageError::InvalidFormat("invalid_d3img_height"))?;
-    if header_size < BKV_D3_HEADER_MIN_BYTES
-        || width == 0
-        || height == 0
-        || width > 16_384
-        || height > 65_536
+    let header = D3ImgHeader {
+        tag: bytes[0..6]
+            .try_into()
+            .map_err(|_| BkvImageError::InvalidFormat("invalid_d3img_header"))?,
+        head_size: read_i16_le(bytes, 6)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_header_size"))?,
+        steel_no: read_i32_le(bytes, 8)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_steel_no"))?,
+        image_index: read_i32_le(bytes, 12)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_image_index"))?,
+        image_sequence: read_i32_le(bytes, 16)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_image_sequence"))?,
+        width: read_i32_le(bytes, 20)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_width"))?,
+        height: read_i32_le(bytes, 24)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_height"))?,
+        scale_x: read_f32_le(bytes, 28)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_scale_x"))?,
+        left: read_i32_le(bytes, 32)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_left"))?,
+        right: read_i32_le(bytes, 36)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_right"))?,
+        start_length: read_i32_le(bytes, 40)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_start_length"))?,
+        end_length: read_i32_le(bytes, 44)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_end_length"))?,
+        start_position: read_i32_le(bytes, 48)
+            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_start_position"))?,
+        camera_number: bytes[52],
+        data_type: bytes[53],
+        pixel_size: bytes[54],
+        reserve: bytes[55..84]
+            .try_into()
+            .map_err(|_| BkvImageError::InvalidFormat("invalid_d3img_header"))?,
+    };
+    if header.tag != *b"3DImg\0" {
+        return Err(BkvImageError::InvalidFormat("invalid_d3img_header"));
+    }
+    if header.head_size != BKV_D3_HEADER_BYTES as i16 {
+        return Err(BkvImageError::InvalidFormat(
+            "invalid_d3img_header_size",
+        ));
+    }
+    if header.pixel_size != 4 {
+        return Err(BkvImageError::InvalidFormat(
+            "invalid_d3img_pixel_size",
+        ));
+    }
+    if header.width <= 0
+        || header.height <= 0
+        || header.width > 16_384
+        || header.height > 65_536
     {
         return Err(BkvImageError::InvalidFormat(
             "d3img_dimensions_out_of_range",
         ));
     }
+    let pixel_count = usize::try_from(header.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(header.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or(BkvImageError::InvalidFormat("d3img_pixel_count_overflow"))?;
+    let expected_bytes = pixel_count
+        .checked_mul(usize::from(header.pixel_size))
+        .and_then(|value| BKV_D3_HEADER_BYTES.checked_add(value))
+        .ok_or(BkvImageError::InvalidFormat("d3img_payload_overflow"))?;
+    if expected_bytes > file_len {
+        return Err(BkvImageError::InvalidFormat("d3img_payload_truncated"));
+    }
+    if expected_bytes < file_len {
+        return Err(BkvImageError::InvalidFormat("d3img_payload_trailing"));
+    }
+    Ok(header)
+}
+
+fn valid_d3img_depth(value: f32) -> bool {
+    value.is_finite() && value != BKV_D3_INVALID_DEPTH
+}
+
+fn evenly_sample_frame_paths(
+    candidates: Vec<(u32, PathBuf)>,
+    maximum: usize,
+) -> Vec<(u32, PathBuf)> {
+    if candidates.len() <= maximum || maximum == 0 {
+        return candidates;
+    }
+    if maximum == 1 {
+        return candidates.into_iter().take(1).collect();
+    }
+    let last = candidates.len() - 1;
+    (0..maximum)
+        .map(|index| candidates[index * last / (maximum - 1)].clone())
+        .collect()
+}
+
+struct LoadedD3Img {
+    frame_number: u32,
+    source_path: PathBuf,
+    header: D3ImgHeader,
+}
+
+fn load_d3img(path: &Path, frame_number: u32) -> Result<LoadedD3Img, String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > BKV_IMAGE_MAX_BYTES {
+        return Err(format!("{}: D3IMG size is out of range", path.display()));
+    }
+    let file_len = usize::try_from(metadata.len())
+        .map_err(|_| format!("{}: D3IMG size is out of range", path.display()))?;
+    let mut file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut header_bytes = [0u8; BKV_D3_HEADER_BYTES];
+    file.read_exact(&mut header_bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let header = parse_d3img_header_with_file_len(&header_bytes, file_len)
+        .map_err(|error| format!("{}: {error:?}", path.display()))?;
+    Ok(LoadedD3Img {
+        frame_number,
+        source_path: path.to_path_buf(),
+        header,
+    })
+}
+
+fn read_sampled_d3img_row(
+    file: &mut fs::File,
+    frame: &LoadedD3Img,
+    source_row: usize,
+    columns: usize,
+) -> Result<Vec<Option<f32>>, String> {
+    let width = usize::try_from(frame.header.width)
+        .map_err(|_| format!("{}: invalid D3IMG width", frame.source_path.display()))?;
+    let height = usize::try_from(frame.header.height)
+        .map_err(|_| format!("{}: invalid D3IMG height", frame.source_path.display()))?;
+    if source_row >= height {
+        return Err(format!(
+            "{}: sampled D3IMG row is out of range",
+            frame.source_path.display()
+        ));
+    }
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| "D3IMG row size overflow".to_string())?;
+    let offset = BKV_D3_HEADER_BYTES
+        .checked_add(
+            source_row
+                .checked_mul(row_bytes)
+                .ok_or_else(|| "D3IMG row offset overflow".to_string())?,
+        )
+        .ok_or_else(|| "D3IMG row offset overflow".to_string())?;
+    file.seek(SeekFrom::Start(offset as u64))
+        .map_err(|error| format!("{}: {error}", frame.source_path.display()))?;
+    let mut row = vec![0u8; row_bytes];
+    file.read_exact(&mut row)
+        .map_err(|error| format!("{}: {error}", frame.source_path.display()))?;
+    Ok((0..columns)
+        .map(|target_column| {
+            let source_column = if columns <= 1 {
+                0
+            } else {
+                target_column * (width - 1) / (columns - 1)
+            };
+            let offset = source_column * 4;
+            let depth = f32::from_le_bytes([
+                row[offset],
+                row[offset + 1],
+                row[offset + 2],
+                row[offset + 3],
+            ]);
+            valid_d3img_depth(depth).then_some(depth)
+        })
+        .collect())
+}
+
+fn median_f32(values: &mut [f32]) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    })
+}
+
+fn build_d3img_surface(
+    sequence: i64,
+    camera_inputs: &[(u32, Vec<(u32, PathBuf)>, PathBuf)],
+) -> Result<(Value, usize), String> {
+    if camera_inputs.is_empty() {
+        return Err("BKV D3IMG camera list is empty".to_string());
+    }
+    if let Some((camera_id, _, directory)) = camera_inputs
+        .iter()
+        .find(|(_, candidates, _)| candidates.is_empty())
+    {
+        return Err(format!(
+            "camera {camera_id} has no D3IMG frames in {}",
+            directory.display()
+        ));
+    }
+
+    let rows = BKV_DEPTH_SURFACE_ROWS;
+    let cols_per_camera = BKV_DEPTH_SURFACE_COLS_PER_CAMERA;
+    let camera_count = camera_inputs.len();
+    let angular_columns = cols_per_camera
+        .checked_mul(camera_count)
+        .ok_or_else(|| "D3IMG surface column count overflow".to_string())?;
+    let mut sampled_cameras = Vec::with_capacity(camera_count);
+    let mut camera_metadata = Vec::with_capacity(camera_count);
+    let mut frame_stems = Vec::new();
+    let mut source_frame_count = 0usize;
+
+    for (camera_id, candidates, directory) in camera_inputs {
+        let frames = candidates
+            .iter()
+            .map(|(frame, path)| load_d3img(path, *frame))
+            .collect::<Result<Vec<_>, _>>()?;
+        source_frame_count += frames.len();
+        let total_height = frames.iter().try_fold(0usize, |total, frame| {
+            usize::try_from(frame.header.height)
+                .ok()
+                .and_then(|height| total.checked_add(height))
+                .ok_or_else(|| "D3IMG combined height overflow".to_string())
+        })?;
+        if total_height == 0 {
+            return Err(format!("camera {camera_id} has no D3IMG rows"));
+        }
+        let mut samples = vec![None; rows * cols_per_camera];
+        let mut row_mappings = Vec::with_capacity(rows);
+        for target_row in 0..rows {
+            let global_row = if rows <= 1 {
+                0
+            } else {
+                target_row * (total_height - 1) / (rows - 1)
+            };
+            let mut preceding_rows = 0usize;
+            let frame_index = frames
+                .iter()
+                .enumerate()
+                .find(|(_, frame)| {
+                    let height = usize::try_from(frame.header.height).unwrap_or_default();
+                    if global_row < preceding_rows + height {
+                        true
+                    } else {
+                        preceding_rows += height;
+                        false
+                    }
+                })
+                .map(|(index, _)| index)
+                .ok_or_else(|| format!("camera {camera_id} D3IMG row mapping failed"))?;
+            let source_row = global_row - preceding_rows;
+            row_mappings.push((frame_index, source_row));
+        }
+        for (frame_index, frame) in frames.iter().enumerate() {
+            let mut file = fs::File::open(&frame.source_path)
+                .map_err(|error| format!("{}: {error}", frame.source_path.display()))?;
+            for (target_row, (_, source_row)) in row_mappings
+                .iter()
+                .enumerate()
+                .filter(|(_, (mapped_frame, _))| *mapped_frame == frame_index)
+            {
+                let sampled =
+                    read_sampled_d3img_row(&mut file, frame, *source_row, cols_per_camera)?;
+                let start = target_row * cols_per_camera;
+                samples[start..start + cols_per_camera].copy_from_slice(&sampled);
+            }
+        }
+        let mut valid_values = samples.iter().flatten().copied().collect::<Vec<_>>();
+        let baseline = median_f32(&mut valid_values)
+            .ok_or_else(|| format!("camera {camera_id} D3IMG has no valid sampled depth"))?;
+        let first = frames
+            .first()
+            .ok_or_else(|| format!("camera {camera_id} D3IMG frame list is empty"))?;
+        let last = frames.last().unwrap_or(first);
+        for frame in &frames {
+            frame_stems.push(format!("camera{camera_id}:{:04}", frame.frame_number));
+        }
+        camera_metadata.push(json!({
+            "cameraId": camera_id,
+            "sourceDirectory": directory.display().to_string(),
+            "frameCount": frames.len(),
+            "firstFrame": first.frame_number,
+            "lastFrame": last.frame_number,
+            "sourceWidth": first.header.width,
+            "sourceHeight": first.header.height,
+            "scaleX": first.header.scale_x,
+            "dataType": first.header.data_type,
+            "pixelSize": first.header.pixel_size,
+            "baseline": baseline,
+            "sourceFirst": first.source_path.display().to_string(),
+            "sourceLast": last.source_path.display().to_string(),
+        }));
+        sampled_cameras.push((baseline, samples));
+    }
+
+    let mut absolute_residuals = sampled_cameras
+        .iter()
+        .flat_map(|(baseline, samples)| {
+            samples
+                .iter()
+                .flatten()
+                .map(move |value| (value - baseline).abs())
+        })
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    absolute_residuals.sort_by(f32::total_cmp);
+    let robust_residual = absolute_residuals
+        .get((absolute_residuals.len().saturating_sub(1) * 95) / 100)
+        .copied()
+        .unwrap_or(1.0)
+        .max(f32::EPSILON);
+    let display_scale = 0.18 / robust_residual;
+    let point_count = rows
+        .checked_mul(angular_columns)
+        .ok_or_else(|| "D3IMG surface point count overflow".to_string())?;
+    let mut positions = Vec::with_capacity(point_count * 3);
+    let mut uvs = Vec::with_capacity(point_count * 2);
+    let mut colors = Vec::with_capacity(point_count * 3);
+    let mut valid_mask = Vec::with_capacity(point_count);
+    let calibrated_mask = vec![0u8; point_count];
+
+    for row in 0..rows {
+        let longitudinal = if rows <= 1 {
+            0.0
+        } else {
+            row as f32 / (rows - 1) as f32
+        };
+        for angular_column in 0..angular_columns {
+            let camera_index = angular_column / cols_per_camera;
+            let camera_column = angular_column % cols_per_camera;
+            let (baseline, samples) = &sampled_cameras[camera_index];
+            let sample = samples[row * cols_per_camera + camera_column];
+            let residual = sample.map(|value| value - baseline).unwrap_or_default();
+            let radial_offset = (residual * display_scale).clamp(-0.28, 0.28);
+            let radius = 1.0 + radial_offset;
+            let angle = std::f32::consts::TAU * angular_column as f32
+                / angular_columns as f32;
+            positions.extend_from_slice(&[
+                longitudinal * 8.0 - 4.0,
+                radius * angle.cos(),
+                radius * angle.sin(),
+            ]);
+            uvs.extend_from_slice(&[
+                longitudinal,
+                angular_column as f32 / angular_columns as f32,
+            ]);
+            if sample.is_some() {
+                let tone = (residual / robust_residual).clamp(-1.0, 1.0);
+                if tone >= 0.0 {
+                    colors.extend_from_slice(&[
+                        0.45 + tone * 0.50,
+                        0.68 - tone * 0.30,
+                        0.72 - tone * 0.45,
+                    ]);
+                } else {
+                    let magnitude = -tone;
+                    colors.extend_from_slice(&[
+                        0.45 - magnitude * 0.28,
+                        0.68 + magnitude * 0.18,
+                        0.72 + magnitude * 0.25,
+                    ]);
+                }
+                valid_mask.push(1u8);
+            } else {
+                colors.extend_from_slice(&[0.03, 0.06, 0.08]);
+                valid_mask.push(0u8);
+            }
+        }
+    }
+
+    let mut indices = Vec::new();
+    for row in 0..rows.saturating_sub(1) {
+        for column in 0..angular_columns {
+            let next_column = (column + 1) % angular_columns;
+            let a = row * angular_columns + column;
+            let b = row * angular_columns + next_column;
+            let c = (row + 1) * angular_columns + column;
+            let d = (row + 1) * angular_columns + next_column;
+            if valid_mask[a] != 0
+                && valid_mask[b] != 0
+                && valid_mask[c] != 0
+                && valid_mask[d] != 0
+            {
+                indices.extend_from_slice(&[
+                    u32::try_from(a).map_err(|_| "D3IMG mesh index overflow")?,
+                    u32::try_from(c).map_err(|_| "D3IMG mesh index overflow")?,
+                    u32::try_from(b).map_err(|_| "D3IMG mesh index overflow")?,
+                    u32::try_from(b).map_err(|_| "D3IMG mesh index overflow")?,
+                    u32::try_from(c).map_err(|_| "D3IMG mesh index overflow")?,
+                    u32::try_from(d).map_err(|_| "D3IMG mesh index overflow")?,
+                ]);
+            }
+        }
+    }
+
+    Ok((
+        json!({
+            "schema": "steel.bkv-depth-surface.v1",
+            "recordId": canonical_bkv_record_id(sequence),
+            "coordinateUnit": "legacy-unknown",
+            "coordinateFrame": {
+                "schema": "steel.bkv-depth-display-frame.v1",
+                "applied": false,
+                "origin": "camera-relative-median",
+                "axis": "x=longitudinal,yz=circumference",
+                "reason": "D3IMG physical depth unit and camera extrinsics are not confirmed",
+            },
+            "cameraCount": camera_count,
+            "frameStems": frame_stems,
+            "rows": rows,
+            "colsPerCamera": cols_per_camera,
+            "positions": positions,
+            "uvs": uvs,
+            "colors": colors,
+            "validMask": valid_mask,
+            "calibratedMask": calibrated_mask,
+            "indices": indices,
+            "source": "d3img-float32",
+            "sourceHeaderBytes": BKV_D3_HEADER_BYTES,
+            "sourcePixelSize": 4,
+            "sourceInvalidSentinelObserved": BKV_D3_INVALID_DEPTH,
+            "sourceFrameCount": source_frame_count,
+            "display": {
+                "mode": "camera-relative-residual",
+                "robustResidualP95": robust_residual,
+                "radialScale": display_scale,
+                "calibrated": false,
+                "unit": "legacy-unknown",
+            },
+            "cameras": camera_metadata,
+            "createdAtMs": current_time_millis(),
+        }),
+        source_frame_count,
+    ))
+}
+
+fn d3img_reconstruction_parameters(surface: &Value) -> Value {
+    json!({
+        "schema": "steel.bkv-depth-reconstruction-parameters.v1",
+        "recordId": surface.get("recordId"),
+        "input": {
+            "format": "D3IMG",
+            "headerBytes": surface.get("sourceHeaderBytes"),
+            "pixelSize": surface.get("sourcePixelSize"),
+            "invalidSentinelObserved": surface.get("sourceInvalidSentinelObserved"),
+            "sourceFrameCount": surface.get("sourceFrameCount"),
+            "frameStems": surface.get("frameStems"),
+        },
+        "sampling": {
+            "rows": surface.get("rows"),
+            "colsPerCamera": surface.get("colsPerCamera"),
+            "cameraCount": surface.get("cameraCount"),
+            "maximumFramesPerCamera": BKV_DEPTH_SURFACE_MAX_FRAMES_PER_CAMERA,
+            "frameSelection": "evenly-spaced",
+            "rowSelection": "evenly-spaced-across-selected-frames",
+        },
+        "reconstruction": {
+            "geometry": "closed-cylinder",
+            "longitudinalExtent": 8.0,
+            "nominalRadius": 1.0,
+            "maximumRadialOffset": 0.28,
+            "cameraNormalization": "valid-sample-median",
+            "coordinateUnit": surface.get("coordinateUnit"),
+            "coordinateFrame": surface.get("coordinateFrame"),
+            "calibrated": false,
+        },
+        "display": surface.get("display"),
+        "cameras": surface.get("cameras"),
+        "createdAtMs": surface.get("createdAtMs"),
+    })
+}
+
+fn surface_f32_values(surface: &Value, name: &str) -> Result<Vec<f32>, String> {
+    surface
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("D3IMG surface {name} is missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|value| value as f32)
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| format!("D3IMG surface {name} contains an invalid number"))
+        })
+        .collect()
+}
+
+fn surface_u32_values(surface: &Value, name: &str) -> Result<Vec<u32>, String> {
+    surface
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("D3IMG surface {name} is missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| format!("D3IMG surface {name} contains an invalid index"))
+        })
+        .collect()
+}
+
+fn surface_u8_values(surface: &Value, name: &str) -> Result<Vec<u8>, String> {
+    surface
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("D3IMG surface {name} is missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| format!("D3IMG surface {name} contains an invalid mask"))
+        })
+        .collect()
+}
+
+fn encode_d3img_surface_bsmesh(surface: &Value) -> Result<Vec<u8>, String> {
+    let positions = surface_f32_values(surface, "positions")?;
+    if positions.len() % 3 != 0 {
+        return Err("D3IMG surface positions are not xyz triples".to_string());
+    }
+    let vertex_count = positions.len() / 3;
+    let uvs = surface_f32_values(surface, "uvs")?;
+    let colors = surface_f32_values(surface, "colors")?;
+    let indices = surface_u32_values(surface, "indices")?;
+    let valid_mask = surface_u8_values(surface, "validMask")?;
+    let calibrated_mask = surface_u8_values(surface, "calibratedMask")?;
+    if uvs.len() != vertex_count * 2
+        || colors.len() != vertex_count * 3
+        || valid_mask.len() != vertex_count
+        || calibrated_mask.len() != vertex_count
+    {
+        return Err("D3IMG surface attribute lengths are inconsistent".to_string());
+    }
+    let rows = surface
+        .get("rows")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "D3IMG surface rows are invalid".to_string())?;
+    let cols_per_camera = surface
+        .get("colsPerCamera")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "D3IMG surface columns are invalid".to_string())?;
+    let camera_count = surface
+        .get("cameraCount")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "D3IMG surface camera count is invalid".to_string())?;
+    let vertex_count = u32::try_from(vertex_count)
+        .map_err(|_| "D3IMG surface vertex count is out of range".to_string())?;
+    let index_count = u32::try_from(indices.len())
+        .map_err(|_| "D3IMG surface index count is out of range".to_string())?;
+    let mut output = Vec::with_capacity(
+        40 + positions.len() * 4
+            + uvs.len() * 4
+            + colors.len() * 4
+            + indices.len() * 4
+            + valid_mask.len()
+            + calibrated_mask.len(),
+    );
+    output.extend_from_slice(b"BSMESH01");
+    for value in [
+        1u32,
+        vertex_count,
+        index_count,
+        0x02 | 0x04,
+        rows,
+        cols_per_camera,
+        camera_count,
+        0,
+    ] {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+    for values in [&positions, &uvs, &colors] {
+        for value in values {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    for value in indices {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+    output.extend_from_slice(&valid_mask);
+    output.extend_from_slice(&calibrated_mask);
+    Ok(output)
+}
+
+fn d3img_to_bmp(bytes: &[u8]) -> Result<Vec<u8>, BkvImageError> {
+    let header = parse_d3img_header(bytes)?;
+    let header_size = usize::try_from(header.head_size)
+        .map_err(|_| BkvImageError::InvalidFormat("invalid_d3img_header_size"))?;
+    let width = u32::try_from(header.width)
+        .map_err(|_| BkvImageError::InvalidFormat("invalid_d3img_width"))?;
+    let height = u32::try_from(header.height)
+        .map_err(|_| BkvImageError::InvalidFormat("invalid_d3img_height"))?;
     let pixel_count = usize::try_from(width)
         .ok()
         .and_then(|width| {
@@ -1514,13 +2425,6 @@ fn d3img_to_bmp(bytes: &[u8]) -> Result<Vec<u8>, BkvImageError> {
                 .and_then(|height| width.checked_mul(height))
         })
         .ok_or(BkvImageError::InvalidFormat("d3img_pixel_count_overflow"))?;
-    let payload_bytes = pixel_count
-        .checked_mul(4)
-        .and_then(|value| header_size.checked_add(value))
-        .ok_or(BkvImageError::InvalidFormat("d3img_payload_overflow"))?;
-    if payload_bytes > bytes.len() {
-        return Err(BkvImageError::InvalidFormat("d3img_payload_truncated"));
-    }
 
     let mut minimum = f32::INFINITY;
     let mut maximum = f32::NEG_INFINITY;
@@ -1532,7 +2436,7 @@ fn d3img_to_bmp(bytes: &[u8]) -> Result<Vec<u8>, BkvImageError> {
             bytes[offset + 2],
             bytes[offset + 3],
         ]);
-        if value.is_finite() && value > -999_999.0 {
+        if valid_d3img_depth(value) {
             minimum = minimum.min(value);
             maximum = maximum.max(value);
         }
@@ -1585,7 +2489,7 @@ fn d3img_to_bmp(bytes: &[u8]) -> Result<Vec<u8>, BkvImageError> {
                 bytes[source_offset + 2],
                 bytes[source_offset + 3],
             ]);
-            let (red, green, blue) = if value.is_finite() && value > -999_999.0 {
+            let (red, green, blue) = if valid_d3img_depth(value) {
                 depth_color(((value - minimum) / span).clamp(0.0, 1.0))
             } else {
                 (0, 0, 0)
@@ -1666,6 +2570,39 @@ fn depth_color(value: f32) -> (u8, u8, u8) {
 mod tests {
     use super::*;
 
+    fn d3img_fixture(width: i32, height: i32, depth: &[f32]) -> Vec<u8> {
+        assert_eq!(depth.len(), usize::try_from(width * height).unwrap());
+        let mut bytes = vec![0_u8; BKV_D3_HEADER_BYTES + depth.len() * 4];
+        bytes[..6].copy_from_slice(b"3DImg\0");
+        bytes[6..8].copy_from_slice(&(BKV_D3_HEADER_BYTES as i16).to_le_bytes());
+        bytes[8..12].copy_from_slice(&18_000_i32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&42_i32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&95_323_i32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&width.to_le_bytes());
+        bytes[24..28].copy_from_slice(&height.to_le_bytes());
+        bytes[28..32].copy_from_slice(&0.2782926_f32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&992_i32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&(992_i32 + width).to_le_bytes());
+        bytes[40..44].copy_from_slice(&95_323_i32.to_le_bytes());
+        bytes[44..48].copy_from_slice(&95_323_i32.to_le_bytes());
+        bytes[48..52].copy_from_slice(&992_i32.to_le_bytes());
+        bytes[52] = 3;
+        bytes[53] = 1;
+        bytes[54] = 4;
+        for (index, value) in depth.iter().enumerate() {
+            let offset = BKV_D3_HEADER_BYTES + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn invalid_d3img_reason(result: Result<D3ImgHeader, BkvImageError>) -> &'static str {
+        match result {
+            Err(BkvImageError::InvalidFormat(reason)) => reason,
+            _ => panic!("expected invalid d3img format"),
+        }
+    }
+
     fn sample_record() -> BkvRecord {
         BkvRecord {
             seq_no: 42,
@@ -1723,6 +2660,30 @@ mod tests {
     }
 
     #[test]
+    fn image_cache_hits_and_invalidates_when_the_source_revision_changes() {
+        let mut cache = BkvImageCache::default();
+        let key = BkvImageCacheKey {
+            camera: 1,
+            sequence: 19_083_25,
+            image_index: 0,
+            kind: "depth",
+        };
+        let bytes = Arc::new(vec![1u8, 2, 3, 4]);
+        cache.insert(key.clone(), 100, 200, Arc::clone(&bytes));
+
+        let cached = cache.get(&key, 100, 200).expect("cache hit");
+        assert!(Arc::ptr_eq(&cached, &bytes));
+        assert_eq!(cache.hits, 1);
+        assert_eq!(cache.misses, 0);
+        assert_eq!(cache.bytes, 4);
+
+        assert!(cache.get(&key, 101, 200).is_none());
+        assert_eq!(cache.entries.len(), 0);
+        assert_eq!(cache.bytes, 0);
+        assert_eq!(cache.misses, 1);
+    }
+
+    #[test]
     fn defect_mapping_stays_inside_the_unfolded_surface() {
         let record = sample_record();
         let defect = BkvDefect {
@@ -1753,20 +2714,189 @@ mod tests {
     }
 
     #[test]
+    fn d3img_header_matches_the_legacy_dat3dheader_layout() {
+        let bytes = d3img_fixture(
+            3,
+            2,
+            &[-1_000_000.0_f32, 10.0, 20.0, 30.0, 40.0, 50.0],
+        );
+        let header = parse_d3img_header(&bytes).expect("parsed header");
+        assert_eq!(header.tag, *b"3DImg\0");
+        assert_eq!(header.head_size, 84);
+        assert_eq!(header.steel_no, 18_000);
+        assert_eq!(header.image_index, 42);
+        assert_eq!(header.image_sequence, 95_323);
+        assert_eq!(header.width, 3);
+        assert_eq!(header.height, 2);
+        assert!((header.scale_x - 0.2782926).abs() < f32::EPSILON);
+        assert_eq!(header.left, 992);
+        assert_eq!(header.right, 995);
+        assert_eq!(header.start_length, 95_323);
+        assert_eq!(header.end_length, 95_323);
+        assert_eq!(header.start_position, 992);
+        assert_eq!(header.camera_number, 3);
+        assert_eq!(header.data_type, 1);
+        assert_eq!(header.pixel_size, 4);
+        assert_eq!(header.reserve, [0; 29]);
+    }
+
+    #[test]
+    fn d3img_header_rejects_invalid_contract_and_payload_lengths() {
+        let valid = d3img_fixture(3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        assert_eq!(
+            invalid_d3img_reason(parse_d3img_header(b"3DImg\0")),
+            "invalid_d3img_header"
+        );
+
+        let mut invalid_magic = valid.clone();
+        invalid_magic[0] = b'X';
+        assert_eq!(
+            invalid_d3img_reason(parse_d3img_header(&invalid_magic)),
+            "invalid_d3img_header"
+        );
+
+        let mut invalid_header_size = valid.clone();
+        invalid_header_size[6..8].copy_from_slice(&82_i16.to_le_bytes());
+        assert_eq!(
+            invalid_d3img_reason(parse_d3img_header(&invalid_header_size)),
+            "invalid_d3img_header_size"
+        );
+
+        let mut invalid_width = valid.clone();
+        invalid_width[20..24].copy_from_slice(&(-3_i32).to_le_bytes());
+        assert_eq!(
+            invalid_d3img_reason(parse_d3img_header(&invalid_width)),
+            "d3img_dimensions_out_of_range"
+        );
+
+        let mut oversized_width = valid.clone();
+        oversized_width[20..24].copy_from_slice(&16_385_i32.to_le_bytes());
+        assert_eq!(
+            invalid_d3img_reason(parse_d3img_header(&oversized_width)),
+            "d3img_dimensions_out_of_range"
+        );
+
+        let mut invalid_pixel_size = valid.clone();
+        invalid_pixel_size[54] = 2;
+        assert_eq!(
+            invalid_d3img_reason(parse_d3img_header(&invalid_pixel_size)),
+            "invalid_d3img_pixel_size"
+        );
+
+        let mut truncated = valid.clone();
+        truncated.pop();
+        assert_eq!(
+            invalid_d3img_reason(parse_d3img_header(&truncated)),
+            "d3img_payload_truncated"
+        );
+
+        let mut trailing = valid;
+        trailing.push(0);
+        assert_eq!(
+            invalid_d3img_reason(parse_d3img_header(&trailing)),
+            "d3img_payload_trailing"
+        );
+    }
+
+    #[test]
     fn d3img_float_depth_is_converted_to_a_bounded_bitmap() {
-        let mut bytes = vec![0_u8; 84 + 4 * 4];
-        bytes[..6].copy_from_slice(b"3DImg\0");
-        bytes[6..8].copy_from_slice(&84_u16.to_le_bytes());
-        bytes[20..24].copy_from_slice(&2_u32.to_le_bytes());
-        bytes[24..28].copy_from_slice(&2_u32.to_le_bytes());
-        for (index, value) in [-1_000_000.0_f32, -10.0, -5.0, 0.0].into_iter().enumerate() {
-            let offset = 84 + index * 4;
-            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
+        let bytes = d3img_fixture(
+            3,
+            2,
+            &[-1_000_000.0_f32, -10.0, -5.0, 0.0, 5.0, 10.0],
+        );
         let bitmap = d3img_to_bmp(&bytes).expect("converted bitmap");
         assert_eq!(&bitmap[..2], b"BM");
-        assert_eq!(read_u32_le(&bitmap, 18), Some(2));
-        assert_eq!(read_u32_le(&bitmap, 22), Some(2));
-        assert_eq!(bitmap.len(), 70);
+        assert_eq!(u32::from_le_bytes(bitmap[18..22].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bitmap[22..26].try_into().unwrap()), 2);
+        assert_eq!(bitmap.len(), 78);
+    }
+
+    #[test]
+    fn d3img_frames_build_and_persist_a_record_bound_surface_mesh() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-bkv-depth-surface-{}-{stamp}",
+            std::process::id()
+        ));
+        let mut camera_inputs = Vec::new();
+        for camera_id in 1..=2u32 {
+            let directory = root
+                .join(format!("CamImageSource{camera_id}"))
+                .join("18000")
+                .join("3D");
+            fs::create_dir_all(&directory).expect("depth fixture directory");
+            let path = directory.join("0000.d3img");
+            let mut depth = (0..16)
+                .map(|index| camera_id as f32 * 100.0 + index as f32)
+                .collect::<Vec<_>>();
+            if camera_id == 1 {
+                depth[0] = BKV_D3_INVALID_DEPTH;
+            }
+            fs::write(&path, d3img_fixture(4, 4, &depth)).expect("depth fixture");
+            camera_inputs.push((camera_id, vec![(0, path)], directory));
+        }
+
+        let (surface, source_frame_count) =
+            build_d3img_surface(18_000, &camera_inputs).expect("surface mesh");
+        let expected_points =
+            BKV_DEPTH_SURFACE_ROWS * BKV_DEPTH_SURFACE_COLS_PER_CAMERA * 2;
+        assert_eq!(surface["schema"], "steel.bkv-depth-surface.v1");
+        assert_eq!(surface["recordId"], "18000");
+        assert_eq!(surface["coordinateUnit"], "legacy-unknown");
+        assert_eq!(surface["cameraCount"], 2);
+        assert_eq!(source_frame_count, 2);
+        assert_eq!(
+            surface["positions"].as_array().map(Vec::len),
+            Some(expected_points * 3)
+        );
+        assert_eq!(
+            surface["validMask"].as_array().map(Vec::len),
+            Some(expected_points)
+        );
+        assert!(surface["validMask"]
+            .as_array()
+            .is_some_and(|mask| mask.iter().any(|value| value == 0)));
+        assert!(surface["indices"]
+            .as_array()
+            .is_some_and(|indices| !indices.is_empty()));
+
+        let output = root.join("surface-mesh.json");
+        write_json_atomic(&output, &surface).expect("persisted surface");
+        let stored: Value = serde_json::from_slice(&fs::read(&output).expect("surface bytes"))
+            .expect("surface JSON");
+        assert_eq!(stored["schema"], "steel.bkv-depth-surface.v1");
+        assert_eq!(stored["sourceFrameCount"], 2);
+        let parameters = d3img_reconstruction_parameters(&stored);
+        assert_eq!(
+            parameters["schema"],
+            "steel.bkv-depth-reconstruction-parameters.v1"
+        );
+        assert_eq!(parameters["sampling"]["rows"], BKV_DEPTH_SURFACE_ROWS);
+        assert_eq!(
+            parameters["sampling"]["colsPerCamera"],
+            BKV_DEPTH_SURFACE_COLS_PER_CAMERA
+        );
+        assert_eq!(
+            parameters["reconstruction"]["coordinateUnit"],
+            "legacy-unknown"
+        );
+        write_json_atomic(&root.join("reconstruction-parameters.json"), &parameters)
+            .expect("persisted reconstruction parameters");
+        let binary = encode_d3img_surface_bsmesh(&stored).expect("binary surface");
+        assert_eq!(&binary[..8], b"BSMESH01");
+        assert_eq!(u32::from_le_bytes(binary[8..12].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(binary[12..16].try_into().unwrap()) as usize,
+            expected_points
+        );
+        assert!(binary.len() < serde_json::to_vec(&stored).unwrap().len());
+        write_bytes_atomic(&root.join("surface-mesh.bsmesh"), &binary)
+            .expect("persisted binary surface");
+        fs::remove_dir_all(&root).expect("fixture cleanup");
     }
 }

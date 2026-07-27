@@ -90,6 +90,7 @@ import {
 import {
   fetchInspectionWorldDefects,
   fetchInspectionWorldRecords,
+  fetchInspectionWorldSurface,
   type InspectionWorldRecords,
 } from './services/inspection-world-api';
 import {
@@ -884,6 +885,58 @@ function InspectionDashboard({
       });
       return;
     }
+    if (dashboardMode.kind === 'bkv-online') {
+      if (!inspectionId) {
+        setRecordBoundSurface({
+          inspectionId: '',
+          loading: false,
+          mesh: null,
+          status: '尚未选择可转换的 BKV 在线记录',
+        });
+        return;
+      }
+      const controller = new AbortController();
+      let loaded = false;
+      let inFlight = false;
+      setRecordBoundSurface({
+        inspectionId,
+        loading: true,
+        mesh: null,
+        status: '正在转换并读取当前流水号的 D3IMG 三维表面…',
+      });
+      const loadDepthSurface = async () => {
+        if (loaded || inFlight || controller.signal.aborted) return;
+        inFlight = true;
+        try {
+          const mesh = await fetchInspectionWorldSurface(inspectionId, controller.signal);
+          if (controller.signal.aborted) return;
+          setRecordBoundSurface({
+            inspectionId,
+            loading: false,
+            mesh,
+            status: `D3IMG 已转换并存储 · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点 · 原始单位未标定`,
+          });
+          loaded = true;
+        } catch (error) {
+          if (!controller.signal.aborted) {
+            setRecordBoundSurface({
+              inspectionId,
+              loading: false,
+              mesh: null,
+              status: error instanceof Error ? `D3IMG 三维表面暂不可用：${error.message}` : 'D3IMG 三维表面暂不可用',
+            });
+          }
+        } finally {
+          inFlight = false;
+        }
+      };
+      void loadDepthSurface();
+      const timer = window.setInterval(() => void loadDepthSurface(), 8000);
+      return () => {
+        controller.abort();
+        window.clearInterval(timer);
+      };
+    }
     if (artifactMode === 'demo') {
       setRecordBoundSurface({
         inspectionId,
@@ -986,7 +1039,7 @@ function InspectionDashboard({
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeSnapshot.currentPlate.plateNo, artifactMode, terminalMode]);
+  }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeSnapshot.currentPlate.plateNo, artifactMode, dashboardMode.kind, terminalMode]);
 
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
   const currentPlateDefects = useMemo(

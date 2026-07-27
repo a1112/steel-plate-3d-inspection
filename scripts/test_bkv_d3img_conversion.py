@@ -9,21 +9,81 @@ import numpy as np
 
 
 HEADER_SIZE = 84
+HEADER_STRUCT = struct.Struct("<6sh5if5i3B29s")
 SENTINEL = np.float32(-1_000_000.0)
 
 
-def write_fixture(path: Path, depth: np.ndarray, seq_no: int = 1_893_700) -> None:
+def write_fixture(
+    path: Path,
+    depth: np.ndarray,
+    seq_no: int = 1_893_700,
+    *,
+    image_index: int = 42,
+    image_sequence: int = 95_323,
+    scale_x: float = 0.2782926,
+    left: int = 992,
+    right: int | None = None,
+    start_length: int = 95_323,
+    end_length: int = 95_323,
+    start_position: int = 992,
+    camera_number: int = 3,
+    data_type: int = 1,
+) -> None:
     height, width = depth.shape
-    header = bytearray(HEADER_SIZE)
-    header[:8] = b"3DImg\x00T\x00"
-    struct.pack_into("<i", header, 8, seq_no)
-    struct.pack_into("<I", header, 20, height)
-    struct.pack_into("<I", header, 24, width)
+    header = HEADER_STRUCT.pack(
+        b"3DImg\0",
+        HEADER_SIZE,
+        seq_no,
+        image_index,
+        image_sequence,
+        width,
+        height,
+        scale_x,
+        left,
+        left + width if right is None else right,
+        start_length,
+        end_length,
+        start_position,
+        camera_number,
+        data_type,
+        4,
+        bytes(29),
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(bytes(header) + depth.astype("<f4", copy=False).tobytes())
+    path.write_bytes(header + depth.astype("<f4", copy=False).tobytes())
 
 
 class BkvD3ImgConversionTests(unittest.TestCase):
+    def test_parse_d3img_reads_complete_header_and_preserves_asymmetric_shape(self) -> None:
+        from scripts.convert_bkv_d3img import parse_d3img
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "CamImageSource3" / "1893700" / "3D" / "0042.d3img"
+            depth = np.arange(6, dtype=np.float32).reshape(2, 3)
+            write_fixture(source, depth)
+
+            parsed = parse_d3img(source)
+
+            self.assertEqual(parsed.header.tag, b"3DImg\0")
+            self.assertEqual(parsed.header.head_size, 84)
+            self.assertEqual(parsed.header.steel_no, 1_893_700)
+            self.assertEqual(parsed.header.image_index, 42)
+            self.assertEqual(parsed.header.image_sequence, 95_323)
+            self.assertEqual(parsed.header.width, 3)
+            self.assertEqual(parsed.header.height, 2)
+            self.assertAlmostEqual(parsed.header.scale_x, 0.2782926, places=6)
+            self.assertEqual(parsed.header.left, 992)
+            self.assertEqual(parsed.header.right, 995)
+            self.assertEqual(parsed.header.start_length, 95_323)
+            self.assertEqual(parsed.header.end_length, 95_323)
+            self.assertEqual(parsed.header.start_position, 992)
+            self.assertEqual(parsed.header.camera_number, 3)
+            self.assertEqual(parsed.header.data_type, 1)
+            self.assertEqual(parsed.header.pixel_size, 4)
+            self.assertEqual(parsed.header.reserve, bytes(29))
+            self.assertEqual(parsed.depth.shape, (2, 3))
+            np.testing.assert_array_equal(parsed.depth, depth)
+
     def test_convert_file_writes_standard_npz(self) -> None:
         from scripts.convert_bkv_d3img import convert_file
 
@@ -83,6 +143,41 @@ class BkvD3ImgConversionTests(unittest.TestCase):
 
             with self.assertRaisesRegex(D3ImgFormatError, "file size mismatch"):
                 parse_depth(source)
+
+    def test_parse_depth_rejects_trailing_payload(self) -> None:
+        from scripts.convert_bkv_d3img import D3ImgFormatError, parse_depth
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "CamImageSource1" / "1893700" / "3D" / "0001.d3img"
+            write_fixture(source, np.ones((2, 3), dtype=np.float32))
+            source.write_bytes(source.read_bytes() + b"\0")
+
+            with self.assertRaisesRegex(D3ImgFormatError, "file size mismatch"):
+                parse_depth(source)
+
+    def test_parse_header_rejects_invalid_contract_fields(self) -> None:
+        from scripts.convert_bkv_d3img import D3ImgFormatError, parse_header
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "CamImageSource1" / "1893700" / "3D" / "0001.d3img"
+            write_fixture(source, np.ones((2, 3), dtype=np.float32))
+            valid = source.read_bytes()
+            with self.assertRaisesRegex(D3ImgFormatError, "shorter than 84-byte header"):
+                parse_header(b"3DImg\0")
+            cases = [
+                ("magic", 0, b"BADImg", "unexpected d3img magic"),
+                ("head size", 6, struct.pack("<h", 82), "unexpected d3img header size"),
+                ("negative width", 20, struct.pack("<i", -3), "invalid dimensions"),
+                ("oversized width", 20, struct.pack("<i", 20_001), "invalid dimensions"),
+                ("zero height", 24, struct.pack("<i", 0), "invalid dimensions"),
+                ("pixel size", 54, b"\x02", "unexpected d3img pixel size"),
+            ]
+            for name, offset, replacement, message in cases:
+                with self.subTest(name=name):
+                    mutated = bytearray(valid)
+                    mutated[offset : offset + len(replacement)] = replacement
+                    with self.assertRaisesRegex(D3ImgFormatError, message):
+                        parse_header(bytes(mutated))
 
     def test_convert_file_can_write_optional_rgba_preview(self) -> None:
         from PIL import Image

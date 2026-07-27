@@ -283,7 +283,7 @@ export type BarSurfaceMesh = {
   validMask?: ArrayLike<number>;
   calibratedMask?: ArrayLike<number>;
   indices: ArrayLike<number>;
-  source?: 'core-bsmesh' | 'json';
+  source?: 'core-bsmesh' | 'bkv-bsmesh' | 'json';
   binaryBytes?: number;
 };
 
