@@ -28,6 +28,7 @@ mod calibration_operations;
 mod controlled_process;
 mod db;
 mod inspection_world;
+mod machine_site_config;
 mod production_tasks;
 mod runtime_profile;
 mod site_config;
