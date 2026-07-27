@@ -1,35 +1,34 @@
-# BKV 调试样本数据
+# BKV 流水号 250525 调试样本
 
-## 2560 卷 JPG 原始图像
+`250525/` 是一组来源一致的六相机完整数据。每路相机均包含同一流水号、同一帧号范围的
+2D JPG 与 3D NPZ：
 
-`2560-jpg/` 仅包含一卷 BKV 六相机 2D 原始图像的 JPG 版本。
+```text
+250525/
+  manifest.json
+  camera-1/
+    2D/0000.jpg ... 0018.jpg
+    3D/0000.npz ... 0018.npz
+  ...
+  camera-6/
+    2D/0000.jpg ... 0018.jpg
+    3D/0000.npz ... 0018.npz
+```
 
-- 相机目录：`camera-1` 至 `camera-6`
-- 每路帧数：19
-- JPG 总数：114
-- 分辨率：2560 × 1024
-- 色彩模式：灰度
-- 转换质量：JPEG quality 100
+- 流水号：`250525`，由全部 114 个 D3IMG 头部的 `steelno` 字段确认
+- 相机：`camera-1` 至 `camera-6`
+- 每路帧数：19，帧号 `0000` 至 `0018`
+- JPG：114 个，灰度，`2560 × 1024`，JPEG quality 100
+- NPZ：114 个，`bkv-depth-v1`，矩阵形状 `(1024, 2560)`，`float32`
 - JPG 总大小：81,103,086 字节
-- 原始数据包：`2560图像.zip`
-
-本目录不包含原始 BMP、`.d3img`、ZIP 或 Git LFS 分片，仅用于离线联调和图像回放。
-
-## D3IMG 转换 NPZ
-
-`d3img-npz/CamImageSource1/18000/3D/0000.npz` 是由真实
-`18000/3D/0000.d3img` 转换得到的单帧远端调试样本，不包含原始
-`.d3img`。
-
-- 格式：`bkv-depth-v1`
-- 流水号：`18000`
-- 相机：`CamImageSource1`（D3IMG 头部相机号 `0`）
-- 帧号：`0000`
-- 矩阵：`1024 × 731`，`float32`
-- 有效点：`318,417`
+- NPZ 总大小：179,985,614 字节
 - 无效值：`-1000000.0`
 - 深度单位：`legacy-unknown`
-- 原始 D3IMG SHA-256：`1144ed82a87e1395ab955204350e80b633f8faa1d8ac02a76edd1db367b411f8`
-- NPZ SHA-256：`afa47f438a36b361d9aee38d2d9f5a2df8cc6bca2baa11a2b944e89a65deab5b`
+- 原始数据包：`2560图像.zip`
+- 原始数据包 SHA-256：`8cc1f6a7b3384166866af1f0d184dd2a8f1ec9f90ad8e8b70f54149c23075be0`
 
-加载时必须使用 `numpy.load(path, allow_pickle=False)`；不要把未标定深度值解释为毫米。
+JPG 与 NPZ 均来自上述同一个原始数据包。仓库不提交原始 BMP、D3IMG 或 ZIP。
+`manifest.json` 记录每帧的相机、帧号、形状、有效点数、源 D3IMG SHA-256 和 NPZ
+SHA-256，远端可据此逐帧校验。
+
+加载 NPZ 时必须使用 `numpy.load(path, allow_pickle=False)`；不要把未标定的深度值解释为毫米。
