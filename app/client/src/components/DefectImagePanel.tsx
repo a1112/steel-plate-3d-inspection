@@ -15,11 +15,12 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse }: Pr
   const [failed, setFailed] = useState(false);
   const cameraId = defect?.cameraIndex;
   const sequenceNo = defect?.artifacts?.sequenceNo;
+  const roi = defect?.artifacts?.roi;
   const imageUrl = useMemo(() => (
     inspectionId && cameraId && sequenceNo != null
-      ? inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo)
+      ? inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo, roi)
       : ''
-  ), [cameraId, inspectionId, sequenceNo]);
+  ), [cameraId, inspectionId, roi?.height, roi?.width, roi?.x, roi?.y, sequenceNo]);
 
   useEffect(() => {
     setActualSize(false);
@@ -77,6 +78,9 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse }: Pr
             <img
               src={imageUrl}
               alt={`${defect.typeLabel} C${cameraId} 第 ${sequenceNo} 帧缺陷图像`}
+              data-roi={roi && roi.width > 0 && roi.height > 0
+                ? `${roi.x},${roi.y},${roi.width},${roi.height}`
+                : 'full-frame'}
               onError={() => setFailed(true)}
             />
           </div>

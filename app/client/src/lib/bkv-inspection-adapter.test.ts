@@ -47,6 +47,25 @@ const defects: InspectionWorldDefects = {
       artifacts: {
         classNo: 16,
         imageRect2d: { left: 473, top: 857, right: 483, bottom: 867 },
+        source: {
+          distanceHeadMm: 11_420,
+          operatorSideMm: 115,
+          driveSideMm: 576,
+          widthMm: 0.45,
+          heightMm: 7.48,
+          depthMm: -0.546,
+          xRatio: 0.94,
+          circumferenceRatio: 0.1665,
+          previewImageUrl: '/api/bkv-online/image?camera=1&index=12&kind=2d',
+          artifacts: {
+            schema: 'steel.surface.defect.artifacts.v1',
+            cameraId: 'camera1',
+            frameId: 'frame-12',
+            sequenceNo: 12,
+            roi: { x: 1208, y: 848, width: 4, height: 11 },
+            roiImage: '/api/bkv-online/image?camera=1&index=12&kind=2d',
+          },
+        },
       },
     },
   }],
@@ -98,6 +117,15 @@ describe('standard BKV inspection adapter', () => {
       severity: 'severe',
       confidence: 51,
       synthetic: false,
+      distanceHeadMm: 11_420,
+      widthMm: 0.45,
+      heightMm: 7.48,
+      depthMm: -0.546,
+      previewImageUrl: '/api/bkv-online/image?camera=1&index=12&kind=2d',
+      artifacts: expect.objectContaining({
+        sequenceNo: 12,
+        roi: { x: 1208, y: 848, width: 4, height: 11 },
+      }),
     });
     expect(merged.defectTypes).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'bkv-class-16', label: '轧折' }),

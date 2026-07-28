@@ -512,6 +512,7 @@ function InspectionDashboard({
     terminalMode === 'bkv' ? 'diameter' : 'overview',
   );
   const [plateMapViewMode, setPlateMapViewMode] = useState<PlateMapViewMode>('2d');
+  const [longitudinalVisibleRange, setLongitudinalVisibleRange] = useState<[number, number] | null>(null);
   const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(false);
   const [worldFocusRequest, setWorldFocusRequest] = useState({
     defectId: null as string | null,
@@ -1492,7 +1493,11 @@ function InspectionDashboard({
                   onSurfaceModeChange={(surfaceDisplayMode) => setState({ surfaceDisplayMode, defectPage: 1 })}
                   onPreviewPositionChange={(previewPositionM) => setState({ previewPositionM: clampPreviewPositionM(previewPositionM, activePlateLengthM) })}
                   onSelectDefect={selectDefectById}
-                  onViewModeChange={setPlateMapViewMode}
+                  onViewModeChange={(nextViewMode) => {
+                    setLongitudinalVisibleRange(null);
+                    setPlateMapViewMode(nextViewMode);
+                  }}
+                  onVisibleRangeChange={setLongitudinalVisibleRange}
                 />
                 <AlarmAnalysis
                   selectedDefect={selectedOnlineDefect}
@@ -1510,6 +1515,7 @@ function InspectionDashboard({
                     nominalDiameterMm: activeSnapshot.currentPlate.widthMm,
                     lengthMm: activeSnapshot.currentPlate.lengthMm,
                   } : undefined}
+                  diameterVisibleRange={longitudinalVisibleRange}
                 />
               </section>
               {rightSidebarCollapsed ? null : <aside className="right-column">
@@ -1534,6 +1540,7 @@ function InspectionDashboard({
                 />
                 <DefectDetectionList
                   defects={visibleDefects}
+                  inspectionId={activeInspection?.inspectionId}
                   selectedDefectId={selectedOnlineDefectId}
                   filters={onlineFilters}
                   filterOpen={defectFilterOpen}

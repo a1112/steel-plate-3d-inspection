@@ -3804,7 +3804,7 @@ button {
   position: absolute;
   z-index: 8;
   right: 12px;
-  bottom: 12px;
+  bottom: 72px;
   width: min(310px, calc(100% - 24px));
   padding: 8px 10px;
   border: 1px solid rgba(130, 206, 255, 0.36);
@@ -3818,6 +3818,134 @@ button {
 .production-artifact-jet-legend strong,
 .production-artifact-jet-legend small {
   display: block;
+}
+
+.production-artifact-axis-navigation {
+  position: absolute;
+  z-index: 9;
+  right: 12px;
+  bottom: 9px;
+  left: 12px;
+  height: 52px;
+  padding: 3px 9px 5px;
+  border: 1px solid rgba(130, 206, 255, .34);
+  border-radius: 6px;
+  color: #dff3ff;
+  background: rgba(4, 20, 32, .86);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .2);
+  cursor: default;
+}
+
+.production-artifact-length-ruler {
+  position: relative;
+  height: 19px;
+  margin: 0 82px 0 62px;
+  border-bottom: 1px solid rgba(130, 206, 255, .38);
+  pointer-events: none;
+}
+
+.production-artifact-length-ruler span {
+  position: absolute;
+  bottom: -13px;
+  color: #8fb9ca;
+  font: 700 8px/1 ui-monospace, monospace;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.production-artifact-length-ruler span:first-child {
+  transform: none;
+}
+
+.production-artifact-length-ruler span:last-child {
+  transform: translateX(-100%);
+}
+
+.production-artifact-length-ruler i {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  width: 1px;
+  height: 5px;
+  background: #56d7ff;
+}
+
+.production-artifact-length-ruler b {
+  font: inherit;
+}
+
+.production-artifact-scrollbar-row {
+  display: grid;
+  grid-template-columns: 54px minmax(100px, 1fr) 78px;
+  align-items: center;
+  gap: 8px;
+  height: 27px;
+  color: #9fdfff;
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.production-artifact-scrollbar {
+  position: relative;
+  width: 100%;
+  height: 12px;
+  cursor: default;
+  touch-action: none;
+}
+
+.production-artifact-scrollbar-track {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  left: 0;
+  height: 4px;
+  border: 1px solid rgba(130, 206, 255, .34);
+  border-radius: 99px;
+  background: rgba(2, 10, 18, .86);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .48);
+}
+
+.production-artifact-scrollbar-thumb {
+  position: absolute;
+  top: 1px;
+  box-sizing: border-box;
+  min-width: 18px;
+  height: 10px;
+  border: 1px solid #69d8f7;
+  border-radius: 3px;
+  background:
+    linear-gradient(90deg, transparent calc(50% - 3px), rgba(255, 255, 255, .55) calc(50% - 3px), rgba(255, 255, 255, .55) calc(50% - 2px), transparent calc(50% - 2px)),
+    linear-gradient(90deg, transparent calc(50% + 2px), rgba(255, 255, 255, .55) calc(50% + 2px), rgba(255, 255, 255, .55) calc(50% + 3px), transparent calc(50% + 3px)),
+    linear-gradient(180deg, #28c4eb, #0587bb);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .46);
+  cursor: grab;
+}
+
+.production-artifact-scrollbar-thumb:active {
+  cursor: grabbing;
+}
+
+.production-artifact-scrollbar-focus {
+  position: absolute;
+  z-index: 2;
+  top: -2px;
+  width: 2px;
+  height: 16px;
+  border-radius: 2px;
+  background: #ffb020;
+  box-shadow: 0 0 0 2px rgba(255, 176, 32, .18), 0 0 7px rgba(255, 176, 32, .7);
+  transform: translateX(-1px);
+  pointer-events: none;
+}
+
+.production-artifact-scrollbar.is-disabled {
+  opacity: .48;
+}
+
+.production-artifact-scrollbar-row strong {
+  color: #dff3ff;
+  font: 800 9px/1 ui-monospace, monospace;
+  text-align: right;
 }
 
 .production-artifact-texture-tag {
@@ -17089,10 +17217,52 @@ button {
   top: 0;
   box-sizing: border-box;
   padding: 5px 8px;
+  overflow: hidden;
   border-left: 1px solid rgba(0, 193, 255, .65);
   color: #56d7ff;
   font: 700 12px/18px ui-monospace, monospace;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   background: rgba(4, 16, 27, .72);
+}
+
+.inspection-world-camera-labels b,
+.inspection-world-camera-labels small {
+  font: inherit;
+}
+
+.inspection-world-camera-labels small {
+  margin-left: 6px;
+  color: #a9d9ec;
+  font-size: 9px;
+}
+
+.inspection-world-length-ruler {
+  position: absolute;
+  z-index: 4;
+  top: 34px;
+  right: 7px;
+  bottom: 34px;
+  width: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding: 5px 6px;
+  border-right: 1px solid rgba(86, 215, 255, .66);
+  border-radius: 4px 0 0 4px;
+  color: #bcecff;
+  background: linear-gradient(90deg, rgba(4, 16, 27, .12), rgba(4, 16, 27, .8));
+  font: 700 9px/1 ui-monospace, monospace;
+  pointer-events: none;
+}
+
+.inspection-world-length-ruler b {
+  writing-mode: vertical-rl;
+  color: #56d7ff;
+  font-size: 9px;
+  letter-spacing: 2px;
 }
 
 .inspection-world-tile-status {

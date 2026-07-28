@@ -147,6 +147,67 @@ describe('ProductionArtifactView', () => {
     expect(onZoomChange).toHaveBeenLastCalledWith(10);
   });
 
+  it('exposes a millimetre ruler and scrolls the visible pipe-length range after zoom', () => {
+    const onVisibleRangeChange = vi.fn();
+    render(
+      <ProductionArtifactView
+        mesh={fixture()}
+        mode="surface"
+        testId="length-navigation-surface"
+        ariaLabel="带长度导航的三维表面"
+        lengthMm={12_000}
+        onVisibleRangeChange={onVisibleRangeChange}
+      />,
+    );
+
+    const view = screen.getByTestId('length-navigation-surface');
+    const scrollbar = screen.getByRole('scrollbar', { name: '三维长度方向滚动条' });
+    const ruler = screen.getByLabelText('三维长度毫米刻度');
+    expect(ruler).toHaveTextContent('0 mm');
+    expect(ruler).toHaveTextContent('3000 mm');
+    expect(ruler).toHaveTextContent('6000 mm');
+    expect(ruler).toHaveTextContent('9000 mm');
+    expect(ruler).toHaveTextContent('12000 mm');
+    expect(scrollbar).toHaveAttribute('aria-disabled', 'true');
+    expect(onVisibleRangeChange).toHaveBeenLastCalledWith(null);
+
+    fireEvent.wheel(view, { deltaY: -100 });
+    expect(scrollbar).toHaveAttribute('aria-disabled', 'false');
+    expect(view).toHaveAttribute('data-visible-range-start', '0.0833');
+    expect(view).toHaveAttribute('data-visible-range-end', '0.9167');
+
+    vi.spyOn(scrollbar, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, top: 0, left: 0, right: 100, bottom: 12, width: 100, height: 12,
+      toJSON: () => ({}),
+    });
+    const pointerDown = new Event('pointerdown', { bubbles: true });
+    Object.defineProperties(pointerDown, {
+      clientX: { value: 55 },
+      pointerId: { value: 9 },
+    });
+    fireEvent(scrollbar, pointerDown);
+    expect(Number(view.getAttribute('data-visible-range-start'))).toBeCloseTo(0.1333, 3);
+    expect(Number(view.getAttribute('data-visible-range-end'))).toBeCloseTo(0.9667, 3);
+
+    Object.defineProperty(view, 'clientWidth', { value: 800, configurable: true });
+    const viewPointerDown = new Event('pointerdown', { bubbles: true });
+    Object.defineProperties(viewPointerDown, {
+      button: { value: 0 },
+      clientX: { value: 500 },
+      clientY: { value: 120 },
+      pointerId: { value: 10 },
+    });
+    fireEvent(view, viewPointerDown);
+    const viewPointerMove = new Event('pointermove', { bubbles: true });
+    Object.defineProperties(viewPointerMove, {
+      clientX: { value: 300 },
+      clientY: { value: 120 },
+      pointerId: { value: 10 },
+    });
+    fireEvent(view, viewPointerMove);
+    expect(Number(view.getAttribute('data-visible-range-start'))).toBeGreaterThan(0.1333);
+  });
+
   it('keeps the camera-facing orientation fixed while allowing unbounded axial roll', () => {
     render(
       <ProductionArtifactView

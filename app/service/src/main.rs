@@ -16074,6 +16074,17 @@ fn inspection_world_frame_response(state: &ServiceState, query: &str) -> Vec<u8>
             &json!({"code": 400, "error": "inspection_world_sequence_required"}).to_string(),
         );
     };
+    let crop = match (
+        parse("cropX"),
+        parse("cropY"),
+        parse("cropWidth"),
+        parse("cropHeight"),
+    ) {
+        (Some(x), Some(y), Some(width), Some(height)) if width > 0 && height > 0 => {
+            Some((x, y, width, height))
+        }
+        _ => None,
+    };
     if state.runtime_config.data_source != "converted-local" {
         return http_response(
             "404 Not Found",
@@ -16102,7 +16113,37 @@ fn inspection_world_frame_response(state: &ServiceState, query: &str) -> Vec<u8>
         })
         .and_then(|file| {
             let source = image::open(file.path).map_err(|error| error.to_string())?;
-            let preview = source.thumbnail(512, 512);
+            let focused = if let Some((x, y, width, height)) = crop {
+                let source_width = source.width();
+                let source_height = source.height();
+                // Some legacy BKV defect coordinates were recorded in the
+                // pre-conversion sensor space. When that box falls outside the
+                // normalized frame, retain a larger surrounding area instead
+                // of returning only the invalid black edge.
+                let legacy_out_of_bounds = x >= source_width
+                    || y >= source_height
+                    || x.saturating_add(width) > source_width
+                    || y.saturating_add(height) > source_height;
+                let minimum_context = if legacy_out_of_bounds {
+                    (512, 512)
+                } else {
+                    (256, 128)
+                };
+                let context_width = width.max(minimum_context.0).min(source_width);
+                let context_height = height.max(minimum_context.1).min(source_height);
+                let center_x = x.saturating_add(width / 2).min(source_width);
+                let center_y = y.saturating_add(height / 2).min(source_height);
+                let crop_x = center_x
+                    .saturating_sub(context_width / 2)
+                    .min(source_width.saturating_sub(context_width));
+                let crop_y = center_y
+                    .saturating_sub(context_height / 2)
+                    .min(source_height.saturating_sub(context_height));
+                source.crop_imm(crop_x, crop_y, context_width, context_height)
+            } else {
+                source
+            };
+            let preview = focused.thumbnail(512, 512);
             let mut body = Vec::new();
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut body, 88)
                 .encode_image(&preview)

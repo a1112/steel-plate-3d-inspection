@@ -59,4 +59,20 @@ describe('buildDiameterMeasurements', () => {
     expect(screen.queryByText('外径偏差变化')).not.toBeInTheDocument();
     expect(screen.queryByText('圆度误差变化')).not.toBeInTheDocument();
   });
+
+  it('switches the curve X axis from global length to the active visible range', () => {
+    render(createElement(DiameterTrendPanel, {
+      mesh: mesh(),
+      nominalDiameterMm: 200,
+      lengthMm: 12_000,
+      visibleRange: [0.25, 0.75],
+    }));
+
+    const grid = screen.getByTestId('diameter-trend-grid');
+    expect(grid).toHaveAttribute('data-x-axis-scope', 'visible');
+    expect(grid).toHaveAttribute('data-x-axis-start-mm', '3000');
+    expect(grid).toHaveAttribute('data-x-axis-end-mm', '9000');
+    expect(screen.getByRole('img')).toHaveTextContent('3000');
+    expect(screen.getByRole('img')).toHaveTextContent('9000 mm');
+  });
 });

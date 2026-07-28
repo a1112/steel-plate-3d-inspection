@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom';
 import type { DefectItem } from '../data/inspection';
 import { getDefectPreviewImage, severityLabels, surfaceLabels } from '../data/inspection';
 import { barSurfaceFileUrl } from '../services/bar-surface-api';
+import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import type { ReportFilters } from '../state/operations';
 import { Panel } from './Panel';
 
@@ -13,6 +14,7 @@ const DEFECT_POPOVER_GAP = 10;
 
 interface DefectDetectionListProps {
   defects: DefectItem[];
+  inspectionId?: string;
   selectedDefectId: string | null;
   filters: ReportFilters;
   filterOpen: boolean;
@@ -38,7 +40,17 @@ function getDefectCameraLabel(defect: DefectItem) {
   return `camera${cameraIndex + 1}`;
 }
 
-function getDefectPreview(defect: DefectItem) {
+function getDefectPreview(defect: DefectItem, inspectionId?: string) {
+  const cameraId = defect.cameraIndex;
+  const sequenceNo = defect.artifacts?.sequenceNo;
+  if (inspectionId && cameraId && sequenceNo != null) {
+    return {
+      url: inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo, defect.artifacts?.roi),
+      source: defect.artifacts?.roi.width && defect.artifacts.roi.height
+        ? '检测记录 ROI 裁剪'
+        : '检测记录原始帧',
+    };
+  }
   if (defect.previewImageUrl) {
     return { url: defect.previewImageUrl, source: defect.synthetic ? '模拟算法产物' : '检测记录预览' };
   }
@@ -60,12 +72,14 @@ function DefectListHoverCard({
   defect,
   top,
   left,
+  inspectionId,
 }: {
   defect: DefectItem;
   top: number;
   left: number;
+  inspectionId?: string;
 }) {
-  const preview = getDefectPreview(defect);
+  const preview = getDefectPreview(defect, inspectionId);
   const style = {
     top,
     left,
@@ -111,6 +125,7 @@ function DefectListHoverCard({
 
 export function DefectDetectionList({
   defects,
+  inspectionId,
   selectedDefectId,
   filters,
   filterOpen,
@@ -230,6 +245,7 @@ export function DefectDetectionList({
             defect={hoveredDefect.defect}
             top={hoveredDefect.top}
             left={hoveredDefect.left}
+            inspectionId={inspectionId}
           />,
           document.body,
         )

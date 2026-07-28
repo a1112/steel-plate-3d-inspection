@@ -301,6 +301,10 @@ export function ProductionArtifactView({
   radialUnit = '显示坐标',
   orientation = 'horizontal',
   onZoomChange,
+  lengthMm = 0,
+  onVisibleRangeChange,
+  focusPositionRatio,
+  focusRevision = 0,
 }: {
   mesh: BarSurfaceMesh;
   mode: 'surface' | 'points';
@@ -313,16 +317,25 @@ export function ProductionArtifactView({
   radialUnit?: string;
   orientation?: ArtifactOrientation;
   onZoomChange?: (zoom: number) => void;
+  lengthMm?: number;
+  onVisibleRangeChange?: (range: [number, number] | null) => void;
+  focusPositionRatio?: number | null;
+  focusRevision?: number;
 }) {
   const [roll, setRoll] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [axisCenter, setAxisCenter] = useState(0.5);
   const [dragging, setDragging] = useState(false);
   const drag = useRef<{
     pointerId: number;
     button: number;
     x: number;
     y: number;
+  } | null>(null);
+  const scrollDrag = useRef<{
+    pointerId: number;
+    grabOffsetRatio: number;
   } | null>(null);
   const artifact = useMemo(
     () => createArtifactGeometry(mesh, mode === 'surface', colorMode, radialUnitScale),
@@ -331,11 +344,36 @@ export function ProductionArtifactView({
   const { geometry, jetSummary } = artifact;
   const hasColors = geometry.getAttribute('color') !== undefined;
   const pointCount = geometry.getAttribute('position')?.count ?? 0;
+  const visibleFraction = Math.min(1, 1 / Math.max(1, zoom));
+  const halfVisibleFraction = visibleFraction / 2;
+  const minimumAxisCenter = halfVisibleFraction;
+  const maximumAxisCenter = 1 - halfVisibleFraction;
+  const visibleRange: [number, number] = [
+    Math.max(0, axisCenter - halfVisibleFraction),
+    Math.min(1, axisCenter + halfVisibleFraction),
+  ];
+  const axisOffset = (0.5 - axisCenter) * NORMALIZED_LONGITUDINAL_SPAN;
+  const rulerTicks = Array.from({ length: 5 }, (_, index) => {
+    const ratio = index / 4;
+    return { ratio, value: ratio * lengthMm };
+  });
 
   useEffect(() => () => geometry.dispose(), [geometry]);
   useEffect(() => {
     setPan({ x: 0, y: 0 });
+    setAxisCenter(0.5);
   }, [orientation]);
+  useEffect(() => {
+    setAxisCenter((current) => clamp(current, minimumAxisCenter, maximumAxisCenter));
+  }, [maximumAxisCenter, minimumAxisCenter]);
+  useEffect(() => {
+    if (focusPositionRatio == null || !Number.isFinite(focusPositionRatio)) return;
+    setAxisCenter(clamp(focusPositionRatio, minimumAxisCenter, maximumAxisCenter));
+  }, [focusPositionRatio, focusRevision, maximumAxisCenter, minimumAxisCenter]);
+  useEffect(() => {
+    if (!onVisibleRangeChange) return;
+    onVisibleRangeChange(visibleFraction >= 0.995 ? null : visibleRange);
+  }, [axisCenter, onVisibleRangeChange, visibleFraction]);
 
   const stopDragging = (event: PointerEvent<HTMLDivElement>) => {
     if (drag.current?.pointerId !== event.pointerId) {
@@ -367,6 +405,8 @@ export function ProductionArtifactView({
       data-artifact-roll={roll.toFixed(3)}
       data-artifact-zoom={zoom.toFixed(2)}
       data-artifact-color-mode={colorMode}
+      data-visible-range-start={visibleRange[0].toFixed(4)}
+      data-visible-range-end={visibleRange[1].toFixed(4)}
       aria-label={ariaLabel}
       onContextMenu={(event) => event.preventDefault()}
       onPointerDown={(event) => {
@@ -391,11 +431,30 @@ export function ProductionArtifactView({
         const deltaX = event.clientX - drag.current.x;
         const deltaY = event.clientY - drag.current.y;
         if (drag.current.button === 0) {
-          setRoll((current) => current + deltaX * 0.012);
+          if (visibleFraction < 0.995 && !event.shiftKey) {
+            const axialDelta = orientation === 'horizontal' ? deltaX : -deltaY;
+            const viewportPixels = Math.max(
+              1,
+              orientation === 'horizontal'
+                ? event.currentTarget.clientWidth
+                : event.currentTarget.clientHeight,
+            );
+            setAxisCenter((current) => clamp(
+              current - axialDelta / viewportPixels * visibleFraction,
+              minimumAxisCenter,
+              maximumAxisCenter,
+            ));
+          } else {
+            setRoll((current) => current + deltaX * 0.012);
+          }
         } else {
           setPan((current) => ({
-            x: current.x + deltaX * 0.006 / zoom,
-            y: current.y - deltaY * 0.006 / zoom,
+            x: orientation === 'vertical'
+              ? current.x + deltaX * 0.006 / zoom
+              : current.x,
+            y: orientation === 'horizontal'
+              ? current.y - deltaY * 0.006 / zoom
+              : current.y,
           }));
         }
         drag.current = {
@@ -414,22 +473,24 @@ export function ProductionArtifactView({
         <ambientLight intensity={0.82} />
         <directionalLight position={[3, 5, 6]} intensity={1.1} />
         <group position={[pan.x, pan.y, 0]} rotation={[0, 0, orientation === 'vertical' ? Math.PI / 2 : 0]}>
-          <group rotation={[roll, 0, 0]}>
-            {mode === 'surface' ? (
-              <mesh geometry={geometry}>
-                {colorMode === 'texture' && textureUrl ? (
-                  <ArtifactTextureMaterial textureUrl={textureUrl} />
-                ) : colorMode === 'radial-jet' ? (
-                  <meshBasicMaterial color="#ffffff" vertexColors side={DoubleSide} />
-                ) : (
-                  <meshStandardMaterial color={hasColors ? '#ffffff' : '#8ba2ad'} vertexColors={hasColors} roughness={0.62} metalness={0.08} side={DoubleSide} />
-                )}
-              </mesh>
-            ) : (
-              <points geometry={geometry}>
-                <pointsMaterial color={hasColors ? '#ffffff' : '#42c9ff'} vertexColors={hasColors} size={0.025} sizeAttenuation />
-              </points>
-            )}
+          <group position={[axisOffset, 0, 0]}>
+            <group rotation={[roll, 0, 0]}>
+              {mode === 'surface' ? (
+                <mesh geometry={geometry}>
+                  {colorMode === 'texture' && textureUrl ? (
+                    <ArtifactTextureMaterial textureUrl={textureUrl} />
+                  ) : colorMode === 'radial-jet' ? (
+                    <meshBasicMaterial color="#ffffff" vertexColors side={DoubleSide} />
+                  ) : (
+                    <meshStandardMaterial color={hasColors ? '#ffffff' : '#8ba2ad'} vertexColors={hasColors} roughness={0.62} metalness={0.08} side={DoubleSide} />
+                  )}
+                </mesh>
+              ) : (
+                <points geometry={geometry}>
+                  <pointsMaterial color={hasColors ? '#ffffff' : '#42c9ff'} vertexColors={hasColors} size={0.025} sizeAttenuation />
+                </points>
+              )}
+            </group>
           </group>
         </group>
       </Canvas>
@@ -452,6 +513,92 @@ export function ProductionArtifactView({
           <small>{jetSummary.fittedSectionCount} 个切面拟合 · 径向偏差单位 {radialUnit}</small>
         </div>
       ) : null}
+      <div
+        className={`production-artifact-axis-navigation orientation-${orientation}`}
+        onPointerDown={(event) => event.stopPropagation()}
+        onPointerMove={(event) => event.stopPropagation()}
+        onPointerUp={(event) => event.stopPropagation()}
+        onWheel={(event) => event.stopPropagation()}
+      >
+        <div className="production-artifact-length-ruler" aria-label="三维长度毫米刻度">
+          {rulerTicks.map((tick, index) => (
+            <span key={`${index}:${tick.ratio}`} style={{ left: `${tick.ratio * 100}%` }}>
+              <i />
+              <b>{lengthMm > 0 ? `${Math.round(tick.value)} mm` : `${Math.round(tick.ratio * 100)}%`}</b>
+            </span>
+          ))}
+        </div>
+        <div className="production-artifact-scrollbar-row">
+          <span>长度视口</span>
+          <div
+            className={`production-artifact-scrollbar ${visibleFraction >= 0.995 ? 'is-disabled' : ''}`}
+            role="scrollbar"
+            aria-label="三维长度方向滚动条"
+            aria-orientation="horizontal"
+            aria-valuemin={0}
+            aria-valuemax={Math.round(lengthMm)}
+            aria-valuenow={Math.round(visibleRange[0] * lengthMm)}
+            aria-valuetext={visibleFraction >= 0.995
+              ? '全长'
+              : `${Math.round(visibleRange[0] * lengthMm)} 至 ${Math.round(visibleRange[1] * lengthMm)} 毫米`}
+            aria-disabled={visibleFraction >= 0.995}
+            onPointerDown={(event) => {
+              if (visibleFraction >= 0.995) return;
+              const rect = event.currentTarget.getBoundingClientRect();
+              const pointerRatio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+              const thumb = (event.target as HTMLElement).closest('.production-artifact-scrollbar-thumb');
+              const grabOffsetRatio = thumb
+                ? clamp(pointerRatio - visibleRange[0], 0, visibleFraction)
+                : halfVisibleFraction;
+              scrollDrag.current = { pointerId: event.pointerId, grabOffsetRatio };
+              event.currentTarget.setPointerCapture?.(event.pointerId);
+              if (!thumb) {
+                setAxisCenter(clamp(pointerRatio, minimumAxisCenter, maximumAxisCenter));
+              }
+            }}
+            onPointerMove={(event) => {
+              if (scrollDrag.current?.pointerId !== event.pointerId) return;
+              const rect = event.currentTarget.getBoundingClientRect();
+              const pointerRatio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+              const nextStart = pointerRatio - scrollDrag.current.grabOffsetRatio;
+              setAxisCenter(clamp(
+                nextStart + halfVisibleFraction,
+                minimumAxisCenter,
+                maximumAxisCenter,
+              ));
+            }}
+            onPointerUp={(event) => {
+              if (scrollDrag.current?.pointerId !== event.pointerId) return;
+              scrollDrag.current = null;
+              event.currentTarget.releasePointerCapture?.(event.pointerId);
+            }}
+            onPointerCancel={() => {
+              scrollDrag.current = null;
+            }}
+          >
+            <i className="production-artifact-scrollbar-track" />
+            {focusPositionRatio != null ? (
+              <span
+                className="production-artifact-scrollbar-focus"
+                style={{ left: `${clamp(focusPositionRatio, 0, 1) * 100}%` }}
+                title={`当前缺陷位置 ${Math.round(clamp(focusPositionRatio, 0, 1) * lengthMm)} mm`}
+              />
+            ) : null}
+            <b
+              className="production-artifact-scrollbar-thumb"
+              style={{
+                left: `${visibleRange[0] * 100}%`,
+                width: `${visibleFraction * 100}%`,
+              }}
+            />
+          </div>
+          <strong>
+            {visibleFraction >= 0.995
+              ? '全长'
+              : `${Math.round(visibleRange[0] * lengthMm)}–${Math.round(visibleRange[1] * lengthMm)} mm`}
+          </strong>
+        </div>
+      </div>
     </div>
   );
 }

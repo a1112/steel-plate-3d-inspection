@@ -39,6 +39,20 @@ const candidateDefect: DefectItem = {
   synthetic: false,
 };
 
+const roiDefect: DefectItem = {
+  ...candidateDefect,
+  id: 'BKV-ROI-1',
+  cameraIndex: 1,
+  cameraId: 'camera1',
+  artifacts: {
+    schema: 'steel.surface.defect.artifacts.v1',
+    cameraId: 'camera1',
+    frameId: 'frame-18',
+    sequenceNo: 18,
+    roi: { x: 1208, y: 848, width: 4, height: 11 },
+  },
+};
+
 describe('DefectDetectionList algorithm defects', () => {
   it('shows an eight-camera synthetic algorithm defect with an explicit marker', () => {
     render(
@@ -99,5 +113,27 @@ describe('DefectDetectionList algorithm defects', () => {
     expect(tooltip).toHaveTextContent('3.20 × 7.40 × 0.48mm');
     expect(tooltip).toHaveTextContent('91.0%');
     expect(tooltip).toHaveTextContent('开发模拟图 · 非生产产物');
+  });
+
+  it('uses the selected production frame ROI in the hover preview', () => {
+    render(
+      <DefectDetectionList
+        defects={[roiDefect]}
+        inspectionId="1908500"
+        selectedDefectId={null}
+        filters={{ keyword: '', severity: 'all', surface: 'all', typeId: 'all' }}
+        filterOpen={false}
+        onSelectDefect={vi.fn()}
+        onToggleFilter={vi.fn()}
+        onFilterChange={vi.fn()}
+        onClearFilters={vi.fn()}
+      />,
+    );
+
+    fireEvent.mouseEnter(screen.getByRole('row', { name: /凹陷候选，camera1/ }));
+    const image = screen.getByRole('img', { name: '凹陷候选缺陷图像' });
+    expect(image).toHaveAttribute('src', expect.stringContaining('cropX=1208'));
+    expect(image).toHaveAttribute('src', expect.stringContaining('cropHeight=11'));
+    expect(screen.getByRole('tooltip')).toHaveTextContent('检测记录 ROI 裁剪');
   });
 });

@@ -60,6 +60,8 @@ function DiameterCurve({
   reference,
   color,
   description,
+  axisStartMm,
+  axisEndMm,
 }: {
   title: string;
   samples: DiameterMeasurement[];
@@ -67,6 +69,8 @@ function DiameterCurve({
   reference: number;
   color: string;
   description: string;
+  axisStartMm: number;
+  axisEndMm: number;
 }) {
   const values = samples.map(value);
   const dataMinimum = values.length ? Math.min(...values) : 0;
@@ -82,25 +86,34 @@ function DiameterCurve({
   const bottom = 34;
   const chartWidth = width - left - right;
   const chartHeight = height - top - bottom;
-  const x = (index: number) => left + index / Math.max(1, samples.length - 1) * chartWidth;
+  const x = (positionMm: number) => (
+    left + Math.max(0, Math.min(1, (
+      positionMm - axisStartMm
+    ) / Math.max(1, axisEndMm - axisStartMm))) * chartWidth
+  );
   const y = (measurement: number) => (
     top + (maximum - measurement) / Math.max(0.001, maximum - minimum) * chartHeight
   );
-  const points = samples.map((sample, index) => `${x(index)},${y(value(sample))}`).join(' ');
+  const points = samples.map((sample) => `${x(sample.positionMm)},${y(value(sample))}`).join(' ');
   const latest = values.at(-1) ?? 0;
 
   return (
     <section className="diameter-curve-card">
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${title}，按钢管长度位置变化`}>
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`${title}，按钢管长度位置变化`}
+      >
         <line x1={left} y1={y(reference)} x2={width - right} y2={y(reference)} className="diameter-reference" />
         <line x1={left} y1={top} x2={left} y2={height - bottom} className="diameter-axis" />
         <line x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} className="diameter-axis" />
         <polyline points={points} fill="none" stroke={color} strokeWidth="2.2" vectorEffect="non-scaling-stroke" />
         <text x={left - 5} y={top + 4} textAnchor="end">{format(maximum)}</text>
         <text x={left - 5} y={height - bottom} textAnchor="end">{format(minimum)}</text>
-        <text x={left} y={height - 7}>0</text>
+        <text x={left} y={height - 7}>{format(axisStartMm, 0)}</text>
         <text x={width - right} y={height - 7} textAnchor="end">
-          {format(samples.at(-1)?.positionMm ?? 0, 0)} mm
+          {format(axisEndMm, 0)} mm
         </text>
       </svg>
       <footer>
@@ -118,16 +131,39 @@ export function DiameterTrendPanel({
   mesh,
   nominalDiameterMm,
   lengthMm,
+  visibleRange = null,
 }: {
   mesh: BarSurfaceMesh;
   nominalDiameterMm: number;
   lengthMm: number;
+  visibleRange?: [number, number] | null;
 }) {
-  const samples = useMemo(
+  const allSamples = useMemo(
     () => buildDiameterMeasurements(mesh, nominalDiameterMm, lengthMm),
     [lengthMm, mesh, nominalDiameterMm],
   );
-  if (!samples.length) {
+  const normalizedRange = useMemo<[number, number] | null>(() => {
+    if (!visibleRange) return null;
+    const start = Math.max(0, Math.min(1, visibleRange[0]));
+    const end = Math.max(start, Math.min(1, visibleRange[1]));
+    return end - start >= 0.995 ? null : [start, end];
+  }, [visibleRange]);
+  const axisStartMm = (normalizedRange?.[0] ?? 0) * lengthMm;
+  const axisEndMm = (normalizedRange?.[1] ?? 1) * lengthMm;
+  const samples = useMemo(() => {
+    if (!normalizedRange) return allSamples;
+    const inside = allSamples.filter((sample) => (
+      sample.positionMm >= axisStartMm && sample.positionMm <= axisEndMm
+    ));
+    const before = [...allSamples].reverse().find((sample) => sample.positionMm < axisStartMm);
+    const after = allSamples.find((sample) => sample.positionMm > axisEndMm);
+    return [
+      ...(before ? [before] : []),
+      ...inside,
+      ...(after ? [after] : []),
+    ];
+  }, [allSamples, axisEndMm, axisStartMm, normalizedRange]);
+  if (!allSamples.length) {
     return (
       <div className="production-artifact-empty compact" role="status">
         <strong>暂无可拟合的外径曲线</strong>
@@ -140,7 +176,11 @@ export function DiameterTrendPanel({
       className="diameter-trend-grid"
       data-testid="diameter-trend-grid"
       data-measurement-unit="mm"
-      data-section-count={samples.length}
+      data-section-count={allSamples.length}
+      data-visible-section-count={samples.length}
+      data-x-axis-scope={normalizedRange ? 'visible' : 'global'}
+      data-x-axis-start-mm={axisStartMm.toFixed(0)}
+      data-x-axis-end-mm={axisEndMm.toFixed(0)}
     >
       <DiameterCurve
         title="拟合外径变化"
@@ -149,6 +189,8 @@ export function DiameterTrendPanel({
         value={(sample) => sample.diameterMm}
         reference={nominalDiameterMm}
         color="#0d9bd7"
+        axisStartMm={axisStartMm}
+        axisEndMm={axisEndMm}
       />
     </div>
   );

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   clampWorldScale,
   getVisibleCameraTiles,
@@ -20,8 +20,11 @@ type Props = {
   defects: InspectionWorldDefect[];
   focusDefectId?: string | number | null;
   focusDefectRevision?: number;
+  focusCameraId?: number | null;
+  focusPositionRatio?: number | null;
   className?: string;
   onFirstPaint?: () => void;
+  onVisibleRangeChange?: (range: [number, number] | null) => void;
   colorMode?: 'gray' | 'jet';
 };
 
@@ -50,8 +53,8 @@ function fitWidthScale(worldWidth: number, viewportWidth: number) {
   return viewportWidth / Math.max(1, worldWidth);
 }
 
-function initialView(meta: InspectionWorldMeta, width: number): ViewState {
-  const scale = fitWidthScale(meta.world.width, width);
+function initialView(worldWidth: number, width: number): ViewState {
+  const scale = fitWidthScale(worldWidth, width);
   return { scrollLeft: 0, scrollTop: 0, scale };
 }
 
@@ -100,8 +103,11 @@ export function InspectionWorldCanvas({
   defects,
   focusDefectId,
   focusDefectRevision = 0,
+  focusCameraId,
+  focusPositionRatio,
   className = '',
   onFirstPaint,
+  onVisibleRangeChange,
   colorMode = 'gray',
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -116,15 +122,26 @@ export function InspectionWorldCanvas({
   const scrollFrame = useRef<number | null>(null);
   const pendingScroll = useRef<{ scrollLeft: number; scrollTop: number } | null>(null);
   const fitWidthMode = useRef(true);
+  const rangeFollowing = useRef(false);
   const consumedFocusRequest = useRef<string | null>(null);
   const lifecycleGeneration = useRef(0);
-  const metaRef = useRef(meta);
   const onFirstPaintRef = useRef(onFirstPaint);
   const firstPaintReported = useRef(false);
   const measured = useRef(false);
   const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
   const [viewportMeasured, setViewportMeasured] = useState(false);
-  const [view, setView] = useState(() => initialView(meta, DEFAULT_WIDTH));
+  const [isolatedCameraId, setIsolatedCameraId] = useState<number | null>(null);
+  const displayCameras = useMemo(() => {
+    if (isolatedCameraId == null) return meta.world.cameras;
+    const selected = meta.world.cameras.find((camera) => camera.cameraId === isolatedCameraId);
+    return selected ? [{ ...selected, offsetX: 0 }] : meta.world.cameras;
+  }, [isolatedCameraId, meta.world.cameras]);
+  const displayWorldWidth = isolatedCameraId == null
+    ? meta.world.width
+    : displayCameras[0]?.width ?? meta.world.width;
+  const displayWorldWidthRef = useRef(displayWorldWidth);
+  displayWorldWidthRef.current = displayWorldWidth;
+  const [view, setView] = useState(() => initialView(meta.world.width, DEFAULT_WIDTH));
   const [level, setLevel] = useState(() => (
     lodForScaleWithHysteresis(view.scale, meta.world.maxLevel)
   ));
@@ -133,14 +150,10 @@ export function InspectionWorldCanvas({
   const [revision, setRevision] = useState(0);
   const [focusScrollRevision, setFocusScrollRevision] = useState(0);
   const worldRevision = useMemo(
-    () => `${recordId}:${meta.sourceRevision}:${meta.sourceFrameCount}:${JSON.stringify(meta.world)}`,
-    [meta.sourceFrameCount, meta.sourceRevision, meta.world, recordId],
+    () => `${recordId}:${meta.sourceRevision}:${meta.sourceFrameCount}:${isolatedCameraId ?? 'all'}:${JSON.stringify(meta.world)}`,
+    [isolatedCameraId, meta.sourceFrameCount, meta.sourceRevision, meta.world, recordId],
   );
   const previousWorldRevision = useRef(worldRevision);
-
-  useLayoutEffect(() => {
-    metaRef.current = meta;
-  }, [meta]);
 
   useLayoutEffect(() => {
     onFirstPaintRef.current = onFirstPaint;
@@ -204,12 +217,12 @@ export function InspectionWorldCanvas({
       setSize({ width, height });
       if (!measured.current) {
         measured.current = true;
-        const nextView = initialView(metaRef.current, width);
+        const nextView = initialView(displayWorldWidthRef.current, width);
         interactionView.current = nextView;
         setView(nextView);
       } else if (fitWidthMode.current) {
         const current = interactionView.current;
-        const scale = fitWidthScale(metaRef.current.world.width, width);
+        const scale = fitWidthScale(displayWorldWidthRef.current, width);
         if (scale !== current.scale) {
           const targetScroll = {
             scrollLeft: (current.scrollLeft / current.scale) * scale,
@@ -240,8 +253,10 @@ export function InspectionWorldCanvas({
     pendingScroll.current = null;
     drag.current = null;
     fitWidthMode.current = true;
+    rangeFollowing.current = false;
+    onVisibleRangeChange?.(null);
     setFailedKeys(new Set());
-    const nextView = initialView(meta, size.width);
+    const nextView = initialView(displayWorldWidth, size.width);
     interactionView.current = nextView;
     setView(nextView);
     const host = hostRef.current;
@@ -250,7 +265,7 @@ export function InspectionWorldCanvas({
       host.scrollTop = 0;
       scheduleScrollRead();
     }
-  }, [meta, scheduleScrollRead, size.height, size.width, worldRevision]);
+  }, [displayWorldWidth, meta, onVisibleRangeChange, scheduleScrollRead, size.height, size.width, worldRevision]);
 
   useEffect(() => {
     const generation = lifecycleGeneration.current + 1;
@@ -282,8 +297,8 @@ export function InspectionWorldCanvas({
   const viewY = view.scrollTop / view.scale;
   const visibleWorldY = Math.max(0, (view.scrollTop - WORLD_TOP_GUTTER_PX) / view.scale);
   const baseExtent = useMemo(
-    () => scaledWorldExtent(meta.world.width, meta.world.height, view.scale, size.width, size.height),
-    [meta.world.height, meta.world.width, size.height, size.width, view.scale],
+    () => scaledWorldExtent(displayWorldWidth, meta.world.height, view.scale, size.width, size.height),
+    [displayWorldWidth, meta.world.height, size.height, size.width, view.scale],
   );
   const extent = useMemo(() => ({
     width: baseExtent.width,
@@ -292,17 +307,17 @@ export function InspectionWorldCanvas({
   const visibleTiles = useMemo(() => {
     if (!viewportMeasured) return [];
     return getVisibleCameraTiles({
-      cameras: meta.world.cameras,
+      cameras: displayCameras,
       tileSize: meta.world.tileSize,
       level,
       viewport: { x: viewX, y: visibleWorldY, width: size.width / view.scale, height: size.height / view.scale },
       prefetch: 1,
     });
-  }, [level, meta.world.cameras, meta.world.tileSize, size.height, size.width, view.scale, viewX, viewportMeasured, visibleWorldY]);
+  }, [displayCameras, level, meta.world.tileSize, size.height, size.width, view.scale, viewX, viewportMeasured, visibleWorldY]);
   const directlyVisibleTiles = useMemo(() => {
     if (!viewportMeasured) return [];
     return getVisibleCameraTiles({
-      cameras: meta.world.cameras,
+      cameras: displayCameras,
       tileSize: meta.world.tileSize,
       level,
       viewport: {
@@ -313,7 +328,7 @@ export function InspectionWorldCanvas({
       },
       prefetch: 0,
     });
-  }, [level, meta.world.cameras, meta.world.tileSize, size.height, size.width, view.scale, viewX, viewportMeasured, visibleWorldY]);
+  }, [displayCameras, level, meta.world.tileSize, size.height, size.width, view.scale, viewX, viewportMeasured, visibleWorldY]);
   const loadCandidates = useMemo(() => {
     const candidates = [...visibleTiles];
     if (level < meta.world.maxLevel) {
@@ -350,8 +365,8 @@ export function InspectionWorldCanvas({
     [loadCandidates, recordId],
   );
   const cameraById = useMemo(
-    () => new Map(meta.world.cameras.map((camera) => [camera.cameraId, camera])),
-    [meta.world.cameras],
+    () => new Map(displayCameras.map((camera) => [camera.cameraId, camera])),
+    [displayCameras],
   );
 
   useLayoutEffect(() => {
@@ -464,10 +479,28 @@ export function InspectionWorldCanvas({
     worldRevision,
   ]);
 
-  const locatableDefects = useMemo(
-    () => defects.filter((defect) => defect.locatable && defect.worldRect),
-    [defects],
-  );
+  const locatableDefects = useMemo(() => {
+    const selectedSourceCamera = isolatedCameraId == null
+      ? null
+      : meta.world.cameras.find((camera) => camera.cameraId === isolatedCameraId);
+    return defects
+      .filter((defect) => (
+        defect.locatable
+        && defect.worldRect
+        && (isolatedCameraId == null || defect.cameraId === isolatedCameraId)
+      ))
+      .map((defect) => (
+        selectedSourceCamera && defect.worldRect
+          ? {
+            ...defect,
+            worldRect: {
+              ...defect.worldRect,
+              x: defect.worldRect.x - selectedSourceCamera.offsetX,
+            },
+          }
+          : defect
+      ));
+  }, [defects, isolatedCameraId, meta.world.cameras]);
   const visibleDefects = useMemo(() => {
     const margin = 32 / view.scale;
     const left = viewX - margin;
@@ -488,35 +521,71 @@ export function InspectionWorldCanvas({
   const focusedRect = focusedDefect?.worldRect;
 
   useEffect(() => {
-    if (!focusedRect || !viewportMeasured) return;
-    const requestKey = `${worldRevision}:${String(focusDefectId)}:${focusDefectRevision}`;
+    const hasLongitudinalFocus = focusPositionRatio != null && Number.isFinite(focusPositionRatio);
+    if ((!focusedRect && !hasLongitudinalFocus) || !viewportMeasured) return;
+    const requestKey = `${worldRevision}:${String(focusDefectId)}:${focusDefectRevision}:${focusCameraId ?? '-'}:${focusPositionRatio ?? '-'}`;
     if (consumedFocusRequest.current === requestKey) return;
     consumedFocusRequest.current = requestKey;
-    const minimumScale = fitWidthScale(meta.world.width, size.width);
-    const targetScale = clampWorldScale(
-      Math.min(size.width / (focusedRect.width + 80), size.height / (focusedRect.height + 80)),
-      minimumScale,
-      Math.max(4, minimumScale),
-    );
+    const minimumScale = fitWidthScale(displayWorldWidth, size.width);
+    const targetScale = focusedRect
+      ? clampWorldScale(
+        Math.min(size.width / (focusedRect.width + 80), size.height / (focusedRect.height + 80)),
+        minimumScale,
+        Math.max(4, minimumScale),
+      )
+      : Math.max(minimumScale, interactionView.current.scale);
+    const focusCamera = focusCameraId == null
+      ? null
+      : displayCameras.find((camera) => camera.cameraId === focusCameraId);
+    const focusX = focusedRect
+      ? focusedRect.x + focusedRect.width / 2
+      : focusCamera
+        ? focusCamera.offsetX + focusCamera.width / 2
+        : displayWorldWidth / 2;
+    const focusY = focusedRect
+      ? focusedRect.y + focusedRect.height / 2
+      : Math.max(0, Math.min(1, Number(focusPositionRatio))) * meta.world.height;
     fitWidthMode.current = false;
+    rangeFollowing.current = true;
     const targetScroll = {
-      scrollLeft: Math.max(0, (focusedRect.x + focusedRect.width / 2) * targetScale - size.width / 2),
-      scrollTop: Math.max(0, (focusedRect.y + focusedRect.height / 2) * targetScale + WORLD_TOP_GUTTER_PX - size.height / 2),
+      scrollLeft: Math.max(0, focusX * targetScale - size.width / 2),
+      scrollTop: Math.max(0, focusY * targetScale + WORLD_TOP_GUTTER_PX - size.height / 2),
     };
     pendingScroll.current = targetScroll;
     interactionView.current = { ...interactionView.current, ...targetScroll, scale: targetScale };
     setView((current) => ({ ...current, ...targetScroll, scale: targetScale }));
     setFocusScrollRevision((current) => current + 1);
   }, [
+    displayCameras,
+    displayWorldWidth,
     focusDefectId,
     focusDefectRevision,
+    focusCameraId,
+    focusPositionRatio,
     focusedRect?.height,
     focusedRect?.width,
     focusedRect?.x,
     focusedRect?.y,
+    meta.world.height,
+    size.height,
+    size.width,
     viewportMeasured,
     worldRevision,
   ]);
+
+  useEffect(() => {
+    if (!onVisibleRangeChange) return;
+    if (!rangeFollowing.current) {
+      onVisibleRangeChange(null);
+      return;
+    }
+    const start = Math.max(0, Math.min(1, visibleWorldY / Math.max(1, meta.world.height)));
+    const end = Math.max(
+      start,
+      Math.min(1, (visibleWorldY + size.height / view.scale) / Math.max(1, meta.world.height)),
+    );
+    onVisibleRangeChange(end - start >= 0.995 ? null : [start, end]);
+  }, [meta.world.height, onVisibleRangeChange, size.height, view.scale, visibleWorldY]);
 
   useLayoutEffect(() => {
     const target = pendingScroll.current;
@@ -589,7 +658,7 @@ export function InspectionWorldCanvas({
     }
     context.fillStyle = 'rgba(0, 193, 255, .65)';
     const dividerTop = Math.max(0, WORLD_TOP_GUTTER_PX - view.scrollTop);
-    for (const camera of meta.world.cameras) {
+    for (const camera of displayCameras) {
       const x = camera.offsetX * view.scale - view.scrollLeft;
       context.fillRect(x, dividerTop, 1, Math.max(0, size.height - dividerTop));
     }
@@ -608,7 +677,7 @@ export function InspectionWorldCanvas({
       firstPaintReported.current = true;
       onFirstPaintRef.current?.();
     }
-  }, [cameraById, colorMode, failedKeys, level, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
+  }, [cameraById, colorMode, displayCameras, failedKeys, level, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -620,7 +689,7 @@ export function InspectionWorldCanvas({
       const pointerX = event.clientX - bounds.left;
       const pointerY = event.clientY - bounds.top;
       const current = interactionView.current;
-      const minimum = fitWidthScale(meta.world.width, size.width);
+      const minimum = fitWidthScale(displayWorldWidth, size.width);
       const scale = clampWorldScale(
         current.scale * Math.exp(-event.deltaY * 0.001),
         minimum,
@@ -628,6 +697,7 @@ export function InspectionWorldCanvas({
       );
       if (scale === current.scale) return;
       fitWidthMode.current = false;
+      rangeFollowing.current = true;
       const baseScroll = pendingScroll.current ?? {
         scrollLeft: hostRef.current?.scrollLeft ?? current.scrollLeft,
         scrollTop: hostRef.current?.scrollTop ?? current.scrollTop,
@@ -654,7 +724,7 @@ export function InspectionWorldCanvas({
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
     return () => canvas.removeEventListener('wheel', onWheel);
-  }, [meta.world.height, meta.world.width, size.height, size.width]);
+  }, [displayWorldWidth, meta.world.height, size.height, size.width]);
 
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     drag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
@@ -674,6 +744,23 @@ export function InspectionWorldCanvas({
   const onPointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (drag.current?.pointerId === event.pointerId) drag.current = null;
   };
+  const handleDoubleClick = (event: ReactMouseEvent<HTMLCanvasElement>) => {
+    if (isolatedCameraId != null) {
+      setIsolatedCameraId(null);
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const worldX = (event.clientX - bounds.left + view.scrollLeft) / view.scale;
+    const camera = meta.world.cameras.find((item) => (
+      worldX >= item.offsetX && worldX <= item.offsetX + item.width
+    ));
+    if (camera) setIsolatedCameraId(camera.cameraId);
+  };
+  const visiblePixelStart = Math.round(Number.isFinite(visibleWorldY) ? visibleWorldY : 0);
+  const visiblePixelEnd = Math.round(Math.min(
+    meta.world.height,
+    (Number.isFinite(visibleWorldY) ? visibleWorldY : 0) + size.height / view.scale,
+  ));
 
   return <div
     ref={hostRef}
@@ -683,9 +770,13 @@ export function InspectionWorldCanvas({
     data-scroll-mode="native"
     data-top-gutter={WORLD_TOP_GUTTER_PX}
     data-color-mode={colorMode}
+    data-isolated-camera={isolatedCameraId == null ? 'all' : isolatedCameraId}
     tabIndex={0}
     aria-label={`${recordId} 检测图像滚动视图`}
-    onScroll={scheduleScrollRead}
+    onScroll={() => {
+      rangeFollowing.current = true;
+      scheduleScrollRead();
+    }}
   >
     <div
       className="inspection-world-scroll-space"
@@ -707,17 +798,30 @@ export function InspectionWorldCanvas({
           data-locatable-defects={locatableDefects.length}
           data-loaded-tiles={loadedTileCount}
           data-cached-tiles={tileCache.current.size}
+          data-visible-pixel-start={visiblePixelStart}
+          data-visible-pixel-end={visiblePixelEnd}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onPointerCancel={onPointerUp}
+          onDoubleClick={handleDoubleClick}
         />
         <div className="inspection-world-camera-labels" aria-hidden="true">
-          {meta.world.cameras.map((camera) => <span
-            key={camera.cameraId}
-            data-testid="inspection-world-camera"
-            style={{ left: `${camera.offsetX * view.scale - view.scrollLeft}px`, width: `${camera.width * view.scale}px` }}
-          >C{camera.cameraId}</span>)}
+          {displayCameras.map((camera) => {
+            const cameraIndex = meta.world.cameras.findIndex((item) => item.cameraId === camera.cameraId);
+            const angleStart = cameraIndex / Math.max(1, meta.world.cameras.length) * 360;
+            const angleEnd = (cameraIndex + 1) / Math.max(1, meta.world.cameras.length) * 360;
+            return <span
+              key={camera.cameraId}
+              data-testid="inspection-world-camera"
+              style={{ left: `${camera.offsetX * view.scale - view.scrollLeft}px`, width: `${camera.width * view.scale}px` }}
+            >C{camera.cameraId}<small>{angleStart.toFixed(0)}°–{angleEnd.toFixed(0)}°</small></span>;
+          })}
+        </div>
+        <div className="inspection-world-length-ruler" aria-label={`当前长度像素 ${visiblePixelStart} 至 ${visiblePixelEnd}`}>
+          <span>{visiblePixelStart}px</span>
+          <b>长度像素</b>
+          <span>{visiblePixelEnd}px</span>
         </div>
         <div className="inspection-world-tile-status" role="status">
           {failedKeys.size

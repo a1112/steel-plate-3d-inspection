@@ -20,6 +20,10 @@ function createSingleRecordSearchPatch(field: RecordSearchField, value: string):
   };
 }
 
+function formatWholeMillimetres(value: number) {
+  return Number.isFinite(value) ? value.toFixed(0) : '—';
+}
+
 interface LeftSidebarProps {
   runtimeMode?: 'online' | 'bkv';
   plate: SteelPlate;
@@ -132,15 +136,15 @@ export function LeftSidebar({
           </div>
           <div>
             <dt>外径/宽度:</dt>
-            <dd>{plate.widthMm} mm</dd>
+            <dd>{formatWholeMillimetres(plate.widthMm)} mm</dd>
           </div>
           <div>
             <dt>钢管长度:</dt>
-            <dd>{plate.lengthMm} mm</dd>
+            <dd>{formatWholeMillimetres(plate.lengthMm)} mm</dd>
           </div>
           <div>
             <dt>壁厚:</dt>
-            <dd>{plate.thicknessMm} mm</dd>
+            <dd>{formatWholeMillimetres(plate.thicknessMm)} mm</dd>
           </div>
           <div>
             <dt>钢种规格:</dt>

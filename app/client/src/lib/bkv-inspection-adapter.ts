@@ -70,6 +70,10 @@ function finiteNumber(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+function textValue(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
 function standardDefectSeverity(grade: number | undefined) {
   if (grade != null && grade >= 3) return 'severe' as const;
   if (grade != null && grade <= 1) return 'minor' as const;
@@ -88,6 +92,13 @@ function standardDefect(
   const source = recordValue(defect.trace?.artifacts?.source);
   const sourceArtifacts = recordValue(source?.artifacts);
   const roi = recordValue(sourceArtifacts?.roi);
+  const sourceFrame = recordValue(sourceArtifacts?.sourceFrame);
+  const imageRectWidth = imageRect
+    ? Math.max(0, (imageRect.right ?? 0) - (imageRect.left ?? 0))
+    : 0;
+  const imageRectHeight = imageRect
+    ? Math.max(0, (imageRect.bottom ?? 0) - (imageRect.top ?? 0))
+    : 0;
   const sequenceNo = finiteNumber(defect.trace?.sequenceNo)
     ?? finiteNumber(defect.imageIndex)
     ?? finiteNumber(source?.imageIndex);
@@ -97,11 +108,22 @@ function standardDefect(
     frameId: String(sourceArtifacts?.frameId || `bkv-${cameraIndex}-${sequenceNo}`),
     sequenceNo,
     roi: {
-      x: finiteNumber(roi?.x) ?? 0,
-      y: finiteNumber(roi?.y) ?? 0,
-      width: finiteNumber(roi?.width) ?? 0,
-      height: finiteNumber(roi?.height) ?? 0,
+      x: finiteNumber(roi?.x) ?? imageRect?.left ?? 0,
+      y: finiteNumber(roi?.y) ?? imageRect?.top ?? 0,
+      width: finiteNumber(roi?.width) ?? imageRectWidth,
+      height: finiteNumber(roi?.height) ?? imageRectHeight,
     },
+    sourceFrame: sourceFrame ? {
+      intensity: textValue(sourceFrame.intensity) ?? undefined,
+      intensitySha256: textValue(sourceFrame.intensitySha256) ?? undefined,
+      depth: textValue(sourceFrame.depth) ?? undefined,
+      depthSha256: textValue(sourceFrame.depthSha256) ?? undefined,
+    } : undefined,
+    roiImage: textValue(sourceArtifacts?.roiImage) ?? undefined,
+    depthRoiImage: textValue(sourceArtifacts?.depthRoiImage) ?? undefined,
+    localPointCloud: textValue(sourceArtifacts?.localPointCloud) ?? undefined,
+    lengthProfile: textValue(sourceArtifacts?.lengthProfile) ?? undefined,
+    widthProfile: textValue(sourceArtifacts?.widthProfile) ?? undefined,
   } : undefined;
   return {
     id: String(defect.id),
@@ -110,27 +132,32 @@ function standardDefect(
     typeLabel: defect.className || '未分类缺陷',
     surface: cameraIndex && cameraIndex <= Math.ceil(cameraCount / 2) ? 'top' : 'bottom',
     severity: standardDefectSeverity(defect.grade),
-    distanceHeadMm: 0,
-    operatorSideMm: 0,
-    driveSideMm: 0,
-    widthMm: 0,
-    heightMm: 0,
-    depthMm: 0,
-    xRatio: 0,
-    yOffsetMm: 0,
+    distanceHeadMm: finiteNumber(source?.distanceHeadMm) ?? 0,
+    operatorSideMm: finiteNumber(source?.operatorSideMm) ?? 0,
+    driveSideMm: finiteNumber(source?.driveSideMm) ?? 0,
+    widthMm: finiteNumber(source?.widthMm) ?? 0,
+    heightMm: finiteNumber(source?.heightMm) ?? 0,
+    depthMm: finiteNumber(source?.depthMm) ?? 0,
+    xRatio: finiteNumber(source?.xRatio) ?? 0,
+    yOffsetMm: finiteNumber(source?.yOffsetMm) ?? 0,
     previewX,
     previewY,
-    previewImageUrl: '',
+    previewImageUrl: textValue(source?.previewImageUrl)
+      ?? textValue(sourceArtifacts?.roiImage)
+      ?? '',
     cameraId: cameraIndex ? `camera${cameraIndex}` : undefined,
     cameraIndex,
-    circumferenceRatio: cameraIndex
-      ? Math.max(0, Math.min(0.999, (cameraIndex - 0.5) / Math.max(1, cameraCount)))
-      : undefined,
-    confidence: defect.confidence,
-    detectionConfidence: defect.confidence,
-    classificationConfidence: defect.confidence,
-    classificationState: 'classified',
-    synthetic: false,
+    circumferenceRatio: finiteNumber(source?.circumferenceRatio)
+      ?? (cameraIndex
+        ? Math.max(0, Math.min(0.999, (cameraIndex - 0.5) / Math.max(1, cameraCount)))
+        : undefined),
+    confidence: finiteNumber(source?.confidence) ?? defect.confidence,
+    detectionConfidence: finiteNumber(source?.detectionConfidence) ?? defect.confidence,
+    classificationConfidence: finiteNumber(source?.classificationConfidence) ?? defect.confidence,
+    classificationState: textValue(source?.classificationState) ?? 'classified',
+    classificationVersion: textValue(source?.classificationVersion) ?? undefined,
+    candidatePolarity: textValue(source?.candidatePolarity) ?? undefined,
+    synthetic: source?.synthetic === true,
     artifacts,
   };
 }

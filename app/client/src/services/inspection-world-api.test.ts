@@ -6,8 +6,22 @@ import {
   fetchInspectionWorldReconstructionParameters,
   fetchInspectionWorldSurface,
   fetchInspectionWorldTile,
+  inspectionWorldFrameUrl,
   type InspectionWorldRecords,
 } from './inspection-world-api';
+
+describe('inspection world frame URLs', () => {
+  it('encodes a defect ROI crop with the source frame request', () => {
+    expect(inspectionWorldFrameUrl('1908500', 1, 18, {
+      x: 1208,
+      y: 848,
+      width: 4,
+      height: 11,
+    })).toContain(
+      'frame?recordId=1908500&cameraId=1&sequenceNo=18&cropX=1208&cropY=848&cropWidth=4&cropHeight=11',
+    );
+  });
+});
 
 function bsmeshFixture() {
   const vertexCount = 2;

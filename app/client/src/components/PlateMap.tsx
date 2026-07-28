@@ -51,6 +51,7 @@ interface PlateMapProps {
   onPreviewPositionChange: (positionM: number) => void;
   onSelectDefect: (defectId: string) => void;
   onViewModeChange?: (viewMode: PlateMapViewMode) => void;
+  onVisibleRangeChange?: (range: [number, number] | null) => void;
 }
 
 const surfaceModeOptions: { id: SurfaceDisplayMode; label: string }[] = [
@@ -1436,6 +1437,7 @@ export function PlateMap({
   onPreviewPositionChange,
   onSelectDefect,
   onViewModeChange,
+  onVisibleRangeChange,
 }: PlateMapProps) {
   const [localViewMode, setLocalViewMode] = useState<PlateMapViewMode>('2d');
   const viewMode = controlledViewMode ?? localViewMode;
@@ -1456,6 +1458,26 @@ export function PlateMap({
   const capturedCameraImageCount = new Set(captureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
   const displayedCameraImageCount = Math.min(cameraLanes.length, Math.max(productionCameraImageCount, capturedCameraImageCount));
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
+  const selectedDefect = defects.find((defect) => defect.id === selectedDefectId) ?? null;
+  const selectedDefectPositionRatio = useMemo(() => {
+    if (!selectedDefect) return null;
+    const lengthMm = safePlateLengthM * 1000;
+    if (selectedDefect.distanceHeadMm > 0 && lengthMm > 0) {
+      return Math.max(0, Math.min(1, selectedDefect.distanceHeadMm / lengthMm));
+    }
+    const sequenceNo = selectedDefect.artifacts?.sequenceNo;
+    const camera = displayedWorld?.meta.world.cameras.find(
+      (item) => item.cameraId === selectedDefect.cameraIndex,
+    );
+    if (sequenceNo != null && camera?.frameNumbers.length) {
+      const index = camera.frameNumbers.indexOf(sequenceNo);
+      if (index >= 0) return index / Math.max(1, camera.frameNumbers.length - 1);
+    }
+    if (sequenceNo != null && surfaceMesh && surfaceMesh.rows > 1) {
+      return Math.max(0, Math.min(1, sequenceNo / (surfaceMesh.rows - 1)));
+    }
+    return null;
+  }, [displayedWorld?.meta.world.cameras, safePlateLengthM, selectedDefect, surfaceMesh]);
   const { textureUrl, textureStatus } = useInspectionWorldTexture(
     inspectionId,
     displayedWorld?.meta,
@@ -1673,6 +1695,10 @@ export function PlateMap({
               radialUnit={nominalDiameterMm > 0 ? 'mm' : '显示坐标'}
               orientation={artifactOrientation}
               onZoomChange={setProductionZoom}
+              lengthMm={safePlateLengthM * 1000}
+              onVisibleRangeChange={onVisibleRangeChange}
+              focusPositionRatio={selectedDefectPositionRatio}
+              focusRevision={worldFocusRequest?.revision}
             />
           ) : (
             <div
@@ -1742,7 +1768,10 @@ export function PlateMap({
               ? worldFocusRequest?.defectId ?? null
               : null}
             focusDefectRevision={worldFocusRequest?.revision}
+            focusCameraId={selectedDefect?.cameraIndex}
+            focusPositionRatio={selectedDefectPositionRatio}
             colorMode={twoDDisplayMode}
+            onVisibleRangeChange={onVisibleRangeChange}
           /> : null}
           {activePendingWorld ? <InspectionWorldCanvas
             key={`pending:${activePendingWorld.recordId}:${activePendingWorld.meta.sourceFrameCount}:${activePendingWorld.meta.world.width}:${activePendingWorld.meta.world.height}`}
@@ -1752,6 +1781,8 @@ export function PlateMap({
             defects={activePendingWorld.defects}
             focusDefectId={worldFocusRequest?.defectId ?? null}
             focusDefectRevision={worldFocusRequest?.revision}
+            focusCameraId={selectedDefect?.cameraIndex}
+            focusPositionRatio={selectedDefectPositionRatio}
             colorMode={twoDDisplayMode}
             onFirstPaint={() => {
               displayedWorldRef.current = activePendingWorld;

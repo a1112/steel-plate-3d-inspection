@@ -7,9 +7,9 @@ import { LeftSidebar } from './LeftSidebar';
 
 const plate: SteelPlate = {
   plateNo: '202606131900',
-  widthMm: 3500,
-  lengthMm: 12000,
-  thicknessMm: 12,
+  widthMm: 691.6292254800729,
+  lengthMm: 12748.696640014648,
+  thicknessMm: 12.4,
   steelGrade: 'Q355B',
   detectedAt: '2026-06-13 19:00',
 };
@@ -64,6 +64,10 @@ describe('LeftSidebar', () => {
     expect(screen.queryByRole('heading', { name: '钢管信息' })).not.toBeInTheDocument();
     expect(screen.getByText('钢管号:')).toBeInTheDocument();
     expect(screen.getByText('Q355B')).toBeInTheDocument();
+    expect(screen.getByText('692 mm')).toBeInTheDocument();
+    expect(screen.getByText('12749 mm')).toBeInTheDocument();
+    expect(screen.getByText('12 mm')).toBeInTheDocument();
+    expect(screen.queryByText(/691\\.629|12748\\.696|12\\.4/)).not.toBeInTheDocument();
   });
 
   it('shows record details beside the table while a row is hovered', () => {

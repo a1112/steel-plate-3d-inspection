@@ -108,6 +108,44 @@ describe('InspectionWorldCanvas', () => {
     expect(vi.mocked(fetchInspectionWorldTile).mock.calls.length).toBeLessThan(126);
   });
 
+  it('centers camera identity with its circumferential angle and toggles single-camera view on double click', async () => {
+    render(<InspectionWorldCanvas recordId="1893700" meta={meta} defects={defects} />);
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    const viewport = screen.getByTestId('inspection-world-viewport');
+
+    expect(screen.getByText('0°–60°')).toBeInTheDocument();
+    expect(screen.getByLabelText('当前长度像素 0 至 360')).toBeInTheDocument();
+    fireEvent.doubleClick(canvas, { clientX: 50, clientY: 120 });
+    await waitFor(() => expect(viewport).toHaveAttribute('data-isolated-camera', '1'));
+    expect(screen.getAllByTestId('inspection-world-camera')).toHaveLength(1);
+    expect(screen.getByText('C1')).toBeInTheDocument();
+
+    fireEvent.doubleClick(canvas, { clientX: 50, clientY: 120 });
+    await waitFor(() => expect(viewport).toHaveAttribute('data-isolated-camera', 'all'));
+    expect(screen.getAllByTestId('inspection-world-camera')).toHaveLength(6);
+  });
+
+  it('reports the current longitudinal range after native scrolling while defaulting to global', async () => {
+    const onVisibleRangeChange = vi.fn();
+    render(
+      <InspectionWorldCanvas
+        recordId="1893700"
+        meta={meta}
+        defects={defects}
+        onVisibleRangeChange={onVisibleRangeChange}
+      />,
+    );
+    const viewport = screen.getByTestId('inspection-world-viewport');
+    expect(onVisibleRangeChange).toHaveBeenLastCalledWith(null);
+
+    viewport.scrollTop = 1_000;
+    fireEvent.scroll(viewport);
+    await waitFor(() => expect(onVisibleRangeChange).toHaveBeenLastCalledWith(expect.any(Array)));
+    const range = onVisibleRangeChange.mock.calls.at(-1)?.[0] as [number, number];
+    expect(range[0]).toBeGreaterThan(0);
+    expect(range[1]).toBeGreaterThan(range[0]);
+  });
+
   it('uses cumulative real camera widths for dividers and camera-local tile requests', async () => {
     render(<InspectionWorldCanvas recordId="1893700" meta={realWidthMeta} defects={[]} />);
     const scale = 1000 / 3870;

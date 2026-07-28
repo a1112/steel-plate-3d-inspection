@@ -337,6 +337,7 @@ export function AlarmAnalysis({
   collapsed,
   viewMode = 'overview',
   diameterMeasurement,
+  diameterVisibleRange,
 }: {
   selectedDefect: DefectItem | null;
   heightProfile: ChartPoint[];
@@ -353,6 +354,7 @@ export function AlarmAnalysis({
     nominalDiameterMm: number;
     lengthMm: number;
   };
+  diameterVisibleRange?: [number, number] | null;
 }) {
   const [localArtifacts, setLocalArtifacts] = useState<{
     pointCloud: BarSurfaceMesh | null;
@@ -452,6 +454,7 @@ export function AlarmAnalysis({
           mesh={surfaceMesh}
           nominalDiameterMm={diameterMeasurement.nominalDiameterMm}
           lengthMm={diameterMeasurement.lengthMm}
+          visibleRange={diameterVisibleRange}
         />
       </Panel>
     );

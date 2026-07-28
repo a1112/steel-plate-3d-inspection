@@ -249,12 +249,20 @@ export function inspectionWorldFrameUrl(
   recordId: string,
   cameraId: number,
   sequenceNo: number,
+  roi?: { x: number; y: number; width: number; height: number } | null,
 ) {
-  return worldUrl('frame', new URLSearchParams({
+  const params = new URLSearchParams({
     recordId,
     cameraId: String(cameraId),
     sequenceNo: String(sequenceNo),
-  }));
+  });
+  if (roi && roi.width > 0 && roi.height > 0) {
+    params.set('cropX', String(Math.max(0, Math.round(roi.x))));
+    params.set('cropY', String(Math.max(0, Math.round(roi.y))));
+    params.set('cropWidth', String(Math.max(1, Math.round(roi.width))));
+    params.set('cropHeight', String(Math.max(1, Math.round(roi.height))));
+  }
+  return worldUrl('frame', params);
 }
 
 const inspectionWorldSurfaceCache = new Map<string, BarSurfaceMesh>();
