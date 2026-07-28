@@ -32,3 +32,26 @@ JPG 与 NPZ 均来自流水号 `1908500` 的同相机、同帧原始 BMP/D3IMG�
 `manifest.json` 记录每帧的相机、帧号、D3IMG 完整头字段、图像形状、有效点数、源 D3IMG SHA-256、JPG SHA-256 和 NPZ SHA-256，远端可据此逐帧校验。`database.json` 只保留本流水号对应的记录、检测详情、被引用的缺陷类型和同步来源信息。
 
 加载 NPZ 时必须使用 `numpy.load(path, allow_pickle=False)`；不要把尚未标定的深度值解释为毫米。
+
+## 作为 BKV 离线模式启动
+
+仓库同时提交由这组 JPG/NPZ 和数据库快照派生的
+`1908500/bkv-runtime-manifest.json`。它记录文件身份、大小和 SHA-256，不复制样例数据，
+也不把未标定深度解释为物理尺寸。
+
+在 macOS/Linux 开发环境中执行：
+
+```bash
+scripts/run-bkv-sample-dev.sh
+```
+
+脚本会先校验提交清单，再把流水号 `1908500`（含数据库快照中的材料和缺陷信息）导入
+`target/data/bkv-sample-1908500-converted`，随后以 `config/sites/bkv-sample`
+现场配置启动服务和操作端。Python 环境需要包含
+`numpy` 与 `Pillow`；可通过 `STEEL_PYTHON=/absolute/path/to/python3` 指定已准备好的解释器。
+
+样例或清单生成逻辑变化后，使用以下命令重新生成并提交权威清单：
+
+```bash
+python3 scripts/build_bkv_sample_runtime.py
+```

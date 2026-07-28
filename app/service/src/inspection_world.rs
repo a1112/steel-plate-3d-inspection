@@ -1,13 +1,363 @@
 use image::{imageops, DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
-use std::io::Cursor;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_TILE_SIZE: u32 = 512;
+const DEFAULT_TILE_SIZE: u32 = 128;
 pub const MISSING_TILE_COLOR: [u8; 3] = [16, 20, 24];
+pub const TILE_CACHE_SCHEMA: &str = "steel.inspection-world-cache.v2";
+
+#[derive(Debug)]
+pub struct CachedTile {
+    pub bytes: Vec<u8>,
+    pub cache_hit: bool,
+    pub etag: String,
+}
+
+fn cache_component(value: &str, label: &str) -> Result<String, WorldError> {
+    let normalized = value.trim();
+    if normalized.is_empty()
+        || normalized.len() > 128
+        || !normalized
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(WorldError::Artifact(format!(
+            "{label} is not a safe cache identity"
+        )));
+    }
+    Ok(normalized.to_string())
+}
+
+pub fn tile_cache_record_root(
+    cache_root: &Path,
+    record_id: &str,
+    source_revision: &str,
+) -> Result<PathBuf, WorldError> {
+    Ok(record_cache_root(cache_root, record_id)?
+        .join(cache_component(source_revision, "sourceRevision")?))
+}
+
+pub fn record_cache_root(cache_root: &Path, record_id: &str) -> Result<PathBuf, WorldError> {
+    Ok(cache_root
+        .join("inspection-world-v2")
+        .join(cache_component(record_id, "recordId")?))
+}
+
+pub fn tile_cache_path(
+    cache_root: &Path,
+    record_id: &str,
+    source_revision: &str,
+    request: TileRequest,
+) -> Result<PathBuf, WorldError> {
+    let extension = match request.format {
+        TileFormat::Jpeg => "jpg",
+        TileFormat::Png => "png",
+    };
+    Ok(
+        tile_cache_record_root(cache_root, record_id, source_revision)?
+            .join("tile")
+            .join(format!("C{}", request.camera_id))
+            .join(format!("L{}", request.level))
+            .join(format!(
+                "{}_{}.{}",
+                request.tile_x, request.tile_y, extension
+            )),
+    )
+}
+
+fn cache_etag(source_revision: &str, request: TileRequest) -> String {
+    let mut digest = Sha256::new();
+    digest.update(source_revision.as_bytes());
+    digest.update(request.camera_id.to_le_bytes());
+    digest.update([request.level]);
+    digest.update(request.tile_x.to_le_bytes());
+    digest.update(request.tile_y.to_le_bytes());
+    digest.update([match request.format {
+        TileFormat::Jpeg => 1,
+        TileFormat::Png => 2,
+    }]);
+    format!("\"{}\"", format!("{:x}", digest.finalize()))
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorldError> {
+    let parent = path.parent().ok_or_else(|| {
+        WorldError::Artifact("tile cache path has no parent directory".to_string())
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        WorldError::Artifact(format!("tile cache directory unavailable: {error}"))
+    })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = path.with_extension(format!(
+        "{}.{}.tmp",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("tile"),
+        nonce
+    ));
+    let result = (|| {
+        let mut file = fs::File::create(&temporary).map_err(|error| {
+            WorldError::Artifact(format!("tile cache temporary file failed: {error}"))
+        })?;
+        file.write_all(bytes)
+            .map_err(|error| WorldError::Artifact(format!("tile cache write failed: {error}")))?;
+        file.sync_all()
+            .map_err(|error| WorldError::Artifact(format!("tile cache sync failed: {error}")))?;
+        fs::rename(&temporary, path)
+            .map_err(|error| WorldError::Artifact(format!("tile cache publish failed: {error}")))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn build_gate() -> &'static (Mutex<HashSet<PathBuf>>, Condvar) {
+    static GATE: OnceLock<(Mutex<HashSet<PathBuf>>, Condvar)> = OnceLock::new();
+    GATE.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()))
+}
+
+pub fn serve_cached_tile<F>(
+    cache_root: &Path,
+    record_id: &str,
+    source_revision: &str,
+    request: TileRequest,
+    generate: F,
+) -> Result<CachedTile, WorldError>
+where
+    F: FnOnce() -> Result<Vec<u8>, WorldError>,
+{
+    let path = tile_cache_path(cache_root, record_id, source_revision, request)?;
+    let etag = cache_etag(source_revision, request);
+    if let Ok(bytes) = fs::read(&path) {
+        return Ok(CachedTile {
+            bytes,
+            cache_hit: true,
+            etag,
+        });
+    }
+    let (active, wake) = build_gate();
+    let mut guard = active
+        .lock()
+        .map_err(|_| WorldError::Artifact("tile build gate poisoned".to_string()))?;
+    loop {
+        if let Ok(bytes) = fs::read(&path) {
+            return Ok(CachedTile {
+                bytes,
+                cache_hit: true,
+                etag,
+            });
+        }
+        if guard.insert(path.clone()) {
+            break;
+        }
+        guard = wake
+            .wait(guard)
+            .map_err(|_| WorldError::Artifact("tile build gate poisoned".to_string()))?;
+    }
+    drop(guard);
+    let generated = generate().and_then(|bytes| {
+        write_bytes_atomic(&path, &bytes)?;
+        Ok(bytes)
+    });
+    if let Ok(mut guard) = active.lock() {
+        guard.remove(&path);
+        wake.notify_all();
+    }
+    generated.map(|bytes| CachedTile {
+        bytes,
+        cache_hit: false,
+        etag,
+    })
+}
+
+pub fn read_cache_status(
+    cache_root: &Path,
+    record_id: &str,
+    source_revision: &str,
+    world: &InspectionWorld,
+) -> Value {
+    let root = match tile_cache_record_root(cache_root, record_id, source_revision) {
+        Ok(root) => root,
+        Err(_) => {
+            return json!({
+                "state": "unavailable",
+                "tileSize": world.tile_size,
+                "maxLevel": world.max_level,
+            })
+        }
+    };
+    fs::read(root.join("cache.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .map(|metadata| {
+            json!({
+                "state": metadata.get("state").and_then(Value::as_str).unwrap_or("building"),
+                "tileSize": metadata.pointer("/tile/tileSize").and_then(Value::as_u64).unwrap_or(u64::from(world.tile_size)),
+                "maxLevel": metadata.pointer("/tile/maxLevel").and_then(Value::as_u64).unwrap_or(u64::from(world.max_level)),
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "state": "building",
+                "tileSize": world.tile_size,
+                "maxLevel": world.max_level,
+            })
+        })
+}
+
+fn pyramid_gate() -> &'static Mutex<HashSet<PathBuf>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn pyramid_metadata(
+    record_id: &str,
+    source_revision: &str,
+    world: &InspectionWorld,
+    state: &str,
+    expected: u64,
+    actual: u64,
+) -> Value {
+    json!({
+        "schema": TILE_CACHE_SCHEMA,
+        "recordId": record_id,
+        "sourceHash": source_revision,
+        "state": state,
+        "tile": {
+            "format": "jpeg",
+            "tileSize": world.tile_size,
+            "maxLevel": world.max_level,
+            "expectedCount": expected,
+            "actualCount": actual,
+        },
+        "world": world,
+    })
+}
+
+pub fn schedule_full_tile_cache<F>(
+    cache_root: PathBuf,
+    record_id: String,
+    source_revision: String,
+    world: InspectionWorld,
+    generate: F,
+) where
+    F: Fn(TileRequest) -> Result<Vec<u8>, WorldError> + Send + Sync + 'static,
+{
+    let Ok(root) = tile_cache_record_root(&cache_root, &record_id, &source_revision) else {
+        return;
+    };
+    if fs::read(root.join("cache.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("complete")
+    {
+        return;
+    }
+    let Ok(mut active) = pyramid_gate().lock() else {
+        return;
+    };
+    if !active.insert(root.clone()) {
+        return;
+    }
+    drop(active);
+
+    let expected = world
+        .cameras
+        .iter()
+        .map(|camera| {
+            (0..=world.max_level)
+                .map(|level| {
+                    let span = u64::from(world.tile_size) << level;
+                    let columns = u64::from(camera.width).div_ceil(span);
+                    let rows = u64::from(camera.height).div_ceil(span);
+                    columns.saturating_mul(rows)
+                })
+                .sum::<u64>()
+        })
+        .sum::<u64>();
+    if let Ok(bytes) = serde_json::to_vec_pretty(&pyramid_metadata(
+        &record_id,
+        &source_revision,
+        &world,
+        "building",
+        expected,
+        0,
+    )) {
+        let _ = write_bytes_atomic(&root.join("cache.json"), &bytes);
+    }
+
+    let generator = Arc::new(generate);
+    thread::spawn(move || {
+        let mut actual = 0_u64;
+        for camera in &world.cameras {
+            for level in 0..=world.max_level {
+                let span = u64::from(world.tile_size) << level;
+                let columns = u64::from(camera.width).div_ceil(span);
+                let rows = u64::from(camera.height).div_ceil(span);
+                for tile_y in 0..rows {
+                    for tile_x in 0..columns {
+                        let request = TileRequest::for_camera(
+                            camera.camera_id,
+                            level,
+                            tile_x as u32,
+                            tile_y as u32,
+                            TileFormat::Jpeg,
+                        );
+                        if serve_cached_tile(
+                            &cache_root,
+                            &record_id,
+                            &source_revision,
+                            request,
+                            || generator(request),
+                        )
+                        .is_ok()
+                        {
+                            actual = actual.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        let state = if actual == expected {
+            "complete"
+        } else {
+            "building"
+        };
+        if let Ok(bytes) = serde_json::to_vec_pretty(&pyramid_metadata(
+            &record_id,
+            &source_revision,
+            &world,
+            state,
+            expected,
+            actual,
+        )) {
+            let _ = write_bytes_atomic(&root.join("cache.json"), &bytes);
+        }
+        if let Ok(mut active) = pyramid_gate().lock() {
+            active.remove(&root);
+        }
+    });
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,8 +453,8 @@ pub fn detect_camera_head(frames: &[(u32, PathBuf)]) -> Result<CameraAlignment, 
                         .and_then(|row| row.checked_sub(STABLE_ROWS as u32))
                         .ok_or(WorldError::DimensionOverflow)?;
                     let average = stable_run.iter().copied().sum::<f32>() / STABLE_ROWS as f32;
-                    let confidence_milli = ((average / 0.8).clamp(0.0, 1.0) * 1000.0)
-                        .round() as u16;
+                    let confidence_milli =
+                        ((average / 0.8).clamp(0.0, 1.0) * 1000.0).round() as u16;
                     return Ok(CameraAlignment {
                         aligned: true,
                         head_offset_y,
@@ -200,9 +550,7 @@ impl InspectionWorld {
         )
     }
 
-    pub fn with_alignments(
-        specs: Vec<(CameraSpec, CameraAlignment)>,
-    ) -> Result<Self, WorldError> {
+    pub fn with_alignments(specs: Vec<(CameraSpec, CameraAlignment)>) -> Result<Self, WorldError> {
         Self::with_tile_size_and_alignments(specs, DEFAULT_TILE_SIZE)
     }
 
@@ -604,6 +952,7 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn camera(camera_id: u32, width: u32, frame_height: u32, frame_count: u32) -> CameraSpec {
@@ -690,6 +1039,7 @@ mod tests {
 
         assert_eq!(world.width, 3_870);
         assert_eq!(world.height, 21_504);
+        assert_eq!(world.tile_size, 128);
         assert_eq!(world.cameras[5].offset_x, 3_193);
     }
 
@@ -1008,6 +1358,34 @@ mod tests {
 
         assert_eq!(calls.get(&1), Some(&1));
         assert_eq!(calls.get(&2), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disk_tile_cache_reports_miss_then_hit_without_regeneration() {
+        let root = temp_root("disk-cache");
+        let request = TileRequest::for_camera(1, 0, 0, 0, TileFormat::Jpeg);
+        let generations = AtomicUsize::new(0);
+
+        let first = serve_cached_tile(&root, "record-1", "revision-1", request, || {
+            generations.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1, 2, 3])
+        })
+        .unwrap();
+        let second = serve_cached_tile(&root, "record-1", "revision-1", request, || {
+            generations.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![4, 5, 6])
+        })
+        .unwrap();
+
+        assert!(!first.cache_hit);
+        assert!(second.cache_hit);
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.etag, second.etag);
+        assert_eq!(generations.load(Ordering::Relaxed), 1);
+        assert!(tile_cache_path(&root, "record-1", "revision-1", request)
+            .unwrap()
+            .is_file());
         fs::remove_dir_all(root).unwrap();
     }
 }

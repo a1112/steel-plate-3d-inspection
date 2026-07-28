@@ -3,6 +3,7 @@ import {
   fetchInspectionWorldDefects,
   fetchInspectionWorldMeta,
   fetchInspectionWorldRecords,
+  fetchInspectionWorldReconstructionParameters,
   fetchInspectionWorldSurface,
   fetchInspectionWorldTile,
   type InspectionWorldRecords,
@@ -66,7 +67,15 @@ describe('inspection world API', () => {
     };
     vi.mocked(fetch)
       .mockResolvedValueOnce(new Response(JSON.stringify(recordsPayload)))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ schema: 'steel.inspection-world.meta.v1', provider: 'bkv', recordId: '1893700', sourceFrameCount: 126, world: { width: 3870, height: 21504, tileSize: 512, maxLevel: 15, cameras: [] } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        schema: 'steel.inspection-world.meta.v1',
+        provider: 'bkv',
+        recordId: '1893700',
+        sourceFrameCount: 126,
+        sourceRevision: 'record-hash',
+        cache: { state: 'complete', tileSize: 128, maxLevel: 15 },
+        world: { width: 3870, height: 21504, tileSize: 128, maxLevel: 15, cameras: [] },
+      })))
       .mockResolvedValueOnce(new Response(JSON.stringify({ schema: 'steel.inspection-world.defects.v1', provider: 'bkv', recordId: '1893700', defects: [] })));
 
     const records = await fetchInspectionWorldRecords(controller.signal);
@@ -89,11 +98,12 @@ describe('inspection world API', () => {
       level: 2,
       x: 3,
       y: 4,
+      revision: 'source-revision',
       format: 'jpeg',
     });
 
     expect(String(vi.mocked(fetch).mock.calls[0][0]))
-      .toContain('recordId=1893700&cameraId=5&level=2&x=3&y=4&format=jpeg');
+      .toContain('recordId=1893700&revision=source-revision&cameraId=5&level=2&x=3&y=4&format=jpeg');
     expect(tile.url).toBe('blob:world-tile');
     tile.revoke();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:world-tile');
@@ -107,13 +117,98 @@ describe('inspection world API', () => {
     const surface = await fetchInspectionWorldSurface('1908293');
     const cached = await fetchInspectionWorldSurface('1908293');
 
-    expect(surface.coordinateUnit).toBe('legacy-unknown');
+    expect(surface.coordinateUnit).toBe('millimeter-normalized-radius');
     expect(surface.positions).toHaveLength(6);
     expect(surface.source).toBe('bkv-bsmesh');
     expect(cached).toBe(surface);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(String(vi.mocked(fetch).mock.calls[0][0]))
       .toContain('/api/inspection-world/surface?recordId=1908293&format=binary');
+    expect(vi.mocked(fetch).mock.calls[0][1]).toMatchObject({ cache: 'no-cache' });
+  });
+
+  it('loads computed NPZ reconstruction parameters for the selected record', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      schema: 'steel.bkv-depth-reconstruction-parameters.v1',
+      recordId: '1908500',
+      input: {
+        format: 'NPZ',
+        depthArray: 'depth.npy',
+        depthType: 'little-endian-float32',
+        sourceFrameCount: 114,
+        invalidDepthFloor: -999999,
+      },
+      sampling: {
+        rows: 128,
+        colsPerCamera: 32,
+        cameraCount: 6,
+        frameSelection: 'all-frames',
+        rowSelection: 'evenly-spaced-across-ordered-frames',
+        columnSelection: 'evenly-spaced',
+      },
+      reconstruction: {
+        geometry: 'closed-cylinder',
+        longitudinalExtent: 8,
+        nominalRadius: 1,
+        maximumRadialOffset: 0.28,
+        cameraNormalization: 'valid-sample-median',
+        coordinateUnit: 'legacy-unknown',
+        calibrated: false,
+      },
+      display: {
+        mode: 'camera-relative-residual',
+        robustResidualP95: 41.689789,
+        radialScale: 0.004318,
+        unit: 'legacy-unknown',
+      },
+      output: {
+        format: 'BSMESH01',
+        vertexCount: 24576,
+        validPointCount: 21882,
+        indexCount: 120870,
+        triangleCount: 40290,
+        binaryBytes: 1319104,
+      },
+      cameras: [],
+    })));
+
+    const parameters = await fetchInspectionWorldReconstructionParameters('1908500');
+
+    expect(parameters.output.vertexCount).toBe(24576);
+    expect(parameters.display.robustResidualP95).toBe(41.689789);
+    expect(String(vi.mocked(fetch).mock.calls[0][0]))
+      .toContain('/api/inspection-world/reconstruction-parameters?recordId=1908500');
+    expect(vi.mocked(fetch).mock.calls[0][1]).toMatchObject({ cache: 'no-cache' });
+  });
+
+  it('forces NPZ reconstruction and bypasses the browser surface cache', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        schema: 'steel.bkv-depth-reconstruction-parameters.v1',
+        recordId: 'force-1908500',
+        input: {},
+        sampling: {},
+        reconstruction: {},
+        display: {},
+        output: { vertexCount: 2 },
+        cameras: [],
+      })))
+      .mockResolvedValueOnce(new Response(bsmeshFixture(), {
+        headers: { 'Content-Type': 'application/vnd.steel.bsmesh' },
+      }));
+
+    await fetchInspectionWorldReconstructionParameters('force-1908500', undefined, true);
+    await fetchInspectionWorldSurface('force-1908500', undefined, true);
+
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(String(calls[0][0])).toContain(
+      '/api/inspection-world/reconstruction-parameters?recordId=force-1908500&rebuild=true',
+    );
+    expect(calls[0][1]).toMatchObject({ cache: 'no-store' });
+    expect(String(calls[1][0])).toMatch(
+      /surface\?recordId=force-1908500&format=binary&refresh=\d+/,
+    );
+    expect(calls[1][1]).toMatchObject({ cache: 'no-store' });
   });
 
   it('rejects an invalid world schema instead of rendering ambiguous data', async () => {

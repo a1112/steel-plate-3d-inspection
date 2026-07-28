@@ -52,7 +52,7 @@ function renderHeader(overrides: Partial<ComponentProps<typeof BrandHeader>> = {
 
 describe('BrandHeader', () => {
   it('shows BKV data status without online hardware or service alarms', () => {
-    renderHeader({
+    const { container } = renderHeader({
       dashboardMode: bkvDashboardMode,
       bkvData: {
         cameraCount: 6,
@@ -75,6 +75,8 @@ describe('BrandHeader', () => {
     expect(screen.queryByText('L2')).not.toBeInTheDocument();
     expect(screen.queryByText('触发网关')).not.toBeInTheDocument();
     expect(screen.queryByText('服务异常')).not.toBeInTheDocument();
+    expect(container.querySelector('.bkv-runtime-status .app-notification-system')).toBeNull();
+    expect(container.querySelector('.brand-right .app-notification-system')).not.toBeNull();
   });
 
   it('reports a standard-store failure as BKV data abnormal without service alarms', () => {

@@ -18,6 +18,13 @@ function firstRule(selector) {
   return block;
 }
 
+function lastRule(selector) {
+  const blocks = ruleBlocks(selector);
+  const block = blocks.at(-1);
+  expect(block, `missing CSS rule ${selector}`).toBeDefined();
+  return block;
+}
+
 function declaration(block, property) {
   return block.match(new RegExp(`(?:^|\\n)\\s*${escapeRegExp(property)}\\s*:\\s*([^;]+);`))?.[1].trim();
 }
@@ -65,8 +72,16 @@ describe('compact online detection layout CSS contract', () => {
     expectDeclaration('.brand-header .top-nav.top-nav-embedded button', 'height', '30px');
   });
 
-  it('uses a compact filter row above the flexible defect list', () => {
-    expectDeclaration('.right-column', 'grid-template-rows', 'auto minmax(0, 1fr)');
+  it('uses one bold blue value treatment across the BKV runtime status blocks', () => {
+    expectDeclaration('.brand-status.bkv-runtime-status .status-block span', 'font-weight', '950');
+    expectDeclaration('.brand-status.bkv-runtime-status .status-block strong', 'color', 'var(--blue)');
+    expectDeclaration('.brand-status.bkv-runtime-status .status-block strong', 'font-weight', '950');
+    expectDeclaration('.brand-status.bkv-runtime-status .status-block strong.ok', 'color', 'var(--blue)');
+    expectDeclaration('.brand-status.bkv-runtime-status > .bkv-mode-status', 'background', 'transparent');
+  });
+
+  it('uses compact defect image and filter rows above the flexible defect list', () => {
+    expectDeclaration('.right-column', 'grid-template-rows', 'auto auto minmax(0, 1fr)');
     expectDeclaration('.right-column', 'gap', '6px');
     expectDeclaration('.defect-filter-panel .panel-body', 'padding', '6px 8px 8px');
     expectDeclaration('.defect-type-filter', 'height', '30px');
@@ -86,6 +101,15 @@ describe('compact online detection layout CSS contract', () => {
 
     expectDeclaration('.window-controls .window-analysis-collapse', 'border-right', '1px solid var(--line)');
     expect(stylesCss).not.toContain('.app-footer-collapse');
+  });
+
+  it('lets the main view consume the released defect-sidebar width', () => {
+    expect(
+      declaration(
+        lastRule('.dashboard-grid.online-dashboard-grid.right-sidebar-collapsed'),
+        'grid-template-columns',
+      ),
+    ).toBe('minmax(0, 1fr)');
   });
 
   it('preserves compact defect filter sizing across every themed style cascade', () => {
@@ -129,7 +153,7 @@ describe('compact online detection layout CSS contract', () => {
     expectEveryDeclaredValue('.online-workspace', 'padding', '0 8px 8px');
     expectEveryDeclaredValue('.dashboard-grid.online-dashboard-grid', 'gap', '6px');
     expectEveryDeclaredValue('.dashboard-grid.online-dashboard-grid', 'padding', '6px 0 0');
-    expectEveryDeclaredValue('.right-column', 'grid-template-rows', 'auto minmax(0, 1fr)');
+    expectEveryDeclaredValue('.right-column', 'grid-template-rows', 'auto auto minmax(0, 1fr)');
     expectEveryDeclaredValue('.right-column', 'gap', '6px');
 
     expectDeclaration('.density-dense .online-workspace', 'gap', '6px');
@@ -140,7 +164,7 @@ describe('compact online detection layout CSS contract', () => {
     expectDeclaration('.theme-dark .online-workspace', 'padding', '0 8px 8px');
     expectDeclaration('.theme-dark .dashboard-grid.online-dashboard-grid', 'gap', '6px');
     expectDeclaration('.theme-dark .right-column', 'gap', '6px');
-    expectDeclaration('.theme-dark .right-column', 'grid-template-rows', 'auto minmax(0, 1fr)');
+    expectDeclaration('.theme-dark .right-column', 'grid-template-rows', 'auto auto minmax(0, 1fr)');
 
     const denseColumnGroup = firstRule(
       '.density-dense .left-column,\n.density-dense .center-column,\n.density-dense .right-column',

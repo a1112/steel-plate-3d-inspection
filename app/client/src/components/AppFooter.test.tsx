@@ -126,6 +126,34 @@ describe('AppFooter', () => {
     expect(screen.queryByRole('button', { name: '3D 重建' })).not.toBeInTheDocument();
   });
 
+  it('keeps main BKV switching in the toolbar and moves lower analysis switching to the footer', () => {
+    const onAnalysisViewModeChange = vi.fn();
+    render(
+      <AppFooter
+        activeNav="online"
+        dashboardMode={bkvDashboardMode}
+        analysis={{
+          defect,
+          surfaceViewMode: '3d',
+          analysisViewMode: 'diameter',
+          collapsed: false,
+          onSurfaceViewModeChange: vi.fn(),
+          onAnalysisViewModeChange,
+          onCollapsedChange: vi.fn(),
+        }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText('选中缺陷分析工具')).toHaveTextContent('凹坑');
+    expect(screen.queryByRole('group', { name: '主检测视图' })).not.toBeInTheDocument();
+    expect(screen.getByRole('group', { name: 'BKV 下方视图' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '宽度曲线' })).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(screen.getByRole('button', { name: '缺陷' }));
+    expect(onAnalysisViewModeChange).toHaveBeenCalledWith('defects');
+  });
+
   it('opens the more menu and disables offline replay outside BKV mode', () => {
     const onOnlineOpen = vi.fn();
     const onBkvOpen = vi.fn();

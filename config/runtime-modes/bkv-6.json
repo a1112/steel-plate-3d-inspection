@@ -51,9 +51,11 @@
     }
   ],
   "storage": {
+    "layoutVersion": 2,
     "sourceRoot": "tmp/legacy-bkv",
     "convertedRoot": "target/data/bkv-converted",
     "catalogPath": "target/data/bkv-converted/catalog.db",
+    "cacheRoot": "target/data/bkv-converted/cache",
     "converterOrigin": "http://127.0.0.1:4893"
   },
   "capture": {

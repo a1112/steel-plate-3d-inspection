@@ -1,7 +1,5 @@
 use crate::machine_site_config::{EffectiveSiteSelection, SiteSelectionSource};
-use crate::site_config::{
-    mark_project_applied, resolve_active_site, resolve_site_by_id, SiteMode,
-};
+use crate::site_config::{mark_project_applied, resolve_active_site, resolve_site_by_id, SiteMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -66,9 +64,15 @@ pub struct RuntimeCamera {
     pub source_directory: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+fn default_record_layout_version() -> u8 {
+    2
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStorage {
+    #[serde(default = "default_record_layout_version")]
+    pub layout_version: u8,
     #[serde(default)]
     pub source_root: String,
     #[serde(default)]
@@ -76,7 +80,22 @@ pub struct RuntimeStorage {
     #[serde(default)]
     pub catalog_path: String,
     #[serde(default)]
+    pub cache_root: String,
+    #[serde(default)]
     pub converter_origin: String,
+}
+
+impl Default for RuntimeStorage {
+    fn default() -> Self {
+        Self {
+            layout_version: default_record_layout_version(),
+            source_root: String::new(),
+            converted_root: String::new(),
+            catalog_path: String::new(),
+            cache_root: String::new(),
+            converter_origin: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -261,6 +280,9 @@ impl RuntimeProfile {
                 .ok_or_else(|| "runtime profile path has no site directory".to_string())?
         };
         validate_profile(&document, &allowed_root, configuration_root)?;
+        if mark_applied {
+            ensure_cache_root_writable(&document.storage, &allowed_root)?;
+        }
 
         let mut hasher = Sha256::new();
         if site_selection_source == SiteSelectionSource::Repository {
@@ -481,6 +503,42 @@ impl RuntimeProfile {
     }
 }
 
+fn ensure_cache_root_writable(storage: &RuntimeStorage, allowed_root: &Path) -> Result<(), String> {
+    let configured = storage.cache_root.trim();
+    if configured.is_empty() {
+        return Ok(());
+    }
+    let cache_root = allowed_root.join(configured);
+    fs::create_dir_all(&cache_root).map_err(|error| {
+        format!(
+            "storage cacheRoot is not writable ({}): {error}",
+            cache_root.display()
+        )
+    })?;
+    let canonical = fs::canonicalize(&cache_root).map_err(|error| {
+        format!(
+            "storage cacheRoot is unavailable ({}): {error}",
+            cache_root.display()
+        )
+    })?;
+    if !canonical.starts_with(allowed_root) {
+        return Err("storage cacheRoot escapes allowed root".to_string());
+    }
+    let probe = canonical.join(format!(".steel-cache-write-probe-{}", std::process::id()));
+    fs::create_dir(&probe).map_err(|error| {
+        format!(
+            "storage cacheRoot is not writable ({}): {error}",
+            canonical.display()
+        )
+    })?;
+    fs::remove_dir(&probe).map_err(|error| {
+        format!(
+            "storage cacheRoot write probe cleanup failed ({}): {error}",
+            probe.display()
+        )
+    })
+}
+
 fn hashable_project_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut project: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("project config JSON invalid: {error}"))?;
@@ -549,15 +607,15 @@ fn validate_profile(
             }
         }
         "headless-cpp" => {
-            if !document.capabilities.direct_camera
-                || !document.capabilities.capture_management
-            {
+            if !document.capabilities.direct_camera || !document.capabilities.capture_management {
                 return Err(
                     "headless-cpp runtime profile requires direct camera capabilities".to_string(),
                 );
             }
             if !capture.enabled {
-                return Err("headless-cpp runtime profile requires capture.enabled=true".to_string());
+                return Err(
+                    "headless-cpp runtime profile requires capture.enabled=true".to_string()
+                );
             }
             if capture.autostart && !capture.enabled {
                 return Err("capture.autostart requires capture.enabled=true".to_string());
@@ -570,6 +628,7 @@ fn validate_profile(
         (&document.storage.source_root, "storage sourceRoot"),
         (&document.storage.converted_root, "storage convertedRoot"),
         (&document.storage.catalog_path, "storage catalogPath"),
+        (&document.storage.cache_root, "storage cacheRoot"),
     ] {
         if !value.trim().is_empty() {
             validate_relative_path(value, label)?;
@@ -579,12 +638,20 @@ fn validate_profile(
             }
         }
     }
+    if document.storage.layout_version != 2 {
+        return Err(
+            "storage layoutVersion must be 2; migrate standard records before startup".to_string(),
+        );
+    }
     if document.data_source == "converted-local"
         && (document.storage.source_root.trim().is_empty()
             || document.storage.converted_root.trim().is_empty()
-            || document.storage.catalog_path.trim().is_empty())
+            || document.storage.catalog_path.trim().is_empty()
+            || document.storage.cache_root.trim().is_empty())
     {
-        return Err("converted-local profile requires source, converted, and catalog paths".into());
+        return Err(
+            "converted-local profile requires source, converted, catalog, and cache paths".into(),
+        );
     }
     if document.data_source == "converted-local" {
         validate_loopback_origin(&document.storage.converter_origin)?;
@@ -601,11 +668,7 @@ fn validate_profile(
             &document.algorithm.config_path,
             "algorithm config",
         )?;
-        let output_root = Path::new(document.algorithm.output_root.trim());
-        if !output_root.is_absolute()
-            || output_root.parent().is_none()
-            || output_root.parent().is_some_and(|parent| parent.parent().is_none())
-        {
+        if !is_absolute_non_volume_root(document.algorithm.output_root.trim()) {
             return Err(
                 "enabled algorithm pipeline outputRoot must be an absolute non-volume-root path"
                     .to_string(),
@@ -675,10 +738,7 @@ fn validate_loopback_origin(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_capture_profile(
-    profile: &RuntimeProfileDocument,
-    bytes: &[u8],
-) -> Result<(), String> {
+fn validate_capture_profile(profile: &RuntimeProfileDocument, bytes: &[u8]) -> Result<(), String> {
     let capture: CaptureProfileDocument = serde_json::from_slice(bytes)
         .map_err(|error| format!("capture profile JSON invalid: {error}"))?;
     if capture.schema != CAPTURE_PROFILE_SCHEMA {
@@ -713,6 +773,30 @@ fn validate_relative_path(value: &str, label: &str) -> Result<(), String> {
         return Err(format!("{label} must remain beneath the allowed root"));
     }
     Ok(())
+}
+
+fn is_absolute_non_volume_root(value: &str) -> bool {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return path.parent().is_some()
+            && path
+                .parent()
+                .is_some_and(|parent| parent.parent().is_some());
+    }
+
+    let bytes = value.as_bytes();
+    if bytes.len() < 4
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return false;
+    }
+    value[3..]
+        .split(['\\', '/'])
+        .filter(|component| !component.is_empty())
+        .count()
+        >= 2
 }
 
 fn contained_existing_file(
@@ -756,8 +840,11 @@ mod tests {
 
     fn write_json(path: &Path, value: &Value) {
         fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture");
-        fs::write(path, serde_json::to_vec_pretty(value).expect("fixture JSON"))
-            .expect("write fixture");
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(value).expect("fixture JSON"),
+        )
+        .expect("write fixture");
     }
 
     fn fixture(profile: Value, capture_profile: Option<Value>) -> Fixture {
@@ -811,9 +898,11 @@ mod tests {
             "cameraCount": 6,
             "cameras": cameras(6),
             "storage": {
+                "layoutVersion": 2,
                 "sourceRoot": "source",
                 "convertedRoot": "converted",
                 "catalogPath": "converted/catalog.db",
+                "cacheRoot": "converted/cache",
                 "converterOrigin": "http://127.0.0.1:4893"
             },
             "capabilities": {
@@ -872,8 +961,7 @@ mod tests {
         });
         let fixture = fixture(profile, Some(capture));
 
-        let loaded =
-            RuntimeProfile::load(&fixture.project, &fixture.root).expect("direct profile");
+        let loaded = RuntimeProfile::load(&fixture.project, &fixture.root).expect("direct profile");
 
         assert_eq!(loaded.camera_count(), 8);
         assert_eq!(
@@ -907,10 +995,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "steel-runtime-site-{}-{stamp}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("steel-runtime-site-{}-{stamp}", std::process::id()));
         let config_root = root.join("config");
         let store =
             SiteConfigStore::new(config_root.join("sites")).expect("site configuration store");
@@ -977,16 +1063,25 @@ mod tests {
             .canonicalize()
             .expect("workspace");
 
-        let loaded = RuntimeProfile::load(
-            &workspace.join("config/project.json"),
-            &workspace,
-        )
-        .expect("checked-in runtime");
+        let loaded = RuntimeProfile::load(&workspace.join("config/project.json"), &workspace)
+            .expect("checked-in runtime");
 
         assert_eq!(loaded.site_id, "bkv-default");
         assert_eq!(loaded.site_mode, SiteMode::Bkv);
         assert_eq!(loaded.camera_count(), 6);
         assert!(!loaded.site_compatibility);
+    }
+
+    #[test]
+    fn recognizes_configured_windows_output_roots_on_every_host_platform() {
+        assert!(is_absolute_non_volume_root(
+            r"D:\steel-inspection\algorithm-data"
+        ));
+        assert!(is_absolute_non_volume_root(
+            "D:/steel-inspection/algorithm-data"
+        ));
+        assert!(!is_absolute_non_volume_root(r"D:\"));
+        assert!(!is_absolute_non_volume_root("D:relative/path"));
     }
 
     #[test]
@@ -1020,9 +1115,8 @@ mod tests {
         );
 
         let loaded = RuntimeProfile::load_for_startup(&project, &root).expect("site runtime");
-        let persisted: Value =
-            serde_json::from_slice(&fs::read(&project).expect("project bytes"))
-                .expect("project JSON");
+        let persisted: Value = serde_json::from_slice(&fs::read(&project).expect("project bytes"))
+            .expect("project JSON");
 
         assert!(!loaded.pending_restart);
         assert_eq!(persisted["pendingRestart"], false);

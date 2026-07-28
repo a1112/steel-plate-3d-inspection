@@ -142,10 +142,12 @@ describe('App BKV provider selection', () => {
           provider: 'bkv',
           recordId,
           sourceFrameCount: 6,
+          sourceRevision: `revision-${recordId}`,
+          cache: { state: 'complete', tileSize: 128, maxLevel: 10 },
           world: {
             width: 600,
             height: 1024,
-            tileSize: 512,
+            tileSize: 128,
             maxLevel: 10,
             cameras: Array.from({ length: 6 }, (_, index) => ({
               cameraId: index + 1,
@@ -196,7 +198,12 @@ describe('App BKV provider selection', () => {
     expect(screen.queryByRole('heading', { name: 'BKV 离线回放' })).not.toBeInTheDocument();
     expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '采集管理' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '3D 重建' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '3D 重建' })).toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: '主检测视图' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '折叠右侧栏' }));
+    expect(screen.queryByRole('heading', { name: '缺陷图像' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '展开右侧栏' }));
+    expect(screen.getByRole('heading', { name: '缺陷图像' })).toBeInTheDocument();
     expect(requestedUrls.some((url) => url.includes('/api/inspection/snapshot'))).toBe(false);
     expect(requestedUrls.some((url) => url.includes('/api/inspection-world/records'))).toBe(true);
     expect(requestedUrls.some((url) => url.includes('/api/bkv/status'))).toBe(false);
@@ -445,11 +452,8 @@ describe('App online severity filters', () => {
 });
 
 describe('App runtime capability routing', () => {
-  it.each([
-    ['capture', '采集管理'],
-    ['bar-surface', '3D 重建'],
-  ])('redirects the %s deep link to the terminal when BKV disables %s', async (app, label) => {
-    window.history.replaceState(null, '', `/?app=${app}`);
+  it('redirects the capture deep link to the terminal when BKV disables capture management', async () => {
+    window.history.replaceState(null, '', '/?app=capture');
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/api/runtime-profile')) {
@@ -468,9 +472,33 @@ describe('App runtime capability routing', () => {
 
     render(<App />);
 
-    expect(await screen.findByText(`当前运行模式不支持${label}，已返回检测终端`)).toBeInTheDocument();
+    expect(await screen.findByText('当前运行模式不支持采集管理，已返回检测终端')).toBeInTheDocument();
     expect(new URLSearchParams(window.location.search).get('app')).toBe('terminal');
-    expect(screen.queryByRole('heading', { name: label })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '采集管理' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the read-only NPZ reconstruction deep link available in BKV mode', async () => {
+    window.history.replaceState(null, '', '/?app=bar-surface');
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/records')) {
+        return new Response(JSON.stringify({
+          ...bkvRecordsPayload,
+          ready: false,
+          batchId: '无离线批次',
+          records: [],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'NPZ 3D 重建工作台' })).toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get('app')).toBe('bar-surface');
   });
 
   it('normalizes an online deep link back to the configured BKV terminal', async () => {

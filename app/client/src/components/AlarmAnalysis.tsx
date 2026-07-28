@@ -9,7 +9,9 @@ import { surfaceLabels } from '../data/inspection';
 import { createPointCloudGeometryArrays } from '../lib/point-cloud-simulator';
 import { createSectionProfiles } from '../lib/section-profiles';
 import { barSurfaceFileUrl, type BarSurfaceMesh } from '../services/bar-surface-api';
+import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import { Panel } from './Panel';
+import { DiameterTrendPanel } from './DiameterTrendPanel';
 import { ProductionArtifactView } from './ProductionArtifactView';
 
 const POINT_CLOUD_INITIAL_YAW = -0.32;
@@ -22,7 +24,7 @@ const CHART_AXIS_MIN_ZOOM = 1;
 const CHART_AXIS_MAX_ZOOM = 3;
 const CHART_AXIS_ZOOM_STEP = 0.2;
 
-export type AnalysisViewMode = 'overview' | 'image' | 'point-cloud' | 'profile';
+export type AnalysisViewMode = 'overview' | 'image' | 'point-cloud' | 'profile' | 'diameter' | 'defects';
 
 function clampPointCloudYaw(yaw: number) {
   return Math.max(POINT_CLOUD_INITIAL_YAW - POINT_CLOUD_MAX_YAW_OFFSET, Math.min(POINT_CLOUD_INITIAL_YAW + POINT_CLOUD_MAX_YAW_OFFSET, yaw));
@@ -326,6 +328,7 @@ export function AlarmAnalysis({
   selectedDefect,
   heightProfile,
   captureImages = [],
+  defects = [],
   artifactMode = 'production',
   surfaceMesh,
   artifactStatus,
@@ -333,10 +336,12 @@ export function AlarmAnalysis({
   headerless = false,
   collapsed,
   viewMode = 'overview',
+  diameterMeasurement,
 }: {
   selectedDefect: DefectItem | null;
   heightProfile: ChartPoint[];
   captureImages?: CaptureImageItem[];
+  defects?: DefectItem[];
   artifactMode?: 'production' | 'demo';
   surfaceMesh?: BarSurfaceMesh | null;
   artifactStatus?: string;
@@ -344,6 +349,10 @@ export function AlarmAnalysis({
   headerless?: boolean;
   collapsed?: boolean;
   viewMode?: AnalysisViewMode;
+  diameterMeasurement?: {
+    nominalDiameterMm: number;
+    lengthMm: number;
+  };
 }) {
   const [localArtifacts, setLocalArtifacts] = useState<{
     pointCloud: BarSurfaceMesh | null;
@@ -353,6 +362,25 @@ export function AlarmAnalysis({
   }>({ pointCloud: null, lengthProfile: [], widthProfile: [], status: '' });
   const isCollapsed = Boolean(collapsed);
   const panelClassName = `alarm-analysis-panel analysis-view-${viewMode}`;
+  const bkvDefectImages: CaptureImageItem[] = inspectionId
+    ? (defects.length ? defects : selectedDefect ? [selectedDefect] : []).flatMap((defect) => {
+      const cameraIndex = defect.cameraIndex;
+      const sequenceNo = defect.artifacts?.sequenceNo;
+      if (!cameraIndex || sequenceNo == null) return [];
+      return [{
+        id: `defect-frame-${defect.id}`,
+        cameraId: `C${cameraIndex} · ${defect.typeLabel}`,
+        cameraIp: '',
+        dataName: 'intensity',
+        sequenceNo,
+        fileType: 'image',
+        path: `inspection-world/${inspectionId}/camera/${cameraIndex}/frame/${sequenceNo}`,
+        url: inspectionWorldFrameUrl(inspectionId, cameraIndex, sequenceNo),
+        createdAt: '',
+      }];
+    })
+    : [];
+  const lowerDefectImages = bkvDefectImages.length ? bkvDefectImages : captureImages;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -395,6 +423,38 @@ export function AlarmAnalysis({
 
   if (isCollapsed) {
     return null;
+  }
+
+  if (
+    surfaceMesh
+    && diameterMeasurement
+    && diameterMeasurement.nominalDiameterMm > 0
+    && diameterMeasurement.lengthMm > 0
+  ) {
+    if (viewMode === 'defects') {
+      return (
+        <Panel
+          title="缺陷图片列表"
+          className={`${panelClassName} defect-strip-analysis-panel`}
+          headerless={headerless}
+        >
+          <CaptureImagePreview captureImages={lowerDefectImages} />
+        </Panel>
+      );
+    }
+    return (
+      <Panel
+        title="拟合外径测量"
+        className={`${panelClassName} diameter-analysis-panel`}
+        headerless={headerless}
+      >
+        <DiameterTrendPanel
+          mesh={surfaceMesh}
+          nominalDiameterMm={diameterMeasurement.nominalDiameterMm}
+          lengthMm={diameterMeasurement.lengthMm}
+        />
+      </Panel>
+    );
   }
 
   if (!selectedDefect && captureImages.length > 0) {

@@ -6,6 +6,18 @@ Environment templates live in `config/env`.
 
 ## BKV offline runtime manifest
 
+For a self-contained developer run backed by the committed six-camera `1908500`
+JPG/NPZ sample and its database snapshot, use:
+
+```bash
+scripts/run-bkv-sample-dev.sh
+```
+
+This selects `config/project.bkv-sample.json`, verifies the committed sample
+runtime manifest, imports the one-record batch into an isolated normalized store under
+`target/data/bkv-sample-1908500-converted`, and starts the Rust service plus Vite client in BKV offline mode.
+It never connects to camera hardware or MySQL.
+
 After converting legacy `.d3img` files and building the six-camera previews, build the
 strict read-only source manifest consumed by the BKV import service:
 
@@ -54,12 +66,29 @@ business records or arbitrary files.
   records/<inspectionId>/
     record.json
     source-provenance.json
-    cameras/C1..C6/frames/<sequence>/intensity.jpg
-    cameras/C1..C6/frames/<sequence>/depth.npz
+    cameras/C1..C6/intensity/<sequence>.jpg
+    cameras/C1..C6/depth/<sequence>.npz
     defects/defects.json
+  cache/inspection-world-v2/<inspectionId>/<sourceHash>/
+    cache.json
+    tile/C1..C6/L0..Ln/<x>_<y>.jpg
+    surface/surface-mesh.bsmesh
+    surface/reconstruction-parameters.json
   imports/.staging/<jobId>/<inspectionId>/
   imports/quarantine/<jobId>-<inspectionId>.json
 ```
+
+新版运行时只接受 `steel.standard-record.v2`。停服迁移已有 V1 标准库：
+
+```bash
+python3 scripts/migrate_standard_records_v2.py \
+  --data-root /absolute/path/to/converted \
+  --cache-root /absolute/path/to/converted/cache
+```
+
+迁移逐记录暂存并校验，写入完整 128px JPEG 瓦片金字塔后再原子切换目录；
+重复运行会跳过 V2 记录。失败记录恢复旧目录，成功后清除事务备份及 `._*`
+AppleDouble 文件。原始 BKV 源目录和仓库内 `sample-data` 始终只读。
 
 `catalog.db` contains an import job/record ledger and normalized
 `material_session`, `production_inspection`, `production_defect`, and
@@ -111,11 +140,16 @@ Run browser verification against an already started BKV service and client with:
 scripts/test-runtime-ui-smoke.ps1 -ExpectBkv
 ```
 
-The 2D viewer consumes one provider-neutral, on-demand image-world contract:
+The 2D viewer consumes one provider-neutral, revision-bound image-world contract:
 `/api/inspection-world/records`, `/meta`, `/defects`, and `/tile`. BKV mode builds
 six camera columns from the manifest JPEG frames (C1 through C6, frame order
 ascending, rotation 0, no flips). The browser requests only visible/prefetched
-tiles and does not prebuild a giant stitched bitmap. `-ExpectBkv` verifies actual
+128px tiles, limits work to six concurrent requests and 400 queued requests, and
+keeps a 64 MiB weighted LRU with parent-LOD fallback. Offline publication prebuilds
+the complete pyramid; online publication builds it in the background while a cache
+miss is synchronously generated and written back. Tile requests include
+`revision=<sourceHash>` and stable responses return `ETag`,
+`X-World-Tile-Cache: HIT|MISS`, and immutable cache headers. `-ExpectBkv` verifies actual
 Canvas pixels, bounded tile requests, defect focus, and the retained JIT/3D tabs.
 
 When BKV is disabled, the same routes use production inspection tables. Records

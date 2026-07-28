@@ -1,0 +1,5 @@
+{
+  "schema": "steel.project-config.v1",
+  "activeSiteConfig": "config/sites/bkv-sample/site.json",
+  "pendingRestart": false
+}

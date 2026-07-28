@@ -1,0 +1,17 @@
+{
+  "schema": "steel.source-processing-config.v1",
+  "processor": "bkv-sample-replay",
+  "processorVersion": "1.0.0",
+  "input": {
+    "intensityDirectory": "2D",
+    "intensityExtension": "jpg",
+    "depthDirectory": "3D",
+    "depthExtension": "npz",
+    "cameraCount": 6
+  },
+  "persistence": {
+    "rawCopy": false,
+    "writeManifest": false,
+    "writeTiming": false
+  }
+}

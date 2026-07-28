@@ -87,6 +87,25 @@ describe('AlarmAnalysis', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
+  it('switches the BKV lower analysis surface to a horizontal defect image strip', () => {
+    const { container } = render(createElement(AlarmAnalysis, {
+      selectedDefect: defect,
+      heightProfile: [],
+      captureImages: [captureImage],
+      surfaceMesh: productionMesh,
+      diameterMeasurement: {
+        nominalDiameterMm: 200,
+        lengthMm: 12_000,
+      },
+      viewMode: 'defects',
+      headerless: true,
+    }));
+
+    expect(container.querySelector('.defect-strip-analysis-panel')).not.toBeNull();
+    expect(screen.getByRole('button', { name: '打开 camera2 intensity #7' })).toBeInTheDocument();
+    expect(screen.queryByTestId('diameter-trend-grid')).not.toBeInTheDocument();
+  });
+
   it('can show the lower analysis charts without the removed panel title', () => {
     render(createElement(AlarmAnalysis, { selectedDefect: defect, heightProfile: points, headerless: true, artifactMode: 'demo' }));
 

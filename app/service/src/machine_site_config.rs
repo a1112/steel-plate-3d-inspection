@@ -181,16 +181,12 @@ fn platform_machine_name() -> Option<String> {
 fn platform_machine_name() -> Option<String> {
     use std::ptr;
     use windows_sys::Win32::System::SystemInformation::{
-        GetComputerNameExW, ComputerNamePhysicalDnsHostname,
+        ComputerNamePhysicalDnsHostname, GetComputerNameExW,
     };
 
     let mut size = 0_u32;
     unsafe {
-        GetComputerNameExW(
-            ComputerNamePhysicalDnsHostname,
-            ptr::null_mut(),
-            &mut size,
-        );
+        GetComputerNameExW(ComputerNamePhysicalDnsHostname, ptr::null_mut(), &mut size);
     }
     if size == 0 {
         return None;
@@ -459,9 +455,7 @@ mod tests {
     #[test]
     fn machine_store_write_read_and_clear_round_trip() {
         let store = MemoryMachineSiteStore::default();
-        store
-            .write_default_site_id("bkv-offline-lcx-ace")
-            .unwrap();
+        store.write_default_site_id("bkv-offline-lcx-ace").unwrap();
         assert_eq!(
             store.read_default_site_id().unwrap().as_deref(),
             Some("bkv-offline-lcx-ace")

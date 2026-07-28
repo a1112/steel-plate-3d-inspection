@@ -51,9 +51,11 @@
     }
   ],
   "storage": {
+    "layoutVersion": 2,
     "sourceRoot": "",
     "convertedRoot": "",
     "catalogPath": "",
+    "cacheRoot": "target/data/bkv-online-cache",
     "converterOrigin": ""
   },
   "capture": {

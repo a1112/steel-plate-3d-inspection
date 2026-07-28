@@ -10,7 +10,7 @@
     "cameraCount": 6
   },
   "inspectionWorld": {
-    "tileSize": 512,
+    "tileSize": 128,
     "tileFormats": [
       "jpeg",
       "png"

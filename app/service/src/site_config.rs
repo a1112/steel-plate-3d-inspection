@@ -499,10 +499,7 @@ impl SiteConfigStore {
                 }
                 if let Some(mode) = entry.unix_mode() {
                     let file_type = mode & 0o170000;
-                    if file_type != 0
-                        && file_type != 0o100000
-                        && file_type != 0o040000
-                    {
+                    if file_type != 0 && file_type != 0o100000 && file_type != 0o040000 {
                         return Err(
                             "site archive contains a link or special filesystem entry".to_string()
                         );
@@ -1245,7 +1242,7 @@ fn algorithm_template(mode: &SiteMode) -> Value {
             "cameraCount": camera_count
         },
         "inspectionWorld": {
-            "tileSize": 512,
+            "tileSize": 128,
             "detectHeadAlignment": true,
             "cacheTiles": true
         }
@@ -1382,10 +1379,9 @@ mod tests {
         fixture.create_bkv("bkv-contained");
         let package = fixture.store.get("bkv-contained").expect("BKV site");
         fs::write(fixture.root.join("outside.json"), b"{}").expect("outside config");
-        let mut site: serde_json::Value = serde_json::from_slice(
-            &fs::read(package.root.join("site.json")).expect("site config"),
-        )
-        .expect("site JSON");
+        let mut site: serde_json::Value =
+            serde_json::from_slice(&fs::read(package.root.join("site.json")).expect("site config"))
+                .expect("site JSON");
         site["algorithmConfig"] = json!("../outside.json");
         fs::write(
             package.root.join("site.json"),
@@ -1455,8 +1451,7 @@ mod tests {
 
         assert_eq!(imported.document.id, "bkv-export");
         assert_eq!(
-            fs::read_to_string(imported.root.join("connection.json"))
-                .expect("imported connection"),
+            fs::read_to_string(imported.root.join("connection.json")).expect("imported connection"),
             fs::read_to_string(package.root.join("connection.json")).expect("source connection")
         );
         assert!(!imported.root.join("sibling-secret.txt").exists());
@@ -1679,8 +1674,7 @@ mod tests {
     fn explicit_site_id_resolves_inside_the_project_site_root() {
         let fixture = SiteConfigFixture::new();
         let config_root = fixture.root.join("config");
-        let store =
-            SiteConfigStore::new(config_root.join("sites")).expect("project site store");
+        let store = SiteConfigStore::new(config_root.join("sites")).expect("project site store");
         store
             .create(CreateSiteConfig {
                 id: "repo-site".to_string(),
@@ -1718,8 +1712,7 @@ mod tests {
     fn explicit_missing_site_id_does_not_fall_back_to_project() {
         let fixture = SiteConfigFixture::new();
         let config_root = fixture.root.join("config");
-        let store =
-            SiteConfigStore::new(config_root.join("sites")).expect("project site store");
+        let store = SiteConfigStore::new(config_root.join("sites")).expect("project site store");
         store
             .create(CreateSiteConfig {
                 id: "repo-site".to_string(),

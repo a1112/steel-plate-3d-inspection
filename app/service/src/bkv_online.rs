@@ -286,7 +286,10 @@ fn current_time_millis() -> u64 {
 }
 
 fn parse_bkv_record_sequence(record_id: &str) -> Result<i64, String> {
-    let normalized = record_id.trim().strip_prefix("bkv-").unwrap_or(record_id.trim());
+    let normalized = record_id
+        .trim()
+        .strip_prefix("bkv-")
+        .unwrap_or(record_id.trim());
     normalized
         .parse::<i64>()
         .ok()
@@ -395,12 +398,7 @@ impl BkvSource {
             record_limit: if profile.algorithm.source_data.enabled {
                 profile.algorithm.source_data.record_limit
             } else {
-                bounded_env_usize(
-                    "STEEL_BKV_RECORD_LIMIT",
-                    DEFAULT_RECORD_LIMIT,
-                    1,
-                    2_000,
-                )
+                bounded_env_usize("STEEL_BKV_RECORD_LIMIT", DEFAULT_RECORD_LIMIT, 1, 2_000)
             },
             defect_window: bounded_env_usize(
                 "STEEL_BKV_DEFECT_WINDOW",
@@ -588,6 +586,7 @@ impl BkvSource {
             "recordId": canonical_bkv_record_id(sequence),
             "legacySeqNo": sequence,
             "sourceFrameCount": processed.source_frame_count,
+            "sourceRevision": processed.revision,
             "world": processed.world,
             "depthSurface": {
                 "available": processed.depth_surface.is_some(),
@@ -624,10 +623,7 @@ impl BkvSource {
         })
     }
 
-    pub fn inspection_world_surface_binary(
-        &self,
-        record_id: &str,
-    ) -> Result<Arc<Vec<u8>>, String> {
+    pub fn inspection_world_surface_binary(&self, record_id: &str) -> Result<Arc<Vec<u8>>, String> {
         let sequence = parse_bkv_record_sequence(record_id)?;
         let processed = self.load_inspection_world(&canonical_bkv_record_id(sequence))?;
         processed.depth_surface_binary.clone().ok_or_else(|| {
@@ -729,7 +725,10 @@ impl BkvSource {
                 .join("tiles")
                 .join(format!("camera{}", request.camera_id))
                 .join(format!("level{}", request.level))
-                .join(format!("{}_{}.{}", request.tile_x, request.tile_y, extension))
+                .join(format!(
+                    "{}_{}.{}",
+                    request.tile_x, request.tile_y, extension
+                ))
         });
         if let Some(path) = cached_path.as_ref() {
             if let Ok(bytes) = fs::read(path) {
@@ -740,9 +739,7 @@ impl BkvSource {
         let bytes = inspection_world::compose_camera_tile(
             &processed.world,
             request,
-            |camera_id, image_index| {
-                Ok(processed.frames.get(&(camera_id, image_index)).cloned())
-            },
+            |camera_id, image_index| Ok(processed.frames.get(&(camera_id, image_index)).cloned()),
         )
         .map_err(|error| error.to_string())?;
         if let Some(path) = cached_path.as_ref() {
@@ -764,7 +761,10 @@ impl BkvSource {
         Ok(bytes)
     }
 
-    fn load_inspection_world(&self, record_id: &str) -> Result<Arc<BkvOnlineInspectionWorld>, String> {
+    fn load_inspection_world(
+        &self,
+        record_id: &str,
+    ) -> Result<Arc<BkvOnlineInspectionWorld>, String> {
         let sequence = parse_bkv_record_sequence(record_id)?;
         if let Some(cached) = self
             .inspection_world_cache
@@ -928,8 +928,8 @@ impl BkvSource {
         let mut specs = Vec::with_capacity(camera_inputs.len());
         let mut source_cameras = Vec::with_capacity(camera_inputs.len());
         for (spec, alignment_frames, image_dir) in camera_inputs {
-            let alignment =
-                inspection_world::detect_camera_head(&alignment_frames).map_err(|error| error.to_string())?;
+            let alignment = inspection_world::detect_camera_head(&alignment_frames)
+                .map_err(|error| error.to_string())?;
             source_cameras.push(json!({
                 "cameraId": spec.camera_id,
                 "sourceDirectory": image_dir.display().to_string(),
@@ -1133,12 +1133,7 @@ impl BkvSource {
         match self.snapshot_value().await {
             Ok(mut snapshot) => {
                 let refreshed_at_ms = current_time_millis();
-                let refresh_count = self
-                    .refresh_state
-                    .read()
-                    .await
-                    .successes
-                    .saturating_add(1);
+                let refresh_count = self.refresh_state.read().await.successes.saturating_add(1);
                 if let Some(object) = snapshot.as_object_mut() {
                     object.insert(
                         "sync".to_string(),
@@ -1151,9 +1146,8 @@ impl BkvSource {
                     );
                 }
                 if let Err(error) = self.persist_source_catalog(&snapshot) {
-                    let error = DbErr::Custom(format!(
-                        "BKV MySQL source-data persistence failed: {error}"
-                    ));
+                    let error =
+                        DbErr::Custom(format!("BKV MySQL source-data persistence failed: {error}"));
                     self.refresh_state.write().await.last_error = Some(error.to_string());
                     return Err(error);
                 }
@@ -1236,12 +1230,7 @@ impl BkvSource {
             d3img_to_bmp(&read_bounded_file(&path)?)?
         });
         if let Ok(mut cache) = self.image_cache.lock() {
-            cache.insert(
-                key,
-                metadata.len(),
-                source_modified_ns,
-                Arc::clone(&bytes),
-            );
+            cache.insert(key, metadata.len(), source_modified_ns, Arc::clone(&bytes));
         }
         Ok(BkvImage {
             content_type: "image/bmp",
@@ -1828,16 +1817,13 @@ fn parse_d3img_header_with_file_len(
             .ok_or(BkvImageError::InvalidFormat("invalid_d3img_image_index"))?,
         image_sequence: read_i32_le(bytes, 16)
             .ok_or(BkvImageError::InvalidFormat("invalid_d3img_image_sequence"))?,
-        width: read_i32_le(bytes, 20)
-            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_width"))?,
+        width: read_i32_le(bytes, 20).ok_or(BkvImageError::InvalidFormat("invalid_d3img_width"))?,
         height: read_i32_le(bytes, 24)
             .ok_or(BkvImageError::InvalidFormat("invalid_d3img_height"))?,
         scale_x: read_f32_le(bytes, 28)
             .ok_or(BkvImageError::InvalidFormat("invalid_d3img_scale_x"))?,
-        left: read_i32_le(bytes, 32)
-            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_left"))?,
-        right: read_i32_le(bytes, 36)
-            .ok_or(BkvImageError::InvalidFormat("invalid_d3img_right"))?,
+        left: read_i32_le(bytes, 32).ok_or(BkvImageError::InvalidFormat("invalid_d3img_left"))?,
+        right: read_i32_le(bytes, 36).ok_or(BkvImageError::InvalidFormat("invalid_d3img_right"))?,
         start_length: read_i32_le(bytes, 40)
             .ok_or(BkvImageError::InvalidFormat("invalid_d3img_start_length"))?,
         end_length: read_i32_le(bytes, 44)
@@ -1855,20 +1841,12 @@ fn parse_d3img_header_with_file_len(
         return Err(BkvImageError::InvalidFormat("invalid_d3img_header"));
     }
     if header.head_size != BKV_D3_HEADER_BYTES as i16 {
-        return Err(BkvImageError::InvalidFormat(
-            "invalid_d3img_header_size",
-        ));
+        return Err(BkvImageError::InvalidFormat("invalid_d3img_header_size"));
     }
     if header.pixel_size != 4 {
-        return Err(BkvImageError::InvalidFormat(
-            "invalid_d3img_pixel_size",
-        ));
+        return Err(BkvImageError::InvalidFormat("invalid_d3img_pixel_size"));
     }
-    if header.width <= 0
-        || header.height <= 0
-        || header.width > 16_384
-        || header.height > 65_536
-    {
+    if header.width <= 0 || header.height <= 0 || header.width > 16_384 || header.height > 65_536 {
         return Err(BkvImageError::InvalidFormat(
             "d3img_dimensions_out_of_range",
         ));
@@ -1921,8 +1899,7 @@ struct LoadedD3Img {
 }
 
 fn load_d3img(path: &Path, frame_number: u32) -> Result<LoadedD3Img, String> {
-    let metadata =
-        fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if !metadata.is_file() || metadata.len() > BKV_IMAGE_MAX_BYTES {
         return Err(format!("{}: D3IMG size is out of range", path.display()));
     }
@@ -2155,17 +2132,13 @@ fn build_d3img_surface(
             let residual = sample.map(|value| value - baseline).unwrap_or_default();
             let radial_offset = (residual * display_scale).clamp(-0.28, 0.28);
             let radius = 1.0 + radial_offset;
-            let angle = std::f32::consts::TAU * angular_column as f32
-                / angular_columns as f32;
+            let angle = std::f32::consts::TAU * angular_column as f32 / angular_columns as f32;
             positions.extend_from_slice(&[
                 longitudinal * 8.0 - 4.0,
                 radius * angle.cos(),
                 radius * angle.sin(),
             ]);
-            uvs.extend_from_slice(&[
-                longitudinal,
-                angular_column as f32 / angular_columns as f32,
-            ]);
+            uvs.extend_from_slice(&[longitudinal, angular_column as f32 / angular_columns as f32]);
             if sample.is_some() {
                 let tone = (residual / robust_residual).clamp(-1.0, 1.0);
                 if tone >= 0.0 {
@@ -2198,10 +2171,7 @@ fn build_d3img_surface(
             let b = row * angular_columns + next_column;
             let c = (row + 1) * angular_columns + column;
             let d = (row + 1) * angular_columns + next_column;
-            if valid_mask[a] != 0
-                && valid_mask[b] != 0
-                && valid_mask[c] != 0
-                && valid_mask[d] != 0
+            if valid_mask[a] != 0 && valid_mask[b] != 0 && valid_mask[c] != 0 && valid_mask[d] != 0
             {
                 indices.extend_from_slice(&[
                     u32::try_from(a).map_err(|_| "D3IMG mesh index overflow")?,
@@ -2508,9 +2478,7 @@ fn latest_completed_record_id(snapshot: &Value) -> Option<&str> {
         .get("records")
         .and_then(Value::as_array)?
         .iter()
-        .find(|record| {
-            record.get("status").and_then(Value::as_str) == Some("completed")
-        })
+        .find(|record| record.get("status").and_then(Value::as_str) == Some("completed"))
         .and_then(|record| record.get("id"))
         .and_then(Value::as_str)
 }
@@ -2525,9 +2493,9 @@ fn source_record_snapshot(
         .get("records")
         .and_then(Value::as_array)
         .and_then(|records| {
-            records.iter().find(|record| {
-                record.get("id").and_then(Value::as_str) == Some(record_id.as_str())
-            })
+            records
+                .iter()
+                .find(|record| record.get("id").and_then(Value::as_str) == Some(record_id.as_str()))
         })
         .cloned()
         .ok_or_else(|| format!("BKV source record {record_id} is unavailable"))?;
@@ -2536,8 +2504,7 @@ fn source_record_snapshot(
         .and_then(Value::as_array)
         .and_then(|inspections| {
             inspections.iter().find(|inspection| {
-                inspection.get("inspectionId").and_then(Value::as_str)
-                    == Some(record_id.as_str())
+                inspection.get("inspectionId").and_then(Value::as_str) == Some(record_id.as_str())
             })
         })
         .cloned()
@@ -2715,11 +2682,7 @@ mod tests {
 
     #[test]
     fn d3img_header_matches_the_legacy_dat3dheader_layout() {
-        let bytes = d3img_fixture(
-            3,
-            2,
-            &[-1_000_000.0_f32, 10.0, 20.0, 30.0, 40.0, 50.0],
-        );
+        let bytes = d3img_fixture(3, 2, &[-1_000_000.0_f32, 10.0, 20.0, 30.0, 40.0, 50.0]);
         let header = parse_d3img_header(&bytes).expect("parsed header");
         assert_eq!(header.tag, *b"3DImg\0");
         assert_eq!(header.head_size, 84);
@@ -2801,11 +2764,7 @@ mod tests {
 
     #[test]
     fn d3img_float_depth_is_converted_to_a_bounded_bitmap() {
-        let bytes = d3img_fixture(
-            3,
-            2,
-            &[-1_000_000.0_f32, -10.0, -5.0, 0.0, 5.0, 10.0],
-        );
+        let bytes = d3img_fixture(3, 2, &[-1_000_000.0_f32, -10.0, -5.0, 0.0, 5.0, 10.0]);
         let bitmap = d3img_to_bmp(&bytes).expect("converted bitmap");
         assert_eq!(&bitmap[..2], b"BM");
         assert_eq!(u32::from_le_bytes(bitmap[18..22].try_into().unwrap()), 3);
@@ -2843,8 +2802,7 @@ mod tests {
 
         let (surface, source_frame_count) =
             build_d3img_surface(18_000, &camera_inputs).expect("surface mesh");
-        let expected_points =
-            BKV_DEPTH_SURFACE_ROWS * BKV_DEPTH_SURFACE_COLS_PER_CAMERA * 2;
+        let expected_points = BKV_DEPTH_SURFACE_ROWS * BKV_DEPTH_SURFACE_COLS_PER_CAMERA * 2;
         assert_eq!(surface["schema"], "steel.bkv-depth-surface.v1");
         assert_eq!(surface["recordId"], "18000");
         assert_eq!(surface["coordinateUnit"], "legacy-unknown");

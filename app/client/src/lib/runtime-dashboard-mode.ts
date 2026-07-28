@@ -26,7 +26,7 @@ export function createRuntimeDashboardMode(
       requestsStandardRecords: true,
       showsHardwareStatus: false,
       showsCaptureManagement: false,
-      showsReconstruction: false,
+      showsReconstruction: true,
       supportsOfflineReplay: true,
     });
   }

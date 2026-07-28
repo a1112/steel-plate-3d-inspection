@@ -128,8 +128,7 @@ impl ConvertedLocalStore {
         }
         Connection::open_with_flags(
             &catalog_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(StoreError::from)?;
         Ok(Self {
@@ -147,8 +146,7 @@ impl ConvertedLocalStore {
     fn connection(&self) -> Result<Connection, StoreError> {
         Connection::open_with_flags(
             &self.catalog_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(StoreError::from)
     }
@@ -169,6 +167,18 @@ impl ConvertedLocalStore {
         {
             return Err(StoreError::new(
                 "converted record directory failed containment or publication checks",
+            ));
+        }
+        let record: Value =
+            serde_json::from_slice(&fs::read(directory.join("record.json")).map_err(|error| {
+                StoreError::new(format!("converted record metadata unavailable: {error}"))
+            })?)
+            .map_err(|error| {
+                StoreError::new(format!("converted record metadata invalid: {error}"))
+            })?;
+        if record.get("schema").and_then(Value::as_str) != Some("steel.standard-record.v2") {
+            return Err(StoreError::new(
+                "converted record layout is V1; run the standard-record V2 migration",
             ));
         }
         Ok(())
@@ -290,7 +300,8 @@ impl InspectionRecordStore for ConvertedLocalStore {
                 artifacts,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     fn capture_files(&self, id: &str) -> Result<Vec<CaptureFileDto>, StoreError> {
@@ -398,8 +409,7 @@ fn validated_relative(value: &str, label: &str) -> Result<PathBuf, StoreError> {
 fn sha256_file(path: &Path) -> Result<String, StoreError> {
     let mut digest = Sha256::new();
     digest.update(
-        fs::read(path)
-            .map_err(|error| StoreError::new(format!("capture read failed: {error}")))?,
+        fs::read(path).map_err(|error| StoreError::new(format!("capture read failed: {error}")))?,
     );
     Ok(format!("{:x}", digest.finalize()))
 }
@@ -447,7 +457,11 @@ mod tests {
         ));
         let records = root.join("records").join("10");
         fs::create_dir_all(&records).expect("record root");
-        fs::write(records.join("record.json"), "{}").expect("published record marker");
+        fs::write(
+            records.join("record.json"),
+            r#"{"schema":"steel.standard-record.v2"}"#,
+        )
+        .expect("published record marker");
         fs::create_dir_all(root.join("imports").join(".staging").join("job").join("99"))
             .expect("staging fixture");
         fs::write(
@@ -509,9 +523,7 @@ mod tests {
             )
             .expect("fixture schema");
         for camera in 1..=6 {
-            let relative = format!(
-                "records/10/cameras/C{camera}/frames/000004/intensity.jpg"
-            );
+            let relative = format!("records/10/cameras/C{camera}/intensity/000004.jpg");
             let path = root.join(&relative);
             fs::create_dir_all(path.parent().expect("frame parent")).expect("frame root");
             image::RgbImage::from_pixel(3, 2, image::Rgb([camera as u8 * 20, 80, 90]))
@@ -597,7 +609,11 @@ mod tests {
         let fixture = fixture();
         let outside = fixture.root.parent().expect("parent").join(format!(
             "{}-outside.jpg",
-            fixture.root.file_name().expect("root name").to_string_lossy()
+            fixture
+                .root
+                .file_name()
+                .expect("root name")
+                .to_string_lossy()
         ));
         fs::write(&outside, b"outside").expect("outside fixture");
         let connection = Connection::open(fixture.root.join("catalog.db")).expect("catalog");
@@ -613,7 +629,7 @@ mod tests {
         let connection = Connection::open(fixture.root.join("catalog.db")).expect("catalog");
         connection
             .execute(
-                "UPDATE capture_file SET path = 'records/10/cameras/C1/frames/000004/intensity.jpg', sha256 = '00' WHERE id = '10-C1-4-intensity'",
+                "UPDATE capture_file SET path = 'records/10/cameras/C1/intensity/000004.jpg', sha256 = '00' WHERE id = '10-C1-4-intensity'",
                 [],
             )
             .expect("hash row");
@@ -624,5 +640,21 @@ mod tests {
             .expect_err("invalid hash must fail");
         assert!(error.to_string().contains("hash"));
         let _ = fs::remove_file(outside);
+    }
+
+    #[test]
+    fn v1_records_require_explicit_migration() {
+        let fixture = fixture();
+        fs::write(
+            fixture.root.join("records/10/record.json"),
+            r#"{"schema":"steel.standard-record.v1"}"#,
+        )
+        .expect("V1 record marker");
+
+        let error = fixture
+            .store
+            .records()
+            .expect_err("V1 record must not be served");
+        assert!(error.to_string().contains("V2 migration"));
     }
 }

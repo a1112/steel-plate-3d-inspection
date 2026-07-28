@@ -12,8 +12,7 @@ use std::sync::Mutex;
 
 const RUNTIME_SCHEMA: &str = "bkv-runtime-v1";
 const CURSOR_SCHEMA: &str = "bkv-replay-cursor-v1";
-const EXPECTED_FIRST_SEQUENCE: u64 = 1_893_700;
-const EXPECTED_MATERIALS: usize = 11;
+const MAX_MATERIALS: usize = 2_000;
 const EXPECTED_CAMERAS: usize = 6;
 const TILE_CACHE_CAPACITY: usize = 64;
 
@@ -87,11 +86,13 @@ impl BkvManager {
             .and_then(Value::as_array)
             .cloned()
             .ok_or_else(|| "BKV manifest materials must be an array".to_string())?;
-        if materials.len() != EXPECTED_MATERIALS
-            || manifest.get("materialCount").and_then(Value::as_u64)
-                != Some(EXPECTED_MATERIALS as u64)
-        {
-            return Err("BKV manifest must contain exactly 11 materials".to_string());
+        if materials.is_empty() || materials.len() > MAX_MATERIALS {
+            return Err(format!(
+                "BKV manifest material count must be between 1 and {MAX_MATERIALS}"
+            ));
+        }
+        if manifest.get("materialCount").and_then(Value::as_u64) != Some(materials.len() as u64) {
+            return Err("BKV manifest material count does not match materials".to_string());
         }
         if manifest.get("cameraCount").and_then(Value::as_u64) != Some(EXPECTED_CAMERAS as u64) {
             return Err("BKV manifest must declare exactly 6 offline cameras".to_string());
@@ -99,28 +100,38 @@ impl BkvManager {
 
         let mut identities = HashSet::new();
         let mut files = HashMap::new();
+        let mut previous_sequence = None;
+        let preview_required = manifest
+            .get("previewRequired")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         for (index, material) in materials.iter().enumerate() {
             let sequence = material
                 .get("legacySeqNo")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| format!("BKV material {index} has no legacySeqNo"))?;
-            let expected = EXPECTED_FIRST_SEQUENCE + index as u64;
-            if sequence != expected || !identities.insert(sequence) {
+            if sequence == 0
+                || previous_sequence.is_some_and(|previous| sequence <= previous)
+                || !identities.insert(sequence)
+            {
                 return Err(format!(
-                    "BKV material sequence coverage mismatch at {sequence}"
+                    "BKV material sequence order or identity is invalid at {sequence}"
                 ));
             }
+            previous_sequence = Some(sequence);
             validate_cameras(material, sequence)?;
             collect_artifacts(&root, material, &mut files)?;
-            for required in ["unwrapped", "cylinder", "summary"] {
-                if material
-                    .pointer(&format!("/artifacts/{required}/path"))
-                    .and_then(Value::as_str)
-                    .is_none()
-                {
-                    return Err(format!(
-                        "BKV material {sequence} is missing {required} preview"
-                    ));
+            if preview_required {
+                for required in ["unwrapped", "cylinder", "summary"] {
+                    if material
+                        .pointer(&format!("/artifacts/{required}/path"))
+                        .and_then(Value::as_str)
+                        .is_none()
+                    {
+                        return Err(format!(
+                            "BKV material {sequence} is missing {required} preview"
+                        ));
+                    }
                 }
             }
         }
@@ -245,6 +256,13 @@ impl BkvManager {
         let material = self.material_ref(legacy_sequence)?;
         let (world, _) =
             build_inspection_world(material, |relative| self.resolve_artifact(relative))?;
+        let source_revision = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(material)
+                    .map_err(|error| format!("BKV material revision failed: {error}"))?
+            )
+        );
         let source_frame_count = world
             .cameras
             .iter()
@@ -256,6 +274,7 @@ impl BkvManager {
             "recordId": legacy_sequence.to_string(),
             "legacySeqNo": legacy_sequence,
             "sourceFrameCount": source_frame_count,
+            "sourceRevision": source_revision,
             "world": world,
         }))
     }
@@ -966,6 +985,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_single_sorted_sample_batch_without_optional_previews() {
+        let (root, manifest, cursor) = fixture("single-sample");
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["materials"] = json!([value["materials"][0].clone()]);
+        value["materials"][0]["legacySeqNo"] = json!(250_525);
+        value["materials"][0]["artifacts"] = json!({});
+        value["materialCount"] = json!(1);
+        value["previewRequired"] = json!(false);
+        fs::write(&manifest, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let manager = BkvManager::load(&root, &manifest, &cursor).unwrap();
+        assert_eq!(manager.status()["materialCount"], 1);
+        assert_eq!(manager.status()["nextLegacySeqNo"], 250_525);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_wrong_cardinality_hash_and_path_escape() {
         let (root, manifest, cursor) = fixture("reject");
         let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
@@ -973,7 +1009,7 @@ mod tests {
         fs::write(&manifest, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         assert!(BkvManager::load(&root, &manifest, &cursor)
             .unwrap_err()
-            .contains("11 materials"));
+            .contains("does not match"));
 
         let (root2, manifest2, cursor2) = fixture("hash");
         let image_path = root2.join("images/1893700/1/0000.jpg");

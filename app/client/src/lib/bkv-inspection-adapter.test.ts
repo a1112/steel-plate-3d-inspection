@@ -95,7 +95,7 @@ describe('standard BKV inspection adapter', () => {
       typeLabel: '轧折',
       cameraId: 'camera1',
       cameraIndex: 1,
-      severity: 'review',
+      severity: 'severe',
       confidence: 51,
       synthetic: false,
     });
@@ -103,7 +103,7 @@ describe('standard BKV inspection adapter', () => {
       expect.objectContaining({ id: 'bkv-class-16', label: '轧折' }),
     ]));
     expect(merged.summary.total).toBe(1);
-    expect(merged.summary.bySeverity.review).toBe(1);
+    expect(merged.summary.bySeverity.severe).toBe(1);
     expect(snapshot.inspections[0].defects).toEqual([]);
   });
 

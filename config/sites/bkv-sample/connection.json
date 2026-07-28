@@ -1,0 +1,7 @@
+{
+  "schema": "steel.site-connection.v1",
+  "provider": "bkv",
+  "dataSource": "committed-sample",
+  "configurationSource": "repository",
+  "requiredEnvironment": []
+}

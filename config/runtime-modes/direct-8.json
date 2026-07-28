@@ -17,7 +17,10 @@
     { "id": "C7", "displayOrder": 7, "sourceCameraId": 7, "role": "array-7" },
     { "id": "C8", "displayOrder": 8, "sourceCameraId": 8, "role": "array-8" }
   ],
-  "storage": {},
+  "storage": {
+    "layoutVersion": 2,
+    "cacheRoot": "target/data/direct-inspection-world-cache"
+  },
   "capture": {
     "enabled": true,
     "autostart": true

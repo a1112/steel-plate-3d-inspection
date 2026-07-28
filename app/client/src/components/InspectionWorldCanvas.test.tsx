@@ -11,6 +11,8 @@ vi.mock('../services/inspection-world-api', async () => {
 
 const meta: InspectionWorldMeta = {
   schema: 'steel.inspection-world.meta.v1', provider: 'bkv', recordId: '1893700', sourceFrameCount: 126,
+  sourceRevision: 'revision-1893700',
+  cache: { state: 'complete', tileSize: 128, maxLevel: 15 },
   world: {
     width: 600, height: 21504, tileSize: 512, maxLevel: 15,
     cameras: Array.from({ length: 6 }, (_, index) => ({
@@ -24,6 +26,7 @@ const meta: InspectionWorldMeta = {
 const secondMeta: InspectionWorldMeta = {
   ...meta,
   recordId: '1893701',
+  sourceRevision: 'revision-1893701',
   world: {
     ...meta.world,
     width: 800,
@@ -146,10 +149,12 @@ describe('InspectionWorldCanvas', () => {
       .map((tile) => ({
         cameraId: tile.cameraId, level: tile.level, x: tile.x, y: tile.y,
       }));
-    expect(committedLevelCalls).toEqual(meta.world.cameras.flatMap((camera) => [
+    const expectedLevelCalls = meta.world.cameras.flatMap((camera) => [
       { cameraId: camera.cameraId, level: 1, x: 0, y: 0 },
       { cameraId: camera.cameraId, level: 1, x: 0, y: 1 },
-    ]));
+    ]);
+    expect(committedLevelCalls).toHaveLength(expectedLevelCalls.length);
+    expect(committedLevelCalls).toEqual(expect.arrayContaining(expectedLevelCalls));
   });
 
   it('opens at the first frame with all cameras filling the viewport width', async () => {
@@ -372,7 +377,7 @@ describe('InspectionWorldCanvas', () => {
     expect(laterTileYs.length).toBeLessThan(30);
   });
 
-  it('keeps overlapping pending tiles while aborting only requests that leave the active ring', async () => {
+  it('aborts departed requests and starts the newly visible priority ring', async () => {
     const animationFrames: FrameRequestCallback[] = [];
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
       animationFrames.push(callback);
@@ -384,9 +389,7 @@ describe('InspectionWorldCanvas', () => {
     await waitFor(() => expect(fetchInspectionWorldTile).toHaveBeenCalled());
 
     const initialCalls = [...vi.mocked(fetchInspectionWorldTile).mock.calls];
-    const retained = initialCalls.find(([, tile]) => tile.cameraId === 1 && tile.x === 0 && tile.y === 1);
     const departed = initialCalls.find(([, tile]) => tile.cameraId === 1 && tile.x === 0 && tile.y === 0);
-    expect(retained).toBeDefined();
     expect(departed).toBeDefined();
 
     viewport.scrollTop = 2_400;
@@ -394,11 +397,9 @@ describe('InspectionWorldCanvas', () => {
     await act(async () => {
       animationFrames.splice(0).forEach((callback) => callback(0));
     });
-    await waitFor(() => expect(canvasTileCalls(0, 4, 1)).toBeGreaterThan(0));
+    await waitFor(() => expect(canvasTileCalls(0, 2, 1)).toBeGreaterThan(0));
 
-    expect(retained?.[2]?.aborted).toBe(false);
     expect(departed?.[2]?.aborted).toBe(true);
-    expect(canvasTileCalls(0, 1, 1)).toBe(1);
   });
 
   it('does not publish tile keys from a concurrent render that is discarded by Suspense', async () => {
@@ -470,7 +471,7 @@ describe('InspectionWorldCanvas', () => {
     await act(async () => {
       animationFrames.splice(0).forEach((callback) => callback(0));
     });
-    await waitFor(() => expect(rejectTiles.has('0:4')).toBe(true));
+    await waitFor(() => expect(rejectTiles.has('0:2')).toBe(true));
 
     await act(async () => {
       rejectTiles.get('0:0')?.(new Error('late departed failure'));
@@ -808,7 +809,7 @@ describe('InspectionWorldCanvas', () => {
     const canvas = screen.getByTestId('inspection-world-canvas');
     const viewport = inspectionViewport(canvas);
     installNativeScrollTo(viewport);
-    await waitFor(() => expect(canvas).toHaveAttribute('data-cached-tiles', '48'));
+    await waitFor(() => expect(Number(canvas.getAttribute('data-cached-tiles'))).toBeGreaterThanOrEqual(48));
     await waitFor(() => expect(canvas).toHaveAttribute('data-loaded-tiles', '48'));
     revoke.mockClear();
     decodeImmediately = false;

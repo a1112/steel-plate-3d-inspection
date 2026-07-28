@@ -11,7 +11,7 @@
   "unit": "legacy-unknown",
   "invalid_sentinel": -1000000.0,
   "database_path": "database.json",
-  "database_sha256": "51bd62af0d53dee3c7e01800d465572e36986413d75cb8bc46481ba1970c82e7",
+  "database_sha256": "ce772232261ac0d9c918b5ffe91b0fe7ccb0093907fbffa7a5d8a30c159156b5",
   "entries": [
     {
       "status": "ok",

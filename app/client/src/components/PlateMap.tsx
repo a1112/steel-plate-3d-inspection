@@ -8,10 +8,17 @@ import type { CaptureImageItem, DefectItem, DefectType } from '../data/inspectio
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import { createSequentialCameraLanes, type CameraDisplayLane } from '../lib/camera-display';
 import { barSurfaceFileUrl, type BarSurfaceCamera, type BarSurfaceMesh } from '../services/bar-surface-api';
-import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, type InspectionWorldDefect, type InspectionWorldMeta } from '../services/inspection-world-api';
+import {
+  fetchInspectionWorldDefects,
+  fetchInspectionWorldMeta,
+  fetchInspectionWorldTile,
+  type InspectionWorldDefect,
+  type InspectionWorldMeta,
+} from '../services/inspection-world-api';
 import { clampPreviewPositionM, DEFAULT_PLATE_LENGTH_M, type SurfaceDisplayMode } from '../state/inspection-ui';
 import { Panel } from './Panel';
-import { ProductionArtifactView } from './ProductionArtifactView';
+import { ProductionArtifactView, type ArtifactOrientation } from './ProductionArtifactView';
+import { BkvSectionView } from './BkvReconstructionApp';
 import { InspectionWorldCanvas } from './InspectionWorldCanvas';
 
 interface PlateMapProps {
@@ -27,6 +34,7 @@ interface PlateMapProps {
   surfaceMode: SurfaceDisplayMode;
   previewPositionM: number;
   plateLengthM?: number;
+  nominalDiameterMm?: number;
   artifactMode?: 'production' | 'demo';
   inspectionId?: string;
   requireInspectionWorld?: boolean;
@@ -51,7 +59,9 @@ const surfaceModeOptions: { id: SurfaceDisplayMode; label: string }[] = [
   { id: 'all', label: '全部' },
 ];
 
-export type PlateMapViewMode = '2d' | '3d' | 'point-cloud';
+export type PlateMapViewMode = '2d' | '3d' | 'section';
+type Plate3DDisplayMode = 'surface' | 'points' | 'texture' | 'jet';
+type Plate2DDisplayMode = 'gray' | 'jet';
 type UnfoldOrientation = 'horizontal' | 'vertical';
 type DisplayWorld = {
   recordId: string;
@@ -70,7 +80,7 @@ export function cameraBandRotationRadians(orientation: UnfoldOrientation) {
 const viewModeOptions: { id: PlateMapViewMode; label: string }[] = [
   { id: '2d', label: '2D' },
   { id: '3d', label: '3D' },
-  { id: 'point-cloud', label: '点云' },
+  { id: 'section', label: '切面' },
 ];
 
 const PLATE_3D_LENGTH = 10;
@@ -82,8 +92,156 @@ const MAX_PLATE_3D_ZOOM = 2.2;
 const PLATE_3D_ZOOM_STEP = 0.12;
 const DEFAULT_CAMERA_LANES = createSequentialCameraLanes(8);
 
+function loadTextureImage(url: string, signal: AbortSignal) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    const abort = () => {
+      image.src = '';
+      reject(new DOMException('Texture loading aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    image.onload = () => {
+      signal.removeEventListener('abort', abort);
+      resolve(image);
+    };
+    image.onerror = () => {
+      signal.removeEventListener('abort', abort);
+      reject(new Error('检测图像瓦片解码失败'));
+    };
+    image.src = url;
+  });
+}
+
+function useInspectionWorldTexture(
+  recordId: string | undefined,
+  meta: InspectionWorldMeta | undefined,
+  enabled: boolean,
+  zoom: number,
+) {
+  const [textureUrl, setTextureUrl] = useState('');
+  const [textureStatus, setTextureStatus] = useState('');
+  const textureRecordRef = useRef('');
+  const detailBoost = Math.min(3, Math.max(0, Math.floor(Math.log2(Math.max(1, zoom)))));
+
+  useEffect(() => {
+    if (!enabled || !recordId || !meta) return;
+    const controller = new AbortController();
+    if (textureRecordRef.current !== recordId) {
+      textureRecordRef.current = recordId;
+      setTextureUrl('');
+    }
+    setTextureStatus('正在生成 2D 检测图像贴图…');
+    const generate = async () => {
+      const scale = Math.min(
+        1,
+        2048 / Math.max(1, meta.world.height),
+        1024 / Math.max(1, meta.world.width),
+      );
+      const baseLevel = Math.min(
+        meta.world.maxLevel,
+        Math.max(0, Math.ceil(Math.log2(1 / Math.max(scale, 1e-6))) + 1),
+      );
+      const level = Math.max(0, baseLevel - detailBoost);
+      const span = meta.world.tileSize * 2 ** level;
+      const worldCanvas = document.createElement('canvas');
+      worldCanvas.width = Math.max(1, Math.round(meta.world.width * scale));
+      worldCanvas.height = Math.max(1, Math.round(meta.world.height * scale));
+      const context = worldCanvas.getContext('2d');
+      if (!context) throw new Error('浏览器不支持贴图合成');
+      context.fillStyle = '#07111c';
+      context.fillRect(0, 0, worldCanvas.width, worldCanvas.height);
+
+      const requests = meta.world.cameras.flatMap((camera) => (
+        Array.from({ length: Math.ceil(camera.height / span) }, (_, y) => (
+          Array.from({ length: Math.ceil(camera.width / span) }, (_, x) => ({
+            camera,
+            x,
+            y,
+          }))
+        )).flat()
+      ));
+      for (let index = 0; index < requests.length; index += 8) {
+        const batch = requests.slice(index, index + 8);
+        await Promise.all(batch.map(async ({ camera, x, y }) => {
+          const tile = await fetchInspectionWorldTile(
+            recordId,
+            {
+              cameraId: camera.cameraId,
+              level,
+              x,
+              y,
+              revision: meta.sourceRevision,
+              format: 'jpeg',
+            },
+            controller.signal,
+          );
+          try {
+            const image = await loadTextureImage(tile.url, controller.signal);
+            const sourceWidth = Math.min(span, camera.width - x * span);
+            const sourceHeight = Math.min(span, camera.height - y * span);
+            context.drawImage(
+              image,
+              (camera.offsetX + x * span) * scale,
+              y * span * scale,
+              sourceWidth * scale,
+              sourceHeight * scale,
+            );
+          } finally {
+            tile.revoke();
+          }
+        }));
+        setTextureStatus(`正在生成 2D 检测图像贴图… ${Math.min(index + 8, requests.length)}/${requests.length}`);
+      }
+
+      const textureCanvas = document.createElement('canvas');
+      textureCanvas.width = worldCanvas.height;
+      textureCanvas.height = worldCanvas.width;
+      const textureContext = textureCanvas.getContext('2d');
+      if (!textureContext) throw new Error('浏览器不支持贴图旋转');
+      textureContext.translate(textureCanvas.width, 0);
+      textureContext.rotate(Math.PI / 2);
+      textureContext.drawImage(worldCanvas, 0, 0);
+      if (controller.signal.aborted) return;
+      setTextureUrl(textureCanvas.toDataURL('image/jpeg', 0.9));
+      setTextureStatus(`2D 检测图像贴图 · LOD ${level} · ${textureCanvas.width}×${textureCanvas.height}`);
+    };
+    void generate().catch((error: unknown) => {
+      if (!controller.signal.aborted) {
+        setTextureStatus(error instanceof Error ? error.message : '2D 检测图像贴图生成失败');
+      }
+    });
+    return () => controller.abort();
+  }, [detailBoost, enabled, meta, recordId]);
+
+  return { textureUrl, textureStatus };
+}
+
 function clampPercent(value: number, min = 0, max = 100) {
   return Math.max(min, Math.min(max, value));
+}
+
+function closestObservedSectionRow(mesh: BarSurfaceMesh, requestedRow: number) {
+  const rowCount = Math.max(1, mesh.rows);
+  const columns = Math.max(1, mesh.colsPerCamera * mesh.cameraCount);
+  const target = Math.max(0, Math.min(rowCount - 1, Math.round(requestedRow)));
+  if (!mesh.validMask || mesh.validMask.length < rowCount * columns) return target;
+  const observedCount = (row: number) => {
+    let observed = 0;
+    const start = row * columns;
+    for (let column = 0; column < columns; column += 1) {
+      if (Number(mesh.validMask?.[start + column]) !== 0) observed += 1;
+    }
+    return observed;
+  };
+  for (const minimumObserved of [Math.max(3, Math.floor(columns / 2)), 3]) {
+    for (let offset = 0; offset < rowCount; offset += 1) {
+      const after = target + offset;
+      if (after < rowCount && observedCount(after) >= minimumObserved) return after;
+      const before = target - offset;
+      if (before >= 0 && before !== after && observedCount(before) >= minimumObserved) return before;
+    }
+  }
+  return target;
 }
 
 function getDefectLengthPercent(defect: DefectItem, plateLengthM: number) {
@@ -694,6 +852,77 @@ function PlateMapActions({
   );
 }
 
+function PlateDisplaySubModes({
+  viewMode,
+  threeMode,
+  twoDMode,
+  artifactOrientation,
+  onThreeModeChange,
+  onTwoDModeChange,
+  onArtifactOrientationChange,
+}: {
+  viewMode: PlateMapViewMode;
+  threeMode: Plate3DDisplayMode;
+  twoDMode: Plate2DDisplayMode;
+  artifactOrientation: ArtifactOrientation;
+  onThreeModeChange: (mode: Plate3DDisplayMode) => void;
+  onTwoDModeChange: (mode: Plate2DDisplayMode) => void;
+  onArtifactOrientationChange: (orientation: ArtifactOrientation) => void;
+}) {
+  if (viewMode === '3d') {
+    const options: Array<{ id: Plate3DDisplayMode; label: string }> = [
+      { id: 'surface', label: '表面' },
+      { id: 'points', label: '点云' },
+      { id: 'texture', label: '贴图' },
+      { id: 'jet', label: 'Jet' },
+    ];
+    return (
+      <>
+        <div className="plate-display-submodes" role="group" aria-label="3D 显示子模式">
+          {options.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              className={threeMode === option.id ? `active ${option.id}` : option.id}
+              aria-pressed={threeMode === option.id}
+              onClick={() => onThreeModeChange(option.id)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+        <div className="artifact-orientation-switch" role="group" aria-label="3D 管轴方向">
+          <button
+            type="button"
+            className={artifactOrientation === 'horizontal' ? 'active' : ''}
+            aria-pressed={artifactOrientation === 'horizontal'}
+            onClick={() => onArtifactOrientationChange('horizontal')}
+          >
+            横向
+          </button>
+          <button
+            type="button"
+            className={artifactOrientation === 'vertical' ? 'active' : ''}
+            aria-pressed={artifactOrientation === 'vertical'}
+            onClick={() => onArtifactOrientationChange('vertical')}
+          >
+            纵向
+          </button>
+        </div>
+      </>
+    );
+  }
+  if (viewMode === '2d') {
+    return (
+      <div className="plate-display-submodes" role="group" aria-label="2D 显示子模式">
+        <button type="button" className={twoDMode === 'gray' ? 'active' : ''} aria-pressed={twoDMode === 'gray'} onClick={() => onTwoDModeChange('gray')}>灰度平铺</button>
+        <button type="button" className={twoDMode === 'jet' ? 'active jet' : 'jet'} aria-pressed={twoDMode === 'jet'} onClick={() => onTwoDModeChange('jet')}>Jet 平铺</button>
+      </div>
+    );
+  }
+  return null;
+}
+
 export function PlateMapToolbar({
   defectTypes,
   defectTypeCounts,
@@ -1190,6 +1419,7 @@ export function PlateMap({
   surfaceMode,
   previewPositionM,
   plateLengthM = DEFAULT_PLATE_LENGTH_M,
+  nominalDiameterMm = 0,
   artifactMode = 'production',
   inspectionId,
   requireInspectionWorld = false,
@@ -1210,6 +1440,10 @@ export function PlateMap({
   const [localViewMode, setLocalViewMode] = useState<PlateMapViewMode>('2d');
   const viewMode = controlledViewMode ?? localViewMode;
   const setViewMode = onViewModeChange ?? setLocalViewMode;
+  const [threeDisplayMode, setThreeDisplayMode] = useState<Plate3DDisplayMode>('surface');
+  const [twoDDisplayMode, setTwoDDisplayMode] = useState<Plate2DDisplayMode>('gray');
+  const [artifactOrientation, setArtifactOrientation] = useState<ArtifactOrientation>('horizontal');
+  const [productionZoom, setProductionZoom] = useState(1);
   const [hoveredDefectId, setHoveredDefectId] = useState<string | null>(null);
   const [unfoldOrientation, setUnfoldOrientation] = useState<UnfoldOrientation>('horizontal');
   const [displayedWorld, setDisplayedWorld] = useState<DisplayWorld | null>(null);
@@ -1222,6 +1456,12 @@ export function PlateMap({
   const capturedCameraImageCount = new Set(captureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
   const displayedCameraImageCount = Math.min(cameraLanes.length, Math.max(productionCameraImageCount, capturedCameraImageCount));
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
+  const { textureUrl, textureStatus } = useInspectionWorldTexture(
+    inspectionId,
+    displayedWorld?.meta,
+    artifactMode === 'production' && viewMode === '3d' && threeDisplayMode === 'texture',
+    productionZoom,
+  );
   useEffect(() => {
     displayedWorldRef.current = displayedWorld;
   }, [displayedWorld]);
@@ -1394,6 +1634,15 @@ export function PlateMap({
         </div>
       ) : null}
       {integratedToolbar ? <PlateMapActions viewMode={viewMode} onViewModeChange={setViewMode} /> : null}
+      <PlateDisplaySubModes
+        viewMode={viewMode}
+        threeMode={threeDisplayMode}
+        twoDMode={twoDDisplayMode}
+        artifactOrientation={artifactOrientation}
+        onThreeModeChange={setThreeDisplayMode}
+        onTwoDModeChange={setTwoDDisplayMode}
+        onArtifactOrientationChange={setArtifactOrientation}
+      />
       {toolbarExtra}
       </div>
 
@@ -1402,17 +1651,53 @@ export function PlateMap({
           surfaceMesh && surfaceMesh.positions.length >= 3 && surfaceMesh.indices.length >= 3 ? (
             <ProductionArtifactView
               mesh={surfaceMesh}
-              mode="surface"
-              testId="plate-production-surface"
-              ariaLabel="当前检测记录真实三维表面"
+              mode={threeDisplayMode === 'points' ? 'points' : 'surface'}
+              testId={threeDisplayMode === 'points'
+                ? 'plate-production-point-cloud'
+                : 'plate-production-surface'}
+              ariaLabel={threeDisplayMode === 'points'
+                ? '当前检测记录真实点云'
+                : threeDisplayMode === 'texture'
+                  ? '当前检测记录二维贴图三维表面'
+                  : threeDisplayMode === 'jet'
+                    ? '当前检测记录 Jet 径向偏差三维表面'
+                    : '当前检测记录真实三维表面'}
               className="plate-production-artifact"
+              colorMode={threeDisplayMode === 'jet'
+                ? 'radial-jet'
+                : threeDisplayMode === 'texture'
+                  ? 'texture'
+                  : 'source'}
+              textureUrl={textureUrl}
+              radialUnitScale={nominalDiameterMm > 0 ? nominalDiameterMm / 2 : 1}
+              radialUnit={nominalDiameterMm > 0 ? 'mm' : '显示坐标'}
+              orientation={artifactOrientation}
+              onZoomChange={setProductionZoom}
             />
           ) : (
-            <div className="production-artifact-empty" role="status" data-testid="plate-production-surface-empty">
-              <strong>暂无生产三维表面产物</strong>
+            <div
+              className="production-artifact-empty"
+              role="status"
+              data-testid={threeDisplayMode === 'points'
+                ? 'plate-production-point-cloud-empty'
+                : 'plate-production-surface-empty'}
+            >
+              <strong>{threeDisplayMode === 'points' ? '暂无生产点云产物' : '暂无生产三维表面产物'}</strong>
               <span>{artifactStatus || '当前检测记录尚未绑定三维重建结果，请等待算法任务完成。'}</span>
             </div>
           )
+        ) : threeDisplayMode === 'points' ? (
+          <PlatePointCloudView
+            defects={defects}
+            defectTypes={defectTypes}
+            selectedDefectId={selectedDefectId}
+            previewPositionM={previewPositionM}
+            plateLengthM={safePlateLengthM}
+            surfaceMode={surfaceMode}
+            artifactMode={artifactMode}
+            surfaceMesh={surfaceMesh}
+            artifactStatus={artifactStatus}
+          />
         ) : (
           <PlateMap3DView
             defects={defects}
@@ -1424,18 +1709,27 @@ export function PlateMap({
             onSelectDefect={onSelectDefect}
           />
         )
-      ) : viewMode === 'point-cloud' ? (
-        <PlatePointCloudView
-          defects={defects}
-          defectTypes={defectTypes}
-          selectedDefectId={selectedDefectId}
-          previewPositionM={previewPositionM}
-          plateLengthM={safePlateLengthM}
-          surfaceMode={surfaceMode}
-          artifactMode={artifactMode}
-          surfaceMesh={surfaceMesh}
-          artifactStatus={artifactStatus}
-        />
+      ) : viewMode === 'section' ? (
+        surfaceMesh && surfaceMesh.positions.length >= 3 ? (
+          <BkvSectionView
+            mesh={surfaceMesh}
+            row={closestObservedSectionRow(
+              surfaceMesh,
+              previewPositionM / Math.max(safePlateLengthM, 0.001) * (surfaceMesh.rows - 1),
+            )}
+            onRowChange={(row) => onPreviewPositionChange(
+              row / Math.max(1, surfaceMesh.rows - 1) * safePlateLengthM,
+            )}
+            recordId={inspectionId || '当前记录'}
+            nominalDiameterMm={nominalDiameterMm}
+            lengthMm={safePlateLengthM * 1000}
+          />
+        ) : (
+          <div className="production-artifact-empty" role="status">
+            <strong>暂无可提取切面的三维表面</strong>
+            <span>{artifactStatus || '当前记录尚未生成 NPZ 三维表面。'}</span>
+          </div>
+        )
       ) : shouldRenderWorldStack ? (
         <div className="inspection-world-stack" data-testid="inspection-world-stack">
           {displayedWorld ? <InspectionWorldCanvas
@@ -1448,6 +1742,7 @@ export function PlateMap({
               ? worldFocusRequest?.defectId ?? null
               : null}
             focusDefectRevision={worldFocusRequest?.revision}
+            colorMode={twoDDisplayMode}
           /> : null}
           {activePendingWorld ? <InspectionWorldCanvas
             key={`pending:${activePendingWorld.recordId}:${activePendingWorld.meta.sourceFrameCount}:${activePendingWorld.meta.world.width}:${activePendingWorld.meta.world.height}`}
@@ -1457,6 +1752,7 @@ export function PlateMap({
             defects={activePendingWorld.defects}
             focusDefectId={worldFocusRequest?.defectId ?? null}
             focusDefectRevision={worldFocusRequest?.revision}
+            colorMode={twoDDisplayMode}
             onFirstPaint={() => {
               displayedWorldRef.current = activePendingWorld;
               setDisplayedWorld(activePendingWorld);
@@ -1512,6 +1808,9 @@ export function PlateMap({
           <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} orientation={unfoldOrientation} />
         </div>
       )}
+      {viewMode === '3d' && threeDisplayMode === 'texture' && textureStatus ? (
+        <div className="plate-texture-status" role="status">{textureStatus}</div>
+      ) : null}
     </Panel>
   );
 }

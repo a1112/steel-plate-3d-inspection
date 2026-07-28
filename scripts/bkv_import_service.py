@@ -20,6 +20,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from PIL import Image
+
 try:
     from scripts.build_bkv_runtime_manifest import load_verified_runtime_manifest
     from scripts.convert_bkv_d3img import validate_artifact_identity
@@ -29,9 +32,12 @@ except ModuleNotFoundError:
 
 
 PUBLIC_SERVICE_SCHEMA = "steel.bkv-import-service.v1"
-STANDARD_RECORD_SCHEMA = "steel.standard-record.v1"
+STANDARD_RECORD_SCHEMA = "steel.standard-record.v2"
+TILE_CACHE_SCHEMA = "steel.inspection-world-cache.v2"
+TILE_SIZE = 128
 PROFILE_SCHEMA = "steel.runtime-profile.v1"
 PROJECT_SCHEMA = "steel.project-config.v1"
+SITE_SCHEMA = "steel.site-config.v1"
 
 
 class ImportInterrupted(RuntimeError):
@@ -106,6 +112,21 @@ def _replace_directory_with_retry(
             time.sleep(0.05 * (2**attempt))
 
 
+def _remove_tree_resilient(path: Path, *, attempts: int = 4) -> bool:
+    """Remove transaction residue despite disappearing AppleDouble sidecar files."""
+    for attempt in range(attempts):
+        if not path.exists():
+            return True
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            return True
+        for apple_double in path.rglob("._*"):
+            if apple_double.is_file():
+                apple_double.unlink(missing_ok=True)
+        time.sleep(0.05 * (2**attempt))
+    return not path.exists()
+
+
 def _read_json(path: Path, label: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -114,6 +135,27 @@ def _read_json(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object: {path}")
     return value
+
+
+def _severity_grade(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        named = {
+            "minor": 1,
+            "review": 2,
+            "moderate": 2,
+            "warning": 2,
+            "severe": 3,
+            "critical": 3,
+        }
+        if normalized in named:
+            return named[normalized]
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"defect severity is invalid: {value}") from error
 
 
 def _contained(root: Path, relative: str, label: str) -> Path:
@@ -147,11 +189,28 @@ class BkvImportService:
         project = _read_json(self.project_path, "project config")
         if project.get("schema") != PROJECT_SCHEMA:
             raise ValueError(f"project schema must be {PROJECT_SCHEMA}")
-        configured_profile = _contained(
-            self.project_root,
-            str(project.get("activeRuntimeProfile", "")),
-            "active runtime profile",
-        )
+        self.site_path: Path | None = None
+        active_site = str(project.get("activeSiteConfig", "")).strip()
+        if active_site:
+            self.site_path = _contained(
+                self.project_root,
+                active_site,
+                "active site config",
+            )
+            site = _read_json(self.site_path, "active site config")
+            if site.get("schema") != SITE_SCHEMA:
+                raise ValueError(f"site schema must be {SITE_SCHEMA}")
+            configured_profile = _contained(
+                self.site_path.parent,
+                str(site.get("runtimeProfile", "")),
+                "site runtime profile",
+            )
+        else:
+            configured_profile = _contained(
+                self.project_root,
+                str(project.get("activeRuntimeProfile", "")),
+                "active runtime profile",
+            )
         self.profile_path = (
             Path(profile_path).resolve() if profile_path is not None else configured_profile
         )
@@ -169,14 +228,49 @@ class BkvImportService:
         self.catalog_path = _contained(
             self.project_root, storage["catalogPath"], "catalog path"
         )
+        self.cache_root = _contained(
+            self.project_root, storage["cacheRoot"], "cache root"
+        )
         try:
             self.catalog_path.relative_to(self.converted_root)
+            self.cache_root.relative_to(self.converted_root)
         except ValueError as error:
-            raise ValueError("catalog path must remain beneath converted root") from error
-        self.manifest_path = self.source_root / "bkv-runtime-manifest.json"
+            raise ValueError(
+                "catalog and cache paths must remain beneath converted root"
+            ) from error
+        manifest_relative = str(
+            storage.get("manifestPath", "bkv-runtime-manifest.json")
+        ).strip()
+        self.manifest_path = _contained(
+            self.source_root,
+            manifest_relative,
+            "BKV runtime manifest",
+        )
         self.interrupt_after_staged_records = interrupt_after_staged_records
         self._lock = threading.Lock()
         self._ensure_catalog()
+        self._recover_replaced_records()
+
+    def _recover_replaced_records(self) -> None:
+        replaced_root = self.converted_root / "imports" / "replaced"
+        if not replaced_root.exists():
+            return
+        for job_root in tuple(replaced_root.iterdir()):
+            if job_root.name.startswith("._") or not job_root.is_dir():
+                continue
+            for backup in tuple(job_root.iterdir()):
+                if backup.name.startswith("._") or not backup.is_dir():
+                    continue
+                destination = self.converted_root / "records" / backup.name
+                if destination.exists():
+                    _remove_tree_resilient(backup)
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    _replace_directory_with_retry(backup, destination)
+            _remove_tree_resilient(job_root)
+        for apple_double in (self.converted_root / "imports").rglob("._*"):
+            if apple_double.is_file():
+                apple_double.unlink(missing_ok=True)
 
     def _validate_profile(self) -> None:
         if self.profile.get("schema") != PROFILE_SCHEMA:
@@ -208,7 +302,9 @@ class BkvImportService:
         storage = self.profile.get("storage")
         if not isinstance(storage, dict):
             raise ValueError("BKV profile storage is missing")
-        for field in ("sourceRoot", "convertedRoot", "catalogPath"):
+        if int(storage.get("layoutVersion", 0)) != 2:
+            raise ValueError("BKV profile storage.layoutVersion must be 2")
+        for field in ("sourceRoot", "convertedRoot", "catalogPath", "cacheRoot"):
             if not str(storage.get(field, "")).strip():
                 raise ValueError(f"BKV profile storage.{field} is missing")
 
@@ -217,6 +313,9 @@ class BkvImportService:
         digest = hashlib.sha256()
         digest.update(self.project_path.read_bytes())
         digest.update(b"\0")
+        if self.site_path is not None:
+            digest.update(self.site_path.read_bytes())
+            digest.update(b"\0")
         digest.update(self.profile_path.read_bytes())
         return digest.hexdigest()
 
@@ -567,7 +666,212 @@ class BkvImportService:
         if row is None or row[0] != record_hash:
             return False
         record_path = _contained(self.converted_root, row[1], "record path")
-        return (record_path / "record.json").is_file()
+        record_file = record_path / "record.json"
+        if not record_file.is_file():
+            return False
+        record = _read_json(record_file, "standard record")
+        return record.get("schema") == STANDARD_RECORD_SCHEMA
+
+    @staticmethod
+    def _write_depth_v2(source: Path, target: Path) -> dict[str, Any]:
+        with np.load(source, allow_pickle=False) as payload:
+            if "depth" not in payload.files:
+                raise ValueError(f"depth NPZ has no depth matrix: {source}")
+            depth = np.asarray(payload["depth"], dtype=np.float32)
+            if depth.ndim != 2 or not depth.size:
+                raise ValueError(f"depth NPZ matrix is invalid: {source}")
+            if "valid_mask" in payload.files:
+                valid_mask = np.asarray(payload["valid_mask"], dtype=np.bool_)
+                if valid_mask.shape != depth.shape:
+                    raise ValueError(f"depth NPZ mask shape mismatch: {source}")
+            else:
+                valid_mask = np.isfinite(depth) & (depth > -999_999.0)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("wb") as stream:
+                np.savez_compressed(
+                    stream,
+                    depth=depth,
+                    valid_mask=valid_mask,
+                )
+            with np.load(temporary, allow_pickle=False) as verified:
+                if set(verified.files) != {"depth", "valid_mask"}:
+                    raise ValueError("standard depth NPZ contains unexpected arrays")
+                if (
+                    verified["depth"].dtype != np.dtype("float32")
+                    or verified["depth"].shape != depth.shape
+                    or verified["valid_mask"].shape != depth.shape
+                ):
+                    raise ValueError("standard depth NPZ verification failed")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {
+            "size": target.stat().st_size,
+            "sha256": _sha256_file(target),
+        }
+
+    @staticmethod
+    def _detect_head_offset(images: list[Image.Image]) -> int:
+        background_rows = 32
+        sample_step = 4
+        stable_rows = 8
+        stable: list[float] = []
+        for frame_index, source in enumerate(images):
+            image = source.convert("L")
+            background = [
+                image.getpixel((x, y))
+                for y in range(min(background_rows, image.height))
+                for x in range(0, image.width, sample_step)
+            ]
+            background.sort()
+            baseline = background[(len(background) - 1) // 20] if background else 0
+            threshold = max(35, min(255, baseline + 18))
+            for y in range(image.height):
+                samples = [
+                    image.getpixel((x, y)) > threshold
+                    for x in range(0, image.width, sample_step)
+                ]
+                occupancy = sum(samples) / max(1, len(samples))
+                if occupancy >= 0.12:
+                    stable.append(occupancy)
+                    stable = stable[-stable_rows:]
+                    if len(stable) == stable_rows:
+                        return frame_index * image.height + y + 1 - stable_rows
+                else:
+                    stable.clear()
+        return 0
+
+    def _stage_tile_cache(
+        self,
+        *,
+        job_id: str,
+        inspection_id: str,
+        record_hash: str,
+        intensity_paths: dict[int, list[Path]],
+    ) -> Path:
+        cache_stage = (
+            self.converted_root
+            / "imports"
+            / ".staging"
+            / job_id
+            / ".cache"
+            / inspection_id
+            / record_hash
+        )
+        if cache_stage.exists():
+            shutil.rmtree(cache_stage)
+        cache_stage.mkdir(parents=True)
+
+        camera_sources: dict[int, tuple[list[Image.Image], int, int, int]] = {}
+        world_width = 0
+        world_height = 0
+        try:
+            for camera_id, paths in sorted(intensity_paths.items()):
+                images = [Image.open(path).convert("L") for path in paths]
+                if not images:
+                    raise ValueError(f"camera C{camera_id} has no intensity images")
+                dimensions = {(image.width, image.height) for image in images}
+                if len(dimensions) != 1:
+                    raise ValueError(f"camera C{camera_id} intensity dimensions differ")
+                width, frame_height = next(iter(dimensions))
+                head_offset = self._detect_head_offset(images)
+                height = frame_height * len(images) - head_offset
+                if height <= 0:
+                    raise ValueError(f"camera C{camera_id} aligned height is invalid")
+                camera_sources[camera_id] = (images, width, height, head_offset)
+                world_width += width
+                world_height = max(world_height, height)
+
+            longest_side = max(world_width, world_height)
+            max_level = 0
+            while longest_side > 1:
+                longest_side = (longest_side + 1) // 2
+                max_level += 1
+
+            camera_meta = []
+            expected_tiles = 0
+            actual_tiles = 0
+            for camera_id, (images, width, height, head_offset) in camera_sources.items():
+                frame_height = images[0].height
+                mosaic = Image.new("L", (width, frame_height * len(images)))
+                for frame_index, image in enumerate(images):
+                    mosaic.paste(image, (0, frame_index * frame_height))
+                current = mosaic.crop((0, head_offset, width, head_offset + height))
+                camera_count = 0
+                for level in range(max_level + 1):
+                    if level > 0:
+                        current = current.resize(
+                            (
+                                max(1, (current.width + 1) // 2),
+                                max(1, (current.height + 1) // 2),
+                            ),
+                            Image.Resampling.NEAREST,
+                        )
+                    tiles_x = max(1, (current.width + TILE_SIZE - 1) // TILE_SIZE)
+                    tiles_y = max(1, (current.height + TILE_SIZE - 1) // TILE_SIZE)
+                    expected_tiles += tiles_x * tiles_y
+                    level_root = cache_stage / "tile" / f"C{camera_id}" / f"L{level}"
+                    level_root.mkdir(parents=True, exist_ok=True)
+                    for tile_x in range(tiles_x):
+                        for tile_y in range(tiles_y):
+                            left = tile_x * TILE_SIZE
+                            top = tile_y * TILE_SIZE
+                            tile = current.crop(
+                                (
+                                    left,
+                                    top,
+                                    min(left + TILE_SIZE, current.width),
+                                    min(top + TILE_SIZE, current.height),
+                                )
+                            )
+                            tile.save(
+                                level_root / f"{tile_x}_{tile_y}.jpg",
+                                format="JPEG",
+                                quality=88,
+                                optimize=False,
+                            )
+                            actual_tiles += 1
+                            camera_count += 1
+                camera_meta.append(
+                    {
+                        "cameraId": camera_id,
+                        "width": width,
+                        "height": height,
+                        "headOffsetY": head_offset,
+                        "tileCount": camera_count,
+                    }
+                )
+        finally:
+            for images, _, _, _ in camera_sources.values():
+                for image in images:
+                    image.close()
+
+        _atomic_json(
+            cache_stage / "cache.json",
+            {
+                "schema": TILE_CACHE_SCHEMA,
+                "recordId": inspection_id,
+                "sourceHash": record_hash,
+                "state": "complete",
+                "complete": True,
+                "tile": {
+                    "tileSize": TILE_SIZE,
+                    "format": "jpeg",
+                    "maxLevel": max_level,
+                    "expectedCount": expected_tiles,
+                    "actualCount": actual_tiles,
+                },
+                "world": {
+                    "width": world_width,
+                    "height": world_height,
+                    "cameras": camera_meta,
+                },
+                "completedAt": _utc_now(),
+            },
+        )
+        return cache_stage
 
     def _stage_record(
         self,
@@ -588,40 +892,44 @@ class BkvImportService:
             shutil.rmtree(stage)
         stage.mkdir(parents=True)
         capture_files = []
+        intensity_paths: dict[int, list[Path]] = {}
         for camera_id, entries in validated["frames"].items():
             for sequence, image, depth in entries:
-                frame = (
-                    stage
-                    / "cameras"
-                    / f"C{camera_id}"
-                    / "frames"
-                    / f"{sequence:06d}"
-                )
-                frame.mkdir(parents=True)
-                intensity_target = frame / "intensity.jpg"
-                depth_target = frame / "depth.npz"
+                camera_root = stage / "cameras" / f"C{camera_id}"
+                intensity_target = camera_root / "intensity" / f"{sequence:06d}.jpg"
+                depth_target = camera_root / "depth" / f"{sequence:06d}.npz"
+                intensity_target.parent.mkdir(parents=True, exist_ok=True)
+                depth_target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(image["sourcePath"], intensity_target)
-                shutil.copy2(depth["sourcePath"], depth_target)
-                for kind, target, source in (
-                    ("intensity", intensity_target, image),
-                    ("depth", depth_target, depth),
+                if (
+                    intensity_target.stat().st_size != image["size"]
+                    or _sha256_file(intensity_target) != image["sha256"]
                 ):
-                    if (
-                        target.stat().st_size != source["size"]
-                        or _sha256_file(target) != source["sha256"]
-                    ):
-                        raise ValueError(
-                            f"staged C{camera_id}/{sequence}/{kind} verification failed"
-                        )
+                    raise ValueError(
+                        f"staged C{camera_id}/{sequence}/intensity verification failed"
+                    )
+                depth_result = self._write_depth_v2(depth["sourcePath"], depth_target)
+                intensity_paths.setdefault(camera_id, []).append(intensity_target)
+                for kind, target, source, stored in (
+                    (
+                        "intensity",
+                        intensity_target,
+                        image,
+                        {"size": image["size"], "sha256": image["sha256"]},
+                    ),
+                    ("depth", depth_target, depth, depth_result),
+                ):
                     capture_files.append(
                         {
                             "cameraId": f"C{camera_id}",
                             "sequenceNo": sequence,
                             "kind": kind,
                             "path": target.relative_to(stage).as_posix(),
-                            "size": source["size"],
-                            "sha256": source["sha256"],
+                            "size": stored["size"],
+                            "sha256": stored["sha256"],
                             "sourcePath": source["sourceRelativePath"],
+                            "sourceSize": source["size"],
+                            "sourceSha256": source["sha256"],
                         }
                     )
         normalized_defects = [
@@ -631,7 +939,7 @@ class BkvImportService:
                 "cameraId": f"C{int(defect['cameraId'])}",
                 "sequenceNo": int(defect["imageIndex"]),
                 "defectType": str(defect.get("className", "")),
-                "severity": defect.get("grade"),
+                "severity": _severity_grade(defect.get("grade")),
                 "confidence": defect.get("confidence"),
                 "artifacts": defect,
             }
@@ -658,7 +966,11 @@ class BkvImportService:
                 "wallThicknessMm": material.get("wallThicknessMm"),
             },
             "captureFiles": [
-                {key: value for key, value in item.items() if key != "sourcePath"}
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"sourcePath", "sourceSize", "sourceSha256"}
+                }
                 for item in capture_files
             ],
             "defectsPath": "defects/defects.json",
@@ -681,8 +993,10 @@ class BkvImportService:
                         "sequenceNo": item["sequenceNo"],
                         "kind": item["kind"],
                         "sourcePath": item["sourcePath"],
-                        "size": item["size"],
-                        "sha256": item["sha256"],
+                        "sourceSize": item["sourceSize"],
+                        "sourceSha256": item["sourceSha256"],
+                        "storedSize": item["size"],
+                        "storedSha256": item["sha256"],
                     }
                     for item in capture_files
                 ],
@@ -695,6 +1009,12 @@ class BkvImportService:
                 "inspectionId": inspection_id,
                 "defects": normalized_defects,
             },
+        )
+        self._stage_tile_cache(
+            job_id=job_id,
+            inspection_id=inspection_id,
+            record_hash=record_hash,
+            intensity_paths=intensity_paths,
         )
         return stage
 
@@ -709,12 +1029,34 @@ class BkvImportService:
     ) -> None:
         destination = self.converted_root / "records" / inspection_id
         destination.parent.mkdir(parents=True, exist_ok=True)
+        staged_cache = (
+            self.converted_root
+            / "imports"
+            / ".staging"
+            / job_id
+            / ".cache"
+            / inspection_id
+            / record_hash
+        )
+        cache_record_root = (
+            self.cache_root / "inspection-world-v2" / inspection_id
+        )
+        cache_destination = cache_record_root / record_hash
+        if not (staged_cache / "cache.json").is_file():
+            raise ValueError("staged inspection-world cache is incomplete")
         replaced_destination: Path | None = None
+        published_cache = False
         if destination.exists():
             provenance = _read_json(
                 destination / "source-provenance.json", "published provenance"
             )
-            if provenance.get("sourceHash") == record_hash:
+            published_record = _read_json(
+                destination / "record.json", "published standard record"
+            )
+            if (
+                provenance.get("sourceHash") == record_hash
+                and published_record.get("schema") == STANDARD_RECORD_SCHEMA
+            ):
                 shutil.rmtree(stage)
             else:
                 replaced_destination = (
@@ -730,7 +1072,17 @@ class BkvImportService:
         else:
             _replace_directory_with_retry(stage, destination)
 
+        cache_destination.parent.mkdir(parents=True, exist_ok=True)
+        if cache_destination.exists():
+            shutil.rmtree(cache_destination)
+        _replace_directory_with_retry(staged_cache, cache_destination)
+        published_cache = True
+
         record = _read_json(destination / "record.json", "standard record")
+        if record.get("schema") != STANDARD_RECORD_SCHEMA:
+            raise ValueError(
+                f"published record schema must be {STANDARD_RECORD_SCHEMA}"
+            )
         defects = _read_json(
             destination / "defects" / "defects.json", "standard defects"
         )["defects"]
@@ -843,11 +1195,33 @@ class BkvImportService:
                     (job_id, inspection_id, record_hash, _utc_now()),
                 )
         except Exception:
+            if published_cache and cache_destination.exists():
+                _remove_tree_resilient(cache_destination)
             if destination.exists():
-                shutil.rmtree(destination)
+                _remove_tree_resilient(destination)
             if replaced_destination is not None and replaced_destination.exists():
                 _replace_directory_with_retry(replaced_destination, destination)
             raise
+        if replaced_destination is not None and replaced_destination.exists():
+            _remove_tree_resilient(replaced_destination)
+        if cache_record_root.exists():
+            for candidate in cache_record_root.iterdir():
+                if candidate != cache_destination and candidate.is_dir():
+                    _remove_tree_resilient(candidate)
+        staging_job = self.converted_root / "imports" / ".staging" / job_id
+        for apple_double in destination.rglob("._*"):
+            if apple_double.is_file():
+                apple_double.unlink()
+        if staging_job.exists():
+            for empty in sorted(
+                (path for path in staging_job.rglob("*") if path.is_dir()),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            ):
+                try:
+                    empty.rmdir()
+                except OSError:
+                    pass
 
     def _write_import_record(
         self,

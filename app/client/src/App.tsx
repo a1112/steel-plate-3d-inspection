@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { X } from 'lucide-react';
+import { PanelRightOpen, X } from 'lucide-react';
 import { getAllDefects, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
 import type { DefectItem, InspectionSnapshot, Severity } from './data/inspection';
 import type { InspectionUiState } from './state/inspection-ui';
@@ -75,6 +75,7 @@ import { AppFooter } from './components/AppFooter';
 import { AlarmAnalysis, type AnalysisViewMode } from './components/AlarmAnalysis';
 import { AlarmCenter } from './components/AlarmCenter';
 import { DefectDetectionList } from './components/DefectDetectionList';
+import { DefectImagePanel } from './components/DefectImagePanel';
 import { LeftSidebar } from './components/LeftSidebar';
 import { PlateMap, type PlateMapViewMode } from './components/PlateMap';
 import { ReportPage } from './components/ReportPage';
@@ -83,6 +84,7 @@ import { DefectFilterPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { BarSurfaceApp } from './components/BarSurfaceApp';
+import { BkvReconstructionApp } from './components/BkvReconstructionApp';
 import {
   buildStandardBkvInspectionSnapshot,
   mergeStandardBkvDefects,
@@ -293,7 +295,11 @@ function ConfiguredApp({
     return (
       <div className={`app-shell theme-${theme} style-${themeStyle} standalone-tool-shell bar-surface-standalone-shell`}>
         <StandaloneWindowTitlebar kind="bar-surface" title="3D 重建工作台" />
-        <BarSurfaceApp expectedCameraCount={runtimeProfile.cameraCount} />
+        {dashboardMode.kind === 'bkv' ? (
+          <BkvReconstructionApp expectedCameraCount={runtimeProfile.cameraCount} />
+        ) : (
+          <BarSurfaceApp expectedCameraCount={runtimeProfile.cameraCount} />
+        )}
       </div>
     );
   }
@@ -502,8 +508,11 @@ function InspectionDashboard({
   const [toast, setToast] = useState<string | null>(null);
   const [viewportSize, setViewportSize] = useState(readViewportSize);
   const [analysisCollapsed, setAnalysisCollapsed] = useState(false);
-  const [analysisViewMode, setAnalysisViewMode] = useState<AnalysisViewMode>('overview');
+  const [analysisViewMode, setAnalysisViewMode] = useState<AnalysisViewMode>(
+    terminalMode === 'bkv' ? 'diameter' : 'overview',
+  );
   const [plateMapViewMode, setPlateMapViewMode] = useState<PlateMapViewMode>('2d');
+  const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(false);
   const [worldFocusRequest, setWorldFocusRequest] = useState({
     defectId: null as string | null,
     revision: 0,
@@ -876,16 +885,7 @@ function InspectionDashboard({
     const inspectionId = activeInspection?.inspectionId?.trim() || '';
     const materialId = activeSnapshot.currentPlate.plateNo;
     const recordSummaryPath = activeInspection?.summaryPath?.trim() || '';
-    if (terminalMode === 'bkv') {
-      setRecordBoundSurface({
-        inspectionId,
-        loading: false,
-        mesh: null,
-        status: 'BKV 离线记录使用检测图像世界瓦片',
-      });
-      return;
-    }
-    if (dashboardMode.kind === 'bkv-online') {
+    if (terminalMode === 'bkv' || dashboardMode.kind === 'bkv-online') {
       if (!inspectionId) {
         setRecordBoundSurface({
           inspectionId: '',
@@ -902,7 +902,9 @@ function InspectionDashboard({
         inspectionId,
         loading: true,
         mesh: null,
-        status: '正在转换并读取当前流水号的 D3IMG 三维表面…',
+        status: terminalMode === 'bkv'
+          ? '正在读取当前离线记录的 NPZ 三维表面…'
+          : '正在转换并读取当前流水号的 D3IMG 三维表面…',
       });
       const loadDepthSurface = async () => {
         if (loaded || inFlight || controller.signal.aborted) return;
@@ -914,7 +916,9 @@ function InspectionDashboard({
             inspectionId,
             loading: false,
             mesh,
-            status: `D3IMG 已转换并存储 · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点 · 原始单位未标定`,
+            status: terminalMode === 'bkv'
+              ? `NPZ 已恢复 · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点 · 深度单位 mm`
+              : `D3IMG 已转换并存储 · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点`,
           });
           loaded = true;
         } catch (error) {
@@ -923,7 +927,9 @@ function InspectionDashboard({
               inspectionId,
               loading: false,
               mesh: null,
-              status: error instanceof Error ? `D3IMG 三维表面暂不可用：${error.message}` : 'D3IMG 三维表面暂不可用',
+              status: error instanceof Error
+                ? `${terminalMode === 'bkv' ? 'NPZ' : 'D3IMG'} 三维表面暂不可用：${error.message}`
+                : `${terminalMode === 'bkv' ? 'NPZ' : 'D3IMG'} 三维表面暂不可用`,
             });
           }
         } finally {
@@ -1399,7 +1405,7 @@ function InspectionDashboard({
         />
       ) : null}
       {uiState.activeNav === 'online' ? (
-        <div className="online-workspace">
+        <div className={`online-workspace ${terminalMode === 'bkv' ? 'runtime-bkv-workspace' : ''}`}>
           <LeftSidebar
             runtimeMode={terminalMode}
             plate={activeSnapshot.currentPlate}
@@ -1415,7 +1421,7 @@ function InspectionDashboard({
             onSearchReset={resetRecordSearchFilters}
           />
           <section className="online-main">
-            <main className="dashboard-grid online-dashboard-grid">
+            <main className={`dashboard-grid online-dashboard-grid ${rightSidebarCollapsed ? 'right-sidebar-collapsed' : ''}`}>
               <section className={`center-column ${analysisCollapsed ? 'analysis-collapsed' : ''}`}>
                 <PlateMap
                   defectTypes={snapshot.defectTypes}
@@ -1427,6 +1433,7 @@ function InspectionDashboard({
                   surfaceMode={uiState.surfaceDisplayMode}
                   previewPositionM={uiState.previewPositionM}
                   plateLengthM={activePlateLengthM}
+                  nominalDiameterMm={activeSnapshot.currentPlate.widthMm}
                   artifactMode={artifactMode}
                   inspectionId={activeInspection?.inspectionId}
                   requireInspectionWorld={dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online'}
@@ -1438,14 +1445,15 @@ function InspectionDashboard({
                   viewMode={plateMapViewMode}
                   integratedToolbar
                   toolbarExtra={
-                    terminalMode === 'bkv' ? (
-                      <div className="snapshot-follow-summary bkv-record-summary" aria-label="BKV 检测数据状态">
-                        <i className="history" />
-                        <strong>BKV 离线记录</strong>
-                        <span>流水号 {activeInspection?.inspectionId ?? '--'} · 批次 {bkvRecords?.batchId ?? '--'}</span>
-                      </div>
-                    ) : (
-                      <>
+                    <>
+                      {terminalMode === 'bkv' ? (
+                        <div className="snapshot-follow-summary bkv-record-summary" aria-label="BKV 检测数据状态">
+                          <i className="history" />
+                          <strong>BKV 离线记录</strong>
+                          <span>流水号 {activeInspection?.inspectionId ?? '--'} · 批次 {bkvRecords?.batchId ?? '--'}</span>
+                        </div>
+                      ) : (
+                        <>
                         <div className="snapshot-follow-summary" aria-label="检测数据状态">
                           <i className={snapshotTracking === 'latest' ? 'live' : 'history'} />
                           <strong>{snapshotTracking === 'latest' ? '实时跟随最新检测' : `固定查看 ${activeSnapshot.currentPlate.plateNo}`}</strong>
@@ -1459,8 +1467,21 @@ function InspectionDashboard({
                             固定当前
                           </button>
                         </div>
-                      </>
-                    )
+                        </>
+                      )}
+                      {rightSidebarCollapsed ? (
+                        <button
+                          type="button"
+                          className="right-sidebar-expand-button"
+                          aria-label="展开右侧栏"
+                          title="展开缺陷侧栏"
+                          onClick={() => setRightSidebarCollapsed(false)}
+                        >
+                          <PanelRightOpen size={14} />
+                          <span>缺陷侧栏</span>
+                        </button>
+                      ) : null}
+                    </>
                   }
                   onToggleType={(typeId) =>
                     setUiState((current) => ({
@@ -1477,6 +1498,7 @@ function InspectionDashboard({
                   selectedDefect={selectedOnlineDefect}
                   heightProfile={activeSnapshot.heightProfile}
                   captureImages={activeSnapshot.captureImages}
+                  defects={visibleDefects}
                   artifactMode={artifactMode}
                   inspectionId={activeInspection?.inspectionId}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
@@ -1484,9 +1506,18 @@ function InspectionDashboard({
                   headerless
                   collapsed={analysisCollapsed}
                   viewMode={analysisViewMode}
+                  diameterMeasurement={terminalMode === 'bkv' ? {
+                    nominalDiameterMm: activeSnapshot.currentPlate.widthMm,
+                    lengthMm: activeSnapshot.currentPlate.lengthMm,
+                  } : undefined}
                 />
               </section>
-              <aside className="right-column">
+              {rightSidebarCollapsed ? null : <aside className="right-column">
+                <DefectImagePanel
+                  inspectionId={activeInspection?.inspectionId}
+                  defect={selectedOnlineDefect}
+                  onSidebarCollapse={() => setRightSidebarCollapsed(true)}
+                />
                 <DefectFilterPanel
                   summary={activeSummary}
                   defectTypes={snapshot.defectTypes}
@@ -1514,7 +1545,7 @@ function InspectionDashboard({
                     setState({ defectPage: 1 });
                   }}
                 />
-              </aside>
+              </aside>}
             </main>
           </section>
         </div>

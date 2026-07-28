@@ -982,7 +982,6 @@ export function BrandHeader({
         </div>
           </>
         )}
-        <NotificationCenter embedded />
       </div>
 
       <div className="brand-right">
@@ -992,6 +991,7 @@ export function BrandHeader({
           <Cpu size={13} />
           <Activity size={13} />
         </div>
+        <NotificationCenter embedded />
         <WindowControls analysisCollapse={dashboardMode.kind === 'direct' ? analysisCollapse : undefined} />
       </div>
     </header>

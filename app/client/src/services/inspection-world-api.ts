@@ -62,6 +62,12 @@ export type InspectionWorldMeta = {
   recordId: string;
   legacySeqNo?: number;
   sourceFrameCount: number;
+  sourceRevision: string;
+  cache: {
+    state: 'building' | 'complete' | 'unavailable';
+    tileSize: number;
+    maxLevel: number;
+  };
   world: InspectionWorld;
   depthSurface?: {
     available: boolean;
@@ -73,6 +79,65 @@ export type InspectionWorldMeta = {
     coordinateUnit: string;
     calibrated: boolean;
   };
+};
+
+export type InspectionWorldReconstructionParameters = {
+  schema: 'steel.bkv-depth-reconstruction-parameters.v1';
+  recordId: string;
+  algorithmRevision?: string;
+  input: {
+    format: 'NPZ';
+    depthArray: string;
+    depthType: string;
+    sourceFrameCount: number;
+    invalidDepthFloor: number;
+  };
+  sampling: {
+    rows: number;
+    colsPerCamera: number;
+    cameraCount: number;
+    frameSelection: string;
+    rowSelection: string;
+    columnSelection: string;
+  };
+  reconstruction: {
+    geometry: string;
+    longitudinalExtent: number;
+    nominalRadius: number;
+    nominalDiameter?: number;
+    maximumRadialOffset: number;
+    cameraNormalization: string;
+    coordinateUnit: string;
+    calibrated: boolean;
+  };
+  display: {
+    mode: string;
+    robustResidualP95: number;
+    radialScale: number;
+    unit: string;
+  };
+  output: {
+    format: string;
+    vertexCount: number;
+    validPointCount: number;
+    imputedPointCount?: number;
+    indexCount: number;
+    triangleCount: number;
+    binaryBytes: number;
+    topology?: string;
+  };
+  cameras: Array<{
+    cameraId: number;
+    frameCount: number;
+    firstSequence: number;
+    lastSequence: number;
+    sourceRows: number;
+    sourceColumns: number;
+    baseline: number;
+    columnBaselineMinimum?: number;
+    columnBaselineMaximum?: number;
+    normalization: string;
+  }>;
 };
 
 export type InspectionWorldDefect = {
@@ -112,6 +177,7 @@ export type WorldTileRequest = {
   level: number;
   x: number;
   y: number;
+  revision: string;
   format?: 'jpeg' | 'png';
 };
 
@@ -155,7 +221,15 @@ export async function fetchInspectionWorldMeta(recordId: string, signal?: AbortS
   const payload = await readJson<InspectionWorldMeta>(await fetch(worldUrl('meta', new URLSearchParams({ recordId })), {
     headers: createAdminHeaders({ Accept: 'application/json' }), signal,
   }), '检测世界元数据读取失败');
-  if (payload.schema !== 'steel.inspection-world.meta.v1' || !payload.world || !Array.isArray(payload.world.cameras)) {
+  if (
+    payload.schema !== 'steel.inspection-world.meta.v1'
+    || typeof payload.sourceRevision !== 'string'
+    || !payload.sourceRevision
+    || !payload.cache
+    || payload.cache.tileSize !== 128
+    || !payload.world
+    || !Array.isArray(payload.world.cameras)
+  ) {
     throw new Error('检测世界元数据格式无效');
   }
   return payload;
@@ -169,6 +243,18 @@ export async function fetchInspectionWorldDefects(recordId: string, signal?: Abo
     throw new Error('检测世界缺陷格式无效');
   }
   return payload;
+}
+
+export function inspectionWorldFrameUrl(
+  recordId: string,
+  cameraId: number,
+  sequenceNo: number,
+) {
+  return worldUrl('frame', new URLSearchParams({
+    recordId,
+    cameraId: String(cameraId),
+    sequenceNo: String(sequenceNo),
+  }));
 }
 
 const inspectionWorldSurfaceCache = new Map<string, BarSurfaceMesh>();
@@ -236,7 +322,7 @@ export function parseInspectionWorldSurfaceBinary(buffer: ArrayBuffer): BarSurfa
   }
   return {
     schema: 'steel.bkv-depth-surface.bsmesh.v1',
-    coordinateUnit: 'legacy-unknown',
+    coordinateUnit: 'millimeter-normalized-radius',
     cameraCount,
     frameStems: [],
     rows,
@@ -252,15 +338,22 @@ export function parseInspectionWorldSurfaceBinary(buffer: ArrayBuffer): BarSurfa
   };
 }
 
-export async function fetchInspectionWorldSurface(recordId: string, signal?: AbortSignal): Promise<BarSurfaceMesh> {
-  const cached = inspectionWorldSurfaceCache.get(recordId);
+export async function fetchInspectionWorldSurface(
+  recordId: string,
+  signal?: AbortSignal,
+  refresh = false,
+): Promise<BarSurfaceMesh> {
+  const cached = refresh ? undefined : inspectionWorldSurfaceCache.get(recordId);
   if (cached) {
     inspectionWorldSurfaceCache.delete(recordId);
     inspectionWorldSurfaceCache.set(recordId, cached);
     return cached;
   }
   try {
-    const binaryResponse = await fetch(worldUrl('surface', new URLSearchParams({ recordId, format: 'binary' })), {
+    const params = new URLSearchParams({ recordId, format: 'binary' });
+    if (refresh) params.set('refresh', String(Date.now()));
+    const binaryResponse = await fetch(worldUrl('surface', params), {
+      cache: refresh ? 'no-store' : 'no-cache',
       headers: createAdminHeaders({ Accept: 'application/vnd.steel.bsmesh' }), signal,
     });
     if (binaryResponse.ok) {
@@ -286,6 +379,35 @@ export async function fetchInspectionWorldSurface(recordId: string, signal?: Abo
   return rememberInspectionWorldSurface(recordId, payload);
 }
 
+export async function fetchInspectionWorldReconstructionParameters(
+  recordId: string,
+  signal?: AbortSignal,
+  rebuild = false,
+): Promise<InspectionWorldReconstructionParameters> {
+  const params = new URLSearchParams({ recordId });
+  if (rebuild) params.set('rebuild', 'true');
+  const payload = await readJson<InspectionWorldReconstructionParameters>(
+    await fetch(
+      worldUrl('reconstruction-parameters', params),
+      {
+        cache: rebuild ? 'no-store' : 'no-cache',
+        headers: createAdminHeaders({ Accept: 'application/json' }),
+        signal,
+      },
+    ),
+    '三维重建参数计算失败',
+  );
+  if (
+    payload.schema !== 'steel.bkv-depth-reconstruction-parameters.v1'
+    || payload.recordId !== recordId
+    || !Array.isArray(payload.cameras)
+    || !Number.isFinite(payload.output?.vertexCount)
+  ) {
+    throw new Error('三维重建参数格式无效');
+  }
+  return payload;
+}
+
 export async function fetchInspectionWorldTile(
   recordId: string,
   request: WorldTileRequest,
@@ -294,15 +416,23 @@ export async function fetchInspectionWorldTile(
   const format = request.format ?? 'jpeg';
   const params = new URLSearchParams({
     recordId,
+    revision: request.revision,
     cameraId: String(request.cameraId),
     level: String(request.level),
     x: String(request.x),
     y: String(request.y),
     format,
   });
-  const response = await fetch(worldUrl('tile', params), {
+  let response = await fetch(worldUrl('tile', params), {
     headers: createAdminHeaders({ Accept: format === 'png' ? 'image/png' : 'image/jpeg' }), signal,
   });
+  if (response.status === 409 && !signal?.aborted) {
+    const refreshed = await fetchInspectionWorldMeta(recordId, signal);
+    params.set('revision', refreshed.sourceRevision);
+    response = await fetch(worldUrl('tile', params), {
+      headers: createAdminHeaders({ Accept: format === 'png' ? 'image/png' : 'image/jpeg' }), signal,
+    });
+  }
   if (!response.ok) throw new Error(`检测世界瓦片读取失败 (HTTP ${response.status})`);
   const url = URL.createObjectURL(await response.blob());
   return { ...request, format, url, revoke: () => URL.revokeObjectURL(url) };

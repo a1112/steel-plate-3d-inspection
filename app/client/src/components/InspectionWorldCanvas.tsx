@@ -6,6 +6,7 @@ import {
   scaledWorldExtent,
   scrollPositionForZoom,
 } from '../lib/inspection-world';
+import { TileRequestQueue } from '../lib/tile-request-queue';
 import {
   fetchInspectionWorldTile,
   type InspectionWorldDefect,
@@ -21,16 +22,29 @@ type Props = {
   focusDefectRevision?: number;
   className?: string;
   onFirstPaint?: () => void;
+  colorMode?: 'gray' | 'jet';
 };
 
 type ViewState = { scrollLeft: number; scrollTop: number; scale: number };
-type TileEntry = { tile: WorldTile; image: HTMLImageElement; loaded: boolean; lastUsed: number };
-type PendingTileRequest = { token: symbol; controller: AbortController };
+type TileEntry = {
+  tile: WorldTile;
+  image: HTMLImageElement;
+  loaded: boolean;
+  lastUsed: number;
+  jetCanvas?: HTMLCanvasElement | null;
+};
+type PendingTileRequest = { token: symbol };
 
 const DEFAULT_WIDTH = 1000;
 const DEFAULT_HEIGHT = 600;
-const TILE_CACHE_LIMIT = 48;
+const TILE_CACHE_BYTES = 64 * 1024 * 1024;
 const WORLD_TOP_GUTTER_PX = 28;
+
+function tileEntryBytes(entry: TileEntry) {
+  const width = entry.image.naturalWidth || entry.image.width || 128;
+  const height = entry.image.naturalHeight || entry.image.height || 128;
+  return width * height * 4 * (entry.jetCanvas ? 2 : 1);
+}
 
 function fitWidthScale(worldWidth: number, viewportWidth: number) {
   return viewportWidth / Math.max(1, worldWidth);
@@ -45,6 +59,39 @@ function disposeTileEntry(entry: TileEntry) {
   entry.image.onload = null;
   entry.image.onerror = null;
   entry.tile.revoke();
+  entry.jetCanvas = null;
+}
+
+function jetChannel(value: number, offset: number) {
+  return Math.round(Math.max(0, Math.min(1, 1.5 - Math.abs(4 * value - offset))) * 255);
+}
+
+function jetTileSource(entry: TileEntry): CanvasImageSource {
+  if (entry.jetCanvas) return entry.jetCanvas;
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = entry.image.naturalWidth || entry.image.width;
+    canvas.height = entry.image.naturalHeight || entry.image.height;
+    const context = canvas.getContext('2d');
+    if (!context || typeof context.getImageData !== 'function') return entry.image;
+    context.drawImage(entry.image, 0, 0);
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    for (let index = 0; index < image.data.length; index += 4) {
+      const value = (
+        image.data[index] * 0.2126
+        + image.data[index + 1] * 0.7152
+        + image.data[index + 2] * 0.0722
+      ) / 255;
+      image.data[index] = jetChannel(value, 3);
+      image.data[index + 1] = jetChannel(value, 2);
+      image.data[index + 2] = jetChannel(value, 1);
+    }
+    context.putImageData(image, 0, 0);
+    entry.jetCanvas = canvas;
+    return canvas;
+  } catch {
+    return entry.image;
+  }
 }
 
 export function InspectionWorldCanvas({
@@ -55,6 +102,7 @@ export function InspectionWorldCanvas({
   focusDefectRevision = 0,
   className = '',
   onFirstPaint,
+  colorMode = 'gray',
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -62,6 +110,7 @@ export function InspectionWorldCanvas({
   const activeTileKeys = useRef(new Set<string>());
   const committedTileKeys = useRef(new Set<string>());
   const pending = useRef(new Map<string, PendingTileRequest>());
+  const requestQueue = useRef(new TileRequestQueue<WorldTile>(6, 400));
   const cacheClock = useRef(0);
   const drag = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const scrollFrame = useRef<number | null>(null);
@@ -84,8 +133,8 @@ export function InspectionWorldCanvas({
   const [revision, setRevision] = useState(0);
   const [focusScrollRevision, setFocusScrollRevision] = useState(0);
   const worldRevision = useMemo(
-    () => `${recordId}:${meta.sourceFrameCount}:${JSON.stringify(meta.world)}`,
-    [meta.sourceFrameCount, meta.world, recordId],
+    () => `${recordId}:${meta.sourceRevision}:${meta.sourceFrameCount}:${JSON.stringify(meta.world)}`,
+    [meta.sourceFrameCount, meta.sourceRevision, meta.world, recordId],
   );
   const previousWorldRevision = useRef(worldRevision);
 
@@ -118,7 +167,11 @@ export function InspectionWorldCanvas({
   }, []);
 
   const evictInactiveTiles = useCallback(() => {
-    if (tileCache.current.size <= TILE_CACHE_LIMIT) return false;
+    let cacheBytes = [...tileCache.current.values()].reduce(
+      (total, entry) => total + tileEntryBytes(entry),
+      0,
+    );
+    if (cacheBytes <= TILE_CACHE_BYTES) return false;
     const currentCoverageReady = [...activeTileKeys.current].every(
       (key) => tileCache.current.get(key)?.loaded,
     );
@@ -128,7 +181,8 @@ export function InspectionWorldCanvas({
       .sort(([, left], [, right]) => left.lastUsed - right.lastUsed);
     let removed = false;
     for (const [key, entry] of candidates) {
-      if (tileCache.current.size <= TILE_CACHE_LIMIT) break;
+      if (cacheBytes <= TILE_CACHE_BYTES) break;
+      cacheBytes -= tileEntryBytes(entry);
       disposeTileEntry(entry);
       tileCache.current.delete(key);
       removed = true;
@@ -181,7 +235,7 @@ export function InspectionWorldCanvas({
     firstPaintReported.current = false;
     tileCache.current.forEach(disposeTileEntry);
     tileCache.current.clear();
-    pending.current.forEach((request) => request.controller.abort());
+    requestQueue.current.cancelAll();
     pending.current.clear();
     pendingScroll.current = null;
     drag.current = null;
@@ -212,7 +266,7 @@ export function InspectionWorldCanvas({
       }
       queueMicrotask(() => {
         if (lifecycleGeneration.current !== generation) return;
-        pending.current.forEach((request) => request.controller.abort());
+        requestQueue.current.cancelAll();
         pending.current.clear();
       });
     };
@@ -245,11 +299,55 @@ export function InspectionWorldCanvas({
       prefetch: 1,
     });
   }, [level, meta.world.cameras, meta.world.tileSize, size.height, size.width, view.scale, viewX, viewportMeasured, visibleWorldY]);
+  const directlyVisibleTiles = useMemo(() => {
+    if (!viewportMeasured) return [];
+    return getVisibleCameraTiles({
+      cameras: meta.world.cameras,
+      tileSize: meta.world.tileSize,
+      level,
+      viewport: {
+        x: viewX,
+        y: visibleWorldY,
+        width: size.width / view.scale,
+        height: size.height / view.scale,
+      },
+      prefetch: 0,
+    });
+  }, [level, meta.world.cameras, meta.world.tileSize, size.height, size.width, view.scale, viewX, viewportMeasured, visibleWorldY]);
+  const loadCandidates = useMemo(() => {
+    const candidates = [...visibleTiles];
+    if (level < meta.world.maxLevel) {
+      for (const tile of directlyVisibleTiles) {
+        candidates.push({
+          cameraId: tile.cameraId,
+          level: level + 1,
+          x: Math.floor(tile.x / 2),
+          y: Math.floor(tile.y / 2),
+        });
+      }
+    }
+    return [...new Map(candidates.map((tile) => [
+      `${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`,
+      tile,
+    ])).values()];
+  }, [directlyVisibleTiles, level, meta.world.maxLevel, visibleTiles]);
   const visibleTileKeys = useMemo(
     () => new Set(visibleTiles.map((tile) => (
       `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`
     ))),
     [recordId, visibleTiles],
+  );
+  const directlyVisibleTileKeys = useMemo(
+    () => new Set(directlyVisibleTiles.map((tile) => (
+      `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`
+    ))),
+    [directlyVisibleTiles, recordId],
+  );
+  const loadCandidateKeys = useMemo(
+    () => new Set(loadCandidates.map((tile) => (
+      `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`
+    ))),
+    [loadCandidates, recordId],
   );
   const cameraById = useMemo(
     () => new Map(meta.world.cameras.map((camera) => [camera.cameraId, camera])),
@@ -257,14 +355,14 @@ export function InspectionWorldCanvas({
   );
 
   useLayoutEffect(() => {
-    const committedKeys = new Set(visibleTileKeys);
+    const committedKeys = new Set(loadCandidateKeys);
     committedTileKeys.current = committedKeys;
     activeTileKeys.current = new Set(committedKeys);
     committedKeys.forEach((key) => {
       const entry = tileCache.current.get(key);
       if (entry) entry.lastUsed = ++cacheClock.current;
     });
-  }, [visibleTileKeys]);
+  }, [loadCandidateKeys]);
 
   useEffect(() => {
     const removedEntry = evictInactiveTiles();
@@ -283,19 +381,40 @@ export function InspectionWorldCanvas({
 
   useEffect(() => {
     pending.current.forEach((request, key) => {
-      if (visibleTileKeys.has(key)) return;
-      request.controller.abort();
+      if (loadCandidateKeys.has(key)) return;
+      requestQueue.current.cancel(key, false);
       pending.current.delete(key);
     });
-    for (const tile of visibleTiles) {
+    const prioritizedCandidates = [...loadCandidates].sort((left, right) => {
+      const key = (tile: typeof left) => `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`;
+      const priority = (tile: typeof left) => {
+        const candidate = key(tile);
+        return directlyVisibleTileKeys.has(candidate)
+          ? 0
+          : visibleTileKeys.has(candidate) ? 1 : 2;
+      };
+      return priority(left) - priority(right);
+    });
+    for (const tile of prioritizedCandidates) {
       const key = `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`;
       if (tileCache.current.has(key) || pending.current.has(key) || failedKeys.has(key)) continue;
-      const controller = new AbortController();
       const requestToken = Symbol(key);
-      pending.current.set(key, { token: requestToken, controller });
-      fetchInspectionWorldTile(recordId, { ...tile, format: 'jpeg' }, controller.signal)
+      pending.current.set(key, { token: requestToken });
+      const priority = directlyVisibleTileKeys.has(key)
+        ? 0
+        : visibleTileKeys.has(key) ? 1 : 2;
+      requestQueue.current.enqueue({
+        key,
+        scope: worldRevision,
+        priority,
+        run: (signal) => fetchInspectionWorldTile(
+          recordId,
+          { ...tile, revision: meta.sourceRevision, format: 'jpeg' },
+          signal,
+        ),
+      })
         .then((worldTile) => {
-          if (controller.signal.aborted || !activeTileKeys.current.has(key)) {
+          if (!activeTileKeys.current.has(key)) {
             worldTile.revoke();
             return;
           }
@@ -319,8 +438,11 @@ export function InspectionWorldCanvas({
           evictInactiveTiles();
           setRevision((value) => value + 1);
         })
-        .catch(() => {
-          if (!controller.signal.aborted && activeTileKeys.current.has(key)) {
+        .catch((error: unknown) => {
+          if (
+            !(error instanceof DOMException && error.name === 'AbortError')
+            && activeTileKeys.current.has(key)
+          ) {
             setFailedKeys((current) => new Set(current).add(key));
           }
         })
@@ -331,7 +453,16 @@ export function InspectionWorldCanvas({
     // Lifecycle cleanup owns cancellation; this cleanup intentionally preserves
     // overlapping per-key requests while allowing StrictMode to replay setup.
     return () => undefined;
-  }, [failedKeys, recordId, visibleTileKeys, visibleTiles]);
+  }, [
+    directlyVisibleTileKeys,
+    failedKeys,
+    loadCandidateKeys,
+    loadCandidates,
+    meta.sourceRevision,
+    recordId,
+    visibleTileKeys,
+    worldRevision,
+  ]);
 
   const locatableDefects = useMemo(
     () => defects.filter((defect) => defect.locatable && defect.worldRect),
@@ -423,7 +554,13 @@ export function InspectionWorldCanvas({
       const screenWidth = Math.min(fallbackSpan, camera.width - entry.tile.x * fallbackSpan) * view.scale;
       const screenHeight = Math.min(fallbackSpan, camera.height - entry.tile.y * fallbackSpan) * view.scale;
       if (screenX + screenWidth < 0 || screenX > size.width || screenY + screenHeight < 0 || screenY > size.height) continue;
-      context.drawImage(entry.image, screenX, screenY, screenWidth, screenHeight);
+      context.drawImage(
+        colorMode === 'jet' ? jetTileSource(entry) : entry.image,
+        screenX,
+        screenY,
+        screenWidth,
+        screenHeight,
+      );
       paintedTile = true;
     }
     for (const tile of visibleTiles) {
@@ -436,7 +573,13 @@ export function InspectionWorldCanvas({
       const screenHeight = Math.min(span, camera.height - tile.y * span) * view.scale;
       const entry = tileCache.current.get(key);
       if (entry?.loaded) {
-        context.drawImage(entry.image, screenX, screenY, screenWidth, screenHeight);
+        context.drawImage(
+          colorMode === 'jet' ? jetTileSource(entry) : entry.image,
+          screenX,
+          screenY,
+          screenWidth,
+          screenHeight,
+        );
         paintedTile = true;
       }
       else if (failedKeys.has(key)) {
@@ -465,7 +608,7 @@ export function InspectionWorldCanvas({
       firstPaintReported.current = true;
       onFirstPaintRef.current?.();
     }
-  }, [cameraById, failedKeys, level, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
+  }, [cameraById, colorMode, failedKeys, level, meta.world.cameras, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -534,11 +677,12 @@ export function InspectionWorldCanvas({
 
   return <div
     ref={hostRef}
-    className={`inspection-world-viewport ${className}`.trim()}
+    className={`inspection-world-viewport color-mode-${colorMode} ${className}`.trim()}
     data-testid="inspection-world-viewport"
     data-record-id={recordId}
     data-scroll-mode="native"
     data-top-gutter={WORLD_TOP_GUTTER_PX}
+    data-color-mode={colorMode}
     tabIndex={0}
     aria-label={`${recordId} 检测图像滚动视图`}
     onScroll={scheduleScrollRead}
@@ -576,8 +720,15 @@ export function InspectionWorldCanvas({
           >C{camera.cameraId}</span>)}
         </div>
         <div className="inspection-world-tile-status" role="status">
-          {failedKeys.size ? `${failedKeys.size} 个瓦片读取失败` : `LOD ${level} · ${visibleTiles.length} 个可见瓦片`}
+          {failedKeys.size
+            ? `${failedKeys.size} 个瓦片读取失败`
+            : `LOD ${level} · ${meta.world.tileSize}px · ${visibleTiles.length} 个可见瓦片`}
         </div>
+        {colorMode === 'jet' ? (
+          <div className="inspection-world-jet-legend" aria-label="二维 Jet 灰度映射图例">
+            <span>低灰度</span><i /><span>高灰度</span>
+          </div>
+        ) : null}
       </div>
     </div>
   </div>;

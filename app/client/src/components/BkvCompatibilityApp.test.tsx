@@ -56,6 +56,8 @@ vi.mock('../services/inspection-world-api', async () => {
 
 const worldMeta: InspectionWorldMeta = {
   schema: 'steel.inspection-world.meta.v1', provider: 'bkv', recordId: '1893700', sourceFrameCount: 126,
+  sourceRevision: 'revision-1893700',
+  cache: { state: 'complete', tileSize: 128, maxLevel: 15 },
   world: {
     width: 3870, height: 21504, tileSize: 512, maxLevel: 15,
     cameras: material.cameras.map((camera, index) => ({

@@ -70,7 +70,7 @@ const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
 const surfaceViewOptions: Array<{ id: PlateMapViewMode; label: string }> = [
   { id: '2d', label: '2D' },
   { id: '3d', label: '3D' },
-  { id: 'point-cloud', label: '点云' },
+  { id: 'section', label: '切面' },
 ];
 
 const analysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
@@ -78,6 +78,11 @@ const analysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
   { id: 'image', label: '灰度' },
   { id: 'point-cloud', label: '局部点云' },
   { id: 'profile', label: '剖面' },
+];
+
+const bkvAnalysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
+  { id: 'diameter', label: '宽度曲线' },
+  { id: 'defects', label: '缺陷' },
 ];
 
 const defaultTerminalViews: FooterTerminalViews = {
@@ -179,6 +184,21 @@ export function AppFooter({
     <footer className={`app-footer ${activeAnalysis ? 'has-analysis-context' : ''}`} data-no-drag>
       {activeAnalysis ? (
         <div className="app-footer-analysis" aria-label="选中缺陷分析工具">
+          {dashboardMode.kind === 'bkv' ? (
+            <div className="app-footer-view-group bkv-analysis-views" role="group" aria-label="BKV 下方视图">
+              {bkvAnalysisViewOptions.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  className={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id ? 'active' : ''}
+                  aria-pressed={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id}
+                  onClick={() => changeAnalysisView(option.id)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
           <div className="app-footer-defect-summary" title={`缺陷 ${activeAnalysis.defect.id} · ${activeAnalysis.defect.plateNo}`}>
             <span className="app-footer-kicker">当前缺陷</span>
             <strong>{activeAnalysis.defect.typeLabel}</strong>
@@ -190,34 +210,38 @@ export function AppFooter({
             <span>传动 {activeAnalysis.defect.driveSideMm}mm</span>
             <span>周期 {activeAnalysis.defect.typeId === 'roll' ? '是' : '否'}</span>
           </div>
-          <div className="app-footer-view-group" role="group" aria-label="主检测视图">
-            <span>主视图</span>
-            {surfaceViewOptions.map((option) => (
-              <button
-                key={option.id}
-                type="button"
-                className={activeAnalysis.surfaceViewMode === option.id ? 'active' : ''}
-                aria-pressed={activeAnalysis.surfaceViewMode === option.id}
-                onClick={() => activeAnalysis.onSurfaceViewModeChange(option.id)}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-          <div className="app-footer-view-group analysis-views" role="group" aria-label="缺陷分析视图">
-            <span>分析</span>
-            {analysisViewOptions.map((option) => (
-              <button
-                key={option.id}
-                type="button"
-                className={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id ? 'active' : ''}
-                aria-pressed={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id}
-                onClick={() => changeAnalysisView(option.id)}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
+          {dashboardMode.kind === 'bkv' ? null : (
+            <>
+              <div className="app-footer-view-group" role="group" aria-label="主检测视图">
+                <span>主视图</span>
+                {surfaceViewOptions.map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className={activeAnalysis.surfaceViewMode === option.id ? 'active' : ''}
+                    aria-pressed={activeAnalysis.surfaceViewMode === option.id}
+                    onClick={() => activeAnalysis.onSurfaceViewModeChange(option.id)}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              <div className="app-footer-view-group analysis-views" role="group" aria-label="缺陷分析视图">
+                <span>分析</span>
+                {analysisViewOptions.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  className={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id ? 'active' : ''}
+                  aria-pressed={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id}
+                  onClick={() => changeAnalysisView(option.id)}
+                >
+                  {option.label}
+                </button>
+                ))}
+              </div>
+            </>
+          )}
         </div>
       ) : (
         <div className="app-footer-context" aria-label="系统工具栏">

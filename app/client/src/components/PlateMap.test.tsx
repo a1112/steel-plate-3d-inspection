@@ -19,6 +19,8 @@ vi.mock('../services/inspection-world-api', async () => {
 
 const onlineWorldMeta: InspectionWorldMeta = {
   schema: 'steel.inspection-world.meta.v1', provider: 'online', recordId: 'INS-WORLD-1', sourceFrameCount: 8,
+  sourceRevision: 'online-revision',
+  cache: { state: 'building', tileSize: 128, maxLevel: 10 },
   world: {
     width: 800, height: 1024, tileSize: 512, maxLevel: 10,
     cameras: Array.from({ length: 8 }, (_, index) => ({
@@ -476,9 +478,9 @@ describe('PlateMap', () => {
     expect(screen.getByTestId('plate-map-3d-view')).toBeInTheDocument();
     expect(screen.queryByRole('slider', { name: '预览位置' })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '点云' }));
+    fireEvent.click(screen.getByRole('button', { name: /^点云$/ }));
 
-    expect(screen.getByRole('button', { name: '点云' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /^点云$/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByTestId('plate-point-cloud-view')).toBeInTheDocument();
     expect(screen.queryByTestId('plate-map-3d-view')).not.toBeInTheDocument();
     expect(screen.queryByRole('slider', { name: '预览位置' })).not.toBeInTheDocument();
@@ -505,7 +507,8 @@ describe('PlateMap', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: '点云' }));
+    fireEvent.click(screen.getByRole('button', { name: '3D' }));
+    fireEvent.click(screen.getByRole('button', { name: /^点云$/ }));
     const view = screen.getByTestId('plate-point-cloud-view');
 
     expect(Number(view.getAttribute('data-point-cloud-points'))).toBeGreaterThan(5000);
@@ -795,7 +798,7 @@ describe('PlateMap', () => {
     expect(screen.getByTestId('plate-production-surface-empty')).toHaveTextContent('暂无生产三维表面产物');
     expect(screen.queryByTestId('plate-map-3d-view')).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '点云' }));
+    fireEvent.click(screen.getByRole('button', { name: /^点云$/ }));
     expect(screen.getByTestId('plate-production-point-cloud-empty')).toHaveTextContent('暂无生产点云产物');
     expect(screen.queryByTestId('plate-point-cloud-view')).not.toBeInTheDocument();
   });
@@ -825,7 +828,7 @@ describe('PlateMap', () => {
     expect(screen.getByTestId('plate-production-surface')).toHaveAttribute('data-artifact-points', '4');
     expect(screen.getByTestId('plate-production-surface')).toHaveAttribute('data-artifact-triangles', '2');
 
-    fireEvent.click(screen.getByRole('button', { name: '点云' }));
+    fireEvent.click(screen.getByRole('button', { name: /^点云$/ }));
     expect(screen.getByTestId('plate-production-point-cloud')).toHaveAttribute('data-artifact-source', 'production-record');
     expect(screen.queryByTestId('plate-point-cloud-view')).not.toBeInTheDocument();
   });

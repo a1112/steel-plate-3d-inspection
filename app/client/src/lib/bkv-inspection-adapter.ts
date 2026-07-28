@@ -60,6 +60,22 @@ function standardDefectTypeId(defect: InspectionWorldDefect) {
   return `bkv-type-${normalizedName || 'unknown'}`;
 }
 
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function finiteNumber(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function standardDefectSeverity(grade: number | undefined) {
+  if (grade != null && grade >= 3) return 'severe' as const;
+  if (grade != null && grade <= 1) return 'minor' as const;
+  return 'review' as const;
+}
+
 function standardDefect(
   plate: SteelPlate,
   defect: InspectionWorldDefect,
@@ -69,13 +85,31 @@ function standardDefect(
   const imageRect = defect.trace?.artifacts?.imageRect2d;
   const previewX = imageRect?.left ?? defect.worldRect?.x ?? 0;
   const previewY = imageRect?.top ?? defect.worldRect?.y ?? 0;
+  const source = recordValue(defect.trace?.artifacts?.source);
+  const sourceArtifacts = recordValue(source?.artifacts);
+  const roi = recordValue(sourceArtifacts?.roi);
+  const sequenceNo = finiteNumber(defect.trace?.sequenceNo)
+    ?? finiteNumber(defect.imageIndex)
+    ?? finiteNumber(source?.imageIndex);
+  const artifacts = cameraIndex && sequenceNo != null ? {
+    schema: String(sourceArtifacts?.schema || 'steel.surface.defect.artifacts.v1'),
+    cameraId: String(sourceArtifacts?.cameraId || `camera${cameraIndex}`),
+    frameId: String(sourceArtifacts?.frameId || `bkv-${cameraIndex}-${sequenceNo}`),
+    sequenceNo,
+    roi: {
+      x: finiteNumber(roi?.x) ?? 0,
+      y: finiteNumber(roi?.y) ?? 0,
+      width: finiteNumber(roi?.width) ?? 0,
+      height: finiteNumber(roi?.height) ?? 0,
+    },
+  } : undefined;
   return {
     id: String(defect.id),
     plateNo: plate.plateNo,
     typeId: standardDefectTypeId(defect),
     typeLabel: defect.className || '未分类缺陷',
     surface: cameraIndex && cameraIndex <= Math.ceil(cameraCount / 2) ? 'top' : 'bottom',
-    severity: 'review',
+    severity: standardDefectSeverity(defect.grade),
     distanceHeadMm: 0,
     operatorSideMm: 0,
     driveSideMm: 0,
@@ -97,7 +131,7 @@ function standardDefect(
     classificationConfidence: defect.confidence,
     classificationState: 'classified',
     synthetic: false,
-    artifacts: undefined,
+    artifacts,
   };
 }
 

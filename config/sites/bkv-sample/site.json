@@ -1,0 +1,11 @@
+{
+  "schema": "steel.site-config.v1",
+  "id": "bkv-sample",
+  "displayName": "BKV 六相机提交样例",
+  "mode": "bkv",
+  "runtimeProfile": "runtime.json",
+  "connectionConfig": "connection.json",
+  "captureConfig": "capture.json",
+  "algorithmConfig": "algorithm.json",
+  "mappingConfig": "mapping.json"
+}

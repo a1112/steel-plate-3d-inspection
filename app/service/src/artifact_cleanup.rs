@@ -28,6 +28,8 @@ pub struct CleanupManifest {
     pub material_id: String,
     pub session_id: String,
     pub entries: Vec<CleanupEntry>,
+    #[serde(default)]
+    pub directories: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -257,7 +259,79 @@ pub fn build_manifest(
         material_id: detail.record.inspection.material_id.clone(),
         session_id: detail.record.inspection.session_id.clone(),
         entries,
+        directories: Vec::new(),
     })
+}
+
+fn collect_cache_tree(
+    directory: &Path,
+    entries: &mut Vec<CleanupEntry>,
+    directories: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    roots: &[PathBuf],
+) -> Result<(), String> {
+    let canonical = fs::canonicalize(directory)
+        .map_err(|error| format!("cache directory unavailable: {error}"))?;
+    if !canonical.is_dir()
+        || is_forbidden_maintenance_path(&canonical)
+        || !roots.iter().any(|root| canonical.starts_with(root))
+    {
+        return Err("cache directory is outside allowed roots".to_string());
+    }
+    directories.push(canonical.display().to_string());
+    for item in
+        fs::read_dir(&canonical).map_err(|error| format!("cache directory read failed: {error}"))?
+    {
+        let item = item.map_err(|error| format!("cache entry read failed: {error}"))?;
+        let file_type = item
+            .file_type()
+            .map_err(|error| format!("cache entry type failed: {error}"))?;
+        if file_type.is_symlink() {
+            return Err("cache tree contains a symbolic link".to_string());
+        }
+        if file_type.is_dir() {
+            collect_cache_tree(&item.path(), entries, directories, seen, roots)?;
+        } else if file_type.is_file() {
+            add_candidate(
+                entries,
+                seen,
+                &item.path().display().to_string(),
+                "inspection-world-cache",
+                roots,
+            );
+        } else {
+            return Err("cache tree contains a non-regular entry".to_string());
+        }
+    }
+    Ok(())
+}
+
+pub fn append_cache_tree(
+    manifest: &mut CleanupManifest,
+    cache_record_root: &Path,
+    allowed_roots_text: &str,
+) -> Result<(), String> {
+    if !cache_record_root.exists() {
+        return Ok(());
+    }
+    let roots = canonical_allowed_roots_from_text(allowed_roots_text)?;
+    let mut seen = manifest
+        .entries
+        .iter()
+        .map(|entry| path_key(Path::new(&entry.path)))
+        .collect::<HashSet<_>>();
+    collect_cache_tree(
+        cache_record_root,
+        &mut manifest.entries,
+        &mut manifest.directories,
+        &mut seen,
+        &roots,
+    )?;
+    manifest
+        .directories
+        .sort_by_key(|path| Path::new(path).components().count());
+    manifest.directories.dedup();
+    Ok(())
 }
 
 fn manifest_counts(manifest: &CleanupManifest) -> (i32, i32, i64) {
@@ -379,6 +453,22 @@ pub async fn execute_persisted_cleanup(
         .await
         .map_err(|error| error.to_string())?;
     }
+    for directory in manifest.directories.iter().rev() {
+        let path = PathBuf::from(directory);
+        if !path.exists() {
+            continue;
+        }
+        let canonical =
+            fs::canonicalize(&path).map_err(|error| format!("cache directory changed: {error}"))?;
+        if !canonical.is_dir()
+            || is_forbidden_maintenance_path(&canonical)
+            || !roots.iter().any(|root| canonical.starts_with(root))
+        {
+            return Err("cache directory changed after cleanup plan was frozen".to_string());
+        }
+        fs::remove_dir(&canonical)
+            .map_err(|error| format!("cache directory is not empty after cleanup: {error}"))?;
+    }
     let (files_deleted, files_missing, bytes_deleted) = manifest_counts(&manifest);
     let serialized = manifest_json(&manifest)?;
     let deleted = db::complete_record_cleanup(
@@ -454,5 +544,43 @@ mod tests {
         assert!(outside_path.exists());
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn cache_tree_is_frozen_into_cleanup_manifest_without_following_links() {
+        let root = temp_root("cache-tree");
+        let record_cache = root
+            .join("inspection-world-v2")
+            .join("record-1")
+            .join("revision-1")
+            .join("tile")
+            .join("C1")
+            .join("L0");
+        fs::create_dir_all(&record_cache).unwrap();
+        fs::write(record_cache.join("0_0.jpg"), b"tile").unwrap();
+        let mut manifest = CleanupManifest {
+            schema: CLEANUP_SCHEMA.to_string(),
+            record_id: "record-1".to_string(),
+            material_id: "material-1".to_string(),
+            session_id: "session-1".to_string(),
+            entries: Vec::new(),
+            directories: Vec::new(),
+        };
+
+        append_cache_tree(
+            &mut manifest,
+            &root.join("inspection-world-v2").join("record-1"),
+            &root.display().to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].kind, "inspection-world-cache");
+        assert!(!manifest.directories.is_empty());
+        assert!(manifest
+            .directories
+            .last()
+            .is_some_and(|path| path.ends_with("L0")));
+        let _ = fs::remove_dir_all(root);
     }
 }

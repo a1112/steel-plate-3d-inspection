@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+use crate::standard_record_store::InspectionRecordStore;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -18,10 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
-use crate::standard_record_store::InspectionRecordStore;
 
-mod artifact_cleanup;
 mod app_resource_usage;
+mod artifact_cleanup;
 mod bkv;
 mod bkv_online;
 mod calibration_operations;
@@ -29,6 +29,7 @@ mod controlled_process;
 mod db;
 mod inspection_world;
 mod machine_site_config;
+mod npz_surface;
 mod production_tasks;
 mod runtime_profile;
 mod site_config;
@@ -256,8 +257,8 @@ struct ServiceState {
     production_task_worker_status: Mutex<ProductionTaskWorkerStatus>,
     production_task_sequence: AtomicU64,
     inspection_world_cache: Mutex<HashMap<String, OnlineInspectionWorldCacheEntry>>,
-    converted_inspection_world_cache:
-        Mutex<HashMap<String, ConvertedInspectionWorldCacheEntry>>,
+    converted_inspection_world_cache: Mutex<HashMap<String, ConvertedInspectionWorldCacheEntry>>,
+    converted_surface_cache: Mutex<HashMap<String, ConvertedSurfaceCacheEntry>>,
     runtime_admission: Mutex<RuntimeAdmissionState>,
     runtime_drain_token: Vec<u8>,
     trigger_gateway_origin: String,
@@ -13694,9 +13695,8 @@ fn runtime_profile_candidate(body: &str) -> Result<Value, String> {
         .get("profile")
         .cloned()
         .or_else(|| {
-            (payload.get("schema").and_then(Value::as_str)
-                == Some("steel.runtime-profile.v1"))
-            .then_some(payload)
+            (payload.get("schema").and_then(Value::as_str) == Some("steel.runtime-profile.v1"))
+                .then_some(payload)
         })
         .ok_or_else(|| "runtime profile request must contain profile".to_string())
 }
@@ -13714,10 +13714,7 @@ fn saved_runtime_profile(
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| "runtime project path has no configuration root".to_string())?;
-    let loaded = runtime_profile::RuntimeProfile::load(
-        &state.runtime_config.project_path,
-        root,
-    )?;
+    let loaded = runtime_profile::RuntimeProfile::load(&state.runtime_config.project_path, root)?;
     Ok((value, loaded))
 }
 
@@ -13739,7 +13736,8 @@ fn read_admin_runtime_profile_response(state: &ServiceState) -> Vec<u8> {
         Err(error) => http_response(
             "500 Internal Server Error",
             "application/json; charset=utf-8",
-            &json!({"code": 500, "error": "runtime_profile_read_failed", "detail": error}).to_string(),
+            &json!({"code": 500, "error": "runtime_profile_read_failed", "detail": error})
+                .to_string(),
         ),
     }
 }
@@ -13751,7 +13749,8 @@ fn validate_admin_runtime_profile_response(state: &ServiceState, body: &str) -> 
             return http_response(
                 "400 Bad Request",
                 "application/json; charset=utf-8",
-                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error}).to_string(),
+                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error})
+                    .to_string(),
             )
         }
     };
@@ -13784,10 +13783,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| "runtime profile filename is invalid".to_string())?;
-    let temporary = parent.join(format!(
-        ".{file_name}.{}.tmp",
-        current_time_millis()
-    ));
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", current_time_millis()));
     let mut file = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -13809,8 +13805,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn replace_existing_file(source: &Path, target: &Path) -> Result<(), String> {
-    fs::rename(source, target)
-        .map_err(|error| format!("runtime profile publish failed: {error}"))
+    fs::rename(source, target).map_err(|error| format!("runtime profile publish failed: {error}"))
 }
 
 #[cfg(windows)]
@@ -13846,18 +13841,15 @@ fn replace_existing_file(source: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
-fn save_admin_runtime_profile_response(
-    state: &ServiceState,
-    body: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn save_admin_runtime_profile_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let candidate = match runtime_profile_candidate(body) {
         Ok(candidate) => candidate,
         Err(error) => {
             return http_response(
                 "400 Bad Request",
                 "application/json; charset=utf-8",
-                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error}).to_string(),
+                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error})
+                    .to_string(),
             )
         }
     };
@@ -13867,7 +13859,8 @@ fn save_admin_runtime_profile_response(
             return http_response(
                 "400 Bad Request",
                 "application/json; charset=utf-8",
-                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error}).to_string(),
+                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error})
+                    .to_string(),
             )
         }
     };
@@ -13885,7 +13878,8 @@ fn save_admin_runtime_profile_response(
         return http_response(
             "500 Internal Server Error",
             "application/json; charset=utf-8",
-            &json!({"code": 500, "error": "runtime_profile_save_failed", "detail": error}).to_string(),
+            &json!({"code": 500, "error": "runtime_profile_save_failed", "detail": error})
+                .to_string(),
         );
     }
     let value = String::from_utf8_lossy(&bytes).to_string();
@@ -14135,11 +14129,7 @@ fn read_admin_site_config_detail_response(state: &ServiceState, query: &str) -> 
     }
 }
 
-fn create_admin_site_config_response(
-    state: &ServiceState,
-    body: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn create_admin_site_config_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let request: CreateSiteConfigRequest = match site_config_request(body) {
         Ok(request) => request,
         Err(response) => return response,
@@ -14171,20 +14161,15 @@ fn create_admin_site_config_response(
     }
 }
 
-fn clone_admin_site_config_response(
-    state: &ServiceState,
-    body: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn clone_admin_site_config_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let request: CloneSiteConfigRequest = match site_config_request(body) {
         Ok(request) => request,
         Err(response) => return response,
     };
-    match state.site_configs.clone_site(
-        &request.source_id,
-        &request.id,
-        &request.display_name,
-    ) {
+    match state
+        .site_configs
+        .clone_site(&request.source_id, &request.id, &request.display_name)
+    {
         Ok(package) => {
             append_site_config_audit(
                 state,
@@ -14207,11 +14192,7 @@ fn clone_admin_site_config_response(
     }
 }
 
-fn update_admin_site_config_response(
-    state: &ServiceState,
-    body: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn update_admin_site_config_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let request: UpdateSiteConfigRequest = match site_config_request(body) {
         Ok(request) => request,
         Err(response) => return response,
@@ -14241,20 +14222,14 @@ fn update_admin_site_config_response(
                 .to_string(),
             )
         }
-        Err(error) if error.contains("mode cannot change") => site_config_error(
-            "400 Bad Request",
-            "site_config_mode_immutable",
-            error,
-        ),
+        Err(error) if error.contains("mode cannot change") => {
+            site_config_error("400 Bad Request", "site_config_mode_immutable", error)
+        }
         Err(error) => site_config_error("400 Bad Request", "site_config_update_failed", error),
     }
 }
 
-fn delete_admin_site_config_response(
-    state: &ServiceState,
-    query: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn delete_admin_site_config_response(state: &ServiceState, query: &str, actor: &str) -> Vec<u8> {
     let Some(id) = query_value(query, "id").filter(|value| !value.trim().is_empty()) else {
         return site_config_error(
             "400 Bad Request",
@@ -14277,13 +14252,7 @@ fn delete_admin_site_config_response(
     }
     match state.site_configs.delete(&id) {
         Ok(()) => {
-            append_site_config_audit(
-                state,
-                actor,
-                "site-config.delete",
-                &id,
-                "删除现场配置",
-            );
+            append_site_config_audit(state, actor, "site-config.delete", &id, "删除现场配置");
             http_response(
                 "200 OK",
                 "application/json; charset=utf-8",
@@ -14294,11 +14263,7 @@ fn delete_admin_site_config_response(
     }
 }
 
-fn check_admin_site_config_response(
-    state: &ServiceState,
-    body: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn check_admin_site_config_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let request: CheckSiteConfigRequest = match site_config_request(body) {
         Ok(request) => request,
         Err(response) => return response,
@@ -14326,11 +14291,7 @@ fn check_admin_site_config_response(
     }
 }
 
-fn activate_admin_site_config_response(
-    state: &ServiceState,
-    body: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn activate_admin_site_config_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let request: ActivateSiteConfigRequest = match site_config_request(body) {
         Ok(request) => request,
         Err(response) => return response,
@@ -14359,11 +14320,9 @@ fn activate_admin_site_config_response(
                 .to_string(),
             )
         }
-        Err(error) if error.contains("blocking availability") => site_config_error(
-            "409 Conflict",
-            "site_config_unavailable",
-            error,
-        ),
+        Err(error) if error.contains("blocking availability") => {
+            site_config_error("409 Conflict", "site_config_unavailable", error)
+        }
         Err(error) => site_config_error("400 Bad Request", "site_config_activate_failed", error),
     }
 }
@@ -14410,19 +14369,11 @@ fn import_admin_site_config_response(
         Err(error) if error.contains("already exists") => {
             site_config_error("409 Conflict", "site_config_import_conflict", error)
         }
-        Err(error) => site_config_error(
-            "400 Bad Request",
-            "site_config_import_failed",
-            error,
-        ),
+        Err(error) => site_config_error("400 Bad Request", "site_config_import_failed", error),
     }
 }
 
-fn export_admin_site_config_response(
-    state: &ServiceState,
-    query: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn export_admin_site_config_response(state: &ServiceState, query: &str, actor: &str) -> Vec<u8> {
     let Some(id) = query_value(query, "id").filter(|value| !value.trim().is_empty()) else {
         return site_config_error(
             "400 Bad Request",
@@ -14506,11 +14457,7 @@ fn read_machine_site_selection_response(state: &ServiceState) -> Vec<u8> {
     )
 }
 
-fn set_machine_default_site_response(
-    state: &ServiceState,
-    body: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn set_machine_default_site_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     if state.environment_site_id.is_some() {
         return site_config_error(
             "409 Conflict",
@@ -14586,10 +14533,9 @@ fn clear_machine_default_site_response(state: &ServiceState, actor: &str) -> Vec
 
 fn bkv_converter_origin(state: &ServiceState) -> Result<&str, Vec<u8>> {
     let origin = state.runtime_config.storage.converter_origin.trim();
-    let authority_only = origin.strip_prefix("http://").is_some_and(|value| {
-        !value.is_empty()
-            && !value.contains(['/', '?', '#', '@'])
-    });
+    let authority_only = origin
+        .strip_prefix("http://")
+        .is_some_and(|value| !value.is_empty() && !value.contains(['/', '?', '#', '@']));
     let (host, _) = health_http_origin_endpoint(origin).map_err(|_| {
         http_response(
             "400 Bad Request",
@@ -14611,11 +14557,7 @@ fn bkv_converter_origin(state: &ServiceState) -> Result<&str, Vec<u8>> {
     Ok(origin)
 }
 
-fn bkv_converter_proxy_response(
-    state: &ServiceState,
-    method: &str,
-    path: &str,
-) -> Vec<u8> {
+fn bkv_converter_proxy_response(state: &ServiceState, method: &str, path: &str) -> Vec<u8> {
     let origin = match bkv_converter_origin(state) {
         Ok(origin) => origin,
         Err(response) => return response,
@@ -14668,14 +14610,15 @@ fn start_admin_bkv_import_job_response(state: &ServiceState, actor: &str) -> Vec
     response
 }
 
-fn retry_admin_bkv_import_job_response(
-    state: &ServiceState,
-    body: &str,
-    actor: &str,
-) -> Vec<u8> {
+fn retry_admin_bkv_import_job_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let job_id = serde_json::from_str::<Value>(body)
         .ok()
-        .and_then(|payload| payload.get("jobId").and_then(Value::as_str).map(str::to_string))
+        .and_then(|payload| {
+            payload
+                .get("jobId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .filter(|value| {
             !value.is_empty()
                 && value.len() <= 128
@@ -14690,8 +14633,7 @@ fn retry_admin_bkv_import_job_response(
             &json!({"code": 400, "error": "bkv_import_job_id_invalid"}).to_string(),
         );
     };
-    let response =
-        bkv_converter_proxy_response(state, "POST", &format!("/retry/{job_id}"));
+    let response = bkv_converter_proxy_response(state, "POST", &format!("/retry/{job_id}"));
     if response.starts_with(b"HTTP/1.1 200 OK") {
         let _ = state.runtime.block_on(db::append_audit_log(
             &state.database.connection,
@@ -15166,9 +15108,10 @@ fn load_converted_inspection_world(
     let captures = store
         .capture_files(record_id)
         .map_err(|error| error.to_string())?;
-    let defects = store.defects(record_id).map_err(|error| error.to_string())?;
-    let mut grouped: HashMap<String, Vec<standard_record_store::CaptureFileDto>> =
-        HashMap::new();
+    let defects = store
+        .defects(record_id)
+        .map_err(|error| error.to_string())?;
+    let mut grouped: HashMap<String, Vec<standard_record_store::CaptureFileDto>> = HashMap::new();
     for capture in captures {
         if capture.kind.eq_ignore_ascii_case("intensity") {
             grouped
@@ -15213,10 +15156,7 @@ fn load_converted_inspection_world(
             }
             alignment_frames.push((image_index, row.path.clone()));
             frames.insert((camera.source_camera_id, image_index), row.path.clone());
-            sequence_ordinals.insert(
-                (camera.source_camera_id, row.sequence_no),
-                image_index,
-            );
+            sequence_ordinals.insert((camera.source_camera_id, row.sequence_no), image_index);
         }
         let (frame_width, frame_height) =
             dimensions.ok_or_else(|| format!("camera {} has no intensity frames", camera.id))?;
@@ -15271,6 +15211,124 @@ fn inspection_world_record_id(query: &str) -> Result<String, Vec<u8>> {
         })
 }
 
+fn inspection_world_meta_with_cache(
+    state: &ServiceState,
+    record_id: &str,
+    mut meta: Value,
+) -> Value {
+    let revision = meta
+        .get("sourceRevision")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let world = meta
+        .get("world")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<inspection_world::InspectionWorld>(value).ok());
+    if let (Some(revision), Some(world)) = (revision.as_ref(), world.as_ref()) {
+        schedule_inspection_world_cache(state, record_id, revision, world);
+    }
+    if let (Some(revision), Some(world), Some(object)) = (revision, world, meta.as_object_mut()) {
+        object.insert(
+            "cache".to_string(),
+            inspection_world::read_cache_status(
+                &inspection_world_cache_root(state),
+                record_id,
+                &revision,
+                &world,
+            ),
+        );
+    }
+    meta
+}
+
+fn schedule_inspection_world_cache(
+    state: &ServiceState,
+    record_id: &str,
+    source_revision: &str,
+    world: &inspection_world::InspectionWorld,
+) {
+    let cache_root = inspection_world_cache_root(state);
+    let cache_record_id = record_id.to_string();
+    let cache_revision = source_revision.to_string();
+    if state.runtime_config.data_source == "bkv-online-mysql" {
+        let Some(source) = state.bkv_online.clone() else {
+            return;
+        };
+        let source_record_id = record_id.to_string();
+        inspection_world::schedule_full_tile_cache(
+            cache_root,
+            cache_record_id,
+            cache_revision,
+            world.clone(),
+            move |request| {
+                source
+                    .inspection_world_tile(&source_record_id, request)
+                    .map_err(inspection_world::WorldError::Artifact)
+            },
+        );
+        return;
+    }
+    if state.runtime_config.data_source == "converted-local" {
+        let Ok(converted) = load_converted_inspection_world(state, record_id) else {
+            return;
+        };
+        let generated = Arc::clone(&converted);
+        inspection_world::schedule_full_tile_cache(
+            cache_root,
+            cache_record_id,
+            cache_revision,
+            world.clone(),
+            move |request| {
+                inspection_world::compose_camera_tile(
+                    &generated.world,
+                    request,
+                    |camera_id, image_index| {
+                        Ok(generated.frames.get(&(camera_id, image_index)).cloned())
+                    },
+                )
+            },
+        );
+        return;
+    }
+    if let Some(manager) = state.bkv.as_ref() {
+        let Ok(sequence) = record_id.parse::<u64>() else {
+            return;
+        };
+        let manager = Arc::clone(manager);
+        inspection_world::schedule_full_tile_cache(
+            cache_root,
+            cache_record_id,
+            cache_revision,
+            world.clone(),
+            move |request| {
+                manager
+                    .inspection_tile(sequence, request)
+                    .map_err(inspection_world::WorldError::Artifact)
+            },
+        );
+        return;
+    }
+    let Ok(online) = load_online_inspection_world(state, record_id) else {
+        return;
+    };
+    let generated = Arc::clone(&online);
+    inspection_world::schedule_full_tile_cache(
+        cache_root,
+        cache_record_id,
+        cache_revision,
+        world.clone(),
+        move |request| {
+            inspection_world::compose_camera_tile(
+                &generated.world,
+                request,
+                |camera_id, image_index| {
+                    Ok(generated.frames.get(&(camera_id, image_index)).cloned())
+                },
+            )
+        },
+    );
+}
+
 fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> {
     let record_id = match inspection_world_record_id(query) {
         Ok(record_id) => record_id,
@@ -15286,7 +15344,7 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
             Ok(meta) => http_response(
                 "200 OK",
                 "application/json; charset=utf-8",
-                &meta.to_string(),
+                &inspection_world_meta_with_cache(state, &record_id, meta).to_string(),
             ),
             Err(error) => http_response(
                 "404 Not Found",
@@ -15297,19 +15355,28 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
     }
     if state.runtime_config.data_source == "converted-local" {
         return match load_converted_inspection_world(state, &record_id) {
-            Ok(converted) => http_response(
-                "200 OK",
-                "application/json; charset=utf-8",
-                &json!({
+            Ok(converted) => {
+                let source_revision = state
+                    .standard_record_store
+                    .as_ref()
+                    .and_then(|store| store.record(&record_id).ok().flatten())
+                    .map(|record| record.source_hash)
+                    .unwrap_or_default();
+                let meta = json!({
                     "schema": "steel.inspection-world.meta.v1",
                     "provider": "bkv",
                     "recordId": record_id,
                     "legacySeqNo": record_id.parse::<u64>().ok(),
                     "sourceFrameCount": converted.frames.len(),
+                    "sourceRevision": source_revision,
                     "world": converted.world,
-                })
-                .to_string(),
-            ),
+                });
+                http_response(
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &inspection_world_meta_with_cache(state, &record_id, meta).to_string(),
+                )
+            }
             Err(error) => http_response(
                 "404 Not Found",
                 "application/json; charset=utf-8",
@@ -15329,7 +15396,7 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
             Ok(meta) => http_response(
                 "200 OK",
                 "application/json; charset=utf-8",
-                &meta.to_string(),
+                &inspection_world_meta_with_cache(state, &record_id, meta).to_string(),
             ),
             Err(error) => http_response(
                 "404 Not Found",
@@ -15339,18 +15406,23 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
         };
     }
     match load_online_inspection_world(state, &record_id) {
-        Ok(online) => http_response(
-            "200 OK",
-            "application/json; charset=utf-8",
-            &json!({
+        Ok(online) => {
+            let source_revision =
+                inspection_world_frames_revision(&record_id, &online.frames).unwrap_or_default();
+            let meta = json!({
                 "schema": "steel.inspection-world.meta.v1",
                 "provider": "online",
                 "recordId": record_id,
                 "sourceFrameCount": online.frames.len(),
+                "sourceRevision": source_revision,
                 "world": online.world,
-            })
-            .to_string(),
-        ),
+            });
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &inspection_world_meta_with_cache(state, &record_id, meta).to_string(),
+            )
+        }
         Err(error) => http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -15365,6 +15437,54 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
+    if state.runtime_config.data_source == "converted-local" {
+        if query_value(query, "format").as_deref() != Some("binary") {
+            return http_response(
+                "406 Not Acceptable",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 406,
+                    "error": "inspection_world_surface_binary_required",
+                    "detail": "converted NPZ surfaces are exposed as application/vnd.steel.bsmesh",
+                })
+                .to_string(),
+            );
+        }
+        let force_rebuild = matches!(query_value(query, "rebuild").as_deref(), Some("true" | "1"));
+        return match load_converted_surface(state, &record_id, force_rebuild) {
+            Ok(surface) => http_bytes_response_with_headers(
+                "200 OK",
+                "application/vnd.steel.bsmesh",
+                surface.binary.as_slice(),
+                &[
+                    (
+                        "Cache-Control",
+                        if force_rebuild {
+                            "no-store"
+                        } else {
+                            "private, no-cache"
+                        },
+                    ),
+                    ("X-Content-Type-Options", "nosniff"),
+                    ("X-Surface-Source", "npz-float32"),
+                    (
+                        "X-Reconstruction-Revision",
+                        npz_surface::RECONSTRUCTION_REVISION,
+                    ),
+                ],
+            ),
+            Err(error) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 404,
+                    "error": "inspection_world_surface_unavailable",
+                    "detail": error,
+                })
+                .to_string(),
+            ),
+        };
+    }
     if state.runtime_config.data_source != "bkv-online-mysql" {
         return http_response(
             "404 Not Found",
@@ -15389,7 +15509,10 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
                 "application/vnd.steel.bsmesh",
                 surface.as_slice(),
                 &[
-                    ("Cache-Control", "private, max-age=300, stale-while-revalidate=60"),
+                    (
+                        "Cache-Control",
+                        "private, max-age=300, stale-while-revalidate=60",
+                    ),
                     ("X-Content-Type-Options", "nosniff"),
                 ],
             ),
@@ -15422,6 +15545,54 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
             &json!({
                 "code": 404,
                 "error": "inspection_world_surface_unavailable",
+                "detail": error,
+            })
+            .to_string(),
+        ),
+    }
+}
+
+fn inspection_world_reconstruction_parameters_response(
+    state: &ServiceState,
+    query: &str,
+) -> Vec<u8> {
+    let record_id = match inspection_world_record_id(query) {
+        Ok(record_id) => record_id,
+        Err(response) => return response,
+    };
+    if state.runtime_config.data_source != "converted-local" {
+        return http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 404,
+                "error": "inspection_world_reconstruction_parameters_unavailable",
+                "detail": "computed NPZ reconstruction parameters require converted-local data",
+            })
+            .to_string(),
+        );
+    }
+    let force_rebuild = matches!(query_value(query, "rebuild").as_deref(), Some("true" | "1"));
+    match load_converted_surface(state, &record_id, force_rebuild) {
+        Ok(surface) => http_response_with_headers(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &surface.parameters.to_string(),
+            &[(
+                "Cache-Control",
+                if force_rebuild {
+                    "no-store"
+                } else {
+                    "private, no-cache"
+                },
+            )],
+        ),
+        Err(error) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 404,
+                "error": "inspection_world_reconstruction_parameters_unavailable",
                 "detail": error,
             })
             .to_string(),
@@ -15647,6 +15818,90 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
     }
 }
 
+fn inspection_world_cache_root(state: &ServiceState) -> PathBuf {
+    let configured = state.runtime_config.storage.cache_root.trim();
+    if configured.is_empty() {
+        workspace_root()
+            .join("target")
+            .join("data")
+            .join("inspection-world-cache")
+            .join(&state.runtime_config.id)
+    } else {
+        workspace_root().join(configured)
+    }
+}
+
+fn inspection_world_frames_revision(
+    record_id: &str,
+    frames: &HashMap<(u32, u32), PathBuf>,
+) -> Result<String, String> {
+    let mut ordered = frames.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|((camera, frame), _)| (*camera, *frame));
+    let mut digest = Sha256::new();
+    digest.update(record_id.as_bytes());
+    for ((camera, frame), path) in ordered {
+        let metadata =
+            fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        digest.update(camera.to_le_bytes());
+        digest.update(frame.to_le_bytes());
+        digest.update(metadata.len().to_le_bytes());
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        digest.update(modified.to_le_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn inspection_world_source_revision(
+    state: &ServiceState,
+    record_id: &str,
+) -> Result<String, String> {
+    if state.runtime_config.data_source == "bkv-online-mysql" {
+        let meta = state
+            .bkv_online
+            .as_ref()
+            .ok_or_else(|| "BKV online source is unavailable".to_string())?
+            .inspection_world_meta(record_id)?;
+        return meta
+            .get("sourceRevision")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "BKV online source revision is unavailable".to_string());
+    }
+    if state.runtime_config.data_source == "converted-local" {
+        if let Ok(cache) = state.converted_inspection_world_cache.lock() {
+            if let Some(entry) = cache.get(record_id) {
+                return Ok(entry.source_hash.clone());
+            }
+        }
+        return state
+            .standard_record_store
+            .as_ref()
+            .ok_or_else(|| "converted record store unavailable".to_string())?
+            .record(record_id)
+            .map_err(|error| error.to_string())?
+            .map(|record| record.source_hash)
+            .ok_or_else(|| format!("converted inspection {record_id} not found"));
+    }
+    if let Some(manager) = state.bkv.as_ref() {
+        let sequence = record_id
+            .parse::<u64>()
+            .map_err(|_| "inspection world record invalid".to_string())?;
+        let meta = manager.inspection_world_meta(sequence)?;
+        return meta
+            .get("sourceRevision")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "BKV source revision is unavailable".to_string());
+    }
+    let online = load_online_inspection_world(state, record_id)?;
+    inspection_world_frames_revision(record_id, &online.frames)
+}
+
 fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> {
     let record_id = match inspection_world_record_id(query) {
         Ok(record_id) => record_id,
@@ -15686,53 +15941,87 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
             )
         }
     };
-    let request = crate::inspection_world::TileRequest::for_camera(
-        camera_id,
-        level,
-        tile_x,
-        tile_y,
-        format,
-    );
-    let result = if state.runtime_config.data_source == "bkv-online-mysql" {
-        state
-            .bkv_online
-            .as_ref()
-            .ok_or_else(|| "BKV online source is unavailable".to_string())
-            .and_then(|source| source.inspection_world_tile(&record_id, request))
-    } else if state.runtime_config.data_source == "converted-local" {
-        load_converted_inspection_world(state, &record_id).and_then(|converted| {
-            inspection_world::compose_camera_tile(
-                &converted.world,
-                request,
-                |camera_id, image_index| {
-                    Ok(converted.frames.get(&(camera_id, image_index)).cloned())
-                },
-            )
-            .map_err(|error| error.to_string())
-        })
-    } else if let Some(manager) = state.bkv.as_ref() {
-        record_id
-            .parse::<u64>()
-            .map_err(|_| "inspection world record invalid".to_string())
-            .and_then(|sequence| manager.inspection_tile(sequence, request))
-    } else {
-        load_online_inspection_world(state, &record_id).and_then(|online| {
-            inspection_world::compose_camera_tile(
-                &online.world,
-                request,
-                |camera_id, image_index| {
-                    Ok(online.frames.get(&(camera_id, image_index)).cloned())
-                },
-            )
-            .map_err(|error| error.to_string())
-        })
+    let request =
+        crate::inspection_world::TileRequest::for_camera(camera_id, level, tile_x, tile_y, format);
+    let source_revision = match inspection_world_source_revision(state, &record_id) {
+        Ok(revision) => revision,
+        Err(error) => return http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error})
+                .to_string(),
+        ),
     };
+    let Some(requested_revision) = query_value(query, "revision") else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "inspection_world_revision_required"}).to_string(),
+        );
+    };
+    if requested_revision != source_revision {
+        return http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": "inspection_world_revision_stale",
+                "sourceRevision": source_revision,
+            })
+            .to_string(),
+        );
+    }
+    let cache_root = inspection_world_cache_root(state);
+    let result = inspection_world::serve_cached_tile(
+        &cache_root,
+        &record_id,
+        &source_revision,
+        request,
+        || {
+            let generated = if state.runtime_config.data_source == "bkv-online-mysql" {
+                state
+                    .bkv_online
+                    .as_ref()
+                    .ok_or_else(|| "BKV online source is unavailable".to_string())
+                    .and_then(|source| source.inspection_world_tile(&record_id, request))
+            } else if state.runtime_config.data_source == "converted-local" {
+                load_converted_inspection_world(state, &record_id).and_then(|converted| {
+                    inspection_world::compose_camera_tile(
+                        &converted.world,
+                        request,
+                        |camera_id, image_index| {
+                            Ok(converted.frames.get(&(camera_id, image_index)).cloned())
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+                })
+            } else if let Some(manager) = state.bkv.as_ref() {
+                record_id
+                    .parse::<u64>()
+                    .map_err(|_| "inspection world record invalid".to_string())
+                    .and_then(|sequence| manager.inspection_tile(sequence, request))
+            } else {
+                load_online_inspection_world(state, &record_id).and_then(|online| {
+                    inspection_world::compose_camera_tile(
+                        &online.world,
+                        request,
+                        |camera_id, image_index| {
+                            Ok(online.frames.get(&(camera_id, image_index)).cloned())
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+                })
+            };
+            generated.map_err(inspection_world::WorldError::Artifact)
+        },
+    );
     match result {
-        Ok(bytes) => {
+        Ok(cached) => {
             let level_header = level.to_string();
             let camera_header = camera_id.to_string();
             let x_header = tile_x.to_string();
             let y_header = tile_y.to_string();
+            let cache_header = if cached.cache_hit { "HIT" } else { "MISS" };
             http_bytes_response_with_headers(
                 "200 OK",
                 if matches!(format, crate::inspection_world::TileFormat::Png) {
@@ -15740,9 +16029,11 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
                 } else {
                     "image/jpeg"
                 },
-                &bytes,
+                &cached.bytes,
                 &[
-                    ("Cache-Control", "private, max-age=300"),
+                    ("Cache-Control", "private, max-age=31536000, immutable"),
+                    ("ETag", &cached.etag),
+                    ("X-World-Tile-Cache", cache_header),
                     ("X-World-Camera-Id", &camera_header),
                     ("X-World-Level", &level_header),
                     ("X-World-Tile-X", &x_header),
@@ -15753,8 +16044,93 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
         Err(error) => http_response(
             "422 Unprocessable Entity",
             "application/json; charset=utf-8",
-            &json!({"code": 422, "error": "inspection_world_tile_failed", "detail": error})
-                .to_string(),
+            &json!({
+                "code": 422,
+                "error": "inspection_world_tile_failed",
+                "detail": error.to_string(),
+            })
+            .to_string(),
+        ),
+    }
+}
+
+fn inspection_world_frame_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let record_id = match inspection_world_record_id(query) {
+        Ok(record_id) => record_id,
+        Err(response) => return response,
+    };
+    let parse = |key: &str| query_value(query, key).and_then(|value| value.parse::<u32>().ok());
+    let Some(camera_id) = parse("cameraId") else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "inspection_world_camera_required"}).to_string(),
+        );
+    };
+    let Some(sequence_no) = parse("sequenceNo").or_else(|| parse("imageIndex")) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code": 400, "error": "inspection_world_sequence_required"}).to_string(),
+        );
+    };
+    if state.runtime_config.data_source != "converted-local" {
+        return http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({"code": 404, "error": "inspection_world_frame_unavailable"}).to_string(),
+        );
+    }
+    let result = state
+        .standard_record_store
+        .as_ref()
+        .ok_or_else(|| "converted record store unavailable".to_string())
+        .and_then(|store| {
+            store
+                .capture_files(&record_id)
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|files| {
+            files
+                .into_iter()
+                .find(|file| {
+                    file.camera_id == format!("C{camera_id}")
+                        && file.sequence_no == sequence_no
+                        && file.kind.eq_ignore_ascii_case("intensity")
+                })
+                .ok_or_else(|| "inspection world intensity frame not found".to_string())
+        })
+        .and_then(|file| {
+            let source = image::open(file.path).map_err(|error| error.to_string())?;
+            let preview = source.thumbnail(512, 512);
+            let mut body = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut body, 88)
+                .encode_image(&preview)
+                .map_err(|error| error.to_string())?;
+            Ok(body)
+        });
+    match result {
+        Ok(body) => http_bytes_response_with_headers(
+            "200 OK",
+            "image/jpeg",
+            &body,
+            &[
+                (
+                    "Cache-Control",
+                    "private, max-age=300, stale-while-revalidate=60",
+                ),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+        ),
+        Err(error) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 404,
+                "error": "inspection_world_frame_not_found",
+                "detail": error,
+            })
+            .to_string(),
         ),
     }
 }
@@ -19912,8 +20288,13 @@ fn execute_record_artifact_cleanup(
     }
     let roots_text =
         artifact_cleanup::configured_roots_for_planning().map_err(|error| (error, None))?;
-    let manifest =
+    let mut manifest =
         artifact_cleanup::build_manifest(&detail, &roots_text).map_err(|error| (error, None))?;
+    let cache_record_root =
+        inspection_world::record_cache_root(&inspection_world_cache_root(state), record_id)
+            .map_err(|error| (error.to_string(), None))?;
+    artifact_cleanup::append_cache_tree(&mut manifest, &cache_record_root, &roots_text)
+        .map_err(|error| (error, None))?;
     let (files_planned, bytes_planned) = artifact_cleanup::manifest_plan_counts(&manifest);
     let manifest_json =
         artifact_cleanup::manifest_json(&manifest).map_err(|error| (error, None))?;
@@ -20196,7 +20577,25 @@ fn apply_record_retention_response(state: &ServiceState, body: &str, actor: &str
                 }
             };
             match artifact_cleanup::build_manifest(&detail, &roots_text) {
-                Ok(manifest) => {
+                Ok(mut manifest) => {
+                    let cache_record_root = match inspection_world::record_cache_root(
+                        &inspection_world_cache_root(state),
+                        id,
+                    ) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            failures.push(json!({ "recordId": id, "error": error.to_string() }));
+                            continue;
+                        }
+                    };
+                    if let Err(error) = artifact_cleanup::append_cache_tree(
+                        &mut manifest,
+                        &cache_record_root,
+                        &roots_text,
+                    ) {
+                        failures.push(json!({ "recordId": id, "error": error }));
+                        continue;
+                    }
                     let (count, bytes) = artifact_cleanup::manifest_plan_counts(&manifest);
                     files_planned += i64::from(count);
                     bytes_planned = bytes_planned.saturating_add(bytes);
@@ -20720,9 +21119,15 @@ fn bkv_online_image_response(state: &ServiceState, query: &str) -> Vec<u8> {
                 image.content_type,
                 image.bytes.as_slice(),
                 &[
-                    ("Cache-Control", "private, max-age=300, stale-while-revalidate=60"),
+                    (
+                        "Cache-Control",
+                        "private, max-age=300, stale-while-revalidate=60",
+                    ),
                     ("X-BKV-Image-Cache", cache_status),
-                    ("Access-Control-Expose-Headers", "X-BKV-Image-Cache, Content-Length"),
+                    (
+                        "Access-Control-Expose-Headers",
+                        "X-BKV-Image-Cache, Content-Length",
+                    ),
                     ("X-Content-Type-Options", "nosniff"),
                 ],
             )
@@ -20887,7 +21292,11 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("GET", "/api/inspection-world/records") => inspection_world_records_response(&state),
         ("GET", "/api/inspection-world/meta") => inspection_world_meta_response(&state, query),
         ("GET", "/api/inspection-world/surface") => inspection_world_surface_response(&state, query),
+        ("GET", "/api/inspection-world/reconstruction-parameters") => {
+            inspection_world_reconstruction_parameters_response(&state, query)
+        }
         ("GET", "/api/inspection-world/defects") => inspection_world_defects_response(&state, query),
+        ("GET", "/api/inspection-world/frame") => inspection_world_frame_response(&state, query),
         ("GET", "/api/inspection-world/tile") => inspection_world_tile_response(&state, query),
         ("POST", "/api/bkv/replay/next") => bkv_next_response(&state),
         ("POST", "/api/bkv/replay/reset") => {
@@ -21238,6 +21647,106 @@ struct ConvertedInspectionWorldCacheEntry {
     world: Arc<ConvertedInspectionWorld>,
 }
 
+struct ConvertedSurfaceCacheEntry {
+    source_hash: String,
+    algorithm_revision: &'static str,
+    surface: Arc<npz_surface::NpzSurface>,
+}
+
+fn load_converted_surface(
+    state: &ServiceState,
+    record_id: &str,
+    force_rebuild: bool,
+) -> Result<Arc<npz_surface::NpzSurface>, String> {
+    let store = state
+        .standard_record_store
+        .as_ref()
+        .ok_or_else(|| "converted record store unavailable".to_string())?;
+    let record = store
+        .record(record_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("converted inspection {record_id} not found"))?;
+    if !force_rebuild {
+        let cache = state
+            .converted_surface_cache
+            .lock()
+            .map_err(|_| "converted surface cache lock poisoned".to_string())?;
+        if let Some(entry) = cache.get(record_id).filter(|entry| {
+            entry.source_hash == record.source_hash
+                && entry.algorithm_revision == npz_surface::RECONSTRUCTION_REVISION
+        }) {
+            return Ok(Arc::clone(&entry.surface));
+        }
+    }
+    let captures = store
+        .capture_files(record_id)
+        .map_err(|error| error.to_string())?;
+    let configured = store.configured_cameras();
+    let camera_ids = configured
+        .iter()
+        .map(|camera| (camera.id.as_str(), camera.source_camera_id))
+        .collect::<HashMap<_, _>>();
+    let depth_captures = captures
+        .into_iter()
+        .filter(|capture| capture.kind.eq_ignore_ascii_case("depth"))
+        .map(|capture| {
+            let camera_id = camera_ids
+                .get(capture.camera_id.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "converted depth capture references unknown camera {}",
+                        capture.camera_id
+                    )
+                })?;
+            Ok((camera_id, capture.sequence_no, capture.path))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for camera in configured {
+        if !depth_captures
+            .iter()
+            .any(|(camera_id, _, _)| *camera_id == camera.source_camera_id)
+        {
+            return Err(format!(
+                "converted camera {} has no NPZ depth captures",
+                camera.id
+            ));
+        }
+    }
+    let nominal_diameter_mm = record
+        .outer_diameter_mm
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| format!("converted inspection {record_id} has no valid outer diameter"))?
+        as f32;
+    let length_mm = record
+        .length_mm
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| format!("converted inspection {record_id} has no valid steel length"))?
+        as f32;
+    let surface = Arc::new(npz_surface::build_npz_surface(
+        record_id,
+        &depth_captures,
+        nominal_diameter_mm,
+        length_mm,
+    )?);
+    let mut cache = state
+        .converted_surface_cache
+        .lock()
+        .map_err(|_| "converted surface cache lock poisoned".to_string())?;
+    if cache.len() >= 8 && !cache.contains_key(record_id) {
+        cache.clear();
+    }
+    cache.insert(
+        record_id.to_string(),
+        ConvertedSurfaceCacheEntry {
+            source_hash: record.source_hash,
+            algorithm_revision: npz_surface::RECONSTRUCTION_REVISION,
+            surface: Arc::clone(&surface),
+        },
+    );
+    Ok(surface)
+}
+
 fn configured_standard_record_store(
     profile: &runtime_profile::RuntimeProfile,
 ) -> Option<Arc<standard_record_store::ConvertedLocalStore>> {
@@ -21331,14 +21840,13 @@ fn main() -> std::io::Result<()> {
             .read_default_site_id()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
     };
-    let effective_site_selection = machine_site_config::select_site(
-        machine_site_config::SiteSelectionInput {
+    let effective_site_selection =
+        machine_site_config::select_site(machine_site_config::SiteSelectionInput {
             environment_site_id: environment_site_id.clone(),
             machine_default_site_id,
             repository_default_site_id: repository_default_site_id.clone(),
-        },
-    )
-    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        })
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let runtime_config = runtime_profile::RuntimeProfile::load_for_startup_selection(
         &project_config_path,
         &workspace_root(),
@@ -21390,6 +21898,7 @@ fn main() -> std::io::Result<()> {
         production_task_sequence: AtomicU64::new(0),
         inspection_world_cache: Mutex::new(HashMap::new()),
         converted_inspection_world_cache: Mutex::new(HashMap::new()),
+        converted_surface_cache: Mutex::new(HashMap::new()),
         runtime_admission: Mutex::new(RuntimeAdmissionState::default()),
         runtime_drain_token: env::var("TRIGGER_OPERATOR_TOKEN")
             .unwrap_or_default()
@@ -21438,8 +21947,13 @@ fn main() -> std::io::Result<()> {
     while !shutdown_requested.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
+                if let Err(error) = stream.set_nonblocking(false) {
+                    eprintln!("failed to configure accepted connection: {error}");
+                    continue;
+                }
                 let state = Arc::clone(&state);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
                 if let Err(error) = std::thread::Builder::new()
                     .name("inspection-http-request".to_string())
                     .spawn(move || handle_client(stream, state))
@@ -21448,7 +21962,7 @@ fn main() -> std::io::Result<()> {
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(5));
             }
             Err(error) => eprintln!("failed to accept connection: {error}"),
         }
@@ -22451,6 +22965,7 @@ mod tests {
             production_task_sequence: AtomicU64::new(0),
             inspection_world_cache: Mutex::new(HashMap::new()),
             converted_inspection_world_cache: Mutex::new(HashMap::new()),
+            converted_surface_cache: Mutex::new(HashMap::new()),
             runtime_admission: Mutex::new(RuntimeAdmissionState::default()),
             runtime_drain_token: b"operator-0123456789abcdef-ABCDEF!".to_vec(),
             trigger_gateway_origin: "disabled".to_string(),
@@ -22458,13 +22973,15 @@ mod tests {
             runtime_profile: "test".to_string(),
             runtime_config: Arc::new(runtime_profile::RuntimeProfile::test_profile(
                 provider.as_str(),
-                if provider == CaptureProvider::Bkv { 6 } else { 8 },
+                if provider == CaptureProvider::Bkv {
+                    6
+                } else {
+                    8
+                },
             )),
             site_configs: site_config::SiteConfigStore::new(site_config_root)
                 .expect("test site config store"),
-            machine_site_store: Arc::new(
-                machine_site_config::MemoryMachineSiteStore::default(),
-            ),
+            machine_site_store: Arc::new(machine_site_config::MemoryMachineSiteStore::default()),
             machine_name: "TEST-HOST".to_string(),
             environment_site_id: None,
             repository_default_site_id: if provider == CaptureProvider::Bkv {
@@ -24173,9 +24690,11 @@ mod tests {
                 "sourceDirectory": format!("camera-{camera}")
             })).collect::<Vec<_>>(),
             "storage": {
+                "layoutVersion": 2,
                 "sourceRoot": "legacy",
                 "convertedRoot": "converted",
                 "catalogPath": "converted/catalog.db",
+                "cacheRoot": "converted/cache",
                 "converterOrigin": "http://127.0.0.1:4893"
             },
             "capabilities": {
@@ -24216,22 +24735,16 @@ mod tests {
 
         profile["displayName"] = json!("BKV 六相机标准化转换");
         let body = json!({"profile": profile}).to_string();
-        let validated =
-            response_json(validate_admin_runtime_profile_response(&state, &body));
+        let validated = response_json(validate_admin_runtime_profile_response(&state, &body));
         assert_eq!(validated["valid"], true);
         assert_eq!(validated["restartRequired"], true);
 
-        let saved = response_json(save_admin_runtime_profile_response(
-            &state,
-            &body,
-            "admin",
-        ));
+        let saved = response_json(save_admin_runtime_profile_response(&state, &body, "admin"));
         assert_eq!(saved["saved"], true);
         assert_eq!(saved["profileId"], "bkv-6");
         assert_eq!(saved["restartRequired"], true);
         assert_eq!(
-            state.runtime_config.display_name,
-            "BKV 六相机离线转换",
+            state.runtime_config.display_name, "BKV 六相机离线转换",
             "active runtime must not hot reload"
         );
         assert_ne!(saved["activeConfigHash"], saved["savedConfigHash"]);
@@ -24322,8 +24835,7 @@ mod tests {
         .expect("project config");
         let loaded =
             runtime_profile::RuntimeProfile::load(&project, &root).expect("runtime profile");
-        let mut state =
-            production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
+        let mut state = production_test_state_with_provider(CaptureProvider::Bkv, "bkv://offline");
         state.runtime_config = Arc::new(loaded);
         state.site_configs = store;
         (root, state)
@@ -24357,8 +24869,7 @@ mod tests {
     #[test]
     fn admin_site_config_export_is_binary_and_import_round_trips_the_package() {
         let (root, state) = admin_site_config_fixture();
-        let exported =
-            export_admin_site_config_response(&state, "id=bkv-current", "admin");
+        let exported = export_admin_site_config_response(&state, "id=bkv-current", "admin");
         let separator = exported
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -24465,15 +24976,9 @@ mod tests {
 
         let overview = response_json(admin_overview_response(&state));
 
-        assert_eq!(
-            overview["siteConfiguration"]["active"]["id"],
-            "bkv-current"
-        );
+        assert_eq!(overview["siteConfiguration"]["active"]["id"], "bkv-current");
         assert_eq!(overview["siteConfiguration"]["active"]["mode"], "bkv");
-        assert_eq!(
-            overview["siteConfiguration"]["active"]["cameraCount"],
-            6
-        );
+        assert_eq!(overview["siteConfiguration"]["active"]["cameraCount"], 6);
         assert_eq!(
             overview["siteConfiguration"]["active"]["capabilities"]["directCamera"],
             false
@@ -24482,10 +24987,7 @@ mod tests {
             overview["siteConfiguration"]["active"]["capabilities"]["offlineReplay"],
             true
         );
-        assert_eq!(
-            overview["siteConfiguration"]["restartRequired"],
-            false
-        );
+        assert_eq!(overview["siteConfiguration"]["restartRequired"], false);
         assert!(overview["siteConfiguration"]["checkSummary"]["normal"]
             .as_u64()
             .is_some_and(|count| count > 0));
@@ -28309,10 +28811,7 @@ mod tests {
         assert!(too_long.contains("长度不能超过"));
     }
 
-    fn converted_world_fixture() -> (
-        PathBuf,
-        standard_record_store::ConvertedLocalStore,
-    ) {
+    fn converted_world_fixture() -> (PathBuf, standard_record_store::ConvertedLocalStore) {
         let sequence = CONVERTED_WORLD_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "steel-converted-world-{}-{}-{}",
@@ -28322,7 +28821,11 @@ mod tests {
         ));
         let record_root = root.join("records").join("10");
         fs::create_dir_all(&record_root).expect("converted record root");
-        fs::write(record_root.join("record.json"), "{}").expect("converted record marker");
+        fs::write(
+            record_root.join("record.json"),
+            r#"{"schema":"steel.standard-record.v2"}"#,
+        )
+        .expect("converted record marker");
         let catalog = root.join("catalog.db");
         let connection = rusqlite::Connection::open(&catalog).expect("converted catalog");
         connection
@@ -28360,8 +28863,7 @@ mod tests {
             )
             .expect("converted fixture schema");
         for camera_id in 1..=6 {
-            let relative =
-                format!("records/10/cameras/C{camera_id}/frames/000004/intensity.jpg");
+            let relative = format!("records/10/cameras/C{camera_id}/intensity/000004.jpg");
             let path = root.join(&relative);
             fs::create_dir_all(path.parent().expect("frame parent")).expect("frame parent");
             image::RgbImage::from_pixel(32, 48, image::Rgb([camera_id as u8 * 20, 80, 100]))
@@ -28423,8 +28925,7 @@ mod tests {
         assert_eq!(meta["world"]["cameras"].as_array().map(Vec::len), Some(6));
         assert_eq!(meta["world"]["cameras"][0]["frameNumbers"], json!([0]));
 
-        let defects =
-            response_json(inspection_world_defects_response(&state, "recordId=10"));
+        let defects = response_json(inspection_world_defects_response(&state, "recordId=10"));
         assert_eq!(defects["provider"], "bkv");
         assert_eq!(defects["defects"][0]["className"], "轧折");
         assert_eq!(defects["defects"][0]["cameraId"], 1);
@@ -28433,13 +28934,36 @@ mod tests {
 
         let tile = inspection_world_tile_response(
             &state,
-            "recordId=10&cameraId=1&level=0&x=0&y=0&format=png",
+            "recordId=10&revision=record-hash&cameraId=1&level=0&x=0&y=0&format=png",
         );
         let separator = tile
             .windows(4)
             .position(|bytes| bytes == b"\r\n\r\n")
             .expect("tile headers");
+        let headers = String::from_utf8_lossy(&tile[..separator]);
+        assert!(headers.contains("ETag:"));
+        assert!(
+            headers.contains("X-World-Tile-Cache: MISS")
+                || headers.contains("X-World-Tile-Cache: HIT"),
+            "the background full-pyramid builder may win the first-request race"
+        );
         image::load_from_memory(&tile[separator + 4..]).expect("converted tile image");
+        let hot_tile = inspection_world_tile_response(
+            &state,
+            "recordId=10&revision=record-hash&cameraId=1&level=0&x=0&y=0&format=png",
+        );
+        let hot_headers = hot_tile
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .map(|separator| String::from_utf8_lossy(&hot_tile[..separator]))
+            .expect("hot tile headers");
+        assert!(hot_headers.contains("X-World-Tile-Cache: HIT"));
+        let stale = response_json(inspection_world_tile_response(
+            &state,
+            "recordId=10&revision=stale&cameraId=1&level=0&x=0&y=0&format=png",
+        ));
+        assert_eq!(stale["error"], "inspection_world_revision_stale");
+        assert_eq!(stale["sourceRevision"], "record-hash");
         fs::remove_dir_all(root).expect("remove converted fixture");
     }
 
@@ -28544,11 +29068,7 @@ mod tests {
             let head_y = if camera_id == 1 { 2 } else { 0 };
             for y in head_y..48 {
                 for x in 0..32 {
-                    frame.put_pixel(
-                        x,
-                        y,
-                        image::Rgb([camera_id as u8 * 20, 80, 100]),
-                    );
+                    frame.put_pixel(x, y, image::Rgb([camera_id as u8 * 20, 80, 100]));
                 }
             }
             frame.save(&path).expect("online intensity fixture");
@@ -28721,15 +29241,15 @@ mod tests {
             &state,
             "recordId=INSP-WORLD-1&level=0&x=0&y=0&format=png",
         ));
-        assert_eq!(
-            missing_camera["error"],
-            "inspection_world_camera_required"
-        );
+        assert_eq!(missing_camera["error"], "inspection_world_camera_required");
 
-        let tile = inspection_world_tile_response(
-            &state,
-            "recordId=INSP-WORLD-1&cameraId=1&level=0&x=0&y=0&format=png",
+        let online_revision = refreshed_meta["sourceRevision"]
+            .as_str()
+            .expect("online source revision");
+        let tile_query = format!(
+            "recordId=INSP-WORLD-1&revision={online_revision}&cameraId=1&level=0&x=0&y=0&format=png"
         );
+        let tile = inspection_world_tile_response(&state, &tile_query);
         let separator = tile
             .windows(4)
             .position(|bytes| bytes == b"\r\n\r\n")
