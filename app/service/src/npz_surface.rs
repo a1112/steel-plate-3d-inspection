@@ -5,12 +5,14 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-const SURFACE_ROWS: usize = 128;
-const COLS_PER_CAMERA: usize = 32;
+// Keep enough longitudinal samples for a useful 10x inspection view and
+// enough circumferential samples to preserve local depth changes per camera.
+const SURFACE_ROWS: usize = 1024;
+const COLS_PER_CAMERA: usize = 64;
 const MAX_NPY_BYTES: u64 = 64 * 1024 * 1024;
 const INVALID_DEPTH_FLOOR: f32 = -999_999.0;
 const DISPLAY_P95_RADIAL_OFFSET: f32 = 0.02;
-pub const RECONSTRUCTION_REVISION: &str = "npz-cylinder-column-profile-v4-mm";
+pub const RECONSTRUCTION_REVISION: &str = "npz-cylinder-column-profile-v5-hires-mm";
 
 pub struct NpzSurface {
     pub binary: Vec<u8>,
@@ -521,7 +523,10 @@ mod tests {
         )
         .expect("surface");
         assert_eq!(&binary[..8], b"BSMESH01");
-        assert_eq!(u32::from_le_bytes(binary[12..16].try_into().unwrap()), 4096);
+        assert_eq!(
+            u32::from_le_bytes(binary[12..16].try_into().unwrap()),
+            (SURFACE_ROWS * COLS_PER_CAMERA) as u32,
+        );
         assert_eq!(
             u32::from_le_bytes(binary[24..28].try_into().unwrap()),
             SURFACE_ROWS as u32

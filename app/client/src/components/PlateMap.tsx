@@ -122,33 +122,51 @@ function useInspectionWorldTexture(
   const [textureUrl, setTextureUrl] = useState('');
   const [textureStatus, setTextureStatus] = useState('');
   const textureRecordRef = useRef('');
+  const textureObjectUrlRef = useRef('');
   const detailBoost = Math.min(3, Math.max(0, Math.floor(Math.log2(Math.max(1, zoom)))));
+
+  useEffect(() => () => {
+    if (textureObjectUrlRef.current) {
+      URL.revokeObjectURL(textureObjectUrlRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     if (!enabled || !recordId || !meta) return;
     const controller = new AbortController();
     if (textureRecordRef.current !== recordId) {
       textureRecordRef.current = recordId;
+      if (textureObjectUrlRef.current) {
+        URL.revokeObjectURL(textureObjectUrlRef.current);
+        textureObjectUrlRef.current = '';
+      }
       setTextureUrl('');
     }
     setTextureStatus('正在生成 2D 检测图像贴图…');
     const generate = async () => {
+      const resolutionMultiplier = 2 ** detailBoost;
+      const maximumTextureDimension = 8192;
+      const maximumTexturePixels = 24 * 1024 * 1024;
       const scale = Math.min(
         1,
-        2048 / Math.max(1, meta.world.height),
-        1024 / Math.max(1, meta.world.width),
+        2048 * resolutionMultiplier / Math.max(1, meta.world.height),
+        1024 * resolutionMultiplier / Math.max(1, meta.world.width),
+        maximumTextureDimension / Math.max(1, meta.world.height),
+        maximumTextureDimension / Math.max(1, meta.world.width),
+        Math.sqrt(maximumTexturePixels / Math.max(1, meta.world.width * meta.world.height)),
       );
-      const baseLevel = Math.min(
+      const level = Math.min(
         meta.world.maxLevel,
-        Math.max(0, Math.ceil(Math.log2(1 / Math.max(scale, 1e-6))) + 1),
+        Math.max(0, Math.floor(Math.log2(1 / Math.max(scale, 1e-6)))),
       );
-      const level = Math.max(0, baseLevel - detailBoost);
       const span = meta.world.tileSize * 2 ** level;
       const worldCanvas = document.createElement('canvas');
       worldCanvas.width = Math.max(1, Math.round(meta.world.width * scale));
       worldCanvas.height = Math.max(1, Math.round(meta.world.height * scale));
       const context = worldCanvas.getContext('2d');
       if (!context) throw new Error('浏览器不支持贴图合成');
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
       context.fillStyle = '#07111c';
       context.fillRect(0, 0, worldCanvas.width, worldCanvas.height);
 
@@ -199,11 +217,24 @@ function useInspectionWorldTexture(
       textureCanvas.height = worldCanvas.width;
       const textureContext = textureCanvas.getContext('2d');
       if (!textureContext) throw new Error('浏览器不支持贴图旋转');
+      textureContext.imageSmoothingEnabled = true;
+      textureContext.imageSmoothingQuality = 'high';
       textureContext.translate(textureCanvas.width, 0);
       textureContext.rotate(Math.PI / 2);
       textureContext.drawImage(worldCanvas, 0, 0);
       if (controller.signal.aborted) return;
-      setTextureUrl(textureCanvas.toDataURL('image/jpeg', 0.9));
+      const blob = await new Promise<Blob | null>((resolve) => {
+        textureCanvas.toBlob(resolve, 'image/jpeg', 0.96);
+      });
+      if (!blob) throw new Error('2D 检测图像贴图编码失败');
+      if (controller.signal.aborted) return;
+      const nextTextureUrl = URL.createObjectURL(blob);
+      const previousTextureUrl = textureObjectUrlRef.current;
+      textureObjectUrlRef.current = nextTextureUrl;
+      setTextureUrl(nextTextureUrl);
+      if (previousTextureUrl) {
+        URL.revokeObjectURL(previousTextureUrl);
+      }
       setTextureStatus(`2D 检测图像贴图 · LOD ${level} · ${textureCanvas.width}×${textureCanvas.height}`);
     };
     void generate().catch((error: unknown) => {

@@ -15,6 +15,9 @@ vi.mock('@react-three/fiber', () => ({
       updateProjectionMatrix: vi.fn(),
       zoom: 1,
     },
+    gl: {
+      capabilities: { getMaxAnisotropy: () => 8 },
+    },
     size: { height: 400, width: 800 },
   }),
 }));
@@ -144,7 +147,33 @@ describe('ProductionArtifactView', () => {
       fireEvent.wheel(view, { deltaY: -100 });
     }
     expect(view).toHaveAttribute('data-artifact-zoom', '10.00');
+    expect(Number(view.getAttribute('data-artifact-render-dpr'))).toBeGreaterThan(1);
     expect(onZoomChange).toHaveBeenLastCalledWith(10);
+  });
+
+  it('keeps the longitudinal and cross-section position under the pointer while zooming', () => {
+    render(
+      <ProductionArtifactView
+        mesh={fixture()}
+        mode="points"
+        testId="pointer-anchored-zoom"
+        ariaLabel="跟随鼠标缩放的点云"
+        lengthMm={12_000}
+      />,
+    );
+
+    const view = screen.getByTestId('pointer-anchored-zoom');
+    vi.spyOn(view, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, top: 0, left: 0, right: 1000, bottom: 500, width: 1000, height: 500,
+      toJSON: () => ({}),
+    });
+    fireEvent.wheel(view, { deltaY: -100, clientX: 750, clientY: 100 });
+
+    const start = Number(view.getAttribute('data-visible-range-start'));
+    const end = Number(view.getAttribute('data-visible-range-end'));
+    expect(start + 0.75 * (end - start)).toBeCloseTo(0.75, 3);
+    expect(Number(view.getAttribute('data-artifact-axis-center'))).toBeCloseTo(0.5417, 3);
+    expect(Number(view.getAttribute('data-artifact-pan-y'))).toBeLessThan(0);
   });
 
   it('exposes a millimetre ruler and scrolls the visible pipe-length range after zoom', () => {
@@ -206,9 +235,11 @@ describe('ProductionArtifactView', () => {
     });
     fireEvent(view, viewPointerMove);
     expect(Number(view.getAttribute('data-visible-range-start'))).toBeGreaterThan(0.1333);
+    expect(ruler).toHaveTextContent('2000 mm');
+    expect(ruler).toHaveTextContent('4500 mm');
   });
 
-  it('keeps the camera-facing orientation fixed while allowing unbounded axial roll', () => {
+  it('keeps the camera-facing orientation fixed while allowing vertical drag to roll the pipe', () => {
     render(
       <ProductionArtifactView
         mesh={fixture()}
@@ -230,8 +261,8 @@ describe('ProductionArtifactView', () => {
     fireEvent(view, pointerDown);
     const pointerMove = new Event('pointermove', { bubbles: true });
     Object.defineProperties(pointerMove, {
-      clientX: { value: 700 },
-      clientY: { value: 200 },
+      clientX: { value: 20 },
+      clientY: { value: 700 },
       pointerId: { value: 7 },
     });
     fireEvent(view, pointerMove);

@@ -4,6 +4,8 @@ import {
   BufferGeometry,
   DoubleSide,
   Float32BufferAttribute,
+  LinearFilter,
+  LinearMipmapLinearFilter,
   SRGBColorSpace,
   TextureLoader,
   Uint32BufferAttribute,
@@ -208,23 +210,26 @@ function createArtifactGeometry(
   let colors: ArrayLike<number> = sourceColors;
 
   if (!indexed && validMask && validMask.length >= pointCount) {
-    const validPositions: number[] = [];
-    const validColors: number[] = [];
+    let validPointCount = 0;
+    for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
+      if (Number(validMask[pointIndex]) !== 0) validPointCount += 1;
+    }
+    const validPositions = new Float32Array(validPointCount * 3);
+    const validColors = hasColors ? new Float32Array(validPointCount * 3) : new Float32Array();
+    let renderedPointIndex = 0;
     for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
       if (Number(validMask[pointIndex]) === 0) continue;
-      const positionIndex = pointIndex * 3;
-      validPositions.push(
-        Number(mesh.positions[positionIndex]),
-        Number(mesh.positions[positionIndex + 1]),
-        Number(mesh.positions[positionIndex + 2]),
-      );
+      const sourceIndex = pointIndex * 3;
+      const targetIndex = renderedPointIndex * 3;
+      validPositions[targetIndex] = Number(mesh.positions[sourceIndex]);
+      validPositions[targetIndex + 1] = Number(mesh.positions[sourceIndex + 1]);
+      validPositions[targetIndex + 2] = Number(mesh.positions[sourceIndex + 2]);
       if (hasColors) {
-        validColors.push(
-          Number(sourceColors[positionIndex]),
-          Number(sourceColors[positionIndex + 1]),
-          Number(sourceColors[positionIndex + 2]),
-        );
+        validColors[targetIndex] = Number(sourceColors[sourceIndex]);
+        validColors[targetIndex + 1] = Number(sourceColors[sourceIndex + 1]);
+        validColors[targetIndex + 2] = Number(sourceColors[sourceIndex + 2]);
       }
+      renderedPointIndex += 1;
     }
     positions = validPositions;
     colors = validColors;
@@ -247,7 +252,9 @@ function createArtifactGeometry(
     }
     geometry.setAttribute('uv', new Float32BufferAttribute(uvs, 2));
     geometry.setIndex(new Uint32BufferAttribute(new Uint32Array(mesh.indices), 1));
-    geometry.computeVertexNormals();
+    if (colorMode === 'source') {
+      geometry.computeVertexNormals();
+    }
   }
   return { geometry, jetSummary: jet?.summary ?? null };
 }
@@ -285,7 +292,15 @@ function ArtifactCamera({
 
 function ArtifactTextureMaterial({ textureUrl }: { textureUrl: string }) {
   const texture = useLoader(TextureLoader, textureUrl);
-  texture.colorSpace = SRGBColorSpace;
+  const { gl } = useThree();
+  useEffect(() => {
+    texture.colorSpace = SRGBColorSpace;
+    texture.generateMipmaps = true;
+    texture.minFilter = LinearMipmapLinearFilter;
+    texture.magFilter = LinearFilter;
+    texture.anisotropy = Math.min(16, gl.capabilities.getMaxAnisotropy());
+    texture.needsUpdate = true;
+  }, [gl, texture]);
   return <meshBasicMaterial color="#ffffff" map={texture} side={DoubleSide} />;
 }
 
@@ -344,6 +359,12 @@ export function ProductionArtifactView({
   const { geometry, jetSummary } = artifact;
   const hasColors = geometry.getAttribute('color') !== undefined;
   const pointCount = geometry.getAttribute('position')?.count ?? 0;
+  const renderDpr = clamp(
+    (typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1)
+      * (1 + Math.min(0.75, Math.log2(Math.max(1, zoom)) / 4)),
+    1,
+    2.5,
+  );
   const visibleFraction = Math.min(1, 1 / Math.max(1, zoom));
   const halfVisibleFraction = visibleFraction / 2;
   const minimumAxisCenter = halfVisibleFraction;
@@ -354,8 +375,9 @@ export function ProductionArtifactView({
   ];
   const axisOffset = (0.5 - axisCenter) * NORMALIZED_LONGITUDINAL_SPAN;
   const rulerTicks = Array.from({ length: 5 }, (_, index) => {
-    const ratio = index / 4;
-    return { ratio, value: ratio * lengthMm };
+    const screenRatio = index / 4;
+    const worldRatio = visibleRange[0] + screenRatio * (visibleRange[1] - visibleRange[0]);
+    return { screenRatio, worldRatio, value: worldRatio * lengthMm };
   });
 
   useEffect(() => () => geometry.dispose(), [geometry]);
@@ -390,6 +412,52 @@ export function ProductionArtifactView({
     event.preventDefault();
     const factor = event.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
     const next = clamp(Number((zoom * factor).toFixed(2)), MIN_ZOOM, MAX_ZOOM);
+    if (next === zoom) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const hasPointerPosition = rect.width > 0
+      && rect.height > 0
+      && Number.isFinite(event.clientX)
+      && Number.isFinite(event.clientY);
+    const pointerX = hasPointerPosition
+      ? clamp((event.clientX - rect.left) / rect.width, 0, 1)
+      : 0.5;
+    const pointerY = hasPointerPosition
+      ? clamp((event.clientY - rect.top) / rect.height, 0, 1)
+      : 0.5;
+    const axialPointerRatio = orientation === 'horizontal' ? pointerX : pointerY;
+    const previousVisibleFraction = Math.min(1, 1 / Math.max(1, zoom));
+    const nextVisibleFraction = Math.min(1, 1 / Math.max(1, next));
+    const anchoredWorldRatio = axisCenter
+      - previousVisibleFraction / 2
+      + axialPointerRatio * previousVisibleFraction;
+    setAxisCenter(clamp(
+      anchoredWorldRatio + (0.5 - axialPointerRatio) * nextVisibleFraction,
+      nextVisibleFraction / 2,
+      1 - nextVisibleFraction / 2,
+    ));
+
+    if (hasPointerPosition) {
+      const aspect = Math.max(rect.width / rect.height, 0.25);
+      const fitWidth = orientation === 'horizontal'
+        ? NORMALIZED_LONGITUDINAL_SPAN
+        : NORMALIZED_CROSS_SPAN;
+      const fitHeight = orientation === 'horizontal'
+        ? NORMALIZED_CROSS_SPAN
+        : NORMALIZED_LONGITUDINAL_SPAN;
+      const baseViewHeight = Math.max(fitWidth / aspect, fitHeight) * 1.18;
+      const baseViewWidth = baseViewHeight * aspect;
+      const cursorX = (pointerX - 0.5) * baseViewWidth;
+      const cursorY = (0.5 - pointerY) * baseViewHeight;
+      const zoomDelta = 1 / next - 1 / zoom;
+      setPan((current) => ({
+        x: orientation === 'vertical'
+          ? current.x + cursorX * zoomDelta
+          : current.x,
+        y: orientation === 'horizontal'
+          ? current.y + cursorY * zoomDelta
+          : current.y,
+      }));
+    }
     setZoom(next);
     onZoomChange?.(next);
   };
@@ -405,6 +473,10 @@ export function ProductionArtifactView({
       data-artifact-roll={roll.toFixed(3)}
       data-artifact-zoom={zoom.toFixed(2)}
       data-artifact-color-mode={colorMode}
+      data-artifact-render-dpr={renderDpr.toFixed(2)}
+      data-artifact-axis-center={axisCenter.toFixed(4)}
+      data-artifact-pan-x={pan.x.toFixed(4)}
+      data-artifact-pan-y={pan.y.toFixed(4)}
       data-visible-range-start={visibleRange[0].toFixed(4)}
       data-visible-range-end={visibleRange[1].toFixed(4)}
       aria-label={ariaLabel}
@@ -431,8 +503,9 @@ export function ProductionArtifactView({
         const deltaX = event.clientX - drag.current.x;
         const deltaY = event.clientY - drag.current.y;
         if (drag.current.button === 0) {
+          const axialDelta = orientation === 'horizontal' ? deltaX : -deltaY;
+          const rotationDelta = orientation === 'horizontal' ? deltaY : deltaX;
           if (visibleFraction < 0.995 && !event.shiftKey) {
-            const axialDelta = orientation === 'horizontal' ? deltaX : -deltaY;
             const viewportPixels = Math.max(
               1,
               orientation === 'horizontal'
@@ -444,9 +517,8 @@ export function ProductionArtifactView({
               minimumAxisCenter,
               maximumAxisCenter,
             ));
-          } else {
-            setRoll((current) => current + deltaX * 0.012);
           }
+          setRoll((current) => current + rotationDelta * 0.012);
         } else {
           setPan((current) => ({
             x: orientation === 'vertical'
@@ -467,7 +539,11 @@ export function ProductionArtifactView({
       onPointerCancel={stopDragging}
       onWheel={handleWheel}
     >
-      <Canvas camera={{ position: [3.4, 2.7, 4.6], fov: 46 }} dpr={[1, 1.5]}>
+      <Canvas
+        camera={{ position: [3.4, 2.7, 4.6], fov: 46 }}
+        dpr={renderDpr}
+        gl={{ antialias: true, powerPreference: 'high-performance' }}
+      >
         <ArtifactCamera zoom={zoom} orientation={orientation} />
         <color attach="background" args={['#081118']} />
         <ambientLight intensity={0.82} />
@@ -522,14 +598,13 @@ export function ProductionArtifactView({
       >
         <div className="production-artifact-length-ruler" aria-label="三维长度毫米刻度">
           {rulerTicks.map((tick, index) => (
-            <span key={`${index}:${tick.ratio}`} style={{ left: `${tick.ratio * 100}%` }}>
+            <span key={`${index}:${tick.worldRatio}`} style={{ left: `${tick.screenRatio * 100}%` }}>
               <i />
-              <b>{lengthMm > 0 ? `${Math.round(tick.value)} mm` : `${Math.round(tick.ratio * 100)}%`}</b>
+              <b>{lengthMm > 0 ? `${Math.round(tick.value)} mm` : `${Math.round(tick.worldRatio * 100)}%`}</b>
             </span>
           ))}
         </div>
         <div className="production-artifact-scrollbar-row">
-          <span>长度视口</span>
           <div
             className={`production-artifact-scrollbar ${visibleFraction >= 0.995 ? 'is-disabled' : ''}`}
             role="scrollbar"
@@ -592,11 +667,6 @@ export function ProductionArtifactView({
               }}
             />
           </div>
-          <strong>
-            {visibleFraction >= 0.995
-              ? '全长'
-              : `${Math.round(visibleRange[0] * lengthMm)}–${Math.round(visibleRange[1] * lengthMm)} mm`}
-          </strong>
         </div>
       </div>
     </div>

@@ -3823,31 +3823,35 @@ button {
 .production-artifact-axis-navigation {
   position: absolute;
   z-index: 9;
-  right: 12px;
-  bottom: 9px;
-  left: 12px;
-  height: 52px;
-  padding: 3px 9px 5px;
-  border: 1px solid rgba(130, 206, 255, .34);
-  border-radius: 6px;
+  right: 8px;
+  bottom: 0;
+  left: 8px;
+  height: 31px;
+  padding: 0 9px 2px;
   color: #dff3ff;
-  background: rgba(4, 20, 32, .86);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, .2);
+  background: linear-gradient(180deg, transparent, rgba(4, 20, 32, .72) 42%, rgba(4, 20, 32, .92));
   cursor: default;
+  opacity: .62;
+  transition: opacity .16s ease;
+}
+
+.production-artifact-axis-navigation:hover,
+.production-artifact-axis-navigation:focus-within {
+  opacity: 1;
 }
 
 .production-artifact-length-ruler {
   position: relative;
-  height: 19px;
-  margin: 0 82px 0 62px;
-  border-bottom: 1px solid rgba(130, 206, 255, .38);
+  height: 18px;
+  margin: 0;
+  border-bottom: 1px solid rgba(130, 206, 255, .24);
   pointer-events: none;
 }
 
 .production-artifact-length-ruler span {
   position: absolute;
-  bottom: -13px;
-  color: #8fb9ca;
+  bottom: 3px;
+  color: rgba(183, 224, 241, .74);
   font: 700 8px/1 ui-monospace, monospace;
   transform: translateX(-50%);
   white-space: nowrap;
@@ -3863,11 +3867,11 @@ button {
 
 .production-artifact-length-ruler i {
   position: absolute;
-  bottom: 12px;
+  bottom: -2px;
   left: 50%;
   width: 1px;
-  height: 5px;
-  background: #56d7ff;
+  height: 4px;
+  background: rgba(86, 215, 255, .62);
 }
 
 .production-artifact-length-ruler b {
@@ -3875,20 +3879,17 @@ button {
 }
 
 .production-artifact-scrollbar-row {
-  display: grid;
-  grid-template-columns: 54px minmax(100px, 1fr) 78px;
-  align-items: center;
-  gap: 8px;
-  height: 27px;
-  color: #9fdfff;
-  font-size: 9px;
-  font-weight: 800;
+  position: absolute;
+  right: 9px;
+  bottom: 0;
+  left: 9px;
+  height: 8px;
 }
 
 .production-artifact-scrollbar {
   position: relative;
   width: 100%;
-  height: 12px;
+  height: 8px;
   cursor: default;
   touch-action: none;
 }
@@ -3898,8 +3899,8 @@ button {
   top: 4px;
   right: 0;
   left: 0;
-  height: 4px;
-  border: 1px solid rgba(130, 206, 255, .34);
+  height: 2px;
+  border: 0;
   border-radius: 99px;
   background: rgba(2, 10, 18, .86);
   box-shadow: inset 0 1px 2px rgba(0, 0, 0, .48);
@@ -3910,7 +3911,7 @@ button {
   top: 1px;
   box-sizing: border-box;
   min-width: 18px;
-  height: 10px;
+  height: 6px;
   border: 1px solid #69d8f7;
   border-radius: 3px;
   background:
@@ -3940,12 +3941,6 @@ button {
 
 .production-artifact-scrollbar.is-disabled {
   opacity: .48;
-}
-
-.production-artifact-scrollbar-row strong {
-  color: #dff3ff;
-  font: 800 9px/1 ui-monospace, monospace;
-  text-align: right;
 }
 
 .production-artifact-texture-tag {
