@@ -20,7 +20,9 @@ function SeverityFilters({ summary, selectedSeverityFilters, onSeverityFilterTog
 
   return (
     <div className="severity-filters-inline">
-      {severityOrder.map((severity) => {
+      {severityOrder
+        .filter((severity) => severityCounts[severity] > 0)
+        .map((severity) => {
         const active = selectedSeverityFilters.has(severity);
         return (
           <button
@@ -56,7 +58,9 @@ export function DefectFilterPanel({
       action={<SeverityFilters summary={summary} selectedSeverityFilters={selectedSeverityFilters} onSeverityFilterToggle={onSeverityFilterToggle} />}
     >
       <div className="defect-type-filter-grid">
-        {defectTypes.map((type) => {
+        {defectTypes
+          .filter((type) => (defectTypeCounts[type.id] ?? 0) > 0)
+          .map((type) => {
           const active = !hiddenDefectTypeIds.has(type.id);
           const count = defectTypeCounts[type.id] ?? 0;
           return (
@@ -88,7 +92,9 @@ export function StatisticsPanel({
   return (
     <Panel title="缺陷数量" className="statistics-panel">
       <div className="defect-count-grid" aria-label={`当前共 ${summary.total} 项缺陷`}>
-        {defectTypes.map((type) => (
+        {defectTypes
+          .filter((type) => (defectTypeCounts[type.id] ?? 0) > 0)
+          .map((type) => (
           <div key={type.id} className="defect-count-item" style={{ '--defect-type-color': type.color } as CSSProperties}>
             <i aria-hidden="true" />
             <span>{type.label}</span>

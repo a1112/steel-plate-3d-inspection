@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App, { formatStorageBytes, formatStorageWarning } from './App';
 import { getMockInspectionSnapshot } from './data/inspection';
@@ -232,6 +232,7 @@ describe('App BKV provider selection', () => {
 
     fireEvent.click(screen.getByText('253B09401250925A12004329'));
     expect(await screen.findByLabelText('1893701 检测图像滚动视图')).toHaveAttribute('data-record-id', '1893701');
+    expect(requestedUrls.some((url) => url.includes('/api/inspection-world/surface'))).toBe(false);
 
     const moreButton = screen.getByRole('button', { name: '更多功能' });
     fireEvent.click(moreButton);
@@ -242,6 +243,72 @@ describe('App BKV provider selection', () => {
 
     expect(screen.getByRole('menuitem', { name: '在线检测' })).toBeDisabled();
     expect(new URLSearchParams(window.location.search).get('view')).not.toBe('online');
+  });
+
+  it('forces a refreshed D3IMG surface fetch when switching from 2D to 3D', async () => {
+    window.history.replaceState(null, '', '/?app=terminal');
+    const requestedUrls: string[] = [];
+    const surfaceMesh = {
+      schema: 'steel.bkv-depth-surface.v1',
+      coordinateUnit: 'legacy-unknown',
+      cameraCount: 6,
+      frameStems: [],
+      rows: 2,
+      colsPerCamera: 1,
+      positions: [0, 0, 1, 0, 1, 0, 8, 0, 1, 8, 1, 0],
+      uvs: [],
+      colors: [],
+      indices: [0, 1, 2, 1, 2, 3],
+    };
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(bkvRuntimeProfile), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/records')) {
+        return new Response(JSON.stringify(bkvRecordsPayload), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/meta')) {
+        return new Response(JSON.stringify({
+          schema: 'steel.inspection-world.meta.v1',
+          provider: 'bkv',
+          recordId: '1893700',
+          sourceFrameCount: 6,
+          sourceRevision: 'revision-1893700',
+          cache: { state: 'complete', tileSize: 128, maxLevel: 10 },
+          world: { width: 600, height: 1024, tileSize: 128, maxLevel: 10, cameras: [] },
+        }), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/defects')) {
+        return new Response(JSON.stringify({
+          schema: 'steel.inspection-world.defects.v1',
+          provider: 'bkv',
+          recordId: '1893700',
+          defects: [],
+        }), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/surface')) {
+        return new Response(JSON.stringify(surfaceMesh), { status: 200 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+    await screen.findByTestId('inspection-world-viewport');
+
+    // 2D 模式下不应请求三维表面
+    const surfaceCallsAfter2d = requestedUrls.filter((url) => url.includes('/api/inspection-world/surface'));
+    expect(surfaceCallsAfter2d).toHaveLength(0);
+
+    // 切换到 3D 模式，应触发带刷新的表面加载
+    const viewToggle = screen.getByRole('group', { name: '显示视图切换' });
+    fireEvent.click(within(viewToggle).getByRole('button', { name: '3D' }));
+
+    await waitFor(() => {
+      const surfaceCalls = requestedUrls.filter((url) => url.includes('/api/inspection-world/surface'));
+      expect(surfaceCalls.length).toBeGreaterThan(0);
+    });
   });
 
   it('keeps the unified BKV shell when explicitly selected BKV data is unavailable', async () => {

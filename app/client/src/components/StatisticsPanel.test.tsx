@@ -49,4 +49,47 @@ describe('defect filters and counts', () => {
     expect(screen.queryByText('钢管号')).not.toBeInTheDocument();
     expect(screen.queryByText('缺陷类别')).not.toBeInTheDocument();
   });
+
+  it('hides defect type filters with zero count', () => {
+    const onDefectTypeToggle = vi.fn();
+    render(
+      <DefectFilterPanel
+        summary={summary}
+        defectTypes={defectTypes}
+        defectTypeCounts={{ pit: 5, scratch: 0 }}
+        hiddenDefectTypeIds={new Set<string>()}
+        selectedSeverityFilters={new Set<Severity>(['severe', 'review', 'minor'])}
+        onDefectTypeToggle={onDefectTypeToggle}
+        onSeverityFilterToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: '凹坑类别过滤，当前5项' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '划伤类别过滤，当前0项' })).not.toBeInTheDocument();
+  });
+
+  it('hides severity filters with zero count', () => {
+    const onSeverityFilterToggle = vi.fn();
+    const summaryWithZero: InspectionSummary = {
+      total: 7,
+      bySeverity: { severe: 4, review: 3, minor: 0 },
+      bySurface: { top: 5, bottom: 2 },
+    };
+
+    render(
+      <DefectFilterPanel
+        summary={summaryWithZero}
+        defectTypes={defectTypes}
+        defectTypeCounts={{ pit: 5, scratch: 7 }}
+        hiddenDefectTypeIds={new Set<string>()}
+        selectedSeverityFilters={new Set<Severity>(['severe', 'review', 'minor'])}
+        onDefectTypeToggle={vi.fn()}
+        onSeverityFilterToggle={onSeverityFilterToggle}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: '严重等级过滤，当前4项' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '待复核等级过滤，当前3项' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '轻微等级过滤，当前0项' })).not.toBeInTheDocument();
+  });
 });

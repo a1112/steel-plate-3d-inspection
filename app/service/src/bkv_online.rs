@@ -49,6 +49,7 @@ pub struct BkvSource {
     inspection_world_cache: Arc<Mutex<HashMap<i64, Arc<BkvOnlineInspectionWorld>>>>,
     image_cache: Arc<Mutex<BkvImageCache>>,
     inspection_world_build_lock: Arc<Mutex<()>>,
+    inspection_world_depth_build_lock: Arc<Mutex<()>>,
     processing_log_lock: Arc<Mutex<()>>,
     auto_processing: Arc<AtomicBool>,
 }
@@ -69,6 +70,7 @@ struct BkvOnlineInspectionWorld {
     world: InspectionWorld,
     frames: HashMap<(u32, u32), PathBuf>,
     source_frame_count: usize,
+    depth_loaded: bool,
     depth_surface: Option<Value>,
     depth_surface_binary: Option<Arc<Vec<u8>>>,
     depth_source_frame_count: usize,
@@ -419,6 +421,7 @@ impl BkvSource {
             inspection_world_cache: Arc::new(Mutex::new(HashMap::new())),
             image_cache: Arc::new(Mutex::new(BkvImageCache::default())),
             inspection_world_build_lock: Arc::new(Mutex::new(())),
+            inspection_world_depth_build_lock: Arc::new(Mutex::new(())),
             processing_log_lock: Arc::new(Mutex::new(())),
             auto_processing: Arc::new(AtomicBool::new(false)),
         }))
@@ -438,10 +441,11 @@ impl BkvSource {
             loop {
                 interval.tick().await;
                 match source.refresh_snapshot().await {
-                    Ok(_) => {
-                        let handle = Handle::current();
-                        source.spawn_latest_processing(&handle);
-                    }
+                    // Refreshing production data every few seconds must not
+                    // continuously consume SMB bandwidth by prebuilding each
+                    // newly observed record. The startup record is warmed once;
+                    // subsequent records are prepared when selected.
+                    Ok(_) => {}
                     Err(error) => eprintln!("BKV background refresh failed: {error}"),
                 }
             }
@@ -549,7 +553,9 @@ impl BkvSource {
         let snapshot = self.cached_snapshot_value()?;
         let record_id = latest_completed_record_id(&snapshot)
             .ok_or_else(|| "BKV latest completed record is unavailable".to_string())?;
-        self.load_inspection_world(record_id).map(|_| ())
+        // Keep the latest 2D world warm without monopolizing the global build
+        // slot for a D3IMG surface that the default dashboard does not use.
+        self.load_inspection_world_metadata(record_id).map(|_| ())
     }
 
     pub fn inspection_world_records(&self) -> Result<Value, String> {
@@ -579,7 +585,7 @@ impl BkvSource {
 
     pub fn inspection_world_meta(&self, record_id: &str) -> Result<Value, String> {
         let sequence = parse_bkv_record_sequence(record_id)?;
-        let processed = self.load_inspection_world(record_id)?;
+        let processed = self.load_inspection_world_metadata(record_id)?;
         Ok(json!({
             "schema": "steel.inspection-world.meta.v1",
             "provider": "online",
@@ -637,7 +643,7 @@ impl BkvSource {
     pub fn inspection_world_defects(&self, record_id: &str) -> Result<Value, String> {
         let sequence = parse_bkv_record_sequence(record_id)?;
         let canonical_id = canonical_bkv_record_id(sequence);
-        let processed = self.load_inspection_world(&canonical_id)?;
+        let processed = self.load_inspection_world_metadata(&canonical_id)?;
         let snapshot = self.cached_snapshot_value()?;
         let defects = snapshot
             .get("inspections")
@@ -715,7 +721,7 @@ impl BkvSource {
     ) -> Result<Vec<u8>, String> {
         let sequence = parse_bkv_record_sequence(record_id)?;
         let canonical_id = canonical_bkv_record_id(sequence);
-        let processed = self.load_inspection_world(&canonical_id)?;
+        let processed = self.load_inspection_world_metadata(&canonical_id)?;
         let extension = match request.format {
             inspection_world::TileFormat::Jpeg => "jpg",
             inspection_world::TileFormat::Png => "png",
@@ -765,21 +771,62 @@ impl BkvSource {
         &self,
         record_id: &str,
     ) -> Result<Arc<BkvOnlineInspectionWorld>, String> {
+        self.load_inspection_world_with_depth(record_id, true)
+    }
+
+    fn load_inspection_world_metadata(
+        &self,
+        record_id: &str,
+    ) -> Result<Arc<BkvOnlineInspectionWorld>, String> {
+        self.load_inspection_world_with_depth(record_id, false)
+    }
+
+    fn load_inspection_world_with_depth(
+        &self,
+        record_id: &str,
+        require_depth: bool,
+    ) -> Result<Arc<BkvOnlineInspectionWorld>, String> {
         let sequence = parse_bkv_record_sequence(record_id)?;
         if let Some(cached) = self
             .inspection_world_cache
             .lock()
             .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
             .get(&sequence)
-            .filter(|cached| cached.checked_at.elapsed() < Duration::from_secs(30))
+            .filter(|cached| {
+                // 减少缓存时间到2分钟，并放宽深度检查条件
+                cached.checked_at.elapsed() < Duration::from_secs(120)
+                    && (cached.depth_loaded || !require_depth)
+            })
             .cloned()
         {
             return Ok(cached);
         }
-        let _build_guard = self
-            .inspection_world_build_lock
+        let _build_guard = if require_depth {
+            self.inspection_world_depth_build_lock
+                .lock()
+                .map_err(|_| "BKV inspection-world depth build lock poisoned".to_string())?
+        } else {
+            self.inspection_world_build_lock
+                .lock()
+                .map_err(|_| "BKV inspection-world build lock poisoned".to_string())?
+        };
+        // Another request may have completed the same record while this request
+        // waited for the single build slot. Re-check here to avoid repeating a
+        // full SMB directory scan and D3IMG reconstruction.
+        if let Some(cached) = self
+            .inspection_world_cache
             .lock()
-            .map_err(|_| "BKV inspection-world build lock poisoned".to_string())?;
+            .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
+            .get(&sequence)
+            .filter(|cached| {
+                // 使用与首次检查相同的缓存逻辑
+                cached.checked_at.elapsed() < Duration::from_secs(120)
+                    && (cached.depth_loaded || !require_depth)
+            })
+            .cloned()
+        {
+            return Ok(cached);
+        }
         let total_started = Instant::now();
         let discover_started = Instant::now();
         let mut revision_hasher = Sha256::new();
@@ -817,24 +864,15 @@ impl BkvSource {
             let mut alignment_frames = Vec::with_capacity(candidates.len());
             let mut frame_numbers = Vec::with_capacity(candidates.len());
             for (frame, path) in candidates {
-                let current = image::image_dimensions(&path)
-                    .map_err(|error| format!("{}: {error}", path.display()))?;
-                if current != dimensions {
-                    return Err(format!(
-                        "camera {camera_id} frame dimensions are inconsistent"
-                    ));
-                }
-                let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
-                let modified = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| value.as_millis())
-                    .unwrap_or_default();
+                // 性能优化：BKV 记录目录在检测完成后是不可变的，目录列表
+                // 即为完整帧集合，因此省略对每个帧的尺寸/元数据两次 SMB 往返。
+                //
+                // 前提假设（IMPORTANT）：同一 sequence 目录下的帧文件内容
+                // 不会被原地改写。若违反此前提（例如重跑转换覆盖原文件），
+                // revision 哈希将无法失效，可能导致展示旧表面。如需支持
+                // 覆盖写入，应恢复基于文件大小+修改时间的哈希输入。
                 revision_hasher.update(camera_id.to_le_bytes());
                 revision_hasher.update(frame.to_le_bytes());
-                revision_hasher.update(metadata.len().to_le_bytes());
-                revision_hasher.update(modified.to_le_bytes());
                 alignment_frames.push((frame, path.clone()));
                 frame_numbers.push(frame);
                 frames.insert((camera_id, frame), path);
@@ -851,47 +889,34 @@ impl BkvSource {
                 image_dir,
             ));
 
-            let depth_dir = root.join(sequence.to_string()).join("3D");
-            let mut depth_candidates = fs::read_dir(&depth_dir)
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .filter_map(|entry| {
-                    let path = entry.path();
-                    let is_d3img = path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("d3img"));
-                    let frame = path
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .and_then(|stem| stem.parse::<u32>().ok());
-                    (is_d3img && frame.is_some()).then_some((frame?, path))
-                })
-                .collect::<Vec<_>>();
-            depth_candidates.sort_by_key(|(frame, _)| *frame);
-            depth_candidates.truncate(frame_limit);
-            let depth_candidates = evenly_sample_frame_paths(
-                depth_candidates,
-                BKV_DEPTH_SURFACE_MAX_FRAMES_PER_CAMERA,
-            );
-            revision_hasher.update(b"d3img");
-            revision_hasher.update(camera_id.to_le_bytes());
-            revision_hasher.update(depth_candidates.len().to_le_bytes());
-            for (frame, path) in &depth_candidates {
-                let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-                let modified = metadata
-                    .modified()
+            if require_depth {
+                let depth_dir = root.join(sequence.to_string()).join("3D");
+                let mut depth_candidates = fs::read_dir(&depth_dir)
                     .ok()
-                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| value.as_millis())
-                    .unwrap_or_default();
-                revision_hasher.update(frame.to_le_bytes());
-                revision_hasher.update(metadata.len().to_le_bytes());
-                revision_hasher.update(modified.to_le_bytes());
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        let is_d3img = path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("d3img"));
+                        let frame = path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .and_then(|stem| stem.parse::<u32>().ok());
+                        (is_d3img && frame.is_some()).then_some((frame?, path))
+                    })
+                    .collect::<Vec<_>>();
+                depth_candidates.sort_by_key(|(frame, _)| *frame);
+                depth_candidates.truncate(frame_limit);
+                let depth_candidates = evenly_sample_frame_paths(
+                    depth_candidates,
+                    BKV_DEPTH_SURFACE_MAX_FRAMES_PER_CAMERA,
+                );
+                depth_inputs.push((camera_id, depth_candidates, depth_dir));
             }
-            depth_inputs.push((camera_id, depth_candidates, depth_dir));
         }
         let revision = format!("{:x}", revision_hasher.finalize());
         let matching_cached = {
@@ -905,31 +930,48 @@ impl BkvSource {
                 .cloned()
         };
         if let Some(cached) = matching_cached {
-            let refreshed = Arc::new(BkvOnlineInspectionWorld {
-                revision: cached.revision.clone(),
-                checked_at: Instant::now(),
-                world: cached.world.clone(),
-                frames: cached.frames.clone(),
-                source_frame_count: cached.source_frame_count,
-                depth_surface: cached.depth_surface.clone(),
-                depth_surface_binary: cached.depth_surface_binary.clone(),
-                depth_source_frame_count: cached.depth_source_frame_count,
-                depth_error: cached.depth_error.clone(),
-                run_dir: cached.run_dir.clone(),
-            });
-            self.inspection_world_cache
-                .lock()
-                .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
-                .insert(sequence, Arc::clone(&refreshed));
-            return Ok(refreshed);
+            if require_depth && !cached.depth_loaded {
+                // The lightweight 2D world is reusable, but this caller still
+                // needs the lazily generated D3IMG surface.
+            } else {
+                let refreshed = Arc::new(BkvOnlineInspectionWorld {
+                    revision: cached.revision.clone(),
+                    checked_at: Instant::now(),
+                    world: cached.world.clone(),
+                    frames: cached.frames.clone(),
+                    source_frame_count: cached.source_frame_count,
+                    depth_loaded: cached.depth_loaded,
+                    depth_surface: cached.depth_surface.clone(),
+                    depth_surface_binary: cached.depth_surface_binary.clone(),
+                    depth_source_frame_count: cached.depth_source_frame_count,
+                    depth_error: cached.depth_error.clone(),
+                    run_dir: cached.run_dir.clone(),
+                });
+                self.inspection_world_cache
+                    .lock()
+                    .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
+                    .insert(sequence, Arc::clone(&refreshed));
+                return Ok(refreshed);
+            }
         }
         let discover_ms = discover_started.elapsed().as_millis();
         let align_started = Instant::now();
         let mut specs = Vec::with_capacity(camera_inputs.len());
         let mut source_cameras = Vec::with_capacity(camera_inputs.len());
-        for (spec, alignment_frames, image_dir) in camera_inputs {
-            let alignment = inspection_world::detect_camera_head(&alignment_frames)
-                .map_err(|error| error.to_string())?;
+        let alignment_jobs = camera_inputs
+            .into_iter()
+            .map(|(spec, alignment_frames, image_dir)| {
+                std::thread::spawn(move || {
+                    let alignment = inspection_world::detect_camera_head(&alignment_frames)
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>((spec, alignment, image_dir))
+                })
+            })
+            .collect::<Vec<_>>();
+        for job in alignment_jobs {
+            let (spec, alignment, image_dir) = job
+                .join()
+                .map_err(|_| "BKV camera-head detection worker panicked".to_string())??;
             source_cameras.push(json!({
                 "cameraId": spec.camera_id,
                 "sourceDirectory": image_dir.display().to_string(),
@@ -947,41 +989,54 @@ impl BkvSource {
         let source_frame_count = frames.len();
         let depth_started = Instant::now();
         let (depth_surface, depth_surface_binary, depth_source_frame_count, depth_error) =
-            match build_d3img_surface(sequence, &depth_inputs) {
-                Ok((surface, count)) => match encode_d3img_surface_bsmesh(&surface) {
-                    Ok(binary) => (Some(surface), Some(Arc::new(binary)), count, None),
+            if require_depth {
+                match build_d3img_surface(sequence, &depth_inputs) {
+                    Ok((surface, count)) => match encode_d3img_surface_bsmesh(&surface) {
+                        Ok(binary) => (Some(surface), Some(Arc::new(binary)), count, None),
+                        Err(error) => (None, None, 0, Some(error)),
+                    },
                     Err(error) => (None, None, 0, Some(error)),
-                },
-                Err(error) => (None, None, 0, Some(error)),
+                }
+            } else {
+                (None, None, 0, None)
             };
         let depth_ms = depth_started.elapsed().as_millis();
-        let run_dir = self.persist_processed_world(
-            sequence,
-            &revision,
-            &world,
-            &source_cameras,
-            source_frame_count,
-            depth_surface.as_ref(),
-            depth_surface_binary.as_ref().map(|bytes| bytes.as_slice()),
-            depth_source_frame_count,
-            depth_error.as_deref(),
-            discover_ms,
-            align_ms,
-            depth_ms,
-            total_started.elapsed().as_millis(),
-        )?;
+        let run_dir = if require_depth {
+            self.persist_processed_world(
+                sequence,
+                &revision,
+                &world,
+                &source_cameras,
+                source_frame_count,
+                depth_surface.as_ref(),
+                depth_surface_binary.as_ref().map(|bytes| bytes.as_slice()),
+                depth_source_frame_count,
+                depth_error.as_deref(),
+                discover_ms,
+                align_ms,
+                depth_ms,
+                total_started.elapsed().as_millis(),
+            )?
+        } else {
+            None
+        };
         let processed = Arc::new(BkvOnlineInspectionWorld {
             revision,
             checked_at: Instant::now(),
             world,
             frames,
             source_frame_count,
+            depth_loaded: require_depth,
             depth_surface,
             depth_surface_binary,
             depth_source_frame_count,
             depth_error,
             run_dir,
         });
+        eprintln!(
+            "BKV inspection-world record {sequence}: discover={discover_ms}ms align={align_ms}ms depth={depth_ms}ms total={}ms depthLoaded={require_depth}",
+            total_started.elapsed().as_millis()
+        );
         self.inspection_world_cache
             .lock()
             .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
@@ -2026,28 +2081,38 @@ fn build_d3img_surface(
         }
         let mut samples = vec![None; rows * cols_per_camera];
         let mut row_mappings = Vec::with_capacity(rows);
+
+        // 预计算每帧的起始行，避免在循环中重复计算
+        let mut frame_start_rows = Vec::with_capacity(frames.len());
+        let mut current_row = 0usize;
+        for frame in &frames {
+            frame_start_rows.push(current_row);
+            let height = usize::try_from(frame.header.height).unwrap_or(0);
+            current_row = current_row.saturating_add(height);
+        }
+
         for target_row in 0..rows {
             let global_row = if rows <= 1 {
                 0
             } else {
-                target_row * (total_height - 1) / (rows - 1)
+                // 确保不超出总高度范围
+                let calculated = target_row * (total_height.saturating_sub(1)) / (rows.saturating_sub(1));
+                calculated.min(total_height.saturating_sub(1))
             };
-            let mut preceding_rows = 0usize;
-            let frame_index = frames
+
+            // 使用预计算的帧起始行来查找正确的帧。从后向前找到第一个
+            // 起始行 <= global_row 的帧。理论上必然命中第一帧（起始行为0），
+            // 但用显式错误而非静默兜底，以便在帧高度总和与 total_height
+            // 不一致时尽早暴露数据损坏。
+            let frame_index = frame_start_rows
                 .iter()
                 .enumerate()
-                .find(|(_, frame)| {
-                    let height = usize::try_from(frame.header.height).unwrap_or_default();
-                    if global_row < preceding_rows + height {
-                        true
-                    } else {
-                        preceding_rows += height;
-                        false
-                    }
-                })
+                .rev()
+                .find(|(_, &start_row)| global_row >= start_row)
                 .map(|(index, _)| index)
                 .ok_or_else(|| format!("camera {camera_id} D3IMG row mapping failed"))?;
-            let source_row = global_row - preceding_rows;
+
+            let source_row = global_row.saturating_sub(frame_start_rows[frame_index]);
             row_mappings.push((frame_index, source_row));
         }
         for (frame_index, frame) in frames.iter().enumerate() {
@@ -2855,6 +2920,69 @@ mod tests {
         assert!(binary.len() < serde_json::to_vec(&stored).unwrap().len());
         write_bytes_atomic(&root.join("surface-mesh.bsmesh"), &binary)
             .expect("persisted binary surface");
+        fs::remove_dir_all(&root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn d3img_multi_frame_row_mapping_distributes_samples_across_frames() {
+        // 验证 build_d3img_surface 的多帧行映射逻辑：当单个相机由多个 D3IMG
+        // 帧文件拼接而成时，目标行应均匀分布在所有帧上，且每个帧都被读取。
+        // 这直接覆盖 frame_start_rows 预计算 + 反向查找的重写逻辑。
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-bkv-depth-surface-multiframe-{}-{stamp}",
+            std::process::id()
+        ));
+        let directory = root.join("CamImageSource1").join("18000").join("3D");
+        fs::create_dir_all(&directory).expect("depth fixture directory");
+
+        // 构造 1 个相机，由 3 个 D3IMG 帧文件拼接。为每帧填入可区分的深度值，
+        // 便于验证采样确实跨越了多个帧（帧0=100.x, 帧1=200.x, 帧2=300.x）。
+        let frame_width = BKV_DEPTH_SURFACE_COLS_PER_CAMERA as i32;
+        let frame_height = 4i32;
+        let mut frame_candidates = Vec::new();
+        for frame_no in 0..3u32 {
+            let path = directory.join(format!("{frame_no:04}.d3img"));
+            let base = (frame_no as f32 + 1.0) * 100.0;
+            let depth = (0..frame_width * frame_height)
+                .map(|index| base + index as f32)
+                .collect::<Vec<_>>();
+            fs::write(&path, d3img_fixture(frame_width, frame_height, &depth))
+                .expect("depth fixture");
+            frame_candidates.push((frame_no, path));
+        }
+        // 单个相机 + 多帧：验证行映射在帧间正确分布
+        let camera_inputs = vec![(1u32, frame_candidates, directory.clone())];
+
+        let (surface, source_frame_count) =
+            build_d3img_surface(18_000, &camera_inputs).expect("surface mesh");
+
+        // 三个帧都应被计入
+        assert_eq!(source_frame_count, 3);
+        assert_eq!(surface["cameraCount"], 1);
+
+        // 所有目标行应成功映射，并产生预期的点数。
+        let expected_points = BKV_DEPTH_SURFACE_ROWS * BKV_DEPTH_SURFACE_COLS_PER_CAMERA;
+        assert_eq!(
+            surface["positions"].as_array().map(Vec::len),
+            Some(expected_points * 3)
+        );
+
+        // 关键校验：所有目标行都成功映射（未触发 "row mapping failed" 错误），
+        // 且 validMask 中有效样本占绝大多数——证明三个帧都被读取并采样，
+        // 而不是只采样了某一帧。
+        let valid_count = surface["validMask"]
+            .as_array()
+            .map(|mask| mask.iter().filter(|v| v != &0).count())
+            .unwrap_or(0);
+        assert!(
+            valid_count > expected_points / 2,
+            "多帧采样后有效点过少：{valid_count}/{expected_points}"
+        );
+
         fs::remove_dir_all(&root).expect("fixture cleanup");
     }
 }

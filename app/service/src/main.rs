@@ -15251,21 +15251,11 @@ fn schedule_inspection_world_cache(
     let cache_record_id = record_id.to_string();
     let cache_revision = source_revision.to_string();
     if state.runtime_config.data_source == "bkv-online-mysql" {
-        let Some(source) = state.bkv_online.clone() else {
-            return;
-        };
-        let source_record_id = record_id.to_string();
-        inspection_world::schedule_full_tile_cache(
-            cache_root,
-            cache_record_id,
-            cache_revision,
-            world.clone(),
-            move |request| {
-                source
-                    .inspection_world_tile(&source_record_id, request)
-                    .map_err(inspection_world::WorldError::Artifact)
-            },
-        );
+        // Online records can contain thousands of tiles. Filling the complete
+        // pyramid as soon as metadata is requested competes with the selected
+        // record for SMB bandwidth and makes rapid record switching slower.
+        // Visible tiles are still generated and persisted on demand by
+        // `inspection_world_tile_response`.
         return;
     }
     if state.runtime_config.data_source == "converted-local" {
@@ -21692,6 +21682,7 @@ struct ConvertedSurfaceCacheEntry {
     source_hash: String,
     algorithm_revision: &'static str,
     surface: Arc<npz_surface::NpzSurface>,
+    stored_at: Instant,
 }
 
 fn load_converted_surface(
@@ -21708,14 +21699,16 @@ fn load_converted_surface(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("converted inspection {record_id} not found"))?;
     if !force_rebuild {
-        let cache = state
+        let mut cache = state
             .converted_surface_cache
             .lock()
             .map_err(|_| "converted surface cache lock poisoned".to_string())?;
-        if let Some(entry) = cache.get(record_id).filter(|entry| {
+        if let Some(entry) = cache.get_mut(record_id).filter(|entry| {
             entry.source_hash == record.source_hash
                 && entry.algorithm_revision == npz_surface::RECONSTRUCTION_REVISION
         }) {
+            // LRU：命中时刷新时间戳，使其不会被优先淘汰
+            entry.stored_at = Instant::now();
             return Ok(Arc::clone(&entry.surface));
         }
     }
@@ -21774,8 +21767,15 @@ fn load_converted_surface(
         .converted_surface_cache
         .lock()
         .map_err(|_| "converted surface cache lock poisoned".to_string())?;
+    // LRU 淘汰：缓存满时只移除最旧的一条，而非清空全部，避免不必要的重建。
     if cache.len() >= 8 && !cache.contains_key(record_id) {
-        cache.clear();
+        if let Some((oldest_key, _)) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.stored_at)
+            .map(|(key, _)| (key.clone(), ()))
+        {
+            cache.remove(&oldest_key);
+        }
     }
     cache.insert(
         record_id.to_string(),
@@ -21783,6 +21783,7 @@ fn load_converted_surface(
             source_hash: record.source_hash,
             algorithm_revision: npz_surface::RECONSTRUCTION_REVISION,
             surface: Arc::clone(&surface),
+            stored_at: Instant::now(),
         },
     );
     Ok(surface)

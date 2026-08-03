@@ -864,6 +864,7 @@ function InspectionDashboard({
   );
   const artifactMode: 'production' | 'demo' = snapshot.source === 'demo' || snapshot.source === 'test' ? 'demo' : 'production';
   const loadedBkvDefectRecordsRef = useRef(new Set<string>());
+  const previousSurfaceViewModeRef = useRef<PlateMapViewMode>('2d');
 
   useEffect(() => {
     if (dashboardMode.kind !== 'bkv') return;
@@ -896,6 +897,19 @@ function InspectionDashboard({
         });
         return;
       }
+      if (plateMapViewMode === '2d') {
+        setRecordBoundSurface({
+          inspectionId,
+          loading: false,
+          mesh: null,
+          status: '二维记录已就绪；切换到 3D、点云或截面时再按需加载 D3IMG 表面。',
+        });
+        return;
+      }
+
+      // 从 2D 切换到 3D/切面时强制刷新，避免使用上次会话残留的缓存
+      const needsRefresh = previousSurfaceViewModeRef.current === '2d';
+      previousSurfaceViewModeRef.current = plateMapViewMode;
       const controller = new AbortController();
       let loaded = false;
       let inFlight = false;
@@ -911,7 +925,7 @@ function InspectionDashboard({
         if (loaded || inFlight || controller.signal.aborted) return;
         inFlight = true;
         try {
-          const mesh = await fetchInspectionWorldSurface(inspectionId, controller.signal);
+          const mesh = await fetchInspectionWorldSurface(inspectionId, controller.signal, needsRefresh);
           if (controller.signal.aborted) return;
           setRecordBoundSurface({
             inspectionId,
@@ -1046,7 +1060,7 @@ function InspectionDashboard({
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeSnapshot.currentPlate.plateNo, artifactMode, dashboardMode.kind, terminalMode]);
+  }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeSnapshot.currentPlate.plateNo, artifactMode, dashboardMode.kind, plateMapViewMode, terminalMode]);
 
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
   const currentPlateDefects = useMemo(

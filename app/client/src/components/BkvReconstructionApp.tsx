@@ -442,7 +442,7 @@ export function BkvReconstructionApp({ expectedCameraCount = 6 }: { expectedCame
                   ? 'Jet 以每个纵向切面的拟合圆为零基准：蓝色为内凹、绿色接近圆面、红色为外凸；色标单位为毫米。'
                   : viewMode === 'points'
                   ? '点云仅显示 NPZ 实测有效点，已过滤名义补点；支持拖拽旋转与滚轮缩放。'
-                    : '显示网格为 128 个纵向采样 × 32 列/相机；NPZ 深度按毫米解释，网格采样密度仍不等同于仪器精度。'}
+                    : `显示网格为 ${(parameters?.sampling.rows ?? 1024)} 个纵向采样 × ${(parameters?.sampling.colsPerCamera ?? 64)} 列/相机；NPZ 深度按毫米解释，网格采样密度仍不等同于仪器精度。`}
             </span>
           </footer>
         </section>
