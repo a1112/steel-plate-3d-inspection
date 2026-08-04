@@ -4,6 +4,9 @@
   "processorVersion": "1.0.0",
   "input": {
     "intensityDirectory": "2D",
+    "sourceAdapters": ["bkv-mysql", "capture-manifest", "standard-record-v2"],
+    "resultSchema": "steel.inspection-result.v1",
+    "resultRoot": "target/data/inspection-results",
     "intensityExtension": "bmp",
     "depthDirectory": "3D",
     "depthExtension": "d3img",

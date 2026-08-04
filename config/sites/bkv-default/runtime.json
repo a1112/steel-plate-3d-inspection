@@ -56,7 +56,9 @@
     "convertedRoot": "",
     "catalogPath": "",
     "cacheRoot": "target/data/bkv-online-cache",
-    "converterOrigin": ""
+    "converterOrigin": "",
+    "resultRoot": "target/data/inspection-results",
+    "resultCatalogPath": "target/data/inspection-results/catalog.db"
   },
   "capture": {
     "enabled": false,

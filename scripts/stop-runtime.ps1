@@ -1,6 +1,6 @@
 param(
   [switch]$IncludeNode,
-  [int[]]$Ports = @(4317, 4873, 4881, 1432)
+  [int[]]$Ports = @(4317, 4873, 4874, 4875, 4881, 1432)
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,7 +32,10 @@ $Patterns = @(
   "*steel-inspection-service*",
   "*steel-trigger-gateway*",
   "*steel_trigger_gateway*",
-  "*steel_capture_service*"
+  "*steel_capture_service*",
+  "*steel-image-service*",
+  "*steel-algorithm-service*",
+  "*steel-inspection-tray*"
 )
 if ($IncludeNode) {
   $Patterns += @("*node*", "*vite*")

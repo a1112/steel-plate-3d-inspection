@@ -47,6 +47,8 @@ try {
   }
   foreach ($File in @(
     "capture-headless\steel_capture_service.exe",
+    "service\steel-image-service.exe",
+    "service\steel-algorithm-service.exe",
     "service\steel-trigger-gateway.exe",
     "service\steel-inspection-service.exe",
     "algorithm-core\steel_bar_surface_core.exe"
@@ -65,6 +67,10 @@ try {
     "capture-config\calibrations\current-8-time-trigger",
     "temp",
     "work\capture",
+    "result-data",
+    "algorithm-input",
+    "work\image",
+    "work\algorithm",
     "work\trigger",
     "work\service"
   )) {
@@ -112,6 +118,7 @@ try {
       "PROC_THREAD_ATTRIBUTE_HANDLE_LIST",
       "application_ready",
       "is_public_environment_name",
+      "STEEL_BKV_",
       "validate_production_environment",
       "validate_state_root",
       "g_state_root",
@@ -425,7 +432,7 @@ try {
       'Wait-RuntimePortsReleased',
       'Get-NetTCPConnection',
       'Get-NetUDPEndpoint',
-      '4317, 4873, 4881, 4882, 4883',
+      '4317, 4873, 4874, 4875, 4881, 4882, 4883',
       'SteelStateRoot',
       'config\runtime-service.env'
     )) {

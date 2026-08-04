@@ -70,7 +70,10 @@ $DeclaredReleaseVersions = @(
 foreach ($CargoManifest in @(
   "app\client\src-tauri\Cargo.toml",
   "app\service\Cargo.toml",
-  "app\trigger\Cargo.toml"
+  "app\trigger\Cargo.toml",
+  "app\algorithm-service\Cargo.toml",
+  "app\image-service\Cargo.toml",
+  "app\tray\Cargo.toml"
 )) {
   $CargoText = Get-Content -LiteralPath (Join-Path $RepoRoot $CargoManifest) -Raw
   if ($CargoText -notmatch '(?m)^version\s*=\s*"([^"]+)"\s*$') {
@@ -545,6 +548,13 @@ if (-not $SkipBuild) {
   }
   Invoke-Checked "powershell" $ServiceBuildArgs
   Invoke-Checked "powershell" $TriggerBuildArgs
+  $AlgorithmServiceBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-algorithm-service.ps1"), "-Profile", $ServiceProfile)
+  $ImageServiceBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-image-service.ps1"), "-Profile", $ServiceProfile)
+  $TrayBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-tray.ps1"), "-Profile", $ServiceProfile)
+  if ($FormalReleasePackage) { $AlgorithmServiceBuildArgs += "-Locked"; $ImageServiceBuildArgs += "-Locked"; $TrayBuildArgs += "-Locked" }
+  Invoke-Checked "powershell" $AlgorithmServiceBuildArgs
+  Invoke-Checked "powershell" $ImageServiceBuildArgs
+  Invoke-Checked "powershell" $TrayBuildArgs
   $ClientBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-client.ps1"))
   if (-not $SkipDesktopBundle) {
     $ClientBuildArgs += "-Tauri"
@@ -598,7 +608,11 @@ foreach ($LockFile in @(
   @{ source = "app\client\package-lock.json"; destination = "client-package-lock.json" },
   @{ source = "app\client\src-tauri\Cargo.lock"; destination = "tauri-Cargo.lock" },
   @{ source = "app\service\Cargo.lock"; destination = "service-Cargo.lock" },
-  @{ source = "app\trigger\Cargo.lock"; destination = "trigger-Cargo.lock" }
+  @{ source = "app\trigger\Cargo.lock"; destination = "trigger-Cargo.lock" },
+  @{ source = "app\result-contract\Cargo.lock"; destination = "result-contract-Cargo.lock" },
+  @{ source = "app\algorithm-service\Cargo.lock"; destination = "algorithm-service-Cargo.lock" },
+  @{ source = "app\image-service\Cargo.lock"; destination = "image-service-Cargo.lock" },
+  @{ source = "app\tray\Cargo.lock"; destination = "tray-Cargo.lock" }
 )) {
   $SourceLock = Join-Path $RepoRoot ([string]$LockFile.source)
   $DestinationLock = Join-Path $BuildEvidenceOut ([string]$LockFile.destination)
@@ -755,7 +769,11 @@ if ($FormalReleasePackage) {
     [ordered]@{ id = 'npm-client'; sourcePath = 'app/client/package-lock.json'; evidencePath = 'build-evidence/client-package-lock.json' },
     [ordered]@{ id = 'cargo-tauri'; sourcePath = 'app/client/src-tauri/Cargo.lock'; evidencePath = 'build-evidence/tauri-Cargo.lock' },
     [ordered]@{ id = 'cargo-service'; sourcePath = 'app/service/Cargo.lock'; evidencePath = 'build-evidence/service-Cargo.lock' },
-    [ordered]@{ id = 'cargo-trigger'; sourcePath = 'app/trigger/Cargo.lock'; evidencePath = 'build-evidence/trigger-Cargo.lock' }
+    [ordered]@{ id = 'cargo-trigger'; sourcePath = 'app/trigger/Cargo.lock'; evidencePath = 'build-evidence/trigger-Cargo.lock' },
+    [ordered]@{ id = 'cargo-result-contract'; sourcePath = 'app/result-contract/Cargo.lock'; evidencePath = 'build-evidence/result-contract-Cargo.lock' },
+    [ordered]@{ id = 'cargo-algorithm-service'; sourcePath = 'app/algorithm-service/Cargo.lock'; evidencePath = 'build-evidence/algorithm-service-Cargo.lock' },
+    [ordered]@{ id = 'cargo-image-service'; sourcePath = 'app/image-service/Cargo.lock'; evidencePath = 'build-evidence/image-service-Cargo.lock' },
+    [ordered]@{ id = 'cargo-tray'; sourcePath = 'app/tray/Cargo.lock'; evidencePath = 'build-evidence/tray-Cargo.lock' }
   )
   $SbomLockEvidence = @()
   foreach ($Lock in $SbomLockDefinitions) {
@@ -877,6 +895,12 @@ $TriggerBuild = if ($ServiceProfile -eq "release") {
   Join-Path $RepoRoot "target\trigger\debug"
 }
 Copy-RequiredFile (Join-Path $TriggerBuild "steel-trigger-gateway.exe") $ServiceOut
+$AlgorithmServiceBuild = if ($ServiceProfile -eq "release") { Join-Path $RepoRoot "target\algorithm-service\release" } else { Join-Path $RepoRoot "target\algorithm-service\debug" }
+Copy-RequiredFile (Join-Path $AlgorithmServiceBuild "steel-algorithm-service.exe") $ServiceOut
+$ImageServiceBuild = if ($ServiceProfile -eq "release") { Join-Path $RepoRoot "target\image-service\release" } else { Join-Path $RepoRoot "target\image-service\debug" }
+Copy-RequiredFile (Join-Path $ImageServiceBuild "steel-image-service.exe") $ServiceOut
+$TrayBuild = if ($ServiceProfile -eq "release") { Join-Path $RepoRoot "target\tray\release" } else { Join-Path $RepoRoot "target\tray\debug" }
+Copy-RequiredFile (Join-Path $TrayBuild "steel-inspection-tray.exe") $ServiceOut
 
 $AlgorithmCoreBuild = Join-Path $RepoRoot "target\algorithm-core\$Configuration"
 Copy-RequiredFile (Join-Path $AlgorithmCoreBuild "steel_bar_surface_core.exe") $AlgorithmCoreOut
@@ -888,6 +912,9 @@ if ($FormalReleasePackage) {
     (Join-Path $ServiceOut "steel-runtime-supervisor.exe"),
     (Join-Path $ServiceOut "steel-inspection-service.exe"),
     (Join-Path $ServiceOut "steel-trigger-gateway.exe"),
+    (Join-Path $ServiceOut "steel-image-service.exe"),
+    (Join-Path $ServiceOut "steel-algorithm-service.exe"),
+    (Join-Path $ServiceOut "steel-inspection-tray.exe"),
     (Join-Path $AlgorithmCoreOut "steel_bar_surface_core.exe")
   )
   foreach ($ArtifactPath in @($FirstPartyRuntimeArtifacts) + @((Join-Path $CaptureOut "nvt_lvm_sdk.dll"))) {
@@ -1399,7 +1426,7 @@ Write-Host "  Logs            $LogDir"
 
 Write-PackageFile "stop-runtime.ps1" @'
 param(
-  [int[]]$Ports = @(4317, 4873, 4881, 1432)
+  [int[]]$Ports = @(4317, 4873, 4874, 4875, 4881, 1432)
 )
 
 $ErrorActionPreference = "Stop"
@@ -1466,17 +1493,20 @@ This package keeps runtime boundaries independent:
 - `capture-headless/`: C++ capture provider and camera SDK runtime DLL.
 - `service/`: Rust service API executable.
 - `service/steel-trigger-gateway.exe`: standalone L2/PLC/API trigger gateway.
+- `service/steel-image-service.exe`: loopback Rust image decode, preview and tile service.
+- `service/steel-algorithm-service.exe`: raw-source adapters and immutable unified-result publisher.
+- `service/steel-inspection-tray.exe`: per-user Windows task-tray companion for SCM controls.
 - `client/`: built frontend files.
 - `config/env/`: environment templates.
 - `docs/`: architecture and API documentation copied from the source tree.
 
-## Start Rust Service with Managed Capture
+## Start the Runtime Supervisor
 
 ```powershell
-.\run-service-managed.ps1 -Port 4873 -CapturePort 4317 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction"
+.\service\steel-runtime-supervisor.exe --service --root . --state-root <StateRoot>
 ```
 
-Rust starts, monitors, restarts, and stops the capture child. The service exposes:
+The Supervisor starts image, algorithm, capture, business, and trigger processes in order and stops them in reverse order. The business service is proxy-only in production and exposes:
 
 ```text
 http://127.0.0.1:4873/api/capture/lifecycle
@@ -1783,6 +1813,9 @@ $Manifest = [ordered]@{
     path = "service/steel-inspection-service.exe"
     triggerGateway = "service/steel-trigger-gateway.exe"
     supervisor = "service/steel-runtime-supervisor.exe"
+    image = "service/steel-image-service.exe"
+    algorithm = "service/steel-algorithm-service.exe"
+    tray = "service/steel-inspection-tray.exe"
     windowsServiceName = "SteelInspectionRuntime"
     profile = $ServiceProfile
     signatures = $RuntimeSignatureEvidence
@@ -1793,6 +1826,9 @@ $Manifest = [ordered]@{
   }
   algorithm = @{
     core = "algorithm-core/steel_bar_surface_core.exe"
+    service = "service/steel-algorithm-service.exe"
+    resultSchema = "steel.inspection-result.v1"
+    resultRoot = "state-root/result-data"
     scripts = "scripts"
   }
   config = @{

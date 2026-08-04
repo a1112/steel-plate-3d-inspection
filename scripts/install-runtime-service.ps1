@@ -1112,6 +1112,9 @@ function Assert-ReleasePackageIntegrity {
     'service/steel-runtime-supervisor.exe',
     'service/steel-inspection-service.exe',
     'service/steel-trigger-gateway.exe',
+    'service/steel-image-service.exe',
+    'service/steel-algorithm-service.exe',
+    'service/steel-inspection-tray.exe',
     'algorithm-core/steel_bar_surface_core.exe',
     'capture-headless/nvt_lvm_sdk.dll'
   )
@@ -1349,7 +1352,11 @@ $RequiredStateDirectories = @(
   (Join-Path $StateRoot 'work'),
   (Join-Path $StateRoot 'work\capture'),
   (Join-Path $StateRoot 'work\trigger'),
-  (Join-Path $StateRoot 'work\service')
+  (Join-Path $StateRoot 'work\service'),
+  (Join-Path $StateRoot 'work\image'),
+  (Join-Path $StateRoot 'work\algorithm'),
+  (Join-Path $StateRoot 'result-data'),
+  (Join-Path $StateRoot 'algorithm-input')
 )
 foreach ($Directory in $RequiredStateDirectories) {
   if (Test-Path -LiteralPath $Directory) {
@@ -1497,7 +1504,7 @@ foreach ($Line in Get-Content -LiteralPath $SecretEnvFile -Encoding utf8) {
   if ($SecretNames.ContainsKey($Matches[1])) {
     throw "Duplicate secret environment key: $($Matches[1])"
   }
-  if ($AllowedSecretNames -cnotcontains $Matches[1]) {
+  if ($AllowedSecretNames -cnotcontains $Matches[1] -and $Matches[1] -notlike 'STEEL_BKV_*') {
     throw "Secret environment key is not allowed: $($Matches[1])"
   }
   $SecretNames[$Matches[1]] = $Matches[2].Trim()
@@ -1697,6 +1704,12 @@ $RuntimeEnvironment = @(
   "STEEL_RELEASE_COMMIT=$ReleaseCommit",
   "INSPECTION_SERVICE_HOST=127.0.0.1",
   "INSPECTION_SERVICE_PORT=4873",
+  "STEEL_RESULT_ROOT=$StateRoot\result-data",
+  "STEEL_RESULT_PROXY_ONLY=1",
+  "STEEL_CAPTURE_MANAGED_BY_SUPERVISOR=1",
+  "STEEL_IMAGE_SERVICE_PORT=4874",
+  "STEEL_ALGORITHM_SERVICE_PORT=4875",
+  "STEEL_ALGORITHM_INPUT_ROOTS=$StateRoot\algorithm-input",
   "STEEL_CAPTURE_PROVIDER=headless-cpp",
   "CAPTURE_SERVICE_ORIGIN=http://127.0.0.1:4317",
   "STEEL_CAPTURE_SERVICE_AUTOSTART=1",
@@ -1754,7 +1767,7 @@ $BinaryPath = Get-RuntimeServiceBinaryPath -ReleaseRoot $RuntimeRoot -StateRoot 
       (Get-Service -Name $ServiceName).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(120))
     }
   } else {
-    foreach ($Port in 4317, 4873, 4881, 4882, 4883) { Assert-PortFree -Port $Port }
+    foreach ($Port in 4317, 4873, 4874, 4875, 4881, 4882, 4883) { Assert-PortFree -Port $Port }
     $ServiceMutationStarted = $true
   }
   Set-DeploymentJournalPhase -Journal $DeploymentJournal -Phase 'service-stopped' -Path $DeploymentJournalPath -Detail 'The prior service is stopped, or no prior service existed.'

@@ -5,6 +5,7 @@ param(
   [int]$ServiceReadyTimeoutSec = 30,
   [switch]$SkipServiceBuild,
   [switch]$NoService,
+  [switch]$NoProcessingServices,
   [switch]$AllowNetworkDependencyFetch,
   [string]$CargoRegistryMirror = "https://rsproxy.cn/index/"
 )
@@ -31,6 +32,13 @@ if (($env:Path -split ";" | ForEach-Object { $_.TrimEnd("\") }) -notcontains $No
 }
 
 $ServiceOrigin = "http://127.0.0.1:$ServicePort"
+$ImageServicePort = 4874
+$AlgorithmServicePort = 4875
+$ProcessingRoot = Join-Path $RunDir "processing"
+$ResultRoot = Join-Path $ProcessingRoot "result-data"
+$AlgorithmInputRoot = Join-Path $ProcessingRoot "algorithm-input"
+$ImageServiceLauncher = $null
+$AlgorithmServiceLauncher = $null
 $ServiceLauncher = $null
 $OwnedServicePid = $null
 
@@ -41,6 +49,10 @@ function Test-InspectionServiceReady {
   } catch {
     return $false
   }
+}
+
+function Test-HttpReady([string]$Uri) {
+  try { return (Invoke-WebRequest -UseBasicParsing -Uri $Uri -TimeoutSec 2).StatusCode -eq 200 } catch { return $false }
 }
 
 function Get-InspectionServicePid {
@@ -54,6 +66,23 @@ function Get-InspectionServicePid {
 }
 
 try {
+  if (-not $NoProcessingServices) {
+    & (Join-Path $PSScriptRoot "build-image-service.ps1") -Profile debug
+    & (Join-Path $PSScriptRoot "build-algorithm-service.ps1") -Profile debug
+    New-Item -ItemType Directory -Force -Path $ResultRoot, $AlgorithmInputRoot | Out-Null
+    $env:STEEL_RESULT_ROOT = $ResultRoot
+    $env:STEEL_ALGORITHM_INPUT_ROOTS = $AlgorithmInputRoot
+    $env:STEEL_IMAGE_SERVICE_PORT = [string]$ImageServicePort
+    $env:STEEL_ALGORITHM_SERVICE_PORT = [string]$AlgorithmServicePort
+    $env:STEEL_RESULT_PROXY_ONLY = "1"
+    $ImageExe = Join-Path $RepoRoot "target\image-service\debug\steel-image-service.exe"
+    $AlgorithmExe = Join-Path $RepoRoot "target\algorithm-service\debug\steel-algorithm-service.exe"
+    $ImageServiceLauncher = Start-Process -FilePath $ImageExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru
+    $AlgorithmServiceLauncher = Start-Process -FilePath $AlgorithmExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru
+    $ProcessingDeadline = (Get-Date).AddSeconds($ServiceReadyTimeoutSec)
+    while ((Get-Date) -lt $ProcessingDeadline -and (-not (Test-HttpReady "http://127.0.0.1:$ImageServicePort/api/health/live") -or -not (Test-HttpReady "http://127.0.0.1:$AlgorithmServicePort/api/health/live"))) { Start-Sleep -Milliseconds 250 }
+    if (-not (Test-HttpReady "http://127.0.0.1:$ImageServicePort/api/health/live") -or -not (Test-HttpReady "http://127.0.0.1:$AlgorithmServicePort/api/health/live")) { throw "Image or algorithm service did not become ready." }
+  }
   if (-not $NoService) {
     if (Test-InspectionServiceReady) {
       Write-Host "Using inspection API already running at $ServiceOrigin."
@@ -65,6 +94,8 @@ try {
       if (-not $SkipServiceBuild) {
         & (Join-Path $PSScriptRoot "build-service.ps1") -Profile debug
       }
+
+      $env:STEEL_RESULT_PROXY_ONLY = "1"
 
       New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
       $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -142,4 +173,6 @@ try {
   if ($ServiceLauncher -and -not $ServiceLauncher.HasExited) {
     Stop-Process -Id $ServiceLauncher.Id -Force -ErrorAction SilentlyContinue
   }
+  if ($ImageServiceLauncher -and -not $ImageServiceLauncher.HasExited) { Stop-Process -Id $ImageServiceLauncher.Id -Force -ErrorAction SilentlyContinue }
+  if ($AlgorithmServiceLauncher -and -not $AlgorithmServiceLauncher.HasExited) { Stop-Process -Id $AlgorithmServiceLauncher.Id -Force -ErrorAction SilentlyContinue }
 }

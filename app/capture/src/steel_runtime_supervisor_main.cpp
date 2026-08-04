@@ -489,13 +489,21 @@ bool is_secret_environment_name(const std::string &name) {
   static const std::vector<std::string> names = {
       "TRIGGER_SHARED_SECRET", "TRIGGER_OPERATOR_TOKEN", "STEEL_DATABASE_URL",
       "STEEL_BOOTSTRAP_ADMIN_PASSWORD"};
-  return std::find(names.begin(), names.end(), name) != names.end();
+  return std::find(names.begin(), names.end(), name) != names.end() ||
+         name.rfind("STEEL_BKV_", 0) == 0;
 }
 
 bool is_public_environment_name(const std::string &name) {
   static const std::vector<std::string> names = {
       "STEEL_RUNTIME_PROFILE",
       "STEEL_ALGORITHM_MODE",
+      "STEEL_RESULT_ROOT",
+      "STEEL_RESULT_PROXY_ONLY",
+      "STEEL_CAPTURE_MANAGED_BY_SUPERVISOR",
+      "STEEL_IMAGE_SERVICE_PORT",
+      "STEEL_ALGORITHM_SERVICE_PORT",
+      "STEEL_IMAGE_PROXY",
+      "STEEL_ALGORITHM_INPUT_ROOTS",
       "BAR_SURFACE_MOCK_DEFECT_COUNT",
       "STEEL_ALGORITHM_ACCEPTANCE_REPORT",
       "STEEL_ALGORITHM_CALIBRATION_PATH",
@@ -636,6 +644,15 @@ bool configure_environment(std::string &error) {
                           (g_runtime_root / "algorithm-core" / "steel_bar_surface_core.exe").c_str());
   SetEnvironmentVariableW(L"STEEL_SERVICE_CONFIG_DIR",
                           (g_state_root / "service").c_str());
+  SetEnvironmentVariableW(L"STEEL_RESULT_ROOT",
+                          (g_state_root / "result-data").c_str());
+  SetEnvironmentVariableW(L"STEEL_RESULT_PROXY_ONLY", L"1");
+  SetEnvironmentVariableW(L"STEEL_CAPTURE_MANAGED_BY_SUPERVISOR", L"1");
+  SetEnvironmentVariableW(L"STEEL_IMAGE_SERVICE_PORT", L"4874");
+  SetEnvironmentVariableW(L"STEEL_ALGORITHM_SERVICE_PORT", L"4875");
+  SetEnvironmentVariableW(L"STEEL_IMAGE_PROXY", L"1");
+  SetEnvironmentVariableW(L"STEEL_ALGORITHM_INPUT_ROOTS",
+                          (g_state_root / "algorithm-input").c_str());
   SetEnvironmentVariableW(L"STEEL_ALGORITHM_CONFIG",
                           (g_runtime_root / "config" / "algorithm" /
                            "bar-surface-production.json").c_str());
@@ -755,6 +772,7 @@ bool validate_production_environment(std::string &error) {
 
 bool child_inherits_environment_name(const ChildSpec &spec, const std::wstring &name) {
   if (_wcsicmp(name.c_str(), L"STEEL_RUNTIME_SECRET_ENV_FILE") == 0) return false;
+  if (name.rfind(L"STEEL_BKV_", 0) == 0) return spec.name == L"algorithm";
   const bool shared = _wcsicmp(name.c_str(), L"TRIGGER_SHARED_SECRET") == 0;
   const bool operator_token = _wcsicmp(name.c_str(), L"TRIGGER_OPERATOR_TOKEN") == 0;
   const bool database = _wcsicmp(name.c_str(), L"STEEL_DATABASE_URL") == 0;
@@ -792,6 +810,15 @@ std::optional<std::vector<wchar_t>> child_environment_block(const ChildSpec &spe
 
 std::vector<ChildSpec> child_specs() {
   return {
+      {L"image", g_runtime_root / "service" / "steel-image-service.exe",
+       g_state_root / "work" / "image", L"", 4874, "/api/health/live", "\"status\":\"live\"",
+       15000},
+      {L"algorithm", g_runtime_root / "service" / "steel-algorithm-service.exe",
+       g_state_root / "work" / "algorithm", L"", 4875, "/api/health/live", "\"status\":\"live\"",
+       20000},
+      {L"capture", g_runtime_root / "capture-headless" / "steel_capture_service.exe",
+       g_state_root / "work" / "capture", L"--port 4317", 4317, "/health", "\"service\":\"steel_capture_service\"",
+       30000},
       {L"service", g_runtime_root / "service" / "steel-inspection-service.exe",
        g_state_root / "work" / "service", L"", 4873, "/api/health/live", "\"status\":\"live\"",
        20000},
@@ -809,6 +836,8 @@ bool validate_runtime(std::string &error) {
   }
   for (const auto &path : {g_runtime_root / "capture-headless" /
                                "steel_capture_service.exe",
+                           g_runtime_root / "service" / "steel-image-service.exe",
+                           g_runtime_root / "service" / "steel-algorithm-service.exe",
                            g_runtime_root / "algorithm-core" / "steel_bar_surface_core.exe",
                            g_runtime_root / "config" / "capture",
                            g_runtime_root / "config" / "algorithm" /
@@ -836,8 +865,12 @@ bool validate_state_root(std::string &error) {
                            g_state_root / "logs",
                            g_state_root / "service",
                            g_state_root / "capture-config",
+                           g_state_root / "result-data",
+                           g_state_root / "algorithm-input",
                            g_state_root / "temp",
                            g_state_root / "work" / "capture",
+                           g_state_root / "work" / "image",
+                           g_state_root / "work" / "algorithm",
                            g_state_root / "work" / "trigger",
                            g_state_root / "work" / "service"}) {
     if (!fs::exists(path)) {

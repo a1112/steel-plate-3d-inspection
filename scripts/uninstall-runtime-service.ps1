@@ -382,7 +382,7 @@ function Wait-ServiceRegistrationAbsent {
 
 function Get-RuntimePortBindings {
   $Bindings = [System.Collections.Generic.List[object]]::new()
-  foreach ($Port in 4317, 4873, 4881, 4882, 4883) {
+  foreach ($Port in 4317, 4873, 4874, 4875, 4881, 4882, 4883) {
     foreach ($Connection in @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)) {
       $Bindings.Add([pscustomobject]@{
         Protocol = 'TCP'

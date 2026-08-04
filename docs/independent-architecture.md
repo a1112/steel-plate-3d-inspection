@@ -94,7 +94,7 @@ Rust readiness exposes separate `algorithm` and `productionPolicy` checks. Missi
 The Rust service reads these environment variables:
 
 - `STEEL_CAPTURE_PROVIDER=headless-cpp`
-  Rust starts and supervises `steel_capture_service.exe`.
+  The Windows runtime Supervisor starts and supervises `steel_capture_service.exe`; Rust only proxies its health/API.
 
 - `STEEL_CAPTURE_PROVIDER=external-api`
   Rust connects to another compatible capture API process.
@@ -103,7 +103,7 @@ The Rust service reads these environment variables:
   Rust does not connect to a local capture API and uses the simulated eight-camera fallback.
 
 - `STEEL_CAPTURE_PROVIDER=bkv`
-  Rust starts no camera SDK process. `config/project.json` must select the
+  The Supervisor starts no camera SDK process in BKV mode. `config/project.json` must select the
   six-camera BKV profile, and the converter must have published its standard
   store before records are available. Capture management and 3D reconstruction
   capabilities remain unavailable; offline replay and backend configuration
@@ -126,14 +126,14 @@ For headless mode, `CAPTURE_SERVICE_PORT` can still be used and defaults to `431
 
 Production delivery has two independent installation lifecycles:
 
-1. The background runtime package is placed in a protected machine directory and registered as the `SteelInspectionRuntime` Windows service. The SCM supervisor owns the Rust and trigger processes; Rust owns the nested capture child lifecycle.
+1. The background runtime package is placed in a protected machine directory and registered as the `SteelInspectionRuntime` Windows service. The SCM supervisor owns the image, algorithm, capture, business, and trigger processes; the business service never starts a raw-source or algorithm child.
 2. The signed Tauri MSI/NSIS installs the operator desktop client. Closing or uninstalling it does not stop or uninstall the background service.
 
 The desktop installer does not currently install the service, and the service installer does not currently install the desktop client. Tauri now selects the offline WebView2 installer and per-machine NSIS mode; formal packaging requires a Microsoft-signed `VC_redist.x64.exe`, one MSI, one NSIS, valid timestamped signatures, and the desktop EXE. Camera SDK/driver, database client, signature, and target-machine prerequisites still belong to the release/deployment boundary rather than to the application runtime graph. See [release-deployment-and-operations.md](release-deployment-and-operations.md).
 
 ## Runtime Rules
 
-- Production deployment uses one Windows SCM host named `SteelInspectionRuntime`. The host owns no SDK or business logic; it injects reviewed environment files, starts Rust and then the trigger gateway with loopback application-level readiness gates, stops them in reverse order, and applies a bounded outer restart policy. Rust starts and contains `steel_capture_service.exe` in a nested Job Object, owns its readiness/restart budget and capture log, and terminates it before Rust exits. The outer host still atomically publishes `StateRoot/service/supervisor-status.json`; whole-runtime restart-budget exhaustion survives process exit, while capture-only exhaustion is reported in Rust health and persistent system-health alarms. The desktop client remains independent of both lifecycles. Source/static preflight is not evidence that SCM state, business drain, continuous log rotation, ACLs, recovery, or upgrade rollback work on the target machine.
+- Production deployment uses one Windows SCM host named `SteelInspectionRuntime`. The host owns no SDK or business logic; it injects reviewed environment files, starts image, algorithm, capture, business, and trigger processes with loopback application-level readiness gates, stops them in reverse order, and applies a bounded outer restart policy. The outer host atomically publishes `StateRoot/service/supervisor-status.json`; whole-runtime restart-budget exhaustion survives process exit, while per-process failures are reported in health and persistent system-health alarms. The desktop client remains independent of all backend lifecycles. Source/static preflight is not evidence that SCM state, business drain, continuous log rotation, ACLs, recovery, or upgrade rollback work on the target machine.
 - Exactly one process may own camera SDK handles; the formal owner is `steel_capture_service.exe`.
 - The Rust service is the API gateway and business orchestrator, not a camera driver.
 - Rust persists calibration dispatch/reconciliation intent and result, while C++ remains the only process that executes SDK calibration. C++ atomically stages known-good previous files with SHA-256 before formal eight-camera writes; those file-only tokens survive restart, while the vendor runtime structure stays process-local and is never serialized.

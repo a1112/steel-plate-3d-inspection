@@ -16,6 +16,7 @@ ctrlc = "3"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+steel-inspection-result-contract = { path = "../result-contract" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

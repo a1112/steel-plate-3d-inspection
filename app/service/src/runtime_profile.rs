@@ -83,6 +83,10 @@ pub struct RuntimeStorage {
     pub cache_root: String,
     #[serde(default)]
     pub converter_origin: String,
+    #[serde(default)]
+    pub result_root: String,
+    #[serde(default)]
+    pub result_catalog_path: String,
 }
 
 impl Default for RuntimeStorage {
@@ -94,6 +98,8 @@ impl Default for RuntimeStorage {
             catalog_path: String::new(),
             cache_root: String::new(),
             converter_origin: String::new(),
+            result_root: String::new(),
+            result_catalog_path: String::new(),
         }
     }
 }

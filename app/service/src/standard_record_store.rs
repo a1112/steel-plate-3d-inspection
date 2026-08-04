@@ -7,6 +7,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfiguredCamera {
@@ -92,6 +93,8 @@ pub struct ConvertedLocalStore {
     catalog_path: PathBuf,
     cameras: Vec<ConfiguredCamera>,
     camera_orders: HashMap<String, usize>,
+    verified_records: Mutex<HashSet<String>>,
+    verified_files: Mutex<HashSet<String>>,
 }
 
 impl ConvertedLocalStore {
@@ -136,6 +139,8 @@ impl ConvertedLocalStore {
             catalog_path,
             cameras,
             camera_orders,
+            verified_records: Mutex::new(HashSet::new()),
+            verified_files: Mutex::new(HashSet::new()),
         })
     }
 
@@ -158,9 +163,17 @@ impl ConvertedLocalStore {
                 "converted record path must be beneath records",
             ));
         }
-        let directory = fs::canonicalize(self.root.join(relative)).map_err(|error| {
+        let directory = fs::canonicalize(self.root.join(&relative)).map_err(|error| {
             StoreError::new(format!("converted record directory unavailable: {error}"))
         })?;
+        if self
+            .verified_records
+            .lock()
+            .map(|records| records.contains(relative.to_string_lossy().as_ref()))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         if !directory.starts_with(&self.root)
             || !directory.is_dir()
             || !directory.join("record.json").is_file()
@@ -176,10 +189,16 @@ impl ConvertedLocalStore {
             .map_err(|error| {
                 StoreError::new(format!("converted record metadata invalid: {error}"))
             })?;
-        if record.get("schema").and_then(Value::as_str) != Some("steel.standard-record.v2") {
+        if !matches!(
+            record.get("schema").and_then(Value::as_str),
+            Some("steel.standard-record.v2") | Some("steel.inspection-result.v1")
+        ) {
             return Err(StoreError::new(
-                "converted record layout is V1; run the standard-record V2 migration",
+                "converted record layout is not a supported unified result; run the V2 migration or publish steel.inspection-result.v1",
             ));
+        }
+        if let Ok(mut records) = self.verified_records.lock() {
+            records.insert(relative.to_string_lossy().into_owned());
         }
         Ok(())
     }
@@ -214,7 +233,8 @@ impl ConvertedLocalStore {
             length_mm: metadata.get("lengthMm").and_then(Value::as_f64),
             outer_diameter_mm: metadata
                 .get("outerDiameterLegacyValue")
-                .and_then(Value::as_f64),
+                .and_then(Value::as_f64)
+                .or_else(|| metadata.get("outerDiameterMm").and_then(Value::as_f64)),
             wall_thickness_mm: metadata.get("wallThicknessMm").and_then(Value::as_f64),
         })
     }
@@ -347,7 +367,7 @@ impl InspectionRecordStore for ConvertedLocalStore {
             let size = u64::try_from(declared_size)
                 .map_err(|_| StoreError::new("capture size is invalid"))?;
             let relative = validated_relative(&relative, "capture path")?;
-            let path = fs::canonicalize(self.root.join(relative)).map_err(|error| {
+            let path = fs::canonicalize(self.root.join(&relative)).map_err(|error| {
                 StoreError::new(format!("indexed capture file unavailable: {error}"))
             })?;
             if !path.starts_with(&self.root) || !path.is_file() {
@@ -360,11 +380,21 @@ impl InspectionRecordStore for ConvertedLocalStore {
             if metadata.len() != size {
                 return Err(StoreError::new("indexed capture file size mismatch"));
             }
-            if declared_hash.len() != 64
-                || !declared_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                || sha256_file(&path)? != declared_hash.to_ascii_lowercase()
-            {
-                return Err(StoreError::new("indexed capture file hash mismatch"));
+            let already_verified = self
+                .verified_files
+                .lock()
+                .map(|files| files.contains(&relative.to_string_lossy().into_owned()))
+                .unwrap_or(false);
+            if !already_verified {
+                if declared_hash.len() != 64
+                    || !declared_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || sha256_file(&path)? != declared_hash.to_ascii_lowercase()
+                {
+                    return Err(StoreError::new("indexed capture file hash mismatch"));
+                }
+                if let Ok(mut files) = self.verified_files.lock() {
+                    files.insert(relative.to_string_lossy().into_owned());
+                }
             }
             files.push(CaptureFileDto {
                 id: file_id,

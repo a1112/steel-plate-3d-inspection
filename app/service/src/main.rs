@@ -1355,6 +1355,25 @@ impl CaptureServiceManager {
             return;
         }
 
+        // In the packaged runtime the Windows Supervisor owns the capture child.
+        // The business service remains a read-only proxy for its health and API.
+        if env::var("STEEL_CAPTURE_MANAGED_BY_SUPERVISOR").as_deref() == Ok("1") {
+            let listening = self.endpoint_listening();
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.desired_running = true;
+                lifecycle.phase = if listening { "ready" } else { "degraded" };
+                lifecycle.pid = None;
+                if listening {
+                    lifecycle.ready_at.get_or_insert_with(current_time_millis);
+                    lifecycle.last_error.clear();
+                } else {
+                    lifecycle.ready_at = None;
+                    lifecycle.last_error = "capture endpoint unavailable (owned by runtime supervisor)".to_string();
+                }
+            }
+            return;
+        }
+
         if self.provider.is_embedded() {
             if let Ok(mut lifecycle) = self.lifecycle.lock() {
                 lifecycle.phase = if lifecycle.desired_running {
@@ -1581,6 +1600,9 @@ impl CaptureServiceManager {
     }
 
     fn stop(&self) -> bool {
+        if env::var("STEEL_CAPTURE_MANAGED_BY_SUPERVISOR").as_deref() == Ok("1") {
+            return true;
+        }
         if self.provider == CaptureProvider::Bkv {
             return true;
         }
@@ -1624,6 +1646,10 @@ impl CaptureServiceManager {
     }
 
     fn shutdown(&self) {
+        if env::var("STEEL_CAPTURE_MANAGED_BY_SUPERVISOR").as_deref() == Ok("1") {
+            self.supervisor_shutdown.store(true, Ordering::Release);
+            return;
+        }
         let _ = self.stop();
         self.supervisor_shutdown.store(true, Ordering::Release);
     }
@@ -4713,6 +4739,44 @@ fn algorithm_calibration_binding_valid(report: &Value, calibration: &Value) -> b
 }
 
 fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
+    if env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1") {
+        let image = bounded_health_http_get(
+            "http://127.0.0.1:4874",
+            "/api/health/live",
+            Duration::from_millis(800),
+        );
+        let algorithm = bounded_health_http_get(
+            "http://127.0.0.1:4875",
+            "/api/health/live",
+            Duration::from_millis(800),
+        );
+        let image_ok = image.as_ref().is_ok_and(|response| {
+            response.status_code == 200
+                && String::from_utf8_lossy(&response.body).contains("steel-image-service")
+        });
+        let algorithm_ok = algorithm.as_ref().is_ok_and(|response| {
+            response.status_code == 200
+                && String::from_utf8_lossy(&response.body).contains("steel-algorithm-service")
+        });
+        let result_root = env::var("STEEL_RESULT_ROOT").ok().map(PathBuf::from);
+        let result_ready = result_root
+            .as_ref()
+            .is_some_and(|root| root.join("catalog.db").is_file());
+        let ready = image_ok && algorithm_ok && result_ready;
+        return (
+            ready,
+            json!({
+                "ok": ready,
+                "readyContribution": ready,
+                "status": if ready { "external-processing-services-ready" } else { "external-processing-services-not-ready" },
+                "required": true,
+                "imageService": { "ok": image_ok, "origin": "http://127.0.0.1:4874" },
+                "algorithmService": { "ok": algorithm_ok, "origin": "http://127.0.0.1:4875" },
+                "resultStore": { "ok": result_ready, "root": result_root },
+                "reason": if !image_ok { json!("image_service_unavailable") } else if !algorithm_ok { json!("algorithm_service_unavailable") } else if !result_ready { json!("unified_result_catalog_unavailable") } else { Value::Null }
+            }),
+        );
+    }
     if state.capture.provider == CaptureProvider::Simulated {
         let allowed =
             synthetic_algorithm_fixtures_allowed(&state.runtime_profile, &state.algorithm_mode);
@@ -14752,8 +14816,14 @@ fn bkv_file_response(state: &ServiceState, query: &str) -> Vec<u8> {
     }
 }
 
+fn unified_result_store_enabled(state: &ServiceState) -> bool {
+    state.standard_record_store.is_some()
+        && (state.runtime_config.data_source == "converted-local"
+            || env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1"))
+}
+
 fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
-    if state.runtime_config.data_source == "bkv-online-mysql" {
+    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
         return match state
             .bkv_online
             .as_ref()
@@ -14772,7 +14842,7 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
             ),
         };
     }
-    if state.runtime_config.data_source == "converted-local" {
+    if unified_result_store_enabled(state) {
         let Some(store) = state.standard_record_store.as_ref() else {
             return http_response(
                 "503 Service Unavailable",
@@ -15250,7 +15320,7 @@ fn schedule_inspection_world_cache(
     let cache_root = inspection_world_cache_root(state);
     let cache_record_id = record_id.to_string();
     let cache_revision = source_revision.to_string();
-    if state.runtime_config.data_source == "bkv-online-mysql" {
+    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
         // Online records can contain thousands of tiles. Filling the complete
         // pyramid as soon as metadata is requested competes with the selected
         // record for SMB bandwidth and makes rapid record switching slower.
@@ -15258,7 +15328,7 @@ fn schedule_inspection_world_cache(
         // `inspection_world_tile_response`.
         return;
     }
-    if state.runtime_config.data_source == "converted-local" {
+    if unified_result_store_enabled(state) {
         let Ok(converted) = load_converted_inspection_world(state, record_id) else {
             return;
         };
@@ -15324,7 +15394,7 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
-    if state.runtime_config.data_source == "bkv-online-mysql" {
+    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
         return match state
             .bkv_online
             .as_ref()
@@ -15343,7 +15413,7 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
             ),
         };
     }
-    if state.runtime_config.data_source == "converted-local" {
+    if unified_result_store_enabled(state) {
         return match load_converted_inspection_world(state, &record_id) {
             Ok(converted) => {
                 let source_revision = state
@@ -15427,7 +15497,7 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
-    if state.runtime_config.data_source == "converted-local" {
+    if unified_result_store_enabled(state) {
         if query_value(query, "format").as_deref() != Some("binary") {
             return http_response(
                 "406 Not Acceptable",
@@ -15475,7 +15545,7 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
             ),
         };
     }
-    if state.runtime_config.data_source != "bkv-online-mysql" {
+    if state.runtime_config.data_source != "bkv-online-mysql" || unified_result_store_enabled(state) {
         return http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -15550,7 +15620,7 @@ fn inspection_world_reconstruction_parameters_response(
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
-    if state.runtime_config.data_source != "converted-local" {
+    if !unified_result_store_enabled(state) {
         return http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -15595,7 +15665,7 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
-    if state.runtime_config.data_source == "bkv-online-mysql" {
+    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
         return match state
             .bkv_online
             .as_ref()
@@ -15614,7 +15684,7 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
             ),
         };
     }
-    if state.runtime_config.data_source == "converted-local" {
+    if unified_result_store_enabled(state) {
         return match load_converted_inspection_world(state, &record_id) {
             Ok(converted) => {
                 let defects = converted
@@ -15850,7 +15920,7 @@ fn inspection_world_source_revision(
     state: &ServiceState,
     record_id: &str,
 ) -> Result<String, String> {
-    if state.runtime_config.data_source == "bkv-online-mysql" {
+    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
         let meta = state
             .bkv_online
             .as_ref()
@@ -15862,7 +15932,7 @@ fn inspection_world_source_revision(
             .map(str::to_string)
             .ok_or_else(|| "BKV online source revision is unavailable".to_string());
     }
-    if state.runtime_config.data_source == "converted-local" {
+    if unified_result_store_enabled(state) {
         if let Ok(cache) = state.converted_inspection_world_cache.lock() {
             if let Some(entry) = cache.get(record_id) {
                 return Ok(entry.source_hash.clone());
@@ -15961,6 +16031,30 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
             .to_string(),
         );
     }
+    if unified_result_store_enabled(state)
+        && env::var("STEEL_IMAGE_PROXY").as_deref() == Ok("1")
+    {
+        let image_path = format!(
+            "/api/tile?recordId={record_id}&cameraId=C{camera_id}&sequenceNo=0&kind=intensity&level={level}&x={tile_x}&y={tile_y}"
+        );
+        if let Ok(response) = bounded_local_http_request(
+            "http://127.0.0.1:4874",
+            "GET",
+            &image_path,
+            "",
+            Duration::from_millis(1_200),
+            &[],
+        ) {
+            if (200..300).contains(&response.status_code) {
+                return http_bytes_response_with_headers(
+                    "200 OK",
+                    "image/jpeg",
+                    &response.body,
+                    &[("Cache-Control", "private, max-age=31536000, immutable")],
+                );
+            }
+        }
+    }
     let cache_root = inspection_world_cache_root(state);
     let result = inspection_world::serve_cached_tile(
         &cache_root,
@@ -15968,13 +16062,13 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
         &source_revision,
         request,
         || {
-            let generated = if state.runtime_config.data_source == "bkv-online-mysql" {
+            let generated = if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
                 state
                     .bkv_online
                     .as_ref()
                     .ok_or_else(|| "BKV online source is unavailable".to_string())
                     .and_then(|source| source.inspection_world_tile(&record_id, request))
-            } else if state.runtime_config.data_source == "converted-local" {
+            } else if unified_result_store_enabled(state) {
                 load_converted_inspection_world(state, &record_id).and_then(|converted| {
                     inspection_world::compose_camera_tile(
                         &converted.world,
@@ -16075,7 +16169,7 @@ fn inspection_world_frame_response(state: &ServiceState, query: &str) -> Vec<u8>
         }
         _ => None,
     };
-    if state.runtime_config.data_source != "converted-local" {
+    if !unified_result_store_enabled(state) {
         return http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -21792,11 +21886,24 @@ fn load_converted_surface(
 fn configured_standard_record_store(
     profile: &runtime_profile::RuntimeProfile,
 ) -> Option<Arc<standard_record_store::ConvertedLocalStore>> {
-    if profile.data_source != "converted-local" {
+    let external_result_root = env::var("STEEL_RESULT_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| (!profile.storage.result_root.trim().is_empty()).then(|| workspace_root().join(&profile.storage.result_root)));
+    if profile.data_source != "converted-local" && external_result_root.is_none() {
         return None;
     }
-    let root = workspace_root().join(&profile.storage.converted_root);
-    let catalog = workspace_root().join(&profile.storage.catalog_path);
+    let root = external_result_root.clone().unwrap_or_else(|| workspace_root().join(&profile.storage.converted_root));
+    let catalog = external_result_root
+        .clone()
+        .map(|path| {
+            if !profile.storage.result_catalog_path.trim().is_empty() && env::var("STEEL_RESULT_ROOT").is_err() {
+                workspace_root().join(&profile.storage.result_catalog_path)
+            } else {
+                path.join("catalog.db")
+            }
+        })
+        .unwrap_or_else(|| workspace_root().join(&profile.storage.catalog_path));
     let cameras = profile
         .cameras
         .iter()
@@ -21903,9 +22010,14 @@ fn main() -> std::io::Result<()> {
         capture_provider,
         &runtime_config.capture,
     ));
-    let bkv_online = runtime
-        .block_on(bkv_online::BkvSource::from_env(&runtime_config))
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+    let bkv_online = if env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1") {
+        println!("raw BKV access disabled: algorithm service owns source ingestion");
+        None
+    } else {
+        runtime
+            .block_on(bkv_online::BkvSource::from_env(&runtime_config))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?
+    };
     if let Some(source) = bkv_online.as_ref() {
         runtime
             .block_on(source.initialize())

@@ -275,7 +275,7 @@ $ExpectedContract = [ordered]@{
     qtRemoved = $true
     windowsServiceSupervisor = $true
     windowsServiceName = "SteelInspectionRuntime"
-    orderedChildren = @("capture", "trigger", "service")
+    orderedChildren = @("image", "algorithm", "capture", "service", "trigger")
     gracefulStop = "CTRL_BREAK-then-timeout-terminate"
     restartBudget = "5-per-10-minutes"
     logRotation = "50MiB-5-generations"
@@ -397,7 +397,7 @@ if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) {
       $Contract.runtime.qtRemoved -eq $true -and
       $Contract.runtime.windowsServiceSupervisor -eq $true -and
       [string]$Contract.runtime.windowsServiceName -eq "SteelInspectionRuntime" -and
-      (Test-ExactStringSet @($Contract.runtime.orderedChildren) @("capture", "trigger", "service")) -and
+      (Test-ExactStringSet @($Contract.runtime.orderedChildren) @("image", "algorithm", "capture", "service", "trigger")) -and
       [string]$Contract.runtime.gracefulStop -eq "CTRL_BREAK-then-timeout-terminate" -and
       [string]$Contract.runtime.restartBudget -eq "5-per-10-minutes" -and
       [string]$Contract.runtime.logRotation -eq "50MiB-5-generations"

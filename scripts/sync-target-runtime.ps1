@@ -106,6 +106,12 @@ Copy-RequiredFile (Join-Path $ServiceBuild "steel-inspection-service.exe") $Serv
 $TriggerBuild = Join-Path $RepoRoot "target\trigger\$ServiceProfile"
 Copy-RequiredFile (Join-Path $TriggerBuild "steel-trigger-gateway.exe") $TriggerOut
 Copy-RequiredFile (Join-Path $TriggerBuild "steel-trigger-gateway.exe") $ServiceOut
+$AlgorithmServiceBuild = Join-Path $RepoRoot "target\algorithm-service\$ServiceProfile"
+Copy-RequiredFile (Join-Path $AlgorithmServiceBuild "steel-algorithm-service.exe") $ServiceOut
+$ImageServiceBuild = Join-Path $RepoRoot "target\image-service\$ServiceProfile"
+Copy-RequiredFile (Join-Path $ImageServiceBuild "steel-image-service.exe") $ServiceOut
+$TrayBuild = Join-Path $RepoRoot "target\tray\$ServiceProfile"
+Copy-RequiredFile (Join-Path $TrayBuild "steel-inspection-tray.exe") $ServiceOut
 
 $AlgorithmCoreBuild = Join-Path $RepoRoot "target\algorithm-core\$Configuration"
 Copy-RequiredFile (Join-Path $AlgorithmCoreBuild "steel_bar_surface_core.exe") $AlgorithmCoreOut
@@ -486,7 +492,7 @@ Write-Host "  Logs            $LogDir"
 
 Write-RuntimeFile "stop-runtime.ps1" @'
 param(
-  [int[]]$Ports = @(4317, 4873, 4881, 1432)
+  [int[]]$Ports = @(4317, 4873, 4874, 4875, 4881, 1432)
 )
 
 $ErrorActionPreference = "Stop"

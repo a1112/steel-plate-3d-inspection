@@ -948,6 +948,9 @@ function Test-PackagedRuntimeContract {
       "service/steel-runtime-supervisor.exe",
       "service/steel-inspection-service.exe",
       "service/steel-trigger-gateway.exe",
+      "service/steel-image-service.exe",
+      "service/steel-algorithm-service.exe",
+      "service/steel-inspection-tray.exe",
       "algorithm-core/steel_bar_surface_core.exe",
       "capture-headless/nvt_lvm_sdk.dll"
     )
@@ -994,6 +997,12 @@ function Test-PackagedRuntimeContract {
     "service.path" = $Manifest.service.path
     "service.triggerGateway" = $Manifest.service.triggerGateway
     "service.supervisor" = $Manifest.service.supervisor
+    "service.image" = $Manifest.service.image
+    "service.algorithm" = $Manifest.service.algorithm
+    "service.tray" = $Manifest.service.tray
+    "algorithm.service" = $Manifest.algorithm.service
+    "algorithm.resultSchema" = $Manifest.algorithm.resultSchema
+    "algorithm.resultRoot" = $Manifest.algorithm.resultRoot
     "client.path" = $Manifest.client.path
     "config.algorithm" = $Manifest.config.algorithm
     "config.algorithmAcceptanceTemplate" = $Manifest.config.algorithmAcceptanceTemplate
