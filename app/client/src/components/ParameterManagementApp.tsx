@@ -93,6 +93,7 @@ import {
 } from '../services/inspection-api';
 import { Panel } from './Panel';
 import { GlobalConfigurationPanel } from './GlobalConfigurationPanel';
+import { RuntimeLogStatusPanel } from './RuntimeLogStatusPanel';
 import { checkSiteConfig } from '../services/site-config-api';
 
 type JsonToken = {
@@ -496,7 +497,7 @@ function createDefaultExternalIntegrationsDraft(): AdminExternalIntegrations {
   };
 }
 
-type ParameterSection = 'overview' | 'services' | 'data' | 'global-config' | 'config' | 'rules' | 'users' | 'permissions' | 'audit' | 'security';
+type ParameterSection = 'overview' | 'services' | 'runtime-logs' | 'data' | 'global-config' | 'config' | 'rules' | 'users' | 'permissions' | 'audit' | 'security';
 type ConfigurationModuleId =
   | 'conversion'
   | 'data-source'
@@ -1511,6 +1512,7 @@ export function ParameterManagementApp() {
   const allTabs: Array<{ id: ParameterSection; label: string }> = [
     { id: 'overview', label: '总览' },
     { id: 'services', label: '服务' },
+    { id: 'runtime-logs', label: '运行日志' },
     { id: 'data', label: '数据' },
     { id: 'global-config', label: '全局配置' },
     { id: 'config', label: '配置' },
@@ -1523,6 +1525,7 @@ export function ParameterManagementApp() {
   const tabPermissions: Partial<Record<ParameterSection, string>> = {
     overview: 'admin.overview',
     services: 'admin.services',
+    'runtime-logs': 'admin.services',
     data: 'admin.records',
     'global-config': 'admin.config',
     config: 'admin.config',
@@ -1575,6 +1578,32 @@ export function ParameterManagementApp() {
       setActiveSection(tabs[0].id);
     }
   }, [activeSection, tabs]);
+
+  useEffect(() => {
+    if (!authSession || activeSection !== 'data') return undefined;
+    let controller: AbortController | null = null;
+    const synchronize = () => {
+      controller?.abort();
+      controller = new AbortController();
+      const requestController = controller;
+      void fetchAdminRecords({
+        keyword: recordKeyword,
+        status: recordStatus,
+        limit: RECORD_PAGE_SIZE,
+        offset: recordOffset,
+      }, requestController.signal)
+        .then((page) => {
+          if (!requestController.signal.aborted) setRecordPage(page);
+        })
+        .catch(() => undefined);
+    };
+    synchronize();
+    const timer = window.setInterval(synchronize, 10_000);
+    return () => {
+      controller?.abort();
+      window.clearInterval(timer);
+    };
+  }, [activeSection, authSession?.token, recordKeyword, recordOffset, recordStatus]);
 
   if (!authChecked) {
     return (
@@ -2072,13 +2101,15 @@ export function ParameterManagementApp() {
       </section>
       ) : null}
 
+      {activeSection === 'runtime-logs' ? <RuntimeLogStatusPanel /> : null}
+
       {activeSection === 'data' ? (
       <section className="parameter-grid parameter-records-grid">
         <Panel title="检测记录查询" className="parameter-card parameter-record-filter-card">
           <div className="admin-record-filter">
             <label>
               <span>管号 / 记录号</span>
-              <input value={recordKeyword} placeholder="例如 202606131900" onChange={(event) => setRecordKeyword(event.target.value)} />
+              <input value={recordKeyword} placeholder="输入管号或记录号" onChange={(event) => setRecordKeyword(event.target.value)} />
             </label>
             <label>
               <span>状态</span>
@@ -2164,10 +2195,14 @@ export function ParameterManagementApp() {
                         <button type="button" onClick={() => void loadRecordDetail(record)}>
                           查看
                         </button>
-                        <button type="button" className="danger" onClick={() => void deleteRecord(record)}>
-                          <Trash2 size={15} />
-                          删除
-                        </button>
+                        {record.source === 'unified-result' ? (
+                          <span className="admin-record-readonly">统一结果只读</span>
+                        ) : (
+                          <button type="button" className="danger" onClick={() => void deleteRecord(record)}>
+                            <Trash2 size={15} />
+                            删除
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>

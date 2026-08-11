@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-const TILE_SIZE: u32 = 128;
+const TILE_SIZE: u32 = 512;
+const MAX_TILE_LEVEL: u32 = 3;
 
 struct State {
     result_root: PathBuf,
@@ -145,7 +146,7 @@ fn serve_tile(state: &State, query: &str, if_none_match: &str) -> Vec<u8> {
         .get("level")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0)
-        .min(8);
+        .min(MAX_TILE_LEVEL);
     let x = params
         .get("x")
         .and_then(|v| v.parse::<u32>().ok())

@@ -177,6 +177,20 @@ Run the Tauri desktop shell in another terminal:
 scripts/run-tauri-dev.ps1 -ServicePort 4873
 ```
 
+For a BKV online debug session, pass an ignored local environment file so the
+algorithm service receives the production source credentials while the
+inspection service remains a result-store proxy:
+
+```powershell
+scripts/run-tauri-dev.ps1 -EnvFile config/env/bkv-online.env.local
+```
+
+The launcher writes debug service output below `target/run/tauri-dev/logs`,
+requests an initial algorithm rescan, and keeps the Tauri client on the local
+4873 API. In **后台管理 -> 运行日志**, administrators can watch the split
+service probes, result catalog readiness, Supervisor status, and bounded log
+tails; the page refreshes every five seconds and cancels stale requests.
+
 To start the already-built headless capture, Rust, trigger, and static-client processes together, use:
 
 ```powershell

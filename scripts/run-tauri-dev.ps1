@@ -17,9 +17,10 @@ $RunDir = Join-Path $RepoRoot "target\run\tauri-dev"
 . (Join-Path $PSScriptRoot "lib-env.ps1")
 
 Import-EnvFile $EnvFile
-if (-not $env:VITE_INSPECTION_SERVICE_ORIGIN) {
-  $env:VITE_INSPECTION_SERVICE_ORIGIN = "http://127.0.0.1:$ServicePort"
-}
+# Tauri debug mode always talks to the locally started inspection service.
+# Keeping this deterministic prevents an EnvFile production origin from
+# bypassing the split image/algorithm services started below.
+$env:VITE_INSPECTION_SERVICE_ORIGIN = "http://127.0.0.1:$ServicePort"
 
 $NpmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
 $NpmPath = if ($NpmCommand) { $NpmCommand.Source } else { Join-Path $env:ProgramFiles "nodejs\npm.cmd" }
@@ -37,6 +38,9 @@ $AlgorithmServicePort = 4875
 $ProcessingRoot = Join-Path $RunDir "processing"
 $ResultRoot = Join-Path $ProcessingRoot "result-data"
 $AlgorithmInputRoot = Join-Path $ProcessingRoot "algorithm-input"
+$LogRoot = Join-Path $RunDir "logs"
+$env:STEEL_RUNTIME_STATE_ROOT = $RunDir
+$env:STEEL_RUNTIME_LOG_DIR = $LogRoot
 $ImageServiceLauncher = $null
 $AlgorithmServiceLauncher = $null
 $ServiceLauncher = $null
@@ -69,16 +73,41 @@ try {
   if (-not $NoProcessingServices) {
     & (Join-Path $PSScriptRoot "build-image-service.ps1") -Profile debug
     & (Join-Path $PSScriptRoot "build-algorithm-service.ps1") -Profile debug
-    New-Item -ItemType Directory -Force -Path $ResultRoot, $AlgorithmInputRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $RunDir, $LogRoot, $ResultRoot, $AlgorithmInputRoot | Out-Null
     $env:STEEL_RESULT_ROOT = $ResultRoot
     $env:STEEL_ALGORITHM_INPUT_ROOTS = $AlgorithmInputRoot
     $env:STEEL_IMAGE_SERVICE_PORT = [string]$ImageServicePort
     $env:STEEL_ALGORITHM_SERVICE_PORT = [string]$AlgorithmServicePort
     $env:STEEL_RESULT_PROXY_ONLY = "1"
+    $env:STEEL_IMAGE_PROXY = "1"
+    $env:STEEL_CAPTURE_MANAGED_BY_SUPERVISOR = "1"
+    # Historical BKV records are metadata-first.  The algorithm service owns
+    # the bounded raw-frame promotion when the user switches to one of them.
+    $env:STEEL_HISTORY_RECONSTRUCTION = "1"
+    $env:STEEL_ALGORITHM_SERVICE_ORIGIN = "http://127.0.0.1:$AlgorithmServicePort"
+    if (-not $env:STEEL_BKV_HISTORY_RUNS_ROOT) {
+      $HistoryRunsRoot = "D:\steel-inspection\algorithm-data\runs"
+      if (Test-Path $HistoryRunsRoot -PathType Container) {
+        $env:STEEL_BKV_HISTORY_RUNS_ROOT = $HistoryRunsRoot
+      }
+    }
+    if (-not $env:STEEL_BKV_IMAGE_HOST) {
+      $env:STEEL_BKV_IMAGE_HOST = "\\10.5.241.17"
+    }
+    if (-not $env:STEEL_BKV_REFRESH_INTERVAL_MS) {
+      $env:STEEL_BKV_REFRESH_INTERVAL_MS = "10000"
+    }
+    if (-not $env:STEEL_BKV_MYSQL_HOST) {
+      Write-Warning "BKV MySQL environment is not loaded; the record list will refresh from the unified result catalog only. Pass -EnvFile with the machine-local BKV credentials to enable online synchronization."
+    }
     $ImageExe = Join-Path $RepoRoot "target\image-service\debug\steel-image-service.exe"
     $AlgorithmExe = Join-Path $RepoRoot "target\algorithm-service\debug\steel-algorithm-service.exe"
-    $ImageServiceLauncher = Start-Process -FilePath $ImageExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru
-    $AlgorithmServiceLauncher = Start-Process -FilePath $AlgorithmExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru
+    $ImageServiceLauncher = Start-Process -FilePath $ImageExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru `
+      -RedirectStandardOutput (Join-Path $LogRoot "image-service.out.log") `
+      -RedirectStandardError (Join-Path $LogRoot "image-service.err.log")
+    $AlgorithmServiceLauncher = Start-Process -FilePath $AlgorithmExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru `
+      -RedirectStandardOutput (Join-Path $LogRoot "algorithm-service.out.log") `
+      -RedirectStandardError (Join-Path $LogRoot "algorithm-service.err.log")
     $ProcessingDeadline = (Get-Date).AddSeconds($ServiceReadyTimeoutSec)
     while ((Get-Date) -lt $ProcessingDeadline -and (-not (Test-HttpReady "http://127.0.0.1:$ImageServicePort/api/health/live") -or -not (Test-HttpReady "http://127.0.0.1:$AlgorithmServicePort/api/health/live"))) { Start-Sleep -Milliseconds 250 }
     if (-not (Test-HttpReady "http://127.0.0.1:$ImageServicePort/api/health/live") -or -not (Test-HttpReady "http://127.0.0.1:$AlgorithmServicePort/api/health/live")) { throw "Image or algorithm service did not become ready." }
@@ -96,18 +125,30 @@ try {
       }
 
       $env:STEEL_RESULT_PROXY_ONLY = "1"
+      $env:STEEL_IMAGE_PROXY = "1"
+      $env:STEEL_CAPTURE_MANAGED_BY_SUPERVISOR = "1"
 
       New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
+      New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null
       $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-      $StdoutPath = Join-Path $RunDir "service-$Stamp.out.log"
-      $StderrPath = Join-Path $RunDir "service-$Stamp.err.log"
+      $StdoutPath = Join-Path $LogRoot "inspection-service-$Stamp.out.log"
+      $StderrPath = Join-Path $LogRoot "inspection-service-$Stamp.err.log"
       $ServiceArguments = @(
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
         "-File", (Join-Path $PSScriptRoot "run-service.ps1"),
         "-Port", [string]$ServicePort,
-        "-NoCaptureAutostart"
+        "-NoCaptureAutostart",
+        "-RuntimeStateRoot", $RunDir,
+        "-RuntimeLogDir", $LogRoot
       )
+      if (-not $NoProcessingServices) {
+        $ServiceArguments += @(
+          "-ResultRoot", $ResultRoot,
+          "-AlgorithmInputRoot", $AlgorithmInputRoot,
+          "-ResultProxyOnly"
+        )
+      }
       if ($EnvFile -and $EnvFile.Trim().Length -gt 0) {
         $ServiceArguments += @("-EnvFile", [string](Resolve-Path $EnvFile))
       }
@@ -146,8 +187,20 @@ try {
     }
   }
 
+  if (-not $NoProcessingServices) {
+    try {
+      Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://127.0.0.1:$AlgorithmServicePort/internal/v1/reprocess" -Body "{}" -ContentType "application/json" -TimeoutSec 5 | Out-Null
+      Write-Host "Algorithm input scan requested."
+    } catch {
+      Write-Warning "Algorithm input scan request failed: $($_.Exception.Message)"
+    }
+  }
+
   Push-Location $ClientDir
   try {
+    # Invoke the package's `tauri` script and pass Tauri 2's `dev` command
+    # through npm.  The second separator keeps Cargo's --locked flag in the
+    # runner argument list instead of sending it to the application.
     $TauriArguments = @("run", "tauri", "--", "dev", "--", "--locked")
     if ($CargoRegistryMirror -and $CargoRegistryMirror.Trim().Length -gt 0) {
       $NormalizedMirror = $CargoRegistryMirror.Trim().TrimEnd("/") + "/"

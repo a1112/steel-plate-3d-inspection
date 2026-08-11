@@ -74,7 +74,7 @@ describe('runtime dashboard mode', () => {
       kind: 'bkv-online',
       cameraCount: 6,
       requestsOnlineServices: false,
-      requestsStandardRecords: false,
+      requestsStandardRecords: true,
       showsHardwareStatus: false,
       showsCaptureManagement: false,
       showsReconstruction: false,

@@ -19,7 +19,7 @@ import { clampPreviewPositionM, DEFAULT_PLATE_LENGTH_M, type SurfaceDisplayMode 
 import { Panel } from './Panel';
 import { ProductionArtifactView, type ArtifactOrientation } from './ProductionArtifactView';
 import { BkvSectionView } from './BkvReconstructionApp';
-import { InspectionWorldCanvas } from './InspectionWorldCanvas';
+import { InspectionWorldCanvas, type InspectionWorldTileLoading } from './InspectionWorldCanvas';
 
 interface PlateMapProps {
   defectTypes: DefectType[];
@@ -1482,6 +1482,7 @@ export function PlateMap({
   const [displayedWorld, setDisplayedWorld] = useState<DisplayWorld | null>(null);
   const displayedWorldRef = useRef<DisplayWorld | null>(null);
   const [pendingWorld, setPendingWorld] = useState<DisplayWorld | null>(null);
+  const [worldTileProgress, setWorldTileProgress] = useState<InspectionWorldTileLoading | null>(null);
   const [worldLoading, setWorldLoading] = useState(false);
   const [worldUnavailable, setWorldUnavailable] = useState(false);
   const [worldError, setWorldError] = useState('');
@@ -1522,6 +1523,7 @@ export function PlateMap({
     setWorldUnavailable(false);
     setWorldError('');
     setPendingWorld(null);
+    setWorldTileProgress(null);
     if (artifactMode !== 'production' || viewMode !== '2d') return;
     if (!inspectionId) {
       setWorldLoading(false);
@@ -1551,6 +1553,7 @@ export function PlateMap({
             meta,
             defects: [],
           });
+          setWorldTileProgress(null);
         }
         try {
           const defectPayload = await fetchInspectionWorldDefects(inspectionId, controller.signal);
@@ -1581,6 +1584,7 @@ export function PlateMap({
         if (!controller.signal.aborted) {
           setWorldUnavailable(true);
           setWorldLoading(false);
+          setWorldTileProgress(null);
           setWorldError(error instanceof Error ? error.message : '检测图像世界读取失败');
         }
       }
@@ -1790,7 +1794,7 @@ export function PlateMap({
       ) : shouldRenderWorldStack ? (
         <div className="inspection-world-stack" data-testid="inspection-world-stack">
           {displayedWorld ? <InspectionWorldCanvas
-            key={`displayed:${displayedWorld.recordId}:${displayedWorld.meta.sourceFrameCount}:${displayedWorld.meta.world.width}:${displayedWorld.meta.world.height}`}
+            key={`world:${displayedWorld.recordId}:${displayedWorld.meta.sourceFrameCount}:${displayedWorld.meta.world.width}:${displayedWorld.meta.world.height}`}
             className="online-inspection-world inspection-world-displayed"
             recordId={displayedWorld.recordId}
             meta={displayedWorld.meta}
@@ -1802,10 +1806,11 @@ export function PlateMap({
             focusCameraId={selectedDefect?.cameraIndex}
             focusPositionRatio={selectedDefectPositionRatio}
             colorMode={twoDDisplayMode}
+            suspendLoading={switchingWorld}
             onVisibleRangeChange={onVisibleRangeChange}
           /> : null}
           {activePendingWorld ? <InspectionWorldCanvas
-            key={`pending:${activePendingWorld.recordId}:${activePendingWorld.meta.sourceFrameCount}:${activePendingWorld.meta.world.width}:${activePendingWorld.meta.world.height}`}
+            key={`world:${activePendingWorld.recordId}:${activePendingWorld.meta.sourceFrameCount}:${activePendingWorld.meta.world.width}:${activePendingWorld.meta.world.height}`}
             className="online-inspection-world inspection-world-preparing"
             recordId={activePendingWorld.recordId}
             meta={activePendingWorld.meta}
@@ -1815,13 +1820,15 @@ export function PlateMap({
             focusCameraId={selectedDefect?.cameraIndex}
             focusPositionRatio={selectedDefectPositionRatio}
             colorMode={twoDDisplayMode}
-            onFirstPaint={() => {
+            onFirstScreenReady={() => {
               displayedWorldRef.current = activePendingWorld;
               setDisplayedWorld(activePendingWorld);
               setPendingWorld((current) => current === activePendingWorld ? null : current);
+              setWorldTileProgress(null);
               setWorldLoading(false);
               setWorldError('');
             }}
+            onTileLoadingChange={setWorldTileProgress}
           /> : null}
           {!displayedWorld ? <div
             className="inspection-world-loading-skeleton"
@@ -1837,6 +1844,17 @@ export function PlateMap({
             aria-label="正在切换 BKV 检测记录"
           >
             正在准备记录 {inspectionId}…
+          </div> : null}
+          {displayedWorld && switchingWorld && worldTileProgress ? <div
+            className="inspection-world-switch-progress"
+            role="status"
+            aria-label="首屏瓦片加载进度"
+          >
+            首屏瓦片 {worldTileProgress.loadedFirstScreenTiles}/{worldTileProgress.firstScreenTiles}
+            <span>
+              候选 {worldTileProgress.loadCandidates} · 并发 {worldTileProgress.activeRequests}/8 · 待完成 {worldTileProgress.pendingTiles}
+              {worldTileProgress.failedTiles ? ` · 失败 ${worldTileProgress.failedTiles}` : ''}
+            </span>
           </div> : null}
           {worldError ? <div className="inspection-world-record-error" role="alert">
             <strong>当前记录图像读取失败</strong>

@@ -2096,7 +2096,8 @@ fn build_d3img_surface(
                 0
             } else {
                 // 确保不超出总高度范围
-                let calculated = target_row * (total_height.saturating_sub(1)) / (rows.saturating_sub(1));
+                let calculated =
+                    target_row * (total_height.saturating_sub(1)) / (rows.saturating_sub(1));
                 calculated.min(total_height.saturating_sub(1))
             };
 

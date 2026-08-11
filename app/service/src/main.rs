@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as UnixMetadataExt, OpenOptionsExt as UnixOpenOptionsExt};
@@ -1368,7 +1368,8 @@ impl CaptureServiceManager {
                     lifecycle.last_error.clear();
                 } else {
                     lifecycle.ready_at = None;
-                    lifecycle.last_error = "capture endpoint unavailable (owned by runtime supervisor)".to_string();
+                    lifecycle.last_error =
+                        "capture endpoint unavailable (owned by runtime supervisor)".to_string();
                 }
             }
             return;
@@ -3819,6 +3820,34 @@ fn capture_health_component_with_bkv_runtime(
     if let Some(lifecycle) = lifecycle.as_object_mut() {
         lifecycle.remove("lastError");
     }
+    // In split runtime/proxy mode the algorithm service owns BKV MySQL and
+    // the six read-only image shares.  The business service must not try to
+    // open the legacy replay root (or report it as a readiness failure).
+    // Its capture contribution is satisfied by the external processing
+    // services and the unified result store instead.
+    if unified_result_store_enabled(state) && state.runtime_config.data_source == "bkv-online-mysql"
+    {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "status": "proxy-only",
+                "provider": "bkv",
+                "source": "algorithm-service",
+                "managed": false,
+                "connected": false,
+                "apiReachable": true,
+                "sdkRequired": false,
+                "sdkReady": Value::Null,
+                "physicalCamerasOnline": 0,
+                "offlineCameraFiles": 0,
+                "onlineImageShares": 6,
+                "latencyMs": 0,
+                "reason": Value::Null,
+                "lifecycle": lifecycle,
+            }),
+        );
+    }
     if state.capture.provider == CaptureProvider::Bkv {
         let runtime = shared_bkv_runtime.cloned().unwrap_or_else(|| {
             production_tasks::configured_bkv_root().and_then(|root| {
@@ -4044,6 +4073,44 @@ fn storage_health_component_with_timeout_and_bkv_runtime(
         &Result<production_tasks::BkvReplayRuntime, production_tasks::BkvRejection>,
     >,
 ) -> (bool, Value) {
+    if unified_result_store_enabled(state) && state.runtime_config.data_source == "bkv-online-mysql"
+    {
+        let root = env::var("STEEL_RESULT_ROOT")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                (!state.runtime_config.storage.result_root.trim().is_empty())
+                    .then(|| workspace_root().join(&state.runtime_config.storage.result_root))
+            });
+        let catalog_ready = root
+            .as_ref()
+            .map(|path| path.join("catalog.db").is_file())
+            .unwrap_or(false);
+        return (
+            catalog_ready,
+            json!({
+                "ok": catalog_ready,
+                "status": if catalog_ready { "unified-result-store" } else { "unavailable" },
+                "provider": "bkv",
+                "simulated": false,
+                "apiReachable": true,
+                "rootExists": root.as_ref().is_some_and(|path| path.is_dir()),
+                "rootWritable": Value::Null,
+                "capacityAvailable": Value::Null,
+                "capacityBytes": Value::Null,
+                "freeBytes": Value::Null,
+                "freePercent": Value::Null,
+                "level": if catalog_ready { "ready" } else { "unavailable" },
+                "warningReason": Value::Null,
+                "queueAccepting": Value::Null,
+                "queueRequired": false,
+                "httpStatus": Value::Null,
+                "latencyMs": 0,
+                "reason": if catalog_ready { Value::Null } else { json!("unified_result_catalog_unavailable") },
+                "rawSourceOwner": "steel-algorithm-service",
+            }),
+        );
+    }
     if state.capture.provider == CaptureProvider::Bkv {
         let runtime = shared_bkv_runtime.cloned().unwrap_or_else(|| {
             production_tasks::configured_bkv_root().and_then(|root| {
@@ -4901,19 +4968,20 @@ fn production_policy_health_component(state: &ServiceState) -> (bool, Value) {
 fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
     let (database_ok, database) = database_health_component(state);
     let (worker_ok, task_worker) = task_worker_health_component(state);
-    let shared_bkv_runtime = if state.capture.provider == CaptureProvider::Bkv {
-        Some(production_tasks::configured_bkv_root().and_then(|root| {
-            state
-                .runtime
-                .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
-                    &state.database.connection,
-                    &root,
-                    Some(Instant::now() + Duration::from_millis(1_500)),
-                ))
-        }))
-    } else {
-        None
-    };
+    let shared_bkv_runtime =
+        if state.capture.provider == CaptureProvider::Bkv && !unified_result_store_enabled(state) {
+            Some(production_tasks::configured_bkv_root().and_then(|root| {
+                state
+                    .runtime
+                    .block_on(production_tasks::load_bkv_replay_runtime_with_deadline(
+                        &state.database.connection,
+                        &root,
+                        Some(Instant::now() + Duration::from_millis(1_500)),
+                    ))
+            }))
+        } else {
+            None
+        };
     let (capture_ok, capture) =
         capture_health_component_with_bkv_runtime(state, shared_bkv_runtime.as_ref());
     let (calibration_ok, calibration_reconciliation) =
@@ -6398,6 +6466,7 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("GET", "/api/admin/config/revisions/detail")
         | ("POST", "/api/admin/config/revisions/restore") => Some("admin.config"),
         ("GET", "/api/admin/services")
+        | ("GET", "/api/admin/runtime/logs")
         | ("POST", "/api/admin/services/capture/start")
         | ("POST", "/api/admin/services/capture/stop")
         | ("POST", "/api/admin/services/capture/restart")
@@ -7337,6 +7406,219 @@ fn read_admin_services_response(state: &ServiceState) -> Vec<u8> {
         "200 OK",
         "application/json; charset=utf-8",
         &admin_services_json(state),
+    )
+}
+
+const RUNTIME_LOG_TAIL_MAX_BYTES: usize = 64 * 1024;
+const RUNTIME_LOG_TAIL_MAX_LINES: usize = 240;
+
+fn runtime_log_root() -> PathBuf {
+    env::var("STEEL_RUNTIME_LOG_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            env::var("STEEL_RUNTIME_STATE_ROOT").map(|root| PathBuf::from(root).join("logs"))
+        })
+        .unwrap_or_else(|_| config_dir().join("logs"))
+}
+
+fn runtime_file_timestamp(metadata: &fs::Metadata) -> String {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis().to_string())
+        .unwrap_or_default()
+}
+
+fn runtime_log_tail(path: &Path) -> (String, bool) {
+    let Ok(mut file) = fs::File::open(path) else {
+        return (String::new(), false);
+    };
+    let Ok(file_length) = file.metadata().map(|metadata| metadata.len()) else {
+        return (String::new(), false);
+    };
+    let truncated_by_bytes = file_length > RUNTIME_LOG_TAIL_MAX_BYTES as u64;
+    let start = file_length.saturating_sub(RUNTIME_LOG_TAIL_MAX_BYTES as u64);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (String::new(), false);
+    }
+    let mut bytes = Vec::with_capacity((file_length - start) as usize);
+    if file
+        .take(RUNTIME_LOG_TAIL_MAX_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return (String::new(), false);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines().collect::<Vec<_>>();
+    let truncated_by_lines = lines.len() > RUNTIME_LOG_TAIL_MAX_LINES;
+    if truncated_by_lines {
+        let keep_from = lines.len().saturating_sub(RUNTIME_LOG_TAIL_MAX_LINES);
+        lines.drain(..keep_from);
+    }
+    (lines.join("\n"), truncated_by_bytes || truncated_by_lines)
+}
+
+fn runtime_log_service_probe(
+    id: &str,
+    name: &str,
+    origin: &str,
+    port: u16,
+    health_path: &str,
+    required: bool,
+) -> Value {
+    let probe = bounded_health_http_get(origin, health_path, Duration::from_millis(350));
+    let (ok, reason) = match probe {
+        Ok(response) if response.status_code == 200 => (true, Value::Null),
+        Ok(response) => (false, json!(format!("http_{}", response.status_code))),
+        Err(error) => (false, json!(error.as_str())),
+    };
+    json!({
+        "id": id,
+        "name": name,
+        "origin": origin,
+        "port": port,
+        "ok": ok,
+        "required": required,
+        "status": if ok { "running" } else { "unavailable" },
+        "reason": reason
+    })
+}
+
+fn runtime_log_status_json(state: &ServiceState) -> String {
+    let log_root = runtime_log_root();
+    let state_root = env::var("STEEL_RUNTIME_STATE_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let result_root = env::var("STEEL_RESULT_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let catalog_path = result_root.as_ref().map(|root| root.join("catalog.db"));
+    let catalog_metadata = catalog_path
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok());
+    let catalog_ready = catalog_metadata.as_ref().is_some_and(fs::Metadata::is_file);
+    let catalog_bytes = catalog_metadata
+        .as_ref()
+        .map(fs::Metadata::len)
+        .unwrap_or(0);
+    let supervisor = match supervisor_runtime_status() {
+        Ok(status) => status.unwrap_or(Value::Null),
+        Err(error) => json!({
+            "status": "invalid",
+            "error": error
+        }),
+    };
+
+    let services = vec![
+        json!({
+            "id": "inspection",
+            "name": "业务服务",
+            "origin": format!("http://127.0.0.1:{}", env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string())),
+            "port": env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string()),
+            "uptimeMs": current_time_millis().saturating_sub(state.started_at),
+            "ok": true,
+            "required": true,
+            "status": "running",
+            "reason": Value::Null
+        }),
+        runtime_log_service_probe(
+            "image",
+            "Rust 图像服务",
+            "http://127.0.0.1:4874",
+            4874,
+            "/api/health/live",
+            true,
+        ),
+        runtime_log_service_probe(
+            "algorithm",
+            "算法服务",
+            "http://127.0.0.1:4875",
+            4875,
+            "/api/health/live",
+            true,
+        ),
+        runtime_log_service_probe(
+            "capture",
+            "采集服务",
+            "http://127.0.0.1:4317",
+            4317,
+            "/health",
+            false,
+        ),
+        runtime_log_service_probe(
+            "trigger",
+            "触发网关",
+            "http://127.0.0.1:4881",
+            4881,
+            "/health",
+            false,
+        ),
+    ];
+    let services_ready = services
+        .iter()
+        .filter(|service| service.get("required").and_then(Value::as_bool) == Some(true))
+        .all(|service| service.get("ok").and_then(Value::as_bool) == Some(true));
+    let required_ready = services_ready && catalog_ready;
+
+    let mut logs = Vec::new();
+    if let Ok(entries) = fs::read_dir(&log_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let (tail, truncated) = runtime_log_tail(&path);
+            logs.push(json!({
+                "name": name,
+                "bytes": metadata.len(),
+                "modifiedAt": runtime_file_timestamp(&metadata),
+                "tail": tail,
+                "truncated": truncated
+            }));
+        }
+    }
+    logs.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .cmp(&right.get("name").and_then(Value::as_str))
+    });
+
+    json!({
+        "schema": "steel.runtime-log-status.v1",
+        "updatedAt": current_time_string(),
+        "status": if required_ready { "running" } else { "degraded" },
+        "runtime": {
+            "stateRoot": state_root,
+            "logRoot": log_root,
+            "supervisor": supervisor
+        },
+        "resultStore": {
+            "root": result_root,
+            "catalogPath": catalog_path,
+            "ready": catalog_ready,
+            "bytes": catalog_bytes
+        },
+        "services": services,
+        "logs": logs
+    })
+    .to_string()
+}
+
+fn read_admin_runtime_log_status_response(state: &ServiceState) -> Vec<u8> {
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &runtime_log_status_json(state),
     )
 }
 
@@ -14823,7 +15105,9 @@ fn unified_result_store_enabled(state: &ServiceState) -> bool {
 }
 
 fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
-    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
+    if state.runtime_config.data_source == "bkv-online-mysql"
+        && !unified_result_store_enabled(state)
+    {
         return match state
             .bkv_online
             .as_ref()
@@ -14853,6 +15137,11 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
         return match store.records() {
             Ok(records) => {
                 let camera_count = store.configured_cameras().len();
+                let catalog_summary = store.catalog_summary().ok();
+                let latest_inspection_time = catalog_summary
+                    .as_ref()
+                    .and_then(|summary| summary.latest_inspection_time.clone())
+                    .or_else(|| records.first().and_then(|record| record.inspection_time.clone()));
                 let sequence_range = records
                     .iter()
                     .filter_map(|record| record.legacy_seq_no)
@@ -14875,6 +15164,10 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
                         "ready": ready,
                         "cameraCount": camera_count,
                         "batchId": batch_id,
+                        "generation": catalog_summary.as_ref().map(|summary| summary.generation),
+                        "recordCount": catalog_summary.as_ref().map(|summary| summary.record_count).unwrap_or(records.len() as u64),
+                        "latestInspectionTime": latest_inspection_time,
+                        "synchronizedAt": current_time_string(),
                         "records": records,
                     })
                     .to_string(),
@@ -14921,6 +15214,97 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
             })).collect::<Vec<_>>()
         }).to_string(),
     )
+}
+
+fn inspection_world_records_status_response(state: &ServiceState) -> Vec<u8> {
+    if !unified_result_store_enabled(state) {
+        return http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({"code":409,"error":"unified_result_store_disabled"}).to_string(),
+        );
+    }
+    let Some(store) = state.standard_record_store.as_ref() else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({"code":503,"error":"converted_record_store_unavailable"}).to_string(),
+        );
+    };
+    match store.catalog_summary() {
+        Ok(summary) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "schema": "steel.inspection-world.records-status.v1",
+                "provider": "bkv",
+                "ready": summary.record_count > 0,
+                "recordCount": summary.record_count,
+                "generation": summary.generation,
+                "latestInspectionTime": summary.latest_inspection_time,
+                "synchronizedAt": current_time_string(),
+            })
+            .to_string(),
+        ),
+        Err(error) => http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({"code":503,"error":"converted_record_store_invalid","detail":error.to_string()}).to_string(),
+        ),
+    }
+}
+
+fn request_historical_reconstruction(state: &ServiceState, record_id: &str) -> Result<(), String> {
+    if env::var("STEEL_HISTORY_RECONSTRUCTION").as_deref() == Ok("0")
+        || !unified_result_store_enabled(state)
+    {
+        return Err("historical reconstruction is disabled".to_string());
+    }
+    let Some(store) = state.standard_record_store.as_ref() else {
+        return Err("converted record store unavailable".to_string());
+    };
+    if store
+        .record(record_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err(format!("converted inspection {record_id} not found"));
+    }
+    let origin = env::var("STEEL_ALGORITHM_SERVICE_ORIGIN")
+        .unwrap_or_else(|_| "http://127.0.0.1:4875".to_string());
+    let body = json!({"recordId": record_id}).to_string();
+    let response = bounded_local_http_request(
+        &origin,
+        "POST",
+        "/internal/v1/reconstruct",
+        &body,
+        Duration::from_secs(
+            env::var("STEEL_HISTORY_RECONSTRUCTION_TIMEOUT_SEC")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(120)
+                .clamp(1, 600),
+        ),
+        &[],
+    )
+    .map_err(|error| {
+        format!(
+            "algorithm reconstruction request failed: {}",
+            error.as_str()
+        )
+    })?;
+    if !(200..300).contains(&response.status_code) {
+        let detail = String::from_utf8_lossy(&response.body).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!(
+                "algorithm reconstruction returned HTTP {}",
+                response.status_code
+            )
+        } else {
+            detail
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -15001,6 +15385,20 @@ fn online_capture_path(
         ));
     }
     Ok(canonical)
+}
+
+fn image_dimensions_with_guessed_format(path: &Path) -> Result<(u32, u32), String> {
+    // Unified-result blobs are content-addressed and intentionally have no
+    // extension.  Guess the format from the bytes first, then force it on the
+    // reader; relying on the path alone makes image 0.25 report an unknown
+    // format on Windows extended paths.
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut prefix = [0_u8; 64];
+    let length = file.read(&mut prefix).map_err(|error| error.to_string())?;
+    let format = image::guess_format(&prefix[..length]).map_err(|error| error.to_string())?;
+    let mut reader = image::ImageReader::open(path).map_err(|error| error.to_string())?;
+    reader.set_format(format);
+    reader.into_dimensions().map_err(|error| error.to_string())
 }
 
 fn load_online_inspection_world(
@@ -15101,7 +15499,7 @@ fn load_online_inspection_world(
             let image_index = u32::try_from(ordinal)
                 .map_err(|_| format!("camera {camera_id} has too many frames"))?;
             let path = online_capture_path(&inspection, &row.path)?;
-            let current = image::image_dimensions(&path)
+            let current = image_dimensions_with_guessed_format(&path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             if dimensions
                 .replace(current)
@@ -15213,7 +15611,7 @@ fn load_converted_inspection_world(
         for (ordinal, row) in rows.iter().enumerate() {
             let image_index =
                 u32::try_from(ordinal).map_err(|_| "too many converted frames".to_string())?;
-            let current = image::image_dimensions(&row.path)
+            let current = image_dimensions_with_guessed_format(&row.path)
                 .map_err(|error| format!("{}: {error}", row.path.display()))?;
             if dimensions
                 .replace(current)
@@ -15320,34 +15718,12 @@ fn schedule_inspection_world_cache(
     let cache_root = inspection_world_cache_root(state);
     let cache_record_id = record_id.to_string();
     let cache_revision = source_revision.to_string();
-    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
-        // Online records can contain thousands of tiles. Filling the complete
-        // pyramid as soon as metadata is requested competes with the selected
-        // record for SMB bandwidth and makes rapid record switching slower.
-        // Visible tiles are still generated and persisted on demand by
-        // `inspection_world_tile_response`.
-        return;
-    }
-    if unified_result_store_enabled(state) {
-        let Ok(converted) = load_converted_inspection_world(state, record_id) else {
-            return;
-        };
-        let generated = Arc::clone(&converted);
-        inspection_world::schedule_full_tile_cache(
-            cache_root,
-            cache_record_id,
-            cache_revision,
-            world.clone(),
-            move |request| {
-                inspection_world::compose_camera_tile(
-                    &generated.world,
-                    request,
-                    |camera_id, image_index| {
-                        Ok(generated.frames.get(&(camera_id, image_index)).cloned())
-                    },
-                )
-            },
-        );
+    if state.runtime_config.data_source == "bkv-online-mysql" || unified_result_store_enabled(state)
+    {
+        // Production/unified records can contain thousands of tiles. Filling
+        // every LOD eagerly competes with the selected record for disk and SMB
+        // bandwidth. Visible single-camera tiles are materialized atomically
+        // on demand by `inspection_world_tile_response` and then reused.
         return;
     }
     if let Some(manager) = state.bkv.as_ref() {
@@ -15394,7 +15770,9 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
-    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
+    if state.runtime_config.data_source == "bkv-online-mysql"
+        && !unified_result_store_enabled(state)
+    {
         return match state
             .bkv_online
             .as_ref()
@@ -15414,7 +15792,20 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
         };
     }
     if unified_result_store_enabled(state) {
-        return match load_converted_inspection_world(state, &record_id) {
+        let converted = match load_converted_inspection_world(state, &record_id) {
+            Ok(converted) => Ok(converted),
+            Err(initial_error) => {
+                // Historical recovery initially publishes metadata only.  A
+                // record switch must be able to promote that record through
+                // the algorithm service before the canvas asks for tiles.
+                if request_historical_reconstruction(state, &record_id).is_ok() {
+                    load_converted_inspection_world(state, &record_id)
+                } else {
+                    Err(initial_error)
+                }
+            }
+        };
+        return match converted {
             Ok(converted) => {
                 let source_revision = state
                     .standard_record_store
@@ -15545,7 +15936,8 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
             ),
         };
     }
-    if state.runtime_config.data_source != "bkv-online-mysql" || unified_result_store_enabled(state) {
+    if state.runtime_config.data_source != "bkv-online-mysql" || unified_result_store_enabled(state)
+    {
         return http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -15665,7 +16057,9 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
         Ok(record_id) => record_id,
         Err(response) => return response,
     };
-    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
+    if state.runtime_config.data_source == "bkv-online-mysql"
+        && !unified_result_store_enabled(state)
+    {
         return match state
             .bkv_online
             .as_ref()
@@ -15685,7 +16079,21 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
         };
     }
     if unified_result_store_enabled(state) {
-        return match load_converted_inspection_world(state, &record_id) {
+        let converted = match load_converted_inspection_world(state, &record_id) {
+            Ok(converted) => Ok(converted),
+            Err(initial_error) => {
+                // Let the algorithm service materialize a historical BKV
+                // record when its metadata exists but no image artifact has
+                // been published yet.  The fallback below still preserves
+                // defect facts if the source share is unavailable.
+                if request_historical_reconstruction(state, &record_id).is_ok() {
+                    load_converted_inspection_world(state, &record_id)
+                } else {
+                    Err(initial_error)
+                }
+            }
+        };
+        return match converted {
             Ok(converted) => {
                 let defects = converted
                     .defects
@@ -15698,29 +16106,25 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
                                 .get(&(camera_id, defect.sequence_no))
                                 .copied()
                         });
-                        let local_rect = defect
-                            .artifacts
-                            .get("imageRect2d")
-                            .and_then(|rect| {
-                                Some(
-                                    inspection_world::PixelRect::from_edges(
-                                        u32::try_from(rect.get("left")?.as_u64()?).ok()?,
-                                        u32::try_from(rect.get("right")?.as_u64()?).ok()?,
-                                        u32::try_from(rect.get("top")?.as_u64()?).ok()?,
-                                        u32::try_from(rect.get("bottom")?.as_u64()?).ok()?,
-                                    )
-                                    .ok()?,
+                        let local_rect = defect.artifacts.get("imageRect2d").and_then(|rect| {
+                            Some(
+                                inspection_world::PixelRect::from_edges(
+                                    u32::try_from(rect.get("left")?.as_u64()?).ok()?,
+                                    u32::try_from(rect.get("right")?.as_u64()?).ok()?,
+                                    u32::try_from(rect.get("top")?.as_u64()?).ok()?,
+                                    u32::try_from(rect.get("bottom")?.as_u64()?).ok()?,
                                 )
-                            });
-                        let world_rect =
-                            camera_id.zip(image_index).zip(local_rect).and_then(
-                                |((camera_id, image_index), rect)| {
-                                    converted
-                                        .world
-                                        .map_defect(camera_id, image_index, rect)
-                                        .ok()
-                                },
-                            );
+                                .ok()?,
+                            )
+                        });
+                        let world_rect = camera_id.zip(image_index).zip(local_rect).and_then(
+                            |((camera_id, image_index), rect)| {
+                                converted
+                                    .world
+                                    .map_defect(camera_id, image_index, rect)
+                                    .ok()
+                            },
+                        );
                         json!({
                             "id": defect.id,
                             "className": defect.defect_type,
@@ -15749,11 +16153,58 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
                     .to_string(),
                 )
             }
-            Err(error) => http_response(
-                "404 Not Found",
-                "application/json; charset=utf-8",
-                &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error}).to_string(),
-            ),
+            Err(error) => {
+                // Metadata-only historical recovery records deliberately do
+                // not copy raw frames. Their defects remain facts in the
+                // unified catalog and should stay visible while image
+                // materialization is pending.
+                let Some(store) = state.standard_record_store.as_ref() else {
+                    return http_response(
+                        "404 Not Found",
+                        "application/json; charset=utf-8",
+                        &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error}).to_string(),
+                    );
+                };
+                if store.record(&record_id).ok().flatten().is_none() {
+                    return http_response(
+                        "404 Not Found",
+                        "application/json; charset=utf-8",
+                        &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": error}).to_string(),
+                    );
+                }
+                match store.defects(&record_id) {
+                    Ok(defects) => http_response(
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        &json!({
+                            "schema": "steel.inspection-world.defects.v1",
+                            "provider": "bkv",
+                            "recordId": record_id,
+                            "deferred": true,
+                            "defects": defects.iter().map(|defect| json!({
+                                "id": defect.id,
+                                "className": defect.defect_type,
+                                "grade": defect.severity,
+                                "confidence": defect.confidence,
+                                "cameraId": numeric_camera_id(&defect.camera_id),
+                                "imageIndex": defect.sequence_no,
+                                "locatable": false,
+                                "worldRect": Value::Null,
+                                "trace": {
+                                    "sequenceNo": defect.sequence_no,
+                                    "artifacts": defect.artifacts,
+                                }
+                            })).collect::<Vec<_>>(),
+                        })
+                        .to_string(),
+                    ),
+                    Err(defect_error) => http_response(
+                        "404 Not Found",
+                        "application/json; charset=utf-8",
+                        &json!({"code": 404, "error": "inspection_world_record_not_found", "detail": format!("{error}; defects: {defect_error}")}).to_string(),
+                    ),
+                }
+            }
         };
     }
     if let Some(manager) = state.bkv.as_ref() {
@@ -15920,7 +16371,9 @@ fn inspection_world_source_revision(
     state: &ServiceState,
     record_id: &str,
 ) -> Result<String, String> {
-    if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
+    if state.runtime_config.data_source == "bkv-online-mysql"
+        && !unified_result_store_enabled(state)
+    {
         let meta = state
             .bkv_online
             .as_ref()
@@ -16031,30 +16484,6 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
             .to_string(),
         );
     }
-    if unified_result_store_enabled(state)
-        && env::var("STEEL_IMAGE_PROXY").as_deref() == Ok("1")
-    {
-        let image_path = format!(
-            "/api/tile?recordId={record_id}&cameraId=C{camera_id}&sequenceNo=0&kind=intensity&level={level}&x={tile_x}&y={tile_y}"
-        );
-        if let Ok(response) = bounded_local_http_request(
-            "http://127.0.0.1:4874",
-            "GET",
-            &image_path,
-            "",
-            Duration::from_millis(1_200),
-            &[],
-        ) {
-            if (200..300).contains(&response.status_code) {
-                return http_bytes_response_with_headers(
-                    "200 OK",
-                    "image/jpeg",
-                    &response.body,
-                    &[("Cache-Control", "private, max-age=31536000, immutable")],
-                );
-            }
-        }
-    }
     let cache_root = inspection_world_cache_root(state);
     let result = inspection_world::serve_cached_tile(
         &cache_root,
@@ -16062,7 +16491,9 @@ fn inspection_world_tile_response(state: &ServiceState, query: &str) -> Vec<u8> 
         &source_revision,
         request,
         || {
-            let generated = if state.runtime_config.data_source == "bkv-online-mysql" && !unified_result_store_enabled(state) {
+            let generated = if state.runtime_config.data_source == "bkv-online-mysql"
+                && !unified_result_store_enabled(state)
+            {
                 state
                     .bkv_online
                     .as_ref()
@@ -16196,7 +16627,20 @@ fn inspection_world_frame_response(state: &ServiceState, query: &str) -> Vec<u8>
                 .ok_or_else(|| "inspection world intensity frame not found".to_string())
         })
         .and_then(|file| {
-            let source = image::open(file.path).map_err(|error| error.to_string())?;
+            // Content-addressed blobs intentionally have no extension.  Use
+            // the bytes to identify the format before decoding; `image::open`
+            // otherwise reports an unknown format for every recovered JPEG.
+            let mut handle = fs::File::open(&file.path).map_err(|error| error.to_string())?;
+            let mut prefix = [0_u8; 64];
+            let length = handle
+                .read(&mut prefix)
+                .map_err(|error| error.to_string())?;
+            let format =
+                image::guess_format(&prefix[..length]).map_err(|error| error.to_string())?;
+            let mut reader =
+                image::ImageReader::open(&file.path).map_err(|error| error.to_string())?;
+            reader.set_format(format);
+            let source = reader.decode().map_err(|error| error.to_string())?;
             let focused = if let Some((x, y, width, height)) = crop {
                 let source_width = source.width();
                 let source_height = source.height();
@@ -18459,6 +18903,138 @@ fn inspection_records_json(page: db::AdminInspectionRecordPage) -> String {
     .to_string()
 }
 
+fn unified_record_status(status: &str) -> &'static str {
+    match status {
+        "partial" | "processing" | "running" | "pending" => "detecting",
+        _ => "completed",
+    }
+}
+
+fn unified_defect_severity(severity: Option<i64>) -> &'static str {
+    match severity {
+        Some(value) if value >= 3 => "severe",
+        Some(1) => "minor",
+        _ => "review",
+    }
+}
+
+fn unified_record_json(
+    record: &standard_record_store::InspectionRecordDto,
+    defects: &[standard_record_store::InspectionDefectDto],
+) -> Value {
+    let severe = defects
+        .iter()
+        .filter(|defect| unified_defect_severity(defect.severity) == "severe")
+        .count() as u64;
+    let minor = defects
+        .iter()
+        .filter(|defect| unified_defect_severity(defect.severity) == "minor")
+        .count() as u64;
+    let classified_review = defects
+        .iter()
+        .filter(|defect| unified_defect_severity(defect.severity) == "review")
+        .count() as u64;
+    let total = u64::try_from(record.defect_count.max(0)).unwrap_or(0);
+    let review = classified_review.saturating_add(
+        total.saturating_sub(
+            severe
+                .saturating_add(minor)
+                .saturating_add(classified_review),
+        ),
+    );
+    let inspection_time = record.inspection_time.as_deref().unwrap_or_default();
+    json!({
+        "id": record.record_id,
+        "time": inspection_time,
+        "plateNo": record.steel_id,
+        "materialId": record.steel_id,
+        "sessionId": format!("result-{}", record.record_id),
+        "status": unified_record_status(&record.status),
+        "productionStatus": record.status,
+        "defectCount": total,
+        "startedAt": inspection_time,
+        "finishedAt": inspection_time,
+        "summaryPath": Value::Null,
+        "source": "unified-result",
+        "sourceRevision": record.source_hash,
+        "plate": {
+            "plateNo": record.steel_id,
+            "widthMm": record.outer_diameter_mm.unwrap_or(0.0),
+            "lengthMm": record.length_mm.unwrap_or(0.0),
+            "thicknessMm": record.wall_thickness_mm.unwrap_or(0.0),
+            "steelGrade": record.steel_type.as_deref().unwrap_or("-"),
+            "detectedAt": inspection_time,
+        },
+        "severity": {
+            "severe": severe,
+            "review": review,
+            "minor": minor,
+        }
+    })
+}
+
+fn unified_record_detail_json(
+    record: &standard_record_store::InspectionRecordDto,
+    defects: &[standard_record_store::InspectionDefectDto],
+) -> String {
+    let mut value = unified_record_json(record, defects);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "defects".to_string(),
+            Value::Array(
+                defects
+                    .iter()
+                    .map(|defect| {
+                        let roi = defect
+                            .artifacts
+                            .get("roi")
+                            .or_else(|| defect.artifacts.get("imageRect2d"));
+                        let width = roi
+                            .and_then(|value| value.get("width"))
+                            .and_then(Value::as_f64)
+                            .or_else(|| {
+                                let left = roi?.get("left")?.as_f64()?;
+                                let right = roi?.get("right")?.as_f64()?;
+                                Some((right - left).abs())
+                            })
+                            .unwrap_or(0.0);
+                        let height = roi
+                            .and_then(|value| value.get("height"))
+                            .and_then(Value::as_f64)
+                            .or_else(|| {
+                                let top = roi?.get("top")?.as_f64()?;
+                                let bottom = roi?.get("bottom")?.as_f64()?;
+                                Some((bottom - top).abs())
+                            })
+                            .unwrap_or(0.0);
+                        json!({
+                            "id": defect.id,
+                            "plateNo": record.steel_id,
+                            "typeId": defect.defect_type,
+                            "typeLabel": defect.defect_type,
+                            "surface": defect.camera_id,
+                            "severity": unified_defect_severity(defect.severity),
+                            "distanceHeadMm": 0.0,
+                            "operatorSideMm": 0.0,
+                            "driveSideMm": 0.0,
+                            "widthMm": width,
+                            "heightMm": height,
+                            "depthMm": 0.0,
+                            "xRatio": 0.0,
+                            "yOffsetMm": 0.0,
+                            "previewX": 0,
+                            "previewY": 0,
+                            "artifacts": defect.artifacts,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert("algorithmTrace".to_string(), Value::Null);
+    }
+    json!({ "record": value }).to_string()
+}
+
 fn read_admin_cameras_response(state: &ServiceState) -> Vec<u8> {
     match state
         .runtime
@@ -19891,6 +20467,50 @@ fn read_admin_records_response(state: &ServiceState, query: &str) -> Vec<u8> {
         limit,
         offset: Some(offset),
     };
+    if unified_result_store_enabled(state) {
+        let Some(store) = state.standard_record_store.as_ref() else {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code":503,"error":"converted_record_store_unavailable"}).to_string(),
+            );
+        };
+        let page_limit = limit.unwrap_or(20);
+        return match store.records_page(
+            filter.keyword.as_deref(),
+            filter.status.as_deref(),
+            page_limit,
+            offset,
+        ) {
+            Ok((total, records)) => {
+                let rows = records
+                    .iter()
+                    .map(|record| {
+                        let defects = store.defects(&record.record_id).unwrap_or_default();
+                        unified_record_json(record, &defects)
+                    })
+                    .collect::<Vec<_>>();
+                http_response(
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "source": "unified-result",
+                        "synchronizedAt": current_time_string(),
+                        "total": total,
+                        "limit": page_limit,
+                        "offset": offset,
+                        "records": rows,
+                    })
+                    .to_string(),
+                )
+            }
+            Err(error) => http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code":503,"error":"converted_record_store_invalid","detail":error.to_string()}).to_string(),
+            ),
+        };
+    }
     match state.runtime.block_on(db::list_inspection_records(
         &state.database.connection,
         filter,
@@ -19922,6 +20542,39 @@ fn read_admin_record_detail_response(state: &ServiceState, query: &str) -> Vec<u
             "application/json; charset=utf-8",
             "{\"code\":400,\"error\":\"record id required\"}",
         );
+    }
+    if unified_result_store_enabled(state) {
+        let Some(store) = state.standard_record_store.as_ref() else {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code":503,"error":"converted_record_store_unavailable"}).to_string(),
+            );
+        };
+        return match store.record(&id) {
+            Ok(Some(record)) => match store.defects(&id) {
+                Ok(defects) => http_response(
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &unified_record_detail_json(&record, &defects),
+                ),
+                Err(error) => http_response(
+                    "503 Service Unavailable",
+                    "application/json; charset=utf-8",
+                    &json!({"code":503,"error":"converted_record_defects_invalid","detail":error.to_string()}).to_string(),
+                ),
+            },
+            Ok(None) => http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                "{\"code\":404,\"error\":\"record not found\"}",
+            ),
+            Err(error) => http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code":503,"error":"converted_record_store_invalid","detail":error.to_string()}).to_string(),
+            ),
+        };
     }
     match state.runtime.block_on(db::find_inspection_record_detail(
         &state.database.connection,
@@ -21061,6 +21714,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "GET", "path": "/api/admin/auth/sessions", "scope": "auth" },
             { "method": "DELETE", "path": "/api/admin/auth/sessions", "scope": "auth" },
             { "method": "GET", "path": "/api/admin/services", "scope": "admin" },
+            { "method": "GET", "path": "/api/admin/runtime/logs", "scope": "admin" },
             { "method": "GET", "path": "/api/admin/diagnostics", "scope": "admin" },
             { "method": "GET", "path": "/api/admin/runtime-profile", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/runtime-profile/validate", "scope": "admin-config" },
@@ -21415,6 +22069,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("GET", "/api/bkv-online/image") => bkv_online_image_response(&state, query),
         ("GET", "/api/inspection-world/records") => inspection_world_records_response(&state),
+        ("GET", "/api/inspection-world/records/status") => {
+            inspection_world_records_status_response(&state)
+        }
         ("GET", "/api/inspection-world/meta") => inspection_world_meta_response(&state, query),
         ("GET", "/api/inspection-world/surface") => inspection_world_surface_response(&state, query),
         ("GET", "/api/inspection-world/reconstruction-parameters") => {
@@ -21451,6 +22108,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             delete_auth_session_response(&state, &request, query)
         }
         ("GET", "/api/admin/services") => read_admin_services_response(&state),
+        ("GET", "/api/admin/runtime/logs") => read_admin_runtime_log_status_response(&state),
         ("GET", "/api/admin/diagnostics") => read_admin_diagnostics_response(&state),
         ("GET", "/api/admin/runtime-profile") => read_admin_runtime_profile_response(&state),
         ("POST", "/api/admin/runtime-profile/validate") => {
@@ -21889,15 +22547,22 @@ fn configured_standard_record_store(
     let external_result_root = env::var("STEEL_RESULT_ROOT")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| (!profile.storage.result_root.trim().is_empty()).then(|| workspace_root().join(&profile.storage.result_root)));
+        .or_else(|| {
+            (!profile.storage.result_root.trim().is_empty())
+                .then(|| workspace_root().join(&profile.storage.result_root))
+        });
     if profile.data_source != "converted-local" && external_result_root.is_none() {
         return None;
     }
-    let root = external_result_root.clone().unwrap_or_else(|| workspace_root().join(&profile.storage.converted_root));
+    let root = external_result_root
+        .clone()
+        .unwrap_or_else(|| workspace_root().join(&profile.storage.converted_root));
     let catalog = external_result_root
         .clone()
         .map(|path| {
-            if !profile.storage.result_catalog_path.trim().is_empty() && env::var("STEEL_RESULT_ROOT").is_err() {
+            if !profile.storage.result_catalog_path.trim().is_empty()
+                && env::var("STEEL_RESULT_ROOT").is_err()
+            {
                 workspace_root().join(&profile.storage.result_catalog_path)
             } else {
                 path.join("catalog.db")
@@ -24313,6 +24978,10 @@ mod tests {
     fn capture_service_operation_routes_require_services_permission() {
         assert_eq!(
             permission_for_route("GET", "/api/admin/services"),
+            Some("admin.services")
+        );
+        assert_eq!(
+            permission_for_route("GET", "/api/admin/runtime/logs"),
             Some("admin.services")
         );
         assert_eq!(

@@ -22,6 +22,7 @@ pub struct InspectionRecordDto {
     pub record_id: String,
     pub legacy_seq_no: Option<u64>,
     pub steel_id: String,
+    pub status: String,
     pub steel_type: Option<String>,
     pub length_mm: Option<f64>,
     pub outer_diameter_mm: Option<f64>,
@@ -30,6 +31,14 @@ pub struct InspectionRecordDto {
     pub defect_count: i64,
     pub camera_count: usize,
     pub source_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectionCatalogSummaryDto {
+    pub record_count: u64,
+    pub generation: u64,
+    pub latest_inspection_time: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -82,6 +91,13 @@ impl From<rusqlite::Error> for StoreError {
 
 pub trait InspectionRecordStore {
     fn records(&self) -> Result<Vec<InspectionRecordDto>, StoreError>;
+    fn records_page(
+        &self,
+        keyword: Option<&str>,
+        status: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(u64, Vec<InspectionRecordDto>), StoreError>;
     fn record(&self, id: &str) -> Result<Option<InspectionRecordDto>, StoreError>;
     fn defects(&self, id: &str) -> Result<Vec<InspectionDefectDto>, StoreError>;
     fn capture_files(&self, id: &str) -> Result<Vec<CaptureFileDto>, StoreError>;
@@ -142,6 +158,25 @@ impl ConvertedLocalStore {
             verified_records: Mutex::new(HashSet::new()),
             verified_files: Mutex::new(HashSet::new()),
         })
+    }
+
+    pub fn catalog_summary(&self) -> Result<InspectionCatalogSummaryDto, StoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(generation), 0), MAX(inspection_time) FROM production_inspection",
+                [],
+                |row| {
+                    let count = row.get::<_, i64>(0)?;
+                    let generation = row.get::<_, i64>(1)?;
+                    Ok(InspectionCatalogSummaryDto {
+                        record_count: u64::try_from(count.max(0)).unwrap_or(0),
+                        generation: u64::try_from(generation.max(0)).unwrap_or(0),
+                        latest_inspection_time: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(StoreError::from)
     }
 
     pub fn configured_cameras(&self) -> &[ConfiguredCamera] {
@@ -222,6 +257,7 @@ impl ConvertedLocalStore {
             legacy_seq_no: record_id.parse::<u64>().ok(),
             record_id,
             steel_id: row.get(1)?,
+            status: row.get(3)?,
             inspection_time: row.get(2)?,
             defect_count: row.get(5)?,
             camera_count,
@@ -274,6 +310,61 @@ impl ConvertedLocalStore {
 impl InspectionRecordStore for ConvertedLocalStore {
     fn records(&self) -> Result<Vec<InspectionRecordDto>, StoreError> {
         self.query_records(None)
+    }
+
+    fn records_page(
+        &self,
+        keyword: Option<&str>,
+        status: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(u64, Vec<InspectionRecordDto>), StoreError> {
+        let connection = self.connection()?;
+        let keyword = keyword.unwrap_or_default().trim();
+        let keyword_pattern = format!("%{keyword}%");
+        let status = status.unwrap_or("all").trim();
+        let completed_statuses =
+            "'ready','completed','finished','algorithm-complete','legacy-imported'";
+        let status_clause = match status {
+            "" | "all" => "1 = 1".to_string(),
+            "completed" => format!("status IN ({completed_statuses})"),
+            "detecting" => format!("status NOT IN ({completed_statuses})"),
+            _ => "status = ?2".to_string(),
+        };
+        let where_clause = format!(
+            "(?1 = '' OR id LIKE ?3 OR material_id LIKE ?3 OR session_id LIKE ?3) AND {status_clause}"
+        );
+        let total = connection.query_row(
+            &format!("SELECT COUNT(*) FROM production_inspection WHERE {where_clause}"),
+            rusqlite::params![keyword, status, keyword_pattern],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let sql = format!(
+            r#"
+            SELECT id, material_id, inspection_time, status, source_hash,
+                   defect_count, camera_count, session_id, metadata_json, record_path
+            FROM production_inspection
+            WHERE {where_clause}
+            ORDER BY inspection_time DESC, id DESC
+            LIMIT ?4 OFFSET ?5
+            "#
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                keyword,
+                status,
+                keyword_pattern,
+                i64::try_from(limit.min(5000)).unwrap_or(5000),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+            ],
+            |row| {
+                self.record_from_row(row)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            },
+        )?;
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok((u64::try_from(total.max(0)).unwrap_or(0), records))
     }
 
     fn record(&self, id: &str) -> Result<Option<InspectionRecordDto>, StoreError> {
@@ -595,6 +686,7 @@ mod tests {
                 record_id: "10".to_string(),
                 legacy_seq_no: Some(10),
                 steel_id: "STEEL-10".to_string(),
+                status: "legacy-imported".to_string(),
                 steel_type: Some("37Mn/2".to_string()),
                 length_mm: Some(12096.0),
                 outer_diameter_mm: Some(233.664),
@@ -610,6 +702,26 @@ mod tests {
         assert_eq!(defects[0].camera_id, "C1");
         assert_eq!(defects[0].sequence_no, 4);
         assert_eq!(defects[0].defect_type, "轧折");
+    }
+
+    #[test]
+    fn pages_and_filters_normalized_records_for_admin_refresh() {
+        let fixture = fixture();
+
+        let (total, records) = fixture
+            .store
+            .records_page(Some("STEEL-10"), Some("completed"), 20, 0)
+            .expect("completed records page");
+        assert_eq!(total, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_id, "10");
+
+        let (total, records) = fixture
+            .store
+            .records_page(Some("missing"), Some("all"), 20, 0)
+            .expect("empty records page");
+        assert_eq!(total, 0);
+        assert!(records.is_empty());
     }
 
     #[test]

@@ -143,12 +143,12 @@ describe('App BKV provider selection', () => {
           recordId,
           sourceFrameCount: 6,
           sourceRevision: `revision-${recordId}`,
-          cache: { state: 'complete', tileSize: 128, maxLevel: 10 },
+          cache: { state: 'on-demand', tileSize: 512, maxLevel: 3 },
           world: {
             width: 600,
             height: 1024,
-            tileSize: 128,
-            maxLevel: 10,
+            tileSize: 512,
+            maxLevel: 3,
             cameras: Array.from({ length: 6 }, (_, index) => ({
               cameraId: index + 1,
               frameWidth: 100,
@@ -276,8 +276,8 @@ describe('App BKV provider selection', () => {
           recordId: '1893700',
           sourceFrameCount: 6,
           sourceRevision: 'revision-1893700',
-          cache: { state: 'complete', tileSize: 128, maxLevel: 10 },
-          world: { width: 600, height: 1024, tileSize: 128, maxLevel: 10, cameras: [] },
+          cache: { state: 'on-demand', tileSize: 512, maxLevel: 3 },
+          world: { width: 600, height: 1024, tileSize: 512, maxLevel: 3, cameras: [] },
         }), { status: 200 });
       }
       if (url.includes('/api/inspection-world/defects')) {

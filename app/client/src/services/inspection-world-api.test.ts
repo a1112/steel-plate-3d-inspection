@@ -87,8 +87,8 @@ describe('inspection world API', () => {
         recordId: '1893700',
         sourceFrameCount: 126,
         sourceRevision: 'record-hash',
-        cache: { state: 'complete', tileSize: 128, maxLevel: 15 },
-        world: { width: 3870, height: 21504, tileSize: 128, maxLevel: 15, cameras: [] },
+        cache: { state: 'on-demand', tileSize: 512, maxLevel: 3 },
+        world: { width: 3870, height: 21504, tileSize: 512, maxLevel: 3, cameras: [] },
       })))
       .mockResolvedValueOnce(new Response(JSON.stringify({ schema: 'steel.inspection-world.defects.v1', provider: 'bkv', recordId: '1893700', defects: [] })));
 
@@ -118,6 +118,8 @@ describe('inspection world API', () => {
 
     expect(String(vi.mocked(fetch).mock.calls[0][0]))
       .toContain('recordId=1893700&revision=source-revision&cameraId=5&level=2&x=3&y=4&format=jpeg');
+    expect(String(vi.mocked(fetch).mock.calls[0][0]))
+      .toContain('layout=steel-world-tile-v3-512-l3');
     expect(tile.url).toBe('blob:world-tile');
     tile.revoke();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:world-tile');

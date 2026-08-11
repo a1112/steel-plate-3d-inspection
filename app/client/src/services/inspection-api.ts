@@ -221,6 +221,52 @@ export type AdminServices = {
   }>;
 };
 
+export type AdminRuntimeLogFile = {
+  name: string;
+  bytes: number;
+  modifiedAt?: string;
+  tail: string;
+  truncated?: boolean;
+};
+
+export type AdminRuntimeService = {
+  id: string;
+  name: string;
+  origin: string;
+  port: string | number;
+  ok: boolean;
+  required: boolean;
+  status: string;
+  reason?: string | null;
+};
+
+export type AdminRuntimeLogStatus = {
+  schema: 'steel.runtime-log-status.v1' | string;
+  updatedAt: string;
+  status: 'running' | 'degraded' | string;
+  runtime: {
+    stateRoot?: string | null;
+    logRoot: string;
+    supervisor?: {
+      status?: string;
+      reason?: string;
+      updatedAt?: string;
+      restartBudgetExhausted?: boolean;
+      restartCountWindow?: number;
+      restartBudgetMaximum?: number;
+      [key: string]: unknown;
+    } | null;
+  };
+  resultStore: {
+    root?: string | null;
+    catalogPath?: string | null;
+    ready: boolean;
+    bytes: number;
+  };
+  services: AdminRuntimeService[];
+  logs: AdminRuntimeLogFile[];
+};
+
 export type AdminAuditLog = {
   id: string;
   actor: string;
@@ -498,6 +544,7 @@ export type AdminInspectionRecord = {
   plateNo: string;
   status: string;
   defectCount: number;
+  source?: 'production' | 'unified-result' | string;
   plate?: {
     plateNo: string;
     widthMm: number;
@@ -600,6 +647,8 @@ export type InspectionReportArchiveDetail = {
 };
 
 export type AdminInspectionRecordPage = {
+  source?: 'production' | 'unified-result' | string;
+  synchronizedAt?: string;
   total: number;
   limit: number;
   offset: number;
@@ -2204,6 +2253,18 @@ export async function fetchAdminServices(signal?: AbortSignal): Promise<AdminSer
   return response.json() as Promise<AdminServices>;
 }
 
+export async function fetchAdminRuntimeLogStatus(signal?: AbortSignal): Promise<AdminRuntimeLogStatus> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/runtime/logs`, {
+    headers: createAdminHeaders({ Accept: 'application/json' }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '运行日志接口异常'));
+  }
+  return response.json() as Promise<AdminRuntimeLogStatus>;
+}
+
 export async function fetchAdminDiagnostics(signal?: AbortSignal): Promise<AdminDiagnostics> {
   const config = getStoredConnectionConfig();
   const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/diagnostics`, {
@@ -2490,6 +2551,7 @@ export async function fetchAdminRecords(filter: AdminRecordFilter = {}, signal?:
   const suffix = params.toString() ? `?${params.toString()}` : '';
   const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/records${suffix}`, {
     headers: createAdminHeaders({ Accept: 'application/json' }),
+    cache: 'no-store',
     signal,
   });
   if (!response.ok) {

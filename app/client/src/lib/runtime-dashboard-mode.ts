@@ -35,7 +35,7 @@ export function createRuntimeDashboardMode(
       kind: 'bkv-online',
       cameraCount: profile.cameraCount,
       requestsOnlineServices: false,
-      requestsStandardRecords: false,
+      requestsStandardRecords: true,
       showsHardwareStatus: false,
       showsCaptureManagement: false,
       showsReconstruction: false,

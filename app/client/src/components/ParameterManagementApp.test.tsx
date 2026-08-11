@@ -404,6 +404,33 @@ const adminServices = {
   ],
 };
 
+const adminRuntimeLogStatus = {
+  schema: 'steel.runtime-log-status.v1',
+  updatedAt: '1782879116000',
+  status: 'running',
+  runtime: {
+    stateRoot: 'target/run/tauri-dev',
+    logRoot: 'target/run/tauri-dev/logs',
+    supervisor: { status: 'running', updatedAt: '1782879115000', restartBudgetExhausted: false },
+  },
+  resultStore: {
+    root: 'target/run/tauri-dev/processing/result-data',
+    catalogPath: 'target/run/tauri-dev/processing/result-data/catalog.db',
+    ready: true,
+    bytes: 4096,
+  },
+  services: [
+    { id: 'inspection', name: '业务服务', origin: 'http://127.0.0.1:4873', port: 4873, ok: true, required: true, status: 'running' },
+    { id: 'image', name: 'Rust 图像服务', origin: 'http://127.0.0.1:4874', port: 4874, ok: true, required: true, status: 'running' },
+    { id: 'algorithm', name: '算法服务', origin: 'http://127.0.0.1:4875', port: 4875, ok: true, required: true, status: 'running' },
+    { id: 'capture', name: '采集服务', origin: 'http://127.0.0.1:4317', port: 4317, ok: false, required: false, status: 'unavailable', reason: 'unreachable' },
+  ],
+  logs: [
+    { name: 'algorithm-service.out.log', bytes: 128, modifiedAt: '1782879115000', tail: 'scan completed: 3 records' },
+    { name: 'supervisor.log', bytes: 256, modifiedAt: '1782879115000', tail: 'runtime supervisor running' },
+  ],
+};
+
 const adminDiagnostics = {
   code: 0,
   checkedAt: '1782879115000',
@@ -796,6 +823,9 @@ describe('ParameterManagementApp', () => {
           return { ok: false, status: 404, json: async () => ({ error: 'not_found' }) };
         }
         return { ok: true, json: async () => adminDiagnostics };
+      }
+      if (url.includes('/api/admin/runtime/logs')) {
+        return { ok: true, json: async () => adminRuntimeLogStatus };
       }
       if (url.includes('/api/admin/services/capture/start')) {
         return { ok: true, json: async () => ({ code: 0, action: 'start', success: true, running: true, started: true, services: { ...adminServices, capture: { ...adminServices.capture, running: true } } }) };
@@ -1265,6 +1295,23 @@ describe('ParameterManagementApp', () => {
     });
     expect(screen.getByText('2', { selector: '.admin-api-summary strong' })).toBeInTheDocument();
     expect(screen.getByText('个后台接口已纳入管理概览')).toBeInTheDocument();
+  });
+
+  it('loads split runtime status and bounded service logs in the runtime log tab', async () => {
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '运行日志' }));
+
+    expect(await screen.findByText('运行正常')).toBeInTheDocument();
+    expect(screen.getByText('统一结果库')).toBeInTheDocument();
+    expect(screen.getByText('已就绪')).toBeInTheDocument();
+    expect(screen.getByText('Rust 图像服务')).toBeInTheDocument();
+    expect(screen.getByText('scan completed: 3 records')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4873/api/admin/runtime/logs',
+      expect.objectContaining({ headers: expect.objectContaining({ Accept: 'application/json' }) }),
+    );
   });
 
   it('saves alarm rules through the backend rule management tab', async () => {

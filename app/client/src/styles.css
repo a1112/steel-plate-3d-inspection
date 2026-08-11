@@ -2563,6 +2563,46 @@ button {
   font-size: 14px;
 }
 
+.record-list-sync {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.record-list-sync > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.record-list-sync > button:hover:not(:disabled) {
+  color: #fff;
+  border-color: var(--blue);
+  background: var(--blue);
+}
+
+.record-list-sync > button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.record-list-sync > button.refreshing svg {
+  animation: record-list-spin 0.9s linear infinite;
+}
+
+@keyframes record-list-spin {
+  to { transform: rotate(360deg); }
+}
+
 .records-table,
 .defect-table,
 .detail-table {
@@ -2606,6 +2646,37 @@ button {
 .defect-table tbody tr:hover,
 .records-table tbody tr.selected,
 .defect-table tbody tr.selected {
+  background: var(--blue-soft);
+}
+
+.records-table .records-load-more-row {
+  cursor: default;
+}
+
+.records-table .records-load-more-row:hover {
+  background: transparent;
+}
+
+.records-load-more-row td {
+  height: 40px;
+  padding: 5px 8px;
+  text-align: center;
+}
+
+.records-load-more-row button {
+  width: 100%;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--blue);
+  background: var(--panel-soft);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.records-load-more-row button:hover {
+  border-color: var(--blue);
   background: var(--blue-soft);
 }
 
@@ -6330,6 +6401,298 @@ button {
   grid-template-rows: repeat(2, minmax(0, 1fr));
 }
 
+.parameter-runtime-logs-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: auto;
+}
+
+.parameter-runtime-summary-card,
+.parameter-runtime-log-files-card {
+  grid-column: 1 / -1;
+}
+
+.parameter-runtime-summary-card .panel-body,
+.parameter-runtime-process-card .panel-body,
+.parameter-runtime-log-files-card .panel-body {
+  min-height: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.runtime-log-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.runtime-log-toolbar > button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 11px;
+  border: 1px solid var(--blue);
+  border-radius: 7px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.runtime-log-toolbar > button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.runtime-log-toolbar .spin {
+  animation: spin 0.9s linear infinite;
+}
+
+.runtime-log-overall {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.runtime-log-overall.normal strong,
+.runtime-log-facts strong.normal {
+  color: var(--green);
+}
+
+.runtime-log-overall.warning strong,
+.runtime-log-facts strong.warning {
+  color: var(--amber);
+}
+
+.runtime-log-overall span:last-child {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.runtime-log-auto-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.runtime-log-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.runtime-log-facts > div {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.runtime-log-facts span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.runtime-log-fact-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.runtime-log-fact-label img {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
+  filter: drop-shadow(0 1px 2px rgba(0, 42, 65, .2));
+}
+
+.runtime-log-facts strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-log-error,
+.runtime-log-empty {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--amber) 48%, var(--line));
+  border-radius: 7px;
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 9%, var(--panel-soft));
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.runtime-process-list {
+  min-height: 0;
+  display: grid;
+  gap: 8px;
+  overflow: auto;
+}
+
+.runtime-process-list > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.runtime-process-list > div.normal {
+  border-color: color-mix(in srgb, var(--green) 44%, var(--line));
+}
+
+.runtime-process-list > div.warning {
+  border-color: color-mix(in srgb, var(--amber) 48%, var(--line));
+}
+
+.runtime-process-list > div.error {
+  border-color: color-mix(in srgb, var(--red) 52%, var(--line));
+}
+
+.runtime-service-icon {
+  width: 40px;
+  height: 40px;
+  display: block;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 3px rgba(0, 42, 65, .24));
+}
+
+.runtime-process-list > div > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.runtime-process-list strong,
+.runtime-process-list span,
+.runtime-process-list small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-process-list strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.runtime-process-list span,
+.runtime-process-list small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.runtime-process-list em {
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.runtime-process-list .warning em {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 15%, transparent);
+}
+
+.runtime-process-list .error em {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+}
+
+.runtime-log-file-list {
+  min-height: 0;
+  display: grid;
+  gap: 8px;
+  overflow: auto;
+}
+
+.runtime-log-file-list details {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.runtime-log-file-list summary {
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: 18px auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.runtime-log-file-list summary::-webkit-details-marker {
+  display: none;
+}
+
+.runtime-log-file-list summary strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.runtime-log-file-list summary span,
+.runtime-log-file-list summary em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-log-file-list summary em {
+  font-style: normal;
+}
+
+.runtime-log-file-list pre {
+  max-height: 300px;
+  margin: 0;
+  overflow: auto;
+  padding: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg) 30%, var(--panel-soft));
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .parameter-login-wrap {
   min-height: 0;
   display: grid;
@@ -7051,6 +7414,15 @@ button {
     grid-template-columns: 1fr;
     grid-template-rows: auto;
     overflow: auto;
+  }
+
+  .parameter-runtime-logs-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+  }
+
+  .runtime-log-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .site-configuration-overview {
@@ -8350,6 +8722,20 @@ button {
   border-color: var(--red);
   color: var(--red);
   background: color-mix(in srgb, var(--red) 10%, transparent);
+}
+
+.admin-record-readonly {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--blue) 35%, var(--line));
+  border-radius: 5px;
+  color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 8%, transparent);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 .admin-record-table th {
@@ -17166,6 +17552,27 @@ button {
   color: #9fdfff;
   background: rgba(3, 18, 30, .88);
   font-size: 12px;
+}
+
+.inspection-world-switch-progress {
+  position: absolute;
+  top: 48px;
+  right: 12px;
+  z-index: 6;
+  display: grid;
+  gap: 3px;
+  min-width: 190px;
+  padding: 6px 10px;
+  border: 1px solid rgba(0, 193, 255, .24);
+  border-radius: 5px;
+  color: #bfe9ff;
+  background: rgba(3, 18, 30, .82);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.inspection-world-switch-progress span {
+  color: #7895aa;
 }
 
 .inspection-world-record-error {

@@ -713,6 +713,49 @@ describe('InspectionWorldCanvas', () => {
     expect(onFirstPaint).toHaveBeenCalledTimes(1);
   });
 
+  it('reports first-screen tile progress and waits for every directly visible tile', async () => {
+    const images: Array<{ onload: null | (() => void) }> = [];
+    class ManualImage {
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(_value: string) { images.push(this); }
+    }
+    vi.stubGlobal('Image', ManualImage);
+    const onFirstScreenReady = vi.fn();
+    const onTileLoadingChange = vi.fn();
+
+    render(
+      <InspectionWorldCanvas
+        recordId="1893700"
+        meta={meta}
+        defects={defects}
+        onFirstScreenReady={onFirstScreenReady}
+        onTileLoadingChange={onTileLoadingChange}
+      />,
+    );
+
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    await waitFor(() => expect(images.length).toBeGreaterThan(0));
+    const firstScreenTiles = Number(canvas.getAttribute('data-first-screen-tiles'));
+    const loadCandidates = Number(canvas.getAttribute('data-load-candidates'));
+    expect(firstScreenTiles).toBeGreaterThan(0);
+    expect(loadCandidates).toBeGreaterThanOrEqual(firstScreenTiles);
+    expect(canvas).toHaveAttribute('data-first-screen-ready', 'false');
+    expect(onTileLoadingChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      firstScreenTiles,
+      ready: false,
+    }));
+
+    await act(async () => images.forEach((image) => image.onload?.()));
+    await waitFor(() => expect(canvas).toHaveAttribute('data-first-screen-ready', 'true'));
+    expect(onFirstScreenReady).toHaveBeenCalledTimes(1);
+    expect(onTileLoadingChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      firstScreenTiles,
+      loadedFirstScreenTiles: firstScreenTiles,
+      ready: true,
+    }));
+  });
+
   it('restarts tiles cancelled by the StrictMode effect cleanup', async () => {
     class LoadedImage {
       onload: null | (() => void) = null;

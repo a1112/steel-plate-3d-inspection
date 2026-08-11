@@ -12,9 +12,18 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_TILE_SIZE: u32 = 128;
+const DEFAULT_TILE_SIZE: u32 = 512;
+const MAX_TILE_LEVEL: u8 = 3;
 pub const MISSING_TILE_COLOR: [u8; 3] = [16, 20, 24];
-pub const TILE_CACHE_SCHEMA: &str = "steel.inspection-world-cache.v2";
+pub const TILE_CACHE_SCHEMA: &str = "steel.inspection-world-cache.v3";
+
+fn open_content_addressed_image(path: &Path) -> Result<DynamicImage, image::ImageError> {
+    let reader = image::ImageReader::open(path)
+        .map_err(image::ImageError::IoError)?
+        .with_guessed_format()
+        .map_err(image::ImageError::IoError)?;
+    reader.decode()
+}
 
 #[derive(Debug)]
 pub struct CachedTile {
@@ -38,18 +47,27 @@ fn cache_component(value: &str, label: &str) -> Result<String, WorldError> {
     Ok(normalized.to_string())
 }
 
+fn cache_revision_component(value: &str) -> Result<String, WorldError> {
+    let normalized = value.trim();
+    if normalized.is_empty() || normalized.len() > 4096 {
+        return Err(WorldError::Artifact(
+            "sourceRevision is not a valid cache identity".to_string(),
+        ));
+    }
+    Ok(format!("r-{:x}", Sha256::digest(normalized.as_bytes())))
+}
+
 pub fn tile_cache_record_root(
     cache_root: &Path,
     record_id: &str,
     source_revision: &str,
 ) -> Result<PathBuf, WorldError> {
-    Ok(record_cache_root(cache_root, record_id)?
-        .join(cache_component(source_revision, "sourceRevision")?))
+    Ok(record_cache_root(cache_root, record_id)?.join(cache_revision_component(source_revision)?))
 }
 
 pub fn record_cache_root(cache_root: &Path, record_id: &str) -> Result<PathBuf, WorldError> {
     Ok(cache_root
-        .join("inspection-world-v2")
+        .join("inspection-world-v3")
         .join(cache_component(record_id, "recordId")?))
 }
 
@@ -77,6 +95,7 @@ pub fn tile_cache_path(
 
 fn cache_etag(source_revision: &str, request: TileRequest) -> String {
     let mut digest = Sha256::new();
+    digest.update(TILE_CACHE_SCHEMA.as_bytes());
     digest.update(source_revision.as_bytes());
     digest.update(request.camera_id.to_le_bytes());
     digest.update([request.level]);
@@ -211,7 +230,7 @@ pub fn read_cache_status(
         })
         .unwrap_or_else(|| {
             json!({
-                "state": "building",
+                "state": "on-demand",
                 "tileSize": world.tile_size,
                 "maxLevel": world.max_level,
             })
@@ -414,7 +433,7 @@ pub fn detect_camera_head(frames: &[(u32, PathBuf)]) -> Result<CameraAlignment, 
 
     let mut stable_run = VecDeque::with_capacity(STABLE_ROWS);
     for (frame_number, path) in frames {
-        let image = image::open(path)
+        let image = open_content_addressed_image(path)
             .map_err(|error| WorldError::Image(format!("{}: {error}", path.display())))?
             .to_luma8();
         let mut background_samples = Vec::new();
@@ -618,8 +637,10 @@ impl InspectionWorld {
         }
 
         let mut max_level = 0_u8;
-        let mut longest_side = offset_x.max(world_height);
-        while longest_side > 1 {
+        let mut longest_side = cameras.iter().fold(0_u32, |longest, camera| {
+            longest.max(camera.width).max(camera.height)
+        });
+        while longest_side > tile_size && max_level < MAX_TILE_LEVEL {
             longest_side = longest_side.div_ceil(2);
             max_level = max_level
                 .checked_add(1)
@@ -768,7 +789,7 @@ where
         let Some(path) = resolve(camera.camera_id, *frame_number)? else {
             continue;
         };
-        let source = image::open(&path)
+        let source = open_content_addressed_image(&path)
             .map_err(|error| WorldError::Image(format!("{}: {error}", path.display())))?
             .to_rgb8();
         if source.dimensions() != (camera.frame_width, camera.frame_height) {
@@ -869,7 +890,7 @@ where
             let Some(path) = resolve(camera.camera_id, *frame_number)? else {
                 continue;
             };
-            let source = image::open(&path)
+            let source = open_content_addressed_image(&path)
                 .map_err(|error| WorldError::Image(format!("{}: {error}", path.display())))?
                 .to_rgb8();
             if source.dimensions() != (camera.frame_width, camera.frame_height) {
@@ -1039,7 +1060,8 @@ mod tests {
 
         assert_eq!(world.width, 3_870);
         assert_eq!(world.height, 21_504);
-        assert_eq!(world.tile_size, 128);
+        assert_eq!(world.tile_size, 512);
+        assert_eq!(world.max_level, 3);
         assert_eq!(world.cameras[5].offset_x, 3_193);
     }
 
@@ -1090,6 +1112,20 @@ mod tests {
         assert!(alignment.aligned);
         assert_eq!(alignment.head_offset_y, 83);
         assert!(alignment.confidence_milli >= 700);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opens_extensionless_content_addressed_jpeg() {
+        let root = temp_root("extensionless-jpeg");
+        let path = root.join("sha256-blob");
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(19, 23, Rgb([80, 90, 100])))
+            .save_with_format(&path, ImageFormat::Jpeg)
+            .unwrap();
+
+        let image = open_content_addressed_image(&path).unwrap();
+
+        assert_eq!(image.dimensions(), (19, 23));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1242,6 +1278,26 @@ mod tests {
     }
 
     #[test]
+    fn default_edge_tile_uses_only_the_remaining_pixels() {
+        let root = temp_root("default-edge-tile");
+        let source = solid_frame(&root, "edge.png", 520, 530, [40, 80, 120]);
+        let world = InspectionWorld::new(vec![camera(1, 520, 530, 1)]).unwrap();
+
+        let bytes = compose_camera_tile(
+            &world,
+            TileRequest::for_camera(1, 0, 1, 1, TileFormat::Png),
+            |_, _| Ok(Some(source.clone())),
+        )
+        .unwrap();
+        let tile = decode_png(&bytes);
+
+        assert_eq!(world.tile_size, 512);
+        assert_eq!(tile.dimensions(), (8, 18));
+        assert_eq!(tile.get_pixel(7, 17).0, [40, 80, 120]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn camera_local_tile_zero_starts_at_detected_raw_head_row() {
         let root = temp_root("camera-local-head");
         let mut source = RgbImage::from_pixel(4, 8, Rgb([255, 0, 0]));
@@ -1285,7 +1341,7 @@ mod tests {
         let root = temp_root("level-one");
         let top = solid_frame(&root, "top.png", 4, 2, [255, 0, 0]);
         let bottom = solid_frame(&root, "bottom.png", 4, 2, [0, 255, 0]);
-        let world = InspectionWorld::with_tile_size(vec![camera(1, 4, 2, 2)], 4).unwrap();
+        let world = InspectionWorld::with_tile_size(vec![camera(1, 4, 2, 2)], 2).unwrap();
 
         let bytes = compose_tile(
             &world,
@@ -1386,6 +1442,24 @@ mod tests {
         assert!(tile_cache_path(&root, "record-1", "revision-1", request)
             .unwrap()
             .is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disk_tile_cache_hashes_opaque_source_revisions() {
+        let root = temp_root("opaque-revision-cache");
+        let request = TileRequest::for_camera(2, 3, 4, 5, TileFormat::Jpeg);
+        let revision = "bkv:91b834580950c12a79cb0ea1ff092fde24f7af77b7c3025aa13b7e8b4fd1ca8e";
+
+        let path = tile_cache_path(&root, "1924610", revision, request).unwrap();
+        let relative = path.strip_prefix(&root).unwrap().to_string_lossy();
+
+        assert!(relative.contains("inspection-world-v3"));
+        assert!(relative.contains("1924610"));
+        assert!(relative.contains("C2"));
+        assert!(relative.contains("L3"));
+        assert!(!relative.contains(revision));
+        assert!(!relative.contains(':'));
         fs::remove_dir_all(root).unwrap();
     }
 }

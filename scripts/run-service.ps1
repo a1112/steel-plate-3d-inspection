@@ -32,6 +32,11 @@ param(
   [string]$AlgorithmConfigPath = "",
   [string]$AlgorithmCalibrationPath = "",
   [string]$AlgorithmCaptureRoot = "",
+  [string]$RuntimeStateRoot = "",
+  [string]$RuntimeLogDir = "",
+  [string]$ResultRoot = "",
+  [string]$AlgorithmInputRoot = "",
+  [switch]$ResultProxyOnly,
   [ValidateRange(10, 7200)]
   [int]$AlgorithmProcessTimeoutSec = 1800,
   [switch]$ForceParameters
@@ -42,6 +47,31 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 . (Join-Path $PSScriptRoot "lib-env.ps1")
 
 Import-EnvFile $EnvFile
+
+# These values are intentionally applied after EnvFile import.  The Tauri
+# development launcher owns the local split-runtime directories and must not
+# be silently redirected to stale paths from a production environment file.
+if ($RuntimeStateRoot.Trim().Length -gt 0) {
+  New-Item -ItemType Directory -Force -Path $RuntimeStateRoot | Out-Null
+  $env:STEEL_RUNTIME_STATE_ROOT = (Resolve-Path $RuntimeStateRoot).Path
+}
+if ($RuntimeLogDir.Trim().Length -gt 0) {
+  New-Item -ItemType Directory -Force -Path $RuntimeLogDir | Out-Null
+  $env:STEEL_RUNTIME_LOG_DIR = (Resolve-Path $RuntimeLogDir).Path
+}
+if ($ResultRoot.Trim().Length -gt 0) {
+  New-Item -ItemType Directory -Force -Path $ResultRoot | Out-Null
+  $env:STEEL_RESULT_ROOT = (Resolve-Path $ResultRoot).Path
+}
+if ($AlgorithmInputRoot.Trim().Length -gt 0) {
+  New-Item -ItemType Directory -Force -Path $AlgorithmInputRoot | Out-Null
+  $env:STEEL_ALGORITHM_INPUT_ROOTS = (Resolve-Path $AlgorithmInputRoot).Path
+}
+if ($ResultProxyOnly) {
+  $env:STEEL_RESULT_PROXY_ONLY = "1"
+  $env:STEEL_IMAGE_PROXY = "1"
+  $env:STEEL_CAPTURE_MANAGED_BY_SUPERVISOR = "1"
+}
 
 if (-not [string]::IsNullOrWhiteSpace($RuntimeProfile)) {
   if ($RuntimeProfile -notin @("development", "acceptance", "production")) {

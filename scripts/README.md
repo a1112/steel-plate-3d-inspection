@@ -910,6 +910,62 @@ Desktop development is not installation evidence. The locked no-bundle Release c
 
 The latest unsigned diagnostic bundle attempts were stopped after the GitHub/proxy installer-resource download stopped making progress. WixTools314 was downloaded/extracted on the second attempt, but `target/cargo/release/bundle` was not created and no MSI/NSIS was generated. Treat this as an incomplete build-resource chain, not a successful bundle or a Rust source-compilation failure.
 
+## BKV historical recovery
+
+Historical `inspection-world-v1` runs can be recovered without touching the
+read-only BKV shares. The first pass converts and deduplicates metadata,
+defects, algorithm revisions, and source provenance into standard-record input
+and publishes metadata-only results in one catalog transaction:
+
+```powershell
+python scripts/recover_bkv_history.py `
+  --runs-root D:\steel-inspection\algorithm-data\runs `
+  --input-root target\run\bkv-history-recovery\input `
+  --inventory target\run\bkv-history-recovery\inventory.json `
+  --publish-root target\run\tauri-dev\processing\result-data
+```
+
+Raw frames are deliberately a bounded second step. Materialize one selected
+record from the six `CamImageSource*` shares, then let the algorithm service
+publish its content-addressed artifacts:
+
+```powershell
+python scripts/materialize_bkv_record.py `
+  --runs-root D:\steel-inspection\algorithm-data\runs `
+  --input-root target\run\tauri-dev\processing\algorithm-input `
+  --record-id 1913329
+```
+
+The materializer copies only 2D frames for the requested record, writes the
+standard capture-file manifest atomically, and records the source directories
+and hashes in `source-provenance.json`. It never deletes or rewrites history.
+
+The debug Tauri launcher enables the same promotion lazily through the
+algorithm service. When `/api/inspection-world/meta?recordId=...` selects a
+metadata-only historical record, the business service sends only the opaque
+record ID to `POST /internal/v1/reconstruct`; the algorithm service resolves
+the retained provenance, materializes the six BKV roots, publishes the unified
+result, and the original metadata request is retried. This keeps the business
+service and the browser away from raw paths. The environment controls are:
+`STEEL_BKV_HISTORY_RUNS_ROOT`, `STEEL_BKV_IMAGE_HOST`,
+`STEEL_BKV_HISTORY_MAX_FRAMES_PER_CAMERA` (default 256), and
+`STEEL_BKV_HISTORY_COMPRESS_JPEG=1` for smaller content-addressed blobs.
+
+For an offline backfill, repeat the materializer command for the records that
+must be immediately available. It is intentionally bounded per record so the
+operator can schedule the work around SMB load; record switching itself does
+not require a full-history copy.
+
+The Rust endpoint can also be driven as a resumable batch (already materialized
+records are skipped by default):
+
+```powershell
+python scripts/rebuild_bkv_history.py `
+  --input-root target\run\bkv-history-recovery\input `
+  --inventory target\run\bkv-history-recovery\rebuild.json `
+  --limit 100
+```
+
 ## Verification
 
 ```powershell

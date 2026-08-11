@@ -1,5 +1,5 @@
-import { AlertTriangle, RotateCcw, Search } from 'lucide-react';
-import { useState, type ChangeEvent, type FormEvent } from 'react';
+import { AlertTriangle, RefreshCw, RotateCcw, Search } from 'lucide-react';
+import { useEffect, useState, type ChangeEvent, type FormEvent } from 'react';
 import { createPortal } from 'react-dom';
 import type { InspectionRecord, InspectionSummary, PlateInspection, SteelPlate } from '../data/inspection';
 import { emptyRecordSearchFilters, type RecordSearchFilters } from '../state/record-search';
@@ -7,10 +7,12 @@ import { Panel } from './Panel';
 
 type RecordSearchField = keyof RecordSearchFilters;
 
+const RECORD_RENDER_BATCH = 200;
+
 const recordSearchOptions: Array<{ field: RecordSearchField; label: string; placeholder: string; inputLabel: string }> = [
   { field: 'serialNo', label: '流水号', placeholder: 'R-001', inputLabel: '流水号查询' },
-  { field: 'plateNo', label: '钢管号', placeholder: '202606131900', inputLabel: '钢管号查询' },
-  { field: 'time', label: '时间', placeholder: '2026-06-13 / 19:00', inputLabel: '时间查询' },
+  { field: 'plateNo', label: '钢管号', placeholder: '输入钢管号', inputLabel: '钢管号查询' },
+  { field: 'time', label: '时间', placeholder: 'YYYY-MM-DD / HH:mm', inputLabel: '时间查询' },
 ];
 
 function createSingleRecordSearchPatch(field: RecordSearchField, value: string): RecordSearchFilters {
@@ -34,7 +36,10 @@ interface LeftSidebarProps {
   searchFilters: RecordSearchFilters;
   filteredCount: number;
   totalCount: number;
+  recordsRefreshing?: boolean;
+  recordsSynchronizedAt?: number | null;
   onRecordSelect: (plateNo: string) => void;
+  onRecordsRefresh?: () => void;
   onSearchChange: (patch: Partial<RecordSearchFilters>) => void;
   onSearchReset: () => void;
 }
@@ -73,12 +78,16 @@ export function LeftSidebar({
   searchFilters,
   filteredCount,
   totalCount,
+  recordsRefreshing = false,
+  recordsSynchronizedAt = null,
   onRecordSelect,
+  onRecordsRefresh,
   onSearchChange,
   onSearchReset,
 }: LeftSidebarProps) {
   const [activeSearchField, setActiveSearchField] = useState<RecordSearchField>('serialNo');
   const [hoveredRecord, setHoveredRecord] = useState<{ record: InspectionRecord; left: number; top: number } | null>(null);
+  const [visibleRecordLimit, setVisibleRecordLimit] = useState(RECORD_RENDER_BATCH);
   const activeSearchOption = recordSearchOptions.find((option) => option.field === activeSearchField) ?? recordSearchOptions[0];
   const activeSearchValue = searchFilters[activeSearchField];
   const hoveredInspection = hoveredRecord
@@ -86,6 +95,11 @@ export function LeftSidebar({
       ?? inspections.find((inspection) => inspection.plate.plateNo === hoveredRecord.record.plateNo)
       ?? null
     : null;
+  const visibleRecords = records.slice(0, visibleRecordLimit);
+
+  useEffect(() => {
+    setVisibleRecordLimit(RECORD_RENDER_BATCH);
+  }, [records.length, searchFilters.plateNo, searchFilters.serialNo, searchFilters.time]);
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -204,8 +218,25 @@ export function LeftSidebar({
         title="检测记录"
         className="records-panel"
         action={(
-          <div className="record-search-count">
-            匹配 <strong>{filteredCount}</strong> / {totalCount}
+          <div className="record-list-sync">
+            <div className="record-search-count">
+              匹配 <strong>{filteredCount}</strong> / {totalCount}
+            </div>
+            {onRecordsRefresh ? (
+              <button
+                type="button"
+                className={recordsRefreshing ? 'refreshing' : ''}
+                onClick={onRecordsRefresh}
+                disabled={recordsRefreshing}
+                aria-label="刷新检测记录"
+                title={recordsSynchronizedAt
+                  ? `最近同步 ${new Date(recordsSynchronizedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
+                  : '刷新检测记录'}
+              >
+                <RefreshCw size={13} />
+                {recordsRefreshing ? '同步中' : '刷新'}
+              </button>
+            ) : null}
           </div>
         )}
       >
@@ -221,7 +252,7 @@ export function LeftSidebar({
             </thead>
             <tbody>
               {records.length > 0 ? (
-                records.map((record) => (
+                visibleRecords.map((record) => (
                   <tr
                     key={record.id}
                     tabIndex={0}
@@ -247,6 +278,19 @@ export function LeftSidebar({
                   <td colSpan={4}>无匹配记录</td>
                 </tr>
               )}
+              {visibleRecords.length < records.length ? (
+                <tr className="records-load-more-row">
+                  <td colSpan={4}>
+                    <button
+                      type="button"
+                      aria-label="加载更多检测记录"
+                      onClick={() => setVisibleRecordLimit((current) => current + RECORD_RENDER_BATCH)}
+                    >
+                      加载更多（已显示 {visibleRecords.length} / {records.length}）
+                    </button>
+                  </td>
+                </tr>
+              ) : null}
             </tbody>
           </table>
         </div>

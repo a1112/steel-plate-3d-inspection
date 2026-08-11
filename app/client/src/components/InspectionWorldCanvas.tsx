@@ -24,8 +24,26 @@ type Props = {
   focusPositionRatio?: number | null;
   className?: string;
   onFirstPaint?: () => void;
+  onFirstScreenReady?: () => void;
+  onTileLoadingChange?: (state: InspectionWorldTileLoading) => void;
+  suspendLoading?: boolean;
   onVisibleRangeChange?: (range: [number, number] | null) => void;
   colorMode?: 'gray' | 'jet';
+};
+
+export type InspectionWorldTileLoading = {
+  recordId: string;
+  level: number;
+  tileSize: number;
+  firstScreenTiles: number;
+  loadedFirstScreenTiles: number;
+  visibleTiles: number;
+  loadedVisibleTiles: number;
+  loadCandidates: number;
+  pendingTiles: number;
+  activeRequests: number;
+  failedTiles: number;
+  ready: boolean;
 };
 
 type ViewState = { scrollLeft: number; scrollTop: number; scale: number };
@@ -42,6 +60,7 @@ const DEFAULT_WIDTH = 1000;
 const DEFAULT_HEIGHT = 600;
 const TILE_CACHE_BYTES = 64 * 1024 * 1024;
 const WORLD_TOP_GUTTER_PX = 28;
+const TILE_REQUEST_CONCURRENCY = 8;
 
 function tileEntryBytes(entry: TileEntry) {
   const width = entry.image.naturalWidth || entry.image.width || 128;
@@ -107,6 +126,9 @@ export function InspectionWorldCanvas({
   focusPositionRatio,
   className = '',
   onFirstPaint,
+  onFirstScreenReady,
+  onTileLoadingChange,
+  suspendLoading = false,
   onVisibleRangeChange,
   colorMode = 'gray',
 }: Props) {
@@ -116,7 +138,7 @@ export function InspectionWorldCanvas({
   const activeTileKeys = useRef(new Set<string>());
   const committedTileKeys = useRef(new Set<string>());
   const pending = useRef(new Map<string, PendingTileRequest>());
-  const requestQueue = useRef(new TileRequestQueue<WorldTile>(6, 400));
+  const requestQueue = useRef(new TileRequestQueue<WorldTile>(TILE_REQUEST_CONCURRENCY, 400));
   const cacheClock = useRef(0);
   const drag = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const scrollFrame = useRef<number | null>(null);
@@ -126,7 +148,11 @@ export function InspectionWorldCanvas({
   const consumedFocusRequest = useRef<string | null>(null);
   const lifecycleGeneration = useRef(0);
   const onFirstPaintRef = useRef(onFirstPaint);
+  const onFirstScreenReadyRef = useRef(onFirstScreenReady);
+  const onTileLoadingChangeRef = useRef(onTileLoadingChange);
   const firstPaintReported = useRef(false);
+  const firstScreenReadyReported = useRef(false);
+  const lastLoadingSignature = useRef<string | null>(null);
   const measured = useRef(false);
   const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
   const [viewportMeasured, setViewportMeasured] = useState(false);
@@ -148,6 +174,7 @@ export function InspectionWorldCanvas({
   const interactionView = useRef(view);
   const [failedKeys, setFailedKeys] = useState<Set<string>>(new Set());
   const [revision, setRevision] = useState(0);
+  const [loadingRevision, setLoadingRevision] = useState(0);
   const [focusScrollRevision, setFocusScrollRevision] = useState(0);
   const worldRevision = useMemo(
     () => `${recordId}:${meta.sourceRevision}:${meta.sourceFrameCount}:${isolatedCameraId ?? 'all'}:${JSON.stringify(meta.world)}`,
@@ -158,6 +185,11 @@ export function InspectionWorldCanvas({
   useLayoutEffect(() => {
     onFirstPaintRef.current = onFirstPaint;
   }, [onFirstPaint]);
+
+  useLayoutEffect(() => {
+    onFirstScreenReadyRef.current = onFirstScreenReady;
+    onTileLoadingChangeRef.current = onTileLoadingChange;
+  }, [onFirstScreenReady, onTileLoadingChange]);
 
   const scheduleScrollRead = useCallback(() => {
     if (scrollFrame.current != null) return;
@@ -246,6 +278,8 @@ export function InspectionWorldCanvas({
     if (previousWorldRevision.current === worldRevision) return;
     previousWorldRevision.current = worldRevision;
     firstPaintReported.current = false;
+    firstScreenReadyReported.current = false;
+    lastLoadingSignature.current = null;
     tileCache.current.forEach(disposeTileEntry);
     tileCache.current.clear();
     requestQueue.current.cancelAll();
@@ -389,12 +423,20 @@ export function InspectionWorldCanvas({
   }, [evictInactiveTiles, visibleTileKeys]);
 
   useEffect(() => {
+    if (!suspendLoading) return;
+    requestQueue.current.cancelAll();
+    pending.current.clear();
+    setLoadingRevision((value) => value + 1);
+  }, [suspendLoading]);
+
+  useEffect(() => {
     if (!failedKeys.size) return;
     const retry = window.setTimeout(() => setFailedKeys(new Set()), 5000);
     return () => window.clearTimeout(retry);
   }, [failedKeys]);
 
   useEffect(() => {
+    if (suspendLoading) return;
     pending.current.forEach((request, key) => {
       if (loadCandidateKeys.has(key)) return;
       requestQueue.current.cancel(key, false);
@@ -410,9 +452,11 @@ export function InspectionWorldCanvas({
       };
       return priority(left) - priority(right);
     });
+    let queued = false;
     for (const tile of prioritizedCandidates) {
       const key = `${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`;
       if (tileCache.current.has(key) || pending.current.has(key) || failedKeys.has(key)) continue;
+      queued = true;
       const requestToken = Symbol(key);
       pending.current.set(key, { token: requestToken });
       const priority = directlyVisibleTileKeys.has(key)
@@ -463,8 +507,10 @@ export function InspectionWorldCanvas({
         })
         .finally(() => {
           if (pending.current.get(key)?.token === requestToken) pending.current.delete(key);
+          setLoadingRevision((value) => value + 1);
         });
     }
+    if (queued) setLoadingRevision((value) => value + 1);
     // Lifecycle cleanup owns cancellation; this cleanup intentionally preserves
     // overlapping per-key requests while allowing StrictMode to replay setup.
     return () => undefined;
@@ -475,6 +521,7 @@ export function InspectionWorldCanvas({
     loadCandidates,
     meta.sourceRevision,
     recordId,
+    suspendLoading,
     visibleTileKeys,
     worldRevision,
   ]);
@@ -515,6 +562,64 @@ export function InspectionWorldCanvas({
   }, [locatableDefects, size.height, size.width, view.scale, viewX, visibleWorldY]);
   const loadedTileCount = visibleTiles.filter((tile) => tileCache.current
     .get(`${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`)?.loaded).length;
+  const loadedFirstScreenTileCount = directlyVisibleTiles.filter((tile) => tileCache.current
+    .get(`${recordId}:${tile.cameraId}:${tile.level}:${tile.x}:${tile.y}`)?.loaded).length;
+  const pendingTileCount = [...pending.current.keys()].filter((key) => loadCandidateKeys.has(key)).length;
+  const firstScreenReady = viewportMeasured
+    && (directlyVisibleTiles.length === 0 || loadedFirstScreenTileCount >= directlyVisibleTiles.length);
+
+  useEffect(() => {
+    if (!viewportMeasured) return;
+    const loading: InspectionWorldTileLoading = {
+      recordId,
+      level,
+      tileSize: meta.world.tileSize,
+      firstScreenTiles: directlyVisibleTiles.length,
+      loadedFirstScreenTiles: loadedFirstScreenTileCount,
+      visibleTiles: visibleTiles.length,
+      loadedVisibleTiles: loadedTileCount,
+      loadCandidates: loadCandidates.length,
+      pendingTiles: pendingTileCount,
+      activeRequests: requestQueue.current.activeCount,
+      failedTiles: failedKeys.size,
+      ready: firstScreenReady,
+    };
+    const signature = [
+      loading.level,
+      loading.firstScreenTiles,
+      loading.loadedFirstScreenTiles,
+      loading.visibleTiles,
+      loading.loadedVisibleTiles,
+      loading.loadCandidates,
+      loading.pendingTiles,
+      loading.activeRequests,
+      loading.failedTiles,
+      loading.ready,
+    ].join(':');
+    if (signature !== lastLoadingSignature.current) {
+      lastLoadingSignature.current = signature;
+      onTileLoadingChangeRef.current?.(loading);
+    }
+    if (firstScreenReady && !firstScreenReadyReported.current) {
+      firstScreenReadyReported.current = true;
+      onFirstScreenReadyRef.current?.();
+    }
+  }, [
+    directlyVisibleTiles,
+    failedKeys.size,
+    firstScreenReady,
+    level,
+    loadingRevision,
+    loadCandidates.length,
+    loadedFirstScreenTileCount,
+    loadedTileCount,
+    meta.world.tileSize,
+    pendingTileCount,
+    recordId,
+    revision,
+    viewportMeasured,
+    visibleTiles.length,
+  ]);
   const focusedDefect = focusDefectId == null
     ? undefined
     : locatableDefects.find((item) => String(item.id) === String(focusDefectId));
@@ -797,6 +902,13 @@ export function InspectionWorldCanvas({
           data-view-scale={view.scale.toFixed(6)}
           data-locatable-defects={locatableDefects.length}
           data-loaded-tiles={loadedTileCount}
+          data-first-screen-tiles={directlyVisibleTiles.length}
+          data-loaded-first-screen-tiles={loadedFirstScreenTileCount}
+          data-pending-tiles={pendingTileCount}
+          data-active-requests={requestQueue.current.activeCount}
+          data-load-candidates={loadCandidates.length}
+          data-max-concurrent={TILE_REQUEST_CONCURRENCY}
+          data-first-screen-ready={firstScreenReady ? 'true' : 'false'}
           data-cached-tiles={tileCache.current.size}
           data-visible-pixel-start={visiblePixelStart}
           data-visible-pixel-end={visiblePixelEnd}
@@ -826,7 +938,9 @@ export function InspectionWorldCanvas({
         <div className="inspection-world-tile-status" role="status">
           {failedKeys.size
             ? `${failedKeys.size} 个瓦片读取失败`
-            : `LOD ${level} · ${meta.world.tileSize}px · ${visibleTiles.length} 个可见瓦片`}
+            : firstScreenReady
+              ? `首屏已就绪 · LOD ${level} · ${meta.world.tileSize}px · 首屏 ${directlyVisibleTiles.length} 块`
+              : `正在加载首屏 ${loadedFirstScreenTileCount}/${directlyVisibleTiles.length} 块 · 并发 ${requestQueue.current.activeCount}/${TILE_REQUEST_CONCURRENCY} · 预取 ${Math.max(0, loadCandidates.length - directlyVisibleTiles.length)} 块`}
         </div>
         {colorMode === 'jet' ? (
           <div className="inspection-world-jet-legend" aria-label="二维 Jet 灰度映射图例">

@@ -53,7 +53,21 @@ export type InspectionWorldRecords = {
   ready?: boolean;
   cameraCount?: number;
   batchId?: string;
+  generation?: number | null;
+  recordCount?: number;
+  latestInspectionTime?: string | null;
+  synchronizedAt?: string;
   records: InspectionWorldRecord[];
+};
+
+export type InspectionWorldRecordsStatus = {
+  schema: 'steel.inspection-world.records-status.v1';
+  provider: InspectionWorldProvider;
+  ready: boolean;
+  recordCount: number;
+  generation: number;
+  latestInspectionTime?: string | null;
+  synchronizedAt?: string;
 };
 
 export type InspectionWorldMeta = {
@@ -64,7 +78,7 @@ export type InspectionWorldMeta = {
   sourceFrameCount: number;
   sourceRevision: string;
   cache: {
-    state: 'building' | 'complete' | 'unavailable';
+    state: 'on-demand' | 'building' | 'complete' | 'unavailable';
     tileSize: number;
     maxLevel: number;
   };
@@ -209,10 +223,28 @@ function worldUrl(path: string, params?: URLSearchParams) {
 
 export async function fetchInspectionWorldRecords(signal?: AbortSignal): Promise<InspectionWorldRecords> {
   const payload = await readJson<InspectionWorldRecords>(await fetch(worldUrl('records'), {
-    headers: createAdminHeaders({ Accept: 'application/json' }), signal,
+    headers: createAdminHeaders({ Accept: 'application/json' }),
+    cache: 'no-store',
+    signal,
   }), '检测世界记录读取失败');
   if (payload.schema !== 'steel.inspection-world.records.v1' || !Array.isArray(payload.records)) {
     throw new Error('检测世界记录格式无效');
+  }
+  return payload;
+}
+
+export async function fetchInspectionWorldRecordsStatus(signal?: AbortSignal): Promise<InspectionWorldRecordsStatus> {
+  const payload = await readJson<InspectionWorldRecordsStatus>(await fetch(worldUrl('records/status'), {
+    headers: createAdminHeaders({ Accept: 'application/json' }),
+    cache: 'no-store',
+    signal,
+  }), '检测记录同步状态读取失败');
+  if (
+    payload.schema !== 'steel.inspection-world.records-status.v1'
+    || typeof payload.generation !== 'number'
+    || typeof payload.recordCount !== 'number'
+  ) {
+    throw new Error('检测记录同步状态格式无效');
   }
   return payload;
 }
@@ -226,8 +258,11 @@ export async function fetchInspectionWorldMeta(recordId: string, signal?: AbortS
     || typeof payload.sourceRevision !== 'string'
     || !payload.sourceRevision
     || !payload.cache
-    || payload.cache.tileSize !== 128
+    || payload.cache.tileSize !== 512
+    || payload.cache.maxLevel > 3
     || !payload.world
+    || payload.world.tileSize !== 512
+    || payload.world.maxLevel > 3
     || !Array.isArray(payload.world.cameras)
   ) {
     throw new Error('检测世界元数据格式无效');
@@ -431,6 +466,7 @@ export async function fetchInspectionWorldTile(
     y: String(request.y),
     format,
   });
+  params.set('layout', 'steel-world-tile-v3-512-l3');
   let response = await fetch(worldUrl('tile', params), {
     headers: createAdminHeaders({ Accept: format === 'png' ? 'image/png' : 'image/jpeg' }), signal,
   });

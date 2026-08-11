@@ -222,6 +222,41 @@ export function buildStandardBkvInspectionSnapshot(
   };
 }
 
+export function synchronizeStandardBkvInspectionRecords(
+  snapshot: InspectionSnapshot,
+  payload: InspectionWorldRecords,
+): InspectionSnapshot {
+  const refreshed = buildStandardBkvInspectionSnapshot(payload);
+  const existingById = new Map(
+    snapshot.inspections
+      .filter((inspection) => inspection.inspectionId)
+      .map((inspection) => [inspection.inspectionId as string, inspection]),
+  );
+  const inspections = refreshed.inspections.map((inspection) => {
+    const existing = inspection.inspectionId
+      ? existingById.get(inspection.inspectionId)
+      : undefined;
+    return existing
+      ? {
+        ...existing,
+        plate: inspection.plate,
+        source: inspection.source,
+      }
+      : inspection;
+  });
+  const defects = inspections.flatMap((inspection) => inspection.defects);
+  return {
+    ...snapshot,
+    currentPlate: refreshed.currentPlate,
+    records: refreshed.records,
+    inspections,
+    defects,
+    defectTypes: mappedDefectTypes(defects),
+    summary: summarize(inspections[0]?.defects ?? []),
+    source: refreshed.source,
+  };
+}
+
 export function mergeStandardBkvDefects(
   snapshot: InspectionSnapshot,
   recordId: string,

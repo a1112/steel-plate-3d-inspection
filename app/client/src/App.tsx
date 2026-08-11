@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { PanelRightOpen, X } from 'lucide-react';
 import { getAllDefects, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
 import type { DefectItem, InspectionSnapshot, Severity } from './data/inspection';
@@ -88,10 +88,12 @@ import { BkvReconstructionApp } from './components/BkvReconstructionApp';
 import {
   buildStandardBkvInspectionSnapshot,
   mergeStandardBkvDefects,
+  synchronizeStandardBkvInspectionRecords,
 } from './lib/bkv-inspection-adapter';
 import {
   fetchInspectionWorldDefects,
   fetchInspectionWorldRecords,
+  fetchInspectionWorldRecordsStatus,
   fetchInspectionWorldSurface,
   type InspectionWorldRecords,
 } from './services/inspection-world-api';
@@ -312,6 +314,8 @@ function ConfiguredApp({
     detail: '正在读取 BKV 标准离线仓库',
   });
   const [loadRevision, setLoadRevision] = useState(0);
+  const [recordsRefreshing, setRecordsRefreshing] = useState(false);
+  const [recordsSynchronizedAt, setRecordsSynchronizedAt] = useState<number | null>(null);
   const resolvedTerminalMode = dashboardMode.kind === 'bkv' ? 'bkv' : 'online';
   const resourceUsageState = useAppResourceUsage();
 
@@ -335,6 +339,7 @@ function ConfiguredApp({
           throw new DOMException('BKV record load aborted', 'AbortError');
         }
         setBkvRecords(records);
+        setRecordsSynchronizedAt(Date.now());
         setBkvDataHealth({
           state: 'ready',
           detail: records.records.length
@@ -367,6 +372,60 @@ function ConfiguredApp({
       });
     return () => controller.abort();
   }, [dashboardMode.kind, dashboardMode.requestsStandardRecords, loadRevision, resolvedTerminalMode]);
+
+  const refreshStandardRecordList = useCallback(async (
+    force = false,
+    signal?: AbortSignal,
+  ) => {
+    if (!dashboardMode.requestsStandardRecords) return;
+    setRecordsRefreshing(true);
+    try {
+      const status = await fetchInspectionWorldRecordsStatus(signal);
+      const currentGeneration = bkvRecords?.generation ?? -1;
+      if (!force && currentGeneration === status.generation) {
+        setRecordsSynchronizedAt(Date.now());
+        return;
+      }
+      const records = await fetchInspectionWorldRecords(signal);
+      if (signal?.aborted) return;
+      setBkvRecords(records);
+      setSnapshot((current) => (
+        current
+          ? synchronizeStandardBkvInspectionRecords(current, records)
+          : buildStandardBkvInspectionSnapshot(records)
+      ));
+      setRecordsSynchronizedAt(Date.now());
+      setBkvDataHealth({
+        state: 'ready',
+        detail: `${records.records.length} 条检测记录已与统一结果目录同步`,
+      });
+    } catch (error) {
+      if (!signal?.aborted) {
+        const detail = error instanceof Error ? error.message : '检测记录同步失败';
+        setBkvDataHealth({ state: 'store-error', detail });
+      }
+    } finally {
+      if (!signal?.aborted) setRecordsRefreshing(false);
+    }
+  }, [bkvRecords?.generation, dashboardMode.requestsStandardRecords]);
+
+  useEffect(() => {
+    if (!dashboardMode.requestsStandardRecords) return undefined;
+    let controller: AbortController | null = null;
+    const refresh = () => {
+      if (document.visibilityState === 'hidden') return;
+      controller?.abort();
+      controller = new AbortController();
+      void refreshStandardRecordList(false, controller.signal);
+    };
+    const timer = window.setInterval(refresh, 10_000);
+    window.addEventListener('focus', refresh);
+    return () => {
+      controller?.abort();
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refresh);
+    };
+  }, [dashboardMode.requestsStandardRecords, refreshStandardRecordList]);
 
   const retryBkvLoad = () => {
     setSnapshot(null);
@@ -453,9 +512,12 @@ function ConfiguredApp({
       dashboardMode={dashboardMode}
       bkvRecords={bkvRecords}
       bkvDataHealth={bkvDataHealth}
+      recordsRefreshing={recordsRefreshing}
+      recordsSynchronizedAt={recordsSynchronizedAt}
       capabilityMessage={capabilityMessage}
       resourceUsageState={resourceUsageState}
       onSnapshotChange={setSnapshot}
+      onRecordsRefresh={() => void refreshStandardRecordList(true)}
     />
   );
 }
@@ -466,18 +528,24 @@ function InspectionDashboard({
   dashboardMode,
   bkvRecords,
   bkvDataHealth,
+  recordsRefreshing,
+  recordsSynchronizedAt,
   capabilityMessage,
   resourceUsageState,
   onSnapshotChange,
+  onRecordsRefresh,
 }: {
   snapshot: InspectionSnapshot;
   runtimeProfile: PublicRuntimeProfile;
   dashboardMode: RuntimeDashboardMode;
   bkvRecords: InspectionWorldRecords | null;
   bkvDataHealth: BkvDataHealth;
+  recordsRefreshing: boolean;
+  recordsSynchronizedAt: number | null;
   capabilityMessage?: string;
   resourceUsageState: AppResourceUsageState;
   onSnapshotChange: (snapshot: InspectionSnapshot) => void;
+  onRecordsRefresh: () => void;
 }) {
   const terminalMode = dashboardMode.kind === 'bkv' ? 'bkv' : 'online';
   const [appMode] = useState(readAppMode);
@@ -570,7 +638,7 @@ function InspectionDashboard({
   }, []);
 
   useEffect(() => {
-    if (terminalMode !== 'online') return;
+    if (!dashboardMode.requestsOnlineServices) return;
     const controller = new AbortController();
     fetchConnectionConfig(controller.signal)
       .then((config) => {
@@ -583,10 +651,10 @@ function InspectionDashboard({
         }
       });
     return () => controller.abort();
-  }, [terminalMode]);
+  }, [dashboardMode.requestsOnlineServices]);
 
   useEffect(() => {
-    if (terminalMode !== 'online') return;
+    if (!dashboardMode.requestsOnlineServices) return;
     const controller = new AbortController();
     fetchInspectionSettings(controller.signal)
       .then((settings) => {
@@ -600,7 +668,7 @@ function InspectionDashboard({
         }
       });
     return () => controller.abort();
-  }, [terminalMode]);
+  }, [dashboardMode.requestsOnlineServices]);
 
   useEffect(() => {
     if (!settingsModalOpen) {
@@ -616,7 +684,7 @@ function InspectionDashboard({
   }, [settingsModalOpen]);
 
   useEffect(() => {
-    if (terminalMode !== 'online') return;
+    if (!dashboardMode.requestsOnlineServices) return;
     let cancelled = false;
     const refreshCapture = async () => {
       try {
@@ -636,10 +704,10 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [terminalMode]);
+  }, [dashboardMode.requestsOnlineServices]);
 
   useEffect(() => {
-    if (terminalMode !== 'online') return;
+    if (!dashboardMode.requestsOnlineServices) return;
     let cancelled = false;
     let inFlight = false;
     const refreshSnapshot = async () => {
@@ -672,10 +740,10 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [onSnapshotChange, snapshotTracking, terminalMode]);
+  }, [dashboardMode.requestsOnlineServices, onSnapshotChange, snapshotTracking]);
 
   useEffect(() => {
-    if (terminalMode !== 'online') return;
+    if (!dashboardMode.requestsOnlineServices) return;
     let cancelled = false;
     let requestInFlight = false;
     const refreshNetwork = async () => {
@@ -712,10 +780,10 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [terminalMode]);
+  }, [dashboardMode.requestsOnlineServices]);
 
   useEffect(() => {
-    if (terminalMode !== 'online') return;
+    if (!dashboardMode.requestsOnlineServices) return;
     let cancelled = false;
     let inFlight = false;
 
@@ -855,7 +923,7 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [terminalMode]);
+  }, [dashboardMode.requestsOnlineServices]);
 
   const activeSnapshot = useMemo(() => getPlateInspectionSnapshot(snapshot, uiState.selectedRecordId), [snapshot, uiState.selectedRecordId]);
   const activeInspection = useMemo(
@@ -1431,7 +1499,10 @@ function InspectionDashboard({
             searchFilters={recordSearchFilters}
             filteredCount={filteredRecords.length}
             totalCount={snapshot.records.length}
+            recordsRefreshing={recordsRefreshing}
+            recordsSynchronizedAt={recordsSynchronizedAt}
             onRecordSelect={selectRecordByPlateNo}
+            onRecordsRefresh={onRecordsRefresh}
             onSearchChange={updateRecordSearchFilters}
             onSearchReset={resetRecordSearchFilters}
           />
