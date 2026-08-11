@@ -2,8 +2,8 @@
 """Materialize one bounded BKV history record into the unified input layout.
 
 The history recovery pass intentionally publishes metadata first.  This
-utility is the explicit, bounded second phase: it copies only the selected
-record's six-camera 2D frames from the read-only BKV shares, writes a complete
+utility is the explicit, bounded second phase: it copies the selected record's
+six-camera 2D frames and converts its 3D depth frames from the read-only BKV shares, writes a complete
 ``steel.standard-record.v2`` input, and atomically exposes it to the algorithm
 service.  It never deletes or rewrites the source share.
 """
@@ -18,17 +18,31 @@ import os
 import re
 import shutil
 import tempfile
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from recover_bkv_history import (
-    CAMERA_COUNT,
-    _atomic_json,
-    _candidate,
-    _iter_candidates,
-    _record,
-)
+import numpy as np
+
+if __package__:
+    from scripts.convert_bkv_d3img import convert_file as convert_d3img_file
+    from scripts.recover_bkv_history import (
+        CAMERA_COUNT,
+        _atomic_json,
+        _candidate,
+        _iter_candidates,
+        _record,
+    )
+else:
+    from convert_bkv_d3img import convert_file as convert_d3img_file
+    from recover_bkv_history import (
+        CAMERA_COUNT,
+        _atomic_json,
+        _candidate,
+        _iter_candidates,
+        _record,
+    )
 
 
 def _sha256(path: Path) -> tuple[int, str]:
@@ -41,12 +55,12 @@ def _sha256(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _numbered_files(directory: Path, limit: int) -> list[Path]:
+def _numbered_files(directory: Path, limit: int, suffixes: set[str]) -> list[Path]:
     files = [
         path
         for path in directory.iterdir()
         if path.is_file()
-        and path.suffix.lower() in {".bmp", ".jpg", ".jpeg"}
+        and path.suffix.lower() in suffixes
     ]
 
     def sort_key(path: Path) -> tuple[int, int, str]:
@@ -77,6 +91,25 @@ def _write_image(source: Path, target: Path, compress_jpeg: bool) -> tuple[int, 
         image.convert("RGB").save(target, format="JPEG", quality=88, optimize=True)
     size, digest = _sha256(target)
     return size, digest, ".jpg"
+
+
+def _validate_depth_npz(path: Path) -> None:
+    with zipfile.ZipFile(path) as archive:
+        try:
+            depth_member = archive.getinfo("depth.npy")
+        except KeyError as error:
+            raise ValueError(f"depth NPZ has no depth.npy: {path}") from error
+        if depth_member.file_size > 64 * 1024 * 1024:
+            raise ValueError(f"depth NPZ exceeds the 64 MiB depth-array limit: {path}")
+    with np.load(path, allow_pickle=False) as artifact:
+        depth = artifact["depth"]
+        if (
+            depth.ndim != 2
+            or 0 in depth.shape
+            or depth.dtype != np.dtype("float32")
+            or not depth.flags.c_contiguous
+        ):
+            raise ValueError(f"depth NPZ must contain a non-empty C-order float32 array: {path}")
 
 
 def _find_candidate(runs_root: Path, record_id: str, run_dir: Path | None = None):
@@ -113,7 +146,7 @@ def _materialize_camera(
     source_directory = _source_directory(candidate.manifest, camera, source_host)
     if not source_directory.is_dir():
         raise ValueError(f"camera C{camera} source directory is unavailable: {source_directory}")
-    source_files = _numbered_files(source_directory, max_frames)
+    source_files = _numbered_files(source_directory, max_frames, {".bmp", ".jpg", ".jpeg"})
     if not source_files:
         raise ValueError(f"camera C{camera} has no 2D frames: {source_directory}")
     camera_id = f"C{camera}"
@@ -137,6 +170,34 @@ def _materialize_camera(
                 "sha256": digest,
             }
         )
+    depth_directory = _source_depth_directory(candidate.manifest, camera, source_host)
+    if not depth_directory.is_dir():
+        raise ValueError(f"camera C{camera} depth directory is unavailable: {depth_directory}")
+    depth_files = _numbered_files(depth_directory, max_frames, {".d3img", ".npz"})
+    if not depth_files:
+        raise ValueError(f"camera C{camera} has no 3D depth frames: {depth_directory}")
+    depth_target_directory = staged_record / "cameras" / camera_id / "depth"
+    depth_target_directory.mkdir(parents=True, exist_ok=True)
+    for sequence, source in enumerate(depth_files):
+        target = depth_target_directory / f"{sequence:06d}.npz"
+        if source.suffix.lower() == ".d3img":
+            convert_d3img_file(source, target)
+        else:
+            shutil.copy2(source, target)
+            _validate_depth_npz(target)
+        size, digest = _sha256(target)
+        total_bytes += size
+        source_hashes.append(digest)
+        copied_files.append(
+            {
+                "cameraId": camera_id,
+                "kind": "depth",
+                "path": target.relative_to(staged_record).as_posix(),
+                "sequenceNo": sequence,
+                "size": size,
+                "sha256": digest,
+            }
+        )
     return camera_id, copied_files, source_hashes, total_bytes
 
 
@@ -153,6 +214,13 @@ def _source_directory(manifest: dict[str, Any], camera: int, source_host: str) -
             if camera_id == camera and value.get("sourceDirectory"):
                 return Path(str(value["sourceDirectory"]))
     return Path(source_host) / f"CamImageSource{camera}" / str(manifest.get("recordId") or "") / "2D"
+
+
+def _source_depth_directory(manifest: dict[str, Any], camera: int, source_host: str) -> Path:
+    intensity = _source_directory(manifest, camera, source_host)
+    if intensity.name.lower() == "2d":
+        return intensity.parent / "3D"
+    return Path(source_host) / f"CamImageSource{camera}" / str(manifest.get("recordId") or "") / "3D"
 
 
 def materialize(
@@ -182,6 +250,7 @@ def materialize(
     source_hashes: list[str] = []
     total_bytes = 0
     camera_counts: dict[str, int] = {}
+    depth_counts: dict[str, int] = {}
     try:
         # Each camera is an independent SMB root.  Bounded parallelism keeps a
         # single record switch responsive without opening an unbounded number
@@ -201,7 +270,8 @@ def materialize(
             ]
             camera_results = [future.result() for future in futures]
         for camera_id, camera_files, camera_hashes, camera_bytes in camera_results:
-            camera_counts[camera_id] = len(camera_files)
+            camera_counts[camera_id] = sum(value["kind"] == "intensity" for value in camera_files)
+            depth_counts[camera_id] = sum(value["kind"] == "depth" for value in camera_files)
             copied_files.extend(camera_files)
             source_hashes.extend(camera_hashes)
             total_bytes += camera_bytes
@@ -227,6 +297,7 @@ def materialize(
                 "materializedFrameCount": len(copied_files),
                 "materializedBytes": total_bytes,
                 "materializedCameraCounts": camera_counts,
+                "materializedDepthCameraCounts": depth_counts,
                 "compressedJpeg": compress_jpeg,
                 "materializer": "bkv-history-materialize-v1",
             }
@@ -250,8 +321,13 @@ def materialize(
                 str(_source_directory(candidate.manifest, camera, source_host))
                 for camera in range(1, CAMERA_COUNT + 1)
             ],
+            "sourceDepthDirectories": [
+                str(_source_depth_directory(candidate.manifest, camera, source_host))
+                for camera in range(1, CAMERA_COUNT + 1)
+            ],
             "frameCount": len(copied_files),
             "cameraCounts": camera_counts,
+            "depthCameraCounts": depth_counts,
             "bytes": total_bytes,
             "sourceHash": record["sourceHash"],
             "rawAssetsDeferred": False,

@@ -60,6 +60,7 @@ export function GlobalConfigurationPanel({
   const [selectedId, setSelectedId] = useState('');
   const [detail, setDetail] = useState<SiteConfigDetailResponse | null>(null);
   const [createDraft, setCreateDraft] = useState<CreateDraft | null>(null);
+  const [modeDraft, setModeDraft] = useState<SiteMode | null>(null);
   const [nameDraft, setNameDraft] = useState('');
   const [busyAction, setBusyAction] = useState('');
   const [message, setMessage] = useState('');
@@ -68,6 +69,7 @@ export function GlobalConfigurationPanel({
   const loadDetail = useCallback(async (id: string, signal?: AbortSignal) => {
     const response = await fetchSiteConfig(id, signal);
     setDetail(response);
+    setModeDraft(response.document.mode);
     setNameDraft(response.document.displayName);
     setLoadError('');
   }, []);
@@ -88,6 +90,7 @@ export function GlobalConfigurationPanel({
       await loadDetail(nextId, signal);
     } else {
       setDetail(null);
+      setModeDraft(null);
     }
     setLoadError('');
   }, [loadDetail]);
@@ -162,6 +165,25 @@ export function GlobalConfigurationPanel({
       await cloneSiteConfig(detail.site.id, { id, displayName });
       await loadCatalog(id);
     }, '现场配置已复制');
+  };
+
+  const prepareModeChange = () => {
+    if (!detail || !modeDraft || modeDraft === detail.document.mode) return;
+    const suffix = modeDraft === 'bkv' ? 'bkv' : 'direct-camera';
+    const baseId = `${detail.site.id}-${suffix}`;
+    const existingIds = new Set(catalog?.sites.map((site) => site.id) ?? []);
+    let id = baseId;
+    let index = 2;
+    while (existingIds.has(id)) {
+      id = `${baseId}-${index}`;
+      index += 1;
+    }
+    setCreateDraft({
+      id,
+      displayName: `${detail.site.displayName} · ${modeLabel(modeDraft)}`,
+      mode: modeDraft,
+    });
+    setMessage(`已选择${modeLabel(modeDraft)}，请确认新建配置并切换`);
   };
 
   const saveName = async () => {
@@ -386,10 +408,32 @@ export function GlobalConfigurationPanel({
                 </header>
 
                 <div className="site-config-facts">
-                  <div>
-                    <span>运行模式</span>
-                    <strong>{modeLabel(detail.document.mode)}</strong>
-                    <em>仅在新建配置时设置</em>
+                  <div className="site-config-mode-fact" data-testid="site-config-mode-setting">
+                    <div className="site-config-mode-current">
+                      <span>当前配置模式</span>
+                      <strong>{modeLabel(detail.document.mode)}</strong>
+                      <em>当前配置包创建后不可原地修改</em>
+                    </div>
+                    <label>
+                      <span>设置为</span>
+                      <select
+                        aria-label="设置配置模式"
+                        value={modeDraft ?? detail.document.mode}
+                        disabled={!canEdit || busy}
+                        onChange={(event) => setModeDraft(event.target.value as SiteMode)}
+                      >
+                        <option value="bkv">BKV 模式</option>
+                        <option value="direct-camera">相机直连模式</option>
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      disabled={!canEdit || busy || !modeDraft
+                        || modeDraft === detail.document.mode}
+                      onClick={prepareModeChange}
+                    >
+                      按此模式新建配置
+                    </button>
                   </div>
                   <div>
                     <span>相机数量</span>

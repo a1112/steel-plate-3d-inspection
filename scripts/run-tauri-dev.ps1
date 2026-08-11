@@ -7,6 +7,7 @@ param(
   [switch]$NoService,
   [switch]$NoProcessingServices,
   [switch]$AllowNetworkDependencyFetch,
+  [string]$DataRoot = "D:\Data",
   [string]$CargoRegistryMirror = "https://rsproxy.cn/index/"
 )
 
@@ -36,8 +37,9 @@ $ServiceOrigin = "http://127.0.0.1:$ServicePort"
 $ImageServicePort = 4874
 $AlgorithmServicePort = 4875
 $ProcessingRoot = Join-Path $RunDir "processing"
-$ResultRoot = Join-Path $ProcessingRoot "result-data"
+$ResultRoot = Join-Path $DataRoot "inspection-results"
 $AlgorithmInputRoot = Join-Path $ProcessingRoot "algorithm-input"
+$InspectionWorldCacheRoot = Join-Path $RunDir "cache\inspection-world"
 $LogRoot = Join-Path $RunDir "logs"
 $env:STEEL_RUNTIME_STATE_ROOT = $RunDir
 $env:STEEL_RUNTIME_LOG_DIR = $LogRoot
@@ -73,9 +75,12 @@ try {
   if (-not $NoProcessingServices) {
     & (Join-Path $PSScriptRoot "build-image-service.ps1") -Profile debug
     & (Join-Path $PSScriptRoot "build-algorithm-service.ps1") -Profile debug
-    New-Item -ItemType Directory -Force -Path $RunDir, $LogRoot, $ResultRoot, $AlgorithmInputRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $RunDir, $LogRoot, $DataRoot, $ResultRoot, $AlgorithmInputRoot, $InspectionWorldCacheRoot | Out-Null
     $env:STEEL_RESULT_ROOT = $ResultRoot
     $env:STEEL_ALGORITHM_INPUT_ROOTS = $AlgorithmInputRoot
+    $env:STEEL_BKV_HISTORY_WORK_ROOT = $AlgorithmInputRoot
+    $env:STEEL_INSPECTION_WORLD_CACHE_ROOT = $InspectionWorldCacheRoot
+    $env:STEEL_INSPECTION_WORLD_HISTORY_LIMIT = "399"
     $env:STEEL_IMAGE_SERVICE_PORT = [string]$ImageServicePort
     $env:STEEL_ALGORITHM_SERVICE_PORT = [string]$AlgorithmServicePort
     $env:STEEL_RESULT_PROXY_ONLY = "1"
@@ -146,6 +151,7 @@ try {
         $ServiceArguments += @(
           "-ResultRoot", $ResultRoot,
           "-AlgorithmInputRoot", $AlgorithmInputRoot,
+          "-InspectionWorldCacheRoot", $InspectionWorldCacheRoot,
           "-ResultProxyOnly"
         )
       }

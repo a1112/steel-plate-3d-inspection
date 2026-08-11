@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
@@ -15104,6 +15105,14 @@ fn unified_result_store_enabled(state: &ServiceState) -> bool {
             || env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1"))
 }
 
+fn inspection_world_history_limit(state: &ServiceState) -> usize {
+    env::var("STEEL_INSPECTION_WORLD_HISTORY_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(state.runtime_config.algorithm.source_data.record_limit)
+        .clamp(1, 5_000)
+}
+
 fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
     if state.runtime_config.data_source == "bkv-online-mysql"
         && !unified_result_store_enabled(state)
@@ -15134,8 +15143,9 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
                 &json!({"code": 503, "error": "converted_record_store_unavailable"}).to_string(),
             );
         };
-        return match store.records() {
-            Ok(records) => {
+        let history_limit = inspection_world_history_limit(state);
+        return match store.records_page(None, None, history_limit as u64, 0) {
+            Ok((_, records)) => {
                 let camera_count = store.configured_cameras().len();
                 let catalog_summary = store.catalog_summary().ok();
                 let latest_inspection_time = catalog_summary
@@ -15165,7 +15175,7 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
                         "cameraCount": camera_count,
                         "batchId": batch_id,
                         "generation": catalog_summary.as_ref().map(|summary| summary.generation),
-                        "recordCount": catalog_summary.as_ref().map(|summary| summary.record_count).unwrap_or(records.len() as u64),
+                        "recordCount": records.len(),
                         "latestInspectionTime": latest_inspection_time,
                         "synchronizedAt": current_time_string(),
                         "records": records,
@@ -15232,20 +15242,25 @@ fn inspection_world_records_status_response(state: &ServiceState) -> Vec<u8> {
         );
     };
     match store.catalog_summary() {
-        Ok(summary) => http_response(
-            "200 OK",
-            "application/json; charset=utf-8",
-            &json!({
-                "schema": "steel.inspection-world.records-status.v1",
-                "provider": "bkv",
-                "ready": summary.record_count > 0,
-                "recordCount": summary.record_count,
-                "generation": summary.generation,
-                "latestInspectionTime": summary.latest_inspection_time,
-                "synchronizedAt": current_time_string(),
-            })
-            .to_string(),
-        ),
+        Ok(summary) => {
+            let record_count = summary
+                .record_count
+                .min(inspection_world_history_limit(state) as u64);
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "schema": "steel.inspection-world.records-status.v1",
+                    "provider": "bkv",
+                    "ready": record_count > 0,
+                    "recordCount": record_count,
+                    "generation": summary.generation,
+                    "latestInspectionTime": summary.latest_inspection_time,
+                    "synchronizedAt": current_time_string(),
+                })
+                .to_string(),
+            )
+        }
         Err(error) => http_response(
             "503 Service Unavailable",
             "application/json; charset=utf-8",
@@ -15253,6 +15268,8 @@ fn inspection_world_records_status_response(state: &ServiceState) -> Vec<u8> {
         ),
     }
 }
+
+static HISTORICAL_RECONSTRUCTIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn request_historical_reconstruction(state: &ServiceState, record_id: &str) -> Result<(), String> {
     if env::var("STEEL_HISTORY_RECONSTRUCTION").as_deref() == Ok("0")
@@ -15273,37 +15290,43 @@ fn request_historical_reconstruction(state: &ServiceState, record_id: &str) -> R
     let origin = env::var("STEEL_ALGORITHM_SERVICE_ORIGIN")
         .unwrap_or_else(|_| "http://127.0.0.1:4875".to_string());
     let body = json!({"recordId": record_id}).to_string();
-    let response = bounded_local_http_request(
-        &origin,
-        "POST",
-        "/internal/v1/reconstruct",
-        &body,
-        Duration::from_secs(
-            env::var("STEEL_HISTORY_RECONSTRUCTION_TIMEOUT_SEC")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(120)
-                .clamp(1, 600),
-        ),
-        &[],
-    )
-    .map_err(|error| {
-        format!(
-            "algorithm reconstruction request failed: {}",
-            error.as_str()
-        )
-    })?;
-    if !(200..300).contains(&response.status_code) {
-        let detail = String::from_utf8_lossy(&response.body).trim().to_string();
-        return Err(if detail.is_empty() {
-            format!(
-                "algorithm reconstruction returned HTTP {}",
-                response.status_code
-            )
-        } else {
-            detail
-        });
+    let timeout = Duration::from_secs(
+        env::var("STEEL_HISTORY_RECONSTRUCTION_TIMEOUT_SEC")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(120)
+            .clamp(1, 600),
+    );
+    let active = HISTORICAL_RECONSTRUCTIONS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut active = active
+        .lock()
+        .map_err(|_| "historical reconstruction lock poisoned".to_string())?;
+    if !active.insert(record_id.to_string()) {
+        return Ok(());
     }
+    let scheduled_record_id = record_id.to_string();
+    thread::spawn(move || {
+        let result = bounded_local_http_request(
+            &origin,
+            "POST",
+            "/internal/v1/reconstruct",
+            &body,
+            timeout,
+            &[],
+        );
+        if let Err(error) = result {
+            eprintln!(
+                "historical reconstruction {} failed: {}",
+                scheduled_record_id,
+                error.as_str()
+            );
+        }
+        if let Some(active) = HISTORICAL_RECONSTRUCTIONS.get() {
+            if let Ok(mut active) = active.lock() {
+                active.remove(&scheduled_record_id);
+            }
+        }
+    });
     Ok(())
 }
 
@@ -15487,7 +15510,7 @@ fn load_online_inspection_world(
     for camera_id in camera_ids {
         let rows = grouped.get_mut(&camera_id).expect("camera group");
         rows.sort_by_key(|row| row.sequence_no);
-        let mut dimensions = None;
+        let mut dimensions: Option<(u32, u32)> = None;
         let mut alignment_frames = Vec::with_capacity(rows.len());
         for (ordinal, row) in rows.iter().enumerate() {
             let sequence = u32::try_from(row.sequence_no).map_err(|_| {
@@ -15501,14 +15524,10 @@ fn load_online_inspection_world(
             let path = online_capture_path(&inspection, &row.path)?;
             let current = image_dimensions_with_guessed_format(&path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
-            if dimensions
-                .replace(current)
-                .is_some_and(|expected| expected != current)
-            {
-                return Err(format!(
-                    "camera {camera_id} intensity dimensions are inconsistent"
-                ));
-            }
+            dimensions = Some(match dimensions {
+                Some((width, height)) => (width.max(current.0), height.max(current.1)),
+                None => current,
+            });
             alignment_frames.push((image_index, path.clone()));
             frames.insert((camera_id, image_index), path);
             sequence_ordinals.insert((camera_id, sequence), image_index);
@@ -15606,23 +15625,24 @@ fn load_converted_inspection_world(
             .get_mut(&camera.id)
             .ok_or_else(|| format!("converted camera {} unavailable", camera.id))?;
         rows.sort_by_key(|row| row.sequence_no);
-        let mut dimensions = None;
-        let mut alignment_frames = Vec::with_capacity(rows.len());
+        let mut dimensions: Option<(u32, u32)> = None;
+        // The converted catalog is immutable and the head position is stable
+        // across the first few acquisition frames. Sampling a bounded prefix
+        // keeps a cold record switch from decoding the whole history just to
+        // construct metadata; every frame is still retained for tile access.
+        let mut alignment_frames = Vec::with_capacity(rows.len().min(8));
         for (ordinal, row) in rows.iter().enumerate() {
             let image_index =
                 u32::try_from(ordinal).map_err(|_| "too many converted frames".to_string())?;
             let current = image_dimensions_with_guessed_format(&row.path)
                 .map_err(|error| format!("{}: {error}", row.path.display()))?;
-            if dimensions
-                .replace(current)
-                .is_some_and(|expected| expected != current)
-            {
-                return Err(format!(
-                    "camera {} intensity dimensions are inconsistent",
-                    camera.id
-                ));
+            dimensions = Some(match dimensions {
+                Some((width, height)) => (width.max(current.0), height.max(current.1)),
+                None => current,
+            });
+            if alignment_frames.len() < 8 {
+                alignment_frames.push((image_index, row.path.clone()));
             }
-            alignment_frames.push((image_index, row.path.clone()));
             frames.insert((camera.source_camera_id, image_index), row.path.clone());
             sequence_ordinals.insert((camera.source_camera_id, row.sequence_no), image_index);
         }
@@ -16330,6 +16350,12 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
 }
 
 fn inspection_world_cache_root(state: &ServiceState) -> PathBuf {
+    if let Some(configured) = env::var("STEEL_INSPECTION_WORLD_CACHE_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return PathBuf::from(configured);
+    }
     let configured = state.runtime_config.storage.cache_root.trim();
     if configured.is_empty() {
         workspace_root()

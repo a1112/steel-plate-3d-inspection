@@ -26,6 +26,7 @@ export interface DefectType {
 export interface DefectItem {
   id: string;
   plateNo: string;
+  inspectionId?: string;
   typeId: string;
   typeLabel: string;
   surface: Surface;
@@ -610,8 +611,9 @@ export function getMockInspectionSnapshot(): InspectionSnapshot {
   };
 }
 
-export function getPlateInspectionSnapshot(snapshot: InspectionSnapshot, plateNo: string): InspectionSnapshot {
-  const inspection = snapshot.inspections.find((item) => item.plate.plateNo === plateNo);
+export function getPlateInspectionSnapshot(snapshot: InspectionSnapshot, recordSelector: string): InspectionSnapshot {
+  const inspection = snapshot.inspections.find((item) => item.inspectionId === recordSelector)
+    ?? snapshot.inspections.find((item) => item.plate.plateNo === recordSelector);
   if (!inspection) {
     return snapshot;
   }

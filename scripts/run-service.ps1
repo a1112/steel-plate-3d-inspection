@@ -36,6 +36,7 @@ param(
   [string]$RuntimeLogDir = "",
   [string]$ResultRoot = "",
   [string]$AlgorithmInputRoot = "",
+  [string]$InspectionWorldCacheRoot = "",
   [switch]$ResultProxyOnly,
   [ValidateRange(10, 7200)]
   [int]$AlgorithmProcessTimeoutSec = 1800,
@@ -66,6 +67,10 @@ if ($ResultRoot.Trim().Length -gt 0) {
 if ($AlgorithmInputRoot.Trim().Length -gt 0) {
   New-Item -ItemType Directory -Force -Path $AlgorithmInputRoot | Out-Null
   $env:STEEL_ALGORITHM_INPUT_ROOTS = (Resolve-Path $AlgorithmInputRoot).Path
+}
+if ($InspectionWorldCacheRoot.Trim().Length -gt 0) {
+  New-Item -ItemType Directory -Force -Path $InspectionWorldCacheRoot | Out-Null
+  $env:STEEL_INSPECTION_WORLD_CACHE_ROOT = (Resolve-Path $InspectionWorldCacheRoot).Path
 }
 if ($ResultProxyOnly) {
   $env:STEEL_RESULT_PROXY_ONLY = "1"

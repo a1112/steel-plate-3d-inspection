@@ -101,8 +101,39 @@ describe('inspection world API', () => {
     expect(String(calls[0][0])).toContain('/api/inspection-world/records');
     expect(String(calls[1][0])).toContain('/api/inspection-world/meta?recordId=1893700');
     expect(String(calls[2][0])).toContain('/api/inspection-world/defects?recordId=1893700');
-    expect(calls[1][1]).toMatchObject({ signal: controller.signal });
     expect(calls[0][1]?.headers).toMatchObject({ Authorization: 'Bearer world-token' });
+  });
+
+  it('deduplicates concurrent metadata and defect requests for one record', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        schema: 'steel.inspection-world.meta.v1',
+        provider: 'bkv',
+        recordId: '1893700',
+        sourceFrameCount: 12,
+        sourceRevision: 'record-hash',
+        cache: { state: 'on-demand', tileSize: 512, maxLevel: 3 },
+        world: { width: 512, height: 512, tileSize: 512, maxLevel: 3, cameras: [] },
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        schema: 'steel.inspection-world.defects.v1',
+        provider: 'bkv',
+        recordId: '1893700',
+        defects: [],
+      })));
+
+    const [firstMeta, secondMeta] = await Promise.all([
+      fetchInspectionWorldMeta('1893700'),
+      fetchInspectionWorldMeta('1893700'),
+    ]);
+    const [firstDefects, secondDefects] = await Promise.all([
+      fetchInspectionWorldDefects('1893700'),
+      fetchInspectionWorldDefects('1893700'),
+    ]);
+
+    expect(firstMeta).toBe(secondMeta);
+    expect(firstDefects).toBe(secondDefects);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it('creates and explicitly revokes a requested tile blob URL', async () => {

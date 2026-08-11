@@ -84,6 +84,7 @@ function standardDefect(
   plate: SteelPlate,
   defect: InspectionWorldDefect,
   cameraCount: number,
+  inspectionId?: string,
 ): DefectItem {
   const cameraIndex = defect.cameraId ?? undefined;
   const imageRect = defect.trace?.artifacts?.imageRect2d;
@@ -128,6 +129,7 @@ function standardDefect(
   return {
     id: String(defect.id),
     plateNo: plate.plateNo,
+    inspectionId,
     typeId: standardDefectTypeId(defect),
     typeLabel: defect.className || '未分类缺陷',
     surface: cameraIndex && cameraIndex <= Math.ceil(cameraCount / 2) ? 'top' : 'bottom',
@@ -278,6 +280,7 @@ export function mergeStandardBkvDefects(
           inspection.plate,
           defect,
           cameraCount,
+          inspection.inspectionId,
         )),
       }
       : inspection

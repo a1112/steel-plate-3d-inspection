@@ -1,9 +1,14 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { InspectionRecord, InspectionSummary, SteelPlate } from '../data/inspection';
+import { fetchInspectionWorldMeta } from '../services/inspection-world-api';
 import { emptyRecordSearchFilters, type RecordSearchFilters } from '../state/record-search';
 import { LeftSidebar } from './LeftSidebar';
+
+vi.mock('../services/inspection-world-api', () => ({
+  fetchInspectionWorldMeta: vi.fn(),
+}));
 
 const plate: SteelPlate = {
   plateNo: '202606131900',
@@ -19,15 +24,32 @@ const records: InspectionRecord[] = [
   { id: 'R-002', time: '18:42', plateNo: '202606131858', status: 'completed', defectCount: 8 },
 ];
 
+const manyRecords: InspectionRecord[] = Array.from({ length: 401 }, (_, index) => ({
+  id: `R-${String(index + 1).padStart(4, '0')}`,
+  time: `18:${String(index % 60).padStart(2, '0')}`,
+  plateNo: `20260613${String(index).padStart(4, '0')}`,
+  status: 'completed',
+  defectCount: index % 9,
+}));
+
 const summary: InspectionSummary = {
   total: 12,
   bySeverity: { severe: 4, review: 3, minor: 5 },
   bySurface: { top: 5, bottom: 7 },
 };
 
-function SidebarHarness({ runtimeMode = 'online' }: { runtimeMode?: 'online' | 'bkv' }) {
+function SidebarHarness({
+  runtimeMode = 'online',
+  onRecordSelect = () => undefined,
+  large = false,
+}: {
+  runtimeMode?: 'online' | 'bkv';
+  onRecordSelect?: (recordId: string) => void;
+  large?: boolean;
+}) {
   const [filters, setFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
-  const filteredRecords = records.filter((record) => {
+  const sourceRecords = large ? manyRecords : records;
+  const filteredRecords = sourceRecords.filter((record) => {
     if (filters.serialNo && !record.id.includes(filters.serialNo)) {
       return false;
     }
@@ -49,8 +71,8 @@ function SidebarHarness({ runtimeMode = 'online' }: { runtimeMode?: 'online' | '
       selectedRecordId={plate.plateNo}
       searchFilters={filters}
       filteredCount={filteredRecords.length}
-      totalCount={records.length}
-      onRecordSelect={() => undefined}
+      totalCount={sourceRecords.length}
+      onRecordSelect={onRecordSelect}
       onSearchChange={(patch) => setFilters((current) => ({ ...current, ...patch }))}
       onSearchReset={() => setFilters(emptyRecordSearchFilters)}
     />
@@ -83,6 +105,34 @@ describe('LeftSidebar', () => {
     expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
   });
 
+  it('selects a row by inspection id instead of the potentially duplicated plate number', () => {
+    const onRecordSelect = vi.fn();
+    render(<SidebarHarness onRecordSelect={onRecordSelect} />);
+
+    fireEvent.click(screen.getByText('202606131858').closest('tr')!);
+
+    expect(onRecordSelect).toHaveBeenCalledWith('R-002');
+  });
+
+  it('shows first-screen cache readiness in the BKV record hover card', async () => {
+    vi.mocked(fetchInspectionWorldMeta).mockResolvedValue({
+      cache: {
+        state: 'on-demand',
+        tileSize: 512,
+        maxLevel: 3,
+        firstScreenTiles: 6,
+        cachedFirstScreenTiles: 6,
+        firstScreenReady: true,
+      },
+    } as Awaited<ReturnType<typeof fetchInspectionWorldMeta>>);
+    render(<SidebarHarness runtimeMode="bkv" />);
+
+    fireEvent.mouseEnter(screen.getByText('202606131858').closest('tr')!);
+
+    await waitFor(() => expect(screen.getByRole('tooltip')).toHaveTextContent('首屏已缓存 6/6'));
+    expect(fetchInspectionWorldMeta).toHaveBeenCalledWith('R-002', expect.any(AbortSignal));
+  });
+
   it('uses a right-side dropdown to switch record search condition', () => {
     render(<SidebarHarness />);
 
@@ -106,5 +156,20 @@ describe('LeftSidebar', () => {
 
     expect(screen.getByText('来源：BKV 标准离线仓库')).toBeInTheDocument();
     expect(screen.queryByText('来源：旧 BKV 文件')).not.toBeInTheDocument();
+  });
+
+  it('loads the next record batch automatically when scrolling near the bottom', async () => {
+    const { container } = render(<SidebarHarness large />);
+    const tableWrap = container.querySelector('.records-table-wrap');
+    expect(tableWrap).not.toBeNull();
+    Object.defineProperties(tableWrap, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 8_000 },
+      scrollTop: { configurable: true, value: 7_700 },
+    });
+
+    fireEvent.scroll(tableWrap!);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /加载更多/ })).toHaveTextContent('已显示 400 / 401'));
   });
 });

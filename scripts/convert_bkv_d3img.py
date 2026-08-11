@@ -91,6 +91,15 @@ def parse_identifiers(source: Path) -> tuple[int, int, int]:
         raise D3ImgFormatError(f"source path does not contain camera/sequence hierarchy: {source}") from exc
 
     camera_match = re.fullmatch(r"CamImageSource(\d+)", camera_dir)
+    # On Windows a UNC share is represented as the path anchor.  For
+    # ``\\host\CamImageSource1\record\3D\frame.d3img`` the third parent has
+    # an empty name, so recover the camera identity from the share component.
+    if camera_match is None:
+        camera_match = re.search(
+            r"(?:^|[\\/])CamImageSource(\d+)[\\/]?$",
+            source.anchor,
+            flags=re.IGNORECASE,
+        )
     if camera_match is None or not seq_dir.isdigit() or not source.stem.isdigit():
         raise D3ImgFormatError(f"source path identifiers are invalid: {source}")
     return int(camera_match.group(1)), int(seq_dir), int(source.stem)

@@ -71,6 +71,33 @@ describe('inspection UI state helpers', () => {
     expect(cleanPlate.previewPositionM).toBe(0);
   });
 
+  it('uses the inspection id to distinguish repeated inspections of the same plate', () => {
+    const snapshot = getMockInspectionSnapshot();
+    const newer = {
+      ...snapshot.inspections[0],
+      inspectionId: 'R-newer',
+      plate: { ...snapshot.inspections[0].plate, plateNo: 'DUPLICATE-PLATE' },
+    };
+    const older = {
+      ...snapshot.inspections[1],
+      inspectionId: 'R-older',
+      plate: { ...snapshot.inspections[1].plate, plateNo: 'DUPLICATE-PLATE' },
+    };
+    const duplicateSnapshot = {
+      ...snapshot,
+      inspections: [newer, older],
+      records: [
+        { ...snapshot.records[0], id: 'R-newer', plateNo: 'DUPLICATE-PLATE' },
+        { ...snapshot.records[1], id: 'R-older', plateNo: 'DUPLICATE-PLATE' },
+      ],
+    };
+
+    const selected = selectRecord(createInitialUiState(duplicateSnapshot), duplicateSnapshot, 'R-older');
+
+    expect(selected.selectedRecordId).toBe('R-older');
+    expect(selected.selectedDefectId).toBe(older.defects[0]?.id ?? null);
+  });
+
   it('paginates stable table rows with a 1-based page number', () => {
     const rows = Array.from({ length: 10 }, (_, index) => index + 1);
 

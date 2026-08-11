@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const RESULT_SCHEMA: &str = "steel.inspection-result.v1";
 pub const CATALOG_SCHEMA: &str = "steel.inspection-result-catalog.v1";
@@ -132,6 +132,7 @@ impl ResultPublisher {
         fs::create_dir_all(root.join("staging"))?;
         let catalog = root.join("catalog.db");
         let connection = Connection::open(&catalog)?;
+        connection.busy_timeout(Duration::from_secs(30))?;
         initialize_catalog(&connection)?;
         Ok(Self { root, catalog })
     }
@@ -230,47 +231,57 @@ impl ResultPublisher {
             }
             return Err(ResultStoreError::Io(error));
         }
-        let connection = Connection::open(&self.catalog)?;
-        let transaction = connection.unchecked_transaction()?;
-        let generation = transaction.query_row(
-            "SELECT COALESCE(MAX(generation), 0) + 1 FROM production_inspection",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? as u64;
-        let result = &input.result;
-        transaction.execute(
-            "INSERT INTO production_inspection (id, session_id, material_id, inspection_time, status, defect_count, camera_count, source_hash, record_path, metadata_json, generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, material_id=excluded.material_id, inspection_time=excluded.inspection_time, status=excluded.status, defect_count=excluded.defect_count, camera_count=excluded.camera_count, source_hash=excluded.source_hash, record_path=excluded.record_path, metadata_json=excluded.metadata_json, generation=excluded.generation",
-            params![result.inspection_id, result.session_id, result.material_id, result.inspection_time, result.status, result.defect_count as i64, result.camera_count as i64, result.source_hash, format!("records/{}", result.inspection_id), serde_json::to_string(&result.material)?, generation as i64],
-        )?;
-        transaction.execute(
-            "DELETE FROM production_defect WHERE inspection_id = ?1",
-            params![result.inspection_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM capture_file WHERE inspection_id = ?1",
-            params![result.inspection_id],
-        )?;
-        for defect in &result.defects {
+        let database_result = (|| -> Result<u64, ResultStoreError> {
+            let connection = Connection::open(&self.catalog)?;
+            connection.busy_timeout(Duration::from_secs(30))?;
+            let transaction = connection.unchecked_transaction()?;
+            let generation = transaction.query_row(
+                "SELECT COALESCE(MAX(generation), 0) + 1 FROM production_inspection",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? as u64;
+            let result = &input.result;
             transaction.execute(
-                "INSERT INTO production_defect (id, inspection_id, camera_id, sequence_no, defect_type, severity, confidence, artifacts_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![defect.id, result.inspection_id, defect.camera_id, defect.sequence_no as i64, defect.defect_type, defect.severity, defect.confidence, serde_json::to_string(&defect.artifacts)?],
+                "INSERT INTO production_inspection (id, session_id, material_id, inspection_time, status, defect_count, camera_count, source_hash, record_path, metadata_json, generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, material_id=excluded.material_id, inspection_time=excluded.inspection_time, status=excluded.status, defect_count=excluded.defect_count, camera_count=excluded.camera_count, source_hash=excluded.source_hash, record_path=excluded.record_path, metadata_json=excluded.metadata_json, generation=excluded.generation",
+                params![result.inspection_id, result.session_id, result.material_id, result.inspection_time, result.status, result.defect_count as i64, result.camera_count as i64, result.source_hash, format!("records/{}", result.inspection_id), serde_json::to_string(&result.material)?, generation as i64],
             )?;
-        }
-        for artifact in &result.artifacts {
             transaction.execute(
-                "INSERT INTO capture_file (id, inspection_id, camera_id, sequence_no, kind, path, size, sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![artifact.id, result.inspection_id, artifact.camera_id, artifact.sequence_no as i64, artifact.kind, artifact.path, artifact.size as i64, artifact.sha256],
+                "DELETE FROM production_defect WHERE inspection_id = ?1",
+                params![result.inspection_id],
             )?;
-        }
-        if let Err(error) = transaction.commit() {
-            let _ = fs::remove_dir_all(&destination);
-            if previous.exists() {
-                let _ = fs::rename(&previous, &destination);
+            transaction.execute(
+                "DELETE FROM capture_file WHERE inspection_id = ?1",
+                params![result.inspection_id],
+            )?;
+            for defect in &result.defects {
+                transaction.execute(
+                    "INSERT INTO production_defect (id, inspection_id, camera_id, sequence_no, defect_type, severity, confidence, artifacts_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![defect.id, result.inspection_id, defect.camera_id, defect.sequence_no as i64, defect.defect_type, defect.severity, defect.confidence, serde_json::to_string(&defect.artifacts)?],
+                )?;
             }
-            return Err(ResultStoreError::Sql(error));
-        }
+            for artifact in &result.artifacts {
+                transaction.execute(
+                    "INSERT INTO capture_file (id, inspection_id, camera_id, sequence_no, kind, path, size, sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![artifact.id, result.inspection_id, artifact.camera_id, artifact.sequence_no as i64, artifact.kind, artifact.path, artifact.size as i64, artifact.sha256],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(generation)
+        })();
+        let generation = match database_result {
+            Ok(generation) => generation,
+            Err(error) => {
+                if let Err(rollback_error) = restore_previous_record(&destination, &previous) {
+                    return Err(ResultStoreError::Invalid(format!(
+                        "catalog publication failed: {error}; record rollback failed: {rollback_error}"
+                    )));
+                }
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        };
         if previous.exists() {
-            fs::remove_dir_all(previous)?;
+            let _ = fs::remove_dir_all(previous);
         }
         let _ = fs::remove_dir_all(&staging);
         Ok(generation)
@@ -293,11 +304,17 @@ impl ResultPublisher {
             Err(_) => return Ok(None),
         };
         if existing.schema != input.result.schema
+            || existing.session_id != input.result.session_id
+            || existing.material_id != input.result.material_id
+            || existing.source != input.result.source
+            || existing.source_record_id != input.result.source_record_id
+            || existing.inspection_time != input.result.inspection_time
             || existing.source_hash != input.result.source_hash
             || existing.config_hash != input.result.config_hash
             || existing.algorithm_version != input.result.algorithm_version
             || existing.status != input.result.status
             || existing.camera_count != input.result.camera_count
+            || existing.cameras != input.result.cameras
             || existing.defect_count != input.result.defect_count
             || existing.material != input.result.material
             || existing.defects != input.result.defects
@@ -310,6 +327,9 @@ impl ResultPublisher {
                 || old.camera_id != new.camera_id
                 || old.sequence_no != new.sequence_no
                 || old.kind != new.kind
+                || old.mime_type != new.mime_type
+                || old.width != new.width
+                || old.height != new.height
                 || (new.size != 0 && old.size != new.size)
                 || (!new.sha256.is_empty() && old.sha256 != new.sha256)
             {
@@ -317,6 +337,7 @@ impl ResultPublisher {
             }
         }
         let connection = Connection::open(&self.catalog)?;
+        connection.busy_timeout(Duration::from_secs(30))?;
         let generation = connection
             .query_row(
                 "SELECT generation FROM production_inspection WHERE id = ?1",
@@ -326,6 +347,16 @@ impl ResultPublisher {
             .optional()?;
         Ok(generation.and_then(|value| u64::try_from(value).ok()))
     }
+}
+
+fn restore_previous_record(destination: &Path, previous: &Path) -> io::Result<()> {
+    if destination.exists() {
+        fs::remove_dir_all(destination)?;
+    }
+    if previous.exists() {
+        fs::rename(previous, destination)?;
+    }
+    Ok(())
 }
 
 pub fn initialize_catalog(connection: &Connection) -> Result<(), ResultStoreError> {
@@ -396,6 +427,66 @@ fn unique_suffix() -> u128 {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn fixture_result(id: &str, source_hash: &str, defect_id: Option<&str>) -> UnifiedResult {
+        let defects = defect_id
+            .map(|defect_id| {
+                vec![ResultDefect {
+                    id: defect_id.to_string(),
+                    camera_id: "C1".into(),
+                    sequence_no: 1,
+                    defect_type: "test".into(),
+                    severity: Some(1),
+                    confidence: Some(0.9),
+                    artifacts: serde_json::json!({}),
+                }]
+            })
+            .unwrap_or_default();
+        UnifiedResult {
+            schema: RESULT_SCHEMA.into(),
+            inspection_id: id.into(),
+            session_id: format!("session-{id}"),
+            material_id: format!("material-{id}"),
+            source: "test".into(),
+            source_record_id: id.into(),
+            inspection_time: None,
+            status: "ready".into(),
+            camera_count: 1,
+            cameras: vec!["C1".into()],
+            defect_count: defects.len(),
+            material: ResultMaterial::default(),
+            artifacts: vec![ResultArtifact {
+                id: format!("artifact-{id}"),
+                camera_id: "C1".into(),
+                sequence_no: 1,
+                kind: "intensity".into(),
+                path: "camera/0001.jpg".into(),
+                mime_type: "image/jpeg".into(),
+                size: 0,
+                sha256: String::new(),
+                width: None,
+                height: None,
+            }],
+            defects,
+            source_hash: source_hash.into(),
+            config_hash: "config".into(),
+            algorithm_version: "test".into(),
+            published_at: "now".into(),
+        }
+    }
+
+    fn publish_fixture(
+        publisher: &ResultPublisher,
+        source: &Path,
+        result: UnifiedResult,
+    ) -> Result<u64, ResultStoreError> {
+        publisher.publish(PublishInput {
+            inspection_id: result.inspection_id.clone(),
+            result,
+            source_directory: source.to_path_buf(),
+            source_provenance: None,
+        })
+    }
 
     #[test]
     fn safe_relative_rejects_escape() {
@@ -471,6 +562,97 @@ mod tests {
                 .unwrap(),
             1
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_changes_are_not_treated_as_an_unchanged_publication() {
+        let root = std::env::temp_dir().join(format!("steel-result-metadata-{}", unique_suffix()));
+        let source = root.join("source");
+        fs::create_dir_all(source.join("camera")).unwrap();
+        fs::write(source.join("camera/0001.jpg"), b"image").unwrap();
+        let publisher = ResultPublisher::open(root.join("results")).unwrap();
+        let initial = fixture_result("1", "source", None);
+        assert_eq!(
+            publish_fixture(&publisher, &source, initial.clone()).unwrap(),
+            1
+        );
+
+        let mut updated = initial;
+        updated.inspection_time = Some("2026-08-11T08:00:00Z".into());
+        updated.session_id = "session-updated".into();
+        assert_eq!(publish_fixture(&publisher, &source, updated).unwrap(), 2);
+        let stored: UnifiedResult = serde_json::from_slice(
+            &fs::read(publisher.root().join("records/1/result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.session_id, "session-updated");
+        assert_eq!(
+            stored.inspection_time.as_deref(),
+            Some("2026-08-11T08:00:00Z")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn database_execute_failure_restores_the_previous_record_directory() {
+        let root = std::env::temp_dir().join(format!("steel-result-rollback-{}", unique_suffix()));
+        let source = root.join("source");
+        fs::create_dir_all(source.join("camera")).unwrap();
+        fs::write(source.join("camera/0001.jpg"), b"image").unwrap();
+        let publisher = ResultPublisher::open(root.join("results")).unwrap();
+        publish_fixture(&publisher, &source, fixture_result("1", "source-old", None)).unwrap();
+        publish_fixture(
+            &publisher,
+            &source,
+            fixture_result("2", "source-two", Some("shared-defect")),
+        )
+        .unwrap();
+
+        let failed = publish_fixture(
+            &publisher,
+            &source,
+            fixture_result("1", "source-new", Some("shared-defect")),
+        );
+        assert!(failed.is_err());
+        let stored: UnifiedResult = serde_json::from_slice(
+            &fs::read(publisher.root().join("records/1/result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.source_hash, "source-old");
+        assert!(stored.defects.is_empty());
+        let connection = Connection::open(publisher.catalog_path()).unwrap();
+        let source_hash: String = connection
+            .query_row(
+                "SELECT source_hash FROM production_inspection WHERE id = '1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_hash, "source-old");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM production_defect WHERE inspection_id = '1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(connection);
+
+        publish_fixture(
+            &publisher,
+            &source,
+            fixture_result("1", "source-new", Some("record-one-defect")),
+        )
+        .unwrap();
+        let repaired: UnifiedResult = serde_json::from_slice(
+            &fs::read(publisher.root().join("records/1/result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repaired.source_hash, "source-new");
         let _ = fs::remove_dir_all(root);
     }
 }

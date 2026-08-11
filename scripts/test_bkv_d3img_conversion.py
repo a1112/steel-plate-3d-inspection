@@ -4,6 +4,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -54,6 +55,53 @@ def write_fixture(
 
 
 class BkvD3ImgConversionTests(unittest.TestCase):
+    def test_parse_identifiers_accepts_unc_camera_share(self) -> None:
+        from pathlib import Path
+
+        from scripts.convert_bkv_d3img import parse_identifiers
+
+        source = Path(r"\\10.5.241.17\CamImageSource6\1913329\3D\0007.d3img")
+        self.assertEqual(parse_identifiers(source), (6, 1913329, 7))
+
+    def test_history_materializer_publishes_intensity_and_converted_depth(self) -> None:
+        from scripts.materialize_bkv_record import _materialize_camera
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "source"
+            intensity = source_root / "CamImageSource1" / "1893700" / "2D"
+            depth = intensity.parent / "3D"
+            intensity.mkdir(parents=True)
+            (intensity / "0001.jpg").write_bytes(b"jpeg-fixture")
+            write_fixture(
+                depth / "0001.d3img",
+                np.array([[1.0, SENTINEL], [2.0, 3.0]], dtype=np.float32),
+                camera_number=1,
+            )
+            candidate = SimpleNamespace(
+                manifest={
+                    "recordId": 1_893_700,
+                    "cameras": [
+                        {"cameraId": 1, "sourceDirectory": str(intensity)}
+                    ],
+                }
+            )
+            staged = root / "staged"
+
+            camera_id, files, _hashes, _size = _materialize_camera(
+                candidate, 1, str(source_root), 10, False, staged
+            )
+
+            self.assertEqual(camera_id, "C1")
+            self.assertEqual([item["kind"] for item in files], ["intensity", "depth"])
+            depth_artifact = staged / files[1]["path"]
+            self.assertTrue(depth_artifact.is_file())
+            with np.load(depth_artifact, allow_pickle=False) as artifact:
+                np.testing.assert_array_equal(
+                    artifact["depth"],
+                    np.array([[1.0, SENTINEL], [2.0, 3.0]], dtype=np.float32),
+                )
+
     def test_parse_d3img_reads_complete_header_and_preserves_asymmetric_shape(self) -> None:
         from scripts.convert_bkv_d3img import parse_d3img
 

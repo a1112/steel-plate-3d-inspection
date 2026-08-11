@@ -936,9 +936,11 @@ python scripts/materialize_bkv_record.py `
   --record-id 1913329
 ```
 
-The materializer copies only 2D frames for the requested record, writes the
-standard capture-file manifest atomically, and records the source directories
-and hashes in `source-provenance.json`. It never deletes or rewrites history.
+The materializer copies the bounded 2D frame set and converts the matching
+legacy 3D frames to validated `bkv-depth-v1` NPZ artifacts for every camera. It
+writes the standard capture-file manifest atomically and records both source
+directories and hashes in `source-provenance.json`. It never deletes or
+rewrites history.
 
 The debug Tauri launcher enables the same promotion lazily through the
 algorithm service. When `/api/inspection-world/meta?recordId=...` selects a
@@ -964,6 +966,21 @@ python scripts/rebuild_bkv_history.py `
   --input-root target\run\bkv-history-recovery\input `
   --inventory target\run\bkv-history-recovery\rebuild.json `
   --limit 100
+```
+
+The development runtime keeps complete, content-addressed processed 2D/3D
+results under `D:\Data\inspection-results`. The history API exposes the newest
+399 coils. A metadata-only coil is promoted on demand when it is selected;
+inspection-world tiles are disposable and remain under
+`target\run\tauri-dev\cache`, so revision folders such as `r-<hash>` are never
+part of the durable result layout. A deliberate eager backfill remains
+available for maintenance windows:
+
+```powershell
+python scripts/rebuild_bkv_history.py `
+  --input-root target\run\bkv-history-recovery\input `
+  --inventory D:\Data\history-399-rebuild.json `
+  --latest --limit 399 --workers 4 --retries 5
 ```
 
 ## Verification

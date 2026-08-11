@@ -75,7 +75,7 @@ export function createInitialUiState(snapshot: InspectionSnapshot): InspectionUi
     theme: readStoredTheme(),
     themeStyle: readStoredThemeStyle(),
     activeNav: 'online',
-    selectedRecordId: snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo,
+    selectedRecordId: snapshot.records[0]?.id ?? snapshot.currentPlate.plateNo,
     selectedDefectId: snapshot.defects[0]?.id ?? null,
     hiddenDefectTypeIds: new Set<string>(),
     surfaceDisplayMode: 'all',
@@ -121,7 +121,7 @@ export function selectDefect(
   return {
     ...state,
     selectedDefectId: defect.id,
-    selectedRecordId: defect.plateNo,
+    selectedRecordId: defect.inspectionId ?? defect.plateNo,
     previewPositionM: getDefectPreviewPositionM(defect),
   };
 }
@@ -129,15 +129,17 @@ export function selectDefect(
 export function selectRecord(
   state: InspectionUiState,
   snapshot: InspectionSnapshot,
-  plateNo: string,
+  recordSelector: string,
 ): InspectionUiState {
-  const inspection = getPlateInspectionSnapshot(snapshot, plateNo);
-  if (inspection.currentPlate.plateNo !== plateNo) {
+  const selectedInspection = snapshot.inspections.find((item) => item.inspectionId === recordSelector)
+    ?? snapshot.inspections.find((item) => item.plate.plateNo === recordSelector);
+  if (!selectedInspection) {
     return state;
   }
+  const inspection = getPlateInspectionSnapshot(snapshot, recordSelector);
   return {
     ...state,
-    selectedRecordId: plateNo,
+    selectedRecordId: selectedInspection.inspectionId ?? selectedInspection.plate.plateNo,
     selectedDefectId: inspection.defects[0]?.id ?? null,
     previewPositionM: getDefectPreviewPositionM(inspection.defects[0]),
     defectPage: 1,

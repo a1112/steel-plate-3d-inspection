@@ -476,7 +476,7 @@ impl InspectionRecordStore for ConvertedLocalStore {
                 .lock()
                 .map(|files| files.contains(&relative.to_string_lossy().into_owned()))
                 .unwrap_or(false);
-            if !already_verified {
+            if !already_verified && !is_content_addressed_blob(&relative, &declared_hash) {
                 if declared_hash.len() != 64
                     || !declared_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
                     || sha256_file(&path)? != declared_hash.to_ascii_lowercase()
@@ -525,6 +525,20 @@ fn validated_relative(value: &str, label: &str) -> Result<PathBuf, StoreError> {
         )));
     }
     Ok(path.to_path_buf())
+}
+
+fn is_content_addressed_blob(path: &Path, declared_hash: &str) -> bool {
+    let Some(parent) = path.parent().and_then(|parent| parent.to_str()) else {
+        return false;
+    };
+    if parent != "blobs" || declared_hash.len() != 64 {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(declared_hash)
+        && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn sha256_file(path: &Path) -> Result<String, StoreError> {

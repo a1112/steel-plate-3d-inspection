@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use steel_inspection_result_contract::{
-    PublishInput, ResultArtifact, ResultDefect, ResultMaterial, ResultPublisher, UnifiedResult,
-    RESULT_SCHEMA,
+    safe_relative, PublishInput, ResultArtifact, ResultDefect, ResultMaterial, ResultPublisher,
+    UnifiedResult, RESULT_SCHEMA,
 };
 
 const DEFAULT_PORT: u16 = 4875;
@@ -246,80 +246,102 @@ impl BkvAdapter {
             return Ok(());
         }
         let inspection_id = seq.to_string();
-        // Unified results are the durable source of truth.  Once a complete
-        // result has been published, a BKV refresh must not copy the same
-        // network-share frames again just because the tile cache was cleared.
-        // Set STEEL_BKV_FORCE_REBUILD=1 only for an intentional raw-frame
-        // re-materialization of already published records.
         let force_rebuild = env::var("STEEL_BKV_FORCE_REBUILD").as_deref() == Ok("1");
-        if !force_rebuild && published_result_is_complete(publisher, &inspection_id) {
-            return Ok(());
-        }
+        let defects = self.load_defects(seq).await.unwrap_or_default();
+        let status = if row_string(row, "complete")? == "1" {
+            "ready"
+        } else {
+            "partial"
+        };
+        // Completed image payloads are immutable in the unified store, but
+        // the legacy database row and defect table can still be finalized
+        // afterwards. Reuse the verified blobs while continuing to publish
+        // those mutable facts. Partial records keep scanning the raw share so
+        // newly arriving frames are not frozen by the first successful poll.
+        let reusable = (!force_rebuild && status == "ready")
+            .then(|| reusable_published_result(publisher, &inspection_id))
+            .flatten();
         let record_source = self.work_root.join(&inspection_id);
-        if record_source.exists() {
-            fs::remove_dir_all(&record_source).map_err(|e| e.to_string())?;
-        }
-        fs::create_dir_all(&record_source).map_err(|e| e.to_string())?;
-        let mut artifacts = Vec::new();
-        let mut source_digest = Sha256::new();
-        for (camera_index, root) in self.image_roots.iter().enumerate() {
-            let source_dir = root.join(seq.to_string()).join("2D");
-            let target_dir = record_source.join(format!("C{}", camera_index + 1));
-            let Ok(entries) = fs::read_dir(source_dir) else {
-                continue;
-            };
-            let mut files = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension()
-                        .and_then(|v| v.to_str())
-                        .is_some_and(|extension| {
-                            extension.eq_ignore_ascii_case("bmp")
-                                || extension.eq_ignore_ascii_case("jpg")
-                                || extension.eq_ignore_ascii_case("jpeg")
-                        })
-                })
-                .collect::<Vec<_>>();
-            files.sort();
-            for (index, source) in files.into_iter().take(256).enumerate() {
-                let Some(name) = source.file_name() else {
+        let (artifacts, source_hash, source_directory, copied_raw_frames) = if let Some(existing) =
+            reusable
+        {
+            (
+                existing.artifacts,
+                existing.source_hash,
+                publisher.root().to_path_buf(),
+                false,
+            )
+        } else {
+            if record_source.exists() {
+                fs::remove_dir_all(&record_source).map_err(|e| e.to_string())?;
+            }
+            fs::create_dir_all(&record_source).map_err(|e| e.to_string())?;
+            let mut artifacts = Vec::new();
+            let mut source_digest = Sha256::new();
+            for (camera_index, root) in self.image_roots.iter().enumerate() {
+                let source_dir = root.join(seq.to_string()).join("2D");
+                let target_dir = record_source.join(format!("C{}", camera_index + 1));
+                let Ok(entries) = fs::read_dir(source_dir) else {
                     continue;
                 };
-                fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
-                let target = target_dir.join(name);
-                fs::copy(&source, &target).map_err(|e| e.to_string())?;
-                let (size, hash) = steel_inspection_result_contract::file_digest(&target)
-                    .map_err(|e| e.to_string())?;
-                source_digest.update(hash.as_bytes());
-                let mime_type = match source
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .map(|value| value.to_ascii_lowercase())
-                    .as_deref()
-                {
-                    Some("jpg") | Some("jpeg") => "image/jpeg",
-                    _ => "image/bmp",
-                };
-                artifacts.push(ResultArtifact {
-                    id: format!("{inspection_id}-C{}-{index:06}-intensity", camera_index + 1),
-                    camera_id: format!("C{}", camera_index + 1),
-                    sequence_no: index as u32,
-                    kind: "intensity".into(),
-                    path: format!("C{}/{}", camera_index + 1, name.to_string_lossy()),
-                    mime_type: mime_type.into(),
-                    size,
-                    sha256: hash,
-                    width: None,
-                    height: None,
-                });
+                let mut files = entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension()
+                            .and_then(|v| v.to_str())
+                            .is_some_and(|extension| {
+                                extension.eq_ignore_ascii_case("bmp")
+                                    || extension.eq_ignore_ascii_case("jpg")
+                                    || extension.eq_ignore_ascii_case("jpeg")
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                files.sort();
+                for (index, source) in files.into_iter().take(256).enumerate() {
+                    let Some(name) = source.file_name() else {
+                        continue;
+                    };
+                    fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+                    let target = target_dir.join(name);
+                    fs::copy(&source, &target).map_err(|e| e.to_string())?;
+                    let (size, hash) = steel_inspection_result_contract::file_digest(&target)
+                        .map_err(|e| e.to_string())?;
+                    source_digest.update(hash.as_bytes());
+                    let mime_type = match source
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(|value| value.to_ascii_lowercase())
+                        .as_deref()
+                    {
+                        Some("jpg") | Some("jpeg") => "image/jpeg",
+                        _ => "image/bmp",
+                    };
+                    artifacts.push(ResultArtifact {
+                        id: format!("{inspection_id}-C{}-{index:06}-intensity", camera_index + 1),
+                        camera_id: format!("C{}", camera_index + 1),
+                        sequence_no: index as u32,
+                        kind: "intensity".into(),
+                        path: format!("C{}/{}", camera_index + 1, name.to_string_lossy()),
+                        mime_type: mime_type.into(),
+                        size,
+                        sha256: hash,
+                        width: None,
+                        height: None,
+                    });
+                }
             }
-        }
-        if artifacts.is_empty() {
-            let _ = fs::remove_dir_all(&record_source);
-            return Ok(());
-        }
-        let defects = self.load_defects(seq).await.unwrap_or_default();
+            if artifacts.is_empty() {
+                let _ = fs::remove_dir_all(&record_source);
+                return Ok(());
+            }
+            (
+                artifacts,
+                format!("bkv:{:x}", source_digest.finalize()),
+                record_source.clone(),
+                true,
+            )
+        };
         let result = UnifiedResult {
             schema: RESULT_SCHEMA.into(),
             inspection_id: inspection_id.clone(),
@@ -328,12 +350,7 @@ impl BkvAdapter {
             source: "bkv-online-mysql".into(),
             source_record_id: inspection_id.clone(),
             inspection_time: Some(row_string(row, "detected_at")?),
-            status: if row_string(row, "complete")? == "1" {
-                "ready"
-            } else {
-                "partial"
-            }
-            .into(),
+            status: status.into(),
             camera_count: self.image_roots.len(),
             cameras: (1..=self.image_roots.len())
                 .map(|index| format!("C{index}"))
@@ -347,13 +364,15 @@ impl BkvAdapter {
             },
             artifacts,
             defects,
-            source_hash: format!("bkv:{:x}", source_digest.finalize()),
+            source_hash,
             config_hash: "bkv-mysql-adapter-v1".into(),
             algorithm_version: processor.into(),
             published_at: utc_now(),
         };
-        publisher.publish(PublishInput { inspection_id, result, source_directory: record_source.clone(), source_provenance: Some(json!({"schema":"steel.source-provenance.v1","provider":"bkv-online-mysql","sourceRecordId":seq})) }).map_err(|e| e.to_string())?;
-        let _ = fs::remove_dir_all(record_source);
+        publisher.publish(PublishInput { inspection_id, result, source_directory, source_provenance: Some(json!({"schema":"steel.source-provenance.v1","provider":"bkv-online-mysql","sourceRecordId":seq})) }).map_err(|e| e.to_string())?;
+        if copied_raw_frames {
+            let _ = fs::remove_dir_all(record_source);
+        }
         Ok(())
     }
 
@@ -363,20 +382,28 @@ impl BkvAdapter {
     }
 }
 
-fn published_result_is_complete(publisher: &ResultPublisher, inspection_id: &str) -> bool {
+fn reusable_published_result(
+    publisher: &ResultPublisher,
+    inspection_id: &str,
+) -> Option<UnifiedResult> {
     let path = publisher
         .root()
         .join("records")
         .join(inspection_id)
         .join("result.json");
-    let Ok(bytes) = fs::read(path) else {
-        return false;
-    };
-    serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|value| value.get("artifacts").cloned())
-        .and_then(|value| value.as_array().cloned())
-        .is_some_and(|artifacts| !artifacts.is_empty())
+    let result = serde_json::from_slice::<UnifiedResult>(&fs::read(path).ok()?).ok()?;
+    if result.status != "ready" || result.artifacts.is_empty() {
+        return None;
+    }
+    result
+        .artifacts
+        .iter()
+        .all(|artifact| {
+            safe_relative(&artifact.path)
+                .ok()
+                .is_some_and(|relative| publisher.root().join(relative).is_file())
+        })
+        .then_some(result)
 }
 
 fn row_string(row: &QueryResult, column: &str) -> Result<String, String> {
@@ -419,15 +446,19 @@ fn source_adapter_loop(state: Arc<State>) {
 }
 
 fn history_input_root(state: &State, record_id: &str) -> Result<PathBuf, String> {
-    let mut roots = state.input_roots.clone();
+    let mut roots = Vec::new();
     let recovered = workspace_root()
         .join("target")
         .join("run")
         .join("bkv-history-recovery")
         .join("input");
-    if recovered.is_dir() && !roots.iter().any(|root| root == &recovered) {
+    // Prefer the immutable metadata recovery tree. The configured input root
+    // is a disposable materialization workspace and can contain a stale or
+    // interrupted copy of the same record.
+    if recovered.is_dir() {
         roots.push(recovered);
     }
+    roots.extend(state.input_roots.clone());
     roots
         .iter()
         .find(|root| {
@@ -475,10 +506,37 @@ fn history_runs_root(input_root: &Path, record_id: &str) -> Result<PathBuf, Stri
         .ok_or_else(|| "historical runs root is unavailable".to_string())
 }
 
+fn history_work_root(state: &State) -> Result<PathBuf, String> {
+    let root = env::var("STEEL_BKV_HISTORY_WORK_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| state.input_roots.first().cloned())
+        .ok_or_else(|| "historical reconstruction work root is unavailable".to_string())?;
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("historical reconstruction work root unavailable: {error}"))?;
+    Ok(root)
+}
+
+fn history_run_directory(input_root: &Path, record_id: &str) -> Option<PathBuf> {
+    let provenance = input_root
+        .join("records")
+        .join(record_id)
+        .join("source-provenance.json");
+    let bytes = fs::read(provenance).ok()?;
+    let value = serde_json::from_slice::<Value>(&bytes).ok()?;
+    value
+        .get("historyRunDirectory")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
 fn run_history_materializer(
     record_id: &str,
     input_root: &Path,
     runs_root: &Path,
+    run_directory: Option<&Path>,
 ) -> Result<(), String> {
     if record_id.is_empty() || !record_id.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("historical reconstruction requires a numeric record id".to_string());
@@ -515,20 +573,8 @@ fn run_history_materializer(
         .arg(input_root)
         .arg("--record-id")
         .arg(record_id);
-    let provenance = input_root
-        .join("records")
-        .join(record_id)
-        .join("source-provenance.json");
-    if let Ok(bytes) = fs::read(&provenance) {
-        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-            if let Some(run_dir) = value
-                .get("historyRunDirectory")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-            {
-                command.arg("--run-dir").arg(run_dir);
-            }
-        }
+    if let Some(run_dir) = run_directory {
+        command.arg("--run-dir").arg(run_dir);
     }
     command
         .arg("--source-host")
@@ -569,10 +615,28 @@ fn published_artifacts_present(state: &State, record_id: &str) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
-    value
-        .get("artifacts")
+    let Some(items) = value.get("artifacts").and_then(Value::as_array) else {
+        return false;
+    };
+    let cameras = value
+        .get("cameras")
         .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    !cameras.is_empty()
+        && cameras.iter().all(|camera| {
+            ["intensity", "depth"].iter().all(|kind| {
+                items.iter().any(|item| {
+                    item.get("cameraId").and_then(Value::as_str) == Some(*camera)
+                        && item.get("kind").and_then(Value::as_str) == Some(*kind)
+                })
+            })
+        })
 }
 
 fn reconstruct_history_record(state: &State, record_id: &str) -> Result<Value, String> {
@@ -599,9 +663,11 @@ fn reconstruct_history_record(state: &State, record_id: &str) -> Result<Value, S
         }
     }
     let result = (|| {
-        let input_root = history_input_root(state, record_id)?;
-        let runs_root = history_runs_root(&input_root, record_id)?;
-        run_history_materializer(record_id, &input_root, &runs_root)?;
+        let metadata_root = history_input_root(state, record_id)?;
+        let runs_root = history_runs_root(&metadata_root, record_id)?;
+        let run_directory = history_run_directory(&metadata_root, record_id);
+        let input_root = history_work_root(state)?;
+        run_history_materializer(record_id, &input_root, &runs_root, run_directory.as_deref())?;
         // Publish only this record synchronously so the inspection API can
         // retry the same request without waiting for a full history rescan.
         let record_path = input_root
@@ -625,6 +691,14 @@ fn reconstruct_history_record(state: &State, record_id: &str) -> Result<Value, S
                 process_single_record(state, &record_path)?;
             }
             thread::sleep(Duration::from_millis(100));
+        }
+        if input_root != metadata_root {
+            let materialized_record = input_root.join("records").join(record_id);
+            if materialized_record.is_dir() {
+                fs::remove_dir_all(&materialized_record).map_err(|error| {
+                    format!("temporary historical input cleanup failed: {error}")
+                })?;
+            }
         }
         Ok(json!({
             "accepted": true,
@@ -1086,4 +1160,79 @@ fn utc_now() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("unix-ms:{millis}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reusable_result_requires_ready_status_and_present_blobs() {
+        let root = env::temp_dir().join(format!(
+            "steel-algorithm-reusable-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let publisher = ResultPublisher::open(&root).expect("publisher");
+        fs::write(root.join("blobs/image"), b"image").expect("blob");
+        let record_dir = root.join("records/1");
+        fs::create_dir_all(&record_dir).expect("record directory");
+        let mut result = UnifiedResult {
+            schema: RESULT_SCHEMA.into(),
+            inspection_id: "1".into(),
+            session_id: "session-1".into(),
+            material_id: "material-1".into(),
+            source: "bkv-online-mysql".into(),
+            source_record_id: "1".into(),
+            inspection_time: None,
+            status: "ready".into(),
+            camera_count: 1,
+            cameras: vec!["C1".into()],
+            defect_count: 0,
+            material: ResultMaterial::default(),
+            artifacts: vec![ResultArtifact {
+                id: "artifact-1".into(),
+                camera_id: "C1".into(),
+                sequence_no: 0,
+                kind: "intensity".into(),
+                path: "blobs/image".into(),
+                mime_type: "image/jpeg".into(),
+                size: 5,
+                sha256: "image".into(),
+                width: None,
+                height: None,
+            }],
+            defects: Vec::new(),
+            source_hash: "source".into(),
+            config_hash: "config".into(),
+            algorithm_version: "test".into(),
+            published_at: "now".into(),
+        };
+        fs::write(
+            record_dir.join("result.json"),
+            serde_json::to_vec(&result).expect("result json"),
+        )
+        .expect("result");
+        assert!(reusable_published_result(&publisher, "1").is_some());
+
+        result.status = "partial".into();
+        fs::write(
+            record_dir.join("result.json"),
+            serde_json::to_vec(&result).expect("partial json"),
+        )
+        .expect("partial result");
+        assert!(reusable_published_result(&publisher, "1").is_none());
+
+        result.status = "ready".into();
+        fs::write(
+            record_dir.join("result.json"),
+            serde_json::to_vec(&result).expect("ready json"),
+        )
+        .expect("ready result");
+        fs::remove_file(root.join("blobs/image")).expect("remove blob");
+        assert!(reusable_published_result(&publisher, "1").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
 }

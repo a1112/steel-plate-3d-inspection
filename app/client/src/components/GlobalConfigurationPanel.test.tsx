@@ -164,16 +164,38 @@ describe('GlobalConfigurationPanel', () => {
     });
   });
 
-  it('selects the active configuration and renders mode as read-only', async () => {
+  it('selects the active configuration and renders its current mode', async () => {
     render(<GlobalConfigurationPanel canEdit />);
 
     const detail = await screen.findByTestId('site-config-detail');
     expect(within(detail).getByText(activeSite.displayName)).toBeInTheDocument();
-    expect(within(detail).getByText('BKV 模式')).toBeInTheDocument();
+    expect(within(detail).getByText('当前配置模式')).toBeInTheDocument();
+    expect(within(detail).getByTestId('site-config-mode-setting').querySelector('strong'))
+      .toHaveTextContent('BKV 模式');
+    expect(within(detail).getByRole('combobox', { name: '设置配置模式' })).toHaveValue('bkv');
+    expect(within(detail).getByRole('button', { name: '按此模式新建配置' })).toBeDisabled();
     expect(within(detail).queryByRole('combobox', { name: '运行模式' })).not.toBeInTheDocument();
     expect(within(detail).getByRole('button', { name: '删除配置' })).toBeDisabled();
     expect(within(detail).getByRole('button', { name: '切换到此配置' })).toBeDisabled();
     expect(screen.getByText('运行中')).toBeInTheDocument();
+  });
+
+  it('prepares a new configuration when the desired mode changes', async () => {
+    render(<GlobalConfigurationPanel canEdit />);
+    const detail = await screen.findByTestId('site-config-detail');
+
+    fireEvent.change(
+      within(detail).getByRole('combobox', { name: '设置配置模式' }),
+      { target: { value: 'direct-camera' } },
+    );
+    fireEvent.click(within(detail).getByRole('button', { name: '按此模式新建配置' }));
+
+    const form = await screen.findByTestId('site-config-create-form');
+    expect(within(form).getByRole('combobox', { name: '运行模式' })).toHaveValue('direct-camera');
+    expect(within(form).getByRole('textbox', { name: '配置标识' })).toHaveValue(
+      'bkv-default-direct-camera',
+    );
+    expect(screen.getByText('已选择相机直连模式，请确认新建配置并切换')).toBeInTheDocument();
   });
 
   it('allows mode selection only in the new configuration form', async () => {

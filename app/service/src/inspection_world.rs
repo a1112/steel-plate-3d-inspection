@@ -218,7 +218,35 @@ pub fn read_cache_status(
             })
         }
     };
-    fs::read(root.join("cache.json"))
+    let first_screen_requests = world
+        .cameras
+        .iter()
+        .flat_map(|camera| {
+            let span = u64::from(world.tile_size) << world.max_level;
+            let columns = u64::from(camera.width).div_ceil(span);
+            (0..columns).map(move |tile_x| {
+                TileRequest::for_camera(
+                    camera.camera_id,
+                    world.max_level,
+                    tile_x as u32,
+                    0,
+                    TileFormat::Jpeg,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let cached_first_screen_tiles = first_screen_requests
+        .iter()
+        .filter(|request| {
+            tile_cache_path(cache_root, record_id, source_revision, **request)
+                .is_ok_and(|path| path.is_file())
+        })
+        .count() as u64;
+    let first_screen_tiles = first_screen_requests.len() as u64;
+    let first_screen_ready =
+        first_screen_tiles > 0 && cached_first_screen_tiles == first_screen_tiles;
+
+    let metadata = fs::read(root.join("cache.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .map(|metadata| {
@@ -226,6 +254,9 @@ pub fn read_cache_status(
                 "state": metadata.get("state").and_then(Value::as_str).unwrap_or("building"),
                 "tileSize": metadata.pointer("/tile/tileSize").and_then(Value::as_u64).unwrap_or(u64::from(world.tile_size)),
                 "maxLevel": metadata.pointer("/tile/maxLevel").and_then(Value::as_u64).unwrap_or(u64::from(world.max_level)),
+                "firstScreenTiles": first_screen_tiles,
+                "cachedFirstScreenTiles": cached_first_screen_tiles,
+                "firstScreenReady": first_screen_ready,
             })
         })
         .unwrap_or_else(|| {
@@ -233,8 +264,12 @@ pub fn read_cache_status(
                 "state": "on-demand",
                 "tileSize": world.tile_size,
                 "maxLevel": world.max_level,
+                "firstScreenTiles": first_screen_tiles,
+                "cachedFirstScreenTiles": cached_first_screen_tiles,
+                "firstScreenReady": first_screen_ready,
             })
-        })
+        });
+    metadata
 }
 
 fn pyramid_gate() -> &'static Mutex<HashSet<PathBuf>> {
@@ -1460,6 +1495,33 @@ mod tests {
         assert!(relative.contains("L3"));
         assert!(!relative.contains(revision));
         assert!(!relative.contains(':'));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_status_reports_first_screen_coverage_for_on_demand_records() {
+        let root = temp_root("first-screen-cache-status");
+        let world =
+            InspectionWorld::with_tile_size(vec![camera(1, 6, 2, 1), camera(2, 2, 2, 1)], 4)
+                .unwrap();
+        let revision = "revision-1";
+
+        let cold = read_cache_status(&root, "record-1", revision, &world);
+        assert_eq!(cold["state"], json!("on-demand"));
+        assert_eq!(cold["firstScreenTiles"], json!(2));
+        assert_eq!(cold["cachedFirstScreenTiles"], json!(0));
+        assert_eq!(cold["firstScreenReady"], json!(false));
+
+        for request in [
+            TileRequest::for_camera(1, 1, 0, 0, TileFormat::Jpeg),
+            TileRequest::for_camera(2, 1, 0, 0, TileFormat::Jpeg),
+        ] {
+            serve_cached_tile(&root, "record-1", revision, request, || Ok(vec![1, 2, 3])).unwrap();
+        }
+
+        let warm = read_cache_status(&root, "record-1", revision, &world);
+        assert_eq!(warm["cachedFirstScreenTiles"], json!(2));
+        assert_eq!(warm["firstScreenReady"], json!(true));
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,13 +1,34 @@
 import { AlertTriangle, RefreshCw, RotateCcw, Search } from 'lucide-react';
-import { useEffect, useState, type ChangeEvent, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent, type UIEvent } from 'react';
 import { createPortal } from 'react-dom';
 import type { InspectionRecord, InspectionSummary, PlateInspection, SteelPlate } from '../data/inspection';
+import { fetchInspectionWorldMeta, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { emptyRecordSearchFilters, type RecordSearchFilters } from '../state/record-search';
 import { Panel } from './Panel';
 
 type RecordSearchField = keyof RecordSearchFilters;
 
 const RECORD_RENDER_BATCH = 200;
+const CACHE_STATUS_HOVER_DELAY_MS = 180;
+
+type RecordCacheProbe = {
+  state: 'loading' | 'ready' | 'error';
+  cache?: InspectionWorldMeta['cache'];
+};
+
+function cacheStatusLabel(probe?: RecordCacheProbe) {
+  if (!probe || probe.state === 'loading') return '检查中…';
+  if (probe.state === 'error' || !probe.cache) return '状态不可用';
+  const { cache } = probe;
+  if (cache.state === 'complete') return '完整缓存';
+  if (cache.firstScreenReady) {
+    return `首屏已缓存 ${cache.cachedFirstScreenTiles ?? cache.firstScreenTiles ?? 0}/${cache.firstScreenTiles ?? 0}`;
+  }
+  if (cache.state === 'building') return '缓存构建中';
+  const cached = cache.cachedFirstScreenTiles ?? 0;
+  const expected = cache.firstScreenTiles ?? 0;
+  return expected > 0 ? `冷缓存 ${cached}/${expected}` : '按需缓存';
+}
 
 const recordSearchOptions: Array<{ field: RecordSearchField; label: string; placeholder: string; inputLabel: string }> = [
   { field: 'serialNo', label: '流水号', placeholder: 'R-001', inputLabel: '流水号查询' },
@@ -38,7 +59,8 @@ interface LeftSidebarProps {
   totalCount: number;
   recordsRefreshing?: boolean;
   recordsSynchronizedAt?: number | null;
-  onRecordSelect: (plateNo: string) => void;
+  showCacheStatus?: boolean;
+  onRecordSelect: (recordId: string) => void;
   onRecordsRefresh?: () => void;
   onSearchChange: (patch: Partial<RecordSearchFilters>) => void;
   onSearchReset: () => void;
@@ -80,14 +102,18 @@ export function LeftSidebar({
   totalCount,
   recordsRefreshing = false,
   recordsSynchronizedAt = null,
+  showCacheStatus,
   onRecordSelect,
   onRecordsRefresh,
   onSearchChange,
   onSearchReset,
 }: LeftSidebarProps) {
+  const cacheStatusEnabled = showCacheStatus ?? runtimeMode === 'bkv';
   const [activeSearchField, setActiveSearchField] = useState<RecordSearchField>('serialNo');
   const [hoveredRecord, setHoveredRecord] = useState<{ record: InspectionRecord; left: number; top: number } | null>(null);
+  const [recordCacheProbes, setRecordCacheProbes] = useState<Record<string, RecordCacheProbe>>({});
   const [visibleRecordLimit, setVisibleRecordLimit] = useState(RECORD_RENDER_BATCH);
+  const recordsTableWrapRef = useRef<HTMLDivElement>(null);
   const activeSearchOption = recordSearchOptions.find((option) => option.field === activeSearchField) ?? recordSearchOptions[0];
   const activeSearchValue = searchFilters[activeSearchField];
   const hoveredInspection = hoveredRecord
@@ -95,11 +121,39 @@ export function LeftSidebar({
       ?? inspections.find((inspection) => inspection.plate.plateNo === hoveredRecord.record.plateNo)
       ?? null
     : null;
+  const hoveredCacheProbe = hoveredRecord ? recordCacheProbes[hoveredRecord.record.id] : undefined;
   const visibleRecords = records.slice(0, visibleRecordLimit);
 
   useEffect(() => {
     setVisibleRecordLimit(RECORD_RENDER_BATCH);
   }, [records.length, searchFilters.plateNo, searchFilters.serialNo, searchFilters.time]);
+
+  useEffect(() => {
+    const recordId = hoveredRecord?.record.id;
+    if (!cacheStatusEnabled || !recordId || recordCacheProbes[recordId]?.state === 'ready') return undefined;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setRecordCacheProbes((current) => ({ ...current, [recordId]: { state: 'loading' } }));
+      void fetchInspectionWorldMeta(recordId, controller.signal)
+        .then((meta) => {
+          if (!controller.signal.aborted) {
+            setRecordCacheProbes((current) => ({
+              ...current,
+              [recordId]: { state: 'ready', cache: meta.cache },
+            }));
+          }
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) {
+            setRecordCacheProbes((current) => ({ ...current, [recordId]: { state: 'error' } }));
+          }
+        });
+    }, CACHE_STATUS_HOVER_DELAY_MS);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [cacheStatusEnabled, hoveredRecord?.record.id]);
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -118,6 +172,12 @@ export function LeftSidebar({
   const handleSearchReset = () => {
     setActiveSearchField('serialNo');
     onSearchReset();
+  };
+
+  const handleRecordsScroll = (event: UIEvent<HTMLDivElement>) => {
+    const element = event.currentTarget;
+    if (element.scrollTop + element.clientHeight < element.scrollHeight - 160) return;
+    setVisibleRecordLimit((current) => Math.min(records.length, current + RECORD_RENDER_BATCH));
   };
 
   const showRecordDetail = (record: InspectionRecord, element: HTMLElement) => {
@@ -240,7 +300,12 @@ export function LeftSidebar({
           </div>
         )}
       >
-        <div className="records-table-wrap">
+        <div
+          ref={recordsTableWrapRef}
+          className="records-table-wrap"
+          onScroll={handleRecordsScroll}
+          data-auto-load="near-bottom"
+        >
           <table className="records-table">
             <thead>
               <tr>
@@ -256,8 +321,8 @@ export function LeftSidebar({
                   <tr
                     key={record.id}
                     tabIndex={0}
-                    className={record.plateNo === selectedRecordId ? 'selected' : ''}
-                    onClick={() => onRecordSelect(record.plateNo)}
+                    className={record.id === selectedRecordId || record.plateNo === selectedRecordId ? 'selected' : ''}
+                    onClick={() => onRecordSelect(record.id)}
                     onMouseEnter={(event) => showRecordDetail(record, event.currentTarget)}
                     onPointerEnter={(event) => showRecordDetail(record, event.currentTarget)}
                     onMouseLeave={() => setHoveredRecord(null)}
@@ -309,6 +374,7 @@ export function LeftSidebar({
           <dl>
             <div><dt>检测时间</dt><dd>{hoveredRecord.record.time}</dd></div>
             <div><dt>记录状态</dt><dd className={hoveredRecord.record.status}>{hoveredRecord.record.status === 'detecting' ? '检测中' : runtimeMode === 'bkv' ? 'BKV 旧记录' : '已完成'}</dd></div>
+            {cacheStatusEnabled ? <div><dt>数据缓存</dt><dd>{cacheStatusLabel(hoveredCacheProbe)}</dd></div> : null}
             <div><dt>缺陷总数</dt><dd>{hoveredRecord.record.defectCount}</dd></div>
             <div><dt>采集产物</dt><dd>{hoveredInspection?.captureImages?.length ?? 0} 件</dd></div>
             <div><dt>规格/钢种</dt><dd>{hoveredInspection?.plate.steelGrade || '—'}</dd></div>

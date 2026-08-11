@@ -55,10 +55,10 @@
     "sourceRoot": "",
     "convertedRoot": "",
     "catalogPath": "",
-    "cacheRoot": "target/data/bkv-online-cache",
+    "cacheRoot": "target/run/inspection-world-cache",
     "converterOrigin": "",
-    "resultRoot": "target/data/inspection-results",
-    "resultCatalogPath": "target/data/inspection-results/catalog.db"
+    "resultRoot": "D:\\Data\\inspection-results",
+    "resultCatalogPath": "D:\\Data\\inspection-results\\catalog.db"
   },
   "capture": {
     "enabled": false,
@@ -75,7 +75,7 @@
     "sourceData": {
       "enabled": true,
       "directory": "source-data/mysql",
-      "recordLimit": 500
+      "recordLimit": 399
     }
   },
   "capabilities": {

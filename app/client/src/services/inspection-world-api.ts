@@ -81,6 +81,9 @@ export type InspectionWorldMeta = {
     state: 'on-demand' | 'building' | 'complete' | 'unavailable';
     tileSize: number;
     maxLevel: number;
+    firstScreenTiles?: number;
+    cachedFirstScreenTiles?: number;
+    firstScreenReady?: boolean;
   };
   world: InspectionWorld;
   depthSurface?: {
@@ -221,6 +224,56 @@ function worldUrl(path: string, params?: URLSearchParams) {
   return `${getInspectionServiceOrigin()}/api/inspection-world/${path}${suffix}`;
 }
 
+const inspectionWorldMetaRequests = new Map<string, Promise<InspectionWorldMeta>>();
+const inspectionWorldDefectRequests = new Map<string, Promise<InspectionWorldDefects>>();
+
+function abortableRequest<T>(request: Promise<T>, signal?: AbortSignal) {
+  if (!signal) return request;
+  if (signal.aborted) {
+    return Promise.reject(new DOMException('Inspection world request aborted', 'AbortError'));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      cleanup();
+      reject(new DOMException('Inspection world request aborted', 'AbortError'));
+    };
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    signal.addEventListener('abort', abort, { once: true });
+    request.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+function sharedInspectionWorldRequest<T>(
+  requests: Map<string, Promise<T>>,
+  key: string,
+  create: () => Promise<T>,
+  signal?: AbortSignal,
+) {
+  let request = requests.get(key);
+  if (!request) {
+    request = create();
+    requests.set(key, request);
+    void request.then(
+      () => {
+        if (requests.get(key) === request) requests.delete(key);
+      },
+      () => {
+        if (requests.get(key) === request) requests.delete(key);
+      },
+    );
+  }
+  return abortableRequest(request, signal);
+}
+
 export async function fetchInspectionWorldRecords(signal?: AbortSignal): Promise<InspectionWorldRecords> {
   const payload = await readJson<InspectionWorldRecords>(await fetch(worldUrl('records'), {
     headers: createAdminHeaders({ Accept: 'application/json' }),
@@ -249,35 +302,49 @@ export async function fetchInspectionWorldRecordsStatus(signal?: AbortSignal): P
   return payload;
 }
 
-export async function fetchInspectionWorldMeta(recordId: string, signal?: AbortSignal): Promise<InspectionWorldMeta> {
-  const payload = await readJson<InspectionWorldMeta>(await fetch(worldUrl('meta', new URLSearchParams({ recordId })), {
-    headers: createAdminHeaders({ Accept: 'application/json' }), signal,
-  }), '检测世界元数据读取失败');
-  if (
-    payload.schema !== 'steel.inspection-world.meta.v1'
-    || typeof payload.sourceRevision !== 'string'
-    || !payload.sourceRevision
-    || !payload.cache
-    || payload.cache.tileSize !== 512
-    || payload.cache.maxLevel > 3
-    || !payload.world
-    || payload.world.tileSize !== 512
-    || payload.world.maxLevel > 3
-    || !Array.isArray(payload.world.cameras)
-  ) {
-    throw new Error('检测世界元数据格式无效');
-  }
-  return payload;
+export function fetchInspectionWorldMeta(recordId: string, signal?: AbortSignal): Promise<InspectionWorldMeta> {
+  return sharedInspectionWorldRequest(
+    inspectionWorldMetaRequests,
+    recordId,
+    async () => {
+      const payload = await readJson<InspectionWorldMeta>(await fetch(worldUrl('meta', new URLSearchParams({ recordId })), {
+        headers: createAdminHeaders({ Accept: 'application/json' }),
+      }), '检测世界元数据读取失败');
+      if (
+        payload.schema !== 'steel.inspection-world.meta.v1'
+        || typeof payload.sourceRevision !== 'string'
+        || !payload.sourceRevision
+        || !payload.cache
+        || payload.cache.tileSize !== 512
+        || payload.cache.maxLevel > 3
+        || !payload.world
+        || payload.world.tileSize !== 512
+        || payload.world.maxLevel > 3
+        || !Array.isArray(payload.world.cameras)
+      ) {
+        throw new Error('检测世界元数据格式无效');
+      }
+      return payload;
+    },
+    signal,
+  );
 }
 
-export async function fetchInspectionWorldDefects(recordId: string, signal?: AbortSignal): Promise<InspectionWorldDefects> {
-  const payload = await readJson<InspectionWorldDefects>(await fetch(worldUrl('defects', new URLSearchParams({ recordId })), {
-    headers: createAdminHeaders({ Accept: 'application/json' }), signal,
-  }), '检测世界缺陷读取失败');
-  if (payload.schema !== 'steel.inspection-world.defects.v1' || !Array.isArray(payload.defects)) {
-    throw new Error('检测世界缺陷格式无效');
-  }
-  return payload;
+export function fetchInspectionWorldDefects(recordId: string, signal?: AbortSignal): Promise<InspectionWorldDefects> {
+  return sharedInspectionWorldRequest(
+    inspectionWorldDefectRequests,
+    recordId,
+    async () => {
+      const payload = await readJson<InspectionWorldDefects>(await fetch(worldUrl('defects', new URLSearchParams({ recordId })), {
+        headers: createAdminHeaders({ Accept: 'application/json' }),
+      }), '检测世界缺陷读取失败');
+      if (payload.schema !== 'steel.inspection-world.defects.v1' || !Array.isArray(payload.defects)) {
+        throw new Error('检测世界缺陷格式无效');
+      }
+      return payload;
+    },
+    signal,
+  );
 }
 
 export function inspectionWorldFrameUrl(

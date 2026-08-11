@@ -723,8 +723,8 @@ function InspectionDashboard({
         onSnapshotChange(nextSnapshot);
         setSnapshotSyncState(`已同步 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`);
         if (snapshotTracking === 'latest') {
-          const latestPlateNo = nextSnapshot.records[0]?.plateNo ?? nextSnapshot.currentPlate.plateNo;
-          setUiState((current) => selectRecord(current, nextSnapshot, latestPlateNo));
+          const latestRecordId = nextSnapshot.records[0]?.id ?? nextSnapshot.currentPlate.plateNo;
+          setUiState((current) => selectRecord(current, nextSnapshot, latestRecordId));
         }
       } catch (error) {
         if (!cancelled) {
@@ -927,8 +927,10 @@ function InspectionDashboard({
 
   const activeSnapshot = useMemo(() => getPlateInspectionSnapshot(snapshot, uiState.selectedRecordId), [snapshot, uiState.selectedRecordId]);
   const activeInspection = useMemo(
-    () => snapshot.inspections.find((inspection) => inspection.plate.plateNo === activeSnapshot.currentPlate.plateNo) ?? null,
-    [activeSnapshot.currentPlate.plateNo, snapshot.inspections],
+    () => snapshot.inspections.find((inspection) => inspection.inspectionId === uiState.selectedRecordId)
+      ?? snapshot.inspections.find((inspection) => inspection.plate.plateNo === activeSnapshot.currentPlate.plateNo)
+      ?? null,
+    [activeSnapshot.currentPlate.plateNo, snapshot.inspections, uiState.selectedRecordId],
   );
   const artifactMode: 'production' | 'demo' = snapshot.source === 'demo' || snapshot.source === 'test' ? 'demo' : 'production';
   const loadedBkvDefectRecordsRef = useRef(new Set<string>());
@@ -1260,9 +1262,9 @@ function InspectionDashboard({
 
   const selectDefectById = (defectId: string) => {
     const defect = allDefects.find((item) => item.id === defectId);
-    const latestPlateNo = snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo;
+    const latestRecordId = snapshot.records[0]?.id ?? snapshot.currentPlate.plateNo;
     if (defect) {
-      setSnapshotTracking(defect.plateNo === latestPlateNo ? 'latest' : 'history');
+      setSnapshotTracking((defect.inspectionId ?? defect.plateNo) === latestRecordId ? 'latest' : 'history');
     }
     setUiState((current) => selectDefect(current, allDefects, defectId));
     setWorldFocusRequest((current) => ({
@@ -1271,10 +1273,10 @@ function InspectionDashboard({
     }));
   };
 
-  const selectRecordByPlateNo = (plateNo: string) => {
-    const latestPlateNo = snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo;
-    setSnapshotTracking(plateNo === latestPlateNo ? 'latest' : 'history');
-    setUiState((current) => selectRecord(current, snapshot, plateNo));
+  const selectRecordById = (recordId: string) => {
+    const latestRecordId = snapshot.records[0]?.id ?? snapshot.currentPlate.plateNo;
+    setSnapshotTracking(recordId === latestRecordId ? 'latest' : 'history');
+    setUiState((current) => selectRecord(current, snapshot, recordId));
     setWorldFocusRequest((current) => ({
       defectId: null,
       revision: current.revision + 1,
@@ -1282,9 +1284,9 @@ function InspectionDashboard({
   };
 
   const followLatestSnapshot = () => {
-    const latestPlateNo = snapshot.records[0]?.plateNo ?? snapshot.currentPlate.plateNo;
+    const latestRecordId = snapshot.records[0]?.id ?? snapshot.currentPlate.plateNo;
     setSnapshotTracking('latest');
-    setUiState((current) => selectRecord(current, snapshot, latestPlateNo));
+    setUiState((current) => selectRecord(current, snapshot, latestRecordId));
     setWorldFocusRequest((current) => ({
       defectId: null,
       revision: current.revision + 1,
@@ -1501,7 +1503,8 @@ function InspectionDashboard({
             totalCount={snapshot.records.length}
             recordsRefreshing={recordsRefreshing}
             recordsSynchronizedAt={recordsSynchronizedAt}
-            onRecordSelect={selectRecordByPlateNo}
+            showCacheStatus={dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online'}
+            onRecordSelect={selectRecordById}
             onRecordsRefresh={onRecordsRefresh}
             onSearchChange={updateRecordSearchFilters}
             onSearchReset={resetRecordSearchFilters}
