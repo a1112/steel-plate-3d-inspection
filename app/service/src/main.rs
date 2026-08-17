@@ -15105,6 +15105,25 @@ fn unified_result_store_enabled(state: &ServiceState) -> bool {
             || env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1"))
 }
 
+fn inspection_world_pixel_rect(value: &Value) -> Option<inspection_world::PixelRect> {
+    let number = |key: &str| value.get(key).and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok());
+    if let (Some(left), Some(top), Some(right), Some(bottom)) = (
+        number("left"),
+        number("top"),
+        number("right"),
+        number("bottom"),
+    ) {
+        if right > left && bottom > top {
+            return inspection_world::PixelRect::from_edges(left, right, top, bottom).ok();
+        }
+    }
+    let x = number("x")?;
+    let y = number("y")?;
+    let width = number("width")?;
+    let height = number("height")?;
+    (width > 0 && height > 0).then(|| inspection_world::PixelRect::new(x, y, width, height))
+}
+
 fn inspection_world_history_limit(state: &ServiceState) -> usize {
     env::var("STEEL_INSPECTION_WORLD_HISTORY_LIMIT")
         .ok()
@@ -16126,17 +16145,11 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
                                 .get(&(camera_id, defect.sequence_no))
                                 .copied()
                         });
-                        let local_rect = defect.artifacts.get("imageRect2d").and_then(|rect| {
-                            Some(
-                                inspection_world::PixelRect::from_edges(
-                                    u32::try_from(rect.get("left")?.as_u64()?).ok()?,
-                                    u32::try_from(rect.get("right")?.as_u64()?).ok()?,
-                                    u32::try_from(rect.get("top")?.as_u64()?).ok()?,
-                                    u32::try_from(rect.get("bottom")?.as_u64()?).ok()?,
-                                )
-                                .ok()?,
-                            )
-                        });
+                        let local_rect = defect
+                            .artifacts
+                            .get("imageRect2d")
+                            .or_else(|| defect.artifacts.get("roi"))
+                            .and_then(inspection_world_pixel_rect);
                         let world_rect = camera_id.zip(image_index).zip(local_rect).and_then(
                             |((camera_id, image_index), rect)| {
                                 converted
@@ -22514,6 +22527,28 @@ fn load_converted_surface(
             Ok((camera_id, capture.sequence_no, capture.path))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    // Historical BKV promotion may have already produced a verified D3IMG
+    // BSMESH in the 399-record run cache while the converted catalog still
+    // contains intensity captures only. Reuse that persisted artifact instead
+    // of reporting a missing NPZ surface or rescanning the SMB shares.
+    if depth_captures.is_empty() {
+        if let Some(surface) = load_persisted_bkv_surface(record_id)? {
+            let mut cache = state
+                .converted_surface_cache
+                .lock()
+                .map_err(|_| "converted surface cache lock poisoned".to_string())?;
+            cache.insert(
+                record_id.to_string(),
+                ConvertedSurfaceCacheEntry {
+                    source_hash: record.source_hash.clone(),
+                    algorithm_revision: npz_surface::RECONSTRUCTION_REVISION,
+                    surface: Arc::clone(&surface),
+                    stored_at: Instant::now(),
+                },
+            );
+            return Ok(surface);
+        }
+    }
     for camera in configured {
         if !depth_captures
             .iter()
@@ -22565,6 +22600,37 @@ fn load_converted_surface(
         },
     );
     Ok(surface)
+}
+
+fn load_persisted_bkv_surface(
+    record_id: &str,
+) -> Result<Option<Arc<npz_surface::NpzSurface>>, String> {
+    let runs_root = env::var("STEEL_BKV_HISTORY_RUNS_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"D:\steel-inspection\algorithm-data\runs"));
+    let run_dir = runs_root.join(record_id).join("inspection-world-v1");
+    let binary_path = run_dir.join("surface-mesh.bsmesh");
+    let binary = match fs::read(&binary_path) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        Ok(_) => return Err(format!("{} is empty", binary_path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", binary_path.display())),
+    };
+    let parameters_path = run_dir.join("reconstruction-parameters.json");
+    let parameters = fs::read(&parameters_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "schema": "steel.bkv-depth-reconstruction-parameters.v1",
+                "recordId": record_id,
+                "input": { "format": "D3IMG" },
+                "output": { "format": "BSMESH01" }
+            })
+        });
+    Ok(Some(Arc::new(npz_surface::NpzSurface { binary, parameters })))
 }
 
 fn configured_standard_record_store(

@@ -11,6 +11,7 @@ import {
   fetchInspectionWorldTile,
   type InspectionWorldDefect,
   type InspectionWorldMeta,
+  type WorldRect,
   type WorldTile,
 } from '../services/inspection-world-api';
 
@@ -19,6 +20,7 @@ type Props = {
   meta: InspectionWorldMeta;
   defects: InspectionWorldDefect[];
   focusDefectId?: string | number | null;
+  selectedDefectId?: string | number | null;
   focusDefectRevision?: number;
   focusCameraId?: number | null;
   focusPositionRatio?: number | null;
@@ -28,6 +30,7 @@ type Props = {
   onTileLoadingChange?: (state: InspectionWorldTileLoading) => void;
   suspendLoading?: boolean;
   onVisibleRangeChange?: (range: [number, number] | null) => void;
+  onDefectClick?: (defectId: string | number) => void;
   colorMode?: 'gray' | 'jet';
 };
 
@@ -84,6 +87,72 @@ function disposeTileEntry(entry: TileEntry) {
   entry.jetCanvas = null;
 }
 
+function finiteNumber(value: unknown) {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function validWorldRect(value: unknown): WorldRect | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Record<string, unknown>;
+  const x = finiteNumber(candidate.x);
+  const y = finiteNumber(candidate.y);
+  const width = finiteNumber(candidate.width);
+  const height = finiteNumber(candidate.height);
+  if (x == null || y == null || width == null || height == null || width <= 0 || height <= 0) {
+    return null;
+  }
+  return { x, y, width, height };
+}
+
+function localRectFromArtifacts(artifacts: unknown): WorldRect | null {
+  if (!artifacts || typeof artifacts !== 'object') return null;
+  const values = artifacts as Record<string, unknown>;
+  const imageRect = values.imageRect2d;
+  if (imageRect && typeof imageRect === 'object') {
+    const edges = imageRect as Record<string, unknown>;
+    const left = finiteNumber(edges.left);
+    const top = finiteNumber(edges.top);
+    const right = finiteNumber(edges.right);
+    const bottom = finiteNumber(edges.bottom);
+    if (left != null && top != null && right != null && bottom != null
+      && right > left && bottom > top) {
+      return { x: left, y: top, width: right - left, height: bottom - top };
+    }
+  }
+  const roi = values.roi;
+  if (roi && typeof roi === 'object') {
+    const rect = validWorldRect(roi);
+    if (rect) return rect;
+  }
+  const nested = values.source;
+  if (nested && typeof nested === 'object') {
+    const nestedArtifacts = (nested as Record<string, unknown>).artifacts;
+    const rect = localRectFromArtifacts(nestedArtifacts);
+    if (rect) return rect;
+  }
+  return null;
+}
+
+function worldRectForDefect(defect: InspectionWorldDefect, meta: InspectionWorldMeta): WorldRect | null {
+  const explicit = validWorldRect(defect.worldRect);
+  if (explicit) return explicit;
+  const local = localRectFromArtifacts(defect.trace?.artifacts);
+  if (!local || defect.cameraId == null) return null;
+  const camera = meta.world.cameras.find((item) => item.cameraId === defect.cameraId);
+  if (!camera) return null;
+  const frameIndex = finiteNumber(defect.imageIndex ?? defect.trace?.sequenceNo);
+  if (frameIndex == null || !camera.frameNumbers.includes(frameIndex)) return null;
+  const x = camera.offsetX + local.x;
+  const y = frameIndex * camera.frameHeight + local.y - (camera.aligned ? (camera.headOffsetY ?? 0) : 0);
+  const rect = { x, y, width: local.width, height: local.height };
+  if (rect.x < camera.offsetX || rect.x + rect.width > camera.offsetX + camera.width
+    || rect.y < 0 || rect.y + rect.height > meta.world.height) {
+    return null;
+  }
+  return rect;
+}
+
 function jetChannel(value: number, offset: number) {
   return Math.round(Math.max(0, Math.min(1, 1.5 - Math.abs(4 * value - offset))) * 255);
 }
@@ -121,6 +190,7 @@ export function InspectionWorldCanvas({
   meta,
   defects,
   focusDefectId,
+  selectedDefectId,
   focusDefectRevision = 0,
   focusCameraId,
   focusPositionRatio,
@@ -130,6 +200,7 @@ export function InspectionWorldCanvas({
   onTileLoadingChange,
   suspendLoading = false,
   onVisibleRangeChange,
+  onDefectClick,
   colorMode = 'gray',
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -531,13 +602,19 @@ export function InspectionWorldCanvas({
       ? null
       : meta.world.cameras.find((camera) => camera.cameraId === isolatedCameraId);
     return defects
-      .filter((defect) => (
-        defect.locatable
-        && defect.worldRect
-        && (isolatedCameraId == null || defect.cameraId === isolatedCameraId)
-      ))
+      .map((defect) => {
+        const worldRect = worldRectForDefect(defect, meta);
+        if (!worldRect || (isolatedCameraId != null && defect.cameraId !== isolatedCameraId)) {
+          return null;
+        }
+        return {
+          ...defect,
+          worldRect,
+        };
+      })
+      .filter((defect): defect is InspectionWorldDefect & { worldRect: WorldRect } => defect != null)
       .map((defect) => (
-        selectedSourceCamera && defect.worldRect
+        selectedSourceCamera
           ? {
             ...defect,
             worldRect: {
@@ -547,7 +624,7 @@ export function InspectionWorldCanvas({
           }
           : defect
       ));
-  }, [defects, isolatedCameraId, meta.world.cameras]);
+  }, [defects, isolatedCameraId, meta]);
   const visibleDefects = useMemo(() => {
     const margin = 32 / view.scale;
     const left = viewX - margin;
@@ -767,22 +844,25 @@ export function InspectionWorldCanvas({
       const x = camera.offsetX * view.scale - view.scrollLeft;
       context.fillRect(x, dividerTop, 1, Math.max(0, size.height - dividerTop));
     }
-    context.strokeStyle = '#ffb020';
     context.lineWidth = 2;
     for (const defect of visibleDefects) {
       const rect = defect.worldRect!;
-      context.strokeRect(
-        rect.x * view.scale - view.scrollLeft,
-        rect.y * view.scale + WORLD_TOP_GUTTER_PX - view.scrollTop,
-        Math.max(3, rect.width * view.scale),
-        Math.max(3, rect.height * view.scale),
-      );
+      const selected = String(defect.id) === String(selectedDefectId ?? focusDefectId ?? '');
+      const screenX = rect.x * view.scale - view.scrollLeft;
+      const screenY = rect.y * view.scale + WORLD_TOP_GUTTER_PX - view.scrollTop;
+      const screenWidth = Math.max(3, rect.width * view.scale);
+      const screenHeight = Math.max(3, rect.height * view.scale);
+      context.fillStyle = selected ? 'rgba(255, 70, 104, .22)' : 'rgba(255, 176, 32, .12)';
+      context.fillRect(screenX, screenY, screenWidth, screenHeight);
+      context.strokeStyle = selected ? '#ff4668' : '#ffb020';
+      context.lineWidth = selected ? 3 : 2;
+      context.strokeRect(screenX, screenY, screenWidth, screenHeight);
     }
     if (paintedTile && !firstPaintReported.current) {
       firstPaintReported.current = true;
       onFirstPaintRef.current?.();
     }
-  }, [cameraById, colorMode, displayCameras, failedKeys, level, meta.world.tileSize, recordId, revision, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
+  }, [cameraById, colorMode, displayCameras, failedKeys, focusDefectId, level, meta.world.tileSize, recordId, revision, selectedDefectId, size.height, size.width, view.scale, view.scrollLeft, view.scrollTop, viewportMeasured, visibleDefects, visibleTiles]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -918,6 +998,41 @@ export function InspectionWorldCanvas({
           onPointerCancel={onPointerUp}
           onDoubleClick={handleDoubleClick}
         />
+        <div
+          className="inspection-world-defect-overlay-layer"
+          data-testid="inspection-world-defect-overlays"
+          data-visible-defects={visibleDefects.length}
+          aria-label="检测缺陷框标注"
+        >
+          {visibleDefects.map((defect) => {
+            const rect = defect.worldRect!;
+            const selected = String(defect.id) === String(selectedDefectId ?? focusDefectId ?? '');
+            const label = defect.className || `缺陷 ${defect.id}`;
+            return <button
+              key={String(defect.id)}
+              type="button"
+              className={`inspection-world-defect-box${selected ? ' is-selected' : ''}`}
+              data-testid="inspection-world-defect-box"
+              data-defect-id={String(defect.id)}
+              aria-label={`${label}，编号 ${defect.id}`}
+              title={`${label} · ${defect.id}`}
+              tabIndex={onDefectClick ? 0 : -1}
+              style={{
+                left: `${rect.x * view.scale - view.scrollLeft}px`,
+                top: `${rect.y * view.scale + WORLD_TOP_GUTTER_PX - view.scrollTop}px`,
+                width: `${Math.max(7, rect.width * view.scale)}px`,
+                height: `${Math.max(7, rect.height * view.scale)}px`,
+              }}
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onDefectClick?.(defect.id);
+              }}
+            >
+              <span>{label}</span>
+            </button>;
+          })}
+        </div>
         <div className="inspection-world-camera-labels" aria-hidden="true">
           {displayCameras.map((camera) => {
             const cameraIndex = meta.world.cameras.findIndex((item) => item.cameraId === camera.cameraId);

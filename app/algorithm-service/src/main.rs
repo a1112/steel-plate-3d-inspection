@@ -377,8 +377,35 @@ impl BkvAdapter {
     }
 
     async fn load_defects(&self, sequence: i64) -> Result<Vec<ResultDefect>, String> {
-        let rows = self.connection.query_all(Statement::from_string(DbBackend::MySql, format!("SELECT CAST(ID AS CHAR) AS id, CAST(CamNo AS CHAR) AS camera_no, CAST(COALESCE(ImgIndex, 0) AS CHAR) AS image_index, CAST(COALESCE(Class, 0) AS CHAR) AS class_no, CAST(COALESCE(Grade, 0) AS CHAR) AS grade, CAST(COALESCE(Confidence, 0) AS CHAR) AS confidence FROM `{}`.`defect` WHERE SeqNo = {} ORDER BY ID DESC LIMIT 5000", self.database, sequence))).await.map_err(|e| e.to_string())?;
-        rows.iter().map(|row| Ok(ResultDefect { id: row_string(row, "id")?, camera_id: format!("C{}", row_string(row, "camera_no")?), sequence_no: row_string(row, "image_index")?.parse().unwrap_or(0), defect_type: format!("bkv-class-{}", row_string(row, "class_no")?), severity: row_string(row, "grade")?.parse().ok(), confidence: row_string(row, "confidence")?.parse().ok(), artifacts: json!({"classNo": row_string(row, "class_no")?, "imageIndex": row_string(row, "image_index")?}) })).collect()
+        let rows = self.connection.query_all(Statement::from_string(DbBackend::MySql, format!("SELECT CAST(ID AS CHAR) AS id, CAST(CamNo AS CHAR) AS camera_no, CAST(COALESCE(ImgIndex, 0) AS CHAR) AS image_index, CAST(COALESCE(Class, 0) AS CHAR) AS class_no, CAST(COALESCE(Grade, 0) AS CHAR) AS grade, CAST(COALESCE(Confidence, 0) AS CHAR) AS confidence, CAST(COALESCE(LeftImg2D, LeftSteel2D, 0) AS CHAR) AS left_image, CAST(COALESCE(RightImg2D, RightSteel2D, 0) AS CHAR) AS right_image, CAST(COALESCE(TopImg2D, TopSteel2D, 0) AS CHAR) AS top_image, CAST(COALESCE(BottomImg2D, BottomSteel2D, 0) AS CHAR) AS bottom_image FROM `{}`.`defect` WHERE SeqNo = {} ORDER BY ID DESC LIMIT 5000", self.database, sequence))).await.map_err(|e| e.to_string())?;
+        rows.iter().map(|row| {
+            let class_no = row_string(row, "class_no")?;
+            let image_index = row_string(row, "image_index")?;
+            let mut artifacts = json!({"classNo": class_no, "imageIndex": image_index});
+            let left = row_string(row, "left_image")?.parse::<i64>().ok();
+            let right = row_string(row, "right_image")?.parse::<i64>().ok();
+            let top = row_string(row, "top_image")?.parse::<i64>().ok();
+            let bottom = row_string(row, "bottom_image")?.parse::<i64>().ok();
+            if let (Some(left), Some(right), Some(top), Some(bottom)) = (left, right, top, bottom) {
+                if left >= 0 && top >= 0 && right > left && bottom > top {
+                    artifacts["imageRect2d"] = json!({
+                        "left": left,
+                        "top": top,
+                        "right": right,
+                        "bottom": bottom,
+                    });
+                }
+            }
+            Ok(ResultDefect {
+                id: row_string(row, "id")?,
+                camera_id: format!("C{}", row_string(row, "camera_no")?),
+                sequence_no: image_index.parse().unwrap_or(0),
+                defect_type: format!("bkv-class-{class_no}"),
+                severity: row_string(row, "grade")?.parse().ok(),
+                confidence: row_string(row, "confidence")?.parse().ok(),
+                artifacts,
+            })
+        }).collect()
     }
 }
 

@@ -1799,6 +1799,7 @@ export function PlateMap({
             recordId={displayedWorld.recordId}
             meta={displayedWorld.meta}
             defects={displayedWorld.defects}
+            selectedDefectId={selectedDefectId}
             focusDefectId={displayedWorld.recordId === inspectionId
               ? worldFocusRequest?.defectId ?? null
               : null}
@@ -1808,6 +1809,7 @@ export function PlateMap({
             colorMode={twoDDisplayMode}
             suspendLoading={switchingWorld}
             onVisibleRangeChange={onVisibleRangeChange}
+            onDefectClick={(defectId) => onSelectDefect(String(defectId))}
           /> : null}
           {activePendingWorld ? <InspectionWorldCanvas
             key={`world:${activePendingWorld.recordId}:${activePendingWorld.meta.sourceFrameCount}:${activePendingWorld.meta.world.width}:${activePendingWorld.meta.world.height}`}
@@ -1815,11 +1817,13 @@ export function PlateMap({
             recordId={activePendingWorld.recordId}
             meta={activePendingWorld.meta}
             defects={activePendingWorld.defects}
+            selectedDefectId={selectedDefectId}
             focusDefectId={worldFocusRequest?.defectId ?? null}
             focusDefectRevision={worldFocusRequest?.revision}
             focusCameraId={selectedDefect?.cameraIndex}
             focusPositionRatio={selectedDefectPositionRatio}
             colorMode={twoDDisplayMode}
+            onDefectClick={(defectId) => onSelectDefect(String(defectId))}
             onFirstScreenReady={() => {
               displayedWorldRef.current = activePendingWorld;
               setDisplayedWorld(activePendingWorld);

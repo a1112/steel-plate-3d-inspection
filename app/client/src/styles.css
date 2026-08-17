@@ -17683,6 +17683,62 @@ button {
 
 .inspection-world-stage canvas:active { cursor: grabbing; }
 
+.inspection-world-defect-overlay-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.inspection-world-defect-box {
+  position: absolute;
+  box-sizing: border-box;
+  min-width: 7px;
+  min-height: 7px;
+  padding: 0;
+  overflow: visible;
+  border: 2px solid #ffb020;
+  border-radius: 2px;
+  background: rgba(255, 176, 32, .12);
+  box-shadow: 0 0 0 1px rgba(4, 16, 27, .6);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.inspection-world-defect-box:hover,
+.inspection-world-defect-box:focus-visible,
+.inspection-world-defect-box.is-selected {
+  z-index: 1;
+  border-color: #ff4668;
+  background: rgba(255, 70, 104, .22);
+  box-shadow: 0 0 0 2px rgba(255, 70, 104, .24), 0 0 12px rgba(255, 70, 104, .42);
+  outline: none;
+}
+
+.inspection-world-defect-box span {
+  position: absolute;
+  left: -2px;
+  bottom: calc(100% + 2px);
+  max-width: 150px;
+  padding: 2px 5px;
+  overflow: hidden;
+  border-radius: 3px;
+  color: #fff4dc;
+  background: rgba(62, 37, 4, .9);
+  font: 600 10px/14px ui-monospace, monospace;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.inspection-world-defect-box.is-selected span,
+.inspection-world-defect-box:hover span,
+.inspection-world-defect-box:focus-visible span {
+  color: #ffe7ec;
+  background: rgba(89, 18, 33, .94);
+}
+
 .inspection-world-camera-labels {
   position: absolute;
   inset: 0 0 auto;

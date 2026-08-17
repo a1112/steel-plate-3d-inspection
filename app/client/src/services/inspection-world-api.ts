@@ -176,6 +176,12 @@ export type InspectionWorldDefect = {
         right?: number;
         bottom?: number;
       };
+      roi?: {
+        x?: number;
+        y?: number;
+        width?: number;
+        height?: number;
+      };
       [key: string]: unknown;
     };
     [key: string]: unknown;
@@ -459,21 +465,34 @@ export async function fetchInspectionWorldSurface(
     inspectionWorldSurfaceCache.set(recordId, cached);
     return cached;
   }
+  const params = new URLSearchParams({ recordId, format: 'binary' });
+  if (refresh) params.set('refresh', String(Date.now()));
+  const binaryResponse = await fetch(worldUrl('surface', params), {
+    cache: refresh ? 'no-store' : 'no-cache',
+    headers: createAdminHeaders({ Accept: 'application/vnd.steel.bsmesh' }), signal,
+  });
+  if (binaryResponse.ok) {
+    return rememberInspectionWorldSurface(
+      recordId,
+      parseInspectionWorldSurfaceBinary(await binaryResponse.arrayBuffer()),
+    );
+  }
+  // Converted-local surfaces deliberately have a binary-only contract. Do not
+  // follow a failed binary request with a JSON request: that second request is
+  // what used to surface the misleading HTTP 406 message in the dashboard.
+  if (binaryResponse.status === 406) {
+    throw new Error('涓夌淮娣卞害琛ㄩ潰鎺ュ彛闇€瑕佷娇鐢ㄤ簩杩涘埗鏍煎紡 (HTTP 406)');
+  }
+  let detail = '';
   try {
-    const params = new URLSearchParams({ recordId, format: 'binary' });
-    if (refresh) params.set('refresh', String(Date.now()));
-    const binaryResponse = await fetch(worldUrl('surface', params), {
-      cache: refresh ? 'no-store' : 'no-cache',
-      headers: createAdminHeaders({ Accept: 'application/vnd.steel.bsmesh' }), signal,
-    });
-    if (binaryResponse.ok) {
-      return rememberInspectionWorldSurface(
-        recordId,
-        parseInspectionWorldSurfaceBinary(await binaryResponse.arrayBuffer()),
-      );
-    }
-  } catch (error) {
-    if (signal?.aborted) throw error;
+    const errorPayload = await binaryResponse.json() as { detail?: unknown; error?: unknown };
+    const value = errorPayload.detail ?? errorPayload.error;
+    if (typeof value === 'string' && value.trim()) detail = value.trim();
+  } catch {
+    // Keep the status-only diagnostic when the service has no JSON body.
+  }
+  if (binaryResponse.status !== 404) {
+    throw new Error(`涓夌淮娣卞害琛ㄩ潰璇诲彇澶辫触${detail ? `锛?{detail}` : ''} (HTTP ${binaryResponse.status})`);
   }
   const payload = await readJson<BarSurfaceMesh>(await fetch(worldUrl('surface', new URLSearchParams({ recordId })), {
     headers: createAdminHeaders({ Accept: 'application/json' }), signal,

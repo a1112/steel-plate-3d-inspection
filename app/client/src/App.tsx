@@ -1142,6 +1142,10 @@ function InspectionDashboard({
     [snapshot, savedSettings],
   );
   const activeSummary = useMemo(() => summarizeDefects(currentPlateDefects), [currentPlateDefects]);
+  // Keep the analysis and defect sidebar out of the default no-defect layout.
+  // The center map remains the primary record view; the auxiliary panels only
+  // become part of the grid when the selected record actually has defects.
+  const hasCurrentDefects = currentPlateDefects.length > 0;
   const baseDeviceStatus = useMemo(() => getDeviceStatusWithOperation(activeSnapshot.status, operationState), [activeSnapshot.status, operationState]);
   const serviceAlarmCount = useMemo(() => {
     if (terminalMode === 'bkv') return 0;
@@ -1511,7 +1515,7 @@ function InspectionDashboard({
           />
           <section className="online-main">
             <main className={`dashboard-grid online-dashboard-grid ${rightSidebarCollapsed ? 'right-sidebar-collapsed' : ''}`}>
-              <section className={`center-column ${analysisCollapsed ? 'analysis-collapsed' : ''}`}>
+              <section className={`center-column ${analysisCollapsed || !hasCurrentDefects ? 'analysis-collapsed' : ''}`}>
                 <PlateMap
                   defectTypes={snapshot.defectTypes}
                   defects={visibleDefects}
@@ -1558,7 +1562,7 @@ function InspectionDashboard({
                         </div>
                         </>
                       )}
-                      {rightSidebarCollapsed ? (
+                      {rightSidebarCollapsed && hasCurrentDefects ? (
                         <button
                           type="button"
                           className="right-sidebar-expand-button"
@@ -1587,26 +1591,28 @@ function InspectionDashboard({
                   }}
                   onVisibleRangeChange={setLongitudinalVisibleRange}
                 />
-                <AlarmAnalysis
-                  selectedDefect={selectedOnlineDefect}
-                  heightProfile={activeSnapshot.heightProfile}
-                  captureImages={activeSnapshot.captureImages}
-                  defects={visibleDefects}
-                  artifactMode={artifactMode}
-                  inspectionId={activeInspection?.inspectionId}
-                  surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
-                  artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
-                  headerless
-                  collapsed={analysisCollapsed}
-                  viewMode={analysisViewMode}
-                  diameterMeasurement={terminalMode === 'bkv' ? {
-                    nominalDiameterMm: activeSnapshot.currentPlate.widthMm,
-                    lengthMm: activeSnapshot.currentPlate.lengthMm,
-                  } : undefined}
-                  diameterVisibleRange={longitudinalVisibleRange}
-                />
+                {hasCurrentDefects ? (
+                  <AlarmAnalysis
+                    selectedDefect={selectedOnlineDefect}
+                    heightProfile={activeSnapshot.heightProfile}
+                    captureImages={activeSnapshot.captureImages}
+                    defects={visibleDefects}
+                    artifactMode={artifactMode}
+                    inspectionId={activeInspection?.inspectionId}
+                    surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
+                    artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
+                    headerless
+                    collapsed={analysisCollapsed}
+                    viewMode={analysisViewMode}
+                    diameterMeasurement={terminalMode === 'bkv' ? {
+                      nominalDiameterMm: activeSnapshot.currentPlate.widthMm,
+                      lengthMm: activeSnapshot.currentPlate.lengthMm,
+                    } : undefined}
+                    diameterVisibleRange={longitudinalVisibleRange}
+                  />
+                ) : null}
               </section>
-              {rightSidebarCollapsed ? null : <aside className="right-column">
+              {rightSidebarCollapsed || !hasCurrentDefects ? null : <aside className="right-column">
                 <DefectImagePanel
                   inspectionId={activeInspection?.inspectionId}
                   defect={selectedOnlineDefect}
