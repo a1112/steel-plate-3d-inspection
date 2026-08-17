@@ -594,6 +594,15 @@ impl BkvSource {
         serde_json::from_str(&payload).map_err(|error| error.to_string())
     }
 
+    pub fn defect_types(&self) -> Result<Vec<Value>, String> {
+        Ok(self
+            .cached_snapshot_value()?
+            .get("defectTypes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     fn process_latest_inspection_world(&self) -> Result<(), String> {
         let snapshot = self.cached_snapshot_value()?;
         let record_id = latest_completed_record_id(&snapshot)
@@ -608,6 +617,11 @@ impl BkvSource {
 
     pub fn inspection_world_records(&self) -> Result<Value, String> {
         let snapshot = self.cached_snapshot_value()?;
+        let defect_types = snapshot
+            .get("defectTypes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let records = snapshot
             .get("records")
             .and_then(Value::as_array)
@@ -627,6 +641,7 @@ impl BkvSource {
         Ok(json!({
             "schema": "steel.inspection-world.records.v1",
             "provider": "online",
+            "defectTypes": defect_types,
             "records": records,
         }))
     }

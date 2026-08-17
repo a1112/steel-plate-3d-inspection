@@ -960,7 +960,7 @@ function InspectionDashboard({
   const previousSurfaceViewModeRef = useRef<PlateMapViewMode>('2d');
 
   useEffect(() => {
-    if (dashboardMode.kind !== 'bkv' && dashboardMode.kind !== 'bkv-online') return;
+    if (!dashboardMode.requestsStandardRecords) return;
     const recordId = activeInspection?.inspectionId?.trim();
     if (!recordId || loadedBkvDefectRecordsRef.current.has(recordId)) return;
     const controller = new AbortController();
@@ -974,7 +974,7 @@ function InspectionDashboard({
         // A record-local world or defect failure must not start online fallback polling.
       });
     return () => controller.abort();
-  }, [activeInspection?.inspectionId, dashboardMode.kind]);
+  }, [activeInspection?.inspectionId, dashboardMode.requestsStandardRecords]);
 
   useEffect(() => {
     const inspectionId = activeInspection?.inspectionId?.trim() || '';

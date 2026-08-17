@@ -57,6 +57,12 @@ export type InspectionWorldRecords = {
   recordCount?: number;
   latestInspectionTime?: string | null;
   synchronizedAt?: string;
+  defectTypes?: Array<{
+    id: string;
+    label: string;
+    color: string;
+    shape: 'circle' | 'square' | 'diamond' | 'rect' | 'star';
+  }>;
   records: InspectionWorldRecord[];
 };
 
