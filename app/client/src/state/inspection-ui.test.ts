@@ -98,6 +98,21 @@ describe('inspection UI state helpers', () => {
     expect(selected.selectedDefectId).toBe(older.defects[0]?.id ?? null);
   });
 
+  it('resolves opaque record ids through the record plate number when inspection ids are absent', () => {
+    const snapshot = getMockInspectionSnapshot();
+    const serviceSnapshot = {
+      ...snapshot,
+      records: snapshot.records.map((record, index) => ({ ...record, id: `R-${index + 1}` })),
+      inspections: snapshot.inspections.map((inspection) => ({ ...inspection, inspectionId: '' })),
+    };
+
+    const selected = selectRecord(createInitialUiState(serviceSnapshot), serviceSnapshot, 'R-2');
+
+    expect(selected.selectedRecordId).toBe('R-2');
+    expect(selected.selectedDefectId).toBe(serviceSnapshot.inspections[1].defects[0]?.id ?? null);
+    expect(selected.previewPositionM).toBe(1.311);
+  });
+
   it('paginates stable table rows with a 1-based page number', () => {
     const rows = Array.from({ length: 10 }, (_, index) => index + 1);
 

@@ -2686,6 +2686,155 @@ button {
   background: var(--blue-soft);
 }
 
+.defect-list-actions,
+.defect-list-view-switch {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.defect-list-view-switch {
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.defect-list-view-switch button {
+  width: 27px;
+  height: 25px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+}
+
+.defect-list-view-switch button.active {
+  color: #fff;
+  background: var(--blue);
+}
+
+.defect-distribution {
+  min-height: 0;
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  grid-template-rows: 24px minmax(180px, 1fr);
+  padding: 8px 10px 10px;
+}
+
+.defect-distribution-camera-axis {
+  grid-column: 2;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  color: color-mix(in srgb, var(--muted) 85%, var(--blue));
+  font-size: 9px;
+  font-weight: 900;
+  text-align: center;
+}
+
+.defect-distribution-camera-axis > span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.defect-distribution-length-ruler {
+  grid-column: 1;
+  grid-row: 2;
+  position: relative;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.defect-distribution-length-ruler > span {
+  position: absolute;
+  top: var(--tick-position);
+  right: 5px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  transform: translateY(-50%);
+  white-space: nowrap;
+}
+
+.defect-distribution-length-ruler > span.first { transform: none; }
+.defect-distribution-length-ruler > span.last { transform: translateY(-100%); }
+
+.defect-distribution-length-ruler i {
+  order: 2;
+  display: block;
+  width: 6px;
+  height: 1px;
+  background: color-mix(in srgb, var(--blue) 55%, var(--line));
+}
+
+.defect-distribution-length-ruler b { font: inherit; }
+
+.defect-distribution-pipe {
+  grid-column: 2;
+  grid-row: 2;
+  position: relative;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--line));
+  border-radius: 12px;
+  background: var(--panel-soft);
+}
+
+.defect-distribution-camera-regions {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.defect-distribution-camera-regions > span {
+  border-right: 1px solid color-mix(in srgb, var(--blue) 24%, transparent);
+  background: color-mix(in srgb, var(--blue) 4%, transparent);
+}
+
+.defect-distribution-camera-regions > span:nth-child(even) {
+  background: color-mix(in srgb, var(--blue) 9%, transparent);
+}
+
+.defect-distribution-camera-regions > span:last-child { border-right: 0; }
+
+.defect-distribution-length-guides {
+  position: absolute;
+  inset: 0;
+}
+
+.defect-distribution-length-guides > i {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: color-mix(in srgb, var(--blue) 18%, transparent);
+}
+
+.defect-distribution-marker {
+  position: absolute;
+  z-index: 1;
+  width: 15px;
+  height: 9px;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  border: 1px solid color-mix(in srgb, var(--defect-type-color, #64748b) 70%, #fff);
+  border-radius: 2px;
+  background: var(--defect-type-color, #64748b);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .32);
+}
+
+.defect-distribution-marker.selected {
+  z-index: 2;
+  outline: 2px solid color-mix(in srgb, var(--blue) 72%, #fff);
+  outline-offset: 2px;
+  transform: translate(-50%, -50%) scale(1.16);
+}
+
 .defect-list-hover-card {
   position: fixed;
   z-index: 1600;
@@ -3891,6 +4040,40 @@ button {
   display: block;
 }
 
+.production-artifact-depth-control {
+  position: absolute;
+  z-index: 10;
+  top: 9px;
+  right: 9px;
+  display: grid;
+  grid-template-columns: auto minmax(72px, 112px) 34px;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border: 1px solid rgba(130, 206, 255, .38);
+  border-radius: 7px;
+  color: #dff3ff;
+  background: rgba(4, 20, 32, .86);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .22);
+  font-size: 9px;
+  font-weight: 850;
+  cursor: default;
+}
+
+.production-artifact-depth-control input {
+  width: 100%;
+  min-width: 72px;
+  margin: 0;
+  accent-color: #22c7ee;
+  cursor: pointer;
+}
+
+.production-artifact-depth-control strong {
+  color: #63def9;
+  font: 900 10px/1 ui-monospace, monospace;
+  text-align: right;
+}
+
 .production-artifact-axis-navigation {
   position: absolute;
   z-index: 9;
@@ -4088,6 +4271,20 @@ button {
   font-size: 11px;
   font-weight: 700;
   line-height: 1.55;
+}
+
+.production-artifact-empty.is-loading::before {
+  content: '';
+  width: 28px;
+  height: 28px;
+  border: 3px solid color-mix(in srgb, var(--blue) 22%, transparent);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: production-artifact-loading 0.8s linear infinite;
+}
+
+@keyframes production-artifact-loading {
+  to { transform: rotate(360deg); }
 }
 
 .production-artifact-empty.compact {
@@ -11539,6 +11736,13 @@ button {
   background: rgba(47, 125, 255, 0.05);
 }
 
+.theme-light button.inspection-world-defect-box,
+.theme-light button.inspection-world-defect-box:hover,
+.theme-light button.inspection-world-defect-box:focus-visible,
+.theme-light button.inspection-world-defect-box.is-selected {
+  background: transparent;
+}
+
 /* Status Indicators Light Theme */
 .theme-light .status-indicator.online {
   background: rgba(22, 216, 111, 0.15);
@@ -17031,6 +17235,135 @@ button {
   white-space: nowrap;
 }
 
+.bkv-conversion-log {
+  margin: 0 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.bkv-conversion-log > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bkv-conversion-log > header > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bkv-conversion-log > header span,
+.bkv-conversion-log > header em,
+.bkv-conversion-log-empty {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bkv-conversion-log-list {
+  max-height: 180px;
+  overflow: auto;
+}
+
+.bkv-conversion-log-list article {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 11px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+}
+
+.bkv-conversion-log-list article:last-child {
+  border-bottom: 0;
+}
+
+.bkv-conversion-log-list article > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bkv-conversion-log-list article span,
+.bkv-conversion-log-list article em {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.bkv-conversion-log-list article span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bkv-conversion-log-list article > em {
+  flex: 0 0 auto;
+  color: var(--cyan);
+}
+
+.bkv-conversion-log-empty {
+  margin: 0;
+  padding: 14px 11px;
+}
+
+.bkv-conversion-history-table-wrap {
+  max-height: 238px;
+  overflow: auto;
+}
+
+.bkv-conversion-history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.bkv-conversion-history-table th,
+.bkv-conversion-history-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.bkv-conversion-history-table th {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  color: var(--text-muted);
+  background: var(--panel-soft);
+  font-size: 10px;
+}
+
+.bkv-conversion-history-table th:first-child,
+.bkv-conversion-history-table td:first-child,
+.bkv-conversion-history-table th:last-child,
+.bkv-conversion-history-table td:last-child {
+  text-align: left;
+}
+
+.bkv-conversion-history-table tbody tr:last-child td { border-bottom: 0; }
+.bkv-conversion-history-table td.success { color: var(--green); }
+.bkv-conversion-history-table td.abnormal { color: var(--red); }
+
+.bkv-conversion-history-table td:last-child {
+  display: grid;
+  gap: 2px;
+}
+
+.bkv-conversion-history-table td:last-child span {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
 .bkv-conversion-preview-heading {
   justify-content: space-between;
   gap: 18px;
@@ -17682,6 +18015,71 @@ button {
 }
 
 .inspection-world-stage canvas:active { cursor: grabbing; }
+
+.inspection-world-defect-overlay-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.inspection-world-defect-box {
+  position: absolute;
+  box-sizing: border-box;
+  min-width: 7px;
+  min-height: 7px;
+  padding: 0;
+  overflow: visible;
+  border: 2px solid #ffb020;
+  border-radius: 2px;
+  background: transparent;
+  box-shadow: 0 0 0 1px rgba(4, 16, 27, .6);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.inspection-world-defect-box:hover,
+.inspection-world-defect-box:focus-visible,
+.inspection-world-defect-box.is-selected {
+  z-index: 1;
+  border-color: #ff4668;
+  background: transparent;
+  box-shadow: 0 0 0 2px rgba(255, 70, 104, .24), 0 0 12px rgba(255, 70, 104, .42);
+  outline: none;
+}
+
+.inspection-world-defect-box span {
+  position: absolute;
+  left: -2px;
+  bottom: calc(100% + 2px);
+  max-width: 150px;
+  padding: 2px 5px;
+  overflow: hidden;
+  border-radius: 3px;
+  color: #fff4dc;
+  background: rgba(62, 37, 4, .9);
+  font: 600 10px/14px ui-monospace, monospace;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.inspection-world-defect-box.is-selected span,
+.inspection-world-defect-box:hover span,
+.inspection-world-defect-box:focus-visible span {
+  color: #ffe7ec;
+  background: rgba(89, 18, 33, .94);
+}
+
+/* The defect overlay must never cover production pixels. Keep this after the
+   light-theme generic button rules so selected and hovered boxes stay hollow. */
+.theme-light .inspection-world-defect-box,
+.theme-light .inspection-world-defect-box:hover,
+.theme-light .inspection-world-defect-box:focus-visible,
+.theme-light .inspection-world-defect-box.is-selected {
+  background: transparent !important;
+}
 
 .inspection-world-camera-labels {
   position: absolute;

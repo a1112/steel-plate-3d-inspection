@@ -134,10 +134,8 @@ describe('AppFooter', () => {
         dashboardMode={bkvDashboardMode}
         analysis={{
           defect,
-          surfaceViewMode: '3d',
           analysisViewMode: 'diameter',
           collapsed: false,
-          onSurfaceViewModeChange: vi.fn(),
           onAnalysisViewModeChange,
           onCollapsedChange: vi.fn(),
         }}
@@ -275,8 +273,7 @@ describe('AppFooter', () => {
     expect(onFlowToggle).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps defect view switchers in the footer without a duplicate collapse control', () => {
-    const onSurfaceViewModeChange = vi.fn();
+  it('keeps only lower defect-analysis view switchers in the footer', () => {
     const onAnalysisViewModeChange = vi.fn();
     const onCollapsedChange = vi.fn();
     render(
@@ -284,10 +281,8 @@ describe('AppFooter', () => {
         activeNav="online"
         analysis={{
           defect,
-          surfaceViewMode: '2d',
           analysisViewMode: 'overview',
           collapsed: true,
-          onSurfaceViewModeChange,
           onAnalysisViewModeChange,
           onCollapsedChange,
         }}
@@ -298,10 +293,10 @@ describe('AppFooter', () => {
 
     expect(screen.getByLabelText('选中缺陷分析工具')).toHaveTextContent('凹坑');
     expect(screen.getByLabelText('选中缺陷分析工具')).toHaveTextContent('0.42×0.36×0.12mm');
-    fireEvent.click(screen.getByRole('button', { name: '3D' }));
+    expect(screen.queryByRole('group', { name: '主检测视图' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '3D' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '局部点云' }));
 
-    expect(onSurfaceViewModeChange).toHaveBeenCalledWith('3d');
     expect(onAnalysisViewModeChange).toHaveBeenCalledWith('point-cloud');
     expect(onCollapsedChange).toHaveBeenCalledWith(false);
     expect(screen.queryByRole('button', { name: '收起缺陷分析区' })).not.toBeInTheDocument();

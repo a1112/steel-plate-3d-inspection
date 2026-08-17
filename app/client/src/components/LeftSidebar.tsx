@@ -8,7 +8,9 @@ import { Panel } from './Panel';
 
 type RecordSearchField = keyof RecordSearchFilters;
 
-const RECORD_RENDER_BATCH = 200;
+// The viewport only shows a small number of rows. Keeping hundreds of
+// off-screen rows mounted makes every record switch needlessly expensive.
+const RECORD_RENDER_BATCH = 50;
 const CACHE_STATUS_HOVER_DELAY_MS = 180;
 
 type RecordCacheProbe = {

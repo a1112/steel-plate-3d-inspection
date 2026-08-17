@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { PanelRightClose } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
+import { bkvOnlineCroppedImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import { Panel } from './Panel';
 
@@ -17,10 +18,15 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse }: Pr
   const sequenceNo = defect?.artifacts?.sequenceNo;
   const roi = defect?.artifacts?.roi;
   const imageUrl = useMemo(() => (
-    inspectionId && cameraId && sequenceNo != null
+    bkvOnlineCroppedImageUrl(
+      defect?.artifacts?.roiImage
+        || defect?.artifacts?.sourceFrame?.intensity
+        || defect?.previewImageUrl,
+      roi,
+    ) || (inspectionId && cameraId && sequenceNo != null
       ? inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo, roi)
-      : ''
-  ), [cameraId, inspectionId, roi?.height, roi?.width, roi?.x, roi?.y, sequenceNo]);
+      : '')
+  ), [cameraId, defect?.artifacts?.roiImage, defect?.artifacts?.sourceFrame?.intensity, defect?.previewImageUrl, inspectionId, roi?.height, roi?.width, roi?.x, roi?.y, sequenceNo]);
 
   useEffect(() => {
     setActualSize(false);

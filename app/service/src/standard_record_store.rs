@@ -43,6 +43,16 @@ pub struct InspectionCatalogSummaryDto {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct InspectionDailySummaryDto {
+    pub date: String,
+    pub record_count: u64,
+    pub success_count: u64,
+    pub abnormal_count: u64,
+    pub latest_record_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InspectionDefectDto {
     pub id: String,
     pub record_id: String,
@@ -176,6 +186,43 @@ impl ConvertedLocalStore {
                     })
                 },
             )
+            .map_err(StoreError::from)
+    }
+
+    pub fn daily_summaries(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<InspectionDailySummaryDto>, StoreError> {
+        let connection = self.connection()?;
+        let completed_statuses =
+            "'ready','completed','finished','algorithm-complete','legacy-imported'";
+        let sql = format!(
+            r#"
+            SELECT COALESCE(NULLIF(SUBSTR(inspection_time, 1, 10), ''), '未标注日期') AS day,
+                   COUNT(*),
+                   SUM(CASE WHEN status IN ({completed_statuses}) THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN status IN ({completed_statuses}) THEN 0 ELSE 1 END),
+                   MAX(id)
+            FROM production_inspection
+            GROUP BY day
+            ORDER BY day DESC
+            LIMIT ?1
+            "#
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            [i64::try_from(limit.clamp(1, 366)).unwrap_or(31)],
+            |row| {
+                Ok(InspectionDailySummaryDto {
+                    date: row.get(0)?,
+                    record_count: u64::try_from(row.get::<_, i64>(1)?.max(0)).unwrap_or(0),
+                    success_count: u64::try_from(row.get::<_, i64>(2)?.max(0)).unwrap_or(0),
+                    abnormal_count: u64::try_from(row.get::<_, i64>(3)?.max(0)).unwrap_or(0),
+                    latest_record_id: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
 
@@ -537,8 +584,7 @@ fn is_content_addressed_blob(path: &Path, declared_hash: &str) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    name.eq_ignore_ascii_case(declared_hash)
-        && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+    name.eq_ignore_ascii_case(declared_hash) && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn sha256_file(path: &Path) -> Result<String, StoreError> {

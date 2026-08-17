@@ -1005,6 +1005,33 @@ describe('InspectionWorldCanvas', () => {
     expect(strokeRect.mock.calls[0][1]).toBeLessThanOrEqual(632);
   });
 
+  it('maps a historical ROI artifact into a clickable world defect box', async () => {
+    vi.mocked(fetchInspectionWorldTile).mockImplementation(() => new Promise(() => undefined));
+    const onDefectClick = vi.fn();
+    render(<InspectionWorldCanvas
+      recordId="1893700"
+      meta={meta}
+      defects={[{
+        id: 'roi-defect',
+        className: '历史缺陷',
+        cameraId: 1,
+        imageIndex: 0,
+        locatable: false,
+        worldRect: null,
+        trace: { artifacts: { roi: { x: 12, y: 14, width: 18, height: 20 } } },
+      }]}
+      onDefectClick={onDefectClick}
+    />);
+
+    const canvas = screen.getByTestId('inspection-world-canvas');
+    await waitFor(() => expect(canvas).toHaveAttribute('data-locatable-defects', '1'));
+    const box = screen.getByTestId('inspection-world-defect-box');
+    expect(box).toHaveAttribute('data-defect-id', 'roi-defect');
+    expect(box).toHaveTextContent('历史缺陷');
+    fireEvent.click(box);
+    expect(onDefectClick).toHaveBeenCalledWith('roi-defect');
+  });
+
   it('focuses a locatable defect and reports a failed tile without shifting the world', async () => {
     vi.mocked(fetchInspectionWorldTile).mockImplementation(async (_record, tile) => {
       if (tile.y === 0) throw new Error('missing tile');

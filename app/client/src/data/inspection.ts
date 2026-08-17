@@ -612,8 +612,7 @@ export function getMockInspectionSnapshot(): InspectionSnapshot {
 }
 
 export function getPlateInspectionSnapshot(snapshot: InspectionSnapshot, recordSelector: string): InspectionSnapshot {
-  const inspection = snapshot.inspections.find((item) => item.inspectionId === recordSelector)
-    ?? snapshot.inspections.find((item) => item.plate.plateNo === recordSelector);
+  const inspection = getInspectionByRecordSelector(snapshot, recordSelector);
   if (!inspection) {
     return snapshot;
   }
@@ -625,6 +624,21 @@ export function getPlateInspectionSnapshot(snapshot: InspectionSnapshot, recordS
     heightProfile: inspection.heightProfile,
     captureImages: inspection.captureImages,
   };
+}
+
+export function getInspectionByRecordSelector(snapshot: InspectionSnapshot, recordSelector: string) {
+  const directInspection = snapshot.inspections.find((item) => item.inspectionId === recordSelector)
+    ?? snapshot.inspections.find((item) => item.plate.plateNo === recordSelector);
+  if (directInspection) {
+    return directInspection;
+  }
+
+  const record = snapshot.records.find((item) => item.id === recordSelector);
+  if (!record) {
+    return undefined;
+  }
+  return snapshot.inspections.find((item) => item.inspectionId === record.id)
+    ?? snapshot.inspections.find((item) => item.plate.plateNo === record.plateNo);
 }
 
 export function getAllDefects(snapshot: InspectionSnapshot): DefectItem[] {

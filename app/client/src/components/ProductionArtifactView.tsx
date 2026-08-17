@@ -18,6 +18,7 @@ const MAX_ZOOM = 10;
 const ZOOM_FACTOR = 1.2;
 const NORMALIZED_LONGITUDINAL_SPAN = 4.2;
 const NORMALIZED_CROSS_SPAN = 1.35;
+const DEFAULT_DEPTH_EXAGGERATION = 3;
 
 export type ArtifactColorMode = 'source' | 'radial-jet' | 'texture';
 export type ArtifactOrientation = 'horizontal' | 'vertical';
@@ -157,6 +158,50 @@ export function buildRadialJetColors(mesh: BarSurfaceMesh, radialUnitScale = 1):
   };
 }
 
+export function buildDepthExaggeratedPositions(
+  mesh: BarSurfaceMesh,
+  exaggeration: number,
+): Float32Array {
+  const factor = clamp(Number.isFinite(exaggeration) ? exaggeration : 1, 1, 8);
+  const output = new Float32Array(mesh.positions.length);
+  for (let index = 0; index < mesh.positions.length; index += 1) {
+    output[index] = Number(mesh.positions[index]);
+  }
+  if (factor <= 1 || output.length < 9) return output;
+
+  const pointCount = Math.floor(output.length / 3);
+  const columns = mesh.colsPerCamera * mesh.cameraCount;
+  const rowCount = columns > 0
+    ? Math.min(mesh.rows, Math.floor(pointCount / columns))
+    : 0;
+  for (let row = 0; row < rowCount; row += 1) {
+    const rowStart = row * columns;
+    const observed: Array<{ pointIndex: number; y: number; z: number }> = [];
+    for (let column = 0; column < columns; column += 1) {
+      const pointIndex = rowStart + column;
+      if (mesh.validMask && Number(mesh.validMask[pointIndex]) === 0) continue;
+      const positionIndex = pointIndex * 3;
+      const y = output[positionIndex + 1];
+      const z = output[positionIndex + 2];
+      if (Number.isFinite(y) && Number.isFinite(z)) observed.push({ pointIndex, y, z });
+    }
+    const fitted = fitSurfaceCircle(observed);
+    if (!fitted) continue;
+    for (const point of observed) {
+      const dy = point.y - fitted.centerY;
+      const dz = point.z - fitted.centerZ;
+      const radius = Math.hypot(dy, dz);
+      if (!Number.isFinite(radius) || radius <= 1e-9) continue;
+      const residual = radius - fitted.radius;
+      const enhancedRadius = Math.max(fitted.radius * 0.05, fitted.radius + residual * factor);
+      const positionIndex = point.pointIndex * 3;
+      output[positionIndex + 1] = fitted.centerY + dy / radius * enhancedRadius;
+      output[positionIndex + 2] = fitted.centerZ + dz / radius * enhancedRadius;
+    }
+  }
+  return output;
+}
+
 function normalizePositions(values: ArrayLike<number>) {
   const normalized = new Float32Array(values.length);
   if (values.length < 3) {
@@ -197,6 +242,7 @@ function createArtifactGeometry(
   indexed: boolean,
   colorMode: ArtifactColorMode,
   radialUnitScale: number,
+  depthExaggeration: number,
 ) {
   const geometry = new BufferGeometry();
   const pointCount = Math.floor(mesh.positions.length / 3);
@@ -206,7 +252,10 @@ function createArtifactGeometry(
   const sourceColors: ArrayLike<number> = jet?.colors ?? mesh.colors;
   const hasColors = sourceColors.length >= pointCount * 3;
   const validMask = mesh.validMask;
-  let positions: ArrayLike<number> = mesh.positions;
+  const surfacePositions = indexed
+    ? buildDepthExaggeratedPositions(mesh, depthExaggeration)
+    : mesh.positions;
+  let positions: ArrayLike<number> = surfacePositions;
   let colors: ArrayLike<number> = sourceColors;
 
   if (!indexed && validMask && validMask.length >= pointCount) {
@@ -341,6 +390,7 @@ export function ProductionArtifactView({
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [axisCenter, setAxisCenter] = useState(0.5);
+  const [depthExaggeration, setDepthExaggeration] = useState(DEFAULT_DEPTH_EXAGGERATION);
   const [dragging, setDragging] = useState(false);
   const drag = useRef<{
     pointerId: number;
@@ -353,8 +403,8 @@ export function ProductionArtifactView({
     grabOffsetRatio: number;
   } | null>(null);
   const artifact = useMemo(
-    () => createArtifactGeometry(mesh, mode === 'surface', colorMode, radialUnitScale),
-    [colorMode, mesh, mode, radialUnitScale],
+    () => createArtifactGeometry(mesh, mode === 'surface', colorMode, radialUnitScale, depthExaggeration),
+    [colorMode, depthExaggeration, mesh, mode, radialUnitScale],
   );
   const { geometry, jetSummary } = artifact;
   const hasColors = geometry.getAttribute('color') !== undefined;
@@ -473,6 +523,7 @@ export function ProductionArtifactView({
       data-artifact-roll={roll.toFixed(3)}
       data-artifact-zoom={zoom.toFixed(2)}
       data-artifact-color-mode={colorMode}
+      data-artifact-depth-exaggeration={depthExaggeration.toFixed(1)}
       data-artifact-render-dpr={renderDpr.toFixed(2)}
       data-artifact-axis-center={axisCenter.toFixed(4)}
       data-artifact-pan-x={pan.x.toFixed(4)}
@@ -588,6 +639,27 @@ export function ProductionArtifactView({
           </div>
           <small>{jetSummary.fittedSectionCount} 个切面拟合 · 径向偏差单位 {radialUnit}</small>
         </div>
+      ) : null}
+      {mode === 'surface' ? (
+        <label
+          className="production-artifact-depth-control"
+          onPointerDown={(event) => event.stopPropagation()}
+          onPointerMove={(event) => event.stopPropagation()}
+          onPointerUp={(event) => event.stopPropagation()}
+          onWheel={(event) => event.stopPropagation()}
+        >
+          <span>深度增强</span>
+          <input
+            type="range"
+            min="1"
+            max="8"
+            step="0.5"
+            value={depthExaggeration}
+            aria-label="三维深度增强倍数"
+            onChange={(event) => setDepthExaggeration(Number(event.target.value))}
+          />
+          <strong>{depthExaggeration.toFixed(1)}×</strong>
+        </label>
       ) : null}
       <div
         className={`production-artifact-axis-navigation orientation-${orientation}`}

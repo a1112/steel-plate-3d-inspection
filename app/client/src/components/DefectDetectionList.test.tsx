@@ -136,4 +136,47 @@ describe('DefectDetectionList algorithm defects', () => {
     expect(image).toHaveAttribute('src', expect.stringContaining('cropHeight=11'));
     expect(screen.getByRole('tooltip')).toHaveTextContent('检测记录 ROI 裁剪');
   });
+  it('switches between the defect list and the pipe distribution map', () => {
+    const onSelectDefect = vi.fn();
+    render(
+      <DefectDetectionList
+        defects={[syntheticDefect, { ...candidateDefect, id: 'ALG-0002', xRatio: 0.22, cameraIndex: 2, circumferenceRatio: 0.25 }]}
+        defectTypes={[
+          { id: 'inclusion', label: '夹杂', color: '#f0141e', shape: 'diamond' },
+          { id: 'pit', label: '凹陷候选', color: '#2f6bff', shape: 'circle' },
+        ]}
+        pipeLengthMm={12_000}
+        selectedDefectId="ALG-0002"
+        filters={{ keyword: '', severity: 'all', surface: 'all', typeId: 'all' }}
+        filterOpen={false}
+        onSelectDefect={onSelectDefect}
+        onToggleFilter={vi.fn()}
+        onFilterChange={vi.fn()}
+        onClearFilters={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('分布图'));
+    expect(screen.getByRole('img', { name: '缺陷分布图，共 2 个缺陷' })).toBeInTheDocument();
+    expect(screen.getByLabelText('钢管长度刻度，0.0 至 12.0 米')).toBeInTheDocument();
+    expect(screen.getByText('12.0 m')).toBeInTheDocument();
+    expect(screen.getByLabelText('相机区域 C1 至 C6')).toHaveTextContent('C1C2C3C4C5C6');
+    expect(screen.queryByText('管头')).not.toBeInTheDocument();
+    expect(screen.queryByText('管尾')).not.toBeInTheDocument();
+    const marker = screen.getByRole('button', { name: /凹陷候选，camera2/ });
+    expect(marker).toHaveClass('selected');
+    expect(marker).toBeEmptyDOMElement();
+    expect(marker).toHaveStyle({ '--defect-type-color': '#2f6bff' });
+    fireEvent.click(marker);
+    expect(onSelectDefect).toHaveBeenCalledWith('ALG-0002');
+
+    const distribution = screen.getByRole('img', { name: '缺陷分布图，共 2 个缺陷' });
+    fireEvent.wheel(distribution.querySelector('.defect-distribution-pipe')!, { deltaY: 120 });
+    expect(onSelectDefect).toHaveBeenLastCalledWith(syntheticDefect.id);
+    fireEvent.wheel(distribution.querySelector('.defect-distribution-pipe')!, { deltaY: -120 });
+    expect(onSelectDefect).toHaveBeenLastCalledWith(syntheticDefect.id);
+
+    fireEvent.click(screen.getByTitle('列表'));
+    expect(screen.getByRole('table')).toBeInTheDocument();
+  });
 });

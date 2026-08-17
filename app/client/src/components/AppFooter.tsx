@@ -16,15 +16,12 @@ import {
 } from '../lib/app-windows';
 import { notify } from '../state/notifications';
 import type { AnalysisViewMode } from './AlarmAnalysis';
-import type { PlateMapViewMode } from './PlateMap';
 import type { NavKey } from './TopNav';
 
 interface FooterAnalysisContext {
   defect: DefectItem;
-  surfaceViewMode: PlateMapViewMode;
   analysisViewMode: AnalysisViewMode;
   collapsed: boolean;
-  onSurfaceViewModeChange: (next: PlateMapViewMode) => void;
   onAnalysisViewModeChange: (next: AnalysisViewMode) => void;
   onCollapsedChange: (collapsed: boolean) => void;
 }
@@ -66,12 +63,6 @@ const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
   showsReconstruction: true,
   supportsOfflineReplay: false,
 };
-
-const surfaceViewOptions: Array<{ id: PlateMapViewMode; label: string }> = [
-  { id: '2d', label: '2D' },
-  { id: '3d', label: '3D' },
-  { id: 'section', label: '切面' },
-];
 
 const analysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
   { id: 'overview', label: '综合' },
@@ -211,22 +202,7 @@ export function AppFooter({
             <span>周期 {activeAnalysis.defect.typeId === 'roll' ? '是' : '否'}</span>
           </div>
           {dashboardMode.kind === 'bkv' ? null : (
-            <>
-              <div className="app-footer-view-group" role="group" aria-label="主检测视图">
-                <span>主视图</span>
-                {surfaceViewOptions.map((option) => (
-                  <button
-                    key={option.id}
-                    type="button"
-                    className={activeAnalysis.surfaceViewMode === option.id ? 'active' : ''}
-                    aria-pressed={activeAnalysis.surfaceViewMode === option.id}
-                    onClick={() => activeAnalysis.onSurfaceViewModeChange(option.id)}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-              <div className="app-footer-view-group analysis-views" role="group" aria-label="缺陷分析视图">
+            <div className="app-footer-view-group analysis-views" role="group" aria-label="缺陷分析视图">
                 <span>分析</span>
                 {analysisViewOptions.map((option) => (
                 <button
@@ -239,8 +215,7 @@ export function AppFooter({
                   {option.label}
                 </button>
                 ))}
-              </div>
-            </>
+            </div>
           )}
         </div>
       ) : (
