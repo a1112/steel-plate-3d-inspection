@@ -7,6 +7,7 @@ import {
   fetchInspectionWorldSurface,
   fetchInspectionWorldTile,
   inspectionWorldFrameUrl,
+  inspectionWorldRecordsMatchStatus,
   type InspectionWorldRecords,
 } from './inspection-world-api';
 import { bkvOnlineCroppedImageUrl } from './bkv-online-api';
@@ -68,6 +69,33 @@ describe('inspection world API', () => {
       createObjectURL: vi.fn(() => 'blob:world-tile'),
       revokeObjectURL: vi.fn(),
     });
+  });
+
+  it('refreshes records when only the defect catalog revision changes', () => {
+    const records: InspectionWorldRecords = {
+      schema: 'steel.inspection-world.records.v1',
+      provider: 'bkv',
+      generation: 42,
+      defectCatalogRevision: 'catalog-before',
+      records: [],
+    };
+
+    expect(inspectionWorldRecordsMatchStatus(records, {
+      schema: 'steel.inspection-world.records-status.v1',
+      provider: 'bkv',
+      ready: true,
+      recordCount: 0,
+      generation: 42,
+      defectCatalogRevision: 'catalog-after',
+    })).toBe(false);
+    expect(inspectionWorldRecordsMatchStatus(records, {
+      schema: 'steel.inspection-world.records-status.v1',
+      provider: 'bkv',
+      ready: true,
+      recordCount: 0,
+      generation: 42,
+      defectCatalogRevision: 'catalog-before',
+    })).toBe(true);
   });
 
   it('loads records metadata and defects through the shared contract', async () => {

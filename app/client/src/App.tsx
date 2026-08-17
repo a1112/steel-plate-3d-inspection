@@ -94,6 +94,7 @@ import {
   fetchInspectionWorldDefects,
   fetchInspectionWorldRecords,
   fetchInspectionWorldRecordsStatus,
+  inspectionWorldRecordsMatchStatus,
   fetchInspectionWorldSurface,
   type InspectionWorldRecords,
 } from './services/inspection-world-api';
@@ -397,8 +398,7 @@ function ConfiguredApp({
     setRecordsRefreshing(true);
     try {
       const status = await fetchInspectionWorldRecordsStatus(signal);
-      const currentGeneration = bkvRecords?.generation ?? -1;
-      if (!force && currentGeneration === status.generation) {
+      if (!force && inspectionWorldRecordsMatchStatus(bkvRecords, status)) {
         setRecordsSynchronizedAt(Date.now());
         return;
       }
@@ -423,7 +423,12 @@ function ConfiguredApp({
     } finally {
       if (!signal?.aborted) setRecordsRefreshing(false);
     }
-  }, [bkvRecords?.generation, dashboardMode.kind, dashboardMode.requestsStandardRecords]);
+  }, [
+    bkvRecords?.defectCatalogRevision,
+    bkvRecords?.generation,
+    dashboardMode.kind,
+    dashboardMode.requestsStandardRecords,
+  ]);
 
   useEffect(() => {
     if (!dashboardMode.requestsStandardRecords) return undefined;

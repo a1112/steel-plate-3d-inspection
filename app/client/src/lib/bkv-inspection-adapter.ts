@@ -51,6 +51,8 @@ function standardDefectClassNo(defect: InspectionWorldDefect) {
 }
 
 function standardDefectTypeId(defect: InspectionWorldDefect) {
+  const explicitTypeId = textValue(defect.trace?.typeId);
+  if (explicitTypeId) return explicitTypeId;
   const classNo = standardDefectClassNo(defect);
   if (classNo) return `bkv-class-${classNo}`;
   const normalizedName = (defect.className || '未分类缺陷')
