@@ -15549,6 +15549,29 @@ fn bkv_defect_type_labels(defect_types: &[Value]) -> HashMap<String, String> {
         .collect()
 }
 
+fn bkv_defect_types_revision(defect_types: &[Value]) -> String {
+    let mut normalized = defect_types
+        .iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?.trim();
+            (!id.is_empty()).then(|| {
+                json!({
+                    "id": id,
+                    "label": item.get("label").and_then(Value::as_str).unwrap_or_default(),
+                    "color": item.get("color").and_then(Value::as_str).unwrap_or_default(),
+                    "shape": item.get("shape").and_then(Value::as_str).unwrap_or_default(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("id").and_then(Value::as_str))
+    });
+    canonical_value_sha256(&Value::Array(normalized)).unwrap_or_default()
+}
+
 fn resolved_bkv_defect_label(
     defect_type: &str,
     artifacts: &Value,
@@ -15609,6 +15632,7 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
             Ok((_, records)) => {
                 let camera_count = store.configured_cameras().len();
                 let defect_types = current_bkv_defect_types(state);
+                let defect_catalog_revision = bkv_defect_types_revision(&defect_types);
                 let catalog_summary = store.catalog_summary().ok();
                 let latest_inspection_time = catalog_summary
                     .as_ref()
@@ -15637,6 +15661,7 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
                         "cameraCount": camera_count,
                         "batchId": batch_id,
                         "generation": catalog_summary.as_ref().map(|summary| summary.generation),
+                        "defectCatalogRevision": defect_catalog_revision,
                         "recordCount": records.len(),
                         "latestInspectionTime": latest_inspection_time,
                         "synchronizedAt": current_time_string(),
@@ -15706,6 +15731,8 @@ fn inspection_world_records_status_response(state: &ServiceState) -> Vec<u8> {
     };
     match store.catalog_summary() {
         Ok(summary) => {
+            let defect_types = current_bkv_defect_types(state);
+            let defect_catalog_revision = bkv_defect_types_revision(&defect_types);
             let record_count = summary
                 .record_count
                 .min(inspection_world_history_limit(state) as u64);
@@ -15718,6 +15745,7 @@ fn inspection_world_records_status_response(state: &ServiceState) -> Vec<u8> {
                     "ready": record_count > 0,
                     "recordCount": record_count,
                     "generation": summary.generation,
+                    "defectCatalogRevision": defect_catalog_revision,
                     "latestInspectionTime": summary.latest_inspection_time,
                     "synchronizedAt": current_time_string(),
                 })
@@ -30322,7 +30350,8 @@ mod tests {
                     material_id TEXT NOT NULL, inspection_time TEXT,
                     status TEXT NOT NULL, defect_count INTEGER NOT NULL,
                     camera_count INTEGER NOT NULL, source_hash TEXT NOT NULL,
-                    record_path TEXT NOT NULL, metadata_json TEXT NOT NULL
+                    record_path TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                    generation INTEGER NOT NULL
                 );
                 CREATE TABLE production_defect (
                     id TEXT PRIMARY KEY, inspection_id TEXT NOT NULL,
@@ -30339,7 +30368,8 @@ mod tests {
                 INSERT INTO production_inspection VALUES (
                     '10', 'bkv-10', 'STEEL-10', '2025-09-26 03:36:17',
                     'legacy-imported', 1, 6, 'record-hash', 'records/10',
-                    '{"steelType":"37Mn/2","lengthMm":12096,"outerDiameterLegacyValue":233.664,"wallThicknessMm":12.5}'
+                    '{"steelType":"37Mn/2","lengthMm":12096,"outerDiameterLegacyValue":233.664,"wallThicknessMm":12.5}',
+                    7
                 );
                 INSERT INTO production_defect VALUES (
                     '10-100', '10', 'C1', 4, '轧折', 1, 51,
@@ -30405,6 +30435,23 @@ mod tests {
             resolved_bkv_defect_label("人工复核名称", &json!({}), &labels),
             "人工复核名称"
         );
+        let original = [json!({
+            "id": "bkv-class-16",
+            "label": "轧折",
+            "color": "#780078",
+            "shape": "circle",
+        })];
+        let recolored = [json!({
+            "id": "bkv-class-16",
+            "label": "轧折",
+            "color": "#00ff00",
+            "shape": "circle",
+        })];
+        assert_ne!(
+            bkv_defect_types_revision(&original),
+            bkv_defect_types_revision(&recolored),
+            "catalog-only changes must trigger dashboard refresh"
+        );
     }
 
     #[test]
@@ -30426,6 +30473,19 @@ mod tests {
         assert_eq!(records["records"][0]["outerDiameterMm"], 233.664);
         assert_eq!(records["records"][0]["wallThicknessMm"], 12.5);
         assert_eq!(records["records"][0]["sourceHash"], "record-hash");
+        assert!(records["defectCatalogRevision"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64));
+
+        let status = response_json(inspection_world_records_status_response(&state));
+        assert_eq!(
+            status["schema"], "steel.inspection-world.records-status.v1",
+            "unexpected records status response: {status}"
+        );
+        assert_eq!(
+            status["defectCatalogRevision"],
+            records["defectCatalogRevision"]
+        );
 
         let meta = response_json(inspection_world_meta_response(&state, "recordId=10"));
         assert_eq!(meta["provider"], "bkv");

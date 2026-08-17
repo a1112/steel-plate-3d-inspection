@@ -141,6 +141,35 @@ describe('standard BKV inspection adapter', () => {
     expect(snapshot.inspections[0].defects).toEqual([]);
   });
 
+  it('preserves the explicit catalog type id from a direct BKV-online defect', () => {
+    const snapshot = buildStandardBkvInspectionSnapshot(records);
+    const directOnlineDefects: InspectionWorldDefects = {
+      ...defects,
+      provider: 'online',
+      defects: [{
+        ...defects.defects[0],
+        className: '轧折',
+        trace: {
+          typeId: 'bkv-class-16',
+          sequenceNo: 12,
+          artifacts: {
+            imageRect2d: { left: 473, top: 857, right: 483, bottom: 867 },
+          },
+        },
+      }],
+    };
+
+    const merged = mergeStandardBkvDefects(snapshot, '1893700', directOnlineDefects);
+
+    expect(merged.inspections[0].defects[0]).toMatchObject({
+      typeId: 'bkv-class-16',
+      typeLabel: '轧折',
+    });
+    expect(merged.defectTypes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'bkv-class-16', color: '#780078' }),
+    ]));
+  });
+
   it('returns a valid empty snapshot when the standard store has no records', () => {
     const snapshot = buildStandardBkvInspectionSnapshot({
       ...records,

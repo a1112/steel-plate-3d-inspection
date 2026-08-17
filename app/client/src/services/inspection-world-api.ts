@@ -54,6 +54,7 @@ export type InspectionWorldRecords = {
   cameraCount?: number;
   batchId?: string;
   generation?: number | null;
+  defectCatalogRevision?: string;
   recordCount?: number;
   latestInspectionTime?: string | null;
   synchronizedAt?: string;
@@ -72,6 +73,7 @@ export type InspectionWorldRecordsStatus = {
   ready: boolean;
   recordCount: number;
   generation: number;
+  defectCatalogRevision?: string;
   latestInspectionTime?: string | null;
   synchronizedAt?: string;
 };
@@ -173,6 +175,7 @@ export type InspectionWorldDefect = {
   locatable: boolean;
   worldRect?: WorldRect | null;
   trace?: {
+    typeId?: string;
     sequenceNo?: number;
     artifacts?: {
       classNo?: number | string;
@@ -193,6 +196,15 @@ export type InspectionWorldDefect = {
     [key: string]: unknown;
   };
 };
+
+export function inspectionWorldRecordsMatchStatus(
+  records: InspectionWorldRecords | null,
+  status: InspectionWorldRecordsStatus,
+) {
+  if (!records) return false;
+  return (records.generation ?? -1) === status.generation
+    && (records.defectCatalogRevision ?? '') === (status.defectCatalogRevision ?? '');
+}
 
 export type InspectionWorldDefects = {
   schema: 'steel.inspection-world.defects.v1';
