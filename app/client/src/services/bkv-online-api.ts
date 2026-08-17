@@ -42,6 +42,17 @@ export type BkvOnlineStatus = {
     outputPath?: string | null;
     [key: string]: unknown;
   }>;
+  dailyHistory?: Array<{
+    date: string;
+    recordCount: number;
+    successCount: number;
+    abnormalCount: number;
+    timedCount: number;
+    elapsedMs: number;
+    averageElapsedMs?: number | null;
+    latestRecordId?: string;
+    latestCompletedAtMs?: number;
+  }>;
 };
 
 export async function fetchBkvOnlineStatus(signal?: AbortSignal): Promise<BkvOnlineStatus> {
@@ -53,4 +64,19 @@ export async function fetchBkvOnlineStatus(signal?: AbortSignal): Promise<BkvOnl
     throw new Error(`在线转换状态读取失败（HTTP ${response.status}）`);
   }
   return response.json() as Promise<BkvOnlineStatus>;
+}
+
+export function bkvOnlineCroppedImageUrl(
+  sourceUrl: string | undefined,
+  roi?: { x: number; y: number; width: number; height: number } | null,
+) {
+  if (!sourceUrl || !sourceUrl.includes('/api/bkv-online/image')) return '';
+  const url = new URL(sourceUrl, getInspectionServiceOrigin());
+  if (roi && roi.width > 0 && roi.height > 0) {
+    url.searchParams.set('cropX', String(Math.max(0, Math.round(roi.x))));
+    url.searchParams.set('cropY', String(Math.max(0, Math.round(roi.y))));
+    url.searchParams.set('cropWidth', String(Math.max(1, Math.round(roi.width))));
+    url.searchParams.set('cropHeight', String(Math.max(1, Math.round(roi.height))));
+  }
+  return url.toString();
 }

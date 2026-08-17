@@ -15027,6 +15027,356 @@ fn bkv_status_response(state: &ServiceState) -> Vec<u8> {
     )
 }
 
+#[derive(Default)]
+struct BkvConversionDaySummary {
+    date: String,
+    record_count: u64,
+    success_count: u64,
+    abnormal_count: u64,
+    timed_count: u64,
+    elapsed_ms: u64,
+    latest_record_id: String,
+    latest_completed_at_ms: u64,
+}
+
+fn bkv_record_timing(state: &ServiceState, record_id: &str) -> Option<Value> {
+    if record_id.is_empty()
+        || !record_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let configured_root = PathBuf::from(state.runtime_config.algorithm.output_root.trim());
+    let root = if configured_root.is_absolute() {
+        configured_root
+    } else {
+        workspace_root().join(configured_root)
+    };
+    let path = root
+        .join("runs")
+        .join(record_id)
+        .join("inspection-world-v1")
+        .join("timing.json");
+    let bytes = fs::read(path).ok()?;
+    (bytes.len() <= 1024 * 1024)
+        .then(|| serde_json::from_slice::<Value>(&bytes).ok())
+        .flatten()
+}
+
+fn recent_bkv_processing_log(state: &ServiceState, limit: usize) -> Vec<Value> {
+    let configured_root = PathBuf::from(state.runtime_config.algorithm.output_root.trim());
+    let root = if configured_root.is_absolute() {
+        configured_root
+    } else {
+        workspace_root().join(configured_root)
+    };
+    let path = root.join(&state.runtime_config.algorithm.timing_log);
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    const MAX_LOG_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return Vec::new();
+    };
+    let offset = length.saturating_sub(MAX_LOG_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut record_ids = HashSet::new();
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry.get("operation").and_then(Value::as_str) == Some("inspection-world"))
+        .filter(|entry| {
+            entry
+                .get("recordId")
+                .and_then(Value::as_str)
+                .is_some_and(|record_id| record_ids.insert(record_id.to_string()))
+        })
+        .take(limit)
+        .collect()
+}
+
+fn bkv_online_unified_status_value(state: &ServiceState) -> Result<Value, String> {
+    let store = state
+        .standard_record_store
+        .as_ref()
+        .ok_or_else(|| "unified result catalog is unavailable".to_string())?;
+    let summary = store.catalog_summary().map_err(|error| error.to_string())?;
+    let record_limit = state
+        .runtime_config
+        .algorithm
+        .source_data
+        .record_limit
+        .clamp(1, 5_000);
+    let (_, records) = store
+        .records_page(None, None, record_limit as u64, 0)
+        .map_err(|error| error.to_string())?;
+
+    let algorithm_status = bounded_local_http_request(
+        "http://127.0.0.1:4875",
+        "GET",
+        "/internal/v1/status",
+        "",
+        Duration::from_secs(2),
+        &[],
+    )
+    .ok()
+    .filter(|response| (200..300).contains(&response.status_code))
+    .and_then(|response| serde_json::from_slice::<Value>(&response.body).ok());
+    let algorithm_ready = algorithm_status
+        .as_ref()
+        .and_then(|value| value.get("ready"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let database_connected = algorithm_status
+        .as_ref()
+        .and_then(|value| value.pointer("/bkvOnline/databaseConnected"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let counters = algorithm_status
+        .as_ref()
+        .and_then(|value| value.get("counters"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let daily_records = store.daily_summaries(31).map_err(|error| error.to_string())?;
+    let mut days = daily_records
+        .into_iter()
+        .map(|day| {
+            (
+                day.date.clone(),
+                BkvConversionDaySummary {
+                    date: day.date,
+                    record_count: day.record_count,
+                    success_count: day.success_count,
+                    abnormal_count: day.abnormal_count,
+                    latest_record_id: day.latest_record_id,
+                    ..BkvConversionDaySummary::default()
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let record_dates = records
+        .iter()
+        .filter_map(|record| {
+            let date = record.inspection_time.as_deref()?.get(0..10)?.to_string();
+            Some((record.record_id.clone(), date))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut timed_record_ids = HashSet::new();
+    let mut processing_log = Vec::new();
+    for record in records.iter().take(24) {
+        let date = record
+            .inspection_time
+            .as_deref()
+            .and_then(|value| value.get(0..10))
+            .filter(|value| {
+                value.len() == 10
+                    && value.bytes().enumerate().all(|(index, byte)| {
+                        if matches!(index, 4 | 7) {
+                            byte == b'-'
+                        } else {
+                            byte.is_ascii_digit()
+                        }
+                    })
+            })
+            .unwrap_or("未标注日期")
+            .to_string();
+        let day = days
+            .entry(date.clone())
+            .or_insert_with(|| BkvConversionDaySummary {
+                date,
+                ..BkvConversionDaySummary::default()
+            });
+        if day.latest_record_id.is_empty() {
+            day.latest_record_id = record.record_id.clone();
+        }
+        if let Some(timing) = bkv_record_timing(state, &record.record_id) {
+            if let Some(elapsed_ms) = timing.get("elapsedMs").and_then(Value::as_u64) {
+                day.timed_count = day.timed_count.saturating_add(1);
+                day.elapsed_ms = day.elapsed_ms.saturating_add(elapsed_ms);
+            }
+            timed_record_ids.insert(record.record_id.clone());
+            day.latest_completed_at_ms = day.latest_completed_at_ms.max(
+                timing
+                    .get("completedAtMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            );
+            processing_log.push(timing);
+        }
+    }
+    for timing in recent_bkv_processing_log(state, 24) {
+        let Some(record_id) = timing.get("recordId").and_then(Value::as_str) else {
+            continue;
+        };
+        if !timed_record_ids.insert(record_id.to_string()) {
+            continue;
+        }
+        let Some(date) = record_dates.get(record_id) else {
+            continue;
+        };
+        let Some(day) = days.get_mut(date) else {
+            continue;
+        };
+        if let Some(elapsed_ms) = timing.get("elapsedMs").and_then(Value::as_u64) {
+            day.timed_count = day.timed_count.saturating_add(1);
+            day.elapsed_ms = day.elapsed_ms.saturating_add(elapsed_ms);
+        }
+        day.latest_completed_at_ms = day.latest_completed_at_ms.max(
+            timing
+                .get("completedAtMs")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        );
+        processing_log.push(timing);
+    }
+    processing_log.sort_by_key(|entry| {
+        std::cmp::Reverse(
+            entry
+                .get("completedAtMs")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        )
+    });
+    processing_log.truncate(24);
+    for day in days.values_mut() {
+        if day.timed_count > 0 || day.latest_record_id.is_empty() {
+            continue;
+        }
+        if let Some(timing) = bkv_record_timing(state, &day.latest_record_id) {
+            if let Some(elapsed_ms) = timing.get("elapsedMs").and_then(Value::as_u64) {
+                day.timed_count = 1;
+                day.elapsed_ms = elapsed_ms;
+            }
+            day.latest_completed_at_ms = timing
+                .get("completedAtMs")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+        }
+    }
+    let mut daily_history = days.into_values().collect::<Vec<_>>();
+    daily_history.sort_by(|left, right| right.date.cmp(&left.date));
+    let daily_history = daily_history
+        .into_iter()
+        .take(31)
+        .map(|day| {
+            json!({
+                "date": day.date,
+                "recordCount": day.record_count,
+                "successCount": day.success_count,
+                "abnormalCount": day.abnormal_count,
+                "timedCount": day.timed_count,
+                "elapsedMs": day.elapsed_ms,
+                "averageElapsedMs": if day.timed_count > 0 { Some(day.elapsed_ms / day.timed_count) } else { None },
+                "latestRecordId": day.latest_record_id,
+                "latestCompletedAtMs": day.latest_completed_at_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    let latest_record = records.first().map(|record| {
+        json!({
+            "id": record.record_id,
+            "plateNo": record.steel_id,
+            "time": record.inspection_time,
+            "defectCount": record.defect_count,
+        })
+    });
+    let last_success_at_ms = counters
+        .get("lastPublishedAt")
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("unix-ms:"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let last_error = counters.get("lastError").cloned().unwrap_or(Value::Null);
+    let refresh_successes = counters
+        .get("published")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let refresh_attempts = counters
+        .get("scanned")
+        .and_then(Value::as_u64)
+        .unwrap_or(refresh_successes);
+
+    Ok(json!({
+        "enabled": true,
+        "running": algorithm_ready,
+        "source": "bkv-online-mysql",
+        "statusSource": "unified-result-store",
+        "databaseConnected": database_connected,
+        "hasSnapshot": !records.is_empty(),
+        "recordLimit": record_limit,
+        "recordCount": summary.record_count,
+        "previewImageCount": 0,
+        "latestRecord": latest_record,
+        "refreshIntervalMs": 5_000,
+        "refreshAttempts": refresh_attempts,
+        "refreshSuccesses": refresh_successes,
+        "lastSuccessAtMs": last_success_at_ms,
+        "lastError": last_error,
+        "lastErrorDetail": last_error,
+        "processingLogPath": state.runtime_config.algorithm.output_root,
+        "processingLog": processing_log,
+        "dailyHistory": daily_history,
+        "catalogGeneration": summary.generation,
+        "latestInspectionTime": summary.latest_inspection_time,
+    }))
+}
+
+fn bkv_online_status_response(state: &ServiceState) -> Vec<u8> {
+    // Split-runtime dashboards must continue to report the authoritative
+    // unified conversion catalog.  A raw BKV source may still be present only
+    // to repair missing historical D3IMG surfaces on demand.
+    if unified_result_store_enabled(state) {
+        return match bkv_online_unified_status_value(state) {
+            Ok(status) => http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &status.to_string(),
+            ),
+            Err(detail) => http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({
+                    "error": "bkv_online_status_unavailable",
+                    "detail": detail,
+                })
+                .to_string(),
+            ),
+        };
+    }
+    if let Some(source) = state.bkv_online.as_ref() {
+        return http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &state.runtime.block_on(source.status_json()),
+        );
+    }
+    match bkv_online_unified_status_value(state) {
+        Ok(status) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &status.to_string(),
+        ),
+        Err(detail) => http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({
+                "error": "bkv_online_status_unavailable",
+                "detail": detail,
+            })
+            .to_string(),
+        ),
+    }
+}
+
 fn bkv_materials_response(state: &ServiceState) -> Vec<u8> {
     let Some(manager) = state.bkv.as_ref() else {
         return bkv_inactive_response();
@@ -15106,7 +15456,12 @@ fn unified_result_store_enabled(state: &ServiceState) -> bool {
 }
 
 fn inspection_world_pixel_rect(value: &Value) -> Option<inspection_world::PixelRect> {
-    let number = |key: &str| value.get(key).and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok());
+    let number = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+    };
     if let (Some(left), Some(top), Some(right), Some(bottom)) = (
         number("left"),
         number("top"),
@@ -15963,16 +16318,51 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
                     ),
                 ],
             ),
-            Err(error) => http_response(
-                "404 Not Found",
-                "application/json; charset=utf-8",
-                &json!({
-                    "code": 404,
-                    "error": "inspection_world_surface_unavailable",
-                    "detail": error,
-                })
-                .to_string(),
-            ),
+            Err(converted_error) => {
+                // The unified catalog can legitimately contain an older
+                // intensity-only publication.  Do not make that catalog row
+                // hide the D3IMG files that still belong to the same BKV
+                // record: reconstruct them lazily through the online source,
+                // which also persists the resulting BSMESH for later reads.
+                match state
+                    .bkv_online
+                    .as_ref()
+                    .ok_or_else(|| "BKV online source is unavailable".to_string())
+                    .and_then(|source| {
+                        source.inspection_world_surface_binary(&record_id, force_rebuild)
+                    })
+                {
+                    Ok(surface) => http_bytes_response_with_headers(
+                        "200 OK",
+                        "application/vnd.steel.bsmesh",
+                        surface.as_slice(),
+                        &[
+                            (
+                                "Cache-Control",
+                                if force_rebuild {
+                                    "no-store"
+                                } else {
+                                    "private, max-age=300, stale-while-revalidate=60"
+                                },
+                            ),
+                            ("X-Content-Type-Options", "nosniff"),
+                            ("X-Surface-Source", "d3img-float32"),
+                        ],
+                    ),
+                    Err(online_error) => http_response(
+                        "404 Not Found",
+                        "application/json; charset=utf-8",
+                        &json!({
+                            "code": 404,
+                            "error": "inspection_world_surface_unavailable",
+                            "detail": format!(
+                                "converted surface unavailable: {converted_error}; D3IMG fallback unavailable: {online_error}"
+                            ),
+                        })
+                        .to_string(),
+                    ),
+                }
+            }
         };
     }
     if state.runtime_config.data_source != "bkv-online-mysql" || unified_result_store_enabled(state)
@@ -15988,12 +16378,14 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
             .to_string(),
         );
     }
+    let force_refresh = query_value(query, "refresh")
+        .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"));
     if query_value(query, "format").as_deref() == Some("binary") {
         return match state
             .bkv_online
             .as_ref()
             .ok_or_else(|| "BKV online source is unavailable".to_string())
-            .and_then(|source| source.inspection_world_surface_binary(&record_id))
+            .and_then(|source| source.inspection_world_surface_binary(&record_id, force_refresh))
         {
             Ok(surface) => http_bytes_response_with_headers(
                 "200 OK",
@@ -16002,7 +16394,11 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
                 &[
                     (
                         "Cache-Control",
-                        "private, max-age=300, stale-while-revalidate=60",
+                        if force_refresh {
+                            "no-store"
+                        } else {
+                            "private, max-age=300, stale-while-revalidate=60"
+                        },
                     ),
                     ("X-Content-Type-Options", "nosniff"),
                 ],
@@ -16023,7 +16419,7 @@ fn inspection_world_surface_response(state: &ServiceState, query: &str) -> Vec<u
         .bkv_online
         .as_ref()
         .ok_or_else(|| "BKV online source is unavailable".to_string())
-        .and_then(|source| source.inspection_world_surface(&record_id))
+        .and_then(|source| source.inspection_world_surface(&record_id, force_refresh))
     {
         Ok(surface) => http_response(
             "200 OK",
@@ -21928,10 +22324,75 @@ fn bkv_online_image_response(state: &ServiceState, query: &str) -> Vec<u8> {
         );
     };
     let kind = query_value(query, "kind").unwrap_or_else(|| "2d".to_string());
+    let parse_crop =
+        |key: &str| query_value(query, key).and_then(|value| value.parse::<u32>().ok());
+    let crop = match (
+        parse_crop("cropX"),
+        parse_crop("cropY"),
+        parse_crop("cropWidth"),
+        parse_crop("cropHeight"),
+    ) {
+        (Some(x), Some(y), Some(width), Some(height)) if width > 0 && height > 0 => {
+            Some((x, y, width, height))
+        }
+        _ => None,
+    };
 
     match source.image(camera, sequence, image_index, &kind) {
         Ok(image) => {
             let cache_status = if image.cache_hit { "HIT" } else { "MISS" };
+            if let Some((x, y, width, height)) = crop {
+                let cropped = image::load_from_memory(image.bytes.as_slice())
+                    .map_err(|error| error.to_string())
+                    .and_then(|source| {
+                        let source_width = source.width();
+                        let source_height = source.height();
+                        let context_width = width.max(256).min(source_width);
+                        let context_height = height.max(128).min(source_height);
+                        let center_x = x.saturating_add(width / 2).min(source_width);
+                        let center_y = y.saturating_add(height / 2).min(source_height);
+                        let crop_x = center_x
+                            .saturating_sub(context_width / 2)
+                            .min(source_width.saturating_sub(context_width));
+                        let crop_y = center_y
+                            .saturating_sub(context_height / 2)
+                            .min(source_height.saturating_sub(context_height));
+                        let preview = source
+                            .crop_imm(crop_x, crop_y, context_width, context_height)
+                            .thumbnail(512, 512);
+                        let mut body = Vec::new();
+                        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut body, 90)
+                            .encode_image(&preview)
+                            .map_err(|error| error.to_string())?;
+                        Ok(body)
+                    });
+                return match cropped {
+                    Ok(body) => http_bytes_response_with_headers(
+                        "200 OK",
+                        "image/jpeg",
+                        &body,
+                        &[
+                            (
+                                "Cache-Control",
+                                "private, max-age=300, stale-while-revalidate=60",
+                            ),
+                            ("X-BKV-Image-Cache", cache_status),
+                            ("X-BKV-Image-Crop", "ROI"),
+                            (
+                                "Access-Control-Expose-Headers",
+                                "X-BKV-Image-Cache, X-BKV-Image-Crop, Content-Length",
+                            ),
+                            ("X-Content-Type-Options", "nosniff"),
+                        ],
+                    ),
+                    Err(detail) => http_response(
+                        "422 Unprocessable Entity",
+                        "application/json; charset=utf-8",
+                        &json!({ "error": "bkv_online_image_crop_failed", "detail": detail })
+                            .to_string(),
+                    ),
+                };
+            }
             http_bytes_response_with_headers(
                 "200 OK",
                 image.content_type,
@@ -22091,21 +22552,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("GET", "/api/bkv/materials") => bkv_materials_response(&state),
         ("GET", "/api/bkv/material") => bkv_material_response(&state, query),
         ("GET", "/api/bkv/file") => bkv_file_response(&state, query),
-        ("GET", "/api/bkv-online/status") => {
-            if let Some(source) = state.bkv_online.as_ref() {
-                http_response(
-                    "200 OK",
-                    "application/json; charset=utf-8",
-                    &state.runtime.block_on(source.status_json()),
-                )
-            } else {
-                http_response(
-                    "404 Not Found",
-                    "application/json; charset=utf-8",
-                    &json!({ "error": "bkv_online_source_disabled" }).to_string(),
-                )
-            }
-        }
+        ("GET", "/api/bkv-online/status") => bkv_online_status_response(&state),
         ("GET", "/api/bkv-online/image") => bkv_online_image_response(&state, query),
         ("GET", "/api/inspection-world/records") => inspection_world_records_response(&state),
         ("GET", "/api/inspection-world/records/status") => {
@@ -22630,7 +23077,10 @@ fn load_persisted_bkv_surface(
                 "output": { "format": "BSMESH01" }
             })
         });
-    Ok(Some(Arc::new(npz_surface::NpzSurface { binary, parameters })))
+    Ok(Some(Arc::new(npz_surface::NpzSurface {
+        binary,
+        parameters,
+    })))
 }
 
 fn configured_standard_record_store(
@@ -22767,19 +23217,37 @@ fn main() -> std::io::Result<()> {
         capture_provider,
         &runtime_config.capture,
     ));
-    let bkv_online = if env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1") {
-        println!("raw BKV access disabled: algorithm service owns source ingestion");
-        None
-    } else {
-        runtime
-            .block_on(bkv_online::BkvSource::from_env(&runtime_config))
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?
+    let result_proxy_only = env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1");
+    let mut bkv_online = match runtime.block_on(bkv_online::BkvSource::from_env(&runtime_config)) {
+        Ok(source) => source,
+        Err(error) if result_proxy_only => {
+            eprintln!("BKV D3IMG fallback disabled: {error}");
+            None
+        }
+        Err(error) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                error.to_string(),
+            ))
+        }
     };
     if let Some(source) = bkv_online.as_ref() {
-        runtime
-            .block_on(source.initialize())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
-        source.start_refresh_loop(runtime.handle());
+        match runtime.block_on(source.initialize()) {
+            Ok(()) => source.start_refresh_loop(runtime.handle()),
+            Err(error) if result_proxy_only => {
+                // The unified catalog remains usable while MySQL/SMB is
+                // temporarily offline.  Only the lazy D3IMG repair path is
+                // unavailable until the next service restart.
+                eprintln!("BKV D3IMG fallback initialization failed: {error}");
+                bkv_online = None;
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    error.to_string(),
+                ))
+            }
+        }
     }
     let bkv_manager = configured_bkv_manager(capture_manager.provider, &runtime_config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;

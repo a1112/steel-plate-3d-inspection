@@ -1473,6 +1473,9 @@ export function PlateMap({
   const [localViewMode, setLocalViewMode] = useState<PlateMapViewMode>('2d');
   const viewMode = controlledViewMode ?? localViewMode;
   const setViewMode = onViewModeChange ?? setLocalViewMode;
+  const artifactLoading = Boolean(
+    artifactStatus && (artifactStatus.startsWith('正在') || artifactStatus.includes('加载')),
+  );
   const [threeDisplayMode, setThreeDisplayMode] = useState<Plate3DDisplayMode>('surface');
   const [twoDDisplayMode, setTwoDDisplayMode] = useState<Plate2DDisplayMode>('gray');
   const [artifactOrientation, setArtifactOrientation] = useState<ArtifactOrientation>('horizontal');
@@ -1737,13 +1740,15 @@ export function PlateMap({
             />
           ) : (
             <div
-              className="production-artifact-empty"
+              className={`production-artifact-empty${artifactLoading ? ' is-loading' : ''}`}
               role="status"
               data-testid={threeDisplayMode === 'points'
                 ? 'plate-production-point-cloud-empty'
                 : 'plate-production-surface-empty'}
             >
-              <strong>{threeDisplayMode === 'points' ? '暂无生产点云产物' : '暂无生产三维表面产物'}</strong>
+              <strong>{artifactLoading
+                ? (threeDisplayMode === 'points' ? '正在准备生产点云' : '正在准备生产三维表面')
+                : (threeDisplayMode === 'points' ? '暂无生产点云产物' : '暂无生产三维表面产物')}</strong>
               <span>{artifactStatus || '当前检测记录尚未绑定三维重建结果，请等待算法任务完成。'}</span>
             </div>
           )
@@ -1786,8 +1791,8 @@ export function PlateMap({
             lengthMm={safePlateLengthM * 1000}
           />
         ) : (
-          <div className="production-artifact-empty" role="status">
-            <strong>暂无可提取切面的三维表面</strong>
+          <div className={`production-artifact-empty${artifactLoading ? ' is-loading' : ''}`} role="status">
+            <strong>{artifactLoading ? '正在准备切面数据' : '暂无可提取切面的三维表面'}</strong>
             <span>{artifactStatus || '当前记录尚未生成 NPZ 三维表面。'}</span>
           </div>
         )
@@ -1824,14 +1829,14 @@ export function PlateMap({
             focusPositionRatio={selectedDefectPositionRatio}
             colorMode={twoDDisplayMode}
             onDefectClick={(defectId) => onSelectDefect(String(defectId))}
-            onFirstScreenReady={() => {
+            onFirstPaint={() => {
               displayedWorldRef.current = activePendingWorld;
               setDisplayedWorld(activePendingWorld);
               setPendingWorld((current) => current === activePendingWorld ? null : current);
-              setWorldTileProgress(null);
               setWorldLoading(false);
               setWorldError('');
             }}
+            onFirstScreenReady={() => setWorldTileProgress(null)}
             onTileLoadingChange={setWorldTileProgress}
           /> : null}
           {!displayedWorld ? <div

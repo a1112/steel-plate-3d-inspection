@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import {
+  buildDepthExaggeratedPositions,
   buildRadialJetColors,
   ProductionArtifactView,
 } from './ProductionArtifactView';
@@ -70,6 +71,22 @@ function radialFixture(): BarSurfaceMesh {
 }
 
 describe('ProductionArtifactView', () => {
+  it('moves observed points along the fitted section normal while preserving nominal fill points', () => {
+    const observedMesh = radialFixture();
+    const enhanced = buildDepthExaggeratedPositions(observedMesh, 3);
+
+    expect(Math.hypot(enhanced[1], enhanced[2])).not.toBeCloseTo(
+      Math.hypot(observedMesh.positions[1], observedMesh.positions[2]),
+      4,
+    );
+
+    const meshWithFill = radialFixture();
+    meshWithFill.validMask = new Uint8Array([1, 1, 1, 0]);
+    const enhancedWithFill = buildDepthExaggeratedPositions(meshWithFill, 3);
+    expect(enhancedWithFill[10]).toBe(meshWithFill.positions[10]);
+    expect(enhancedWithFill[11]).toBe(meshWithFill.positions[11]);
+  });
+
   it('maps signed residuals from the fitted section circle to Jet colors', () => {
     const result = buildRadialJetColors(radialFixture());
 
@@ -125,6 +142,9 @@ describe('ProductionArtifactView', () => {
       'data-artifact-color-mode',
       'radial-jet',
     );
+    expect(screen.getByTestId('jet-surface')).toHaveAttribute('data-artifact-depth-exaggeration', '3.0');
+    fireEvent.change(screen.getByRole('slider', { name: '三维深度增强倍数' }), { target: { value: '6' } });
+    expect(screen.getByTestId('jet-surface')).toHaveAttribute('data-artifact-depth-exaggeration', '6.0');
     expect(screen.getByLabelText('Jet 拟合圆径向偏差图例')).toHaveTextContent(
       '1 个切面拟合 · 径向偏差单位 显示坐标',
     );

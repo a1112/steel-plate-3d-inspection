@@ -334,7 +334,7 @@ function ConfiguredApp({
       });
     }
     writeTerminalViewMode(resolvedTerminalMode);
-    const loadSnapshot = dashboardMode.requestsStandardRecords && dashboardMode.kind !== 'bkv-online'
+    const loadSnapshot = dashboardMode.requestsStandardRecords
       ? fetchInspectionWorldRecords(controller.signal).then((records) => {
         if (controller.signal.aborted) {
           throw new DOMException('BKV record load aborted', 'AbortError');
@@ -393,10 +393,7 @@ function ConfiguredApp({
     force = false,
     signal?: AbortSignal,
   ) => {
-    // The online MySQL adapter owns its own snapshot refresh loop.  The
-    // converted-local records/status endpoint intentionally returns 409 for
-    // this mode, so do not turn that expected response into a false BKV error.
-    if (!dashboardMode.requestsStandardRecords || dashboardMode.kind === 'bkv-online') return;
+    if (!dashboardMode.requestsStandardRecords) return;
     setRecordsRefreshing(true);
     try {
       const status = await fetchInspectionWorldRecordsStatus(signal);
@@ -429,7 +426,7 @@ function ConfiguredApp({
   }, [bkvRecords?.generation, dashboardMode.kind, dashboardMode.requestsStandardRecords]);
 
   useEffect(() => {
-    if (!dashboardMode.requestsStandardRecords || dashboardMode.kind === 'bkv-online') return undefined;
+    if (!dashboardMode.requestsStandardRecords) return undefined;
     let controller: AbortController | null = null;
     const refresh = () => {
       if (document.visibilityState === 'hidden') return;
@@ -445,40 +442,6 @@ function ConfiguredApp({
       window.removeEventListener('focus', refresh);
     };
   }, [dashboardMode.kind, dashboardMode.requestsStandardRecords, refreshStandardRecordList]);
-
-  useEffect(() => {
-    if (dashboardMode.kind !== 'bkv-online') return undefined;
-    let cancelled = false;
-    let inFlight = false;
-    const refreshOnlineSnapshot = async () => {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        const nextSnapshot = await fetchInspectionSnapshot();
-        if (cancelled) return;
-        setSnapshot(nextSnapshot);
-        setRecordsSynchronizedAt(Date.now());
-        setBkvDataHealth({
-          state: 'ready',
-          detail: `${nextSnapshot.records.length} 条在线记录、${nextSnapshot.captureImages?.length ?? 0} 路实际图像已就绪`,
-        });
-      } catch (error) {
-        if (!cancelled) {
-          setBkvDataHealth({
-            state: 'store-error',
-            detail: error instanceof Error ? error.message : 'BKV 在线转换快照读取失败',
-          });
-        }
-      } finally {
-        inFlight = false;
-      }
-    };
-    const timer = window.setInterval(() => void refreshOnlineSnapshot(), 8_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [dashboardMode.kind]);
 
   const retryBkvLoad = () => {
     setSnapshot(null);
@@ -760,7 +723,8 @@ function InspectionDashboard({
   }, [dashboardMode.requestsOnlineServices]);
 
   useEffect(() => {
-    if (!dashboardMode.requestsOnlineServices) return;
+    const continuouslyRefreshSnapshot = dashboardMode.requestsOnlineServices;
+    if (!continuouslyRefreshSnapshot) return;
     let cancelled = false;
     let inFlight = false;
     const refreshSnapshot = async () => {
@@ -793,7 +757,7 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [dashboardMode.requestsOnlineServices, onSnapshotChange, snapshotTracking]);
+  }, [dashboardMode.kind, dashboardMode.requestsOnlineServices, onSnapshotChange, snapshotTracking]);
 
   useEffect(() => {
     if (!dashboardMode.requestsOnlineServices) return;
@@ -985,12 +949,18 @@ function InspectionDashboard({
       ?? null,
     [activeSnapshot.currentPlate.plateNo, snapshot.inspections, uiState.selectedRecordId],
   );
+  const activeRecordStatus = useMemo(
+    () => snapshot.records.find((record) => record.id === uiState.selectedRecordId)?.status
+      ?? snapshot.records.find((record) => record.plateNo === activeSnapshot.currentPlate.plateNo)?.status
+      ?? 'completed',
+    [activeSnapshot.currentPlate.plateNo, snapshot.records, uiState.selectedRecordId],
+  );
   const artifactMode: 'production' | 'demo' = snapshot.source === 'demo' || snapshot.source === 'test' ? 'demo' : 'production';
   const loadedBkvDefectRecordsRef = useRef(new Set<string>());
   const previousSurfaceViewModeRef = useRef<PlateMapViewMode>('2d');
 
   useEffect(() => {
-    if (dashboardMode.kind !== 'bkv') return;
+    if (dashboardMode.kind !== 'bkv' && dashboardMode.kind !== 'bkv-online') return;
     const recordId = activeInspection?.inspectionId?.trim();
     if (!recordId || loadedBkvDefectRecordsRef.current.has(recordId)) return;
     const controller = new AbortController();
@@ -1032,6 +1002,9 @@ function InspectionDashboard({
 
       // 从 2D 切换到 3D/切面时强制刷新，避免使用上次会话残留的缓存
       const needsRefresh = previousSurfaceViewModeRef.current === '2d';
+      const continuouslyRefreshSurface = dashboardMode.kind === 'bkv-online'
+        && snapshotTracking === 'latest'
+        && activeRecordStatus === 'detecting';
       previousSurfaceViewModeRef.current = plateMapViewMode;
       const controller = new AbortController();
       let loaded = false;
@@ -1045,10 +1018,14 @@ function InspectionDashboard({
           : '正在转换并读取当前流水号的 D3IMG 三维表面…',
       });
       const loadDepthSurface = async () => {
-        if (loaded || inFlight || controller.signal.aborted) return;
+        if ((loaded && !continuouslyRefreshSurface) || inFlight || controller.signal.aborted) return;
         inFlight = true;
         try {
-          const mesh = await fetchInspectionWorldSurface(inspectionId, controller.signal, needsRefresh);
+          const mesh = await fetchInspectionWorldSurface(
+            inspectionId,
+            controller.signal,
+            needsRefresh || continuouslyRefreshSurface,
+          );
           if (controller.signal.aborted) return;
           setRecordBoundSurface({
             inspectionId,
@@ -1056,7 +1033,9 @@ function InspectionDashboard({
             mesh,
             status: terminalMode === 'bkv'
               ? `NPZ 已恢复 · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点 · 深度单位 mm`
-              : `D3IMG 已转换并存储 · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点`,
+              : continuouslyRefreshSurface
+                ? `D3IMG 实时重建 · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点 · ${new Date().toLocaleTimeString('zh-CN', { hour12: false })} 更新`
+                : `D3IMG 已转换并存储 · ${Math.floor(mesh.positions.length / 3).toLocaleString('zh-CN')} 点`,
           });
           loaded = true;
         } catch (error) {
@@ -1183,7 +1162,7 @@ function InspectionDashboard({
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeSnapshot.currentPlate.plateNo, artifactMode, dashboardMode.kind, plateMapViewMode, terminalMode]);
+  }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeRecordStatus, activeSnapshot.currentPlate.plateNo, artifactMode, dashboardMode.kind, plateMapViewMode, snapshotTracking, terminalMode]);
 
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
   const currentPlateDefects = useMemo(
@@ -1522,8 +1501,8 @@ function InspectionDashboard({
           batchId: bkvRecords?.batchId ?? '读取中',
           health: bkvDataHealth,
         } : dashboardMode.kind === 'bkv-online' ? {
-          cameraCount: dashboardMode.cameraCount,
-          availableCameraCount: new Set((snapshot.captureImages ?? []).map((image) => image.cameraId)).size,
+          cameraCount: bkvRecords?.cameraCount ?? dashboardMode.cameraCount,
+          availableCameraCount: bkvRecords?.ready ? (bkvRecords.cameraCount ?? dashboardMode.cameraCount) : 0,
           batchId: snapshot.records[0]?.id ?? '读取中',
           health: bkvDataHealth,
         } : undefined}
@@ -1687,6 +1666,8 @@ function InspectionDashboard({
                 />
                 <DefectDetectionList
                   defects={visibleDefects}
+                  defectTypes={snapshot.defectTypes}
+                  pipeLengthMm={activeSnapshot.currentPlate.lengthMm}
                   inspectionId={activeInspection?.inspectionId}
                   selectedDefectId={selectedOnlineDefectId}
                   filters={onlineFilters}
@@ -1804,10 +1785,8 @@ function InspectionDashboard({
         onFlowToggle={() => setInspectionFlowVisible((current) => !current)}
         analysis={selectedOnlineDefect ? {
           defect: selectedOnlineDefect,
-          surfaceViewMode: plateMapViewMode,
           analysisViewMode,
           collapsed: analysisCollapsed,
-          onSurfaceViewModeChange: setPlateMapViewMode,
           onAnalysisViewModeChange: setAnalysisViewMode,
           onCollapsedChange: setAnalysisCollapsed,
         } : null}

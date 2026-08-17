@@ -170,6 +170,6 @@ describe('LeftSidebar', () => {
 
     fireEvent.scroll(tableWrap!);
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /加载更多/ })).toHaveTextContent('已显示 400 / 401'));
+    await waitFor(() => expect(screen.getByRole('button', { name: /加载更多/ })).toHaveTextContent('已显示 100 / 401'));
   });
 });

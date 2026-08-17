@@ -37,7 +37,11 @@ function formatLogTime(value?: number) {
 }
 
 function formatLogValue(value: unknown) {
-  if (typeof value === 'number' && Number.isFinite(value)) return `${value} ms`;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (value >= 60_000) return `${(value / 60_000).toFixed(1)} 分钟`;
+    if (value >= 1_000) return `${(value / 1_000).toFixed(1)} 秒`;
+    return `${value} ms`;
+  }
   if (typeof value === 'string' && value.trim()) return value;
   return '--';
 }
@@ -114,6 +118,7 @@ export function BkvConversionStatusDialog({
   );
   const statusError = error || status?.lastErrorDetail || status?.lastError;
   const processingLog = status?.processingLog ?? [];
+  const dailyHistory = status?.dailyHistory ?? [];
 
   return (
     <div className="bkv-conversion-dialog-backdrop" role="presentation" onMouseDown={onClose}>
@@ -167,8 +172,8 @@ export function BkvConversionStatusDialog({
             <strong>{status?.refreshSuccesses ?? '--'}</strong>
           </article>
           <article>
-            <span>转换记录</span>
-            <strong>{status ? `${status.recordCount}/${status.recordLimit}` : '--'}</strong>
+            <span>历史记录</span>
+            <strong>{status ? `${status.recordCount.toLocaleString('zh-CN')} 条` : '--'}</strong>
           </article>
           <article>
             <ImageIcon size={18} />
@@ -192,17 +197,64 @@ export function BkvConversionStatusDialog({
           </div>
         </dl>
 
-        <section className="bkv-conversion-log" aria-label="转换日志">
+        <section className="bkv-conversion-log bkv-conversion-history" aria-label="每日转换记录">
           <header>
             <div>
-              <strong>转换日志</strong>
+              <strong>每日转换记录</strong>
+              <span>跟随最新历史记录统计；耗时来自实际 inspection-world 转换计时</span>
+            </div>
+            <em>最近 {dailyHistory.length} 天</em>
+          </header>
+          {dailyHistory.length ? (
+            <div className="bkv-conversion-history-table-wrap">
+              <table className="bkv-conversion-history-table">
+                <thead>
+                  <tr>
+                    <th>日期</th>
+                    <th>历史记录</th>
+                    <th>成功</th>
+                    <th>异常</th>
+                    <th>计时样本</th>
+                    <th>样本总耗时</th>
+                    <th>样本平均耗时</th>
+                    <th>最新记录</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {dailyHistory.map((day) => (
+                    <tr key={day.date}>
+                      <td><strong>{day.date}</strong></td>
+                      <td>{day.recordCount}</td>
+                      <td className="success">{day.successCount}</td>
+                      <td className={day.abnormalCount ? 'abnormal' : ''}>{day.abnormalCount}</td>
+                      <td>{day.timedCount}</td>
+                      <td>{formatLogValue(day.elapsedMs)}</td>
+                      <td>{formatLogValue(day.averageElapsedMs)}</td>
+                      <td>
+                        <strong>{day.latestRecordId || '--'}</strong>
+                        <span>{formatLogTime(day.latestCompletedAtMs)}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="bkv-conversion-log-empty">当前历史记录尚未生成每日转换统计。</p>
+          )}
+        </section>
+
+        <section className="bkv-conversion-log" aria-label="最近转换明细">
+          <header>
+            <div>
+              <strong>最近转换明细</strong>
               <span>{status?.processingLogPath || '尚未生成算法处理日志'}</span>
             </div>
             <em>最近 {processingLog.length} 条</em>
           </header>
           {processingLog.length ? (
             <div className="bkv-conversion-log-list">
-              {processingLog.slice().reverse().map((entry, index) => (
+              {processingLog.map((entry, index) => (
                 <article key={`${entry.completedAtMs ?? 'log'}-${entry.recordId ?? index}`}>
                   <div>
                     <strong>{entry.operation || 'processing'}</strong>
@@ -212,9 +264,7 @@ export function BkvConversionStatusDialog({
                 </article>
               ))}
             </div>
-          ) : (
-            <p className="bkv-conversion-log-empty">当前没有可展示的转换日志。</p>
-          )}
+          ) : <p className="bkv-conversion-log-empty">当前没有带计时数据的转换明细。</p>}
         </section>
 
         <div className="bkv-conversion-preview-heading">

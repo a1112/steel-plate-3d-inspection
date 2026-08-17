@@ -9,6 +9,7 @@ import { surfaceLabels } from '../data/inspection';
 import { createPointCloudGeometryArrays } from '../lib/point-cloud-simulator';
 import { createSectionProfiles } from '../lib/section-profiles';
 import { barSurfaceFileUrl, type BarSurfaceMesh } from '../services/bar-surface-api';
+import { bkvOnlineCroppedImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import { Panel } from './Panel';
 import { DiameterTrendPanel } from './DiameterTrendPanel';
@@ -47,8 +48,14 @@ function DefectPreview({
   captureImages: CaptureImageItem[];
   artifactMode: 'production' | 'demo';
 }) {
-  const artifactPreviewUrl = defect.artifacts?.roiImage ? barSurfaceFileUrl(defect.artifacts.roiImage) : '';
-  const previewImageUrl = defect.previewImageUrl || artifactPreviewUrl;
+  const onlineCropUrl = bkvOnlineCroppedImageUrl(
+    defect.artifacts?.roiImage
+      || defect.artifacts?.sourceFrame?.intensity
+      || defect.previewImageUrl,
+    defect.artifacts?.roi,
+  );
+  const artifactPreviewUrl = defect.artifacts?.roiImage && !onlineCropUrl ? barSurfaceFileUrl(defect.artifacts.roiImage) : '';
+  const previewImageUrl = onlineCropUrl || defect.previewImageUrl || artifactPreviewUrl;
   const recordImage = captureImages.find((image) => image.dataName === 'intensity' && image.url)
     ?? captureImages.find((image) => image.dataName === 'depth' && image.url);
   if (artifactMode === 'production' && !previewImageUrl) {
@@ -369,6 +376,12 @@ export function AlarmAnalysis({
       const cameraIndex = defect.cameraIndex;
       const sequenceNo = defect.artifacts?.sequenceNo;
       if (!cameraIndex || sequenceNo == null) return [];
+      const onlineCropUrl = bkvOnlineCroppedImageUrl(
+        defect.artifacts?.roiImage
+          || defect.artifacts?.sourceFrame?.intensity
+          || defect.previewImageUrl,
+        defect.artifacts?.roi,
+      );
       return [{
         id: `defect-frame-${defect.id}`,
         cameraId: `C${cameraIndex} · ${defect.typeLabel}`,
@@ -377,7 +390,7 @@ export function AlarmAnalysis({
         sequenceNo,
         fileType: 'image',
         path: `inspection-world/${inspectionId}/camera/${cameraIndex}/frame/${sequenceNo}`,
-        url: inspectionWorldFrameUrl(inspectionId, cameraIndex, sequenceNo),
+        url: onlineCropUrl || inspectionWorldFrameUrl(inspectionId, cameraIndex, sequenceNo, defect.artifacts?.roi),
         createdAt: '',
       }];
     })

@@ -33,6 +33,17 @@ vi.mock('../services/bkv-online-api', () => ({
       elapsedMs: 1234,
       completedAtMs: 1_784_891_000_000,
     }],
+    dailyHistory: [{
+      date: '2026-07-24',
+      recordCount: 18,
+      successCount: 17,
+      abnormalCount: 1,
+      timedCount: 15,
+      elapsedMs: 75_000,
+      averageElapsedMs: 5_000,
+      latestRecordId: '1902341',
+      latestCompletedAtMs: 1_784_891_000_000,
+    }],
   }),
 }));
 
@@ -58,11 +69,15 @@ describe('BkvConversionStatusDialog', () => {
     render(<BkvConversionStatusDialog snapshot={snapshot} onClose={onClose} />);
 
     expect(await screen.findByText('转换循环运行正常')).toBeInTheDocument();
-    expect(screen.getByText('500/500')).toBeInTheDocument();
+    expect(screen.getByText('500 条')).toBeInTheDocument();
     expect(screen.getByText('6 张')).toBeInTheDocument();
-    expect(screen.getByText('转换日志')).toBeInTheDocument();
+    expect(screen.getByText('每日转换记录')).toBeInTheDocument();
+    expect(screen.getByText('2026-07-24')).toBeInTheDocument();
+    expect(screen.getByText('1.3 分钟')).toBeInTheDocument();
+    expect(screen.getByText('5.0 秒')).toBeInTheDocument();
+    expect(screen.getByText('最近转换明细')).toBeInTheDocument();
     expect(screen.getByText('记录 1902341 · 19:03:20')).toBeInTheDocument();
-    expect(screen.getByText('1234 ms')).toBeInTheDocument();
+    expect(screen.getByText('1.2 秒')).toBeInTheDocument();
     expect(screen.getAllByRole('img', { name: /实际2D图像/ })).toHaveLength(6);
     expect(screen.getByRole('img', { name: 'camera1 实际2D图像' })).toHaveAttribute(
       'src',

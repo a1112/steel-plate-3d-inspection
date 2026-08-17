@@ -1,9 +1,10 @@
-import { Filter } from 'lucide-react';
-import { useState, type ChangeEvent, type CSSProperties, type KeyboardEvent } from 'react';
+import { Filter, List, Map as MapIcon } from 'lucide-react';
+import { useState, type ChangeEvent, type CSSProperties, type KeyboardEvent, type WheelEvent } from 'react';
 import { createPortal } from 'react-dom';
-import type { DefectItem } from '../data/inspection';
+import type { DefectItem, DefectType } from '../data/inspection';
 import { getDefectPreviewImage, severityLabels, surfaceLabels } from '../data/inspection';
 import { barSurfaceFileUrl } from '../services/bar-surface-api';
+import { bkvOnlineCroppedImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import type { ReportFilters } from '../state/operations';
 import { Panel } from './Panel';
@@ -14,6 +15,8 @@ const DEFECT_POPOVER_GAP = 10;
 
 interface DefectDetectionListProps {
   defects: DefectItem[];
+  defectTypes?: DefectType[];
+  pipeLengthMm?: number;
   inspectionId?: string;
   selectedDefectId: string | null;
   filters: ReportFilters;
@@ -43,6 +46,15 @@ function getDefectCameraLabel(defect: DefectItem) {
 function getDefectPreview(defect: DefectItem, inspectionId?: string) {
   const cameraId = defect.cameraIndex;
   const sequenceNo = defect.artifacts?.sequenceNo;
+  const onlineCrop = bkvOnlineCroppedImageUrl(
+    defect.artifacts?.roiImage
+      || defect.artifacts?.sourceFrame?.intensity
+      || defect.previewImageUrl,
+    defect.artifacts?.roi,
+  );
+  if (onlineCrop) {
+    return { url: onlineCrop, source: 'BKV 缺陷 ROI 裁剪' };
+  }
   if (inspectionId && cameraId && sequenceNo != null) {
     return {
       url: inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo, defect.artifacts?.roi),
@@ -125,6 +137,8 @@ function DefectListHoverCard({
 
 export function DefectDetectionList({
   defects,
+  defectTypes = [],
+  pipeLengthMm = 0,
   inspectionId,
   selectedDefectId,
   filters,
@@ -139,6 +153,15 @@ export function DefectDetectionList({
     top: number;
     left: number;
   } | null>(null);
+  const [displayMode, setDisplayMode] = useState<'list' | 'distribution'>('list');
+  const distributionLengthMm = pipeLengthMm > 0
+    ? pipeLengthMm
+    : Math.max(0, ...defects.map((defect) => defect.distanceHeadMm));
+  const lengthTicks = Array.from({ length: 5 }, (_, index) => ({
+    ratio: index / 4,
+    value: Math.round(distributionLengthMm * index / 4),
+  }));
+  const defectColorByType = new Map(defectTypes.map((type) => [type.id, type.color]));
 
   const handleSelect = (event: ChangeEvent<HTMLSelectElement>, key: 'severity') => {
     onFilterChange({ [key]: event.target.value } as Partial<ReportFilters>);
@@ -167,14 +190,32 @@ export function DefectDetectionList({
     }
   };
 
+  const handleDistributionWheel = (event: WheelEvent<HTMLDivElement>) => {
+    if (!defects.length || event.deltaY === 0) return;
+    event.preventDefault();
+    const selectedIndex = defects.findIndex((defect) => defect.id === selectedDefectId);
+    const direction = event.deltaY > 0 ? 1 : -1;
+    const nextIndex = selectedIndex < 0
+      ? direction > 0 ? 0 : defects.length - 1
+      : (selectedIndex + direction + defects.length) % defects.length;
+    setHoveredDefect(null);
+    onSelectDefect(defects[nextIndex].id);
+  };
+
   return (
     <Panel
       title="缺陷检测列表"
       className="defect-list-panel"
       action={
-        <button type="button" className={`icon-filter ${filterOpen ? 'active' : ''}`} title="筛选" onClick={onToggleFilter}>
-          <Filter size={17} />
-        </button>
+        <div className="defect-list-actions">
+          <div className="defect-list-view-switch" role="group" aria-label="缺陷列表显示方式">
+            <button type="button" className={displayMode === 'list' ? 'active' : ''} aria-pressed={displayMode === 'list'} title="列表" onClick={() => setDisplayMode('list')}><List size={15} /></button>
+            <button type="button" className={displayMode === 'distribution' ? 'active' : ''} aria-pressed={displayMode === 'distribution'} title="分布图" onClick={() => setDisplayMode('distribution')}><MapIcon size={15} /></button>
+          </div>
+          <button type="button" className={`icon-filter ${filterOpen ? 'active' : ''}`} title="筛选" onClick={onToggleFilter}>
+            <Filter size={17} />
+          </button>
+        </div>
       }
     >
       {filterOpen ? (
@@ -191,7 +232,60 @@ export function DefectDetectionList({
           </button>
         </div>
       ) : null}
-      <div className="defect-table-wrap">
+      {displayMode === 'distribution' ? (
+        <div className="defect-distribution" role="img" aria-label={`缺陷分布图，共 ${defects.length} 个缺陷`}>
+          <div className="defect-distribution-camera-axis" aria-label="相机区域 C1 至 C6">
+            {Array.from({ length: 6 }, (_, index) => <span key={index}>C{index + 1}</span>)}
+          </div>
+          <div className="defect-distribution-length-ruler" aria-label={`钢管长度刻度，0.0 至 ${(distributionLengthMm / 1_000).toFixed(1)} 米`}>
+            {lengthTicks.map((tick) => (
+              <span
+                key={tick.ratio}
+                className={tick.ratio === 0 ? 'first' : tick.ratio === 1 ? 'last' : ''}
+                style={{ '--tick-position': `${tick.ratio * 100}%` } as CSSProperties}
+              >
+                <i aria-hidden="true" />
+                <b>{(tick.value / 1_000).toFixed(1)} m</b>
+              </span>
+            ))}
+          </div>
+          <div className="defect-distribution-pipe" onWheel={handleDistributionWheel}>
+            <div className="defect-distribution-camera-regions" aria-hidden="true">
+              {Array.from({ length: 6 }, (_, index) => <span key={index} />)}
+            </div>
+            <div className="defect-distribution-length-guides" aria-hidden="true">
+              {lengthTicks.slice(1, -1).map((tick) => (
+                <i key={tick.ratio} style={{ top: `${tick.ratio * 100}%` }} />
+              ))}
+            </div>
+            {defects.map((defect, index) => {
+              const lengthRatio = Number.isFinite(defect.xRatio)
+                ? defect.xRatio
+                : defects.length > 1 ? index / (defects.length - 1) : 0.5;
+              const cameraLabel = getDefectCameraLabel(defect);
+              const cameraIndex = Number(cameraLabel.replace('camera', '')) || 1;
+              const cameraRegionRatio = (Math.max(1, Math.min(6, cameraIndex)) - 0.5) / 6;
+              return <button
+                key={defect.id}
+                type="button"
+                className={`defect-distribution-marker ${defect.severity}${defect.id === selectedDefectId ? ' selected' : ''}`}
+                style={{
+                  left: `${cameraRegionRatio * 100}%`,
+                  top: `${Math.max(1.5, Math.min(98.5, lengthRatio * 100))}%`,
+                  '--defect-type-color': defectColorByType.get(defect.typeId) ?? '#64748b',
+                } as CSSProperties}
+                aria-label={`${defect.typeLabel}，${getDefectCameraLabel(defect)}，距头${defect.distanceHeadMm}mm`}
+                title={`${defect.typeLabel} · ${getDefectCameraLabel(defect)} · ${defect.distanceHeadMm}mm`}
+                onClick={() => onSelectDefect(defect.id)}
+                onMouseEnter={(event) => showDefectDetails(defect, event.currentTarget)}
+                onMouseLeave={() => setHoveredDefect(null)}
+                onFocus={(event) => showDefectDetails(defect, event.currentTarget)}
+                onBlur={() => setHoveredDefect(null)}
+              />;
+            })}
+          </div>
+        </div>
+      ) : <div className="defect-table-wrap">
         <table className="defect-table">
           <thead>
             <tr>
@@ -238,7 +332,7 @@ export function DefectDetectionList({
             )}
           </tbody>
         </table>
-      </div>
+      </div>}
       {hoveredDefect && typeof document !== 'undefined'
         ? createPortal(
           <DefectListHoverCard

@@ -32,6 +32,7 @@ const BKV_D3_INVALID_DEPTH: f32 = -1_000_000.0;
 const BKV_DEPTH_SURFACE_ROWS: usize = 1024;
 const BKV_DEPTH_SURFACE_COLS_PER_CAMERA: usize = 64;
 const BKV_DEPTH_SURFACE_MAX_FRAMES_PER_CAMERA: usize = 16;
+const BKV_DEPTH_RECONSTRUCTION_REVISION: &str = "d3img-cylinder-v2";
 const BKV_IMAGE_CACHE_MAX_ENTRIES: usize = 64;
 const BKV_IMAGE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
@@ -532,9 +533,9 @@ impl BkvSource {
     }
 
     fn processing_log_path(&self) -> Option<PathBuf> {
-        self.algorithm.enabled.then(|| {
-            PathBuf::from(&self.algorithm.output_root).join(&self.algorithm.timing_log)
-        })
+        self.algorithm
+            .enabled
+            .then(|| PathBuf::from(&self.algorithm.output_root).join(&self.algorithm.timing_log))
     }
 
     fn recent_processing_log(&self) -> Vec<Value> {
@@ -597,9 +598,12 @@ impl BkvSource {
         let snapshot = self.cached_snapshot_value()?;
         let record_id = latest_completed_record_id(&snapshot)
             .ok_or_else(|| "BKV latest completed record is unavailable".to_string())?;
-        // Keep the latest 2D world warm without monopolizing the global build
-        // slot for a D3IMG surface that the default dashboard does not use.
-        self.load_inspection_world_metadata(record_id).map(|_| ())
+        // A production conversion is complete only when the 2D world and the
+        // record-bound D3IMG/BSMESH surface are both available.  Build the
+        // latest completed record in the background so opening 3D or a
+        // section view never becomes the first reconstruction trigger.
+        self.load_inspection_world_with_depth(record_id, true, false)
+            .map(|_| ())
     }
 
     pub fn inspection_world_records(&self) -> Result<Value, String> {
@@ -663,15 +667,22 @@ impl BkvSource {
         }))
     }
 
-    pub fn inspection_world_surface(&self, record_id: &str) -> Result<Value, String> {
+    pub fn inspection_world_surface(
+        &self,
+        record_id: &str,
+        force_refresh: bool,
+    ) -> Result<Value, String> {
         let sequence = parse_bkv_record_sequence(record_id)?;
-        let processed = self.load_inspection_world(&canonical_bkv_record_id(sequence))?;
+        let processed = self.load_inspection_world_with_depth(
+            &canonical_bkv_record_id(sequence),
+            true,
+            force_refresh,
+        )?;
         if let Some(surface) = processed.depth_surface.clone() {
             return Ok(surface);
         }
         if let Some(path) = processed.depth_surface_path.as_ref() {
-            let bytes = fs::read(path)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
             return serde_json::from_slice(&bytes)
                 .map_err(|error| format!("{}: {error}", path.display()));
         }
@@ -681,9 +692,17 @@ impl BkvSource {
             .unwrap_or_else(|| "BKV D3IMG surface is unavailable".to_string()))
     }
 
-    pub fn inspection_world_surface_binary(&self, record_id: &str) -> Result<Arc<Vec<u8>>, String> {
+    pub fn inspection_world_surface_binary(
+        &self,
+        record_id: &str,
+        force_refresh: bool,
+    ) -> Result<Arc<Vec<u8>>, String> {
         let sequence = parse_bkv_record_sequence(record_id)?;
-        let processed = self.load_inspection_world(&canonical_bkv_record_id(sequence))?;
+        let processed = self.load_inspection_world_with_depth(
+            &canonical_bkv_record_id(sequence),
+            true,
+            force_refresh,
+        )?;
         processed.depth_surface_binary.clone().ok_or_else(|| {
             processed
                 .depth_error
@@ -819,50 +838,49 @@ impl BkvSource {
         Ok(bytes)
     }
 
-    fn load_inspection_world(
-        &self,
-        record_id: &str,
-    ) -> Result<Arc<BkvOnlineInspectionWorld>, String> {
-        self.load_inspection_world_with_depth(record_id, true)
-    }
-
     fn load_inspection_world_metadata(
         &self,
         record_id: &str,
     ) -> Result<Arc<BkvOnlineInspectionWorld>, String> {
-        self.load_inspection_world_with_depth(record_id, false)
+        self.load_inspection_world_with_depth(record_id, false, false)
     }
 
     fn load_inspection_world_with_depth(
         &self,
         record_id: &str,
         require_depth: bool,
+        force_refresh: bool,
     ) -> Result<Arc<BkvOnlineInspectionWorld>, String> {
         let sequence = parse_bkv_record_sequence(record_id)?;
-        if let Some(cached) = self
-            .inspection_world_cache
-            .lock()
-            .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
-            .get(&sequence)
-            .filter(|cached| {
-                // 减少缓存时间到2分钟，并放宽深度检查条件
-                cached.checked_at.elapsed() < Duration::from_secs(120)
-                    && (cached.depth_loaded || !require_depth)
-            })
-            .cloned()
-        {
-            return Ok(cached);
+        if !force_refresh {
+            if let Some(cached) = self
+                .inspection_world_cache
+                .lock()
+                .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
+                .get(&sequence)
+                .filter(|cached| {
+                    cached.checked_at.elapsed() < Duration::from_secs(120)
+                        && (cached.depth_loaded || !require_depth)
+                })
+                .cloned()
+            {
+                return Ok(cached);
+            }
         }
         // Historical BKV records are immutable after acquisition.  Reuse the
         // persisted inspection-world manifest/surface before touching the SMB
         // shares again; this makes a record switch instant after the first
         // conversion and also allows the service to recover after a restart.
-        if let Some(persisted) = self.load_persisted_inspection_world(sequence, require_depth)? {
-            self.inspection_world_cache
-                .lock()
-                .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
-                .insert(sequence, Arc::clone(&persisted));
-            return Ok(persisted);
+        if !force_refresh {
+            if let Some(persisted) =
+                self.load_persisted_inspection_world(sequence, require_depth)?
+            {
+                self.inspection_world_cache
+                    .lock()
+                    .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
+                    .insert(sequence, Arc::clone(&persisted));
+                return Ok(persisted);
+            }
         }
         let _build_guard = if require_depth {
             self.inspection_world_depth_build_lock
@@ -876,19 +894,20 @@ impl BkvSource {
         // Another request may have completed the same record while this request
         // waited for the single build slot. Re-check here to avoid repeating a
         // full SMB directory scan and D3IMG reconstruction.
-        if let Some(cached) = self
-            .inspection_world_cache
-            .lock()
-            .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
-            .get(&sequence)
-            .filter(|cached| {
-                // 使用与首次检查相同的缓存逻辑
-                cached.checked_at.elapsed() < Duration::from_secs(120)
-                    && (cached.depth_loaded || !require_depth)
-            })
-            .cloned()
-        {
-            return Ok(cached);
+        if !force_refresh {
+            if let Some(cached) = self
+                .inspection_world_cache
+                .lock()
+                .map_err(|_| "BKV inspection-world cache lock poisoned".to_string())?
+                .get(&sequence)
+                .filter(|cached| {
+                    cached.checked_at.elapsed() < Duration::from_secs(120)
+                        && (cached.depth_loaded || !require_depth)
+                })
+                .cloned()
+            {
+                return Ok(cached);
+            }
         }
         let total_started = Instant::now();
         let discover_started = Instant::now();
@@ -918,7 +937,7 @@ impl BkvSource {
                 })
                 .collect::<Vec<_>>();
             candidates.sort_by_key(|(frame, _)| *frame);
-            candidates.truncate(frame_limit);
+            let candidates = evenly_sample_frame_paths(candidates, frame_limit);
             if candidates.is_empty() {
                 return Err(format!("{} has no 2D BMP frames", image_dir.display()));
             }
@@ -973,11 +992,15 @@ impl BkvSource {
                     })
                     .collect::<Vec<_>>();
                 depth_candidates.sort_by_key(|(frame, _)| *frame);
-                depth_candidates.truncate(frame_limit);
                 let depth_candidates = evenly_sample_frame_paths(
                     depth_candidates,
-                    BKV_DEPTH_SURFACE_MAX_FRAMES_PER_CAMERA,
+                    frame_limit.min(BKV_DEPTH_SURFACE_MAX_FRAMES_PER_CAMERA),
                 );
+                revision_hasher.update(b"D3IMG");
+                revision_hasher.update(camera_id.to_le_bytes());
+                for (frame, _) in &depth_candidates {
+                    revision_hasher.update(frame.to_le_bytes());
+                }
                 depth_inputs.push((camera_id, depth_candidates, depth_dir));
             }
         }
@@ -1141,6 +1164,14 @@ impl BkvSource {
         };
         let manifest: Value = serde_json::from_slice(&manifest_bytes)
             .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        if require_depth
+            && manifest
+                .get("reconstructionRevision")
+                .and_then(Value::as_str)
+                != Some(BKV_DEPTH_RECONSTRUCTION_REVISION)
+        {
+            return Ok(None);
+        }
         let world: InspectionWorld = serde_json::from_value(
             manifest
                 .get("world")
@@ -1152,13 +1183,13 @@ impl BkvSource {
         let mut frames = HashMap::new();
         let mut sequence_ordinals = HashMap::new();
         for camera in &world.cameras {
-            let Some((_, root)) = self
-                .cameras
-                .iter()
-                .zip(self.image_roots.iter())
-                .find(|(configured, _)| {
-                    u32::try_from(configured.source_camera_id).ok() == Some(camera.camera_id)
-                })
+            let Some((_, root)) =
+                self.cameras
+                    .iter()
+                    .zip(self.image_roots.iter())
+                    .find(|(configured, _)| {
+                        u32::try_from(configured.source_camera_id).ok() == Some(camera.camera_id)
+                    })
             else {
                 return Ok(None);
             };
@@ -1263,6 +1294,7 @@ impl BkvSource {
             "recordId": canonical_bkv_record_id(sequence),
             "legacySeqNo": sequence,
             "revision": revision,
+            "reconstructionRevision": BKV_DEPTH_RECONSTRUCTION_REVISION,
             "source": "bkv-online-mysql",
             "sourceFrameCount": source_frame_count,
             "world": world,
@@ -1294,9 +1326,18 @@ impl BkvSource {
             write_bytes_atomic(&run_dir.join("surface-mesh.bsmesh"), binary)?;
         }
         if self.algorithm.source_data.enabled {
-            let snapshot = self.cached_snapshot_value()?;
-            let source_record = source_record_snapshot(&snapshot, sequence, &self.database)?;
-            write_json_atomic(&run_dir.join("source-record.json"), &source_record)?;
+            // A record can still exist on the immutable image share after it
+            // has moved outside the bounded MySQL snapshot window.  The mesh
+            // is already complete at this point, so an optional diagnostic
+            // source snapshot must not turn a successful D3IMG reconstruction
+            // into an HTTP failure.
+            if let Ok(snapshot) = self.cached_snapshot_value() {
+                if let Ok(source_record) =
+                    source_record_snapshot(&snapshot, sequence, &self.database)
+                {
+                    write_json_atomic(&run_dir.join("source-record.json"), &source_record)?;
+                }
+            }
         }
         let persist_ms = persist_started.elapsed().as_millis();
         let timing = json!({
@@ -2422,17 +2463,18 @@ fn build_d3img_surface(
             let b = row * angular_columns + next_column;
             let c = (row + 1) * angular_columns + column;
             let d = (row + 1) * angular_columns + next_column;
-            if valid_mask[a] != 0 && valid_mask[b] != 0 && valid_mask[c] != 0 && valid_mask[d] != 0
-            {
-                indices.extend_from_slice(&[
-                    u32::try_from(a).map_err(|_| "D3IMG mesh index overflow")?,
-                    u32::try_from(c).map_err(|_| "D3IMG mesh index overflow")?,
-                    u32::try_from(b).map_err(|_| "D3IMG mesh index overflow")?,
-                    u32::try_from(b).map_err(|_| "D3IMG mesh index overflow")?,
-                    u32::try_from(c).map_err(|_| "D3IMG mesh index overflow")?,
-                    u32::try_from(d).map_err(|_| "D3IMG mesh index overflow")?,
-                ]);
-            }
+            // Missing D3IMG samples already occupy the fitted nominal cylinder.
+            // Keep those imputed vertices in the surface topology so sparse rows
+            // do not split one pipe into several disconnected ribbons.  The
+            // valid mask remains authoritative for point-cloud and Jet analysis.
+            indices.extend_from_slice(&[
+                u32::try_from(a).map_err(|_| "D3IMG mesh index overflow")?,
+                u32::try_from(c).map_err(|_| "D3IMG mesh index overflow")?,
+                u32::try_from(b).map_err(|_| "D3IMG mesh index overflow")?,
+                u32::try_from(b).map_err(|_| "D3IMG mesh index overflow")?,
+                u32::try_from(c).map_err(|_| "D3IMG mesh index overflow")?,
+                u32::try_from(d).map_err(|_| "D3IMG mesh index overflow")?,
+            ]);
         }
     }
 
@@ -2459,6 +2501,7 @@ fn build_d3img_surface(
             "calibratedMask": calibrated_mask,
             "indices": indices,
             "source": "d3img-float32",
+            "reconstructionRevision": BKV_DEPTH_RECONSTRUCTION_REVISION,
             "sourceHeaderBytes": BKV_D3_HEADER_BYTES,
             "sourcePixelSize": 4,
             "sourceInvalidSentinelObserved": BKV_D3_INVALID_DEPTH,
@@ -2787,6 +2830,17 @@ fn depth_color(value: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evenly_sampled_live_frames_keep_both_ends_of_a_growing_sequence() {
+        let candidates = (1..=100)
+            .map(|frame| (frame, PathBuf::from(format!("{frame}.d3img"))))
+            .collect::<Vec<_>>();
+
+        let sampled = evenly_sample_frame_paths(candidates, 4);
+
+        assert_eq!(sampled.iter().map(|(frame, _)| *frame).collect::<Vec<_>>(), vec![1, 34, 67, 100]);
+    }
 
     fn d3img_fixture(width: i32, height: i32, depth: &[f32]) -> Vec<u8> {
         assert_eq!(depth.len(), usize::try_from(width * height).unwrap());

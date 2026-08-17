@@ -9,6 +9,7 @@ import {
   inspectionWorldFrameUrl,
   type InspectionWorldRecords,
 } from './inspection-world-api';
+import { bkvOnlineCroppedImageUrl } from './bkv-online-api';
 
 describe('inspection world frame URLs', () => {
   it('encodes a defect ROI crop with the source frame request', () => {
@@ -19,6 +20,15 @@ describe('inspection world frame URLs', () => {
       height: 11,
     })).toContain(
       'frame?recordId=1908500&cameraId=1&sequenceNo=18&cropX=1208&cropY=848&cropWidth=4&cropHeight=11',
+    );
+  });
+
+  it('adds a defect ROI to the BKV online image endpoint', () => {
+    expect(bkvOnlineCroppedImageUrl(
+      '/api/bkv-online/image?camera=1&seq=1934011&index=13&kind=2d',
+      { x: 1036, y: 826, width: 12, height: 23 },
+    )).toContain(
+      'camera=1&seq=1934011&index=13&kind=2d&cropX=1036&cropY=826&cropWidth=12&cropHeight=23',
     );
   });
 });

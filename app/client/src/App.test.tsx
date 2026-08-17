@@ -49,6 +49,19 @@ const directRuntimeProfile = {
   },
 };
 
+const bkvOnlineRuntimeProfile = {
+  ...bkvRuntimeProfile,
+  profileId: 'bkv-online-6',
+  displayName: 'BKV 在线转换',
+  dataSource: 'bkv-online-mysql',
+  capabilities: {
+    directCamera: false,
+    captureManagement: false,
+    reconstruction: false,
+    offlineReplay: false,
+  },
+};
+
 const bkvRecordsPayload = {
   schema: 'steel.inspection-world.records.v1',
   provider: 'bkv',
@@ -123,6 +136,48 @@ describe('storage capacity warning presentation', () => {
 });
 
 describe('App BKV provider selection', () => {
+  it('uses the unified standard record catalog in BKV online mode', async () => {
+    window.history.replaceState(null, '', '/?app=terminal&view=online');
+    const requestedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(bkvOnlineRuntimeProfile), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/records')) {
+        return new Response(JSON.stringify(bkvRecordsPayload), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/meta')) {
+        return new Response(JSON.stringify({
+          schema: 'steel.inspection-world.meta.v1',
+          provider: 'bkv',
+          recordId: '1893700',
+          sourceFrameCount: 6,
+          sourceRevision: 'revision-1893700',
+          cache: { state: 'on-demand', tileSize: 512, maxLevel: 3 },
+          world: { width: 600, height: 1024, tileSize: 512, maxLevel: 3, cameras: [] },
+        }), { status: 200 });
+      }
+      if (url.includes('/api/inspection-world/defects')) {
+        return new Response(JSON.stringify({
+          schema: 'steel.inspection-world.defects.v1',
+          provider: 'bkv',
+          recordId: '1893700',
+          defects: [],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    render(<App />);
+
+    expect((await screen.findAllByText('253B09401250925A12004328')).length).toBeGreaterThan(0);
+    expect(await screen.findByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
+    expect(requestedUrls.some((url) => url.includes('/api/inspection-world/records'))).toBe(true);
+    expect(requestedUrls.some((url) => url.includes('/api/inspection/snapshot'))).toBe(false);
+  });
+
   it('renders ready BKV data inside the shared dashboard without online hardware polling', async () => {
     window.history.replaceState(null, '', '/?app=terminal');
     const requestedUrls: string[] = [];

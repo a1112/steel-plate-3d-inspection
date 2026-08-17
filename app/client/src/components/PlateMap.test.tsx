@@ -286,9 +286,9 @@ describe('online inspection world compatibility', () => {
 
     const nextRecordImages = images.slice(previousImageCount);
     await act(async () => nextRecordImages[0]?.onload?.());
-    expect(screen.getAllByTestId('inspection-world-viewport').some((element) => (
-      element.getAttribute('data-record-id') === '1893700'
-    ))).toBe(true);
+    await waitFor(() => {
+      expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893701');
+    });
     await act(async () => nextRecordImages.slice(1).forEach((image) => image.onload?.()));
     await waitFor(() => {
       expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893701');

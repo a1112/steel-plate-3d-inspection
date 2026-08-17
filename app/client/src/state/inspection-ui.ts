@@ -1,4 +1,4 @@
-import { getPlateInspectionSnapshot } from '../data/inspection';
+import { getInspectionByRecordSelector, getPlateInspectionSnapshot } from '../data/inspection';
 import type { DefectItem, InspectionSnapshot, Surface, ThemeMode, ThemeStyle } from '../data/inspection';
 
 export type SurfaceDisplayMode = Surface | 'all';
@@ -131,15 +131,15 @@ export function selectRecord(
   snapshot: InspectionSnapshot,
   recordSelector: string,
 ): InspectionUiState {
-  const selectedInspection = snapshot.inspections.find((item) => item.inspectionId === recordSelector)
-    ?? snapshot.inspections.find((item) => item.plate.plateNo === recordSelector);
+  const selectedInspection = getInspectionByRecordSelector(snapshot, recordSelector);
   if (!selectedInspection) {
     return state;
   }
   const inspection = getPlateInspectionSnapshot(snapshot, recordSelector);
+  const selectedRecord = snapshot.records.find((item) => item.id === recordSelector);
   return {
     ...state,
-    selectedRecordId: selectedInspection.inspectionId ?? selectedInspection.plate.plateNo,
+    selectedRecordId: selectedRecord?.id || selectedInspection.inspectionId?.trim() || selectedInspection.plate.plateNo,
     selectedDefectId: inspection.defects[0]?.id ?? null,
     previewPositionM: getDefectPreviewPositionM(inspection.defects[0]),
     defectPage: 1,

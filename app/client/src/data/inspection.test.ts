@@ -76,6 +76,20 @@ describe('getMockInspectionSnapshot', () => {
     expect(selected.defects.every((defect) => defect.plateNo === '202606131858')).toBe(true);
   });
 
+  it('loads a historical snapshot when the record id differs from an empty inspection id', () => {
+    const snapshot = getMockInspectionSnapshot();
+    const serviceSnapshot = {
+      ...snapshot,
+      records: snapshot.records.map((record, index) => ({ ...record, id: `R-${index + 1}` })),
+      inspections: snapshot.inspections.map((inspection) => ({ ...inspection, inspectionId: '' })),
+    };
+
+    const historical = getPlateInspectionSnapshot(serviceSnapshot, 'R-2');
+
+    expect(historical.currentPlate.plateNo).toBe(serviceSnapshot.records[1].plateNo);
+    expect(historical.defects).toEqual(serviceSnapshot.inspections[1].defects);
+  });
+
   it('attaches generated mock defect images only to the explicit demo fixture', () => {
     const snapshot = getMockInspectionSnapshot();
     const historical = getPlateInspectionSnapshot(snapshot, '202606131858');

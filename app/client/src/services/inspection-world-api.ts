@@ -494,7 +494,10 @@ export async function fetchInspectionWorldSurface(
   if (binaryResponse.status !== 404) {
     throw new Error(`涓夌淮娣卞害琛ㄩ潰璇诲彇澶辫触${detail ? `锛?{detail}` : ''} (HTTP ${binaryResponse.status})`);
   }
-  const payload = await readJson<BarSurfaceMesh>(await fetch(worldUrl('surface', new URLSearchParams({ recordId })), {
+  const jsonParams = new URLSearchParams({ recordId });
+  if (refresh) jsonParams.set('refresh', String(Date.now()));
+  const payload = await readJson<BarSurfaceMesh>(await fetch(worldUrl('surface', jsonParams), {
+    cache: refresh ? 'no-store' : 'no-cache',
     headers: createAdminHeaders({ Accept: 'application/json' }), signal,
   }), '三维深度表面读取失败');
   if (
