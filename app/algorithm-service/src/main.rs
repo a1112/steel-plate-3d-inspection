@@ -233,6 +233,48 @@ impl BkvAdapter {
         Ok(())
     }
 
+    async fn load_defect_types(&self) -> Result<Vec<Value>, String> {
+        let rows = self
+            .connection
+            .query_all(Statement::from_string(
+                DbBackend::MySql,
+                format!(
+                    "SELECT CAST(ClassNo AS CHAR) AS class_no, \
+                     COALESCE(CONVERT(ClassName USING utf8mb4), '') AS label, \
+                     CAST(COALESCE(Red, 128) AS CHAR) AS red_value, \
+                     CAST(COALESCE(Green, 128) AS CHAR) AS green_value, \
+                     CAST(COALESCE(Blue, 128) AS CHAR) AS blue_value \
+                     FROM `{}`.`defectclass` ORDER BY ClassNo",
+                    self.database
+                ),
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        let shapes = ["circle", "square", "diamond", "rect", "star"];
+        rows.iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let class_no = row_string(row, "class_no")?;
+                let label = row_string(row, "label")?;
+                let red = row_string(row, "red_value")?
+                    .parse::<u8>()
+                    .unwrap_or(128);
+                let green = row_string(row, "green_value")?
+                    .parse::<u8>()
+                    .unwrap_or(128);
+                let blue = row_string(row, "blue_value")?
+                    .parse::<u8>()
+                    .unwrap_or(128);
+                Ok(json!({
+                    "id": format!("bkv-class-{class_no}"),
+                    "label": if label.trim().is_empty() { format!("缺陷类型 {class_no}") } else { label },
+                    "color": format!("#{red:02x}{green:02x}{blue:02x}"),
+                    "shape": shapes[index % shapes.len()],
+                }))
+            })
+            .collect()
+    }
+
     async fn publish_record(
         &self,
         publisher: &ResultPublisher,
@@ -377,35 +419,39 @@ impl BkvAdapter {
     }
 
     async fn load_defects(&self, sequence: i64) -> Result<Vec<ResultDefect>, String> {
-        let rows = self.connection.query_all(Statement::from_string(DbBackend::MySql, format!("SELECT CAST(ID AS CHAR) AS id, CAST(CamNo AS CHAR) AS camera_no, CAST(COALESCE(ImgIndex, 0) AS CHAR) AS image_index, CAST(COALESCE(Class, 0) AS CHAR) AS class_no, CAST(COALESCE(Grade, 0) AS CHAR) AS grade, CAST(COALESCE(Confidence, 0) AS CHAR) AS confidence, CAST(COALESCE(LeftImg2D, LeftSteel2D, 0) AS CHAR) AS left_image, CAST(COALESCE(RightImg2D, RightSteel2D, 0) AS CHAR) AS right_image, CAST(COALESCE(TopImg2D, TopSteel2D, 0) AS CHAR) AS top_image, CAST(COALESCE(BottomImg2D, BottomSteel2D, 0) AS CHAR) AS bottom_image FROM `{}`.`defect` WHERE SeqNo = {} ORDER BY ID DESC LIMIT 5000", self.database, sequence))).await.map_err(|e| e.to_string())?;
-        rows.iter().map(|row| {
-            let class_no = row_string(row, "class_no")?;
-            let image_index = row_string(row, "image_index")?;
-            let mut artifacts = json!({"classNo": class_no, "imageIndex": image_index});
-            let left = row_string(row, "left_image")?.parse::<i64>().ok();
-            let right = row_string(row, "right_image")?.parse::<i64>().ok();
-            let top = row_string(row, "top_image")?.parse::<i64>().ok();
-            let bottom = row_string(row, "bottom_image")?.parse::<i64>().ok();
-            if let (Some(left), Some(right), Some(top), Some(bottom)) = (left, right, top, bottom) {
-                if left >= 0 && top >= 0 && right > left && bottom > top {
-                    artifacts["imageRect2d"] = json!({
-                        "left": left,
-                        "top": top,
-                        "right": right,
-                        "bottom": bottom,
-                    });
+        let rows = self.connection.query_all(Statement::from_string(DbBackend::MySql, format!("SELECT CAST(d.ID AS CHAR) AS id, CAST(d.CamNo AS CHAR) AS camera_no, CAST(COALESCE(d.ImgIndex, 0) AS CHAR) AS image_index, CAST(COALESCE(d.Class, 0) AS CHAR) AS class_no, COALESCE(NULLIF(CONVERT(c.ClassName USING utf8mb4), ''), CONCAT('bkv-class-', COALESCE(d.Class, 0))) AS class_name, CAST(COALESCE(d.Grade, 0) AS CHAR) AS grade, CAST(COALESCE(d.Confidence, 0) AS CHAR) AS confidence, CAST(COALESCE(d.LeftImg2D, d.LeftSteel2D, 0) AS CHAR) AS left_image, CAST(COALESCE(d.RightImg2D, d.RightSteel2D, 0) AS CHAR) AS right_image, CAST(COALESCE(d.TopImg2D, d.TopSteel2D, 0) AS CHAR) AS top_image, CAST(COALESCE(d.BottomImg2D, d.BottomSteel2D, 0) AS CHAR) AS bottom_image FROM `{0}`.`defect` d LEFT JOIN `{0}`.`defectclass` c ON c.ClassNo = d.Class WHERE d.SeqNo = {1} ORDER BY d.ID DESC LIMIT 5000", self.database, sequence))).await.map_err(|e| e.to_string())?;
+        rows.iter()
+            .map(|row| {
+                let class_no = row_string(row, "class_no")?;
+                let image_index = row_string(row, "image_index")?;
+                let mut artifacts = json!({"classNo": class_no, "imageIndex": image_index});
+                let left = row_string(row, "left_image")?.parse::<i64>().ok();
+                let right = row_string(row, "right_image")?.parse::<i64>().ok();
+                let top = row_string(row, "top_image")?.parse::<i64>().ok();
+                let bottom = row_string(row, "bottom_image")?.parse::<i64>().ok();
+                if let (Some(left), Some(right), Some(top), Some(bottom)) =
+                    (left, right, top, bottom)
+                {
+                    if left >= 0 && top >= 0 && right > left && bottom > top {
+                        artifacts["imageRect2d"] = json!({
+                            "left": left,
+                            "top": top,
+                            "right": right,
+                            "bottom": bottom,
+                        });
+                    }
                 }
-            }
-            Ok(ResultDefect {
-                id: row_string(row, "id")?,
-                camera_id: format!("C{}", row_string(row, "camera_no")?),
-                sequence_no: image_index.parse().unwrap_or(0),
-                defect_type: format!("bkv-class-{class_no}"),
-                severity: row_string(row, "grade")?.parse().ok(),
-                confidence: row_string(row, "confidence")?.parse().ok(),
-                artifacts,
+                Ok(ResultDefect {
+                    id: row_string(row, "id")?,
+                    camera_id: format!("C{}", row_string(row, "camera_no")?),
+                    sequence_no: image_index.parse().unwrap_or(0),
+                    defect_type: row_string(row, "class_name")?,
+                    severity: row_string(row, "grade")?.parse().ok(),
+                    confidence: row_string(row, "confidence")?.parse().ok(),
+                    artifacts,
+                })
             })
-        }).collect()
+            .collect()
     }
 }
 
@@ -1089,6 +1135,18 @@ fn handle_client(mut stream: TcpStream, state: Arc<State>) {
     let response = match (method, path) {
         ("GET", "/api/health/live") | ("GET", "/health") => response(200, &json!({"status":"live","service":"steel-algorithm-service","schema":"steel.algorithm-service.health.v1"}).to_string()),
         ("GET", "/internal/v1/status") => response(200, &status_json(&state)),
+        ("GET", "/internal/v1/defect-types") => {
+            match (state.mysql_runtime.as_ref(), state.bkv.as_ref()) {
+                (Some(runtime), Some(adapter)) => match runtime.block_on(adapter.load_defect_types()) {
+                    Ok(defect_types) => response(200, &json!({
+                        "schema": "steel.bkv.defect-types.v1",
+                        "defectTypes": defect_types,
+                    }).to_string()),
+                    Err(error) => response(503, &json!({"error":"bkv_defect_types_unavailable","detail":error}).to_string()),
+                },
+                _ => response(404, &json!({"error":"bkv_source_disabled"}).to_string()),
+            }
+        }
         ("POST", "/internal/v1/reprocess") => { let _ = serde_json::from_str::<Value>(body); scan_sources(&state); response(202, &json!({"accepted":true,"service":"steel-algorithm-service"}).to_string()) }
         ("POST", "/internal/v1/run") => { scan_sources(&state); response(202, &json!({"accepted":true}).to_string()) }
         ("POST", "/internal/v1/reconstruct") => {

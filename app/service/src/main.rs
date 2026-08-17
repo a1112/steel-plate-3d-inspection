@@ -15487,6 +15487,93 @@ fn inspection_world_history_limit(state: &ServiceState) -> usize {
         .clamp(1, 5_000)
 }
 
+static BKV_DEFECT_TYPES_CACHE: OnceLock<Mutex<Option<(Instant, Vec<Value>)>>> = OnceLock::new();
+
+fn current_bkv_defect_types(state: &ServiceState) -> Vec<Value> {
+    let direct = state
+        .bkv_online
+        .as_ref()
+        .and_then(|source| source.defect_types().ok())
+        .unwrap_or_default();
+    if !direct.is_empty() {
+        return direct;
+    }
+
+    let cache = BKV_DEFECT_TYPES_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((refreshed_at, values)) = guard.as_ref() {
+            if refreshed_at.elapsed() < Duration::from_secs(10) {
+                return values.clone();
+            }
+        }
+    }
+
+    let origin = env::var("STEEL_ALGORITHM_SERVICE_ORIGIN")
+        .unwrap_or_else(|_| "http://127.0.0.1:4875".to_string());
+    let fetched = bounded_health_http_get(
+        &origin,
+        "/internal/v1/defect-types",
+        Duration::from_millis(1_500),
+    )
+    .ok()
+    .filter(|response| response.status_code == 200)
+    .and_then(|response| serde_json::from_slice::<Value>(&response.body).ok())
+    .and_then(|payload| {
+        payload
+            .get("defectTypes")
+            .and_then(Value::as_array)
+            .cloned()
+    })
+    .filter(|values| !values.is_empty());
+    if let Some(values) = fetched {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some((Instant::now(), values.clone()));
+        }
+        return values;
+    }
+    cache
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|(_, values)| values.clone()))
+        .unwrap_or_default()
+}
+
+fn bkv_defect_type_labels(defect_types: &[Value]) -> HashMap<String, String> {
+    defect_types
+        .iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?.trim();
+            let label = item.get("label").and_then(Value::as_str)?.trim();
+            (!id.is_empty() && !label.is_empty()).then(|| (id.to_string(), label.to_string()))
+        })
+        .collect()
+}
+
+fn resolved_bkv_defect_label(
+    defect_type: &str,
+    artifacts: &Value,
+    labels: &HashMap<String, String>,
+) -> String {
+    let stored = defect_type.trim();
+    let artifact_class = artifacts.get("classNo").and_then(|value| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| value.as_i64().map(|value| value.to_string()))
+    });
+    let type_id = stored
+        .strip_prefix("bkv-class-")
+        .map(|value| format!("bkv-class-{value}"))
+        .or_else(|| artifact_class.map(|value| format!("bkv-class-{value}")));
+    type_id
+        .as_ref()
+        .and_then(|id| labels.get(id))
+        .cloned()
+        .unwrap_or_else(|| stored.to_string())
+}
+
 fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
     if state.runtime_config.data_source == "bkv-online-mysql"
         && !unified_result_store_enabled(state)
@@ -15521,6 +15608,7 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
         return match store.records_page(None, None, history_limit as u64, 0) {
             Ok((_, records)) => {
                 let camera_count = store.configured_cameras().len();
+                let defect_types = current_bkv_defect_types(state);
                 let catalog_summary = store.catalog_summary().ok();
                 let latest_inspection_time = catalog_summary
                     .as_ref()
@@ -15552,6 +15640,7 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
                         "recordCount": records.len(),
                         "latestInspectionTime": latest_inspection_time,
                         "synchronizedAt": current_time_string(),
+                        "defectTypes": defect_types,
                         "records": records,
                     })
                     .to_string(),
@@ -16514,6 +16603,8 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
         };
     }
     if unified_result_store_enabled(state) {
+        let defect_types = current_bkv_defect_types(state);
+        let defect_type_labels = bkv_defect_type_labels(&defect_types);
         let converted = match load_converted_inspection_world(state, &record_id) {
             Ok(converted) => Ok(converted),
             Err(initial_error) => {
@@ -16534,6 +16625,11 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
                     .defects
                     .iter()
                     .map(|defect| {
+                        let class_name = resolved_bkv_defect_label(
+                            &defect.defect_type,
+                            &defect.artifacts,
+                            &defect_type_labels,
+                        );
                         let camera_id = numeric_camera_id(&defect.camera_id);
                         let image_index = camera_id.and_then(|camera_id| {
                             converted
@@ -16556,7 +16652,7 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
                         );
                         json!({
                             "id": defect.id,
-                            "className": defect.defect_type,
+                            "className": class_name,
                             "grade": defect.severity,
                             "confidence": defect.confidence,
                             "cameraId": camera_id,
@@ -16610,20 +16706,27 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
                             "provider": "bkv",
                             "recordId": record_id,
                             "deferred": true,
-                            "defects": defects.iter().map(|defect| json!({
-                                "id": defect.id,
-                                "className": defect.defect_type,
-                                "grade": defect.severity,
-                                "confidence": defect.confidence,
-                                "cameraId": numeric_camera_id(&defect.camera_id),
-                                "imageIndex": defect.sequence_no,
-                                "locatable": false,
-                                "worldRect": Value::Null,
-                                "trace": {
-                                    "sequenceNo": defect.sequence_no,
-                                    "artifacts": defect.artifacts,
-                                }
-                            })).collect::<Vec<_>>(),
+                            "defects": defects.iter().map(|defect| {
+                                let class_name = resolved_bkv_defect_label(
+                                    &defect.defect_type,
+                                    &defect.artifacts,
+                                    &defect_type_labels,
+                                );
+                                json!({
+                                    "id": defect.id,
+                                    "className": class_name,
+                                    "grade": defect.severity,
+                                    "confidence": defect.confidence,
+                                    "cameraId": numeric_camera_id(&defect.camera_id),
+                                    "imageIndex": defect.sequence_no,
+                                    "locatable": false,
+                                    "worldRect": Value::Null,
+                                    "trace": {
+                                        "sequenceNo": defect.sequence_no,
+                                        "artifacts": defect.artifacts,
+                                    }
+                                })
+                            }).collect::<Vec<_>>(),
                         })
                         .to_string(),
                     ),
@@ -30281,6 +30384,27 @@ mod tests {
         )
         .expect("converted store");
         (root, store)
+    }
+
+    #[test]
+    fn latest_bkv_defect_catalog_resolves_cached_class_ids() {
+        let labels = bkv_defect_type_labels(&[
+            json!({"id": "bkv-class-9", "label": "矫直碰伤"}),
+            json!({"id": "bkv-class-16", "label": "轧折"}),
+        ]);
+
+        assert_eq!(
+            resolved_bkv_defect_label("bkv-class-9", &json!({"classNo": "9"}), &labels),
+            "矫直碰伤"
+        );
+        assert_eq!(
+            resolved_bkv_defect_label("unknown", &json!({"classNo": 16}), &labels),
+            "轧折"
+        );
+        assert_eq!(
+            resolved_bkv_defect_label("人工复核名称", &json!({}), &labels),
+            "人工复核名称"
+        );
     }
 
     #[test]

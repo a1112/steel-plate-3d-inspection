@@ -14,6 +14,12 @@ const records: InspectionWorldRecords = {
   ready: true,
   cameraCount: 6,
   batchId: 'legacy-1893700-1893710',
+  defectTypes: [{
+    id: 'bkv-class-16',
+    label: '轧折',
+    color: '#780078',
+    shape: 'circle',
+  }],
   records: Array.from({ length: 11 }, (_, index) => ({
     recordId: String(1893700 + index),
     legacySeqNo: 1893700 + index,
@@ -35,7 +41,7 @@ const defects: InspectionWorldDefects = {
   recordId: '1893700',
   defects: [{
     id: '1893700-2019096',
-    className: '轧折',
+    className: 'bkv-class-16',
     grade: 16,
     confidence: 51,
     cameraId: 1,
@@ -128,7 +134,7 @@ describe('standard BKV inspection adapter', () => {
       }),
     });
     expect(merged.defectTypes).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'bkv-class-16', label: '轧折' }),
+      expect.objectContaining({ id: 'bkv-class-16', label: '轧折', color: '#780078' }),
     ]));
     expect(merged.summary.total).toBe(1);
     expect(merged.summary.bySeverity.severe).toBe(1);

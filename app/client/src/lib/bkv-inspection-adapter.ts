@@ -84,6 +84,7 @@ function standardDefect(
   plate: SteelPlate,
   defect: InspectionWorldDefect,
   cameraCount: number,
+  defectTypes: DefectType[],
   inspectionId?: string,
 ): DefectItem {
   const cameraIndex = defect.cameraId ?? undefined;
@@ -126,12 +127,14 @@ function standardDefect(
     lengthProfile: textValue(sourceArtifacts?.lengthProfile) ?? undefined,
     widthProfile: textValue(sourceArtifacts?.widthProfile) ?? undefined,
   } : undefined;
+  const typeId = standardDefectTypeId(defect);
+  const catalogType = defectTypes.find((item) => item.id === typeId);
   return {
     id: String(defect.id),
     plateNo: plate.plateNo,
     inspectionId,
-    typeId: standardDefectTypeId(defect),
-    typeLabel: defect.className || '未分类缺陷',
+    typeId,
+    typeLabel: catalogType?.label || defect.className || '未分类缺陷',
     surface: cameraIndex && cameraIndex <= Math.ceil(cameraCount / 2) ? 'top' : 'bottom',
     severity: standardDefectSeverity(defect.grade),
     distanceHeadMm: finiteNumber(source?.distanceHeadMm) ?? 0,
@@ -199,7 +202,7 @@ export function buildStandardBkvInspectionSnapshot(
 
   return {
     currentPlate,
-    defectTypes: [],
+    defectTypes: payload.defectTypes ?? [],
     defects: [],
     records: payload.records.map((record) => ({
       id: record.recordId,
@@ -246,15 +249,24 @@ export function synchronizeStandardBkvInspectionRecords(
       }
       : inspection;
   });
-  const defects = inspections.flatMap((inspection) => inspection.defects);
+  const catalog = refreshed.defectTypes.length ? refreshed.defectTypes : snapshot.defectTypes;
+  const labels = new Map(catalog.map((item) => [item.id, item.label]));
+  const synchronizedInspections = inspections.map((inspection) => ({
+    ...inspection,
+    defects: inspection.defects.map((defect) => ({
+      ...defect,
+      typeLabel: labels.get(defect.typeId) || defect.typeLabel,
+    })),
+  }));
+  const defects = synchronizedInspections.flatMap((inspection) => inspection.defects);
   return {
     ...snapshot,
     currentPlate: refreshed.currentPlate,
     records: refreshed.records,
-    inspections,
+    inspections: synchronizedInspections,
     defects,
-    defectTypes: mappedDefectTypes(defects),
-    summary: summarize(inspections[0]?.defects ?? []),
+    defectTypes: catalog.length ? catalog : mappedDefectTypes(defects),
+    summary: summarize(synchronizedInspections[0]?.defects ?? []),
     source: refreshed.source,
   };
 }
@@ -280,6 +292,7 @@ export function mergeStandardBkvDefects(
           inspection.plate,
           defect,
           cameraCount,
+          snapshot.defectTypes,
           inspection.inspectionId,
         )),
       }
@@ -291,7 +304,7 @@ export function mergeStandardBkvDefects(
     ...snapshot,
     inspections,
     defects,
-    defectTypes: mappedDefectTypes(defects),
+    defectTypes: snapshot.defectTypes.length ? snapshot.defectTypes : mappedDefectTypes(defects),
     summary: summarize(currentInspection?.defects ?? []),
   };
 }
