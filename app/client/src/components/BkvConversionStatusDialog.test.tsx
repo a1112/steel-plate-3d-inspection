@@ -25,6 +25,14 @@ vi.mock('../services/bkv-online-api', () => ({
     refreshSuccesses: 54,
     lastSuccessAtMs: 1_784_891_000_000,
     lastError: null,
+    lastErrorDetail: null,
+    processingLogPath: 'D:/steel-inspection/algorithm-data/processing-times.jsonl',
+    processingLog: [{
+      operation: 'inspection-world',
+      recordId: '1902341',
+      elapsedMs: 1234,
+      completedAtMs: 1_784_891_000_000,
+    }],
   }),
 }));
 
@@ -52,6 +60,9 @@ describe('BkvConversionStatusDialog', () => {
     expect(await screen.findByText('转换循环运行正常')).toBeInTheDocument();
     expect(screen.getByText('500/500')).toBeInTheDocument();
     expect(screen.getByText('6 张')).toBeInTheDocument();
+    expect(screen.getByText('转换日志')).toBeInTheDocument();
+    expect(screen.getByText('记录 1902341 · 19:03:20')).toBeInTheDocument();
+    expect(screen.getByText('1234 ms')).toBeInTheDocument();
     expect(screen.getAllByRole('img', { name: /实际2D图像/ })).toHaveLength(6);
     expect(screen.getByRole('img', { name: 'camera1 实际2D图像' })).toHaveAttribute(
       'src',

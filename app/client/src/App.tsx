@@ -106,6 +106,7 @@ import {
 import { InspectionFlowTool } from './components/InspectionFlowTool';
 import { StandaloneWindowTitlebar } from './components/StandaloneWindowTitlebar';
 import { BkvConversionStatusDialog } from './components/BkvConversionStatusDialog';
+import { fetchBkvOnlineStatus } from './services/bkv-online-api';
 import { inferNotificationTone, notify } from './state/notifications';
 import { resolveAppRoute, type AppRoute } from './lib/app-windows';
 import {
@@ -333,7 +334,7 @@ function ConfiguredApp({
       });
     }
     writeTerminalViewMode(resolvedTerminalMode);
-    const loadSnapshot = dashboardMode.requestsStandardRecords
+    const loadSnapshot = dashboardMode.requestsStandardRecords && dashboardMode.kind !== 'bkv-online'
       ? fetchInspectionWorldRecords(controller.signal).then((records) => {
         if (controller.signal.aborted) {
           throw new DOMException('BKV record load aborted', 'AbortError');
@@ -370,6 +371,21 @@ function ConfiguredApp({
           }
         }
       });
+    if (dashboardMode.kind === 'bkv-online') {
+      fetchBkvOnlineStatus(controller.signal)
+        .then((status) => {
+          if (!controller.signal.aborted && (status.lastError || status.lastErrorDetail)) {
+            setBkvDataHealth({
+              state: 'store-error',
+              detail: status.lastErrorDetail || status.lastError || 'BKV 在线转换状态异常',
+            });
+          }
+        })
+        .catch(() => {
+          // The snapshot endpoint remains the source of truth for initial UI
+          // loading; the status dialog exposes a detailed polling error.
+        });
+    }
     return () => controller.abort();
   }, [dashboardMode.kind, dashboardMode.requestsStandardRecords, loadRevision, resolvedTerminalMode]);
 
@@ -377,7 +393,10 @@ function ConfiguredApp({
     force = false,
     signal?: AbortSignal,
   ) => {
-    if (!dashboardMode.requestsStandardRecords) return;
+    // The online MySQL adapter owns its own snapshot refresh loop.  The
+    // converted-local records/status endpoint intentionally returns 409 for
+    // this mode, so do not turn that expected response into a false BKV error.
+    if (!dashboardMode.requestsStandardRecords || dashboardMode.kind === 'bkv-online') return;
     setRecordsRefreshing(true);
     try {
       const status = await fetchInspectionWorldRecordsStatus(signal);
@@ -407,10 +426,10 @@ function ConfiguredApp({
     } finally {
       if (!signal?.aborted) setRecordsRefreshing(false);
     }
-  }, [bkvRecords?.generation, dashboardMode.requestsStandardRecords]);
+  }, [bkvRecords?.generation, dashboardMode.kind, dashboardMode.requestsStandardRecords]);
 
   useEffect(() => {
-    if (!dashboardMode.requestsStandardRecords) return undefined;
+    if (!dashboardMode.requestsStandardRecords || dashboardMode.kind === 'bkv-online') return undefined;
     let controller: AbortController | null = null;
     const refresh = () => {
       if (document.visibilityState === 'hidden') return;
@@ -425,7 +444,41 @@ function ConfiguredApp({
       window.clearInterval(timer);
       window.removeEventListener('focus', refresh);
     };
-  }, [dashboardMode.requestsStandardRecords, refreshStandardRecordList]);
+  }, [dashboardMode.kind, dashboardMode.requestsStandardRecords, refreshStandardRecordList]);
+
+  useEffect(() => {
+    if (dashboardMode.kind !== 'bkv-online') return undefined;
+    let cancelled = false;
+    let inFlight = false;
+    const refreshOnlineSnapshot = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const nextSnapshot = await fetchInspectionSnapshot();
+        if (cancelled) return;
+        setSnapshot(nextSnapshot);
+        setRecordsSynchronizedAt(Date.now());
+        setBkvDataHealth({
+          state: 'ready',
+          detail: `${nextSnapshot.records.length} 条在线记录、${nextSnapshot.captureImages?.length ?? 0} 路实际图像已就绪`,
+        });
+      } catch (error) {
+        if (!cancelled) {
+          setBkvDataHealth({
+            state: 'store-error',
+            detail: error instanceof Error ? error.message : 'BKV 在线转换快照读取失败',
+          });
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = window.setInterval(() => void refreshOnlineSnapshot(), 8_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [dashboardMode.kind]);
 
   const retryBkvLoad = () => {
     setSnapshot(null);
@@ -1514,7 +1567,7 @@ function InspectionDashboard({
             onSearchReset={resetRecordSearchFilters}
           />
           <section className="online-main">
-            <main className={`dashboard-grid online-dashboard-grid ${rightSidebarCollapsed ? 'right-sidebar-collapsed' : ''}`}>
+            <main className={`dashboard-grid online-dashboard-grid ${rightSidebarCollapsed || !hasCurrentDefects ? 'right-sidebar-collapsed' : ''}`}>
               <section className={`center-column ${analysisCollapsed || !hasCurrentDefects ? 'analysis-collapsed' : ''}`}>
                 <PlateMap
                   defectTypes={snapshot.defectTypes}

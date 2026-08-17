@@ -31,6 +31,17 @@ function formatStatusTime(value: number) {
   return new Date(value).toLocaleString('zh-CN', { hour12: false });
 }
 
+function formatLogTime(value?: number) {
+  if (!value) return '--';
+  return new Date(value).toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function formatLogValue(value: unknown) {
+  if (typeof value === 'number' && Number.isFinite(value)) return `${value} ms`;
+  if (typeof value === 'string' && value.trim()) return value;
+  return '--';
+}
+
 function buildPreviewImages(snapshot: InspectionSnapshot): PreviewImage[] {
   const images: PreviewImage[] = (snapshot.captureImages ?? []).slice(0, 6).map((image) => ({
     id: image.id,
@@ -95,7 +106,14 @@ export function BkvConversionStatusDialog({
     };
   }, [onClose]);
 
-  const healthy = Boolean(status?.running && status.databaseConnected && !status.lastError);
+  const healthy = Boolean(
+    status?.running
+      && status.databaseConnected
+      && !status.lastError
+      && !status.lastErrorDetail,
+  );
+  const statusError = error || status?.lastErrorDetail || status?.lastError;
+  const processingLog = status?.processingLog ?? [];
 
   return (
     <div className="bkv-conversion-dialog-backdrop" role="presentation" onMouseDown={onClose}>
@@ -131,10 +149,10 @@ export function BkvConversionStatusDialog({
         <div className={`bkv-conversion-health ${healthy ? 'healthy' : 'warning'}`}>
           <i aria-hidden="true" />
           <div>
-            <strong>{healthy ? '转换循环运行正常' : '正在检查转换循环'}</strong>
-            <span>{error || status?.lastError || '数据库已连接，图像按需读取并转换'}</span>
+            <strong>{healthy ? '转换循环运行正常' : statusError ? '转换循环异常' : '正在检查转换循环'}</strong>
+            <span>{statusError || '数据库已连接，图像按需读取并转换'}</span>
           </div>
-          <em>{healthy ? '运行中' : '检查中'}</em>
+          <em>{healthy ? '运行中' : statusError ? '异常' : '检查中'}</em>
         </div>
 
         <div className="bkv-conversion-metrics">
@@ -173,6 +191,31 @@ export function BkvConversionStatusDialog({
             </dd>
           </div>
         </dl>
+
+        <section className="bkv-conversion-log" aria-label="转换日志">
+          <header>
+            <div>
+              <strong>转换日志</strong>
+              <span>{status?.processingLogPath || '尚未生成算法处理日志'}</span>
+            </div>
+            <em>最近 {processingLog.length} 条</em>
+          </header>
+          {processingLog.length ? (
+            <div className="bkv-conversion-log-list">
+              {processingLog.slice().reverse().map((entry, index) => (
+                <article key={`${entry.completedAtMs ?? 'log'}-${entry.recordId ?? index}`}>
+                  <div>
+                    <strong>{entry.operation || 'processing'}</strong>
+                    <span>{entry.recordId ? `记录 ${entry.recordId}` : '系统任务'} · {formatLogTime(entry.completedAtMs)}</span>
+                  </div>
+                  <em>{formatLogValue(entry.elapsedMs)}</em>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="bkv-conversion-log-empty">当前没有可展示的转换日志。</p>
+          )}
+        </section>
 
         <div className="bkv-conversion-preview-heading">
           <div>

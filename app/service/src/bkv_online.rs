@@ -500,6 +500,7 @@ impl BkvSource {
                 })
             })
             .unwrap_or_else(|| json!({"error": "cache_lock_failed"}));
+        let processing_log = self.recent_processing_log();
         json!({
             "enabled": true,
             "running": true,
@@ -519,9 +520,51 @@ impl BkvSource {
             "refreshAttempts": state.attempts,
             "refreshSuccesses": state.successes,
             "lastSuccessAtMs": state.refreshed_at_ms,
-            "lastError": state.last_error.as_ref().map(|_| "refresh_failed")
+            // Keep the original error text.  The header is intentionally
+            // compact, while the status dialog uses this field to explain
+            // the exact failed step instead of showing a generic alarm.
+            "lastError": state.last_error.clone(),
+            "lastErrorDetail": state.last_error.clone(),
+            "processingLogPath": self.processing_log_path().map(|path| path.display().to_string()),
+            "processingLog": processing_log,
         })
         .to_string()
+    }
+
+    fn processing_log_path(&self) -> Option<PathBuf> {
+        self.algorithm.enabled.then(|| {
+            PathBuf::from(&self.algorithm.output_root).join(&self.algorithm.timing_log)
+        })
+    }
+
+    fn recent_processing_log(&self) -> Vec<Value> {
+        let Some(path) = self.processing_log_path() else {
+            return Vec::new();
+        };
+        let Ok(mut file) = fs::File::open(&path) else {
+            return Vec::new();
+        };
+        const MAX_LOG_BYTES: u64 = 512 * 1024;
+        let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+            return Vec::new();
+        };
+        let offset = length.saturating_sub(MAX_LOG_BYTES);
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return Vec::new();
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            return Vec::new();
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .rev()
+            .take(24)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     }
 
     fn spawn_latest_processing(&self, runtime: &Handle) {

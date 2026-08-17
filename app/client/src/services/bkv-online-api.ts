@@ -29,6 +29,19 @@ export type BkvOnlineStatus = {
   refreshSuccesses: number;
   lastSuccessAtMs: number;
   lastError: string | null;
+  lastErrorDetail?: string | null;
+  processingLogPath?: string | null;
+  processingLog?: Array<{
+    schema?: string;
+    operation?: string;
+    recordId?: string;
+    revision?: string;
+    elapsedMs?: number;
+    completedAtMs?: number;
+    phases?: Record<string, number>;
+    outputPath?: string | null;
+    [key: string]: unknown;
+  }>;
 };
 
 export async function fetchBkvOnlineStatus(signal?: AbortSignal): Promise<BkvOnlineStatus> {
