@@ -1,22 +1,22 @@
 name: Export sample data
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/export-sample-data
+      - main
     paths:
       - .github/workflows/export-sample-data.yml
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   export:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout repository
+      - name: Checkout pull request source
         uses: actions/checkout@v4
 
       - name: Build migration inventory
@@ -65,15 +65,3 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
-
-      - name: Record export run
-        shell: bash
-        run: |
-          mkdir -p .migration
-          printf '%s\n' "${{ github.run_id }}" > .migration/export-run-id.txt
-          cp sample-data-migration-inventory.json .migration/inventory.json
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- .migration/export-run-id.txt .migration/inventory.json
-          git commit -m "chore: record sample data export [skip ci]"
-          git push origin HEAD:agent/export-sample-data
