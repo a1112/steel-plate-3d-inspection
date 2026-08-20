@@ -73,7 +73,10 @@ function Get-MissingWhitespaceInsensitiveLiterals {
 function Get-SourceBeforeTests {
   param([string]$Text)
 
-  $Marker = [regex]::Match($Text, '(?m)^\s*#\[cfg\(test\)\]\s*$')
+  $Marker = [regex]::Match(
+    $Text,
+    '(?m)^\s*#\[cfg\(test\)\]\s*\r?\n\s*mod\s+tests\s*\{'
+  )
   if ($Marker.Success) {
     return $Text.Substring(0, $Marker.Index)
   }
