@@ -1,0 +1,4 @@
+# SICK Ranger/Ruler bring-up baseline; validate this matrix against the installed SDK/firmware.
+harvesters>=1.4.2,<2
+numpy>=2.0,<3
+Pillow>=11,<13

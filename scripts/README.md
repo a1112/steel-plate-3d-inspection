@@ -4,6 +4,32 @@ These scripts keep the four runtime boundaries independent.
 
 Environment templates live in `config/env`.
 
+## SICK GenTL capture sidecar
+
+The SICK sidecar uses the vendor GenTL producer and Harvesters to bind a camera
+by exact serial number, read `Coord3D_C16` plus `Mono8`, and commit each frame to
+both the native Steel layout and the `LG_3D` NPZ/JPEG/JSON layout.
+
+```powershell
+python -m pip install -r scripts\sick_capture_requirements.txt
+python scripts\sick_probe.py --cti $env:SICK_GENTL_CTI
+$SiteId = 'sick-single-lab'
+python scripts\sick_capture_service.py `
+  --profile "config\sites\$SiteId\capture.json"
+python scripts\validate_lg3d.py D:\steel-sick-data\C1\FAT-SICK-001
+```
+
+`config/sites/sick-single-lab/capture.json` intentionally contains required
+hardware placeholders and fails closed until its CTI hash, camera serial, model,
+IP, and storage paths are replaced through the reviewed site-configuration
+workflow. See [the SICK integration guide](../docs/sick-gentl-capture.md).
+
+Run the hardware-independent contract tests with:
+
+```powershell
+python -m unittest scripts.test_sick_capture -v
+```
+
 ## BKV offline runtime manifest
 
 The full six-camera `1908500` JPG/NPZ dataset is versioned in the private

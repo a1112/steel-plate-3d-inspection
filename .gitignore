@@ -11,6 +11,8 @@ app/service/build/
 .worktrees/
 *.log
 *.local
+*.local.env
+*.local.json
 __pycache__/
 *.py[cod]
 logFile.ini

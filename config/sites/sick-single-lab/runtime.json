@@ -1,0 +1,48 @@
+{
+  "schema": "steel.runtime-profile.v1",
+  "id": "sick-single-lab",
+  "displayName": "SICK 单相机 GenTL 采集",
+  "provider": "external-api",
+  "dataSource": "online-production",
+  "cameraConnection": "headless-cpp",
+  "cameraCount": 1,
+  "captureProfile": "capture.json",
+  "cameras": [
+    {
+      "id": "C1",
+      "displayOrder": 1,
+      "sourceCameraId": 1,
+      "role": "sick-array-1",
+      "sourceDirectory": ""
+    }
+  ],
+  "storage": {
+    "layoutVersion": 2,
+    "sourceRoot": "",
+    "convertedRoot": "",
+    "catalogPath": "",
+    "cacheRoot": "target/data/sick-single-lab-cache",
+    "converterOrigin": "",
+    "resultRoot": "",
+    "resultCatalogPath": ""
+  },
+  "capture": {
+    "enabled": true,
+    "autostart": false
+  },
+  "algorithm": {
+    "enabled": false,
+    "autoProcessLatest": false,
+    "processor": "",
+    "configPath": "",
+    "outputRoot": "",
+    "timingLog": "processing-times.jsonl",
+    "maxFramesPerCamera": 64
+  },
+  "capabilities": {
+    "directCamera": true,
+    "captureManagement": true,
+    "reconstruction": false,
+    "offlineReplay": true
+  }
+}

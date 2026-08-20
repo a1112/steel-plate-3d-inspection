@@ -140,7 +140,7 @@ if ($TriggerOrigin.Trim().Length -gt 0) {
 
 if ($NoCaptureAutostart) {
   $env:STEEL_CAPTURE_SERVICE_AUTOSTART = "0"
-} elseif ($Provider -eq "headless-cpp") {
+} elseif ($Provider -eq "headless-cpp" -and ($ForceParameters -or -not $env:STEEL_CAPTURE_SERVICE_AUTOSTART)) {
   $env:STEEL_CAPTURE_SERVICE_AUTOSTART = "1"
 }
 $env:STEEL_CAPTURE_RESTART_BUDGET = [string]$CaptureRestartBudget

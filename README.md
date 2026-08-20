@@ -32,6 +32,7 @@ The Qt-to-Tauri capability matrix, production gates, and diagnostic-retirement d
 The production readiness gap assessment, closure design, and Go/No-Go checklist are in [docs/production-readiness-gap-and-closure-design.md](docs/production-readiness-gap-and-closure-design.md).
 The versioned payload, schema ledger, persistent upgrade journal, crash recovery, and fault-injection contract is in [docs/atomic-upgrade-and-database-migration-design.md](docs/atomic-upgrade-and-database-migration-design.md); it remains a P0 No-Go until its target-machine evidence is complete.
 The release, two-stage installation, offline prerequisites, supervisor acceptance, operations, and evidence SOP is in [docs/release-deployment-and-operations.md](docs/release-deployment-and-operations.md).
+The real SICK GenTL bring-up, single-camera sidecar integration, LG_3D-compatible storage contract, and FAT checklist are in [docs/sick-gentl-capture.md](docs/sick-gentl-capture.md).
 
 ## Migration Status
 
@@ -56,7 +57,7 @@ Choose an environment template from [config/env](config/env), or pass values on 
 The active installation is selected by `config/project.json`. Its
 `activeSiteConfig` points to a package under `config/sites/<site-id>`:
 
-- `site.json` identifies the site and fixes its mode (`bkv` or `direct`);
+- `site.json` identifies the site and fixes its mode (`bkv` or `direct-camera`);
 - `runtime.json` defines the provider, camera count and capabilities;
 - `connection.json` contains non-secret connection settings;
 - `capture.json` contains capture-side settings used by direct-camera sites.
