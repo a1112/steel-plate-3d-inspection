@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   export:
@@ -45,7 +45,7 @@ jobs:
           inventory = {
               "schemaVersion": 1,
               "sourceRepository": "a1112/steel-plate-3d-inspection",
-              "sourceCommit": "\${{ github.sha }}",
+              "sourceCommit": "${{ github.sha }}",
               "fileCount": len(files),
               "totalBytes": total,
               "files": files,
@@ -65,3 +65,15 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
+
+      - name: Record export run
+        shell: bash
+        run: |
+          mkdir -p .migration
+          printf '%s\n' "${{ github.run_id }}" > .migration/export-run-id.txt
+          cp sample-data-migration-inventory.json .migration/inventory.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- .migration/export-run-id.txt .migration/inventory.json
+          git commit -m "chore: record sample data export [skip ci]"
+          git push origin HEAD:agent/export-sample-data
