@@ -177,12 +177,13 @@ if ((Get-LowerSha256 $SbomPath) -cne [string]$Sbom.sha256) {
 }
 $Bom = Read-Json $SbomPath 'CycloneDX SBOM'
 Assert-ExactKeys $Bom @('$schema', 'bomFormat', 'specVersion', 'serialNumber', 'version', 'metadata', 'components', 'dependencies') 'CycloneDX SBOM'
+Assert-JsonInteger $Bom.version 'CycloneDX version' 1
 if ($Bom.'$schema' -isnot [string] -or $Bom.bomFormat -isnot [string] -or
     $Bom.specVersion -isnot [string] -or $Bom.serialNumber -isnot [string] -or
     [string]$Bom.'$schema' -cne 'http://cyclonedx.org/schema/bom-1.5.schema.json' -or
     [string]$Bom.bomFormat -cne 'CycloneDX' -or
     [string]$Bom.specVersion -cne '1.5' -or
-    $Bom.version -isnot [int] -or [int]$Bom.version -ne 1 -or
+    [int]$Bom.version -ne 1 -or
     [string]$Bom.serialNumber -notmatch '^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$') {
   throw 'Packaged SBOM does not declare deterministic CycloneDX 1.5.'
 }
