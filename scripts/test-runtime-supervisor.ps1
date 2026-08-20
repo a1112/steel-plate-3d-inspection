@@ -586,6 +586,8 @@ try {
     throw "Supervisor accepted an incomplete runtime layout."
   }
 
+  # The final probe is expected to fail; do not leak its native exit code to callers.
+  $global:LASTEXITCODE = 0
   [ordered]@{
     code = 0
     schema = "steel.runtime-supervisor.test.v1"
