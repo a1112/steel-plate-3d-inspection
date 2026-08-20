@@ -524,7 +524,7 @@ $DatabaseContract = Get-Content -LiteralPath $DatabaseContractSource -Raw -Encod
 $ServiceDatabaseSource = Get-Content -LiteralPath (Join-Path $RepoRoot "app\service\src\db\mod.rs") -Raw -Encoding UTF8
 $ServiceSchemaVersionMatches = [regex]::Matches(
   $ServiceDatabaseSource,
-  '(?m)^pub const DATABASE_SCHEMA_VERSION: i64 = ([1-9][0-9]*);$'
+  '(?m)^pub const DATABASE_SCHEMA_VERSION: i64 = ([1-9][0-9]*);\r?$'
 )
 if ($ServiceSchemaVersionMatches.Count -ne 1 -or
     [long]$DatabaseContract.schemaVersion -ne [long]$ServiceSchemaVersionMatches[0].Groups[1].Value -or

@@ -60,9 +60,7 @@ jobs:
 
       - name: Test and build frontend
         working-directory: app/client
-        run: |
-          npm test -- --run
-          npm run build
+        run: npm test -- --run && npm run build
 
       - name: Test Rust service
         run: cargo test --locked --manifest-path app/service/Cargo.toml
