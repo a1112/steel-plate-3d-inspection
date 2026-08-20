@@ -53,7 +53,13 @@ function Resolve-PackageFile {
 function Read-Json {
   param([string]$Path, [string]$Label)
   try {
-    return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $Text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $ConvertCommand = Get-Command ConvertFrom-Json -ErrorAction Stop
+    $ConvertParameters = @{}
+    if ($ConvertCommand.Parameters.ContainsKey('DateKind')) {
+      $ConvertParameters['DateKind'] = 'String'
+    }
+    return $Text | ConvertFrom-Json @ConvertParameters
   } catch {
     throw "$Label must be valid UTF-8 JSON: $Path"
   }
