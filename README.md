@@ -197,6 +197,22 @@ To start the already-built headless capture, Rust, trigger, and static-client pr
 scripts/start-integrated-capture-management.ps1 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction" -TriggerMode manual -OpenBrowser
 ```
 
+## Versioned sample data
+
+The full BKV `1908500` dataset is stored separately in the private
+[`a1112/sample-data`](https://github.com/a1112/sample-data) repository and is
+pinned by commit. It is not included in normal source clones.
+
+```bash
+python scripts/fetch_sample_data.py
+python scripts/fetch_sample_data.py --check
+scripts/run-bkv-sample-dev.sh
+```
+
+The fetcher uses a sparse Git checkout, reconstructs the versioned artifact,
+validates every source file and SHA-256 digest, and publishes the cache under
+`target/sample-data-cache`. See [docs/sample-data.md](docs/sample-data.md).
+
 ## Verification
 
 Passing the simulated acceptance or the integrated 24/24 matrix alone is not a production release decision. The separate algorithm-qualification, signing, offline-installation, service-lifecycle, disaster-recovery, and site-signoff gates remain mandatory.
