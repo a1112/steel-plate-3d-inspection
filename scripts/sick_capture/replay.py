@@ -48,7 +48,9 @@ class ValidationResult:
 
 def _load_frame(base: Path, index: int) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     depth_path = base / "3d" / f"{index}.npz"
-    intensity_path = base / "2d" / f"{index}.jpg"
+    intensity_path = base / "2d" / f"{index}.png"
+    if not intensity_path.is_file():
+        intensity_path = base / "2d" / f"{index}.jpg"
     metadata_path = base / "json" / f"{index}.json"
     for path in (depth_path, intensity_path, metadata_path):
         if not path.is_file():

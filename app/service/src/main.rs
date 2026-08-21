@@ -2123,10 +2123,10 @@ impl CaptureServiceManager {
         if !self.provider.uses_local_api() {
             return None;
         }
-        self.supervisor_tick();
-        if !self.endpoint_listening() {
-            return None;
-        }
+        // The request itself is the availability check. A separate TCP probe
+        // here doubles every preview connection and can overflow the provider
+        // accept queue when six camera images refresh together. Lifecycle
+        // health remains updated by the dedicated supervisor thread.
         self.request_response_with_read_timeout(method, path_with_query, body, read_timeout)
     }
 
@@ -3188,13 +3188,24 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
                 &inspection.session_id,
             ))
             .map_err(|error| error.to_string())?;
-        let files = state
-            .runtime
-            .block_on(db::capture_files_for_inspection(
-                &state.database.connection,
-                &inspection.id,
-            ))
-            .map_err(|error| error.to_string())?;
+        let files = if state.capture.provider == CaptureProvider::Bkv {
+            state
+                .runtime
+                .block_on(db::capture_files_for_inspection(
+                    &state.database.connection,
+                    &inspection.id,
+                ))
+                .map_err(|error| error.to_string())?
+        } else {
+            state
+                .runtime
+                .block_on(db::recent_preview_capture_files_for_inspection(
+                    &state.database.connection,
+                    &inspection.id,
+                    128,
+                ))
+                .map_err(|error| error.to_string())?
+        };
         let production_defects = state
             .runtime
             .block_on(db::production_defects_for_inspection(
@@ -3223,8 +3234,30 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
                     .ok_or_else(|| "bkv_artifact_unavailable".to_string())?;
                 (Vec::new(), artifacts)
             } else {
+                let mut latest_by_component: HashMap<
+                    (String, String),
+                    &db::entities::capture_file::Model,
+                > = HashMap::new();
+                for file in &files {
+                    let key = (file.camera_id.clone(), file.data_name.to_ascii_lowercase());
+                    let replace = latest_by_component
+                        .get(&key)
+                        .is_none_or(|current| current.sequence_no < file.sequence_no);
+                    if replace {
+                        latest_by_component.insert(key, file);
+                    }
+                }
+                let mut previews = latest_by_component.into_values().collect::<Vec<_>>();
+                previews.sort_by(|left, right| {
+                    left.camera_id
+                        .cmp(&right.camera_id)
+                        .then_with(|| left.data_name.cmp(&right.data_name))
+                });
                 (
-                    files.iter().map(production_capture_image_value).collect(),
+                    previews
+                        .into_iter()
+                        .map(production_capture_image_value)
+                        .collect(),
                     Vec::new(),
                 )
             };
@@ -4871,6 +4904,19 @@ fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
             }),
         );
     }
+    if !state.runtime_config.algorithm.enabled && !state.runtime_config.capabilities.reconstruction
+    {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "readyContribution": true,
+                "status": "capture-only-not-required",
+                "required": false,
+                "reason": Value::Null
+            }),
+        );
+    }
     let (config_ok, config_detail, config) = algorithm_config_health();
     let (paths_ok, paths) = algorithm_runtime_paths_health();
     let acceptance_bundle = configured_algorithm_acceptance_report();
@@ -4942,6 +4988,23 @@ fn production_policy_health_component(state: &ServiceState) -> (bool, Value) {
                 "status": "bkv-compatibility-isolated",
                 "required": false,
                 "syntheticFixturesAllowed": false,
+                "reason": Value::Null
+            }),
+        );
+    }
+    if !state.runtime_config.algorithm.enabled && !state.runtime_config.capabilities.reconstruction
+    {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "readyContribution": true,
+                "status": "capture-only-not-required",
+                "required": false,
+                "runtimeProfile": state.runtime_profile,
+                "algorithmMode": state.algorithm_mode,
+                "syntheticFixturesAllowed": false,
+                "mockDefectCount": state.algorithm_mock_defect_count.parse::<u64>().ok(),
                 "reason": Value::Null
             }),
         );
@@ -6014,6 +6077,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/steel/status"),
     ("GET", "/api/param"),
     ("GET", "/api/capture/latest"),
+    ("GET", "/api/capture/history"),
     ("GET", "/api/capture/continuous-settings"),
     ("GET", "/api/stream/status"),
     ("GET", "/api/calibration/active"),
@@ -10039,11 +10103,17 @@ fn capture_proxy_http_response(
         capture.set_collecting(false);
     }
     if let Some(response) = proxy_response {
+        let cache_headers: &[(&str, &str)] =
+            if method == "GET" && path == "/api/capture/file" && response.status_code == 200 {
+                &[("Cache-Control", "public, max-age=31536000, immutable")]
+            } else {
+                &[("Cache-Control", "no-store")]
+            };
         return http_bytes_response_with_headers(
             &capture_proxy_status(response.status_code),
             &response.content_type,
             &response.body,
-            &[],
+            cache_headers,
         );
     }
     if capture.provider == CaptureProvider::Simulated {
@@ -10329,6 +10399,80 @@ fn provider_code_from_response(provider: &Value, fallback: i32) -> i32 {
         .unwrap_or(fallback)
 }
 
+fn steel_flow_value(flow: &db::entities::steel_flow::Model) -> Value {
+    json!({
+        "flowNo": flow.flow_no,
+        "flowCode": flow.flow_code,
+        "sessionId": flow.session_id,
+        "materialId": flow.material_id,
+        "source": flow.source,
+        "status": flow.status,
+        "imageCount": flow.image_count,
+        "nextImageNo": flow.next_image_no,
+        "storageRoot": flow.storage_root,
+        "startedAt": flow.started_at,
+        "finishedAt": flow.finished_at,
+        "updatedAt": flow.updated_at
+    })
+}
+
+fn latest_steel_flow_response(state: &ServiceState) -> Vec<u8> {
+    let flow = match state
+        .runtime
+        .block_on(db::latest_steel_flow(&state.database.connection))
+    {
+        Ok(flow) => flow,
+        Err(error) => {
+            return production_database_error_response(
+                "load_latest_steel_flow",
+                &error.to_string(),
+            );
+        }
+    };
+    let Some(flow) = flow else {
+        return http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({ "code": 0, "flow": Value::Null, "images": [] }).to_string(),
+        );
+    };
+    let images = match state.runtime.block_on(db::steel_flow_images(
+        &state.database.connection,
+        flow.flow_no,
+    )) {
+        Ok(images) => images,
+        Err(error) => {
+            return production_database_error_response(
+                "load_steel_flow_images",
+                &error.to_string(),
+            );
+        }
+    };
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "flow": steel_flow_value(&flow),
+            "images": images.into_iter().map(|image| json!({
+                "flowNo": image.flow_no,
+                "imageNo": image.image_no,
+                "cameraId": image.camera_id,
+                "cameraIp": image.camera_ip,
+                "cameraSequenceNo": image.camera_sequence_no,
+                "intensityPath": image.intensity_path,
+                "depthPath": image.depth_path,
+                "metadataPath": image.metadata_path,
+                "width": image.width,
+                "height": image.height,
+                "meanIntensity": image.mean_intensity,
+                "capturedAt": image.captured_at
+            })).collect::<Vec<_>>()
+        })
+        .to_string(),
+    )
+}
+
 fn production_status_response(state: &ServiceState) -> Vec<u8> {
     let mut latest_session = match state
         .runtime
@@ -10347,6 +10491,33 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
         Err(error) => {
             return production_database_error_response("load_active_session", &error.to_string());
         }
+    };
+    let latest_flow = match state
+        .runtime
+        .block_on(db::latest_steel_flow(&state.database.connection))
+    {
+        Ok(flow) => flow,
+        Err(error) => {
+            return production_database_error_response(
+                "load_latest_steel_flow",
+                &error.to_string(),
+            );
+        }
+    };
+    let active_flow = match active_session.as_ref() {
+        Some(session) => match state.runtime.block_on(db::find_steel_flow_by_session(
+            &state.database.connection,
+            &session.id,
+        )) {
+            Ok(flow) => flow,
+            Err(error) => {
+                return production_database_error_response(
+                    "load_active_steel_flow",
+                    &error.to_string(),
+                );
+            }
+        },
+        None => None,
     };
     let selected_bkv_inspection = if state.capture.provider == CaptureProvider::Bkv {
         match selected_bkv_inspection_for_view(state) {
@@ -10450,6 +10621,8 @@ fn production_status_response(state: &ServiceState) -> Vec<u8> {
             },
             "latestSession": latest_session_json,
             "activeSession": active_session_json,
+            "latestFlow": latest_flow.as_ref().map(steel_flow_value),
+            "activeFlow": active_flow.as_ref().map(steel_flow_value),
             "admission": runtime_drain_status_json(state),
             "latestInspection": latest_inspection.map(|inspection| {
                 let capture_summary_path = production_session_summary_path(
@@ -10666,6 +10839,7 @@ fn write_production_event_response(
             }
         }
     }
+    let requested_material_id = material_id_from_payload(&payload, "");
     let target = match resolve_production_event_target(
         &payload,
         default_event,
@@ -10677,7 +10851,7 @@ fn write_production_event_response(
         Ok(target) => target,
         Err(conflict) => return production_transition_conflict_response(conflict),
     };
-    let material_id = target.material_id;
+    let mut material_id = target.material_id;
     let session_id = target.session_id;
     let previous_session = latest_open
         .as_ref()
@@ -10801,6 +10975,40 @@ fn write_production_event_response(
         .map(|session| session.started_at.clone())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| now.clone());
+    let mut steel_flow = match default_event {
+        "steel-in" => match state.runtime.block_on(db::start_steel_flow(
+            &state.database.connection,
+            db::SteelFlowInput {
+                session_id: session_id.clone(),
+                material_id: requested_material_id.clone(),
+                source: source.clone(),
+                status: "starting".to_string(),
+                storage_root: storage_root.clone(),
+                started_at: started_at.clone(),
+                raw_payload: payload.to_string(),
+            },
+        )) {
+            Ok(flow) => Some(flow),
+            Err(error) => {
+                return production_database_error_response("start_steel_flow", &error.to_string());
+            }
+        },
+        "steel-out" => match state.runtime.block_on(db::find_steel_flow_by_session(
+            &state.database.connection,
+            &session_id,
+        )) {
+            Ok(flow) => flow,
+            Err(error) => {
+                return production_database_error_response("load_steel_flow", &error.to_string());
+            }
+        },
+        _ => None,
+    };
+    if requested_material_id.is_empty() {
+        if let Some(flow) = steel_flow.as_ref() {
+            material_id = flow.material_id.clone();
+        }
+    }
     let session_input = db::MaterialSessionInput {
         id: session_id.clone(),
         material_id: material_id.clone(),
@@ -10951,6 +11159,10 @@ fn write_production_event_response(
         "intervalMs": value_i32(&payload, &["intervalMs", "interval_ms"], 0).clamp(0, 600_000),
         "algorithmPhase": "pending"
     });
+    if let (Some(object), Some(flow)) = (provider_payload.as_object_mut(), steel_flow.as_ref()) {
+        object.insert("flowNo".to_string(), json!(flow.flow_no));
+        object.insert("flowCode".to_string(), json!(flow.flow_code));
+    }
     if let Some(auto_capture) = payload
         .get("autoCapture")
         .or_else(|| payload.get("auto_capture"))
@@ -11057,6 +11269,27 @@ fn write_production_event_response(
             &error.to_string(),
         );
     }
+    if steel_flow.is_some() {
+        steel_flow = match state.runtime.block_on(db::update_steel_flow_status(
+            &state.database.connection,
+            &session_id,
+            final_session_status,
+            if default_event == "steel-out" && provider_succeeded {
+                &now
+            } else {
+                ""
+            },
+            &payload.to_string(),
+        )) {
+            Ok(flow) => flow,
+            Err(error) => {
+                return production_database_error_response(
+                    "finalize_steel_flow",
+                    &error.to_string(),
+                );
+            }
+        };
+    }
     let _ = state.runtime.block_on(db::append_audit_log(
         &state.database.connection,
         actor,
@@ -11089,6 +11322,8 @@ fn write_production_event_response(
                 "materialId": material_id,
                 "sessionId": session_id,
                 "inspectionId": inspection_id,
+                "flowNo": steel_flow.as_ref().map(|flow| flow.flow_no),
+                "flowCode": steel_flow.as_ref().map(|flow| flow.flow_code.clone()),
                 "triggerEventId": row.id,
                 "mode": mode,
                 "triggerMode": trigger_mode,
@@ -11285,13 +11520,12 @@ fn production_session_summary_path(
     )
 }
 
-fn capture_file_rows_from_result(
-    state: &ServiceState,
+fn capture_file_inputs_from_result(
     inspection_id: &str,
     session_id: &str,
     material_id: &str,
     result: &Value,
-) -> Result<usize, String> {
+) -> Vec<db::CaptureFileInput> {
     let camera_ip = value_string(result, &["ip", "cameraIp", "camera_ip"]);
     let camera_id = value_string(result, &["cameraId", "camera_id"]).if_empty(&camera_ip);
     let sequence_no = value_i32(result, &["attempt", "sequenceNo", "sequence_no"], 0);
@@ -11299,67 +11533,233 @@ fn capture_file_rows_from_result(
     let outputs = [
         (
             "depth",
-            "png",
             value_string(result, &["depthOutput", "output"]),
             value_bool(result, &["depthExists"], true),
         ),
         (
             "intensity",
-            "png",
             value_string(result, &["intensityOutput"]),
             value_bool(result, &["intensityExists"], true),
         ),
         (
             "metadata",
-            "json",
             metadata_path.clone(),
             value_bool(result, &["metadataExists"], true),
         ),
         (
             "sdk-derived",
-            "png",
             value_string(result, &["sdkOutput"]),
             value_bool(result, &["sdkExists"], true),
         ),
         (
             "sdk-derived-depth",
-            "png",
             value_string(result, &["sdkDepthOutput"]),
             value_bool(result, &["sdkDepthExists"], true),
         ),
         (
             "sdk-derived-intensity",
-            "png",
             value_string(result, &["sdkIntensityOutput"]),
             value_bool(result, &["sdkIntensityExists"], true),
         ),
     ];
-    let mut inserted = 0;
-    for (data_name, file_type, path, exists) in outputs {
-        if path.trim().is_empty() || !exists {
-            continue;
-        }
+    outputs
+        .into_iter()
+        .filter_map(|(data_name, path, exists)| {
+            if path.trim().is_empty() || !exists {
+                return None;
+            }
+            let file_type = Path::new(&path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("bin")
+                .to_ascii_lowercase();
+            Some(db::CaptureFileInput {
+                inspection_id: inspection_id.to_string(),
+                session_id: session_id.to_string(),
+                material_id: material_id.to_string(),
+                camera_id: camera_id.clone(),
+                camera_ip: camera_ip.clone(),
+                data_name: data_name.to_string(),
+                sequence_no,
+                file_type,
+                path,
+                metadata_path: metadata_path.clone(),
+            })
+        })
+        .collect()
+}
+
+fn capture_file_rows_from_result(
+    state: &ServiceState,
+    inspection_id: &str,
+    session_id: &str,
+    material_id: &str,
+    result: &Value,
+) -> Result<usize, String> {
+    let inputs = capture_file_inputs_from_result(inspection_id, session_id, material_id, result);
+    let count = inputs.len();
+    for input in inputs {
         state
             .runtime
-            .block_on(db::append_capture_file(
-                &state.database.connection,
-                db::CaptureFileInput {
-                    inspection_id: inspection_id.to_string(),
-                    session_id: session_id.to_string(),
-                    material_id: material_id.to_string(),
-                    camera_id: camera_id.clone(),
-                    camera_ip: camera_ip.clone(),
-                    data_name: data_name.to_string(),
-                    sequence_no,
-                    file_type: file_type.to_string(),
-                    path,
-                    metadata_path: metadata_path.clone(),
-                },
-            ))
+            .block_on(db::append_capture_file(&state.database.connection, input))
             .map_err(|error| error.to_string())?;
-        inserted += 1;
     }
-    Ok(inserted)
+    Ok(count)
+}
+
+fn write_capture_commit_response(state: &ServiceState, body: &str) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "code": 400, "error": error.to_string() }).to_string(),
+            );
+        }
+    };
+    let session_id = value_string(&payload, &["sessionId", "session_id"]);
+    if session_id.is_empty() {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "code": 400, "error": "session_id_required" }).to_string(),
+        );
+    }
+    let flow = match state.runtime.block_on(db::find_steel_flow_by_session(
+        &state.database.connection,
+        &session_id,
+    )) {
+        Ok(Some(flow)) => flow,
+        Ok(None) => {
+            return http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 409,
+                    "error": "steel_flow_not_found",
+                    "sessionId": session_id
+                })
+                .to_string(),
+            );
+        }
+        Err(error) => {
+            return production_database_error_response(
+                "load_capture_steel_flow",
+                &error.to_string(),
+            );
+        }
+    };
+    let inspection_id = value_string(&payload, &["inspectionId", "inspection_id"])
+        .if_empty(&format!("INSP-{session_id}"));
+    let Some(results) = payload.get("results").and_then(Value::as_array) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({ "code": 400, "error": "capture_results_required" }).to_string(),
+        );
+    };
+
+    let mut image_inputs = Vec::new();
+    let mut capture_file_inputs = Vec::new();
+    for result in results {
+        if provider_code_from_response(result, 500) != 0
+            || !value_bool(result, &["completeFrame"], false)
+            || value_bool(result, &["discarded"], false)
+        {
+            continue;
+        }
+        let camera_ip = value_string(result, &["ip", "cameraIp", "camera_ip"]);
+        let camera_id = value_string(result, &["cameraId", "camera_id"]).if_empty(&camera_ip);
+        let camera_sequence_no = i64::from(value_i32(
+            result,
+            &["attempt", "sequenceNo", "sequence_no"],
+            0,
+        ));
+        if camera_id.is_empty() || camera_sequence_no <= 0 {
+            continue;
+        }
+        image_inputs.push(db::SteelFlowImageInput {
+            inspection_id: inspection_id.clone(),
+            session_id: session_id.clone(),
+            material_id: flow.material_id.clone(),
+            camera_id: camera_id.clone(),
+            camera_ip,
+            camera_sequence_no,
+            depth_path: value_string(result, &["depthOutput", "output"]),
+            intensity_path: value_string(result, &["intensityOutput"]),
+            metadata_path: value_string(
+                result,
+                &["metadataOutput", "metadata_path", "metadataPath"],
+            ),
+            width: value_i32(result, &["width"], 0),
+            height: value_i32(result, &["lines", "height"], 0),
+            mean_intensity: value_f64_or(result, &["meanIntensity"], 0.0),
+            captured_at: value_string(result, &["capturedAt", "captured_at"]),
+        });
+        capture_file_inputs.extend(capture_file_inputs_from_result(
+            &inspection_id,
+            &session_id,
+            &flow.material_id,
+            result,
+        ));
+    }
+    let appended_images = match state.runtime.block_on(db::append_steel_flow_images(
+        &state.database.connection,
+        image_inputs,
+    )) {
+        Ok(images) => images,
+        Err(error) => {
+            return production_database_error_response(
+                "append_steel_flow_images",
+                &error.to_string(),
+            );
+        }
+    };
+    let capture_file_rows = match state.runtime.block_on(db::append_capture_files(
+        &state.database.connection,
+        capture_file_inputs,
+    )) {
+        Ok(count) => count,
+        Err(error) => {
+            return production_database_error_response("append_capture_files", &error.to_string());
+        }
+    };
+    let images = appended_images
+        .into_iter()
+        .map(|appended| {
+            json!({
+                "flowNo": appended.image.flow_no,
+                "imageNo": appended.image.image_no,
+                "cameraId": appended.image.camera_id,
+                "cameraSequenceNo": appended.image.camera_sequence_no,
+                "inserted": appended.inserted
+            })
+        })
+        .collect::<Vec<_>>();
+    let current_flow = state
+        .runtime
+        .block_on(db::find_steel_flow_by_session(
+            &state.database.connection,
+            &session_id,
+        ))
+        .ok()
+        .flatten()
+        .unwrap_or(flow);
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "flowNo": current_flow.flow_no,
+            "flowCode": current_flow.flow_code,
+            "sessionId": session_id,
+            "imageCount": current_flow.image_count,
+            "captureFileRows": capture_file_rows,
+            "images": images
+        })
+        .to_string(),
+    )
 }
 
 fn write_final_production_summary_file(
@@ -15151,7 +15551,9 @@ fn bkv_online_unified_status_value(state: &ServiceState) -> Result<Value, String
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let daily_records = store.daily_summaries(31).map_err(|error| error.to_string())?;
+    let daily_records = store
+        .daily_summaries(31)
+        .map_err(|error| error.to_string())?;
     let mut days = daily_records
         .into_iter()
         .map(|day| {
@@ -15866,8 +16268,53 @@ fn numeric_camera_id(value: &str) -> Option<u32> {
         .filter(|camera_id| *camera_id > 0)
 }
 
-fn online_capture_path(
+fn online_capture_allowed_roots(
+    state: &ServiceState,
     inspection: &db::entities::production_inspection::Model,
+) -> Result<Vec<PathBuf>, String> {
+    if inspection.storage_root.trim().is_empty() {
+        return Err(format!(
+            "online inspection {} has no storage root",
+            inspection.id
+        ));
+    }
+    let inspection_root = fs::canonicalize(&inspection.storage_root).map_err(|error| {
+        format!(
+            "online inspection {} storage root {} is unavailable: {error}",
+            inspection.id, inspection.storage_root
+        )
+    })?;
+    let mut roots = vec![inspection_root];
+    let response = bounded_health_http_get(
+        &state.capture.origin,
+        "/api/storage/status",
+        Duration::from_millis(800),
+    );
+    if let Ok(response) = response {
+        if response.status_code == 200 {
+            if let Ok(payload) = serde_json::from_slice::<Value>(&response.body) {
+                if let Some(camera_roots) = payload.get("cameraRoots").and_then(Value::as_array) {
+                    for camera_root in camera_roots {
+                        let Some(value) = camera_root.get("root").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let Ok(root) = fs::canonicalize(value) else {
+                            continue;
+                        };
+                        if root.is_dir() && !roots.contains(&root) {
+                            roots.push(root);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(roots)
+}
+
+fn online_capture_path_with_roots(
+    inspection: &db::entities::production_inspection::Model,
+    allowed_roots: &[PathBuf],
     value: &str,
 ) -> Result<PathBuf, String> {
     if inspection.storage_root.trim().is_empty() {
@@ -15890,11 +16337,19 @@ fn online_capture_path(
     };
     let canonical = fs::canonicalize(&candidate)
         .map_err(|error| format!("{}: {error}", candidate.display()))?;
-    if !canonical.starts_with(&root) {
+    if !allowed_roots
+        .iter()
+        .any(|allowed_root| canonical.starts_with(allowed_root))
+    {
+        let allowed = allowed_roots
+            .iter()
+            .map(|allowed_root| allowed_root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(format!(
-            "capture path {} is outside inspection storage root {}",
+            "capture path {} is outside allowed capture roots [{}]",
             canonical.display(),
-            root.display()
+            allowed
         ));
     }
     if !canonical.is_file() {
@@ -15904,6 +16359,19 @@ fn online_capture_path(
         ));
     }
     Ok(canonical)
+}
+
+fn online_capture_path(
+    inspection: &db::entities::production_inspection::Model,
+    value: &str,
+) -> Result<PathBuf, String> {
+    let root = fs::canonicalize(&inspection.storage_root).map_err(|error| {
+        format!(
+            "online inspection {} storage root {} is unavailable: {error}",
+            inspection.id, inspection.storage_root
+        )
+    })?;
+    online_capture_path_with_roots(inspection, &[root], value)
 }
 
 fn image_dimensions_with_guessed_format(path: &Path) -> Result<(u32, u32), String> {
@@ -15983,6 +16451,7 @@ fn load_online_inspection_world(
             record_id,
         ))
         .map_err(|error| error.to_string())?;
+    let allowed_capture_roots = online_capture_allowed_roots(state, &inspection)?;
     let mut grouped: HashMap<u32, Vec<db::entities::capture_file::Model>> = HashMap::new();
     for capture in captures {
         if !capture.data_name.eq_ignore_ascii_case("intensity") {
@@ -16017,7 +16486,8 @@ fn load_online_inspection_world(
             })?;
             let image_index = u32::try_from(ordinal)
                 .map_err(|_| format!("camera {camera_id} has too many frames"))?;
-            let path = online_capture_path(&inspection, &row.path)?;
+            let path =
+                online_capture_path_with_roots(&inspection, &allowed_capture_roots, &row.path)?;
             let current = image_dimensions_with_guessed_format(&path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             dimensions = Some(match dimensions {
@@ -22886,6 +23356,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             ProductionAlarmAction::Resolve,
         ),
         ("GET", "/api/production/status") => production_status_response(&state),
+        ("GET", "/api/production/flows/latest") => latest_steel_flow_response(&state),
         ("POST", "/api/production/tasks") => {
             production_tasks::enqueue_response(&state, body, actor)
         }
@@ -22922,6 +23393,9 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("POST", "/api/production/capture-summary") => {
             write_capture_summary_response(&state, body, actor)
+        }
+        ("POST", "/internal/v1/capture-commit") => {
+            write_capture_commit_response(&state, body)
         }
         ("POST", "/api/production/capture-once") => {
             write_production_capture_once_response(&state, body, actor)
@@ -25312,6 +25786,26 @@ mod tests {
     }
 
     #[test]
+    fn capture_only_runtime_does_not_require_algorithm_qualification() {
+        let mut state =
+            production_test_state_with_provider(CaptureProvider::ExternalApi, "http://127.0.0.1:0");
+        let mut profile = runtime_profile::RuntimeProfile::test_profile("external-api", 6);
+        profile.algorithm.enabled = false;
+        profile.capabilities.reconstruction = false;
+        state.runtime_config = Arc::new(profile);
+
+        let (algorithm_ready, algorithm) = algorithm_health_component(&state);
+        let (policy_ready, policy) = production_policy_health_component(&state);
+
+        assert!(algorithm_ready);
+        assert_eq!(algorithm["required"], json!(false));
+        assert_eq!(algorithm["status"], json!("capture-only-not-required"));
+        assert!(policy_ready);
+        assert_eq!(policy["required"], json!(false));
+        assert_eq!(policy["status"], json!("capture-only-not-required"));
+    }
+
+    #[test]
     fn trigger_health_timeout_is_bounded_and_required_trigger_gates_service_readiness() {
         let body = json!({
             "code": 0,
@@ -26705,6 +27199,7 @@ mod tests {
     fn latest_capture_metadata_is_read_through_the_rust_proxy() {
         assert!(is_capture_json_proxy_route("GET", "/api/capture/logs"));
         assert!(is_capture_json_proxy_route("GET", "/api/capture/latest"));
+        assert!(is_capture_json_proxy_route("GET", "/api/capture/history"));
         assert!(!is_capture_json_proxy_route("POST", "/api/capture/latest"));
         assert!(!is_capture_json_proxy_route("GET", "/api/capture/file"));
         assert!(is_capture_json_proxy_route("POST", "/api/stream/start"));
@@ -30871,7 +31366,54 @@ mod tests {
         let error = online_capture_path(&inspection, "../outside.png")
             .expect_err("path traversal must be rejected");
 
-        assert!(error.contains("outside inspection storage root"));
+        assert!(error.contains("outside allowed capture roots"));
         fs::remove_dir_all(base).expect("remove online path fixture");
+    }
+
+    #[test]
+    fn online_capture_path_accepts_a_provider_camera_root() {
+        let base = std::env::temp_dir().join(format!(
+            "steel-online-world-multi-root-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let inspection_root = base.join("inspection");
+        let camera_root = base.join("camera-2");
+        fs::create_dir_all(&inspection_root).expect("inspection root");
+        fs::create_dir_all(&camera_root).expect("camera root");
+        let image_path = camera_root.join("0.png");
+        image::RgbImage::new(1, 1)
+            .save(&image_path)
+            .expect("camera image fixture");
+        let inspection = db::entities::production_inspection::Model {
+            id: "INSP-MULTI-ROOT".to_string(),
+            material_id: "MAT-MULTI-ROOT".to_string(),
+            session_id: "SESSION-MULTI-ROOT".to_string(),
+            status: "running".to_string(),
+            storage_root: inspection_root.display().to_string(),
+            summary_path: String::new(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            capture_count: 1,
+            defect_count: 0,
+            raw_payload: "{}".to_string(),
+        };
+        let roots = vec![
+            fs::canonicalize(&inspection_root).expect("canonical inspection root"),
+            fs::canonicalize(&camera_root).expect("canonical camera root"),
+        ];
+
+        let resolved = online_capture_path_with_roots(
+            &inspection,
+            &roots,
+            image_path.to_str().expect("camera image path"),
+        )
+        .expect("provider camera root should be accepted");
+
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&image_path).expect("canonical image")
+        );
+        fs::remove_dir_all(base).expect("remove multi-root fixture");
     }
 }

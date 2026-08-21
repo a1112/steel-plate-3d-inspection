@@ -326,6 +326,84 @@ describe('persistent production command client', () => {
     ))).toBe(true);
   });
 
+  it('uses the external provider camera topology when admin config is unavailable', async () => {
+    const providerCameras = [
+      {
+        cameraIndex: 1,
+        cameraId: 'C1',
+        ip: '192.168.101.144',
+        model: 'RulerX',
+        sn: '25440062',
+        role: 'top',
+        storageRoot: 'D:\\steel-sick-data\\C1',
+        driverId: 'sick-gentl-harvesters',
+        connected: true,
+      },
+      {
+        cameraIndex: 2,
+        cameraId: 'C2',
+        ip: '192.168.102.206',
+        model: 'RulerX',
+        sn: '25440063',
+        role: 'side',
+        storageRoot: 'D:\\steel-sick-data\\C2',
+        driverId: 'sick-gentl-harvesters',
+        connected: true,
+      },
+    ];
+    const statuses = providerCameras.map((camera) => ({
+      ...camera,
+      deviceId: camera.cameraIndex,
+      connected: true,
+      acquisitionState: 'acquiring',
+      continuousAcquiring: true,
+      continuousFps: 7.2,
+      continuousFrameCount: 25,
+    }));
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith('/api/config')) return Promise.resolve(jsonResponse({ error: 'admin token required' }, 401));
+      if (url.endsWith('/api/capture/health')) {
+        return Promise.resolve(jsonResponse({
+          service: 'steel_sick_capture_sidecar',
+          time: '2026-08-21T00:00:00Z',
+          provider: 'external-api',
+          sdkReady: true,
+          sdkCode: 0,
+          connected: true,
+          ip: providerCameras[0].ip,
+          cameraCount: 2,
+          driverId: 'sick-gentl-harvesters',
+        }));
+      }
+      if (url.endsWith('/api/cameras')) return Promise.resolve(jsonResponse({ cameras: providerCameras }));
+      if (url.endsWith('/api/camera/status')) return Promise.resolve(jsonResponse(statuses[0]));
+      if (url.endsWith('/api/camera/statuses')) return Promise.resolve(jsonResponse({ statuses }));
+      if (url.endsWith('/api/capture/logs')) return Promise.resolve(jsonResponse({ events: [] }));
+      return Promise.resolve(jsonResponse({ error: 'unexpected route' }, 404));
+    }));
+
+    const snapshot = await readCaptureSnapshot();
+
+    expect(snapshot.config.cameras).toHaveLength(2);
+    expect(snapshot.config.cameras.map((camera) => camera.ip)).toEqual(
+      providerCameras.map((camera) => camera.ip),
+    );
+    expect(snapshot.config.cameras[0]).toMatchObject({
+      id: 'C1',
+      name: 'C1',
+      role: 'top',
+      outputPath: 'D:\\steel-sick-data\\C1',
+    });
+    expect(snapshot.statuses).toHaveLength(2);
+    expect(snapshot.statuses[0]).toMatchObject({
+      name: 'C1',
+      connected: true,
+      acquisitionState: 'acquiring',
+      continuousAcquiring: true,
+    });
+  });
+
   it('types BKV capture evidence without exposing local paths', () => {
     const result: BkvProductionCommandResult = {
       code: 0,

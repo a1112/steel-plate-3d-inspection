@@ -30,8 +30,8 @@ def _json_scalar(value: Any) -> Any:
 
 def _text(value: Any) -> str:
     if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value or "")
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value or "").strip()
 
 
 def _node_value(node_map: Any, name: str, fallback: Any = None) -> Any:
@@ -57,7 +57,11 @@ def node_snapshot(node_map: Any) -> dict[str, Any]:
     for name in dir(node_map):
         try:
             value = _json_scalar(getattr(node_map, name).value)
-        except (AttributeError, RuntimeError, ValueError, TypeError):
+        # GenTL producers may expose implemented nodes that are not readable in
+        # the camera's current feature state.  Vendor AccessException classes
+        # are not consistently derived from RuntimeError, so an optional
+        # diagnostic snapshot must skip any ordinary node-read exception.
+        except Exception:
             continue
         if isinstance(value, (str, int, float, bool)) or value is None:
             result[name] = value

@@ -9,6 +9,7 @@ use sea_orm::{
     QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde_json::{self, json, Value};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -19,11 +20,11 @@ use entities::{
     admin_role, admin_user, app_config, audit_log, calibration_operation, camera_config,
     capture_file, config_revision, defect, defect_type, inspection_record, material_session,
     production_alarm, production_defect, production_inspection, production_task, record_cleanup,
-    secondary_data, steel_plate, trigger_event,
+    secondary_data, steel_flow, steel_flow_image, steel_plate, trigger_event,
 };
 
 pub const DEVELOPMENT_DEFAULT_ADMIN_PASSWORD: &str = "admin123";
-pub const DATABASE_SCHEMA_VERSION: i64 = 1;
+pub const DATABASE_SCHEMA_VERSION: i64 = 2;
 pub const NON_PRODUCTION_DATABASE_ENGINES: [&str; 3] = ["sqlite", "mysql", "postgres"];
 pub const PRODUCTION_DATABASE_ENGINES: [&str; 2] = ["sqlite", "mysql"];
 
@@ -296,7 +297,10 @@ mod security_tests {
             assert!(dirty_error.to_string().contains("dirty or has an active migration"));
             execute(
                 &fresh,
-                "UPDATE steel_schema_state SET current_version = 2, dirty = 0, active_migration_id = '' WHERE singleton_id = 1",
+                &format!(
+                    "UPDATE steel_schema_state SET current_version = {}, dirty = 0, active_migration_id = '' WHERE singleton_id = 1",
+                    DATABASE_SCHEMA_VERSION + 1
+                ),
             )
             .await
             .expect("mark schema unreadable");
@@ -558,6 +562,40 @@ pub struct CaptureFileInput {
     pub file_type: String,
     pub path: String,
     pub metadata_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SteelFlowInput {
+    pub session_id: String,
+    pub material_id: String,
+    pub source: String,
+    pub status: String,
+    pub storage_root: String,
+    pub started_at: String,
+    pub raw_payload: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SteelFlowImageInput {
+    pub inspection_id: String,
+    pub session_id: String,
+    pub material_id: String,
+    pub camera_id: String,
+    pub camera_ip: String,
+    pub camera_sequence_no: i64,
+    pub depth_path: String,
+    pub intensity_path: String,
+    pub metadata_path: String,
+    pub width: i32,
+    pub height: i32,
+    pub mean_intensity: f64,
+    pub captured_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SteelFlowImageAppend {
+    pub image: steel_flow_image::Model,
+    pub inserted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3094,6 +3132,337 @@ pub async fn append_capture_file(
     .await
 }
 
+pub async fn append_capture_files(
+    connection: &DatabaseConnection,
+    inputs: Vec<CaptureFileInput>,
+) -> Result<usize, DbErr> {
+    let Some(first) = inputs.first() else {
+        return Ok(0);
+    };
+    let inspection_id = first.inspection_id.clone();
+    if inputs
+        .iter()
+        .any(|input| input.inspection_id != inspection_id)
+    {
+        return Err(DbErr::Custom(
+            "capture file batch must use one inspection_id".to_string(),
+        ));
+    }
+    let transaction = connection.begin().await?;
+    let existing = capture_file::Entity::find()
+        .filter(capture_file::Column::InspectionId.eq(&inspection_id))
+        .all(&transaction)
+        .await?;
+    let mut keys = existing
+        .into_iter()
+        .map(|row| (row.camera_id, row.sequence_no, row.data_name))
+        .collect::<HashSet<_>>();
+    let mut active_models = Vec::new();
+    for (position, input) in inputs.into_iter().enumerate() {
+        let key = (
+            input.camera_id.clone(),
+            input.sequence_no,
+            input.data_name.clone(),
+        );
+        if !keys.insert(key) {
+            continue;
+        }
+        active_models.push(capture_file::ActiveModel {
+            id: Set(format!("CAP-{}-{position}", now_nanos_string())),
+            inspection_id: Set(input.inspection_id),
+            session_id: Set(input.session_id),
+            material_id: Set(input.material_id),
+            camera_id: Set(input.camera_id),
+            camera_ip: Set(input.camera_ip),
+            data_name: Set(input.data_name),
+            sequence_no: Set(input.sequence_no),
+            file_type: Set(input.file_type),
+            path: Set(input.path),
+            metadata_path: Set(input.metadata_path),
+            created_at: Set(now_millis_string()),
+        });
+    }
+    let inserted = active_models.len();
+    if !active_models.is_empty() {
+        capture_file::Entity::insert_many(active_models)
+            .exec(&transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(inserted)
+}
+
+pub async fn start_steel_flow(
+    connection: &DatabaseConnection,
+    input: SteelFlowInput,
+) -> Result<steel_flow::Model, DbErr> {
+    let now = now_millis_string();
+    if let Some(model) = steel_flow::Entity::find()
+        .filter(steel_flow::Column::SessionId.eq(&input.session_id))
+        .one(connection)
+        .await?
+    {
+        let mut active: steel_flow::ActiveModel = model.into();
+        if !input.material_id.trim().is_empty() {
+            active.material_id = Set(input.material_id);
+        }
+        active.source = Set(input.source);
+        active.status = Set(input.status);
+        if !input.storage_root.trim().is_empty() {
+            active.storage_root = Set(input.storage_root);
+        }
+        active.updated_at = Set(now);
+        active.raw_payload = Set(input.raw_payload);
+        return active.update(connection).await;
+    }
+
+    let started_at = if input.started_at.trim().is_empty() {
+        now.clone()
+    } else {
+        input.started_at
+    };
+    let inserted = steel_flow::ActiveModel {
+        flow_no: sea_orm::ActiveValue::NotSet,
+        flow_code: Set(String::new()),
+        session_id: Set(input.session_id),
+        material_id: Set(input.material_id.clone()),
+        source: Set(input.source),
+        status: Set(input.status),
+        next_image_no: Set(1),
+        image_count: Set(0),
+        storage_root: Set(input.storage_root),
+        started_at: Set(started_at),
+        finished_at: Set(String::new()),
+        updated_at: Set(now.clone()),
+        raw_payload: Set(input.raw_payload),
+    }
+    .insert(connection)
+    .await?;
+    let flow_code = format!("FLOW-{:010}", inserted.flow_no);
+    let mut active: steel_flow::ActiveModel = inserted.into();
+    active.flow_code = Set(flow_code.clone());
+    if input.material_id.trim().is_empty() {
+        active.material_id = Set(flow_code);
+    }
+    active.updated_at = Set(now);
+    active.update(connection).await
+}
+
+pub async fn update_steel_flow_status(
+    connection: &DatabaseConnection,
+    session_id: &str,
+    status: &str,
+    finished_at: &str,
+    raw_payload: &str,
+) -> Result<Option<steel_flow::Model>, DbErr> {
+    let Some(model) = steel_flow::Entity::find()
+        .filter(steel_flow::Column::SessionId.eq(session_id))
+        .one(connection)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut active: steel_flow::ActiveModel = model.into();
+    active.status = Set(status.to_string());
+    active.finished_at = Set(finished_at.to_string());
+    active.updated_at = Set(now_millis_string());
+    active.raw_payload = Set(raw_payload.to_string());
+    active.update(connection).await.map(Some)
+}
+
+pub async fn find_steel_flow_by_session(
+    connection: &DatabaseConnection,
+    session_id: &str,
+) -> Result<Option<steel_flow::Model>, DbErr> {
+    steel_flow::Entity::find()
+        .filter(steel_flow::Column::SessionId.eq(session_id))
+        .one(connection)
+        .await
+}
+
+pub async fn latest_steel_flow(
+    connection: &DatabaseConnection,
+) -> Result<Option<steel_flow::Model>, DbErr> {
+    steel_flow::Entity::find()
+        .order_by_desc(steel_flow::Column::FlowNo)
+        .one(connection)
+        .await
+}
+
+pub async fn append_steel_flow_image(
+    connection: &DatabaseConnection,
+    input: SteelFlowImageInput,
+) -> Result<SteelFlowImageAppend, DbErr> {
+    let transaction = connection.begin().await?;
+    if let Some(image) = steel_flow_image::Entity::find()
+        .filter(steel_flow_image::Column::SessionId.eq(&input.session_id))
+        .filter(steel_flow_image::Column::CameraId.eq(&input.camera_id))
+        .filter(steel_flow_image::Column::CameraSequenceNo.eq(input.camera_sequence_no))
+        .one(&transaction)
+        .await?
+    {
+        transaction.commit().await?;
+        return Ok(SteelFlowImageAppend {
+            image,
+            inserted: false,
+        });
+    }
+
+    let flow_query =
+        steel_flow::Entity::find().filter(steel_flow::Column::SessionId.eq(&input.session_id));
+    let flow = if connection.get_database_backend() == DbBackend::Sqlite {
+        flow_query.one(&transaction).await?
+    } else {
+        flow_query.lock_exclusive().one(&transaction).await?
+    }
+    .ok_or_else(|| {
+        DbErr::Custom(format!(
+            "steel flow is missing for capture session {}",
+            input.session_id
+        ))
+    })?;
+    let image_no = flow.next_image_no.max(1);
+    let now = now_millis_string();
+    let image = steel_flow_image::ActiveModel {
+        flow_no: Set(flow.flow_no),
+        image_no: Set(image_no),
+        inspection_id: Set(input.inspection_id),
+        session_id: Set(input.session_id),
+        material_id: Set(input.material_id),
+        camera_id: Set(input.camera_id),
+        camera_ip: Set(input.camera_ip),
+        camera_sequence_no: Set(input.camera_sequence_no),
+        depth_path: Set(input.depth_path),
+        intensity_path: Set(input.intensity_path),
+        metadata_path: Set(input.metadata_path),
+        width: Set(input.width),
+        height: Set(input.height),
+        mean_intensity: Set(input.mean_intensity),
+        captured_at: Set(if input.captured_at.trim().is_empty() {
+            now.clone()
+        } else {
+            input.captured_at
+        }),
+        created_at: Set(now.clone()),
+    }
+    .insert(&transaction)
+    .await?;
+    let mut active_flow: steel_flow::ActiveModel = flow.into();
+    active_flow.next_image_no = Set(image_no + 1);
+    active_flow.image_count = Set(image_no);
+    active_flow.updated_at = Set(now);
+    active_flow.update(&transaction).await?;
+    transaction.commit().await?;
+    Ok(SteelFlowImageAppend {
+        image,
+        inserted: true,
+    })
+}
+
+pub async fn append_steel_flow_images(
+    connection: &DatabaseConnection,
+    inputs: Vec<SteelFlowImageInput>,
+) -> Result<Vec<SteelFlowImageAppend>, DbErr> {
+    let Some(first) = inputs.first() else {
+        return Ok(Vec::new());
+    };
+    let session_id = first.session_id.clone();
+    if inputs.iter().any(|input| input.session_id != session_id) {
+        return Err(DbErr::Custom(
+            "steel flow image batch must use one session_id".to_string(),
+        ));
+    }
+
+    let transaction = connection.begin().await?;
+    let flow_query =
+        steel_flow::Entity::find().filter(steel_flow::Column::SessionId.eq(&session_id));
+    let flow = if connection.get_database_backend() == DbBackend::Sqlite {
+        flow_query.one(&transaction).await?
+    } else {
+        flow_query.lock_exclusive().one(&transaction).await?
+    }
+    .ok_or_else(|| {
+        DbErr::Custom(format!(
+            "steel flow is missing for capture session {session_id}"
+        ))
+    })?;
+    let existing = steel_flow_image::Entity::find()
+        .filter(steel_flow_image::Column::SessionId.eq(&session_id))
+        .all(&transaction)
+        .await?;
+    let mut by_source = existing
+        .into_iter()
+        .map(|image| ((image.camera_id.clone(), image.camera_sequence_no), image))
+        .collect::<HashMap<_, _>>();
+    let mut next_image_no = flow.next_image_no.max(1);
+    let mut active_models = Vec::new();
+    let mut appended = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let key = (input.camera_id.clone(), input.camera_sequence_no);
+        if let Some(image) = by_source.get(&key) {
+            appended.push(SteelFlowImageAppend {
+                image: image.clone(),
+                inserted: false,
+            });
+            continue;
+        }
+        let now = now_millis_string();
+        let image = steel_flow_image::Model {
+            flow_no: flow.flow_no,
+            image_no: next_image_no,
+            inspection_id: input.inspection_id,
+            session_id: input.session_id,
+            material_id: input.material_id,
+            camera_id: input.camera_id,
+            camera_ip: input.camera_ip,
+            camera_sequence_no: input.camera_sequence_no,
+            depth_path: input.depth_path,
+            intensity_path: input.intensity_path,
+            metadata_path: input.metadata_path,
+            width: input.width,
+            height: input.height,
+            mean_intensity: input.mean_intensity,
+            captured_at: if input.captured_at.trim().is_empty() {
+                now.clone()
+            } else {
+                input.captured_at
+            },
+            created_at: now,
+        };
+        active_models.push(steel_flow_image::ActiveModel::from(image.clone()));
+        by_source.insert(key, image.clone());
+        appended.push(SteelFlowImageAppend {
+            image,
+            inserted: true,
+        });
+        next_image_no += 1;
+    }
+    if !active_models.is_empty() {
+        steel_flow_image::Entity::insert_many(active_models)
+            .exec(&transaction)
+            .await?;
+        let now = now_millis_string();
+        let mut active_flow: steel_flow::ActiveModel = flow.into();
+        active_flow.next_image_no = Set(next_image_no);
+        active_flow.image_count = Set(next_image_no - 1);
+        active_flow.updated_at = Set(now);
+        active_flow.update(&transaction).await?;
+    }
+    transaction.commit().await?;
+    Ok(appended)
+}
+
+pub async fn steel_flow_images(
+    connection: &DatabaseConnection,
+    flow_no: i64,
+) -> Result<Vec<steel_flow_image::Model>, DbErr> {
+    steel_flow_image::Entity::find()
+        .filter(steel_flow_image::Column::FlowNo.eq(flow_no))
+        .order_by_asc(steel_flow_image::Column::ImageNo)
+        .all(connection)
+        .await
+}
+
 pub async fn capture_files_for_inspection(
     connection: &DatabaseConnection,
     inspection_id: &str,
@@ -3103,6 +3472,22 @@ pub async fn capture_files_for_inspection(
         .order_by_asc(capture_file::Column::CameraId)
         .order_by_asc(capture_file::Column::SequenceNo)
         .order_by_asc(capture_file::Column::DataName)
+        .all(connection)
+        .await
+}
+
+pub async fn recent_preview_capture_files_for_inspection(
+    connection: &DatabaseConnection,
+    inspection_id: &str,
+    limit: u64,
+) -> Result<Vec<capture_file::Model>, DbErr> {
+    capture_file::Entity::find()
+        .filter(capture_file::Column::InspectionId.eq(inspection_id))
+        .filter(capture_file::Column::DataName.is_in(["intensity", "depth"]))
+        .order_by_desc(capture_file::Column::SequenceNo)
+        .order_by_asc(capture_file::Column::CameraId)
+        .order_by_asc(capture_file::Column::DataName)
+        .limit(limit.clamp(12, 256))
         .all(connection)
         .await
 }
@@ -4414,7 +4799,7 @@ async fn create_schema_ledger(connection: &DatabaseConnection) -> Result<(), DbE
     .await
 }
 
-async fn validate_schema_ledger(connection: &DatabaseConnection) -> Result<i64, DbErr> {
+async fn read_schema_ledger_version(connection: &DatabaseConnection) -> Result<i64, DbErr> {
     let count_sql = match connection.get_database_backend() {
         DbBackend::MySql => "SELECT CAST(COUNT(*) AS SIGNED) AS row_count FROM steel_schema_state",
         _ => "SELECT COUNT(*) AS row_count FROM steel_schema_state",
@@ -4462,6 +4847,11 @@ async fn validate_schema_ledger(connection: &DatabaseConnection) -> Result<i64, 
                 .to_string(),
         ));
     }
+    Ok(current_version)
+}
+
+async fn validate_schema_ledger(connection: &DatabaseConnection) -> Result<i64, DbErr> {
+    let current_version = read_schema_ledger_version(connection).await?;
     if current_version != DATABASE_SCHEMA_VERSION {
         return Err(DbErr::Custom(format!(
             "database schema version {current_version} is outside this service's readable range {}..={}",
@@ -4471,6 +4861,48 @@ async fn validate_schema_ledger(connection: &DatabaseConnection) -> Result<i64, 
     Ok(current_version)
 }
 
+async fn migrate_schema_v1_to_v2(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    let migration_id = "v1-to-v2-steel-flow-image-ledger";
+    let started_at = now_millis_string();
+    let engine = match connection.get_database_backend() {
+        DbBackend::Sqlite => "sqlite",
+        DbBackend::MySql => "mysql",
+        DbBackend::Postgres => "postgres",
+    };
+    execute(
+        connection,
+        &format!(
+            "INSERT INTO steel_schema_migration \
+             (migration_id, from_version, to_version, engine, checksum, release_version, release_commit, transaction_id, state, started_at, applied_at, error) \
+             VALUES ('{migration_id}', 1, 2, '{engine}', 'steel-flow-image-ledger-v2', '', '', '{migration_id}', 'applying', '{started_at}', '', '')"
+        ),
+    )
+    .await?;
+    execute(
+        connection,
+        &format!(
+            "UPDATE steel_schema_state SET dirty = 1, active_migration_id = '{migration_id}', updated_at = '{started_at}' WHERE singleton_id = 1"
+        ),
+    )
+    .await?;
+    create_steel_flow_schema(connection).await?;
+    let applied_at = now_millis_string();
+    execute(
+        connection,
+        &format!(
+            "UPDATE steel_schema_migration SET state = 'applied', applied_at = '{applied_at}' WHERE migration_id = '{migration_id}'"
+        ),
+    )
+    .await?;
+    execute(
+        connection,
+        &format!(
+            "UPDATE steel_schema_state SET current_version = 2, dirty = 0, active_migration_id = '', updated_at = '{applied_at}' WHERE singleton_id = 1"
+        ),
+    )
+    .await
+}
+
 async fn prepare_schema(
     connection: &DatabaseConnection,
     production_policy: bool,
@@ -4478,6 +4910,10 @@ async fn prepare_schema(
     let state_tables = schema_table_count(connection, "steel_schema_state").await?;
     let migration_tables = schema_table_count(connection, "steel_schema_migration").await?;
     if state_tables == 1 && migration_tables == 1 {
+        let current_version = read_schema_ledger_version(connection).await?;
+        if current_version == 1 && DATABASE_SCHEMA_VERSION == 2 {
+            migrate_schema_v1_to_v2(connection).await?;
+        }
         return validate_schema_ledger(connection).await;
     }
     if state_tables != 0 || migration_tables != 0 {
@@ -4730,6 +5166,7 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
         )",
     )
     .await?;
+    create_steel_flow_schema(connection).await?;
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS record_cleanup (
@@ -4894,6 +5331,70 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
         "CREATE INDEX idx_capture_file_frame_data ON capture_file(inspection_id, camera_id, sequence_no, data_name)",
         "CREATE INDEX idx_record_cleanup_record_created ON record_cleanup(record_id, created_at)",
         "CREATE INDEX idx_record_cleanup_status_updated ON record_cleanup(status, updated_at)",
+    ] {
+        execute_compatible_migration(connection, index).await?;
+    }
+    Ok(())
+}
+
+async fn create_steel_flow_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    let flow_no = match connection.get_database_backend() {
+        DbBackend::Sqlite => "INTEGER PRIMARY KEY AUTOINCREMENT",
+        DbBackend::MySql => "BIGINT PRIMARY KEY AUTO_INCREMENT",
+        DbBackend::Postgres => "BIGSERIAL PRIMARY KEY",
+    };
+    execute(
+        connection,
+        &format!(
+            "CREATE TABLE IF NOT EXISTS steel_flow (
+                flow_no {flow_no},
+                flow_code VARCHAR(64) NOT NULL,
+                session_id VARCHAR(128) NOT NULL,
+                material_id VARCHAR(128) NOT NULL,
+                source VARCHAR(128) NOT NULL,
+                status VARCHAR(64) NOT NULL,
+                next_image_no BIGINT NOT NULL,
+                image_count BIGINT NOT NULL,
+                storage_root VARCHAR(1024) NOT NULL,
+                started_at VARCHAR(64) NOT NULL,
+                finished_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
+                raw_payload TEXT NOT NULL
+            )"
+        ),
+    )
+    .await?;
+    execute(
+        connection,
+        "CREATE TABLE IF NOT EXISTS steel_flow_image (
+            flow_no BIGINT NOT NULL,
+            image_no BIGINT NOT NULL,
+            inspection_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            material_id VARCHAR(128) NOT NULL,
+            camera_id VARCHAR(128) NOT NULL,
+            camera_ip VARCHAR(64) NOT NULL,
+            camera_sequence_no BIGINT NOT NULL,
+            depth_path VARCHAR(1024) NOT NULL,
+            intensity_path VARCHAR(1024) NOT NULL,
+            metadata_path VARCHAR(1024) NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            mean_intensity DOUBLE PRECISION NOT NULL,
+            captured_at VARCHAR(64) NOT NULL,
+            created_at VARCHAR(64) NOT NULL,
+            PRIMARY KEY (flow_no, image_no),
+            FOREIGN KEY (flow_no) REFERENCES steel_flow(flow_no) ON DELETE CASCADE
+        )",
+    )
+    .await?;
+    for index in [
+        "CREATE UNIQUE INDEX idx_steel_flow_code ON steel_flow(flow_code)",
+        "CREATE UNIQUE INDEX idx_steel_flow_session ON steel_flow(session_id)",
+        "CREATE INDEX idx_steel_flow_status_started ON steel_flow(status, started_at)",
+        "CREATE UNIQUE INDEX idx_steel_flow_image_source ON steel_flow_image(flow_no, camera_id, camera_sequence_no)",
+        "CREATE INDEX idx_steel_flow_image_session_no ON steel_flow_image(session_id, image_no)",
+        "CREATE INDEX idx_steel_flow_image_captured ON steel_flow_image(flow_no, captured_at)",
     ] {
         execute_compatible_migration(connection, index).await?;
     }
@@ -5502,6 +6003,138 @@ fn demo_defects() -> Vec<defect::Model> {
             preview_y: row.14,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod steel_flow_tests {
+    use super::*;
+
+    fn flow_input(session_id: &str) -> SteelFlowInput {
+        SteelFlowInput {
+            session_id: session_id.to_string(),
+            material_id: String::new(),
+            source: "grayscale".to_string(),
+            status: "starting".to_string(),
+            storage_root: "D:/steel-sick-data".to_string(),
+            started_at: "1000".to_string(),
+            raw_payload: "{}".to_string(),
+        }
+    }
+
+    fn image_input(session_id: &str, camera_id: &str, sequence_no: i64) -> SteelFlowImageInput {
+        SteelFlowImageInput {
+            inspection_id: format!("INSP-{session_id}"),
+            session_id: session_id.to_string(),
+            material_id: String::new(),
+            camera_id: camera_id.to_string(),
+            camera_ip: "192.0.2.10".to_string(),
+            camera_sequence_no: sequence_no,
+            depth_path: format!("{camera_id}/{sequence_no}/depth.png"),
+            intensity_path: format!("{camera_id}/{sequence_no}/intensity.png"),
+            metadata_path: format!("{camera_id}/{sequence_no}/metadata.json"),
+            width: 3200,
+            height: 1280,
+            mean_intensity: 42.0,
+            captured_at: "1100".to_string(),
+        }
+    }
+
+    #[test]
+    fn steel_flow_and_scoped_image_numbers_are_monotonic_and_idempotent() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            let first = start_steel_flow(&database.connection, flow_input("SESSION-1"))
+                .await
+                .expect("first flow");
+            let second = start_steel_flow(&database.connection, flow_input("SESSION-2"))
+                .await
+                .expect("second flow");
+            assert_eq!(first.flow_no, 1);
+            assert_eq!(first.flow_code, "FLOW-0000000001");
+            assert_eq!(first.material_id, first.flow_code);
+            assert_eq!(second.flow_no, 2);
+
+            let mut repeated_input = flow_input("SESSION-1");
+            repeated_input.storage_root.clear();
+            let repeated = start_steel_flow(&database.connection, repeated_input)
+                .await
+                .expect("repeated flow");
+            assert_eq!(repeated.flow_no, first.flow_no);
+            assert_eq!(repeated.storage_root, "D:/steel-sick-data");
+
+            let image_1 =
+                append_steel_flow_image(&database.connection, image_input("SESSION-1", "C1", 1))
+                    .await
+                    .expect("image 1");
+            let image_2 =
+                append_steel_flow_image(&database.connection, image_input("SESSION-1", "C2", 1))
+                    .await
+                    .expect("image 2");
+            let replay =
+                append_steel_flow_image(&database.connection, image_input("SESSION-1", "C1", 1))
+                    .await
+                    .expect("idempotent image replay");
+            assert_eq!(image_1.image.image_no, 1);
+            assert_eq!(image_2.image.image_no, 2);
+            assert!(image_1.inserted && image_2.inserted);
+            assert!(!replay.inserted);
+            assert_eq!(replay.image.image_no, 1);
+            assert_eq!(
+                find_steel_flow_by_session(&database.connection, "SESSION-1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .image_count,
+                2
+            );
+
+            let next_flow_image =
+                append_steel_flow_image(&database.connection, image_input("SESSION-2", "C1", 1))
+                    .await
+                    .expect("next flow first image");
+            assert_eq!(next_flow_image.image.image_no, 1);
+        });
+    }
+
+    #[test]
+    fn schema_v1_is_migrated_to_the_flow_image_ledger() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database = Database::connect("sqlite::memory:")
+                .await
+                .expect("database");
+            create_schema(&database).await.expect("schema");
+            create_schema_ledger(&database).await.expect("ledger");
+            execute(&database, "DROP TABLE steel_flow_image")
+                .await
+                .expect("drop images");
+            execute(&database, "DROP TABLE steel_flow")
+                .await
+                .expect("drop flows");
+            execute(
+                &database,
+                "UPDATE steel_schema_state SET current_version = 1 WHERE singleton_id = 1",
+            )
+            .await
+            .expect("downgrade fixture");
+            assert_eq!(prepare_schema(&database, false).await.unwrap(), 2);
+            assert_eq!(
+                steel_flow::Entity::find().count(&database).await.unwrap(),
+                0
+            );
+            assert_eq!(
+                steel_flow_image::Entity::find()
+                    .count(&database)
+                    .await
+                    .unwrap(),
+                0
+            );
+        });
+    }
 }
 
 #[cfg(test)]

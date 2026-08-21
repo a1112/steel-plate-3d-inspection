@@ -331,6 +331,66 @@ pub mod capture_file {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod steel_flow {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "steel_flow")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub flow_no: i64,
+        pub flow_code: String,
+        pub session_id: String,
+        pub material_id: String,
+        pub source: String,
+        pub status: String,
+        pub next_image_no: i64,
+        pub image_count: i64,
+        pub storage_root: String,
+        pub started_at: String,
+        pub finished_at: String,
+        pub updated_at: String,
+        pub raw_payload: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod steel_flow_image {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "steel_flow_image")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub flow_no: i64,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub image_no: i64,
+        pub inspection_id: String,
+        pub session_id: String,
+        pub material_id: String,
+        pub camera_id: String,
+        pub camera_ip: String,
+        pub camera_sequence_no: i64,
+        pub depth_path: String,
+        pub intensity_path: String,
+        pub metadata_path: String,
+        pub width: i32,
+        pub height: i32,
+        pub mean_intensity: f64,
+        pub captured_at: String,
+        pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod record_cleanup {
     use sea_orm::entity::prelude::*;
 

@@ -2854,7 +2854,10 @@ mod tests {
 
         let sampled = evenly_sample_frame_paths(candidates, 4);
 
-        assert_eq!(sampled.iter().map(|(frame, _)| *frame).collect::<Vec<_>>(), vec![1, 34, 67, 100]);
+        assert_eq!(
+            sampled.iter().map(|(frame, _)| *frame).collect::<Vec<_>>(),
+            vec![1, 34, 67, 100]
+        );
     }
 
     fn d3img_fixture(width: i32, height: i32, depth: &[f32]) -> Vec<u8> {

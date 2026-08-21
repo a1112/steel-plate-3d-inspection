@@ -203,7 +203,6 @@ export function LeftSidebar({
         </div>
       ) : null}
       <SidebarAlertCard summary={summary} />
-
       <Panel title="钢管信息" className="plate-info-panel" headerless>
         <dl className="plate-info-list">
           <div>

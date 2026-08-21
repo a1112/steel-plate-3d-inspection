@@ -77,6 +77,7 @@ import { AlarmCenter } from './components/AlarmCenter';
 import { DefectDetectionList } from './components/DefectDetectionList';
 import { DefectImagePanel } from './components/DefectImagePanel';
 import { LeftSidebar } from './components/LeftSidebar';
+import { LiveMonitoringPage } from './components/LiveCameraMonitor';
 import { PlateMap, type PlateMapViewMode } from './components/PlateMap';
 import { ReportPage } from './components/ReportPage';
 import { SettingsPage } from './components/SettingsPage';
@@ -323,6 +324,7 @@ function ConfiguredApp({
 
   useEffect(() => {
     const controller = new AbortController();
+    let retryTimer: number | undefined;
     setSnapshot(null);
     setLoadError(null);
     setBkvRecords(null);
@@ -370,6 +372,9 @@ function ConfiguredApp({
           if (dashboardMode.requestsStandardRecords || dashboardMode.kind === 'bkv-online') {
             setBkvDataHealth({ state: 'store-error', detail });
           }
+          retryTimer = window.setTimeout(() => {
+            setLoadRevision((value) => value + 1);
+          }, 2_000);
         }
       });
     if (dashboardMode.kind === 'bkv-online') {
@@ -387,7 +392,10 @@ function ConfiguredApp({
           // loading; the status dialog exposes a detailed polling error.
         });
     }
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    };
   }, [dashboardMode.kind, dashboardMode.requestsStandardRecords, loadRevision, resolvedTerminalMode]);
 
   const refreshStandardRecordList = useCallback(async (
@@ -715,7 +723,10 @@ function InspectionDashboard({
         }
       } catch (error) {
         if (!cancelled) {
-          setCaptureSnapshot(createEmptyCaptureSnapshot(error instanceof Error ? error.message : 'capture service offline'));
+          const message = error instanceof Error ? error.message : 'capture service offline';
+          setCaptureSnapshot((current) => current.health
+            ? { ...current, error: message }
+            : createEmptyCaptureSnapshot(message));
         }
       }
     };
@@ -1691,7 +1702,9 @@ function InspectionDashboard({
         </div>
       ) : (
         <>
-          {uiState.activeNav === 'report' ? (
+          {uiState.activeNav === 'live' ? (
+            <LiveMonitoringPage statuses={captureSnapshot.statuses} />
+          ) : uiState.activeNav === 'report' ? (
             <ReportPage
               defectTypes={snapshot.defectTypes}
               inspections={snapshot.inspections}

@@ -20,6 +20,11 @@ export type CaptureCamera = {
   ip: string;
   model: string;
   sn: string;
+  cameraIndex?: number;
+  cameraId?: string;
+  name?: string;
+  role?: string;
+  storageRoot?: string;
   driverId?: string;
   source?: string;
   configured?: boolean;
@@ -115,6 +120,9 @@ export type CaptureCameraStatus = {
   streamFrames?: number;
   streamFps?: number | null;
   streamLastFrameAt?: string | null;
+  streamWidth?: number;
+  streamHeight?: number;
+  storageRoot?: string;
   captureConfig?: CaptureSdkReadback;
   error?: string | null;
 };
@@ -404,6 +412,34 @@ export type CaptureStreamStartOptions = {
   fpsLimit?: number;
   hs?: boolean;
   controlMode?: number;
+};
+
+export type CaptureHistoryCameraFrame = {
+  cameraId: string;
+  cameraIndex: number;
+  ip: string;
+  artifactRef: string;
+  width: number;
+  height: number;
+  bytes: number;
+  storedAt: string;
+};
+
+export type CaptureHistoryFrame = {
+  frameId: string;
+  materialId: string;
+  sequence: number;
+  capturedAt: string;
+  cameras: CaptureHistoryCameraFrame[];
+};
+
+export type CaptureHistoryResult = {
+  code: number;
+  storageRoot: string;
+  total: number;
+  count: number;
+  hasMore: boolean;
+  frames: CaptureHistoryFrame[];
 };
 
 export type CaptureProfileEntry = {
@@ -1206,6 +1242,38 @@ function createStatusFromConfig(
   };
 }
 
+function createProviderCameraConfig(
+  camera: CaptureCamera,
+  index: number,
+  providerStatus?: CaptureCameraStatus,
+): CaptureCameraConfig {
+  const sequence = camera.cameraIndex ?? providerStatus?.deviceId ?? index + 1;
+  const id = camera.cameraId?.trim()
+    || providerStatus?.configId?.trim()
+    || `camera-${sequence}`;
+  return {
+    id,
+    name: camera.name?.trim()
+      || providerStatus?.name?.trim()
+      || camera.cameraId?.trim()
+      || `C${sequence}`,
+    ip: camera.ip,
+    driverId: camera.driverId
+      || providerStatus?.driverId
+      || "external-api",
+    modelHint: camera.model || providerStatus?.model || "",
+    role: camera.role
+      || providerStatus?.role
+      || `camera-${sequence}`,
+    enabled: providerStatus?.enabled !== false,
+    triggerMode: providerStatus?.continuousAcquiring ? "continuous" : "external",
+    exposureUs: providerStatus?.captureConfig?.exposureTime ?? 0,
+    gain: providerStatus?.captureConfig?.gainK ?? 0,
+    depthLines: providerStatus?.captureConfig?.triggerLines ?? 0,
+    outputPath: camera.storageRoot || providerStatus?.storageRoot || "",
+  };
+}
+
 function hydrateSnapshot(
   partial: Partial<CaptureSnapshot> & { error?: string | null },
 ): CaptureSnapshot {
@@ -1382,7 +1450,9 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
       ),
       readJson<unknown>("/api/capture/health").then(parseCaptureHealth),
       readJson<{ cameras: CaptureCamera[] }>("/api/cameras"),
-      readJson<CaptureCameraStatus>("/api/camera/status"),
+      readJson<CaptureCameraStatus>("/api/camera/status").catch(
+        (): CaptureCameraStatus => ({ connected: false, deviceId: -1, ip: "" }),
+      ),
       readJson<{ statuses: CaptureCameraStatus[] }>(
         "/api/camera/statuses",
       ).catch(() => ({ statuses: [] })),
@@ -1400,16 +1470,10 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
     return createBkvOfflineSnapshot(health, logs);
   }
 
-  const config = {
-    ...createDefaultCaptureConfig(),
-    cameras: configResult.capture?.cameras?.length
-      ? configResult.capture.cameras
-      : createDefaultCaptureConfig().cameras,
-  };
   const cameras = camerasResult.cameras.map((camera) => ({
     ...camera,
-    driverId: camera.driverId ?? "lvm-nvt",
-    source: camera.source ?? "http-service",
+    driverId: camera.driverId ?? health.driverId ?? "lvm-nvt",
+    source: camera.source ?? (health.provider === "external-api" ? "external-api" : "http-service"),
   }));
   const discoveredByIp = new Map(cameras.map((camera) => [camera.ip, camera]));
   const statusByIp = new Map(
@@ -1418,6 +1482,54 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
       cameraStatus,
     ]),
   );
+  // The external SICK provider deliberately returns its full telemetry on
+  // both /api/cameras and /api/camera/statuses.  Use the discovery rows as a
+  // lossless fallback when an intermediate proxy temporarily omits the
+  // status collection, instead of showing correctly discovered cameras as
+  // offline.
+  if (health.provider === "external-api") {
+    cameras.forEach((camera) => {
+      const providerStatus = camera as unknown as CaptureCameraStatus;
+      if (!statusByIp.has(camera.ip) && typeof providerStatus.connected === "boolean") {
+        statusByIp.set(camera.ip, providerStatus);
+      }
+    });
+  }
+  const providerTopology = cameras.length > 0
+    ? cameras
+    : statusesResult.statuses.map((providerStatus) => ({
+        ip: providerStatus.ip,
+        model: providerStatus.model ?? "",
+        sn: providerStatus.sn ?? "",
+        cameraIndex: providerStatus.deviceId,
+        cameraId: providerStatus.configId ?? providerStatus.name ?? undefined,
+        name: providerStatus.name ?? undefined,
+        role: providerStatus.role ?? undefined,
+        storageRoot: providerStatus.storageRoot,
+        driverId: providerStatus.driverId,
+        source: "external-api",
+      }));
+  const configuredCameras = configResult.capture?.cameras ?? [];
+  const configuredTopologyOverlap = configuredCameras.filter((camera) => (
+    providerTopology.some((providerCamera) => providerCamera.ip === camera.ip)
+  )).length;
+  const useProviderTopology = providerTopology.length > 0
+    && (
+      health.provider === "external-api"
+      || configuredCameras.length === 0
+      || configuredTopologyOverlap === 0
+    );
+  const config = {
+    ...createDefaultCaptureConfig(),
+    ...(configResult.capture ?? {}),
+    cameras: useProviderTopology
+      ? providerTopology.map((camera, index) => (
+          createProviderCameraConfig(camera, index, statusByIp.get(camera.ip))
+        ))
+      : configuredCameras.length > 0
+        ? configuredCameras
+        : createDefaultCaptureConfig().cameras,
+  };
   const statuses = config.cameras.map((camera) => {
     const backendStatus =
       statusByIp.get(camera.ip) ??
@@ -1426,13 +1538,12 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
       return {
         ...createStatusFromConfig(camera, discoveredByIp.get(camera.ip)),
         ...backendStatus,
-        driverId: backendStatus.driverId ?? "lvm-nvt",
+        driverId: backendStatus.driverId ?? health.driverId ?? camera.driverId,
         name: camera.name,
         role: camera.role,
         configId: camera.id,
-        acquisitionState: backendStatus.connected
-          ? "connected"
-          : backendStatus.acquisitionState,
+        acquisitionState: backendStatus.acquisitionState
+          ?? (backendStatus.connected ? "connected" : "offline"),
         sdkStatus:
           backendStatus.sdkStatus ?? (health.sdkReady ? "ready" : "error"),
         error:
@@ -2058,10 +2169,25 @@ export async function stopCaptureStream(ip: string): Promise<CaptureStreamStatus
 
 export function captureStreamImageUrl(
   ip: string,
-  kind: "depth" | "intensity" = "depth",
+  kind: "depth" | "intensity" | "intensity-grid" = "depth",
 ) {
   const query = new URLSearchParams({ ip, kind, v: String(Date.now()) });
   return `${getCaptureServiceOrigin()}/api/stream/latest?${query.toString()}`;
+}
+
+export async function readCaptureHistory(limit = 240): Promise<CaptureHistoryResult> {
+  const query = new URLSearchParams({
+    limit: String(Math.max(1, Math.min(500, Math.round(limit)))),
+  });
+  return readJson<CaptureHistoryResult>(`/api/capture/history?${query.toString()}`);
+}
+
+export function captureHistoryImageUrl(artifactRef: string, maxWidth = 800) {
+  const query = new URLSearchParams({
+    path: artifactRef,
+    maxWidth: String(Math.max(160, Math.min(4096, Math.round(maxWidth)))),
+  });
+  return `${getCaptureServiceOrigin()}/api/capture/file?${query.toString()}`;
 }
 
 export async function readActiveCaptureCalibration(

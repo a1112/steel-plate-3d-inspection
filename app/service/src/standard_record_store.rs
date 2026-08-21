@@ -210,9 +210,8 @@ impl ConvertedLocalStore {
             "#
         );
         let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(
-            [i64::try_from(limit.clamp(1, 366)).unwrap_or(31)],
-            |row| {
+        let rows =
+            statement.query_map([i64::try_from(limit.clamp(1, 366)).unwrap_or(31)], |row| {
                 Ok(InspectionDailySummaryDto {
                     date: row.get(0)?,
                     record_count: u64::try_from(row.get::<_, i64>(1)?.max(0)).unwrap_or(0),
@@ -220,8 +219,7 @@ impl ConvertedLocalStore {
                     abnormal_count: u64::try_from(row.get::<_, i64>(3)?.max(0)).unwrap_or(0),
                     latest_record_id: row.get(4)?,
                 })
-            },
-        )?;
+            })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }

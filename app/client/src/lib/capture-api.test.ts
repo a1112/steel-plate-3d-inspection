@@ -11,6 +11,7 @@ import {
   CAMERA_ROI_CONFIRMATION,
   CaptureAdminApiError,
   calculateSystemNetworkRates,
+  captureHistoryImageUrl,
   captureStreamImageUrl,
   chooseCaptureLocalDirectory,
   chooseCaptureLocalFile,
@@ -27,6 +28,7 @@ import {
   readCaptureProfiles,
   readCaptureCalibrationOperationDetail,
   readCaptureContinuousSettings,
+  readCaptureHistory,
   readCaptureParam,
   readCaptureLocalTextFile,
   readActiveCaptureCalibration,
@@ -226,6 +228,27 @@ describe("readLatestCaptureFile", () => {
     expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:4873/api/stream/stop");
     expect(captureStreamImageUrl("192.168.101.100", "intensity")).toBe(
       "http://127.0.0.1:4873/api/stream/latest?ip=192.168.101.100&kind=intensity&v=1783771200123",
+    );
+  });
+
+  it("reads capture history and requests a pixel-bounded playback image", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0,
+      storageRoot: "D:\\steel-sick-data",
+      total: 1,
+      count: 1,
+      hasMore: false,
+      frames: [],
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await readCaptureHistory(999);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:4873/api/capture/history?limit=500",
+    );
+    expect(captureHistoryImageUrl("C1/BAR-001/intensity/000001.png", 8192)).toBe(
+      "http://127.0.0.1:4873/api/capture/file?path=C1%2FBAR-001%2Fintensity%2F000001.png&maxWidth=4096",
     );
   });
 

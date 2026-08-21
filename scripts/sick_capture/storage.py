@@ -69,7 +69,10 @@ def atomic_npz(path: Path, array: np.ndarray, *, fsync: bool) -> None:
     temporary = _temporary_path(path)
     try:
         with temporary.open("wb") as stream:
-            np.savez_compressed(stream, array=array)
+            # ZIP_STORED keeps the established .npz contract while avoiding
+            # the multi-second DEFLATE cost observed on full steel frames.
+            # The dedicated RAID volumes provide enough sequential bandwidth.
+            np.savez(stream, array=array)
             _flush(stream, fsync)
         if path.exists():
             raise FileExistsError(path)
@@ -136,7 +139,7 @@ class FrameWriteResult:
             "lines": frame.height,
             "depthDataFormat": frame.depth_data_format,
             "intensityDataFormat": frame.intensity_data_format,
-            "depthPersistenceMode": "sick-coord3d-c16-raw-png+lg3d-npz",
+            "depthPersistenceMode": "single-lg3d-npz-store",
             "output": str(self.steel_depth),
             "depthOutput": str(self.steel_depth),
             "intensityOutput": str(self.steel_intensity),
@@ -175,20 +178,21 @@ class SequenceAllocator:
             if key not in self._next:
                 material_root = camera_root / _safe_segment(material_id)
                 existing: list[int] = []
-                for directory, suffix, steel_numbering in (
-                    ("3d", ".npz", False),
-                    ("2d", ".jpg", False),
-                    ("json", ".json", False),
-                    ("depth", ".png", True),
-                    ("intensity", ".png", True),
-                    ("metadata", ".json", True),
+                for directory, suffixes, steel_numbering in (
+                    ("3d", (".npz",), False),
+                    ("2d", (".png", ".jpg", ".jpeg"), False),
+                    ("json", (".json",), False),
+                    ("depth", (".png",), True),
+                    ("intensity", (".png",), True),
+                    ("metadata", (".json",), True),
                 ):
-                    for path in (material_root / directory).glob(f"*{suffix}"):
-                        if not path.stem.isdigit():
-                            continue
-                        index = int(path.stem) - 1 if steel_numbering else int(path.stem)
-                        if index >= 0:
-                            existing.append(index)
+                    for suffix in suffixes:
+                        for path in (material_root / directory).glob(f"*{suffix}"):
+                            if not path.stem.isdigit():
+                                continue
+                            index = int(path.stem) - 1 if steel_numbering else int(path.stem)
+                            if index >= 0:
+                                existing.append(index)
                 self._next[key] = max(existing, default=-1) + 1
             index = self._next[key]
             self._next[key] += 1
@@ -230,21 +234,18 @@ class DualFormatWriter:
         steel_sequence = lg_index + 1
 
         lg3d_depth = base / "3d" / f"{lg_index}.npz"
-        lg3d_intensity = base / "2d" / f"{lg_index}.jpg"
+        lg3d_intensity = base / "2d" / f"{lg_index}.png"
         lg3d_metadata = base / "json" / f"{lg_index}.json"
-        steel_depth = base / "depth" / f"{steel_sequence:06d}.png"
-        steel_intensity = base / "intensity" / f"{steel_sequence:06d}.png"
-        steel_metadata = base / "metadata" / f"{steel_sequence:06d}.json"
+        # Keep one canonical artifact per component. Database-facing paths
+        # alias the LG_3D files instead of writing duplicate depth/metadata.
+        steel_depth = lg3d_depth
+        # Intensity has one canonical PNG only.  Keeping a second copy below
+        # intensity/ doubled compression work on the acquisition hot path.
+        steel_intensity = lg3d_intensity
+        steel_metadata = lg3d_metadata
         camera_config = base / "camera_config.json"
 
-        final_paths = (
-            lg3d_depth,
-            lg3d_intensity,
-            lg3d_metadata,
-            steel_depth,
-            steel_intensity,
-            steel_metadata,
-        )
+        final_paths = (lg3d_depth, lg3d_intensity, lg3d_metadata)
         collisions = [str(path) for path in final_paths if path.exists()]
         if collisions:
             raise FileExistsError(f"frame outputs already exist: {collisions}")
@@ -313,36 +314,23 @@ class DualFormatWriter:
                     f"configured={configured_firmware!r} frame={frame.firmware!r}"
                 )
 
-        atomic_npz(lg3d_depth, frame.depth_raw, fsync=self.fsync)
         atomic_image(
             lg3d_intensity,
             frame.intensity,
-            image_format="JPEG",
-            quality=self.jpeg_quality,
-            optimize=True,
-            fsync=self.fsync,
-        )
-        atomic_image(
-            steel_depth,
-            frame.depth_raw,
             image_format="PNG",
-            compress_level=3,
+            compress_level=1,
             fsync=self.fsync,
         )
-        atomic_image(
-            steel_intensity,
-            frame.intensity,
-            image_format="PNG",
-            compress_level=3,
-            fsync=self.fsync,
-        )
+        atomic_npz(lg3d_depth, frame.depth_raw, fsync=self.fsync)
         self._fault("data-files-committed")
 
+        intensity_checksum = sha256_file(lg3d_intensity)
+        depth_checksum = sha256_file(lg3d_depth)
         checksums = {
-            "lg3d3d": sha256_file(lg3d_depth),
-            "lg3d2d": sha256_file(lg3d_intensity),
-            "steelDepth": sha256_file(steel_depth),
-            "steelIntensity": sha256_file(steel_intensity),
+            "lg3d3d": depth_checksum,
+            "lg3d2d": intensity_checksum,
+            "steelDepth": depth_checksum,
+            "steelIntensity": intensity_checksum,
         }
         cap_time = datetime.fromtimestamp(
             frame.host_utc_ns / 1_000_000_000,
@@ -371,16 +359,15 @@ class DualFormatWriter:
             "hostMonotonicNs": frame.host_monotonic_ns,
             "sessionId": session_id,
             "productionEventId": production_event_id,
+            "cameraFrameSequence": frame.sequence,
             "checksums": checksums,
         }
-        atomic_json(lg3d_metadata, legacy_metadata, fsync=self.fsync, overwrite=False)
-        self._fault("legacy-metadata-committed")
-
         steel_metadata_payload = {
             **legacy_metadata,
             "schema": "steel.sick-frame.v1",
             "complete": True,
             "legacyCompatible": True,
+            "intensityPersistenceMode": "single-2d-png",
             "sequenceNo": steel_sequence,
             "depthOutput": str(steel_depth),
             "intensityOutput": str(steel_intensity),
@@ -392,11 +379,12 @@ class DualFormatWriter:
             },
         }
         atomic_json(
-            steel_metadata,
+            lg3d_metadata,
             steel_metadata_payload,
             fsync=self.fsync,
             overwrite=False,
         )
+        self._fault("legacy-metadata-committed")
         self._fault("steel-metadata-committed")
         return FrameWriteResult(
             camera_root=camera_root,
