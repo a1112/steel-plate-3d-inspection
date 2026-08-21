@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "purpose": "small parser and image/depth frame fixture; not a complete replay dataset",
+  "sourceDataset": "bkv/1908500",
+  "cameraId": 2,
+  "frameNo": 0,
+  "files": [
+    {
+      "path": "camera-2/2D/0000.jpg",
+      "size": 305959,
+      "sha256": "70624596dcabdee6ed906a4c4e5925e65c6ec805b402319a70ffc1cfdb2e0cac"
+    },
+    {
+      "path": "camera-2/3D/0000.npz",
+      "size": 829496,
+      "sha256": "2914d96d924db3e38c6714e3b9bfd02b07b075e8514ade179fa91521576b8ac2"
+    }
+  ]
+}

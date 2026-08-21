@@ -1,0 +1,12 @@
+{
+  "schema": "steel.site-mapping.v1",
+  "cameras": [
+    {
+      "id": "C1",
+      "displayOrder": 1,
+      "sourceCameraId": 1
+    }
+  ],
+  "fields": {},
+  "defects": {}
+}

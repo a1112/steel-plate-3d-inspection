@@ -12,48 +12,48 @@
       "displayOrder": 1,
       "sourceCameraId": 1,
       "role": "legacy-array-1",
-      "sourceDirectory": "sample-data/bkv/1908500/camera-1"
+      "sourceDirectory": "target/sample-data-cache/content/sample-data/bkv/1908500/camera-1"
     },
     {
       "id": "C2",
       "displayOrder": 2,
       "sourceCameraId": 2,
       "role": "legacy-array-2",
-      "sourceDirectory": "sample-data/bkv/1908500/camera-2"
+      "sourceDirectory": "target/sample-data-cache/content/sample-data/bkv/1908500/camera-2"
     },
     {
       "id": "C3",
       "displayOrder": 3,
       "sourceCameraId": 3,
       "role": "legacy-array-3",
-      "sourceDirectory": "sample-data/bkv/1908500/camera-3"
+      "sourceDirectory": "target/sample-data-cache/content/sample-data/bkv/1908500/camera-3"
     },
     {
       "id": "C4",
       "displayOrder": 4,
       "sourceCameraId": 4,
       "role": "legacy-array-4",
-      "sourceDirectory": "sample-data/bkv/1908500/camera-4"
+      "sourceDirectory": "target/sample-data-cache/content/sample-data/bkv/1908500/camera-4"
     },
     {
       "id": "C5",
       "displayOrder": 5,
       "sourceCameraId": 5,
       "role": "legacy-array-5",
-      "sourceDirectory": "sample-data/bkv/1908500/camera-5"
+      "sourceDirectory": "target/sample-data-cache/content/sample-data/bkv/1908500/camera-5"
     },
     {
       "id": "C6",
       "displayOrder": 6,
       "sourceCameraId": 6,
       "role": "legacy-array-6",
-      "sourceDirectory": "sample-data/bkv/1908500/camera-6"
+      "sourceDirectory": "target/sample-data-cache/content/sample-data/bkv/1908500/camera-6"
     }
   ],
   "storage": {
     "layoutVersion": 2,
     "sourceRoot": ".",
-    "manifestPath": "sample-data/bkv/1908500/bkv-runtime-manifest.json",
+    "manifestPath": "target/sample-data-cache/content/sample-data/bkv/1908500/bkv-runtime-manifest.json",
     "convertedRoot": "target/data/bkv-sample-1908500-converted",
     "catalogPath": "target/data/bkv-sample-1908500-converted/catalog.db",
     "cacheRoot": "target/data/bkv-sample-1908500-converted/cache",

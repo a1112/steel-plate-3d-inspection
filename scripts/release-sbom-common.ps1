@@ -14,7 +14,11 @@ function Read-JsonDictionary {
   $ConvertCommand = Get-Command ConvertFrom-Json -ErrorAction Stop
   if ($ConvertCommand.Parameters.ContainsKey('AsHashtable')) {
     try {
-      return $Text | ConvertFrom-Json -AsHashtable -Depth 100
+      $ConvertParameters = @{ AsHashtable = $true; Depth = 100 }
+      if ($ConvertCommand.Parameters.ContainsKey('DateKind')) {
+        $ConvertParameters['DateKind'] = 'String'
+      }
+      return $Text | ConvertFrom-Json @ConvertParameters
     } catch {
       throw "JSON input is invalid: $Path ($($_.Exception.Message))"
     }

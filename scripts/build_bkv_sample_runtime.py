@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a BKV offline runtime manifest from the committed JPG/NPZ sample."""
+"""Build a BKV offline runtime manifest from a verified JPG/NPZ sample."""
 
 from __future__ import annotations
 
@@ -352,7 +352,7 @@ def build_sample_runtime_manifest(
         "quarantine": {},
         "notes": {
             "mode": "offline-replay-no-camera-hardware",
-            "source": "committed-bkv-sample",
+            "source": "versioned-external-bkv-sample",
             "preview": "JPG/NPZ inspection world; no precomputed legacy preview artifacts",
         },
     }
@@ -365,7 +365,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--sample-root",
         type=Path,
-        default=project_root / "sample-data" / "bkv" / "1908500",
+        default=project_root / "target" / "sample-data-cache" / "content" / "sample-data" / "bkv" / "1908500",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument(

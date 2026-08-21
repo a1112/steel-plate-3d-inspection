@@ -11,7 +11,7 @@
   "allowDowngrades": false,
   "devtools": false,
   "rustTarget": "x86_64-pc-windows-msvc",
-  "cargoConfigSha256": "09721ea55b37685910ef3162b7d8e073c368ea23ce96c46db2f522f94a44a84a",
-  "tauriConfigSha256": "1dd437b62ceb8c7dc9373991904dffdcabfdfcf75b230967472a28719896d07c",
-  "tauriCargoSha256": "9583f84baed1ba7f79f9e27f3ed0b33112cdbf5d19ffc914844e7547a93f5c88"
+  "cargoConfigSha256": "3da3357ad30dd603163bc0dd2bbb3db5ff2ef315bc7dfcc6e281cb4c4624a0e9",
+  "tauriConfigSha256": "628c47d4346d0ef59e913b389da290c2804d20beee1b0032b4c0101f33903979",
+  "tauriCargoSha256": "4cd404157cc93b6c33aa5ab00c1b063a0890cc34d58d11ee8a6cf8eb4ebd2088"
 }

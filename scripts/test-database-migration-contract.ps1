@@ -162,7 +162,7 @@ try {
   $ServiceDatabaseSource = Get-Content -LiteralPath $ServiceDatabaseSourcePath -Raw -Encoding UTF8
   $SchemaVersionMatches = [regex]::Matches(
     $ServiceDatabaseSource,
-    '(?m)^pub const DATABASE_SCHEMA_VERSION: i64 = ([1-9][0-9]*);$'
+    '(?m)^pub const DATABASE_SCHEMA_VERSION: i64 = ([1-9][0-9]*);\r?$'
   )
   if ($SchemaVersionMatches.Count -ne 1 -or
       [long]$TrackedContract.schemaVersion -ne [long]$SchemaVersionMatches[0].Groups[1].Value -or

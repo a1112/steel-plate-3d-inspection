@@ -48,13 +48,30 @@ function Assert-NoMatches {
     [string]$Path,
     [string]$Message
   )
-  $Matches = & rg -n $Pattern $Path
-  if ($LASTEXITCODE -eq 0) {
-    Write-Host $Matches
-    throw $Message
+  $Ripgrep = Get-Command rg -ErrorAction SilentlyContinue
+  if ($null -ne $Ripgrep) {
+    $Matches = & $Ripgrep.Source -n $Pattern $Path
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host $Matches
+      throw $Message
+    }
+    if ($LASTEXITCODE -gt 1) {
+      throw "rg failed while checking $Path"
+    }
+    return
   }
-  if ($LASTEXITCODE -gt 1) {
-    throw "rg failed while checking $Path"
+
+  $Candidates = if (Test-Path -LiteralPath $Path -PathType Leaf) {
+    @(Get-Item -LiteralPath $Path)
+  } else {
+    @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force | Where-Object {
+      $_.FullName -notmatch '[\\/](node_modules|target|dist)[\\/]'
+    })
+  }
+  $Matches = @($Candidates | Select-String -Pattern $Pattern -CaseSensitive)
+  if ($Matches.Count -gt 0) {
+    $Matches | ForEach-Object { Write-Host $_ }
+    throw $Message
   }
 }
 

@@ -1474,6 +1474,10 @@ bool business_drain_self_test() {
 }
 
 bool managed_recovery_self_test() {
+  const std::string healthy_health =
+      "{\"ready\":true,\"sdkReady\":true,\"sdkCode\":0,"
+      "\"recoveryRequired\":false,\"invalidManifest\":false,"
+      "\"sdkCaptureState\":{\"restartRequired\":false}}";
   const std::string restart_health =
       "{\"ready\":false,\"sdkReady\":false,\"sdkCode\":49007,"
       "\"recoveryRequired\":false,\"invalidManifest\":false,"
@@ -1482,7 +1486,8 @@ bool managed_recovery_self_test() {
       "{\"ready\":false,\"sdkReady\":false,\"sdkCode\":49007,"
       "\"recoveryRequired\":true,\"invalidManifest\":false,"
       "\"sdkCaptureState\":{\"restartRequired\":true}}";
-  if (!steel_runtime::capture_requires_managed_restart(200, restart_health) ||
+  if (steel_runtime::capture_requires_managed_restart(200, healthy_health) ||
+      !steel_runtime::capture_requires_managed_restart(200, restart_health) ||
       steel_runtime::capture_requires_managed_restart(200, reconciliation_health)) {
     return false;
   }

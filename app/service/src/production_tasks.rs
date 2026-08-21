@@ -292,15 +292,23 @@ fn bkv_test_runtime_verification_active(root: &Path) -> u64 {
 }
 
 #[cfg(test)]
+fn bkv_test_root_key(root: &Path) -> String {
+    fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(test)]
 fn bkv_test_hash_reads(root: &Path) -> u64 {
-    let root = root.to_string_lossy();
+    let root = bkv_test_root_key(root);
     BKV_ARTIFACT_HASH_READS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map(|reads| {
             reads
                 .iter()
-                .filter(|(identity, _)| identity.contains(root.as_ref()))
+                .filter(|(identity, _)| identity.contains(root.as_str()))
                 .map(|(_, count)| *count)
                 .sum()
         })
@@ -337,7 +345,7 @@ fn bkv_test_set_mapping_delay(root: &Path, delay: Duration) {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
     {
-        delays.insert(root.to_string_lossy().into_owned(), delay);
+        delays.insert(bkv_test_root_key(root), delay);
     }
 }
 

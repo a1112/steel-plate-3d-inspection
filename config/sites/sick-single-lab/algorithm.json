@@ -1,0 +1,16 @@
+{
+  "schema": "steel.source-processing-config.v1",
+  "processor": "sick-capture-only",
+  "processorVersion": "1.0.0",
+  "input": {
+    "cameraCount": 1,
+    "depthFormat": "Coord3D_C16",
+    "intensityFormat": "Mono8",
+    "depthUnit": "raw-device-code"
+  },
+  "inspectionWorld": {
+    "tileSize": 128,
+    "detectHeadAlignment": false,
+    "cacheTiles": false
+  }
+}

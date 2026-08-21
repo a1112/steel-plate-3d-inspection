@@ -11,6 +11,8 @@ app/service/build/
 .worktrees/
 *.log
 *.local
+*.local.env
+*.local.json
 __pycache__/
 *.py[cod]
 logFile.ini
@@ -18,3 +20,6 @@ config/*.sqlite
 config/*.sqlite-*
 simulated/production/
 ._*
+sample-data/
+target/sample-data-cache/
+target/sample-data-repository/

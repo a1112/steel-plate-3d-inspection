@@ -1,0 +1,16 @@
+{
+  "schema": "steel.site-connection.v1",
+  "provider": "external-api",
+  "dataSource": "online-production",
+  "configurationSource": "environment",
+  "host": "127.0.0.1",
+  "port": 4317,
+  "sidecar": "sick-gentl-harvesters",
+  "requiredEnvironment": [
+    "SICK_GENTL_CTI",
+    "STEEL_CAPTURE_PROVIDER",
+    "STEEL_CAPTURE_SERVICE_AUTOSTART",
+    "CAPTURE_SERVICE_ORIGIN",
+    "STEEL_SITE_CONFIG_ID"
+  ]
+}

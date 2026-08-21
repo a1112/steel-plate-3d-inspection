@@ -32,6 +32,7 @@ The Qt-to-Tauri capability matrix, production gates, and diagnostic-retirement d
 The production readiness gap assessment, closure design, and Go/No-Go checklist are in [docs/production-readiness-gap-and-closure-design.md](docs/production-readiness-gap-and-closure-design.md).
 The versioned payload, schema ledger, persistent upgrade journal, crash recovery, and fault-injection contract is in [docs/atomic-upgrade-and-database-migration-design.md](docs/atomic-upgrade-and-database-migration-design.md); it remains a P0 No-Go until its target-machine evidence is complete.
 The release, two-stage installation, offline prerequisites, supervisor acceptance, operations, and evidence SOP is in [docs/release-deployment-and-operations.md](docs/release-deployment-and-operations.md).
+The real SICK GenTL bring-up, single-camera sidecar integration, LG_3D-compatible storage contract, and FAT checklist are in [docs/sick-gentl-capture.md](docs/sick-gentl-capture.md).
 
 ## Migration Status
 
@@ -56,7 +57,7 @@ Choose an environment template from [config/env](config/env), or pass values on 
 The active installation is selected by `config/project.json`. Its
 `activeSiteConfig` points to a package under `config/sites/<site-id>`:
 
-- `site.json` identifies the site and fixes its mode (`bkv` or `direct`);
+- `site.json` identifies the site and fixes its mode (`bkv` or `direct-camera`);
 - `runtime.json` defines the provider, camera count and capabilities;
 - `connection.json` contains non-secret connection settings;
 - `capture.json` contains capture-side settings used by direct-camera sites.
@@ -196,6 +197,22 @@ To start the already-built headless capture, Rust, trigger, and static-client pr
 ```powershell
 scripts/start-integrated-capture-management.ps1 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction" -TriggerMode manual -OpenBrowser
 ```
+
+## Versioned sample data
+
+The full BKV `1908500` dataset is stored separately in the private
+[`a1112/sample-data`](https://github.com/a1112/sample-data) repository and is
+pinned by commit. It is not included in normal source clones.
+
+```bash
+python scripts/fetch_sample_data.py
+python scripts/fetch_sample_data.py --check
+scripts/run-bkv-sample-dev.sh
+```
+
+The fetcher uses a sparse Git checkout, reconstructs the versioned artifact,
+validates every source file and SHA-256 digest, and publishes the cache under
+`target/sample-data-cache`. See [docs/sample-data.md](docs/sample-data.md).
 
 ## Verification
 

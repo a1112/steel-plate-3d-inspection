@@ -8,7 +8,9 @@ state_root="${STEEL_BKV_SAMPLE_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state
 python_bin="${STEEL_PYTHON:-python3}"
 codex_python="${HOME}/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
 project_config="${repo_root}/config/project.bkv-sample.json"
-sample_root="${repo_root}/sample-data/bkv/1908500"
+sample_cache_root="${STEEL_SAMPLE_DATA_CACHE_ROOT:-${repo_root}/target/sample-data-cache}"
+sample_repository_cache="${STEEL_SAMPLE_DATA_REPOSITORY_CACHE:-${repo_root}/target/sample-data-repository}"
+sample_root="${STEEL_BKV_SAMPLE_ROOT:-${sample_cache_root}/content/sample-data/bkv/1908500}"
 manifest_path="${sample_root}/bkv-runtime-manifest.json"
 service_log="${state_root}/logs/service.log"
 
@@ -37,6 +39,14 @@ fi
   exit 1
 }
 
+if [[ ! -f "${sample_root}/manifest.json" ]]; then
+  echo "Fetching and verifying versioned BKV sample data..."
+  "${python_bin}" "${repo_root}/scripts/fetch_sample_data.py" \
+    --project-root "${repo_root}" \
+    --cache-root "${sample_cache_root}" \
+    --repository-cache "${sample_repository_cache}"
+fi
+
 if lsof -nP -iTCP:"${service_port}" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "Port ${service_port} is already in use; stop the existing inspection service first." >&2
   exit 1
@@ -51,7 +61,7 @@ mkdir -p \
   "${state_root}/logs" \
   "${repo_root}/target/data/bkv-sample-1908500-runtime"
 
-echo "Verifying committed BKV sample manifest..."
+echo "Verifying downloaded BKV sample manifest..."
 "${python_bin}" "${repo_root}/scripts/build_bkv_sample_runtime.py" \
   --project-root "${repo_root}" \
   --sample-root "${sample_root}" \

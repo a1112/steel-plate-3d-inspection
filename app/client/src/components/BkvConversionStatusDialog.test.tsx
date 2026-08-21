@@ -76,7 +76,8 @@ describe('BkvConversionStatusDialog', () => {
     expect(screen.getByText('1.3 分钟')).toBeInTheDocument();
     expect(screen.getByText('5.0 秒')).toBeInTheDocument();
     expect(screen.getByText('最近转换明细')).toBeInTheDocument();
-    expect(screen.getByText('记录 1902341 · 19:03:20')).toBeInTheDocument();
+    const expectedLogTime = new Date(1_784_891_000_000).toLocaleTimeString('zh-CN', { hour12: false });
+    expect(screen.getByText(`记录 1902341 · ${expectedLogTime}`)).toBeInTheDocument();
     expect(screen.getByText('1.2 秒')).toBeInTheDocument();
     expect(screen.getAllByRole('img', { name: /实际2D图像/ })).toHaveLength(6);
     expect(screen.getByRole('img', { name: 'camera1 实际2D图像' })).toHaveAttribute(

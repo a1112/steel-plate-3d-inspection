@@ -11761,6 +11761,10 @@ fn write_capture_summary_response(state: &ServiceState, body: &str, actor: &str)
     )
 }
 
+fn production_capture_expected_cameras(profile: &runtime_profile::RuntimeProfile) -> usize {
+    profile.camera_count().max(1)
+}
+
 fn write_production_capture_once_response(
     state: &ServiceState,
     body: &str,
@@ -11824,9 +11828,10 @@ fn write_production_capture_once_response(
     }
     let (material_id, session_id) = active_session_for_payload(state, &payload);
     let mut capture_body = payload.as_object().cloned().unwrap_or_default();
+    let expected_cameras = production_capture_expected_cameras(state.runtime_config.as_ref());
     capture_body
         .entry("expectedCameras".to_string())
-        .or_insert_with(|| json!(8));
+        .or_insert_with(|| json!(expected_cameras));
     capture_body
         .entry("rounds".to_string())
         .or_insert_with(|| json!(1));
@@ -23489,6 +23494,15 @@ mod tests {
 
     static CONVERTED_WORLD_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static SITE_CONFIG_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn production_capture_defaults_to_runtime_camera_topology() {
+        let single = runtime_profile::RuntimeProfile::test_profile("headless-cpp", 1);
+        let eight = runtime_profile::RuntimeProfile::test_profile("headless-cpp", 8);
+
+        assert_eq!(production_capture_expected_cameras(&single), 1);
+        assert_eq!(production_capture_expected_cameras(&eight), 8);
+    }
 
     #[test]
     fn bkv_import_mutations_require_admin_services_permission() {
