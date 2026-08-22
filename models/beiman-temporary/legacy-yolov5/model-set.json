@@ -1,0 +1,87 @@
+{
+  "schema": "steel.temporary-defect-model-set.v1",
+  "id": "beiman-legacy-yolov5-temporary-2026-08-22",
+  "temporary": true,
+  "intendedUse": "Offline surface-defect candidate detection and temporary fine-grained recognition on closed SICK flows",
+  "limitations": [
+    "The YOLO detector recognizes only background versus defect candidate.",
+    "The migrated EfficientNet classifiers are from the prior bar inspection line and are not a substitute for FAT validation on the SICK data distribution.",
+    "Every result must remain in review state until FAT validation is complete."
+  ],
+  "provenance": {
+    "sourceProgram": "D:\\北满小棒程序\\OnlineDefect\\OnlineDefect",
+    "legacyRuntimeEntry": "Hkj_IBK3DDefectDetectSystem.py",
+    "legacyCodeLicenseNotice": "The inspected YOLOv5 source files identify GPL-3.0; no legacy source code is required by online ONNX inference."
+  },
+  "models": {
+    "2d": {
+      "sourceFile": "steel_model/2D_model/yolov5s_GG.pt",
+      "checkpoint": "surface-defect-2d.pt",
+      "checkpointSha256": "f971701f339da60abca1a7ed0f9724eb85f87abf79d5f807741b6129b7e227b3",
+      "onnx": "surface-defect-2d.onnx",
+      "onnxSha256": "30d5d2ec1aaf75a1bfd8d098673fbf197959cafd3654f61aec9d7593051a96d2",
+      "classes": ["__background__", "defect"],
+      "inputShape": [1, 3, 640, 640],
+      "outputShape": [1, 25200, 7]
+    },
+    "3d": {
+      "sourceFile": "steel_model/3D_model/yolov5s_GG3D.pt",
+      "checkpoint": "surface-defect-3d.pt",
+      "checkpointSha256": "18fc96aa84aef93e57a53d5812d11d9529fb12a879fadd7ea9d8c3e2134c2e20",
+      "onnx": "surface-defect-3d.onnx",
+      "onnxSha256": "ee4fe266dff11b0ef73f9f75f2c962c29db518aad54ed5514947a495b259e5ee",
+      "classes": ["__background__", "defect"],
+      "inputShape": [1, 3, 640, 640],
+      "outputShape": [1, 25200, 7]
+    }
+  },
+  "classifiers": {
+    "2d": {
+      "sourceFile": "steel_model/2D_class_model/steel_model_classifier_2d.h5",
+      "sourceSha256": "353d64fdf7aa4e5d2433806391c3b1ae84ea1cdcf455bc3f5c566c6ace02503f",
+      "onnx": "surface-classifier-2d.onnx",
+      "onnxSha256": "d1a30363f6078320f16088dd81122c2c013d33c6e7904f3b5c4d51cd04433a24",
+      "inputShape": [null, 224, 224, 3],
+      "outputShape": [null, 15],
+      "classes": [
+        {"outputIndex": 0, "internalId": 8, "externalId": 11, "name": "耳子", "acceptedDefect": true},
+        {"outputIndex": 1, "internalId": 9, "externalId": 14, "name": "压痕", "acceptedDefect": true},
+        {"outputIndex": 2, "internalId": 11, "externalId": 15, "name": "伪缺陷误判划伤", "acceptedDefect": false},
+        {"outputIndex": 3, "internalId": 10, "externalId": 15, "name": "伪缺陷误判耳子", "acceptedDefect": false},
+        {"outputIndex": 4, "internalId": 12, "externalId": 15, "name": "伪缺陷误判裂纹", "acceptedDefect": false},
+        {"outputIndex": 5, "internalId": 13, "externalId": 15, "name": "伪缺陷轧槽车削印", "acceptedDefect": false},
+        {"outputIndex": 6, "internalId": 14, "externalId": 15, "name": "纵向伪缺陷", "acceptedDefect": false},
+        {"outputIndex": 7, "internalId": 15, "externalId": 15, "name": "纵向伪缺陷2", "acceptedDefect": false},
+        {"outputIndex": 8, "internalId": 1, "externalId": 1, "name": "伪缺陷", "acceptedDefect": false},
+        {"outputIndex": 9, "internalId": 2, "externalId": 2, "name": "断缝", "acceptedDefect": true},
+        {"outputIndex": 10, "internalId": 3, "externalId": 3, "name": "划伤", "acceptedDefect": true},
+        {"outputIndex": 11, "internalId": 4, "externalId": 4, "name": "麻面", "acceptedDefect": true},
+        {"outputIndex": 12, "internalId": 5, "externalId": 5, "name": "凹坑", "acceptedDefect": true},
+        {"outputIndex": 13, "internalId": 6, "externalId": 6, "name": "裂纹", "acceptedDefect": true},
+        {"outputIndex": 14, "internalId": 7, "externalId": 8, "name": "烂钢", "acceptedDefect": true}
+      ]
+    },
+    "3d": {
+      "sourceFile": "steel_model/3D_class_model/steel_model_classifier.h5",
+      "sourceSha256": "c9419835cedeaf71a7515e871234f4646aa650ccf586f912dc622d5fb4fccfb4",
+      "onnx": "surface-classifier-3d.onnx",
+      "onnxSha256": "74c03be0d208d8b094ac7544f4b47cf689669ef0b79a90247f2a020123299d5b",
+      "inputShape": [null, 224, 224, 3],
+      "outputShape": [null, 12],
+      "classes": [
+        {"outputIndex": 0, "internalId": 5, "externalId": 11, "name": "耳子", "acceptedDefect": true},
+        {"outputIndex": 1, "internalId": 6, "externalId": 12, "name": "结疤", "acceptedDefect": true},
+        {"outputIndex": 2, "internalId": 7, "externalId": 13, "name": "瘤子粘钢", "acceptedDefect": true},
+        {"outputIndex": 3, "internalId": 8, "externalId": 14, "name": "压痕", "acceptedDefect": true},
+        {"outputIndex": 4, "internalId": 9, "externalId": 15, "name": "伪缺陷误判耳子", "acceptedDefect": false},
+        {"outputIndex": 5, "internalId": 10, "externalId": 15, "name": "伪缺陷误判裂纹", "acceptedDefect": false},
+        {"outputIndex": 6, "internalId": 11, "externalId": 15, "name": "纵向伪缺陷", "acceptedDefect": false},
+        {"outputIndex": 7, "internalId": 12, "externalId": 15, "name": "纵向伪缺陷2", "acceptedDefect": false},
+        {"outputIndex": 8, "internalId": 1, "externalId": 1, "name": "伪缺陷", "acceptedDefect": false},
+        {"outputIndex": 9, "internalId": 2, "externalId": 3, "name": "划伤", "acceptedDefect": true},
+        {"outputIndex": 10, "internalId": 3, "externalId": 5, "name": "凹坑", "acceptedDefect": true},
+        {"outputIndex": 11, "internalId": 4, "externalId": 6, "name": "裂纹", "acceptedDefect": true}
+      ]
+    }
+  }
+}

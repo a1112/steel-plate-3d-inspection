@@ -23,3 +23,5 @@ simulated/production/
 sample-data/
 target/sample-data-cache/
 target/sample-data-repository/
+models/**/*.onnx
+models/**/*.pt

@@ -28,8 +28,14 @@ from PIL import Image
 
 from .alignment import (
     AlignmentConfig,
+    _atomic_json,
     alignment_manifest_path,
     build_and_write_flow_alignment,
+)
+from .defect_detection import (
+    DefectDetectionConfig,
+    build_and_write_flow_defect_detection,
+    defect_detection_manifest_path,
 )
 from .gentl import SickGenTLBackend
 from .measurement import (
@@ -136,6 +142,44 @@ def _build_flow_artifacts(
     )
     build_and_write_playback_index(camera_roots, storage_root, material_id)
     return alignment_path, alignment, measurement_path, measurement
+
+
+def _build_flow_defect_artifact(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment: dict[str, Any],
+    defect_detection_config: DefectDetectionConfig,
+) -> tuple[Path, dict[str, Any]]:
+    try:
+        return build_and_write_flow_defect_detection(
+            camera_roots,
+            storage_root,
+            material_id,
+            alignment,
+            config=defect_detection_config,
+        )
+    except Exception as error:
+        # A temporary learned model must never invalidate already completed
+        # alignment, measurement, playback or immutable capture artifacts.
+        defect_path = defect_detection_manifest_path(storage_root, material_id)
+        defects = {
+            "schema": "steel.sick-flow-defect-detection.v1",
+            "generatedAt": _utc_text(),
+            "materialId": material_id,
+            "state": "failed",
+            "temporaryModel": True,
+            "error": str(error),
+            "quality": {
+                "reviewRequired": True,
+                "fineGrainedClassification": False,
+                "gpuAcceleration": False,
+            },
+            "statistics": {"defectCount": 0},
+            "defects": [],
+        }
+        _atomic_json(defect_path, defects)
+        return defect_path, defects
 
 
 def _write_storage_shared_frame(
@@ -291,6 +335,14 @@ def _integer(payload: dict[str, Any], key: str, default: int, minimum: int, maxi
     if not minimum <= value <= maximum:
         raise ValueError(f"{key} must be between {minimum} and {maximum}")
     return value
+
+
+def _profile_relative_path(profile: SickCaptureProfile, value: Any) -> Path | None:
+    text = os.path.expandvars(str(value or "").strip())
+    if not text:
+        return None
+    candidate = Path(text)
+    return candidate if candidate.is_absolute() else profile.source_path.parent / candidate
 
 
 class ProviderRuntime:
@@ -503,6 +555,81 @@ class ProviderRuntime:
                 capture_defaults.get("measurementMaximumCircleResidualMm", 0.5)
             ),
         ).bounded()
+        self.defect_detection_config = DefectDetectionConfig(
+            enabled=_truthy(
+                os.environ.get(
+                    "SICK_DEFECT_DETECTION_ENABLED",
+                    capture_defaults.get("defectDetectionEnabled"),
+                ),
+                False,
+            ),
+            model_2d_path=_profile_relative_path(
+                profile,
+                os.environ.get(
+                    "SICK_DEFECT_MODEL_2D",
+                    capture_defaults.get("defectModel2dPath", ""),
+                ),
+            ),
+            model_3d_path=_profile_relative_path(
+                profile,
+                os.environ.get(
+                    "SICK_DEFECT_MODEL_3D",
+                    capture_defaults.get("defectModel3dPath", ""),
+                ),
+            ),
+            classifier_2d_path=_profile_relative_path(
+                profile,
+                os.environ.get(
+                    "SICK_DEFECT_CLASSIFIER_2D",
+                    capture_defaults.get("defectClassifier2dPath", ""),
+                ),
+            ),
+            classifier_3d_path=_profile_relative_path(
+                profile,
+                os.environ.get(
+                    "SICK_DEFECT_CLASSIFIER_3D",
+                    capture_defaults.get("defectClassifier3dPath", ""),
+                ),
+            ),
+            model_manifest_path=_profile_relative_path(
+                profile,
+                capture_defaults.get("defectModelManifestPath", ""),
+            ),
+            image_size=int(capture_defaults.get("defectImageSize", 640)),
+            confidence_threshold=float(
+                capture_defaults.get("defectConfidenceThreshold", 0.25)
+            ),
+            iou_threshold=float(capture_defaults.get("defectIouThreshold", 0.25)),
+            merge_iou_threshold=float(
+                capture_defaults.get("defectMergeIouThreshold", 0.20)
+            ),
+            maximum_detections_per_frame=int(
+                capture_defaults.get("defectMaximumPerFrame", 100)
+            ),
+            classification_confidence_threshold=float(
+                capture_defaults.get(
+                    "defectClassificationConfidenceThreshold", 0.55
+                )
+            ),
+            frame_stride=int(capture_defaults.get("defectFrameStride", 1)),
+            cpu_frame_stride=int(capture_defaults.get("defectCpuFrameStride", 8)),
+            gpu_device_id=int(
+                os.environ.get(
+                    "SICK_DEFECT_GPU_DEVICE",
+                    capture_defaults.get("defectGpuDevice", 1),
+                )
+            ),
+            depth_exposure=float(capture_defaults.get("defectDepthExposure", 300.0)),
+            capture_origin=os.environ.get(
+                "SICK_CAPTURE_ORIGIN", "http://127.0.0.1:4317"
+            ),
+            maximum_idle_wait_seconds=float(
+                capture_defaults.get("defectMaximumIdleWaitSeconds", 300.0)
+            ),
+            maximum_pending_storage_rounds=int(
+                capture_defaults.get("defectMaximumPendingStorageRounds", 0)
+            ),
+        ).bounded()
         self.storage_process_threads = max(
             0,
             min(profile.expected_cameras, configured_storage_process_workers),
@@ -664,8 +791,17 @@ class ProviderRuntime:
             max_tasks_per_child=1,
             initializer=_initialize_flow_analysis_process,
         )
+        # Learned inference has its own recycled, below-normal-priority
+        # process.  A slow model can therefore never delay alignment,
+        # measurement or publication of the playback index.
+        self.defect_detection_compute_pool = ProcessPoolExecutor(
+            max_workers=1,
+            max_tasks_per_child=1,
+            initializer=_initialize_flow_analysis_process,
+        )
         self.alignment_lock = threading.RLock()
         self.alignment_futures: dict[str, Future[Any]] = {}
+        self.defect_detection_futures: dict[str, Future[Any]] = {}
         self.alignment_status: dict[str, Any] = {
             "state": "idle",
             "materialId": "",
@@ -680,6 +816,16 @@ class ProviderRuntime:
             "path": "",
             "metricValid": False,
             "qualityGate": None,
+            "error": "",
+            "updatedAt": _utc_text(),
+        }
+        self.defect_detection_status: dict[str, Any] = {
+            "state": "idle" if self.defect_detection_config.enabled else "disabled",
+            "materialId": "",
+            "path": "",
+            "defectCount": 0,
+            "temporaryModel": True,
+            "gpuAcceleration": False,
             "error": "",
             "updatedAt": _utc_text(),
         }
@@ -912,6 +1058,7 @@ class ProviderRuntime:
         self.playback_compute_pool.shutdown(wait=True, cancel_futures=False)
         self.alignment_pool.shutdown(wait=True, cancel_futures=False)
         self.alignment_compute_pool.shutdown(wait=True, cancel_futures=False)
+        self.defect_detection_compute_pool.shutdown(wait=False, cancel_futures=True)
         self.disconnect(force=True)
         self.backend.close()
 
@@ -1206,6 +1353,115 @@ class ProviderRuntime:
             self.playback_warm_futures[material_id] = future
         return True
 
+    def _schedule_flow_defect_detection(
+        self, material_id: str, alignment: dict[str, Any]
+    ) -> bool:
+        normalized = material_id.strip()
+        if not normalized or _safe_segment(normalized) != normalized:
+            return False
+        if not self.defect_detection_config.enabled:
+            with self.alignment_lock:
+                self.defect_detection_status = {
+                    **self.defect_detection_status,
+                    "state": "disabled",
+                    "materialId": normalized,
+                    "updatedAt": _utc_text(),
+                }
+            return False
+        with self.alignment_lock:
+            existing = self.defect_detection_futures.get(normalized)
+            if existing is not None and not existing.done():
+                return False
+            self.defect_detection_status = {
+                "state": "waiting-for-capture-idle",
+                "materialId": normalized,
+                "path": str(
+                    defect_detection_manifest_path(
+                        self.profile.storage_root, normalized
+                    )
+                ),
+                "defectCount": 0,
+                "temporaryModel": True,
+                "gpuAcceleration": False,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+            camera_roots = {
+                camera.camera_id: camera.storage_root
+                for camera in self.profile.enabled_cameras
+            }
+            future = self.defect_detection_compute_pool.submit(
+                _build_flow_defect_artifact,
+                camera_roots,
+                self.profile.storage_root,
+                normalized,
+                alignment,
+                self.defect_detection_config,
+            )
+            self.defect_detection_futures[normalized] = future
+
+        def completed(done: Future[Any]) -> None:
+            try:
+                defect_path, defects = done.result()
+                quality = defects.get("quality", {})
+                with self.alignment_lock:
+                    if self.defect_detection_status.get("materialId") == normalized:
+                        self.defect_detection_status = {
+                            "state": defects.get("state", "complete"),
+                            "materialId": normalized,
+                            "path": str(defect_path),
+                            "defectCount": int(
+                                defects.get("statistics", {}).get("defectCount", 0)
+                            ),
+                            "temporaryModel": True,
+                            "gpuAcceleration": bool(
+                                quality.get("gpuAcceleration", False)
+                            ),
+                            "error": str(defects.get("error", "")),
+                            "updatedAt": _utc_text(),
+                        }
+                self._log(
+                    "info",
+                    "flow defect detection completed",
+                    materialId=normalized,
+                    path=str(defect_path),
+                    state=defects.get("state"),
+                    defectCount=int(
+                        defects.get("statistics", {}).get("defectCount", 0)
+                    ),
+                )
+            except Exception as error:
+                with self.alignment_lock:
+                    if self.defect_detection_status.get("materialId") == normalized:
+                        self.defect_detection_status = {
+                            **self.defect_detection_status,
+                            "state": "failed",
+                            "error": str(error),
+                            "updatedAt": _utc_text(),
+                        }
+                self._log(
+                    "warning",
+                    "flow defect detection failed",
+                    materialId=normalized,
+                    error=str(error),
+                )
+
+        future.add_done_callback(completed)
+        return True
+
+    def _schedule_defect_rebuild(self, material_id: str) -> bool:
+        normalized = material_id.strip()
+        if not normalized or _safe_segment(normalized) != normalized:
+            return False
+        path = alignment_manifest_path(self.profile.storage_root, normalized)
+        if path.is_file():
+            try:
+                alignment = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False
+            return self._schedule_flow_defect_detection(normalized, alignment)
+        return self._schedule_flow_alignment(normalized)
+
     def _schedule_flow_alignment(self, material_id: str) -> bool:
         normalized = material_id.strip()
         if not normalized or _safe_segment(normalized) != normalized:
@@ -1230,6 +1486,24 @@ class ProviderRuntime:
                 ),
                 "metricValid": False,
                 "qualityGate": None,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+            self.defect_detection_status = {
+                "state": (
+                    "waiting-for-alignment"
+                    if self.defect_detection_config.enabled
+                    else "disabled"
+                ),
+                "materialId": normalized,
+                "path": str(
+                    defect_detection_manifest_path(
+                        self.profile.storage_root, normalized
+                    )
+                ),
+                "defectCount": 0,
+                "temporaryModel": True,
+                "gpuAcceleration": False,
                 "error": "",
                 "updatedAt": _utc_text(),
             }
@@ -1268,6 +1542,7 @@ class ProviderRuntime:
                     ),
                 )
                 self._schedule_playback_warm(normalized)
+                self._schedule_flow_defect_detection(normalized, manifest)
             except Exception as error:
                 with self.alignment_lock:
                     self.alignment_status = {
@@ -1288,6 +1563,20 @@ class ProviderRuntime:
                         ),
                         "metricValid": False,
                         "qualityGate": None,
+                        "error": str(error),
+                        "updatedAt": _utc_text(),
+                    }
+                    self.defect_detection_status = {
+                        "state": "failed",
+                        "materialId": normalized,
+                        "path": str(
+                            defect_detection_manifest_path(
+                                self.profile.storage_root, normalized
+                            )
+                        ),
+                        "defectCount": 0,
+                        "temporaryModel": True,
+                        "gpuAcceleration": False,
                         "error": str(error),
                         "updatedAt": _utc_text(),
                     }
@@ -1345,6 +1634,7 @@ class ProviderRuntime:
                 status = dict(self.measurement_status)
             if status.get("materialId") == normalized and status.get("state") in {
                 "waiting-for-alignment",
+                "waiting-for-capture-idle",
                 "building",
             }:
                 return 202, {"code": 0, **status}
@@ -1362,6 +1652,39 @@ class ProviderRuntime:
                 "detail": str(error),
             }
         return 200, {"code": 0, "path": str(path), "measurement": payload}
+
+    def defect_detection_json(
+        self, material_id: str = ""
+    ) -> tuple[int, dict[str, Any]]:
+        normalized = material_id.strip()
+        if normalized and _safe_segment(normalized) != normalized:
+            return 400, {"code": 400, "error": "invalid_material_id"}
+        if not normalized:
+            with self.alignment_lock:
+                return 200, {"code": 0, **self.defect_detection_status}
+        path = defect_detection_manifest_path(self.profile.storage_root, normalized)
+        if not path.is_file():
+            with self.alignment_lock:
+                status = dict(self.defect_detection_status)
+            if status.get("materialId") == normalized and status.get("state") in {
+                "waiting-for-alignment",
+                "building",
+            }:
+                return 202, {"code": 0, **status}
+            return 404, {
+                "code": 404,
+                "error": "defect_detection_not_found",
+                "materialId": normalized,
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as error:
+            return 500, {
+                "code": 500,
+                "error": "defect_detection_invalid",
+                "detail": str(error),
+            }
+        return 200, {"code": 0, "path": str(path), "detection": payload}
 
     def _database_commit_loop(self) -> None:
         while True:
@@ -2036,6 +2359,7 @@ class ProviderRuntime:
         with self.alignment_lock:
             alignment = dict(self.alignment_status)
             measurement = dict(self.measurement_status)
+            defect_detection = dict(self.defect_detection_status)
         return {
             "code": 0 if backend_ready else 49110,
             "service": "steel_sick_capture_sidecar",
@@ -2093,6 +2417,7 @@ class ProviderRuntime:
             "acquisitionSynchronization": self._synchronization_json(),
             "flowAlignment": alignment,
             "flowMeasurement": measurement,
+            "flowDefectDetection": defect_detection,
             "lastError": self.last_error or None,
             "uptimeSeconds": round(time.time() - self.started_at, 3),
             "cameras": [self._camera_row(camera) for camera in self.profile.enabled_cameras],
@@ -4280,6 +4605,10 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
             material_id = (query.get("materialId") or [""])[0]
             status, payload = self.runtime.measurement_json(material_id)
             self._send_json(status, payload)
+        elif path == "/api/capture/defects":
+            material_id = (query.get("materialId") or [""])[0]
+            status, payload = self.runtime.defect_detection_json(material_id)
+            self._send_json(status, payload)
         elif path == "/api/stream/status":
             identity = (query.get("ip") or query.get("cameraId") or [""])[0]
             self._send_json(200, self.runtime.stream_status(identity))
@@ -4358,14 +4687,27 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
         elif path in {
             "/api/capture/alignment/rebuild",
             "/api/capture/measurement/rebuild",
+            "/api/capture/defects/rebuild",
         }:
             material_id = str(payload.get("materialId", "")).strip()
             if not material_id:
                 self._send_json(400, {"code": 400, "error": "materialId is required"})
-            elif self.runtime._schedule_flow_alignment(material_id):
+            elif (
+                self.runtime._schedule_defect_rebuild(material_id)
+                if path == "/api/capture/defects/rebuild"
+                else self.runtime._schedule_flow_alignment(material_id)
+            ):
                 self._send_json(
                     202,
-                    {"code": 0, "state": "waiting-for-storage", "materialId": material_id},
+                    {
+                        "code": 0,
+                        "state": (
+                            "waiting-for-capture-idle"
+                            if path == "/api/capture/defects/rebuild"
+                            else "waiting-for-storage"
+                        ),
+                        "materialId": material_id,
+                    },
                 )
             else:
                 self._send_json(

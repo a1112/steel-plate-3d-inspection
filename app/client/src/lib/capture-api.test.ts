@@ -28,6 +28,7 @@ import {
   readCaptureProfiles,
   readCaptureCalibrationOperationDetail,
   readCaptureContinuousSettings,
+  readCaptureDefects,
   readCaptureHistory,
   readCapturePlaybackCacheStatus,
   readCaptureMeasurement,
@@ -36,6 +37,7 @@ import {
   readActiveCaptureCalibration,
   readLatestCaptureFile,
   rebuildCaptureMeasurement,
+  rebuildCaptureDefects,
   runCaptureContinuousTest,
   recoverCaptureCameraParams,
   rollbackCaptureCalibrationSet,
@@ -292,6 +294,36 @@ describe("readLatestCaptureFile", () => {
     expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
       materialId: "FLOW-0000000001",
     });
+  });
+
+  it("reads and rebuilds temporary defect detection through Rust", async () => {
+    const responseBody = JSON.stringify({
+      code: 0,
+      path: "D:\\steel-sick-data\\defects\\FLOW-0000000001\\manifest.json",
+      detection: {
+        schema: "steel.sick-flow-defect-detection.v1",
+        generatedAt: "2026-08-22T10:00:00Z",
+        materialId: "FLOW-0000000001",
+        state: "complete",
+        temporaryModel: true,
+        quality: { reviewRequired: true, fineGrainedClassification: false },
+        defects: [],
+      },
+    });
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(
+      new Response(responseBody, { status: 200, headers: { "Content-Type": "application/json" } }),
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await readCaptureDefects("FLOW-0000000001");
+    await rebuildCaptureDefects("FLOW-0000000001");
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:4873/api/capture/defects?materialId=FLOW-0000000001",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:4873/api/capture/defects/rebuild",
+    );
   });
 
   it("rejects out-of-range realtime preview parameters before dispatch", async () => {

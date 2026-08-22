@@ -2921,6 +2921,130 @@ button {
   font-size: 10px;
 }
 
+.capture-defect-panel {
+  flex: 0 0 auto;
+  border: 1px solid #d9e5ec;
+  border-radius: 10px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.capture-defect-panel > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid #e7eef3;
+}
+
+.capture-defect-panel > header > div,
+.capture-defect-panel > header > div > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.capture-defect-panel > header > div > div {
+  align-items: baseline;
+}
+
+.capture-defect-panel > header span,
+.capture-defect-panel small {
+  color: #71818d;
+  font-size: 11px;
+}
+
+.capture-defect-panel button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #cfdae1;
+  border-radius: 6px;
+  background: #f8fbfc;
+  padding: 5px 9px;
+  color: #314752;
+}
+
+.capture-defect-content {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.28fr) 1fr;
+  gap: 12px;
+  padding: 10px 12px;
+}
+
+.capture-defect-content aside {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+}
+
+.capture-defect-content aside strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 16px;
+}
+
+.defect-state {
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: #edf3f6;
+  color: #536873;
+  font-size: 11px;
+}
+
+.defect-state-complete {
+  background: #e6f7f2;
+  color: #08795f;
+}
+
+.defect-state-degraded,
+.defect-state-failed {
+  background: #fff0e2;
+  color: #a85012;
+}
+
+.capture-defect-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.capture-defect-list > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  border: 1px solid #e4ebef;
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: #fafcfd;
+}
+
+.capture-defect-list b,
+.capture-defect-list span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.capture-defect-list span,
+.capture-defect-none {
+  color: #6f7f89;
+}
+
+.capture-defect-empty {
+  min-height: 66px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #75858f;
+}
+
 .sidebar-data-source {
   display: flex;
   align-items: center;

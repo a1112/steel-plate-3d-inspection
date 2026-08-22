@@ -563,6 +563,64 @@ export type CaptureMeasurementResponse = {
   measurement: CaptureFlowMeasurement;
 };
 
+export type CaptureDetectedDefect = {
+  id: string;
+  cameraId: string;
+  storageIndex: number;
+  cameraFrameSequence?: number | null;
+  capturedAt?: string | number | null;
+  imageRect2d: { left: number; top: number; right: number; bottom: number };
+  classId: string;
+  className: string;
+  classificationStage: string;
+  fineGrainedClass?: string | null;
+  externalClassId?: number | null;
+  recognitionConfidence?: number | null;
+  confidence: number;
+  severity: "review" | string;
+  modalities: Array<"2d" | "3d" | string>;
+  reviewImage?: string;
+};
+
+export type CaptureFlowDefectDetection = {
+  schema: "steel.sick-flow-defect-detection.v1" | string;
+  generatedAt: string;
+  materialId: string;
+  state: "complete" | "degraded" | "failed" | "disabled" | string;
+  temporaryModel: boolean;
+  error?: string;
+  quality: {
+    reviewRequired: boolean;
+    fineGrainedClassification: boolean;
+    binaryDetectionOnly?: boolean;
+    gpuAcceleration?: boolean;
+    sampled?: boolean;
+    reason?: string;
+  };
+  statistics?: {
+    processedFrames?: number;
+    skippedFrames?: number;
+    inferenceCount?: number;
+    recognitionInferenceCount?: number;
+    rawCandidateCount?: number;
+    boundaryArtifactFilteredCount?: number;
+    pseudoDefectFilteredCount?: number;
+    defectCount?: number;
+    elapsedMs?: number;
+  };
+  defects: CaptureDetectedDefect[];
+};
+
+export type CaptureDefectDetectionResponse = {
+  code: number;
+  path?: string;
+  detection?: CaptureFlowDefectDetection;
+  state?: string;
+  materialId?: string;
+  defectCount?: number;
+  gpuAcceleration?: boolean;
+};
+
 export type CaptureProfileEntry = {
   name: string;
   path?: string;
@@ -2348,6 +2406,22 @@ export async function readCaptureMeasurement(
 export async function rebuildCaptureMeasurement(materialId: string) {
   return writeJson<{ code: number; state: string; materialId: string }>(
     "/api/capture/measurement/rebuild",
+    { materialId: materialId.trim() },
+  );
+}
+
+export async function readCaptureDefects(
+  materialId: string,
+): Promise<CaptureDefectDetectionResponse> {
+  const query = new URLSearchParams({ materialId: materialId.trim() });
+  return readJson<CaptureDefectDetectionResponse>(
+    `/api/capture/defects?${query.toString()}`,
+  );
+}
+
+export async function rebuildCaptureDefects(materialId: string) {
+  return writeJson<{ code: number; state: string; materialId: string }>(
+    "/api/capture/defects/rebuild",
     { materialId: materialId.trim() },
   );
 }

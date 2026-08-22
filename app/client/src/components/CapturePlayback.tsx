@@ -8,6 +8,7 @@ import {
   type CaptureHistoryResult,
 } from '../lib/capture-api';
 import { CaptureMeasurementPanel } from './CaptureMeasurementPanel';
+import { CaptureDefectDetectionPanel } from './CaptureDefectDetectionPanel';
 
 interface CapturePlaybackProps {
   statuses: CaptureCameraStatus[];
@@ -222,6 +223,7 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
       )}
 
       {frame?.materialId ? <CaptureMeasurementPanel materialId={frame.materialId} /> : null}
+      {frame?.materialId ? <CaptureDefectDetectionPanel materialId={frame.materialId} /> : null}
 
       <footer className="capture-playback-timeline">
         <button type="button" onClick={() => move(-1)} disabled={requestedFrameIndex <= 0} aria-label="上一历史帧"><ChevronLeft size={16} /></button>

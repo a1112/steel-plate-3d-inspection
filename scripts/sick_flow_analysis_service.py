@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import threading
 import time
@@ -12,6 +13,10 @@ from pathlib import Path
 from urllib import request
 
 from sick_capture.alignment import AlignmentConfig, build_and_write_flow_alignment
+from sick_capture.defect_detection import (
+    DefectDetectionConfig,
+    build_and_write_flow_defect_detection,
+)
 from sick_capture.measurement import MeasurementConfig, build_and_write_flow_measurement
 from sick_capture.profile import load_profile
 
@@ -55,6 +60,7 @@ def analyze(
     material_id: str,
     alignment_config: AlignmentConfig,
     measurement_config: MeasurementConfig,
+    defect_detection_config: DefectDetectionConfig,
     calibration_path: Path | None,
 ) -> None:
     alignment_path, alignment = build_and_write_flow_alignment(
@@ -71,6 +77,13 @@ def analyze(
         calibration_path=calibration_path,
         config=measurement_config,
     )
+    defect_path, defects = build_and_write_flow_defect_detection(
+        camera_roots,
+        storage_root,
+        material_id,
+        alignment,
+        config=defect_detection_config,
+    )
     print(
         json.dumps(
             {
@@ -78,6 +91,9 @@ def analyze(
                 "materialId": material_id,
                 "alignment": str(alignment_path),
                 "measurement": str(measurement_path),
+                "defects": str(defect_path),
+                "defectState": defects.get("state"),
+                "defectCount": defects.get("statistics", {}).get("defectCount", 0),
                 "synchronized": alignment.get("quality", {}).get("synchronized"),
                 "metricValid": measurement.get("metricValid"),
             },
@@ -128,6 +144,41 @@ def main() -> int:
         candidate = Path(calibration_text)
         calibration_path = candidate if candidate.is_absolute() else profile.source_path.parent / candidate
 
+    def configured_path(key: str) -> Path | None:
+        text = os.path.expandvars(str(defaults.get(key, "")).strip())
+        if not text:
+            return None
+        candidate = Path(text)
+        return candidate if candidate.is_absolute() else profile.source_path.parent / candidate
+
+    defect_detection_config = DefectDetectionConfig(
+        enabled=bool(defaults.get("defectDetectionEnabled", False)),
+        model_2d_path=configured_path("defectModel2dPath"),
+        model_3d_path=configured_path("defectModel3dPath"),
+        classifier_2d_path=configured_path("defectClassifier2dPath"),
+        classifier_3d_path=configured_path("defectClassifier3dPath"),
+        model_manifest_path=configured_path("defectModelManifestPath"),
+        image_size=int(defaults.get("defectImageSize", 640)),
+        confidence_threshold=float(defaults.get("defectConfidenceThreshold", 0.25)),
+        iou_threshold=float(defaults.get("defectIouThreshold", 0.25)),
+        merge_iou_threshold=float(defaults.get("defectMergeIouThreshold", 0.20)),
+        maximum_detections_per_frame=int(defaults.get("defectMaximumPerFrame", 100)),
+        classification_confidence_threshold=float(
+            defaults.get("defectClassificationConfidenceThreshold", 0.55)
+        ),
+        frame_stride=int(defaults.get("defectFrameStride", 1)),
+        cpu_frame_stride=int(defaults.get("defectCpuFrameStride", 8)),
+        gpu_device_id=int(defaults.get("defectGpuDevice", 1)),
+        depth_exposure=float(defaults.get("defectDepthExposure", 300.0)),
+        capture_origin=args.capture_origin,
+        maximum_idle_wait_seconds=float(
+            defaults.get("defectMaximumIdleWaitSeconds", 300.0)
+        ),
+        maximum_pending_storage_rounds=int(
+            defaults.get("defectMaximumPendingStorageRounds", 0)
+        ),
+    ).bounded()
+
     if args.once:
         analyze(
             camera_roots,
@@ -135,6 +186,7 @@ def main() -> int:
             args.once,
             alignment_config,
             measurement_config,
+            defect_detection_config,
             calibration_path,
         )
         return 0
@@ -170,6 +222,7 @@ def main() -> int:
                         material_id,
                         alignment_config,
                         measurement_config,
+                        defect_detection_config,
                         calibration_path,
                     )
                     after = flow_signature(camera_roots, material_id)

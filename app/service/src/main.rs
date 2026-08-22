@@ -6082,6 +6082,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/capture/continuous-settings"),
     ("GET", "/api/capture/alignment"),
     ("GET", "/api/capture/measurement"),
+    ("GET", "/api/capture/defects"),
     ("GET", "/api/stream/status"),
     ("GET", "/api/calibration/active"),
     ("GET", "/api/calibration/status"),
@@ -6111,6 +6112,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/capture/continuous-settings"),
     ("POST", "/api/capture/alignment/rebuild"),
     ("POST", "/api/capture/measurement/rebuild"),
+    ("POST", "/api/capture/defects/rebuild"),
     ("POST", "/api/capture/preset/line-continuous"),
     ("POST", "/api/stream/start"),
     ("POST", "/api/stream/stop"),
@@ -27176,9 +27178,14 @@ mod tests {
         ));
         assert!(is_capture_json_proxy_route("GET", "/api/capture/alignment"));
         assert!(is_capture_json_proxy_route("GET", "/api/capture/measurement"));
+        assert!(is_capture_json_proxy_route("GET", "/api/capture/defects"));
         assert!(is_capture_json_proxy_route(
             "POST",
             "/api/capture/measurement/rebuild"
+        ));
+        assert!(is_capture_json_proxy_route(
+            "POST",
+            "/api/capture/defects/rebuild"
         ));
         assert!(!is_capture_json_proxy_route("POST", "/api/capture/latest"));
         assert!(!is_capture_json_proxy_route("GET", "/api/capture/file"));
