@@ -67,15 +67,39 @@ describe('LiveMonitoringPage', () => {
   });
 
   it('renders a full monitoring page, auto-starts a stream, and switches cameras and image planes', async () => {
-    render(<LiveMonitoringPage statuses={statuses} />);
+    render(<LiveMonitoringPage statuses={statuses} health={{
+      service: 'steel_sick_capture_sidecar',
+      time: '2026-08-21T04:00:00Z',
+      provider: 'external-api',
+      sdkReady: true,
+      sdkCode: 0,
+      connected: true,
+      ip: statuses[0].ip,
+      cameraCount: 2,
+      expectedCameras: 2,
+      acquisitionSynchronization: {
+        schema: 'steel.capture-synchronization.v1',
+        status: 'synchronized',
+        synchronized: true,
+        expectedCameras: 2,
+        connectedCameras: 2,
+        windowRounds: 20,
+        completeRounds: 20,
+        incompleteRounds: 0,
+        completenessPercent: 100,
+        frameCounts: { C1: 120, C2: 120 },
+        frameCountSkew: 0,
+      },
+    }} />);
 
     expect(screen.getByRole('main', { name: '相机监控页面' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '相机监控' })).toBeInTheDocument();
+    expect(screen.getByText('2/2 · 偏差 0')).toBeInTheDocument();
 
     await waitFor(() => expect(captureMocks.start).toHaveBeenCalledWith(expect.objectContaining({
       ip: '192.168.101.144',
       dataMode: 3,
-      fpsLimit: 8,
+      fpsLimit: 2,
     })));
     expect(screen.getByRole('img', { name: 'C1 实时灰度图' })).toHaveAttribute(
       'src',
@@ -104,7 +128,7 @@ describe('LiveMonitoringPage', () => {
     expect(screen.getByLabelText('历史六相机画面')).toBeInTheDocument();
     expect(screen.getByRole('img', { name: 'C1 历史灰度图' })).toHaveAttribute(
       'src',
-      expect.stringContaining('maxWidth=800'),
+      expect.stringContaining('maxWidth=560'),
     );
   });
 });

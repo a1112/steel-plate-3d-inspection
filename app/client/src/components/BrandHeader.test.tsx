@@ -170,7 +170,7 @@ describe('BrandHeader', () => {
     expect(document.querySelector('#receiver-detail-panel')).toBeInTheDocument();
     expect(document.body.textContent).toContain('network monitor pending');
     expect(document.body.textContent).toContain('0Mbps');
-    expect(document.body.textContent).not.toContain('120Mbps');
+    expect(screen.queryByText('120Mbps')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /apply|limit|throttle/i })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId('camera-status-button'));

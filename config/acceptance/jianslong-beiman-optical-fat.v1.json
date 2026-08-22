@@ -1,0 +1,80 @@
+{
+  "schema": "steel.optical-acceptance-baseline.v1",
+  "id": "jianslong-beiman-small-bar-optical-fat-v1",
+  "source": {
+    "document": "建龙北满设备测试报告（光学部分）(1).docx",
+    "equipment": "黑龙江建龙小棒3D表面质量检测仪",
+    "environment": "常温常压、无强光干扰、稳定供电"
+  },
+  "threeDimensional": {
+    "cameraCount": 6,
+    "workingDistance": {
+      "nearMm": 385.0,
+      "farMm": 620.0,
+      "nearFieldWidthMm": 181.0,
+      "farFieldWidthMm": 280.0
+    },
+    "exposureUs": [65.0, 20.0, 20.0, 60.0, 20.0, 15.0],
+    "heightBlockToleranceMm": 0.1,
+    "heightBlockMeasurements": [
+      { "camera": 1, "nominalMm": 50.0, "measuredMm": 50.0992 },
+      { "camera": 2, "nominalMm": 50.0, "measuredMm": 50.0556 },
+      { "camera": 3, "nominalMm": 80.0, "measuredMm": 80.0368 },
+      { "camera": 4, "nominalMm": 50.0, "measuredMm": 50.0059 },
+      { "camera": 5, "nominalMm": 50.0, "measuredMm": 50.0136 },
+      { "camera": 6, "nominalMm": 50.0, "measuredMm": 49.9958 }
+    ],
+    "stitching": {
+      "parameterConvention": "fListTx/fListTz in mm; fListRy in degrees",
+      "cameras": [
+        { "camera": 1, "fListTx": 24.647, "fListTz": 95.154, "fListRy": -90.016 },
+        { "camera": 2, "fListTx": 82.43, "fListTz": 50.124, "fListRy": -149.722 },
+        { "camera": 3, "fListTx": 73.986, "fListTz": -43.518, "fListRy": -210.23 },
+        { "camera": 4, "fListTx": -28.858, "fListTz": -86.154, "fListRy": -269.725 },
+        { "camera": 5, "fListTx": -92.226, "fListTz": -16.705, "fListRy": -329.997 },
+        { "camera": 6, "fListTx": -65.825, "fListTz": 66.592, "fListRy": -30.456 }
+      ]
+    }
+  },
+  "twoDimensional": {
+    "cameraCount": 4,
+    "workingDistanceMm": 470.0,
+    "fieldWidthMm": 304.0,
+    "exposureUs": 10.0,
+    "aperture": "F4",
+    "gain": 8.0,
+    "tdi": 2,
+    "lightLevel": 255,
+    "productDiameterMm": 120.0,
+    "axisPositionsMm": [-73.8, -61.27, null, null]
+  },
+  "synchronization": {
+    "requireEqualCameraCounts": true,
+    "maxLiveFrameCountSkew": 0,
+    "twoDimensional": {
+      "triggerPulseCount": 5569,
+      "cameraCounts": [5569, 5569, 5569, 5569]
+    },
+    "threeDimensional": {
+      "triggerPulseCount": 2784,
+      "cameraCounts": [2784, 2784, 2784, 2784, 2784, 2784],
+      "encoderPulsesPerProfile": 12
+    },
+    "crossSystem": {
+      "manualTravelMm": 23.2,
+      "twoDimensionalPulseCount": 2784,
+      "threeDimensionalPulseCount": 2784
+    }
+  },
+  "productionGate": {
+    "requirePhysicalProvider": true,
+    "requireAllCamerasConnected": true,
+    "requireSynchronizationTelemetry": true,
+    "requireNoCaptureFrameFailures": true,
+    "requireNoTransportFrameGaps": true,
+    "requireNoDroppedStorageRounds": true,
+    "requireNoFailedStorageRounds": true,
+    "requireNoDatabaseCommitFailures": true,
+    "allowSyntheticFallback": false
+  }
+}

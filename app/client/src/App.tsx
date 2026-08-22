@@ -1703,7 +1703,7 @@ function InspectionDashboard({
       ) : (
         <>
           {uiState.activeNav === 'live' ? (
-            <LiveMonitoringPage statuses={captureSnapshot.statuses} />
+            <LiveMonitoringPage statuses={captureSnapshot.statuses} health={captureSnapshot.health} />
           ) : uiState.activeNav === 'report' ? (
             <ReportPage
               defectTypes={snapshot.defectTypes}

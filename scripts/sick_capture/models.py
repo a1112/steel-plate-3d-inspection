@@ -27,6 +27,17 @@ class RawFrame:
     intensity_data_format: str
     coordinate_config: dict[str, dict[str, Any]] = field(default_factory=dict)
     camera_config: dict[str, Any] = field(default_factory=dict)
+    # GenTL frame ID reported by the transport layer.  ``sequence`` is the
+    # sidecar-local monotonic counter, while this value preserves the device
+    # transport identity needed for cross-camera synchronization audits.
+    transport_frame_id: int = 0
+    transport_frame_gap: int = 0
+    # Host-side software-trigger telemetry.  These remain zero/free-run for
+    # continuous acquisition and are persisted so synchronization quality can
+    # be audited without relying on process logs.
+    trigger_issued_ns: int = 0
+    trigger_completed_ns: int = 0
+    frame_trigger_mode: str = "free-run"
 
     def __post_init__(self) -> None:
         if (

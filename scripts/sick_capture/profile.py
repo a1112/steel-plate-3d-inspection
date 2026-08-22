@@ -224,6 +224,55 @@ def load_profile(
     timeout_ms = int(capture_defaults.get("timeoutMs", payload.get("timeoutMs", 8000)))
     if timeout_ms < 100 or timeout_ms > 600_000:
         raise ValueError("capture timeoutMs must be between 100 and 600000")
+    steel_detection_edge = str(
+        capture_defaults.get("steelDetectionEdge", "bottom")
+    ).strip().lower()
+    if steel_detection_edge not in {"top", "bottom"}:
+        raise ValueError("captureDefaults.steelDetectionEdge must be top or bottom")
+    steel_detection_tail_rows = int(
+        capture_defaults.get("steelDetectionTailRows", 32)
+    )
+    if not 1 <= steel_detection_tail_rows <= 4096:
+        raise ValueError(
+            "captureDefaults.steelDetectionTailRows must be between 1 and 4096"
+        )
+    frame_trigger_mode = str(
+        capture_defaults.get("frameTriggerMode", "free-run")
+    ).strip().lower()
+    if frame_trigger_mode not in {"free-run", "software"}:
+        raise ValueError(
+            "captureDefaults.frameTriggerMode must be free-run or software"
+        )
+    bounded_integer_settings = (
+        ("steelPreRollFrames", 0, 8, 1),
+        ("steelPostRollFrames", 0, 8, 1),
+        ("blackFrameCacheRounds", 1, 8, 8),
+        ("alignmentSearchFrames", 1, 32, 8),
+        ("alignmentStableRows", 1, 128, 8),
+        ("alignmentSampleStep", 1, 32, 4),
+        ("softSyncAnchorIntervalFrames", 1, 512, 16),
+        ("measurementRowWindow", 1, 128, 16),
+        ("measurementMaximumProfilePoints", 32, 2048, 320),
+        ("measurementMaximumSections", 1, 64, 12),
+        ("measurementMinimumCirclePoints", 8, 4096, 48),
+    )
+    for name, minimum, maximum, default in bounded_integer_settings:
+        value = int(capture_defaults.get(name, default))
+        if value < minimum or value > maximum:
+            raise ValueError(
+                f"captureDefaults.{name} must be between {minimum} and {maximum}"
+            )
+    bounded_float_settings = (
+        ("alignmentDepthValidRatio", 0.0001, 1.0, 0.005),
+        ("softSyncMaximumResidualMs", 0.1, 10_000.0, 40.0),
+        ("measurementMaximumCircleResidualMm", 0.001, 100.0, 0.5),
+    )
+    for name, minimum, maximum, default in bounded_float_settings:
+        value = float(capture_defaults.get(name, default))
+        if value < minimum or value > maximum:
+            raise ValueError(
+                f"captureDefaults.{name} must be between {minimum} and {maximum}"
+            )
     jpeg_quality = int(compatibility.get("jpegQuality", 95))
     if not 1 <= jpeg_quality <= 100:
         raise ValueError("compatibility.jpegQuality must be between 1 and 100")

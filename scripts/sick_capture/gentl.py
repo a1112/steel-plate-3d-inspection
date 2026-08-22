@@ -41,6 +41,14 @@ def _node_value(node_map: Any, name: str, fallback: Any = None) -> Any:
         return fallback
 
 
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
 def _set_node(node_map: Any, name: str, value: Any) -> None:
     try:
         node = getattr(node_map, name)
@@ -50,6 +58,112 @@ def _set_node(node_map: Any, name: str, value: Any) -> None:
         raise RuntimeError(f"cannot set required GenICam node {name}={value!r}: {error}") from error
     if readback != value:
         raise RuntimeError(f"GenICam node {name} readback mismatch: requested={value!r} actual={readback!r}")
+
+
+def _node_symbolics(node_map: Any, name: str) -> list[str]:
+    try:
+        node = getattr(node_map, name)
+    except (AttributeError, RuntimeError, ValueError, TypeError):
+        return []
+    for attribute in ("symbolics", "symbols"):
+        try:
+            values = getattr(node, attribute)
+            if callable(values):
+                values = values()
+            return [str(value) for value in values]
+        except (AttributeError, RuntimeError, ValueError, TypeError):
+            continue
+    return []
+
+
+def frame_trigger_capability_snapshot(
+    node_map: Any, *, probe_frame_start: bool = False
+) -> dict[str, Any]:
+    """Read FrameStart capability, restoring the original selector after a probe."""
+
+    selector_node = getattr(node_map, "TriggerSelector", None)
+    original_selector = _node_value(node_map, "TriggerSelector")
+    if probe_frame_start and selector_node is not None:
+        try:
+            selector_node.value = "FrameStart"
+        except (AttributeError, RuntimeError, ValueError, TypeError):
+            pass
+    try:
+        command = getattr(node_map, "TriggerSoftware")
+    except (AttributeError, RuntimeError, ValueError, TypeError):
+        command = None
+    executable = bool(
+        command is not None
+        and (
+            callable(getattr(command, "execute", None))
+            or callable(getattr(command, "run", None))
+        )
+    )
+    command_implemented = "TriggerSoftware" in dir(node_map)
+    selectors = _node_symbolics(node_map, "TriggerSelector")
+    sources = _node_symbolics(node_map, "TriggerSource")
+    current_selector = _node_value(node_map, "TriggerSelector")
+    current_source = _node_value(node_map, "TriggerSource")
+    current_mode = _node_value(node_map, "TriggerMode")
+    selector_supported = not selectors or "FrameStart" in selectors
+    source_supported = not sources or "Software" in sources
+    result = {
+        "frameStartSupported": bool(selector_supported),
+        "softwareSourceSupported": bool(source_supported),
+        "softwareCommandImplemented": command_implemented,
+        "softwareCommandAvailable": executable,
+        "softwareTriggerCapable": bool(
+            selector_supported and source_supported and command_implemented
+        ),
+        "frameSynchronizationCapable": bool(
+            _node_value(node_map, "FrameSynchronizationCapable", False)
+        ),
+        "currentSelector": current_selector,
+        "currentMode": current_mode,
+        "currentSource": current_source,
+        "selectorOptions": selectors,
+        "sourceOptions": sources,
+    }
+    if probe_frame_start and selector_node is not None and original_selector is not None:
+        try:
+            selector_node.value = original_selector
+        except (AttributeError, RuntimeError, ValueError, TypeError):
+            result["selectorRestoreFailed"] = True
+    result["probedSelector"] = current_selector
+    result["currentSelector"] = _node_value(
+        node_map, "TriggerSelector", current_selector
+    )
+    return result
+
+
+def configure_frame_software_trigger(node_map: Any) -> dict[str, Any]:
+    capability = frame_trigger_capability_snapshot(node_map)
+    if not capability["softwareTriggerCapable"]:
+        raise RuntimeError(
+            "camera does not expose a complete FrameStart/Software trigger contract"
+        )
+    _set_node(node_map, "TriggerSelector", "FrameStart")
+    _set_node(node_map, "TriggerMode", "On")
+    _set_node(node_map, "TriggerSource", "Software")
+    readback = frame_trigger_capability_snapshot(node_map)
+    if readback["currentMode"] != "On" or readback["currentSource"] != "Software":
+        raise RuntimeError(f"software trigger readback mismatch: {readback}")
+    return readback
+
+
+def execute_software_trigger(node_map: Any) -> tuple[int, int]:
+    try:
+        command = getattr(node_map, "TriggerSoftware")
+    except (AttributeError, RuntimeError, ValueError, TypeError) as error:
+        raise RuntimeError("GenICam TriggerSoftware command is unavailable") from error
+    execute = getattr(command, "execute", None)
+    if not callable(execute):
+        execute = getattr(command, "run", None)
+    if not callable(execute):
+        raise RuntimeError("GenICam TriggerSoftware command is not executable")
+    issued_ns = time.time_ns()
+    execute()
+    return issued_ns, time.time_ns()
 
 
 def node_snapshot(node_map: Any) -> dict[str, Any]:
@@ -158,11 +272,63 @@ class SickCameraSession:
         self.lock = threading.Lock()
         self.started = False
         self.sequence = 0
+        self.last_transport_frame_id: int | None = None
+        capture_defaults = profile.raw.get("captureDefaults", {})
+        requested_buffers = max(
+            3,
+            min(64, int(capture_defaults.get("gentlBufferCount", 8))),
+        )
+        minimum_buffers = int(getattr(image_acquirer, "min_num_buffers", 1) or 1)
+        if hasattr(image_acquirer, "num_buffers"):
+            image_acquirer.num_buffers = max(minimum_buffers, requested_buffers)
+        self.buffer_count = int(
+            getattr(image_acquirer, "num_buffers", minimum_buffers) or minimum_buffers
+        )
+        self.minimum_buffer_count = minimum_buffers
+        self.background_acquisition = bool(
+            capture_defaults.get("gentlBackgroundAcquisition", False)
+        )
+        if self.background_acquisition and hasattr(
+            image_acquirer, "num_filled_buffers_to_hold"
+        ):
+            image_acquirer.num_filled_buffers_to_hold = self.buffer_count
         _set_node(self.node_map, "DeviceScanType", profile.device_scan_type)
         for name, value in camera.node_overrides.items():
             _set_node(self.node_map, name, value)
+        self.frame_trigger_mode = str(
+            capture_defaults.get("frameTriggerMode", "free-run")
+        ).strip().lower()
+        self.trigger_capability = frame_trigger_capability_snapshot(
+            self.node_map, probe_frame_start=True
+        )
+        if self.frame_trigger_mode == "software":
+            self.trigger_capability = configure_frame_software_trigger(self.node_map)
         self.coordinate_config = coordinate_snapshot(self.node_map)
         self.camera_config = node_snapshot(self.node_map)
+        self.telemetry_lock = threading.Lock()
+        self.telemetry_poll_interval_seconds = 1.0
+        self.telemetry_last_poll_monotonic = 0.0
+        self.telemetry: dict[str, Any] = {
+            "deviceTemperature": _finite_float(
+                self.camera_config.get("DeviceTemperature")
+            ),
+            "deviceTemperatureMin": _finite_float(
+                self.camera_config.get("DeviceTemperatureMin")
+            ),
+            "deviceTemperatureMax": _finite_float(
+                self.camera_config.get("DeviceTemperatureMax")
+            ),
+            "deviceLinkThroughputCurrent": _finite_float(
+                self.camera_config.get("DeviceLinkThroughputCurrent")
+            ),
+            "deviceLinkThroughputLimit": _finite_float(
+                self.camera_config.get("DeviceLinkThroughputLimit")
+            ),
+            "acquisitionFrameRate": _finite_float(
+                self.camera_config.get("AcquisitionFrameRate")
+            ),
+            "updatedAtNs": time.time_ns(),
+        }
         actual_ip = _ipv4_from_node(_node_value(self.node_map, "GevCurrentIPAddress"))
         self.identity = {
             "serialNumber": _text(_node_value(self.node_map, "DeviceSerialNumber", "")),
@@ -198,9 +364,51 @@ class SickCameraSession:
         if not actual_ip:
             raise RuntimeError("SICK GevCurrentIPAddress readback is unavailable or invalid")
 
+    def trigger_status(self) -> dict[str, Any]:
+        return {
+            **self.trigger_capability,
+            "configuredMode": self.frame_trigger_mode,
+            "active": self.frame_trigger_mode == "software",
+        }
+
+    def _refresh_telemetry(self, now_monotonic: float | None = None) -> None:
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        if now - self.telemetry_last_poll_monotonic < self.telemetry_poll_interval_seconds:
+            return
+        self.telemetry_last_poll_monotonic = now
+        node_names = {
+            "deviceTemperature": "DeviceTemperature",
+            "deviceTemperatureMin": "DeviceTemperatureMin",
+            "deviceTemperatureMax": "DeviceTemperatureMax",
+            "deviceLinkThroughputCurrent": "DeviceLinkThroughputCurrent",
+            "deviceLinkThroughputLimit": "DeviceLinkThroughputLimit",
+            "acquisitionFrameRate": "AcquisitionFrameRate",
+        }
+        updates: dict[str, Any] = {}
+        for output_name, node_name in node_names.items():
+            value = _finite_float(_node_value(self.node_map, node_name))
+            if value is not None:
+                updates[output_name] = value
+        updates["updatedAtNs"] = time.time_ns()
+        with self.telemetry_lock:
+            self.telemetry.update(updates)
+
+    def telemetry_snapshot(self) -> dict[str, Any]:
+        """Return cached device telemetry without blocking the capture/status threads."""
+
+        with self.telemetry_lock:
+            return dict(self.telemetry)
+
     def start(self) -> None:
         if not self.started:
-            self.image_acquirer.start()
+            try:
+                self.image_acquirer.start(
+                    run_as_thread=self.background_acquisition,
+                )
+            except TypeError:
+                # Compatibility with older GenTL consumers that do not expose
+                # Harvesters' run_as_thread keyword.
+                self.image_acquirer.start()
             self.started = True
 
     def stop(self) -> None:
@@ -222,6 +430,12 @@ class SickCameraSession:
         timeout_seconds = (timeout_ms or self.profile.timeout_ms) / 1000.0
         with self.lock:
             self.start()
+            trigger_issued_ns = 0
+            trigger_completed_ns = 0
+            if self.frame_trigger_mode == "software":
+                trigger_issued_ns, trigger_completed_ns = execute_software_trigger(
+                    self.node_map
+                )
             with self.image_acquirer.fetch(timeout=timeout_seconds) as buffer:
                 components = tuple(buffer.payload.components)
                 depth_component, intensity_component = select_components(
@@ -233,8 +447,18 @@ class SickCameraSession:
                 intensity = component_array(intensity_component, np.uint8)
                 timestamp = int(getattr(buffer, "timestamp", 0) or 0)
                 timestamp_frequency = int(getattr(buffer, "timestamp_frequency", 0) or 0)
+                transport_frame_id = int(getattr(buffer, "frame_id", 0) or 0)
+                transport_frame_gap = (
+                    max(0, transport_frame_id - self.last_transport_frame_id - 1)
+                    if self.last_transport_frame_id is not None
+                    and transport_frame_id > self.last_transport_frame_id
+                    else 0
+                )
+                if transport_frame_id > 0:
+                    self.last_transport_frame_id = transport_frame_id
                 depth_data_format = _format_text(depth_component)
                 intensity_data_format = _format_text(intensity_component)
+            self._refresh_telemetry()
             utc_ns = time.time_ns()
             monotonic_ns = time.monotonic_ns()
             sequence = self.sequence
@@ -257,6 +481,11 @@ class SickCameraSession:
                 intensity_data_format=intensity_data_format,
                 coordinate_config=self.coordinate_config,
                 camera_config=self.camera_config,
+                transport_frame_id=transport_frame_id,
+                transport_frame_gap=transport_frame_gap,
+                trigger_issued_ns=trigger_issued_ns,
+                trigger_completed_ns=trigger_completed_ns,
+                frame_trigger_mode=self.frame_trigger_mode,
             )
 
 

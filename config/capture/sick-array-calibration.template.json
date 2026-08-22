@@ -1,0 +1,25 @@
+{
+  "schema": "steel.sick-array-calibration.v1",
+  "revision": "SITE-CALIBRATION-REQUIRED",
+  "approved": false,
+  "approvedAt": null,
+  "approvedBy": null,
+  "coordinateFrame": {
+    "x": "cross-section-horizontal-mm",
+    "y": "bar-motion-mm",
+    "z": "cross-section-vertical-mm"
+  },
+  "target": {
+    "type": "certified-round-bar",
+    "nominalDiameterMm": null,
+    "certificate": null
+  },
+  "cameras": {
+    "C1": { "serialNumber": "25440062", "localToArray": null },
+    "C2": { "serialNumber": "25440064", "localToArray": null },
+    "C3": { "serialNumber": "25440058", "localToArray": null },
+    "C4": { "serialNumber": "25440053", "localToArray": null },
+    "C5": { "serialNumber": "25440060", "localToArray": null },
+    "C6": { "serialNumber": "25440059", "localToArray": null }
+  }
+}

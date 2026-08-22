@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,21 +64,27 @@ def atomic_json(path: Path, payload: Any, *, fsync: bool, overwrite: bool = True
         temporary.unlink(missing_ok=True)
 
 
-def atomic_npz(path: Path, array: np.ndarray, *, fsync: bool) -> None:
+def atomic_npz(path: Path, array: np.ndarray, *, fsync: bool) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise FileExistsError(path)
     temporary = _temporary_path(path)
     try:
+        encoded = io.BytesIO()
+        # ZIP_STORED keeps the established .npz contract while avoiding the
+        # multi-second DEFLATE cost observed on full steel frames.
+        np.savez(encoded, array=array)
+        payload = encoded.getbuffer()
+        digest = hashlib.sha256(payload).hexdigest()
         with temporary.open("wb") as stream:
-            # ZIP_STORED keeps the established .npz contract while avoiding
-            # the multi-second DEFLATE cost observed on full steel frames.
-            # The dedicated RAID volumes provide enough sequential bandwidth.
-            np.savez(stream, array=array)
+            stream.write(payload)
             _flush(stream, fsync)
+        payload.release()
+        encoded.close()
         if path.exists():
             raise FileExistsError(path)
         os.replace(temporary, path)
+        return digest
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -88,19 +96,26 @@ def atomic_image(
     image_format: str,
     fsync: bool,
     **save_options: Any,
-) -> None:
+) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise FileExistsError(path)
     temporary = _temporary_path(path)
     image = Image.fromarray(array)
     try:
+        encoded = io.BytesIO()
+        image.save(encoded, format=image_format, **save_options)
+        payload = encoded.getbuffer()
+        digest = hashlib.sha256(payload).hexdigest()
         with temporary.open("wb") as stream:
-            image.save(stream, format=image_format, **save_options)
+            stream.write(payload)
             _flush(stream, fsync)
+        payload.release()
+        encoded.close()
         if path.exists():
             raise FileExistsError(path)
         os.replace(temporary, path)
+        return digest
     finally:
         image.close()
         temporary.unlink(missing_ok=True)
@@ -120,6 +135,7 @@ class FrameWriteResult:
     steel_metadata: Path
     camera_config: Path
     checksums: dict[str, str]
+    write_elapsed_ms: float = 0.0
 
     def provider_row(self, frame: RawFrame, round_index: int) -> dict[str, Any]:
         return {
@@ -206,10 +222,12 @@ class DualFormatWriter:
         jpeg_quality: int = 95,
         fsync: bool = False,
         fault_hook: Callable[[str], None] | None = None,
+        artifact_context: dict[str, Any] | None = None,
     ) -> None:
         self.jpeg_quality = jpeg_quality
         self.fsync = fsync
         self.fault_hook = fault_hook
+        self.artifact_context = dict(artifact_context or {})
         self.sequences = SequenceAllocator()
 
     def _fault(self, stage: str) -> None:
@@ -225,7 +243,12 @@ class DualFormatWriter:
         index: int | None = None,
         session_id: str = "",
         production_event_id: str = "",
+        inspection_id: str = "",
+        capture_round: int = 0,
+        sync_group_id: str = "",
+        intensity_compress_level: int | None = None,
     ) -> FrameWriteResult:
+        write_started = time.perf_counter()
         safe_material = _safe_segment(material_id)
         base = camera_root / safe_material
         lg_index = self.sequences.reserve(camera_root, safe_material) if index is None else int(index)
@@ -314,18 +337,23 @@ class DualFormatWriter:
                     f"configured={configured_firmware!r} frame={frame.firmware!r}"
                 )
 
-        atomic_image(
+        png_compress_level = (
+            1
+            if intensity_compress_level is None
+            else max(0, min(9, int(intensity_compress_level)))
+        )
+        intensity_checksum = atomic_image(
             lg3d_intensity,
             frame.intensity,
             image_format="PNG",
-            compress_level=1,
+            # Level 1 is lossless PNG and is the measured CPU/I/O optimum on
+            # the target host; playback remains resized/JPEG-cached.
+            compress_level=png_compress_level,
             fsync=self.fsync,
         )
-        atomic_npz(lg3d_depth, frame.depth_raw, fsync=self.fsync)
+        depth_checksum = atomic_npz(lg3d_depth, frame.depth_raw, fsync=self.fsync)
         self._fault("data-files-committed")
 
-        intensity_checksum = sha256_file(lg3d_intensity)
-        depth_checksum = sha256_file(lg3d_depth)
         checksums = {
             "lg3d3d": depth_checksum,
             "lg3d2d": intensity_checksum,
@@ -359,8 +387,72 @@ class DualFormatWriter:
             "hostMonotonicNs": frame.host_monotonic_ns,
             "sessionId": session_id,
             "productionEventId": production_event_id,
+            "inspectionId": inspection_id,
+            "captureRound": capture_round,
+            "syncGroupId": sync_group_id,
             "cameraFrameSequence": frame.sequence,
+            "transportFrameId": frame.transport_frame_id,
+            "transportFrameGap": frame.transport_frame_gap,
+            "frameTriggerMode": frame.frame_trigger_mode,
+            "triggerIssuedNs": frame.trigger_issued_ns,
+            "triggerCompletedNs": frame.trigger_completed_ns,
             "checksums": checksums,
+        }
+        calibration = self.artifact_context.get("calibration", {})
+        metric_projection_verified = bool(
+            calibration.get("metricProjectionVerified", False)
+            if isinstance(calibration, dict)
+            else False
+        )
+        frame_artifact = {
+            "schema": "steel.frame-artifact.v1",
+            "physicalCapture": True,
+            "synthetic": False,
+            "inspectionId": inspection_id,
+            "materialId": material_id,
+            "sessionId": session_id,
+            "productionEventId": production_event_id,
+            "syncGroupId": sync_group_id,
+            "captureRound": capture_round,
+            "camera": {
+                "id": frame.camera_id,
+                "key": frame.camera_key,
+                "serialNumber": frame.serial_number,
+                "model": frame.model,
+                "firmware": frame.firmware,
+                "ip": frame.ip,
+            },
+            "sequence": {
+                "storageIndex": lg_index,
+                "sequenceNo": steel_sequence,
+                "cameraFrameSequence": frame.sequence,
+                "transportFrameId": frame.transport_frame_id,
+                "transportFrameGap": frame.transport_frame_gap,
+                "frameTriggerMode": frame.frame_trigger_mode,
+                "triggerIssuedNs": frame.trigger_issued_ns,
+                "triggerCompletedNs": frame.trigger_completed_ns,
+                "deviceTimestamp": frame.timestamp,
+                "deviceTimestampFrequency": frame.timestamp_frequency,
+                "hostUtcNs": frame.host_utc_ns,
+                "hostMonotonicNs": frame.host_monotonic_ns,
+            },
+            "shape": {"width": frame.width, "height": frame.height},
+            "formats": {
+                "depth": frame.depth_data_format,
+                "intensity": frame.intensity_data_format,
+            },
+            "units": {
+                "depth": "raw-device-code",
+                "metricProjectionVerified": metric_projection_verified,
+            },
+            "artifacts": {
+                "depth": str(steel_depth),
+                "intensity": str(steel_intensity),
+                "metadata": str(steel_metadata),
+                "cameraConfig": str(camera_config),
+            },
+            "checksums": checksums,
+            **self.artifact_context,
         }
         steel_metadata_payload = {
             **legacy_metadata,
@@ -368,6 +460,7 @@ class DualFormatWriter:
             "complete": True,
             "legacyCompatible": True,
             "intensityPersistenceMode": "single-2d-png",
+            "intensityPngCompressLevel": png_compress_level,
             "sequenceNo": steel_sequence,
             "depthOutput": str(steel_depth),
             "intensityOutput": str(steel_intensity),
@@ -377,6 +470,7 @@ class DualFormatWriter:
                 "intensityOutput": str(lg3d_intensity),
                 "metadataOutput": str(lg3d_metadata),
             },
+            "frameArtifact": frame_artifact,
         }
         atomic_json(
             lg3d_metadata,
@@ -399,6 +493,10 @@ class DualFormatWriter:
             steel_metadata=steel_metadata,
             camera_config=camera_config,
             checksums=checksums,
+            write_elapsed_ms=round(
+                (time.perf_counter() - write_started) * 1000.0,
+                3,
+            ),
         )
 
 

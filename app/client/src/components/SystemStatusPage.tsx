@@ -49,6 +49,7 @@ import {
   createDefaultCaptureConfig,
   disconnectCaptureCamera,
   openCaptureLocalPath,
+  readCaptureCameraStatuses,
   readCaptureContinuousSettings,
   readLatestCaptureFile,
   setCaptureParam,
@@ -266,7 +267,10 @@ function getStatusTone(status: CaptureCameraStatus) {
     return 'disabled';
   }
   if (status.connected) {
-    if ((status.lostPulseCounter ?? 0) > 0 || (status.bufferOverflowCounter ?? 0) > 0) {
+    const recentFrameDrops = status.transportFrameGapCount
+      ?? status.lostPulseCounter
+      ?? 0;
+    if (recentFrameDrops > 0 || (status.bufferOverflowCounter ?? 0) > 0) {
       return 'warning';
     }
     return 'online';
@@ -308,11 +312,41 @@ function getStatusLabel(status: CaptureCameraStatus) {
 }
 
 function getTemperature(status: CaptureCameraStatus) {
-  const values = [status.temperatureJ28, status.temperatureJ29, status.temperatureJ30].filter((value): value is number => typeof value === 'number');
+  const values = [
+    status.deviceTemperature,
+    status.temperatureJ28,
+    status.temperatureJ29,
+    status.temperatureJ30,
+  ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
   if (values.length === 0) {
     return '-';
   }
   return `${Math.max(...values).toFixed(1)} C`;
+}
+
+function getTemperatureDetail(status: CaptureCameraStatus) {
+  const current = getTemperature(status);
+  if (current === '-') {
+    return current;
+  }
+  const minimum = status.deviceTemperatureMin;
+  const maximum = status.deviceTemperatureMax;
+  return typeof minimum === 'number' && typeof maximum === 'number'
+    ? `${current}（设备范围 ${minimum.toFixed(1)}–${maximum.toFixed(1)} C）`
+    : current;
+}
+
+function getRecentFrameDropCount(status: CaptureCameraStatus) {
+  return status.transportFrameGapCount ?? status.lostPulseCounter;
+}
+
+function getFrameDropReview(status: CaptureCameraStatus) {
+  const drops = getRecentFrameDropCount(status);
+  if (drops === undefined) {
+    return '-';
+  }
+  const rounds = status.synchronizationWindowRounds;
+  return `${drops} 帧${rounds ? ` / 最近 ${rounds} 轮` : ''}`;
 }
 
 function isSimulationCapture(capture: CaptureSnapshot) {
@@ -377,7 +411,6 @@ function CameraCard({
 }) {
   const tone = getStatusTone(status);
   const previewActive = Boolean(status.streamRunning);
-  const displayedFps = previewActive ? status.streamFps : status.continuousFps;
 
   return (
     <button type="button" className={`capture-camera-card ${tone}`} onClick={() => onOpen(status.ip)}>
@@ -394,24 +427,24 @@ function CameraCard({
           <dd>{status.ip}</dd>
         </div>
         <div>
-          <dt>{previewActive ? '预览 FPS' : '连续 FPS'}</dt>
-          <dd>{formatNumber(displayedFps)}</dd>
+          <dt>连续 FPS</dt>
+          <dd>{formatNumber(status.continuousFps)}</dd>
         </div>
         <div>
-          <dt>缓存</dt>
-          <dd>{formatNumber(status.bufferPercent, 0)}%</dd>
+          <dt>{previewActive ? '预览 FPS' : '采集帧数'}</dt>
+          <dd>{previewActive ? formatNumber(status.streamFps) : (status.continuousFrameCount ?? '-')}</dd>
         </div>
         <div>
           <dt>温度</dt>
           <dd>{getTemperature(status)}</dd>
         </div>
         <div>
-          <dt>丢脉冲</dt>
-          <dd>{status.lostPulseCounter ?? 0}</dd>
+          <dt>最近丢帧</dt>
+          <dd>{getRecentFrameDropCount(status) ?? '-'}</dd>
         </div>
         <div>
-          <dt>{previewActive ? '预览帧数' : '最近完成帧'}</dt>
-          <dd>{previewActive ? (status.streamFrames ?? 0) : formatTime(status.lastContinuousFrameAt ?? status.lastFrameTime)}</dd>
+          <dt>最近采集</dt>
+          <dd>{formatTime(status.lastContinuousFrameAt ?? status.lastFrameTime)}</dd>
         </div>
       </dl>
       <footer>
@@ -623,12 +656,45 @@ export function CaptureManagementApp({
   const [siteSimulationRounds, setSiteSimulationRounds] = useState(3);
   const [siteSimulationPhase, setSiteSimulationPhase] = useState('待机');
   const [siteSimulationSummary, setSiteSimulationSummary] = useState<string | null>(null);
+  const [liveCameraStatuses, setLiveCameraStatuses] = useState<CaptureCameraStatus[]>(capture.statuses);
 
   useEffect(() => {
     if (!configDirty) {
       setLocalConfig(capture.config);
     }
   }, [capture.config, configDirty]);
+
+  useEffect(() => {
+    setLiveCameraStatuses(capture.statuses);
+  }, [capture.statuses]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let requestRunning = false;
+    const refresh = async () => {
+      if (requestRunning) {
+        return;
+      }
+      requestRunning = true;
+      try {
+        const statuses = await readCaptureCameraStatuses();
+        if (!cancelled && statuses.length > 0) {
+          setLiveCameraStatuses(statuses);
+        }
+      } catch {
+        // Keep the latest known-good rows. The full snapshot refresh remains
+        // the slower fallback when this lightweight telemetry call is absent.
+      } finally {
+        requestRunning = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const syncProductionDraftFromStatus = useCallback(
     (nextStatus: ProductionStatus) => {
@@ -743,7 +809,7 @@ export function CaptureManagementApp({
   }, []);
 
   const overviewStatuses = useMemo(() => {
-    const statusesByIp = new Map(capture.statuses.map((item) => [item.ip, item]));
+    const statusesByIp = new Map(liveCameraStatuses.map((item) => [item.ip, item]));
     const configuredIps = new Set(localConfig.cameras.map((camera) => camera.ip));
     return [
       ...localConfig.cameras.map((camera) => ({
@@ -754,9 +820,9 @@ export function CaptureManagementApp({
         configId: statusesByIp.get(camera.ip)?.configId ?? camera.id,
         enabled: camera.enabled,
       })),
-      ...capture.statuses.filter((item) => !configuredIps.has(item.ip)),
+      ...liveCameraStatuses.filter((item) => !configuredIps.has(item.ip)),
     ];
-  }, [capture.statuses, localConfig.cameras]);
+  }, [liveCameraStatuses, localConfig.cameras]);
 
   const selectedStatus = selectedIp ? overviewStatuses.find((item) => item.ip === selectedIp) ?? null : null;
   const selectedConfig = selectedStatus ? localConfig.cameras.find((camera) => camera.ip === selectedStatus.ip || camera.id === selectedStatus.configId) ?? null : null;
@@ -1790,19 +1856,19 @@ export function CaptureManagementApp({
             </div>
             <div>
               <dt>温度</dt>
-              <dd>{selectedStatus.temperatureJ28 === undefined ? '-' : `${selectedStatus.temperatureJ28.toFixed(1)} C`}</dd>
+              <dd>{getTemperature(selectedStatus)}</dd>
             </div>
             <div>
-              <dt>线速率</dt>
-              <dd>{selectedStatus.captureConfig?.timeTriggerFreq === undefined ? '-' : `${formatNumber(selectedStatus.captureConfig.timeTriggerFreq, 0)} Hz`}</dd>
+              <dt>连续 FPS</dt>
+              <dd>{formatNumber(selectedStatus.continuousFps)}</dd>
             </div>
             <div>
-              <dt>{selectedStatus.streamRunning ? '预览 FPS' : '连续 FPS'}</dt>
-              <dd>{formatNumber(selectedStatus.streamRunning ? selectedStatus.streamFps : selectedStatus.continuousFps)}</dd>
+              <dt>{selectedStatus.streamRunning ? '预览 FPS' : '最近丢帧'}</dt>
+              <dd>{selectedStatus.streamRunning ? formatNumber(selectedStatus.streamFps) : (getRecentFrameDropCount(selectedStatus) ?? '-')}</dd>
             </div>
             <div>
-              <dt>{selectedStatus.streamRunning ? '预览帧数' : '帧计数'}</dt>
-              <dd>{selectedStatus.streamRunning ? (selectedStatus.streamFrames ?? 0) : (selectedStatus.continuousFrameCount ?? '-')}</dd>
+              <dt>连续帧数</dt>
+              <dd>{selectedStatus.continuousFrameCount ?? '-'}</dd>
             </div>
           </dl>
           <i className={getStatusTone(selectedStatus)}>{getStatusLabel(selectedStatus)}</i>
@@ -1834,32 +1900,52 @@ export function CaptureManagementApp({
                 <dd>{selectedStatus.sn || '-'}</dd>
               </div>
               <div>
-                <dt>{selectedStatus.streamRunning ? '预览 FPS' : '连续 FPS'}</dt>
-                <dd>{formatNumber(selectedStatus.streamRunning ? selectedStatus.streamFps : selectedStatus.continuousFps)}</dd>
+                <dt>连续采集 FPS</dt>
+                <dd>{formatNumber(selectedStatus.continuousFps)}</dd>
               </div>
               <div>
-                <dt>{selectedStatus.streamRunning ? '预览帧数' : '连续帧数'}</dt>
-                <dd>{selectedStatus.streamRunning ? (selectedStatus.streamFrames ?? 0) : (selectedStatus.continuousFrameCount ?? '-')}</dd>
+                <dt>预览 FPS</dt>
+                <dd>{selectedStatus.streamRunning ? formatNumber(selectedStatus.streamFps) : '-'}</dd>
               </div>
               <div>
-                <dt>缓存</dt>
-                <dd>{formatNumber(selectedStatus.bufferPercent, 0)}%</dd>
+                <dt>连续采集帧数</dt>
+                <dd>{selectedStatus.continuousFrameCount ?? '-'}</dd>
               </div>
               <div>
                 <dt>温度</dt>
-                <dd>
-                  {selectedStatus.temperatureJ28 === undefined
-                    ? '-'
-                    : `${selectedStatus.temperatureJ28?.toFixed(1)} / ${selectedStatus.temperatureJ29?.toFixed(1)} / ${selectedStatus.temperatureJ30?.toFixed(1)} C`}
-                </dd>
+                <dd>{getTemperatureDetail(selectedStatus)}</dd>
               </div>
               <div>
-                <dt>丢脉冲</dt>
-                <dd>{selectedStatus.lostPulseCounter ?? 0}</dd>
+                <dt>温度更新时间</dt>
+                <dd>{formatTime(selectedStatus.temperatureUpdatedAt)}</dd>
+              </div>
+              <div>
+                <dt>最近窗口丢帧</dt>
+                <dd>{getFrameDropReview(selectedStatus)}</dd>
+              </div>
+              <div>
+                <dt>服务启动后累计丢帧</dt>
+                <dd>{selectedStatus.lifetimeTransportFrameGapCount ?? selectedStatus.lostPulseCounter ?? '-'}</dd>
+              </div>
+              <div>
+                <dt>最近丢帧率</dt>
+                <dd>{selectedStatus.transportFrameDropPercent === undefined ? '-' : `${formatNumber(selectedStatus.transportFrameDropPercent, 4)}%`}</dd>
+              </div>
+              <div>
+                <dt>GenTL 帧号</dt>
+                <dd>{selectedStatus.transportFrameId ?? '-'}</dd>
+              </div>
+              <div>
+                <dt>相机采集频率</dt>
+                <dd>{selectedStatus.acquisitionFrameRate === undefined || selectedStatus.acquisitionFrameRate === null ? '-' : `${formatNumber(selectedStatus.acquisitionFrameRate)} Hz`}</dd>
+              </div>
+              <div>
+                <dt>设备链路吞吐</dt>
+                <dd>{selectedStatus.deviceLinkThroughputCurrent === undefined || selectedStatus.deviceLinkThroughputCurrent === null ? '-' : `${formatNumber(selectedStatus.deviceLinkThroughputCurrent / 1_000_000, 1)} MB/s`}</dd>
               </div>
               <div>
                 <dt>缓存溢出</dt>
-                <dd>{selectedStatus.bufferOverflowCounter ?? 0}</dd>
+                <dd>{selectedStatus.bufferOverflowCounter ?? '-'}</dd>
               </div>
             </dl> : null}
             {detailTab === 'sdk' ? <CaptureSdkReadback status={selectedStatus} /> : null}

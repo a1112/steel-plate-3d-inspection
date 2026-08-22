@@ -29,10 +29,13 @@ import {
   readCaptureCalibrationOperationDetail,
   readCaptureContinuousSettings,
   readCaptureHistory,
+  readCapturePlaybackCacheStatus,
+  readCaptureMeasurement,
   readCaptureParam,
   readCaptureLocalTextFile,
   readActiveCaptureCalibration,
   readLatestCaptureFile,
+  rebuildCaptureMeasurement,
   runCaptureContinuousTest,
   recoverCaptureCameraParams,
   rollbackCaptureCalibrationSet,
@@ -196,7 +199,7 @@ describe("readLatestCaptureFile", () => {
     );
   });
 
-  it("starts and stops realtime preview through Rust and keeps frame URLs on the Rust origin", async () => {
+  it("keeps realtime controls on Rust and reads frame bytes from the loopback data plane", async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response(JSON.stringify({ code: 0, ip: "192.168.101.100", running: true }), {
         status: 200,
@@ -227,19 +230,19 @@ describe("readLatestCaptureFile", () => {
     });
     expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:4873/api/stream/stop");
     expect(captureStreamImageUrl("192.168.101.100", "intensity")).toBe(
-      "http://127.0.0.1:4873/api/stream/latest?ip=192.168.101.100&kind=intensity&v=1783771200123",
+      "http://127.0.0.1:4317/api/stream/latest?ip=192.168.101.100&kind=intensity&v=1783771200123",
     );
   });
 
   it("reads capture history and requests a pixel-bounded playback image", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
       code: 0,
       storageRoot: "D:\\steel-sick-data",
       total: 1,
       count: 1,
       hasMore: false,
       frames: [],
-    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }), { status: 200, headers: { "Content-Type": "application/json" } })));
     vi.stubGlobal("fetch", fetchMock);
 
     await readCaptureHistory(999);
@@ -250,6 +253,45 @@ describe("readLatestCaptureFile", () => {
     expect(captureHistoryImageUrl("C1/BAR-001/intensity/000001.png", 8192)).toBe(
       "http://127.0.0.1:4873/api/capture/file?path=C1%2FBAR-001%2Fintensity%2F000001.png&maxWidth=4096",
     );
+
+    await readCapturePlaybackCacheStatus();
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:4873/api/capture/cache/status",
+    );
+  });
+
+  it("reads and rebuilds the selected flow measurement through Rust", async () => {
+    const responseBody = JSON.stringify({
+      code: 0,
+      path: "D:\\steel-sick-data\\measurements\\FLOW-0000000001.json",
+      measurement: {
+        schema: "steel.ranger3-flow-measurement.v1",
+        generatedAt: "2026-08-22T04:00:00Z",
+        materialId: "FLOW-0000000001",
+        mode: "preview",
+        metricValid: false,
+        qualityGate: { passed: false, reasons: ["approved-array-calibration-missing"] },
+        selectedSection: {},
+        cameras: {},
+      },
+    });
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(
+      new Response(responseBody, { status: 200, headers: { "Content-Type": "application/json" } }),
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await readCaptureMeasurement("FLOW-0000000001");
+    await rebuildCaptureMeasurement("FLOW-0000000001");
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:4873/api/capture/measurement?materialId=FLOW-0000000001",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://127.0.0.1:4873/api/capture/measurement/rebuild",
+    );
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      materialId: "FLOW-0000000001",
+    });
   });
 
   it("rejects out-of-range realtime preview parameters before dispatch", async () => {

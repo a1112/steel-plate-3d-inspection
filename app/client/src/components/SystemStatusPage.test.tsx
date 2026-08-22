@@ -108,12 +108,17 @@ it('does not expose capture management or reconstruction in a non-direct runtime
 describe('CaptureManagementApp production trigger flow', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
   let siteCaptureCount: number;
+  let cameraStatusesPayload: unknown;
 
   beforeEach(() => {
     window.localStorage.clear();
     siteCaptureCount = 0;
+    cameraStatusesPayload = { code: 0, statuses: [] };
     fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      if (url === 'http://127.0.0.1:4873/api/camera/statuses') {
+        return jsonResponse(cameraStatusesPayload);
+      }
       if (url === 'http://127.0.0.1:4873/api/production/status') {
         return jsonResponse({
           ...productionStatus,
@@ -386,7 +391,7 @@ describe('CaptureManagementApp production trigger flow', () => {
     expect(await within(settings).findByText(/已运行时下发：线触发 360.5 Hz，8\/8 台相机/)).toBeInTheDocument();
   });
 
-  it('shows preview FPS and preview frame count while a camera realtime stream owns acquisition telemetry', () => {
+  it('keeps production FPS visible while separately showing preview FPS', () => {
     const capture = createEmptyCaptureSnapshot(null);
     capture.statuses[3] = {
       ...capture.statuses[3],
@@ -400,10 +405,61 @@ describe('CaptureManagementApp production trigger flow', () => {
     renderCaptureManagement(fetchMock, capture);
 
     const camera = screen.getByRole('button', { name: /4 号采集相机/ });
+    expect(within(camera).getByText('连续 FPS')).toBeInTheDocument();
+    expect(within(camera).getByText('0.0')).toBeInTheDocument();
     expect(within(camera).getByText('预览 FPS')).toBeInTheDocument();
     expect(within(camera).getByText('4.8')).toBeInTheDocument();
-    expect(within(camera).getByText('预览帧数')).toBeInTheDocument();
-    expect(within(camera).getByText('1826')).toBeInTheDocument();
+  });
+
+  it('refreshes SICK temperature, continuous FPS and frame-drop review in camera details', async () => {
+    const capture = createEmptyCaptureSnapshot(null);
+    const base = {
+      ...capture.statuses[0],
+      connected: true,
+      acquisitionState: 'acquiring',
+      continuousAcquiring: true,
+      continuousFrameCount: 100,
+      deviceTemperature: 44.5,
+      deviceTemperatureMin: 24,
+      deviceTemperatureMax: 54,
+      temperatureUpdatedAt: '2026-08-22T08:00:00.000Z',
+      continuousFps: 6.7,
+      streamRunning: true,
+      streamFps: 2.0,
+      transportFrameId: 1000,
+      transportFrameGapCount: 0,
+      lifetimeTransportFrameGapCount: 3,
+      synchronizationWindowRounds: 120,
+      transportFrameDropPercent: 0,
+    };
+    cameraStatusesPayload = { code: 0, statuses: [base] };
+    renderCaptureManagement(fetchMock, capture);
+
+    const camera = await screen.findByRole('button', { name: /1 号采集相机/ });
+    await waitFor(() => expect(within(camera).getByText('44.5 C')).toBeInTheDocument());
+    fireEvent.click(camera);
+    expect(await screen.findByText('44.5 C（设备范围 24.0–54.0 C）')).toBeInTheDocument();
+    expect(screen.getByText('0 帧 / 最近 120 轮')).toBeInTheDocument();
+    expect(screen.getByText('GenTL 帧号')).toBeInTheDocument();
+    expect(screen.getByText('1000')).toBeInTheDocument();
+
+    cameraStatusesPayload = {
+      code: 0,
+      statuses: [{
+        ...base,
+        continuousFps: 6.9,
+        continuousFrameCount: 108,
+        deviceTemperature: 45.0,
+        transportFrameId: 1008,
+        transportFrameGapCount: 2,
+        lifetimeTransportFrameGapCount: 5,
+        transportFrameDropPercent: 1.6393,
+      }],
+    };
+    await waitFor(() => expect(screen.getByText('45.0 C（设备范围 24.0–54.0 C）')).toBeInTheDocument(), { timeout: 2500 });
+    expect(screen.getByText('2 帧 / 最近 120 轮')).toBeInTheDocument();
+    expect(screen.getByText('1.6393%')).toBeInTheDocument();
+    expect(screen.getAllByText('6.9').length).toBeGreaterThan(0);
   });
 
   it('runs the complete simulated site flow with the current eight-camera source', async () => {
@@ -495,7 +551,7 @@ describe('CaptureManagementApp production trigger flow', () => {
     ).toBe(true);
   });
 
-  it('starts a connected camera realtime preview through Rust and reads frames from the Rust origin', async () => {
+  it('starts a connected camera realtime preview through Rust and reads frames directly from the capture data plane', async () => {
     const capture = createEmptyCaptureSnapshot(null);
     capture.statuses[0] = {
       ...capture.statuses[0],
@@ -534,7 +590,7 @@ describe('CaptureManagementApp production trigger flow', () => {
     await waitFor(() => {
       expect(screen.getByRole('img', { name: '1 号采集相机 depth map' })).toHaveAttribute(
         'src',
-        expect.stringContaining('http://127.0.0.1:4873/api/stream/latest?'),
+        expect.stringContaining('http://127.0.0.1:4317/api/stream/latest?'),
       );
     });
     expect(view.container.querySelector('.capture-message')).not.toBeInTheDocument();

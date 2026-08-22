@@ -16,6 +16,7 @@ import {
   startCaptureStream,
   stopCaptureStream,
   type CaptureCameraStatus,
+  type CaptureHealth,
 } from '../lib/capture-api';
 import { CapturePlayback } from './CapturePlayback';
 
@@ -24,6 +25,7 @@ type MonitorMode = 'live' | 'playback';
 
 interface LiveMonitoringPageProps {
   statuses: CaptureCameraStatus[];
+  health?: CaptureHealth | null;
 }
 
 interface StableStreamImageProps {
@@ -109,13 +111,16 @@ function formatFrameTime(value?: string | null) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString('zh-CN', { hour12: false });
 }
 
-export function LiveMonitoringPage({ statuses }: LiveMonitoringPageProps) {
+export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPageProps) {
   const cameras = useMemo(
     () => statuses.filter((status) => status.enabled !== false),
     [statuses],
   );
   const connected = cameras.filter((status) => status.connected);
   const acquiring = cameras.filter((status) => status.continuousAcquiring);
+  const synchronization = health?.provider !== 'bkv'
+    ? health?.acquisitionSynchronization
+    : undefined;
   const [selectedIp, setSelectedIp] = useState('');
   const [focusedIp, setFocusedIp] = useState<string | null>(null);
   const [monitorMode, setMonitorMode] = useState<MonitorMode>('live');
@@ -155,7 +160,7 @@ export function LiveMonitoringPage({ statuses }: LiveMonitoringPageProps) {
     let cancelled = false;
     setBusy(true);
     setMessage('正在接入实时采集…');
-    void startCaptureStream({ ip: selected.ip, dataMode: 3, fpsLimit: 8 })
+    void startCaptureStream({ ip: selected.ip, dataMode: 3, fpsLimit: 2 })
       .then((result) => {
         if (cancelled) return;
         if (result.code !== 0) throw new Error(result.error || result.message || `code ${result.code}`);
@@ -193,7 +198,10 @@ export function LiveMonitoringPage({ statuses }: LiveMonitoringPageProps) {
 
   useEffect(() => {
     if (monitorMode !== 'live' || !playing || !selected?.ip) return undefined;
-    const timer = window.setInterval(() => setRefreshToken((value) => value + 1), 220);
+    // The provider publishes at most two previews per second. Polling faster
+    // only creates duplicate six-camera proxy requests and delays history/API
+    // responses while adding no visible frames.
+    const timer = window.setInterval(() => setRefreshToken((value) => value + 1), 500);
     return () => window.clearInterval(timer);
   }, [monitorMode, playing, selected?.ip]);
 
@@ -278,6 +286,13 @@ export function LiveMonitoringPage({ statuses }: LiveMonitoringPageProps) {
         {monitorMode === 'live' ? <div className="live-monitor-summary" aria-label="实时采集汇总">
           <span><i className={connected.length > 0 ? 'online' : ''} />相机在线 <b>{connected.length}/{cameras.length}</b></span>
           <span><Waves size={14} />连续采集 <b>{acquiring.length}/{cameras.length}</b></span>
+          <span title={synchronization?.lastRound?.missingCameras?.length
+            ? `缺少：${synchronization.lastRound.missingCameras.join('、')}`
+            : '最近同步采集轮次完整'}>
+            <Radio size={14} />同步 <b>{synchronization
+              ? `${synchronization.connectedCameras}/${synchronization.expectedCameras} · 偏差 ${synchronization.frameCountSkew}`
+              : '等待'}</b>
+          </span>
           <span><ImageIcon size={14} />已显示 <b>{renderedFrames}</b> 帧</span>
         </div> : null}
       </header>
@@ -453,6 +468,7 @@ export function LiveMonitoringPage({ statuses }: LiveMonitoringPageProps) {
                       <span>{formatFps(status.streamFps ?? status.continuousFps)} FPS</span>
                       <span>实时流 {status.streamFrames ?? 0} 帧</span>
                       <span>连续采集 {status.continuousFrameCount ?? 0} 帧</span>
+                      <span>同步偏差 {status.continuousFrameDelta ?? 0}</span>
                     </footer>
                   </section>
                 );

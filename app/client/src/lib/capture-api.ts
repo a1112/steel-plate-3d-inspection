@@ -50,6 +50,49 @@ export type PhysicalCaptureHealth = {
   driverId?: string;
   driverName?: string;
   cameraCount?: number;
+  expectedCameras?: number;
+  acquisitionSynchronization?: CaptureSynchronizationStatus;
+  storageQueue?: CaptureHealthStorageQueueStatus;
+};
+
+export type CaptureSynchronizationRound = {
+  round: number;
+  receivedCameras: number;
+  complete: boolean;
+  missingCameras: string[];
+  hostCaptureSkewMs?: number | null;
+  cameraSequenceSkew?: number | null;
+  transportFrameIdsAvailable?: number;
+  transportFrameGaps?: Record<string, number>;
+};
+
+export type CaptureSynchronizationStatus = {
+  schema: "steel.capture-synchronization.v1" | string;
+  status: "waiting" | "synchronized" | "degraded" | string;
+  synchronized: boolean;
+  expectedCameras: number;
+  connectedCameras: number;
+  windowRounds: number;
+  completeRounds: number;
+  incompleteRounds: number;
+  completenessPercent: number;
+  frameCounts: Record<string, number>;
+  frameCountSkew: number;
+  transportFrameGapCounts?: Record<string, number>;
+  transportFrameGaps?: number;
+  lifetimeTransportFrameGapCounts?: Record<string, number>;
+  lifetimeTransportFrameGaps?: number;
+  lastRound?: CaptureSynchronizationRound | null;
+};
+
+export type CaptureHealthStorageQueueStatus = {
+  accepting?: boolean;
+  capacityRounds?: number;
+  pendingRounds?: number;
+  activeRounds?: number;
+  droppedRounds?: number;
+  droppedFrames?: number;
+  failedRounds?: number;
 };
 
 export type BkvCaptureHealth = {
@@ -100,6 +143,7 @@ export type CaptureCameraStatus = {
    */
   continuousFps?: number | null;
   continuousFrameCount?: number | null;
+  continuousFrameDelta?: number | null;
   continuousFinalizedCount?: number | null;
   continuousSuccessfulFrameCount?: number | null;
   continuousLastResultCode?: number | null;
@@ -114,6 +158,19 @@ export type CaptureCameraStatus = {
   temperatureJ28?: number;
   temperatureJ29?: number;
   temperatureJ30?: number;
+  deviceTemperature?: number | null;
+  deviceTemperatureMin?: number | null;
+  deviceTemperatureMax?: number | null;
+  temperatureUpdatedAt?: string | null;
+  acquisitionFrameRate?: number | null;
+  deviceLinkThroughputCurrent?: number | null;
+  deviceLinkThroughputLimit?: number | null;
+  transportFrameId?: number | null;
+  transportFrameGapCount?: number;
+  lifetimeTransportFrameGapCount?: number;
+  transportFrameDropPercent?: number;
+  synchronizationWindowRounds?: number;
+  hasRecentFrameDrops?: boolean;
   lostPulseCounter?: number;
   bufferOverflowCounter?: number;
   streamRunning?: boolean;
@@ -421,6 +478,9 @@ export type CaptureHistoryCameraFrame = {
   artifactRef: string;
   width: number;
   height: number;
+  playbackWidth?: number;
+  playbackHeight?: number;
+  validRoi?: number[];
   bytes: number;
   storedAt: string;
 };
@@ -439,7 +499,68 @@ export type CaptureHistoryResult = {
   total: number;
   count: number;
   hasMore: boolean;
+  indexed?: boolean;
+  catalogPath?: string;
   frames: CaptureHistoryFrame[];
+};
+
+export type CapturePlaybackCacheStatus = {
+  code: number;
+  schema: string;
+  cacheRoot: string;
+  catalogPath: string;
+  catalogAvailable: boolean;
+  memoryEntries: number;
+  memoryHits: number;
+  diskHits: number;
+  pyramidsBuilt: number;
+  buildFailures: number;
+  averageBuildMs?: number | null;
+};
+
+export type CaptureMeasurementCamera = {
+  available: boolean;
+  storageIndex?: number;
+  rowIndex?: number;
+  rowClipped?: boolean;
+  cropBox?: number[];
+  validProfilePoints?: number;
+  localProfile?: number[][];
+  arrayProfile?: number[][] | null;
+  calibrationApplied?: boolean;
+  reason?: string;
+};
+
+export type CaptureFlowMeasurement = {
+  schema: "steel.ranger3-flow-measurement.v1" | string;
+  generatedAt: string;
+  materialId: string;
+  mode: "preview" | "metric" | string;
+  metricValid: boolean;
+  qualityGate: { passed: boolean; reasons: string[] };
+  selectedSection: {
+    anchorOrdinal?: number | null;
+    elapsedFromHeadMs?: number | null;
+    circleFit?: {
+      available?: boolean;
+      diameterMm?: number;
+      radiusMm?: number;
+      p95AbsResidualMm?: number;
+      reason?: string;
+    };
+  };
+  cameras: Record<string, CaptureMeasurementCamera>;
+  surfaceFit?: {
+    available?: boolean;
+    absoluteLongitudinalScaleVerified?: boolean;
+    reason?: string | null;
+  };
+};
+
+export type CaptureMeasurementResponse = {
+  code: number;
+  path: string;
+  measurement: CaptureFlowMeasurement;
 };
 
 export type CaptureProfileEntry = {
@@ -888,12 +1009,20 @@ export type ActivateCaptureCalibrationInput = {
 };
 
 const DEFAULT_CAPTURE_SERVICE_ORIGIN = "http://127.0.0.1:4873";
+const DEFAULT_CAPTURE_STREAM_ORIGIN = "http://127.0.0.1:4317";
 
 function getCaptureServiceOrigin() {
-  // The desktop UI is never a capture-provider client. Every request, including
-  // image reads, must traverse the Rust service so its auth, audit and provider
-  // policy remain authoritative.
+  // Mutations and JSON telemetry stay on the Rust control plane.
   return getInspectionServiceOrigin() || DEFAULT_CAPTURE_SERVICE_ORIGIN;
+}
+
+function getCaptureStreamOrigin() {
+  // Live images are a high-rate, loopback-only data plane. Sending six image
+  // reads through the thread-per-request Rust proxy caused cancelled browser
+  // refreshes to accumulate proxy workers and saturate every CPU core. Keep
+  // start/stop authorization on 4873 while reading immutable preview bytes
+  // directly from the local capture provider.
+  return DEFAULT_CAPTURE_STREAM_ORIGIN;
 }
 
 function hasTauriRuntime() {
@@ -1373,6 +1502,15 @@ function parseCaptureHealth(value: unknown): CaptureHealth {
       : {}),
     ...(typeof value.cameraCount === "number"
       ? { cameraCount: value.cameraCount }
+      : {}),
+    ...(typeof value.expectedCameras === "number"
+      ? { expectedCameras: value.expectedCameras }
+      : {}),
+    ...(isRecord(value.acquisitionSynchronization)
+      ? { acquisitionSynchronization: value.acquisitionSynchronization as CaptureSynchronizationStatus }
+      : {}),
+    ...(isRecord(value.storageQueue)
+      ? { storageQueue: value.storageQueue as CaptureHealthStorageQueueStatus }
       : {}),
   };
 }
@@ -2172,7 +2310,19 @@ export function captureStreamImageUrl(
   kind: "depth" | "intensity" | "intensity-grid" = "depth",
 ) {
   const query = new URLSearchParams({ ip, kind, v: String(Date.now()) });
-  return `${getCaptureServiceOrigin()}/api/stream/latest?${query.toString()}`;
+  return `${getCaptureStreamOrigin()}/api/stream/latest?${query.toString()}`;
+}
+
+/**
+ * Read only the rapidly changing per-camera telemetry. This endpoint is safe
+ * to poll more frequently than the full capture snapshot because it avoids
+ * configuration, logs and history requests.
+ */
+export async function readCaptureCameraStatuses(): Promise<CaptureCameraStatus[]> {
+  const result = await readJson<{ statuses?: CaptureCameraStatus[] }>(
+    "/api/camera/statuses",
+  );
+  return Array.isArray(result.statuses) ? result.statuses : [];
 }
 
 export async function readCaptureHistory(limit = 240): Promise<CaptureHistoryResult> {
@@ -2180,6 +2330,26 @@ export async function readCaptureHistory(limit = 240): Promise<CaptureHistoryRes
     limit: String(Math.max(1, Math.min(500, Math.round(limit)))),
   });
   return readJson<CaptureHistoryResult>(`/api/capture/history?${query.toString()}`);
+}
+
+export async function readCapturePlaybackCacheStatus(): Promise<CapturePlaybackCacheStatus> {
+  return readJson<CapturePlaybackCacheStatus>("/api/capture/cache/status");
+}
+
+export async function readCaptureMeasurement(
+  materialId: string,
+): Promise<CaptureMeasurementResponse> {
+  const query = new URLSearchParams({ materialId: materialId.trim() });
+  return readJson<CaptureMeasurementResponse>(
+    `/api/capture/measurement?${query.toString()}`,
+  );
+}
+
+export async function rebuildCaptureMeasurement(materialId: string) {
+  return writeJson<{ code: number; state: string; materialId: string }>(
+    "/api/capture/measurement/rebuild",
+    { materialId: materialId.trim() },
+  );
 }
 
 export function captureHistoryImageUrl(artifactRef: string, maxWidth = 800) {

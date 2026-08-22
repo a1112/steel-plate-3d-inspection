@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import datetime as dt
 import io
 import json
 import mimetypes
@@ -12,8 +13,10 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
@@ -23,8 +26,30 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import numpy as np
 from PIL import Image
 
+from .alignment import (
+    AlignmentConfig,
+    alignment_manifest_path,
+    build_and_write_flow_alignment,
+)
 from .gentl import SickGenTLBackend
-from .profile import CameraProfile, SickCaptureProfile, load_profile
+from .measurement import (
+    MeasurementConfig,
+    build_and_write_flow_measurement,
+    measurement_manifest_path,
+)
+from .playback import (
+    build_and_write_playback_index,
+    build_image_pyramid,
+    flow_pyramid_cache_status_path,
+    playback_catalog_path,
+    playback_index_path,
+    read_image_pyramid,
+    read_indexed_history,
+    select_pyramid_image,
+    source_fingerprint,
+    write_flow_pyramid_cache_status,
+)
+from .profile import CameraProfile, SickCaptureProfile, load_profile, sha256_file
 from .storage import DualFormatWriter, atomic_summary
 
 
@@ -35,6 +60,149 @@ SICK_CAPTURE_FAILED = 49100
 SICK_COMPONENT_SCHEMA_MISMATCH = 49101
 SICK_STORAGE_FAILED = 49102
 LIVE_PREVIEW_BLACK_MAX = 8.0
+LIVE_PREVIEW_MAX_FPS = 2.0
+
+
+_STORAGE_PROCESS_WRITER: DualFormatWriter | None = None
+_STORAGE_PROCESS_SHARED_MEMORY: dict[str, shared_memory.SharedMemory] = {}
+_STORAGE_PROCESS_THREAD_POOL: ThreadPoolExecutor | None = None
+
+
+def _initialize_storage_process_writer(
+    jpeg_quality: int,
+    fsync: bool,
+    artifact_context: dict[str, Any],
+    thread_count: int,
+) -> None:
+    global _STORAGE_PROCESS_WRITER, _STORAGE_PROCESS_SHARED_MEMORY
+    global _STORAGE_PROCESS_THREAD_POOL
+    _STORAGE_PROCESS_WRITER = DualFormatWriter(
+        jpeg_quality=jpeg_quality,
+        fsync=fsync,
+        artifact_context=artifact_context,
+    )
+    _STORAGE_PROCESS_SHARED_MEMORY = {}
+    _STORAGE_PROCESS_THREAD_POOL = ThreadPoolExecutor(
+        max_workers=max(1, thread_count),
+        thread_name_prefix="sick-storage-disk",
+    )
+
+
+def _initialize_flow_analysis_process() -> None:
+    """Keep offline PNG/NPZ analysis from pre-empting the GenTL fetch loop."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            below_normal_priority_class = 0x00004000
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel32.SetPriorityClass.restype = ctypes.c_int
+            process = kernel32.GetCurrentProcess()
+            if not kernel32.SetPriorityClass(
+                process, below_normal_priority_class
+            ):
+                raise OSError(ctypes.get_last_error(), "SetPriorityClass failed")
+        else:
+            os.nice(10)
+    except (AttributeError, OSError, ValueError):
+        # Priority lowering is a protective optimization. Analysis remains
+        # correct on platforms that do not expose either mechanism.
+        pass
+
+
+def _build_flow_artifacts(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment_config: AlignmentConfig,
+    calibration_path: Path | None,
+    measurement_config: MeasurementConfig,
+) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
+    alignment_path, alignment = build_and_write_flow_alignment(
+        camera_roots,
+        storage_root,
+        material_id,
+        config=alignment_config,
+    )
+    measurement_path, measurement = build_and_write_flow_measurement(
+        camera_roots,
+        storage_root,
+        material_id,
+        alignment,
+        calibration_path=calibration_path,
+        config=measurement_config,
+    )
+    build_and_write_playback_index(camera_roots, storage_root, material_id)
+    return alignment_path, alignment, measurement_path, measurement
+
+
+def _write_storage_shared_frame(
+    camera_root: Path,
+    material_id: str,
+    frame_stub: Any,
+    depth_descriptor: tuple[str, tuple[int, ...], str],
+    intensity_descriptor: tuple[str, tuple[int, ...], str],
+    options: dict[str, Any],
+) -> Any:
+    if _STORAGE_PROCESS_WRITER is None:
+        raise RuntimeError("storage process writer is not initialized")
+    depth_memory = _STORAGE_PROCESS_SHARED_MEMORY.get(depth_descriptor[0])
+    if depth_memory is None:
+        depth_memory = shared_memory.SharedMemory(name=depth_descriptor[0])
+        _STORAGE_PROCESS_SHARED_MEMORY[depth_descriptor[0]] = depth_memory
+    intensity_memory = _STORAGE_PROCESS_SHARED_MEMORY.get(intensity_descriptor[0])
+    if intensity_memory is None:
+        intensity_memory = shared_memory.SharedMemory(name=intensity_descriptor[0])
+        _STORAGE_PROCESS_SHARED_MEMORY[intensity_descriptor[0]] = intensity_memory
+    depth = np.ndarray(
+        depth_descriptor[1],
+        dtype=np.dtype(depth_descriptor[2]),
+        buffer=depth_memory.buf,
+    )
+    intensity = np.ndarray(
+        intensity_descriptor[1],
+        dtype=np.dtype(intensity_descriptor[2]),
+        buffer=intensity_memory.buf,
+    )
+    frame = replace(frame_stub, depth_raw=depth, intensity=intensity)
+    return _STORAGE_PROCESS_WRITER.write(
+        camera_root,
+        material_id,
+        frame,
+        **options,
+    )
+
+
+def _write_storage_shared_round(
+    tasks: list[
+        tuple[
+            Path,
+            str,
+            Any,
+            tuple[str, tuple[int, ...], str],
+            tuple[str, tuple[int, ...], str],
+            dict[str, Any],
+        ]
+    ],
+) -> list[tuple[bool, Any, str]]:
+    if _STORAGE_PROCESS_THREAD_POOL is None:
+        raise RuntimeError("storage process thread pool is not initialized")
+    futures = [
+        _STORAGE_PROCESS_THREAD_POOL.submit(
+            _write_storage_shared_frame,
+            *task,
+        )
+        for task in tasks
+    ]
+    outcomes: list[tuple[bool, Any, str]] = []
+    for future in futures:
+        try:
+            outcomes.append((True, future.result(), ""))
+        except Exception as error:
+            outcomes.append((False, None, f"{type(error).__name__}: {error}"))
+    return outcomes
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -43,6 +211,28 @@ def _truthy(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _steel_tail_metrics(
+    intensity: np.ndarray,
+    *,
+    edge: str,
+    rows: int,
+    bright_threshold: float,
+) -> tuple[float, float, int]:
+    """Return max, bright ratio and actual row count at the latest scan edge."""
+
+    if intensity.ndim < 2 or intensity.size == 0:
+        return 0.0, 0.0, 0
+    row_count = min(max(1, int(rows)), int(intensity.shape[0]))
+    region = intensity[:row_count] if edge == "top" else intensity[-row_count:]
+    maximum = float(np.max(region)) if region.size else 0.0
+    bright_ratio = (
+        float(np.count_nonzero(region > bright_threshold)) / float(region.size)
+        if region.size
+        else 0.0
+    )
+    return maximum, bright_ratio, row_count
 
 
 def _safe_segment(value: str) -> str:
@@ -55,9 +245,42 @@ def _safe_segment(value: str) -> str:
 
 
 def _utc_text() -> str:
-    import datetime as dt
-
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _frame_artifact_context(profile: SickCaptureProfile) -> dict[str, Any]:
+    """Build immutable provenance attached to every persisted physical frame."""
+
+    calibration = profile.raw.get("calibration", {})
+    if not isinstance(calibration, dict):
+        calibration = {}
+    calibration_value = str(
+        calibration.get("artifactPath", profile.raw.get("arrayCalibrationFile", "")) or ""
+    ).strip()
+    calibration_path: Path | None = None
+    if calibration_value:
+        candidate = Path(os.path.expandvars(calibration_value))
+        candidates = [candidate] if candidate.is_absolute() else [
+            (profile.source_path.parent / candidate).resolve(),
+            (Path.cwd() / candidate).resolve(),
+        ]
+        calibration_path = next((item for item in candidates if item.is_file()), candidates[0])
+    calibration_exists = bool(calibration_path and calibration_path.is_file())
+    return {
+        "captureProfile": {
+            "name": profile.name,
+            "path": str(profile.source_path),
+            "sha256": sha256_file(profile.source_path),
+        },
+        "calibration": {
+            "path": str(calibration_path) if calibration_path else "",
+            "sha256": sha256_file(calibration_path) if calibration_exists else "",
+            "present": calibration_exists,
+            "metricProjectionVerified": bool(
+                calibration.get("metricProjectionVerified", False)
+            ),
+        },
+    }
 
 
 def _integer(payload: dict[str, Any], key: str, default: int, minimum: int, maximum: int) -> int:
@@ -80,9 +303,11 @@ class ProviderRuntime:
     ) -> None:
         self.profile = profile
         self.backend = backend or SickGenTLBackend(profile)
+        artifact_context = _frame_artifact_context(profile)
         self.writer = writer or DualFormatWriter(
             jpeg_quality=profile.jpeg_quality,
             fsync=profile.fsync,
+            artifact_context=artifact_context,
         )
         self.sessions: dict[str, Any] = {}
         self.session_errors: dict[str, str] = {}
@@ -94,6 +319,9 @@ class ProviderRuntime:
         self.save_enabled = False
         self.save_generation = 0
         capture_defaults = profile.raw.get("captureDefaults", {})
+        self.frame_trigger_mode = str(
+            capture_defaults.get("frameTriggerMode", "free-run")
+        ).strip().lower()
         self.service_origin = os.environ.get(
             "STEEL_INSPECTION_SERVICE_ORIGIN", "http://127.0.0.1:4873"
         ).rstrip("/")
@@ -137,7 +365,7 @@ class ProviderRuntime:
         self.steel_pre_roll_frames = max(
             0,
             min(
-                10,
+                8,
                 int(
                     os.environ.get(
                         "SICK_STEEL_PRE_ROLL_FRAMES",
@@ -149,7 +377,7 @@ class ProviderRuntime:
         self.steel_post_roll_frames = max(
             0,
             min(
-                10,
+                8,
                 int(
                     os.environ.get(
                         "SICK_STEEL_POST_ROLL_FRAMES",
@@ -196,14 +424,134 @@ class ProviderRuntime:
             max_workers=max(1, profile.expected_cameras),
             thread_name_prefix="sick-capture",
         )
-        self.storage_writer_pool = ThreadPoolExecutor(
-            max_workers=max(1, profile.expected_cameras),
-            thread_name_prefix="sick-storage-camera",
+        configured_storage_process_workers = int(
+            capture_defaults.get(
+                "storageWriterThreads",
+                capture_defaults.get(
+                    # Compatibility alias: this now controls disk threads
+                    # inside one isolated storage process.
+                    "storageProcessWorkers",
+                    min(4, profile.expected_cameras)
+                    if profile.expected_cameras >= 4
+                    else 0,
+                ),
+            )
         )
+        self.steel_detection_edge = str(
+            os.environ.get(
+                "SICK_STEEL_DETECTION_EDGE",
+                capture_defaults.get("steelDetectionEdge", "bottom"),
+            )
+        ).strip().lower()
+        if self.steel_detection_edge not in {"top", "bottom"}:
+            raise ValueError("steelDetectionEdge must be top or bottom")
+        self.steel_detection_tail_rows = max(
+            1,
+            min(
+                4096,
+                int(
+                    os.environ.get(
+                        "SICK_STEEL_DETECTION_TAIL_ROWS",
+                        capture_defaults.get("steelDetectionTailRows", 32),
+                    )
+                ),
+            ),
+        )
+        self.alignment_config = AlignmentConfig(
+            search_frames=int(
+                capture_defaults.get(
+                    "alignmentSearchFrames",
+                    max(self.steel_pre_roll_frames + self.steel_entry_rounds, 8),
+                )
+            ),
+            stable_rows=int(capture_defaults.get("alignmentStableRows", 8)),
+            sample_step=int(capture_defaults.get("alignmentSampleStep", 4)),
+            depth_valid_ratio=float(
+                capture_defaults.get("alignmentDepthValidRatio", 0.005)
+            ),
+            intensity_threshold=self.steel_bright_threshold,
+            intensity_ratio=self.steel_bright_ratio,
+            anchor_interval_frames=int(
+                capture_defaults.get("softSyncAnchorIntervalFrames", 16)
+            ),
+            maximum_anchor_residual_ms=float(
+                capture_defaults.get("softSyncMaximumResidualMs", 40.0)
+            ),
+        ).bounded()
+        calibration_value = os.path.expandvars(
+            str(capture_defaults.get("arrayCalibrationPath", "")).strip()
+        )
+        self.array_calibration_path = (
+            (
+                Path(calibration_value)
+                if Path(calibration_value).is_absolute()
+                else profile.source_path.parent / calibration_value
+            )
+            if calibration_value
+            else None
+        )
+        self.measurement_config = MeasurementConfig(
+            row_window=int(capture_defaults.get("measurementRowWindow", 16)),
+            maximum_profile_points=int(
+                capture_defaults.get("measurementMaximumProfilePoints", 320)
+            ),
+            maximum_sections=int(capture_defaults.get("measurementMaximumSections", 12)),
+            minimum_circle_points=int(
+                capture_defaults.get("measurementMinimumCirclePoints", 48)
+            ),
+            maximum_circle_residual_mm=float(
+                capture_defaults.get("measurementMaximumCircleResidualMm", 0.5)
+            ),
+        ).bounded()
+        self.storage_process_threads = max(
+            0,
+            min(profile.expected_cameras, configured_storage_process_workers),
+        )
+        self.storage_process_workers = 1 if self.storage_process_threads else 0
+        if self.storage_process_workers:
+            self.storage_writer_pool = ProcessPoolExecutor(
+                max_workers=1,
+                initializer=_initialize_storage_process_writer,
+                initargs=(
+                    profile.jpeg_quality,
+                    profile.fsync,
+                    artifact_context,
+                    self.storage_process_threads,
+                ),
+            )
+        else:
+            self.storage_writer_pool = ThreadPoolExecutor(
+                max_workers=max(1, profile.expected_cameras),
+                thread_name_prefix="sick-storage-camera",
+            )
+        self.storage_shared_buffers: dict[
+            str,
+            tuple[
+                shared_memory.SharedMemory,
+                shared_memory.SharedMemory,
+                tuple[int, ...],
+                str,
+                str,
+            ],
+        ] = {}
         self.storage_round_pool = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="sick-storage-round",
         )
+        # Preview conversion must never occupy a camera fetch worker.  A
+        # bounded latest-frame pool lets the UI drop stale previews while the
+        # acquisition path continues consuming every GenTL frame.
+        self.preview_worker_threads = max(
+            1,
+            min(2, int(capture_defaults.get("previewWorkerThreads", 1))),
+        )
+        self.preview_pool = ThreadPoolExecutor(
+            max_workers=self.preview_worker_threads,
+            thread_name_prefix="sick-preview",
+        )
+        self.preview_work_lock = threading.Lock()
+        self.preview_pending_cameras: set[str] = set()
+        self.preview_scheduled_at: dict[str, float] = {}
         self.storage_queue_capacity_rounds = max(
             1,
             min(
@@ -223,13 +571,22 @@ class ProviderRuntime:
             + self.steel_post_roll_frames,
         )
         self.storage_queue_lock = threading.RLock()
+        self.storage_queue_space = threading.Condition(self.storage_queue_lock)
         self.storage_queue_accepting = True
         self.storage_queue_pending_rounds = 0
+        self.storage_queue_pending_by_material: dict[str, int] = {}
         self.storage_queue_active_rounds = 0
         self.storage_queue_completed_rounds = 0
         self.storage_queue_dropped_rounds = 0
         self.storage_queue_dropped_frames = 0
         self.storage_queue_failed_rounds = 0
+        self.storage_queue_high_water_rounds = 0
+        self.storage_queue_backpressure_waits = 0
+        self.storage_queue_backpressure_seconds = 0.0
+        self.storage_write_samples: deque[tuple[float, int, float]] = deque(maxlen=120)
+        self.storage_camera_write_ms: dict[str, deque[float]] = {
+            camera.key: deque(maxlen=120) for camera in profile.enabled_cameras
+        }
         self.state_lock = threading.RLock()
         self.acquisition_stop = threading.Event()
         self.acquisition_thread: threading.Thread | None = None
@@ -248,6 +605,25 @@ class ProviderRuntime:
             }
             for camera in profile.enabled_cameras
         }
+        self.synchronization_window: deque[dict[str, Any]] = deque(maxlen=120)
+        self.synchronization_warmup_rounds = max(
+            0,
+            int(
+                capture_defaults.get(
+                    "synchronizationWarmupRounds",
+                    profile.expected_cameras,
+                )
+            ),
+        )
+        self.synchronization_warmup_remaining = self.synchronization_warmup_rounds
+        self.startup_capture_retries = max(
+            0,
+            min(3, int(capture_defaults.get("startupCaptureRetries", 1))),
+        )
+        self.last_transport_frame_ids: dict[str, int] = {}
+        self.transport_frame_gap_counts: dict[str, int] = {
+            camera.key: 0 for camera in profile.enabled_cameras
+        }
         self.stream_lock = threading.RLock()
         self.stream_camera_key = ""
         self.stream_options: dict[str, Any] = {}
@@ -260,6 +636,7 @@ class ProviderRuntime:
         self.stream_frame_ticks_by_camera: dict[str, deque[float]] = {}
         self.stream_dimensions: dict[str, tuple[int, int]] = {}
         self.stream_latest: dict[str, dict[str, bytes]] = {}
+        self.stream_requested_kinds: dict[str, dict[str, float]] = {}
         self.preview_seed_lock = threading.Lock()
         self.history_lock = threading.RLock()
         self.history_cache: list[dict[str, Any]] = []
@@ -267,15 +644,108 @@ class ProviderRuntime:
         self.history_cache_limit = 0
         self.history_cache_material_id = ""
         self.history_cache_has_more = False
-        self.playback_image_cache: OrderedDict[
-            tuple[str, int, int], tuple[str, bytes]
+        self.indexed_history_cache: OrderedDict[
+            tuple[int, str, int], dict[str, Any]
         ] = OrderedDict()
+        self.history_refresh_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="sick-history-index",
+        )
+        self.history_refresh_future: Future[tuple[list[dict[str, Any]], bool]] | None = None
+        self.alignment_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="sick-flow-alignment",
+        )
+        # CPU- and I/O-heavy reconstruction must not share the interpreter GIL
+        # with the real-time GenTL acquisition loop. Recycle the low-priority
+        # child after every flow so decoded image arrays cannot accumulate.
+        self.alignment_compute_pool = ProcessPoolExecutor(
+            max_workers=1,
+            max_tasks_per_child=1,
+            initializer=_initialize_flow_analysis_process,
+        )
+        self.alignment_lock = threading.RLock()
+        self.alignment_futures: dict[str, Future[Any]] = {}
+        self.alignment_status: dict[str, Any] = {
+            "state": "idle",
+            "materialId": "",
+            "path": "",
+            "quality": None,
+            "error": "",
+            "updatedAt": _utc_text(),
+        }
+        self.measurement_status: dict[str, Any] = {
+            "state": "idle",
+            "materialId": "",
+            "path": "",
+            "metricValid": False,
+            "qualityGate": None,
+            "error": "",
+            "updatedAt": _utc_text(),
+        }
+        self.playback_image_cache: OrderedDict[
+            tuple[str, int, int, str], tuple[str, bytes]
+        ] = OrderedDict()
+        self.playback_cache_root = self.profile.storage_root / "cache"
+        self.playback_cache_build_locks = [threading.Lock() for _ in range(16)]
+        self.playback_cache_memory_hits = 0
+        self.playback_cache_disk_hits = 0
+        self.playback_cache_builds = 0
+        self.playback_cache_build_failures = 0
+        self.playback_cache_build_ms: deque[float] = deque(maxlen=120)
+        self.playback_compute_pool = ProcessPoolExecutor(
+            max_workers=2,
+            max_tasks_per_child=32,
+            initializer=_initialize_flow_analysis_process,
+        )
+        self.playback_warm_stop = threading.Event()
+        self.playback_warm_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="sick-playback-warm",
+        )
+        self.playback_warm_compute_pool = ProcessPoolExecutor(
+            max_workers=1,
+            max_tasks_per_child=128,
+            initializer=_initialize_flow_analysis_process,
+        )
+        self.playback_warm_futures: dict[str, Future[Any]] = {}
+        self.playback_warm_status: dict[str, Any] = {
+            "state": "idle",
+            "materialId": "",
+            "cachedImageCount": 0,
+            "sourceImageCount": 0,
+            "failureCount": 0,
+            "updatedAt": _utc_text(),
+        }
         self.events: deque[dict[str, Any]] = deque(maxlen=200)
         self.frames_received = 0
         self.frames_committed = 0
         self.frames_failed = 0
+        self.database_commit_batches = 0
+        self.database_commit_failures = 0
+        self.database_commit_retries = 0
+        self.database_commit_last_success_at = ""
+        self.database_commit_last_error = ""
+        self.database_commit_capacity_rounds = 128
+        self.database_commit_max_batch_rounds = 16
+        self.database_commit_coalesce_seconds = 0.2
+        self.database_commit_queue: deque[
+            tuple[str, str, list[dict[str, Any]]]
+        ] = deque()
+        self.database_commit_condition = threading.Condition()
+        self.database_commit_accepting = True
+        self.database_commit_active_rounds = 0
+        self.database_commit_high_water_rounds = 0
+        self.database_commit_succeeded_rounds = 0
+        self.database_commit_failed_rounds = 0
         self.last_error = ""
         self.started_at = time.time()
+        self.database_commit_thread = threading.Thread(
+            target=self._database_commit_loop,
+            name="sick-database-commit",
+            daemon=True,
+        )
+        self.database_commit_thread.start()
         for root in {profile.storage_root, *(camera.storage_root for camera in profile.enabled_cameras)}:
             root.mkdir(parents=True, exist_ok=True)
         try:
@@ -403,14 +873,29 @@ class ProviderRuntime:
 
     def close(self) -> None:
         self.acquisition_stop.set()
+        self.playback_warm_stop.set()
         thread = self.acquisition_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(2.0, self.profile.timeout_ms / 1000.0 + 1.0))
-        with self.storage_queue_lock:
+        with self.storage_queue_space:
             self.storage_queue_accepting = False
+            self.storage_queue_space.notify_all()
         self.capture_pool.shutdown(wait=True, cancel_futures=True)
+        self.preview_pool.shutdown(wait=True, cancel_futures=True)
         self.storage_round_pool.shutdown(wait=True, cancel_futures=False)
         self.storage_writer_pool.shutdown(wait=True, cancel_futures=False)
+        for depth_memory, intensity_memory, *_ in self.storage_shared_buffers.values():
+            for memory in (depth_memory, intensity_memory):
+                memory.close()
+                try:
+                    memory.unlink()
+                except FileNotFoundError:
+                    pass
+        self.storage_shared_buffers.clear()
+        with self.database_commit_condition:
+            self.database_commit_accepting = False
+            self.database_commit_condition.notify_all()
+        self.database_commit_thread.join(timeout=60.0)
         with self.stream_lock:
             self.stream_camera_key = ""
             self.stream_latest.clear()
@@ -420,6 +905,13 @@ class ProviderRuntime:
             self.stream_dimensions.clear()
         with self.history_lock:
             self.playback_image_cache.clear()
+            self.indexed_history_cache.clear()
+        self.history_refresh_pool.shutdown(wait=True, cancel_futures=True)
+        self.playback_warm_pool.shutdown(wait=True, cancel_futures=True)
+        self.playback_warm_compute_pool.shutdown(wait=True, cancel_futures=False)
+        self.playback_compute_pool.shutdown(wait=True, cancel_futures=False)
+        self.alignment_pool.shutdown(wait=True, cancel_futures=False)
+        self.alignment_compute_pool.shutdown(wait=True, cancel_futures=False)
         self.disconnect(force=True)
         self.backend.close()
 
@@ -445,7 +937,7 @@ class ProviderRuntime:
         material_id: str,
         session_id: str,
         results: list[dict[str, Any]],
-    ) -> None:
+    ) -> bool:
         committed = [
             {key: value for key, value in row.items() if not key.startswith("_")}
             for row in results
@@ -454,28 +946,540 @@ class ProviderRuntime:
             and not bool(row.get("discarded"))
         ]
         if not committed or not session_id:
-            return
-        try:
-            response = self._post_service_json(
-                "/internal/v1/capture-commit",
-                {
-                    "schema": "steel.capture.commit.v1",
-                    "materialId": material_id,
-                    "sessionId": session_id,
-                    "inspectionId": f"INSP-{session_id}",
-                    "results": committed,
-                },
-            )
-            if int(response.get("code", 500)) != 0:
-                raise RuntimeError(str(response.get("error", "capture commit rejected")))
-            with self.state_lock:
-                self.active_flow_no = int(response.get("flowNo", 0) or 0) or self.active_flow_no
-                self.active_flow_code = str(
-                    response.get("flowCode", self.active_flow_code)
+            return True
+        payload = {
+            "schema": "steel.capture.commit.v1",
+            "materialId": material_id,
+            "sessionId": session_id,
+            "inspectionId": f"INSP-{session_id}",
+            "results": committed,
+        }
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = self._post_service_json(
+                    "/internal/v1/capture-commit",
+                    payload,
                 )
-        except Exception as error:
-            self.last_error = str(error)
-            self._log("warning", "capture database commit failed", error=str(error))
+                if int(response.get("code", 500)) != 0:
+                    raise RuntimeError(
+                        str(response.get("error", "capture commit rejected"))
+                    )
+                with self.state_lock:
+                    # Database writes are asynchronous and can finish after the
+                    # next steel-in transition. Never let a delayed commit for
+                    # the previous material overwrite the new active flow.
+                    if (
+                        not self.active_session_id
+                        or self.active_session_id == session_id
+                    ):
+                        self.active_flow_no = (
+                            int(response.get("flowNo", 0) or 0) or self.active_flow_no
+                        )
+                        self.active_flow_code = str(
+                            response.get("flowCode", self.active_flow_code)
+                        )
+                    self.database_commit_batches += 1
+                    self.database_commit_last_success_at = _utc_text()
+                    self.database_commit_last_error = ""
+                    if self.last_error.startswith("inspection service callback failed"):
+                        self.last_error = ""
+                return True
+            except Exception as error:
+                last_error = error
+                if attempt < 3:
+                    with self.state_lock:
+                        self.database_commit_retries += 1
+                    time.sleep(0.25 * attempt)
+        message = str(last_error or "capture database commit failed")
+        with self.state_lock:
+            self.database_commit_last_error = message
+            self.last_error = message
+        self._log(
+            "warning",
+            "capture database commit deferred",
+            attempts=3,
+            error=message,
+        )
+        return False
+
+    def _enqueue_database_commit(
+        self,
+        material_id: str,
+        session_id: str,
+        results: list[dict[str, Any]],
+    ) -> bool:
+        if not results or not material_id or not session_id:
+            return False
+        item = (material_id, session_id, results)
+        with self.database_commit_condition:
+            while (
+                len(self.database_commit_queue) >= self.database_commit_capacity_rounds
+                and self.database_commit_accepting
+            ):
+                self.database_commit_condition.wait(timeout=0.25)
+            if not self.database_commit_accepting:
+                return False
+            self.database_commit_queue.append(item)
+            self.database_commit_high_water_rounds = max(
+                self.database_commit_high_water_rounds,
+                len(self.database_commit_queue),
+            )
+            self.database_commit_condition.notify_all()
+        return True
+
+    def _alignment_worker(
+        self, material_id: str
+    ) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
+        # steel-out is observed before the capture loop enqueues its final
+        # post-roll round.  Require a short quiet period after the bounded
+        # storage queue drains so the manifest never races that last write.
+        deadline = time.monotonic() + 120.0
+        quiet_since: float | None = None
+        while time.monotonic() < deadline:
+            with self.storage_queue_lock:
+                # Back-to-back bars may keep the global queue permanently
+                # non-empty.  Only this flow's writes must settle before its
+                # immutable alignment/measurement manifests are generated.
+                idle = self.storage_queue_pending_by_material.get(material_id, 0) == 0
+            if idle:
+                quiet_since = quiet_since or time.monotonic()
+                if time.monotonic() - quiet_since >= 0.75:
+                    break
+            else:
+                quiet_since = None
+            time.sleep(0.1)
+        else:
+            raise TimeoutError(
+                f"storage queue did not settle before alignment: {material_id}"
+            )
+        with self.alignment_lock:
+            if self.alignment_status.get("materialId") == material_id:
+                self.alignment_status = {
+                    **self.alignment_status,
+                    "state": "building",
+                    "updatedAt": _utc_text(),
+                }
+        camera_roots = {
+            camera.camera_id: camera.storage_root
+            for camera in self.profile.enabled_cameras
+        }
+        with self.alignment_lock:
+            self.measurement_status = {
+                "state": "building",
+                "materialId": material_id,
+                "path": str(
+                    measurement_manifest_path(self.profile.storage_root, material_id)
+                ),
+                "metricValid": False,
+                "qualityGate": None,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+        alignment_path, alignment, measurement_path, measurement = (
+            self.alignment_compute_pool.submit(
+                _build_flow_artifacts,
+                camera_roots,
+                self.profile.storage_root,
+                material_id,
+                self.alignment_config,
+                self.array_calibration_path,
+                self.measurement_config,
+            ).result()
+        )
+        return alignment_path, alignment, measurement_path, measurement
+
+    def _set_playback_warm_status(self, **values: Any) -> None:
+        with self.history_lock:
+            self.playback_warm_status = {
+                **self.playback_warm_status,
+                **values,
+                "updatedAt": _utc_text(),
+            }
+
+    def _playback_warm_worker(self, material_id: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        index_path = playback_index_path(self.profile.storage_root, material_id)
+        index = json.loads(index_path.read_text(encoding="utf-8-sig"))
+        camera_roots = {
+            camera.camera_id: camera.storage_root
+            for camera in self.profile.enabled_cameras
+        }
+        sources: list[Path] = []
+        for frame in index.get("frames", []):
+            for camera in frame.get("cameras", []):
+                camera_id = str(camera.get("cameraId", ""))
+                parts = Path(str(camera.get("artifactRef", ""))).parts
+                root = camera_roots.get(camera_id)
+                if root is not None and len(parts) >= 2:
+                    sources.append(root.joinpath(*parts[1:]))
+
+        cached = 0
+        failures: list[dict[str, str]] = []
+        idle_since: float | None = None
+        state = "waiting-for-idle"
+        self._set_playback_warm_status(
+            state=state,
+            materialId=material_id,
+            cachedImageCount=0,
+            sourceImageCount=len(sources),
+            failureCount=0,
+        )
+        for source in sources:
+            while not self.playback_warm_stop.is_set():
+                with self.state_lock:
+                    steel_present = self.steel_present
+                with self.storage_queue_lock:
+                    storage_idle = (
+                        self.storage_queue_pending_rounds == 0
+                        and self.storage_queue_active_rounds == 0
+                    )
+                if not steel_present and storage_idle:
+                    idle_since = idle_since or time.monotonic()
+                    if time.monotonic() - idle_since >= 0.75:
+                        break
+                else:
+                    idle_since = None
+                if state != "paused-for-acquisition":
+                    state = "paused-for-acquisition"
+                    self._set_playback_warm_status(state=state)
+                self.playback_warm_stop.wait(0.2)
+            if self.playback_warm_stop.is_set():
+                self._set_playback_warm_status(state="stopped")
+                return {"state": "stopped", "materialId": material_id}
+            if state != "building":
+                state = "building"
+                self._set_playback_warm_status(state=state)
+            try:
+                if source.is_file() and not source.is_symlink():
+                    self.playback_warm_compute_pool.submit(
+                        build_image_pyramid,
+                        source,
+                        self.playback_cache_root,
+                    ).result()
+                    cached += 1
+            except Exception as error:
+                failures.append({"source": str(source), "error": str(error)})
+            self._set_playback_warm_status(
+                cachedImageCount=cached,
+                failureCount=len(failures),
+            )
+
+        result = {
+            "schema": "steel.capture-flow-pyramid-cache.v1",
+            "generatedAt": _utc_text(),
+            "materialId": material_id,
+            "frameCount": int(index.get("frameCount", 0)),
+            "sourceImageCount": len(sources),
+            "cachedImageCount": cached,
+            "failureCount": len(failures),
+            "failures": failures[:20],
+            "elapsedMs": round((time.perf_counter() - started) * 1000.0, 3),
+            "throttledForAcquisition": True,
+        }
+        write_flow_pyramid_cache_status(self.profile.storage_root, result)
+        self._set_playback_warm_status(state="ready", **result)
+        return result
+
+    def _schedule_playback_warm(self, material_id: str) -> bool:
+        status_path = flow_pyramid_cache_status_path(
+            self.profile.storage_root, material_id
+        )
+        if status_path.is_file():
+            try:
+                status = json.loads(status_path.read_text(encoding="utf-8-sig"))
+                if (
+                    int(status.get("failureCount", 0)) == 0
+                    and int(status.get("cachedImageCount", 0))
+                    >= int(status.get("sourceImageCount", 1))
+                ):
+                    return False
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        with self.history_lock:
+            existing = self.playback_warm_futures.get(material_id)
+            if existing is not None and not existing.done():
+                return False
+            future = self.playback_warm_pool.submit(
+                self._playback_warm_worker, material_id
+            )
+            self.playback_warm_futures[material_id] = future
+        return True
+
+    def _schedule_flow_alignment(self, material_id: str) -> bool:
+        normalized = material_id.strip()
+        if not normalized or _safe_segment(normalized) != normalized:
+            return False
+        with self.alignment_lock:
+            existing = self.alignment_futures.get(normalized)
+            if existing is not None and not existing.done():
+                return False
+            self.alignment_status = {
+                "state": "waiting-for-storage",
+                "materialId": normalized,
+                "path": str(alignment_manifest_path(self.profile.storage_root, normalized)),
+                "quality": None,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+            self.measurement_status = {
+                "state": "waiting-for-alignment",
+                "materialId": normalized,
+                "path": str(
+                    measurement_manifest_path(self.profile.storage_root, normalized)
+                ),
+                "metricValid": False,
+                "qualityGate": None,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+            future = self.alignment_pool.submit(self._alignment_worker, normalized)
+            self.alignment_futures[normalized] = future
+
+        def completed(done: Future[Any]) -> None:
+            try:
+                path, manifest, measurement_path, measurement = done.result()
+                quality = manifest.get("quality")
+                with self.alignment_lock:
+                    self.alignment_status = {
+                        "state": "ready",
+                        "materialId": normalized,
+                        "path": str(path),
+                        "quality": quality,
+                        "error": "",
+                        "updatedAt": _utc_text(),
+                    }
+                    self.measurement_status = {
+                        "state": "ready",
+                        "materialId": normalized,
+                        "path": str(measurement_path),
+                        "metricValid": bool(measurement.get("metricValid")),
+                        "qualityGate": measurement.get("qualityGate"),
+                        "error": "",
+                        "updatedAt": _utc_text(),
+                    }
+                self._log(
+                    "info",
+                    "flow soft alignment completed",
+                    materialId=normalized,
+                    path=str(path),
+                    synchronized=bool(
+                        isinstance(quality, dict) and quality.get("synchronized")
+                    ),
+                )
+                self._schedule_playback_warm(normalized)
+            except Exception as error:
+                with self.alignment_lock:
+                    self.alignment_status = {
+                        "state": "failed",
+                        "materialId": normalized,
+                        "path": str(
+                            alignment_manifest_path(self.profile.storage_root, normalized)
+                        ),
+                        "quality": None,
+                        "error": str(error),
+                        "updatedAt": _utc_text(),
+                    }
+                    self.measurement_status = {
+                        "state": "failed",
+                        "materialId": normalized,
+                        "path": str(
+                            measurement_manifest_path(self.profile.storage_root, normalized)
+                        ),
+                        "metricValid": False,
+                        "qualityGate": None,
+                        "error": str(error),
+                        "updatedAt": _utc_text(),
+                    }
+                self._log(
+                    "warning",
+                    "flow soft alignment failed",
+                    materialId=normalized,
+                    error=str(error),
+                )
+
+        future.add_done_callback(completed)
+        return True
+
+    def alignment_json(self, material_id: str = "") -> tuple[int, dict[str, Any]]:
+        normalized = material_id.strip()
+        if normalized and _safe_segment(normalized) != normalized:
+            return 400, {"code": 400, "error": "invalid_material_id"}
+        if not normalized:
+            with self.alignment_lock:
+                return 200, {"code": 0, **self.alignment_status}
+        path = alignment_manifest_path(self.profile.storage_root, normalized)
+        if not path.is_file():
+            with self.alignment_lock:
+                status = dict(self.alignment_status)
+            if status.get("materialId") == normalized and status.get("state") in {
+                "waiting-for-storage",
+                "building",
+            }:
+                return 202, {"code": 0, **status}
+            return 404, {
+                "code": 404,
+                "error": "alignment_not_found",
+                "materialId": normalized,
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as error:
+            return 500, {
+                "code": 500,
+                "error": "alignment_invalid",
+                "detail": str(error),
+            }
+        return 200, {"code": 0, "path": str(path), "alignment": payload}
+
+    def measurement_json(self, material_id: str = "") -> tuple[int, dict[str, Any]]:
+        normalized = material_id.strip()
+        if normalized and _safe_segment(normalized) != normalized:
+            return 400, {"code": 400, "error": "invalid_material_id"}
+        if not normalized:
+            with self.alignment_lock:
+                return 200, {"code": 0, **self.measurement_status}
+        path = measurement_manifest_path(self.profile.storage_root, normalized)
+        if not path.is_file():
+            with self.alignment_lock:
+                status = dict(self.measurement_status)
+            if status.get("materialId") == normalized and status.get("state") in {
+                "waiting-for-alignment",
+                "building",
+            }:
+                return 202, {"code": 0, **status}
+            return 404, {
+                "code": 404,
+                "error": "measurement_not_found",
+                "materialId": normalized,
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as error:
+            return 500, {
+                "code": 500,
+                "error": "measurement_invalid",
+                "detail": str(error),
+            }
+        return 200, {"code": 0, "path": str(path), "measurement": payload}
+
+    def _database_commit_loop(self) -> None:
+        while True:
+            with self.database_commit_condition:
+                while (
+                    not self.database_commit_queue
+                    and self.database_commit_accepting
+                ):
+                    self.database_commit_condition.wait(timeout=0.5)
+                if not self.database_commit_queue and not self.database_commit_accepting:
+                    return
+                material_id, session_id, first_results = self.database_commit_queue.popleft()
+                batch = [(material_id, session_id, first_results)]
+                coalesce_deadline = (
+                    time.monotonic() + self.database_commit_coalesce_seconds
+                )
+                while len(batch) < self.database_commit_max_batch_rounds:
+                    while (
+                        not self.database_commit_queue
+                        and self.database_commit_accepting
+                        and time.monotonic() < coalesce_deadline
+                    ):
+                        self.database_commit_condition.wait(
+                            timeout=max(0.0, coalesce_deadline - time.monotonic())
+                        )
+                    if not self.database_commit_queue:
+                        break
+                    next_material, next_session, next_results = self.database_commit_queue[0]
+                    if next_material != material_id or next_session != session_id:
+                        break
+                    batch.append(self.database_commit_queue.popleft())
+                self.database_commit_active_rounds += len(batch)
+                self.database_commit_condition.notify_all()
+
+            combined = [row for _, _, rows in batch for row in rows]
+            succeeded = self._commit_capture_results(material_id, session_id, combined)
+            with self.database_commit_condition:
+                self.database_commit_active_rounds = max(
+                    0,
+                    self.database_commit_active_rounds - len(batch),
+                )
+                if succeeded:
+                    self.database_commit_succeeded_rounds += len(batch)
+                else:
+                    if self.database_commit_accepting:
+                        # The image artifacts are already durable.  Preserve
+                        # their metadata commit at the head of the bounded
+                        # queue so a brief Rust/PostgreSQL restart cannot make
+                        # the database permanently diverge from disk.
+                        for item in reversed(batch):
+                            self.database_commit_queue.appendleft(item)
+                        self.database_commit_high_water_rounds = max(
+                            self.database_commit_high_water_rounds,
+                            len(self.database_commit_queue),
+                        )
+                        self.database_commit_retries += 1
+                    else:
+                        self.database_commit_failures += 1
+                        self.database_commit_failed_rounds += len(batch)
+                self.database_commit_condition.notify_all()
+            if not succeeded and self.database_commit_accepting:
+                time.sleep(1.0)
+
+    def _share_storage_frame(
+        self,
+        camera_key: str,
+        frame: Any,
+    ) -> tuple[
+        tuple[str, tuple[int, ...], str],
+        tuple[str, tuple[int, ...], str],
+    ]:
+        shape = tuple(frame.depth_raw.shape)
+        depth_dtype = frame.depth_raw.dtype.str
+        intensity_dtype = frame.intensity.dtype.str
+        existing = self.storage_shared_buffers.get(camera_key)
+        if existing is not None and (
+            existing[2] != shape
+            or existing[3] != depth_dtype
+            or existing[4] != intensity_dtype
+        ):
+            for memory in existing[:2]:
+                memory.close()
+                try:
+                    memory.unlink()
+                except FileNotFoundError:
+                    pass
+            existing = None
+        if existing is None:
+            depth_memory = shared_memory.SharedMemory(
+                create=True,
+                size=frame.depth_raw.nbytes,
+            )
+            intensity_memory = shared_memory.SharedMemory(
+                create=True,
+                size=frame.intensity.nbytes,
+            )
+            existing = (
+                depth_memory,
+                intensity_memory,
+                shape,
+                depth_dtype,
+                intensity_dtype,
+            )
+            self.storage_shared_buffers[camera_key] = existing
+        depth_memory, intensity_memory, *_ = existing
+        depth_target = np.ndarray(shape, dtype=frame.depth_raw.dtype, buffer=depth_memory.buf)
+        intensity_target = np.ndarray(
+            shape,
+            dtype=frame.intensity.dtype,
+            buffer=intensity_memory.buf,
+        )
+        np.copyto(depth_target, frame.depth_raw)
+        np.copyto(intensity_target, frame.intensity)
+        del depth_target, intensity_target
+        return (
+            (depth_memory.name, shape, depth_dtype),
+            (intensity_memory.name, shape, intensity_dtype),
+        )
 
     def _persist_cached_round(
         self,
@@ -485,11 +1489,35 @@ class ProviderRuntime:
         session_id: str,
         boundary_phase: str,
         require_steel_signal: bool = False,
+        production_event_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if not material_id or not session_id:
             return []
 
+        if production_event_id is None:
+            with self.state_lock:
+                production_event_id = self.active_flow_code
+        # Automatic grayscale capture uses the database flow code as its
+        # material directory. Prefer that immutable value over mutable global
+        # state, which may already refer to an adjacent steel while an async
+        # storage task is running.
+        if material_id.startswith("FLOW-"):
+            production_event_id = material_id
+        resolved_event_id = production_event_id or ""
+
+        storage_started = time.monotonic()
         futures: list[tuple[Any, CameraProfile, Any, dict[str, Any]]] = []
+        process_tasks: list[
+            tuple[
+                Path,
+                str,
+                Any,
+                tuple[str, tuple[int, ...], str],
+                tuple[str, tuple[int, ...], str],
+                dict[str, Any],
+            ]
+        ] = []
+        process_contexts: list[tuple[CameraProfile, Any, dict[str, Any]]] = []
         for row in rows:
             frame = row.get("_rawFrame")
             camera = self.camera_for_identity(str(row.get("cameraKey", "")))
@@ -499,17 +1527,78 @@ class ProviderRuntime:
                 continue
             if require_steel_signal and not bool(row.get("steelSignal")):
                 continue
-            future = self.storage_writer_pool.submit(
-                self.writer.write,
-                camera.storage_root,
-                material_id,
-                frame,
-                session_id=session_id,
-                production_event_id=self.active_flow_code,
+            options = {
+                "session_id": session_id,
+                "production_event_id": resolved_event_id,
+                "inspection_id": f"INSP-{session_id}",
+                "capture_round": int(row.get("round", 0)),
+                "sync_group_id": (
+                    f"{resolved_event_id or session_id}:"
+                    f"round-{int(row.get('round', 0)):012d}"
+                ),
+                # Level 1 is the measured optimum on the target host: it
+                # encodes faster than level 0 and cuts roughly 10 MiB/round.
+                "intensity_compress_level": 1,
+            }
+            if self.storage_process_workers:
+                options["index"] = self.writer.sequences.reserve(
+                    camera.storage_root,
+                    material_id,
+                )
+                depth_descriptor, intensity_descriptor = self._share_storage_frame(
+                    camera.key,
+                    frame,
+                )
+                frame_stub = replace(
+                    frame,
+                    depth_raw=np.empty((0, 0), dtype=np.uint16),
+                    intensity=np.empty((0, 0), dtype=np.uint8),
+                )
+                process_tasks.append(
+                    (
+                        camera.storage_root,
+                        material_id,
+                        frame_stub,
+                        depth_descriptor,
+                        intensity_descriptor,
+                        options,
+                    )
+                )
+                process_contexts.append((camera, frame, row))
+            else:
+                future = self.storage_writer_pool.submit(
+                    self.writer.write,
+                    camera.storage_root,
+                    material_id,
+                    frame,
+                    **options,
+                )
+                futures.append((future, camera, frame, row))
+
+        if process_tasks:
+            round_future = self.storage_writer_pool.submit(
+                _write_storage_shared_round,
+                process_tasks,
             )
-            futures.append((future, camera, frame, row))
+            try:
+                outcomes = round_future.result()
+            except Exception as error:
+                outcomes = [
+                    (False, None, f"{type(error).__name__}: {error}")
+                    for _ in process_tasks
+                ]
+            for outcome, context in zip(outcomes, process_contexts, strict=True):
+                succeeded, result, message = outcome
+                completed_future: Future[Any] = Future()
+                if succeeded:
+                    completed_future.set_result(result)
+                else:
+                    completed_future.set_exception(RuntimeError(message))
+                camera, frame, row = context
+                futures.append((completed_future, camera, frame, row))
 
         committed: list[dict[str, Any]] = []
+        committed_bytes = 0
         for future, camera, frame, source_row in futures:
             try:
                 result = future.result()
@@ -524,10 +1613,30 @@ class ProviderRuntime:
                         "brightPixelRatio": float(source_row.get("brightPixelRatio", 0.0)),
                         "steelSignal": bool(source_row.get("steelSignal")),
                         "capturedAt": str(source_row.get("capturedAt", _utc_text())),
+                        "cameraFrameSequence": source_row.get("cameraFrameSequence"),
+                        "transportFrameId": source_row.get("transportFrameId"),
+                        "transportFrameGap": source_row.get("transportFrameGap", 0),
+                        "deviceTimestamp": source_row.get("deviceTimestamp"),
+                        "timestampFrequency": source_row.get("timestampFrequency"),
+                        "hostUtcNs": source_row.get("hostUtcNs"),
+                        "hostMonotonicNs": source_row.get("hostMonotonicNs"),
+                        "frameTriggerMode": source_row.get("frameTriggerMode"),
+                        "triggerIssuedNs": source_row.get("triggerIssuedNs"),
+                        "triggerCompletedNs": source_row.get("triggerCompletedNs"),
+                        "triggerCommandLatencyUs": source_row.get(
+                            "triggerCommandLatencyUs"
+                        ),
                         "boundaryPhase": boundary_phase,
                     }
                 )
                 committed.append(persisted)
+                committed_bytes += result.steel_depth.stat().st_size
+                committed_bytes += result.steel_intensity.stat().st_size
+                committed_bytes += result.steel_metadata.stat().st_size
+                with self.storage_queue_lock:
+                    self.storage_camera_write_ms[camera.key].append(
+                        float(result.write_elapsed_ms)
+                    )
                 self._count_frames(committed=1)
                 with self.state_lock:
                     if bool(source_row.get("discarded")):
@@ -549,7 +1658,12 @@ class ProviderRuntime:
                 )
 
         if committed:
-            self._commit_capture_results(material_id, session_id, committed)
+            storage_elapsed = max(time.monotonic() - storage_started, 0.000_001)
+            with self.storage_queue_lock:
+                self.storage_write_samples.append(
+                    (time.monotonic(), committed_bytes, storage_elapsed)
+                )
+            self._enqueue_database_commit(material_id, session_id, committed)
             self._log(
                 "info",
                 "cached boundary frames persisted",
@@ -569,11 +1683,12 @@ class ProviderRuntime:
         boundary_phase: str,
         require_steel_signal: bool = False,
         force: bool = False,
+        production_event_id: str | None = None,
     ) -> bool:
         received_count = sum(bool(row.get("frameReceived")) for row in rows)
         if not received_count or not material_id or not session_id:
             return False
-        with self.storage_queue_lock:
+        with self.storage_queue_space:
             if not self.storage_queue_accepting:
                 return False
             queue_limit = self.storage_queue_capacity_rounds
@@ -583,13 +1698,28 @@ class ProviderRuntime:
                     self.storage_queue_capacity_rounds
                     - self.storage_queue_boundary_reserve_rounds,
                 )
-            if self.storage_queue_pending_rounds >= queue_limit:
-                self.storage_queue_dropped_rounds += 1
-                self.storage_queue_dropped_frames += received_count
-                with self.state_lock:
-                    self.continuous_discarded_frame_count += received_count
+            wait_started = 0.0
+            while (
+                self.storage_queue_pending_rounds >= queue_limit
+                and self.storage_queue_accepting
+                and not self.acquisition_stop.is_set()
+            ):
+                if wait_started == 0.0:
+                    wait_started = time.monotonic()
+                    self.storage_queue_backpressure_waits += 1
+                self.storage_queue_space.wait(timeout=0.25)
+            if wait_started:
+                self.storage_queue_backpressure_seconds += time.monotonic() - wait_started
+            if not self.storage_queue_accepting or self.acquisition_stop.is_set():
                 return False
             self.storage_queue_pending_rounds += 1
+            self.storage_queue_pending_by_material[material_id] = (
+                self.storage_queue_pending_by_material.get(material_id, 0) + 1
+            )
+            self.storage_queue_high_water_rounds = max(
+                self.storage_queue_high_water_rounds,
+                self.storage_queue_pending_rounds,
+            )
 
         def persist() -> list[dict[str, Any]]:
             with self.storage_queue_lock:
@@ -601,6 +1731,7 @@ class ProviderRuntime:
                     session_id=session_id,
                     boundary_phase=boundary_phase,
                     require_steel_signal=require_steel_signal,
+                    production_event_id=production_event_id,
                 )
             finally:
                 with self.storage_queue_lock:
@@ -623,12 +1754,21 @@ class ProviderRuntime:
                     boundaryPhase=boundary_phase,
                     error=str(error),
                 )
-            with self.storage_queue_lock:
+            with self.storage_queue_space:
                 self.storage_queue_pending_rounds = max(
                     0, self.storage_queue_pending_rounds - 1
                 )
+                material_pending = max(
+                    0,
+                    self.storage_queue_pending_by_material.get(material_id, 0) - 1,
+                )
+                if material_pending:
+                    self.storage_queue_pending_by_material[material_id] = material_pending
+                else:
+                    self.storage_queue_pending_by_material.pop(material_id, None)
                 self.storage_queue_completed_rounds += 0 if failed else 1
                 self.storage_queue_failed_rounds += 1 if failed else 0
+                self.storage_queue_space.notify_all()
 
         future.add_done_callback(completed)
         return True
@@ -711,7 +1851,61 @@ class ProviderRuntime:
     def _camera_row(self, camera: CameraProfile) -> dict[str, Any]:
         session = self.sessions.get(camera.key)
         identity = getattr(session, "identity", {}) if session else {}
-        stats = self.continuous_stats[camera.key]
+        with self.state_lock:
+            stats_source = self.continuous_stats[camera.key]
+            stats = {
+                **stats_source,
+                "ticks": tuple(stats_source["ticks"]),
+            }
+            frame_counts = [
+                int(item["frameCount"]) for item in self.continuous_stats.values()
+            ]
+            recent_transport_gap_count = sum(
+                int(row.get("transportFrameGaps", {}).get(camera.key, 0))
+                for row in self.synchronization_window
+            )
+            synchronization_window_rounds = len(self.synchronization_window)
+            lifetime_transport_gap_count = int(
+                self.transport_frame_gap_counts.get(camera.key, 0)
+            )
+            last_transport_frame_id = self.last_transport_frame_ids.get(camera.key)
+        telemetry: dict[str, Any] = {}
+        telemetry_reader = getattr(session, "telemetry_snapshot", None)
+        if callable(telemetry_reader):
+            try:
+                telemetry = telemetry_reader()
+            except Exception:
+                telemetry = {}
+        trigger_status: dict[str, Any] = {
+            "configuredMode": self.frame_trigger_mode,
+            "active": self.frame_trigger_mode == "software",
+            "softwareTriggerCapable": False,
+        }
+        trigger_reader = getattr(session, "trigger_status", None)
+        if callable(trigger_reader):
+            try:
+                trigger_status = trigger_reader()
+            except Exception:
+                pass
+        camera_config = getattr(session, "camera_config", {}) if session else {}
+        device_temperature = telemetry.get(
+            "deviceTemperature", camera_config.get("DeviceTemperature")
+        )
+        device_temperature_min = telemetry.get(
+            "deviceTemperatureMin", camera_config.get("DeviceTemperatureMin")
+        )
+        device_temperature_max = telemetry.get(
+            "deviceTemperatureMax", camera_config.get("DeviceTemperatureMax")
+        )
+        telemetry_updated_at_ns = int(telemetry.get("updatedAtNs", 0) or 0)
+        telemetry_updated_at = (
+            dt.datetime.fromtimestamp(
+                telemetry_updated_at_ns / 1_000_000_000,
+                tz=dt.timezone.utc,
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            if telemetry_updated_at_ns > 0
+            else None
+        )
         with self.stream_lock:
             stream_running = bool(
                 self.stream_camera_key
@@ -731,6 +1925,19 @@ class ProviderRuntime:
             and self._acquisition_running()
             and session is not None
         )
+        minimum_frame_count = min(frame_counts, default=0)
+        continuous_fps = self._rolling_fps(stats["ticks"])
+        recent_observed_frames = synchronization_window_rounds
+        recent_transport_drop_percent = (
+            round(
+                100.0
+                * recent_transport_gap_count
+                / (recent_observed_frames + recent_transport_gap_count),
+                4,
+            )
+            if recent_observed_frames + recent_transport_gap_count > 0
+            else 0.0
+        )
         return {
             "cameraIndex": camera.camera_index,
             "deviceId": camera.camera_index,
@@ -744,12 +1951,34 @@ class ProviderRuntime:
             "role": camera.role,
             "driverMode": "sick-gentl",
             "driverId": "sick-gentl-harvesters",
+            "gentlBufferCount": (
+                int(getattr(session, "buffer_count", 0)) if session is not None else 0
+            ),
+            "gentlMinimumBufferCount": (
+                int(getattr(session, "minimum_buffer_count", 0))
+                if session is not None
+                else 0
+            ),
+            "gentlBackgroundAcquisition": (
+                bool(getattr(session, "background_acquisition", False))
+                if session is not None
+                else False
+            ),
+            "frameTrigger": trigger_status,
+            "frameTriggerMode": trigger_status.get(
+                "configuredMode", self.frame_trigger_mode
+            ),
+            "softwareTriggerCapable": bool(
+                trigger_status.get("softwareTriggerCapable", False)
+            ),
             "connected": session is not None,
             "acquiring": bool(session is not None and getattr(session, "started", False)),
             "acquisitionState": "acquiring" if continuous_running else "connected" if session else "offline",
             "continuousAcquiring": continuous_running,
-            "continuousFps": self._rolling_fps(stats["ticks"]),
+            "continuousFps": continuous_fps,
+            "fps": continuous_fps,
             "continuousFrameCount": stats["frameCount"],
+            "continuousFrameDelta": int(stats["frameCount"]) - minimum_frame_count,
             "continuousFinalizedCount": stats["finalizedCount"],
             "continuousSuccessfulFrameCount": stats["successfulFrameCount"],
             "continuousLastResultCode": stats["lastResultCode"],
@@ -761,6 +1990,31 @@ class ProviderRuntime:
             "streamLastFrameAt": stream_last_frame_at,
             "streamWidth": self.stream_dimensions.get(camera.key, (0, 0))[0],
             "streamHeight": self.stream_dimensions.get(camera.key, (0, 0))[1],
+            "deviceTemperature": device_temperature,
+            "deviceTemperatureMin": device_temperature_min,
+            "deviceTemperatureMax": device_temperature_max,
+            # Compatibility for the existing camera status UI. SICK exposes a
+            # single selected device-temperature sensor rather than J28-J30.
+            "temperatureJ28": device_temperature,
+            "temperatureUpdatedAt": telemetry_updated_at,
+            "deviceLinkThroughputCurrent": telemetry.get(
+                "deviceLinkThroughputCurrent",
+                camera_config.get("DeviceLinkThroughputCurrent"),
+            ),
+            "deviceLinkThroughputLimit": telemetry.get(
+                "deviceLinkThroughputLimit",
+                camera_config.get("DeviceLinkThroughputLimit"),
+            ),
+            "acquisitionFrameRate": telemetry.get(
+                "acquisitionFrameRate", camera_config.get("AcquisitionFrameRate")
+            ),
+            "transportFrameId": last_transport_frame_id,
+            "transportFrameGapCount": recent_transport_gap_count,
+            "lifetimeTransportFrameGapCount": lifetime_transport_gap_count,
+            "transportFrameDropPercent": recent_transport_drop_percent,
+            "synchronizationWindowRounds": synchronization_window_rounds,
+            "hasRecentFrameDrops": recent_transport_gap_count > 0,
+            "lostPulseCounter": lifetime_transport_gap_count,
             "storageRoot": str(camera.storage_root),
             "lastError": self.session_errors.get(camera.key, ""),
         }
@@ -779,6 +2033,9 @@ class ProviderRuntime:
         backend_ready = bool(getattr(self.backend, "started", False))
         connected = len(self.sessions)
         provider_ready = backend_ready and connected == self.profile.expected_cameras
+        with self.alignment_lock:
+            alignment = dict(self.alignment_status)
+            measurement = dict(self.measurement_status)
         return {
             "code": 0 if backend_ready else 49110,
             "service": "steel_sick_capture_sidecar",
@@ -815,9 +2072,27 @@ class ProviderRuntime:
             "framesReceived": self.frames_received,
             "framesCommitted": self.frames_committed,
             "framesFailed": self.frames_failed,
+            "databaseCommit": {
+                "schema": "steel.capture-database-commit.v1",
+                "capacityRounds": self.database_commit_capacity_rounds,
+                "maxBatchRounds": self.database_commit_max_batch_rounds,
+                "pendingRounds": len(self.database_commit_queue),
+                "activeRounds": self.database_commit_active_rounds,
+                "highWaterRounds": self.database_commit_high_water_rounds,
+                "succeededBatches": self.database_commit_batches,
+                "succeededRounds": self.database_commit_succeeded_rounds,
+                "failedBatches": self.database_commit_failures,
+                "failedRounds": self.database_commit_failed_rounds,
+                "retryCount": self.database_commit_retries,
+                "lastSuccessAt": self.database_commit_last_success_at or None,
+                "lastError": self.database_commit_last_error or None,
+            },
             "blackFramesDiscarded": self.black_frame_count,
             "continuousAcquisitionFrameCount": self.continuous_acquisition_frame_count,
             "continuousDiscardedFrameCount": self.continuous_discarded_frame_count,
+            "acquisitionSynchronization": self._synchronization_json(),
+            "flowAlignment": alignment,
+            "flowMeasurement": measurement,
             "lastError": self.last_error or None,
             "uptimeSeconds": round(time.time() - self.started_at, 3),
             "cameras": [self._camera_row(camera) for camera in self.profile.enabled_cameras],
@@ -858,9 +2133,39 @@ class ProviderRuntime:
 
     def _queue_json(self) -> dict[str, Any]:
         with self.storage_queue_lock:
+            now = time.monotonic()
+            recent = [sample for sample in self.storage_write_samples if now - sample[0] <= 10.0]
+            recent_bytes = sum(sample[1] for sample in recent)
+            recent_seconds = sum(sample[2] for sample in recent)
+            camera_write_latency = {}
+            for camera_key, samples in self.storage_camera_write_ms.items():
+                values = list(samples)
+                ordered = sorted(values)
+                p95_index = max(
+                    0,
+                    min(
+                        len(ordered) - 1,
+                        (len(ordered) * 95 + 99) // 100 - 1,
+                    ),
+                )
+                camera_write_latency[camera_key] = {
+                    "samples": len(values),
+                    "average": round(sum(values) / len(values), 3) if values else None,
+                    "p95": round(ordered[p95_index], 3) if ordered else None,
+                    "maximum": round(max(values), 3) if values else None,
+                }
             return {
                 "accepting": self.storage_queue_accepting,
                 "workerCount": self.profile.expected_cameras,
+                "writerMode": (
+                    "process-shared-memory"
+                    if self.storage_process_workers
+                    else "thread"
+                ),
+                "writerProcessCount": self.storage_process_workers,
+                "writerThreadCount": self.storage_process_threads,
+                "previewWorkerCount": self.preview_worker_threads,
+                "sharedMemorySlots": len(self.storage_shared_buffers),
                 "capacityRounds": self.storage_queue_capacity_rounds,
                 "reservedBoundaryRounds": self.storage_queue_boundary_reserve_rounds,
                 "capacityItems": (
@@ -880,8 +2185,14 @@ class ProviderRuntime:
                 "droppedFrames": self.storage_queue_dropped_frames,
                 "failedRounds": self.storage_queue_failed_rounds,
                 "failed": self.frames_failed,
-                "recentWriteBytesPerSecond": 0.0,
-                "implementation": "bounded-round-cache+ordered-round-writer+per-camera-disks",
+                "highWaterRounds": self.storage_queue_high_water_rounds,
+                "backpressureWaits": self.storage_queue_backpressure_waits,
+                "backpressureSeconds": round(self.storage_queue_backpressure_seconds, 3),
+                "recentWriteBytesPerSecond": (
+                    round(recent_bytes / recent_seconds, 3) if recent_seconds > 0 else 0.0
+                ),
+                "cameraWriteLatencyMs": camera_write_latency,
+                "implementation": "bounded-round-cache+lossless-backpressure+ordered-round-writer+per-camera-disks",
             }
 
     def storage_json(self) -> dict[str, Any]:
@@ -914,6 +2225,8 @@ class ProviderRuntime:
         }
 
     def steel_status_json(self) -> dict[str, Any]:
+        with self.alignment_lock:
+            alignment = dict(self.alignment_status)
         with self.state_lock:
             return {
                 "code": 0,
@@ -942,6 +2255,9 @@ class ProviderRuntime:
                 "grayscaleSteelDetection": self.grayscale_steel_detection,
                 "steelBrightPixelThreshold": self.steel_bright_threshold,
                 "steelBrightPixelRatio": self.steel_bright_ratio,
+                "steelDetectionRegion": "tail-rows",
+                "steelDetectionEdge": self.steel_detection_edge,
+                "steelDetectionTailRows": self.steel_detection_tail_rows,
                 "steelMinCameras": self.steel_min_cameras,
                 "steelEntryRounds": self.steel_entry_rounds,
                 "steelExitRounds": self.steel_exit_rounds,
@@ -953,6 +2269,8 @@ class ProviderRuntime:
                 "steelExitStreak": self.steel_exit_streak,
                 "continuousAcquisitionFrameCount": self.continuous_acquisition_frame_count,
                 "continuousDiscardedFrameCount": self.continuous_discarded_frame_count,
+                "acquisitionSynchronization": self._synchronization_json(),
+                "flowAlignment": alignment,
                 "connectedCameras": len(self.sessions),
                 "storageRoot": str(self.profile.storage_root),
                 "updatedAt": _utc_text(),
@@ -973,12 +2291,25 @@ class ProviderRuntime:
             "grayscaleSteelDetection": self.grayscale_steel_detection,
             "steelBrightPixelThreshold": self.steel_bright_threshold,
             "steelBrightPixelRatio": self.steel_bright_ratio,
+            "steelDetectionRegion": "tail-rows",
+            "steelDetectionEdge": self.steel_detection_edge,
+            "steelDetectionTailRows": self.steel_detection_tail_rows,
             "steelMinCameras": self.steel_min_cameras,
             "steelEntryRounds": self.steel_entry_rounds,
             "steelExitRounds": self.steel_exit_rounds,
             "steelPreRollFrames": self.steel_pre_roll_frames,
             "steelPostRollFrames": self.steel_post_roll_frames,
             "blackFrameCacheRounds": self.black_frame_cache_rounds,
+            "alignmentSearchFrames": self.alignment_config.search_frames,
+            "alignmentStableRows": self.alignment_config.stable_rows,
+            "softSyncAnchorIntervalFrames": self.alignment_config.anchor_interval_frames,
+            "softSyncMaximumResidualMs": self.alignment_config.maximum_anchor_residual_ms,
+            "frameTriggerMode": self.frame_trigger_mode,
+            "frameTriggerRequiresRestart": True,
+            "arrayCalibrationPath": str(self.array_calibration_path or ""),
+            "arrayCalibrationAvailable": bool(
+                self.array_calibration_path and self.array_calibration_path.is_file()
+            ),
             "storageWriteCacheRounds": self.storage_queue_capacity_rounds,
             "requiresProfileRestart": False,
             "runtimeOnly": True,
@@ -1046,6 +2377,7 @@ class ProviderRuntime:
             mode_result = self.set_capture_mode({"captureMode": requested_mode})
             if mode_result["code"] != 0:
                 return mode_result
+        completed_material_id = ""
         with self.state_lock:
             if normalized in {"steelin", "in"}:
                 self.save_generation += 1
@@ -1059,6 +2391,7 @@ class ProviderRuntime:
                     self.steel_present = True
                     self.save_enabled = bool(payload.get("saveEnabled", True))
                 else:
+                    completed_material_id = self.active_material_id or material_id
                     self.steel_present = False
                     self.save_enabled = False
                     self.active_material_id = ""
@@ -1093,7 +2426,7 @@ class ProviderRuntime:
                 sessionId=session_id,
                 saveEnabled=self.save_enabled,
             )
-            return {
+            response = {
                 "code": 0,
                 "cmd": command,
                 "value": value,
@@ -1114,12 +2447,24 @@ class ProviderRuntime:
                 "grayscaleSteelDetection": self.grayscale_steel_detection,
                 "driverMode": "sick-gentl",
             }
+        if completed_material_id:
+            self._schedule_flow_alignment(completed_material_id)
+        return response
 
     def _ensure_acquisition_worker(self) -> None:
         with self.state_lock:
             self.acquisition_stop.clear()
             if self._acquisition_running():
                 return
+            # A camera's transport frame counter continues advancing while
+            # acquisition is intentionally paused. Comparing the first frame
+            # after resume with the old frame id would falsely report every
+            # paused device frame as a transport drop. Start a fresh rolling
+            # window and warm-up baseline for each acquisition-worker run;
+            # verified lifetime gaps from earlier active runs remain intact.
+            self.last_transport_frame_ids.clear()
+            self.synchronization_window.clear()
+            self.synchronization_warmup_remaining = self.synchronization_warmup_rounds
             thread = threading.Thread(
                 target=self._acquisition_loop,
                 name="sick-live-acquisition",
@@ -1183,14 +2528,24 @@ class ProviderRuntime:
                         and preview.getextrema()[1] <= minimum_visible_max
                     ):
                         return None
-                    preview.save(output, format="PNG", optimize=False)
+                    preview.save(
+                        output,
+                        format="PNG",
+                        optimize=False,
+                        compress_level=1,
+                    )
             else:
                 if (
                     minimum_visible_max is not None
                     and source.getextrema()[1] <= minimum_visible_max
                 ):
                     return None
-                source.save(output, format="PNG", optimize=False)
+                source.save(
+                    output,
+                    format="PNG",
+                    optimize=False,
+                    compress_level=1,
+                )
         return output.getvalue()
 
     def _publish_stream_frame(
@@ -1225,6 +2580,13 @@ class ProviderRuntime:
             )
             if ticks and now - ticks[-1] < 1.0 / fps_limit:
                 return
+            requested_kinds = {
+                kind
+                for kind, requested_at in self.stream_requested_kinds.get(
+                    camera.key, {}
+                ).items()
+                if now - requested_at <= 2.0
+            }
         try:
             grid_preview = self._preview_png(
                 intensity,
@@ -1235,16 +2597,19 @@ class ProviderRuntime:
             if grid_preview is None:
                 return
             latest = {"intensity-grid": grid_preview}
-            # The 2x3 overview uses an 800-pixel preview based on its actual
-            # card size. Full-resolution intensity/depth conversion is kept
-            # only for the focused camera.
+            # The 2x3 overview uses only the 800-pixel preview.  Full-width
+            # intensity and the considerably more expensive depth percentile
+            # conversion are generated only while the UI is actively asking
+            # for that kind on the focused camera.
             if active_key == camera.key:
-                intensity_preview = self._preview_png(intensity, depth=False)
-                depth_preview = self._preview_png(frame.depth_raw, depth=True)
-                if intensity_preview is not None:
-                    latest["intensity"] = intensity_preview
-                if depth_preview is not None:
-                    latest["depth"] = depth_preview
+                if "intensity" in requested_kinds:
+                    intensity_preview = self._preview_png(intensity, depth=False)
+                    if intensity_preview is not None:
+                        latest["intensity"] = intensity_preview
+                if "depth" in requested_kinds:
+                    depth_preview = self._preview_png(frame.depth_raw, depth=True)
+                    if depth_preview is not None:
+                        latest["depth"] = depth_preview
         except Exception as error:
             self._log("warning", "SICK live preview conversion failed", cameraKey=camera.key, error=str(error))
             return
@@ -1272,6 +2637,42 @@ class ProviderRuntime:
                 self.stream_last_frame_at = frame_at
                 self.stream_frame_ticks = self.stream_frame_ticks_by_camera[camera.key]
 
+    def _schedule_stream_frame(self, camera: CameraProfile, frame: Any) -> None:
+        with self.stream_lock:
+            active_key = self.stream_camera_key
+            if not active_key or (
+                self.capture_mode != "continuous" and active_key != camera.key
+            ):
+                return
+        with self.preview_work_lock:
+            now = time.monotonic()
+            previous = self.preview_scheduled_at.get(camera.key, 0.0)
+            if now - previous < 1.0 / LIVE_PREVIEW_MAX_FPS:
+                return
+            if camera.key in self.preview_pending_cameras:
+                return
+            self.preview_pending_cameras.add(camera.key)
+            self.preview_scheduled_at[camera.key] = now
+
+        future = self.preview_pool.submit(self._publish_stream_frame, camera, frame)
+
+        def completed(done: Any) -> None:
+            try:
+                done.result()
+            except Exception as error:
+                self.last_error = str(error)
+                self._log(
+                    "warning",
+                    "live preview encoding failed",
+                    cameraKey=camera.key,
+                    error=str(error),
+                )
+            finally:
+                with self.preview_work_lock:
+                    self.preview_pending_cameras.discard(camera.key)
+
+        future.add_done_callback(completed)
+
     def _seed_stream_cache_from_storage(self) -> None:
         if not self.preview_seed_lock.acquire(blocking=False):
             return
@@ -1280,18 +2681,13 @@ class ProviderRuntime:
                 with self.stream_lock:
                     if self.stream_latest.get(camera.key, {}).get("intensity-grid"):
                         continue
-                candidates = [
-                    path
-                    for root in self._camera_read_roots(camera)
-                    for pattern in ("*/2d/*.png", "*/2d/*.jpg", "*/intensity/*.png")
-                    for path in root.glob(pattern)
-                    if path.is_file()
-                ]
-                try:
-                    candidates.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
-                except OSError:
-                    continue
-                for path in candidates[:128]:
+                candidates = self._recent_camera_files(
+                    camera,
+                    directories=("2d", "intensity"),
+                    suffixes=(".png", ".jpg", ".jpeg"),
+                    limit=128,
+                )
+                for path in candidates:
                     try:
                         with Image.open(path) as source:
                             intensity = np.asarray(source.convert("L")).copy()
@@ -1307,18 +2703,19 @@ class ProviderRuntime:
                             depth=False,
                             max_width=800,
                         )
-                        intensity_preview = self._preview_png(
-                            intensity,
-                            depth=False,
-                        )
-                        if grid_preview is None or intensity_preview is None:
+                        if grid_preview is None:
                             continue
                     except (OSError, ValueError):
                         continue
                     with self.stream_lock:
                         camera_latest = self.stream_latest.setdefault(camera.key, {})
                         camera_latest.setdefault("intensity-grid", grid_preview)
-                        camera_latest.setdefault("intensity", intensity_preview)
+                        # Use the already encoded grid image as the immediate
+                        # focused fallback too.  The next live steel frame
+                        # replaces it with a full-width preview for the active
+                        # camera, while cold-starting six cards avoids six
+                        # redundant full-resolution PNG encodes.
+                        camera_latest.setdefault("intensity", grid_preview)
                         self.stream_dimensions.setdefault(
                             camera.key,
                             (int(intensity.shape[1]), int(intensity.shape[0])),
@@ -1387,6 +2784,7 @@ class ProviderRuntime:
             self.stream_frame_count = 0
             self.stream_last_frame_at = ""
             self.stream_frame_ticks.clear()
+            self.stream_requested_kinds.clear()
             if self.capture_mode != "continuous":
                 self.stream_latest.pop(camera.key, None)
             self.stream_frame_counts[camera.key] = 0
@@ -1412,6 +2810,7 @@ class ProviderRuntime:
                 self.stream_last_frame_at_by_camera.clear()
                 self.stream_frame_ticks_by_camera.clear()
                 self.stream_frame_ticks.clear()
+                self.stream_requested_kinds.clear()
         self._stop_acquisition_if_idle()
         return {"code": 0, "running": False, "ip": identity, "frameCount": 0}
 
@@ -1430,6 +2829,10 @@ class ProviderRuntime:
                 and target.key != self.stream_camera_key
             ):
                 return None
+            if kind in {"intensity", "depth"}:
+                self.stream_requested_kinds.setdefault(target.key, {})[
+                    kind
+                ] = time.monotonic()
             return self.stream_latest.get(target.key, {}).get(kind)
 
     def _record_continuous_round(self, results: list[dict[str, Any]], persist_frame: bool) -> None:
@@ -1455,6 +2858,135 @@ class ProviderRuntime:
                     NO_STEEL_FRAME_DISCARDED,
                 }:
                     self.continuous_discarded_frame_count += 1
+
+    def _record_synchronization_round(self, results: list[dict[str, Any]]) -> None:
+        received = [row for row in results if bool(row.get("frameReceived"))]
+        received_keys = {str(row.get("cameraKey", "")) for row in received}
+        expected_keys = {camera.key for camera in self.profile.enabled_cameras}
+        host_times = [
+            int(row["hostUtcNs"])
+            for row in received
+            if int(row.get("hostUtcNs", 0) or 0) > 0
+        ]
+        sequences = [
+            int(row["cameraFrameSequence"])
+            for row in received
+            if row.get("cameraFrameSequence") is not None
+        ]
+        transport_ids = {
+            str(row.get("cameraKey", "")): int(row.get("transportFrameId", 0) or 0)
+            for row in received
+            if int(row.get("transportFrameId", 0) or 0) > 0
+        }
+        trigger_times = [
+            int(row.get("triggerIssuedNs", 0) or 0)
+            for row in received
+            if int(row.get("triggerIssuedNs", 0) or 0) > 0
+        ]
+        with self.state_lock:
+            warming_up = self.synchronization_warmup_remaining > 0
+            transport_gaps: dict[str, int] = {}
+            for camera_key, current_frame_id in transport_ids.items():
+                previous_frame_id = self.last_transport_frame_ids.get(camera_key)
+                gap = (
+                    max(0, current_frame_id - previous_frame_id - 1)
+                    if previous_frame_id is not None and current_frame_id > previous_frame_id
+                    else 0
+                )
+                if gap and not warming_up:
+                    self.transport_frame_gap_counts[camera_key] += gap
+                    transport_gaps[camera_key] = gap
+                self.last_transport_frame_ids[camera_key] = current_frame_id
+            if warming_up:
+                self.synchronization_warmup_remaining -= 1
+                return
+            self.synchronization_window.append(
+                {
+                    "round": max((int(row.get("round", 0)) for row in results), default=0),
+                    "receivedCameras": len(received_keys),
+                    "complete": received_keys == expected_keys,
+                    "missingCameras": sorted(expected_keys - received_keys),
+                    "hostCaptureSkewMs": (
+                        round((max(host_times) - min(host_times)) / 1_000_000, 3)
+                        if len(host_times) == len(expected_keys) and host_times
+                        else None
+                    ),
+                    "cameraSequenceSkew": (
+                        max(sequences) - min(sequences)
+                        if len(sequences) == len(expected_keys) and sequences
+                        else None
+                    ),
+                    "transportFrameIdsAvailable": len(transport_ids),
+                    "transportFrameGaps": transport_gaps,
+                    "frameTriggerMode": self.frame_trigger_mode,
+                    "softwareTriggeredCameras": len(trigger_times),
+                    "triggerIssueSkewMs": (
+                        round((max(trigger_times) - min(trigger_times)) / 1_000_000, 3)
+                        if len(trigger_times) == len(expected_keys) and trigger_times
+                        else None
+                    ),
+                }
+            )
+
+    def _synchronization_json(self) -> dict[str, Any]:
+        with self.state_lock:
+            window = list(self.synchronization_window)
+            counts = {
+                camera.key: int(self.continuous_stats[camera.key]["frameCount"])
+                for camera in self.profile.enabled_cameras
+            }
+            lifetime_transport_gap_counts = dict(self.transport_frame_gap_counts)
+            warmup_remaining = self.synchronization_warmup_remaining
+        transport_gap_counts = {
+            camera.key: sum(
+                int(row.get("transportFrameGaps", {}).get(camera.key, 0))
+                for row in window
+            )
+            for camera in self.profile.enabled_cameras
+        }
+        values = list(counts.values())
+        frame_count_skew = max(values, default=0) - min(values, default=0)
+        complete_rounds = sum(bool(row["complete"]) for row in window)
+        last = window[-1] if window else None
+        synchronized = bool(
+            last
+            and last["complete"]
+            and complete_rounds == len(window)
+            and frame_count_skew <= 1
+            and sum(transport_gap_counts.values()) == 0
+            and len(self.sessions) == self.profile.expected_cameras
+            and (
+                self.frame_trigger_mode != "software"
+                or (
+                    last.get("triggerIssueSkewMs") is not None
+                    and float(last["triggerIssueSkewMs"])
+                    <= self.alignment_config.maximum_anchor_residual_ms
+                )
+            )
+        )
+        return {
+            "schema": "steel.capture-synchronization.v1",
+            "status": "synchronized" if synchronized else "degraded" if window else "waiting",
+            "synchronized": synchronized,
+            "expectedCameras": self.profile.expected_cameras,
+            "connectedCameras": len(self.sessions),
+            "frameTriggerMode": self.frame_trigger_mode,
+            "hardwareEncoderConnected": False,
+            "absoluteLongitudinalScaleVerified": False,
+            "warmupRounds": self.synchronization_warmup_rounds,
+            "warmupRemaining": warmup_remaining,
+            "windowRounds": len(window),
+            "completeRounds": complete_rounds,
+            "incompleteRounds": len(window) - complete_rounds,
+            "completenessPercent": round(100.0 * complete_rounds / len(window), 3) if window else 0.0,
+            "frameCounts": counts,
+            "frameCountSkew": frame_count_skew,
+            "transportFrameGapCounts": transport_gap_counts,
+            "transportFrameGaps": sum(transport_gap_counts.values()),
+            "lifetimeTransportFrameGapCounts": lifetime_transport_gap_counts,
+            "lifetimeTransportFrameGaps": sum(lifetime_transport_gap_counts.values()),
+            "lastRound": last,
+        }
 
     def _acquisition_loop(self) -> None:
         self.capture_lock.acquire()
@@ -1500,7 +3032,11 @@ class ProviderRuntime:
                     "materialId": material_id,
                     "sessionId": session_id,
                     "timeoutMs": self.profile.timeout_ms,
-                    "retries": 0,
+                    "retries": (
+                        self.startup_capture_retries
+                        if round_index <= self.synchronization_warmup_rounds
+                        else 0
+                    ),
                     "discardBlackFrames": True,
                     "blackFrameThreshold": self.profile.black_frame_threshold,
                     "_persistFrame": persist_frame,
@@ -1515,6 +3051,7 @@ class ProviderRuntime:
                 )
                 if continuous:
                     self._record_continuous_round(results, persist_frame)
+                    self._record_synchronization_round(results)
                     received = [row for row in results if bool(row.get("frameReceived"))]
                     signal_cameras = sum(bool(row.get("steelSignal")) for row in received)
                     required = min(self.steel_min_cameras, len(received)) if received else 1
@@ -1549,7 +3086,11 @@ class ProviderRuntime:
                                 material_id=material_id,
                                 session_id=session_id,
                                 boundary_phase="normal",
-                                require_steel_signal=True,
+                                # Steel presence is decided once for the whole
+                                # synchronized camera round.  Filtering again
+                                # per camera created unequal six-camera frame
+                                # sets whenever one valid view was darker.
+                                require_steel_signal=False,
                             )
                     self._evaluate_grayscale_steel(results)
                     with self.state_lock:
@@ -1653,24 +3194,56 @@ class ProviderRuntime:
                 frame = session.fetch_frame(timeout_ms)
                 self._count_frames(received=1)
                 captured_at = _utc_text()
+                frame_telemetry = {
+                    "cameraFrameSequence": frame.sequence,
+                    "transportFrameId": frame.transport_frame_id,
+                    "transportFrameGap": frame.transport_frame_gap,
+                    "deviceTimestamp": frame.timestamp,
+                    "timestampFrequency": frame.timestamp_frequency,
+                    "hostUtcNs": frame.host_utc_ns,
+                    "hostMonotonicNs": frame.host_monotonic_ns,
+                    "frameTriggerMode": frame.frame_trigger_mode,
+                    "triggerIssuedNs": frame.trigger_issued_ns,
+                    "triggerCompletedNs": frame.trigger_completed_ns,
+                    "triggerCommandLatencyUs": round(
+                        max(0, frame.trigger_completed_ns - frame.trigger_issued_ns)
+                        / 1000.0,
+                        3,
+                    )
+                    if frame.trigger_issued_ns > 0
+                    else None,
+                }
                 mean_intensity = float(np.mean(frame.intensity))
                 max_intensity = float(np.max(frame.intensity)) if frame.intensity.size else 0.0
-                bright_pixel_ratio = (
-                    float(np.count_nonzero(frame.intensity > self.steel_bright_threshold))
-                    / float(frame.intensity.size)
-                    if frame.intensity.size
-                    else 0.0
+                (
+                    steel_detection_max_intensity,
+                    bright_pixel_ratio,
+                    steel_detection_rows,
+                ) = _steel_tail_metrics(
+                    frame.intensity,
+                    edge=self.steel_detection_edge,
+                    rows=self.steel_detection_tail_rows,
+                    bright_threshold=self.steel_bright_threshold,
                 )
                 steel_signal = (
-                    max_intensity > self.steel_bright_threshold
+                    steel_detection_max_intensity > self.steel_bright_threshold
                     and bright_pixel_ratio >= self.steel_bright_ratio
+                )
+                frame_telemetry.update(
+                    {
+                        "steelDetectionRegion": "tail-rows",
+                        "steelDetectionEdge": self.steel_detection_edge,
+                        "steelDetectionRows": steel_detection_rows,
+                        "steelDetectionMaxIntensity": steel_detection_max_intensity,
+                    }
                 )
                 retained_frame = (
                     {"_rawFrame": frame}
                     if bool(payload.get("_retainRawFrame", False))
                     else {}
                 )
-                self._publish_stream_frame(camera, frame)
+                if steel_signal:
+                    self._schedule_stream_frame(camera, frame)
                 if save_generation is not None:
                     with self.state_lock:
                         still_armed = (
@@ -1701,6 +3274,7 @@ class ProviderRuntime:
                             "brightPixelRatio": bright_pixel_ratio,
                             "steelSignal": steel_signal,
                             "capturedAt": captured_at,
+                            **frame_telemetry,
                             **retained_frame,
                         }
                 if not persist_frame:
@@ -1729,6 +3303,7 @@ class ProviderRuntime:
                         "capturedAt": captured_at,
                         "workerStartedNs": started_ns,
                         "workerCompletedNs": time.time_ns(),
+                        **frame_telemetry,
                         **retained_frame,
                     }
                 if bool(payload.get("discardBlackFrames", False)):
@@ -1764,6 +3339,7 @@ class ProviderRuntime:
                             "capturedAt": captured_at,
                             "workerStartedNs": started_ns,
                             "workerCompletedNs": time.time_ns(),
+                            **frame_telemetry,
                             **retained_frame,
                         }
                 if bool(payload.get("_deferPersistence", False)):
@@ -1792,6 +3368,7 @@ class ProviderRuntime:
                         "capturedAt": captured_at,
                         "workerStartedNs": started_ns,
                         "workerCompletedNs": time.time_ns(),
+                        **frame_telemetry,
                         **retained_frame,
                     }
                 if (
@@ -1824,6 +3401,7 @@ class ProviderRuntime:
                         "capturedAt": captured_at,
                         "workerStartedNs": started_ns,
                         "workerCompletedNs": time.time_ns(),
+                        **frame_telemetry,
                         **retained_frame,
                     }
                 result = self.writer.write(
@@ -1833,6 +3411,16 @@ class ProviderRuntime:
                     session_id=session_id,
                     production_event_id=str(
                         payload.get("productionEventId", payload.get("inspectionId", ""))
+                    ),
+                    inspection_id=str(
+                        payload.get("inspectionId", f"INSP-{session_id}" if session_id else "")
+                    ),
+                    capture_round=round_index,
+                    sync_group_id=str(
+                        payload.get(
+                            "syncGroupId",
+                            f"{session_id or material_id}:round-{round_index:012d}",
+                        )
                     ),
                 )
                 row = result.provider_row(frame, round_index)
@@ -1849,6 +3437,7 @@ class ProviderRuntime:
                         "brightPixelRatio": bright_pixel_ratio,
                         "steelSignal": steel_signal,
                         "capturedAt": captured_at,
+                        **frame_telemetry,
                         **retained_frame,
                     }
                 )
@@ -2112,26 +3701,76 @@ class ProviderRuntime:
             roots.append(legacy_root)
         return roots
 
+    def _recent_camera_files(
+        self,
+        camera: CameraProfile,
+        *,
+        directories: tuple[str, ...],
+        suffixes: tuple[str, ...],
+        limit: int,
+        material_limit: int = 32,
+    ) -> list[Path]:
+        """Return recent artifacts without walking every historical frame.
+
+        A camera disk can contain hundreds of flows and tens of thousands of
+        PNG/NPZ files.  Expanding ``*/2d/*.png`` before sorting made the first
+        live preview wait behind a full archive scan.  Material directories
+        are cheap to enumerate, so inspect only the newest bounded set and
+        then rank the contained artifacts.
+        """
+        material_dirs: list[tuple[int, Path]] = []
+        for root in self._camera_read_roots(camera):
+            try:
+                for candidate in root.iterdir():
+                    if candidate.is_dir():
+                        material_dirs.append((candidate.stat().st_mtime_ns, candidate))
+            except OSError:
+                continue
+        material_dirs.sort(key=lambda item: item[0], reverse=True)
+
+        normalized_suffixes = {suffix.lower() for suffix in suffixes}
+        candidates: list[tuple[int, Path]] = []
+        for _, material_dir in material_dirs[: max(1, material_limit)]:
+            for directory in directories:
+                artifact_dir = material_dir / directory
+                try:
+                    for path in artifact_dir.iterdir():
+                        if path.suffix.lower() not in normalized_suffixes or not path.is_file():
+                            continue
+                        candidates.append((path.stat().st_mtime_ns, path))
+                except OSError:
+                    continue
+            # One or two recent flows normally contain more than enough
+            # candidates.  Bound directory I/O while retaining head/tail
+            # frames that may be dark and skipped by the preview filter.
+            if len(candidates) >= max(limit * 2, limit + 32):
+                break
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [path for _, path in candidates[:limit]]
+
     def latest_file(self, query: dict[str, list[str]]) -> Path | None:
         identity = (query.get("ip") or query.get("cameraId") or [""])[0]
         kind = (query.get("kind") or ["intensity"])[0]
         camera = self.camera_for_identity(identity) if identity else self.profile.enabled_cameras[0]
         if camera is None or kind not in {"depth", "intensity", "metadata", "3d", "2d", "json"}:
             return None
-        candidates = [
-            path
-            for root in self._camera_read_roots(camera)
-            for path in root.glob(f"*/{kind}/*")
-            if path.is_file()
-        ]
-        if not candidates and kind == "intensity":
-            candidates = [
-                path
-                for root in self._camera_read_roots(camera)
-                for path in root.glob("*/2d/*.png")
-                if path.is_file()
-            ]
-        return max(candidates, key=lambda path: path.stat().st_mtime_ns) if candidates else None
+        directory = {"3d": "3d", "2d": "2d", "json": "json"}.get(kind, kind)
+        suffixes = {
+            "depth": (".png", ".npz"),
+            "intensity": (".png", ".jpg", ".jpeg"),
+            "metadata": (".json",),
+            "3d": (".npz",),
+            "2d": (".png", ".jpg", ".jpeg"),
+            "json": (".json",),
+        }[kind]
+        directories = (directory, "2d") if kind == "intensity" else (directory,)
+        candidates = self._recent_camera_files(
+            camera,
+            directories=directories,
+            suffixes=suffixes,
+            limit=1,
+        )
+        return candidates[0] if candidates else None
 
     @staticmethod
     def _file_time_text(timestamp: float) -> str:
@@ -2204,6 +3843,7 @@ class ProviderRuntime:
                     read_root,
                     material_root,
                     active_root,
+                    max_frames,
                 )
             if len(grouped) >= max_frames:
                 has_more = material_index + 1 < len(ordered_materials)
@@ -2221,6 +3861,7 @@ class ProviderRuntime:
         read_root: Path,
         material_root: Path,
         active_root: bool,
+        max_frames: int,
     ) -> None:
         image_roots = [
             (root, zero_based)
@@ -2232,13 +3873,19 @@ class ProviderRuntime:
         ]
         for image_root, zero_based_2d in image_roots:
             try:
-                paths = [
-                    path
-                    for path in image_root.iterdir()
-                    if path.is_file()
-                    and not path.is_symlink()
-                    and path.suffix.lower() == ".png"
-                ]
+                numbered_paths: list[tuple[int, Path]] = []
+                for path in image_root.iterdir():
+                    if path.is_symlink() or path.suffix.lower() != ".png":
+                        continue
+                    try:
+                        sequence = int(path.stem) + (1 if zero_based_2d else 0)
+                    except ValueError:
+                        continue
+                    numbered_paths.append((sequence, path))
+                # Only the newest requested frames can appear in the response.
+                # Avoid stat/open work for every historical image in a long run.
+                numbered_paths.sort(key=lambda item: item[0], reverse=True)
+                paths = [path for _, path in numbered_paths[:max_frames]]
             except OSError:
                 continue
             dimensions = None
@@ -2312,12 +3959,69 @@ class ProviderRuntime:
                 }
             )
 
+    def _refresh_history_cache(self, limit: int, material_id: str) -> None:
+        try:
+            frames, has_more = self._scan_capture_history(limit, material_id)
+        except Exception as error:
+            self._log("warning", "capture history refresh failed", error=str(error))
+            return
+        with self.history_lock:
+            if self.history_cache_material_id != material_id:
+                return
+            self.history_cache = frames
+            self.history_cache_has_more = has_more
+            self.history_cache_at = time.monotonic()
+            self.history_cache_limit = limit
+
+    def _schedule_history_refresh(self, limit: int, material_id: str) -> None:
+        with self.history_lock:
+            if self.history_refresh_future is not None and not self.history_refresh_future.done():
+                return
+            self.history_refresh_future = self.history_refresh_pool.submit(
+                self._refresh_history_cache,
+                limit,
+                material_id,
+            )
+
     def capture_history_json(self, query: dict[str, list[str]]) -> dict[str, Any]:
         try:
             limit = max(1, min(500, int((query.get("limit") or ["240"])[0])))
         except (TypeError, ValueError):
             limit = 240
         material_id = (query.get("materialId") or [""])[0].strip()
+        catalog_path = playback_catalog_path(self.profile.storage_root)
+        try:
+            catalog_mtime_ns = catalog_path.stat().st_mtime_ns
+        except OSError:
+            catalog_mtime_ns = 0
+        indexed_key = (limit, material_id, catalog_mtime_ns)
+        with self.history_lock:
+            cached_indexed = self.indexed_history_cache.get(indexed_key)
+            if cached_indexed is not None:
+                self.indexed_history_cache.move_to_end(indexed_key)
+                return cached_indexed
+        indexed = read_indexed_history(self.profile.storage_root, limit, material_id)
+        if indexed is not None:
+            frames, has_more, total = indexed
+            result = {
+                "code": 0,
+                "storageRoot": str(self.profile.storage_root),
+                "total": total,
+                "count": len(frames),
+                "hasMore": has_more,
+                "refreshing": False,
+                "indexed": True,
+                "catalogPath": str(playback_catalog_path(self.profile.storage_root)),
+                "frames": frames,
+            }
+            with self.history_lock:
+                self.indexed_history_cache[indexed_key] = result
+                self.indexed_history_cache.move_to_end(indexed_key)
+                while len(self.indexed_history_cache) > 16:
+                    self.indexed_history_cache.popitem(last=False)
+            return result
+        scan_now = False
+        refreshing = False
         with self.history_lock:
             cache_stale = (
                 self.history_cache_at <= 0
@@ -2326,13 +4030,24 @@ class ProviderRuntime:
                 or self.history_cache_limit < limit
             )
             if cache_stale:
-                self.history_cache, self.history_cache_has_more = self._scan_capture_history(
-                    limit,
-                    material_id,
+                cache_usable = (
+                    self.history_cache_at > 0
+                    and self.history_cache_material_id == material_id
+                    and self.history_cache_limit >= limit
                 )
+                scan_now = not cache_usable
+                refreshing = cache_usable
+        if scan_now:
+            frames, has_unscanned = self._scan_capture_history(limit, material_id)
+            with self.history_lock:
+                self.history_cache = frames
+                self.history_cache_has_more = has_unscanned
                 self.history_cache_at = time.monotonic()
                 self.history_cache_limit = limit
                 self.history_cache_material_id = material_id
+        elif refreshing:
+            self._schedule_history_refresh(limit, material_id)
+        with self.history_lock:
             frames = list(self.history_cache)
             has_unscanned = self.history_cache_has_more
         total = len(frames) + (1 if has_unscanned else 0)
@@ -2343,6 +4058,8 @@ class ProviderRuntime:
             "total": total,
             "count": len(selected),
             "hasMore": has_unscanned or total > len(selected),
+            "refreshing": refreshing,
+            "indexed": False,
             "frames": selected,
         }
 
@@ -2354,37 +4071,95 @@ class ProviderRuntime:
         if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
             return None
         stat = path.stat()
-        key = (str(path), stat.st_mtime_ns, max_width)
+        fingerprint = source_fingerprint(path, self.playback_cache_root)
+        key = (str(path), stat.st_mtime_ns, max_width, fingerprint)
         with self.history_lock:
             cached = self.playback_image_cache.get(key)
             if cached is not None:
                 self.playback_image_cache.move_to_end(key)
+                self.playback_cache_memory_hits += 1
                 return cached
-        output = io.BytesIO()
-        with Image.open(path) as source:
-            converted = source.convert("L")
+        build_lock = self.playback_cache_build_locks[
+            int(fingerprint[:2], 16) % len(self.playback_cache_build_locks)
+        ]
+        with build_lock:
+            existing = read_image_pyramid(self.playback_cache_root, fingerprint)
+            disk_hit = existing is not None
+            cache_succeeded = False
+            started = time.monotonic()
             try:
-                if converted.width > max_width:
-                    target_height = max(
-                        1,
-                        round(converted.height * max_width / converted.width),
-                    )
-                    with converted.resize(
-                        (max_width, target_height),
-                        Image.Resampling.BILINEAR,
-                    ) as preview:
-                        preview.save(output, format="JPEG", quality=84, optimize=False)
+                if existing is None:
+                    manifest_path, manifest = self.playback_compute_pool.submit(
+                        build_image_pyramid,
+                        path,
+                        self.playback_cache_root,
+                    ).result()
                 else:
-                    converted.save(output, format="JPEG", quality=84, optimize=False)
-            finally:
-                converted.close()
-        result = ("image/jpeg", output.getvalue())
+                    manifest_path, manifest = existing
+                selected_path, _ = select_pyramid_image(manifest_path, manifest, max_width)
+                result = ("image/jpeg", selected_path.read_bytes())
+                cache_succeeded = True
+            except Exception as error:
+                with self.history_lock:
+                    self.playback_cache_build_failures += 1
+                self._log(
+                    "warning",
+                    "playback pyramid build failed; serving transient preview",
+                    path=str(path),
+                    error=str(error),
+                )
+                output = io.BytesIO()
+                with Image.open(path) as source:
+                    converted = source.convert("L")
+                    try:
+                        if converted.width > max_width:
+                            target_height = max(
+                                1,
+                                round(converted.height * max_width / converted.width),
+                            )
+                            with converted.resize(
+                                (max_width, target_height), Image.Resampling.BILINEAR
+                            ) as preview:
+                                preview.save(output, format="JPEG", quality=84, optimize=False)
+                        else:
+                            converted.save(output, format="JPEG", quality=84, optimize=False)
+                    finally:
+                        converted.close()
+                result = ("image/jpeg", output.getvalue())
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            if cache_succeeded:
+                with self.history_lock:
+                    if disk_hit:
+                        self.playback_cache_disk_hits += 1
+                    else:
+                        self.playback_cache_builds += 1
+                        self.playback_cache_build_ms.append(elapsed_ms)
         with self.history_lock:
             self.playback_image_cache[key] = result
             self.playback_image_cache.move_to_end(key)
-            while len(self.playback_image_cache) > 96:
+            while len(self.playback_image_cache) > 384:
                 self.playback_image_cache.popitem(last=False)
         return result
+
+    def playback_cache_status_json(self) -> dict[str, Any]:
+        with self.history_lock:
+            build_samples = list(self.playback_cache_build_ms)
+            return {
+                "code": 0,
+                "schema": "steel.capture-playback-cache-status.v1",
+                "cacheRoot": str(self.playback_cache_root / "playback-pyramid" / "v1"),
+                "catalogPath": str(playback_catalog_path(self.profile.storage_root)),
+                "catalogAvailable": playback_catalog_path(self.profile.storage_root).is_file(),
+                "memoryEntries": len(self.playback_image_cache),
+                "memoryHits": self.playback_cache_memory_hits,
+                "diskHits": self.playback_cache_disk_hits,
+                "pyramidsBuilt": self.playback_cache_builds,
+                "buildFailures": self.playback_cache_build_failures,
+                "averageBuildMs": round(sum(build_samples) / len(build_samples), 3)
+                if build_samples
+                else None,
+                "fullPyramidWarm": dict(self.playback_warm_status),
+            }
 
     def allowed_file(self, value: str) -> Path | None:
         if not value:
@@ -2414,13 +4189,25 @@ class ProviderRuntime:
 
 class SickCaptureRequestHandler(BaseHTTPRequestHandler):
     server_version = "SteelSickCapture/1.0"
+    protocol_version = "HTTP/1.1"
 
     @property
     def runtime(self) -> ProviderRuntime:
         return getattr(self.server, "runtime")
 
     def log_message(self, format: str, *args: Any) -> None:
-        self.runtime._log("debug", format % args)
+        # UI polling can generate hundreds of successful requests per minute.
+        # Keep the bounded operational event ring for capture, storage and
+        # transition diagnostics instead of evicting them with access logs.
+        return
+
+    def _write_response_body(self, body: bytes) -> bool:
+        """Write a response without turning cancelled UI polls into errors."""
+        try:
+            self.wfile.write(body)
+            return True
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return False
 
     def _send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -2429,7 +4216,7 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_response_body(body)
 
     def _payload(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -2451,7 +4238,8 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         with path.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
-                self.wfile.write(block)
+                if not self._write_response_body(block):
+                    break
 
     def _send_png(self, body: bytes) -> None:
         self.send_response(200)
@@ -2459,7 +4247,7 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_response_body(body)
 
     def _send_immutable_image(self, content_type: str, body: bytes) -> None:
         self.send_response(200)
@@ -2467,7 +4255,7 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_response_body(body)
 
     def do_GET(self) -> None:  # noqa: N802
         split = urlsplit(self.path)
@@ -2484,6 +4272,14 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.runtime.steel_status_json())
         elif path == "/api/capture/continuous-settings":
             self._send_json(200, self.runtime.continuous_settings_json())
+        elif path == "/api/capture/alignment":
+            material_id = (query.get("materialId") or [""])[0]
+            status, payload = self.runtime.alignment_json(material_id)
+            self._send_json(status, payload)
+        elif path == "/api/capture/measurement":
+            material_id = (query.get("materialId") or [""])[0]
+            status, payload = self.runtime.measurement_json(material_id)
+            self._send_json(status, payload)
         elif path == "/api/stream/status":
             identity = (query.get("ip") or query.get("cameraId") or [""])[0]
             self._send_json(200, self.runtime.stream_status(identity))
@@ -2513,6 +4309,8 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
                 self._send_file(latest)
         elif path == "/api/capture/history":
             self._send_json(200, self.runtime.capture_history_json(query))
+        elif path == "/api/capture/cache/status":
+            self._send_json(200, self.runtime.playback_cache_status_json())
         elif path == "/api/capture/file":
             allowed = self.runtime.allowed_file((query.get("path") or [""])[0])
             if allowed is None:
@@ -2557,6 +4355,23 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, result)
         elif path == "/api/capture/continuous-settings":
             self._send_json(200, self.runtime.continuous_settings_json())
+        elif path in {
+            "/api/capture/alignment/rebuild",
+            "/api/capture/measurement/rebuild",
+        }:
+            material_id = str(payload.get("materialId", "")).strip()
+            if not material_id:
+                self._send_json(400, {"code": 400, "error": "materialId is required"})
+            elif self.runtime._schedule_flow_alignment(material_id):
+                self._send_json(
+                    202,
+                    {"code": 0, "state": "waiting-for-storage", "materialId": material_id},
+                )
+            else:
+                self._send_json(
+                    409,
+                    {"code": 409, "error": "alignment_already_running_or_invalid"},
+                )
         elif path == "/api/stream/start":
             result = self.runtime.start_stream(payload)
             self._send_json(200 if result["code"] == 0 else 400, result)

@@ -6078,7 +6078,10 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/param"),
     ("GET", "/api/capture/latest"),
     ("GET", "/api/capture/history"),
+    ("GET", "/api/capture/cache/status"),
     ("GET", "/api/capture/continuous-settings"),
+    ("GET", "/api/capture/alignment"),
+    ("GET", "/api/capture/measurement"),
     ("GET", "/api/stream/status"),
     ("GET", "/api/calibration/active"),
     ("GET", "/api/calibration/status"),
@@ -6106,6 +6109,8 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/capture/depth-map"),
     ("POST", "/api/capture/continuous-test"),
     ("POST", "/api/capture/continuous-settings"),
+    ("POST", "/api/capture/alignment/rebuild"),
+    ("POST", "/api/capture/measurement/rebuild"),
     ("POST", "/api/capture/preset/line-continuous"),
     ("POST", "/api/stream/start"),
     ("POST", "/api/stream/stop"),
@@ -6125,6 +6130,24 @@ fn is_capture_json_proxy_route(method: &str, path: &str) -> bool {
 
 fn is_capture_binary_proxy_route(method: &str, path: &str) -> bool {
     CAPTURE_BINARY_PROXY_ROUTES.contains(&(method, path))
+}
+
+fn capture_stream_redirect_response(capture: &CaptureServiceManager, raw_path: &str) -> Vec<u8> {
+    // Live preview images are a high-rate loopback data plane. Proxying them
+    // through this thread-per-request control service means a WebView refresh
+    // can leave hundreds of cancelled proxy workers behind and saturate every
+    // CPU core. A redirect also protects clients with an older cached bundle
+    // that still points image URLs at port 4873.
+    let location = format!("{}{}", capture.origin.trim_end_matches('/'), raw_path);
+    http_bytes_response_with_headers(
+        "307 Temporary Redirect",
+        "text/plain; charset=utf-8",
+        b"capture stream moved to local data plane",
+        &[
+            ("Location", location.as_str()),
+            ("Cache-Control", "no-store"),
+        ],
+    )
 }
 
 fn append_capture_proxy_manifest_routes(routes: &mut Vec<Value>) {
@@ -16678,9 +16701,6 @@ fn inspection_world_meta_with_cache(
         .get("world")
         .cloned()
         .and_then(|value| serde_json::from_value::<inspection_world::InspectionWorld>(value).ok());
-    if let (Some(revision), Some(world)) = (revision.as_ref(), world.as_ref()) {
-        schedule_inspection_world_cache(state, record_id, revision, world);
-    }
     if let (Some(revision), Some(world), Some(object)) = (revision, world, meta.as_object_mut()) {
         object.insert(
             "cache".to_string(),
@@ -16693,62 +16713,6 @@ fn inspection_world_meta_with_cache(
         );
     }
     meta
-}
-
-fn schedule_inspection_world_cache(
-    state: &ServiceState,
-    record_id: &str,
-    source_revision: &str,
-    world: &inspection_world::InspectionWorld,
-) {
-    let cache_root = inspection_world_cache_root(state);
-    let cache_record_id = record_id.to_string();
-    let cache_revision = source_revision.to_string();
-    if state.runtime_config.data_source == "bkv-online-mysql" || unified_result_store_enabled(state)
-    {
-        // Production/unified records can contain thousands of tiles. Filling
-        // every LOD eagerly competes with the selected record for disk and SMB
-        // bandwidth. Visible single-camera tiles are materialized atomically
-        // on demand by `inspection_world_tile_response` and then reused.
-        return;
-    }
-    if let Some(manager) = state.bkv.as_ref() {
-        let Ok(sequence) = record_id.parse::<u64>() else {
-            return;
-        };
-        let manager = Arc::clone(manager);
-        inspection_world::schedule_full_tile_cache(
-            cache_root,
-            cache_record_id,
-            cache_revision,
-            world.clone(),
-            move |request| {
-                manager
-                    .inspection_tile(sequence, request)
-                    .map_err(inspection_world::WorldError::Artifact)
-            },
-        );
-        return;
-    }
-    let Ok(online) = load_online_inspection_world(state, record_id) else {
-        return;
-    };
-    let generated = Arc::clone(&online);
-    inspection_world::schedule_full_tile_cache(
-        cache_root,
-        cache_record_id,
-        cache_revision,
-        world.clone(),
-        move |request| {
-            inspection_world::compose_camera_tile(
-                &generated.world,
-                request,
-                |camera_id, image_index| {
-                    Ok(generated.frames.get(&(camera_id, image_index)).cloned())
-                },
-            )
-        },
-    );
 }
 
 fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> {
@@ -23481,6 +23445,12 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         _ if is_capture_json_proxy_route(method, path) => {
             capture_proxy_http_response(&state.capture, method, raw_path, path, body)
         }
+        _ if method == "GET"
+            && path == "/api/stream/latest"
+            && state.capture.provider.uses_local_api() =>
+        {
+            capture_stream_redirect_response(&state.capture, raw_path)
+        }
         _ if is_capture_binary_proxy_route(method, path) => {
             capture_proxy_http_response(&state.capture, method, raw_path, path, body)
         }
@@ -27200,6 +27170,16 @@ mod tests {
         assert!(is_capture_json_proxy_route("GET", "/api/capture/logs"));
         assert!(is_capture_json_proxy_route("GET", "/api/capture/latest"));
         assert!(is_capture_json_proxy_route("GET", "/api/capture/history"));
+        assert!(is_capture_json_proxy_route(
+            "GET",
+            "/api/capture/cache/status"
+        ));
+        assert!(is_capture_json_proxy_route("GET", "/api/capture/alignment"));
+        assert!(is_capture_json_proxy_route("GET", "/api/capture/measurement"));
+        assert!(is_capture_json_proxy_route(
+            "POST",
+            "/api/capture/measurement/rebuild"
+        ));
         assert!(!is_capture_json_proxy_route("POST", "/api/capture/latest"));
         assert!(!is_capture_json_proxy_route("GET", "/api/capture/file"));
         assert!(is_capture_json_proxy_route("POST", "/api/stream/start"));
@@ -27221,6 +27201,23 @@ mod tests {
             "GET",
             "/api/capture/continuous-settings"
         ));
+    }
+
+    #[test]
+    fn live_capture_images_redirect_to_the_loopback_data_plane() {
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:4317",
+        );
+        let response = response_text(capture_stream_redirect_response(
+            &state.capture,
+            "/api/stream/latest?ip=192.168.101.144&kind=intensity-grid",
+        ));
+        assert!(response.starts_with("HTTP/1.1 307 Temporary Redirect"));
+        assert!(response.contains(
+            "Location: http://127.0.0.1:4317/api/stream/latest?ip=192.168.101.144&kind=intensity-grid"
+        ));
+        assert!(response.contains("Cache-Control: no-store"));
     }
 
     #[test]
@@ -31217,6 +31214,7 @@ mod tests {
         assert_eq!(meta["world"]["cameras"].as_array().map(Vec::len), Some(8));
         assert_eq!(meta["world"]["cameras"][0]["frameNumbers"], json!([0]));
         assert_eq!(meta["world"]["cameras"][0]["headOffsetY"], 2);
+        assert_eq!(meta["cache"]["state"], "on-demand");
 
         let defects = response_json(inspection_world_defects_response(
             &state,

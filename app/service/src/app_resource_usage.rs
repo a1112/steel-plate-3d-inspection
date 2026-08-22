@@ -1,5 +1,4 @@
 use serde::Serialize;
-use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{get_current_pid, Pid, ProcessesToUpdate, System};
@@ -48,24 +47,6 @@ fn normalize_process_group_cpu_usage(raw_cpu_usage: f32, logical_cpu_count: usiz
         return raw_cpu_usage.clamp(0.0, 100.0);
     }
     (raw_cpu_usage / logical_cpu_count as f32).clamp(0.0, 100.0)
-}
-
-fn collect_process_tree_pids(system: &System, root_pid: Pid) -> HashSet<Pid> {
-    let mut pids = HashSet::from([root_pid]);
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (pid, process) in system.processes() {
-            if process
-                .parent()
-                .is_some_and(|parent| pids.contains(&parent))
-                && pids.insert(*pid)
-            {
-                changed = true;
-            }
-        }
-    }
-    pids
 }
 
 fn add_process_memory_to_breakdown(
@@ -173,33 +154,36 @@ fn sampled_at_ms() -> u128 {
 
 fn collect_app_resource_usage() -> Result<AppResourceUsage, String> {
     let current_pid = get_current_pid().map_err(|error| error.to_string())?;
-    let system = RESOURCE_SYSTEM.get_or_init(|| Mutex::new(System::new_all()));
+    // The service fallback only promises degraded, service-process-only metrics.
+    // Refreshing every process on the machine once per UI poll is both misleading
+    // (the capture and Tauri processes are siblings, not children) and very costly
+    // on high-core Windows hosts.  It can also leave sysinfo's parallel workers
+    // consuming CPU after the request has completed.  Keep this endpoint bounded
+    // to the current service PID; the native Tauri command remains the precise path.
+    let system = RESOURCE_SYSTEM.get_or_init(|| Mutex::new(System::new()));
     let mut system = system
         .lock()
         .map_err(|_| "resource monitor lock poisoned".to_string())?;
 
     system.refresh_memory();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+    system.refresh_processes(ProcessesToUpdate::Some(&[current_pid]), true);
 
-    let process_pids = collect_process_tree_pids(&system, current_pid);
     let mut raw_cpu_usage = 0.0f32;
     let mut memory_used = 0u64;
     let mut process_count = 0usize;
     let mut breakdown = ProcessMemoryBreakdown::default();
 
-    for pid in process_pids {
-        if let Some(process) = system.process(pid) {
-            raw_cpu_usage += process.cpu_usage();
-            let process_memory =
-                platform_working_set_bytes(pid).unwrap_or_else(|| process.memory());
-            memory_used = memory_used.saturating_add(process_memory);
-            process_count += 1;
-            add_process_memory_to_breakdown(
-                &mut breakdown,
-                &process.name().to_string_lossy(),
-                process_memory,
-            );
-        }
+    if let Some(process) = system.process(current_pid) {
+        raw_cpu_usage = process.cpu_usage();
+        let process_memory =
+            platform_working_set_bytes(current_pid).unwrap_or_else(|| process.memory());
+        memory_used = process_memory;
+        process_count = 1;
+        add_process_memory_to_breakdown(
+            &mut breakdown,
+            &process.name().to_string_lossy(),
+            process_memory,
+        );
     }
 
     let memory_total = system.total_memory();

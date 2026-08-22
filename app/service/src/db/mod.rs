@@ -3148,9 +3148,33 @@ pub async fn append_capture_files(
             "capture file batch must use one inspection_id".to_string(),
         ));
     }
+    // A continuous inspection can contain tens of thousands of artifacts. Do
+    // not reload the complete inspection ledger for every six-camera round;
+    // only the source keys present in this idempotent batch can collide.
+    let camera_ids = inputs
+        .iter()
+        .map(|input| input.camera_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let sequence_nos = inputs
+        .iter()
+        .map(|input| input.sequence_no)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let data_names = inputs
+        .iter()
+        .map(|input| input.data_name.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let transaction = connection.begin().await?;
     let existing = capture_file::Entity::find()
         .filter(capture_file::Column::InspectionId.eq(&inspection_id))
+        .filter(capture_file::Column::CameraId.is_in(camera_ids))
+        .filter(capture_file::Column::SequenceNo.is_in(sequence_nos))
+        .filter(capture_file::Column::DataName.is_in(data_names))
         .all(&transaction)
         .await?;
     let mut keys = existing
@@ -3386,8 +3410,25 @@ pub async fn append_steel_flow_images(
             "steel flow is missing for capture session {session_id}"
         ))
     })?;
+    // Query through the unique source-key index instead of scanning every
+    // image already assigned to this flow. Runtime stays bounded as a plate
+    // grows while replayed capture commits remain idempotent.
+    let camera_ids = inputs
+        .iter()
+        .map(|input| input.camera_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let sequence_nos = inputs
+        .iter()
+        .map(|input| input.camera_sequence_no)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let existing = steel_flow_image::Entity::find()
-        .filter(steel_flow_image::Column::SessionId.eq(&session_id))
+        .filter(steel_flow_image::Column::FlowNo.eq(flow.flow_no))
+        .filter(steel_flow_image::Column::CameraId.is_in(camera_ids))
+        .filter(steel_flow_image::Column::CameraSequenceNo.is_in(sequence_nos))
         .all(&transaction)
         .await?;
     let mut by_source = existing
@@ -6039,6 +6080,26 @@ mod steel_flow_tests {
         }
     }
 
+    fn capture_file_input(
+        session_id: &str,
+        camera_id: &str,
+        sequence_no: i32,
+        data_name: &str,
+    ) -> CaptureFileInput {
+        CaptureFileInput {
+            inspection_id: format!("INSP-{session_id}"),
+            session_id: session_id.to_string(),
+            material_id: format!("FLOW-{session_id}"),
+            camera_id: camera_id.to_string(),
+            camera_ip: "192.0.2.10".to_string(),
+            data_name: data_name.to_string(),
+            sequence_no,
+            file_type: data_name.to_string(),
+            path: format!("{camera_id}/{sequence_no}/{data_name}.bin"),
+            metadata_path: format!("{camera_id}/{sequence_no}/metadata.json"),
+        }
+    }
+
     #[test]
     fn steel_flow_and_scoped_image_numbers_are_monotonic_and_idempotent() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -6097,6 +6158,73 @@ mod steel_flow_tests {
                     .await
                     .expect("next flow first image");
             assert_eq!(next_flow_image.image.image_no, 1);
+        });
+    }
+
+    #[test]
+    fn continuous_capture_batches_are_scoped_and_idempotent() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            start_steel_flow(&database.connection, flow_input("SESSION-BATCH"))
+                .await
+                .expect("flow");
+
+            let first_images = vec![
+                image_input("SESSION-BATCH", "C1", 1),
+                image_input("SESSION-BATCH", "C2", 1),
+            ];
+            let second_images = vec![
+                image_input("SESSION-BATCH", "C1", 2),
+                image_input("SESSION-BATCH", "C2", 2),
+            ];
+            let first = append_steel_flow_images(&database.connection, first_images.clone())
+                .await
+                .expect("first image batch");
+            let second = append_steel_flow_images(&database.connection, second_images)
+                .await
+                .expect("second image batch");
+            let replay = append_steel_flow_images(&database.connection, first_images)
+                .await
+                .expect("replayed image batch");
+            assert!(first.iter().all(|row| row.inserted));
+            assert!(second.iter().all(|row| row.inserted));
+            assert!(replay.iter().all(|row| !row.inserted));
+            assert_eq!(
+                replay
+                    .iter()
+                    .map(|row| row.image.image_no)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+
+            let first_files = vec![
+                capture_file_input("SESSION-BATCH", "C1", 1, "depth"),
+                capture_file_input("SESSION-BATCH", "C1", 1, "intensity"),
+                capture_file_input("SESSION-BATCH", "C2", 1, "depth"),
+            ];
+            assert_eq!(
+                append_capture_files(&database.connection, first_files.clone())
+                    .await
+                    .expect("first file batch"),
+                3
+            );
+            assert_eq!(
+                append_capture_files(&database.connection, first_files)
+                    .await
+                    .expect("replayed file batch"),
+                0
+            );
+            assert_eq!(
+                capture_file::Entity::find()
+                    .count(&database.connection)
+                    .await
+                    .expect("file count"),
+                3
+            );
         });
     }
 
