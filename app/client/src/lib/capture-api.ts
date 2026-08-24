@@ -1151,7 +1151,14 @@ function getCaptureStreamOrigin() {
   // refreshes to accumulate proxy workers and saturate every CPU core. Keep
   // start/stop authorization on 4873 while reading immutable preview bytes
   // directly from the local capture provider.
-  return DEFAULT_CAPTURE_STREAM_ORIGIN;
+  const controlOrigin = getCaptureServiceOrigin();
+  try {
+    const host = new URL(controlOrigin).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const loopback = host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".localhost");
+    return loopback ? DEFAULT_CAPTURE_STREAM_ORIGIN : controlOrigin;
+  } catch {
+    return DEFAULT_CAPTURE_STREAM_ORIGIN;
+  }
 }
 
 function hasTauriRuntime() {

@@ -80,6 +80,36 @@ export type ConnectionConfig = {
   mode: ConnectionMode;
   host: string;
   port: number;
+  runtime?: ConnectionRuntimeInfo;
+};
+
+export type ConnectionRuntimeInfo = {
+  service: string;
+  bindHost: string;
+  advertisedHost: string;
+  port: number;
+  origin: string;
+  lanAccess: boolean;
+  databaseEngine: string;
+  databaseStatus: string;
+  databaseFallbackActive: boolean;
+  schemaVersion: number;
+};
+
+export type DiscoveredInspectionService = {
+  host: string;
+  port: number;
+  origin: string;
+  scope: 'lan' | 'loopback' | string;
+  preferred: boolean;
+};
+
+export type ConnectionDiscoveryResult = {
+  schema: 'steel.inspection-service-discovery.v1';
+  code: number;
+  runtime: ConnectionRuntimeInfo;
+  preferred: DiscoveredInspectionService;
+  addresses: DiscoveredInspectionService[];
 };
 
 export type AdminTableMetric = {
@@ -967,6 +997,10 @@ export type ServiceHealthCheck = {
   required?: boolean;
   readyContribution?: boolean;
   apiReachable?: boolean;
+  engine?: string;
+  requestedEngine?: string;
+  fallbackActive?: boolean;
+  schemaVersion?: number;
   sdkReady?: boolean | null;
   writable?: boolean;
   accepting?: boolean;
@@ -1032,11 +1066,24 @@ const defectPreviewImages: Record<string, string> = {
 };
 
 export function createDefaultConnectionConfig(): ConnectionConfig {
+  const pageHost = typeof window !== 'undefined' ? window.location?.hostname?.trim() : '';
+  const host = pageHost && !matchesLoopbackHost(pageHost) ? pageHost : '127.0.0.1';
   return {
     mode: 'online',
-    host: '127.0.0.1',
+    host,
     port: 4873,
   };
+}
+
+function matchesLoopbackHost(host: string) {
+  const normalized = host.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1' || normalized.endsWith('.localhost');
+}
+
+function formatServiceOrigin(host: string, port: number) {
+  const normalized = host.trim().replace(/^\[|\]$/g, '');
+  const authority = normalized.includes(':') ? `[${normalized}]` : normalized;
+  return `http://${authority}:${port}`;
 }
 
 function getSafeLocalStorage() {
@@ -1069,7 +1116,11 @@ function getStoredConnectionConfig(): ConnectionConfig {
 export function saveLocalConnectionConfig(config: ConnectionConfig) {
   const storage = getSafeLocalStorage();
   if (storage) {
-    storage.setItem(CONNECTION_CONFIG_KEY, JSON.stringify(config));
+    storage.setItem(CONNECTION_CONFIG_KEY, JSON.stringify({
+      mode: config.mode,
+      host: config.host,
+      port: config.port,
+    }));
   }
 }
 
@@ -1113,7 +1164,7 @@ export function getInspectionServiceOrigin(config = getStoredConnectionConfig())
   if (configuredOrigin && configuredOrigin.trim().length > 0) {
     return configuredOrigin;
   }
-  return config.host && config.port ? `http://${config.host}:${config.port}` : DEFAULT_SERVICE_ORIGIN;
+  return config.host && config.port ? formatServiceOrigin(config.host, config.port) : DEFAULT_SERVICE_ORIGIN;
 }
 
 export function getTriggerGatewayOrigin() {
@@ -2040,11 +2091,86 @@ export async function fetchConnectionConfig(signal?: AbortSignal): Promise<Conne
       return localConfig;
     }
     const remoteConfig = { ...createDefaultConnectionConfig(), ...((await response.json()) as Partial<ConnectionConfig>) };
+    if (matchesLoopbackHost(remoteConfig.host) && !matchesLoopbackHost(localConfig.host)) {
+      // A shared server-side connection record may still contain 127.0.0.1.
+      // Keep the LAN hostname that successfully reached this service so a
+      // remote browser does not redirect its next request to its own machine.
+      remoteConfig.host = localConfig.host;
+    }
     saveLocalConnectionConfig(remoteConfig);
     return remoteConfig;
   } catch {
     return localConfig;
   }
+}
+
+function connectionDiscoveryOrigins(config: ConnectionConfig) {
+  const origins = new Set<string>();
+  const configuredOrigin = import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN?.trim();
+  if (configuredOrigin) {
+    origins.add(configuredOrigin.replace(/\/$/, ''));
+  }
+  if (config.host && config.port) {
+    origins.add(formatServiceOrigin(config.host, config.port));
+  }
+  if (typeof window !== 'undefined') {
+    const pageHost = window.location?.hostname?.trim();
+    if (pageHost) {
+      origins.add(formatServiceOrigin(pageHost, config.port || 4873));
+    }
+  }
+  origins.add(formatServiceOrigin('127.0.0.1', config.port || 4873));
+  return [...origins];
+}
+
+async function probeConnectionDiscovery(origin: string, signal?: AbortSignal): Promise<ConnectionDiscoveryResult> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  const timeout = window.setTimeout(() => controller.abort(), 1800);
+  try {
+    const response = await fetch(`${origin}/api/config/discovery`, {
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`服务发现响应 ${response.status}`);
+    }
+    const payload = (await response.json()) as ConnectionDiscoveryResult;
+    if (payload.schema !== 'steel.inspection-service-discovery.v1' || !Array.isArray(payload.addresses)) {
+      throw new Error('服务发现响应格式不正确');
+    }
+    return payload;
+  } finally {
+    window.clearTimeout(timeout);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
+export async function discoverInspectionServices(
+  config = getStoredConnectionConfig(),
+  signal?: AbortSignal,
+): Promise<ConnectionDiscoveryResult> {
+  const attempts = await Promise.allSettled(
+    connectionDiscoveryOrigins(config).map((origin) => probeConnectionDiscovery(origin, signal)),
+  );
+  const successful = attempts
+    .filter((attempt): attempt is PromiseFulfilledResult<ConnectionDiscoveryResult> => attempt.status === 'fulfilled')
+    .map((attempt) => attempt.value);
+  if (successful.length === 0) {
+    throw new Error('未发现局域网检测服务，请确认服务已启动且防火墙允许当前端口');
+  }
+  const primary = successful.find((result) => result.preferred?.scope === 'lan') ?? successful[0];
+  const addresses = new Map<string, DiscoveredInspectionService>();
+  for (const result of successful) {
+    for (const address of result.addresses) {
+      addresses.set(address.origin, address);
+    }
+  }
+  return {
+    ...primary,
+    addresses: [...addresses.values()].sort((left, right) => Number(right.preferred) - Number(left.preferred)),
+  };
 }
 
 export async function saveConnectionConfig(config: ConnectionConfig): Promise<void> {
@@ -2055,7 +2181,7 @@ export async function saveConnectionConfig(config: ConnectionConfig): Promise<vo
   const response = await fetch(`${getInspectionServiceOrigin(config)}/api/config/connection`, {
     method: 'POST',
     headers: createAdminHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify(config),
+    body: JSON.stringify({ mode: config.mode, host: config.host, port: config.port }),
   });
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '连接设置保存失败'));

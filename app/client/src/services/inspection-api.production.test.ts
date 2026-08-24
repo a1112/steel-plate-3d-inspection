@@ -8,6 +8,8 @@ import {
 import { getMockInspectionSnapshot } from '../data/inspection';
 import {
   captureProductionOnce,
+  discoverInspectionServices,
+  fetchConnectionConfig,
   fetchInspectionReportArchive,
   fetchInspectionReportArchives,
   fetchInspectionSnapshot,
@@ -49,6 +51,68 @@ afterEach(() => {
 });
 
 describe('persistent production command client', () => {
+  it('discovers the advertised LAN service and de-duplicates addresses', async () => {
+    const discovery = {
+      schema: 'steel.inspection-service-discovery.v1',
+      code: 0,
+      runtime: {
+        service: 'steel-inspection-service',
+        bindHost: '0.0.0.0',
+        advertisedHost: '192.168.10.25',
+        port: 4873,
+        origin: 'http://192.168.10.25:4873',
+        lanAccess: true,
+        databaseEngine: 'postgres',
+        databaseStatus: 'up',
+        databaseFallbackActive: false,
+        schemaVersion: 4,
+      },
+      preferred: {
+        host: '192.168.10.25',
+        port: 4873,
+        origin: 'http://192.168.10.25:4873',
+        scope: 'lan',
+        preferred: true,
+      },
+      addresses: [
+        {
+          host: '192.168.10.25',
+          port: 4873,
+          origin: 'http://192.168.10.25:4873',
+          scope: 'lan',
+          preferred: true,
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(discovery));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await discoverInspectionServices({ mode: 'online', host: '127.0.0.1', port: 4873 });
+
+    expect(fetchMock).toHaveBeenCalled();
+    expect(result.preferred.host).toBe('192.168.10.25');
+    expect(result.runtime.databaseEngine).toBe('postgres');
+    expect(result.addresses).toHaveLength(1);
+  });
+
+  it('keeps the reachable LAN host when the shared connection record still uses loopback', async () => {
+    window.localStorage.setItem('steel-inspection-connection-config', JSON.stringify({
+      mode: 'online',
+      host: '192.168.10.25',
+      port: 4873,
+    }));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+      mode: 'online',
+      host: '127.0.0.1',
+      port: 4873,
+    })));
+
+    const config = await fetchConnectionConfig();
+
+    expect(config.host).toBe('192.168.10.25');
+    expect(JSON.parse(window.localStorage.getItem('steel-inspection-connection-config') || '{}').host).toBe('192.168.10.25');
+  });
+
   it('keeps BKV replay and physical capture contracts discriminated', () => {
     const bkvHealth: BkvCaptureHealth = {
       service: 'steel-inspection-service',

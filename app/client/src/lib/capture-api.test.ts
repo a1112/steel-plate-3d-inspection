@@ -300,6 +300,18 @@ describe("readLatestCaptureFile", () => {
     );
   });
 
+  it("keeps live preview images on the inspection proxy for a LAN client", () => {
+    window.localStorage.setItem("steel-inspection-connection-config", JSON.stringify({
+      mode: "online",
+      host: "192.168.10.25",
+      port: 4873,
+    }));
+
+    expect(captureStreamImageUrl("192.168.101.100", "intensity", 42)).toBe(
+      "http://192.168.10.25:4873/api/stream/latest?ip=192.168.101.100&kind=intensity&region=valid&v=42",
+    );
+  });
+
   it("reads capture history and requests a pixel-bounded playback image", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
       code: 0,

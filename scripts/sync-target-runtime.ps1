@@ -229,7 +229,7 @@ if (-not (Test-Path $Exe -PathType Leaf)) {
   throw "Missing service executable: $Exe"
 }
 
-$env:INSPECTION_SERVICE_HOST = "127.0.0.1"
+$env:INSPECTION_SERVICE_HOST = "0.0.0.0"
 $env:INSPECTION_SERVICE_PORT = [string]$Port
 $env:STEEL_CAPTURE_PROVIDER = "headless-cpp"
 $env:CAPTURE_SERVICE_ORIGIN = "http://127.0.0.1:$CapturePort"
@@ -278,7 +278,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigRoot)) {
   $ConfigRoot = Join-Path $Root "config\service"
 }
 
-$env:INSPECTION_SERVICE_HOST = "127.0.0.1"
+$env:INSPECTION_SERVICE_HOST = "0.0.0.0"
 $env:INSPECTION_SERVICE_PORT = [string]$Port
 $env:STEEL_CAPTURE_PROVIDER = "simulated"
 $env:STEEL_CAPTURE_SERVICE_AUTOSTART = "0"
