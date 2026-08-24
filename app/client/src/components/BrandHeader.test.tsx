@@ -391,12 +391,12 @@ describe('BrandHeader', () => {
   });
 
   it('renders the embedded navigation before the system title', () => {
-    const { container } = renderHeader();
+    const { container } = renderHeader({ systemName: '北满特钢小棒检测系统' });
     const titleMetaGroup = container.querySelector<HTMLElement>('.title-meta-group');
 
     expect(titleMetaGroup).not.toBeNull();
     const navigation = within(titleMetaGroup!).getByRole('navigation');
-    const title = within(titleMetaGroup!).getByText('钢管3D表面检测系统');
+    const title = within(titleMetaGroup!).getByText('北满特钢小棒检测系统');
 
     expect(navigation.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });

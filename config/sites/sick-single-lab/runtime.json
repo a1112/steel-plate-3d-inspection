@@ -31,9 +31,9 @@
     "autostart": false
   },
   "algorithm": {
-    "enabled": false,
-    "autoProcessLatest": false,
-    "processor": "",
+    "enabled": true,
+    "autoProcessLatest": true,
+    "processor": "sick-flow-event-v2",
     "configPath": "",
     "outputRoot": "",
     "timingLog": "processing-times.jsonl",

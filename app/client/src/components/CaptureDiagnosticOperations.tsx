@@ -11,6 +11,7 @@ import {
   CAMERA_ROI_CONFIRMATION,
   captureValidationFrame,
   chooseCaptureLocalFile,
+  defaultCaptureProfileName,
   loadCaptureCalibration,
   loadCaptureParamFile,
   loadCaptureRoi,
@@ -134,15 +135,28 @@ export function captureMaintenancePhrase(ip: string) {
 export function CaptureDiagnosticOperations({
   cameraIps,
   cameraStatuses = EMPTY_CAMERA_STATUSES,
+  expectedCameraCount = cameraIps.length,
+  profileName,
+  maintenanceSupported = true,
+  maintenanceUnsupportedReason = '当前采集驱动未提供 SDK 参数、ROI 或标定写入接口。',
 }: {
   cameraIps: string[];
   cameraStatuses?: CaptureCameraStatus[];
+  expectedCameraCount?: number;
+  profileName?: string;
+  maintenanceSupported?: boolean;
+  maintenanceUnsupportedReason?: string;
 }) {
   const normalizedIpSignature = normalizeIps(cameraIps).join('\u001f');
   const normalizedIps = useMemo(
     () => normalizedIpSignature ? normalizedIpSignature.split('\u001f') : [],
     [normalizedIpSignature],
   );
+  const calibrationCameraCount = Number.isFinite(expectedCameraCount)
+    ? Math.max(1, Math.trunc(expectedCameraCount))
+    : Math.max(1, normalizedIps.length);
+  const configuredProfileName = profileName?.trim()
+    || defaultCaptureProfileName(calibrationCameraCount);
   const cameraStatusByIp = useMemo(
     () => new Map(cameraStatuses.map((status) => [status.ip, status])),
     [cameraStatuses],
@@ -173,14 +187,14 @@ export function CaptureDiagnosticOperations({
   const [calibrationConfirmation, setCalibrationConfirmation] = useState('');
   const [roiConfirmation, setRoiConfirmation] = useState('');
   const [validationConfirmation, setValidationConfirmation] = useState('');
-  const [calibrationSetProfile, setCalibrationSetProfile] = useState('current-8-time-trigger');
+  const [calibrationSetProfile, setCalibrationSetProfile] = useState(configuredProfileName);
   const [arrayCalibrationPath, setArrayCalibrationPath] = useState('');
   const [calibrationMappings, setCalibrationMappings] = useState<CaptureCalibrationMapping[]>(() =>
-    normalizedIps.map((ip) => ({
-      ip,
+    Array.from({ length: calibrationCameraCount }, (_, index) => ({
+      ip: normalizedIps[index] || '',
       path: '',
       artifactType: 'camera-sdk',
-      expectedSn: cameraStatusByIp.get(ip)?.sn || '',
+      expectedSn: cameraStatusByIp.get(normalizedIps[index] || '')?.sn || '',
     })),
   );
   const [calibrationSetPersistActive, setCalibrationSetPersistActive] = useState(false);
@@ -249,7 +263,7 @@ export function CaptureDiagnosticOperations({
     calibrationSetSaveToDevice,
     calibrationSetAllowExternal,
   ]);
-  const calibrationMappingsComplete = calibrationMappings.length === 8
+  const calibrationMappingsComplete = calibrationMappings.length === calibrationCameraCount
     && calibrationMappings.every((item) =>
       item.ip.trim() && item.path.trim() && item.expectedSn?.trim() && item.rollbackPath?.trim());
   const calibrationSetPreflightPassed = calibrationSetPreflightSignature === calibrationSetSignature;
@@ -295,10 +309,17 @@ export function CaptureDiagnosticOperations({
   useEffect(() => {
     setCalibrationMappings((current) => {
       const byIp = new Map(current.map((item) => [item.ip, item]));
-      return normalizedIps.map((ip) => ({
-        ...(byIp.get(ip) || { ip, path: '', artifactType: 'camera-sdk' }),
-        expectedSn: byIp.get(ip)?.expectedSn || cameraStatusByIp.get(ip)?.sn || '',
-      }));
+      return Array.from({ length: calibrationCameraCount }, (_, index) => {
+        const ip = normalizedIps[index] || '';
+        const existing = byIp.get(ip) || current[index];
+        return {
+          ...(existing || { path: '', artifactType: 'camera-sdk' }),
+          ip,
+          expectedSn: existing?.ip === ip
+            ? existing.expectedSn || cameraStatusByIp.get(ip)?.sn || ''
+            : cameraStatusByIp.get(ip)?.sn || '',
+        };
+      });
     });
     setCalibrationSetPreflightSignature('');
     setCalibrationSetConfirmation('');
@@ -306,7 +327,16 @@ export function CaptureDiagnosticOperations({
     setApplyOperationId('');
     setApplyOperationDetail(null);
     setBatchPersistConfirmation('');
-  }, [cameraSerialSignature, normalizedIpSignature]);
+  }, [calibrationCameraCount, cameraSerialSignature, normalizedIpSignature]);
+
+  useEffect(() => {
+    setCalibrationSetProfile(configuredProfileName);
+    setCalibrationSetPreflightSignature('');
+    setCalibrationSetConfirmation('');
+    setCalibrationSetDeviceConfirmation('');
+    setApplyOperationId('');
+    setApplyOperationDetail(null);
+  }, [configuredProfileName]);
 
   const selectIp = (ip: string) => {
     setSelectedIp(ip);
@@ -480,9 +510,9 @@ export function CaptureDiagnosticOperations({
     const response = await run(
       'persist-param-all',
       () => persistAllCaptureCameraParams({
-        name: calibrationSetProfile.trim() || 'current-8-time-trigger',
+        name: calibrationSetProfile.trim() || configuredProfileName,
         ips: normalizedIps,
-        cameraParamDir: `config/camera-params/${calibrationSetProfile.trim() || 'current-8-time-trigger'}`,
+        cameraParamDir: `config/camera-params/${calibrationSetProfile.trim() || configuredProfileName}`,
         applySoftTrigger: false,
       }),
       (next) => `全部相机参数快照/设备持久化完成：成功 ${next.saved ?? 0}，失败 ${next.failed ?? 0}`,
@@ -567,7 +597,7 @@ export function CaptureDiagnosticOperations({
     path: arrayCalibrationPath,
     cameraCalibrations: calibrationMappings,
     ips: calibrationMappings.map((item) => item.ip),
-    expectedCameras: 8,
+    expectedCameras: calibrationCameraCount,
     dryRun,
     stopStreams: true,
     atomic: true,
@@ -586,7 +616,7 @@ export function CaptureDiagnosticOperations({
 
   const handleCalibrationSetPreflight = async (newOperation = false) => {
     if (!calibrationSetProfile.trim() || !calibrationMappingsComplete) {
-      setMessage('整组标定预检需要 8 台相机的唯一 IP、SDK 标定文件、期望 SN 和已知良好回滚文件');
+      setMessage(`整组标定预检需要 ${calibrationCameraCount} 台相机的唯一 IP、SDK 标定文件、期望 SN 和已知良好回滚文件`);
       return;
     }
     if (calibrationSetPersistActive && !arrayCalibrationPath.trim()) {
@@ -821,6 +851,16 @@ export function CaptureDiagnosticOperations({
     }
   };
 
+  if (!maintenanceSupported) {
+    return (
+      <section className="capture-diagnostic-operations capture-unsupported-operation" role="note">
+        <header><AlertTriangle size={16} /><strong>SDK 维护与标定不可用</strong></header>
+        <p>{maintenanceUnsupportedReason}</p>
+        <p>当前 {calibrationCameraCount} 相机拓扑由运行 Profile <code>{configuredProfileName}</code> 管理；请修改并审核采集 Profile 后重启服务，不会向现场设备发送未实现的写入请求。</p>
+      </section>
+    );
+  }
+
   return (
     <section className="capture-diagnostic-operations" aria-label="受控开发诊断">
       <header>
@@ -978,7 +1018,7 @@ export function CaptureDiagnosticOperations({
         </section>
 
         <section className="capture-calibration-set-diagnostic">
-          <header><Camera size={16} /><strong>8 相机 SDK 标定整组下发</strong></header>
+          <header><Camera size={16} /><strong>{calibrationCameraCount} 相机 SDK 标定整组下发</strong></header>
           <p>先执行 <code>dryRun=true</code> 预检；只有同一份配置预检通过后才能真实应用。默认原子下发、失败回滚、不更新 active pointer、不写设备。</p>
           <div className="capture-calibration-set-header-fields">
             <label>

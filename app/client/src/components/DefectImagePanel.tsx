@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { PanelRightClose } from 'lucide-react';
-import type { DefectItem } from '../data/inspection';
+import type { DefectItem, DefectReviewStatus } from '../data/inspection';
 import { bkvOnlineCroppedImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import { Panel } from './Panel';
@@ -9,11 +9,20 @@ type Props = {
   inspectionId?: string;
   defect: DefectItem | null;
   onSidebarCollapse?: () => void;
+  onReviewDefect?: (defect: DefectItem, status: DefectReviewStatus, note: string) => Promise<void>;
 };
 
-export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse }: Props) {
+const reviewLabels: Record<DefectReviewStatus, string> = {
+  pending: '待复核',
+  confirmed: '已确认',
+  'false-positive': '已排除',
+};
+
+export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse, onReviewDefect }: Props) {
   const [actualSize, setActualSize] = useState(false);
   const [failed, setFailed] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [reviewError, setReviewError] = useState('');
   const cameraId = defect?.cameraIndex;
   const sequenceNo = defect?.artifacts?.sequenceNo;
   const roi = defect?.artifacts?.roi;
@@ -23,7 +32,7 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse }: Pr
         || defect?.artifacts?.sourceFrame?.intensity
         || defect?.previewImageUrl,
       roi,
-    ) || (inspectionId && cameraId && sequenceNo != null
+    ) || defect?.previewImageUrl || (inspectionId && cameraId && sequenceNo != null
       ? inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo, roi)
       : '')
   ), [cameraId, defect?.artifacts?.roiImage, defect?.artifacts?.sourceFrame?.intensity, defect?.previewImageUrl, inspectionId, roi?.height, roi?.width, roi?.x, roi?.y, sequenceNo]);
@@ -31,7 +40,30 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse }: Pr
   useEffect(() => {
     setActualSize(false);
     setFailed(false);
+    setReviewError('');
   }, [defect?.id, imageUrl]);
+
+  const submitReview = async (status: DefectReviewStatus) => {
+    if (!defect || !onReviewDefect || reviewing) return;
+    let note = '';
+    if (status !== 'pending') {
+      const response = window.prompt(
+        status === 'confirmed' ? '确认说明（可选）' : '排除原因（可选）',
+        defect.reviewNote ?? '',
+      );
+      if (response === null) return;
+      note = response;
+    }
+    setReviewError('');
+    setReviewing(true);
+    try {
+      await onReviewDefect(defect, status, note);
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : '缺陷复核写入失败');
+    } finally {
+      setReviewing(false);
+    }
+  };
 
   return (
     <Panel
@@ -80,6 +112,19 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse }: Pr
             </button>
             <span>{defect.typeLabel} · {Math.round((defect.confidence ?? 0) * 100)}%</span>
           </div>
+          {onReviewDefect ? (
+            <div className="defect-review-controls">
+              <span className={`defect-review-status ${defect.reviewStatus ?? 'pending'}`}>
+                {reviewLabels[defect.reviewStatus ?? 'pending']}
+              </span>
+              <button type="button" disabled={reviewing} onClick={() => void submitReview('confirmed')}>确认缺陷</button>
+              <button type="button" disabled={reviewing} onClick={() => void submitReview('false-positive')}>排除误报</button>
+              {(defect.reviewStatus ?? 'pending') !== 'pending'
+                ? <button type="button" disabled={reviewing} onClick={() => void submitReview('pending')}>恢复待复核</button>
+                : null}
+            </div>
+          ) : null}
+          {reviewError ? <div className="defect-review-error" role="alert">{reviewError}</div> : null}
           <div className={`defect-image-viewport ${actualSize ? 'actual-size' : ''}`}>
             <img
               src={imageUrl}

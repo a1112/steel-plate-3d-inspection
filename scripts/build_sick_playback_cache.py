@@ -13,6 +13,9 @@ from sick_capture.playback import (
     warm_flow_image_pyramids,
 )
 from sick_capture.profile import load_profile
+from sick_capture.regions import build_and_write_flow_region_map
+from sick_capture.measurement import measurement_manifest_path
+from sick_capture.paths import capture_root
 
 
 def _lower_priority() -> None:
@@ -40,10 +43,15 @@ def _recent_materials(
     camera_roots: dict[str, Path], storage_root: Path, limit: int
 ) -> list[str]:
     modified: dict[str, int] = {}
-    measurement_root = storage_root / "measurements"
-    for measurement in measurement_root.glob("*.json"):
-        material_id = measurement.stem
-        if not any((root / material_id / "json").is_dir() for root in camera_roots.values()):
+    for flow in storage_root.iterdir() if storage_root.is_dir() else []:
+        if not flow.is_dir() or not flow.name.isdecimal():
+            continue
+        material_id = flow.name
+        measurement = measurement_manifest_path(storage_root, material_id)
+        if not any(
+            (capture_root(root, material_id, camera_id) / "json").is_dir()
+            for camera_id, root in camera_roots.items()
+        ):
             continue
         try:
             modified[material_id] = measurement.stat().st_mtime_ns
@@ -72,6 +80,15 @@ def main() -> int:
     )
     for material_id in reversed(materials):
         started = time.perf_counter()
+        measurement_path = measurement_manifest_path(profile.storage_root, material_id)
+        region_path = None
+        region_state = "measurement-missing"
+        if measurement_path.is_file():
+            measurement = json.loads(measurement_path.read_text(encoding="utf-8-sig"))
+            region_path, regions = build_and_write_flow_region_map(
+                camera_roots, profile.storage_root, material_id, measurement
+            )
+            region_state = str(regions.get("state", "unknown"))
         path, index = build_and_write_playback_index(
             camera_roots, profile.storage_root, material_id
         )
@@ -90,6 +107,8 @@ def main() -> int:
                     "frames": index.get("frameCount", 0),
                     "pyramids": warmed,
                     "index": str(path),
+                    "regionManifest": str(region_path) if region_path else "",
+                    "regionState": region_state,
                     "elapsedMs": round((time.perf_counter() - started) * 1000.0, 3),
                 },
                 ensure_ascii=False,

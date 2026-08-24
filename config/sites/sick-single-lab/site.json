@@ -1,7 +1,7 @@
 {
   "schema": "steel.site-config.v1",
   "id": "sick-single-lab",
-  "displayName": "SICK 单相机 GenTL 采集现场",
+  "displayName": "北满特钢小棒检测系统",
   "mode": "direct-camera",
   "runtimeProfile": "runtime.json",
   "connectionConfig": "connection.json",

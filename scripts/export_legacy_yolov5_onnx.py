@@ -31,6 +31,7 @@ def export_model(
     *,
     image_size: int = 640,
     opset: int = 12,
+    dynamic_batch: bool = True,
 ) -> dict[str, Any]:
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
@@ -86,6 +87,14 @@ def export_model(
             output_names=["predictions"],
             opset_version=opset,
             do_constant_folding=True,
+            dynamic_axes=(
+                {
+                    "images": {0: "batch"},
+                    "predictions": {0: "batch"},
+                }
+                if dynamic_batch
+                else None
+            ),
         )
     onnx_model = onnx.load(str(output_path))
     onnx.checker.check_model(onnx_model)
@@ -97,7 +106,9 @@ def export_model(
         "outputSha256": sha256_file(output_path),
         "imageSize": image_size,
         "opset": opset,
-        "outputShape": [int(value) for value in output.shape],
+        "inputShape": [None if dynamic_batch else 1, 3, image_size, image_size],
+        "outputShape": [None if dynamic_batch else 1, *[int(value) for value in output.shape[1:]]],
+        "dynamicBatch": dynamic_batch,
         "classNames": names,
         "parameterCount": sum(parameter.numel() for parameter in model.parameters()),
     }
@@ -110,6 +121,11 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--image-size", type=int, default=640)
     parser.add_argument("--opset", type=int, default=12)
+    parser.add_argument(
+        "--static-batch",
+        action="store_true",
+        help="retain a fixed batch dimension of one (dynamic batch is the default)",
+    )
     args = parser.parse_args()
     result = export_model(
         Path(args.checkpoint).resolve(),
@@ -117,6 +133,7 @@ def main() -> int:
         Path(args.output).resolve(),
         image_size=max(32, args.image_size),
         opset=max(11, args.opset),
+        dynamic_batch=not args.static_batch,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

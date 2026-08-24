@@ -69,7 +69,10 @@ async fn choose_local_file(
         }
     }
     Ok(local_path_result(
-        dialog.pick_file().await.map(|handle| handle.path().to_path_buf()),
+        dialog
+            .pick_file()
+            .await
+            .map(|handle| handle.path().to_path_buf()),
     ))
 }
 
@@ -132,7 +135,9 @@ fn open_local_path(path: String) -> Result<LocalPathResult, String> {
     if !requested.is_absolute() {
         return Err("local path must be absolute".to_string());
     }
-    let canonical = requested.canonicalize().map_err(|error| error.to_string())?;
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
 
     #[cfg(target_os = "windows")]
     let mut command = {
@@ -174,7 +179,9 @@ fn read_local_text_file(path: String) -> Result<LocalTextFileResult, String> {
     if !requested.is_absolute() {
         return Err("local text path must be absolute".to_string());
     }
-    let canonical = requested.canonicalize().map_err(|error| error.to_string())?;
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
     if !canonical.is_file() {
         return Err("local text path must be a regular file".to_string());
     }
@@ -240,32 +247,17 @@ fn open_app_window(
 
 #[tauri::command]
 fn open_capture_management_window(app: tauri::AppHandle) -> Result<WindowCommandResult, String> {
-    open_app_window(
-        app,
-        CAPTURE_MANAGEMENT_WINDOW,
-        "采集管理",
-        "capture",
-    )
+    open_app_window(app, CAPTURE_MANAGEMENT_WINDOW, "采集管理", "capture")
 }
 
 #[tauri::command]
 fn open_parameter_management_window(app: tauri::AppHandle) -> Result<WindowCommandResult, String> {
-    open_app_window(
-        app,
-        PARAMETER_MANAGEMENT_WINDOW,
-        "后台管理",
-        "parameters",
-    )
+    open_app_window(app, PARAMETER_MANAGEMENT_WINDOW, "后台管理", "parameters")
 }
 
 #[tauri::command]
 fn open_bar_surface_window(app: tauri::AppHandle) -> Result<WindowCommandResult, String> {
-    open_app_window(
-        app,
-        BAR_SURFACE_WINDOW,
-        "3D 重建工作台",
-        "bar-surface",
-    )
+    open_app_window(app, BAR_SURFACE_WINDOW, "3D 重建工作台", "bar-surface")
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

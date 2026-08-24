@@ -1,5 +1,5 @@
 import { Canvas, useThree } from '@react-three/fiber';
-import { ArrowLeft, Box, Camera, CircleDot, ExternalLink, FileJson, FolderOpen, Image as ImageIcon, Play, RefreshCw, Rotate3d, Square, Wrench } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Box, Camera, CircleDot, ExternalLink, FileJson, FolderOpen, Image as ImageIcon, Play, RefreshCw, Rotate3d, Square, Wrench } from 'lucide-react';
 import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type PointerEvent, type ReactNode } from 'react';
 import {
   BufferGeometry,
@@ -38,6 +38,7 @@ import {
 import {
   activateCaptureCalibration,
   chooseCaptureLocalFile,
+  defaultCaptureProfileName,
   openCaptureLocalPath,
   readActiveCaptureCalibration,
   readCaptureLocalTextFile,
@@ -45,6 +46,7 @@ import {
 } from '../lib/capture-api';
 import { hasStoredAdminSession } from '../services/inspection-api';
 import { inferNotificationTone, notify } from '../state/notifications';
+import { DEFAULT_SYSTEM_NAME } from '../lib/system-brand';
 
 function numberText(value: number | undefined, fractionDigits = 0) {
   if (typeof value !== 'number' || Number.isNaN(value)) {
@@ -1008,6 +1010,8 @@ function BarSurfaceCalibrationPanel({
   onRefreshActive,
   onOpenVersionDirectory,
   onRunWithCalibration,
+  activationSupported,
+  activationUnsupportedReason,
 }: {
   manifest: BarSurfaceManifest;
   expectedCameraCount: number;
@@ -1023,6 +1027,8 @@ function BarSurfaceCalibrationPanel({
   onRefreshActive: () => void;
   onOpenVersionDirectory: () => void;
   onRunWithCalibration: (calibrationPath: string) => void;
+  activationSupported: boolean;
+  activationUnsupportedReason: string;
 }) {
   const calibration = manifest.calibration;
   const currentPath = calibration?.path || '';
@@ -1084,7 +1090,7 @@ function BarSurfaceCalibrationPanel({
             <FileJson size={16} />
             导入 fit_report
           </button>
-          <button type="button" onClick={onRefreshActive} disabled={busy}>
+          <button type="button" onClick={onRefreshActive} disabled={busy || !activationSupported} title={activationSupported ? undefined : activationUnsupportedReason}>
             <RefreshCw size={16} />
             刷新当前版本
           </button>
@@ -1100,11 +1106,17 @@ function BarSurfaceCalibrationPanel({
             <Play size={16} />
             {correctedReady ? '用新修正标定重建' : '用当前标定重建'}
           </button>
-          <button type="button" onClick={onActivate} disabled={busy || !fittedPath}>
+          <button type="button" onClick={onActivate} disabled={busy || !fittedPath || !activationSupported} title={activationSupported ? undefined : activationUnsupportedReason}>
             <Square size={16} />
             {activationBusy ? '激活中' : '手动激活当前修正'}
           </button>
         </div>
+        {!activationSupported ? (
+          <div className="capture-calibration-safety" role="note">
+            <AlertTriangle size={16} />
+            <span>{activationUnsupportedReason}拟合、对比和指定 XML 重建仍可使用。</span>
+          </div>
+        ) : null}
         {fitReport?.beforePreview || fitReport?.afterPreview ? (
           <div className="bar-surface-calibration-previews">
             {fitReport.beforePreview ? (
@@ -1340,7 +1352,20 @@ function BarSurfaceHeader({
   );
 }
 
-export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount?: number }) {
+export function BarSurfaceApp({
+  expectedCameraCount = 8,
+  systemName = DEFAULT_SYSTEM_NAME,
+  captureProfileName,
+  calibrationActivationSupported = true,
+}: {
+  expectedCameraCount?: number;
+  systemName?: string;
+  captureProfileName?: string;
+  calibrationActivationSupported?: boolean;
+}) {
+  const calibrationProfileName = captureProfileName?.trim()
+    || defaultCaptureProfileName(expectedCameraCount);
+  const calibrationActivationUnsupportedReason = 'SICK Ranger3 采集 sidecar 不支持运行期写入阵列标定版本；';
   const [latest, setLatest] = useState<BarSurfaceLatestResponse | null>(null);
   const [mesh, setMesh] = useState<BarSurfaceMesh | null>(null);
   const [captureMaterials, setCaptureMaterials] = useState<BarSurfaceCaptureMaterial[]>([]);
@@ -1379,6 +1404,10 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
   }, [calibrationMessage]);
 
   const refreshActiveCalibration = async () => {
+    if (!calibrationActivationSupported) {
+      setCalibrationMessage(`${calibrationActivationUnsupportedReason}当前页面仅读取算法标定产物。`);
+      return null;
+    }
     if (!hasStoredAdminSession()) {
       setCalibrationMessage('登录后台管理后可读取采集端当前标定；阵列重建标定不受影响。');
       return null;
@@ -1545,12 +1574,16 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
   }, []);
 
   useEffect(() => {
+    if (!calibrationActivationSupported) {
+      setCalibrationMessage(`${calibrationActivationUnsupportedReason}拟合与指定 XML 重建仍可使用。`);
+      return;
+    }
     if (!hasStoredAdminSession()) {
       setCalibrationMessage('登录后台管理后可读取采集端当前标定；阵列重建标定不受影响。');
       return;
     }
     let cancelled = false;
-    readActiveCaptureCalibration()
+    readActiveCaptureCalibration(calibrationProfileName)
       .then((status) => {
         if (!cancelled) {
           setActiveCalibration(status);
@@ -1564,11 +1597,11 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [calibrationActivationSupported, calibrationProfileName]);
 
   useEffect(() => {
-    document.title = '棒材表面 3D 重建工作台';
-  }, []);
+    document.title = `${systemName} - 3D 重建工作台`;
+  }, [systemName]);
 
   const handleMaterialChange = async (materialId: string) => {
     setSelectedMaterialId(materialId);
@@ -1674,6 +1707,7 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
       }
       const payload = await captureBarSurfaceProductionOnce({
         materialId,
+        expectedCameras: expectedCameraCount,
         rounds: 1,
         lines: 1000,
         timeoutMs: 8000,
@@ -1788,7 +1822,7 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
 
   const handleCalibrationFit = async () => {
     setCalibrationBusy(true);
-    setCalibrationMessage(`正在采集 ${expectedCameraCount} 相机标定帧；检测到有效圆形标定物且质量门通过后将自动修正并激活…`);
+    setCalibrationMessage(`正在采集 ${expectedCameraCount} 相机标定帧；检测到有效圆形标定物且质量门通过后将生成可复核修正${calibrationActivationSupported ? '并自动激活' : ''}…`);
     setLoadError(null);
     try {
       const calibrationPath = latest?.manifest.calibration?.path || '';
@@ -1798,8 +1832,8 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
         maxPointsPerCamera: 2400,
         maxShiftMm: 5,
         expectedCameras: expectedCameraCount,
-        autoActivate: true,
-        profile: 'current-8-time-trigger',
+        autoActivate: calibrationActivationSupported,
+        profile: calibrationProfileName,
         onTaskStatus: (task) => setActiveTask(task),
       });
       setCalibrationFitReport(payload.result);
@@ -1810,7 +1844,7 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
       } else if (!payload.result.correctionAccepted) {
         setCalibrationMessage(`已检测到标定物，但修正质量门未通过：${payload.result.correctionQuality?.reasons?.join('、') || '拟合改善不足'}；未激活。`);
       } else if (payload.autoActivation?.activated) {
-        const status = await readActiveCaptureCalibration('current-8-time-trigger');
+        const status = await readActiveCaptureCalibration(calibrationProfileName);
         setActiveCalibration(status);
         setCalibrationMessage(`${expectedCameraCount} 相机自动标定修正已激活：${payload.autoActivation.version || status.activeCalibration?.version || '新版本'}，残差 ${metricText(before)} -> ${metricText(after)}；未写入相机设备。`);
       } else {
@@ -1824,6 +1858,10 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
   };
 
   const handleActivateCalibration = async () => {
+    if (!calibrationActivationSupported) {
+      setCalibrationMessage(`${calibrationActivationUnsupportedReason}请完成离线审核后更新采集 Profile 并重启。`);
+      return;
+    }
     const report = calibrationFitReport;
     const correctedXml = report?.correctedXml || '';
     if (!report || !correctedXml) {
@@ -1838,7 +1876,7 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
       const separator = outputDir.includes('\\') ? '\\' : '/';
       const fitReportPath = outputDir ? `${outputDir.replace(/[\\/]$/, '')}${separator}fit_report.json` : '';
       const status = await activateCaptureCalibration({
-        name: 'current-8-time-trigger',
+        name: calibrationProfileName,
         path: correctedXml,
         version,
         fitReport: fitReportPath,
@@ -1847,7 +1885,7 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
         sourceCalibration: report.calibration,
         fitBefore: report.fitBefore,
         fitAfter: report.fitAfter,
-        cameraParamDir: 'config/camera-params/current-8-time-trigger',
+        cameraParamDir: `config/camera-params/${calibrationProfileName}`,
         allowExternal: true,
         saveToDevice: false,
         appliedBy: 'tauri-calibration-review',
@@ -1919,6 +1957,8 @@ export function BarSurfaceApp({ expectedCameraCount = 8 }: { expectedCameraCount
             onRefreshActive={() => void refreshActiveCalibration()}
             onOpenVersionDirectory={() => void handleOpenCalibrationVersionDirectory()}
             onRunWithCalibration={handleRunWithCalibration}
+            activationSupported={calibrationActivationSupported}
+            activationUnsupportedReason={calibrationActivationUnsupportedReason}
           />
           <section className="bar-surface-main-grid">
           <div className="bar-surface-panel bar-surface-camera-panel">

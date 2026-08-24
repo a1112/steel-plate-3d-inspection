@@ -327,6 +327,9 @@ class SickCameraSession:
             "acquisitionFrameRate": _finite_float(
                 self.camera_config.get("AcquisitionFrameRate")
             ),
+            "acquisitionLineRate": _finite_float(
+                self.camera_config.get("AcquisitionLineRate")
+            ),
             "updatedAtNs": time.time_ns(),
         }
         actual_ip = _ipv4_from_node(_node_value(self.node_map, "GevCurrentIPAddress"))
@@ -383,6 +386,7 @@ class SickCameraSession:
             "deviceLinkThroughputCurrent": "DeviceLinkThroughputCurrent",
             "deviceLinkThroughputLimit": "DeviceLinkThroughputLimit",
             "acquisitionFrameRate": "AcquisitionFrameRate",
+            "acquisitionLineRate": "AcquisitionLineRate",
         }
         updates: dict[str, Any] = {}
         for output_name, node_name in node_names.items():

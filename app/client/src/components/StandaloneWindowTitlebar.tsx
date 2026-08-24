@@ -4,6 +4,7 @@ import { useMemo } from 'react';
 import { canStartTitlebarDrag } from '../lib/titlebar-drag';
 import { getTauriWindowApi } from '../lib/tauri-window';
 import { WindowControls } from './WindowControls';
+import { DEFAULT_SYSTEM_NAME } from '../lib/system-brand';
 
 const titlebarIcons: Record<'capture' | 'parameters' | 'bar-surface', ElementType> = {
   capture: Camera,
@@ -14,9 +15,11 @@ const titlebarIcons: Record<'capture' | 'parameters' | 'bar-surface', ElementTyp
 export function StandaloneWindowTitlebar({
   kind,
   title,
+  systemName = DEFAULT_SYSTEM_NAME,
 }: {
   kind: 'capture' | 'parameters' | 'bar-surface';
   title: string;
+  systemName?: string;
 }) {
   const windowApi = useMemo(() => getTauriWindowApi(), []);
   const Icon = titlebarIcons[kind];
@@ -40,7 +43,7 @@ export function StandaloneWindowTitlebar({
     <header className="standalone-window-titlebar" onMouseDown={(event) => void handleMouseDown(event)}>
       <div className="standalone-window-title">
         <Icon size={17} />
-        <span>钢管 3D 表面检测系统</span>
+        <span>{systemName}</span>
         <strong>{title}</strong>
       </div>
       <WindowControls />

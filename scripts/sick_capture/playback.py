@@ -7,20 +7,60 @@ import hashlib
 import io
 import json
 import os
+import re
 import tempfile
 import time
+from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
+from .regions import (
+    detect_valid_sensor_roi,
+    read_region_manifest,
+    region_manifest_path,
+)
+from .paths import (
+    cache_root as flow_cache_root,
+    capture_root,
+    playback_index_path as canonical_playback_index_path,
+    playback_roi_path as canonical_playback_roi_path,
+    pyramid_status_path,
+)
+from .storage import replace_file
+
 
 PLAYBACK_INDEX_SCHEMA = "steel.capture-playback-index.v1"
 PLAYBACK_CATALOG_SCHEMA = "steel.capture-playback-catalog.v1"
 PYRAMID_SCHEMA = "steel.capture-image-pyramid.v1"
-PYRAMID_ALGORITHM = "flow-horizontal-grayscale-roi-v2"
+PYRAMID_ALGORITHM = "flow-stable-full-height-valid-region-v4"
 PYRAMID_WIDTHS = (160, 320, 640, 800, 1280, 2560)
+
+CameraRootValue = Path | Sequence[Path]
+
+_INDEX_NUMBER_FIELD = re.compile(
+    r'"(?P<key>cameraIndex|captureRound|hostUtcNs|width|height|intensityBytes)"\s*:\s*'
+    r'(?P<value>-?[0-9]+(?:\.[0-9eE+\-]+)?)'
+)
+_INDEX_STRING_FIELD = re.compile(
+    r'"(?P<key>cameraId|cameraIp)"\s*:\s*(?P<value>"(?:\\.|[^"\\])*")'
+)
+
+
+def _camera_root_candidates(value: CameraRootValue) -> list[Path]:
+    values = [value] if isinstance(value, Path) else list(value)
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for item in values:
+        root = Path(item)
+        identity = str(root.resolve()).lower()
+        if identity not in seen:
+            seen.add(identity)
+            roots.append(root)
+    return roots
 
 
 def _utc_text(nanoseconds: int | None = None) -> str:
@@ -43,7 +83,7 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        replace_file(temporary, path)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
@@ -54,11 +94,59 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     _atomic_bytes(path, body)
 
 
+def _atomic_compact_json(path: Path, payload: dict[str, Any]) -> None:
+    body = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    _atomic_bytes(path, body)
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(value, dict):
         raise ValueError(f"JSON payload must be an object: {path}")
     return value
+
+
+def _read_index_metadata(path: Path) -> dict[str, Any]:
+    """Read only playback index scalars from large capture audit metadata.
+
+    Capture metadata can contain a sizeable SDK audit tree.  Fully decoding it
+    for every historical frame made a catalog rebuild CPU- and memory-bound.
+    The fields below are top-level immutable scalars; first occurrence wins.
+    """
+    text = path.read_text(encoding="utf-8-sig")
+    numbers: dict[str, str] = {}
+    strings: dict[str, str] = {}
+    for match in _INDEX_NUMBER_FIELD.finditer(text):
+        numbers.setdefault(match.group("key"), match.group("value"))
+    for match in _INDEX_STRING_FIELD.finditer(text):
+        strings.setdefault(match.group("key"), match.group("value"))
+
+    def integer(key: str, default: int = 0) -> int:
+        try:
+            return int(float(numbers.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def string(key: str, default: str = "") -> str:
+        try:
+            return str(json.loads(strings[key]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return default
+
+    return {
+        "cameraId": string("cameraId"),
+        "cameraIp": string("cameraIp"),
+        "cameraIndex": integer("cameraIndex", 0),
+        "captureRound": integer("captureRound", 0),
+        "hostUtcNs": integer("hostUtcNs", 0),
+        "width": integer("width", 0),
+        "height": integer("height", 0),
+        "intensityBytes": integer("intensityBytes", 0),
+    }
 
 
 def _numeric_files(directory: Path, suffix: str) -> list[tuple[int, Path]]:
@@ -72,6 +160,40 @@ def _numeric_files(directory: Path, suffix: str) -> list[tuple[int, Path]]:
             continue
     result.sort(key=lambda item: item[0])
     return result
+
+
+def _stored_image_suffix(flow_root: Path) -> str | None:
+    """Return the on-disk 2D format used by one material directory."""
+    directory = flow_root / "2d"
+    if not directory.is_dir():
+        return None
+    found: set[str] = set()
+    try:
+        for path in directory.iterdir():
+            suffix = path.suffix.lower()
+            if path.stem.isdecimal() and suffix in {".png", ".jpg", ".jpeg"}:
+                found.add(suffix)
+    except OSError:
+        return None
+    return next(
+        (suffix for suffix in (".png", ".jpg", ".jpeg") if suffix in found),
+        None,
+    )
+
+
+def _png_size(path: Path) -> tuple[int, int]:
+    with path.open("rb") as stream:
+        header = stream.read(24)
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"invalid PNG header: {path}")
+    return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+
+
+def _stored_image_size(path: Path) -> tuple[int, int]:
+    if path.suffix.lower() == ".png":
+        return _png_size(path)
+    with Image.open(path) as image:
+        return image.size
 
 
 def _dominant_bounds(
@@ -101,38 +223,50 @@ def detect_valid_grayscale_roi(
     minimum_occupancy: float = 0.005,
     horizontal_padding: int = 16,
     vertical_padding: int = 4,
-) -> list[int]:
+) -> list[int] | None:
     """Find the dominant bright steel region and reject isolated black-border noise."""
-    value = np.asarray(image)
-    if value.ndim != 2 or value.size == 0:
-        raise ValueError("grayscale ROI source must be a non-empty 2D plane")
-    height, width = value.shape
-    sampled = value[::2, ::2] > threshold
-    row_strength = np.mean(sampled, axis=1)
-    column_strength = np.mean(sampled, axis=0)
-    row_bounds = _dominant_bounds(
-        row_strength >= minimum_occupancy,
-        row_strength,
-        maximum_gap=4,
+    return detect_valid_sensor_roi(
+        image,
+        threshold=threshold,
+        minimum_occupancy=minimum_occupancy,
+        horizontal_padding=horizontal_padding,
+        vertical_padding=vertical_padding,
+        minimum_width=32,
     )
-    column_bounds = _dominant_bounds(
-        column_strength >= minimum_occupancy,
-        column_strength,
-        maximum_gap=16,
-    )
-    if row_bounds is None or column_bounds is None:
-        return [0, 0, width, height]
-    top = max(0, row_bounds[0] * 2 - vertical_padding)
-    bottom = min(height, row_bounds[1] * 2 + vertical_padding)
-    left = max(0, column_bounds[0] * 2 - horizontal_padding)
-    right = min(width, column_bounds[1] * 2 + horizontal_padding)
-    if right - left < 32 or bottom - top < 8:
-        return [0, 0, width, height]
-    return [left, top, right, bottom]
 
 
 def playback_roi_path(storage_root: Path, material_id: str) -> Path:
-    return storage_root / "history" / "roi" / f"{material_id}.json"
+    return canonical_playback_roi_path(storage_root, material_id)
+
+
+def _capture_image_identity(source_path: Path) -> tuple[str, str] | None:
+    """Return strict v2 flow/camera identity only for immutable raw 2D files."""
+    try:
+        material_id = source_path.parents[3].name
+        camera_id = source_path.parents[1].name
+        if (
+            not material_id.isdecimal()
+            or int(material_id) <= 0
+            or source_path.parent.name != "2d"
+            or source_path.parents[2].name != "capture"
+            or not camera_id
+        ):
+            return None
+        return str(int(material_id)), camera_id
+    except (IndexError, ValueError):
+        return None
+
+
+def _is_defect_review_image(source_path: Path) -> bool:
+    try:
+        return (
+            source_path.parent.name == "review"
+            and source_path.parents[1].name == "defects"
+            and source_path.parents[2].name == "derived"
+            and source_path.parents[3].name.isdecimal()
+        )
+    except IndexError:
+        return False
 
 
 def _flow_horizontal_roi(
@@ -141,12 +275,16 @@ def _flow_horizontal_roi(
     image_width: int | None,
 ) -> tuple[list[int] | None, Path | None]:
     try:
-        flow_root = source_path.parent.parent
-        material_id = flow_root.name
-        camera_id = flow_root.parent.name
-        roi_path = playback_roi_path(cache_root.parent, material_id)
+        identity = _capture_image_identity(source_path)
+        if identity is None:
+            return None, None
+        material_id, camera_id = identity
+        storage_root = cache_root.parent.parent
+        roi_path = playback_roi_path(storage_root, material_id)
         payload = _read_json(roi_path)
         box = payload.get("cameras", {}).get(camera_id)
+        if isinstance(box, dict):
+            box = box.get("stableCrop")
         if not isinstance(box, list) or len(box) != 4:
             return None, roi_path
         left, _, right, _ = (int(value) for value in box)
@@ -175,7 +313,7 @@ def source_fingerprint(path: Path, cache_root: Path | None = None) -> str:
 
 
 def pyramid_directory(cache_root: Path, fingerprint: str) -> Path:
-    return cache_root / "playback-pyramid" / "v1" / fingerprint[:2] / fingerprint
+    return cache_root / "playback-pyramid" / "v2" / fingerprint[:2] / fingerprint
 
 
 def read_image_pyramid(
@@ -216,14 +354,24 @@ def build_image_pyramid(source_path: Path, cache_root: Path) -> tuple[Path, dict
     try:
         plane = np.asarray(grayscale)
         original_width, original_height = grayscale.size
-        detected_box = detect_valid_grayscale_roi(plane)
+        # Defect review crops are already the final >=64-pixel algorithm
+        # artifact.  Cropping them a second time in the playback cache can
+        # remove context and violate the small-image contract.
+        detected_box = (
+            None
+            if _is_defect_review_image(source_path)
+            else detect_valid_grayscale_roi(plane)
+        )
         flow_roi, flow_roi_path = _flow_horizontal_roi(
             source_path, cache_root, original_width
         )
-        crop_box = list(detected_box)
+        crop_box = list(detected_box or [0, 0, original_width, original_height])
         if flow_roi is not None:
-            crop_box[0] = flow_roi[0]
-            crop_box[2] = flow_roi[2]
+            # A material-level region is deliberately stable in sensor space:
+            # crop only the black horizontal margins and retain every line of
+            # the longitudinal scan.  Frame-local vertical threshold bounds
+            # can otherwise cut the head/tail and make online lanes jump.
+            crop_box = [flow_roi[0], 0, flow_roi[2], original_height]
         cropped = grayscale.crop(tuple(crop_box))
     finally:
         grayscale.close()
@@ -291,21 +439,15 @@ def select_pyramid_image(
 
 
 def playback_index_path(storage_root: Path, material_id: str) -> Path:
-    return storage_root / "history" / f"{material_id}.json"
+    return canonical_playback_index_path(storage_root, material_id)
 
 
 def playback_catalog_path(storage_root: Path) -> Path:
-    return storage_root / "history" / "catalog.json"
+    return storage_root / "catalog.json"
 
 
 def flow_pyramid_cache_status_path(storage_root: Path, material_id: str) -> Path:
-    return (
-        storage_root
-        / "cache"
-        / "playback-pyramid"
-        / "flows"
-        / f"{material_id}.json"
-    )
+    return pyramid_status_path(storage_root, material_id)
 
 
 def write_flow_pyramid_cache_status(
@@ -315,67 +457,158 @@ def write_flow_pyramid_cache_status(
     path = flow_pyramid_cache_status_path(
         storage_root, str(payload.get("materialId", "unknown"))
     )
-    _atomic_json(path, payload)
+    _atomic_compact_json(path, payload)
     return path
 
 
 def build_and_write_playback_index(
-    camera_roots: dict[str, Path],
+    camera_roots: dict[str, CameraRootValue],
     storage_root: Path,
     material_id: str,
+    *,
+    update_catalog: bool = True,
+    camera_scan_workers: int = 6,
+    validate_image_files: bool = True,
+    metadata_mode: str = "scalars",
 ) -> tuple[Path, dict[str, Any]]:
-    grouped: dict[int, dict[str, Any]] = {}
-    for fallback_index, (camera_id, camera_root) in enumerate(sorted(camera_roots.items()), start=1):
-        flow_root = camera_root / material_id
-        for storage_index, metadata_path in _numeric_files(flow_root / "json", ".json"):
-            intensity_path = flow_root / "2d" / f"{storage_index}.png"
-            if not intensity_path.is_file() or intensity_path.is_symlink():
+    if metadata_mode not in {"scalars", "filesystem"}:
+        raise ValueError(f"unsupported playback metadata mode: {metadata_mode}")
+
+    def scan_camera(
+        item: tuple[int, tuple[str, CameraRootValue]],
+    ) -> list[tuple[int, int, dict[str, Any]]]:
+        fallback_index, (camera_id, root_value) = item
+        result: list[tuple[int, int, dict[str, Any]]] = []
+        roots = _camera_root_candidates(root_value)
+        seen_storage_indices: set[int] = set()
+        for root_index, camera_root in enumerate(roots):
+            flow_root = capture_root(camera_root, material_id, camera_id)
+            image_suffix = _stored_image_suffix(flow_root)
+            if image_suffix is None:
                 continue
-            try:
-                metadata = _read_json(metadata_path)
-                stat = intensity_path.stat()
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            capture_round = int(metadata.get("captureRound", storage_index + 1) or storage_index + 1)
-            host_ns = int(metadata.get("hostUtcNs", 0) or 0) or stat.st_mtime_ns
-            width = int(metadata.get("width", 0) or 0)
-            height = int(metadata.get("height", 0) or 0)
-            if width <= 0 or height <= 0:
+            filesystem_host_ns = 0
+            filesystem_size = (0, 0)
+            if metadata_mode == "filesystem":
                 try:
-                    with Image.open(intensity_path) as image:
-                        width, height = image.size
-                except OSError:
+                    filesystem_host_ns = (flow_root / "json").stat().st_mtime_ns
+                    first_image = next(
+                        path
+                        for _, path in _numeric_files(flow_root / "2d", image_suffix)
+                    )
+                    filesystem_size = _stored_image_size(first_image)
+                except (OSError, StopIteration, ValueError):
                     continue
-            frame = grouped.setdefault(
-                capture_round,
-                {
-                    "frameId": f"{material_id}:{capture_round:012d}",
-                    "materialId": material_id,
-                    "sequence": capture_round,
-                    "capturedAt": _utc_text(host_ns),
-                    "sortNs": host_ns,
-                    "cameras": [],
-                },
-            )
-            if host_ns < int(frame["sortNs"]):
-                frame["sortNs"] = host_ns
-                frame["capturedAt"] = _utc_text(host_ns)
-            camera_key = str(metadata.get("cameraKey", camera_id) or camera_id)
-            numeric_index = "".join(character for character in camera_id if character.isdigit())
-            frame["cameras"].append(
-                {
-                    "cameraId": str(metadata.get("cameraId", camera_id) or camera_id),
-                    "cameraIndex": int(numeric_index) if numeric_index else fallback_index,
+            for storage_index, metadata_path in _numeric_files(
+                flow_root / "json", ".json"
+            ):
+                if storage_index in seen_storage_indices:
+                    continue
+                intensity_path = flow_root / "2d" / f"{storage_index}{image_suffix}"
+                if metadata_mode == "filesystem":
+                    metadata: dict[str, Any] = {
+                        "cameraId": camera_id,
+                        "cameraIp": "",
+                        "captureRound": storage_index + 1,
+                        "hostUtcNs": filesystem_host_ns + storage_index,
+                        "width": filesystem_size[0],
+                        "height": filesystem_size[1],
+                        "intensityBytes": 0,
+                    }
+                else:
+                    try:
+                        metadata = _read_index_metadata(metadata_path)
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        continue
+                stat = None
+                if validate_image_files:
+                    try:
+                        if intensity_path.is_symlink():
+                            continue
+                        stat = intensity_path.stat()
+                        if not intensity_path.is_file():
+                            continue
+                    except OSError:
+                        continue
+                capture_round = int(
+                    metadata.get("captureRound", storage_index + 1)
+                    or storage_index + 1
+                )
+                host_ns = int(metadata.get("hostUtcNs", 0) or 0)
+                if host_ns <= 0:
+                    try:
+                        host_ns = (
+                            stat.st_mtime_ns
+                            if stat is not None
+                            else metadata_path.stat().st_mtime_ns
+                        )
+                    except OSError:
+                        continue
+                width = int(metadata.get("width", 0) or 0)
+                height = int(metadata.get("height", 0) or 0)
+                if width <= 0 or height <= 0:
+                    try:
+                        if intensity_path.suffix.lower() == ".png":
+                            width, height = _png_size(intensity_path)
+                        else:
+                            with Image.open(intensity_path) as image:
+                                width, height = image.size
+                    except (OSError, ValueError):
+                        continue
+                numeric_index = "".join(
+                    character for character in camera_id if character.isdigit()
+                )
+                camera_payload = {
+                    "cameraId": str(
+                        metadata.get("cameraId", camera_id) or camera_id
+                    ),
+                    "cameraIndex": (
+                        int(numeric_index) if numeric_index else fallback_index
+                    ),
                     "ip": str(metadata.get("cameraIp", "")),
-                    "artifactRef": f"{camera_key}/{material_id}/2d/{storage_index}.png",
+                    "artifactRef": (
+                        f"{material_id}/capture/{camera_id}/2d/"
+                        f"{storage_index}{image_suffix}"
+                        if root_index == 0
+                        else str(intensity_path.resolve())
+                    ),
                     "storageIndex": storage_index,
                     "captureRound": capture_round,
                     "width": width,
                     "height": height,
-                    "bytes": stat.st_size,
+                    "bytes": (
+                        stat.st_size
+                        if stat is not None
+                        else int(metadata.get("intensityBytes", 0) or 0)
+                    ),
                     "storedAt": _utc_text(host_ns),
                 }
-            )
+                result.append((capture_round, host_ns, camera_payload))
+                seen_storage_indices.add(storage_index)
+        return result
+
+    camera_items = list(enumerate(sorted(camera_roots.items()), start=1))
+    grouped: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(camera_scan_workers, len(camera_items))),
+        thread_name_prefix="history-camera-scan",
+    ) as executor:
+        for camera_entries in executor.map(scan_camera, camera_items):
+            for capture_round, host_ns, camera in camera_entries:
+                frame = grouped.setdefault(
+                    capture_round,
+                    {
+                        "frameId": f"{material_id}:{capture_round:012d}",
+                        "materialId": material_id,
+                        "sequence": capture_round,
+                        "capturedAt": _utc_text(host_ns),
+                        "sortNs": host_ns,
+                        "cameras": [],
+                    },
+                )
+                if host_ns < int(frame["sortNs"]):
+                    frame["sortNs"] = host_ns
+                    frame["capturedAt"] = _utc_text(host_ns)
+                frame["cameras"].append(camera)
 
     frames = sorted(grouped.values(), key=lambda row: int(row["sortNs"]))
     for frame in frames:
@@ -393,19 +626,21 @@ def build_and_write_playback_index(
     }
     path = playback_index_path(storage_root, material_id)
 
-    measurement_path = storage_root / "measurements" / f"{material_id}.json"
-    if not measurement_path.is_file():
-        measurement_path = next(
-            (
-                root / material_id / "measurement.json"
-                for root in camera_roots.values()
-                if (root / material_id / "measurement.json").is_file()
-            ),
-            measurement_path,
-        )
+    from .measurement import measurement_manifest_path
+
+    measurement_path = measurement_manifest_path(storage_root, material_id)
     try:
+        region_map = read_region_manifest(storage_root, material_id)
         measurement = _read_json(measurement_path)
-        source_boxes = measurement.get("twoDimensionalCrop", {})
+        source_boxes = (
+            {
+                camera_id: row.get("stableCrop")
+                for camera_id, row in region_map.get("cameras", {}).items()
+                if isinstance(row, dict)
+            }
+            if region_map is not None
+            else measurement.get("twoDimensionalCrop", {})
+        )
         camera_boxes = {
             str(camera_id): [int(value) for value in box]
             for camera_id, box in source_boxes.items()
@@ -422,19 +657,47 @@ def build_and_write_playback_index(
                     camera["validRoi"] = box
                     camera["playbackWidth"] = box[2] - box[0]
                     camera["playbackHeight"] = int(camera.get("height", 0))
+                    camera["sourceSize"] = [
+                        int(camera.get("width", 0)),
+                        int(camera.get("height", 0)),
+                    ]
+                    camera["displaySize"] = [
+                        box[2] - box[0],
+                        int(camera.get("height", 0)),
+                    ]
+                    camera["sourceOffset"] = {"x": box[0], "y": 0}
+                    if region_map is not None:
+                        region_row = region_map.get("cameras", {}).get(
+                            str(camera.get("cameraId", "")), {}
+                        )
+                        camera["regionState"] = region_row.get("state")
+                        camera["calibrationRevision"] = region_map.get(
+                            "calibration", {}
+                        ).get("revision")
             _atomic_json(
                 playback_roi_path(storage_root, material_id),
                 {
-                    "schema": "steel.capture-playback-roi.v1",
+                    "schema": "steel.capture-playback-roi.v2",
                     "generatedAt": _utc_text(),
                     "materialId": material_id,
                     "measurementPath": str(measurement_path),
-                    "cameras": camera_boxes,
+                    "regionManifestPath": str(region_manifest_path(storage_root, material_id)) if region_map else "",
+                    "cameras": {
+                        camera_id: (
+                            region_map.get("cameras", {}).get(camera_id)
+                            if region_map is not None
+                            else box
+                        )
+                        for camera_id, box in camera_boxes.items()
+                    },
                 },
             )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         pass
-    _atomic_json(path, payload)
+    _atomic_compact_json(path, payload)
+
+    if not update_catalog:
+        return path, payload
 
     catalog_path = playback_catalog_path(storage_root)
     try:
@@ -449,14 +712,14 @@ def build_and_write_playback_index(
     entries.append(
         {
             "materialId": material_id,
-            "indexFile": path.name,
+            "indexFile": path.relative_to(storage_root).as_posix(),
             "frameCount": len(frames),
             "firstHostUtcNs": first_ns,
             "lastHostUtcNs": last_ns,
         }
     )
     entries.sort(key=lambda row: int(row.get("lastHostUtcNs", 0)), reverse=True)
-    _atomic_json(
+    _atomic_compact_json(
         catalog_path,
         {
             "schema": PLAYBACK_CATALOG_SCHEMA,
@@ -469,15 +732,126 @@ def build_and_write_playback_index(
     return path, payload
 
 
+def rebuild_playback_history(
+    camera_roots: dict[str, CameraRootValue],
+    storage_root: Path,
+    *,
+    max_workers: int = 6,
+    progress: Callable[[int, int, int], None] | None = None,
+) -> dict[str, Any]:
+    """Rebuild every numeric material index and publish one atomic catalog.
+
+    Derived indexes are always regenerated from committed raw metadata.  The
+    v2 layout intentionally has no compatibility/normalization branch for old
+    history files: rebuilding means rebuilding.
+    """
+    material_ids: set[str] = set()
+    for value in camera_roots.values():
+        for root in _camera_root_candidates(value):
+            try:
+                material_ids.update(
+                    path.name
+                    for path in root.iterdir()
+                    if path.is_dir() and path.name.isdecimal()
+                )
+            except OSError:
+                continue
+
+    entries: list[dict[str, Any]] = []
+    frame_count = 0
+    reused_count = 0
+    rebuilt_count = 0
+    ordered_material_ids = sorted(material_ids, key=int)
+    completed = 0
+    worker_count = max(1, min(max_workers, len(ordered_material_ids) or 1))
+
+    def record(material_id: str, path: Path, payload: dict[str, Any]) -> None:
+        nonlocal frame_count
+        count = int(payload.get("frameCount", 0))
+        if count <= 0:
+            return
+        frame_count += count
+        entries.append(
+            {
+                "materialId": material_id,
+                "indexFile": path.relative_to(storage_root).as_posix(),
+                "frameCount": count,
+                "firstHostUtcNs": int(payload.get("firstHostUtcNs", 0)),
+                "lastHostUtcNs": int(payload.get("lastHostUtcNs", 0)),
+            }
+        )
+
+    def rebuild_one(
+        material_id: str,
+    ) -> tuple[str, Path, dict[str, Any]]:
+        path, payload = build_and_write_playback_index(
+            camera_roots,
+            storage_root,
+            material_id,
+            update_catalog=False,
+            camera_scan_workers=1,
+            validate_image_files=False,
+            metadata_mode="filesystem",
+        )
+        return material_id, path, payload
+
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="history-flow-rebuild",
+    ) as executor:
+        source = iter(ordered_material_ids)
+        pending = {
+            executor.submit(rebuild_one, material_id)
+            for material_id in (
+                next(source, None) for _ in range(worker_count)
+            )
+            if material_id is not None
+        }
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                material_id, path, payload = future.result()
+                if int(payload.get("frameCount", 0)) > 0:
+                    rebuilt_count += 1
+                else:
+                    path.unlink(missing_ok=True)
+                completed += 1
+                record(material_id, path, payload)
+                if progress is not None:
+                    progress(completed, len(ordered_material_ids), rebuilt_count)
+                next_material = next(source, None)
+                if next_material is not None:
+                    pending.add(executor.submit(rebuild_one, next_material))
+
+    entries.sort(key=lambda row: int(row.get("lastHostUtcNs", 0)), reverse=True)
+    catalog = {
+        "schema": PLAYBACK_CATALOG_SCHEMA,
+        "generatedAt": _utc_text(),
+        "materialCount": len(entries),
+        "frameCount": frame_count,
+        "materials": entries,
+    }
+    path = playback_catalog_path(storage_root)
+    _atomic_compact_json(path, catalog)
+    return {
+        "catalogPath": str(path),
+        "materialCount": len(entries),
+        "frameCount": frame_count,
+        "reusedIndexCount": reused_count,
+        "rebuiltIndexCount": rebuilt_count,
+        "workerCount": worker_count,
+    }
+
+
 def warm_flow_image_pyramids(
-    camera_roots: dict[str, Path],
+    camera_roots: dict[str, CameraRootValue],
     storage_root: Path,
     index: dict[str, Any],
 ) -> dict[str, Any]:
     """Persist every pyramid level for a completed flow in a low-priority worker."""
     started = time.perf_counter()
     material_id = str(index.get("materialId", ""))
-    cache_root = storage_root / "cache"
+    cache_root = flow_cache_root(storage_root, material_id)
     cached = 0
     failures: list[dict[str, str]] = []
     for frame in index.get("frames", []):
@@ -485,10 +859,20 @@ def warm_flow_image_pyramids(
             camera_id = str(camera.get("cameraId", ""))
             artifact = str(camera.get("artifactRef", ""))
             parts = Path(artifact).parts
-            camera_root = camera_roots.get(camera_id)
-            if camera_root is None or len(parts) < 2:
+            root_value = camera_roots.get(camera_id)
+            if root_value is None or len(parts) < 2:
                 continue
-            source = camera_root.joinpath(*parts[1:])
+            if Path(artifact).is_absolute():
+                source = Path(artifact)
+            else:
+                source = next(
+                    (
+                        root.joinpath(*parts)
+                        for root in _camera_root_candidates(root_value)
+                        if root.joinpath(*parts).is_file()
+                    ),
+                    _camera_root_candidates(root_value)[0].joinpath(*parts),
+                )
             try:
                 if not source.is_file() or source.is_symlink():
                     continue
@@ -531,7 +915,7 @@ def read_indexed_history(
     total = sum(int(row.get("frameCount", 0)) for row in entries)
     frames: list[dict[str, Any]] = []
     for entry in entries:
-        index_path = storage_root / "history" / str(entry.get("indexFile", ""))
+        index_path = storage_root / str(entry.get("indexFile", ""))
         try:
             payload = _read_json(index_path)
         except (OSError, ValueError, json.JSONDecodeError):

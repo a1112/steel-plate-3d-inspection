@@ -1,5 +1,7 @@
 //! Shared immutable result contract used by the algorithm, image and business services.
 
+pub mod surface;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

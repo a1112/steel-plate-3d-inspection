@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Bar Surface 3D Reconstruction",
+  "productName": "北满特钢小棒检测系统",
   "version": "0.1.0",
   "identifier": "com.bkgy.steel-plate-3d-inspection",
   "build": {
@@ -15,7 +15,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "\u68d2\u6750\u8868\u9762 3D \u91cd\u5efa\u5de5\u4f5c\u53f0",
+        "title": "\u5317\u6ee1\u7279\u94a2\u5c0f\u68d2\u68c0\u6d4b\u7cfb\u7edf",
         "width": 1680,
         "height": 945,
         "minWidth": 1366,

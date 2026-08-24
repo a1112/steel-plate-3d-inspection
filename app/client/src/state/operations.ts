@@ -44,7 +44,10 @@ function stableReportSuffix(values: string[]) {
 export function createReportMetadata(inspections: PlateInspection[], defects: DefectItem[]): ReportMetadata {
   const relevantMaterials = new Set(defects.map((defect) => defect.plateNo));
   const relevant = inspections.filter((inspection) => relevantMaterials.size === 0 || relevantMaterials.has(inspection.plate.plateNo));
-  const inspectionIds = [...new Set(relevant.map((inspection) => inspection.inspectionId).filter((value): value is string => Boolean(value)))].sort();
+  const inspectionIds = [...new Set([
+    ...relevant.map((inspection) => inspection.inspectionId),
+    ...defects.map((defect) => defect.inspectionId),
+  ].filter((value): value is string => Boolean(value)))].sort();
   const materialIds = [...new Set((defects.length ? defects.map((defect) => defect.plateNo) : relevant.map((inspection) => inspection.plate.plateNo)).filter(Boolean))].sort();
   const identity = inspectionIds.length ? inspectionIds : materialIds.length ? materialIds : ['EMPTY'];
   const reportId = inspectionIds.length === 1

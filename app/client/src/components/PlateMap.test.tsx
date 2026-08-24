@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType } from '../data/inspection';
 import { createSequentialCameraLanes } from '../lib/camera-display';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
+import { fetchCaptureRoiPreviews, type CaptureRoiPreviewResult } from '../services/capture-roi-api';
 import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { cameraBandRotationRadians, PlateMap as ProductionPlateMap } from './PlateMap';
 
@@ -14,6 +15,14 @@ vi.mock('../services/inspection-world-api', async () => {
     fetchInspectionWorldMeta: vi.fn(),
     fetchInspectionWorldDefects: vi.fn(),
     fetchInspectionWorldTile: vi.fn(),
+  };
+});
+
+vi.mock('../services/capture-roi-api', async () => {
+  const actual = await vi.importActual<typeof import('../services/capture-roi-api')>('../services/capture-roi-api');
+  return {
+    ...actual,
+    fetchCaptureRoiPreviews: vi.fn(),
   };
 });
 
@@ -36,6 +45,7 @@ beforeEach(() => {
   vi.mocked(fetchInspectionWorldMeta).mockRejectedValue(new Error('no persisted world'));
   vi.mocked(fetchInspectionWorldDefects).mockRejectedValue(new Error('no persisted world'));
   vi.mocked(fetchInspectionWorldTile).mockImplementation(async (_record, tile) => ({ ...tile, url: 'blob:online-world', revoke: vi.fn() }));
+  vi.mocked(fetchCaptureRoiPreviews).mockResolvedValue(null);
 });
 
 // These legacy interaction cases intentionally exercise the bundled demo/test
@@ -172,10 +182,230 @@ describe('online inspection world compatibility', () => {
     context.mockRestore();
   });
 
+  it('uses the numeric flow playback index for six algorithm ROI bands without probing missing world metadata', async () => {
+    const roiResult: CaptureRoiPreviewResult = {
+      materialId: '2747',
+      indexed: true,
+      totalFrames: 187,
+      representativeFrameId: '2747:000000008769',
+      expectedCameraCount: 6,
+      complete: true,
+      images: Array.from({ length: 6 }, (_, index) => ({
+        id: `capture-roi:2747:C${index + 1}:8769`,
+        cameraId: `C${index + 1}`,
+        cameraIp: `192.168.10${index + 1}.100`,
+        dataName: 'intensity',
+        sequenceNo: 126,
+        fileType: 'png',
+        path: `2747/capture/C${index + 1}/2d/126.png`,
+        url: `http://127.0.0.1:4873/api/capture/file?camera=C${index + 1}&region=valid`,
+        createdAt: '2026-08-24T02:00:00.000Z',
+        validRoi: [100, 0, 700, 1024],
+        sourceFrameId: '2747:000000008769',
+        sourceFrameSequence: 8769,
+        sourceWidth: 2560,
+        sourceHeight: 1024,
+      })),
+    };
+    vi.mocked(fetchCaptureRoiPreviews).mockResolvedValue(roiResult);
+
+    render(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        inspectionId="INSP-unknown-material-1787509339423"
+        captureMaterialId="2747"
+        cameraLanes={createSequentialCameraLanes(6)}
+      />,
+    );
+
+    expect(await screen.findByTestId('capture-roi-status')).toHaveTextContent('算法 ROI 6/6');
+    expect(screen.getAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+    expect(fetchCaptureRoiPreviews).toHaveBeenCalledWith(
+      '2747',
+      ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'],
+    );
+    expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
+  });
+
+  it('keeps the record-bound capture fallback while waiting and upgrades when the ROI index appears', async () => {
+    vi.useFakeTimers();
+    const roiResult: CaptureRoiPreviewResult = {
+      materialId: '2747',
+      indexed: true,
+      totalFrames: 20,
+      representativeFrameId: '2747:000000000020',
+      expectedCameraCount: 6,
+      complete: true,
+      images: Array.from({ length: 6 }, (_, index) => ({
+        id: `roi-${index + 1}`,
+        cameraId: `C${index + 1}`,
+        cameraIp: `192.168.10${index + 1}.100`,
+        dataName: 'intensity',
+        sequenceNo: 20,
+        fileType: 'png',
+        path: `2747/capture/C${index + 1}/2d/20.png`,
+        url: `http://127.0.0.1:4873/roi-C${index + 1}.jpg`,
+        createdAt: '2026-08-24T02:00:00.000Z',
+        validRoi: [100, 0, 700, 1024],
+        sourceFrameId: '2747:000000000020',
+        sourceFrameSequence: 20,
+        sourceWidth: 2560,
+        sourceHeight: 1024,
+      })),
+    };
+    vi.mocked(fetchCaptureRoiPreviews)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(roiResult);
+    try {
+      render(
+        <ProductionPlateMap
+          {...common}
+          artifactMode="production"
+          inspectionId="INSP-unknown-material-1787509339423"
+          captureMaterialId="2747"
+          cameraLanes={createSequentialCameraLanes(6)}
+          captureImages={Array.from({ length: 6 }, (_, index) => ({
+            id: `raw-${index + 1}`,
+            cameraId: `C${index + 1}`,
+            cameraIp: `192.168.10${index + 1}.100`,
+            dataName: 'intensity',
+            sequenceNo: 1,
+            fileType: 'png',
+            path: `2747/capture/C${index + 1}/2d/1.png`,
+            url: `http://127.0.0.1:4873/raw-C${index + 1}.png`,
+            createdAt: '2026-08-24T01:59:00.000Z',
+          }))}
+        />,
+      );
+      await act(async () => { await Promise.resolve(); });
+
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('采集裁剪预览');
+      expect(screen.getAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+      expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(8_000); });
+
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法 ROI 6/6');
+      expect(fetchCaptureRoiPreviews).toHaveBeenCalledTimes(2);
+      expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not request raw frame images until the ROI catalog probe has settled', async () => {
+    let resolveProbe: ((result: CaptureRoiPreviewResult | null) => void) | undefined;
+    vi.mocked(fetchCaptureRoiPreviews).mockReturnValue(new Promise((resolve) => {
+      resolveProbe = resolve;
+    }));
+    const rawImages = Array.from({ length: 6 }, (_, index) => ({
+      id: `raw-pending-${index + 1}`,
+      cameraId: `C${index + 1}`,
+      cameraIp: `192.168.10${index + 1}.100`,
+      dataName: 'intensity',
+      sequenceNo: 1,
+      fileType: 'png',
+      path: `2822/capture/C${index + 1}/2d/1.png`,
+      url: `http://127.0.0.1:4873/pending-raw-C${index + 1}.png`,
+      createdAt: '2026-08-24T04:00:00.000Z',
+    }));
+    render(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        captureMaterialId="2822"
+        cameraLanes={createSequentialCameraLanes(6)}
+        captureImages={rawImages}
+      />,
+    );
+
+    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('正在读取算法 ROI');
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+
+    await act(async () => { resolveProbe?.(null); });
+
+    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('采集裁剪预览');
+    expect(screen.getAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+  });
+
+  it('temporarily shows the latest complete ROI flow and keeps probing the current flow', async () => {
+    vi.useFakeTimers();
+    const makeResult = (materialId: string): CaptureRoiPreviewResult => ({
+      materialId,
+      indexed: true,
+      totalFrames: 24,
+      representativeFrameId: `${materialId}:000000000024`,
+      expectedCameraCount: 6,
+      complete: true,
+      images: Array.from({ length: 6 }, (_, index) => ({
+        id: `roi-${materialId}-${index + 1}`,
+        cameraId: `C${index + 1}`,
+        cameraIp: `192.168.10${index + 1}.100`,
+        dataName: 'intensity',
+        sequenceNo: 24,
+        fileType: 'png',
+        path: `${materialId}/capture/C${index + 1}/2d/24.png`,
+        url: `http://127.0.0.1:4873/${materialId}-C${index + 1}.jpg`,
+        createdAt: '2026-08-24T04:00:00.000Z',
+        validRoi: [100, 0, 700, 1024],
+        sourceFrameId: `${materialId}:000000000024`,
+        sourceFrameSequence: 24,
+        sourceWidth: 2560,
+        sourceHeight: 1024,
+      })),
+    });
+    const currentResult = makeResult('2822');
+    const fallbackResult = makeResult('2818');
+    let currentReady = false;
+    vi.mocked(fetchCaptureRoiPreviews).mockImplementation(async (materialId) => {
+      if (materialId === '2822') return currentReady ? currentResult : null;
+      if (materialId === '2818') return fallbackResult;
+      return null;
+    });
+
+    try {
+      render(
+        <ProductionPlateMap
+          {...common}
+          artifactMode="production"
+          captureMaterialId="2822"
+          captureRoiFallbackMaterialIds={['2821', '2818']}
+          cameraLanes={createSequentialCameraLanes(6)}
+        />,
+      );
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法 ROI 6/6 · 回退流水 2818');
+      expect(vi.mocked(fetchCaptureRoiPreviews).mock.calls.map(([materialId]) => materialId)).toEqual([
+        '2822',
+        '2821',
+        '2818',
+      ]);
+
+      currentReady = true;
+      await act(async () => { await vi.advanceTimersByTimeAsync(8_000); });
+
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法 ROI 6/6');
+      expect(screen.getByTestId('capture-roi-status')).not.toHaveTextContent('回退流水');
+      expect(fetchCaptureRoiPreviews).toHaveBeenLastCalledWith(
+        '2822',
+        ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'],
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('labels the existing camera bands as a live preview when no world is persisted', async () => {
     render(<ProductionPlateMap {...common} artifactMode="production" inspectionId="INS-LIVE-1" />);
 
-    expect(await screen.findByText('实时预览')).toBeInTheDocument();
+    expect(await screen.findByText('采集裁剪预览')).toBeInTheDocument();
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
     expect(screen.getByTestId('bar-unfolded-map')).toBeInTheDocument();
   });
@@ -194,7 +424,7 @@ describe('online inspection world compatibility', () => {
       });
       render(<ProductionPlateMap {...common} artifactMode="production" inspectionId="INS-WORLD-1" />);
       await act(async () => { await Promise.resolve(); });
-      expect(screen.getByText('实时预览')).toBeInTheDocument();
+      expect(screen.getByText('采集裁剪预览')).toBeInTheDocument();
 
       await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
 

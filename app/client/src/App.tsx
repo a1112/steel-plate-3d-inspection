@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { PanelRightOpen, X } from 'lucide-react';
 import { getAllDefects, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
-import type { DefectItem, InspectionSnapshot, Severity } from './data/inspection';
+import type { DefectItem, DefectReviewStatus, InspectionSnapshot, Severity } from './data/inspection';
 import type { InspectionUiState } from './state/inspection-ui';
 import {
   createInitialUiState,
@@ -46,6 +46,7 @@ import {
   fetchServiceHealthDetails,
   fetchTriggerGatewayStatus,
   fetchInspectionSnapshot,
+  fetchProductionDefectHistory,
   fetchInspectionSettings,
   fetchInspectionReportArchives,
   fetchInspectionReportArchive,
@@ -57,6 +58,7 @@ import {
   getInspectionServiceOrigin,
   getTriggerGatewayOrigin,
   issueInspectionReportArchive,
+  reviewProductionDefect,
   type InspectionReportArchiveSummary,
 } from './services/inspection-api';
 import { exportInspectionArchiveAsPrintableHtml } from './lib/report-export';
@@ -119,6 +121,7 @@ import {
   createRuntimeDashboardMode,
   type RuntimeDashboardMode,
 } from './lib/runtime-dashboard-mode';
+import { resolveSystemName } from './lib/system-brand';
 import './styles.css';
 import './styles/theme-system.css';
 
@@ -219,6 +222,7 @@ export default function App() {
   const [runtimeProfile, setRuntimeProfile] = useState<PublicRuntimeProfile | null>(null);
   const [runtimeProfileError, setRuntimeProfileError] = useState('');
   const requestedAppMode = readAppMode();
+  const systemName = resolveSystemName(runtimeProfile?.siteDisplayName);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -236,6 +240,14 @@ export default function App() {
       });
     return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    document.title = systemName;
+    const windowApi = getTauriWindowApi();
+    if (windowApi.isAvailable) {
+      void windowApi.setTitle(systemName).catch(() => {});
+    }
+  }, [systemName]);
 
   useEffect(() => {
     if (!runtimeProfile || typeof window === 'undefined') {
@@ -294,16 +306,22 @@ function ConfiguredApp({
   appMode: AppMode;
   capabilityMessage?: string;
 }) {
+  const systemName = resolveSystemName(runtimeProfile.siteDisplayName);
   if (appMode === 'bar-surface') {
     const theme = readStoredTheme();
     const themeStyle = readStoredThemeStyle();
     return (
       <div className={`app-shell theme-${theme} style-${themeStyle} standalone-tool-shell bar-surface-standalone-shell`}>
-        <StandaloneWindowTitlebar kind="bar-surface" title="3D 重建工作台" />
+        <StandaloneWindowTitlebar kind="bar-surface" title="3D 重建工作台" systemName={systemName} />
         {dashboardMode.kind === 'bkv' ? (
           <BkvReconstructionApp expectedCameraCount={runtimeProfile.cameraCount} />
         ) : (
-          <BarSurfaceApp expectedCameraCount={runtimeProfile.cameraCount} />
+          <BarSurfaceApp
+            expectedCameraCount={runtimeProfile.cameraCount}
+            systemName={systemName}
+            captureProfileName={runtimeProfile.profileId}
+            calibrationActivationSupported={!runtimeProfile.profileId.toLowerCase().startsWith('sick-')}
+          />
         )}
       </div>
     );
@@ -481,6 +499,7 @@ function ConfiguredApp({
     return (
       <div className={`app-shell theme-${theme} style-${themeStyle} bkv-mode-error-shell`}>
         <BrandHeader
+          systemName={systemName}
           status={status}
           theme={theme}
           expectedCameraCount={runtimeProfile.cameraCount}
@@ -504,6 +523,7 @@ function ConfiguredApp({
           </section>
         </main>
         <AppFooter
+          systemName={systemName}
           activeNav="online"
           dashboardMode={dashboardMode}
           resourceUsage={resourceUsageState.usage}
@@ -576,6 +596,7 @@ function InspectionDashboard({
   onSnapshotChange: (snapshot: InspectionSnapshot) => void;
   onRecordsRefresh: () => void;
 }) {
+  const systemName = resolveSystemName(runtimeProfile.siteDisplayName);
   const terminalMode = dashboardMode.kind === 'bkv' ? 'bkv' : 'online';
   const [appMode] = useState(readAppMode);
   const [uiState, setUiState] = useState(() => createInitialUiState(snapshot));
@@ -591,6 +612,7 @@ function InspectionDashboard({
   const [onlineFilters, setOnlineFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
   const [selectedOnlineSeverities, setSelectedOnlineSeverities] = useState<Set<Severity>>(() => new Set(ALL_SEVERITY_FILTERS));
   const [reportFilters, setReportFilters] = useState<ReportFilters>(() => createDefaultReportFilters());
+  const [historicalDefects, setHistoricalDefects] = useState<DefectItem[]>([]);
   const [recordSearchFilters, setRecordSearchFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
   const [defectFilterOpen, setDefectFilterOpen] = useState(false);
   const [reportPage, setReportPage] = useState(1);
@@ -633,6 +655,28 @@ function InspectionDashboard({
     triggerGateway: buildUnknownService('触发网关', getTriggerGatewayOrigin()),
   }));
   const [triggerGatewayStatus, setTriggerGatewayStatus] = useState<TriggerGatewayStatus | null>(null);
+
+  useEffect(() => {
+    if (terminalMode !== 'online' || uiState.activeNav !== 'report') return undefined;
+    const controller = new AbortController();
+    const refresh = () => {
+      void fetchProductionDefectHistory(5_000, controller.signal)
+        .then((result) => {
+          if (!controller.signal.aborted) setHistoricalDefects(result.defects);
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) {
+            setToast(error instanceof Error ? error.message : '历史缺陷读取失败');
+          }
+        });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 15_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [terminalMode, uiState.activeNav]);
 
   useEffect(() => {
     if (!toast) {
@@ -825,6 +869,7 @@ function InspectionDashboard({
         return;
       }
       inFlight = true;
+      let triggerHealthCheck: Awaited<ReturnType<typeof fetchServiceHealthDetails>>['checks']['trigger'];
 
       try {
         const apiOrigin = getInspectionServiceOrigin();
@@ -850,8 +895,12 @@ function InspectionDashboard({
             capture?: { name?: string; running?: boolean; origin?: string };
           };
           const checks = health.checks ?? {};
+          triggerHealthCheck = checks.trigger;
           const blockingChecks = Object.entries(checks).filter(([, check]) =>
-            check && check.ok !== true && check.readyContribution !== true,
+            check
+            && check.required !== false
+            && check.ok !== true
+            && check.readyContribution !== true,
           );
           const blockingCheckDetail = blockingChecks.map(([name, check]) => {
             if (name === 'calibrationReconciliation') {
@@ -920,25 +969,40 @@ function InspectionDashboard({
         if (cancelled) {
           return;
         }
+        const triggerOptional = triggerHealthCheck?.required === false;
+        const triggerOnline = triggerStatus.code === 0 && !triggerStatus.error;
         setServiceStatus((current) => ({
           ...current,
           triggerGateway: {
             name: 'trigger-gateway',
-            state: triggerStatus.code === 0 && !triggerStatus.error ? 'online' : 'offline',
-            detail: triggerStatus.modeLabel ? `模式 ${triggerStatus.modeLabel}` : triggerStatus.mode || '未知',
+            state: triggerOnline || triggerOptional ? 'online' : 'offline',
+            detail: triggerOnline
+              ? (triggerStatus.modeLabel ? `模式 ${triggerStatus.modeLabel}` : triggerStatus.mode || '未知')
+              : triggerOptional
+                ? '当前采集模式无需外部触发网关'
+                : triggerStatus.error || triggerStatus.message || '触发网关异常',
             endpoint: getTriggerGatewayOrigin(),
           },
         }));
         setTriggerGatewayStatus(triggerStatus);
       } catch (error) {
         if (!cancelled) {
-          setTriggerGatewayStatus(null);
+          const triggerOptional = triggerHealthCheck?.required === false;
+          setTriggerGatewayStatus(triggerOptional ? {
+            code: 0,
+            mode: 'gray',
+            modeLabel: '当前模式无需外部触发',
+            manualAllowed: false,
+            inspectionServiceHealthy: true,
+          } : null);
           setServiceStatus((current) => ({
             ...current,
             triggerGateway: {
               ...current.triggerGateway,
-              state: 'offline',
-              detail: error instanceof Error ? error.message : '触发网关连接失败',
+              state: triggerOptional ? 'online' : 'offline',
+              detail: triggerOptional
+                ? '外部触发网关未启动；当前灰度进出钢模式不依赖该服务'
+                : error instanceof Error ? error.message : '触发网关连接失败',
             },
           }));
         }
@@ -970,6 +1034,13 @@ function InspectionDashboard({
       ?? snapshot.records.find((record) => record.plateNo === activeSnapshot.currentPlate.plateNo)?.status
       ?? 'completed',
     [activeSnapshot.currentPlate.plateNo, snapshot.records, uiState.selectedRecordId],
+  );
+  const recentCompletedCaptureMaterialIds = useMemo(
+    () => [...new Set(snapshot.records
+      .filter((record) => record.status === 'completed')
+      .map((record) => record.plateNo.trim())
+      .filter(Boolean))],
+    [snapshot.records],
   );
   const artifactMode: 'production' | 'demo' = snapshot.source === 'demo' || snapshot.source === 'test' ? 'demo' : 'production';
   const loadedBkvDefectRecordsRef = useRef(new Set<string>());
@@ -1185,10 +1256,11 @@ function InspectionDashboard({
     () => applyInspectionSettingsToDefects(activeSnapshot.defects, savedSettings),
     [activeSnapshot.defects, savedSettings],
   );
-  const allDefects = useMemo(
-    () => applyInspectionSettingsToDefects(getAllDefects(snapshot), savedSettings),
-    [snapshot, savedSettings],
-  );
+  const allDefects = useMemo(() => {
+    const merged = new Map(historicalDefects.map((defect) => [defect.id, defect]));
+    getAllDefects(snapshot).forEach((defect) => merged.set(defect.id, defect));
+    return applyInspectionSettingsToDefects([...merged.values()], savedSettings);
+  }, [historicalDefects, snapshot, savedSettings]);
   const activeSummary = useMemo(() => summarizeDefects(currentPlateDefects), [currentPlateDefects]);
   // Keep the analysis and defect sidebar out of the default no-defect layout.
   // The center map remains the primary record view; the auxiliary panels only
@@ -1323,6 +1395,25 @@ function InspectionDashboard({
       defectId,
       revision: current.revision + 1,
     }));
+  };
+
+  const reviewDefect = async (defect: DefectItem, status: DefectReviewStatus, note: string) => {
+    try {
+      await reviewProductionDefect({ defectId: defect.id, status, note });
+      const [nextSnapshot, history] = await Promise.all([
+        fetchInspectionSnapshot(),
+        terminalMode === 'online'
+          ? fetchProductionDefectHistory(5_000)
+          : Promise.resolve({ total: 0, defects: [] as DefectItem[] }),
+      ]);
+      onSnapshotChange(nextSnapshot);
+      if (terminalMode === 'online') setHistoricalDefects(history.defects);
+      setToast(status === 'confirmed' ? '缺陷已确认' : status === 'false-positive' ? '误报已排除' : '缺陷已恢复待复核');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '缺陷复核写入失败';
+      setToast(message);
+      throw error;
+    }
   };
 
   const selectRecordById = (recordId: string) => {
@@ -1474,7 +1565,7 @@ function InspectionDashboard({
   if (appMode === 'capture') {
     return (
       <div className={`app-shell theme-${uiState.theme} style-${uiState.themeStyle} ${responsiveClassName} capture-standalone-shell`}>
-        <StandaloneWindowTitlebar kind="capture" title="采集管理" />
+        <StandaloneWindowTitlebar kind="capture" title="采集管理" systemName={systemName} />
         <main className="workspace-page capture-page capture-standalone-page">
           <CaptureManagementApp
             status={deviceStatus}
@@ -1493,7 +1584,7 @@ function InspectionDashboard({
   if (appMode === 'parameters') {
     return (
       <div className={`app-shell theme-${uiState.theme} style-${uiState.themeStyle} ${responsiveClassName} parameter-standalone-shell`}>
-        <StandaloneWindowTitlebar kind="parameters" title="后台管理" />
+        <StandaloneWindowTitlebar kind="parameters" title="后台管理" systemName={systemName} />
         <ParameterManagementApp />
       </div>
     );
@@ -1502,6 +1593,7 @@ function InspectionDashboard({
   return (
     <div className={`app-shell theme-${uiState.theme} style-${uiState.themeStyle} ${responsiveClassName}`}>
       <BrandHeader
+        systemName={systemName}
         status={deviceStatus}
         theme={uiState.theme}
         expectedCameraCount={runtimeProfile.cameraCount}
@@ -1578,6 +1670,13 @@ function InspectionDashboard({
                   artifactMode={artifactMode}
                   inspectionId={activeInspection?.inspectionId}
                   requireInspectionWorld={dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online'}
+                  captureMaterialId={activeSnapshot.currentPlate.plateNo}
+                  captureRoiFallbackMaterialIds={snapshotTracking === 'latest'
+                    ? recentCompletedCaptureMaterialIds
+                      .filter((materialId) => materialId !== activeSnapshot.currentPlate.plateNo)
+                      .slice(0, 6)
+                    : []}
+                  refreshCaptureRoi={snapshotTracking === 'latest' && activeRecordStatus === 'detecting'}
                   captureImages={activeSnapshot.captureImages ?? []}
                   cameraLanes={runtimeCameraLanes}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
@@ -1665,6 +1764,7 @@ function InspectionDashboard({
                   inspectionId={activeInspection?.inspectionId}
                   defect={selectedOnlineDefect}
                   onSidebarCollapse={() => setRightSidebarCollapsed(true)}
+                  onReviewDefect={reviewDefect}
                 />
                 <DefectFilterPanel
                   summary={activeSummary}
@@ -1706,6 +1806,7 @@ function InspectionDashboard({
             <LiveMonitoringPage statuses={captureSnapshot.statuses} health={captureSnapshot.health} />
           ) : uiState.activeNav === 'report' ? (
             <ReportPage
+              systemName={systemName}
               defectTypes={snapshot.defectTypes}
               inspections={snapshot.inspections}
               rows={reportRows}
@@ -1750,7 +1851,7 @@ function InspectionDashboard({
                   .then(({ archive }) => {
                     downloadTextFile(
                       `${archive.reportId}.print.html`,
-                      exportInspectionArchiveAsPrintableHtml(archive),
+                      exportInspectionArchiveAsPrintableHtml(archive, systemName),
                       'text/html;charset=utf-8',
                     );
                     setToast(`归档打印版已生成：${archive.reportId}`);
@@ -1791,6 +1892,7 @@ function InspectionDashboard({
         </>
       )}
       <AppFooter
+        systemName={systemName}
         activeNav={uiState.activeNav}
         dashboardMode={dashboardMode}
         resourceUsage={resourceUsageState.usage}

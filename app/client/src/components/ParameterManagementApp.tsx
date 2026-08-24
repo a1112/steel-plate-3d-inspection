@@ -681,7 +681,7 @@ export function ParameterManagementApp() {
         records: [],
       })),
       fetchAdminSecurityPolicy().catch((): AdminSecurityPolicy | null => null),
-      readJsonText('/api/config'),
+      readJsonText('/api/config/capture'),
       readJsonText('/api/config/connection'),
     ]);
     setConnection(nextConnection);

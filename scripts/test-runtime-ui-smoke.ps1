@@ -405,7 +405,7 @@ async function runBkvNativeScrollChecks(page, result) {
   result.interactionScreenshots = [await page.screenshot('bkv-terminal-view-menu')];
   await page.click('.app-footer-more-menu button:first-of-type');
   await requireEventually('switches-from-bkv-to-original-online-view', `(() => {
-    const heading = document.body?.innerText.includes('\u94a2\u7ba13D\u8868\u9762\u68c0\u6d4b\u7cfb\u7edf');
+    const heading = document.body?.innerText.includes('\u5317\u6ee1\u7279\u94a2\u5c0f\u68d2\u68c0\u6d4b\u7cfb\u7edf');
     const view = new URLSearchParams(window.location.search).get('view');
     return heading && view === 'online' ? { view, heading: true } : false;
   })()`);
@@ -824,24 +824,61 @@ const standardChecks = [
   {
     id: 'terminal',
     url: appUrl('terminal'),
-    requiredText: ['\u94a2\u7ba13D\u8868\u9762\u68c0\u6d4b\u7cfb\u7edf', '\u5728\u7ebf\u68c0\u6d4b', '\u91c7\u96c6\u7ba1\u7406', '3D \u91cd\u5efa'],
+    requiredText: ['\u5317\u6ee1\u7279\u94a2\u5c0f\u68d2\u68c0\u6d4b\u7cfb\u7edf', '\u5728\u7ebf\u68c0\u6d4b', '\u5b9e\u65f6\u76d1\u63a7', '\u7f3a\u9677\u62a5\u8868'],
     clickSelector: '[data-testid="receiver-status-button"]',
     afterClickText: ['\u62a5\u7ea7\u5668\u7f51\u53e3\u8be6\u7ec6\u4fe1\u606f', '\u5b9e\u65f6\u4e0a\u4f20', '\u5b9e\u65f6\u4e0b\u8f7d', '\u5e26\u5bbd\u76d1\u63a7', 'Windows \u7f51\u5361\u5b9e\u65f6\u6536\u53d1\u901f\u7387'],
     requiredExpressions: [
       '(() => { const text = document.body ? document.body.innerText : ""; return text.includes("Windows \u7f51\u5361\u5b9e\u65f6\u6536\u53d1\u901f\u7387") && !text.includes("network monitor pending") && !text.includes("network monitor offline") && !text.includes("/api/system/network \u79bb\u7ebf") && !text.includes("\u672a\u53d1\u73b0\u7f51\u5361") && !text.includes("\u4f30\u7b97\u7f51\u901f"); })()',
+      `(() => {
+        const text = document.body?.innerText || '';
+        return text.includes('\u76f8\u673a\u72b6\u6001')
+          && text.includes('6/6')
+          && text.includes('\u63a7\u5236')
+          && text.includes('3/3')
+          && !text.includes('\u670d\u52a1\u5f02\u5e38');
+      })()`,
     ],
   },
   {
     id: 'capture',
     url: appUrl('capture'),
     requiredText: ['\u91c7\u96c6\u7ba1\u7406', '\u72b6\u6001\u603b\u89c8', '\u914d\u7f6e\u4e2d\u5fc3', '\u65e5\u5fd7\u8bb0\u5f55', 'API \u7ba1\u7406'],
+    requiredExpressions: [
+      `(() => {
+        const text = document.body?.innerText || '';
+        const cards = [...document.querySelectorAll('.capture-camera-card')];
+        const sickReady = text.includes('\u5728\u7ebf\u76f8\u673a')
+          && text.includes('6/6')
+          && cards.length === 6
+          && cards.every((card) => card.innerText.includes('Ranger3-60'))
+          && cards.every((card) => !card.innerText.includes('192.168.107.100'))
+          && text.includes('SICK GenTL Producer via Harvesters')
+          && text.includes('GigE Vision / GenTL')
+          && !text.includes('LVM/NVT 3D Camera SDK');
+        const legacyReady = text.includes('8/8')
+          && cards.length === 8
+          && cards.every((card) => card.innerText.includes('LVM'))
+          && !text.includes('capture service pending');
+        return sickReady || legacyReady;
+      })()`,
+    ],
   },
   {
     id: 'bar-surface',
     url: appUrl('bar-surface'),
-    requiredText: ['3D \u91cd\u5efa\u5de5\u4f5c\u53f0', '\u516d\u76f8\u673a', '3D', '\u5207\u9762'],
+    requiredText: ['\u5317\u6ee1\u7279\u94a2\u5c0f\u68d2\u68c0\u6d4b\u7cfb\u7edf'],
     requiredExpressions: [
-      'document.querySelector("canvas") !== null || document.body.innerText.includes("3D \u91cd\u5efa\u5de5\u4f5c\u53f0")',
+      `(() => {
+        const text = document.body?.innerText || '';
+        const unsupported = text.includes('\u5f53\u524d\u8fd0\u884c\u6a21\u5f0f\u4e0d\u652f\u63013D \u91cd\u5efa');
+        const workbench = text.includes('3D \u91cd\u5efa\u5de5\u4f5c\u53f0') && text.includes('\u5207\u9762');
+        const runtimeReady = text.includes('\u76f8\u673a\u72b6\u6001')
+          && text.includes('6/6')
+          && text.includes('\u63a7\u5236')
+          && text.includes('3/3')
+          && !text.includes('\u670d\u52a1\u5f02\u5e38');
+        return runtimeReady && (unsupported || workbench);
+      })()`,
     ],
   },
 ];

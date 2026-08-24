@@ -224,6 +224,16 @@ export type WorldTileRequest = {
 
 export type WorldTile = WorldTileRequest & { url: string; revoke: () => void };
 
+export class InspectionWorldHttpError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'InspectionWorldHttpError';
+    this.status = status;
+  }
+}
+
 async function readJson<T>(response: Response, fallback: string): Promise<T> {
   if (!response.ok) {
     let detail = '';
@@ -238,7 +248,10 @@ async function readJson<T>(response: Response, fallback: string): Promise<T> {
     } catch {
       // Preserve the HTTP fallback when an error body is absent or not JSON.
     }
-    throw new Error(`${fallback}${detail ? `：${detail}` : ''} (HTTP ${response.status})`);
+    throw new InspectionWorldHttpError(
+      `${fallback}${detail ? `：${detail}` : ''} (HTTP ${response.status})`,
+      response.status,
+    );
   }
   return response.json() as Promise<T>;
 }
@@ -499,7 +512,7 @@ export async function fetchInspectionWorldSurface(
   // follow a failed binary request with a JSON request: that second request is
   // what used to surface the misleading HTTP 406 message in the dashboard.
   if (binaryResponse.status === 406) {
-    throw new Error('涓夌淮娣卞害琛ㄩ潰鎺ュ彛闇€瑕佷娇鐢ㄤ簩杩涘埗鏍煎紡 (HTTP 406)');
+    throw new Error('三维深度表面接口需要使用二进制格式 (HTTP 406)');
   }
   let detail = '';
   try {
@@ -510,7 +523,7 @@ export async function fetchInspectionWorldSurface(
     // Keep the status-only diagnostic when the service has no JSON body.
   }
   if (binaryResponse.status !== 404) {
-    throw new Error(`涓夌淮娣卞害琛ㄩ潰璇诲彇澶辫触${detail ? `锛?{detail}` : ''} (HTTP ${binaryResponse.status})`);
+    throw new Error(`三维深度表面读取失败${detail ? `：${detail}` : ''} (HTTP ${binaryResponse.status})`);
   }
   const jsonParams = new URLSearchParams({ recordId });
   if (refresh) jsonParams.set('refresh', String(Date.now()));

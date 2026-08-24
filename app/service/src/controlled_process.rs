@@ -436,7 +436,16 @@ mod tests {
             "$child = Start-Process powershell.exe -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') -PassThru; Set-Content -LiteralPath '{escaped_pid_file}' -Value $child.Id -NoNewline; Start-Sleep -Seconds 30"
         );
         let cancellation_file = pid_file.clone();
-        let check = move || cancellation_file.is_file();
+        // `Set-Content` creates the file before its bytes are necessarily
+        // visible to another thread.  Cancelling on existence alone can kill
+        // the process tree between create and write, leaving an empty file and
+        // making this test race instead of exercising descendant cleanup.
+        let check = move || {
+            std::fs::read_to_string(&cancellation_file)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .is_some()
+        };
         let mut command = powershell(&script);
         let result = run(&mut command, Duration::from_secs(10), Some(&check));
         assert_eq!(result.unwrap_err(), ControlledProcessError::Cancelled);

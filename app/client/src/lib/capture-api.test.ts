@@ -26,6 +26,7 @@ import {
   persistCaptureParamsToDevice,
   readCaptureProfile,
   readCaptureProfiles,
+  readCaptureSnapshot,
   readCaptureCalibrationOperationDetail,
   readCaptureContinuousSettings,
   readCaptureDefects,
@@ -174,6 +175,69 @@ describe("calculateSystemNetworkRates", () => {
   });
 });
 
+describe("readCaptureSnapshot", () => {
+  it("uses the active SICK GenTL identity instead of the legacy LVM fallback", async () => {
+    const camera = {
+      cameraIndex: 1,
+      cameraId: "C1",
+      name: "C1",
+      role: "sick-405-1",
+      ip: "192.168.101.144",
+      model: "Ranger3-60",
+      sn: "25440062",
+      driverId: "sick-gentl-harvesters",
+      connected: true,
+      acquiring: true,
+      continuousAcquiring: true,
+      continuousFps: 3.9,
+      deviceId: 1,
+      configId: "C1",
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/api/config")
+        ? { capture: { mode: "sick-array-6", driver: "sick-gentl", cameras: [] } }
+        : url.endsWith("/api/capture/health")
+          ? {
+              service: "steel_sick_capture_sidecar",
+              time: "2026-08-24T02:00:00Z",
+              provider: "external-api",
+              sdkReady: true,
+              sdkCode: 0,
+              connected: true,
+              ip: camera.ip,
+              driverId: "sick-gentl-harvesters",
+              driverName: "SICK GenTL Producer via Harvesters",
+              cameraCount: 1,
+              expectedCameras: 1,
+            }
+          : url.endsWith("/api/cameras")
+            ? { cameras: [camera] }
+            : url.endsWith("/api/camera/statuses")
+              ? { statuses: [camera] }
+              : url.endsWith("/api/camera/status")
+                ? camera
+                : { events: [] };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await readCaptureSnapshot();
+
+    expect(result.driver).toMatchObject({
+      id: "sick-gentl-harvesters",
+      name: "SICK GenTL Producer via Harvesters",
+      vendor: "SICK",
+      transport: "GigE Vision / GenTL",
+      supportedModels: ["Ranger3-60"],
+    });
+    expect(result.driver.name).not.toContain("LVM");
+  });
+});
+
 describe("readLatestCaptureFile", () => {
   it("reads latest image metadata through Rust and resolves the proxied image URL", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
@@ -232,7 +296,7 @@ describe("readLatestCaptureFile", () => {
     });
     expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:4873/api/stream/stop");
     expect(captureStreamImageUrl("192.168.101.100", "intensity")).toBe(
-      "http://127.0.0.1:4317/api/stream/latest?ip=192.168.101.100&kind=intensity&v=1783771200123",
+      "http://127.0.0.1:4317/api/stream/latest?ip=192.168.101.100&kind=intensity&region=valid&v=1783771200123",
     );
   });
 
@@ -252,8 +316,8 @@ describe("readLatestCaptureFile", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:4873/api/capture/history?limit=500",
     );
-    expect(captureHistoryImageUrl("C1/BAR-001/intensity/000001.png", 8192)).toBe(
-      "http://127.0.0.1:4873/api/capture/file?path=C1%2FBAR-001%2Fintensity%2F000001.png&maxWidth=4096",
+    expect(captureHistoryImageUrl("63/capture/C1/2d/1.png", 8192)).toBe(
+      "http://127.0.0.1:4873/api/capture/file?path=63%2Fcapture%2FC1%2F2d%2F1.png&maxWidth=4096&region=valid",
     );
 
     await readCapturePlaybackCacheStatus();
@@ -262,14 +326,33 @@ describe("readLatestCaptureFile", () => {
     );
   });
 
+  it("binds capture history to the selected numeric material flow", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0,
+      storageRoot: "D:\\steel-sick-data",
+      total: 0,
+      count: 0,
+      hasMore: false,
+      indexed: true,
+      frames: [],
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await readCaptureHistory(500, " 2747 ");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:4873/api/capture/history?limit=500&materialId=2747",
+    );
+  });
+
   it("reads and rebuilds the selected flow measurement through Rust", async () => {
     const responseBody = JSON.stringify({
       code: 0,
-      path: "D:\\steel-sick-data\\measurements\\FLOW-0000000001.json",
+      path: "D:\\steel-sick-data\\1\\derived\\geometry\\measurement.json",
       measurement: {
         schema: "steel.ranger3-flow-measurement.v1",
         generatedAt: "2026-08-22T04:00:00Z",
-        materialId: "FLOW-0000000001",
+        materialId: "1",
         mode: "preview",
         metricValid: false,
         qualityGate: { passed: false, reasons: ["approved-array-calibration-missing"] },
@@ -282,28 +365,28 @@ describe("readLatestCaptureFile", () => {
     ));
     vi.stubGlobal("fetch", fetchMock);
 
-    await readCaptureMeasurement("FLOW-0000000001");
-    await rebuildCaptureMeasurement("FLOW-0000000001");
+    await readCaptureMeasurement("1");
+    await rebuildCaptureMeasurement("1");
 
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "http://127.0.0.1:4873/api/capture/measurement?materialId=FLOW-0000000001",
+      "http://127.0.0.1:4873/api/capture/measurement?materialId=1",
     );
     expect(fetchMock.mock.calls[1][0]).toBe(
       "http://127.0.0.1:4873/api/capture/measurement/rebuild",
     );
     expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
-      materialId: "FLOW-0000000001",
+      materialId: "1",
     });
   });
 
   it("reads and rebuilds temporary defect detection through Rust", async () => {
     const responseBody = JSON.stringify({
       code: 0,
-      path: "D:\\steel-sick-data\\defects\\FLOW-0000000001\\manifest.json",
+      path: "D:\\steel-sick-data\\1\\derived\\defects\\manifest.json",
       detection: {
         schema: "steel.sick-flow-defect-detection.v1",
         generatedAt: "2026-08-22T10:00:00Z",
-        materialId: "FLOW-0000000001",
+        materialId: "1",
         state: "complete",
         temporaryModel: true,
         quality: { reviewRequired: true, fineGrainedClassification: false },
@@ -315,11 +398,11 @@ describe("readLatestCaptureFile", () => {
     ));
     vi.stubGlobal("fetch", fetchMock);
 
-    await readCaptureDefects("FLOW-0000000001");
-    await rebuildCaptureDefects("FLOW-0000000001");
+    await readCaptureDefects("1");
+    await rebuildCaptureDefects("1");
 
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "http://127.0.0.1:4873/api/capture/defects?materialId=FLOW-0000000001",
+      "http://127.0.0.1:4873/api/capture/defects?materialId=1",
     );
     expect(fetchMock.mock.calls[1][0]).toBe(
       "http://127.0.0.1:4873/api/capture/defects/rebuild",
@@ -434,7 +517,7 @@ describe("readLatestCaptureFile", () => {
     });
 
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "http://127.0.0.1:4873/api/calibration/active?profile=current-8-time-trigger",
+      "http://127.0.0.1:4873/api/calibration/active",
     );
     expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({
       Authorization: "Bearer calibration-admin-token",

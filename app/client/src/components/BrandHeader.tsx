@@ -9,6 +9,7 @@ import type { RuntimeDashboardMode } from '../lib/runtime-dashboard-mode';
 import { NotificationCenter } from './NotificationCenter';
 import { TopNav, type NavKey } from './TopNav';
 import { WindowControls } from './WindowControls';
+import { DEFAULT_SYSTEM_NAME } from '../lib/system-brand';
 
 export type BkvDataHealth =
   | { state: 'loading'; detail: string }
@@ -23,6 +24,7 @@ export type BkvHeaderData = {
 };
 
 interface BrandHeaderProps {
+  systemName?: string;
   status: DeviceStatus;
   theme: ThemeMode;
   expectedCameraCount?: number;
@@ -702,6 +704,7 @@ function SystemStatusDetailPanel({ status }: { status: DeviceStatus }) {
 }
 
 export function BrandHeader({
+  systemName = DEFAULT_SYSTEM_NAME,
   status,
   theme,
   expectedCameraCount = DEFAULT_CAMERA_COUNT,
@@ -849,7 +852,7 @@ export function BrandHeader({
 
       <div className="title-meta-group">
         <TopNav active={activeNav} onChange={onNavChange} embedded />
-        <div className="system-title">钢管3D表面检测系统</div>
+        <div className="system-title">{systemName}</div>
       </div>
 
       <div className={`brand-status ${dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online' ? 'bkv-runtime-status' : 'online-runtime-status'}`}>

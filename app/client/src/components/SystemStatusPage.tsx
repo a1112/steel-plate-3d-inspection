@@ -595,6 +595,9 @@ export function CaptureManagementApp({
   onAction: (action: SystemAction) => void;
   className?: string;
 }) {
+  const runtimeCameraCount = Number.isFinite(expectedCameraCount)
+    ? Math.max(1, Math.trunc(expectedCameraCount))
+    : Math.max(1, capture.config?.cameras.length ?? capture.statuses.length);
   const showReturnToTerminal = className.split(/\s+/).includes('standalone-capture-manager');
   const embeddedMode = className.split(/\s+/).includes('embedded-capture-manager');
   const [activeView, setActiveView] = useState<CaptureView>('overview');
@@ -1356,7 +1359,7 @@ export function CaptureManagementApp({
         captureProductionOnce({
           ...productionPayload(),
           rounds: 1,
-          expectedCameras: expectedCameraCount,
+          expectedCameras: runtimeCameraCount,
           lines: 1000,
           width: 0,
           timeoutMs: 8000,
@@ -1448,7 +1451,7 @@ export function CaptureManagementApp({
       entered = true;
       sessionId = steelIn.sessionId || sessionId;
 
-      const targetCaptureCount = baselineCaptureCount + rounds * 8;
+      const targetCaptureCount = baselineCaptureCount + rounds * runtimeCameraCount;
       const captureDeadline = Date.now() + 60 * 60 * 1000;
       let currentCaptureCount = baselineCaptureCount;
       while (currentCaptureCount < targetCaptureCount) {
@@ -1459,7 +1462,7 @@ export function CaptureManagementApp({
         const nextStatus = await refreshProductionStatus();
         currentCaptureCount = Number(providerValue(nextStatus.capture ?? null, ['captureSuccessCount'])) || 0;
         const completedFrames = Math.max(0, currentCaptureCount - baselineCaptureCount);
-        setSiteSimulationPhase(`3/4 实机连续采集 · ${Math.min(rounds, Math.floor(completedFrames / 8))}/${rounds} 轮`);
+        setSiteSimulationPhase(`3/4 实机连续采集 · ${Math.min(rounds, Math.floor(completedFrames / runtimeCameraCount))}/${rounds} 轮`);
       }
 
       setSiteSimulationPhase('4/4 模拟出钢');
@@ -1469,7 +1472,7 @@ export function CaptureManagementApp({
       );
       entered = false;
       setSiteSimulationPhase('完成');
-      setSiteSimulationSummary(`现场模拟完成：${basePayload.materialId}，8 台真实相机并行采集 ${rounds} 轮`);
+      setSiteSimulationSummary(`现场模拟完成：${basePayload.materialId}，${runtimeCameraCount} 台真实相机并行采集 ${rounds} 轮`);
       setProductionMessage(`现场模拟运行完成：${basePayload.materialId}`);
       await refreshProductionStatus();
     } catch (error) {
@@ -2297,7 +2300,7 @@ export function CaptureManagementApp({
               <CaptureOperationsPanel
                 cameraIps={localConfig.cameras.filter((camera) => camera.enabled).map((camera) => camera.ip)}
                 cameraStatuses={overviewStatuses}
-                expectedCameraCount={expectedCameraCount}
+                expectedCameraCount={runtimeCameraCount}
               />
             </section>
           ) : activeView === 'logs' ? (

@@ -975,11 +975,11 @@ export async function captureBarSurfaceProductionOnce(options: {
   lines?: number;
   timeoutMs?: number;
   intervalMs?: number;
+  expectedCameras?: number;
   onTaskStatus?: (task: BarSurfaceProductionTask<BarSurfaceProductionCaptureResponse>) => void;
 } = {}): Promise<BarSurfaceProductionCaptureResponse> {
   const body: Record<string, unknown> = {
     materialId: options.materialId || 'latest',
-    expectedCameras: 8,
     rounds: options.rounds ?? 1,
     lines: options.lines ?? 1000,
     width: 0,
@@ -996,6 +996,9 @@ export async function captureBarSurfaceProductionOnce(options: {
     discardBlackFrames: true,
     saveSdkDerived: false,
   };
+  if (Number.isInteger(options.expectedCameras) && Number(options.expectedCameras) > 0) {
+    body.expectedCameras = options.expectedCameras;
+  }
   if (options.sessionId) {
     body.sessionId = options.sessionId;
   }
@@ -1108,7 +1111,6 @@ export async function fitBarSurfaceCalibration(options: {
     rows: options.rows || '250,500,750',
     maxPointsPerCamera: options.maxPointsPerCamera ?? 2400,
     maxShiftMm: options.maxShiftMm ?? 5,
-    expectedCameras: options.expectedCameras ?? 8,
     minPointsPerCamera: options.minPointsPerCamera ?? 100,
     minDiameterMm: options.minDiameterMm ?? 20,
     maxDiameterMm: options.maxDiameterMm ?? 1000,
@@ -1117,12 +1119,17 @@ export async function fitBarSurfaceCalibration(options: {
     maxRelativeResidual: options.maxRelativeResidual ?? 0.08,
     minImprovementRatio: options.minImprovementRatio ?? 0.03,
     autoActivate: options.autoActivate ?? true,
-    profile: options.profile || 'current-8-time-trigger',
     lines: options.lines ?? 1000,
     width: options.width ?? 0,
     timeoutMs: options.timeoutMs ?? 8000,
     dataMode: options.dataMode ?? 3,
   };
+  if (Number.isInteger(options.expectedCameras) && Number(options.expectedCameras) > 0) {
+    body.expectedCameras = options.expectedCameras;
+  }
+  if (options.profile?.trim()) {
+    body.profile = options.profile.trim();
+  }
   if (options.materialId) {
     body.materialId = options.materialId;
   }

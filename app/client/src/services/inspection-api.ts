@@ -5,6 +5,7 @@ import { getMockInspectionSnapshot } from '../data/inspection';
 import type {
   CaptureImageItem,
   DefectItem,
+  DefectReviewStatus,
   InspectionSnapshot,
   PlateInspection,
 } from '../data/inspection';
@@ -1256,9 +1257,21 @@ function normalizeServiceUrl(value: string | undefined, origin: string) {
 }
 
 function normalizeCaptureImage(image: CaptureImageItem, origin: string): CaptureImageItem {
+  let imageUrl = normalizeServiceUrl(image.url, origin);
+  const normalizedPath = image.path.replaceAll('\\', '/');
+  const isSickIntensityFrame = image.dataName.toLowerCase() === 'intensity'
+    && /(?:^|\/)\d+\/capture\/C\d+\/2d\/[^/]+\.png$/i.test(normalizedPath);
+  if (isSickIntensityFrame) {
+    const params = new URLSearchParams({
+      path: image.path,
+      maxWidth: '2048',
+      region: 'valid',
+    });
+    imageUrl = `${origin}/api/capture/file?${params.toString()}`;
+  }
   return {
     ...image,
-    url: normalizeServiceUrl(image.url, origin),
+    url: imageUrl,
     metadataUrl: normalizeServiceUrl(image.metadataUrl, origin),
   };
 }
@@ -1498,6 +1511,71 @@ function isBkvPlateInspection(
     && value.bkvArtifacts.every((artifact) => { try { parseBkvArtifact(artifact); return true; } catch { return false; } });
 }
 
+function epochMillis(value: unknown): number | null {
+  const text = typeof value === 'number' ? String(Math.trunc(value)) : String(value ?? '').trim();
+  if (!/^\d{10,16}$/.test(text)) return null;
+  let numeric = Number(text);
+  if (!Number.isFinite(numeric)) return null;
+  if (text.length <= 10) numeric *= 1_000;
+  if (text.length > 13) numeric /= 10 ** (text.length - 13);
+  const date = new Date(numeric);
+  const year = date.getFullYear();
+  return Number.isNaN(date.getTime()) || year < 2000 || year > 2200 ? null : numeric;
+}
+
+export function formatProductionDateTime(value: unknown): string {
+  const millis = epochMillis(value);
+  if (millis === null) return String(value ?? '');
+  return new Date(millis).toLocaleString('zh-CN', { hour12: false });
+}
+
+export function formatProductionRecordTime(value: unknown, detectedAt?: unknown): string {
+  const text = String(value ?? '').trim();
+  const timeMatch = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(text);
+  if (timeMatch
+    && Number(timeMatch[1]) <= 23
+    && Number(timeMatch[2]) <= 59
+    && (timeMatch[3] === undefined || Number(timeMatch[3]) <= 59)) {
+    return text;
+  }
+  const millis = epochMillis(value) ?? epochMillis(detectedAt);
+  return millis === null
+    ? '--:--'
+    : new Date(millis).toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function normalizeSnapshotTimes<T extends InspectionSnapshot>(snapshot: T): T {
+  const detectedAtByRecord = new Map<string, unknown>();
+  const detectedAtByMaterial = new Map<string, unknown>();
+  const inspections = snapshot.inspections.map((inspection) => {
+    const detectedAt = inspection.plate.detectedAt;
+    if (inspection.inspectionId) detectedAtByRecord.set(inspection.inspectionId, detectedAt);
+    detectedAtByMaterial.set(inspection.plate.plateNo, detectedAt);
+    return {
+      ...inspection,
+      plate: {
+        ...inspection.plate,
+        detectedAt: formatProductionDateTime(detectedAt),
+      },
+    };
+  });
+  return {
+    ...snapshot,
+    currentPlate: {
+      ...snapshot.currentPlate,
+      detectedAt: formatProductionDateTime(snapshot.currentPlate.detectedAt),
+    },
+    records: snapshot.records.map((record) => ({
+      ...record,
+      time: formatProductionRecordTime(
+        record.time,
+        detectedAtByRecord.get(record.id) ?? detectedAtByMaterial.get(record.plateNo),
+      ),
+    })),
+    inspections,
+  } as T;
+}
+
 function normalizeInspectionSnapshot(snapshot: unknown, origin: string): InspectionSnapshotResponse {
   if (!isInspectionSnapshotShape(snapshot)) {
     throw new Error('inspection snapshot shape is invalid');
@@ -1543,7 +1621,7 @@ function normalizeInspectionSnapshot(snapshot: unknown, origin: string): Inspect
       || snapshot.legacySeqNo !== undefined || snapshot.replay !== undefined) {
       throw new Error('BKV offline snapshot contains a selection');
     }
-    return {
+    return normalizeSnapshotTimes({
       ...snapshot,
       provider: 'bkv',
       source: snapshot.source,
@@ -1568,7 +1646,7 @@ function normalizeInspectionSnapshot(snapshot: unknown, origin: string): Inspect
         const artifact = parseBkvArtifact(raw);
         return { ...artifact, url: normalizeServiceUrl(artifact.url, origin) };
       }),
-    };
+    });
   }
   // Static fixtures are allowed only for an explicitly identified demo/test
   // snapshot. Unknown and database-backed sources must fail closed so the
@@ -1579,12 +1657,12 @@ function normalizeInspectionSnapshot(snapshot: unknown, origin: string): Inspect
     defects: inspection.defects.map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
     captureImages: inspection.captureImages?.map((image) => normalizeCaptureImage(image, origin)),
   }));
-  const normalized = {
+  const normalized = normalizeSnapshotTimes({
     ...snapshot,
     defects: snapshot.defects.map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
     captureImages: snapshot.captureImages?.map((image) => normalizeCaptureImage(image, origin)),
     inspections,
-  };
+  });
   return normalized;
 }
 
@@ -1605,6 +1683,70 @@ export async function fetchInspectionSnapshot(
     throw new Error(await readAdminErrorMessage(response, '后台数据接口异常'));
   }
   return normalizeInspectionSnapshot(await response.json(), origin);
+}
+
+export type DefectReviewInput = {
+  defectId: string;
+  status: DefectReviewStatus;
+  note?: string;
+  defectType?: string;
+  severity?: 'severe' | 'review' | 'minor';
+};
+
+export type ProductionDefectHistory = {
+  total: number;
+  defects: DefectItem[];
+};
+
+export async function fetchProductionDefectHistory(
+  limit = 5_000,
+  signal?: AbortSignal,
+): Promise<ProductionDefectHistory> {
+  const config = getStoredConnectionConfig();
+  if (config.mode === 'demo') {
+    return { total: 0, defects: [] };
+  }
+  const origin = getInspectionServiceOrigin(config);
+  // `limit` is a UI memory/latency budget, not a database page size. The old
+  // loop kept paging until `total` and could pull an unbounded defect table on
+  // every 15-second report refresh.
+  const requestedLimit = Math.max(1, Math.min(10_000, Math.round(limit)));
+  const query = new URLSearchParams({ limit: String(requestedLimit) });
+  const response = await fetch(`${origin}/api/defects/history?${query.toString()}`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '历史缺陷读取失败'));
+  }
+  const payload: unknown = await response.json();
+  if (!isRecord(payload)
+    || payload.schema !== 'steel.production-defect-history.v1'
+    || !Array.isArray(payload.defects)
+    || !payload.defects.every(isRecord)
+    || typeof payload.total !== 'number') {
+    throw new Error('历史缺陷数据格式无效');
+  }
+  const page = payload.defects as unknown as DefectItem[];
+  return {
+    total: Math.max(0, Math.trunc(payload.total)),
+    defects: [...new Map(page
+      .slice(0, requestedLimit)
+      .map((defect) => withPreviewImage(defect, false, origin))
+      .map((defect) => [defect.id, defect])).values()],
+  };
+}
+
+export async function reviewProductionDefect(input: DefectReviewInput): Promise<void> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/defects/review`, {
+    method: 'POST',
+    headers: createAdminHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '缺陷复核写入失败'));
+  }
 }
 
 export async function fetchBkvStatus(signal?: AbortSignal): Promise<BkvStatus> {

@@ -272,7 +272,6 @@ describe('bar-surface persistent production tasks', () => {
         operation: 'calibration-capture-fit',
         expectedCameras: 8,
         autoActivate: true,
-        profile: 'current-8-time-trigger',
         lines: 1000,
         width: 0,
         timeoutMs: 8000,

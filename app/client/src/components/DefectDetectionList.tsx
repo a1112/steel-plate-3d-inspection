@@ -55,6 +55,9 @@ function getDefectPreview(defect: DefectItem, inspectionId?: string) {
   if (onlineCrop) {
     return { url: onlineCrop, source: 'BKV 缺陷 ROI 裁剪' };
   }
+  if (defect.previewImageUrl) {
+    return { url: defect.previewImageUrl, source: defect.synthetic ? '模拟算法产物' : '检测记录缺陷小图' };
+  }
   if (inspectionId && cameraId && sequenceNo != null) {
     return {
       url: inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo, defect.artifacts?.roi),
@@ -62,9 +65,6 @@ function getDefectPreview(defect: DefectItem, inspectionId?: string) {
         ? '检测记录 ROI 裁剪'
         : '检测记录原始帧',
     };
-  }
-  if (defect.previewImageUrl) {
-    return { url: defect.previewImageUrl, source: defect.synthetic ? '模拟算法产物' : '检测记录预览' };
   }
   if (defect.artifacts?.roiImage) {
     return { url: barSurfaceFileUrl(defect.artifacts.roiImage), source: '生产 ROI 产物' };
@@ -315,6 +315,9 @@ export function DefectDetectionList({
                   <td>{String(index + 1).padStart(2, '0')}</td>
                   <td>
                     {defect.typeLabel}
+                    <small className={`defect-review-badge ${defect.reviewStatus ?? 'pending'}`}>
+                      {defect.reviewStatus === 'confirmed' ? '已确认' : defect.reviewStatus === 'false-positive' ? '已排除' : '待复核'}
+                    </small>
                     {defect.classificationState === 'candidate-only' ? <small className="candidate-defect-badge">候选</small> : null}
                     {defect.synthetic ? <small className="synthetic-defect-badge">模拟</small> : null}
                   </td>

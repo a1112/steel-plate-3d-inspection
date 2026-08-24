@@ -45,6 +45,8 @@ export type InspectionWorldTileLoading = {
   loadCandidates: number;
   pendingTiles: number;
   activeRequests: number;
+  activeRequestBytes: number;
+  pendingRequestBytes: number;
   failedTiles: number;
   ready: boolean;
 };
@@ -163,7 +165,7 @@ function jetTileSource(entry: TileEntry): CanvasImageSource {
     const canvas = document.createElement('canvas');
     canvas.width = entry.image.naturalWidth || entry.image.width;
     canvas.height = entry.image.naturalHeight || entry.image.height;
-    const context = canvas.getContext('2d');
+    const context = canvas.getContext('2d', { willReadFrequently: true });
     if (!context || typeof context.getImageData !== 'function') return entry.image;
     context.drawImage(entry.image, 0, 0);
     const image = context.getImageData(0, 0, canvas.width, canvas.height);
@@ -537,6 +539,9 @@ export function InspectionWorldCanvas({
         key,
         scope: worldRevision,
         priority,
+        // Budget decoded RGBA memory, which is the meaningful browser-side
+        // pressure rather than the usually much smaller JPEG transfer size.
+        estimatedBytes: meta.world.tileSize * meta.world.tileSize * 4,
         run: (signal) => fetchInspectionWorldTile(
           recordId,
           { ...tile, revision: meta.sourceRevision, format: 'jpeg' },
@@ -647,6 +652,7 @@ export function InspectionWorldCanvas({
 
   useEffect(() => {
     if (!viewportMeasured) return;
+    const queueTelemetry = requestQueue.current.telemetry();
     const loading: InspectionWorldTileLoading = {
       recordId,
       level,
@@ -658,6 +664,8 @@ export function InspectionWorldCanvas({
       loadCandidates: loadCandidates.length,
       pendingTiles: pendingTileCount,
       activeRequests: requestQueue.current.activeCount,
+      activeRequestBytes: queueTelemetry.activeBytes,
+      pendingRequestBytes: queueTelemetry.pendingBytes,
       failedTiles: failedKeys.size,
       ready: firstScreenReady,
     };
@@ -670,6 +678,8 @@ export function InspectionWorldCanvas({
       loading.loadCandidates,
       loading.pendingTiles,
       loading.activeRequests,
+      loading.activeRequestBytes,
+      loading.pendingRequestBytes,
       loading.failedTiles,
       loading.ready,
     ].join(':');

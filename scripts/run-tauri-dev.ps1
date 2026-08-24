@@ -8,6 +8,8 @@ param(
   [switch]$NoProcessingServices,
   [switch]$AllowNetworkDependencyFetch,
   [string]$DataRoot = "D:\Data",
+  [string]$SickCaptureProfile = "",
+  [string]$PythonExecutable = "D:\project\py312\python.exe",
   [string]$CargoRegistryMirror = "https://rsproxy.cn/index/"
 )
 
@@ -46,7 +48,25 @@ $env:STEEL_RUNTIME_LOG_DIR = $LogRoot
 $ImageServiceLauncher = $null
 $AlgorithmServiceLauncher = $null
 $ServiceLauncher = $null
+$SickCaptureLauncher = $null
 $OwnedServicePid = $null
+New-Item -ItemType Directory -Force -Path $RunDir, $LogRoot | Out-Null
+
+if ($SickCaptureProfile -and $SickCaptureProfile.Trim().Length -gt 0) {
+  $SickCaptureProfile = [string](Resolve-Path $SickCaptureProfile)
+  if (-not (Test-Path $PythonExecutable -PathType Leaf)) {
+    throw "Python executable was not found: $PythonExecutable"
+  }
+  $env:STEEL_SICK_CAPTURE_PROFILE = $SickCaptureProfile
+  $env:STEEL_PYTHON_EXECUTABLE = $PythonExecutable
+  $env:CAPTURE_SERVICE_ORIGIN = "http://127.0.0.1:4317"
+  $env:INSPECTION_SERVICE_ORIGIN = $ServiceOrigin
+  if (-not $env:STEEL_TRIGGER_HEALTH_REQUIRED) {
+    # This profile derives steel-in/out directly from the six grayscale
+    # streams; an external trigger gateway is therefore optional.
+    $env:STEEL_TRIGGER_HEALTH_REQUIRED = "0"
+  }
+}
 
 function Test-InspectionServiceReady {
   try {
@@ -71,7 +91,52 @@ function Get-InspectionServicePid {
   return $null
 }
 
+function Stop-ProcessTree([int]$RootProcessId) {
+  $Children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$RootProcessId" -ErrorAction SilentlyContinue)
+  foreach ($Child in $Children) {
+    Stop-ProcessTree -RootProcessId ([int]$Child.ProcessId)
+  }
+  Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
+}
+
 try {
+  if ($SickCaptureProfile) {
+    if (Test-HttpReady "http://127.0.0.1:4317/health") {
+      Write-Host "Using SICK capture service already running at http://127.0.0.1:4317."
+    } else {
+      $SickCaptureLauncher = Start-Process -FilePath $PythonExecutable `
+        -ArgumentList @(
+          (Join-Path $RepoRoot "scripts\sick_capture_service.py"),
+          "--profile", $SickCaptureProfile,
+          "--host", "127.0.0.1",
+          "--port", "4317"
+        ) `
+        -WorkingDirectory $RepoRoot `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $LogRoot "sick-capture.out.log") `
+        -RedirectStandardError (Join-Path $LogRoot "sick-capture.err.log") `
+        -PassThru
+      try {
+        # Camera transport and steel-boundary decisions must preempt optional
+        # historical preprocessing when both are active on the same host.
+        $SickCaptureLauncher.PriorityClass = "AboveNormal"
+      } catch {
+        Write-Warning "Could not raise SICK capture priority: $($_.Exception.Message)"
+      }
+      $CaptureDeadline = (Get-Date).AddSeconds($ServiceReadyTimeoutSec)
+      while ((Get-Date) -lt $CaptureDeadline -and -not (Test-HttpReady "http://127.0.0.1:4317/health")) {
+        if ($SickCaptureLauncher.HasExited) {
+          $CaptureError = Get-Content (Join-Path $LogRoot "sick-capture.err.log") -Tail 30 -ErrorAction SilentlyContinue
+          throw "SICK capture service exited before readiness. $($CaptureError -join [Environment]::NewLine)"
+        }
+        Start-Sleep -Milliseconds 250
+      }
+      if (-not (Test-HttpReady "http://127.0.0.1:4317/health")) {
+        throw "SICK capture service did not become ready within $ServiceReadyTimeoutSec seconds."
+      }
+      Write-Host "SICK capture service ready at http://127.0.0.1:4317 (PID $($SickCaptureLauncher.Id))."
+    }
+  }
   if (-not $NoProcessingServices) {
     & (Join-Path $PSScriptRoot "build-image-service.ps1") -Profile debug
     & (Join-Path $PSScriptRoot "build-algorithm-service.ps1") -Profile debug
@@ -208,7 +273,11 @@ try {
     # through npm.  The second separator keeps Cargo's --locked flag in the
     # runner argument list instead of sending it to the application.
     $TauriArguments = @("run", "tauri", "--", "dev", "--", "--locked")
-    if ($CargoRegistryMirror -and $CargoRegistryMirror.Trim().Length -gt 0) {
+    $RepoCargoConfig = Join-Path $RepoRoot ".cargo\config.toml"
+    $RepoAlreadyDefinesMirror = (Test-Path $RepoCargoConfig -PathType Leaf) -and (
+      Select-String -Path $RepoCargoConfig -Pattern '^\s*replace-with\s*=' -Quiet
+    )
+    if (-not $RepoAlreadyDefinesMirror -and $CargoRegistryMirror -and $CargoRegistryMirror.Trim().Length -gt 0) {
       $NormalizedMirror = $CargoRegistryMirror.Trim().TrimEnd("/") + "/"
       $TauriArguments += @(
         "--config", "source.crates-io.replace-with='rsproxy'",
@@ -230,8 +299,9 @@ try {
     Stop-Process -Id $OwnedServicePid -Force -ErrorAction SilentlyContinue
   }
   if ($ServiceLauncher -and -not $ServiceLauncher.HasExited) {
-    Stop-Process -Id $ServiceLauncher.Id -Force -ErrorAction SilentlyContinue
+    Stop-ProcessTree -RootProcessId $ServiceLauncher.Id
   }
-  if ($ImageServiceLauncher -and -not $ImageServiceLauncher.HasExited) { Stop-Process -Id $ImageServiceLauncher.Id -Force -ErrorAction SilentlyContinue }
-  if ($AlgorithmServiceLauncher -and -not $AlgorithmServiceLauncher.HasExited) { Stop-Process -Id $AlgorithmServiceLauncher.Id -Force -ErrorAction SilentlyContinue }
+  if ($ImageServiceLauncher -and -not $ImageServiceLauncher.HasExited) { Stop-ProcessTree -RootProcessId $ImageServiceLauncher.Id }
+  if ($AlgorithmServiceLauncher -and -not $AlgorithmServiceLauncher.HasExited) { Stop-ProcessTree -RootProcessId $AlgorithmServiceLauncher.Id }
+  if ($SickCaptureLauncher -and -not $SickCaptureLauncher.HasExited) { Stop-ProcessTree -RootProcessId $SickCaptureLauncher.Id }
 }

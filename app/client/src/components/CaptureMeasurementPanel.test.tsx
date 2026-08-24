@@ -4,8 +4,13 @@ import { CaptureMeasurementPanel } from './CaptureMeasurementPanel';
 
 const readCaptureMeasurement = vi.fn();
 const rebuildCaptureMeasurement = vi.fn();
+const CaptureApiError = vi.hoisted(() => class extends Error {
+  status: number;
+  constructor(message: string, status: number) { super(message); this.status = status; }
+});
 
 vi.mock('../lib/capture-api', () => ({
+  CaptureApiError,
   readCaptureMeasurement: (...args: unknown[]) => readCaptureMeasurement(...args),
   rebuildCaptureMeasurement: (...args: unknown[]) => rebuildCaptureMeasurement(...args),
 }));
@@ -39,5 +44,13 @@ describe('CaptureMeasurementPanel', () => {
     expect(screen.getByRole('img', { name: '棒材截面曲线' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /重新分析/ }));
     await waitFor(() => expect(rebuildCaptureMeasurement).toHaveBeenCalledWith('FLOW-1'));
+  });
+
+  it('treats a missing algorithm artifact as an actionable pending state', async () => {
+    readCaptureMeasurement.mockRejectedValueOnce(new CaptureApiError('capture api 404', 404));
+    render(<CaptureMeasurementPanel materialId="63" />);
+
+    expect(await screen.findByText('尚未生成截面分析；已提交的任务会自动刷新')).toBeInTheDocument();
+    expect(screen.queryByText('capture api 404')).not.toBeInTheDocument();
   });
 });

@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import uuid
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +48,10 @@ class StandardRecordV2Migrator:
         return helper
 
     def run(self) -> dict[str, int]:
-        with self._connection() as connection:
+        # sqlite3.Connection's context manager commits or rolls back but does
+        # not close the handle.  Keep an explicit closing context so Windows
+        # can release catalog.db immediately after each migration phase.
+        with closing(self._connection()) as connection, connection:
             records = connection.execute(
                 "SELECT id, source_hash, record_path FROM production_inspection ORDER BY id"
             ).fetchall()
@@ -94,7 +98,7 @@ class StandardRecordV2Migrator:
         intensity_paths: dict[int, list[Path]] = {}
         updates: list[tuple[str, int, str, int, str]] = []
 
-        with self._connection() as connection:
+        with closing(self._connection()) as connection, connection:
             rows = connection.execute(
                 """
                 SELECT id, camera_id, sequence_no, kind, path
@@ -208,7 +212,7 @@ class StandardRecordV2Migrator:
                 shutil.rmtree(cache_destination)
             _replace_directory_with_retry(cache_stage, cache_destination)
             cache_published = True
-            with self._connection() as connection:
+            with closing(self._connection()) as connection, connection:
                 for path, size, sha256, _, file_id in updates:
                     connection.execute(
                         """

@@ -6,6 +6,7 @@ export type ThemeMode = 'dark' | 'light' | 'graphite';
 export type ThemeStyle = 'default' | 'soft' | 'tech' | 'industrial' | 'modern';
 export type Severity = 'severe' | 'review' | 'minor';
 export type Surface = 'top' | 'bottom';
+export type DefectReviewStatus = 'pending' | 'confirmed' | 'false-positive';
 
 export interface SteelPlate {
   plateNo: string;
@@ -52,6 +53,12 @@ export interface DefectItem {
   classificationVersion?: string;
   candidatePolarity?: 'depression' | 'protrusion' | string;
   synthetic?: boolean;
+  source?: string;
+  sourceDefectId?: string;
+  reviewStatus?: DefectReviewStatus;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  reviewNote?: string;
   artifacts?: DefectArtifacts;
 }
 

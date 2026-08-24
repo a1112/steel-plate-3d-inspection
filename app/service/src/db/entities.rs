@@ -391,6 +391,39 @@ pub mod steel_flow_image {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod steel_flow_region {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "steel_flow_region")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub flow_no: i64,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub camera_id: String,
+        pub material_id: String,
+        pub state: String,
+        pub source_width: i32,
+        pub source_height: i32,
+        pub crop_left: i32,
+        pub crop_right: i32,
+        pub overlap_column_count: i32,
+        pub owned_column_count: i32,
+        pub calibration_revision: String,
+        pub calibration_sha256: String,
+        pub manifest_path: String,
+        pub manifest_sha256: String,
+        pub quality_json: String,
+        pub region_json: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod record_cleanup {
     use sea_orm::entity::prelude::*;
 
@@ -474,7 +507,15 @@ pub mod production_defect {
         pub depth_mm: f64,
         pub confidence: f64,
         pub geometry_json: String,
+        pub source: String,
+        pub source_defect_id: String,
+        pub preview_image_path: String,
+        pub review_status: String,
+        pub reviewed_by: String,
+        pub reviewed_at: String,
+        pub review_note: String,
         pub created_at: String,
+        pub updated_at: String,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

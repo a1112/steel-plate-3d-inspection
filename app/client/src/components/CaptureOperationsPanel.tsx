@@ -14,6 +14,7 @@ import {
   applyCaptureProfile,
   applyCaptureStorageRoot,
   chooseCaptureLocalDirectory,
+  defaultCaptureProfileName,
   connectAllCaptureCameras,
   loadAllCaptureCameraParams,
   openCaptureLocalPath,
@@ -83,10 +84,14 @@ export function CaptureOperationsPanel({
     () => Array.from(new Set(cameraIps.map((ip) => ip.trim()).filter(Boolean))),
     [cameraIps],
   );
+  const configuredCameraCount = Number.isFinite(expectedCameraCount)
+    ? Math.max(1, Math.trunc(expectedCameraCount))
+    : Math.max(1, normalizedIps.length);
+  const defaultProfileName = defaultCaptureProfileName(configuredCameraCount);
   const [profiles, setProfiles] = useState<CaptureProfilesStatus | null>(null);
   const [storage, setStorage] = useState<CaptureStorageStatus | null>(null);
-  const [selectedProfile, setSelectedProfile] = useState('current-8-time-trigger');
-  const [cameraParamDir, setCameraParamDir] = useState('config/camera-params/current-8-time-trigger');
+  const [selectedProfile, setSelectedProfile] = useState(defaultProfileName);
+  const [cameraParamDir, setCameraParamDir] = useState(`config/camera-params/${defaultProfileName}`);
   const [storageRoot, setStorageRoot] = useState('H:/');
   const [recoveryIp, setRecoveryIp] = useState(normalizedIps[0] ?? '');
   const [autoConnect, setAutoConnect] = useState(true);
@@ -198,7 +203,7 @@ export function CaptureOperationsPanel({
       () =>
         applyCaptureProfile({
           name: selectedProfile,
-          expectedCameras: normalizedIps.length || expectedCameraCount,
+          expectedCameras: normalizedIps.length || configuredCameraCount,
           autoConnect,
           loadCameraParams: loadParamsOnApply,
           saveToDevice: false,
@@ -242,6 +247,8 @@ export function CaptureOperationsPanel({
   };
 
   const queue = storage?.queue;
+  const sickSidecar = selectedProfile.trim().toLowerCase().startsWith('sick-')
+    || cameraStatuses.some((status) => status.driverId?.toLowerCase().startsWith('sick-gentl'));
   const profileNames = profiles?.profiles?.length
     ? profiles.profiles
     : [selectedProfile];
@@ -260,6 +267,15 @@ export function CaptureOperationsPanel({
       <div className="capture-operations-permission">
         所有操作经 Rust 服务的受控代理执行，需要后台“配置管理”权限；前端不会直连 C++ 或相机 SDK。
       </div>
+      {sickSidecar ? (
+        <div className="capture-calibration-safety" role="note">
+          <AlertTriangle size={16} />
+          <span>
+            SICK Ranger3 的设备参数、标定和分盘路径由已审核的采集 Profile 管理；
+            运行期仅保留连接、状态、队列和连续采集测试，不会发送未实现的设备写入请求。
+          </span>
+        </div>
+      ) : null}
       <div className="capture-operations-grid">
         <section>
           <header>
@@ -273,6 +289,7 @@ export function CaptureOperationsPanel({
             <span>配置名称</span>
             <select
               value={selectedProfile}
+              disabled={sickSidecar}
               onChange={(event) => {
                 setSelectedProfile(event.target.value);
                 setCameraParamDir(`config/camera-params/${event.target.value}`);
@@ -284,15 +301,15 @@ export function CaptureOperationsPanel({
             </select>
           </label>
           <div className="capture-operation-checks">
-            <label><input type="checkbox" checked={autoConnect} onChange={(event) => setAutoConnect(event.target.checked)} />自动连接</label>
-            <label><input type="checkbox" checked={loadParamsOnApply} onChange={(event) => setLoadParamsOnApply(event.target.checked)} />同时加载参数文件</label>
-            <label><input type="checkbox" checked={changeStorageOnApply} onChange={(event) => setChangeStorageOnApply(event.target.checked)} />允许切换存储目录</label>
+            <label><input type="checkbox" checked={autoConnect} disabled={sickSidecar} onChange={(event) => setAutoConnect(event.target.checked)} />自动连接</label>
+            <label><input type="checkbox" checked={loadParamsOnApply} disabled={sickSidecar} onChange={(event) => setLoadParamsOnApply(event.target.checked)} />同时加载参数文件</label>
+            <label><input type="checkbox" checked={changeStorageOnApply} disabled={sickSidecar} onChange={(event) => setChangeStorageOnApply(event.target.checked)} />允许切换存储目录</label>
           </div>
           <label className="capture-danger-confirm">
-            <input type="checkbox" checked={confirmProfileApply} onChange={(event) => setConfirmProfileApply(event.target.checked)} />
+            <input type="checkbox" checked={confirmProfileApply} disabled={sickSidecar} onChange={(event) => setConfirmProfileApply(event.target.checked)} />
             我确认应用会改变相机当前运行参数，并可能连接设备
           </label>
-          <button type="button" className="primary" disabled={busy !== null || !selectedProfile || !confirmProfileApply} onClick={() => void handleApplyProfile()}>
+          <button type="button" className="primary" disabled={sickSidecar || busy !== null || !selectedProfile || !confirmProfileApply} onClick={() => void handleApplyProfile()}>
             <Upload size={15} />应用 Profile
           </button>
           <p>应用始终使用 <code>saveToDevice=false</code>，不会把参数永久写入相机。</p>
@@ -302,7 +319,7 @@ export function CaptureOperationsPanel({
           <header>
             <Link size={17} />
             <div>
-              <strong>{expectedCameraCount} 相机连接</strong>
+              <strong>{configuredCameraCount} 相机连接</strong>
               <span>{normalizedIps.length || 0} 个配置地址</span>
             </div>
           </header>
@@ -333,14 +350,14 @@ export function CaptureOperationsPanel({
           <label>
             <span>参数目录</span>
             <div className="capture-path-picker">
-              <input value={cameraParamDir} onChange={(event) => setCameraParamDir(event.target.value)} />
-              <button type="button" aria-label="选择相机参数目录" onClick={() => void chooseDirectory('选择相机参数目录', setCameraParamDir)}><FolderCog size={14} /></button>
+              <input value={cameraParamDir} disabled={sickSidecar} onChange={(event) => setCameraParamDir(event.target.value)} />
+              <button type="button" aria-label="选择相机参数目录" disabled={sickSidecar} onClick={() => void chooseDirectory('选择相机参数目录', setCameraParamDir)}><FolderCog size={14} /></button>
             </div>
           </label>
           <div className="capture-operation-actions">
             <button
               type="button"
-              disabled={busy !== null || !selectedProfile}
+              disabled={sickSidecar || busy !== null || !selectedProfile}
               onClick={() => void runOperation(
                 'save-params',
                 () => saveAllCaptureCameraParams({
@@ -357,7 +374,7 @@ export function CaptureOperationsPanel({
             </button>
             <button
               type="button"
-              disabled={busy !== null || !confirmLoad || !selectedProfile}
+              disabled={sickSidecar || busy !== null || !confirmLoad || !selectedProfile}
               onClick={() => void runOperation(
                 'load-params',
                 () => loadAllCaptureCameraParams({
@@ -375,7 +392,7 @@ export function CaptureOperationsPanel({
             </button>
           </div>
           <label className="capture-danger-confirm">
-            <input type="checkbox" checked={confirmLoad} onChange={(event) => setConfirmLoad(event.target.checked)} />
+            <input type="checkbox" checked={confirmLoad} disabled={sickSidecar} onChange={(event) => setConfirmLoad(event.target.checked)} />
             我确认当前没有采集或实时流，允许加载参数文件
           </label>
         </section>
@@ -390,18 +407,18 @@ export function CaptureOperationsPanel({
           </header>
           <label>
             <span>相机 IP</span>
-            <select value={recoveryIp} onChange={(event) => setRecoveryIp(event.target.value)}>
+            <select value={recoveryIp} disabled={sickSidecar} onChange={(event) => setRecoveryIp(event.target.value)}>
               {normalizedIps.map((ip) => <option key={ip} value={ip}>{ip}</option>)}
             </select>
           </label>
           <label className="capture-danger-confirm">
-            <input type="checkbox" checked={confirmRecovery} onChange={(event) => setConfirmRecovery(event.target.checked)} />
+            <input type="checkbox" checked={confirmRecovery} disabled={sickSidecar} onChange={(event) => setConfirmRecovery(event.target.checked)} />
             我确认恢复该相机当前参数
           </label>
           <button
             type="button"
             className="danger"
-            disabled={busy !== null || !confirmRecovery || !recoveryIp}
+            disabled={sickSidecar || busy !== null || !confirmRecovery || !recoveryIp}
             onClick={() => void runOperation(
               'recover-params',
               () => recoverCaptureCameraParams(recoveryIp),
@@ -423,16 +440,16 @@ export function CaptureOperationsPanel({
           <label>
             <span>根目录</span>
             <div className="capture-path-picker">
-              <input value={storageRoot} onChange={(event) => setStorageRoot(event.target.value)} />
-              <button type="button" aria-label="选择正式存储根目录" onClick={() => void chooseDirectory('选择正式存储根目录', setStorageRoot)}><FolderCog size={14} /></button>
+              <input value={storageRoot} disabled={sickSidecar} onChange={(event) => setStorageRoot(event.target.value)} />
+              <button type="button" aria-label="选择正式存储根目录" disabled={sickSidecar} onClick={() => void chooseDirectory('选择正式存储根目录', setStorageRoot)}><FolderCog size={14} /></button>
               <button type="button" aria-label="打开正式存储根目录" onClick={() => void openLocalPath(storageRoot)}><FolderCog size={14} />打开</button>
             </div>
           </label>
           <label className="capture-danger-confirm">
-            <input type="checkbox" checked={confirmStorage} onChange={(event) => setConfirmStorage(event.target.checked)} />
+            <input type="checkbox" checked={confirmStorage} disabled={sickSidecar} onChange={(event) => setConfirmStorage(event.target.checked)} />
             我确认后续采集切换到这个落盘根目录
           </label>
-          <button type="button" disabled={busy !== null || !storageRoot.trim()} onClick={() => void handleApplyStorage()}>
+          <button type="button" disabled={sickSidecar || busy !== null || !storageRoot.trim()} onClick={() => void handleApplyStorage()}>
             <FolderCog size={15} />应用存储目录
           </button>
         </section>
@@ -484,13 +501,22 @@ export function CaptureOperationsPanel({
       <CaptureAdvancedOperations
         cameraIps={normalizedIps}
         cameraStatuses={cameraStatuses}
-        expectedCameraCount={expectedCameraCount}
+        expectedCameraCount={configuredCameraCount}
         profiles={profiles}
         storage={storage}
         onProfilesChange={setProfiles}
         onStorageChange={setStorage}
+        profileMutationSupported={!sickSidecar}
+        profileMutationUnsupportedReason="SICK Ranger3 的 Profile、参数和分盘路径必须通过受控配置文件审核后重启生效。"
       />
-      <CaptureDiagnosticOperations cameraIps={normalizedIps} cameraStatuses={cameraStatuses} />
+      <CaptureDiagnosticOperations
+        cameraIps={normalizedIps}
+        cameraStatuses={cameraStatuses}
+        expectedCameraCount={configuredCameraCount}
+        profileName={selectedProfile}
+        maintenanceSupported={!sickSidecar}
+        maintenanceUnsupportedReason="SICK Ranger3 采集 sidecar 当前仅支持 Profile 受控配置、连接、采集与预览，未实现 SDK 参数、ROI 和标定写入端点。"
+      />
     </Panel>
   );
 }

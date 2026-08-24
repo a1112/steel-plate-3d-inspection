@@ -11,6 +11,9 @@ import {
   fetchInspectionReportArchive,
   fetchInspectionReportArchives,
   fetchInspectionSnapshot,
+  fetchProductionDefectHistory,
+  formatProductionDateTime,
+  formatProductionRecordTime,
   fetchBkvStatus,
   fetchBkvArtifact,
   parseBkvArtifact,
@@ -20,6 +23,7 @@ import {
   stopProductionSteelOut,
   triggerGatewayManualSteelIn,
   writeProductionSteelInfo,
+  reviewProductionDefect,
 } from './inspection-api';
 import type {
   BkvArtifact,
@@ -630,6 +634,123 @@ describe('persistent production command client', () => {
     expect(snapshot.inspections.flatMap((inspection) => inspection.defects).every((defect) => defect.previewImageUrl === '')).toBe(true);
     expect(snapshot.captureImages?.[0].url).toBe(
       'http://127.0.0.1:4873/api/production/file?path=records%2FINS-1%2Fintensity.png',
+    );
+  });
+
+  it('uses the stable valid-region endpoint for SICK online intensity frames', async () => {
+    const fixture = getMockInspectionSnapshot();
+    const sourcePath = 'H:\\steel-sick-data\\2444\\capture\\C5\\2d\\219.png';
+    const productionSnapshot = {
+      ...fixture,
+      source: 'sqlite-seaorm',
+      captureImages: [{
+        id: 'CAPTURE-SICK-C5',
+        cameraId: 'C5',
+        cameraIp: '192.168.105.190',
+        dataName: 'intensity',
+        sequenceNo: 220,
+        fileType: 'png',
+        path: sourcePath,
+        url: `/api/production/file?path=${encodeURIComponent(sourcePath)}`,
+        createdAt: '2026-08-23 14:49:00',
+      }],
+    };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(productionSnapshot)));
+
+    const snapshot = await fetchInspectionSnapshot();
+
+    expect(snapshot.captureImages?.[0].url).toBe(
+      `http://127.0.0.1:4873/api/capture/file?path=${encodeURIComponent(sourcePath)}&maxWidth=2048&region=valid`,
+    );
+  });
+
+  it('normalizes epoch timestamps and repairs malformed record clocks from inspection time', async () => {
+    const fixture = getMockInspectionSnapshot();
+    const epoch = '1787498686739';
+    const productionSnapshot = {
+      ...fixture,
+      source: 'sqlite-seaorm',
+      currentPlate: { ...fixture.currentPlate, detectedAt: epoch },
+      records: [{ ...fixture.records[0], id: 'INSP-63', plateNo: '63', time: '67:39' }],
+      inspections: [{
+        ...fixture.inspections[0],
+        inspectionId: 'INSP-63',
+        plate: { ...fixture.inspections[0].plate, plateNo: '63', detectedAt: epoch },
+      }],
+    };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(productionSnapshot)));
+
+    const snapshot = await fetchInspectionSnapshot();
+    const expectedDate = new Date(Number(epoch));
+    expect(snapshot.currentPlate.detectedAt).toBe(expectedDate.toLocaleString('zh-CN', { hour12: false }));
+    expect(snapshot.inspections[0].plate.detectedAt).toBe(expectedDate.toLocaleString('zh-CN', { hour12: false }));
+    expect(snapshot.records[0].time).toBe(expectedDate.toLocaleTimeString('zh-CN', { hour12: false }));
+    expect(formatProductionRecordTime('19:00', epoch)).toBe('19:00');
+    expect(formatProductionDateTime('2026-08-24 08:30:00')).toBe('2026-08-24 08:30:00');
+  });
+
+  it('reads database-backed defect history and resolves cached crop URLs', async () => {
+    const defect = {
+      ...getMockInspectionSnapshot().defects[0],
+      id: 'SICK-63-C1-000001',
+      plateNo: '63',
+      previewImageUrl: '/api/capture/file?path=defect-crop.png',
+      reviewStatus: 'pending',
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      schema: 'steel.production-defect-history.v1',
+      code: 0,
+      total: 1,
+      defects: [defect],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const history = await fetchProductionDefectHistory();
+
+    expect(history.total).toBe(1);
+    expect(history.defects[0].previewImageUrl).toBe(
+      'http://127.0.0.1:4873/api/capture/file?path=defect-crop.png',
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4873/api/defects/history?limit=5000',
+      expect.objectContaining({ headers: { Accept: 'application/json' } }),
+    );
+  });
+
+  it('writes defect review with the current authenticated operator session', async () => {
+    window.localStorage.setItem(
+      'steel-inspection-admin-session',
+      JSON.stringify({
+        authenticated: true,
+        token: 'review-token',
+        expiresAt: '2099-01-01T00:00:00.000Z',
+        user: { id: 'reviewer', permissions: ['admin.records'] },
+      }),
+    );
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      code: 0,
+      defectId: 'SICK-63-C1-000001',
+      reviewStatus: 'confirmed',
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await reviewProductionDefect({
+      defectId: 'SICK-63-C1-000001',
+      status: 'confirmed',
+      note: '人工确认',
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4873/api/defects/review',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer review-token' }),
+        body: JSON.stringify({
+          defectId: 'SICK-63-C1-000001',
+          status: 'confirmed',
+          note: '人工确认',
+        }),
+      }),
     );
   });
 

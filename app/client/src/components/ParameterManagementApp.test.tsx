@@ -1213,6 +1213,9 @@ describe('ParameterManagementApp', () => {
       'http://127.0.0.1:4873/api/admin/diagnostics',
       expect.objectContaining({ headers: expect.objectContaining({ Accept: 'application/json' }) }),
     );
+    const requestedPaths = fetchMock.mock.calls.map(([url]) => new URL(String(url)).pathname);
+    expect(requestedPaths).toContain('/api/config/capture');
+    expect(requestedPaths).not.toContain('/api/config');
 
     fireEvent.click(screen.getByRole('button', { name: /重新自检/ }));
     await waitFor(() => {

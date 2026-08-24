@@ -2110,6 +2110,16 @@ button {
   font-size: 13px;
 }
 
+.live-monitor-summary > span.warning {
+  border-color: color-mix(in srgb, var(--orange) 55%, var(--line));
+  color: var(--orange);
+  background: color-mix(in srgb, var(--orange) 10%, var(--panel-soft));
+}
+
+.live-monitor-summary > span.warning b {
+  color: var(--orange);
+}
+
 .live-monitor-layout {
   min-height: 0;
   display: grid;
@@ -3023,6 +3033,14 @@ button {
   background: #fafcfd;
 }
 
+.capture-defect-list img {
+  width: 100%;
+  height: 72px;
+  border-radius: 4px;
+  object-fit: contain;
+  background: #02070a;
+}
+
 .capture-defect-list b,
 .capture-defect-list span {
   overflow: hidden;
@@ -3177,9 +3195,9 @@ button {
 }
 
 .app-shell .panel.defect-image-panel .panel-body {
-  height: 166px;
+  height: 206px;
   display: grid;
-  grid-template-rows: 28px minmax(0, 1fr);
+  grid-template-rows: 28px 30px minmax(0, 1fr);
   gap: 6px;
   padding: 6px 8px 8px;
 }
@@ -3223,6 +3241,76 @@ button {
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.defect-review-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.defect-review-controls button {
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  background: var(--panel-soft);
+  font-size: 9px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.defect-review-controls button:hover:not(:disabled) {
+  border-color: var(--cyan);
+  color: #fff;
+  background: var(--blue);
+}
+
+.defect-review-controls button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.defect-review-status {
+  min-width: 50px;
+  color: var(--amber);
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.defect-review-status.confirmed {
+  color: var(--green);
+}
+
+.defect-review-status.false-positive {
+  color: var(--muted);
+}
+
+.defect-review-error {
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--red) 45%, var(--line));
+  border-radius: 4px;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  font-size: 11px;
+}
+
+.defect-review-badge {
+  display: inline-flex;
+  margin-left: 4px;
+  color: var(--amber);
+  font-size: 8px;
+  font-weight: 800;
+}
+
+.defect-review-badge.confirmed {
+  color: var(--green);
+}
+
+.defect-review-badge.false-positive {
+  color: var(--muted);
 }
 
 .defect-image-viewport {

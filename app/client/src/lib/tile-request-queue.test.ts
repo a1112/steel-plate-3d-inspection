@@ -68,4 +68,34 @@ describe('TileRequestQueue', () => {
     await expect(active).rejects.toMatchObject({ name: 'AbortError' });
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
   });
+
+  it('bounds active estimated bytes and exposes scheduling telemetry', async () => {
+    const queue = new TileRequestQueue<number>(8, 20, 10);
+    const releases: Array<() => void> = [];
+    const tasks = [6, 6, 4].map((estimatedBytes, index) => queue.enqueue({
+      key: `byte-${index}`,
+      scope: 'record-a',
+      priority: 0,
+      estimatedBytes,
+      run: () => new Promise<number>((resolve) => {
+        releases.push(() => resolve(index));
+      }),
+    }));
+
+    expect(queue.activeCount).toBe(2);
+    expect(queue.activeBytes).toBe(10);
+    expect(queue.pendingCount).toBe(1);
+    releases.shift()?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(queue.activeCount).toBe(2);
+    expect(queue.activeBytes).toBe(10);
+    releases.splice(0).forEach((release) => release());
+    await Promise.all(tasks);
+    expect(queue.telemetry()).toMatchObject({
+      completed: 3,
+      peakActiveBytes: 10,
+      failed: 0,
+    });
+  });
 });

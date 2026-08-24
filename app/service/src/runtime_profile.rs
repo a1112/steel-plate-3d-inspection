@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 const RUNTIME_PROFILE_SCHEMA: &str = "steel.runtime-profile.v1";
-const CAPTURE_PROFILE_SCHEMA: &str = "steel.capture.profile.v1";
+const CAPTURE_PROFILE_SCHEMAS: &[&str] = &["steel.capture.profile.v1", "steel.capture.profile.v2"];
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -747,9 +747,10 @@ fn validate_loopback_origin(value: &str) -> Result<(), String> {
 fn validate_capture_profile(profile: &RuntimeProfileDocument, bytes: &[u8]) -> Result<(), String> {
     let capture: CaptureProfileDocument = serde_json::from_slice(bytes)
         .map_err(|error| format!("capture profile JSON invalid: {error}"))?;
-    if capture.schema != CAPTURE_PROFILE_SCHEMA {
+    if !CAPTURE_PROFILE_SCHEMAS.contains(&capture.schema.as_str()) {
         return Err(format!(
-            "capture profile schema must be {CAPTURE_PROFILE_SCHEMA}"
+            "capture profile schema must be one of {}",
+            CAPTURE_PROFILE_SCHEMAS.join(", ")
         ));
     }
     let enabled = capture

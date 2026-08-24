@@ -62,6 +62,8 @@ type CaptureAdvancedOperationsProps = {
   cameraStatuses?: CaptureCameraStatus[];
   onProfilesChange: (profiles: CaptureProfilesStatus) => void;
   onStorageChange: (storage: CaptureStorageStatus) => void;
+  profileMutationSupported?: boolean;
+  profileMutationUnsupportedReason?: string;
 };
 
 function normalizeIps(cameraIps: string[]) {
@@ -220,6 +222,8 @@ export function CaptureAdvancedOperations({
   cameraStatuses = [],
   onProfilesChange,
   onStorageChange,
+  profileMutationSupported = true,
+  profileMutationUnsupportedReason = '当前采集驱动不支持运行期 Profile 与存储映射写入。',
 }: CaptureAdvancedOperationsProps) {
   const normalizedIps = useMemo(() => normalizeIps(cameraIps), [cameraIps]);
   const [selectedProfile, setSelectedProfile] = useState('');
@@ -654,6 +658,8 @@ export function CaptureAdvancedOperations({
       </div>
 
       <div className="capture-advanced-grid">
+        {profileMutationSupported ? (
+          <>
         <section className="capture-profile-editor-operation">
           <header>
             <FileJson size={17} />
@@ -835,6 +841,34 @@ export function CaptureAdvancedOperations({
             <HardDrive size={15} />应用逐相机目录
           </button>
         </section>
+          </>
+        ) : (
+          <section className="capture-profile-editor-operation capture-unsupported-operation" role="note">
+            <header>
+              <AlertTriangle size={17} />
+              <div>
+                <strong>Profile 与分盘配置只读</strong>
+                <span title={selectedEntry?.path}>{selectedEntry?.path || profiles?.profileRoot || '等待采集服务路径'}</span>
+              </div>
+            </header>
+            <p>{profileMutationUnsupportedReason}</p>
+            <div className="capture-profile-toolbar">
+              <label>
+                <span>已审核 Profile</span>
+                <select value={selectedProfile} onChange={(event) => setSelectedProfile(event.target.value)}>
+                  {profileNames.map((name) => <option key={name} value={name}>{name}</option>)}
+                </select>
+              </label>
+              <button type="button" disabled={busy !== null || !selectedProfile} onClick={() => void loadProfile(selectedProfile)}>
+                <RefreshCw size={14} className={busy === 'read-profile' ? 'spin' : ''} />读取当前 Profile
+              </button>
+            </div>
+            <label className="capture-profile-json-editor">
+              <span>Profile JSON（只读）</span>
+              <textarea value={profileJson} readOnly spellCheck={false} />
+            </label>
+          </section>
+        )}
 
         <section className="capture-continuous-operation">
           <header>

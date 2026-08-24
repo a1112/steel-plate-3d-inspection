@@ -228,6 +228,23 @@ describe('AppFooter', () => {
     expect(moreButton).toHaveAttribute('aria-expanded', 'false');
   });
 
+  it('opens the system status page from the more menu', () => {
+    const onNavChange = vi.fn();
+    render(
+      <AppFooter
+        activeNav="online"
+        onNavChange={onNavChange}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '系统状态' }));
+
+    expect(onNavChange).toHaveBeenCalledWith('status');
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+  });
+
   it('opens management tools through independent-window callbacks', () => {
     const onSettingsOpen = vi.fn();
     const onParameterManagementOpen = vi.fn();

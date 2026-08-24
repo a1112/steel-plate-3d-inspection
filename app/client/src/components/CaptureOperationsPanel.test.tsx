@@ -7,6 +7,7 @@ const api = vi.hoisted(() => ({
   applyCaptureProfile: vi.fn(),
   applyCaptureStorageRoot: vi.fn(),
   connectAllCaptureCameras: vi.fn(),
+  defaultCaptureProfileName: vi.fn((cameraCount: number) => `current-${cameraCount}-time-trigger`),
   chooseCaptureLocalDirectory: vi.fn(),
   importCaptureProfileFromProviderPath: vi.fn(),
   loadAllCaptureCameraParams: vi.fn(),
@@ -164,5 +165,29 @@ describe('CaptureOperationsPanel', () => {
         'E:/steel-capture-data',
       );
     });
+  });
+
+  it('keeps unsupported SICK device mutations read-only while leaving capture controls available', async () => {
+    render(
+      <CaptureOperationsPanel
+        cameraIps={['192.168.101.144', '192.168.102.206']}
+        expectedCameraCount={2}
+        cameraStatuses={[
+          { ip: '192.168.101.144', driverId: 'sick-gentl-harvesters' },
+          { ip: '192.168.102.206', driverId: 'sick-gentl-harvesters' },
+        ] as never}
+      />,
+    );
+
+    expect(await screen.findByText(/SICK Ranger3 的设备参数/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '发现并连接全部' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '应用 Profile' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保存全部参数' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '加载全部参数' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '恢复选中相机' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '应用存储目录' })).toBeDisabled();
+    expect(screen.getByText('Profile 与分盘配置只读')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '读取当前 Profile' })).toBeEnabled();
+    expect(screen.getByText('并行连续采集测试')).toBeInTheDocument();
   });
 });

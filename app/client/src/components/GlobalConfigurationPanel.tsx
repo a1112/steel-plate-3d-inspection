@@ -191,7 +191,7 @@ export function GlobalConfigurationPanel({
     await runMutation('save', async () => {
       await updateSiteConfig(detail.site.id, { displayName: nameDraft.trim() });
       await loadCatalog(detail.site.id);
-    }, '配置名称已保存');
+    }, '系统名称已保存，重启检测服务后应用到全部窗口');
   };
 
   const runCheck = async (depth: SiteConfigCheckDepth) => {
@@ -448,7 +448,7 @@ export function GlobalConfigurationPanel({
                 </div>
 
                 <label className="site-config-name-field">
-                  <span>显示名称</span>
+                  <span>系统名称</span>
                   <input
                     aria-label="显示名称"
                     value={nameDraft}

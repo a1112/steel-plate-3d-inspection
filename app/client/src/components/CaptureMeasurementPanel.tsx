@@ -1,6 +1,7 @@
 import { CircleDot, RefreshCw, Ruler } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  CaptureApiError,
   readCaptureMeasurement,
   rebuildCaptureMeasurement,
   type CaptureFlowMeasurement,
@@ -55,34 +56,70 @@ function CrossSection({ measurement }: { measurement: CaptureFlowMeasurement }) 
 export function CaptureMeasurementPanel({ materialId }: CaptureMeasurementPanelProps) {
   const [measurement, setMeasurement] = useState<CaptureFlowMeasurement | null>(null);
   const [loading, setLoading] = useState(false);
+  const [rebuildPending, setRebuildPending] = useState(false);
   const [error, setError] = useState('');
+  const mountedRef = useRef(true);
 
-  const load = useCallback(async () => {
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const load = useCallback(async (showLoading = true) => {
     if (!materialId) return;
-    setLoading(true);
-    setError('');
+    if (showLoading) setLoading(true);
     try {
       const result = await readCaptureMeasurement(materialId);
-      setMeasurement(result.measurement);
+      if (mountedRef.current) {
+        setMeasurement(result.measurement);
+        setRebuildPending(false);
+        setError('');
+      }
     } catch (loadError) {
-      setMeasurement(null);
-      setError(loadError instanceof Error ? loadError.message : '截面分析读取失败');
+      if (mountedRef.current) {
+        setMeasurement(null);
+        if (loadError instanceof CaptureApiError && loadError.status === 404) {
+          setError('尚未生成截面分析；已提交的任务会自动刷新');
+        } else {
+          setRebuildPending(false);
+          setError(loadError instanceof Error ? loadError.message : '截面分析读取失败');
+        }
+      }
     } finally {
-      setLoading(false);
+      if (mountedRef.current && showLoading) setLoading(false);
     }
   }, [materialId]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    setMeasurement(null);
+    setRebuildPending(false);
+    setError('');
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    if (!rebuildPending) return undefined;
+    const timer = window.setInterval(() => void load(false), 2_000);
+    return () => window.clearInterval(timer);
+  }, [load, rebuildPending]);
 
   const rebuild = async () => {
     setLoading(true);
     setError('');
     try {
       await rebuildCaptureMeasurement(materialId);
-      window.setTimeout(() => void load(), 1500);
+      if (mountedRef.current) {
+        setRebuildPending(true);
+        setError('截面分析任务已提交，正在等待算法结果…');
+        setLoading(false);
+      }
     } catch (rebuildError) {
-      setError(rebuildError instanceof Error ? rebuildError.message : '重新分析失败');
-      setLoading(false);
+      if (mountedRef.current) {
+        setError(rebuildError instanceof Error ? rebuildError.message : '重新分析失败');
+        setLoading(false);
+      }
     }
   };
 
@@ -94,8 +131,8 @@ export function CaptureMeasurementPanel({ materialId }: CaptureMeasurementPanelP
           <CircleDot size={17} />
           <div><strong>截面与外径</strong><span>{materialId}</span></div>
         </div>
-        <button type="button" onClick={() => void rebuild()} disabled={loading}>
-          <RefreshCw size={14} className={loading ? 'spin' : ''} />重新分析
+        <button type="button" onClick={() => void rebuild()} disabled={loading || rebuildPending}>
+          <RefreshCw size={14} className={loading || rebuildPending ? 'spin' : ''} />{rebuildPending ? '分析中' : '重新分析'}
         </button>
       </header>
       {measurement ? (

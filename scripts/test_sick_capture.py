@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import time
@@ -12,6 +13,8 @@ import unittest
 from pathlib import Path
 from typing import Callable
 from urllib import request
+from urllib.parse import quote
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -31,6 +34,7 @@ from scripts.sick_capture.gentl import (
     select_components,
 )
 from scripts.sick_capture.models import RawFrame
+from scripts.sick_capture.events import publish_committed_round, write_flow_manifest
 from scripts.sick_capture.measurement import (
     MeasurementConfig,
     build_flow_measurement,
@@ -42,9 +46,15 @@ from scripts.sick_capture.playback import (
     build_image_pyramid,
     detect_valid_grayscale_roi,
     read_indexed_history,
+    rebuild_playback_history,
     select_pyramid_image,
 )
 from scripts.sick_capture.profile import CameraProfile, load_profile
+from scripts.sick_capture.regions import (
+    build_flow_region_map,
+    detect_valid_sensor_roi,
+    stable_horizontal_roi,
+)
 from scripts.sick_capture.provider import (
     CAPTURE_DISCARDED_NOT_ARMED,
     NO_STEEL_FRAME_DISCARDED,
@@ -53,7 +63,13 @@ from scripts.sick_capture.provider import (
     _steel_tail_metrics,
 )
 from scripts.sick_capture.replay import LG3DReplaySource, validate_lg3d_dataset
-from scripts.sick_capture.storage import DualFormatWriter
+from scripts.sick_capture.storage import DualFormatWriter, atomic_summary
+from scripts.sick_capture.paths import (
+    alignment_path,
+    capture_root as camera_capture_root,
+    measurement_path,
+    playback_roi_path,
+)
 
 
 def sample_frame(sequence: int = 0) -> RawFrame:
@@ -408,7 +424,7 @@ class SickAlignmentTests(unittest.TestCase):
         head_global_row: int,
         frame_ids: list[int],
     ) -> None:
-        flow_root = camera_root / material_id
+        flow_root = camera_capture_root(camera_root, material_id, camera_id)
         for directory in ("2d", "3d", "json"):
             (flow_root / directory).mkdir(parents=True, exist_ok=True)
         (flow_root / "camera_config.json").write_text(
@@ -445,7 +461,7 @@ class SickAlignmentTests(unittest.TestCase):
     def test_flow_alignment_uses_head_relative_time_and_records_transport_gap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            material_id = "FLOW-0000000001"
+            material_id = "1"
             c1 = root / "C1"
             c2 = root / "C2"
             self._write_camera_flow(
@@ -493,13 +509,13 @@ class SickAlignmentTests(unittest.TestCase):
             )
             self.assertTrue(path.is_file())
             self.assertEqual(written["materialId"], material_id)
-            self.assertTrue((c1 / material_id / "alignment.json").is_file())
-            self.assertTrue((c2 / material_id / "alignment.json").is_file())
+            self.assertEqual(path, alignment_path(root, material_id))
+            self.assertFalse((camera_capture_root(c1, material_id, "C1") / "alignment.json").exists())
 
     def test_current_flow_measurement_emits_crop_preview_but_blocks_uncalibrated_metric(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            material_id = "FLOW-0000000002"
+            material_id = "2"
             camera_root = root / "C1"
             self._write_camera_flow(
                 camera_root,
@@ -534,8 +550,8 @@ class SickAlignmentTests(unittest.TestCase):
     def test_approved_calibration_releases_diameter_and_cylinder_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            material_id = "FLOW-METRIC"
-            flow_root = root / "C1" / material_id
+            material_id = "3"
+            flow_root = camera_capture_root(root / "C1", material_id, "C1")
             for name in ("2d", "3d", "json"):
                 (flow_root / name).mkdir(parents=True, exist_ok=True)
 
@@ -623,7 +639,7 @@ class SickAlignmentTests(unittest.TestCase):
     def test_flow_alignment_fails_quality_gate_when_saved_head_is_clipped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            material_id = "FLOW-CLIPPED"
+            material_id = "4"
             c1 = root / "C1"
             self._write_camera_flow(
                 c1,
@@ -645,7 +661,7 @@ class SickAlignmentTests(unittest.TestCase):
     def test_flow_alignment_ignores_static_depth_background_for_grayscale_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            material_id = "FLOW-DEPTH-BACKGROUND"
+            material_id = "5"
             camera_root = root / "C1"
             self._write_camera_flow(
                 camera_root,
@@ -659,7 +675,7 @@ class SickAlignmentTests(unittest.TestCase):
             # bright steel arrives. It must not move the grayscale boundary to
             # the first saved row.
             for index in range(3):
-                path = camera_root / material_id / "3d" / f"{index}.npz"
+                path = camera_capture_root(camera_root, material_id, "C1") / "3d" / f"{index}.npz"
                 with np.load(path, allow_pickle=False) as payload:
                     depth = np.asarray(payload[payload.files[0]]).copy()
                 depth[:, :4] = 500
@@ -678,7 +694,7 @@ class SickAlignmentTests(unittest.TestCase):
     def test_saved_black_frame_omission_is_not_reported_as_transport_loss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            material_id = "FLOW-OMISSION"
+            material_id = "6"
             camera_root = root / "C1"
             self._write_camera_flow(
                 camera_root,
@@ -688,11 +704,12 @@ class SickAlignmentTests(unittest.TestCase):
                 head_global_row=4,
                 frame_ids=[10, 12, 13],
             )
-            middle = camera_root / material_id / "json" / "1.json"
+            flow_root = camera_capture_root(camera_root, material_id, "C1")
+            middle = flow_root / "json" / "1.json"
             payload = json.loads(middle.read_text(encoding="utf-8"))
             payload["captureRound"] = 102
             middle.write_text(json.dumps(payload), encoding="utf-8")
-            last = camera_root / material_id / "json" / "2.json"
+            last = flow_root / "json" / "2.json"
             payload = json.loads(last.read_text(encoding="utf-8"))
             payload["captureRound"] = 103
             last.write_text(json.dumps(payload), encoding="utf-8")
@@ -707,6 +724,41 @@ class SickAlignmentTests(unittest.TestCase):
 
 
 class SickPlaybackTests(unittest.TestCase):
+    def test_black_frame_has_no_valid_roi_and_cannot_expand_to_full_frame(self) -> None:
+        black = np.zeros((128, 320), dtype=np.uint8)
+        self.assertIsNone(detect_valid_grayscale_roi(black))
+        full = [96, 0, 224, 128]
+        partial = [70, 112, 250, 128]
+        self.assertEqual(
+            stable_horizontal_roi([full, full, partial], 320, 128),
+            full,
+        )
+
+    def test_region_map_keeps_full_height_and_blocks_uncalibrated_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "C1"
+            flow = camera_capture_root(root, "7", "C1")
+            (flow / "2d").mkdir(parents=True)
+            (flow / "3d").mkdir()
+            for index in range(3):
+                image = np.zeros((96, 320), dtype=np.uint8)
+                image[:, 180:260] = 40
+                Image.fromarray(image, mode="L").save(flow / "2d" / f"{index}.png")
+                np.savez_compressed(flow / "3d" / f"{index}.npz", image.astype(np.uint16))
+            regions = build_flow_region_map(
+                {"C1": root},
+                "7",
+                {
+                    "metricValid": False,
+                    "qualityGate": {"reasons": ["approved-array-calibration-missing"]},
+                    "calibration": {"approved": False, "calibratedCameras": 0},
+                    "selectedSection": {"circleFit": {"available": False}},
+                },
+            )
+            self.assertTrue(regions["backgroundReady"])
+            self.assertFalse(regions["defectDetectionAllowed"])
+            self.assertEqual(regions["cameras"]["C1"]["stableCrop"][1:], [0, 276, 96])
+
     def test_grayscale_roi_crops_black_border_and_ignores_isolated_noise(self) -> None:
         image = np.zeros((100, 240), dtype=np.uint8)
         image[10:90, 80:160] = 64
@@ -739,13 +791,13 @@ class SickPlaybackTests(unittest.TestCase):
     def test_pyramid_uses_stable_flow_horizontal_roi(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "C1" / "FLOW-STABLE" / "2d" / "0.png"
+            source = camera_capture_root(root / "C1", "8", "C1") / "2d" / "0.png"
             source.parent.mkdir(parents=True)
             image = np.zeros((120, 400), dtype=np.uint8)
             image[30:80, 180:230] = 80
             Image.fromarray(image, mode="L").save(source)
-            cache_root = root / "cache"
-            roi_path = root / "history" / "roi" / "FLOW-STABLE.json"
+            cache_root = root / "8" / "cache"
+            roi_path = playback_roi_path(root, "8")
             roi_path.parent.mkdir(parents=True)
             roi_path.write_text(
                 json.dumps({"cameras": {"C1": [100, 0, 300, 120]}}),
@@ -753,14 +805,28 @@ class SickPlaybackTests(unittest.TestCase):
             )
 
             _, manifest = build_image_pyramid(source, cache_root)
-            self.assertEqual(manifest["validRoi"], [100, 26, 300, 84])
+            self.assertEqual(manifest["validRoi"], [100, 0, 300, 120])
             self.assertEqual(manifest["frameDetectedRoi"], [164, 26, 246, 84])
             self.assertEqual(manifest["flowHorizontalRoi"], [100, 0, 300, 0])
+
+    def test_defect_review_pyramid_preserves_the_complete_minimum_crop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "9" / "derived" / "defects" / "review" / "9-C1-1.png"
+            source.parent.mkdir(parents=True)
+            image = np.zeros((64, 64), dtype=np.uint8)
+            image[24:40, 26:38] = 100
+            Image.fromarray(image, mode="L").save(source)
+
+            _, manifest = build_image_pyramid(source, root / "9" / "cache")
+            self.assertEqual(manifest["validRoi"], [0, 0, 64, 64])
+            self.assertEqual(manifest["cropSize"], [64, 64])
+            self.assertFalse(manifest["blackBorderCropped"])
 
     def test_playback_index_groups_cameras_by_capture_round_not_storage_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            material_id = "FLOW-INDEX"
+            material_id = "9"
             camera_roots = {"C1": root / "C1", "C2": root / "C2"}
             rows = {
                 "C1": [(0, 100), (1, 101)],
@@ -768,7 +834,7 @@ class SickPlaybackTests(unittest.TestCase):
                 "C2": [(0, 101)],
             }
             for camera_id, values in rows.items():
-                flow = camera_roots[camera_id] / material_id
+                flow = camera_capture_root(camera_roots[camera_id], material_id, camera_id)
                 (flow / "2d").mkdir(parents=True)
                 (flow / "json").mkdir()
                 for storage_index, capture_round in values:
@@ -791,8 +857,9 @@ class SickPlaybackTests(unittest.TestCase):
                         encoding="utf-8",
                     )
 
-            (root / "measurements").mkdir()
-            (root / "measurements" / f"{material_id}.json").write_text(
+            target_measurement = measurement_path(root, material_id)
+            target_measurement.parent.mkdir(parents=True)
+            target_measurement.write_text(
                 json.dumps(
                     {
                         "twoDimensionalCrop": {
@@ -818,6 +885,109 @@ class SickPlaybackTests(unittest.TestCase):
             self.assertEqual(history[-1]["sequence"], 101)
             self.assertEqual(len(history[-1]["cameras"]), 2)
             self.assertEqual(history[-1]["cameras"][0]["playbackWidth"], 40)
+
+    def test_history_rebuild_uses_only_flow_first_camera_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = root / "external"
+            storage = root / "storage"
+            for material_id, capture_round in (("1", 10), ("57", 20)):
+                flow = camera_capture_root(active, material_id, "C2")
+                (flow / "2d").mkdir(parents=True)
+                (flow / "json").mkdir()
+                Image.fromarray(
+                    np.full((8, 40), 60, dtype=np.uint8), mode="L"
+                ).save(
+                    flow / "2d" / ("0.jpg" if material_id == "1" else "0.png")
+                )
+                (flow / "json" / "0.json").write_text(
+                    json.dumps(
+                        {
+                            "cameraId": "C2",
+                            "cameraKey": "C2",
+                            "captureRound": capture_round,
+                            "hostUtcNs": 1_700_000_000_000_000_000 + capture_round,
+                            "width": 40,
+                            "height": 8,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            rebuilt = rebuild_playback_history(
+                {"C2": active}, storage
+            )
+            self.assertEqual(rebuilt["materialCount"], 2)
+            self.assertEqual(rebuilt["frameCount"], 2)
+            catalog = json.loads(
+                (storage / "catalog.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                {row["materialId"] for row in catalog["materials"]}, {"1", "57"}
+            )
+            rebuilt_index = json.loads(
+                (storage / "1" / "derived" / "playback" / "index.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(
+                not Path(rebuilt_index["frames"][0]["cameras"][0]["artifactRef"])
+                .is_absolute()
+            )
+            self.assertTrue(
+                rebuilt_index["frames"][0]["cameras"][0]["artifactRef"].endswith(
+                    ".jpg"
+                )
+            )
+
+    def test_history_rebuild_does_not_read_old_history_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = root / "external"
+            storage = root / "storage"
+            flow = camera_capture_root(active, "1", "C2")
+            (flow / "2d").mkdir(parents=True)
+            Image.fromarray(np.full((8, 40), 60, dtype=np.uint8), mode="L").save(
+                flow / "2d" / "0.jpg"
+            )
+            history = storage / "history"
+            history.mkdir(parents=True)
+            (history / "1.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "steel.capture-playback-index.v1",
+                        "materialId": "FLOW-0000000001",
+                        "frameCount": 1,
+                        "firstHostUtcNs": 100,
+                        "lastHostUtcNs": 100,
+                        "frames": [
+                            {
+                                "frameId": "FLOW-0000000001:000000000010",
+                                "materialId": "FLOW-0000000001",
+                                "sequence": 10,
+                                "sortNs": 100,
+                                "cameras": [
+                                    {
+                                        "cameraId": "C2",
+                                        "storageIndex": 0,
+                                        "artifactRef": "C2/FLOW-0000000001/2d/0.jpg",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            rebuilt = rebuild_playback_history(
+                {"C2": active}, storage
+            )
+            self.assertEqual(rebuilt["reusedIndexCount"], 0)
+            self.assertEqual(rebuilt["rebuiltIndexCount"], 0)
+            self.assertFalse((storage / "1" / "derived" / "playback" / "index.json").exists())
 
 
 class SickProfileTests(unittest.TestCase):
@@ -903,11 +1073,69 @@ class SickSitePackageTests(unittest.TestCase):
         self.assertEqual(len(runtime["cameras"]), 1)
         self.assertEqual(len(capture["cameras"]), 1)
         self.assertEqual(len(mapping["cameras"]), 1)
-        self.assertFalse(runtime["algorithm"]["enabled"])
+        self.assertTrue(runtime["algorithm"]["enabled"])
+        self.assertEqual(runtime["algorithm"]["processor"], "sick-flow-event-v2")
         self.assertFalse(runtime["capabilities"]["reconstruction"])
 
 
+class SickEventTests(unittest.TestCase):
+    def test_committed_event_validates_artifacts_and_reports_partial_camera_round(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = DualFormatWriter().write(root / "C1", "10", sample_frame())
+            row = result.provider_row(sample_frame(), 7)
+            event_path = publish_committed_round(
+                root,
+                "10",
+                "SESSION-10",
+                [row],
+                boundary_phase="normal",
+                expected_camera_ids={"C1", "C2"},
+            )
+            event = json.loads(event_path.read_text(encoding="utf-8"))
+            self.assertFalse(event["complete"])
+            self.assertEqual(event["expectedCameraCount"], 2)
+            self.assertEqual(event["committedCameraCount"], 1)
+            self.assertEqual(event["missingCameraIds"], ["C2"])
+
+            result.steel_depth.unlink()
+            with self.assertRaises(FileNotFoundError):
+                publish_committed_round(
+                    root,
+                    "10",
+                    "SESSION-10",
+                    [{**row, "round": 8}],
+                    boundary_phase="normal",
+                    expected_camera_ids={"C1"},
+                )
+
+
 class SickStorageTests(unittest.TestCase):
+    def test_atomic_summary_retries_transient_windows_sharing_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "status.json"
+            real_replace = os.replace
+            attempts = 0
+
+            def replace_after_two_failures(source: object, destination: object) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError(5, "simulated sharing violation")
+                real_replace(source, destination)
+
+            with patch(
+                "scripts.sick_capture.storage.os.replace",
+                side_effect=replace_after_two_failures,
+            ):
+                atomic_summary(target, {"state": "ready"})
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(
+                json.loads(target.read_text(encoding="utf-8")),
+                {"state": "ready"},
+            )
+
     def test_dual_writer_preserves_exact_lg3d_contract_and_raw_depth(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             camera_root = Path(directory) / "C1"
@@ -927,7 +1155,7 @@ class SickStorageTests(unittest.TestCase):
                 }
             ).write(
                 camera_root,
-                "COIL-001",
+                "10",
                 replace(sample_frame(), transport_frame_id=77),
                 session_id="SESSION-001",
                 production_event_id="FLOW-0000000001",
@@ -935,7 +1163,7 @@ class SickStorageTests(unittest.TestCase):
                 capture_round=9,
                 sync_group_id="FLOW-0000000001:round-000000000009",
             )
-            base = camera_root / "COIL-001"
+            base = camera_capture_root(camera_root, "10", "C1")
 
             validation = validate_lg3d_dataset(base)
             self.assertEqual(validation.frame_count, 1)
@@ -980,11 +1208,11 @@ class SickStorageTests(unittest.TestCase):
             np.testing.assert_array_equal(replayed.depth_raw, sample_frame().depth_raw)
 
             with self.assertRaises(FileExistsError):
-                DualFormatWriter().write(camera_root, "COIL-001", sample_frame(), index=0)
+                DualFormatWriter().write(camera_root, "10", sample_frame(), index=0)
             with self.assertRaisesRegex(ValueError, "serial mismatch"):
                 DualFormatWriter().write(
                     camera_root,
-                    "COIL-001",
+                    "10",
                     replace(sample_frame(2), serial_number="WRONG-SERIAL"),
                     index=2,
                 )
@@ -999,20 +1227,324 @@ class SickStorageTests(unittest.TestCase):
 
             with self.assertRaisesRegex(OSError, "simulated power loss"):
                 DualFormatWriter(fault_hook=fail_after_data).write(
-                    camera_root, "COIL-002", sample_frame()
+                    camera_root, "11", sample_frame()
                 )
-            base = camera_root / "COIL-002"
+            base = camera_capture_root(camera_root, "11", "C1")
             self.assertFalse((base / "json" / "0.json").exists())
             self.assertFalse((base / "metadata" / "000001.json").exists())
             with self.assertRaisesRegex(ValueError, "no complete LG_3D frames"):
                 validate_lg3d_dataset(base)
 
-            recovered = DualFormatWriter().write(camera_root, "COIL-002", sample_frame(1))
+            recovered = DualFormatWriter().write(camera_root, "11", sample_frame(1))
             self.assertEqual(recovered.lg_index, 1)
             self.assertTrue(recovered.steel_metadata.is_file())
 
 
 class SickProviderTests(unittest.TestCase):
+    def test_http_server_suppresses_only_cancelled_client_connection_errors(self) -> None:
+        server = object.__new__(SickCaptureHTTPServer)
+        with patch("http.server.ThreadingHTTPServer.handle_error") as parent:
+            try:
+                raise ConnectionResetError("client cancelled polling request")
+            except ConnectionResetError:
+                server.handle_error(None, ("127.0.0.1", 12345))
+            parent.assert_not_called()
+
+            try:
+                raise RuntimeError("real server failure")
+            except RuntimeError:
+                server.handle_error(None, ("127.0.0.1", 12345))
+            parent.assert_called_once()
+
+    def test_missing_defect_manifest_reports_processing_for_existing_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            try:
+                write_flow_manifest(
+                    profile.storage_root,
+                    2598,
+                    session_id="SESSION-2598",
+                    state="closed",
+                    camera_roots={
+                        camera.camera_id: camera_capture_root(
+                            camera.storage_root, "2598", camera.camera_id
+                        )
+                    },
+                )
+                status_root = (
+                    profile.storage_root
+                    / "system"
+                    / "jobs"
+                    / "defect-history-backfill"
+                )
+                status_root.mkdir(parents=True)
+                (status_root / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "state": "running",
+                            "processId": os.getpid(),
+                            "phase": "rebuild",
+                            "currentMaterialId": "2593",
+                            "reprocessedMaterials": 10,
+                            "materialCount": 100,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (status_root / ".lock").write_text(
+                    str(os.getpid()), encoding="ascii"
+                )
+
+                status, pending = runtime.defect_detection_json("2598")
+                self.assertEqual(status, 202)
+                self.assertEqual(pending["code"], 0)
+                self.assertEqual(pending["state"], "queued")
+                self.assertEqual(pending["phase"], "history-backfill")
+                self.assertEqual(pending["retryAfterMs"], 2000)
+                paused_payload = json.loads(
+                    (status_root / "status.json").read_text(encoding="utf-8")
+                )
+                paused_payload.update(
+                    {
+                        "state": "paused",
+                        "pauseReason": "steel-present",
+                        "capturePhase": "steel-in-saving",
+                        "captureQueue": {"pendingRounds": 12, "activeRounds": 1},
+                    }
+                )
+                (status_root / "status.json").write_text(
+                    json.dumps(paused_payload), encoding="utf-8"
+                )
+                paused_status, paused = runtime.defect_detection_json("2598")
+                self.assertEqual(paused_status, 202)
+                self.assertEqual(paused["phase"], "history-backfill")
+                self.assertEqual(paused["historyBackfill"]["state"], "paused")
+                self.assertEqual(
+                    paused["historyBackfill"]["pauseReason"], "steel-present"
+                )
+                self.assertEqual(
+                    paused["historyBackfill"]["captureQueue"]["pendingRounds"], 12
+                )
+                self.assertEqual(
+                    runtime.defect_detection_json("FLOW-0000002598")[0], 400
+                )
+                self.assertEqual(runtime.defect_detection_json("9999")[0], 404)
+            finally:
+                runtime.close()
+
+    def test_stale_history_backfill_status_is_not_reported_as_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            try:
+                write_flow_manifest(
+                    profile.storage_root,
+                    2598,
+                    session_id="SESSION-2598",
+                    state="closed",
+                    camera_roots={
+                        camera.camera_id: camera_capture_root(
+                            camera.storage_root, "2598", camera.camera_id
+                        )
+                    },
+                )
+                status_root = (
+                    profile.storage_root
+                    / "system"
+                    / "jobs"
+                    / "defect-history-backfill"
+                )
+                status_root.mkdir(parents=True)
+                (status_root / "status.json").write_text(
+                    json.dumps(
+                        {
+                            "state": "running",
+                            "processId": 999_999_999,
+                            "phase": "rebuild",
+                            "currentMaterialId": "2598",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (status_root / ".lock").write_text(
+                    "999999999", encoding="ascii"
+                )
+
+                with patch(
+                    "scripts.sick_capture.provider._process_is_running",
+                    return_value=False,
+                ):
+                    status, pending = runtime.defect_detection_json("2598")
+                self.assertEqual(status, 202)
+                self.assertNotEqual(pending["phase"], "history-backfill")
+                self.assertIsNone(pending["historyBackfill"])
+            finally:
+                runtime.close()
+
+    def test_flow_analysis_status_marks_a_stale_heartbeat_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            try:
+                status_path = (
+                    profile.storage_root
+                    / "system"
+                    / "jobs"
+                    / "flow-analysis"
+                    / "status.json"
+                )
+                status_path.parent.mkdir(parents=True)
+                status_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": "steel.flow-analysis-queue.v1",
+                            "state": "running",
+                            "updatedAtUnixMs": int(time.time() * 1000) - 60_000,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                status = runtime._flow_analysis_queue_status()
+                self.assertIsNotNone(status)
+                self.assertEqual(status["state"], "unavailable")
+                self.assertFalse(status["heartbeatFresh"])
+                self.assertGreaterEqual(status["heartbeatAgeMs"], 60_000)
+            finally:
+                runtime.close()
+
+    def test_storage_queue_failure_exposes_last_round_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            try:
+                def fail_round(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+                    raise RuntimeError("simulated event publication failure")
+
+                runtime._persist_cached_round = fail_round  # type: ignore[method-assign]
+                self.assertTrue(
+                    runtime._enqueue_storage_round(
+                        [{"frameReceived": True}],
+                        material_id="2599",
+                        session_id="SESSION-2599",
+                        boundary_phase="normal",
+                    )
+                )
+                deadline = time.monotonic() + 2.0
+                while (
+                    runtime.health_json()["storageQueue"]["failedRounds"] == 0
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                queue_status = runtime.health_json()["storageQueue"]
+                self.assertEqual(queue_status["failedRounds"], 1)
+                self.assertEqual(queue_status["lastFailedMaterialId"], "2599")
+                self.assertEqual(queue_status["lastFailedPhase"], "normal")
+                self.assertIn("simulated event publication failure", queue_status["lastError"])
+            finally:
+                runtime.close()
+
+    def test_startup_recovers_interrupted_flow_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            camera = profile.enabled_cameras[0]
+            write_flow_manifest(
+                profile.storage_root,
+                12,
+                session_id="SESSION-12",
+                state="capturing",
+                camera_roots={
+                    camera.camera_id: camera.storage_root
+                    / "12"
+                    / "capture"
+                    / camera.camera_id
+                },
+                latest_round=41,
+            )
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            try:
+                manifest = json.loads(
+                    (profile.storage_root / "12" / "flow.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(manifest["state"], "closed")
+                self.assertEqual(manifest["latestCommittedRound"], 41)
+                recovery = next(
+                    row
+                    for row in runtime.events
+                    if row.get("message") == "interrupted flow manifests recovered"
+                )
+                self.assertEqual(recovery["recoveredFlowCount"], 1)
+            finally:
+                runtime.close()
+
+    def test_new_flow_closes_an_unfinished_active_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            try:
+                runtime.steel_event(
+                    {
+                        "cmd": "steelIn",
+                        "value": 1,
+                        "materialId": "21",
+                        "flowNo": 21,
+                        "sessionId": "SESSION-21",
+                    }
+                )
+                runtime.steel_event(
+                    {
+                        "cmd": "steelIn",
+                        "value": 1,
+                        "materialId": "22",
+                        "flowNo": 22,
+                        "sessionId": "SESSION-22",
+                    }
+                )
+                first = json.loads(
+                    (profile.storage_root / "21" / "flow.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                second = json.loads(
+                    (profile.storage_root / "22" / "flow.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(first["state"], "closed")
+                self.assertEqual(second["state"], "capturing")
+            finally:
+                runtime.close()
+
+    def test_healthy_round_clears_transient_startup_schema_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            try:
+                runtime.last_error = (
+                    "SICK component schema mismatch: formats=[] expectedDepth=[]"
+                )
+                runtime._record_continuous_round(
+                    [
+                        {
+                            "cameraKey": "C1",
+                            "code": 0,
+                            "frameReceived": True,
+                            "completeFrame": True,
+                            "capturedAt": "2026-08-23T00:00:00.000Z",
+                        }
+                    ],
+                    persist_frame=False,
+                )
+                self.assertEqual(runtime.last_error, "")
+                self.assertEqual(runtime.continuous_stats["C1"]["frameCount"], 1)
+            finally:
+                runtime.close()
+
     def test_http_server_accept_queue_supports_six_camera_preview_bursts(self) -> None:
         self.assertGreaterEqual(SickCaptureHTTPServer.request_queue_size, 16)
 
@@ -1042,7 +1574,7 @@ class SickProviderTests(unittest.TestCase):
             try:
                 self.assertTrue(
                     runtime._enqueue_storage_round(
-                        [row], material_id="CACHE", session_id="SESSION", boundary_phase="normal"
+                        [row], material_id="12", session_id="SESSION", boundary_phase="normal"
                     )
                 )
                 self.assertTrue(first_started.wait(timeout=1))
@@ -1051,7 +1583,7 @@ class SickProviderTests(unittest.TestCase):
                 def enqueue_second() -> None:
                     result["accepted"] = runtime._enqueue_storage_round(
                         [{**row, "round": 2}],
-                        material_id="CACHE",
+                        material_id="12",
                         session_id="SESSION",
                         boundary_phase="normal",
                     )
@@ -1114,6 +1646,34 @@ class SickProviderTests(unittest.TestCase):
                 self.assertEqual(
                     [row["continuousFrameDelta"] for row in runtime.cameras_json()["cameras"]],
                     [0, 0],
+                )
+                runtime._record_synchronization_round(
+                    [
+                        {
+                            "cameraKey": "C1",
+                            "round": 4,
+                            "frameReceived": True,
+                            "hostUtcNs": 2_000_000_000,
+                            "cameraFrameSequence": 4,
+                            "transportFrameId": 10_003,
+                        },
+                        {
+                            "cameraKey": "C2",
+                            "round": 4,
+                            "frameReceived": True,
+                            "hostUtcNs": 2_100_000_000,
+                            "cameraFrameSequence": 4,
+                            "transportFrameId": 10_003,
+                        },
+                    ]
+                )
+                degraded = runtime.health_json()["acquisitionSynchronization"]
+                self.assertFalse(degraded["synchronized"])
+                self.assertEqual(degraded["lastHostCaptureSkewMs"], 100.0)
+                self.assertFalse(degraded["hostCaptureSkewWithinLimit"])
+                self.assertIn(
+                    "host-capture-skew-out-of-tolerance",
+                    degraded["qualityReasons"],
                 )
             finally:
                 runtime.close()
@@ -1251,12 +1811,13 @@ class SickProviderTests(unittest.TestCase):
 
             profile = load_profile(profile_path)
             runtime = ProviderRuntime(profile, backend=FakeBackend(session))
+            runtime._commit_capture_results = lambda *_args: True  # type: ignore[method-assign]
             try:
                 runtime.steel_event(
                     {
                         "cmd": "steelIn",
                         "value": 1,
-                        "materialId": "SYNC-STEEL",
+                        "materialId": "41",
                         "sessionId": "SYNC-SESSION",
                     }
                 )
@@ -1265,7 +1826,10 @@ class SickProviderTests(unittest.TestCase):
                 # drained. The material directory remains authoritative.
                 runtime.active_flow_code = "FLOW-0000000041"
                 deadline = time.monotonic() + 3
-                camera_dirs = [camera.storage_root / "SYNC-STEEL" / "json" for camera in profile.enabled_cameras]
+                camera_dirs = [
+                    camera_capture_root(camera.storage_root, "41", camera.camera_id) / "json"
+                    for camera in profile.enabled_cameras
+                ]
                 while time.monotonic() < deadline:
                     counts = [len(list(path.glob("*.json"))) for path in camera_dirs]
                     if min(counts, default=0) >= 2:
@@ -1324,7 +1888,7 @@ class SickProviderTests(unittest.TestCase):
                     {
                         "cmd": "steelIn",
                         "value": 1,
-                        "materialId": "COIL-003",
+                        "materialId": "43",
                         "sessionId": "SESSION-003",
                         "saveEnabled": True,
                     }
@@ -1355,8 +1919,8 @@ class SickProviderTests(unittest.TestCase):
                     self.assertEqual(intensity_path.parent.name, "2d")
                     self.assertEqual(intensity_path.suffix.lower(), ".png")
                     self.assertEqual(row["lg3dIntensityOutput"], row["intensityOutput"])
-                self.assertFalse(
-                    (profile.enabled_cameras[0].storage_root / "COIL-003" / "intensity").exists()
+                self.assertTrue(
+                    (camera_capture_root(profile.enabled_cameras[0].storage_root, "43", "C1") / "2d").exists()
                 )
                 self.assertTrue(summary["summaryExists"])
                 health = runtime.health_json()
@@ -1387,7 +1951,7 @@ class SickProviderTests(unittest.TestCase):
                     {
                         "cmd": "steelIn",
                         "value": 1,
-                        "materialId": "SPARSE-STEEL",
+                        "materialId": "44",
                         "sessionId": "SPARSE-SESSION",
                     }
                 )
@@ -1421,7 +1985,7 @@ class SickProviderTests(unittest.TestCase):
                     {
                         "cmd": "steelIn",
                         "value": 1,
-                        "materialId": "EXIT-CANDIDATE",
+                        "materialId": "45",
                         "sessionId": "EXIT-SESSION",
                     }
                 )
@@ -1467,8 +2031,9 @@ class SickProviderTests(unittest.TestCase):
                     {
                         "cmd": "steelIn",
                         "value": 1,
-                        "materialId": "BOUNDARY-CACHE",
+                        "materialId": "42",
                         "sessionId": "BOUNDARY-SESSION",
+                        "flowCode": "FLOW-0000000042",
                     }
                 )
                 entry_frame = sample_frame(1)
@@ -1493,13 +2058,13 @@ class SickProviderTests(unittest.TestCase):
 
                 pre = runtime._persist_cached_round(
                     [cached_row(entry_frame, True)],
-                    material_id="FLOW-0000000042",
+                    material_id="42",
                     session_id="BOUNDARY-SESSION",
                     boundary_phase="pre-roll",
                 )
                 post = runtime._persist_cached_round(
                     [cached_row(post_frame, False)],
-                    material_id="FLOW-0000000042",
+                    material_id="42",
                     session_id="BOUNDARY-SESSION",
                     boundary_phase="post-roll",
                 )
@@ -1545,7 +2110,7 @@ class SickProviderTests(unittest.TestCase):
                 runtime._commit_capture_results = commit  # type: ignore[method-assign]
                 self.assertTrue(
                     runtime._enqueue_database_commit(
-                        "FLOW-RETRY",
+                        "46",
                         "SESSION-RETRY",
                         [{"code": 0, "completeFrame": True}],
                     )
@@ -1568,7 +2133,7 @@ class SickProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             profile = load_profile(write_profile(Path(directory)))
             runtime = ProviderRuntime(profile, backend=FakeBackend())
-            runtime.active_material_id = "FLOW-0000000042"
+            runtime.active_material_id = "42"
             runtime.active_session_id = "SESSION-42"
             runtime.active_flow_no = 42
             runtime.active_flow_code = "FLOW-0000000042"
@@ -1613,6 +2178,7 @@ class SickProviderTests(unittest.TestCase):
             payload["cameras"] = cameras
             payload["expectedCameras"] = 4
             payload["captureDefaults"]["storageProcessWorkers"] = 2
+            payload["captureDefaults"]["storageRoundWorkers"] = 2
             profile_path.write_text(json.dumps(payload), encoding="utf-8")
             profile = load_profile(profile_path)
             runtime = ProviderRuntime(profile, backend=FakeBackend())
@@ -1632,6 +2198,7 @@ class SickProviderTests(unittest.TestCase):
                     {
                         "cameraKey": camera.key,
                         "round": 1,
+                        "frameReceived": True,
                         "maxIntensity": 60.0,
                         "meanIntensity": 35.0,
                         "brightPixelRatio": 1.0,
@@ -1642,20 +2209,160 @@ class SickProviderTests(unittest.TestCase):
             try:
                 committed = runtime._persist_cached_round(
                     rows,
-                    material_id="PROCESS-WRITER",
+                    material_id="47",
                     session_id="PROCESS-SESSION",
                     boundary_phase="normal",
                 )
                 self.assertEqual(len(committed), 4)
                 queue = runtime.health_json()["storageQueue"]
                 self.assertEqual(queue["writerMode"], "process-shared-memory")
-                self.assertEqual(queue["writerProcessCount"], 1)
-                self.assertEqual(queue["writerThreadCount"], 2)
+                self.assertEqual(queue["writerProcessCount"], 2)
+                self.assertEqual(queue["writerThreadCount"], 0)
+                self.assertEqual(queue["roundWorkerCount"], 2)
+                self.assertEqual(
+                    queue["writerTopology"],
+                    "ordered-pipelined-rounds+one-process-per-camera-task",
+                )
                 for camera in profile.enabled_cameras:
-                    root = camera.storage_root / "PROCESS-WRITER"
+                    root = camera_capture_root(camera.storage_root, "47", camera.camera_id)
                     self.assertTrue((root / "3d" / "0.npz").is_file())
                     self.assertTrue((root / "2d" / "0.png").is_file())
                     self.assertTrue((root / "json" / "0.json").is_file())
+
+                second_rows = [
+                    {
+                        **row,
+                        "round": 2,
+                        "_rawFrame": replace(row["_rawFrame"], sequence=20),
+                    }
+                    for row in rows
+                ]
+                third_rows = [
+                    {
+                        **row,
+                        "round": 3,
+                        "_rawFrame": replace(row["_rawFrame"], sequence=30),
+                    }
+                    for row in rows
+                ]
+                self.assertTrue(
+                    runtime._enqueue_storage_round(
+                        second_rows,
+                        material_id="47",
+                        session_id="PROCESS-SESSION",
+                        boundary_phase="normal",
+                    )
+                )
+                self.assertTrue(
+                    runtime._enqueue_storage_round(
+                        third_rows,
+                        material_id="47",
+                        session_id="PROCESS-SESSION",
+                        boundary_phase="normal",
+                    )
+                )
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    queue = runtime.health_json()["storageQueue"]
+                    if queue["pendingRounds"] == 0:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(queue["pendingRounds"], 0)
+                self.assertEqual(queue["completedRounds"], 2)
+                self.assertEqual(queue["failedRounds"], 0)
+                self.assertEqual(queue["sharedMemorySlots"], 8)
+                for camera in profile.enabled_cameras:
+                    root = camera_capture_root(
+                        camera.storage_root,
+                        "47",
+                        camera.camera_id,
+                    )
+                    self.assertTrue((root / "2d" / "1.png").is_file())
+                    self.assertTrue((root / "2d" / "2.png").is_file())
+                manifest = json.loads(
+                    (profile.storage_root / "47" / "flow.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(manifest["latestCommittedRound"], 3)
+            finally:
+                runtime.close()
+
+    def test_pipelined_round_failure_releases_ordered_finalize_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile_path = write_profile(Path(directory))
+            payload = json.loads(profile_path.read_text(encoding="utf-8"))
+            payload["captureDefaults"]["storageProcessWorkers"] = 1
+            payload["captureDefaults"]["storageRoundWorkers"] = 2
+            profile_path.write_text(json.dumps(payload), encoding="utf-8")
+            profile = load_profile(profile_path)
+            runtime = ProviderRuntime(profile, backend=FakeBackend())
+            runtime._commit_capture_results = lambda *_args: True  # type: ignore[method-assign]
+            original_share = runtime._share_storage_frame
+            share_calls = 0
+
+            def fail_first_share(camera_key, frame, slot=0):
+                nonlocal share_calls
+                share_calls += 1
+                if share_calls == 1:
+                    raise RuntimeError("simulated shared-memory copy failure")
+                return original_share(camera_key, frame, slot)
+
+            runtime._share_storage_frame = fail_first_share  # type: ignore[method-assign]
+            row = {
+                "cameraKey": "C1",
+                "frameReceived": True,
+                "round": 1,
+                "maxIntensity": 60.0,
+                "meanIntensity": 35.0,
+                "brightPixelRatio": 1.0,
+                "steelSignal": True,
+                "_rawFrame": sample_frame(1),
+            }
+            try:
+                self.assertTrue(
+                    runtime._enqueue_storage_round(
+                        [row],
+                        material_id="48",
+                        session_id="PROCESS-FAILURE",
+                        boundary_phase="normal",
+                    )
+                )
+                self.assertTrue(
+                    runtime._enqueue_storage_round(
+                        [
+                            {
+                                **row,
+                                "round": 2,
+                                "_rawFrame": sample_frame(2),
+                            }
+                        ],
+                        material_id="48",
+                        session_id="PROCESS-FAILURE",
+                        boundary_phase="normal",
+                    )
+                )
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    queue = runtime.health_json()["storageQueue"]
+                    if queue["pendingRounds"] == 0:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(queue["pendingRounds"], 0)
+                self.assertEqual(queue["failedRounds"], 1)
+                self.assertEqual(queue["completedRounds"], 1)
+                root = camera_capture_root(
+                    profile.enabled_cameras[0].storage_root,
+                    "48",
+                    "C1",
+                )
+                self.assertTrue((root / "2d" / "1.png").is_file())
+                manifest = json.loads(
+                    (profile.storage_root / "48" / "flow.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(manifest["latestCommittedRound"], 2)
             finally:
                 runtime.close()
 
@@ -1702,7 +2409,7 @@ class SickProviderTests(unittest.TestCase):
                     {
                         "cmd": "steelIn",
                         "value": 1,
-                        "materialId": "COIL-CONTINUOUS",
+                        "materialId": "48",
                         "sessionId": "SESSION-CONTINUOUS",
                         "captureMode": "continuous",
                         "discardBlackFrames": True,
@@ -1724,15 +2431,40 @@ class SickProviderTests(unittest.TestCase):
                 self.assertIsNotNone(runtime.stream_latest_bytes("192.0.2.10", "intensity-grid"))
                 self.assertTrue(runtime.stream_status("192.0.2.10")["sharedWithContinuousCapture"])
 
-                committed = runtime.frames_committed
                 runtime.steel_event({"cmd": "steelIn", "value": 0})
+                deadline = time.monotonic() + 3
+                manifest: dict[str, object] = {}
+                while time.monotonic() < deadline:
+                    queue = runtime.health_json()["storageQueue"]
+                    try:
+                        manifest = json.loads(
+                            (profile.storage_root / "48" / "flow.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        manifest = {}
+                    if (
+                        queue["pendingRounds"] == 0
+                        and queue["activeRounds"] == 0
+                        and manifest.get("state") == "closed"
+                    ):
+                        break
+                    time.sleep(0.02)
+                # Persistence is deliberately asynchronous. Rounds already in
+                # the bounded writer queue may commit after steel-out, so an
+                # arbitrary ``+1`` allowance is not a valid stop contract.
+                # Once that queue has drained, however, capture must remain
+                # disarmed and no further production frame may be committed.
+                committed_after_drain = runtime.frames_committed
                 time.sleep(0.08)
-                self.assertLessEqual(runtime.frames_committed, committed + 1)
+                self.assertEqual(runtime.frames_committed, committed_after_drain)
                 self.assertGreater(runtime.continuous_discarded_frame_count, 0)
+                self.assertEqual(manifest["state"], "closed")
                 queue = runtime.health_json()["storageQueue"]
                 self.assertEqual(
                     queue["implementation"],
-                    "bounded-round-cache+lossless-backpressure+ordered-round-writer+per-camera-disks",
+                    "bounded-round-cache+lossless-backpressure+ordered-pipelined-round-writer+per-camera-disks",
                 )
                 self.assertGreaterEqual(queue["capacityRounds"], 1)
                 self.assertLessEqual(queue["capacityRounds"], 128)
@@ -1745,7 +2477,7 @@ class SickProviderTests(unittest.TestCase):
             finally:
                 runtime.close()
 
-    def test_continuous_preview_cache_exposes_every_camera_intensity_frame(self) -> None:
+    def test_continuous_preview_subscriptions_are_independent_per_camera(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile_path = write_profile(Path(directory))
             payload = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -1770,6 +2502,10 @@ class SickProviderTests(unittest.TestCase):
                     runtime.start_stream({"ip": "192.0.2.10", "fpsLimit": 30})["code"],
                     0,
                 )
+                self.assertEqual(
+                    runtime.start_stream({"ip": "192.0.2.11", "fpsLimit": 30})["code"],
+                    0,
+                )
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
                     if all(
@@ -1784,8 +2520,182 @@ class SickProviderTests(unittest.TestCase):
                 self.assertTrue(runtime.stream_status("192.0.2.11")["running"])
                 self.assertGreater(runtime.stream_status("192.0.2.11")["frameCount"], 0)
                 self.assertIsNone(runtime.stream_latest_bytes("192.0.2.11", "depth"))
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if runtime.stream_latest_bytes("192.0.2.11", "depth") is not None:
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(runtime.stream_latest_bytes("192.0.2.11", "depth"))
+
+                first_stop = runtime.stop_stream({"ip": "192.0.2.10"})
+                self.assertEqual(first_stop["remainingSubscriptions"], 1)
+                self.assertFalse(runtime.stream_status("192.0.2.10")["running"])
+                self.assertTrue(runtime.stream_status("192.0.2.11")["running"])
+                self.assertIsNotNone(
+                    runtime.stream_latest_bytes("192.0.2.11", "intensity-grid")
+                )
+                self.assertIsNone(
+                    runtime.stream_latest_bytes("192.0.2.10", "intensity-grid")
+                )
+
+                final_stop = runtime.stop_stream({"ip": "192.0.2.11"})
+                self.assertEqual(final_stop["remainingSubscriptions"], 0)
+                self.assertEqual(runtime.stream_subscriptions, {})
+                self.assertEqual(runtime.stream_latest, {})
             finally:
                 runtime.close()
+
+    def test_recent_camera_files_prefers_latest_numeric_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            try:
+                for flow_id in (2, 10):
+                    image_dir = (
+                        camera.storage_root
+                        / str(flow_id)
+                        / "capture"
+                        / camera.camera_id
+                        / "2d"
+                    )
+                    image_dir.mkdir(parents=True)
+                    Image.fromarray(np.full((8, 8), 200, dtype=np.uint8)).save(
+                        image_dir / "0.png"
+                    )
+                recent = runtime._recent_camera_files(
+                    camera,
+                    directories=("2d",),
+                    suffixes=(".png",),
+                    limit=1,
+                )
+                self.assertEqual(recent[0].parents[3].name, "10")
+            finally:
+                runtime.close()
+
+    def test_latest_file_maps_public_kinds_to_v2_capture_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            capture_root = (
+                camera.storage_root / "31" / "capture" / camera.camera_id
+            )
+            try:
+                for name in ("3d", "2d", "json"):
+                    (capture_root / name).mkdir(parents=True)
+                np.savez_compressed(
+                    capture_root / "3d" / "7.npz",
+                    depth=np.ones((2, 2), dtype=np.uint16),
+                )
+                Image.fromarray(np.full((2, 2), 128, dtype=np.uint8)).save(
+                    capture_root / "2d" / "7.png"
+                )
+                (capture_root / "json" / "7.json").write_text(
+                    json.dumps({"frameId": 7}), encoding="utf-8"
+                )
+
+                identity = {"cameraId": [camera.camera_id]}
+                self.assertEqual(
+                    runtime.latest_file({**identity, "kind": ["depth"]}),
+                    capture_root / "3d" / "7.npz",
+                )
+                self.assertEqual(
+                    runtime.latest_file({**identity, "kind": ["intensity"]}),
+                    capture_root / "2d" / "7.png",
+                )
+                self.assertEqual(
+                    runtime.latest_file({**identity, "kind": ["metadata"]}),
+                    capture_root / "json" / "7.json",
+                )
+            finally:
+                runtime.close()
+
+    def test_idle_stream_seed_includes_historical_valid_depth_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            capture_root = (
+                camera.storage_root / "32" / "capture" / camera.camera_id
+            )
+            try:
+                (capture_root / "2d").mkdir(parents=True)
+                (capture_root / "3d").mkdir(parents=True)
+                intensity = np.zeros((32, 128), dtype=np.uint8)
+                intensity[:, 40:88] = 180
+                depth = np.zeros((32, 128), dtype=np.uint16)
+                depth[:, 40:88] = np.arange(48, dtype=np.uint16) + 1_000
+                Image.fromarray(intensity).save(capture_root / "2d" / "3.png")
+                np.savez(capture_root / "3d" / "3.npz", array=depth)
+                with runtime.stream_lock:
+                    runtime.stream_subscriptions[camera.key] = {"fpsLimit": 5}
+                    runtime.stream_camera_key = camera.key
+
+                runtime._seed_stream_cache_from_storage(camera.key)
+
+                self.assertIsNotNone(
+                    runtime.stream_latest_bytes(
+                        camera.ip, "intensity-grid", "valid"
+                    )
+                )
+                self.assertIsNotNone(
+                    runtime.stream_latest_bytes(camera.ip, "depth", "valid")
+                )
+                self.assertIsNotNone(
+                    runtime.stream_latest_bytes(
+                        camera.ip,
+                        "depth",
+                        wait_seconds=1.0,
+                    )
+                )
+                self.assertIn(
+                    "depth-raw",
+                    runtime.stream_status(camera.ip)["readyVariants"],
+                )
+            finally:
+                runtime.close()
+
+    def test_http_kind_switch_waits_for_a_real_png_and_reports_ready_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            server = SickCaptureHTTPServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            origin = f"http://127.0.0.1:{server.server_port}"
+            camera = profile.enabled_cameras[0]
+            try:
+                started = runtime.start_stream(
+                    {"ip": camera.ip, "dataMode": 3, "fpsLimit": 2}
+                )
+                self.assertEqual(started["code"], 0)
+                self.assertIn("readyKinds", started)
+
+                # Depth was not made a continuous six-camera cost by start;
+                # its first image request registers the kind and waits in the
+                # HTTP worker for the next genuine camera frame.
+                with request.urlopen(
+                    f"{origin}/api/stream/latest?ip={camera.ip}&kind=depth",
+                    timeout=3,
+                ) as response:
+                    body = response.read()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers["Content-Type"], "image/png")
+                    self.assertEqual(
+                        response.headers["Cross-Origin-Resource-Policy"],
+                        "cross-origin",
+                    )
+                self.assertTrue(body.startswith(b"\x89PNG\r\n\x1a\n"))
+                status = runtime.stream_status(camera.ip)
+                self.assertTrue(status["ready"])
+                self.assertFalse(status["warmingUp"])
+                self.assertIn("depth", status["readyKinds"])
+                self.assertIn("depth-raw", status["readyVariants"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
     def test_live_preview_keeps_the_last_valid_frame_when_black_frames_arrive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1794,6 +2704,7 @@ class SickProviderTests(unittest.TestCase):
             camera = profile.enabled_cameras[0]
             try:
                 with runtime.stream_lock:
+                    runtime.stream_subscriptions[camera.key] = {"fpsLimit": 30}
                     runtime.stream_camera_key = camera.key
                     runtime.stream_options = {"fpsLimit": 30}
                 runtime.steel_bright_ratio = 0.5
@@ -1865,7 +2776,7 @@ class SickProviderTests(unittest.TestCase):
                     {
                         "cmd": "steelIn",
                         "value": 1,
-                        "materialId": "COIL-BOUNDARY",
+                        "materialId": "49",
                         "sessionId": "SESSION-BOUNDARY",
                     }
                 )
@@ -1880,8 +2791,9 @@ class SickProviderTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(summary["code"], CAPTURE_DISCARDED_NOT_ARMED)
                 self.assertEqual(summary["completeFrames"], 0)
+                self.assertEqual(runtime.frames_failed, 0)
                 self.assertFalse(
-                    (profile.enabled_cameras[0].storage_root / "COIL-BOUNDARY").exists()
+                    camera_capture_root(profile.enabled_cameras[0].storage_root, "49", "C1").exists()
                 )
             finally:
                 release_fetch.set()
@@ -1902,6 +2814,34 @@ class SickProviderTests(unittest.TestCase):
                         payload = json.loads(response.read())
                     self.assertEqual(response.status, 200)
                     self.assertEqual(payload["code"], 0)
+                image_path = (
+                    camera_capture_root(
+                        profile.enabled_cameras[0].storage_root, "51", "C1"
+                    )
+                    / "2d"
+                    / "0.png"
+                )
+                image_path.parent.mkdir(parents=True)
+                Image.fromarray(
+                    np.full((64, 64), 40, dtype=np.uint8), mode="L"
+                ).save(image_path)
+                with request.urlopen(
+                    f"{origin}/api/capture/file?path={quote('51/capture/C1/2d/0.png')}",
+                    timeout=2,
+                ) as image_response:
+                    image_body = image_response.read()
+                    self.assertEqual(image_response.headers["Content-Type"], "image/png")
+                    self.assertEqual(
+                        image_response.headers["Access-Control-Allow-Origin"], "*"
+                    )
+                    self.assertEqual(
+                        image_response.headers["Cross-Origin-Resource-Policy"],
+                        "cross-origin",
+                    )
+                    self.assertEqual(
+                        image_response.headers["X-Content-Type-Options"], "nosniff"
+                    )
+                    self.assertTrue(image_body.startswith(b"\x89PNG\r\n\x1a\n"))
                 with request.urlopen(
                     request.Request(
                         f"{origin}/api/steel/event",
@@ -1910,7 +2850,7 @@ class SickProviderTests(unittest.TestCase):
                             {
                                 "cmd": "steelIn",
                                 "value": 1,
-                                "materialId": "HTTP-COIL",
+                                "materialId": "50",
                                 "sessionId": "HTTP-SESSION",
                             }
                         ).encode("utf-8"),

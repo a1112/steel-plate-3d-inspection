@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from .paths import capture_root, measurement_path
 from PIL import Image
 
 from .alignment import _atomic_json, _read_json
@@ -70,7 +72,7 @@ def _intensity(path: Path) -> np.ndarray:
     return value
 
 
-def _crop_box(depth: np.ndarray, intensity: np.ndarray) -> list[int]:
+def _crop_box(depth: np.ndarray, intensity: np.ndarray) -> list[int] | None:
     if depth.shape != intensity.shape:
         raise ValueError("depth/intensity shape mismatch")
     # Match the online grayscale gate. Sparse valid depth from fixtures or
@@ -122,6 +124,8 @@ def _profile(
         )
     )
     crop = _crop_box(depth, intensity)
+    if crop is None:
+        raise ValueError("stable foreground source unavailable")
     return points, {
         "storageIndex": storage_index,
         "rowIndex": center,
@@ -132,6 +136,7 @@ def _profile(
         "croppedShape": [crop[3] - crop[1], crop[2] - crop[0]],
         "sourceCoordinateOffset": {"x": crop[0], "row": crop[1]},
         "validProfilePoints": int(points.shape[0]),
+        "validProfileColumns": columns[valid].astype(int).tolist(),
         "depthPath": str(depth_path),
         "intensityPath": str(intensity_path),
         "metadataPath": str(metadata_path),
@@ -279,7 +284,7 @@ def build_flow_measurement(
                 continue
             try:
                 profile, details = _profile(
-                    camera_root / material_id,
+                    capture_root(camera_root, material_id, camera_id),
                     int(mapping["storageIndex"]),
                     mapping.get("rowIndex"),
                     settings,
@@ -353,7 +358,7 @@ def build_flow_measurement(
                     continue
                 try:
                     profile, _ = _profile(
-                        camera_root / material_id,
+                        capture_root(camera_root, material_id, camera_id),
                         int(mapping["storageIndex"]),
                         mapping.get("rowIndex"),
                         settings,
@@ -425,7 +430,7 @@ def build_flow_measurement(
 
 
 def measurement_manifest_path(storage_root: Path, material_id: str) -> Path:
-    return storage_root / "measurements" / f"{material_id}.json"
+    return measurement_path(storage_root, material_id)
 
 
 def build_and_write_flow_measurement(
@@ -446,8 +451,4 @@ def build_and_write_flow_measurement(
     )
     path = measurement_manifest_path(storage_root, material_id)
     _atomic_json(path, result)
-    for root in camera_roots.values():
-        flow_root = root / material_id
-        if flow_root.is_dir():
-            _atomic_json(flow_root / "measurement.json", result)
     return path, result

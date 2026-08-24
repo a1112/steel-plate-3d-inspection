@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Box, Database, History, Monitor, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
+import { Activity, Box, Database, History, Monitor, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
 import {
   formatResourceBreakdown,
@@ -17,6 +17,7 @@ import {
 import { notify } from '../state/notifications';
 import type { AnalysisViewMode } from './AlarmAnalysis';
 import type { NavKey } from './TopNav';
+import { DEFAULT_SYSTEM_NAME } from '../lib/system-brand';
 
 interface FooterAnalysisContext {
   defect: DefectItem;
@@ -38,6 +39,7 @@ interface FooterTerminalViews {
 }
 
 interface AppFooterProps {
+  systemName?: string;
   activeNav: NavKey;
   analysis?: FooterAnalysisContext | null;
   terminalViews?: FooterTerminalViews;
@@ -86,11 +88,13 @@ function getDefectSizeLabel(defect: DefectItem) {
 }
 
 export function AppFooter({
+  systemName = DEFAULT_SYSTEM_NAME,
   activeNav,
   analysis,
   terminalViews = defaultTerminalViews,
   flowVisible = false,
   onFlowToggle,
+  onNavChange,
   onSettingsOpen,
   onParameterManagementOpen = openParameterManagementWindow,
   onCaptureManagementOpen = openCaptureManagementWindow,
@@ -137,9 +141,10 @@ export function AppFooter({
     };
   }, [moreMenuOpen]);
 
-  const openTerminalView = (entry: FooterTerminalViewEntry) => {
+  const openTerminalView = (entry: FooterTerminalViewEntry, fallback?: () => void) => {
     if (!entry.available) return;
-    entry.onOpen?.();
+    if (entry.onOpen) entry.onOpen();
+    else fallback?.();
     setMoreMenuOpen(false);
   };
   const changeAnalysisView = (next: AnalysisViewMode) => {
@@ -221,7 +226,7 @@ export function AppFooter({
       ) : (
         <div className="app-footer-context" aria-label="系统工具栏">
           <span>系统工具</span>
-          <strong>钢管 3D 表面检测平台</strong>
+          <strong>{systemName}</strong>
         </div>
       )}
       <div
@@ -285,10 +290,23 @@ export function AppFooter({
               <button
                 type="button"
                 role="menuitem"
+                className={activeNav === 'status' ? 'active' : ''}
+                aria-current={activeNav === 'status' ? 'page' : undefined}
+                onClick={() => {
+                  onNavChange('status');
+                  setMoreMenuOpen(false);
+                }}
+              >
+                <Activity size={15} />
+                <span>系统状态</span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
                 className={terminalViews.online.active ? 'active' : ''}
                 aria-current={terminalViews.online.active ? 'page' : undefined}
                 disabled={!terminalViews.online.available}
-                onClick={() => openTerminalView(terminalViews.online)}
+                onClick={() => openTerminalView(terminalViews.online, () => onNavChange('online'))}
               >
                 <Monitor size={15} />
                 <span>在线检测</span>

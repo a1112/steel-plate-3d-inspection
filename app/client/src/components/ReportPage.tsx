@@ -5,6 +5,7 @@ import type { DefectItem, DefectType, PlateInspection, Severity } from '../data/
 import { severityLabels } from '../data/inspection';
 import type { ReportFilters, ReportMetadata, ReportMetrics } from '../state/operations';
 import type { InspectionReportArchiveSummary } from '../services/inspection-api';
+import { DEFAULT_SYSTEM_NAME } from '../lib/system-brand';
 import { Panel } from './Panel';
 
 const severityOptions: Array<{ value: ReportFilters['severity']; label: string }> = [
@@ -126,6 +127,7 @@ function DefectRows({
 }
 
 export function ReportPage({
+  systemName = DEFAULT_SYSTEM_NAME,
   defectTypes,
   inspections,
   rows,
@@ -151,6 +153,7 @@ export function ReportPage({
   archiveReports,
   archiveStatus,
 }: {
+  systemName?: string;
   defectTypes: DefectType[];
   inspections: PlateInspection[];
   rows: DefectItem[];
@@ -205,7 +208,7 @@ export function ReportPage({
       <section className="report-document">
         <header className="report-document-header">
           <div>
-            <span>钢管 3D 表面检测系统</span>
+            <span>{systemName}</span>
             <h1>钢管表面缺陷检测报表</h1>
           </div>
           <div className="report-document-meta">

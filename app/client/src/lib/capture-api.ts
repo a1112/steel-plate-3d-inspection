@@ -179,6 +179,9 @@ export type CaptureCameraStatus = {
   streamLastFrameAt?: string | null;
   streamWidth?: number;
   streamHeight?: number;
+  streamValidRoi?: number[] | null;
+  streamDisplayWidth?: number;
+  streamDisplayHeight?: number;
   storageRoot?: string;
   captureConfig?: CaptureSdkReadback;
   error?: string | null;
@@ -476,11 +479,18 @@ export type CaptureHistoryCameraFrame = {
   cameraIndex: number;
   ip: string;
   artifactRef: string;
+  storageIndex?: number;
+  captureRound?: number;
   width: number;
   height: number;
   playbackWidth?: number;
   playbackHeight?: number;
   validRoi?: number[];
+  sourceSize?: number[];
+  displaySize?: number[];
+  sourceOffset?: { x: number; y: number };
+  regionState?: string;
+  calibrationRevision?: string | null;
   bytes: number;
   storedAt: string;
 };
@@ -502,6 +512,29 @@ export type CaptureHistoryResult = {
   indexed?: boolean;
   catalogPath?: string;
   frames: CaptureHistoryFrame[];
+};
+
+export type CaptureRegionCamera = {
+  cameraId: string;
+  state: string;
+  sourceSize: number[];
+  stableCrop: number[] | null;
+  sourceOffset: { x: number; y: number } | null;
+  displaySize: number[];
+  ownedColumnIntervals: number[][];
+  overlapColumnIntervals: number[][];
+};
+
+export type CaptureRegionMap = {
+  schema: "steel.capture-region-map.v1";
+  materialId: string;
+  state: string;
+  backgroundReady: boolean;
+  defectDetectionAllowed: boolean;
+  qualityGate: { passed: boolean; reasons: string[] };
+  calibration: { revision?: string | null; approved: boolean; sha256: string };
+  ownership: { ready: boolean; reasons: string[]; pairs: unknown[] };
+  cameras: Record<string, CaptureRegionCamera>;
 };
 
 export type CapturePlaybackCacheStatus = {
@@ -580,6 +613,8 @@ export type CaptureDetectedDefect = {
   severity: "review" | string;
   modalities: Array<"2d" | "3d" | string>;
   reviewImage?: string;
+  reviewImageWidth?: number;
+  reviewImageHeight?: number;
 };
 
 export type CaptureFlowDefectDetection = {
@@ -607,6 +642,18 @@ export type CaptureFlowDefectDetection = {
     pseudoDefectFilteredCount?: number;
     defectCount?: number;
     elapsedMs?: number;
+    computeElapsedMs?: number;
+    averageFrameMs?: number;
+    throughputFramesPerSecond?: number;
+    computeThroughputFramesPerSecond?: number;
+    timingsMs?: {
+      captureWaitMs?: number;
+      sourceDecodeMs?: number;
+      preprocessMs?: number;
+      detectorInferenceMs?: number;
+      classificationMs?: number;
+      postprocessMs?: number;
+    };
   };
   defects: CaptureDetectedDefect[];
 };
@@ -619,6 +666,16 @@ export type CaptureDefectDetectionResponse = {
   materialId?: string;
   defectCount?: number;
   gpuAcceleration?: boolean;
+  historyBackfill?: {
+    state?: string;
+    phase?: string;
+    currentMaterialId?: string;
+    pauseReason?: string | null;
+    capturePhase?: string;
+    captureQueue?: { pendingRounds?: number; activeRounds?: number };
+    reprocessedMaterials?: number;
+    materialCount?: number;
+  } | null;
 };
 
 export type CaptureProfileEntry = {
@@ -699,6 +756,13 @@ export const CAMERA_CALIBRATION_SET_CONFIRMATION = "APPLY CAMERA CALIBRATION SET
 export const CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION = "ROLLBACK CAMERA CALIBRATION";
 export const CAMERA_ROI_CONFIRMATION = "APPLY CAMERA ROI";
 export const CAMERA_DEVICE_PERSIST_CONFIRMATION = "PERSIST CAMERA PARAMETERS";
+
+export function defaultCaptureProfileName(cameraCount: number) {
+  const normalizedCount = Number.isFinite(cameraCount)
+    ? Math.max(1, Math.trunc(cameraCount))
+    : 1;
+  return `current-${normalizedCount}-time-trigger`;
+}
 
 export type CaptureCalibrationStatus = CaptureCommandResult & {
   ip?: string;
@@ -861,15 +925,22 @@ export type CaptureReconciliationFencePayload = {
   unresolvedOperations?: CaptureReconciliationFenceOperation[];
 };
 
-export class CaptureAdminApiError extends Error {
+export class CaptureApiError extends Error {
   readonly status: number;
   readonly payload?: unknown;
 
   constructor(message: string, status: number, payload?: unknown) {
     super(message);
-    this.name = "CaptureAdminApiError";
+    this.name = "CaptureApiError";
     this.status = status;
     this.payload = payload;
+  }
+}
+
+export class CaptureAdminApiError extends CaptureApiError {
+  constructor(message: string, status: number, payload?: unknown) {
+    super(message, status, payload);
+    this.name = "CaptureAdminApiError";
   }
 }
 
@@ -1166,7 +1237,12 @@ export async function saveCapturePreviewFromUrl(
 async function readJson<T>(path: string): Promise<T> {
   const response = await fetch(`${getCaptureServiceOrigin()}${path}`);
   if (!response.ok) {
-    throw new Error(`capture api ${response.status}`);
+    const payload = await response.clone().json().catch(() => undefined);
+    throw new CaptureApiError(
+      await readAdminErrorMessage(response, "采集服务请求失败"),
+      response.status,
+      payload,
+    );
   }
   return response.json() as Promise<T>;
 }
@@ -1178,7 +1254,12 @@ async function writeJson<T>(path: string, body: unknown = {}): Promise<T> {
     body: JSON.stringify(body),
   });
   if (!response.ok) {
-    throw new Error(`capture api ${response.status}`);
+    const payload = await response.clone().json().catch(() => undefined);
+    throw new CaptureApiError(
+      await readAdminErrorMessage(response, "采集服务操作失败"),
+      response.status,
+      payload,
+    );
   }
   return response.json() as Promise<T>;
 }
@@ -1573,6 +1654,46 @@ function parseCaptureHealth(value: unknown): CaptureHealth {
   };
 }
 
+function createPhysicalCaptureDriver(
+  health: PhysicalCaptureHealth,
+  cameras: CaptureCamera[],
+): CaptureDriverInfo {
+  const fallback = createDefaultCaptureDriver();
+  const externalSick = health.provider === "external-api"
+    || health.driverId?.toLowerCase().includes("sick") === true;
+  if (!externalSick) {
+    return {
+      ...fallback,
+      id: health.driverId?.trim() || fallback.id,
+      name: health.driverName?.trim() || fallback.name,
+      sdkVersion: health.sdkVersion ?? "",
+    };
+  }
+  const supportedModels = [...new Set(
+    cameras
+      .map((camera) => camera.model.trim())
+      .filter(Boolean),
+  )];
+  return {
+    id: health.driverId?.trim() || "sick-gentl",
+    name: health.driverName?.trim() || "SICK GenTL Producer",
+    vendor: "SICK",
+    transport: "GigE Vision / GenTL",
+    sdkVersion: health.sdkVersion ?? "",
+    supportedModels: supportedModels.length > 0
+      ? supportedModels
+      : ["Ranger3"],
+    features: [
+      "discover",
+      "multi-connect",
+      "continuous",
+      "intensity",
+      "depth-map",
+      "status-readback",
+    ],
+  };
+}
+
 function createBkvOfflineSnapshot(
   health: BkvCaptureHealth,
   logs: CaptureLogEvent[],
@@ -1756,10 +1877,7 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
 
   return hydrateSnapshot({
     health,
-    driver: {
-      ...createDefaultCaptureDriver(),
-      sdkVersion: health.sdkVersion ?? "",
-    },
+    driver: createPhysicalCaptureDriver(health, cameras),
     config,
     cameras,
     status,
@@ -2366,8 +2484,9 @@ export async function stopCaptureStream(ip: string): Promise<CaptureStreamStatus
 export function captureStreamImageUrl(
   ip: string,
   kind: "depth" | "intensity" | "intensity-grid" = "depth",
+  revision: string | number = Date.now(),
 ) {
-  const query = new URLSearchParams({ ip, kind, v: String(Date.now()) });
+  const query = new URLSearchParams({ ip, kind, region: "valid", v: String(revision) });
   return `${getCaptureStreamOrigin()}/api/stream/latest?${query.toString()}`;
 }
 
@@ -2383,10 +2502,17 @@ export async function readCaptureCameraStatuses(): Promise<CaptureCameraStatus[]
   return Array.isArray(result.statuses) ? result.statuses : [];
 }
 
-export async function readCaptureHistory(limit = 240): Promise<CaptureHistoryResult> {
+export async function readCaptureHistory(
+  limit = 240,
+  materialId?: string,
+): Promise<CaptureHistoryResult> {
   const query = new URLSearchParams({
     limit: String(Math.max(1, Math.min(500, Math.round(limit)))),
   });
+  const normalizedMaterialId = materialId?.trim();
+  if (normalizedMaterialId) {
+    query.set("materialId", normalizedMaterialId);
+  }
   return readJson<CaptureHistoryResult>(`/api/capture/history?${query.toString()}`);
 }
 
@@ -2401,6 +2527,14 @@ export async function readCaptureMeasurement(
   return readJson<CaptureMeasurementResponse>(
     `/api/capture/measurement?${query.toString()}`,
   );
+}
+
+export async function readCaptureRegions(materialId: string): Promise<CaptureRegionMap> {
+  const query = new URLSearchParams({ materialId: materialId.trim() });
+  const response = await readJson<{ code: number; regions: CaptureRegionMap }>(
+    `/api/capture/regions?${query.toString()}`,
+  );
+  return response.regions;
 }
 
 export async function rebuildCaptureMeasurement(materialId: string) {
@@ -2430,16 +2564,29 @@ export function captureHistoryImageUrl(artifactRef: string, maxWidth = 800) {
   const query = new URLSearchParams({
     path: artifactRef,
     maxWidth: String(Math.max(160, Math.min(4096, Math.round(maxWidth)))),
+    region: "valid",
+  });
+  return `${getCaptureServiceOrigin()}/api/capture/file?${query.toString()}`;
+}
+
+export function captureArtifactImageUrl(artifactRef: string, maxWidth = 320) {
+  const query = new URLSearchParams({
+    path: artifactRef,
+    maxWidth: String(Math.max(64, Math.min(2048, Math.round(maxWidth)))),
   });
   return `${getCaptureServiceOrigin()}/api/capture/file?${query.toString()}`;
 }
 
 export async function readActiveCaptureCalibration(
-  profile = "current-8-time-trigger",
+  profile?: string,
 ): Promise<ActiveCaptureCalibration> {
-  const query = new URLSearchParams({ profile });
+  const query = new URLSearchParams();
+  if (profile?.trim()) {
+    query.set("profile", profile.trim());
+  }
+  const suffix = query.size > 0 ? `?${query.toString()}` : "";
   return readAdminJson<ActiveCaptureCalibration>(
-    `/api/calibration/active?${query.toString()}`,
+    `/api/calibration/active${suffix}`,
   );
 }
 
@@ -2492,9 +2639,16 @@ export async function applyCaptureCalibrationSet(
     }))
     .filter((item) => item.ip && item.path);
   const saveToDevice = input.saveToDevice === true;
+  const expectedCameras = Number.isInteger(input.expectedCameras)
+    ? Number(input.expectedCameras)
+    : cameraCalibrations.length;
   const uniqueIps = new Set(cameraCalibrations.map((item) => item.ip));
-  if (cameraCalibrations.length !== 8 || uniqueIps.size !== 8) {
-    throw new Error("整组标定必须包含 8 台唯一相机");
+  if (
+    expectedCameras < 1
+    || cameraCalibrations.length !== expectedCameras
+    || uniqueIps.size !== expectedCameras
+  ) {
+    throw new Error(`整组标定必须包含 ${expectedCameras} 台唯一相机`);
   }
   const uniqueCalibrationPaths = new Set(
     cameraCalibrations.map((item) => item.path.replaceAll("\\", "/").toUpperCase()),
@@ -2532,7 +2686,7 @@ export async function applyCaptureCalibrationSet(
       path: input.path?.trim() || undefined,
       cameraCalibrations,
       ips: cameraCalibrations.map((item) => item.ip),
-      expectedCameras: 8,
+      expectedCameras,
       stopStreams: true,
       atomic: true,
       rollbackOnFailure: true,

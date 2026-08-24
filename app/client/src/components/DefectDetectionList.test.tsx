@@ -136,6 +136,34 @@ describe('DefectDetectionList algorithm defects', () => {
     expect(image).toHaveAttribute('src', expect.stringContaining('cropHeight=11'));
     expect(screen.getByRole('tooltip')).toHaveTextContent('检测记录 ROI 裁剪');
   });
+
+  it('prefers the cached defect crop over loading the production frame', () => {
+    const cached = {
+      ...roiDefect,
+      previewImageUrl: 'http://127.0.0.1:4873/api/capture/file?path=defect-crop.png',
+    };
+    render(
+      <DefectDetectionList
+        defects={[cached]}
+        inspectionId="1908500"
+        selectedDefectId={null}
+        filters={{ keyword: '', severity: 'all', surface: 'all', typeId: 'all' }}
+        filterOpen={false}
+        onSelectDefect={vi.fn()}
+        onToggleFilter={vi.fn()}
+        onFilterChange={vi.fn()}
+        onClearFilters={vi.fn()}
+      />,
+    );
+
+    fireEvent.mouseEnter(screen.getByRole('row', { name: /凹陷候选，camera1/ }));
+    expect(screen.getByRole('img', { name: '凹陷候选缺陷图像' })).toHaveAttribute(
+      'src',
+      cached.previewImageUrl,
+    );
+    expect(screen.getByRole('tooltip')).toHaveTextContent('检测记录缺陷小图');
+  });
+
   it('switches between the defect list and the pipe distribution map', () => {
     const onSelectDefect = vi.fn();
     render(

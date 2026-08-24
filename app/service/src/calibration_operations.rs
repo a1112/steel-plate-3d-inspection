@@ -1,7 +1,7 @@
 use super::{
     capture_proxy_http_response, capture_proxy_status, http_bytes_response_with_headers,
-    http_response, query_value, validate_capture_device_mutation_request, CaptureProxyResponse,
-    ServiceState,
+    http_response, production_capture_expected_cameras, query_value,
+    validate_capture_device_mutation_request_for_camera_count, CaptureProxyResponse, ServiceState,
 };
 use crate::db;
 use crate::db::entities::calibration_operation;
@@ -191,12 +191,18 @@ pub(super) fn apply_response(state: &ServiceState, body: &str, actor: &str) -> V
         Ok(value) => value,
         Err(_) => return validation_error_response("calibration_operation_normalization_failed"),
     };
-    if let Err(error) = validate_capture_device_mutation_request(APPLY_PATH, &normalized_body) {
+    let expected_cameras = production_capture_expected_cameras(state.runtime_config.as_ref());
+    if let Err(error) = validate_capture_device_mutation_request_for_camera_count(
+        APPLY_PATH,
+        &normalized_body,
+        expected_cameras,
+    ) {
         return validation_error_response(error);
     }
     if value.get("dryRun").and_then(Value::as_bool) == Some(true) {
         return capture_proxy_http_response(
             &state.capture,
+            expected_cameras,
             "POST",
             APPLY_PATH,
             APPLY_PATH,
@@ -513,7 +519,11 @@ where
         Ok(normalized) => normalized,
         Err(error) => return validation_error_response(error),
     };
-    if let Err(error) = validate_capture_device_mutation_request(path, &request_json) {
+    if let Err(error) = validate_capture_device_mutation_request_for_camera_count(
+        path,
+        &request_json,
+        production_capture_expected_cameras(state.runtime_config.as_ref()),
+    ) {
         return validation_error_response(error);
     }
     let hash = request_hash(kind, &request_json);

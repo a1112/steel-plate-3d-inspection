@@ -15,9 +15,12 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
+
+from .paths import alignment_path, capture_root
+from .storage import replace_file
 from PIL import Image
 
 
@@ -63,11 +66,26 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _numeric_files(directory: Path, suffix: str) -> dict[int, Path]:
+def _numeric_files(
+    directory: Path,
+    suffix: str,
+    *,
+    execution_gate: Callable[[str], None] | None = None,
+    gate_phase: str = "numeric-file-scan",
+) -> dict[int, Path]:
     result: dict[int, Path] = {}
+    if execution_gate is not None:
+        execution_gate(gate_phase)
     if not directory.is_dir():
         return result
-    for path in directory.glob(f"*{suffix}"):
+    paths = iter(directory.glob(f"*{suffix}"))
+    while True:
+        if execution_gate is not None:
+            execution_gate(gate_phase)
+        try:
+            path = next(paths)
+        except StopIteration:
+            break
         try:
             index = int(path.stem)
         except ValueError:
@@ -117,8 +135,14 @@ def _boundary_detection(
     config: AlignmentConfig,
     *,
     from_start: bool,
+    execution_gate: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    intensity_files = _numeric_files(flow_root / "2d", ".png")
+    intensity_files = _numeric_files(
+        flow_root / "2d",
+        ".png",
+        execution_gate=execution_gate,
+        gate_phase="alignment-boundary-file-scan",
+    )
     selected = (
         frame_indices[: config.search_frames]
         if from_start
@@ -128,6 +152,8 @@ def _boundary_detection(
     strength_blocks: list[np.ndarray] = []
     heights: list[tuple[int, int]] = []
     for index in selected:
+        if execution_gate is not None:
+            execution_gate("alignment-boundary-frame-read")
         intensity_path = intensity_files.get(index)
         if intensity_path is None:
             continue
@@ -194,10 +220,21 @@ def _boundary_detection(
     }
 
 
-def _frame_records(flow_root: Path) -> list[dict[str, Any]]:
-    metadata_files = _numeric_files(flow_root / "json", ".json")
+def _frame_records(
+    flow_root: Path,
+    *,
+    execution_gate: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    metadata_files = _numeric_files(
+        flow_root / "json",
+        ".json",
+        execution_gate=execution_gate,
+        gate_phase="alignment-metadata-file-scan",
+    )
     records: list[dict[str, Any]] = []
     for storage_index, path in sorted(metadata_files.items()):
+        if execution_gate is not None:
+            execution_gate("alignment-metadata-read")
         payload = _read_json(path)
         timestamp = int(payload.get("timestamp", payload.get("deviceTimestamp", 0)) or 0)
         frequency = int(
@@ -332,12 +369,15 @@ def build_flow_alignment(
     material_id: str,
     *,
     config: AlignmentConfig | None = None,
+    execution_gate: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     settings = (config or AlignmentConfig()).bounded()
     cameras: dict[str, dict[str, Any]] = {}
     for camera_id, camera_root in sorted(camera_roots.items()):
-        flow_root = camera_root / material_id
-        records = _frame_records(flow_root)
+        if execution_gate is not None:
+            execution_gate(f"alignment-camera:{camera_id}")
+        flow_root = capture_root(camera_root, material_id, camera_id)
+        records = _frame_records(flow_root, execution_gate=execution_gate)
         frame_indices = [int(item["storageIndex"]) for item in records]
         if not records:
             cameras[camera_id] = {
@@ -354,12 +394,14 @@ def build_flow_alignment(
             frame_indices,
             settings,
             from_start=True,
+            execution_gate=execution_gate,
         )
         tail = _boundary_detection(
             flow_root,
             frame_indices,
             settings,
             from_start=False,
+            execution_gate=execution_gate,
         )
         head_time = _boundary_time(records, head, rate)
         tail_time = _boundary_time(records, tail, rate)
@@ -367,6 +409,8 @@ def build_flow_alignment(
         elapsed_records: list[dict[str, Any]] = []
         if head_time is not None:
             for record in records:
+                if execution_gate is not None:
+                    execution_gate("alignment-elapsed-record")
                 seconds = _device_seconds(record)
                 if seconds is not None:
                     elapsed.append(seconds - head_time)
@@ -435,6 +479,8 @@ def build_flow_alignment(
             ):
                 anchor_targets.append(common_end)
         for ordinal, target in enumerate(anchor_targets):
+            if execution_gate is not None:
+                execution_gate("alignment-anchor")
             reference_index = max(0, bisect.bisect_right(reference_elapsed, target) - 1)
             mapped: dict[str, Any] = {}
             for camera_id, row in cameras.items():
@@ -574,7 +620,7 @@ def build_flow_alignment(
 
 
 def alignment_manifest_path(storage_root: Path, material_id: str) -> Path:
-    return storage_root / "alignment" / f"{material_id}.json"
+    return alignment_path(storage_root, material_id)
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -590,7 +636,7 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
             json.dump(payload, stream, ensure_ascii=False, indent=2)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        replace_file(temporary, path)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
@@ -602,12 +648,16 @@ def build_and_write_flow_alignment(
     material_id: str,
     *,
     config: AlignmentConfig | None = None,
+    execution_gate: Callable[[str], None] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
-    manifest = build_flow_alignment(camera_roots, material_id, config=config)
+    manifest = build_flow_alignment(
+        camera_roots,
+        material_id,
+        config=config,
+        execution_gate=execution_gate,
+    )
     canonical = alignment_manifest_path(storage_root, material_id)
+    if execution_gate is not None:
+        execution_gate("alignment-manifest-write")
     _atomic_json(canonical, manifest)
-    for camera_root in camera_roots.values():
-        flow_root = camera_root / material_id
-        if flow_root.is_dir():
-            _atomic_json(flow_root / "alignment.json", manifest)
     return canonical, manifest

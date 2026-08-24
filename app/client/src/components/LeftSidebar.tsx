@@ -45,8 +45,10 @@ function createSingleRecordSearchPatch(field: RecordSearchField, value: string):
   };
 }
 
-function formatWholeMillimetres(value: number) {
-  return Number.isFinite(value) ? value.toFixed(0) : '—';
+function formatWholeMillimetres(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? `${value.toFixed(0)} mm`
+    : '待录入';
 }
 
 interface LeftSidebarProps {
@@ -211,15 +213,15 @@ export function LeftSidebar({
           </div>
           <div>
             <dt>外径/宽度:</dt>
-            <dd>{formatWholeMillimetres(plate.widthMm)} mm</dd>
+            <dd>{formatWholeMillimetres(plate.widthMm)}</dd>
           </div>
           <div>
             <dt>钢管长度:</dt>
-            <dd>{formatWholeMillimetres(plate.lengthMm)} mm</dd>
+            <dd>{formatWholeMillimetres(plate.lengthMm)}</dd>
           </div>
           <div>
             <dt>壁厚:</dt>
-            <dd>{formatWholeMillimetres(plate.thicknessMm)} mm</dd>
+            <dd>{formatWholeMillimetres(plate.thicknessMm)}</dd>
           </div>
           <div>
             <dt>钢种规格:</dt>
@@ -379,9 +381,9 @@ export function LeftSidebar({
             <div><dt>缺陷总数</dt><dd>{hoveredRecord.record.defectCount}</dd></div>
             <div><dt>采集产物</dt><dd>{hoveredInspection?.captureImages?.length ?? 0} 件</dd></div>
             <div><dt>规格/钢种</dt><dd>{hoveredInspection?.plate.steelGrade || '—'}</dd></div>
-            <div><dt>外径/宽度</dt><dd>{hoveredInspection?.plate.widthMm ?? 0} mm</dd></div>
-            <div><dt>长度</dt><dd>{hoveredInspection?.plate.lengthMm ?? 0} mm</dd></div>
-            <div><dt>壁厚</dt><dd>{hoveredInspection?.plate.thicknessMm ?? 0} mm</dd></div>
+            <div><dt>外径/宽度</dt><dd>{formatWholeMillimetres(hoveredInspection?.plate.widthMm)}</dd></div>
+            <div><dt>长度</dt><dd>{formatWholeMillimetres(hoveredInspection?.plate.lengthMm)}</dd></div>
+            <div><dt>壁厚</dt><dd>{formatWholeMillimetres(hoveredInspection?.plate.thicknessMm)}</dd></div>
           </dl>
           <section>
             <strong>缺陷分布</strong>

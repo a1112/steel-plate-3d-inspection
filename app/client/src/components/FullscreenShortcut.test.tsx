@@ -10,6 +10,7 @@ function createWindowApi() {
     close: vi.fn(async () => {}),
     isFullscreen: vi.fn(async () => fullscreen),
     minimize: vi.fn(async () => {}),
+    setTitle: vi.fn(async () => {}),
     setFullscreen: vi.fn(async (next: boolean) => { fullscreen = next; }),
     startDragging: vi.fn(async () => {}),
     toggleMaximize: vi.fn(async () => {}),

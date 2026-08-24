@@ -18,6 +18,7 @@ import numpy as np
 from PIL import Image
 
 from .models import RawFrame
+from .paths import capture_root, flow_id
 
 
 def sha256_file(path: Path) -> str:
@@ -47,6 +48,20 @@ def _flush(stream: Any, fsync: bool) -> None:
         os.fsync(stream.fileno())
 
 
+def replace_file(temporary: Path, path: Path) -> None:
+    """Atomically replace a file despite short-lived Windows readers."""
+    retry_delays = (0.0, 0.005, 0.010, 0.020, 0.040, 0.080, 0.160)
+    for attempt, delay in enumerate(retry_delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt + 1 == len(retry_delays):
+                raise
+
+
 def atomic_json(path: Path, payload: Any, *, fsync: bool, overwrite: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not overwrite and path.exists():
@@ -59,7 +74,7 @@ def atomic_json(path: Path, payload: Any, *, fsync: bool, overwrite: bool = True
             _flush(stream, fsync)
         if not overwrite and path.exists():
             raise FileExistsError(path)
-        os.replace(temporary, path)
+        replace_file(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -83,7 +98,7 @@ def atomic_npz(path: Path, array: np.ndarray, *, fsync: bool) -> str:
         encoded.close()
         if path.exists():
             raise FileExistsError(path)
-        os.replace(temporary, path)
+        replace_file(temporary, path)
         return digest
     finally:
         temporary.unlink(missing_ok=True)
@@ -114,7 +129,7 @@ def atomic_image(
         encoded.close()
         if path.exists():
             raise FileExistsError(path)
-        os.replace(temporary, path)
+        replace_file(temporary, path)
         return digest
     finally:
         image.close()
@@ -136,6 +151,7 @@ class FrameWriteResult:
     camera_config: Path
     checksums: dict[str, str]
     write_elapsed_ms: float = 0.0
+    write_bytes: int = 0
 
     def provider_row(self, frame: RawFrame, round_index: int) -> dict[str, Any]:
         return {
@@ -163,20 +179,14 @@ class FrameWriteResult:
             "lg3dDepthOutput": str(self.lg3d_depth),
             "lg3dIntensityOutput": str(self.lg3d_intensity),
             "lg3dMetadataOutput": str(self.lg3d_metadata),
-            "depthExists": self.steel_depth.is_file(),
-            "intensityExists": self.steel_intensity.is_file(),
-            "metadataExists": self.steel_metadata.is_file(),
-            "completeFrame": all(
-                path.is_file()
-                for path in (
-                    self.lg3d_depth,
-                    self.lg3d_intensity,
-                    self.lg3d_metadata,
-                    self.steel_depth,
-                    self.steel_intensity,
-                    self.steel_metadata,
-                )
-            ),
+            # ``DualFormatWriter.write`` returns only after the two data files
+            # and metadata-last transaction have committed.  Re-statting the
+            # canonical files and their aliases here caused dozens of serial
+            # cross-volume metadata operations for every six-camera round.
+            "depthExists": True,
+            "intensityExists": True,
+            "metadataExists": True,
+            "completeFrame": True,
             "frameTransaction": True,
             "metadataCommitLast": True,
             "checksums": self.checksums,
@@ -188,11 +198,12 @@ class SequenceAllocator:
         self._lock = threading.Lock()
         self._next: dict[tuple[str, str], int] = {}
 
-    def reserve(self, camera_root: Path, material_id: str) -> int:
-        key = (str(camera_root.resolve()), material_id)
+    def reserve(self, camera_root: Path, material_id: str, camera_id: str) -> int:
+        normalized_flow = flow_id(material_id)
+        key = (str(camera_root.resolve()), f"{normalized_flow}:{camera_id}")
         with self._lock:
             if key not in self._next:
-                material_root = camera_root / _safe_segment(material_id)
+                material_root = capture_root(camera_root, normalized_flow, camera_id)
                 existing: list[int] = []
                 for directory, suffixes, steel_numbering in (
                     ("3d", (".npz",), False),
@@ -249,9 +260,13 @@ class DualFormatWriter:
         intensity_compress_level: int | None = None,
     ) -> FrameWriteResult:
         write_started = time.perf_counter()
-        safe_material = _safe_segment(material_id)
-        base = camera_root / safe_material
-        lg_index = self.sequences.reserve(camera_root, safe_material) if index is None else int(index)
+        safe_material = flow_id(material_id)
+        base = capture_root(camera_root, safe_material, frame.camera_id)
+        lg_index = (
+            self.sequences.reserve(camera_root, safe_material, frame.camera_id)
+            if index is None
+            else int(index)
+        )
         if lg_index < 0:
             raise ValueError("frame index cannot be negative")
         steel_sequence = lg_index + 1
@@ -480,6 +495,10 @@ class DualFormatWriter:
         )
         self._fault("legacy-metadata-committed")
         self._fault("steel-metadata-committed")
+        # Capture exact persisted bytes while still inside the per-camera
+        # process.  These three cached stats run in parallel across camera
+        # volumes and replace the previous serial parent-process stats.
+        write_bytes = sum(path.stat().st_size for path in final_paths)
         return FrameWriteResult(
             camera_root=camera_root,
             material_id=material_id,
@@ -497,6 +516,7 @@ class DualFormatWriter:
                 (time.perf_counter() - write_started) * 1000.0,
                 3,
             ),
+            write_bytes=write_bytes,
         )
 
 

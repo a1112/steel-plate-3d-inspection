@@ -42,10 +42,12 @@ function SidebarHarness({
   runtimeMode = 'online',
   onRecordSelect = () => undefined,
   large = false,
+  selectedPlate = plate,
 }: {
   runtimeMode?: 'online' | 'bkv';
   onRecordSelect?: (recordId: string) => void;
   large?: boolean;
+  selectedPlate?: SteelPlate;
 }) {
   const [filters, setFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
   const sourceRecords = large ? manyRecords : records;
@@ -65,7 +67,7 @@ function SidebarHarness({
   return (
     <LeftSidebar
       runtimeMode={runtimeMode}
-      plate={plate}
+      plate={selectedPlate}
       summary={summary}
       records={filteredRecords}
       selectedRecordId={plate.plateNo}
@@ -90,6 +92,13 @@ describe('LeftSidebar', () => {
     expect(screen.getByText('12749 mm')).toBeInTheDocument();
     expect(screen.getByText('12 mm')).toBeInTheDocument();
     expect(screen.queryByText(/691\\.629|12748\\.696|12\\.4/)).not.toBeInTheDocument();
+  });
+
+  it('does not present missing dimensions as valid zero measurements', () => {
+    render(<SidebarHarness selectedPlate={{ ...plate, widthMm: 0, lengthMm: 0, thicknessMm: 0 }} />);
+
+    expect(screen.getAllByText('待录入')).toHaveLength(3);
+    expect(screen.queryByText('0 mm')).not.toBeInTheDocument();
   });
 
   it('shows record details beside the table while a row is hovered', () => {

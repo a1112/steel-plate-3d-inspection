@@ -9,9 +9,15 @@ import { severityLabels, surfaceLabels } from '../data/inspection';
 import { createSequentialCameraLanes, type CameraDisplayLane } from '../lib/camera-display';
 import { barSurfaceFileUrl, type BarSurfaceCamera, type BarSurfaceMesh } from '../services/bar-surface-api';
 import {
+  fetchCaptureRoiPreviews,
+  isNumericCaptureFlowId,
+  type CaptureRoiPreviewResult,
+} from '../services/capture-roi-api';
+import {
   fetchInspectionWorldDefects,
   fetchInspectionWorldMeta,
   fetchInspectionWorldTile,
+  InspectionWorldHttpError,
   type InspectionWorldDefect,
   type InspectionWorldMeta,
 } from '../services/inspection-world-api';
@@ -38,6 +44,9 @@ interface PlateMapProps {
   artifactMode?: 'production' | 'demo';
   inspectionId?: string;
   requireInspectionWorld?: boolean;
+  captureMaterialId?: string;
+  captureRoiFallbackMaterialIds?: readonly string[];
+  refreshCaptureRoi?: boolean;
   captureImages?: CaptureImageItem[];
   cameraLanes?: CameraDisplayLane[];
   surfaceMesh?: BarSurfaceMesh | null;
@@ -69,6 +78,84 @@ type DisplayWorld = {
   meta: InspectionWorldMeta;
   defects: InspectionWorldDefect[];
 };
+
+type CaptureRoiState = {
+  materialId: string;
+  status: 'idle' | 'loading' | 'ready' | 'missing' | 'error';
+  result: CaptureRoiPreviewResult | null;
+};
+
+function useCaptureRoiPreviews(
+  materialId: string | undefined,
+  cameraIds: readonly string[],
+  fallbackMaterialIds: readonly string[],
+  enabled: boolean,
+  keepRefreshing: boolean,
+) {
+  const cameraKey = cameraIds.join(',');
+  const fallbackKey = fallbackMaterialIds
+    .map((item) => item.trim())
+    .filter((item, index, values) => isNumericCaptureFlowId(item) && values.indexOf(item) === index)
+    .join(',');
+  const [state, setState] = useState<CaptureRoiState>({
+    materialId: '',
+    status: 'idle',
+    result: null,
+  });
+  useEffect(() => {
+    const normalizedMaterialId = materialId?.trim() || '';
+    if (!enabled || !isNumericCaptureFlowId(normalizedMaterialId)) {
+      setState({ materialId: normalizedMaterialId, status: 'idle', result: null });
+      return undefined;
+    }
+    const expectedCameraIds = cameraKey.split(',').filter(Boolean);
+    const candidateMaterialIds = [
+      normalizedMaterialId,
+      ...fallbackKey.split(',').filter((item) => item && item !== normalizedMaterialId),
+    ];
+    let cancelled = false;
+    let timer: number | undefined;
+    let failures = 0;
+    setState({ materialId: normalizedMaterialId, status: 'loading', result: null });
+
+    const schedule = (delayMs: number) => {
+      if (!cancelled) timer = window.setTimeout(() => void refresh(), delayMs);
+    };
+    const refresh = async () => {
+      try {
+        let result: CaptureRoiPreviewResult | null = null;
+        for (const candidateMaterialId of candidateMaterialIds) {
+          const candidate = await fetchCaptureRoiPreviews(candidateMaterialId, expectedCameraIds);
+          if (cancelled) return;
+          if (candidate && (!result || candidate.images.length > result.images.length)) result = candidate;
+          if (candidate?.complete) {
+            result = candidate;
+            break;
+          }
+        }
+        if (cancelled) return;
+        failures = 0;
+        setState({
+          materialId: normalizedMaterialId,
+          status: result ? 'ready' : 'missing',
+          result,
+        });
+        if (keepRefreshing || !result?.complete || result.materialId !== normalizedMaterialId) schedule(8_000);
+      } catch {
+        if (cancelled) return;
+        failures += 1;
+        setState({ materialId: normalizedMaterialId, status: 'error', result: null });
+        schedule(Math.min(30_000, 4_000 * (2 ** Math.min(3, failures - 1))));
+      }
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [cameraKey, enabled, fallbackKey, keepRefreshing, materialId]);
+  return state;
+}
 
 export function cameraBandRotationRadians(orientation: UnfoldOrientation) {
   // Line-scan frames store the camera cross-section on X and acquisition
@@ -544,6 +631,16 @@ function CameraBandImage({
   return <canvas ref={canvasRef} className="bar-camera-band-image" aria-label={`${label} 实际裁剪图`} />;
 }
 
+function captureImageCameraName(image: CaptureImageItem) {
+  for (const value of [image.cameraId, image.cameraIp, image.path]) {
+    const identity = value.match(/(?:^|[\\/])(?:camera|camimagesource|c)[-_ ]?(\d+)(?:[\\/]|$)/i)
+      ?? value.match(/^(?:camera|camimagesource|c)[-_ ]?(\d+)$/i);
+    if (identity) return `camera${Number(identity[1])}`;
+  }
+  const legacyIpMatch = image.cameraIp.match(/\.10(\d)\./);
+  return legacyIpMatch ? `camera${Number(legacyIpMatch[1])}` : '';
+}
+
 function BarUnfoldedMap({
   defects,
   defectTypes,
@@ -586,18 +683,7 @@ function BarUnfoldedMap({
     captureImages
       .filter((image) => image.dataName.toLowerCase() === 'intensity')
       .forEach((image) => {
-        const identityMatch = [
-          image.cameraId,
-          image.cameraIp,
-          image.path,
-        ].map((value) => value.match(/(?:camera|camimagesource)[-_ ]?(\d+)/i))
-          .find((match): match is RegExpMatchArray => Boolean(match));
-        const legacyIpMatch = image.cameraId.match(/\.10(\d)\./);
-        const cameraName = identityMatch
-          ? `camera${Number(identityMatch[1])}`
-          : legacyIpMatch
-            ? `camera${Number(legacyIpMatch[1])}`
-            : '';
+        const cameraName = captureImageCameraName(image);
         if (!cameraName) return;
         const current = images.get(cameraName);
         if (!current || image.sequenceNo > current.sequenceNo) images.set(cameraName, image);
@@ -638,7 +724,7 @@ function BarUnfoldedMap({
                 }
               }}
             >
-              {source ? <CameraBandImage src={source} label={lane.cameraId} orientation={orientation} cropBlackBorders={!preview} /> : null}
+              {source ? <CameraBandImage src={source} label={lane.cameraId} orientation={orientation} /> : null}
               <span>{lane.shortLabel}</span>
             </div>;
           })}
@@ -1455,6 +1541,9 @@ export function PlateMap({
   artifactMode = 'production',
   inspectionId,
   requireInspectionWorld = false,
+  captureMaterialId,
+  captureRoiFallbackMaterialIds = [],
+  refreshCaptureRoi = false,
   captureImages = [],
   cameraLanes = DEFAULT_CAMERA_LANES,
   surfaceMesh,
@@ -1489,8 +1578,33 @@ export function PlateMap({
   const [worldLoading, setWorldLoading] = useState(false);
   const [worldUnavailable, setWorldUnavailable] = useState(false);
   const [worldError, setWorldError] = useState('');
+  const captureRoiEligible = artifactMode === 'production'
+    && viewMode === '2d'
+    && !requireInspectionWorld
+    && isNumericCaptureFlowId(captureMaterialId);
+  const captureRoiState = useCaptureRoiPreviews(
+    captureMaterialId,
+    cameraLanes.map((lane) => lane.shortLabel),
+    captureRoiFallbackMaterialIds,
+    captureRoiEligible,
+    refreshCaptureRoi,
+  );
+  const captureRoiResult = captureRoiState.materialId === captureMaterialId?.trim()
+    ? captureRoiState.result
+    : null;
+  const captureRoiPending = captureRoiEligible && (
+    captureRoiState.materialId !== captureMaterialId?.trim()
+    || captureRoiState.status === 'idle'
+    || captureRoiState.status === 'loading'
+  );
+  // A freshly completed flow can be present in the record list before every
+  // raw artifact has become readable on its camera disk.  Wait for the ROI
+  // catalog probe before issuing image requests; use raw frames only after the
+  // probe has definitively reported missing/error.
+  const displayedCaptureImages = captureRoiResult?.images
+    ?? (captureRoiPending ? [] : captureImages);
   const productionCameraImageCount = surfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
-  const capturedCameraImageCount = new Set(captureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
+  const capturedCameraImageCount = new Set(displayedCaptureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
   const displayedCameraImageCount = Math.min(cameraLanes.length, Math.max(productionCameraImageCount, capturedCameraImageCount));
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
   const selectedDefect = defects.find((defect) => defect.id === selectedDefectId) ?? null;
@@ -1528,13 +1642,26 @@ export function PlateMap({
     setPendingWorld(null);
     setWorldTileProgress(null);
     if (artifactMode !== 'production' || viewMode !== '2d') return;
+    if (captureRoiEligible) {
+      // Direct SICK records are keyed by their numeric flow/material ID in
+      // derived/playback/index.json. Prefer that stable-ROI index and avoid a
+      // known-missing inspection-world lookup keyed by the database ID.
+      displayedWorldRef.current = null;
+      setDisplayedWorld(null);
+      setWorldUnavailable(true);
+      setWorldLoading(captureRoiState.status === 'idle' || captureRoiState.status === 'loading');
+      return;
+    }
     if (!inspectionId) {
       setWorldLoading(false);
+      setWorldUnavailable(true);
       return;
     }
     setWorldLoading(true);
     const controller = new AbortController();
+    let worldMissing = false;
     const refresh = async () => {
+      if (worldMissing || controller.signal.aborted) return;
       try {
         const meta = await fetchInspectionWorldMeta(inspectionId, controller.signal);
         if (controller.signal.aborted) return;
@@ -1588,7 +1715,17 @@ export function PlateMap({
           setWorldUnavailable(true);
           setWorldLoading(false);
           setWorldTileProgress(null);
-          setWorldError(error instanceof Error ? error.message : '检测图像世界读取失败');
+          // A direct-camera record can legitimately have cropped frame
+          // artifacts before a tile world is generated. Fall back to those
+          // frames and do not hammer the missing meta endpoint every 5 s.
+          if (!requireInspectionWorld
+            && error instanceof InspectionWorldHttpError
+            && error.status === 404) {
+            worldMissing = true;
+            setWorldError('');
+          } else {
+            setWorldError(error instanceof Error ? error.message : '检测图像世界读取失败');
+          }
         }
       }
     };
@@ -1598,7 +1735,7 @@ export function PlateMap({
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [artifactMode, inspectionId, viewMode]);
+  }, [artifactMode, captureRoiEligible, captureRoiState.status, inspectionId, requireInspectionWorld, viewMode]);
   const activePendingWorld = pendingWorld?.recordId === inspectionId ? pendingWorld : null;
   const shouldRenderWorldStack = viewMode === '2d' && (
     displayedWorld !== null
@@ -1685,7 +1822,7 @@ export function PlateMap({
       {integratedToolbar ? null : <div className={`record-artifact-provenance ${artifactMode}`} role="note">
         {artifactMode === 'demo'
           ? '演示/测试数据：允许使用内置表面与模拟点云，不代表当前生产结果。'
-          : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；实际相机图像 ${displayedCameraImageCount}/${cameraLanes.length} 路（自动裁剪黑边）。`}
+          : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；算法 ROI 图像 ${displayedCameraImageCount}/${cameraLanes.length} 路。`}
       </div>}
       {viewMode === '2d' && !shouldRenderWorldStack ? (
         <div className="unfold-orientation-switch" role="group" aria-label="二维展开方向">
@@ -1877,7 +2014,15 @@ export function PlateMap({
         </div>
       ) : (
         <div className={`bar-unfolded-layout orientation-${unfoldOrientation}`}>
-          {artifactMode === 'production' && worldUnavailable ? <span className="live-preview-badge">实时预览</span> : null}
+          {artifactMode === 'production' && worldUnavailable ? <span className="live-preview-badge" data-testid="capture-roi-status">
+            {captureRoiResult
+              ? `算法 ROI ${captureRoiResult.images.length}/${captureRoiResult.expectedCameraCount}${captureRoiResult.materialId !== captureMaterialId?.trim()
+                ? ` · 回退流水 ${captureRoiResult.materialId}`
+                : ''}`
+              : captureRoiPending
+                ? '正在读取算法 ROI'
+                : '采集裁剪预览'}
+          </span> : null}
           <BarUnfoldedMap
             defects={defects}
             defectTypes={defectTypes}
@@ -1891,7 +2036,7 @@ export function PlateMap({
             onDefectNavigationWheel={handleDefectNavigationWheel}
             orientation={unfoldOrientation}
             surfaceCameras={surfaceCameras}
-            captureImages={captureImages}
+            captureImages={displayedCaptureImages}
             cameraLanes={cameraLanes}
           />
           <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} orientation={unfoldOrientation} />

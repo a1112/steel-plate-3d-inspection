@@ -2385,20 +2385,83 @@ fn production_file_url(path: &str) -> String {
 }
 
 fn production_time_label(started_at: &str, material_id: &str) -> String {
-    material_id
-        .split('-')
-        .find(|part| part.len() == 6 && part.chars().all(|ch| ch.is_ascii_digit()))
-        .map(|part| format!("{}:{}", &part[0..2], &part[2..4]))
+    let _ = material_id;
+    production_timestamp_parts(started_at)
+        .map(|(_, _, _, hour, minute, _)| format!("{hour:02}:{minute:02}"))
+        .or_else(|| timestamp_clock_fragment(started_at))
+        .unwrap_or_else(|| "--:--".to_string())
+}
+
+fn timestamp_clock_fragment(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    (0..bytes.len().saturating_sub(4)).find_map(|index| {
+        let fragment = bytes.get(index..index + 5)?;
+        if fragment[2] != b':'
+            || !fragment[0].is_ascii_digit()
+            || !fragment[1].is_ascii_digit()
+            || !fragment[3].is_ascii_digit()
+            || !fragment[4].is_ascii_digit()
+        {
+            return None;
+        }
+        let hour = u32::from(fragment[0] - b'0') * 10 + u32::from(fragment[1] - b'0');
+        let minute = u32::from(fragment[3] - b'0') * 10 + u32::from(fragment[4] - b'0');
+        (hour < 24 && minute < 60).then(|| format!("{hour:02}:{minute:02}"))
+    })
+}
+
+fn production_timestamp_parts(value: &str) -> Option<(i64, u32, u32, u32, u32, u32)> {
+    let raw = value.trim().parse::<i64>().ok()?;
+    let seconds = if raw.unsigned_abs() >= 100_000_000_000 {
+        raw.div_euclid(1_000)
+    } else if raw.unsigned_abs() >= 1_000_000_000 {
+        raw
+    } else {
+        return None;
+    };
+    // The installation timezone is Asia/Shanghai, which has used UTC+08:00
+    // without daylight-saving transitions for all production-era records.
+    let local_seconds = seconds.checked_add(8 * 60 * 60)?;
+    let days = local_seconds.div_euclid(86_400);
+    let seconds_of_day = local_seconds.rem_euclid(86_400) as u32;
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    // Howard Hinnant's civil-from-days conversion, with day zero at
+    // 1970-01-01. Keeping this local avoids pulling a timezone/runtime crate
+    // into the high-rate API service for one deterministic conversion.
+    let shifted = days.checked_add(719_468)?;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    }
+    .div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
+        - day_of_era / 146_096)
+        .div_euclid(365);
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2).div_euclid(153);
+    let day = day_of_year - (153 * month_prime + 2).div_euclid(5) + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+    Some((year, month as u32, day as u32, hour, minute, second))
+}
+
+fn production_timestamp_label(value: &str) -> String {
+    production_timestamp_parts(value)
+        .map(|(year, month, day, hour, minute, second)| {
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+        })
         .unwrap_or_else(|| {
-            if started_at.len() >= 4 {
-                let end = started_at.len();
-                format!(
-                    "{}:{}",
-                    &started_at[end - 4..end - 2],
-                    &started_at[end - 2..end]
-                )
+            let value = value.trim();
+            if value.contains('-') && value.contains(':') {
+                value.to_string()
             } else {
-                "--:--".to_string()
+                String::new()
             }
         })
 }
@@ -2420,11 +2483,23 @@ fn production_plate_value(
         "lengthMm": session.map(|item| item.length_mm).unwrap_or(0.0),
         "thicknessMm": session.map(|item| item.thickness_mm).unwrap_or(0.0),
         "steelGrade": session.map(|item| item.hard.clone()).filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "实际生产".to_string()),
-        "detectedAt": session.map(|item| item.started_at.clone()).unwrap_or_else(|| inspection.started_at.clone())
+        "detectedAt": production_timestamp_label(
+            session
+                .map(|item| item.started_at.as_str())
+                .unwrap_or(inspection.started_at.as_str())
+        )
     })
 }
 
 fn production_defect_label(type_id: &str, geometry: &Value) -> String {
+    if let Some(label) = geometry
+        .get("className")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return label.to_string();
+    }
     if geometry.get("classificationState").and_then(Value::as_str) == Some("candidate-only") {
         return match geometry.get("candidatePolarity").and_then(Value::as_str) {
             Some("depression") => "凹陷候选",
@@ -2459,7 +2534,17 @@ fn production_defect_severity(severity: &str) -> &'static str {
 }
 
 fn production_defect_surface(camera_id: &str) -> &'static str {
-    if camera_id.contains("101") || camera_id.contains("102") || camera_id.contains("103") {
+    let camera_number = camera_id
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<u8>()
+        .ok();
+    if matches!(camera_number, Some(1..=3))
+        || camera_id.contains("101")
+        || camera_id.contains("102")
+        || camera_id.contains("103")
+    {
         "top"
     } else {
         "bottom"
@@ -2489,6 +2574,11 @@ fn production_defect_value(
     } else {
         0.0
     };
+    let distance_head_mm = if length > 0.0 {
+        (x_ratio * length).round() as i64
+    } else {
+        defect.x_mm.round() as i64
+    };
     let y_offset = if width > 0.0 {
         ((defect.y_mm / width) - 0.5).clamp(-1.0, 1.0)
     } else {
@@ -2496,6 +2586,7 @@ fn production_defect_value(
     };
     json!({
         "id": defect.id,
+        "inspectionId": defect.inspection_id,
         "plateNo": inspection.material_id,
         "cameraId": defect.camera_id,
         "cameraIndex": geometry_camera_index,
@@ -2507,7 +2598,7 @@ fn production_defect_value(
         "classificationConfidence": geometry.get("classificationConfidence").cloned().unwrap_or(Value::Null),
         "surface": production_defect_surface(&defect.camera_id),
         "severity": production_defect_severity(&defect.severity),
-        "distanceHeadMm": defect.x_mm.round() as i64,
+        "distanceHeadMm": distance_head_mm,
         "operatorSideMm": defect.y_mm.round() as i64,
         "driveSideMm": if width > 0.0 { (width - defect.y_mm).round() as i64 } else { 0 },
         "widthMm": defect.width_mm,
@@ -2518,12 +2609,97 @@ fn production_defect_value(
         "circumferenceRatio": geometry_circumference_ratio,
         "confidence": defect.confidence,
         "detectionConfidence": defect.confidence,
+        "source": defect.source,
+        "sourceDefectId": defect.source_defect_id,
+        "reviewStatus": defect.review_status,
+        "reviewedBy": defect.reviewed_by,
+        "reviewedAt": defect.reviewed_at,
+        "reviewNote": defect.review_note,
         "synthetic": geometry.get("synthetic").and_then(Value::as_bool).unwrap_or(false),
         "artifacts": defect_artifacts,
         "previewX": (x_ratio * 100.0).round() as i64,
         "previewY": (geometry_circumference_ratio.unwrap_or(0.5 - y_offset / 2.0).clamp(0.0, 1.0) * 100.0).round() as i64,
-        "previewImageUrl": ""
+        "previewImageUrl": if defect.preview_image_path.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "/api/capture/file?path={}",
+                url_encode_component(&defect.preview_image_path)
+            )
+        }
     })
+}
+
+fn production_defect_history_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let limit = query_value(query, "limit")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000)
+        .clamp(1, 10_000);
+    let offset = query_value(query, "offset")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let defects = match state.runtime.block_on(db::list_recent_production_defects(
+        &state.database.connection,
+        limit,
+        offset,
+    )) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code":503,"error":"production_defect_history_unavailable","detail":error.to_string()}).to_string(),
+            )
+        }
+    };
+    let inspection_ids = defects
+        .iter()
+        .map(|defect| defect.inspection_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let inspections = match state.runtime.block_on(db::production_inspections_by_ids(
+        &state.database.connection,
+        inspection_ids,
+    )) {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|inspection| (inspection.id.clone(), inspection))
+            .collect::<HashMap<_, _>>(),
+        Err(error) => {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code":503,"error":"production_defect_inspections_unavailable","detail":error.to_string()}).to_string(),
+            )
+        }
+    };
+    let items = defects
+        .iter()
+        .filter_map(|defect| {
+            let inspection = inspections.get(&defect.inspection_id)?;
+            let plate = production_plate_value(inspection, None);
+            Some(production_defect_value(defect, inspection, &plate))
+        })
+        .collect::<Vec<_>>();
+    let total = state
+        .runtime
+        .block_on(db::count_production_defects(&state.database.connection))
+        .unwrap_or(items.len() as u64);
+    http_response_with_headers(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "schema":"steel.production-defect-history.v1",
+            "code":0,
+            "total":total,
+            "limit":limit,
+            "offset":offset,
+            "defects":items
+        })
+        .to_string(),
+        &[("Cache-Control", "private, no-cache")],
+    )
 }
 
 fn production_capture_image_value(file: &db::entities::capture_file::Model) -> Value {
@@ -5815,7 +5991,13 @@ fn split_path_and_query(raw_path: &str) -> (&str, &str) {
 fn is_production_mutation_route(method: &str, path: &str) -> bool {
     method == "POST"
         && ((path.starts_with("/api/production/") && !path.starts_with("/api/production/tasks"))
-            || matches!(path, "/api/bkv/import" | "/api/bkv/replay/reset"))
+            || matches!(
+                path,
+                "/api/bkv/import"
+                    | "/api/bkv/replay/reset"
+                    | "/internal/v1/defect-batch"
+                    | "/api/defects/review"
+            ))
 }
 
 const LINE_CONTINUOUS_PRESET_CONFIRMATION: &str = "APPLY LINE CONTINUOUS PRESET";
@@ -5828,9 +6010,20 @@ const CAMERA_CALIBRATION_ROLLBACK_CONFIRMATION: &str = "ROLLBACK CAMERA CALIBRAT
 const CAMERA_ROI_CONFIRMATION: &str = "APPLY CAMERA ROI";
 const CALIBRATION_SET_CAMERA_COUNT: usize = 8;
 
-fn validate_calibration_set_safety(
+fn calibration_set_camera_count_error(expected_cameras: usize) -> &'static str {
+    if expected_cameras == CALIBRATION_SET_CAMERA_COUNT {
+        "calibration_set_requires_eight_cameras"
+    } else {
+        "calibration_set_camera_count_mismatch"
+    }
+}
+
+fn validate_calibration_set_safety_for_camera_count(
     object: &serde_json::Map<String, Value>,
+    expected_cameras: usize,
 ) -> Result<(), &'static str> {
+    let expected_cameras = expected_cameras.max(1);
+    let camera_count_error = calibration_set_camera_count_error(expected_cameras);
     if object.get("atomic").and_then(Value::as_bool) != Some(true)
         || object.get("rollbackOnFailure").and_then(Value::as_bool) != Some(true)
         || object.get("requireAllMapped").and_then(Value::as_bool) != Some(true)
@@ -5838,10 +6031,8 @@ fn validate_calibration_set_safety(
     {
         return Err("calibration_set_safe_mode_required");
     }
-    if object.get("expectedCameras").and_then(Value::as_u64)
-        != Some(CALIBRATION_SET_CAMERA_COUNT as u64)
-    {
-        return Err("calibration_set_requires_eight_cameras");
+    if object.get("expectedCameras").and_then(Value::as_u64) != Some(expected_cameras as u64) {
+        return Err(camera_count_error);
     }
     if object
         .get("allowBestEffortDeviceRollback")
@@ -5866,8 +6057,8 @@ fn validate_calibration_set_safety(
         .get("cameraCalibrations")
         .and_then(Value::as_array)
         .ok_or("calibration_set_mapping_required")?;
-    if mappings.len() != CALIBRATION_SET_CAMERA_COUNT {
-        return Err("calibration_set_requires_eight_cameras");
+    if mappings.len() != expected_cameras {
+        return Err(camera_count_error);
     }
     let mut mapping_ips = std::collections::BTreeSet::new();
     let mut mapping_serials = std::collections::BTreeSet::new();
@@ -5903,14 +6094,14 @@ fn validate_calibration_set_safety(
         .get("ips")
         .and_then(Value::as_array)
         .ok_or("calibration_set_target_list_required")?;
-    if requested_ips.len() != CALIBRATION_SET_CAMERA_COUNT {
-        return Err("calibration_set_requires_eight_cameras");
+    if requested_ips.len() != expected_cameras {
+        return Err(camera_count_error);
     }
     let requested_ips = requested_ips
         .iter()
         .map(|value| value.as_str().map(str::trim).unwrap_or_default())
         .collect::<std::collections::BTreeSet<_>>();
-    if requested_ips.len() != CALIBRATION_SET_CAMERA_COUNT
+    if requested_ips.len() != expected_cameras
         || requested_ips.iter().any(|ip| !mapping_ips.contains(*ip))
     {
         return Err("calibration_set_target_mapping_mismatch");
@@ -5965,6 +6156,18 @@ fn validate_line_continuous_preset_request(body: &str) -> Result<(), &'static st
 }
 
 fn validate_capture_device_mutation_request(path: &str, body: &str) -> Result<(), &'static str> {
+    validate_capture_device_mutation_request_for_camera_count(
+        path,
+        body,
+        CALIBRATION_SET_CAMERA_COUNT,
+    )
+}
+
+fn validate_capture_device_mutation_request_for_camera_count(
+    path: &str,
+    body: &str,
+    expected_cameras: usize,
+) -> Result<(), &'static str> {
     let payload = serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
     let object = payload.as_object().ok_or("json_object_required")?;
 
@@ -5976,7 +6179,7 @@ fn validate_capture_device_mutation_request(path: &str, body: &str) -> Result<()
         return Err("camera_calibration_confirmation_required");
     }
     if path == "/api/calibration/apply-all" {
-        validate_calibration_set_safety(object)?;
+        validate_calibration_set_safety_for_camera_count(object, expected_cameras)?;
     }
     if path == "/api/calibration/apply-all"
         && object.get("dryRun").and_then(Value::as_bool) != Some(true)
@@ -6082,6 +6285,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/capture/continuous-settings"),
     ("GET", "/api/capture/alignment"),
     ("GET", "/api/capture/measurement"),
+    ("GET", "/api/capture/regions"),
     ("GET", "/api/capture/defects"),
     ("GET", "/api/stream/status"),
     ("GET", "/api/calibration/active"),
@@ -6110,9 +6314,6 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/capture/depth-map"),
     ("POST", "/api/capture/continuous-test"),
     ("POST", "/api/capture/continuous-settings"),
-    ("POST", "/api/capture/alignment/rebuild"),
-    ("POST", "/api/capture/measurement/rebuild"),
-    ("POST", "/api/capture/defects/rebuild"),
     ("POST", "/api/capture/preset/line-continuous"),
     ("POST", "/api/stream/start"),
     ("POST", "/api/stream/stop"),
@@ -6132,6 +6333,46 @@ fn is_capture_json_proxy_route(method: &str, path: &str) -> bool {
 
 fn is_capture_binary_proxy_route(method: &str, path: &str) -> bool {
     CAPTURE_BINARY_PROXY_ROUTES.contains(&(method, path))
+}
+
+fn is_sick_algorithm_reprocess_route(method: &str, path: &str) -> bool {
+    method == "POST"
+        && matches!(
+            path,
+            "/api/capture/alignment/rebuild"
+                | "/api/capture/measurement/rebuild"
+                | "/api/capture/defects/rebuild"
+        )
+}
+
+fn sick_algorithm_reprocess_response(body: &str) -> Vec<u8> {
+    let origin = env::var("STEEL_ALGORITHM_SERVICE_ORIGIN")
+        .unwrap_or_else(|_| "http://127.0.0.1:4875".to_string());
+    match bounded_local_http_request(
+        &origin,
+        "POST",
+        "/internal/v1/reprocess",
+        body,
+        Duration::from_secs(3),
+        &[],
+    ) {
+        Ok(response) => http_bytes_response_with_headers(
+            &capture_proxy_status(response.status_code),
+            &response.content_type,
+            &response.body,
+            &[("Cache-Control", "no-store")],
+        ),
+        Err(error) => http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 503,
+                "error": "algorithm_service_unavailable",
+                "detail": format!("{error:?}"),
+            })
+            .to_string(),
+        ),
+    }
 }
 
 fn capture_stream_redirect_response(capture: &CaptureServiceManager, raw_path: &str) -> Vec<u8> {
@@ -6491,8 +6732,7 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("GET", "/api/admin/diagnostics") => Some("admin.overview"),
         ("POST", "/api/bkv/replay/next") => Some("admin.services"),
         ("POST", "/api/admin/database/maintenance") => Some("admin.services"),
-        ("GET", "/api/config")
-        | ("GET", "/api/config/capture")
+        ("GET", "/api/config/capture")
         | ("GET", "/api/config/status")
         | ("GET", "/api/config/profiles")
         | ("GET", "/api/config/profile")
@@ -6604,6 +6844,7 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         ("POST", "/api/alarms/acknowledge") | ("POST", "/api/alarms/resolve") => {
             Some("admin.records")
         }
+        ("POST", "/api/defects/review") => Some("admin.records"),
         ("POST", "/api/admin/auth/password")
         | ("GET", "/api/admin/auth/sessions")
         | ("DELETE", "/api/admin/auth/sessions") => Some("admin.self"),
@@ -8245,6 +8486,188 @@ fn read_config_response(state: &ServiceState) -> Vec<u8> {
             "500 Internal Server Error",
             "application/json; charset=utf-8",
             &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
+        ),
+    }
+}
+
+fn runtime_public_capture_config(profile: &runtime_profile::RuntimeProfile) -> Option<Value> {
+    let relative = profile.capture_profile.as_deref()?;
+    let profile_root = fs::canonicalize(profile.profile_path.parent()?).ok()?;
+    let capture_path = fs::canonicalize(profile_root.join(relative)).ok()?;
+    if !capture_path.starts_with(&profile_root) || !capture_path.is_file() {
+        return None;
+    }
+
+    let document = serde_json::from_slice::<Value>(&fs::read(capture_path).ok()?).ok()?;
+    let capture = document.as_object()?;
+    let defaults = capture.get("captureDefaults").and_then(Value::as_object);
+    let driver = capture
+        .get("driverMode")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(profile.camera_connection.as_str())
+        .to_string();
+    let default_trigger_mode = defaults
+        .and_then(|object| object.get("frameTriggerMode"))
+        .and_then(Value::as_str)
+        .unwrap_or("continuous")
+        .to_string();
+    let cameras = capture
+        .get("cameras")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_object)
+                .map(|camera| {
+                    let value = |name: &str| camera.get(name).cloned().unwrap_or(Value::Null);
+                    let id = camera
+                        .get("id")
+                        .or_else(|| camera.get("key"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let name = camera
+                        .get("name")
+                        .or_else(|| camera.get("key"))
+                        .or_else(|| camera.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let model = camera
+                        .get("modelHint")
+                        .or_else(|| camera.get("model"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "ip": value("ip"),
+                        "driverId": driver,
+                        "modelHint": model,
+                        "role": value("role"),
+                        "enabled": camera.get("enabled").cloned().unwrap_or_else(|| json!(true)),
+                        "triggerMode": camera
+                            .get("triggerMode")
+                            .cloned()
+                            .unwrap_or_else(|| json!(default_trigger_mode)),
+                        "exposureUs": camera.get("exposureUs").cloned().unwrap_or_else(|| json!(0)),
+                        "gain": camera.get("gain").cloned().unwrap_or_else(|| json!(0)),
+                        "depthLines": camera.get("depthLines").cloned().unwrap_or_else(|| json!(0)),
+                        // Per-camera disks, serial numbers and firmware remain private.
+                        "outputPath": ""
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(json!({
+        "mode": profile.id,
+        "name": capture.get("name").cloned().unwrap_or(Value::Null),
+        "driver": driver,
+        "fallback": "disabled",
+        "expectedCameras": capture
+            .get("expectedCameras")
+            .cloned()
+            .unwrap_or_else(|| json!(profile.camera_count())),
+        "cameras": cameras
+    }))
+}
+
+fn sanitize_public_capture_config(value: &Value, state: &ServiceState) -> Value {
+    let service = value.get("service").and_then(Value::as_object);
+    let runtime_capture = runtime_public_capture_config(state.runtime_config.as_ref());
+    let capture = runtime_capture
+        .as_ref()
+        .and_then(Value::as_object)
+        .or_else(|| value.get("capture").and_then(Value::as_object));
+    let cameras = capture
+        .and_then(|object| object.get("cameras"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_object)
+                .map(|camera| {
+                    let field = |name: &str| camera.get(name).cloned().unwrap_or(Value::Null);
+                    json!({
+                        "id": field("id"),
+                        "name": field("name"),
+                        "ip": field("ip"),
+                        "driverId": field("driverId"),
+                        "modelHint": field("modelHint"),
+                        "role": field("role"),
+                        "enabled": field("enabled"),
+                        "triggerMode": field("triggerMode"),
+                        "exposureUs": field("exposureUs"),
+                        "gain": field("gain"),
+                        "depthLines": field("depthLines"),
+                        // Storage roots and absolute output paths are admin-only.
+                        "outputPath": ""
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let capture_field = |name: &str| {
+        capture
+            .and_then(|object| object.get(name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    json!({
+        "schema": "steel.public-capture-config.v1",
+        "service": {
+            "name": service
+                .and_then(|object| object.get("name"))
+                .cloned()
+                .unwrap_or_else(|| json!("steel-inspection-service")),
+            "role": service
+                .and_then(|object| object.get("role"))
+                .cloned()
+                .unwrap_or_else(|| json!("api-config-capture-orchestrator")),
+            "capturePort": state.capture.port,
+            "captureProvider": state.capture.provider.as_str(),
+            "captureManaged": state.capture.provider.is_managed(),
+            "updatedAt": service
+                .and_then(|object| object.get("updatedAt"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        },
+        "capture": {
+            "mode": capture_field("mode"),
+            "name": capture_field("name"),
+            "driver": capture_field("driver"),
+            "provider": state.capture.provider.as_str(),
+            "fallback": capture_field("fallback"),
+            "expectedCameras": capture_field("expectedCameras"),
+            "cameras": cameras
+        }
+    })
+}
+
+fn read_public_config_response(state: &ServiceState) -> Vec<u8> {
+    let raw = match state
+        .runtime
+        .block_on(db::get_config(&state.database.connection, "capture"))
+    {
+        Ok(Some(config)) => Ok(config.value),
+        Ok(None) => state
+            .config_json
+            .lock()
+            .map(|config| config.clone())
+            .map_err(|_| "config_lock_poisoned".to_string()),
+        Err(_) => Err("config_database_unavailable".to_string()),
+    };
+    match raw.and_then(|raw| {
+        serde_json::from_str::<Value>(&raw).map_err(|_| "config_json_invalid".to_string())
+    }) {
+        Ok(value) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &sanitize_public_capture_config(&value, state).to_string(),
+        ),
+        Err(error) => http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({"code":503,"error":error,"retryable":true}).to_string(),
         ),
     }
 }
@@ -10050,6 +10473,7 @@ fn capture_provider_unavailable_response(capture: &CaptureServiceManager) -> Vec
 
 fn capture_proxy_http_response(
     capture: &CaptureServiceManager,
+    expected_cameras: usize,
     method: &str,
     raw_path: &str,
     path: &str,
@@ -10070,7 +10494,9 @@ fn capture_proxy_http_response(
             );
         }
     } else if method == "POST" {
-        if let Err(error) = validate_capture_device_mutation_request(path, body) {
+        if let Err(error) =
+            validate_capture_device_mutation_request_for_camera_count(path, body, expected_cameras)
+        {
             return http_response(
                 "400 Bad Request",
                 "application/json; charset=utf-8",
@@ -10128,6 +10554,23 @@ fn capture_proxy_http_response(
         capture.set_collecting(false);
     }
     if let Some(response) = proxy_response {
+        if method == "GET" && path == "/api/capture/defects" && response.status_code == 404 {
+            let (_, query) = split_path_and_query(raw_path);
+            return http_response(
+                "202 Accepted",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 0,
+                    "schema": "steel.defect-processing-status.v1",
+                    "state": "waiting-for-committed-frames",
+                    "phase": "capture",
+                    "materialId": query_value(query, "materialId").unwrap_or_default(),
+                    "retryAfterMs": 2000,
+                    "retryable": true
+                })
+                .to_string(),
+            );
+        }
         let cache_headers: &[(&str, &str)] =
             if method == "GET" && path == "/api/capture/file" && response.status_code == 200 {
                 &[("Cache-Control", "public, max-age=31536000, immutable")]
@@ -10154,6 +10597,32 @@ fn trigger_gateway_proxy_http_response(
     body: &str,
     actor: &str,
 ) -> Vec<u8> {
+    let optional_read = method == "GET"
+        && !state.trigger_health_required
+        && matches!(
+            split_path_and_query(raw_path).0,
+            "/api/trigger/status" | "/api/trigger/mode"
+        );
+    let optional_response = |reason: &str| {
+        http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 0,
+                "service": "steel-trigger-gateway",
+                "status": "not-required",
+                "required": false,
+                "available": false,
+                "mode": "gray",
+                "modeLabel": "灰度进出钢（采集内置）",
+                "manualAllowed": false,
+                "allowedModes": ["gray"],
+                "inspectionServiceHealthy": true,
+                "reason": reason
+            })
+            .to_string(),
+        )
+    };
     let operator_token = env::var("TRIGGER_OPERATOR_TOKEN").unwrap_or_default();
     let operator_headers = if method == "POST" && !operator_token.is_empty() {
         vec![("X-Trigger-Operator-Token", operator_token.as_str())]
@@ -10169,6 +10638,9 @@ fn trigger_gateway_proxy_http_response(
         &operator_headers,
     ) {
         Ok(response) => {
+            if optional_read && !(200..300).contains(&response.status_code) {
+                return optional_response("optional_trigger_gateway_http_error");
+            }
             if method == "POST" {
                 let path = split_path_and_query(raw_path).0;
                 let _ = state.runtime.block_on(db::append_audit_log(
@@ -10191,6 +10663,10 @@ fn trigger_gateway_proxy_http_response(
                 &[],
             )
         }
+        Err(HealthHttpProbeError::Timeout) if optional_read => {
+            optional_response("optional_trigger_gateway_timeout")
+        }
+        Err(_) if optional_read => optional_response("optional_trigger_gateway_unavailable"),
         Err(HealthHttpProbeError::Timeout) => http_response(
             "504 Gateway Timeout",
             "application/json; charset=utf-8",
@@ -11161,12 +11637,21 @@ fn write_production_event_response(
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    // The capture/algorithm storage identity is always the immutable database
+    // flow number. Business material codes remain service-owned metadata and
+    // must never be used as directory names.
+    let capture_flow_id = steel_flow
+        .as_ref()
+        .map(|flow| flow.flow_no.to_string())
+        .unwrap_or_else(|| material_id.clone());
     let mut provider_payload = json!({
         "cmd": command.clone(),
         "value": value,
-        "id": material_id,
-        "steelId": material_id,
+        "id": capture_flow_id,
+        "materialId": capture_flow_id,
+        "steelId": capture_flow_id,
         "steelNo": material_id,
+        "businessMaterialId": material_id,
         "sessionId": session_id,
         "inspectionId": inspection_id,
         "steelType": steel_type,
@@ -11785,6 +12270,169 @@ fn write_capture_commit_response(state: &ServiceState, body: &str) -> Vec<u8> {
         })
         .to_string(),
     )
+}
+
+fn resolve_algorithm_steel_flow(
+    state: &ServiceState,
+    flow_reference: &str,
+) -> Result<Option<db::entities::steel_flow::Model>, String> {
+    let flow_reference = flow_reference.trim();
+    if let Ok(flow_no) = flow_reference.parse::<i64>() {
+        if flow_no > 0 {
+            let by_number = state
+                .runtime
+                .block_on(db::find_steel_flow_by_no(
+                    &state.database.connection,
+                    flow_no,
+                ))
+                .map_err(|error| error.to_string())?;
+            if by_number.is_some() {
+                return Ok(by_number);
+            }
+        }
+    }
+    state
+        .runtime
+        .block_on(db::find_latest_steel_flow_by_material(
+            &state.database.connection,
+            flow_reference,
+        ))
+        .map_err(|error| error.to_string())
+}
+
+fn write_capture_regions_response(state: &ServiceState, body: &str) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code":400,"error":error.to_string()}).to_string(),
+            )
+        }
+    };
+    let flow_reference = value_string(
+        &payload,
+        &["flowNo", "flow_no", "materialId", "material_id"],
+    );
+    let Some(regions) = payload.get("regions") else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code":400,"error":"regions_required"}).to_string(),
+        );
+    };
+    if flow_reference.is_empty()
+        || regions.get("schema").and_then(Value::as_str) != Some("steel.capture-region-map.v1")
+    {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code":400,"error":"invalid_region_manifest"}).to_string(),
+        );
+    }
+    let flow = match resolve_algorithm_steel_flow(state, &flow_reference) {
+        Ok(Some(flow)) => flow,
+        Ok(None) => {
+            return http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({"code":409,"error":"steel_flow_not_found","flowReference":flow_reference})
+                    .to_string(),
+            )
+        }
+        Err(error) => {
+            return production_database_error_response("load_region_steel_flow", &error.to_string())
+        }
+    };
+    let material_id = flow.material_id.clone();
+    let calibration = regions.get("calibration").cloned().unwrap_or(Value::Null);
+    let quality = regions.get("qualityGate").cloned().unwrap_or(Value::Null);
+    let manifest_path = value_string(&payload, &["manifestPath", "manifest_path"]);
+    let manifest_sha256 = value_string(&payload, &["manifestSha256", "manifest_sha256"]);
+    let interval_width = |value: Option<&Value>| -> i32 {
+        value
+            .and_then(Value::as_array)
+            .map(|intervals| {
+                intervals
+                    .iter()
+                    .filter_map(|interval| {
+                        let values = interval.as_array()?;
+                        let left = values.first()?.as_f64()?;
+                        let right = values.get(1)?.as_f64()?;
+                        Some((right - left).max(0.0).round() as i32)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+    let Some(cameras) = regions.get("cameras").and_then(Value::as_object) else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code":400,"error":"region_cameras_required"}).to_string(),
+        );
+    };
+    let inputs = cameras
+        .iter()
+        .map(|(camera_id, row)| {
+            let source = row.get("sourceSize").and_then(Value::as_array);
+            let crop = row.get("stableCrop").and_then(Value::as_array);
+            db::SteelFlowRegionInput {
+                session_id: flow.session_id.clone(),
+                material_id: material_id.clone(),
+                camera_id: camera_id.clone(),
+                state: row
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable")
+                    .to_string(),
+                source_width: source
+                    .and_then(|v| v.first())
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32,
+                source_height: source
+                    .and_then(|v| v.get(1))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32,
+                crop_left: crop
+                    .and_then(|v| v.first())
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32,
+                crop_right: crop
+                    .and_then(|v| v.get(2))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32,
+                overlap_column_count: interval_width(row.get("overlapColumnIntervals")),
+                owned_column_count: interval_width(row.get("ownedColumnIntervals")),
+                calibration_revision: calibration
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                calibration_sha256: calibration
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                manifest_path: manifest_path.clone(),
+                manifest_sha256: manifest_sha256.clone(),
+                quality_json: quality.to_string(),
+                region_json: row.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    match state.runtime.block_on(db::upsert_steel_flow_regions(
+        &state.database.connection, inputs
+    )) {
+        Ok(rows) => http_response(
+            "200 OK", "application/json; charset=utf-8",
+            &json!({"code":0,"flowNo":flow.flow_no,"materialId":material_id,"cameraCount":rows.len()}).to_string(),
+        ),
+        Err(error) => production_database_error_response(
+            "upsert_steel_flow_regions", &error.to_string()
+        ),
+    }
 }
 
 fn write_final_production_summary_file(
@@ -12900,6 +13548,300 @@ fn write_production_defect_response(state: &ServiceState, body: &str, actor: &st
             "500 Internal Server Error",
             "application/json; charset=utf-8",
             &json!({ "code": 500, "error": error.to_string() }).to_string(),
+        ),
+    }
+}
+
+fn safe_imported_defect_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 118
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return None;
+    }
+    Some(format!("SICK-{value}"))
+}
+
+fn write_production_defect_batch_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code":400,"error":"invalid_defect_batch","detail":error.to_string()})
+                    .to_string(),
+            )
+        }
+    };
+    if payload.get("schema").and_then(Value::as_str) != Some("steel.capture-defect-import.v1") {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code":400,"error":"invalid_defect_batch_schema"}).to_string(),
+        );
+    }
+    let flow_reference = value_string(
+        &payload,
+        &["flowNo", "flow_no", "materialId", "material_id"],
+    );
+    if flow_reference.is_empty() || flow_reference.len() > 128 {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code":400,"error":"invalid_flow_reference"}).to_string(),
+        );
+    }
+    let flow = match resolve_algorithm_steel_flow(state, &flow_reference) {
+        Ok(Some(flow)) => flow,
+        Ok(None) => {
+            return http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                &json!({"code":404,"error":"steel_flow_not_found","flowReference":flow_reference})
+                    .to_string(),
+            )
+        }
+        Err(error) => {
+            return production_database_error_response("load_defect_steel_flow", &error.to_string())
+        }
+    };
+    let requested_inspection_id = value_string(&payload, &["inspectionId", "inspection_id"]);
+    let inspection = if requested_inspection_id.is_empty() {
+        state
+            .runtime
+            .block_on(db::latest_production_inspection_for_session(
+                &state.database.connection,
+                &flow.session_id,
+            ))
+    } else {
+        state.runtime.block_on(db::find_production_inspection(
+            &state.database.connection,
+            &requested_inspection_id,
+        ))
+    };
+    let inspection = match inspection {
+        Ok(Some(value)) if value.session_id == flow.session_id => value,
+        Ok(_) => return http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({"code":404,"error":"production_inspection_not_found","flowNo":flow.flow_no})
+                .to_string(),
+        ),
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"code":500,"error":error.to_string()}).to_string(),
+            )
+        }
+    };
+    let material_id = inspection.material_id.clone();
+    let rows = match payload.get("defects").and_then(Value::as_array) {
+        Some(rows) if rows.len() <= 10_000 => rows,
+        _ => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code":400,"error":"invalid_defect_batch_rows"}).to_string(),
+            )
+        }
+    };
+    let source = "sick-temporary-defect-model".to_string();
+    let mut imports = Vec::with_capacity(rows.len());
+    for row in rows {
+        let source_id = value_string(row, &["sourceDefectId", "source_defect_id", "id"]);
+        let Some(id) = safe_imported_defect_id(&source_id) else {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code":400,"error":"invalid_source_defect_id"}).to_string(),
+            );
+        };
+        let camera_id = value_string(row, &["cameraId", "camera_id"]);
+        let defect_type = value_string(row, &["defectType", "defect_type", "type"])
+            .if_empty("surface-defect-candidate");
+        let severity = value_string(row, &["severity"])
+            .if_empty("review")
+            .to_ascii_lowercase();
+        let confidence = value_f64(row, &["confidence", "score"]);
+        let preview_image_path = value_string(row, &["previewImagePath", "preview_image_path"]);
+        let geometry = row.get("geometry").cloned().unwrap_or_else(|| json!({}));
+        let geometry_json = geometry.to_string();
+        let numbers = [
+            value_f64(row, &["xMm", "x_mm"]),
+            value_f64(row, &["yMm", "y_mm"]),
+            value_f64(row, &["zMm", "z_mm"]),
+            value_f64(row, &["widthMm", "width_mm"]),
+            value_f64(row, &["heightMm", "height_mm"]),
+            value_f64(row, &["depthMm", "depth_mm"]),
+        ];
+        if camera_id.is_empty()
+            || camera_id.len() > 128
+            || defect_type.len() > 128
+            || !matches!(severity.as_str(), "severe" | "review" | "minor")
+            || !(0.0..=1.0).contains(&confidence)
+            || numbers.iter().any(|value| !value.is_finite())
+            || numbers[3] < 0.0
+            || numbers[4] < 0.0
+            || preview_image_path.len() > 1024
+            || (!preview_image_path.is_empty()
+                && !preview_image_path.to_ascii_lowercase().ends_with(".png"))
+            || geometry_json.len() > 64 * 1024
+        {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code":400,"error":"invalid_defect_batch_row","sourceDefectId":source_id})
+                    .to_string(),
+            );
+        }
+        imports.push(db::ImportedProductionDefectInput {
+            id,
+            source: source.clone(),
+            source_defect_id: source_id,
+            preview_image_path,
+            defect: db::ProductionDefectInput {
+                inspection_id: inspection.id.clone(),
+                material_id: material_id.clone(),
+                camera_id,
+                defect_type,
+                severity,
+                x_mm: numbers[0],
+                y_mm: numbers[1],
+                z_mm: numbers[2],
+                width_mm: numbers[3],
+                height_mm: numbers[4],
+                depth_mm: numbers[5],
+                confidence,
+                geometry_json,
+            },
+        });
+    }
+    let replace_pending = payload
+        .get("replacePending")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    match state.runtime.block_on(db::import_production_defects(
+        &state.database.connection,
+        &inspection.id,
+        &source,
+        replace_pending,
+        imports,
+    )) {
+        Ok(result) => {
+            let _ = state.runtime.block_on(db::append_audit_log(
+                &state.database.connection,
+                actor,
+                "production.defects.imported",
+                &inspection.id,
+                &format!(
+                    "material={} inserted={} updated={} deleted={}",
+                    material_id, result.inserted, result.updated, result.deleted
+                ),
+                "info",
+            ));
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code":0,
+                    "flowNo":flow.flow_no,
+                    "inspectionId":inspection.id,
+                    "materialId":material_id,
+                    "inserted":result.inserted,
+                    "updated":result.updated,
+                    "deleted":result.deleted,
+                    "total":result.defects.len()
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code":500,"error":error.to_string()}).to_string(),
+        ),
+    }
+}
+
+fn write_production_defect_review_response(
+    state: &ServiceState,
+    body: &str,
+    actor: &str,
+) -> Vec<u8> {
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code":400,"error":error.to_string()}).to_string(),
+            )
+        }
+    };
+    let id = value_string(&payload, &["id", "defectId", "defect_id"]);
+    let status =
+        value_string(&payload, &["status", "reviewStatus", "review_status"]).to_ascii_lowercase();
+    let note = value_string(&payload, &["note", "reviewNote", "review_note"]);
+    let defect_type = value_string(&payload, &["defectType", "defect_type", "type"]);
+    let severity = value_string(&payload, &["severity"]).to_ascii_lowercase();
+    if id.is_empty()
+        || id.len() > 128
+        || !matches!(status.as_str(), "pending" | "confirmed" | "false-positive")
+        || note.len() > 1024
+        || defect_type.len() > 128
+        || (!severity.is_empty() && !matches!(severity.as_str(), "severe" | "review" | "minor"))
+    {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code":400,"error":"invalid_defect_review"}).to_string(),
+        );
+    }
+    let input = db::ProductionDefectReviewInput {
+        id: id.clone(),
+        status: status.clone(),
+        defect_type: (!defect_type.is_empty()).then_some(defect_type),
+        severity: (!severity.is_empty()).then_some(severity),
+        actor: actor.to_string(),
+        note,
+    };
+    match state.runtime.block_on(db::review_production_defect(
+        &state.database.connection,
+        input,
+    )) {
+        Ok(Some(row)) => {
+            let _ = state.runtime.block_on(db::append_audit_log(
+                &state.database.connection,
+                actor,
+                "production.defect.reviewed",
+                &id,
+                &format!("status={status} material={}", row.material_id),
+                "info",
+            ));
+            http_response(
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({"code":0,"defectId":id,"reviewStatus":status}).to_string(),
+            )
+        }
+        Ok(None) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            &json!({"code":404,"error":"production_defect_not_found"}).to_string(),
+        ),
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code":500,"error":error.to_string()}).to_string(),
         ),
     }
 }
@@ -16117,7 +17059,7 @@ fn inspection_world_records_response(state: &ServiceState) -> Vec<u8> {
             &manager.inspection_world_records().to_string(),
         );
     }
-    let records = match state.runtime.block_on(db::list_recent_production_inspections(
+    let records = match state.runtime.block_on(db::list_recent_inspection_world_inspections(
         &state.database.connection,
         200,
     )) {
@@ -18013,6 +18955,27 @@ fn algorithm_value_bool(value: &Value, key: &str, fallback: bool) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(fallback)
 }
 
+fn algorithm_expected_cameras(request: &Value, fallback: usize) -> i64 {
+    algorithm_value_i64(request, "expectedCameras", fallback.max(1) as i64).clamp(1, 24)
+}
+
+fn live_calibration_expected_cameras(
+    request: &Value,
+    configured_cameras: usize,
+) -> Result<i64, Value> {
+    let configured_cameras = configured_cameras.max(1);
+    let requested_cameras = algorithm_expected_cameras(request, configured_cameras);
+    if requested_cameras as usize != configured_cameras {
+        return Err(json!({
+            "code": 400,
+            "error": "calibration_capture_camera_count_mismatch",
+            "expectedCameras": requested_cameras,
+            "configuredCameras": configured_cameras
+        }));
+    }
+    Ok(requested_cameras)
+}
+
 fn production_algorithm_request_config_error(request: &Value) -> Option<&'static str> {
     let (config_ok, _, config) = algorithm_config_health();
     let Some(config) = config.filter(|_| config_ok) else {
@@ -18399,6 +19362,7 @@ fn run_bar_surface_algorithm(
 
 fn run_bar_surface_calibration_fit(
     request: &Value,
+    default_expected_cameras: usize,
     cancellation_requested: Option<&dyn Fn() -> bool>,
 ) -> Result<Value, Value> {
     let capture_root = algorithm_value_string(
@@ -18425,9 +19389,8 @@ fn run_bar_surface_calibration_fit(
     let max_shift = algorithm_value_f64(request, "maxShiftMm", 5.0)
         .clamp(0.1, 50.0)
         .to_string();
-    let expected_cameras = algorithm_value_i64(request, "expectedCameras", 8)
-        .clamp(1, 24)
-        .to_string();
+    let expected_cameras =
+        algorithm_expected_cameras(request, default_expected_cameras).to_string();
     let min_points_per_camera = algorithm_value_i64(request, "minPointsPerCamera", 100)
         .clamp(20, 20000)
         .to_string();
@@ -18773,14 +19736,8 @@ fn run_bar_surface_calibration_capture_fit(
     actor: &str,
     cancellation_requested: Option<&dyn Fn() -> bool>,
 ) -> Result<Value, Value> {
-    let expected_cameras = algorithm_value_i64(request, "expectedCameras", 8);
-    if expected_cameras != 8 {
-        return Err(json!({
-            "code": 400,
-            "error": "calibration_capture_requires_eight_cameras",
-            "expectedCameras": expected_cameras
-        }));
-    }
+    let configured_cameras = production_capture_expected_cameras(state.runtime_config.as_ref());
+    let expected_cameras = live_calibration_expected_cameras(request, configured_cameras)?;
     let material_id = algorithm_value_string(
         request,
         "materialId",
@@ -18792,7 +19749,7 @@ fn run_bar_surface_calibration_capture_fit(
         &format!("continuous-test/auto-calibration-{}", current_time_millis()),
     );
     let mut capture_body = serde_json::Map::new();
-    capture_body.insert("expectedCameras".to_string(), json!(8));
+    capture_body.insert("expectedCameras".to_string(), json!(expected_cameras));
     capture_body.insert("rounds".to_string(), json!(1));
     capture_body.insert(
         "lines".to_string(),
@@ -18904,7 +19861,11 @@ fn run_bar_surface_calibration_capture_fit(
         )),
     );
     fit_request.insert("materialId".to_string(), json!(material_id));
-    let fit = run_bar_surface_calibration_fit(&Value::Object(fit_request), cancellation_requested)?;
+    let fit = run_bar_surface_calibration_fit(
+        &Value::Object(fit_request),
+        configured_cameras,
+        cancellation_requested,
+    )?;
     let result = fit.get("result").cloned().unwrap_or_else(|| json!({}));
     let auto_activate = algorithm_value_bool(request, "autoActivate", true);
     let (target_detected, correction_accepted, activation_reason) =
@@ -18937,7 +19898,8 @@ fn run_bar_surface_calibration_capture_fit(
             .and_then(|value| value.to_str())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("automatic-array-calibration");
-        let profile_name = algorithm_value_string(request, "profile", "current-8-time-trigger");
+        let default_profile_name = format!("current-{expected_cameras}-time-trigger");
+        let profile_name = algorithm_value_string(request, "profile", &default_profile_name);
         let activation_request = json!({
             "name": profile_name,
             "path": corrected_xml,
@@ -19014,7 +19976,8 @@ fn run_bar_surface_calibration_capture_fit(
             .and_then(Value::as_str)
             .unwrap_or("calibration-fit"),
         &format!(
-            "eight-camera calibration capture and fit completed from {}; targetDetected={}; correctionAccepted={}; autoActivated={}",
+            "{}-camera calibration capture and fit completed from {}; targetDetected={}; correctionAccepted={}; autoActivated={}",
+            expected_cameras,
             capture_summary_dir.display(),
             target_detected,
             correction_accepted,
@@ -19082,9 +20045,13 @@ fn algorithm_run_response(body: &str) -> Vec<u8> {
     }
 }
 
-fn algorithm_calibration_fit_response(body: &str) -> Vec<u8> {
+fn algorithm_calibration_fit_response(state: &ServiceState, body: &str) -> Vec<u8> {
     let request: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    match run_bar_surface_calibration_fit(&request, None) {
+    match run_bar_surface_calibration_fit(
+        &request,
+        production_capture_expected_cameras(state.runtime_config.as_ref()),
+        None,
+    ) {
         Ok(payload) => http_response(
             "200 OK",
             "application/json; charset=utf-8",
@@ -22822,6 +23789,9 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/production/capture-once", "scope": "production" },
             { "method": "POST", "path": "/api/production/algorithm/run", "scope": "production" },
             { "method": "POST", "path": "/api/production/defect", "scope": "production" },
+            { "method": "POST", "path": "/internal/v1/defect-batch", "scope": "capture" },
+            { "method": "GET", "path": "/api/defects/history", "scope": "production" },
+            { "method": "POST", "path": "/api/defects/review", "scope": "production" },
             { "method": "GET", "path": "/api/production/file", "scope": "production" },
             { "method": "GET", "path": "/api/steel/status", "scope": "capture" },
             { "method": "POST", "path": "/api/steel/capture-mode", "scope": "capture" },
@@ -23153,7 +24123,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("GET", "/api/algorithm/bar-surface/runs") => algorithm_runs_response(query),
         ("POST", "/api/algorithm/bar-surface/run") => algorithm_run_response(body),
         ("POST", "/api/algorithm/bar-surface/calibration/fit") => {
-            algorithm_calibration_fit_response(body)
+            algorithm_calibration_fit_response(&state, body)
         }
         ("POST", "/api/admin/auth/login") => write_auth_login_response(&state, &request, body),
         ("GET", "/api/admin/auth/me") => read_auth_me_response(&state, &request),
@@ -23232,7 +24202,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("POST", "/api/capture/start") => start_capture_service_response(&state, actor),
         ("POST", "/api/capture/stop") => stop_capture_service_response(&state, actor),
         ("POST", "/api/capture/restart") => restart_capture_service_response(&state, actor),
-        ("GET", "/api/config") | ("GET", "/api/config/capture") => read_config_response(&state),
+        ("GET", "/api/config") => read_public_config_response(&state),
+        ("GET", "/api/config/capture") => read_config_response(&state),
         ("POST", "/api/config/capture") => write_config_response(&state, body, actor),
         ("GET", "/api/config/connection") => read_connection_response(&state),
         ("POST", "/api/config/connection") => write_connection_response(&state, body, actor),
@@ -23363,6 +24334,17 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("POST", "/internal/v1/capture-commit") => {
             write_capture_commit_response(&state, body)
         }
+        ("POST", "/internal/v1/capture-regions") => {
+            if peer.is_some_and(|address| address.ip().is_loopback()) {
+                write_capture_regions_response(&state, body)
+            } else {
+                http_response(
+                    "403 Forbidden",
+                    "application/json; charset=utf-8",
+                    &json!({"code":403,"error":"capture_regions_loopback_only"}).to_string(),
+                )
+            }
+        }
         ("POST", "/api/production/capture-once") => {
             write_production_capture_once_response(&state, body, actor)
         }
@@ -23371,6 +24353,21 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         ("POST", "/api/production/defect") => {
             write_production_defect_response(&state, body, actor)
+        }
+        ("POST", "/internal/v1/defect-batch") => {
+            if peer.is_some_and(|address| address.ip().is_loopback()) {
+                write_production_defect_batch_response(&state, body, "sick-capture")
+            } else {
+                http_response(
+                    "403 Forbidden",
+                    "application/json; charset=utf-8",
+                    &json!({"code":403,"error":"defect_batch_loopback_only"}).to_string(),
+                )
+            }
+        }
+        ("GET", "/api/defects/history") => production_defect_history_response(&state, query),
+        ("POST", "/api/defects/review") => {
+            write_production_defect_review_response(&state, body, actor)
         }
         ("GET", "/api/production/file") => production_file_response(&state, query),
         ("GET", "/api/calibration/operations/detail") => {
@@ -23444,8 +24441,18 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         _ if is_trigger_gateway_proxy_route(method, path) => {
             trigger_gateway_proxy_http_response(&state, method, raw_path, body, actor)
         }
+        _ if is_sick_algorithm_reprocess_route(method, path) => {
+            sick_algorithm_reprocess_response(body)
+        }
         _ if is_capture_json_proxy_route(method, path) => {
-            capture_proxy_http_response(&state.capture, method, raw_path, path, body)
+            capture_proxy_http_response(
+                &state.capture,
+                production_capture_expected_cameras(state.runtime_config.as_ref()),
+                method,
+                raw_path,
+                path,
+                body,
+            )
         }
         _ if method == "GET"
             && path == "/api/stream/latest"
@@ -23454,7 +24461,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
             capture_stream_redirect_response(&state.capture, raw_path)
         }
         _ if is_capture_binary_proxy_route(method, path) => {
-            capture_proxy_http_response(&state.capture, method, raw_path, path, body)
+            capture_proxy_http_response(
+                &state.capture,
+                production_capture_expected_cameras(state.runtime_config.as_ref()),
+                method,
+                raw_path,
+                path,
+                body,
+            )
         }
         _ => http_response(
             "404 Not Found",
@@ -23944,10 +24958,41 @@ mod tests {
     #[test]
     fn production_capture_defaults_to_runtime_camera_topology() {
         let single = runtime_profile::RuntimeProfile::test_profile("headless-cpp", 1);
+        let six = runtime_profile::RuntimeProfile::test_profile("sick-gentl", 6);
         let eight = runtime_profile::RuntimeProfile::test_profile("headless-cpp", 8);
 
         assert_eq!(production_capture_expected_cameras(&single), 1);
+        assert_eq!(production_capture_expected_cameras(&six), 6);
         assert_eq!(production_capture_expected_cameras(&eight), 8);
+    }
+
+    #[test]
+    fn calibration_camera_count_defaults_to_runtime_and_respects_explicit_offline_value() {
+        assert_eq!(algorithm_expected_cameras(&json!({}), 6), 6);
+        assert_eq!(
+            algorithm_expected_cameras(&json!({ "expectedCameras": 8 }), 6),
+            8
+        );
+        assert_eq!(
+            live_calibration_expected_cameras(&json!({}), 6).expect("six-camera default"),
+            6
+        );
+        assert_eq!(
+            live_calibration_expected_cameras(&json!({ "expectedCameras": 6 }), 6)
+                .expect("explicit six-camera request"),
+            6
+        );
+        let mismatch = live_calibration_expected_cameras(&json!({ "expectedCameras": 8 }), 6)
+            .expect_err("live capture must match configured topology");
+        assert_eq!(
+            mismatch["error"],
+            "calibration_capture_camera_count_mismatch"
+        );
+        assert_eq!(mismatch["configuredCameras"], 6);
+        assert_eq!(
+            live_calibration_expected_cameras(&json!({}), 8).expect("legacy eight-camera default"),
+            8
+        );
     }
 
     #[test]
@@ -24409,7 +25454,9 @@ mod tests {
                     .starts_with("HTTP/1.1 403 Forbidden"));
                     fs::remove_file(&artifact_path).unwrap();
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(1314) => {}
                 Err(error) => panic!("create Windows reparse symlink: {error}"),
             }
             fs::write(&artifact_path, b"legacy-depth").unwrap();
@@ -24606,7 +25653,7 @@ mod tests {
                     material_id: "REAL-NEWER".to_string(),
                     camera_id: "camera-1".to_string(),
                     camera_ip: "192.168.101.100".to_string(),
-                    data_name: "depth.png".to_string(),
+                    data_name: "depth".to_string(),
                     sequence_no: 1,
                     file_type: "png".to_string(),
                     path: real_capture_path.to_string(),
@@ -25912,9 +26959,9 @@ mod tests {
     }
 
     #[test]
-    fn capture_config_reads_require_admin_config_permission() {
+    fn public_capture_summary_is_anonymous_but_full_config_requires_admin_permission() {
+        assert_eq!(permission_for_route("GET", "/api/config"), None);
         for (method, path) in [
-            ("GET", "/api/config"),
             ("GET", "/api/config/capture"),
             ("GET", "/api/config/status"),
             ("GET", "/api/config/profiles"),
@@ -25951,6 +26998,226 @@ mod tests {
                 "capture configuration route must be protected: {method} {path}"
             );
         }
+    }
+
+    #[test]
+    fn public_capture_summary_removes_origins_storage_paths_and_unknown_fields() {
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:4874",
+        );
+        let sanitized = sanitize_public_capture_config(
+            &json!({
+                "service": {
+                    "name": "inspection",
+                    "role": "capture",
+                    "captureOrigin": "http://10.0.0.8:4874",
+                    "updatedAt": "now",
+                    "operatorToken": "secret"
+                },
+                "capture": {
+                    "mode": "eight-camera",
+                    "driver": "lvm-nvt",
+                    "fallback": "disabled",
+                    "databasePassword": "secret",
+                    "cameras": [{
+                        "id": "C1",
+                        "name": "camera 1",
+                        "ip": "192.0.2.1",
+                        "driverId": "lvm-nvt",
+                        "modelHint": "RMS",
+                        "role": "surface",
+                        "enabled": true,
+                        "triggerMode": "software",
+                        "exposureUs": 850,
+                        "gain": 1,
+                        "depthLines": 1280,
+                        "outputPath": "H:/steel-secret/C1",
+                        "password": "secret"
+                    }]
+                }
+            }),
+            &state,
+        );
+        assert_eq!(sanitized["service"]["capturePort"], 4874);
+        assert_eq!(sanitized["capture"]["cameras"][0]["outputPath"], "");
+        let serialized = sanitized.to_string();
+        assert!(!serialized.contains("captureOrigin"));
+        assert!(!serialized.contains("steel-secret"));
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn public_capture_summary_prefers_active_runtime_camera_topology() {
+        let root = std::env::temp_dir().join(format!(
+            "steel-public-runtime-capture-{}-{}",
+            std::process::id(),
+            SITE_CONFIG_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("runtime capture fixture root");
+        let capture_path = root.join("capture.json");
+        fs::write(
+            &capture_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "steel.capture.profile.v2",
+                "name": "sick-six-live",
+                "driverMode": "sick-gentl",
+                "expectedCameras": 2,
+                "storageRoot": "H:/private-capture-root",
+                "captureDefaults": { "frameTriggerMode": "free-run" },
+                "cameras": [{
+                    "cameraIndex": 1,
+                    "id": "C1",
+                    "key": "C1",
+                    "ip": "192.0.2.11",
+                    "model": "Ranger3-60",
+                    "serialNumber": "private-serial-1",
+                    "firmware": "private-firmware-1",
+                    "role": "surface-1",
+                    "storageRoot": "D:/private-camera-root",
+                    "enabled": true
+                }, {
+                    "cameraIndex": 2,
+                    "id": "C2",
+                    "key": "C2",
+                    "ip": "192.0.2.12",
+                    "model": "Ranger3-60",
+                    "role": "surface-2",
+                    "enabled": true
+                }]
+            }))
+            .expect("capture profile JSON"),
+        )
+        .expect("capture profile");
+
+        let mut profile = runtime_profile::RuntimeProfile::test_profile("external-api", 2);
+        profile.id = "sick-array-2".to_string();
+        profile.capture_profile = Some("capture.json".to_string());
+        profile.profile_path = root.join("runtime.json");
+        let mut state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:4874",
+        );
+        state.runtime_config = Arc::new(profile);
+
+        let sanitized = sanitize_public_capture_config(
+            &json!({
+                "capture": {
+                    "mode": "eight-camera",
+                    "driver": "lvm-nvt",
+                    "cameras": [{ "id": "CAM-01", "ip": "198.51.100.10" }]
+                }
+            }),
+            &state,
+        );
+        assert_eq!(sanitized["capture"]["mode"], json!("sick-array-2"));
+        assert_eq!(sanitized["capture"]["driver"], json!("sick-gentl"));
+        assert_eq!(sanitized["capture"]["expectedCameras"], json!(2));
+        assert_eq!(sanitized["capture"]["cameras"].as_array().unwrap().len(), 2);
+        assert_eq!(sanitized["capture"]["cameras"][0]["id"], json!("C1"));
+        assert_eq!(
+            sanitized["capture"]["cameras"][0]["triggerMode"],
+            json!("free-run")
+        );
+        assert_eq!(sanitized["capture"]["cameras"][0]["outputPath"], "");
+        let serialized = sanitized.to_string();
+        assert!(!serialized.contains("CAM-01"));
+        assert!(!serialized.contains("private-capture-root"));
+        assert!(!serialized.contains("private-camera-root"));
+        assert!(!serialized.contains("private-serial"));
+        assert!(!serialized.contains("private-firmware"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn production_epoch_milliseconds_are_rendered_as_shanghai_wall_clock_time() {
+        assert_eq!(
+            production_timestamp_label("1787498887838"),
+            "2026-08-23 23:28:07"
+        );
+        assert_eq!(production_time_label("1787498887838", "2603"), "23:28");
+        assert_eq!(production_time_label("not-a-time", "2603"), "--:--");
+        assert_eq!(production_timestamp_label("1"), "");
+        assert_eq!(
+            production_timestamp_label("2026-08-23 23:28:07"),
+            "2026-08-23 23:28:07"
+        );
+    }
+
+    #[test]
+    fn numeric_algorithm_flow_reference_binds_regions_and_defects_to_the_same_session() {
+        let state = production_test_state();
+        insert_production_record(
+            &state,
+            "INSP-FLOW-IDENTITY",
+            "2603",
+            "SESSION-FLOW-IDENTITY",
+            "completed",
+            "completed",
+            "1787498887838",
+        );
+        let flow = state
+            .runtime
+            .block_on(db::start_steel_flow(
+                &state.database.connection,
+                db::SteelFlowInput {
+                    session_id: "SESSION-FLOW-IDENTITY".to_string(),
+                    material_id: "2603".to_string(),
+                    source: "grayscale".to_string(),
+                    status: "completed".to_string(),
+                    storage_root: "H:/steel".to_string(),
+                    started_at: "1787498887838".to_string(),
+                    raw_payload: "{}".to_string(),
+                },
+            ))
+            .expect("steel flow");
+
+        let region_response = response_json(write_capture_regions_response(
+            &state,
+            &json!({
+                "materialId": flow.flow_no.to_string(),
+                "regions": {
+                    "schema": "steel.capture-region-map.v1",
+                    "cameras": {
+                        "C1": {
+                            "state": "ready",
+                            "sourceSize": [200, 100],
+                            "stableCrop": [20, 0, 180, 100],
+                            "overlapColumnIntervals": [],
+                            "ownedColumnIntervals": [[20, 180]]
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        ));
+        assert_eq!(region_response["code"], 0);
+        assert_eq!(region_response["flowNo"], flow.flow_no);
+        assert_eq!(region_response["materialId"], "2603");
+
+        let defect_response = response_json(write_production_defect_batch_response(
+            &state,
+            &json!({
+                "schema": "steel.capture-defect-import.v1",
+                "materialId": flow.flow_no.to_string(),
+                "defects": [{
+                    "sourceDefectId": format!("{}-C1-000001", flow.flow_no),
+                    "cameraId": "C1",
+                    "defectType": "surface-defect-candidate",
+                    "severity": "review",
+                    "confidence": 0.8,
+                    "geometry": {"lengthRatio": 0.25}
+                }]
+            })
+            .to_string(),
+            "algorithm",
+        ));
+        assert_eq!(defect_response["code"], 0);
+        assert_eq!(defect_response["flowNo"], flow.flow_no);
+        assert_eq!(defect_response["inspectionId"], "INSP-FLOW-IDENTITY");
+        assert_eq!(defect_response["materialId"], "2603");
+        assert_eq!(defect_response["inserted"], 1);
     }
 
     #[test]
@@ -26628,6 +27895,7 @@ mod tests {
         .expect("runtime profile JSON");
 
         assert_eq!(body["schema"], "steel.runtime-profile.public.v1");
+        assert_eq!(body["siteDisplayName"], "test site");
         assert_eq!(body["profileId"], "test-bkv-6");
         assert_eq!(body["cameraCount"], 6);
         assert_eq!(body["cameras"].as_array().map(Vec::len), Some(6));
@@ -27177,15 +28445,23 @@ mod tests {
             "/api/capture/cache/status"
         ));
         assert!(is_capture_json_proxy_route("GET", "/api/capture/alignment"));
-        assert!(is_capture_json_proxy_route("GET", "/api/capture/measurement"));
-        assert!(is_capture_json_proxy_route("GET", "/api/capture/defects"));
         assert!(is_capture_json_proxy_route(
+            "GET",
+            "/api/capture/measurement"
+        ));
+        assert!(is_capture_json_proxy_route("GET", "/api/capture/regions"));
+        assert!(is_capture_json_proxy_route("GET", "/api/capture/defects"));
+        assert!(is_sick_algorithm_reprocess_route(
             "POST",
             "/api/capture/measurement/rebuild"
         ));
-        assert!(is_capture_json_proxy_route(
+        assert!(is_sick_algorithm_reprocess_route(
             "POST",
             "/api/capture/defects/rebuild"
+        ));
+        assert!(!is_capture_json_proxy_route(
+            "POST",
+            "/api/capture/measurement/rebuild"
         ));
         assert!(!is_capture_json_proxy_route("POST", "/api/capture/latest"));
         assert!(!is_capture_json_proxy_route("GET", "/api/capture/file"));
@@ -27492,6 +28768,58 @@ mod tests {
             )
         )
         .is_ok());
+    }
+
+    #[test]
+    fn calibration_set_safety_uses_runtime_camera_topology_and_keeps_legacy_eight() {
+        let mappings = (1..=6)
+            .map(|index| {
+                json!({
+                    "ip": format!("192.0.2.{index}"),
+                    "path": format!("camera-{index}.xml"),
+                    "rollbackPath": format!("known-good-camera-{index}.xml"),
+                    "expectedSn": format!("SN-{index}"),
+                    "artifactType": "camera-sdk"
+                })
+            })
+            .collect::<Vec<_>>();
+        let safe_six = json!({
+            "dryRun": true,
+            "atomic": true,
+            "rollbackOnFailure": true,
+            "requireAllMapped": true,
+            "stopStreams": true,
+            "expectedCameras": 6,
+            "ips": mappings.iter().filter_map(|item| item.get("ip").cloned()).collect::<Vec<_>>(),
+            "cameraCalibrations": mappings,
+            "persistActive": false,
+            "saveCameraParams": false,
+            "saveToDevice": false
+        });
+        assert!(validate_capture_device_mutation_request_for_camera_count(
+            "/api/calibration/apply-all",
+            &safe_six.to_string(),
+            6,
+        )
+        .is_ok());
+        assert_eq!(
+            validate_capture_device_mutation_request(
+                "/api/calibration/apply-all",
+                &safe_six.to_string(),
+            ),
+            Err("calibration_set_requires_eight_cameras")
+        );
+
+        let mut wrong_count = safe_six;
+        wrong_count["expectedCameras"] = json!(8);
+        assert_eq!(
+            validate_capture_device_mutation_request_for_camera_count(
+                "/api/calibration/apply-all",
+                &wrong_count.to_string(),
+                6,
+            ),
+            Err("calibration_set_camera_count_mismatch")
+        );
     }
 
     #[test]
@@ -28192,6 +29520,7 @@ mod tests {
 
         let mut unavailable = production_test_state();
         unavailable.trigger_gateway_origin = unused_local_http_origin();
+        unavailable.trigger_health_required = true;
         let private_origin = unavailable.trigger_gateway_origin.clone();
         let response = response_text(trigger_gateway_proxy_http_response(
             &unavailable,
@@ -28203,6 +29532,24 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(response.contains("trigger_gateway_unavailable"));
         assert!(!response.contains(&private_origin));
+
+        unavailable.trigger_health_required = false;
+        let response = response_text(trigger_gateway_proxy_http_response(
+            &unavailable,
+            "GET",
+            "/api/trigger/status",
+            "",
+            "operator-a",
+        ));
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        let payload: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap())
+            .expect("optional trigger status");
+        assert_eq!(payload["code"], 0);
+        assert_eq!(payload["status"], "not-required");
+        assert_eq!(payload["required"], false);
+        assert_eq!(payload["available"], false);
+        assert_eq!(payload["mode"], "gray");
+        assert_eq!(payload["manualAllowed"], false);
 
         for path in [
             "/api/trigger/mode",
@@ -28216,6 +29563,34 @@ mod tests {
     }
 
     #[test]
+    fn missing_capture_defect_manifest_is_reported_as_pending_work() {
+        let body = json!({
+            "code": 404,
+            "error": "defect_detection_not_found",
+            "materialId": "63"
+        })
+        .to_string();
+        let (origin, server) = spawn_health_http_server("404 Not Found", body, Duration::ZERO);
+        let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+        let response = response_text(capture_proxy_http_response(
+            &state.capture,
+            production_capture_expected_cameras(state.runtime_config.as_ref()),
+            "GET",
+            "/api/capture/defects?materialId=63",
+            "/api/capture/defects",
+            "",
+        ));
+        server.join().expect("capture provider test server");
+        assert!(response.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        let payload: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap())
+            .expect("pending defect response");
+        assert_eq!(payload["code"], 0);
+        assert_eq!(payload["state"], "waiting-for-committed-frames");
+        assert_eq!(payload["materialId"], "63");
+        assert_eq!(payload["retryable"], true);
+    }
+
+    #[test]
     fn production_mutations_share_one_serial_command_lane() {
         assert!(is_production_mutation_route(
             "POST",
@@ -28225,6 +29600,15 @@ mod tests {
             "POST",
             "/api/production/steel-out"
         ));
+        assert!(is_production_mutation_route(
+            "POST",
+            "/internal/v1/defect-batch"
+        ));
+        assert!(is_production_mutation_route("POST", "/api/defects/review"));
+        assert_eq!(
+            permission_for_route("POST", "/api/defects/review"),
+            Some("admin.records")
+        );
         assert!(!is_production_mutation_route(
             "GET",
             "/api/production/status"
@@ -30542,7 +31926,7 @@ mod tests {
     }
 
     #[test]
-    fn calibration_capture_fit_requires_one_complete_frame_from_each_of_eight_cameras() {
+    fn calibration_capture_fit_requires_one_complete_frame_from_each_configured_camera() {
         let root = std::env::temp_dir().join(format!(
             "steel-calibration-capture-summary-{}-{}",
             std::process::id(),
@@ -30551,31 +31935,39 @@ mod tests {
         fs::create_dir_all(&root).expect("create calibration capture test directory");
         let summary_path = root.join("summary.json");
         fs::write(&summary_path, "{}").expect("write calibration capture summary");
-        let results = (1..=8)
-            .map(|index| {
-                json!({
-                    "code": 0,
-                    "ip": format!("192.168.200.{index}"),
-                    "completeFrame": true,
-                    "metadataOutput": root.join(format!("camera-{index}.json")).display().to_string()
+        let complete_capture = |expected_cameras: i64| {
+            let results = (1..=expected_cameras)
+                .map(|index| {
+                    json!({
+                        "code": 0,
+                        "ip": format!("192.168.200.{index}"),
+                        "completeFrame": true,
+                        "metadataOutput": root.join(format!("camera-{index}.json")).display().to_string()
+                    })
                 })
+                .collect::<Vec<_>>();
+            json!({
+                "code": 0,
+                "successes": expected_cameras,
+                "failures": 0,
+                "completeFrames": expected_cameras,
+                "metadataFrames": expected_cameras,
+                "summaryOutput": summary_path.display().to_string(),
+                "results": results
             })
-            .collect::<Vec<_>>();
-        let complete = json!({
-            "code": 0,
-            "successes": 8,
-            "failures": 0,
-            "completeFrames": 8,
-            "metadataFrames": 8,
-            "summaryOutput": summary_path.display().to_string(),
-            "results": results
-        });
-        assert_eq!(
-            calibration_capture_data_dir(&complete, 8).expect("complete capture"),
-            root
-        );
+        };
+        for expected_cameras in [6, 8] {
+            assert_eq!(
+                calibration_capture_data_dir(
+                    &complete_capture(expected_cameras),
+                    expected_cameras,
+                )
+                .expect("complete capture"),
+                root
+            );
+        }
 
-        let mut incomplete = complete;
+        let mut incomplete = complete_capture(8);
         incomplete["metadataFrames"] = json!(7);
         let error = calibration_capture_data_dir(&incomplete, 8)
             .expect_err("incomplete calibration capture must fail");
@@ -31135,13 +32527,6 @@ mod tests {
             ))
             .expect("online inspection storage root update");
 
-        let records = response_json(inspection_world_records_response(&state));
-
-        assert_eq!(records["schema"], "steel.inspection-world.records.v1");
-        assert_eq!(records["provider"], "online");
-        assert_eq!(records["records"][0]["recordId"], "INSP-WORLD-1");
-        assert_eq!(records["records"][0]["steelId"], "MAT-WORLD-1");
-
         for camera_id in 1..=8 {
             let path = image_root.join(format!("camera-{camera_id}.png"));
             let mut frame = image::RgbImage::from_pixel(32, 48, image::Rgb([0, 0, 0]));
@@ -31175,6 +32560,13 @@ mod tests {
                 ))
                 .expect("online capture fixture");
         }
+        let records = response_json(inspection_world_records_response(&state));
+
+        assert_eq!(records["schema"], "steel.inspection-world.records.v1");
+        assert_eq!(records["provider"], "online");
+        assert_eq!(records["records"][0]["recordId"], "INSP-WORLD-1");
+        assert_eq!(records["records"][0]["steelId"], "MAT-WORLD-1");
+
         for (id, geometry_json) in [
             (
                 "ONLINE-LOCATABLE",

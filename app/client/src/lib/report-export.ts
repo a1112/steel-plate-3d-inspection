@@ -1,4 +1,5 @@
 import type { InspectionReportArchive } from '../services/inspection-api';
+import { DEFAULT_SYSTEM_NAME } from './system-brand';
 
 type JsonObject = Record<string, unknown>;
 
@@ -80,7 +81,10 @@ function defectRows(defects: unknown[]): string {
   }).join('');
 }
 
-export function exportInspectionArchiveAsPrintableHtml(archive: InspectionReportArchive): string {
+export function exportInspectionArchiveAsPrintableHtml(
+  archive: InspectionReportArchive,
+  systemName = DEFAULT_SYSTEM_NAME,
+): string {
   const document = object(archive.document);
   const record = object(document.record);
   const plate = object(record.plate);
@@ -140,7 +144,7 @@ export function exportInspectionArchiveAsPrintableHtml(archive: InspectionReport
   <div class="toolbar"><button type="button" onclick="window.print()">打印 / 保存为 PDF</button></div>
   <main>
     <header>
-      <div><div class="eyebrow">钢材 3D 表面检测系统 · 不可变归档打印件</div><h1>钢材表面缺陷检测报告</h1></div>
+      <div><div class="eyebrow">${escapeReportHtml(systemName)} · 不可变归档打印件</div><h1>钢材表面缺陷检测报告</h1></div>
       <div class="identity">
         <strong>${escapeReportHtml(archive.reportId)}</strong><br>
         签发：${escapeReportHtml(archive.issuedAt)} / ${escapeReportHtml(archive.issuedBy)}<br>

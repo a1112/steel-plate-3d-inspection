@@ -5,6 +5,7 @@ import { getMockInspectionSnapshot } from './data/inspection';
 
 const bkvRuntimeProfile = {
   schema: 'steel.runtime-profile.public.v1',
+  siteDisplayName: '北满特钢小棒检测系统',
   profileId: 'bkv-6',
   displayName: 'BKV 六相机离线转换',
   provider: 'bkv',
@@ -237,7 +238,7 @@ describe('App BKV provider selection', () => {
     }));
 
     const { container } = render(<App />);
-    expect(await screen.findByText('钢管3D表面检测系统')).toBeInTheDocument();
+    expect((await screen.findAllByText('北满特钢小棒检测系统')).length).toBeGreaterThan(0);
     expect(screen.getByText('BKV 模式')).toBeInTheDocument();
     expect(screen.getByText('离线数据')).toBeInTheDocument();
     expect(screen.getByText('6/6')).toBeInTheDocument();
@@ -294,7 +295,7 @@ describe('App BKV provider selection', () => {
     const replayItem = screen.getByRole('menuitem', { name: '离线回放' });
     expect(replayItem).toBeEnabled();
     expect(replayItem).toHaveAttribute('aria-current', 'page');
-    expect(screen.getByText('钢管3D表面检测系统')).toBeInTheDocument();
+    expect(screen.getAllByText('北满特钢小棒检测系统').length).toBeGreaterThan(0);
 
     expect(screen.getByRole('menuitem', { name: '在线检测' })).toBeDisabled();
     expect(new URLSearchParams(window.location.search).get('view')).not.toBe('online');
@@ -384,7 +385,7 @@ describe('App BKV provider selection', () => {
     render(<App />);
 
     expect(await screen.findByRole('heading', { name: 'BKV 数据读取失败' })).toBeInTheDocument();
-    expect(screen.getByText('钢管3D表面检测系统')).toBeInTheDocument();
+    expect(screen.getAllByText('北满特钢小棒检测系统').length).toBeGreaterThan(0);
     expect(screen.getByText('BKV 模式')).toBeInTheDocument();
     expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
     expect(screen.queryByText(/服务异常/)).not.toBeInTheDocument();

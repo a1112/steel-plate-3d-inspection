@@ -1833,6 +1833,12 @@ def generate_mock_defects(mesh: dict[str, Any], count: int) -> list[dict[str, An
     count = max(0, min(int(count), 64))
     if count == 0:
         return []
+    try:
+        camera_count = int(mesh["cameraCount"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("mesh cameraCount must be a positive integer") from error
+    if camera_count <= 0:
+        raise ValueError("mesh cameraCount must be a positive integer")
     positions = np.asarray(mesh["positions"], dtype=np.float64).reshape((-1, 3))
     valid = np.asarray(mesh.get("validMask", [1] * positions.shape[0]), dtype=bool)
     valid_positions = positions[valid & np.all(np.isfinite(positions), axis=1)]
@@ -1849,9 +1855,9 @@ def generate_mock_defects(mesh: dict[str, Any], count: int) -> list[dict[str, An
     defects: list[dict[str, Any]] = []
     for index in range(count):
         length_ratio = (index + 1.0) / (count + 1.0)
-        camera_index = index % max(1, int(mesh.get("cameraCount", 8)))
+        camera_index = index % camera_count
         local_ratio = 0.28 + 0.44 * ((index * 37) % 100) / 100.0
-        circumference_ratio = (camera_index + local_ratio) / max(1, int(mesh.get("cameraCount", 8)))
+        circumference_ratio = (camera_index + local_ratio) / camera_count
         depth = 0.32 + 0.11 * (index % 5)
         signed_depth = -depth if index % 2 == 0 else depth
         defects.append({
