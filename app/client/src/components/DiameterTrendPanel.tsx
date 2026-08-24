@@ -183,7 +183,7 @@ export function DiameterTrendPanel({
       data-x-axis-end-mm={axisEndMm.toFixed(0)}
     >
       <DiameterCurve
-        title="拟合外径变化"
+        title="测径（外径）曲线"
         description={`名义外径 ${format(nominalDiameterMm)} mm`}
         samples={samples}
         value={(sample) => sample.diameterMm}

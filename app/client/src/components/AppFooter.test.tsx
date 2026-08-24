@@ -147,7 +147,7 @@ describe('AppFooter', () => {
     expect(screen.getByLabelText('选中缺陷分析工具')).toHaveTextContent('凹坑');
     expect(screen.queryByRole('group', { name: '主检测视图' })).not.toBeInTheDocument();
     expect(screen.getByRole('group', { name: 'BKV 下方视图' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '宽度曲线' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: '测径（外径）' })).toHaveAttribute('aria-pressed', 'true');
     fireEvent.click(screen.getByRole('button', { name: '缺陷' }));
     expect(onAnalysisViewModeChange).toHaveBeenCalledWith('defects');
   });
@@ -312,9 +312,9 @@ describe('AppFooter', () => {
     expect(screen.getByLabelText('选中缺陷分析工具')).toHaveTextContent('0.42×0.36×0.12mm');
     expect(screen.queryByRole('group', { name: '主检测视图' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '3D' })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '局部点云' }));
+    fireEvent.click(screen.getByRole('button', { name: '测径（外径）' }));
 
-    expect(onAnalysisViewModeChange).toHaveBeenCalledWith('point-cloud');
+    expect(onAnalysisViewModeChange).toHaveBeenCalledWith('diameter');
     expect(onCollapsedChange).toHaveBeenCalledWith(false);
     expect(screen.queryByRole('button', { name: '收起缺陷分析区' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '展开缺陷分析区' })).not.toBeInTheDocument();

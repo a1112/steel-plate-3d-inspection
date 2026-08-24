@@ -6008,6 +6008,16 @@ button {
   font-weight: 900;
 }
 
+.diameter-analysis-cell .diameter-trend-grid {
+  height: calc(100% - 26px);
+  min-height: 210px;
+  padding: 0;
+}
+
+.diameter-analysis-cell .diameter-curve-card svg {
+  min-height: 0;
+}
+
 .defect-preview {
   position: relative;
   width: 100%;
@@ -11098,6 +11108,7 @@ button {
 
 .density-dense .defect-preview,
 .density-dense .height-chart,
+.density-dense .diameter-analysis-cell .diameter-trend-grid,
 .density-dense .point-cloud-viewer {
   min-height: 140px;
 }
@@ -11553,7 +11564,8 @@ button {
   }
 
   .defect-preview,
-  .height-chart {
+  .height-chart,
+  .diameter-analysis-cell .diameter-trend-grid {
     min-height: 160px;
   }
 
@@ -19829,6 +19841,23 @@ button {
 
 .diameter-analysis-panel .panel-body {
   padding: 0;
+}
+
+.diameter-only-analysis {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 4px;
+  padding: 3px;
+}
+
+.diameter-only-analysis > h3 {
+  margin: 0;
+  padding: 0 4px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 900;
 }
 
 .diameter-analysis-panel .diameter-curve-card svg {

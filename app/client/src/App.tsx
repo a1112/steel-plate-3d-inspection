@@ -628,7 +628,7 @@ function InspectionDashboard({
   const [viewportSize, setViewportSize] = useState(readViewportSize);
   const [analysisCollapsed, setAnalysisCollapsed] = useState(false);
   const [analysisViewMode, setAnalysisViewMode] = useState<AnalysisViewMode>(
-    terminalMode === 'bkv' ? 'diameter' : 'overview',
+    'diameter',
   );
   const [plateMapViewMode, setPlateMapViewMode] = useState<PlateMapViewMode>('2d');
   const [longitudinalVisibleRange, setLongitudinalVisibleRange] = useState<[number, number] | null>(null);
@@ -1751,10 +1751,10 @@ function InspectionDashboard({
                     headerless
                     collapsed={analysisCollapsed}
                     viewMode={analysisViewMode}
-                    diameterMeasurement={terminalMode === 'bkv' ? {
+                    diameterMeasurement={{
                       nominalDiameterMm: activeSnapshot.currentPlate.widthMm,
                       lengthMm: activeSnapshot.currentPlate.lengthMm,
-                    } : undefined}
+                    }}
                     diameterVisibleRange={longitudinalVisibleRange}
                   />
                 ) : null}

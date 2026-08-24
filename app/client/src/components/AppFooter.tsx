@@ -67,14 +67,11 @@ const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
 };
 
 const analysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
-  { id: 'overview', label: '综合' },
-  { id: 'image', label: '灰度' },
-  { id: 'point-cloud', label: '局部点云' },
-  { id: 'profile', label: '剖面' },
+  { id: 'diameter', label: '测径（外径）' },
 ];
 
 const bkvAnalysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
-  { id: 'diameter', label: '宽度曲线' },
+  { id: 'diameter', label: '测径（外径）' },
   { id: 'defects', label: '缺陷' },
 ];
 

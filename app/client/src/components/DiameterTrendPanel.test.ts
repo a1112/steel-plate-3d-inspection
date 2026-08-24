@@ -53,7 +53,7 @@ describe('buildDiameterMeasurements', () => {
     }));
 
     expect(screen.getAllByRole('img')).toHaveLength(1);
-    expect(screen.getByRole('img', { name: '拟合外径变化，按钢管长度位置变化' })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: '测径（外径）曲线，按钢管长度位置变化' })).toBeInTheDocument();
     expect(container.querySelector('.diameter-curve-card > header')).toBeNull();
     expect(container.querySelector('.diameter-curve-card > footer')).toHaveTextContent('名义外径 200.000 mm');
     expect(screen.queryByText('外径偏差变化')).not.toBeInTheDocument();
