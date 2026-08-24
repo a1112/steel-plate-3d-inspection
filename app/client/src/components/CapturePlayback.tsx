@@ -27,14 +27,50 @@ function timeLabel(value: string) {
 
 type PlaybackViewport = { width: number; height: number };
 
+function readyPlaybackRoi(
+  saved: CaptureHistoryCameraFrame,
+): [number, number, number, number] | null {
+  const roi = saved.validRoi;
+  if (saved.regionState !== 'ready' || !roi || roi.length !== 4 || !roi.every(Number.isFinite)) {
+    return null;
+  }
+  const [left, top, right, bottom] = roi.map(Math.round);
+  return left >= 0
+    && top >= 0
+    && right > left
+    && bottom > top
+    && right <= saved.width
+    && bottom <= saved.height
+    ? [left, top, right, bottom]
+    : null;
+}
+
+function playbackImageSize(saved: CaptureHistoryCameraFrame, roi: [number, number, number, number]) {
+  const roiWidth = roi[2] - roi[0];
+  const roiHeight = roi[3] - roi[1];
+  const indexedWidth = Number(saved.playbackWidth || 0);
+  const indexedHeight = Number(saved.playbackHeight || 0);
+  const hasIndexedSize = indexedWidth > 0 && indexedHeight > 0;
+  return {
+    width: hasIndexedSize ? indexedWidth : roiWidth,
+    height: hasIndexedSize ? indexedHeight : roiHeight,
+  };
+}
+
 function playbackRequestWidth(
   saved: CaptureHistoryCameraFrame,
   viewport: PlaybackViewport,
 ) {
   const cellWidth = viewport.width > 0 ? Math.max(160, (viewport.width - 16) / 3) : 560;
   const cellHeight = viewport.height > 0 ? Math.max(100, (viewport.height - 8) / 2 - 59) : 300;
-  const sourceWidth = saved.playbackWidth || saved.width;
-  const sourceHeight = saved.playbackHeight || saved.height;
+  const roi = readyPlaybackRoi(saved);
+  const roiWidth = roi ? roi[2] - roi[0] : 0;
+  const roiHeight = roi ? roi[3] - roi[1] : 0;
+  const indexedWidth = Number(saved.playbackWidth || 0);
+  const indexedHeight = Number(saved.playbackHeight || 0);
+  const hasIndexedSize = indexedWidth > 0 && indexedHeight > 0;
+  const sourceWidth = hasIndexedSize ? indexedWidth : roiWidth;
+  const sourceHeight = hasIndexedSize ? indexedHeight : roiHeight;
   const aspect = sourceHeight > 0 ? sourceWidth / sourceHeight : 1;
   const renderedWidth = Math.min(cellWidth, cellHeight * aspect);
   const pixelRatio = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
@@ -121,9 +157,12 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
     setSwitching(true);
     const timer = window.setTimeout(() => {
       const target = frames[requestedFrameIndex];
-      const urls = target.cameras.map((camera) => (
-        captureHistoryImageUrl(camera.artifactRef, playbackRequestWidth(camera, viewport))
-      ));
+      const urls = target.cameras.flatMap((camera) => {
+        const roi = readyPlaybackRoi(camera);
+        return roi
+          ? [captureHistoryImageUrl(camera.artifactRef, playbackRequestWidth(camera, viewport), roi)]
+          : [];
+      });
       const preload = urls.map((url) => new Promise<void>((resolve) => {
         const image = new Image();
         image.onload = () => resolve();
@@ -149,11 +188,14 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
         const neighbor = frames[neighborIndex];
         if (!neighbor) continue;
         for (const camera of neighbor.cameras) {
+          const roi = readyPlaybackRoi(camera);
+          if (!roi) continue;
           const image = new Image();
           image.decoding = 'async';
           image.src = captureHistoryImageUrl(
             camera.artifactRef,
             playbackRequestWidth(camera, viewport),
+            roi,
           );
         }
       }
@@ -180,34 +222,38 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
         <div ref={gridRef} className="capture-playback-grid" aria-label="历史六相机画面">
           {cameras.map((camera, index) => {
             const saved = frame.cameras.find((item) => (
-              item.cameraId === camera.configId
-              || item.cameraId === camera.name
-              || item.ip === camera.ip
-              || item.cameraIndex === camera.deviceId
+              readyPlaybackRoi(item) !== null
+              && (item.cameraId === camera.configId
+                || item.cameraId === camera.name
+                || item.ip === camera.ip
+                || item.cameraIndex === camera.deviceId)
             ));
             const label = cameraLabel(camera, index);
+            const roi = saved ? readyPlaybackRoi(saved) : null;
+            const size = saved && roi ? playbackImageSize(saved, roi) : null;
             return (
               <article key={camera.ip} className="capture-playback-card">
                 <header><b>{label}</b><span>{camera.ip}</span></header>
                 <div>
-                  {saved ? (
+                  {saved && roi && size ? (
                     <img
                       src={captureHistoryImageUrl(
                         saved.artifactRef,
                         playbackRequestWidth(saved, viewport),
+                        roi,
                       )}
                       alt={`${label} 历史灰度图`}
-                      width={saved.width}
-                      height={saved.height}
+                      width={size.width}
+                      height={size.height}
                       decoding="async"
                       loading="eager"
                     />
                   ) : (
-                    <span className="capture-playback-missing"><Camera size={25} />该帧无图像</span>
+                    <span className="capture-playback-missing"><Camera size={25} />该帧无算法裁剪图</span>
                   )}
                 </div>
                 <footer>
-                  <span>{saved ? `${saved.width}×${saved.height}` : '--'}</span>
+                  <span>{size ? `${size.width}×${size.height}` : '--'}</span>
                   <span>{saved ? `${Math.max(1, Math.round(saved.bytes / 1024))} KB` : '--'}</span>
                 </footer>
               </article>

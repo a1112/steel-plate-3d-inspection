@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -13,6 +14,7 @@ import unittest
 from pathlib import Path
 from typing import Callable
 from urllib import request
+from urllib.error import HTTPError
 from urllib.parse import quote
 from unittest.mock import patch
 
@@ -144,6 +146,33 @@ def write_profile(root: Path) -> Path:
     }
     path = root / "capture.json"
     path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    return path
+
+
+def write_ready_playback_roi(
+    storage_root: Path,
+    material_id: str,
+    camera_id: str,
+    crop_box: list[int],
+) -> Path:
+    path = playback_roi_path(storage_root, material_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "steel.capture-playback-roi.v2",
+                "materialId": material_id,
+                "cameras": {
+                    camera_id: {
+                        "cameraId": camera_id,
+                        "state": "ready",
+                        "stableCrop": crop_box,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -787,6 +816,71 @@ class SickPlaybackTests(unittest.TestCase):
             self.assertEqual(second_path, manifest_path)
             self.assertEqual(second["sourceFingerprint"], manifest["sourceFingerprint"])
             self.assertEqual(manifest_path.stat().st_mtime_ns, original_time)
+
+    def test_explicit_crop_pyramid_uses_exact_roi_and_coordinate_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.png"
+            # A fully bright image would make automatic thresholding retain the
+            # complete frame.  The explicit algorithm ROI must still win exactly.
+            Image.fromarray(np.full((100, 240), 80, dtype=np.uint8), mode="L").save(
+                source
+            )
+            cache_root = root / "cache"
+
+            first_path, first = build_image_pyramid(
+                source,
+                cache_root,
+                [20, 10, 100, 70],
+            )
+            first_image_path, _ = select_pyramid_image(first_path, first, 160)
+            with Image.open(first_image_path) as first_image:
+                self.assertEqual(first_image.size, (80, 60))
+            self.assertEqual(first["validRoi"], [20, 10, 100, 70])
+            self.assertEqual(first["requestedCrop"], [20, 10, 100, 70])
+            self.assertEqual(first["cropSize"], [80, 60])
+            self.assertEqual(first["cropSource"], "explicit-algorithm-roi")
+            self.assertIsNone(first["frameDetectedRoi"])
+
+            second_path, second = build_image_pyramid(
+                source,
+                cache_root,
+                [120, 5, 220, 85],
+            )
+            self.assertNotEqual(second_path, first_path)
+            self.assertNotEqual(second["sourceFingerprint"], first["sourceFingerprint"])
+            self.assertEqual(second["validRoi"], [120, 5, 220, 85])
+            self.assertEqual(second["cropSize"], [100, 80])
+
+            repeated_path, repeated = build_image_pyramid(
+                source,
+                cache_root,
+                [20, 10, 100, 70],
+            )
+            self.assertEqual(repeated_path, first_path)
+            self.assertEqual(repeated["sourceFingerprint"], first["sourceFingerprint"])
+
+    def test_explicit_crop_pyramid_rejects_invalid_or_coerced_coordinates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.png"
+            Image.fromarray(np.full((60, 80), 40, dtype=np.uint8), mode="L").save(
+                source
+            )
+            cache_root = root / "cache"
+            invalid_boxes = (
+                [-1, 0, 40, 40],
+                [0, 0, 81, 40],
+                [10, 10, 10, 40],
+                [10, 40, 30, 20],
+                [0, 0, 40],
+                [0, 0, 40.5, 40],
+                [False, 0, 40, 40],
+            )
+            for crop_box in invalid_boxes:
+                with self.subTest(crop_box=crop_box):
+                    with self.assertRaises(ValueError):
+                        build_image_pyramid(source, cache_root, crop_box)
 
     def test_pyramid_uses_stable_flow_horizontal_roi(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2545,6 +2639,110 @@ class SickProviderTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_subscribed_preview_is_scheduled_when_tail_signal_is_false(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            try:
+                with runtime.stream_lock:
+                    runtime.stream_subscriptions[camera.key] = {"fpsLimit": 2}
+                # The sample is visible but cannot satisfy the tail detector at
+                # this threshold.  Preview routing must still let the bounded
+                # publisher make its independent full-frame decision.
+                runtime.steel_bright_threshold = 255.0
+                with patch.object(runtime, "_schedule_stream_frame") as scheduled:
+                    result = runtime._capture_one(
+                        camera,
+                        {
+                            "timeoutMs": 1_000,
+                            "_persistFrame": False,
+                            "materialId": "1",
+                        },
+                        1,
+                        0,
+                        threading.Barrier(1),
+                        None,
+                    )
+                self.assertFalse(result["steelSignal"])
+                scheduled.assert_called_once()
+                self.assertIs(scheduled.call_args.args[0], camera)
+                self.assertEqual(scheduled.call_args.args[1].camera_key, camera.key)
+            finally:
+                runtime.close()
+
+    def test_stream_primary_readiness_requires_the_subscription_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            try:
+                with (
+                    patch.object(runtime, "_schedule_stream_seed"),
+                    patch.object(runtime, "_acquisition_running", return_value=True),
+                ):
+                    runtime.start_stream({"ip": camera.ip, "dataMode": 3})
+                    self.assertEqual(
+                        set(runtime.stream_requested_kinds[camera.key]),
+                        {"intensity-grid"},
+                    )
+                    status = runtime.stream_status(camera.ip)
+                    self.assertEqual(status["primaryVariant"], "intensity-grid")
+                    self.assertFalse(status["primaryReady"])
+                    self.assertFalse(status["gridReady"])
+                    self.assertFalse(status["ready"])
+                    self.assertTrue(status["warmingUp"])
+
+                    with runtime.stream_lock:
+                        runtime.stream_latest[camera.key] = {
+                            "intensity-valid": b"focused-only"
+                        }
+                    status = runtime.stream_status(camera.ip)
+                    self.assertEqual(status["readyVariants"], ["intensity-valid"])
+                    self.assertFalse(status["gridReady"])
+                    self.assertFalse(status["ready"])
+
+                    with runtime.stream_lock:
+                        runtime.stream_latest[camera.key]["intensity-grid"] = b"grid"
+                    status = runtime.stream_status(camera.ip)
+                    self.assertTrue(status["gridReady"])
+                    self.assertTrue(status["primaryReady"])
+                    self.assertTrue(status["ready"])
+                    self.assertFalse(status["warmingUp"])
+
+                    with runtime.stream_lock:
+                        runtime.stream_latest.pop(camera.key, None)
+                        runtime.stream_requested_kinds.pop(camera.key, None)
+                    runtime.start_stream({"ip": camera.ip, "dataMode": 2})
+                    self.assertEqual(
+                        set(runtime.stream_requested_kinds[camera.key]),
+                        {"intensity-grid"},
+                    )
+
+                    with runtime.stream_lock:
+                        runtime.stream_latest[camera.key] = {"intensity-grid": b"grid"}
+                        runtime.stream_requested_kinds.pop(camera.key, None)
+                    runtime.start_stream({"ip": camera.ip, "dataMode": 1})
+                    self.assertEqual(
+                        set(runtime.stream_requested_kinds[camera.key]),
+                        {"depth-valid"},
+                    )
+                    status = runtime.stream_status(camera.ip)
+                    self.assertEqual(status["primaryVariant"], "depth-valid")
+                    self.assertTrue(status["gridReady"])
+                    self.assertFalse(status["primaryReady"])
+                    self.assertFalse(status["ready"])
+                    self.assertTrue(status["warmingUp"])
+
+                    with runtime.stream_lock:
+                        runtime.stream_latest[camera.key]["depth-valid"] = b"depth"
+                    status = runtime.stream_status(camera.ip)
+                    self.assertTrue(status["primaryReady"])
+                    self.assertTrue(status["ready"])
+                    self.assertFalse(status["warmingUp"])
+            finally:
+                runtime.close()
+
     def test_recent_camera_files_prefers_latest_numeric_flow(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile = load_profile(write_profile(Path(directory)))
@@ -2631,6 +2829,9 @@ class SickProviderTests(unittest.TestCase):
                 with runtime.stream_lock:
                     runtime.stream_subscriptions[camera.key] = {"fpsLimit": 5}
                     runtime.stream_camera_key = camera.key
+                    runtime.stream_requested_kinds[camera.key] = {
+                        "depth-valid": time.monotonic()
+                    }
 
                 runtime._seed_stream_cache_from_storage(camera.key)
 
@@ -2651,6 +2852,52 @@ class SickProviderTests(unittest.TestCase):
                 )
                 self.assertIn(
                     "depth-raw",
+                    runtime.stream_status(camera.ip)["readyVariants"],
+                )
+            finally:
+                runtime.close()
+
+    def test_intensity_only_archive_seed_does_not_open_depth_npz(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            capture_root = (
+                camera.storage_root / "33" / "capture" / camera.camera_id
+            )
+            try:
+                (capture_root / "2d").mkdir(parents=True)
+                (capture_root / "3d").mkdir(parents=True)
+                intensity = np.zeros((32, 128), dtype=np.uint8)
+                intensity[:, 40:88] = 180
+                Image.fromarray(intensity).save(capture_root / "2d" / "4.png")
+                np.savez(
+                    capture_root / "3d" / "4.npz",
+                    array=np.full((32, 128), 1_000, dtype=np.uint16),
+                )
+                with runtime.stream_lock:
+                    runtime.stream_subscriptions[camera.key] = {"fpsLimit": 5}
+                    runtime.stream_camera_key = camera.key
+                    runtime.stream_requested_kinds[camera.key] = {
+                        "intensity-grid": time.monotonic()
+                    }
+
+                with patch(
+                    "scripts.sick_capture.provider.np.load",
+                    side_effect=AssertionError("unrequested depth archive was opened"),
+                ) as load_depth:
+                    runtime._seed_stream_cache_from_storage(camera.key)
+
+                load_depth.assert_not_called()
+                self.assertIsNotNone(
+                    runtime.stream_latest_bytes(
+                        camera.ip,
+                        "intensity-grid",
+                        "valid",
+                    )
+                )
+                self.assertNotIn(
+                    "depth-valid",
                     runtime.stream_status(camera.ip)["readyVariants"],
                 )
             finally:
@@ -2799,6 +3046,71 @@ class SickProviderTests(unittest.TestCase):
                 release_fetch.set()
                 runtime.close()
 
+    def test_playback_cache_failure_keeps_explicit_crop_and_fails_closed_without_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            backend = FakeBackend()
+            runtime = ProviderRuntime(profile, backend=backend)
+            source = (
+                camera_capture_root(
+                    profile.enabled_cameras[0].storage_root,
+                    "52",
+                    "C1",
+                )
+                / "2d"
+                / "0.png"
+            )
+            source.parent.mkdir(parents=True)
+            Image.fromarray(
+                np.arange(80 * 60, dtype=np.uint16).reshape(60, 80).astype(np.uint8),
+                mode="L",
+            ).save(source)
+            write_ready_playback_roi(
+                profile.storage_root,
+                "52",
+                "C1",
+                [10, 5, 50, 35],
+            )
+            try:
+                with patch.object(
+                    runtime.playback_compute_pool,
+                    "submit",
+                    side_effect=RuntimeError("forced pyramid failure"),
+                ):
+                    strict = runtime.optimized_playback_image(
+                        source,
+                        160,
+                        [10, 5, 50, 35],
+                    )
+                    self.assertIsNotNone(strict)
+                    assert strict is not None
+                    self.assertEqual(strict[0], "image/jpeg")
+                    with Image.open(io.BytesIO(strict[1])) as preview:
+                        self.assertEqual(preview.size, (40, 30))
+
+                    self.assertIsNone(
+                        runtime.optimized_playback_image(source, 160, None)
+                    )
+                    self.assertIsNone(
+                        runtime.optimized_playback_image(
+                            source,
+                            160,
+                            [70, 0, 90, 20],
+                        )
+                    )
+                    self.assertIsNone(
+                        runtime.optimized_playback_image(
+                            source,
+                            160,
+                            [0, 0, 40, 30],
+                        )
+                    )
+            finally:
+                runtime.close()
+            self.assertTrue(backend.closed)
+
     def test_loopback_http_contract_exposes_health_storage_and_steel_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile = load_profile(write_profile(Path(directory)))
@@ -2825,6 +3137,12 @@ class SickProviderTests(unittest.TestCase):
                 Image.fromarray(
                     np.full((64, 64), 40, dtype=np.uint8), mode="L"
                 ).save(image_path)
+                roi_path = write_ready_playback_roi(
+                    profile.storage_root,
+                    "51",
+                    "C1",
+                    [16, 0, 48, 64],
+                )
                 with request.urlopen(
                     f"{origin}/api/capture/file?path={quote('51/capture/C1/2d/0.png')}",
                     timeout=2,
@@ -2842,6 +3160,53 @@ class SickProviderTests(unittest.TestCase):
                         image_response.headers["X-Content-Type-Options"], "nosniff"
                     )
                     self.assertTrue(image_body.startswith(b"\x89PNG\r\n\x1a\n"))
+                valid_url = (
+                    f"{origin}/api/capture/file?path={quote('51/capture/C1/2d/0.png')}"
+                    "&maxWidth=160&region=valid"
+                    "&cropX=16&cropY=0&cropWidth=32&cropHeight=64"
+                )
+                with request.urlopen(valid_url, timeout=2) as valid_response:
+                    with Image.open(io.BytesIO(valid_response.read())) as cropped:
+                        self.assertEqual(valid_response.status, 200)
+                        self.assertEqual(cropped.size, (32, 64))
+                        self.assertEqual(valid_response.headers["Content-Type"], "image/jpeg")
+                valid_region_base = (
+                    f"{origin}/api/capture/file?path={quote('51/capture/C1/2d/0.png')}"
+                    "&region=valid"
+                )
+                rejected_queries = (
+                    "&maxWidth=160",
+                    "&maxWidth=160&cropX=16&cropY=0&cropWidth=32",
+                    "&maxWidth=159&cropX=16&cropY=0&cropWidth=32&cropHeight=64",
+                    "&maxWidth=160&cropX=60&cropY=0&cropWidth=8&cropHeight=64",
+                    "&maxWidth=160&cropX=x&cropY=0&cropWidth=32&cropHeight=64",
+                    "&maxWidth=160&cropX=0&cropY=0&cropWidth=64&cropHeight=64",
+                )
+                for query_suffix in rejected_queries:
+                    with self.subTest(query_suffix=query_suffix):
+                        with self.assertRaises(HTTPError) as rejected:
+                            request.urlopen(
+                                f"{valid_region_base}{query_suffix}",
+                                timeout=2,
+                            )
+                        self.assertEqual(rejected.exception.code, 422)
+                        self.assertEqual(
+                            rejected.exception.headers["Cache-Control"],
+                            "no-store",
+                        )
+                        error_payload = json.loads(rejected.exception.read())
+                        self.assertEqual(
+                            error_payload["error"],
+                            "capture_valid_region_not_ready",
+                        )
+                roi_path.unlink()
+                with self.assertRaises(HTTPError) as missing_indexed_roi:
+                    request.urlopen(valid_url, timeout=2)
+                self.assertEqual(missing_indexed_roi.exception.code, 422)
+                self.assertEqual(
+                    json.loads(missing_indexed_roi.exception.read())["error"],
+                    "capture_valid_region_not_ready",
+                )
                 with request.urlopen(
                     request.Request(
                         f"{origin}/api/steel/event",

@@ -531,7 +531,6 @@ function ConfiguredApp({
           resourceUsage={resourceUsageState.usage}
           resourceUsageStale={resourceUsageState.stale}
           terminalViews={{
-            online: { available: false, active: false },
             bkv: { available: true, active: true, onOpen: retryBkvLoad },
           }}
           onNavChange={() => undefined}
@@ -636,6 +635,7 @@ function InspectionDashboard({
     'diameter',
   );
   const [plateMapViewMode, setPlateMapViewMode] = useState<PlateMapViewMode>('2d');
+  const [onlineWorkspaceMode, setOnlineWorkspaceMode] = useState<'inspection' | 'camera'>('inspection');
   const [longitudinalVisibleRange, setLongitudinalVisibleRange] = useState<[number, number] | null>(null);
   const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(false);
   const [worldFocusRequest, setWorldFocusRequest] = useState({
@@ -1696,6 +1696,28 @@ function InspectionDashboard({
         />
       ) : null}
       {uiState.activeNav === 'online' ? (
+        <div className="online-unified-page">
+          <div className="online-workspace-tabs" role="tablist" aria-label="在线监测模式">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={onlineWorkspaceMode === 'inspection'}
+              className={onlineWorkspaceMode === 'inspection' ? 'active' : ''}
+              onClick={() => setOnlineWorkspaceMode('inspection')}
+            >
+              检测结果
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={onlineWorkspaceMode === 'camera'}
+              className={onlineWorkspaceMode === 'camera' ? 'active' : ''}
+              onClick={() => setOnlineWorkspaceMode('camera')}
+            >
+              相机实时 / 回放
+            </button>
+          </div>
+          {onlineWorkspaceMode === 'inspection' ? (
         <div className={`online-workspace ${terminalMode === 'bkv' ? 'runtime-bkv-workspace' : ''}`}>
           <LeftSidebar
             runtimeMode={terminalMode}
@@ -1862,11 +1884,13 @@ function InspectionDashboard({
             </main>
           </section>
         </div>
+          ) : (
+            <LiveMonitoringPage statuses={captureSnapshot.statuses} health={captureSnapshot.health} />
+          )}
+        </div>
       ) : (
         <>
-          {uiState.activeNav === 'live' ? (
-            <LiveMonitoringPage statuses={captureSnapshot.statuses} health={captureSnapshot.health} />
-          ) : uiState.activeNav === 'report' ? (
+          {uiState.activeNav === 'report' ? (
             <ReportPage
               systemName={systemName}
               defectTypes={snapshot.defectTypes}
@@ -1960,7 +1984,6 @@ function InspectionDashboard({
         resourceUsage={resourceUsageState.usage}
         resourceUsageStale={resourceUsageState.stale}
         terminalViews={{
-          online: { available: dashboardMode.kind !== 'bkv', active: dashboardMode.kind !== 'bkv' },
           bkv: { available: dashboardMode.kind === 'bkv', active: dashboardMode.kind === 'bkv' },
         }}
         flowVisible={inspectionFlowVisible}

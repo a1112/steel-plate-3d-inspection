@@ -4,7 +4,7 @@ import { createPortal } from 'react-dom';
 import type { DefectItem, DefectType } from '../data/inspection';
 import { getDefectPreviewImage, severityLabels, surfaceLabels } from '../data/inspection';
 import { barSurfaceFileUrl } from '../services/bar-surface-api';
-import { bkvOnlineCroppedImageUrl } from '../services/bkv-online-api';
+import { bkvOnlineCroppedImageUrl, isBkvOnlineImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import type { ReportFilters } from '../state/operations';
 import { Panel } from './Panel';
@@ -43,36 +43,54 @@ function getDefectCameraLabel(defect: DefectItem) {
   return `camera${cameraIndex + 1}`;
 }
 
+function explicitRoiArtifactUrl(value: string | undefined) {
+  const source = value?.trim() ?? '';
+  if (!source || isBkvOnlineImageUrl(source)) return '';
+  return /^(?:https?:|data:|blob:)/i.test(source) || source.startsWith('/')
+    ? source
+    : barSurfaceFileUrl(source);
+}
+
 function getDefectPreview(defect: DefectItem, inspectionId?: string) {
   const cameraId = defect.cameraIndex;
   const sequenceNo = defect.artifacts?.sequenceNo;
-  const onlineCrop = bkvOnlineCroppedImageUrl(
-    defect.artifacts?.roiImage
-      || defect.artifacts?.sourceFrame?.intensity
-      || defect.previewImageUrl,
-    defect.artifacts?.roi,
-  );
-  if (onlineCrop) {
-    return { url: onlineCrop, source: 'BKV 缺陷 ROI 裁剪' };
+  const roi = defect.artifacts?.roi;
+  const roiImage = defect.artifacts?.roiImage;
+  const previewImage = defect.previewImageUrl?.trim() ?? '';
+
+  const explicitRoiImage = explicitRoiArtifactUrl(roiImage);
+  if (explicitRoiImage) {
+    return { url: explicitRoiImage, source: '生产 ROI 产物' };
   }
-  if (defect.previewImageUrl) {
-    return { url: defect.previewImageUrl, source: defect.synthetic ? '模拟算法产物' : '检测记录缺陷小图' };
+
+  const bkvRoiImage = bkvOnlineCroppedImageUrl(roiImage, roi);
+  if (bkvRoiImage) {
+    return { url: bkvRoiImage, source: 'BKV 缺陷 ROI 裁剪' };
   }
+
+  if (previewImage && !isBkvOnlineImageUrl(previewImage)) {
+    return { url: previewImage, source: defect.synthetic ? '模拟算法产物' : '检测记录缺陷小图' };
+  }
+
+  const bkvPreview = bkvOnlineCroppedImageUrl(previewImage, roi);
+  if (bkvPreview) {
+    return { url: bkvPreview, source: 'BKV 缺陷 ROI 裁剪' };
+  }
+
+  const bkvSourceFrame = bkvOnlineCroppedImageUrl(defect.artifacts?.sourceFrame?.intensity, roi);
+  if (bkvSourceFrame) {
+    return { url: bkvSourceFrame, source: 'BKV 缺陷 ROI 裁剪' };
+  }
+
   if (inspectionId && cameraId && sequenceNo != null) {
-    return {
-      url: inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo, defect.artifacts?.roi),
-      source: defect.artifacts?.roi.width && defect.artifacts.roi.height
-        ? '检测记录 ROI 裁剪'
-        : '检测记录原始帧',
-    };
+    const worldRoiImage = inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo, roi);
+    if (worldRoiImage) return { url: worldRoiImage, source: '检测记录 ROI 裁剪' };
   }
-  if (defect.artifacts?.roiImage) {
-    return { url: barSurfaceFileUrl(defect.artifacts.roiImage), source: '生产 ROI 产物' };
-  }
-  if (import.meta.env.DEV) {
+
+  if (defect.synthetic && import.meta.env.DEV) {
     return { url: getDefectPreviewImage(defect.typeId), source: '开发模拟图 · 非生产产物' };
   }
-  return { url: '', source: '暂无图像产物' };
+  return { url: '', source: '算法 ROI 小图未就绪' };
 }
 
 function getDefectConfidence(defect: DefectItem) {
@@ -113,10 +131,10 @@ function DefectListHoverCard({
         <em className={defect.severity}>{severityLabels[defect.severity]}</em>
       </header>
       <figure className={preview.url ? '' : 'is-empty'}>
-        {preview.url ? <img src={preview.url} alt={`${defect.typeLabel}缺陷图像`} /> : <span>暂无缺陷 ROI 图像</span>}
+        {preview.url ? <img src={preview.url} alt={`${defect.typeLabel}缺陷图像`} /> : <span>{preview.source}</span>}
         <figcaption>
           <b>{getDefectCameraLabel(defect)}</b>
-          <span>{preview.source}</span>
+          {preview.url ? <span>{preview.source}</span> : null}
         </figcaption>
       </figure>
       <dl>

@@ -40,18 +40,34 @@ function canonicalCameraId(value: string) {
   return match ? `C${Number(match[1])}` : value.trim().toUpperCase();
 }
 
-function validRoi(value: number[] | undefined): [number, number, number, number] | null {
+function validRoi(
+  value: number[] | undefined,
+  sourceWidth: number,
+  sourceHeight: number,
+): [number, number, number, number] | null {
   if (!value || value.length !== 4 || !value.every(Number.isFinite)) return null;
   const [left, top, right, bottom] = value.map((item) => Math.round(item));
-  return right > left && bottom > top ? [left, top, right, bottom] : null;
+  return left >= 0
+    && top >= 0
+    && right > left
+    && bottom > top
+    && right <= sourceWidth
+    && bottom <= sourceHeight
+    ? [left, top, right, bottom]
+    : null;
 }
 
 function eligibleCamera(
   frame: CaptureHistoryFrame,
   camera: CaptureHistoryCameraFrame,
 ): EligibleCamera | null {
-  const roi = validRoi(camera.validRoi);
-  if (!roi || camera.regionState !== 'ready' || !camera.artifactRef.trim()) return null;
+  const artifactRef = camera.artifactRef.trim().replaceAll('\\', '/');
+  const roi = validRoi(camera.validRoi, camera.width, camera.height);
+  if (
+    !roi
+    || camera.regionState !== 'ready'
+    || !/(?:^|\/)capture\/[^/]+\/2d\/[^/]+\.png$/i.test(artifactRef)
+  ) return null;
   const pixels = Math.max(1, (roi[2] - roi[0]) * (roi[3] - roi[1]));
   return {
     frame,
@@ -159,7 +175,7 @@ export function selectCaptureRoiPreviews(
       sequenceNo: camera.storageIndex ?? frame.sequence,
       fileType: 'png',
       path: camera.artifactRef,
-      url: captureHistoryImageUrl(camera.artifactRef, 2048),
+      url: captureHistoryImageUrl(camera.artifactRef, 2048, roi),
       createdAt: camera.storedAt || frame.capturedAt,
       validRoi: roi,
       sourceFrameId: frame.frameId,

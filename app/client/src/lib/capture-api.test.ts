@@ -274,6 +274,8 @@ describe("readLatestCaptureFile", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(Date, "now").mockReturnValue(1783771200123);
+    const startController = new AbortController();
+    const stopController = new AbortController();
 
     await startCaptureStream({
       ip: "192.168.101.100",
@@ -282,8 +284,8 @@ describe("readLatestCaptureFile", () => {
       dataMode: 1,
       fpsLimit: 12,
       hs: true,
-    });
-    await stopCaptureStream("192.168.101.100");
+    }, startController.signal);
+    await stopCaptureStream("192.168.101.100", stopController.signal);
 
     expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:4873/api/stream/start");
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toMatchObject({
@@ -294,7 +296,9 @@ describe("readLatestCaptureFile", () => {
       fpsLimit: 12,
       hs: true,
     });
+    expect(fetchMock.mock.calls[0][1]?.signal).toBe(startController.signal);
     expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:4873/api/stream/stop");
+    expect(fetchMock.mock.calls[1][1]?.signal).toBe(stopController.signal);
     expect(captureStreamImageUrl("192.168.101.100", "intensity")).toBe(
       "http://127.0.0.1:4317/api/stream/latest?ip=192.168.101.100&kind=intensity&region=valid&v=1783771200123",
     );
@@ -328,8 +332,11 @@ describe("readLatestCaptureFile", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:4873/api/capture/history?limit=500",
     );
-    expect(captureHistoryImageUrl("63/capture/C1/2d/1.png", 8192)).toBe(
-      "http://127.0.0.1:4873/api/capture/file?path=63%2Fcapture%2FC1%2F2d%2F1.png&maxWidth=4096&region=valid",
+    expect(captureHistoryImageUrl("63/capture/C1/2d/1.png", 8192, [0, 0, 2560, 1280])).toBe(
+      "http://127.0.0.1:4873/api/capture/file?path=63%2Fcapture%2FC1%2F2d%2F1.png&maxWidth=4096&region=valid&cropX=0&cropY=0&cropWidth=2560&cropHeight=1280",
+    );
+    expect(captureHistoryImageUrl("63/capture/C1/2d/1.png", 2048, [665, 0, 1144, 1024])).toBe(
+      "http://127.0.0.1:4873/api/capture/file?path=63%2Fcapture%2FC1%2F2d%2F1.png&maxWidth=2048&region=valid&cropX=665&cropY=0&cropWidth=479&cropHeight=1024",
     );
 
     await readCapturePlaybackCacheStatus();

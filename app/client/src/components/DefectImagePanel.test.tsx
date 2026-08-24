@@ -77,4 +77,57 @@ describe('DefectImagePanel review workflow', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('当前账号没有复核权限');
     expect(screen.getByRole('button', { name: '确认缺陷' })).not.toBeDisabled();
   });
+
+  it('does not treat an ordinary source-frame intensity file as a defect crop', () => {
+    const sourceFrameOnly: DefectItem = {
+      ...defect,
+      previewImageUrl: '',
+      artifacts: {
+        ...defect.artifacts!,
+        sourceFrame: {
+          intensity: 'http://127.0.0.1:4873/api/capture/file?path=63%2Fcapture%2FC1%2F2d%2F18.png',
+        },
+      },
+    };
+
+    render(<DefectImagePanel defect={sourceFrameOnly} />);
+
+    expect(screen.getByText('算法 ROI 小图未就绪')).toBeInTheDocument();
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+  });
+
+  it('does not request an inspection frame when its ROI is invalid', () => {
+    const invalidRoi: DefectItem = {
+      ...defect,
+      previewImageUrl: '',
+      artifacts: {
+        ...defect.artifacts!,
+        roi: { x: 100, y: 200, width: 0, height: 9 },
+      },
+    };
+
+    render(<DefectImagePanel inspectionId="INSP-63" defect={invalidRoi} />);
+
+    expect(screen.getByText('算法 ROI 小图未就绪')).toBeInTheDocument();
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+  });
+
+  it('uses a BKV source frame only through a legal ROI crop request', () => {
+    const bkvRoi: DefectItem = {
+      ...defect,
+      previewImageUrl: '',
+      artifacts: {
+        ...defect.artifacts!,
+        sourceFrame: {
+          intensity: '/api/bkv-online/image?camera=1&seq=63&index=18&kind=2d',
+        },
+      },
+    };
+
+    render(<DefectImagePanel defect={bkvRoi} />);
+
+    const image = screen.getByRole('img', { name: /划伤/ });
+    expect(image).toHaveAttribute('src', expect.stringContaining('cropX=100'));
+    expect(image).toHaveAttribute('src', expect.stringContaining('cropHeight=9'));
+  });
 });

@@ -94,6 +94,13 @@ describe('capture ROI preview selection', () => {
     expect(result?.images[0].url).toContain(
       '/api/capture/file?path=2747%2Fcapture%2FC1%2F2d%2F80.png&maxWidth=2048&region=valid',
     );
+    const previewUrl = new URL(result!.images[0].url);
+    expect(Object.fromEntries(previewUrl.searchParams)).toMatchObject({
+      cropX: '100',
+      cropY: '0',
+      cropWidth: '600',
+      cropHeight: '1024',
+    });
   });
 
   it('fills only transport-gap camera slots from another indexed frame', () => {
@@ -118,5 +125,17 @@ describe('capture ROI preview selection', () => {
     expect(selectCaptureRoiPreviews(raw, '2747', ['C1'])).toBeNull();
     expect(selectCaptureRoiPreviews(missingRoi, '2747', ['C1'])).toBeNull();
     expect(selectCaptureRoiPreviews(blocked, '2747', ['C1'])).toBeNull();
+  });
+
+  it('rejects invalid bounds and artifacts that are not indexed 2D PNG frames', () => {
+    const negative = history([frame(1, [camera(1, 1000, { validRoi: [-1, 0, 700, 1024] })])]);
+    const outside = history([frame(1, [camera(1, 1000, { validRoi: [100, 0, 2561, 1024] })])]);
+    const wrongArtifact = history([frame(1, [camera(1, 1000, {
+      artifactRef: '2747/capture/C1/3d/1.npz',
+    })])]);
+
+    expect(selectCaptureRoiPreviews(negative, '2747', ['C1'])).toBeNull();
+    expect(selectCaptureRoiPreviews(outside, '2747', ['C1'])).toBeNull();
+    expect(selectCaptureRoiPreviews(wrongArtifact, '2747', ['C1'])).toBeNull();
   });
 });

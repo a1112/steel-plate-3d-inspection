@@ -91,6 +91,13 @@ class CaptureService:
         ) as response:
             return response.status, response.read()
 
+    def request_bytes(self, path, timeout=10):
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{self.port}{path}",
+            timeout=timeout,
+        ) as response:
+            return response.status, response.read(), response.headers
+
     def stop(self, timeout=10):
         if self.process.poll() is None:
             self.process.send_signal(signal.CTRL_BREAK_EVENT)
@@ -205,11 +212,91 @@ def frame_transaction_and_overlap(executable, root):
         require(len(metadata_paths) == 12, "frame outputs reused metadata paths")
         allowed_status, allowed_body = service.capture_file(summary["results"][0]["depthOutput"])
         require(allowed_status == 200 and allowed_body, "capture file under storage root was not served")
+        encoded_depth_path = urllib.parse.quote(
+            summary["results"][0]["depthOutput"], safe=""
+        )
+        valid_region_url = (
+            f"/api/capture/file?path={encoded_depth_path}&region=valid"
+        )
+        rejected_valid_region_queries = (
+            "",
+            "&cropX=0&cropY=0&cropWidth=20",
+            "&cropX=x&cropY=0&cropWidth=20&cropHeight=20",
+            "&cropX=-1&cropY=0&cropWidth=20&cropHeight=20",
+            "&cropX=0&cropY=0&cropWidth=0&cropHeight=20",
+            "&cropX=150&cropY=0&cropWidth=20&cropHeight=20",
+            "&cropX=0&cropX=1&cropY=0&cropWidth=20&cropHeight=20",
+            "&cropX=10&cropY=5&cropWidth=40&cropHeight=30",
+        )
+        for suffix in rejected_valid_region_queries:
+            rejected = rejected_json(
+                service, valid_region_url + suffix, None, 422
+            )
+            require(
+                rejected.get("error") == "capture_valid_region_not_ready",
+                "valid-region capture request did not fail closed",
+            )
+        duplicate_region = rejected_json(
+            service,
+            f"/api/capture/file?path={encoded_depth_path}&region=valid&region=raw",
+            None,
+            422,
+        )
+        require(
+            duplicate_region.get("error") == "capture_valid_region_not_ready",
+            "duplicate capture region bypassed strict parsing",
+        )
         try:
             service.capture_file(Path(__file__).resolve())
             raise AssertionError("capture file endpoint exposed a file outside configured roots")
         except urllib.error.HTTPError as error:
             require(error.code == 403, "outside capture file should be rejected with HTTP 403")
+
+        stream_ip = capture_body(Path(root) / "pipeline", rounds=1)["ips"][0]
+        stream = service.request(
+            "/api/stream/start",
+            {
+                "ip": stream_ip,
+                "width": 160,
+                "lines": 96,
+                "dataMode": 3,
+                "fpsLimit": 2,
+            },
+        )
+        try:
+            require(stream.get("code") == 0 and stream.get("running") is True,
+                    "simulated stream did not start")
+            for key in ("latestDepthUrl", "latestIntensityUrl"):
+                latest_url = stream.get(key, "")
+                require("region=valid" in latest_url,
+                        f"{key} did not advertise the strict valid-region contract")
+                rejected = rejected_json(service, latest_url, None, 422)
+                require(
+                    rejected.get("error") == "capture_valid_region_not_ready",
+                    f"{key} exposed an uncropped source frame",
+                )
+            raw_url = (
+                f"/api/stream/latest?ip={urllib.parse.quote(stream_ip, safe='')}"
+                "&kind=intensity&region=raw"
+            )
+            raw_status, raw_body, raw_headers = service.request_bytes(raw_url)
+            require(raw_status == 200 and raw_body.startswith(b"\x89PNG\r\n\x1a\n"),
+                    "explicit raw stream compatibility was broken")
+            require(raw_headers.get_content_type() == "image/png",
+                    "raw stream returned the wrong content type")
+            malformed_stream_region = rejected_json(
+                service,
+                raw_url.replace("region=raw", "region=valid&region=raw"),
+                None,
+                422,
+            )
+            require(
+                malformed_stream_region.get("error")
+                == "capture_valid_region_not_ready",
+                "duplicate stream region bypassed strict parsing",
+            )
+        finally:
+            service.request("/api/stream/stop", {"ip": stream_ip})
 
         dry_run_body = calibration_apply_body(root, dry_run=True)
         dry_run = service.request("/api/calibration/apply-all", dry_run_body)

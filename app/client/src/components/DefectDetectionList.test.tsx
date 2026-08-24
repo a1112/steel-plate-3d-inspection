@@ -164,6 +164,39 @@ describe('DefectDetectionList algorithm defects', () => {
     expect(screen.getByRole('tooltip')).toHaveTextContent('检测记录缺陷小图');
   });
 
+  it('shows an explicit pending state instead of falling back to a source frame or uncropped inspection frame', () => {
+    const sourceFrameOnly: DefectItem = {
+      ...roiDefect,
+      artifacts: {
+        ...roiDefect.artifacts!,
+        roi: { x: 1208, y: 848, width: 0, height: 11 },
+        sourceFrame: {
+          intensity: 'http://127.0.0.1:4873/api/capture/file?path=1908500%2Fcapture%2FC1%2F2d%2F18.png',
+        },
+      },
+    };
+    render(
+      <DefectDetectionList
+        defects={[sourceFrameOnly]}
+        inspectionId="1908500"
+        selectedDefectId={null}
+        filters={{ keyword: '', severity: 'all', surface: 'all', typeId: 'all' }}
+        filterOpen={false}
+        onSelectDefect={vi.fn()}
+        onToggleFilter={vi.fn()}
+        onFilterChange={vi.fn()}
+        onClearFilters={vi.fn()}
+      />,
+    );
+
+    fireEvent.mouseEnter(screen.getByRole('row', { name: /凹陷候选，camera1/ }));
+
+    const tooltip = screen.getByRole('tooltip');
+    expect(tooltip).toHaveTextContent('算法 ROI 小图未就绪');
+    expect(tooltip.querySelector('img')).toBeNull();
+    expect(tooltip).not.toHaveTextContent('检测记录原始帧');
+  });
+
   it('switches between the defect list and the pipe distribution map', () => {
     const onSelectDefect = vi.fn();
     render(

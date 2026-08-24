@@ -297,7 +297,7 @@ describe('App BKV provider selection', () => {
     expect(replayItem).toHaveAttribute('aria-current', 'page');
     expect(screen.getAllByText('北满特钢小棒检测系统').length).toBeGreaterThan(0);
 
-    expect(screen.getByRole('menuitem', { name: '在线检测' })).toBeDisabled();
+    expect(screen.queryByRole('menuitem', { name: '在线检测' })).not.toBeInTheDocument();
     expect(new URLSearchParams(window.location.search).get('view')).not.toBe('online');
   });
 
@@ -487,6 +487,27 @@ describe('App online severity filters', () => {
         };
       }),
     );
+  });
+
+  it('exposes one top-level online monitor and switches its complete result/camera modes', async () => {
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole('button', { name: '在线监测' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: '在线监测' })).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: '实时监控' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('tablist', { name: '在线监测模式' })).toHaveLength(1);
+    expect(screen.getByRole('tab', { name: '检测结果' })).toHaveAttribute('aria-selected', 'true');
+    expect(container.querySelectorAll('.online-workspace')).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('tab', { name: '相机实时 / 回放' }));
+    expect(await screen.findByRole('heading', { name: '相机监控' })).toBeInTheDocument();
+    expect(container.querySelectorAll('.online-workspace')).toHaveLength(0);
+    expect(screen.getByRole('tab', { name: '实时' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: '回放' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: '检测结果' }));
+    expect(container.querySelectorAll('.online-workspace')).toHaveLength(1);
+    expect(screen.queryByRole('heading', { name: '相机监控' })).not.toBeInTheDocument();
   });
 
   it('shows the complete scrollable defect list and toggles statistics severities', async () => {

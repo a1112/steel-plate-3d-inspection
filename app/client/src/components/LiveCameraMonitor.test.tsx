@@ -1,26 +1,27 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useState } from 'react';
 import type { CaptureCameraStatus, CaptureHealth } from '../lib/capture-api';
 import { LiveMonitoringPage, StableStreamImage } from './LiveCameraMonitor';
 
 const captureMocks = vi.hoisted(() => ({
-  start: vi.fn(async ({ ip }: { ip: string }) => ({ code: 0, running: true, ip })),
-  stop: vi.fn(async (ip: string) => ({ code: 0, running: false, ip })),
+  start: vi.fn(async ({ ip }: { ip: string }, _signal?: AbortSignal) => ({ code: 0, running: true, ip })),
+  stop: vi.fn(async (ip: string, _signal?: AbortSignal) => ({ code: 0, running: false, ip })),
   history: vi.fn(async () => ({
     code: 0,
     storageRoot: 'D:\\steel-sick-data',
     total: 1,
     count: 1,
     hasMore: false,
+    indexed: true,
     frames: [{
       frameId: 'MAT-001:000001',
       materialId: 'MAT-001',
       sequence: 1,
       capturedAt: '2026-08-21T04:00:00Z',
       cameras: [
-        { cameraId: 'C1', cameraIndex: 1, ip: '192.168.101.144', artifactRef: 'C1/MAT-001/intensity/000001.png', width: 2560, height: 1280, bytes: 1234, storedAt: '2026-08-21T04:00:00Z' },
-        { cameraId: 'C2', cameraIndex: 2, ip: '192.168.102.206', artifactRef: 'C2/MAT-001/intensity/000001.png', width: 2560, height: 1280, bytes: 1234, storedAt: '2026-08-21T04:00:00Z' },
+        { cameraId: 'C1', cameraIndex: 1, ip: '192.168.101.144', artifactRef: '1/capture/C1/2d/1.png', width: 2560, height: 1280, playbackWidth: 600, playbackHeight: 1280, validRoi: [100, 0, 700, 1280], regionState: 'ready', bytes: 1234, storedAt: '2026-08-21T04:00:00Z' },
+        { cameraId: 'C2', cameraIndex: 2, ip: '192.168.102.206', artifactRef: '1/capture/C2/2d/1.png', width: 2560, height: 1280, playbackWidth: 600, playbackHeight: 1280, validRoi: [200, 0, 800, 1280], regionState: 'ready', bytes: 1234, storedAt: '2026-08-21T04:00:00Z' },
       ],
     }],
   })),
@@ -33,8 +34,14 @@ vi.mock('../lib/capture-api', async (importOriginal) => {
     startCaptureStream: captureMocks.start,
     stopCaptureStream: captureMocks.stop,
     readCaptureHistory: captureMocks.history,
-    captureStreamImageUrl: (ip: string, kind: string) => `/api/stream/latest?ip=${ip}&kind=${kind}`,
-    captureHistoryImageUrl: (artifactRef: string, maxWidth: number) => `/api/capture/file?path=${artifactRef}&maxWidth=${maxWidth}`,
+    captureStreamImageUrl: (ip: string, kind: string, revision: string | number) => (
+      `/api/stream/latest?ip=${ip}&kind=${kind}&region=valid&v=${revision}`
+    ),
+    captureHistoryImageUrl: (
+      artifactRef: string,
+      maxWidth: number,
+      roi: readonly [number, number, number, number],
+    ) => `/api/capture/file?path=${artifactRef}&maxWidth=${maxWidth}&region=valid&cropX=${roi[0]}&cropY=${roi[1]}&cropWidth=${roi[2] - roi[0]}&cropHeight=${roi[3] - roi[1]}`,
   };
 });
 
@@ -93,6 +100,134 @@ describe('LiveMonitoringPage', () => {
     expect(view.container.querySelectorAll('img')).toHaveLength(1);
     expect(view.container.querySelector('.live-monitor-image-preload')).not.toBeInTheDocument();
     expect(screen.getByRole('img', { name: '单一在途实时帧' })).toHaveAttribute('src', '/stable-frame.png?v=7');
+  });
+
+  it('times out a stalled preload, keeps the committed frame, and retries', async () => {
+    vi.useFakeTimers();
+    const onFrame = vi.fn();
+    const onError = vi.fn();
+    const view = render(
+      <StableStreamImage src="/frame-a.png" alt="超时保护实时帧" onFrame={onFrame} onError={onError} />,
+    );
+
+    try {
+      fireEvent.load(view.container.querySelector<HTMLImageElement>('.live-monitor-image-preload')!);
+      view.rerender(
+        <StableStreamImage src="/frame-b.png" alt="超时保护实时帧" onFrame={onFrame} onError={onError} />,
+      );
+      expect(screen.getByRole('img', { name: '超时保护实时帧' })).toHaveAttribute('src', '/frame-a.png');
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_500);
+      });
+
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('img', { name: '超时保护实时帧' })).toHaveAttribute('src', '/frame-a.png');
+      expect(view.container.querySelector('.live-monitor-image-preload')).not.toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      expect(view.container.querySelector('.live-monitor-image-preload')).toHaveAttribute('src', '/frame-b.png');
+      expect(screen.getByRole('img', { name: '超时保护实时帧' })).toHaveAttribute('src', '/frame-a.png');
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it('starts the 500ms refresh clock before initially empty statuses become available', async () => {
+    vi.useFakeTimers();
+    const view = render(<LiveMonitoringPage statuses={[]} />);
+
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      view.rerender(<LiveMonitoringPage statuses={[{
+        ...statuses[0],
+        streamRunning: true,
+        streamFrames: 1,
+      }]} />);
+
+      const preload = view.container.querySelector<HTMLImageElement>('.live-monitor-image-preload');
+      expect(preload).toHaveAttribute('src', expect.stringMatching(/region=valid.*v=2/));
+      expect(screen.getByText('C1 等待首帧')).toBeVisible();
+      fireEvent.error(preload!);
+      expect(screen.getByText('C1 等待首帧，正在重试')).toBeVisible();
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps six committed frames visible while staggered refreshes load or fail', async () => {
+    vi.useFakeTimers();
+    const sixStatuses: CaptureCameraStatus[] = Array.from({ length: 6 }, (_, index) => ({
+      connected: true,
+      deviceId: index + 1,
+      ip: `192.168.10${index + 1}.100`,
+      name: `C${index + 1}`,
+      continuousAcquiring: true,
+      streamRunning: true,
+      streamFrames: 10,
+    }));
+    const view = render(<LiveMonitoringPage statuses={sixStatuses} />);
+
+    try {
+      const initialPreloads = [...view.container.querySelectorAll<HTMLImageElement>(
+        '.live-monitor-image-preload',
+      )];
+      expect(initialPreloads).toHaveLength(6);
+      expect(initialPreloads.every((image) => (
+        image.src.includes('region=valid') && image.src.includes('v=0')
+      ))).toBe(true);
+      initialPreloads.forEach((image) => fireEvent.load(image));
+
+      const initialFrames = screen.getAllByRole('img', { name: /C\d 实时灰度图/ });
+      expect(initialFrames).toHaveLength(6);
+      const initialSources = new Map(initialFrames.map((image) => [image.getAttribute('alt'), image.getAttribute('src')]));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+
+      const refreshPreloads = [...view.container.querySelectorAll<HTMLImageElement>(
+        '.live-monitor-image-preload',
+      )];
+      expect(refreshPreloads).toHaveLength(6);
+      expect(refreshPreloads.every((image) => (
+        image.src.includes('region=valid') && image.src.includes('v=1')
+      ))).toBe(true);
+      expect(screen.getAllByRole('img', { name: /C\d 实时灰度图/ })).toHaveLength(6);
+
+      refreshPreloads.forEach((image, index) => {
+        if (index % 2 === 0) fireEvent.load(image);
+        else fireEvent.error(image);
+      });
+
+      const settledFrames = screen.getAllByRole('img', { name: /C\d 实时灰度图/ });
+      expect(settledFrames).toHaveLength(6);
+      settledFrames.forEach((image, index) => {
+        expect(image).toHaveAttribute('src', expect.stringContaining('region=valid'));
+        if (index % 2 === 0) {
+          expect(image).toHaveAttribute('src', expect.stringContaining('v=1'));
+        } else {
+          expect(image.getAttribute('src')).toBe(initialSources.get(image.getAttribute('alt')));
+        }
+      });
+      expect(view.container.querySelectorAll('.live-monitor-grid-empty')).toHaveLength(0);
+
+      view.rerender(<LiveMonitoringPage statuses={sixStatuses.map((status) => ({
+        ...status,
+        streamFrames: (status.streamFrames ?? 0) + 1,
+      }))} />);
+      expect(screen.getAllByRole('img', { name: /C\d 实时灰度图/ })).toHaveLength(6);
+      expect(view.container.querySelectorAll('.live-monitor-grid-empty')).toHaveLength(0);
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
   });
 
   it('surfaces transport gaps even when all cameras have equal frame counts', () => {
@@ -163,12 +298,12 @@ describe('LiveMonitoringPage', () => {
         ip: '192.168.101.144',
         dataMode: 3,
         fpsLimit: 2,
-      }));
+      }), expect.anything());
       expect(captureMocks.start).toHaveBeenCalledWith(expect.objectContaining({
         ip: '192.168.102.206',
         dataMode: 3,
         fpsLimit: 2,
-      }));
+      }), expect.anything());
     });
     view.rerender(
       <LiveMonitoringPage
@@ -178,7 +313,11 @@ describe('LiveMonitoringPage', () => {
     );
     expect(screen.getByRole('img', { name: 'C1 实时灰度图' })).toHaveAttribute(
       'src',
-      expect.stringContaining('kind=intensity-grid'),
+      expect.stringMatching(/kind=intensity-grid.*region=valid/),
+    );
+    expect(screen.getByRole('img', { name: 'C2 实时灰度图' })).toHaveAttribute(
+      'src',
+      expect.stringMatching(/kind=intensity-grid.*region=valid/),
     );
 
     expect(screen.getByLabelText('六相机实时画面网格')).toBeInTheDocument();
@@ -187,7 +326,7 @@ describe('LiveMonitoringPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '深度图' }));
     expect(screen.getByRole('img', { name: 'C2 实时深度图' })).toHaveAttribute(
       'src',
-      expect.stringContaining('kind=depth'),
+      expect.stringMatching(/kind=depth.*region=valid/),
     );
 
     fireEvent.doubleClick(screen.getByRole('img', { name: 'C2 实时深度图' }));
@@ -195,8 +334,8 @@ describe('LiveMonitoringPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '暂停六相机实时播放' }));
     await waitFor(() => {
-      expect(captureMocks.stop).toHaveBeenCalledWith('192.168.101.144');
-      expect(captureMocks.stop).toHaveBeenCalledWith('192.168.102.206');
+      expect(captureMocks.stop).toHaveBeenCalledWith('192.168.101.144', expect.anything());
+      expect(captureMocks.stop).toHaveBeenCalledWith('192.168.102.206', expect.anything());
     });
 
     fireEvent.click(screen.getByRole('tab', { name: '回放' }));
@@ -204,7 +343,11 @@ describe('LiveMonitoringPage', () => {
     expect(screen.getByLabelText('历史六相机画面')).toBeInTheDocument();
     expect(screen.getByRole('img', { name: 'C1 历史灰度图' })).toHaveAttribute(
       'src',
-      expect.stringContaining('maxWidth=560'),
+      expect.stringMatching(/maxWidth=\d+.*region=valid.*cropX=100/),
+    );
+    expect(screen.getByRole('img', { name: 'C2 历史灰度图' })).toHaveAttribute(
+      'src',
+      expect.stringMatching(/maxWidth=\d+.*region=valid.*cropX=200.*cropWidth=600.*cropHeight=1280/),
     );
   });
 
@@ -239,6 +382,68 @@ describe('LiveMonitoringPage', () => {
     }
   });
 
+  it('does not cancel a successful in-flight start or leak busy when topology polling changes', async () => {
+    let resolveStart!: (value: { code: number; running: boolean; ip: string }) => void;
+    captureMocks.start.mockImplementationOnce((_options, _signal) => new Promise((resolve) => {
+      resolveStart = resolve;
+    }));
+    const initialStatus = statuses[0];
+    const view = render(<LiveMonitoringPage statuses={[initialStatus]} />);
+
+    await waitFor(() => expect(captureMocks.start).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('button', { name: '暂停六相机实时播放' })).toBeDisabled();
+
+    view.rerender(<LiveMonitoringPage statuses={[{
+      ...initialStatus,
+      streamRunning: true,
+      streamFrames: 0,
+    }]} />);
+    await act(async () => {
+      resolveStart({ code: 0, running: true, ip: initialStatus.ip });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(
+      screen.getByRole('button', { name: '暂停六相机实时播放' }),
+    ).not.toBeDisabled());
+    expect(captureMocks.stop).not.toHaveBeenCalled();
+    view.unmount();
+  });
+
+  it('aborts an in-flight start when leaving realtime mode without an unhandled rejection', async () => {
+    let observedSignal: AbortSignal | undefined;
+    captureMocks.start.mockImplementationOnce((_options, signal) => new Promise((_resolve, reject) => {
+      observedSignal = signal;
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+    }));
+    const view = render(<LiveMonitoringPage statuses={[statuses[0]]} />);
+
+    await waitFor(() => expect(observedSignal).toBeDefined());
+    fireEvent.click(screen.getByRole('tab', { name: '回放' }));
+
+    await waitFor(() => expect(observedSignal?.aborted).toBe(true));
+    await waitFor(() => expect(screen.getByLabelText('历史六相机画面')).toBeInTheDocument());
+    view.unmount();
+  });
+
+  it('best-effort stops an in-flight start when the monitor unmounts', async () => {
+    let observedSignal: AbortSignal | undefined;
+    captureMocks.start.mockImplementationOnce((_options, signal) => new Promise((_resolve, reject) => {
+      observedSignal = signal;
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+    }));
+    const view = render(<LiveMonitoringPage statuses={[statuses[0]]} />);
+
+    await waitFor(() => expect(observedSignal).toBeDefined());
+    view.unmount();
+
+    expect(observedSignal?.aborted).toBe(true);
+    await waitFor(() => expect(captureMocks.stop).toHaveBeenCalledWith(
+      statuses[0].ip,
+      expect.anything(),
+    ));
+  });
+
   it('keeps the other camera previews running when a focused camera is paused', async () => {
     render(<LiveMonitoringPage statuses={statuses} />);
 
@@ -246,8 +451,8 @@ describe('LiveMonitoringPage', () => {
     fireEvent.doubleClick(screen.getByRole('button', { name: '放大 C2 实时画面' }));
     fireEvent.click(screen.getByRole('button', { name: '暂停相机实时播放' }));
 
-    await waitFor(() => expect(captureMocks.stop).toHaveBeenCalledWith('192.168.102.206'));
-    expect(captureMocks.stop).not.toHaveBeenCalledWith('192.168.101.144');
+    await waitFor(() => expect(captureMocks.stop).toHaveBeenCalledWith('192.168.102.206', expect.anything()));
+    expect(captureMocks.stop).not.toHaveBeenCalledWith('192.168.101.144', expect.anything());
   });
 
   it('does not request a stopped camera through stale running telemetry before restart', async () => {
@@ -260,7 +465,7 @@ describe('LiveMonitoringPage', () => {
 
     fireEvent.doubleClick(screen.getByRole('button', { name: '放大 C2 实时画面' }));
     fireEvent.click(screen.getByRole('button', { name: '暂停相机实时播放' }));
-    await waitFor(() => expect(captureMocks.stop).toHaveBeenCalledWith('192.168.102.206'));
+    await waitFor(() => expect(captureMocks.stop).toHaveBeenCalledWith('192.168.102.206', expect.anything()));
     await waitFor(() => expect(
       screen.getByRole('button', { name: '启动相机实时播放' }),
     ).not.toBeDisabled());
@@ -278,7 +483,7 @@ describe('LiveMonitoringPage', () => {
     );
     await waitFor(() => expect(captureMocks.start).toHaveBeenCalledWith(expect.objectContaining({
       ip: '192.168.102.206',
-    })));
+    }), expect.anything()));
     expect(captureMocks.start).toHaveBeenCalledTimes(1);
   });
 });

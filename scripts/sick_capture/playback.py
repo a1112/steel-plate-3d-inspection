@@ -299,14 +299,33 @@ def _flow_horizontal_roi(
         return None, None
 
 
-def source_fingerprint(path: Path, cache_root: Path | None = None) -> str:
+def source_fingerprint(
+    path: Path,
+    cache_root: Path | None = None,
+    crop_box: list[int] | None = None,
+) -> str:
     stat = path.stat()
     digest = hashlib.sha256()
     digest.update(PYRAMID_ALGORITHM.encode("ascii"))
     digest.update(str(path.resolve()).lower().encode("utf-8"))
     digest.update(stat.st_size.to_bytes(8, "little", signed=False))
     digest.update(stat.st_mtime_ns.to_bytes(8, "little", signed=False))
-    if cache_root is not None:
+    if crop_box is not None:
+        if len(crop_box) != 4 or any(
+            isinstance(value, bool) or not isinstance(value, (int, np.integer))
+            for value in crop_box
+        ):
+            raise ValueError("playback crop coordinates must be four integers")
+        # The explicit algorithm ROI is part of the immutable browser/cache
+        # identity.  Prefix the field so it can never alias a future metadata
+        # component which happens to serialize to the same JSON array.
+        digest.update(b"\0explicit-crop\0")
+        digest.update(
+            json.dumps([int(value) for value in crop_box], separators=(",", ":")).encode(
+                "ascii"
+            )
+        )
+    elif cache_root is not None:
         flow_roi, _ = _flow_horizontal_roi(path, cache_root, None)
         digest.update(json.dumps(flow_roi, separators=(",", ":")).encode("ascii"))
     return digest.hexdigest()
@@ -341,8 +360,77 @@ def read_image_pyramid(
         return None
 
 
-def build_image_pyramid(source_path: Path, cache_root: Path) -> tuple[Path, dict[str, Any]]:
-    fingerprint = source_fingerprint(source_path, cache_root)
+def validate_playback_crop_box(
+    crop_box: list[int],
+    image_width: int,
+    image_height: int,
+) -> list[int]:
+    """Validate an algorithm-owned crop without silently coercing coordinates."""
+    if len(crop_box) != 4:
+        raise ValueError("playback crop must contain four coordinates")
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, np.integer))
+        for value in crop_box
+    ):
+        raise ValueError("playback crop coordinates must be integers")
+    left, top, right, bottom = (int(value) for value in crop_box)
+    if (
+        image_width <= 0
+        or image_height <= 0
+        or left < 0
+        or top < 0
+        or right <= left
+        or bottom <= top
+        or right > image_width
+        or bottom > image_height
+    ):
+        raise ValueError(
+            f"playback crop is outside source image: {crop_box} "
+            f"for {image_width}x{image_height}"
+        )
+    return [left, top, right, bottom]
+
+
+def read_indexed_playback_crop(
+    source_path: Path,
+    cache_root: Path,
+    image_width: int,
+    image_height: int,
+) -> list[int] | None:
+    """Return the committed ready ROI for one immutable v2 capture image."""
+    identity = _capture_image_identity(source_path)
+    if identity is None:
+        return None
+    material_id, camera_id = identity
+    storage_root = cache_root.parent.parent
+    roi_path = playback_roi_path(storage_root, material_id)
+    try:
+        payload = _read_json(roi_path)
+        if (
+            payload.get("schema") != "steel.capture-playback-roi.v2"
+            or str(payload.get("materialId", "")) != material_id
+        ):
+            return None
+        cameras = payload.get("cameras")
+        if not isinstance(cameras, dict):
+            return None
+        camera = cameras.get(camera_id)
+        if not isinstance(camera, dict) or camera.get("state") != "ready":
+            return None
+        box = camera.get("stableCrop")
+        if not isinstance(box, list):
+            return None
+        return validate_playback_crop_box(box, image_width, image_height)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def build_image_pyramid(
+    source_path: Path,
+    cache_root: Path,
+    requested_crop_box: list[int] | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    fingerprint = source_fingerprint(source_path, cache_root, requested_crop_box)
     directory = pyramid_directory(cache_root, fingerprint)
     manifest_path = directory / "manifest.json"
     existing = read_image_pyramid(cache_root, fingerprint)
@@ -352,26 +440,43 @@ def build_image_pyramid(source_path: Path, cache_root: Path) -> tuple[Path, dict
     with Image.open(source_path) as opened:
         grayscale = opened.convert("L")
     try:
-        plane = np.asarray(grayscale)
         original_width, original_height = grayscale.size
-        # Defect review crops are already the final >=64-pixel algorithm
-        # artifact.  Cropping them a second time in the playback cache can
-        # remove context and violate the small-image contract.
-        detected_box = (
-            None
-            if _is_defect_review_image(source_path)
-            else detect_valid_grayscale_roi(plane)
-        )
-        flow_roi, flow_roi_path = _flow_horizontal_roi(
-            source_path, cache_root, original_width
-        )
-        crop_box = list(detected_box or [0, 0, original_width, original_height])
-        if flow_roi is not None:
-            # A material-level region is deliberately stable in sensor space:
-            # crop only the black horizontal margins and retain every line of
-            # the longitudinal scan.  Frame-local vertical threshold bounds
-            # can otherwise cut the head/tail and make online lanes jump.
-            crop_box = [flow_roi[0], 0, flow_roi[2], original_height]
+        if requested_crop_box is not None:
+            # The online inspection request is already bound to the ROI stored
+            # in the indexed algorithm result.  Do not rerun frame thresholding
+            # here: doing so both wastes CPU and risks replacing that immutable
+            # result with a different frame-local crop.
+            crop_box = validate_playback_crop_box(
+                requested_crop_box,
+                original_width,
+                original_height,
+            )
+            detected_box = None
+            flow_roi = None
+            flow_roi_path = None
+            crop_source = "explicit-algorithm-roi"
+        else:
+            plane = np.asarray(grayscale)
+            # Defect review crops are already the final >=64-pixel algorithm
+            # artifact.  Cropping them a second time in the playback cache can
+            # remove context and violate the small-image contract.
+            detected_box = (
+                None
+                if _is_defect_review_image(source_path)
+                else detect_valid_grayscale_roi(plane)
+            )
+            flow_roi, flow_roi_path = _flow_horizontal_roi(
+                source_path, cache_root, original_width
+            )
+            crop_box = list(detected_box or [0, 0, original_width, original_height])
+            crop_source = "frame-detected-roi" if detected_box is not None else "full-source"
+            if flow_roi is not None:
+                # A material-level region is deliberately stable in sensor space:
+                # crop only the black horizontal margins and retain every line of
+                # the longitudinal scan.  Frame-local vertical threshold bounds
+                # can otherwise cut the head/tail and make online lanes jump.
+                crop_box = [flow_roi[0], 0, flow_roi[2], original_height]
+                crop_source = "flow-stable-horizontal-roi"
         cropped = grayscale.crop(tuple(crop_box))
     finally:
         grayscale.close()
@@ -410,6 +515,8 @@ def build_image_pyramid(source_path: Path, cache_root: Path) -> tuple[Path, dict
             "sourceFingerprint": fingerprint,
             "originalSize": [original_width, original_height],
             "validRoi": crop_box,
+            "cropSource": crop_source,
+            "requestedCrop": crop_box if requested_crop_box is not None else None,
             "frameDetectedRoi": detected_box,
             "flowHorizontalRoi": flow_roi,
             "flowRoiPath": str(flow_roi_path) if flow_roi_path else "",

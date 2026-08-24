@@ -352,10 +352,7 @@ async function createPage(cdp) {
   return { sessionId, evaluate, waitForExpression, waitForText, navigate, screenshot, click, wheel };
 }
 
-async function runBkvNativeScrollChecks(page, result) {
-  const viewportSelector = '[data-testid="inspection-world-viewport"]';
-  const canvasSelector = '[data-testid="inspection-world-canvas"]';
-
+async function runUnifiedOnlineModeChecks(page, result) {
   async function requireEventually(id, expression) {
     try {
       const value = await page.waitForExpression(expression);
@@ -375,400 +372,41 @@ async function runBkvNativeScrollChecks(page, result) {
     }
   }
 
-  async function performWheel(id, options) {
-    try {
-      const point = await page.wheel(canvasSelector, options);
-      result.checks.push({ kind: 'interaction', id, ok: true, value: point });
-      return point;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      result.checks.push({ kind: 'interaction', id, ok: false, error: message.slice(0, 240) });
-      throw error;
-    }
-  }
+  result.interactionScreenshots = [];
 
-  await requireEventually('bkv-footer-more-entry-visible', `(() => {
-    const more = document.querySelector('button[aria-label="\u66f4\u591a\u529f\u80fd"]');
-    return more ? { expanded: more.getAttribute('aria-expanded') } : false;
-  })()`);
-  await page.click('button[aria-label="\u66f4\u591a\u529f\u80fd"]');
-  await requireEventually('bkv-offline-replay-entry-enabled', `(() => {
-    const items = [...document.querySelectorAll('[role="menuitem"]')];
-    const online = items.find((item) => item.textContent.includes('\u5728\u7ebf\u68c0\u6d4b'));
-    const item = items.find((entry) => entry.textContent.includes('\u79bb\u7ebf\u56de\u653e'));
-    return item && item.textContent.includes('\u79bb\u7ebf\u56de\u653e')
-      && online && !online.disabled
-      && !item.disabled && item.getAttribute('aria-current') === 'page'
-      ? { online: online.textContent.trim(), bkv: item.textContent.trim(), active: true }
-      : false;
-  })()`);
-  result.interactionScreenshots = [await page.screenshot('bkv-terminal-view-menu')];
-  await page.click('.app-footer-more-menu button:first-of-type');
-  await requireEventually('switches-from-bkv-to-original-online-view', `(() => {
-    const heading = document.body?.innerText.includes('\u5317\u6ee1\u7279\u94a2\u5c0f\u68d2\u68c0\u6d4b\u7cfb\u7edf');
-    const view = new URLSearchParams(window.location.search).get('view');
-    return heading && view === 'online' ? { view, heading: true } : false;
-  })()`);
-  await page.click('button[aria-label="\u66f4\u591a\u529f\u80fd"]');
-  await requireEventually('online-footer-keeps-bkv-entry-enabled', `(() => {
-    const items = [...document.querySelectorAll('[role="menuitem"]')];
-    const online = items.find((item) => item.textContent.includes('\u5728\u7ebf\u68c0\u6d4b'));
-    const bkv = items.find((item) => item.textContent.includes('\u79bb\u7ebf\u56de\u653e'));
-    return online?.getAttribute('aria-current') === 'page' && bkv && !bkv.disabled
-      ? { onlineActive: true, bkvEnabled: true }
-      : false;
-  })()`);
-  await page.click('.app-footer-more-menu button:nth-of-type(2)');
-  await requireEventually('switches-back-to-bkv-replay', `(() => {
-    const heading = document.body?.innerText.includes('BKV \u79bb\u7ebf\u56de\u653e');
-    const view = new URLSearchParams(window.location.search).get('view');
-    return heading && view === 'bkv' ? { view, heading: true } : false;
-  })()`);
+  const inspection = await requireEventually(
+    'unique-online-monitoring-entry-and-inspection-mode',
+    "(() => { const topLabels = [...document.querySelectorAll('.top-nav button')].map((button) => button.textContent.trim()); const workspace = document.querySelector('.online-workspace-tabs'); const modes = workspace ? [...workspace.querySelectorAll('[role=tab]')] : []; const previewUrls = performance.getEntriesByType('resource').map((entry) => entry.name).filter((name) => name.includes('/api/capture/file') && name.includes('maxWidth=')); const invalidUrls = previewUrls.filter((value) => { const url = new URL(value, location.href); return url.searchParams.get('region') !== 'valid' || Number(url.searchParams.get('cropWidth')) <= 0 || Number(url.searchParams.get('cropHeight')) <= 0; }); const value = { topLabels, modes: modes.map((button) => ({ label: button.textContent.trim(), selected: button.getAttribute('aria-selected') })), previewUrlCount: previewUrls.length, invalidUrls }; return topLabels.filter((label) => label === '\u5728\u7ebf\u76d1\u6d4b').length === 1 && !topLabels.includes('\u5728\u7ebf\u68c0\u6d4b') && !topLabels.includes('\u5b9e\u65f6\u76d1\u63a7') && modes.length === 2 && modes[0].textContent.includes('\u68c0\u6d4b\u7ed3\u679c') && modes[0].getAttribute('aria-selected') === 'true' && modes[1].textContent.includes('\u76f8\u673a\u5b9e\u65f6 / \u56de\u653e') && modes[1].getAttribute('aria-selected') === 'false' && document.querySelector('.online-workspace') && !document.querySelector('.live-monitor-page') && previewUrls.length > 0 && invalidUrls.length === 0 ? value : false; })()",
+  );
+  result.interactionScreenshots.push(await page.screenshot('online-monitoring-inspection'));
 
-  async function requireTileFetchQuiescence() {
-    const deadline = Date.now() + timeoutMs;
-    let last = null;
-    try {
-      while (Date.now() < deadline) {
-        const beforeFrames = await page.evaluate(`(() => {
-          const probe = window.__steelInspectionTileFetchProbe;
-          return probe ? { total: probe.total, pending: probe.pending } : null;
-        })()`);
-        if (beforeFrames?.pending === 0) {
-          const afterFrames = await page.evaluate(`(async () => {
-            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-            const probe = window.__steelInspectionTileFetchProbe;
-            return probe ? { total: probe.total, pending: probe.pending } : null;
-          })()`);
-          await delay(250);
-          const afterInterval = await page.evaluate(`(() => {
-            const probe = window.__steelInspectionTileFetchProbe;
-            return probe ? { total: probe.total, pending: probe.pending } : null;
-          })()`);
-          last = { beforeFrames, afterFrames, afterInterval };
-          if (afterFrames?.pending === 0
-            && afterInterval?.pending === 0
-            && beforeFrames.total === afterFrames.total
-            && afterFrames.total === afterInterval.total) {
-            await page.evaluate(`(() => {
-              window.__steelInspectionTileFetchProbe.quiescentTotal = ${afterInterval.total};
-              return true;
-            })()`);
-            result.checks.push({
-              kind: 'interaction',
-              id: 'deep-scroll-tile-fetches-quiescent',
-              ok: true,
-              value: { total: afterInterval.total, pending: 0, stableFrames: 2, stableIntervalMs: 250 },
-            });
-            return afterInterval;
-          }
-        }
-        await delay(100);
-      }
-      throw new Error(`tile fetches did not become quiescent; last=${JSON.stringify(last)}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      result.checks.push({
-        kind: 'interaction',
-        id: 'deep-scroll-tile-fetches-quiescent',
-        ok: false,
-        error: message.slice(0, 240),
-      });
-      throw error;
-    }
-  }
+  await page.click('.online-workspace-tabs button:nth-child(2)');
+  const live = await requireEventually(
+    'online-monitoring-camera-live-mode-valid-region-only',
+    "(() => { const mainTabs = [...document.querySelectorAll('.online-workspace-tabs [role=tab]')]; const monitorTabs = [...document.querySelectorAll('.live-monitor-mode-tabs [role=tab]')]; const cards = [...document.querySelectorAll('.live-monitor-grid-card')]; const cardImages = cards.map((card) => [...card.querySelectorAll('img:not([aria-hidden=\"true\"])')].filter((image) => image.naturalWidth > 0 && image.naturalHeight > 0)); const visibleImages = cardImages.flat(); const urls = visibleImages.map((image) => image.currentSrc || image.src).filter((value) => value && value.includes('/api/stream/latest')); const parsedUrls = urls.map((value) => new URL(value, location.href)); const invalidUrls = parsedUrls.filter((url) => url.searchParams.get('region') !== 'valid' || url.searchParams.get('region') === 'raw'); const uniqueIps = [...new Set(parsedUrls.map((url) => url.searchParams.get('ip')).filter(Boolean))]; const hiddenPreloads = cards.reduce((total, card) => total + card.querySelectorAll('img[aria-hidden=\"true\"]').length, 0); const value = { mainMode: mainTabs[1]?.textContent.trim(), monitorModes: monitorTabs.map((button) => ({ label: button.textContent.trim(), selected: button.getAttribute('aria-selected') })), cards: cards.length, visibleImages: visibleImages.length, hiddenPreloads, urls, uniqueIps, invalidUrls: invalidUrls.map((url) => url.href) }; return mainTabs.length === 2 && mainTabs[1].getAttribute('aria-selected') === 'true' && document.querySelector('.live-monitor-page') && monitorTabs.length === 2 && monitorTabs[0].textContent.includes('\u5b9e\u65f6') && monitorTabs[0].getAttribute('aria-selected') === 'true' && monitorTabs[1].textContent.includes('\u56de\u653e') && cards.length === 6 && cardImages.every((images) => images.length === 1) && visibleImages.length === 6 && urls.length === 6 && uniqueIps.length === 6 && invalidUrls.length === 0 ? value : false; })()",
+  );
+  result.interactionScreenshots.push(await page.screenshot('online-monitoring-camera-live'));
 
-  await requireEventually('tile-fetch-probe-installed', `(() => {
-    let probe = window.__steelInspectionTileFetchProbe;
-    if (!probe) {
-      const originalFetch = window.fetch;
-      probe = {
-        total: 0,
-        pending: 0,
-        counts: Object.create(null),
-        originalFetch,
-        wrappedFetch: null,
-      };
-      probe.wrappedFetch = function (...args) {
-        const input = args[0];
-        const url = typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input?.url || String(input);
-        if (!url.includes('/api/inspection-world/tile')) {
-          return Reflect.apply(probe.originalFetch, this, args);
-        }
-        probe.total += 1;
-        probe.pending += 1;
-        probe.counts[url] = (probe.counts[url] || 0) + 1;
-        let response;
-        try {
-          response = Reflect.apply(probe.originalFetch, this, args);
-        } catch (error) {
-          probe.pending -= 1;
-          throw error;
-        }
-        return Promise.resolve(response).finally(() => {
-          probe.pending -= 1;
-        });
-      };
-      window.__steelInspectionTileFetchProbe = probe;
-    }
-    if (window.fetch !== probe.wrappedFetch) window.fetch = probe.wrappedFetch;
-    return window.fetch === probe.wrappedFetch
-      ? { installed: true, total: probe.total, pending: probe.pending }
-      : false;
-  })()`);
+  await page.click('.live-monitor-mode-tabs button:nth-child(2)');
+  const playback = await requireEventually(
+    'online-monitoring-playback-mode-valid-roi-only',
+    "(() => { const monitorTabs = [...document.querySelectorAll('.live-monitor-mode-tabs [role=tab]')]; const images = [...document.querySelectorAll('.capture-playback-grid img')]; const urls = images.map((image) => image.currentSrc || image.src).filter(Boolean); const invalidUrls = urls.filter((value) => { const url = new URL(value, location.href); return !url.pathname.endsWith('/api/capture/file') || url.searchParams.get('region') !== 'valid' || Number(url.searchParams.get('cropWidth')) <= 0 || Number(url.searchParams.get('cropHeight')) <= 0 || url.searchParams.get('region') === 'raw'; }); const value = { monitorModes: monitorTabs.map((button) => ({ label: button.textContent.trim(), selected: button.getAttribute('aria-selected') })), images: images.length, urls, invalidUrls }; return document.querySelector('.capture-playback') && monitorTabs.length === 2 && monitorTabs[1].textContent.includes('\u56de\u653e') && monitorTabs[1].getAttribute('aria-selected') === 'true' && images.length > 0 && invalidUrls.length === 0 ? value : false; })()",
+  );
+  result.interactionScreenshots.push(await page.screenshot('online-monitoring-playback'));
 
-  const initial = await requireEventually('native-scroll-initial-fit', `(() => {
-    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
-    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
-    const spacer = document.querySelector('[data-testid="inspection-world-scroll-space"]');
-    const cameras = [...document.querySelectorAll('[data-testid="inspection-world-camera"]')];
-    const fetchProbe = window.__steelInspectionTileFetchProbe;
-    if (!viewport || !canvas || !spacer || cameras.length !== 6 || !fetchProbe || fetchProbe.pending !== 0) return false;
-    const canvasBounds = canvas.getBoundingClientRect();
-    const firstBounds = cameras[0].getBoundingClientRect();
-    const lastBounds = cameras[cameras.length - 1].getBoundingClientRect();
-    const scale = Number(canvas.getAttribute('data-view-scale'));
-    const tileResources = performance.getEntriesByType('resource')
-      .filter((entry) => entry.name.includes('/api/inspection-world/tile'));
-    const value = {
-      record: canvas.getAttribute('aria-label'),
-      recordSequence: document.querySelector('[data-testid="bkv-record-row"][aria-current="true"]')?.getAttribute('data-sequence') || '',
-      scrollMode: viewport.getAttribute('data-scroll-mode'),
-      scrollLeft: viewport.scrollLeft,
-      scrollTop: viewport.scrollTop,
-      scrollWidth: viewport.scrollWidth,
-      scrollHeight: viewport.scrollHeight,
-      clientWidth: viewport.clientWidth,
-      clientHeight: viewport.clientHeight,
-      spacerWidth: spacer.getBoundingClientRect().width,
-      spacerHeight: spacer.getBoundingClientRect().height,
-      scale,
-      viewY: Number(canvas.getAttribute('data-view-y')),
-      tileRequestBaseline: tileResources.length,
-      tileRequestUniqueBaseline: [...new Set(tileResources.map((entry) => entry.name))],
-      tileFetchBaseline: fetchProbe.total,
-      tileFetchUniqueBaseline: Object.keys(fetchProbe.counts),
-      camerasFit: Math.abs(firstBounds.left - canvasBounds.left) <= 2
-        && Math.abs(lastBounds.right - canvasBounds.right) <= 2
-        && cameras.every((camera) => {
-          const bounds = camera.getBoundingClientRect();
-          return bounds.left >= canvasBounds.left - 2 && bounds.right <= canvasBounds.right + 2;
-        }),
-    };
-    window.__steelInspectionWorldSmoke = { initial: value };
-    return value.scrollMode === 'native'
-      && value.scrollHeight > value.clientHeight
-      && value.scrollLeft === 0
-      && value.scrollTop === 0
-      && value.scrollWidth <= value.clientWidth + 2
-      && value.spacerWidth <= value.clientWidth + 2
-      && value.scale > 0
-      && value.viewY === 0
-      && value.camerasFit
-      ? value
-      : false;
-  })()`);
+  await page.click('.live-monitor-mode-tabs button:first-child');
+  await requireEventually(
+    'returns-from-playback-to-camera-live',
+    "(() => { const tabs = [...document.querySelectorAll('.live-monitor-mode-tabs [role=tab]')]; return tabs.length === 2 && tabs[0].getAttribute('aria-selected') === 'true' && document.querySelector('.live-monitor-camera-grid') ? { live: true, cards: document.querySelectorAll('.live-monitor-grid-card').length } : false; })()",
+  );
 
-  await page.evaluate(`(() => {
-    window.__steelInspectionWorldSmoke.plainWheel = { defaultPrevented: null };
-    document.addEventListener('wheel', (event) => {
-      window.__steelInspectionWorldSmoke.plainWheel.defaultPrevented = event.defaultPrevented;
-    }, { once: true });
-    return true;
-  })()`);
-  await performWheel('plain-wheel-visible-target', { deltaY: 640 });
-  const plainWheel = await requireEventually('plain-wheel-scrolls-without-zoom', `(() => {
-    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
-    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
-    const smoke = window.__steelInspectionWorldSmoke;
-    if (!viewport || !canvas || !smoke) return false;
-    const value = {
-      scrollTop: viewport.scrollTop,
-      viewY: Number(canvas.getAttribute('data-view-y')),
-      scale: Number(canvas.getAttribute('data-view-scale')),
-      defaultPrevented: smoke.plainWheel?.defaultPrevented,
-    };
-    smoke.plainWheel = value;
-    return value.scrollTop > 0
-      && value.viewY > smoke.initial.viewY
-      && Math.abs(value.scale - smoke.initial.scale) < 0.000001
-      && value.defaultPrevented === false
-      ? value
-      : false;
-  })()`);
+  await page.click('.online-workspace-tabs button:first-child');
+  await requireEventually(
+    'returns-to-inspection-results-with-single-top-level-entry',
+    "(() => { const topLabels = [...document.querySelectorAll('.top-nav button')].map((button) => button.textContent.trim()); const tabs = [...document.querySelectorAll('.online-workspace-tabs [role=tab]')]; return topLabels.filter((label) => label === '\u5728\u7ebf\u76d1\u6d4b').length === 1 && !topLabels.includes('\u5728\u7ebf\u68c0\u6d4b') && !topLabels.includes('\u5b9e\u65f6\u76d1\u63a7') && tabs.length === 2 && tabs[0].getAttribute('aria-selected') === 'true' && document.querySelector('.online-workspace') && !document.querySelector('.live-monitor-page') ? { inspection: true, topLabels } : false; })()",
+  );
 
-  await page.evaluate(`(() => {
-    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
-    window.__steelInspectionWorldSmoke.ctrlWheel = {
-      defaultPrevented: null,
-      pageScrollY: window.scrollY,
-      viewportScrollTop: viewport?.scrollTop ?? -1,
-      visualScale: window.visualViewport?.scale ?? 1,
-    };
-    document.addEventListener('wheel', (event) => {
-      window.__steelInspectionWorldSmoke.ctrlWheel.defaultPrevented = event.defaultPrevented;
-    }, { once: true });
-    return true;
-  })()`);
-  await performWheel('ctrl-wheel-visible-target', { deltaY: -420, ctrlKey: true });
-  const ctrlWheel = await requireEventually('ctrl-wheel-zooms-without-page-navigation', `(() => {
-    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
-    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
-    const smoke = window.__steelInspectionWorldSmoke;
-    if (!viewport || !canvas || !smoke) return false;
-    const value = {
-      scrollLeft: viewport.scrollLeft,
-      scrollTop: viewport.scrollTop,
-      scale: Number(canvas.getAttribute('data-view-scale')),
-      loadedTiles: Number(canvas.getAttribute('data-loaded-tiles')),
-      defaultPrevented: smoke.ctrlWheel?.defaultPrevented,
-      pageScrollY: window.scrollY,
-      visualScale: window.visualViewport?.scale ?? 1,
-    };
-    return value.scale > smoke.plainWheel.scale
-      && value.loadedTiles > 0
-      && value.defaultPrevented === true
-      && value.pageScrollY === smoke.ctrlWheel.pageScrollY
-      && value.visualScale === smoke.ctrlWheel.visualScale
-      ? value
-      : false;
-  })()`);
-
-  await page.evaluate(`(() => {
-    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
-    if (!viewport) return false;
-    window.__steelInspectionWorldSmoke.beforeDeepViewY = Number(
-      document.querySelector(${JSON.stringify(canvasSelector)})?.getAttribute('data-view-y') || 0
-    );
-    viewport.scrollTop = Math.floor((viewport.scrollHeight - viewport.clientHeight) * 0.78);
-    viewport.dispatchEvent(new Event('scroll'));
-    return true;
-  })()`);
-  await requireEventually('deep-scroll-position-loaded', `(() => {
-    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
-    if (!canvas) return false;
-    const viewY = Number(canvas.getAttribute('data-view-y'));
-    const loadedTiles = Number(canvas.getAttribute('data-loaded-tiles'));
-    return viewY > window.__steelInspectionWorldSmoke.beforeDeepViewY && loadedTiles > 0
-      ? { viewY, loadedTiles }
-      : false;
-  })()`);
-  await requireTileFetchQuiescence();
-  const deepScroll = await requireEventually('deep-scroll-keeps-tile-work-bounded', `(() => {
-    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
-    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
-    const status = document.querySelector('.inspection-world-tile-status')?.textContent || '';
-    const visibleMatch = status.match(/(\\d+)\\s*\u4e2a\u53ef\u89c1\u74e6\u7247/);
-    if (!viewport || !canvas || !visibleMatch) return false;
-    const tileResources = performance.getEntriesByType('resource')
-      .filter((entry) => entry.name.includes('/api/inspection-world/tile'));
-    const fetchProbe = window.__steelInspectionTileFetchProbe;
-    if (!fetchProbe) return false;
-    const requestedTiles = fetchProbe.total - window.__steelInspectionWorldSmoke.initial.tileFetchBaseline;
-    const baselineFetchNames = new Set(window.__steelInspectionWorldSmoke.initial.tileFetchUniqueBaseline);
-    const uniqueRequestedTiles = Object.keys(fetchProbe.counts)
-      .filter((name) => !baselineFetchNames.has(name)).length;
-    const completedResourceTiles = tileResources.length
-      - window.__steelInspectionWorldSmoke.initial.tileRequestBaseline;
-    const uniqueResourceNames = new Set(tileResources.map((entry) => entry.name));
-    const baselineResourceNames = new Set(window.__steelInspectionWorldSmoke.initial.tileRequestUniqueBaseline);
-    const uniqueCompletedResourceTiles = [...uniqueResourceNames]
-      .filter((name) => !baselineResourceNames.has(name)).length;
-    const visibleTiles = Number(visibleMatch[1]);
-    const cachedTiles = Number(canvas.getAttribute('data-cached-tiles'));
-    const requestBudget = Math.min(64, Math.max(24, (visibleTiles + cachedTiles) * 2));
-    const value = {
-      scrollTop: viewport.scrollTop,
-      viewY: Number(canvas.getAttribute('data-view-y')),
-      visibleTiles,
-      loadedTiles: Number(canvas.getAttribute('data-loaded-tiles')),
-      cachedTiles,
-      requestedTiles,
-      uniqueRequestedTiles,
-      pendingTiles: fetchProbe.pending,
-      completedResourceTiles,
-      uniqueCompletedResourceTiles,
-      requestBudget,
-    };
-    return value.viewY > window.__steelInspectionWorldSmoke.beforeDeepViewY
-      && value.visibleTiles > 0 && value.visibleTiles < 126
-      && value.loadedTiles > 0 && value.loadedTiles < 126
-      && value.cachedTiles > 0 && value.cachedTiles < 126
-      && value.requestedTiles > 0 && value.requestedTiles <= value.requestBudget
-      && value.pendingTiles === 0
-      && fetchProbe.total === fetchProbe.quiescentTotal
-      ? value
-      : false;
-  })()`);
-  // Additive diagnostic artifact: steel.runtime.ui-smoke.v1 consumers ignore unknown fields.
-  result.interactionScreenshots.push(await page.screenshot('bkv-2d-deep-scroll'));
-
-  await page.evaluate(`(() => {
-    const firstValue = window.__steelInspectionWorldSmoke.initial.recordSequence;
-    const next = [...document.querySelectorAll('[data-testid="bkv-record-row"]')]
-      .find((row) => row.getAttribute('data-sequence') !== firstValue);
-    if (!next) return false;
-    next.click();
-    return true;
-  })()`);
-  const switched = await requireEventually('record-switch-restores-top-fit-width', `(() => {
-    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
-    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
-    const spacer = document.querySelector('[data-testid="inspection-world-scroll-space"]');
-    const cameras = [...document.querySelectorAll('[data-testid="inspection-world-camera"]')];
-    if (!viewport || !canvas || !spacer || cameras.length !== 6) return false;
-    const canvasBounds = canvas.getBoundingClientRect();
-    const firstBounds = cameras[0].getBoundingClientRect();
-    const lastBounds = cameras[cameras.length - 1].getBoundingClientRect();
-    const value = {
-      record: canvas.getAttribute('aria-label'),
-      scrollLeft: viewport.scrollLeft,
-      scrollTop: viewport.scrollTop,
-      scrollWidth: viewport.scrollWidth,
-      clientWidth: viewport.clientWidth,
-      spacerWidth: spacer.getBoundingClientRect().width,
-      spacerHeight: spacer.getBoundingClientRect().height,
-      scale: Number(canvas.getAttribute('data-view-scale')),
-      viewY: Number(canvas.getAttribute('data-view-y')),
-      loadedTiles: Number(canvas.getAttribute('data-loaded-tiles')),
-      camerasFit: Math.abs(firstBounds.left - canvasBounds.left) <= 2
-        && Math.abs(lastBounds.right - canvasBounds.right) <= 2,
-    };
-    return value.record !== window.__steelInspectionWorldSmoke.initial.record
-      && value.scrollLeft === 0 && value.scrollTop === 0 && value.viewY === 0
-      && value.scrollWidth <= value.clientWidth + 2
-      && value.spacerWidth <= value.clientWidth + 2
-      && value.spacerHeight > viewport.clientHeight
-      && value.scale > 0 && value.loadedTiles > 0 && value.camerasFit
-      ? value
-      : false;
-  })()`);
-
-  await page.evaluate(`(() => {
-    const firstValue = window.__steelInspectionWorldSmoke.initial.recordSequence;
-    const first = [...document.querySelectorAll('[data-testid="bkv-record-row"]')]
-      .find((row) => row.getAttribute('data-sequence') === firstValue);
-    if (!first) return false;
-    first.click();
-    return true;
-  })()`);
-  await requireEventually('record-switch-restores-first-record', `(() => {
-    const viewport = document.querySelector(${JSON.stringify(viewportSelector)});
-    const canvas = document.querySelector(${JSON.stringify(canvasSelector)});
-    return viewport && canvas
-      && canvas.getAttribute('aria-label') === window.__steelInspectionWorldSmoke.initial.record
-      && viewport.scrollLeft === 0 && viewport.scrollTop === 0
-      && Number(canvas.getAttribute('data-view-y')) === 0
-      && Number(canvas.getAttribute('data-loaded-tiles')) > 0
-      ? { record: canvas.getAttribute('aria-label'), scrollLeft: viewport.scrollLeft, scrollTop: viewport.scrollTop }
-      : false;
-  })()`);
-
-  return { initial, plainWheel, ctrlWheel, deepScroll, switched };
+  return { inspection, live, playback };
 }
 
 async function runPageCheck(page, check) {
@@ -824,7 +462,7 @@ const standardChecks = [
   {
     id: 'terminal',
     url: appUrl('terminal'),
-    requiredText: ['\u5317\u6ee1\u7279\u94a2\u5c0f\u68d2\u68c0\u6d4b\u7cfb\u7edf', '\u5728\u7ebf\u68c0\u6d4b', '\u5b9e\u65f6\u76d1\u63a7', '\u7f3a\u9677\u62a5\u8868'],
+    requiredText: ['\u5317\u6ee1\u7279\u94a2\u5c0f\u68d2\u68c0\u6d4b\u7cfb\u7edf', '\u5728\u7ebf\u76d1\u6d4b', '\u68c0\u6d4b\u7ed3\u679c', '\u76f8\u673a\u5b9e\u65f6 / \u56de\u653e', '\u7f3a\u9677\u62a5\u8868'],
     clickSelector: '[data-testid="receiver-status-button"]',
     afterClickText: ['\u62a5\u7ea7\u5668\u7f51\u53e3\u8be6\u7ec6\u4fe1\u606f', '\u5b9e\u65f6\u4e0a\u4f20', '\u5b9e\u65f6\u4e0b\u8f7d', '\u5e26\u5bbd\u76d1\u63a7', 'Windows \u7f51\u5361\u5b9e\u65f6\u6536\u53d1\u901f\u7387'],
     requiredExpressions: [
@@ -838,6 +476,7 @@ const standardChecks = [
           && !text.includes('\u670d\u52a1\u5f02\u5e38');
       })()`,
     ],
+    runInteraction: runUnifiedOnlineModeChecks,
   },
   {
     id: 'capture',
@@ -885,54 +524,17 @@ const standardChecks = [
 
 const bkvChecks = [
   {
-    id: 'bkv-2d-inspection-world',
+    id: 'bkv-unified-inspection-world',
     url: appUrl('terminal'),
-    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', '126 \u5e27\u68c0\u6d4b\u56fe\u50cf\u4e16\u754c', 'C1', 'C6', '\u771f\u5b9e\u76f8\u673a\u5728\u7ebf 0', '\u786c\u4ef6\u63a7\u5236\u5df2\u7981\u7528'],
+    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', '\u5728\u7ebf\u76d1\u6d4b', '\u68c0\u6d4b\u7ed3\u679c'],
     requiredExpressions: [
+      'document.querySelectorAll(".online-workspace").length === 1',
+      'document.querySelectorAll(".online-workspace-tabs [role=tab]").length === 2',
+      'document.querySelector(".runtime-bkv-workspace") !== null',
       'document.querySelectorAll("[data-testid=inspection-world-canvas]").length === 1',
       'document.querySelectorAll("[data-testid=inspection-world-camera]").length === 6',
       'Number(document.querySelector("[data-testid=inspection-world-canvas]")?.getAttribute("data-loaded-tiles")) > 0',
-      'document.querySelector(".bkv-camera-strip") === null && document.querySelectorAll("[data-testid=bkv-camera-lane]").length === 0',
-      '![...document.querySelectorAll("[data-testid=inspection-world-camera]")].some((lane) => lane.innerText.includes("C7"))',
-      '(() => { const count = performance.getEntriesByType("resource").filter((entry) => entry.name.includes("/api/inspection-world/tile")).length; return count > 0 && count < 126; })()',
-      '(() => { const canvas = document.querySelector("[data-testid=inspection-world-canvas]"); if (!canvas) return false; const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data; for (let index = 0; index < data.length; index += 64) { const r = data[index], g = data[index + 1], b = data[index + 2]; if (r > 32 && Math.abs(r - g) < 6 && Math.abs(g - b) < 6) return true; } return false; })()',
-      '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
-    ],
-    runInteraction: runBkvNativeScrollChecks,
-  },
-  {
-    id: 'bkv-defect-focus',
-    url: appUrl('terminal'),
-    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '126 \u5e27\u68c0\u6d4b\u56fe\u50cf\u4e16\u754c', '\u8f67\u6298'],
-    clickSelector: '.bkv-defect-list button',
-    afterClickText: ['\u8f67\u6298', 'C1', 'C6'],
-    requiredExpressions: [
-      'Number(document.querySelector("[data-testid=inspection-world-canvas]")?.getAttribute("data-view-y")) > 10000',
-      'document.querySelector("[data-testid=inspection-world-canvas]")?.getAttribute("data-locatable-defects") === "1"',
-      'Number(document.querySelector("[data-testid=inspection-world-canvas]")?.getAttribute("data-loaded-tiles")) > 0',
-      '(() => { const canvas = document.querySelector("[data-testid=inspection-world-canvas]"); if (!canvas) return false; const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data; for (let index = 0; index < data.length; index += 64) { const r = data[index], g = data[index + 1], b = data[index + 2]; if (r > 32 && Math.abs(r - g) < 6 && Math.abs(g - b) < 6) return true; } return false; })()',
-    ],
-  },
-  {
-    id: 'bkv-unwrapped',
-    url: appUrl('terminal'),
-    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', '\u771f\u5b9e\u76f8\u673a\u5728\u7ebf 0', '\u786c\u4ef6\u63a7\u5236\u5df2\u7981\u7528'],
-    clickSelector: '.bkv-view-tabs button:nth-child(2)',
-    afterClickText: ['JIT \u5e73\u94fa\u5c55\u5f00', '\u672a\u6807\u5b9a\u9884\u89c8'],
-    requiredExpressions: [
-      'document.querySelector("img.bkv-unwrapped")?.naturalWidth > 0',
-      '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
-    ],
-  },
-  {
-    id: 'bkv-cylinder',
-    url: appUrl('terminal'),
-    requiredText: ['BKV \u79bb\u7ebf\u56de\u653e', '6/6 \u79bb\u7ebf\u6570\u636e', '\u771f\u5b9e\u76f8\u673a\u5728\u7ebf 0', '\u786c\u4ef6\u63a7\u5236\u5df2\u7981\u7528'],
-    clickSelector: '.bkv-view-tabs button:nth-child(3)',
-    afterClickText: ['\u5706\u67f1 3D', '\u672a\u6807\u5b9a\u9884\u89c8'],
-    requiredExpressions: [
-      'document.querySelector(".bkv-camera-strip") === null && document.querySelector(".bkv-visual-panel canvas") !== null',
-      '![...document.querySelectorAll("button")].some((button) => button.innerText.trim() === "\u8fde\u63a5\u76f8\u673a")',
+      'document.querySelector(".bkv-app-shell") === null && document.querySelector(".bkv-view-tabs") === null && document.querySelector(".bkv-visual-panel") === null',
     ],
   },
 ];

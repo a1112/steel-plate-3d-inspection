@@ -183,8 +183,9 @@ keeps a 64 MiB weighted LRU with parent-LOD fallback. Offline publication prebui
 the complete pyramid; online publication builds it in the background while a cache
 miss is synchronously generated and written back. Tile requests include
 `revision=<sourceHash>` and stable responses return `ETag`,
-`X-World-Tile-Cache: HIT|MISS`, and immutable cache headers. `-ExpectBkv` verifies actual
-Canvas pixels, bounded tile requests, defect focus, and the retained JIT/3D tabs.
+`X-World-Tile-Cache: HIT|MISS`, and immutable cache headers. `-ExpectBkv` verifies the
+single unified monitoring workspace, the six-camera inspection-world canvas, and loaded tiles;
+the removed legacy BKV tab shell is rejected.
 
 When BKV is disabled, the same routes use production inspection tables. Records
 come from `production_inspection`; intensity frames are sorted by their original

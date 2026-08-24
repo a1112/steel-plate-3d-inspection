@@ -40,6 +40,11 @@ const onlineWorldMeta: InspectionWorldMeta = {
   },
 };
 
+function algorithmRoiUrl(materialId: string, cameraId: string, sequence: number) {
+  const path = encodeURIComponent(`${materialId}/capture/${cameraId}/2d/${sequence}.png`);
+  return `http://127.0.0.1:4873/api/capture/file?path=${path}&maxWidth=2048&region=valid&cropX=100&cropY=0&cropWidth=600&cropHeight=1024`;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fetchInspectionWorldMeta).mockRejectedValue(new Error('no persisted world'));
@@ -92,7 +97,7 @@ describe('parameterized camera lanes', () => {
     expect(screen.queryByText('C8')).not.toBeInTheDocument();
   });
 
-  it('maps BKV CamImageSource identities into all six main-view camera bands', () => {
+  it('does not leak unprocessed BKV CamImageSource frames into camera bands', () => {
     render(
       <PlateMap
         defectTypes={defectTypes}
@@ -121,9 +126,8 @@ describe('parameterized camera lanes', () => {
       />,
     );
 
-    expect(screen.getAllByLabelText(/实际裁剪图/)).toHaveLength(6);
-    expect(screen.getByLabelText('camera1 实际裁剪图')).toBeInTheDocument();
-    expect(screen.getByLabelText('camera6 实际裁剪图')).toBeInTheDocument();
+    expect(screen.queryByLabelText(/实际裁剪图/)).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /采集图像/ })).toHaveLength(6);
   });
 
   it('shows an explicit empty state instead of a zero-camera canvas', () => {
@@ -198,7 +202,7 @@ describe('online inspection world compatibility', () => {
         sequenceNo: 126,
         fileType: 'png',
         path: `2747/capture/C${index + 1}/2d/126.png`,
-        url: `http://127.0.0.1:4873/api/capture/file?camera=C${index + 1}&region=valid`,
+        url: algorithmRoiUrl('2747', `C${index + 1}`, 126),
         createdAt: '2026-08-24T02:00:00.000Z',
         validRoi: [100, 0, 700, 1024],
         sourceFrameId: '2747:000000008769',
@@ -229,8 +233,19 @@ describe('online inspection world compatibility', () => {
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
   });
 
-  it('keeps the record-bound capture fallback while waiting and upgrades when the ROI index appears', async () => {
+  it('keeps raw record images hidden while waiting and upgrades when the ROI index appears', async () => {
     vi.useFakeTimers();
+    const requestedImageUrls: string[] = [];
+    const NativeImage = globalThis.Image;
+    class RequestedImage {
+      complete = false;
+      naturalWidth = 0;
+      naturalHeight = 0;
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(value: string) { requestedImageUrls.push(value); }
+    }
+    vi.stubGlobal('Image', RequestedImage);
     const roiResult: CaptureRoiPreviewResult = {
       materialId: '2747',
       indexed: true,
@@ -246,7 +261,7 @@ describe('online inspection world compatibility', () => {
         sequenceNo: 20,
         fileType: 'png',
         path: `2747/capture/C${index + 1}/2d/20.png`,
-        url: `http://127.0.0.1:4873/roi-C${index + 1}.jpg`,
+        url: algorithmRoiUrl('2747', `C${index + 1}`, 20),
         createdAt: '2026-08-24T02:00:00.000Z',
         validRoi: [100, 0, 700, 1024],
         sourceFrameId: '2747:000000000020',
@@ -281,16 +296,25 @@ describe('online inspection world compatibility', () => {
       );
       await act(async () => { await Promise.resolve(); });
 
-      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('采集裁剪预览');
-      expect(screen.getAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法裁剪图尚未就绪');
+      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+      expect(requestedImageUrls).toEqual([]);
       expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
 
       await act(async () => { await vi.advanceTimersByTimeAsync(8_000); });
 
       expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法 ROI 6/6');
+      expect(requestedImageUrls).toHaveLength(6);
+      expect(requestedImageUrls.every((url) => (
+        url.includes('region=valid')
+        && url.includes('cropX=100')
+        && url.includes('cropWidth=600')
+        && !url.includes('/raw-')
+      ))).toBe(true);
       expect(fetchCaptureRoiPreviews).toHaveBeenCalledTimes(2);
       expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
     } finally {
+      vi.stubGlobal('Image', NativeImage);
       vi.useRealTimers();
     }
   });
@@ -326,8 +350,8 @@ describe('online inspection world compatibility', () => {
 
     await act(async () => { resolveProbe?.(null); });
 
-    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('采集裁剪预览');
-    expect(screen.getAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法裁剪图尚未就绪');
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
   });
 
   it('temporarily shows the latest complete ROI flow and keeps probing the current flow', async () => {
@@ -347,7 +371,7 @@ describe('online inspection world compatibility', () => {
         sequenceNo: 24,
         fileType: 'png',
         path: `${materialId}/capture/C${index + 1}/2d/24.png`,
-        url: `http://127.0.0.1:4873/${materialId}-C${index + 1}.jpg`,
+        url: algorithmRoiUrl(materialId, `C${index + 1}`, 24),
         createdAt: '2026-08-24T04:00:00.000Z',
         validRoi: [100, 0, 700, 1024],
         sourceFrameId: `${materialId}:000000000024`,
@@ -402,10 +426,10 @@ describe('online inspection world compatibility', () => {
     }
   });
 
-  it('labels the existing camera bands as a live preview when no world is persisted', async () => {
+  it('shows a fail-closed state when neither an algorithm ROI nor a world is persisted', async () => {
     render(<ProductionPlateMap {...common} artifactMode="production" inspectionId="INS-LIVE-1" />);
 
-    expect(await screen.findByText('采集裁剪预览')).toBeInTheDocument();
+    expect(await screen.findByText('算法裁剪图尚未就绪')).toBeInTheDocument();
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
     expect(screen.getByTestId('bar-unfolded-map')).toBeInTheDocument();
   });
@@ -424,7 +448,7 @@ describe('online inspection world compatibility', () => {
       });
       render(<ProductionPlateMap {...common} artifactMode="production" inspectionId="INS-WORLD-1" />);
       await act(async () => { await Promise.resolve(); });
-      expect(screen.getByText('采集裁剪预览')).toBeInTheDocument();
+      expect(screen.getByText('算法裁剪图尚未就绪')).toBeInTheDocument();
 
       await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
 

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { PanelRightClose } from 'lucide-react';
 import type { DefectItem, DefectReviewStatus } from '../data/inspection';
-import { bkvOnlineCroppedImageUrl } from '../services/bkv-online-api';
+import { barSurfaceFileUrl } from '../services/bar-surface-api';
+import { bkvOnlineCroppedImageUrl, isBkvOnlineImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import { Panel } from './Panel';
 
@@ -18,6 +19,50 @@ const reviewLabels: Record<DefectReviewStatus, string> = {
   'false-positive': '已排除',
 };
 
+function explicitRoiArtifactUrl(value: string | undefined) {
+  const source = value?.trim() ?? '';
+  if (!source || isBkvOnlineImageUrl(source)) return '';
+  return /^(?:https?:|data:|blob:)/i.test(source) || source.startsWith('/')
+    ? source
+    : barSurfaceFileUrl(source);
+}
+
+function defectRoiImageUrl(defect: DefectItem, inspectionId?: string) {
+  const roi = defect.artifacts?.roi;
+  const roiImage = defect.artifacts?.roiImage;
+  const previewImage = defect.previewImageUrl?.trim() ?? '';
+
+  const explicitRoiImage = explicitRoiArtifactUrl(roiImage);
+  if (explicitRoiImage) return explicitRoiImage;
+
+  const bkvRoiImage = bkvOnlineCroppedImageUrl(roiImage, roi);
+  if (bkvRoiImage) return bkvRoiImage;
+
+  if (previewImage && !isBkvOnlineImageUrl(previewImage)) return previewImage;
+
+  const bkvPreview = bkvOnlineCroppedImageUrl(previewImage, roi);
+  if (bkvPreview) return bkvPreview;
+
+  const bkvSourceFrame = bkvOnlineCroppedImageUrl(defect.artifacts?.sourceFrame?.intensity, roi);
+  if (bkvSourceFrame) return bkvSourceFrame;
+
+  return inspectionId && defect.cameraIndex && defect.artifacts?.sequenceNo != null
+    ? inspectionWorldFrameUrl(inspectionId, defect.cameraIndex, defect.artifacts.sequenceNo, roi)
+    : '';
+}
+
+function roiLabel(roi: { x: number; y: number; width: number; height: number } | null | undefined) {
+  if (roi
+    && [roi.x, roi.y, roi.width, roi.height].every(Number.isFinite)
+    && roi.x >= 0
+    && roi.y >= 0
+    && roi.width > 0
+    && roi.height > 0) {
+    return `${roi.x},${roi.y},${roi.width},${roi.height}`;
+  }
+  return 'derived-defect-image';
+}
+
 export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse, onReviewDefect }: Props) {
   const [actualSize, setActualSize] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -26,16 +71,10 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse, onRe
   const cameraId = defect?.cameraIndex;
   const sequenceNo = defect?.artifacts?.sequenceNo;
   const roi = defect?.artifacts?.roi;
-  const imageUrl = useMemo(() => (
-    bkvOnlineCroppedImageUrl(
-      defect?.artifacts?.roiImage
-        || defect?.artifacts?.sourceFrame?.intensity
-        || defect?.previewImageUrl,
-      roi,
-    ) || defect?.previewImageUrl || (inspectionId && cameraId && sequenceNo != null
-      ? inspectionWorldFrameUrl(inspectionId, cameraId, sequenceNo, roi)
-      : '')
-  ), [cameraId, defect?.artifacts?.roiImage, defect?.artifacts?.sourceFrame?.intensity, defect?.previewImageUrl, inspectionId, roi?.height, roi?.width, roi?.x, roi?.y, sequenceNo]);
+  const imageUrl = useMemo(
+    () => defect ? defectRoiImageUrl(defect, inspectionId) : '',
+    [defect, inspectionId],
+  );
 
   useEffect(() => {
     setActualSize(false);
@@ -89,7 +128,7 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse, onRe
       ) : !imageUrl || failed ? (
         <div className="defect-image-empty">
           <strong>{defect.typeLabel}</strong>
-          <span>{failed ? '缺陷原始图像读取失败' : '当前缺陷未绑定原始帧'}</span>
+          <span>{failed ? '算法 ROI 小图读取失败' : '算法 ROI 小图未就绪'}</span>
         </div>
       ) : (
         <>
@@ -129,9 +168,7 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse, onRe
             <img
               src={imageUrl}
               alt={`${defect.typeLabel} C${cameraId} 第 ${sequenceNo} 帧缺陷图像`}
-              data-roi={roi && roi.width > 0 && roi.height > 0
-                ? `${roi.x},${roi.y},${roi.width},${roi.height}`
-                : 'full-frame'}
+              data-roi={roiLabel(roi)}
               onError={() => setFailed(true)}
             />
           </div>

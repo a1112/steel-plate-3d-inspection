@@ -37,6 +37,20 @@ const captureImage: CaptureImageItem = {
   createdAt: '2026-07-12 10:00:00',
 };
 
+const roiArtifactDefect: DefectItem = {
+  ...defect,
+  cameraId: 'camera2',
+  cameraIndex: 2,
+  artifacts: {
+    schema: 'steel.surface.defect.artifacts.v1',
+    cameraId: 'camera2',
+    frameId: 'frame-007',
+    sequenceNo: 7,
+    roi: { x: 10, y: 20, width: 30, height: 40 },
+    roiImage: 'runs/MAT/RUN/defects/D-001/intensity-roi.png',
+  },
+};
+
 const diameterMesh: BarSurfaceMesh = {
   schema: 'steel.bar-surface.mesh.v1',
   coordinateUnit: 'millimeter-normalized-radius',
@@ -83,7 +97,7 @@ describe('AlarmAnalysis', () => {
     }));
 
     expect(screen.getByText('暂无测径（外径）曲线')).toBeInTheDocument();
-    expect(screen.queryByText('暂无生产缺陷图像产物')).not.toBeInTheDocument();
+    expect(screen.queryByText('算法 ROI 小图未就绪')).not.toBeInTheDocument();
     expect(screen.queryByText('暂无生产点云产物')).not.toBeInTheDocument();
   });
 
@@ -97,7 +111,21 @@ describe('AlarmAnalysis', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it('keeps the BKV defect strip as a separate non-analysis view', () => {
+  it('uses an algorithm ROI image in the separate defect strip', () => {
+    const { container } = render(createElement(AlarmAnalysis, {
+      selectedDefect: roiArtifactDefect,
+      heightProfile: [],
+      captureImages: [captureImage],
+      viewMode: 'defects',
+      headerless: true,
+    }));
+
+    expect(screen.getByRole('button', { name: '打开 C2 · 凹坑 intensity #7' })).toBeInTheDocument();
+    expect(container.querySelector(`img[src="${captureImage.url}"]`)).toBeNull();
+    expect(screen.queryByTestId('diameter-trend-grid')).not.toBeInTheDocument();
+  });
+
+  it('does not substitute a production capture when an ROI image is unavailable', () => {
     render(createElement(AlarmAnalysis, {
       selectedDefect: defect,
       heightProfile: [],
@@ -106,15 +134,16 @@ describe('AlarmAnalysis', () => {
       headerless: true,
     }));
 
-    expect(screen.getByRole('button', { name: '打开 camera2 intensity #7' })).toBeInTheDocument();
-    expect(screen.queryByTestId('diameter-trend-grid')).not.toBeInTheDocument();
+    expect(screen.getByText('算法 ROI 小图未就绪')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '打开 camera2 intensity #7' })).not.toBeInTheDocument();
   });
 
-  it('opens a production capture from the retained BKV defect strip', () => {
+  it('opens a demo capture from the retained defect strip', () => {
     render(createElement(AlarmAnalysis, {
       selectedDefect: defect,
       heightProfile: [],
       captureImages: [captureImage],
+      artifactMode: 'demo',
       viewMode: 'defects',
       headerless: true,
     }));

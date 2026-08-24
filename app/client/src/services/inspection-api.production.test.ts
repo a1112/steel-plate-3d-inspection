@@ -701,7 +701,7 @@ describe('persistent production command client', () => {
     );
   });
 
-  it('uses the stable valid-region endpoint for SICK online intensity frames', async () => {
+  it('leaves raw SICK intensity frames empty until the ROI index supplies coordinates', async () => {
     const fixture = getMockInspectionSnapshot();
     const sourcePath = 'H:\\steel-sick-data\\2444\\capture\\C5\\2d\\219.png';
     const productionSnapshot = {
@@ -723,8 +723,33 @@ describe('persistent production command client', () => {
 
     const snapshot = await fetchInspectionSnapshot();
 
+    expect(snapshot.captureImages?.[0].url).toBe('');
+  });
+
+  it('keeps a SICK intensity preview only when the service supplies an explicit ROI', async () => {
+    const fixture = getMockInspectionSnapshot();
+    const sourcePath = 'H:\\steel-sick-data\\2444\\capture\\C5\\2d\\219.png';
+    const productionSnapshot = {
+      ...fixture,
+      source: 'sqlite-seaorm',
+      captureImages: [{
+        id: 'CAPTURE-SICK-C5-ROI',
+        cameraId: 'C5',
+        cameraIp: '192.168.105.190',
+        dataName: 'intensity',
+        sequenceNo: 220,
+        fileType: 'png',
+        path: sourcePath,
+        url: `/api/capture/file?path=${encodeURIComponent(sourcePath)}&maxWidth=1600&region=valid&cropX=100&cropY=20&cropWidth=600&cropHeight=980`,
+        createdAt: '2026-08-23 14:49:00',
+      }],
+    };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(productionSnapshot)));
+
+    const snapshot = await fetchInspectionSnapshot();
+
     expect(snapshot.captureImages?.[0].url).toBe(
-      `http://127.0.0.1:4873/api/capture/file?path=${encodeURIComponent(sourcePath)}&maxWidth=2048&region=valid`,
+      `http://127.0.0.1:4873/api/capture/file?path=${encodeURIComponent(sourcePath)}&maxWidth=1600&region=valid&cropX=100&cropY=20&cropWidth=600&cropHeight=980`,
     );
   });
 

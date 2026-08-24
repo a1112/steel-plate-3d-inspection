@@ -1254,11 +1254,16 @@ async function readJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-async function writeJson<T>(path: string, body: unknown = {}): Promise<T> {
+async function writeJson<T>(
+  path: string,
+  body: unknown = {},
+  signal?: AbortSignal,
+): Promise<T> {
   const response = await fetch(`${getCaptureServiceOrigin()}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
   if (!response.ok) {
     const payload = await response.clone().json().catch(() => undefined);
@@ -2466,6 +2471,7 @@ export function validateCaptureStreamStartOptions(
 
 export async function startCaptureStream(
   options: CaptureStreamStartOptions,
+  signal?: AbortSignal,
 ): Promise<CaptureStreamStatus> {
   const request: CaptureStreamStartOptions = {
     lines: 1280,
@@ -2481,11 +2487,14 @@ export async function startCaptureStream(
   if (validationError) {
     throw new Error(validationError);
   }
-  return writeJson<CaptureStreamStatus>("/api/stream/start", request);
+  return writeJson<CaptureStreamStatus>("/api/stream/start", request, signal);
 }
 
-export async function stopCaptureStream(ip: string): Promise<CaptureStreamStatus> {
-  return writeJson<CaptureStreamStatus>("/api/stream/stop", { ip });
+export async function stopCaptureStream(
+  ip: string,
+  signal?: AbortSignal,
+): Promise<CaptureStreamStatus> {
+  return writeJson<CaptureStreamStatus>("/api/stream/stop", { ip }, signal);
 }
 
 export function captureStreamImageUrl(
@@ -2567,12 +2576,25 @@ export async function rebuildCaptureDefects(materialId: string) {
   );
 }
 
-export function captureHistoryImageUrl(artifactRef: string, maxWidth = 800) {
+export function captureHistoryImageUrl(
+  artifactRef: string,
+  maxWidth: number,
+  validRoi: readonly [number, number, number, number],
+) {
   const query = new URLSearchParams({
     path: artifactRef,
     maxWidth: String(Math.max(160, Math.min(4096, Math.round(maxWidth)))),
     region: "valid",
   });
+  if (validRoi.length === 4 && validRoi.every(Number.isFinite)) {
+    const [left, top, right, bottom] = validRoi.map(Math.round);
+    if (left >= 0 && top >= 0 && right > left && bottom > top) {
+      query.set("cropX", String(left));
+      query.set("cropY", String(top));
+      query.set("cropWidth", String(right - left));
+      query.set("cropHeight", String(bottom - top));
+    }
+  }
   return `${getCaptureServiceOrigin()}/api/capture/file?${query.toString()}`;
 }
 

@@ -1307,18 +1307,62 @@ function normalizeServiceUrl(value: string | undefined, origin: string) {
   return value.startsWith('/') ? `${origin}${value}` : value;
 }
 
+function explicitCaptureCrop(value: string | undefined, origin: string) {
+  if (!value?.trim()) return null;
+  try {
+    const url = new URL(normalizeServiceUrl(value, origin), origin);
+    const cropValues = ['cropX', 'cropY', 'cropWidth', 'cropHeight']
+      .map((key) => url.searchParams.get(key));
+    if (cropValues.some((item) => !item?.trim())) {
+      return null;
+    }
+    const crop = {
+      x: Number(cropValues[0]),
+      y: Number(cropValues[1]),
+      width: Number(cropValues[2]),
+      height: Number(cropValues[3]),
+    };
+    if (![crop.x, crop.y, crop.width, crop.height].every(Number.isFinite)
+      || crop.x < 0
+      || crop.y < 0
+      || crop.width <= 0
+      || crop.height <= 0) {
+      return null;
+    }
+    const normalized = {
+      x: Math.round(crop.x),
+      y: Math.round(crop.y),
+      width: Math.round(crop.width),
+      height: Math.round(crop.height),
+      maxWidth: Math.max(160, Math.min(4096, Math.round(Number(url.searchParams.get('maxWidth')) || 2048))),
+    };
+    return normalized.width >= 1 && normalized.height >= 1 ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeCaptureImage(image: CaptureImageItem, origin: string): CaptureImageItem {
   let imageUrl = normalizeServiceUrl(image.url, origin);
   const normalizedPath = image.path.replaceAll('\\', '/');
   const isSickIntensityFrame = image.dataName.toLowerCase() === 'intensity'
     && /(?:^|\/)\d+\/capture\/C\d+\/2d\/[^/]+\.png$/i.test(normalizedPath);
   if (isSickIntensityFrame) {
-    const params = new URLSearchParams({
-      path: image.path,
-      maxWidth: '2048',
-      region: 'valid',
-    });
-    imageUrl = `${origin}/api/capture/file?${params.toString()}`;
+    const crop = explicitCaptureCrop(image.url, origin);
+    if (!crop) {
+      imageUrl = '';
+    } else {
+      const params = new URLSearchParams({
+        path: image.path,
+        maxWidth: String(crop.maxWidth),
+        region: 'valid',
+        cropX: String(crop.x),
+        cropY: String(crop.y),
+        cropWidth: String(crop.width),
+        cropHeight: String(crop.height),
+      });
+      imageUrl = `${origin}/api/capture/file?${params.toString()}`;
+    }
   }
   return {
     ...image,

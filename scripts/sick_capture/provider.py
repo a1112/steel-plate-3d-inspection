@@ -45,15 +45,18 @@ from .measurement import (
     measurement_manifest_path,
 )
 from .playback import (
+    _capture_image_identity,
     build_and_write_playback_index,
     build_image_pyramid,
     flow_pyramid_cache_status_path,
     playback_catalog_path,
     playback_index_path,
     read_image_pyramid,
+    read_indexed_playback_crop,
     read_indexed_history,
     select_pyramid_image,
     source_fingerprint,
+    validate_playback_crop_box,
     write_flow_pyramid_cache_status,
 )
 from .profile import CameraProfile, SickCaptureProfile, load_profile, sha256_file
@@ -3820,8 +3823,11 @@ class ProviderRuntime:
                             raw_intensity = self._preview_png(intensity, depth=False)
                             if raw_intensity is not None:
                                 previews["intensity-raw"] = raw_intensity
+                        depth_requested = bool(
+                            {"depth-valid", "depth-raw"} & requested_kinds
+                        )
                         depth_path = path.parent.parent / "3d" / f"{path.stem}.npz"
-                        if depth_path.is_file():
+                        if depth_requested and depth_path.is_file():
                             try:
                                 with np.load(depth_path, allow_pickle=False) as archive:
                                     if "array" not in archive.files:
@@ -3938,6 +3944,13 @@ class ProviderRuntime:
             options = dict(self.stream_subscriptions.get(reported_key, {}))
             subscribed_keys = list(self.stream_subscriptions)
             ready_variants = sorted(self.stream_latest.get(reported_key, {}))
+            primary_variant = (
+                "depth-valid"
+                if int(options.get("dataMode", 3) or 3) == 1
+                else "intensity-grid"
+            )
+            primary_ready = primary_variant in ready_variants
+            grid_ready = "intensity-grid" in ready_variants
             ready_kinds = sorted(
                 {
                     "intensity-grid" if value == "intensity-grid" else value.split("-", 1)[0]
@@ -3947,8 +3960,11 @@ class ProviderRuntime:
             return {
                 "code": 0,
                 "running": running,
-                "ready": bool(ready_variants),
-                "warmingUp": running and not ready_variants,
+                "ready": primary_ready,
+                "warmingUp": running and not primary_ready,
+                "primaryVariant": primary_variant,
+                "primaryReady": primary_ready,
+                "gridReady": grid_ready,
                 "readyKinds": ready_kinds,
                 "readyVariants": ready_variants,
                 "ip": (reported.ip if reported is not None else identity),
@@ -4004,11 +4020,11 @@ class ProviderRuntime:
                 self.stream_last_frame_at_by_camera.pop(camera.key, None)
                 self.stream_frame_ticks_by_camera[camera.key] = deque(maxlen=20)
                 self.stream_requested_kinds.pop(camera.key, None)
-            # Mode 1 is a depth-only focused preview. Modes 2/3 initially use
-            # intensity; depth for mode 3 is generated on its first request so
-            # a six-camera grid does not pay six full depth conversions.
+            # Mode 1 is a depth-only focused preview. Modes 2/3 initially need
+            # only the bounded overview image; full-width intensity and depth
+            # are generated on their first focused request.
             initial_kind = (
-                "depth-valid" if options["dataMode"] == 1 else "intensity-valid"
+                "depth-valid" if options["dataMode"] == 1 else "intensity-grid"
             )
             self.stream_requested_kinds.setdefault(camera.key, {})[
                 initial_kind
@@ -4605,8 +4621,13 @@ class ProviderRuntime:
                     if bool(payload.get("_retainRawFrame", False))
                     else {}
                 )
-                if steel_signal:
-                    self._schedule_stream_frame(camera, frame)
+                # Preview eligibility is independent from the bottom-edge
+                # steel-in/out signal.  A head/tail frame or a camera with a
+                # different sensor orientation can contain a valid full-frame
+                # ROI while its configured tail rows are dark.  The scheduler
+                # already enforces a two-FPS, one-pending-frame bound and the
+                # publisher rejects black/sparse frames before encoding.
+                self._schedule_stream_frame(camera, frame)
                 if save_generation is not None:
                     with self.state_lock:
                         still_armed = (
@@ -5443,17 +5464,93 @@ class ProviderRuntime:
             "frames": selected,
         }
 
+    def _strict_transient_playback_image(
+        self,
+        path: Path,
+        max_width: int,
+        crop_box: list[int],
+    ) -> tuple[str, bytes] | None:
+        """Encode an exact ROI in memory without ever falling back to raw pixels."""
+        try:
+            with Image.open(path) as source:
+                with source.convert("L") as converted:
+                    validated = validate_playback_crop_box(
+                        crop_box,
+                        converted.width,
+                        converted.height,
+                    )
+                    with converted.crop(tuple(validated)) as cropped:
+                        output = io.BytesIO()
+                        if cropped.width > max_width:
+                            target_height = max(
+                                1,
+                                round(cropped.height * max_width / cropped.width),
+                            )
+                            with cropped.resize(
+                                (max_width, target_height), Image.Resampling.BILINEAR
+                            ) as preview:
+                                preview.save(
+                                    output,
+                                    format="JPEG",
+                                    quality=84,
+                                    optimize=False,
+                                )
+                        else:
+                            cropped.save(
+                                output,
+                                format="JPEG",
+                                quality=84,
+                                optimize=False,
+                            )
+            return "image/jpeg", output.getvalue()
+        except Exception as error:
+            self._log(
+                "warning",
+                "strict transient playback crop failed",
+                path=str(path),
+                cropBox=crop_box,
+                error=str(error),
+            )
+            return None
+
     def optimized_playback_image(
         self,
         path: Path,
         max_width: int,
+        crop_box: list[int] | None = None,
     ) -> tuple[str, bytes] | None:
         if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
             return None
-        stat = path.stat()
-        material_id = path.parents[3].name
-        cache_root = flow_cache_root(self.profile.storage_root, material_id)
-        fingerprint = source_fingerprint(path, cache_root)
+        identity = _capture_image_identity(path)
+        if identity is None:
+            return None
+        material_id, _camera_id = identity
+        try:
+            stat = path.stat()
+            cache_root = flow_cache_root(self.profile.storage_root, material_id)
+            if crop_box is not None:
+                # A query-supplied rectangle is only a coordinate echo.  The
+                # algorithm's committed per-flow ROI remains authoritative so
+                # callers cannot ask for the complete raw frame under the
+                # `region=valid` cache/API contract.
+                with Image.open(path) as source:
+                    requested_crop = validate_playback_crop_box(
+                        crop_box,
+                        source.width,
+                        source.height,
+                    )
+                    indexed_crop = read_indexed_playback_crop(
+                        path,
+                        cache_root,
+                        source.width,
+                        source.height,
+                    )
+                if indexed_crop is None or requested_crop != indexed_crop:
+                    return None
+                crop_box = indexed_crop
+            fingerprint = source_fingerprint(path, cache_root, crop_box)
+        except (OSError, ValueError, TypeError):
+            return None
         key = (str(path), stat.st_mtime_ns, max_width, fingerprint)
         with self.history_lock:
             cached = self.playback_image_cache.get(key)
@@ -5465,20 +5562,32 @@ class ProviderRuntime:
             int(fingerprint[:2], 16) % len(self.playback_cache_build_locks)
         ]
         with build_lock:
-            existing = read_image_pyramid(cache_root, fingerprint)
-            disk_hit = existing is not None
+            disk_hit = False
             cache_succeeded = False
             started = time.monotonic()
             try:
+                existing = read_image_pyramid(cache_root, fingerprint)
+                disk_hit = existing is not None
                 if existing is None:
                     manifest_path, manifest = self.playback_compute_pool.submit(
                         build_image_pyramid,
                         path,
                         cache_root,
+                        crop_box,
                     ).result()
                 else:
                     manifest_path, manifest = existing
-                selected_path, _ = select_pyramid_image(manifest_path, manifest, max_width)
+                if crop_box is not None and (
+                    manifest.get("cropSource") != "explicit-algorithm-roi"
+                    or manifest.get("requestedCrop") != crop_box
+                    or manifest.get("validRoi") != crop_box
+                ):
+                    raise ValueError("playback pyramid crop contract mismatch")
+                selected_path, _ = select_pyramid_image(
+                    manifest_path,
+                    manifest,
+                    max_width,
+                )
                 result = ("image/jpeg", selected_path.read_bytes())
                 cache_succeeded = True
             except Exception as error:
@@ -5486,28 +5595,20 @@ class ProviderRuntime:
                     self.playback_cache_build_failures += 1
                 self._log(
                     "warning",
-                    "playback pyramid build failed; serving transient preview",
+                    "playback pyramid build failed; using strict transient crop",
                     path=str(path),
+                    cropBox=crop_box,
                     error=str(error),
                 )
-                output = io.BytesIO()
-                with Image.open(path) as source:
-                    converted = source.convert("L")
-                    try:
-                        if converted.width > max_width:
-                            target_height = max(
-                                1,
-                                round(converted.height * max_width / converted.width),
-                            )
-                            with converted.resize(
-                                (max_width, target_height), Image.Resampling.BILINEAR
-                            ) as preview:
-                                preview.save(output, format="JPEG", quality=84, optimize=False)
-                        else:
-                            converted.save(output, format="JPEG", quality=84, optimize=False)
-                    finally:
-                        converted.close()
-                result = ("image/jpeg", output.getvalue())
+                if crop_box is None:
+                    return None
+                result = self._strict_transient_playback_image(
+                    path,
+                    max_width,
+                    crop_box,
+                )
+                if result is None:
+                    return None
             elapsed_ms = (time.monotonic() - started) * 1000.0
             if cache_succeeded:
                 with self.history_lock:
@@ -5760,14 +5861,39 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     max_width = 0
                 region = (query.get("region") or ["raw"])[0]
-                if region == "valid" and 160 <= max_width <= 4096:
-                    optimized = self.runtime.optimized_playback_image(allowed, max_width)
+                if region == "valid":
+                    try:
+                        crop_x = int((query.get("cropX") or [""])[0])
+                        crop_y = int((query.get("cropY") or [""])[0])
+                        crop_width = int((query.get("cropWidth") or [""])[0])
+                        crop_height = int((query.get("cropHeight") or [""])[0])
+                    except (TypeError, ValueError):
+                        crop_box = None
+                    else:
+                        crop_box = [
+                            crop_x,
+                            crop_y,
+                            crop_x + crop_width,
+                            crop_y + crop_height,
+                        ] if crop_width > 0 and crop_height > 0 else None
+                    if crop_box is None or not 160 <= max_width <= 4096:
+                        self._send_json(
+                            422,
+                            {"code": 422, "error": "capture_valid_region_not_ready"},
+                        )
+                    else:
+                        optimized = self.runtime.optimized_playback_image(
+                            allowed, max_width, crop_box
+                        )
+                        if optimized is None:
+                            self._send_json(
+                                422,
+                                {"code": 422, "error": "capture_valid_region_not_ready"},
+                            )
+                        else:
+                            self._send_immutable_image(*optimized)
                 else:
-                    optimized = None
-                if optimized is None:
                     self._send_file(allowed)
-                else:
-                    self._send_immutable_image(*optimized)
         else:
             self._send_json(404, {"code": 404, "error": "route_not_found", "path": path})
 

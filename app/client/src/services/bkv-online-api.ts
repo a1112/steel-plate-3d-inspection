@@ -66,17 +66,50 @@ export async function fetchBkvOnlineStatus(signal?: AbortSignal): Promise<BkvOnl
   return response.json() as Promise<BkvOnlineStatus>;
 }
 
+type ImageRoi = { x: number; y: number; width: number; height: number };
+
+function normalizedImageRoi(roi?: ImageRoi | null): ImageRoi | null {
+  if (!roi
+    || ![roi.x, roi.y, roi.width, roi.height].every(Number.isFinite)
+    || roi.x < 0
+    || roi.y < 0
+    || roi.width <= 0
+    || roi.height <= 0) {
+    return null;
+  }
+  const normalized = {
+    x: Math.round(roi.x),
+    y: Math.round(roi.y),
+    width: Math.round(roi.width),
+    height: Math.round(roi.height),
+  };
+  return normalized.width >= 1 && normalized.height >= 1 ? normalized : null;
+}
+
+function parseBkvOnlineImageUrl(sourceUrl: string | undefined) {
+  if (!sourceUrl?.trim()) return null;
+  try {
+    const url = new URL(sourceUrl, getInspectionServiceOrigin());
+    return url.pathname === '/api/bkv-online/image' ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isBkvOnlineImageUrl(sourceUrl: string | undefined) {
+  return parseBkvOnlineImageUrl(sourceUrl) !== null;
+}
+
 export function bkvOnlineCroppedImageUrl(
   sourceUrl: string | undefined,
-  roi?: { x: number; y: number; width: number; height: number } | null,
+  roi?: ImageRoi | null,
 ) {
-  if (!sourceUrl || !sourceUrl.includes('/api/bkv-online/image')) return '';
-  const url = new URL(sourceUrl, getInspectionServiceOrigin());
-  if (roi && roi.width > 0 && roi.height > 0) {
-    url.searchParams.set('cropX', String(Math.max(0, Math.round(roi.x))));
-    url.searchParams.set('cropY', String(Math.max(0, Math.round(roi.y))));
-    url.searchParams.set('cropWidth', String(Math.max(1, Math.round(roi.width))));
-    url.searchParams.set('cropHeight', String(Math.max(1, Math.round(roi.height))));
-  }
+  const normalizedRoi = normalizedImageRoi(roi);
+  const url = normalizedRoi ? parseBkvOnlineImageUrl(sourceUrl) : null;
+  if (!url || !normalizedRoi) return '';
+  url.searchParams.set('cropX', String(normalizedRoi.x));
+  url.searchParams.set('cropY', String(normalizedRoi.y));
+  url.searchParams.set('cropWidth', String(normalizedRoi.width));
+  url.searchParams.set('cropHeight', String(normalizedRoi.height));
   return url.toString();
 }

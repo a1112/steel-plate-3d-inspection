@@ -32,6 +32,24 @@ describe('inspection world frame URLs', () => {
       'camera=1&seq=1934011&index=13&kind=2d&cropX=1036&cropY=826&cropWidth=12&cropHeight=23',
     );
   });
+
+  it('fails closed instead of returning a full inspection frame without a legal ROI', () => {
+    expect(inspectionWorldFrameUrl('1908500', 1, 18)).toBe('');
+    expect(inspectionWorldFrameUrl('1908500', 1, 18, null)).toBe('');
+    expect(inspectionWorldFrameUrl('1908500', 1, 18, { x: 0, y: 0, width: 0, height: 20 })).toBe('');
+    expect(inspectionWorldFrameUrl('1908500', 1, 18, { x: -1, y: 0, width: 20, height: 20 })).toBe('');
+    expect(inspectionWorldFrameUrl('1908500', 1, 18, { x: 0, y: Number.NaN, width: 20, height: 20 })).toBe('');
+  });
+
+  it('fails closed instead of returning a full BKV frame without a legal ROI', () => {
+    const source = '/api/bkv-online/image?camera=1&seq=1934011&index=13&kind=2d';
+    expect(bkvOnlineCroppedImageUrl(source)).toBe('');
+    expect(bkvOnlineCroppedImageUrl(source, null)).toBe('');
+    expect(bkvOnlineCroppedImageUrl(source, { x: 0, y: 0, width: 12, height: 0 })).toBe('');
+    expect(bkvOnlineCroppedImageUrl(source, { x: 0, y: -1, width: 12, height: 23 })).toBe('');
+    expect(bkvOnlineCroppedImageUrl(source, { x: 0, y: 0, width: Number.POSITIVE_INFINITY, height: 23 })).toBe('');
+    expect(bkvOnlineCroppedImageUrl('/api/bkv-online/image-preview', { x: 0, y: 0, width: 12, height: 23 })).toBe('');
+  });
 });
 
 function bsmeshFixture() {

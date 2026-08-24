@@ -390,17 +390,30 @@ export function inspectionWorldFrameUrl(
   sequenceNo: number,
   roi?: { x: number; y: number; width: number; height: number } | null,
 ) {
+  if (!roi
+    || ![roi.x, roi.y, roi.width, roi.height].every(Number.isFinite)
+    || roi.x < 0
+    || roi.y < 0
+    || roi.width <= 0
+    || roi.height <= 0) {
+    return '';
+  }
+  const normalizedRoi = {
+    x: Math.round(roi.x),
+    y: Math.round(roi.y),
+    width: Math.round(roi.width),
+    height: Math.round(roi.height),
+  };
+  if (normalizedRoi.width < 1 || normalizedRoi.height < 1) return '';
   const params = new URLSearchParams({
     recordId,
     cameraId: String(cameraId),
     sequenceNo: String(sequenceNo),
   });
-  if (roi && roi.width > 0 && roi.height > 0) {
-    params.set('cropX', String(Math.max(0, Math.round(roi.x))));
-    params.set('cropY', String(Math.max(0, Math.round(roi.y))));
-    params.set('cropWidth', String(Math.max(1, Math.round(roi.width))));
-    params.set('cropHeight', String(Math.max(1, Math.round(roi.height))));
-  }
+  params.set('cropX', String(normalizedRoi.x));
+  params.set('cropY', String(normalizedRoi.y));
+  params.set('cropWidth', String(normalizedRoi.width));
+  params.set('cropHeight', String(normalizedRoi.height));
   return worldUrl('frame', params);
 }
 

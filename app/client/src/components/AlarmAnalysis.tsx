@@ -2,15 +2,64 @@ import { ChevronLeft, ChevronRight, Maximize2, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { CaptureImageItem, ChartPoint, DefectItem } from '../data/inspection';
-import type { BarSurfaceMesh } from '../services/bar-surface-api';
-import { bkvOnlineCroppedImageUrl } from '../services/bkv-online-api';
+import { barSurfaceFileUrl, type BarSurfaceMesh } from '../services/bar-surface-api';
+import { bkvOnlineCroppedImageUrl, isBkvOnlineImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import { DiameterTrendPanel } from './DiameterTrendPanel';
 import { Panel } from './Panel';
 
 export type AnalysisViewMode = 'overview' | 'image' | 'point-cloud' | 'profile' | 'diameter' | 'defects';
 
-function CaptureImagePreview({ captureImages }: { captureImages: CaptureImageItem[] }) {
+function explicitRoiArtifactUrl(value: string | undefined) {
+  const source = value?.trim() ?? '';
+  if (!source || isBkvOnlineImageUrl(source)) return '';
+  return /^(?:https?:|data:|blob:)/i.test(source) || source.startsWith('/')
+    ? source
+    : barSurfaceFileUrl(source);
+}
+
+function defectRoiImageUrl(defect: DefectItem, inspectionId?: string) {
+  const roi = defect.artifacts?.roi;
+  const roiImage = defect.artifacts?.roiImage;
+  const previewImage = defect.previewImageUrl?.trim() ?? '';
+
+  const explicitRoiImage = explicitRoiArtifactUrl(roiImage);
+  if (explicitRoiImage) return explicitRoiImage;
+
+  const bkvRoiImage = bkvOnlineCroppedImageUrl(roiImage, roi);
+  if (bkvRoiImage) return bkvRoiImage;
+
+  if (previewImage && !isBkvOnlineImageUrl(previewImage)) return previewImage;
+
+  const bkvPreview = bkvOnlineCroppedImageUrl(previewImage, roi);
+  if (bkvPreview) return bkvPreview;
+
+  const bkvSourceFrame = bkvOnlineCroppedImageUrl(defect.artifacts?.sourceFrame?.intensity, roi);
+  if (bkvSourceFrame) return bkvSourceFrame;
+
+  const cameraIndex = defect.cameraIndex;
+  const sequenceNo = defect.artifacts?.sequenceNo;
+  return inspectionId && cameraIndex && sequenceNo != null
+    ? inspectionWorldFrameUrl(inspectionId, cameraIndex, sequenceNo, roi)
+    : '';
+}
+
+function AlgorithmRoiImageEmpty() {
+  return (
+    <div className="production-artifact-empty compact" role="status">
+      <strong>算法 ROI 小图未就绪</strong>
+      <span>当前缺陷尚未生成可显示的 ROI 裁剪或缺陷小图产物。</span>
+    </div>
+  );
+}
+
+function CaptureImagePreview({
+  captureImages,
+  artifactSource,
+}: {
+  captureImages: CaptureImageItem[];
+  artifactSource: 'production-roi' | 'demo';
+}) {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const visibleImages = captureImages
     .filter((image) => image.url && (image.dataName === 'depth' || image.dataName === 'intensity'))
@@ -39,7 +88,7 @@ function CaptureImagePreview({ captureImages }: { captureImages: CaptureImageIte
   }
 
   return (
-    <div className="capture-image-preview-grid" data-artifact-source="production-record">
+    <div className="capture-image-preview-grid" data-artifact-source={artifactSource}>
       {visibleImages.map((image, index) => (
         <figure key={`${image.id}-${image.dataName}`} className="capture-image-preview-card">
           <button type="button" className="capture-image-preview-open" onClick={() => setSelectedIndex(index)} aria-label={`打开 ${image.cameraId || image.cameraIp} ${image.dataName} #${image.sequenceNo}`}>
@@ -91,6 +140,7 @@ export function AlarmAnalysis({
   selectedDefect,
   captureImages = [],
   defects = [],
+  artifactMode = 'production',
   surfaceMesh,
   inspectionId,
   headerless = false,
@@ -114,29 +164,27 @@ export function AlarmAnalysis({
   diameterVisibleRange?: [number, number] | null;
 }) {
   const panelClassName = `alarm-analysis-panel analysis-view-${viewMode}`;
-  const bkvDefectImages: CaptureImageItem[] = inspectionId
-    ? (defects.length ? defects : selectedDefect ? [selectedDefect] : []).flatMap((defect) => {
+  const defectRoiImages: CaptureImageItem[] = (defects.length ? defects : selectedDefect ? [selectedDefect] : [])
+    .flatMap((defect) => {
+      const imageUrl = defectRoiImageUrl(defect, inspectionId);
+      if (!imageUrl) return [];
       const cameraIndex = defect.cameraIndex;
-      const sequenceNo = defect.artifacts?.sequenceNo;
-      if (!cameraIndex || sequenceNo == null) return [];
-      const onlineCropUrl = bkvOnlineCroppedImageUrl(
-        defect.artifacts?.roiImage || defect.artifacts?.sourceFrame?.intensity || defect.previewImageUrl,
-        defect.artifacts?.roi,
-      );
+      const sequenceNo = defect.artifacts?.sequenceNo ?? 0;
       return [{
         id: `defect-frame-${defect.id}`,
-        cameraId: `C${cameraIndex} · ${defect.typeLabel}`,
+        cameraId: `${cameraIndex ? `C${cameraIndex}` : defect.cameraId || '未定位相机'} · ${defect.typeLabel}`,
         cameraIp: '',
         dataName: 'intensity',
         sequenceNo,
         fileType: 'image',
-        path: `inspection-world/${inspectionId}/camera/${cameraIndex}/frame/${sequenceNo}`,
-        url: onlineCropUrl || inspectionWorldFrameUrl(inspectionId, cameraIndex, sequenceNo, defect.artifacts?.roi),
+        path: defect.artifacts?.roiImage || `defect-roi/${defect.id}`,
+        url: imageUrl,
         createdAt: '',
       }];
-    })
-    : [];
-  const lowerDefectImages = bkvDefectImages.length ? bkvDefectImages : captureImages;
+    });
+  const lowerDefectImages = defectRoiImages.length
+    ? defectRoiImages
+    : artifactMode === 'demo' ? captureImages : [];
   const canMeasureDiameter = Boolean(
     surfaceMesh
     && diameterMeasurement
@@ -149,7 +197,9 @@ export function AlarmAnalysis({
   if (viewMode === 'defects') {
     return (
       <Panel title="缺陷图片列表" className={`${panelClassName} defect-strip-analysis-panel`} headerless={headerless}>
-        <CaptureImagePreview captureImages={lowerDefectImages} />
+        {artifactMode === 'production' && lowerDefectImages.length === 0
+          ? <AlgorithmRoiImageEmpty />
+          : <CaptureImagePreview captureImages={lowerDefectImages} artifactSource={artifactMode === 'production' ? 'production-roi' : 'demo'} />}
       </Panel>
     );
   }

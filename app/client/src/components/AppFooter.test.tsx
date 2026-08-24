@@ -153,13 +153,11 @@ describe('AppFooter', () => {
   });
 
   it('opens the more menu and disables offline replay outside BKV mode', () => {
-    const onOnlineOpen = vi.fn();
     const onBkvOpen = vi.fn();
     render(
       <AppFooter
         activeNav="online"
         terminalViews={{
-          online: { available: true, active: true, onOpen: onOnlineOpen },
           bkv: { available: false, active: false, onOpen: onBkvOpen },
         }}
         onNavChange={vi.fn()}
@@ -172,24 +170,19 @@ describe('AppFooter', () => {
     fireEvent.click(moreButton);
 
     expect(moreButton).toHaveAttribute('aria-expanded', 'true');
-    const onlineItem = screen.getByRole('menuitem', { name: '在线检测' });
     const replayItem = screen.getByRole('menuitem', { name: '离线回放' });
-    expect(onlineItem).toBeEnabled();
-    expect(onlineItem).toHaveAttribute('aria-current', 'page');
+    expect(screen.queryByRole('menuitem', { name: '在线检测' })).not.toBeInTheDocument();
     expect(replayItem).toBeDisabled();
     expect(screen.getByText('仅 BKV 模式可用')).toBeInTheDocument();
     fireEvent.click(replayItem);
-    expect(onOnlineOpen).not.toHaveBeenCalled();
     expect(onBkvOpen).not.toHaveBeenCalled();
   });
 
-  it('opens the original online inspection view from BKV mode', () => {
-    const onOnlineOpen = vi.fn();
+  it('does not duplicate the top-level online monitoring entry in the footer', () => {
     render(
       <AppFooter
         activeNav="online"
         terminalViews={{
-          online: { available: true, active: false, onOpen: onOnlineOpen },
           bkv: { available: true, active: true, onOpen: vi.fn() },
         }}
         onNavChange={vi.fn()}
@@ -199,10 +192,7 @@ describe('AppFooter', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
     expect(screen.getByRole('menuitem', { name: '离线回放' })).toHaveAttribute('aria-current', 'page');
-    fireEvent.click(screen.getByRole('menuitem', { name: '在线检测' }));
-
-    expect(onOnlineOpen).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: '在线检测' })).not.toBeInTheDocument();
   });
 
   it('closes the more menu when Escape is pressed', () => {
@@ -210,7 +200,6 @@ describe('AppFooter', () => {
       <AppFooter
         activeNav="online"
         terminalViews={{
-          online: { available: true, active: false, onOpen: vi.fn() },
           bkv: { available: true, active: true, onOpen: vi.fn() },
         }}
         onNavChange={vi.fn()}

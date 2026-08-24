@@ -22,6 +22,20 @@ import { CapturePlayback } from './CapturePlayback';
 
 type PreviewKind = 'intensity' | 'depth';
 type MonitorMode = 'live' | 'playback';
+const STREAM_IMAGE_LOAD_TIMEOUT_MS = 3_500;
+const STREAM_CONTROL_TIMEOUT_MS = 8_000;
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === 'AbortError';
+}
+
+function stopStreamBestEffort(ip: string) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), STREAM_CONTROL_TIMEOUT_MS);
+  void stopCaptureStream(ip, controller.signal)
+    .catch(() => undefined)
+    .finally(() => window.clearTimeout(timeout));
+}
 
 interface LiveMonitoringPageProps {
   statuses: CaptureCameraStatus[];
@@ -32,43 +46,81 @@ interface StableStreamImageProps {
   src: string;
   alt: string;
   title?: string;
+  waitingLabel?: string;
   onDoubleClick?: () => void;
   onFrame: () => void;
   onError: () => void;
+}
+
+interface PendingStreamImage {
+  id: number;
+  src: string;
+}
+
+interface PendingStreamControlRequest {
+  controller: AbortController;
+  timeout: number;
 }
 
 export function StableStreamImage({
   src,
   alt,
   title,
+  waitingLabel = '等待实时首帧',
   onDoubleClick,
   onFrame,
   onError,
 }: StableStreamImageProps) {
   const [displaySrc, setDisplaySrc] = useState('');
-  const [pendingSrc, setPendingSrc] = useState('');
+  const [pending, setPending] = useState<PendingStreamImage | null>(null);
   const [retryRevision, setRetryRevision] = useState(0);
+  const [retrying, setRetrying] = useState(false);
   const failureCountRef = useRef(0);
   const retryAtRef = useRef(0);
   const retryTimerRef = useRef<number | null>(null);
+  const loadTimerRef = useRef<number | null>(null);
+  const nextAttemptIdRef = useRef(0);
+  const pendingRef = useRef<PendingStreamImage | null>(null);
+
+  const clearRetryTimer = () => {
+    if (retryTimerRef.current !== null) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+  };
+
+  const clearLoadTimer = () => {
+    if (loadTimerRef.current !== null) {
+      window.clearTimeout(loadTimerRef.current);
+      loadTimerRef.current = null;
+    }
+  };
+
+  const replacePending = (next: PendingStreamImage | null) => {
+    pendingRef.current = next;
+    setPending(next);
+  };
 
   useEffect(() => () => {
-    if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current);
+    clearRetryTimer();
+    clearLoadTimer();
+    pendingRef.current = null;
+  // Timer cleanup uses refs and is intentionally registered only once.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     if (!src) {
       setDisplaySrc('');
-      setPendingSrc('');
+      replacePending(null);
+      setRetrying(false);
       failureCountRef.current = 0;
       retryAtRef.current = 0;
-      if (retryTimerRef.current !== null) {
-        window.clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = null;
-      }
+      clearRetryTimer();
+      clearLoadTimer();
       return;
     }
-    if (pendingSrc || src === displaySrc) return;
+    if (pending || src === displaySrc) return;
     const retryDelay = retryAtRef.current - Date.now();
     if (retryDelay > 0) {
       if (retryTimerRef.current === null) {
@@ -79,41 +131,70 @@ export function StableStreamImage({
       }
       return;
     }
-    setPendingSrc(src);
-  }, [displaySrc, pendingSrc, retryRevision, src]);
+    const next = { id: nextAttemptIdRef.current + 1, src };
+    nextAttemptIdRef.current = next.id;
+    replacePending(next);
+  // Timer helpers only mutate refs; pending is the request serialization gate.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displaySrc, pending, retryRevision, src]);
 
-  const commitPending = () => {
-    if (!pendingSrc) return;
+  const commitPending = (candidate: PendingStreamImage) => {
+    if (pendingRef.current?.id !== candidate.id) return;
+    clearLoadTimer();
+    clearRetryTimer();
     failureCountRef.current = 0;
     retryAtRef.current = 0;
-    setDisplaySrc(pendingSrc);
-    setPendingSrc('');
+    setRetrying(false);
+    setDisplaySrc(candidate.src);
+    replacePending(null);
     onFrame();
   };
 
-  const rejectPending = () => {
-    if (!pendingSrc) return;
+  const rejectPending = (candidate: PendingStreamImage) => {
+    if (pendingRef.current?.id !== candidate.id) return;
+    clearLoadTimer();
     failureCountRef.current += 1;
     retryAtRef.current = Date.now() + Math.min(5_000, 500 * (2 ** Math.min(4, failureCountRef.current - 1)));
-    setPendingSrc('');
+    setRetrying(true);
+    replacePending(null);
     onError();
   };
+
+  useEffect(() => {
+    clearLoadTimer();
+    if (!pending) return undefined;
+    loadTimerRef.current = window.setTimeout(() => {
+      loadTimerRef.current = null;
+      rejectPending(pending);
+    }, STREAM_IMAGE_LOAD_TIMEOUT_MS);
+    return clearLoadTimer;
+  // Each pending request owns exactly one deadline; rejectPending validates its id.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending]);
 
   return (
     <>
       {displaySrc ? (
         <img src={displaySrc} alt={alt} title={title} onDoubleClick={onDoubleClick} />
       ) : null}
-      {pendingSrc ? (
+      {!displaySrc ? (
+        <div className="live-monitor-empty live-monitor-stream-wait" role="status">
+          <RefreshCw size={22} className="spin" />
+          <strong>{retrying ? `${waitingLabel}，正在重试` : waitingLabel}</strong>
+          <span>{retrying ? '尚未收到可解码图像，旧画面不会被黑帧替换' : '正在建立实时图像通道'}</span>
+        </div>
+      ) : null}
+      {pending ? (
         <img
           className="live-monitor-image-preload"
-          src={pendingSrc}
+          key={pending.id}
+          src={pending.src}
           alt={displaySrc ? '' : alt}
           aria-hidden={displaySrc ? true : undefined}
           title={displaySrc ? undefined : title}
           onDoubleClick={displaySrc ? undefined : onDoubleClick}
-          onLoad={commitPending}
-          onError={rejectPending}
+          onLoad={() => commitPending(pending)}
+          onError={() => rejectPending(pending)}
         />
       ) : null}
     </>
@@ -169,7 +250,15 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
   const lastStreamFrameAtRef = useRef(new Map<string, number>());
   const streamStartFailureCountRef = useRef(new Map<string, number>());
   const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAtRef = useRef(0);
   const pausedByUserRef = useRef(false);
+  const mountedRef = useRef(true);
+  const liveStreamDesiredRef = useRef(true);
+  const streamLifecycleGenerationRef = useRef(0);
+  const startRequestsRef = useRef(new Map<string, PendingStreamControlRequest>());
+  const stopRequestsRef = useRef(new Set<PendingStreamControlRequest>());
+  const activeStartBatchesRef = useRef(new Set<number>());
+  const nextStartBatchIdRef = useRef(0);
 
   const streamTopologyKey = cameras
     .map((status) => `${status.ip}:${status.connected ? 1 : 0}:${status.streamRunning ? 1 : 0}`)
@@ -211,19 +300,31 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
   };
 
   const scheduleReconnect = (delayMs: number) => {
-    if (reconnectTimerRef.current !== null) return;
+    if (!mountedRef.current || !liveStreamDesiredRef.current) return;
+    const boundedDelay = Math.max(250, delayMs);
+    const reconnectAt = Date.now() + boundedDelay;
+    if (reconnectTimerRef.current !== null && reconnectAtRef.current <= reconnectAt) return;
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    reconnectAtRef.current = reconnectAt;
     reconnectTimerRef.current = window.setTimeout(() => {
       reconnectTimerRef.current = null;
+      reconnectAtRef.current = 0;
       setReconnectToken((value) => value + 1);
-    }, Math.max(250, delayMs));
+    }, boundedDelay);
   };
 
   const stopStreams = async (ips: string[]) => {
     const uniqueIps = [...new Set(ips.filter(Boolean))];
     uniqueIps.forEach((ip) => locallyStoppedStreamIpsRef.current.add(ip));
     const results = await Promise.allSettled(uniqueIps.map(async (ip) => {
+      const controller = new AbortController();
+      const request: PendingStreamControlRequest = {
+        controller,
+        timeout: window.setTimeout(() => controller.abort(), STREAM_CONTROL_TIMEOUT_MS),
+      };
+      stopRequestsRef.current.add(request);
       try {
-        const result = await stopCaptureStream(ip);
+        const result = await stopCaptureStream(ip, controller.signal);
         if (result.code !== 0) {
           throw new Error(result.error || result.message || `code ${result.code}`);
         }
@@ -234,7 +335,10 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
         return ip;
       } catch (error) {
         locallyStoppedStreamIpsRef.current.delete(ip);
-        throw error;
+        throw isAbortError(error) ? new Error(`${ip} 停止请求超时`) : error;
+      } finally {
+        window.clearTimeout(request.timeout);
+        stopRequestsRef.current.delete(request);
       }
     }));
     const stopped = results.filter((result) => result.status === 'fulfilled').length;
@@ -245,17 +349,37 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
   };
 
   useEffect(() => () => {
+    mountedRef.current = false;
+    liveStreamDesiredRef.current = false;
+    streamLifecycleGenerationRef.current += 1;
+    const cleanupIps = [...new Set([
+      ...ownedStreamIpsRef.current,
+      ...startingStreamIpsRef.current,
+      ...startRequestsRef.current.keys(),
+    ])];
     if (reconnectTimerRef.current !== null) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
+      reconnectAtRef.current = 0;
     }
-    const ownedIps = [...ownedStreamIpsRef.current];
+    for (const request of startRequestsRef.current.values()) {
+      window.clearTimeout(request.timeout);
+      request.controller.abort();
+    }
+    startRequestsRef.current.clear();
+    for (const request of stopRequestsRef.current) {
+      window.clearTimeout(request.timeout);
+      request.controller.abort();
+    }
+    stopRequestsRef.current.clear();
     ownedStreamIpsRef.current.clear();
+    startingStreamIpsRef.current.clear();
     locallyStoppedStreamIpsRef.current.clear();
     streamStartedAtRef.current.clear();
     lastStreamFrameAtRef.current.clear();
     streamStartFailureCountRef.current.clear();
-    for (const ip of ownedIps) void stopCaptureStream(ip).catch(() => undefined);
+    activeStartBatchesRef.current.clear();
+    for (const ip of cleanupIps) stopStreamBestEffort(ip);
   }, []);
 
   useEffect(() => {
@@ -269,8 +393,26 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
   }, [monitorMode, playing, selected?.ip, selected?.streamRunning]);
 
   useEffect(() => {
+    const desired = monitorMode === 'live' && playing;
+    liveStreamDesiredRef.current = desired;
+    streamLifecycleGenerationRef.current += 1;
+    if (!desired) {
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+        reconnectAtRef.current = 0;
+      }
+      for (const request of startRequestsRef.current.values()) request.controller.abort();
+      setBusy(false);
+    }
+  }, [monitorMode, playing]);
+
+  useEffect(() => {
     if (monitorMode !== 'live' || !playing) return undefined;
-    let cancelled = false;
+    const generation = streamLifecycleGenerationRef.current;
+    const lifecycleIsActive = () => mountedRef.current
+      && liveStreamDesiredRef.current
+      && streamLifecycleGenerationRef.current === generation;
     const now = Date.now();
     let nextVerificationDelay = Number.POSITIVE_INFINITY;
     const targets = cameras.filter((status) => {
@@ -312,6 +454,10 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
     if (Number.isFinite(nextVerificationDelay)) scheduleReconnect(nextVerificationDelay);
     if (targets.length === 0) return undefined;
 
+    const batchId = nextStartBatchIdRef.current + 1;
+    nextStartBatchIdRef.current = batchId;
+    activeStartBatchesRef.current.add(batchId);
+    targets.forEach((target) => startingStreamIpsRef.current.add(target.ip));
     setBusy(true);
     setMessage(`正在接入 ${targets.length} 路实时采集…`);
     void (async () => {
@@ -319,17 +465,29 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
       let started = 0;
       const errors: string[] = [];
       const worker = async () => {
-        while (!cancelled) {
+        while (lifecycleIsActive()) {
           const index = cursor;
           cursor += 1;
           const target = targets[index];
           if (!target) return;
-          startingStreamIpsRef.current.add(target.ip);
+          const controller = new AbortController();
+          let timedOut = false;
+          const request: PendingStreamControlRequest = {
+            controller,
+            timeout: window.setTimeout(() => {
+              timedOut = true;
+              controller.abort();
+            }, STREAM_CONTROL_TIMEOUT_MS),
+          };
+          startRequestsRef.current.set(target.ip, request);
           try {
-            const result = await startCaptureStream({ ip: target.ip, dataMode: 3, fpsLimit: 2 });
+            const result = await startCaptureStream(
+              { ip: target.ip, dataMode: 3, fpsLimit: 2 },
+              controller.signal,
+            );
             if (result.code !== 0) throw new Error(result.error || result.message || `code ${result.code}`);
-            if (cancelled) {
-              void stopCaptureStream(target.ip).catch(() => undefined);
+            if (!lifecycleIsActive()) {
+              stopStreamBestEffort(target.ip);
               return;
             }
             ownedStreamIpsRef.current.add(target.ip);
@@ -337,44 +495,58 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
             streamStartFailureCountRef.current.delete(target.ip);
             started += 1;
           } catch (error) {
+            if (!lifecycleIsActive() && isAbortError(error)) return;
             streamStartFailureCountRef.current.set(
               target.ip,
               (streamStartFailureCountRef.current.get(target.ip) ?? 0) + 1,
             );
-            errors.push(`${cameraLabel(target, cameras.indexOf(target))}: ${error instanceof Error ? error.message : '启动失败'}`);
+            const detail = timedOut
+              ? '启动请求超时'
+              : error instanceof Error ? error.message : '启动失败';
+            errors.push(`${cameraLabel(target, cameras.indexOf(target))}: ${detail}`);
           } finally {
+            window.clearTimeout(request.timeout);
+            if (startRequestsRef.current.get(target.ip) === request) {
+              startRequestsRef.current.delete(target.ip);
+            }
             startingStreamIpsRef.current.delete(target.ip);
           }
         }
       };
-      await Promise.all(Array.from({ length: Math.min(2, targets.length) }, () => worker()));
-      if (cancelled) return;
-      setRenderedFrames(0);
-      setRenderedAt(null);
-      setBusy(false);
-      if (errors.length > 0) {
-        setMessage(`${started}/${targets.length} 路已启动；${errors.join('；')}`);
-        const highestFailureCount = Math.max(
-          1,
-          ...targets.map((target) => streamStartFailureCountRef.current.get(target.ip) ?? 0),
-        );
-        scheduleReconnect(Math.min(30_000, 2_000 * (2 ** Math.min(4, highestFailureCount - 1))));
-      } else {
-        setMessage(`已启动 ${started} 路实时预览，等待首帧`);
-        // Re-render once after provider warm-up; the lifecycle watchdog then
-        // keeps its separate ten-second first-frame deadline.
-        scheduleReconnect(4_000);
+      try {
+        await Promise.all(Array.from({ length: Math.min(2, targets.length) }, () => worker()));
+        if (!lifecycleIsActive()) return;
+        setRenderedFrames(0);
+        setRenderedAt(null);
+        if (errors.length > 0) {
+          setMessage(`${started}/${targets.length} 路已启动；${errors.join('；')}`);
+          const highestFailureCount = Math.max(
+            1,
+            ...targets.map((target) => streamStartFailureCountRef.current.get(target.ip) ?? 0),
+          );
+          scheduleReconnect(Math.min(30_000, 2_000 * (2 ** Math.min(4, highestFailureCount - 1))));
+        } else {
+          setMessage(`已启动 ${started} 路实时预览，等待首帧`);
+          // Re-render once after provider warm-up; the lifecycle watchdog then
+          // keeps its separate ten-second first-frame deadline.
+          scheduleReconnect(4_000);
+        }
+      } finally {
+        targets.forEach((target) => startingStreamIpsRef.current.delete(target.ip));
+        activeStartBatchesRef.current.delete(batchId);
+        if (mountedRef.current && activeStartBatchesRef.current.size === 0) setBusy(false);
+        if (mountedRef.current && liveStreamDesiredRef.current && !lifecycleIsActive()) {
+          scheduleReconnect(250);
+        }
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return undefined;
   // The topology key is the stable, per-camera dependency for stream lifecycle.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [monitorMode, playing, reconnectToken, streamTopologyKey]);
 
   useEffect(() => {
-    if (monitorMode !== 'live' || !playing || !selected?.ip) return undefined;
+    if (monitorMode !== 'live' || !playing) return undefined;
     // The provider publishes at most two previews per second. Polling faster
     // only creates duplicate six-camera proxy requests and delays history/API
     // responses while adding no visible frames.
@@ -520,6 +692,7 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
                 src={imageUrl}
                 alt={`${cameraLabel(selected!, selectedIndex)} 实时${kind === 'intensity' ? '灰度' : '深度'}图`}
                 title="双击返回六相机网格"
+                waitingLabel={`${cameraLabel(selected!, selectedIndex)} 等待首帧`}
                 onDoubleClick={returnToGrid}
                 onFrame={() => handleImageLoad(selected!.ip)}
                 onError={() => setMessage('等待相机有效帧')}
@@ -641,6 +814,7 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
                         <StableStreamImage
                           src={gridImageUrl}
                           alt={`${label} 实时灰度图`}
+                          waitingLabel={`${label} 等待首帧`}
                           onFrame={() => handleImageLoad(status.ip)}
                           onError={() => setMessage(`${label} 等待有效帧`)}
                         />

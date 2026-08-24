@@ -489,6 +489,64 @@ std::string get_query_param(const std::string& query, const std::string& key) {
   return url_decode(query.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
 }
 
+enum class UniqueQueryParamState {
+  Missing,
+  Present,
+  Invalid,
+};
+
+UniqueQueryParamState get_unique_query_param(const std::string& query,
+                                             const std::string& key,
+                                             std::string& value) {
+  bool found = false;
+  size_t begin = 0;
+  while (begin <= query.size()) {
+    const size_t end = query.find('&', begin);
+    const std::string segment = query.substr(
+        begin, end == std::string::npos ? std::string::npos : end - begin);
+    const size_t equals = segment.find('=');
+    const std::string segment_key =
+        equals == std::string::npos ? segment : segment.substr(0, equals);
+    if (segment_key == key) {
+      if (found || equals == std::string::npos) {
+        return UniqueQueryParamState::Invalid;
+      }
+      found = true;
+      value = url_decode(segment.substr(equals + 1));
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    begin = end + 1;
+  }
+  return found ? UniqueQueryParamState::Present
+               : UniqueQueryParamState::Missing;
+}
+
+bool parse_unique_unsigned_query_param(const std::string& query,
+                                       const std::string& key,
+                                       std::uint64_t& value) {
+  std::string text;
+  if (get_unique_query_param(query, key, text) !=
+          UniqueQueryParamState::Present ||
+      text.empty()) {
+    return false;
+  }
+  std::uint64_t parsed = 0;
+  for (const unsigned char ch : text) {
+    if (!std::isdigit(ch)) {
+      return false;
+    }
+    const std::uint64_t digit = static_cast<std::uint64_t>(ch - '0');
+    if (parsed > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+      return false;
+    }
+    parsed = parsed * 10 + digit;
+  }
+  value = parsed;
+  return true;
+}
+
 std::string json_string_field(const std::string& body, const std::string& key, const std::string& fallback = "") {
   std::string needle = "\"" + key + "\"";
   size_t key_pos = body.find(needle);
@@ -1281,6 +1339,37 @@ bool read_file(const std::string& path, std::string& out) {
   buffer << file.rdbuf();
   out = buffer.str();
   return true;
+}
+
+bool read_png_dimensions(const std::filesystem::path& path,
+                         std::uint32_t& width,
+                         std::uint32_t& height) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    return false;
+  }
+  unsigned char header[24]{};
+  file.read(reinterpret_cast<char*>(header), sizeof(header));
+  if (file.gcount() != static_cast<std::streamsize>(sizeof(header))) {
+    return false;
+  }
+  static const unsigned char signature[8] = {
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+  if (!std::equal(signature, signature + sizeof(signature), header) ||
+      header[8] != 0 || header[9] != 0 || header[10] != 0 ||
+      header[11] != 13 || header[12] != 'I' || header[13] != 'H' ||
+      header[14] != 'D' || header[15] != 'R') {
+    return false;
+  }
+  const auto big_endian_u32 = [&header](size_t offset) {
+    return (static_cast<std::uint32_t>(header[offset]) << 24) |
+           (static_cast<std::uint32_t>(header[offset + 1]) << 16) |
+           (static_cast<std::uint32_t>(header[offset + 2]) << 8) |
+           static_cast<std::uint32_t>(header[offset + 3]);
+  };
+  width = big_endian_u32(16);
+  height = big_endian_u32(20);
+  return width > 0 && height > 0;
 }
 
 std::filesystem::path temp_output_path_for(const std::filesystem::path& target) {
@@ -7621,6 +7710,41 @@ class CaptureRuntime {
             std::filesystem::path(path), allowed_roots, resolved)) {
       return {403, "", "image/png"};
     }
+
+    std::string region;
+    const UniqueQueryParamState region_state =
+        get_unique_query_param(query, "region", region);
+    if (region_state == UniqueQueryParamState::Invalid ||
+        (region_state == UniqueQueryParamState::Present &&
+         region != "raw" && region != "valid")) {
+      return {422, json_error(422, "capture_valid_region_not_ready")};
+    }
+    if (region_state == UniqueQueryParamState::Present && region == "valid") {
+      std::uint64_t crop_x = 0;
+      std::uint64_t crop_y = 0;
+      std::uint64_t crop_width = 0;
+      std::uint64_t crop_height = 0;
+      std::uint32_t image_width = 0;
+      std::uint32_t image_height = 0;
+      const bool crop_syntax_valid =
+          parse_unique_unsigned_query_param(query, "cropX", crop_x) &&
+          parse_unique_unsigned_query_param(query, "cropY", crop_y) &&
+          parse_unique_unsigned_query_param(query, "cropWidth", crop_width) &&
+          parse_unique_unsigned_query_param(query, "cropHeight", crop_height) &&
+          crop_width > 0 && crop_height > 0;
+      const bool image_header_valid =
+          crop_syntax_valid &&
+          read_png_dimensions(resolved, image_width, image_height);
+      const bool crop_bounds_valid =
+          image_header_valid && crop_x < image_width && crop_y < image_height &&
+          crop_width <= static_cast<std::uint64_t>(image_width) - crop_x &&
+          crop_height <= static_cast<std::uint64_t>(image_height) - crop_y;
+      // This provider currently has no safe decoder/encoder. Keep valid-region
+      // requests fail-closed even after validating PNG bounds; returning source
+      // bytes here would silently expose the uncropped acquisition frame.
+      (void)crop_bounds_valid;
+      return {422, json_error(422, "capture_valid_region_not_ready")};
+    }
     std::string body;
     if (!read_file(resolved.string(), body)) {
       return {404, "", "image/png"};
@@ -7878,13 +8002,26 @@ class CaptureRuntime {
          << json_pair("updatedAt", stream.updated_at) << ","
          << json_pair("latestDepthPath", stream.latest_depth_path) << ","
          << json_pair("latestIntensityPath", stream.latest_intensity_path) << ","
-         << json_pair("latestDepthUrl", stream.latest_depth_path.empty() ? "" : "/api/stream/latest?kind=depth&ip=" + url_encode(session.ip)) << ","
-         << json_pair("latestIntensityUrl", stream.latest_intensity_path.empty() ? "" : "/api/stream/latest?kind=intensity&ip=" + url_encode(session.ip))
+         << json_pair("latestDepthUrl", stream.latest_depth_path.empty() ? "" : "/api/stream/latest?kind=depth&ip=" + url_encode(session.ip) + "&region=valid") << ","
+         << json_pair("latestIntensityUrl", stream.latest_intensity_path.empty() ? "" : "/api/stream/latest?kind=intensity&ip=" + url_encode(session.ip) + "&region=valid")
          << "}";
     return json.str();
   }
 
   RouteResult stream_latest_response(const std::string& query) {
+    std::string region;
+    const UniqueQueryParamState region_state =
+        get_unique_query_param(query, "region", region);
+    if (region_state == UniqueQueryParamState::Invalid ||
+        (region_state == UniqueQueryParamState::Present &&
+         region != "raw" && region != "valid")) {
+      return {422, json_error(422, "capture_valid_region_not_ready")};
+    }
+    if (region_state == UniqueQueryParamState::Present && region == "valid") {
+      // The stream cache contains only the source PNG. Never ignore the region
+      // contract and fall back to that uncropped frame.
+      return {422, json_error(422, "capture_valid_region_not_ready")};
+    }
     std::string ip = get_query_param(query, "ip");
     std::string kind = get_query_param(query, "kind");
     if (kind.empty()) {

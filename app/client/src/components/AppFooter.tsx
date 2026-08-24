@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Activity, Box, Database, History, Monitor, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
+import { Activity, Box, Database, History, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
 import {
   formatResourceBreakdown,
@@ -34,7 +34,6 @@ interface FooterTerminalViewEntry {
 }
 
 interface FooterTerminalViews {
-  online: FooterTerminalViewEntry;
   bkv: FooterTerminalViewEntry;
 }
 
@@ -76,7 +75,6 @@ const bkvAnalysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
 ];
 
 const defaultTerminalViews: FooterTerminalViews = {
-  online: { available: true, active: true },
   bkv: { available: false, active: false },
 };
 
@@ -138,10 +136,9 @@ export function AppFooter({
     };
   }, [moreMenuOpen]);
 
-  const openTerminalView = (entry: FooterTerminalViewEntry, fallback?: () => void) => {
+  const openTerminalView = (entry: FooterTerminalViewEntry) => {
     if (!entry.available) return;
     if (entry.onOpen) entry.onOpen();
-    else fallback?.();
     setMoreMenuOpen(false);
   };
   const changeAnalysisView = (next: AnalysisViewMode) => {
@@ -273,7 +270,7 @@ export function AppFooter({
         <div className="app-footer-more" ref={moreMenuRef}>
           <button
             type="button"
-            className={moreMenuOpen || terminalViews.online.active || terminalViews.bkv.active ? 'active' : ''}
+            className={moreMenuOpen || terminalViews.bkv.active ? 'active' : ''}
             aria-label="更多功能"
             aria-haspopup="menu"
             aria-expanded={moreMenuOpen}
@@ -296,17 +293,6 @@ export function AppFooter({
               >
                 <Activity size={15} />
                 <span>系统状态</span>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className={terminalViews.online.active ? 'active' : ''}
-                aria-current={terminalViews.online.active ? 'page' : undefined}
-                disabled={!terminalViews.online.available}
-                onClick={() => openTerminalView(terminalViews.online, () => onNavChange('online'))}
-              >
-                <Monitor size={15} />
-                <span>在线检测</span>
               </button>
               <button
                 type="button"

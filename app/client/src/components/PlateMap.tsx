@@ -1597,12 +1597,9 @@ export function PlateMap({
     || captureRoiState.status === 'idle'
     || captureRoiState.status === 'loading'
   );
-  // A freshly completed flow can be present in the record list before every
-  // raw artifact has become readable on its camera disk.  Wait for the ROI
-  // catalog probe before issuing image requests; use raw frames only after the
-  // probe has definitively reported missing/error.
-  const displayedCaptureImages = captureRoiResult?.images
-    ?? (captureRoiPending ? [] : captureImages);
+  // Online inspection is an algorithm-result surface. A missing ROI must stay
+  // empty instead of leaking the traceability/raw capture frame into this UI.
+  const displayedCaptureImages = captureRoiResult?.images ?? [];
   const productionCameraImageCount = surfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
   const capturedCameraImageCount = new Set(displayedCaptureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
   const displayedCameraImageCount = Math.min(cameraLanes.length, Math.max(productionCameraImageCount, capturedCameraImageCount));
@@ -2021,7 +2018,7 @@ export function PlateMap({
                 : ''}`
               : captureRoiPending
                 ? '正在读取算法 ROI'
-                : '采集裁剪预览'}
+                : '算法裁剪图尚未就绪'}
           </span> : null}
           <BarUnfoldedMap
             defects={defects}

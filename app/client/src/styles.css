@@ -1715,6 +1715,50 @@ button {
   background: rgba(47, 125, 255, 0.055);
 }
 
+.online-unified-page {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.online-workspace-tabs {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.online-workspace-tabs button {
+  min-height: 30px;
+  padding: 0 16px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.online-workspace-tabs button:hover {
+  color: var(--text);
+  background: var(--surface-input);
+}
+
+.online-workspace-tabs button.active {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+}
+
+.online-unified-page > .live-monitor-page {
+  min-height: 0;
+}
+
 .online-workspace {
   flex: 1;
   min-height: 0;
