@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { PanelRightOpen, X } from 'lucide-react';
-import { getAllDefects, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
+import { getAllDefects, getMockInspectionSnapshot, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
 import type { DefectItem, DefectReviewStatus, InspectionSnapshot, Severity } from './data/inspection';
 import type { InspectionUiState } from './state/inspection-ui';
 import {
@@ -54,6 +54,8 @@ import {
   fetchProductionStatus,
   saveAdminInspectionSettings,
   saveConnectionConfig,
+  saveLocalConnectionConfig,
+  readLocalConnectionConfig,
   type ConnectionConfig,
   type DiscoveredInspectionService,
   type TriggerGatewayStatus,
@@ -112,6 +114,7 @@ import {
 import { InspectionFlowTool } from './components/InspectionFlowTool';
 import { StandaloneWindowTitlebar } from './components/StandaloneWindowTitlebar';
 import { BkvConversionStatusDialog } from './components/BkvConversionStatusDialog';
+import { ConnectionRecoveryDialog } from './components/ConnectionRecoveryDialog';
 import { fetchBkvOnlineStatus } from './services/bkv-online-api';
 import { inferNotificationTone, notify } from './state/notifications';
 import { resolveAppRoute, type AppRoute } from './lib/app-windows';
@@ -176,6 +179,31 @@ type RecordBoundSurfaceArtifact = {
 
 type AppMode = AppRoute;
 
+function createDisconnectedRuntimeProfile(): PublicRuntimeProfile {
+  return {
+    schema: 'steel.runtime-profile.public.v1',
+    profileId: 'disconnected-direct-8',
+    displayName: '八相机在线检测',
+    provider: 'direct',
+    dataSource: 'online',
+    cameraConnection: 'headless-cpp',
+    cameraCount: 8,
+    cameras: Array.from({ length: 8 }, (_, index) => ({
+      id: `C${index + 1}`,
+      displayOrder: index + 1,
+      sourceCameraId: index + 1,
+      role: `camera-${index + 1}`,
+    })),
+    configHash: 'disconnected-fallback',
+    capabilities: {
+      directCamera: true,
+      captureManagement: true,
+      reconstruction: true,
+      offlineReplay: false,
+    },
+  };
+}
+
 function buildUnknownService(name: string, endpoint: string): ServiceStatusPanelItem {
   return {
     name,
@@ -223,24 +251,61 @@ function filterDefectsBySelectedSeverities(defects: DefectItem[], selectedSeveri
 export default function App() {
   const [runtimeProfile, setRuntimeProfile] = useState<PublicRuntimeProfile | null>(null);
   const [runtimeProfileError, setRuntimeProfileError] = useState('');
+  const [runtimeProfileRevision, setRuntimeProfileRevision] = useState(0);
+  const [connectionIssue, setConnectionIssue] = useState<string | null>(null);
+  const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
+  const [connectionRetrying, setConnectionRetrying] = useState(false);
   const requestedAppMode = readAppMode();
   const systemName = resolveSystemName(runtimeProfile?.siteDisplayName);
 
   useEffect(() => {
     const controller = new AbortController();
+    let disposed = false;
+    const timeout = window.setTimeout(() => controller.abort(), 3_500);
     fetchRuntimeProfile(controller.signal)
       .then((profile) => {
-        if (!controller.signal.aborted) {
+        if (!disposed) {
+          window.clearTimeout(timeout);
           setRuntimeProfile(profile);
           setRuntimeProfileError('');
+          setConnectionIssue(null);
+          setConnectionDialogOpen(false);
+          setConnectionRetrying(false);
         }
       })
       .catch((error: unknown) => {
-        if (!controller.signal.aborted) {
-          setRuntimeProfileError(error instanceof Error ? error.message : '运行配置读取失败');
+        if (!disposed) {
+          window.clearTimeout(timeout);
+          const detail = controller.signal.aborted
+            ? '连接检测服务超时，请检查服务端 IP、端口和防火墙'
+            : error instanceof Error ? error.message : '运行配置读取失败';
+          setRuntimeProfile(createDisconnectedRuntimeProfile());
+          setRuntimeProfileError(detail);
+          setConnectionIssue(detail);
+          setConnectionDialogOpen(true);
+          setConnectionRetrying(false);
         }
       });
-    return () => controller.abort();
+    return () => {
+      disposed = true;
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [runtimeProfileRevision]);
+
+  const reportConnectionIssue = useCallback((detail: string) => {
+    setConnectionIssue(detail);
+    setConnectionDialogOpen(true);
+    setConnectionRetrying(false);
+  }, []);
+
+  const retryConnection = useCallback((connection: ConnectionConfig) => {
+    saveLocalConnectionConfig(connection);
+    setConnectionRetrying(true);
+    setRuntimeProfile(null);
+    setRuntimeProfileError('');
+    setConnectionIssue(null);
+    setRuntimeProfileRevision((current) => current + 1);
   }, []);
 
   useEffect(() => {
@@ -288,12 +353,26 @@ export default function App() {
   const appMode = blockedLabel ? 'terminal' : requestedAppMode;
 
   return (
-    <ConfiguredApp
-      runtimeProfile={runtimeProfile}
-      dashboardMode={dashboardMode}
-      appMode={appMode}
-      capabilityMessage={blockedLabel ? `当前运行模式不支持${blockedLabel}，已返回检测终端` : undefined}
-    />
+    <>
+      <ConfiguredApp
+        runtimeProfile={runtimeProfile}
+        dashboardMode={dashboardMode}
+        appMode={appMode}
+        capabilityMessage={blockedLabel ? `当前运行模式不支持${blockedLabel}，已返回检测终端` : undefined}
+        onConnectionIssue={reportConnectionIssue}
+      />
+      {connectionIssue && connectionDialogOpen ? (
+        <ConnectionRecoveryDialog
+          key={`${runtimeProfileRevision}-${connectionIssue}`}
+          error={connectionIssue}
+          initialConnection={readLocalConnectionConfig()}
+          theme={readStoredTheme()}
+          retrying={connectionRetrying}
+          onDismiss={() => setConnectionDialogOpen(false)}
+          onRetry={retryConnection}
+        />
+      ) : null}
+    </>
   );
 }
 
@@ -302,11 +381,13 @@ function ConfiguredApp({
   dashboardMode,
   appMode,
   capabilityMessage,
+  onConnectionIssue,
 }: {
   runtimeProfile: PublicRuntimeProfile;
   dashboardMode: RuntimeDashboardMode;
   appMode: AppMode;
   capabilityMessage?: string;
+  onConnectionIssue: (detail: string) => void;
 }) {
   const systemName = resolveSystemName(runtimeProfile.siteDisplayName);
   if (appMode === 'bar-surface') {
@@ -389,6 +470,11 @@ function ConfiguredApp({
         if (!controller.signal.aborted) {
           const detail = error instanceof Error ? error.message : '后台数据接口不可用';
           setLoadError(detail);
+          if (!dashboardMode.requestsStandardRecords) {
+            setSnapshot(getMockInspectionSnapshot());
+            onConnectionIssue(detail);
+            return;
+          }
           if (dashboardMode.requestsStandardRecords || dashboardMode.kind === 'bkv-online') {
             setBkvDataHealth({ state: 'store-error', detail });
           }
@@ -416,7 +502,7 @@ function ConfiguredApp({
       controller.abort();
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
-  }, [dashboardMode.kind, dashboardMode.requestsStandardRecords, loadRevision, resolvedTerminalMode]);
+  }, [dashboardMode.kind, dashboardMode.requestsStandardRecords, loadRevision, onConnectionIssue, resolvedTerminalMode]);
 
   const refreshStandardRecordList = useCallback(async (
     force = false,

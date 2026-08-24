@@ -1113,6 +1113,10 @@ function getStoredConnectionConfig(): ConnectionConfig {
   }
 }
 
+export function readLocalConnectionConfig(): ConnectionConfig {
+  return getStoredConnectionConfig();
+}
+
 export function saveLocalConnectionConfig(config: ConnectionConfig) {
   const storage = getSafeLocalStorage();
   if (storage) {

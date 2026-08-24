@@ -7223,6 +7223,167 @@ button {
   backdrop-filter: var(--modal-backdrop-filter);
 }
 
+.connection-recovery-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 260;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(4, 12, 22, 0.66);
+  -webkit-backdrop-filter: var(--modal-backdrop-filter);
+  backdrop-filter: var(--modal-backdrop-filter);
+}
+
+.connection-recovery-dialog {
+  width: min(560px, calc(100vw - 48px));
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--panel);
+  box-shadow: var(--floating-shadow);
+}
+
+.connection-recovery-dialog > header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.connection-recovery-dialog > header > div {
+  min-width: 0;
+}
+
+.connection-recovery-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+
+.connection-recovery-dialog > header span:not(.connection-recovery-icon) {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.connection-recovery-dialog h2 {
+  margin: 3px 0 0;
+  font-size: 21px;
+}
+
+.connection-recovery-dialog > header > button {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  cursor: pointer;
+}
+
+.connection-recovery-dialog > p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.connection-recovery-hint {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.connection-recovery-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 132px;
+  gap: 10px;
+}
+
+.connection-recovery-fields label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.connection-recovery-fields input {
+  width: 100%;
+  height: 38px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-input);
+}
+
+.connection-recovery-fields input:focus {
+  border-color: var(--blue);
+  outline: 2px solid color-mix(in srgb, var(--blue) 20%, transparent);
+}
+
+.connection-recovery-status {
+  padding: 8px 10px;
+  border-radius: 6px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 12px;
+}
+
+.connection-recovery-dialog > footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.connection-recovery-dialog > footer button {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.connection-recovery-dialog > footer button.secondary {
+  color: var(--text);
+  background: var(--panel-soft);
+}
+
+.connection-recovery-dialog > footer button.primary {
+  border-color: var(--blue);
+  color: #fff;
+  background: var(--blue);
+}
+
+.connection-recovery-dialog > footer button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+@media (max-width: 640px) {
+  .connection-recovery-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .connection-recovery-dialog > footer {
+    flex-wrap: wrap;
+  }
+}
+
 .settings-modal {
   width: min(1180px, calc(100vw - 52px));
   height: min(720px, calc(100vh - 52px));

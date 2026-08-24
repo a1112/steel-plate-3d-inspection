@@ -136,6 +136,23 @@ describe('storage capacity warning presentation', () => {
   });
 });
 
+describe('App disconnected startup', () => {
+  it('enters the dashboard and offers IP configuration in an error dialog', async () => {
+    window.history.replaceState(null, '', '/?app=terminal');
+    window.localStorage.clear();
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+
+    render(<App />);
+
+    const dialog = await screen.findByRole('alertdialog', { name: '未连接到检测服务' });
+    expect(screen.queryByRole('heading', { name: '运行配置不可用' })).not.toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '检测记录' })).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: '直接进入' }));
+    expect(screen.queryByRole('alertdialog', { name: '未连接到检测服务' })).not.toBeInTheDocument();
+  });
+});
+
 describe('App BKV provider selection', () => {
   it('uses the unified standard record catalog in BKV online mode', async () => {
     window.history.replaceState(null, '', '/?app=terminal&view=online');
