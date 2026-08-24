@@ -78,14 +78,7 @@ function CaptureImagePreview({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [selectedImage, visibleImages.length]);
 
-  if (visibleImages.length === 0) {
-    return (
-      <div className="analysis-empty">
-        <h3>当前钢管暂无缺陷</h3>
-        <p>真实检测记录已加载，当前流水还没有可显示的缺陷图像或采集图像。</p>
-      </div>
-    );
-  }
+  if (visibleImages.length === 0) return <AlgorithmRoiImageEmpty />;
 
   return (
     <div className="capture-image-preview-grid" data-artifact-source={artifactSource}>
@@ -108,7 +101,7 @@ function CaptureImagePreview({
           <section className="capture-image-viewer" role="dialog" aria-modal="true" aria-label="单相机采集图像查看">
             <header>
               <div>
-                <span>单相机采集图像</span>
+                <span>单相机缺陷图像</span>
                 <strong>{selectedImage.cameraId || selectedImage.cameraIp}</strong>
               </div>
               <button type="button" onClick={() => setSelectedIndex(null)} aria-label="关闭图像弹窗"><X size={18} /></button>
