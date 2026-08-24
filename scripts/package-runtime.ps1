@@ -1106,7 +1106,7 @@ if (-not (Test-Path $Exe -PathType Leaf)) {
   throw "Missing service executable: $Exe"
 }
 
-$env:INSPECTION_SERVICE_HOST = "127.0.0.1"
+$env:INSPECTION_SERVICE_HOST = "0.0.0.0"
 $env:INSPECTION_SERVICE_PORT = [string]$Port
 $env:STEEL_CAPTURE_PROVIDER = "external-api"
 $env:CAPTURE_SERVICE_ORIGIN = $CaptureOrigin
@@ -1150,7 +1150,7 @@ $CaptureExe = Join-Path $Root "capture-headless\steel_capture_service.exe"
 if (-not (Test-Path $Exe -PathType Leaf)) { throw "Missing service executable: $Exe" }
 if (-not (Test-Path $CaptureExe -PathType Leaf)) { throw "Missing capture executable: $CaptureExe" }
 
-$env:INSPECTION_SERVICE_HOST = "127.0.0.1"
+$env:INSPECTION_SERVICE_HOST = "0.0.0.0"
 $env:INSPECTION_SERVICE_PORT = [string]$Port
 $env:STEEL_CAPTURE_PROVIDER = "headless-cpp"
 $env:CAPTURE_SERVICE_ORIGIN = "http://127.0.0.1:$CapturePort"
@@ -1202,7 +1202,7 @@ if (-not (Test-Path $Exe -PathType Leaf)) {
   throw "Missing service executable: $Exe"
 }
 
-$env:INSPECTION_SERVICE_HOST = "127.0.0.1"
+$env:INSPECTION_SERVICE_HOST = "0.0.0.0"
 $env:INSPECTION_SERVICE_PORT = [string]$Port
 $env:STEEL_CAPTURE_PROVIDER = "simulated"
 $env:STEEL_CAPTURE_SERVICE_AUTOSTART = "0"

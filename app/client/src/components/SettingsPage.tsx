@@ -1,8 +1,8 @@
-import { ClipboardCheck, Cpu, Factory, Gauge, Monitor, Palette, RadioTower, RotateCcw, Save, Send, Server, Sparkles } from 'lucide-react';
+import { ClipboardCheck, Cpu, Factory, Gauge, LoaderCircle, Monitor, Palette, Radar, RadioTower, RotateCcw, Save, Send, Server, Sparkles } from 'lucide-react';
 import { useState, type ChangeEvent, type ElementType } from 'react';
 import type { ThemeMode, ThemeStyle } from '../data/inspection';
 import { openParameterManagementWindow } from '../lib/app-windows';
-import type { ConnectionConfig, ConnectionMode } from '../services/inspection-api';
+import type { ConnectionConfig, ConnectionMode, DiscoveredInspectionService } from '../services/inspection-api';
 import type { InspectionSettings, SettingsErrors } from '../state/operations';
 import { Panel } from './Panel';
 
@@ -150,11 +150,16 @@ export function SettingsPage({
   errors,
   connection = { mode: 'online', host: '127.0.0.1', port: 4873 },
   connectionStatus,
+  discoveredServices = [],
+  discoveryStatus,
+  discoveryBusy = false,
   onThemeChange,
   onThemeStyleChange = () => undefined,
   onDraftChange,
   onConnectionChange = () => undefined,
   onConnectionSave = () => undefined,
+  onConnectionDiscover = () => undefined,
+  onConnectionAutoSet = () => undefined,
   onSave,
   onReset,
   onApplyToPlate,
@@ -167,11 +172,16 @@ export function SettingsPage({
   errors: SettingsErrors;
   connection?: ConnectionConfig;
   connectionStatus?: string | null;
+  discoveredServices?: DiscoveredInspectionService[];
+  discoveryStatus?: string | null;
+  discoveryBusy?: boolean;
   onThemeChange: (theme: ThemeMode) => void;
   onThemeStyleChange?: (themeStyle: ThemeStyle) => void;
   onDraftChange: (patch: Partial<InspectionSettings>) => void;
   onConnectionChange?: (patch: Partial<ConnectionConfig>) => void;
   onConnectionSave?: () => void;
+  onConnectionDiscover?: () => void;
+  onConnectionAutoSet?: (service: DiscoveredInspectionService) => void;
   onSave: () => void;
   onReset: () => void;
   onApplyToPlate: () => void;
@@ -256,6 +266,10 @@ export function SettingsPage({
                 </div>
               </label>
               <div className="settings-actions">
+                <button type="button" disabled={connection.mode === 'demo' || discoveryBusy} onClick={onConnectionDiscover}>
+                  {discoveryBusy ? <LoaderCircle className="spin" size={16} /> : <Radar size={16} />}
+                  {discoveryBusy ? '正在发现' : '自动发现'}
+                </button>
                 <button type="button" onClick={onConnectionSave}>
                   <Save size={16} />
                   保存连接
@@ -269,6 +283,27 @@ export function SettingsPage({
                   参数管理
                 </button>
               </div>
+              {discoveryStatus || discoveredServices.length > 0 ? (
+                <section className="connection-discovery" aria-label="自动发现结果">
+                  <header>
+                    <strong>局域网服务</strong>
+                    <span>{discoveryStatus ?? `发现 ${discoveredServices.length} 个可用地址`}</span>
+                  </header>
+                  {discoveredServices.length > 0 ? (
+                    <div className="connection-discovery-list">
+                      {discoveredServices.map((service) => (
+                        <article key={service.origin} className={service.preferred ? 'preferred' : ''}>
+                          <span>
+                            <strong>{service.host}:{service.port}</strong>
+                            <em>{service.scope === 'lan' ? '局域网地址' : '本机地址'}{service.preferred ? ' · 推荐' : ''}</em>
+                          </span>
+                          <button type="button" onClick={() => onConnectionAutoSet(service)}>自动设置</button>
+                        </article>
+                      ))}
+                    </div>
+                  ) : null}
+                </section>
+              ) : null}
               <dl className="settings-summary">
                 <div>
                   <dt>当前模式</dt>
@@ -276,7 +311,7 @@ export function SettingsPage({
                 </div>
                 <div>
                   <dt>数据来源</dt>
-                  <dd>{connection.mode === 'online' ? '服务端 SQLite 数据库' : '客户端内置演示数据'}</dd>
+                  <dd>{connection.mode === 'online' ? `${(connection.runtime?.databaseEngine || '服务端').toUpperCase()} 数据库` : '客户端内置演示数据'}</dd>
                 </div>
                 <div>
                   <dt>服务端地址</dt>
@@ -285,6 +320,10 @@ export function SettingsPage({
                 <div>
                   <dt>状态</dt>
                   <dd>{connectionStatus ?? '待保存'}</dd>
+                </div>
+                <div>
+                  <dt>局域网访问</dt>
+                  <dd>{connection.runtime ? (connection.runtime.lanAccess ? `已开启 · ${connection.runtime.advertisedHost}` : '仅限本机') : '等待服务同步'}</dd>
                 </div>
               </dl>
             </Panel>

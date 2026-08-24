@@ -42,6 +42,7 @@ import {
 } from './hooks/use-app-resource-usage';
 import {
   createDefaultConnectionConfig,
+  discoverInspectionServices,
   fetchConnectionConfig,
   fetchServiceHealthDetails,
   fetchTriggerGatewayStatus,
@@ -54,6 +55,7 @@ import {
   saveAdminInspectionSettings,
   saveConnectionConfig,
   type ConnectionConfig,
+  type DiscoveredInspectionService,
   type TriggerGatewayStatus,
   getInspectionServiceOrigin,
   getTriggerGatewayOrigin,
@@ -623,6 +625,9 @@ function InspectionDashboard({
   const [settingsErrors, setSettingsErrors] = useState(() => validateSettings(createDefaultSettings()));
   const [connectionDraft, setConnectionDraft] = useState<ConnectionConfig>(() => createDefaultConnectionConfig());
   const [connectionStatus, setConnectionStatus] = useState<string | null>('读取中');
+  const [discoveredServices, setDiscoveredServices] = useState<DiscoveredInspectionService[]>([]);
+  const [connectionDiscoveryStatus, setConnectionDiscoveryStatus] = useState<string | null>(null);
+  const [connectionDiscoveryBusy, setConnectionDiscoveryBusy] = useState(false);
   const [operationState, setOperationState] = useState(() => createInitialOperationState());
   const [toast, setToast] = useState<string | null>(null);
   const [viewportSize, setViewportSize] = useState(readViewportSize);
@@ -725,6 +730,41 @@ function InspectionDashboard({
       });
     return () => controller.abort();
   }, [dashboardMode.requestsOnlineServices]);
+
+  useEffect(() => {
+    if (!dashboardMode.requestsOnlineServices || !settingsModalOpen) return;
+    const controller = new AbortController();
+    setConnectionStatus('正在同步服务端真实配置');
+    Promise.all([
+      fetchConnectionConfig(controller.signal),
+      fetchInspectionSettings(controller.signal),
+      fetchServiceHealthDetails(controller.signal),
+    ])
+      .then(([config, settings, health]) => {
+        const database = health.checks.database;
+        const synchronizedConfig: ConnectionConfig = {
+          ...config,
+          runtime: config.runtime ? {
+            ...config.runtime,
+            databaseEngine: database?.engine || config.runtime.databaseEngine,
+            databaseStatus: database?.status || config.runtime.databaseStatus,
+            databaseFallbackActive: database?.fallbackActive ?? config.runtime.databaseFallbackActive,
+            schemaVersion: database?.schemaVersion ?? config.runtime.schemaVersion,
+          } : config.runtime,
+        };
+        setConnectionDraft(synchronizedConfig);
+        setSavedSettings(settings);
+        setSettingsDraft(settings);
+        setSettingsErrors(validateSettings(settings));
+        setConnectionStatus(`真实配置已同步 · ${(database?.engine || config.runtime?.databaseEngine || 'database').toUpperCase()}`);
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setConnectionStatus(error instanceof Error ? error.message : '配置中心同步失败');
+        }
+      });
+    return () => controller.abort();
+  }, [dashboardMode.requestsOnlineServices, settingsModalOpen]);
 
   useEffect(() => {
     if (!dashboardMode.requestsOnlineServices) return;
@@ -1520,6 +1560,28 @@ function InspectionDashboard({
     }
   };
 
+  const discoverConnections = async () => {
+    setConnectionDiscoveryBusy(true);
+    setConnectionDiscoveryStatus('正在扫描当前局域网服务');
+    try {
+      const result = await discoverInspectionServices(connectionDraft);
+      setDiscoveredServices(result.addresses);
+      setConnectionDraft((current) => ({ ...current, runtime: result.runtime }));
+      setConnectionDiscoveryStatus(`发现 ${result.addresses.length} 个可用地址`);
+    } catch (error) {
+      setDiscoveredServices([]);
+      setConnectionDiscoveryStatus(error instanceof Error ? error.message : '自动发现失败');
+    } finally {
+      setConnectionDiscoveryBusy(false);
+    }
+  };
+
+  const applyDiscoveredConnection = (service: DiscoveredInspectionService) => {
+    updateConnectionDraft({ mode: 'online', host: service.host, port: service.port });
+    setConnectionStatus(`已自动设置 ${service.host}:${service.port}，请保存连接`);
+    setConnectionDiscoveryStatus(`已选择${service.scope === 'lan' ? '局域网' : '本机'}地址 ${service.host}`);
+  };
+
   const handleSystemAction = async (action: SystemAction) => {
     if (action === 'self-check') {
       setToast('系统自检中');
@@ -1942,6 +2004,9 @@ function InspectionDashboard({
               errors={settingsErrors}
               connection={connectionDraft}
               connectionStatus={connectionStatus}
+              discoveredServices={discoveredServices}
+              discoveryStatus={connectionDiscoveryStatus}
+              discoveryBusy={connectionDiscoveryBusy}
               onThemeChange={(theme) => setState({ theme })}
               onThemeStyleChange={(themeStyle) => setState({ themeStyle })}
               onDraftChange={(patch) => {
@@ -1953,6 +2018,8 @@ function InspectionDashboard({
               }}
               onConnectionChange={updateConnectionDraft}
               onConnectionSave={() => void saveConnection()}
+              onConnectionDiscover={() => void discoverConnections()}
+              onConnectionAutoSet={applyDiscoveredConnection}
               onSave={() => saveSettings('参数已保存')}
               onReset={resetSettings}
               onApplyToPlate={() => saveSettings('参数已应用到当前钢管')}

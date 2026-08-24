@@ -32,7 +32,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' customprotocol: asset:; connect-src ipc: http://ipc.localhost http://127.0.0.1:*; img-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:"
+      "csp": "default-src 'self' customprotocol: asset:; connect-src ipc: http://ipc.localhost http://*:*; img-src 'self' asset: http://asset.localhost http://*:* blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:"
     }
   },
   "bundle": {

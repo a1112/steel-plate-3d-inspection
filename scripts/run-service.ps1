@@ -7,6 +7,7 @@ param(
   [string]$CaptureStorageRoot = "",
   [string]$CameraStorageRoot = "",
   [string]$TriggerOrigin = "",
+  [string]$HostAddress = "0.0.0.0",
   [int]$Port = 4873,
   [switch]$NoCaptureAutostart,
   [ValidateRange(1, 20)]
@@ -110,6 +111,9 @@ New-Item -ItemType Directory -Force -Path $ConfigRoot | Out-Null
 
 if ($ForceParameters -or -not $env:INSPECTION_SERVICE_PORT) {
   $env:INSPECTION_SERVICE_PORT = [string]$Port
+}
+if ($ForceParameters -or -not $env:INSPECTION_SERVICE_HOST) {
+  $env:INSPECTION_SERVICE_HOST = $HostAddress
 }
 if ($ForceParameters -or -not $env:STEEL_CAPTURE_PROVIDER) {
   $env:STEEL_CAPTURE_PROVIDER = $Provider

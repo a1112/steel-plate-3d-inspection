@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as UnixMetadataExt, OpenOptionsExt as UnixOpenOptionsExt};
 #[cfg(windows)]
@@ -7076,7 +7076,26 @@ fn is_trusted_local_origin(value: &str) -> bool {
     let Some(host) = origin_host(value) else {
         return false;
     };
-    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") || host.ends_with(".localhost")
+    if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") || host.ends_with(".localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|address| match address {
+        IpAddr::V4(address) => {
+            address.is_private() || address.is_link_local() || address.is_loopback()
+        }
+        IpAddr::V6(address) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+    })
+}
+
+fn request_targets_loopback(request: &str) -> bool {
+    let Some(host) = request_header(request, "Host") else {
+        return true;
+    };
+    origin_host(&format!("http://{host}")).is_some_and(|host| {
+        matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") || host.ends_with(".localhost")
+    })
 }
 
 fn request_state_changing_method(request: &str, method: &str) -> bool {
@@ -9467,25 +9486,145 @@ fn write_config_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u
     }
 }
 
+fn configured_service_port() -> u16 {
+    env::var("INSPECTION_SERVICE_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(4873)
+}
+
+fn configured_service_host() -> String {
+    env::var("INSPECTION_SERVICE_HOST")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "0.0.0.0".to_string())
+}
+
+fn preferred_lan_service_host(bind_host: &str) -> String {
+    if let Some(host) = env::var("INSPECTION_SERVICE_ADVERTISED_HOST")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return host;
+    }
+    if let Ok(address) = bind_host.parse::<IpAddr>() {
+        if !address.is_unspecified() && !address.is_loopback() {
+            return address.to_string();
+        }
+    }
+    for target in ["192.0.2.1:9", "198.51.100.1:9"] {
+        let Ok(socket) = UdpSocket::bind(("0.0.0.0", 0)) else {
+            continue;
+        };
+        if socket.connect(target).is_ok() {
+            if let Ok(SocketAddr::V4(address)) = socket.local_addr() {
+                let ip = *address.ip();
+                if !ip.is_unspecified() && !ip.is_loopback() {
+                    return ip.to_string();
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+fn service_http_origin(host: &str, port: u16) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
+fn connection_runtime_value(state: &ServiceState) -> Value {
+    let bind_host = configured_service_host();
+    let advertised_host = preferred_lan_service_host(&bind_host);
+    let port = configured_service_port();
+    json!({
+        "service": "steel-inspection-service",
+        "bindHost": bind_host,
+        "advertisedHost": advertised_host,
+        "port": port,
+        "origin": service_http_origin(&advertised_host, port),
+        "lanAccess": !matches!(bind_host.as_str(), "127.0.0.1" | "::1" | "localhost"),
+        "databaseEngine": state.database.engine,
+        "databaseStatus": if state.database.fallback_active { "degraded" } else { "up" },
+        "databaseFallbackActive": state.database.fallback_active,
+        "schemaVersion": state.database.schema_version
+    })
+}
+
+fn connection_discovery_response(state: &ServiceState) -> Vec<u8> {
+    let runtime = connection_runtime_value(state);
+    let preferred_host = runtime
+        .get("advertisedHost")
+        .and_then(Value::as_str)
+        .unwrap_or("127.0.0.1");
+    let port = runtime
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(4873);
+    let mut addresses = vec![json!({
+        "host": preferred_host,
+        "port": port,
+        "origin": service_http_origin(preferred_host, port),
+        "scope": if preferred_host == "127.0.0.1" { "loopback" } else { "lan" },
+        "preferred": true
+    })];
+    if preferred_host != "127.0.0.1" {
+        addresses.push(json!({
+            "host": "127.0.0.1",
+            "port": port,
+            "origin": format!("http://127.0.0.1:{port}"),
+            "scope": "loopback",
+            "preferred": false
+        }));
+    }
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "schema": "steel.inspection-service-discovery.v1",
+            "code": 0,
+            "runtime": runtime,
+            "preferred": addresses.first().cloned().unwrap_or(Value::Null),
+            "addresses": addresses
+        })
+        .to_string(),
+    )
+}
+
 fn read_connection_response(state: &ServiceState) -> Vec<u8> {
-    match state
+    let stored = match state
         .runtime
         .block_on(db::get_config(&state.database.connection, "connection"))
     {
         Ok(Some(config)) => {
-            http_response("200 OK", "application/json; charset=utf-8", &config.value)
+            serde_json::from_str::<Value>(&config.value).unwrap_or_else(|_| json!({}))
         }
-        Ok(None) => http_response(
-            "200 OK",
-            "application/json; charset=utf-8",
-            "{\"mode\":\"demo\",\"host\":\"127.0.0.1\",\"port\":4873}",
-        ),
-        Err(error) => http_response(
-            "500 Internal Server Error",
-            "application/json; charset=utf-8",
-            &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
-        ),
-    }
+        Ok(None) => json!({
+            "mode": "online",
+            "host": "127.0.0.1",
+            "port": configured_service_port()
+        }),
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string())),
+            )
+        }
+    };
+    let mut payload = stored.as_object().cloned().unwrap_or_default();
+    payload.insert("runtime".to_string(), connection_runtime_value(state));
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &Value::Object(payload).to_string(),
+    )
 }
 
 fn write_connection_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
@@ -23759,6 +23898,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "GET", "path": "/api/admin/database/integrity", "scope": "admin" },
             { "method": "POST", "path": "/api/admin/database/maintenance", "scope": "admin" },
             { "method": "GET", "path": "/api/config", "scope": "config" },
+            { "method": "GET", "path": "/api/config/discovery", "scope": "config" },
             { "method": "GET", "path": "/api/config/connection", "scope": "config" },
             { "method": "POST", "path": "/api/config/connection", "scope": "config" },
             { "method": "GET", "path": "/api/config/capture", "scope": "config" },
@@ -24205,6 +24345,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         ("GET", "/api/config") => read_public_config_response(&state),
         ("GET", "/api/config/capture") => read_config_response(&state),
         ("POST", "/api/config/capture") => write_config_response(&state, body, actor),
+        ("GET", "/api/config/discovery") => connection_discovery_response(&state),
         ("GET", "/api/config/connection") => read_connection_response(&state),
         ("POST", "/api/config/connection") => write_connection_response(&state, body, actor),
         ("GET", "/api/inspection/settings") | ("GET", "/api/admin/inspection-settings") => {
@@ -24456,7 +24597,8 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
         }
         _ if method == "GET"
             && path == "/api/stream/latest"
-            && state.capture.provider.uses_local_api() =>
+            && state.capture.provider.uses_local_api()
+            && request_targets_loopback(&request) =>
         {
             capture_stream_redirect_response(&state.capture, raw_path)
         }
@@ -24726,14 +24868,18 @@ fn configured_standard_record_store(
 }
 
 fn main() -> std::io::Result<()> {
-    let port = env::var("INSPECTION_SERVICE_PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(4873);
+    let port = configured_service_port();
+    let host = configured_service_host();
     let config_dir = config_dir();
     std::fs::create_dir_all(&config_dir)?;
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let listener = TcpListener::bind((host.as_str(), port))?;
     listener.set_nonblocking(true)?;
+    eprintln!(
+        "steel-inspection-service listening on {}:{} (advertised as {})",
+        host,
+        port,
+        preferred_lan_service_host(&host)
+    );
     let database_path = config_dir.join("steel-inspection.sqlite");
     let runtime = Runtime::new()?;
     let database = runtime
@@ -27239,6 +27385,7 @@ mod tests {
     #[test]
     fn connection_config_read_remains_public_for_client_bootstrap() {
         assert_eq!(permission_for_route("GET", "/api/config/connection"), None);
+        assert_eq!(permission_for_route("GET", "/api/config/discovery"), None);
         assert_eq!(
             permission_for_route("POST", "/api/config/connection"),
             Some("admin.config")
@@ -27600,6 +27747,13 @@ mod tests {
 
         let tauri = "POST /api/admin/users HTTP/1.1\r\nOrigin: tauri://localhost\r\n\r\n";
         assert!(request_origin_allowed(tauri, "POST"));
+
+        let lan = "POST /api/admin/users HTTP/1.1\r\nOrigin: http://192.168.10.25:1432\r\n\r\n";
+        assert!(request_origin_allowed(lan, "POST"));
+
+        let private_ten =
+            "POST /api/admin/users HTTP/1.1\r\nOrigin: http://10.20.30.40:1432\r\n\r\n";
+        assert!(request_origin_allowed(private_ten, "POST"));
 
         let untrusted = "POST /api/admin/users HTTP/1.1\r\nOrigin: https://example.com\r\n\r\n";
         assert!(!request_origin_allowed(untrusted, "POST"));
@@ -28501,6 +28655,16 @@ mod tests {
             "Location: http://127.0.0.1:4317/api/stream/latest?ip=192.168.101.144&kind=intensity-grid"
         ));
         assert!(response.contains("Cache-Control: no-store"));
+    }
+
+    #[test]
+    fn live_capture_images_use_the_proxy_for_lan_requests() {
+        assert!(request_targets_loopback(
+            "GET /api/stream/latest HTTP/1.1\r\nHost: 127.0.0.1:4873\r\n\r\n"
+        ));
+        assert!(!request_targets_loopback(
+            "GET /api/stream/latest HTTP/1.1\r\nHost: 192.168.10.25:4873\r\n\r\n"
+        ));
     }
 
     #[test]
