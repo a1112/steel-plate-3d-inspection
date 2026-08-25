@@ -2206,6 +2206,44 @@ class SickProviderTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_diagnostic_capture_generates_one_numeric_flow_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend())
+            try:
+                status, summary = runtime.continuous_capture(
+                    {
+                        "expectedCameras": 1,
+                        "rounds": 1,
+                        "outputDir": "diagnostic-default-id",
+                    }
+                )
+                self.assertEqual(status, 200)
+                material_id = summary["materialId"]
+                self.assertTrue(material_id.isdecimal())
+                self.assertGreater(int(material_id), 0)
+                self.assertTrue(
+                    (
+                        profile.storage_root
+                        / "diagnostic-default-id"
+                        / "C1"
+                        / material_id
+                        / "json"
+                        / "0.json"
+                    ).is_file()
+                )
+
+                invalid_status, invalid = runtime.continuous_capture(
+                    {
+                        "expectedCameras": 1,
+                        "materialId": "diagnostic",
+                    }
+                )
+                self.assertEqual(invalid_status, 400)
+                self.assertIn("positive numeric", invalid["error"])
+            finally:
+                runtime.close()
+
     def test_production_capture_requires_steel_in_and_writes_provider_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile = load_profile(write_profile(Path(directory)))
@@ -3234,6 +3272,32 @@ class SickProviderTests(unittest.TestCase):
                     expected,
                 )
                 self.assertEqual(runtime.stream_frame_counts[camera.key], 1)
+            finally:
+                runtime.close()
+
+    def test_live_preview_publishes_initial_black_frame_as_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            try:
+                with runtime.stream_lock:
+                    runtime.stream_subscriptions[camera.key] = {"fpsLimit": 30}
+                    runtime.stream_camera_key = camera.key
+                    runtime.stream_options = {"fpsLimit": 30}
+                frame = sample_frame(1)
+                black = replace(frame, intensity=np.zeros_like(frame.intensity))
+
+                runtime._publish_stream_frame(camera, black)
+
+                preview = runtime.stream_latest_bytes(camera.ip, "intensity-grid")
+                self.assertIsNotNone(preview)
+                self.assertTrue(preview.startswith(b"\x89PNG\r\n\x1a\n"))
+                self.assertEqual(runtime.stream_frame_counts[camera.key], 1)
+                with patch.object(runtime, "_acquisition_running", return_value=True):
+                    status = runtime.stream_status(camera.ip)
+                self.assertTrue(status["ready"])
+                self.assertFalse(status["warmingUp"])
             finally:
                 runtime.close()
 

@@ -3625,44 +3625,55 @@ class ProviderRuntime:
         frame: Any,
     ) -> None:
         intensity = np.asarray(frame.intensity)
+        if intensity.size == 0:
+            return
         preview_black_max = max(
             LIVE_PREVIEW_BLACK_MAX,
             self.profile.black_frame_threshold,
         )
-        if intensity.size == 0 or float(np.max(intensity)) <= preview_black_max:
-            return
         visible_ratio = float(
             np.count_nonzero(intensity > self.steel_bright_threshold)
         ) / float(intensity.size)
-        # Isolated dust/sensor specks in an otherwise black image previously
-        # replaced the last good preview and looked like a black flicker.
-        if visible_ratio < self.steel_bright_ratio:
-            return
-        detected_roi = detect_valid_sensor_roi(
-            intensity,
-            np.asarray(frame.depth_raw),
-            threshold=self.steel_bright_threshold,
-            minimum_occupancy=max(0.0005, self.steel_bright_ratio / 4.0),
-            minimum_width=min(64, int(intensity.shape[1])),
+        visible_frame = bool(
+            float(np.max(intensity)) > preview_black_max
+            and visible_ratio >= self.steel_bright_ratio
         )
         height, width = intensity.shape
-        if detected_roi is None:
-            return
-        with self.stream_lock:
-            samples = self.stream_roi_samples.setdefault(camera.key, deque(maxlen=8))
-            if (
-                camera.key not in self.stream_valid_rois
-                and detected_roi[3] - detected_roi[1] >= height * 0.8
-            ):
-                samples.append(detected_roi)
-                if len(samples) >= 8:
-                    stable = stable_horizontal_roi(list(samples), width, height)
-                    if stable is not None:
-                        self.stream_valid_rois[camera.key] = stable
-            display_roi = self.stream_valid_rois.get(
-                camera.key,
-                [detected_roi[0], 0, detected_roi[2], height],
+        if visible_frame:
+            detected_roi = detect_valid_sensor_roi(
+                intensity,
+                np.asarray(frame.depth_raw),
+                threshold=self.steel_bright_threshold,
+                minimum_occupancy=max(0.0005, self.steel_bright_ratio / 4.0),
+                minimum_width=min(64, int(intensity.shape[1])),
             )
+            if detected_roi is None:
+                return
+            with self.stream_lock:
+                samples = self.stream_roi_samples.setdefault(camera.key, deque(maxlen=8))
+                if (
+                    camera.key not in self.stream_valid_rois
+                    and detected_roi[3] - detected_roi[1] >= height * 0.8
+                ):
+                    samples.append(detected_roi)
+                    if len(samples) >= 8:
+                        stable = stable_horizontal_roi(list(samples), width, height)
+                        if stable is not None:
+                            self.stream_valid_rois[camera.key] = stable
+                display_roi = self.stream_valid_rois.get(
+                    camera.key,
+                    [detected_roi[0], 0, detected_roi[2], height],
+                )
+        else:
+            # A real but dark camera frame must still make a new subscription
+            # ready; otherwise the UI reports an endless loading state while
+            # the camera is healthy and simply sees no steel.  Once a useful
+            # frame exists, keep it instead of replacing it with black/sparse
+            # noise between steel records.
+            with self.stream_lock:
+                if "intensity-grid" in self.stream_latest.get(camera.key, {}):
+                    return
+            display_roi = [0, 0, width, height]
         crop_left, _crop_top, crop_right, _crop_bottom = display_roi
         valid_intensity = intensity[:, crop_left:crop_right]
         valid_depth = np.asarray(frame.depth_raw)[:, crop_left:crop_right]
@@ -3689,7 +3700,7 @@ class ProviderRuntime:
                 valid_intensity,
                 depth=False,
                 max_width=800,
-                minimum_visible_max=LIVE_PREVIEW_BLACK_MAX,
+                minimum_visible_max=(LIVE_PREVIEW_BLACK_MAX if visible_frame else None),
             )
             if grid_preview is None:
                 return
@@ -4601,6 +4612,23 @@ class ProviderRuntime:
                 selected.append(camera)
         return selected
 
+    def _prepare_capture_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Resolve one valid flow id before a capture round starts.
+
+        Production captures inherit the active steel flow when the caller does
+        not repeat it.  Standalone diagnostics have no active steel, so assign
+        one numeric id to the whole request instead of letting each writer fall
+        back to the invalid legacy value ``diagnostic``.
+        """
+        request = dict(payload)
+        material_id = str(request.get("materialId", self.active_material_id)).strip()
+        if not material_id:
+            if bool(request.get("productionLayout", False)):
+                raise ValueError("production capture requires a positive numeric materialId")
+            material_id = str(time.time_ns())
+        request["materialId"] = flow_id(material_id)
+        return request
+
     def _capture_one(
         self,
         camera: CameraProfile,
@@ -5008,8 +5036,9 @@ class ProviderRuntime:
                     "error": "capture_mode_disabled",
                 }
 
-            rounds = _integer(payload, "rounds", 1, 1, 10_000)
-            interval_ms = _integer(payload, "intervalMs", 0, 0, 600_000)
+            request = self._prepare_capture_request(payload)
+            rounds = _integer(request, "rounds", 1, 1, 10_000)
+            interval_ms = _integer(request, "intervalMs", 0, 0, 600_000)
             results: list[dict[str, Any]] = []
             started_at = _utc_text()
             started_monotonic_ns = time.monotonic_ns()
@@ -5017,7 +5046,7 @@ class ProviderRuntime:
                 results.extend(
                     self._run_capture_round(
                         selected,
-                        payload,
+                        request,
                         round_index,
                         save_generation,
                     )
@@ -5040,9 +5069,9 @@ class ProviderRuntime:
                 }
                 for row in results
             )
-            material_id = str(payload.get("materialId", self.active_material_id or "diagnostic"))
-            session_id = str(payload.get("sessionId", self.active_session_id or "diagnostic"))
-            production_layout = bool(payload.get("productionLayout", False))
+            material_id = str(request["materialId"])
+            session_id = str(request.get("sessionId", self.active_session_id or "diagnostic"))
+            production_layout = bool(request.get("productionLayout", False))
             if production_layout:
                 summary_path = (
                     self.profile.storage_root
@@ -5054,7 +5083,7 @@ class ProviderRuntime:
             else:
                 summary_path = (
                     self.profile.storage_root
-                    / _safe_segment(str(payload.get("outputDir", "continuous-test")))
+                    / _safe_segment(str(request.get("outputDir", "continuous-test")))
                     / "summary.json"
                 )
             failed_code = next(
@@ -5087,11 +5116,11 @@ class ProviderRuntime:
                 "discardedFrames": discarded_frames,
                 "blackFrames": black_frames,
                 "rounds": rounds,
-                "retries": int(payload.get("retries", 0) or 0),
+                "retries": int(request.get("retries", 0) or 0),
                 "cameraCount": len(selected),
                 "expectedCameras": expected,
                 "expectedMet": failures == 0 and complete_frames == rounds * expected,
-                "connectFirst": bool(payload.get("connectFirst", False)),
+                "connectFirst": bool(request.get("connectFirst", False)),
                 "saveSdkDerived": False,
                 "roundIntervalMs": interval_ms,
                 "elapsedMs": round((time.monotonic_ns() - started_monotonic_ns) / 1_000_000, 3),
