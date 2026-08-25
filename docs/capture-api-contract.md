@@ -607,16 +607,16 @@ When a production session is active and `/api/capture/depth-map` is called witho
 <camera-root>/<material-id>/<data-name>/<sequence>.<extension>
 ```
 
-The provider uses per-camera roots from the active profile or `POST /api/storage/camera-roots`; the current eight-camera default maps the known IPs to `H:/camera1` through `H:/camera8` when drive `H:` exists. If a camera root is not configured, it falls back to `<storageRoot>/<camera-id>`, where `<camera-id>` is the camera SN when available or the IP. The default data-name directories are `depth`, `intensity`, and `metadata`; `sdk-derived` is written only when a capture request explicitly sends `saveSdkDerived:true` or `save_sdk_derived:true`. The production session summary still lives under `<storageRoot>/production/<safe-steel-id>/<sessionId>/summary.json`. Explicit `output` and `outputDir` values still take precedence unless `productionLayout:true` is sent to `/api/capture/continuous-test`.
+The provider uses distinct per-camera roots from the active profile or `POST /api/storage/camera-roots`. The current six-camera SICK site maps them to `D:/C1`, `E:/C2`, `F:/C3`, `G:/C4`, `H:/C5`, and `D:/C6`; the root already identifies the camera, so the material directory does not repeat `capture/<camera-id>`. If a camera root is not configured, it falls back to `<storageRoot>/<camera-id>`. The default data-name directories are `depth`, `intensity`, and `metadata`; `sdk-derived` is written only when a capture request explicitly sends `saveSdkDerived:true` or `save_sdk_derived:true`. The production session summary still lives under `<storageRoot>/production/<safe-steel-id>/<sessionId>/summary.json`. Explicit `output` and `outputDir` values still take precedence unless `productionLayout:true` is sent to `/api/capture/continuous-test`.
 
 Production capture calls may send `steelStateAware:true` or `requireSteelPresent:true`. When the provider has not received entry-steel/save state, it returns code `49000` (`CAPTURE_DISCARDED_NOT_ARMED`) and does not write frame images. When `discardBlackFrames:true`, a frame whose intensity image is below `blackFrameThreshold` returns code `49001` (`BLACK_FRAME_DISCARDED`); depth, intensity, and optional SDK-derived images are removed, while metadata records `discarded:true` and `discardReason:"black-frame"`.
 
 Example:
 
 ```text
-H:/camera1/MAT-20260707-001/depth/000001.png
-H:/camera1/MAT-20260707-001/intensity/000001.png
-H:/camera1/MAT-20260707-001/metadata/000001.json
+H:/C5/4018/3d/0.npz
+H:/C5/4018/2d/0.png
+H:/C5/4018/json/0.json
 ```
 
 The diagnostic viewer and Tauri capture page use the latest-file endpoint to preview only the newest saved artifact for a selected camera:

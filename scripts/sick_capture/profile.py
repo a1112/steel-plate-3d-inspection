@@ -215,9 +215,13 @@ def load_profile(
         )
     if [camera.camera_index for camera in enabled] != list(range(1, expected_cameras + 1)):
         raise ValueError("enabled cameraIndex values must be contiguous and start at 1")
-    # Multiple cameras may share one physical disk.  The v2 path contract
-    # isolates them below <flow>/capture/<camera>, so requiring a distinct
-    # root per camera would incorrectly force the flow id behind C1/C6.
+    resolved_camera_roots = {
+        str(camera.storage_root.resolve()).casefold() for camera in enabled
+    }
+    if len(resolved_camera_roots) != len(enabled):
+        raise ValueError(
+            "enabled cameras require distinct camera storage roots such as D:\\C1 and D:\\C6"
+        )
 
     capture_defaults = payload.get("captureDefaults", {})
     compatibility = payload.get("compatibility", {})

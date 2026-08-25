@@ -1,8 +1,8 @@
-"""Canonical flow-first storage paths shared by capture and algorithms.
+"""Canonical camera-root storage paths shared by capture and algorithms.
 
-The physical root may differ per camera, but everything below that root starts
-with the immutable numeric database flow number.  Consumers must use these
-helpers instead of reconstructing paths from UI or business identifiers.
+Each camera owns one explicit root such as ``H:\\C5``. Raw data lives directly
+under ``<camera-root>/<flow>/<2d|3d|json>``; the camera id and ``capture`` are
+not repeated below a root that already identifies the camera.
 """
 
 from __future__ import annotations
@@ -10,7 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 
 
-LAYOUT_SCHEMA = "steel.flow-storage.v2"
+LAYOUT_SCHEMA = "steel.camera-storage.v3"
+CAPTURE_KINDS = frozenset({"2d", "3d", "json"})
 
 
 def flow_id(value: str | int) -> str:
@@ -32,7 +33,48 @@ def capture_root(
     camera = camera_id.strip()
     if not camera or any(character in camera for character in "\\/:"):
         raise ValueError(f"invalid camera id: {camera_id!r}")
-    return flow_root(camera_storage_root, value) / "capture" / camera
+    return flow_root(camera_storage_root, value)
+
+
+def capture_artifact_ref(
+    camera_id: str,
+    value: str | int,
+    kind: str,
+    filename: str,
+) -> str:
+    camera = camera_id.strip()
+    directory = kind.strip().lower()
+    name = Path(filename).name
+    if not camera or any(character in camera for character in "\\/:"):
+        raise ValueError(f"invalid camera id: {camera_id!r}")
+    if directory not in CAPTURE_KINDS:
+        raise ValueError(f"invalid capture kind: {kind!r}")
+    if not name or name != filename:
+        raise ValueError(f"invalid capture filename: {filename!r}")
+    # Keep the public/API reference stable even though the physical directory
+    # no longer repeats ``capture/<camera>`` below a camera-specific root.
+    return f"{flow_id(value)}/capture/{camera}/{directory}/{name}"
+
+
+def resolve_capture_artifact(
+    camera_storage_root: Path,
+    camera_id: str,
+    artifact_ref: str,
+) -> Path:
+    supplied = Path(artifact_ref)
+    if supplied.is_absolute():
+        return supplied.resolve()
+    parts = supplied.parts
+    if (
+        len(parts) != 5
+        or not parts[0].isdecimal()
+        or parts[1].lower() != "capture"
+        or parts[2].lower() != camera_id.strip().lower()
+        or parts[3].lower() not in CAPTURE_KINDS
+        or Path(parts[4]).name != parts[4]
+    ):
+        raise ValueError(f"invalid capture artifact reference: {artifact_ref!r}")
+    return (Path(camera_storage_root) / flow_id(parts[0]) / parts[3].lower() / parts[4]).resolve()
 
 
 def flow_manifest_path(storage_root: Path, value: str | int) -> Path:

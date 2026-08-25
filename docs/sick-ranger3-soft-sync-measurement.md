@@ -4,9 +4,8 @@
 
 每次出钢后，采集服务会依次生成：
 
-- `D:\steel-sick-data\alignment\<FLOW>.json`：头尾、FrameID 缺口、设备时钟归一、周期软同步锚点和锚点行号；
-- `D:\steel-sick-data\measurements\<FLOW>.json`：2D 裁剪框、六相机截面曲线、鲁棒圆拟合、外径和多截面圆柱拟合门禁；
-- 每个相机流水目录中的 `alignment.json` 与 `measurement.json` 副本。
+- `D:\steel-sick-data\<FLOW>\sync\alignment.json`：头尾、FrameID 缺口、设备时钟归一、周期软同步锚点和锚点行号；
+- `D:\steel-sick-data\<FLOW>\derived\geometry\measurement.json`：2D 裁剪框、六相机截面曲线、鲁棒圆拟合、外径和多截面圆柱拟合门禁。
 
 头尾检测只使用与在线进出钢相同的灰度占比判据，并在最多 32 个已保存帧内搜索稳定边沿；固定夹具、氧化皮或粉尘产生的稀疏深度点不会再被当成整帧有钢。周期锚点只建立在六台相机头尾之间的共同有效钢段中，先用每台相机的头部将设备时钟归零，再按帧时间定位到具体扫描行。
 
@@ -22,10 +21,9 @@
 
 每根钢完成分析后，低优先级独立进程会生成以下派生数据，原始 PNG/NPZ 始终保持不变：
 
-- `D:\steel-sick-data\history\<FLOW>.json`：按 `captureRound` 对齐的六相机回放索引，避免各相机丢弃黑帧后按本地文件编号错配；
-- `D:\steel-sick-data\history\roi\<FLOW>.json`：同一流、同一相机共用的稳定横向有效窗口；
-- `D:\steel-sick-data\cache\playback-pyramid\v1\...`：每张有效 2D 图的持久化渐进 JPEG 金字塔；
-- `D:\steel-sick-data\cache\playback-pyramid\flows\<FLOW>.json`：整根钢预热数量、耗时和失败清单。
+- `D:\steel-sick-data\<FLOW>\derived\playback\index.json`：按 `captureRound` 对齐的六相机回放索引，避免各相机丢弃黑帧后按本地文件编号错配；
+- `D:\steel-sick-data\<FLOW>\derived\playback\roi.json`：同一流、同一相机共用的稳定横向有效窗口；
+- `D:\steel-sick-data\<FLOW>\cache\playback-pyramid\...`：该流水每张有效 2D 图的持久化渐进 JPEG 金字塔和预热状态。
 
 裁剪先使用灰度连通占比排除孤立亮点，再组合“流级稳定左右边界”和“当前帧头尾边界”。金字塔 `manifest.json` 保存 `originalSize`、`validRoi`、`frameDetectedRoi` 和 `flowHorizontalRoi`，算法测量结果中的 `sourceCoordinateOffset` 可将裁剪坐标还原到原始相机坐标。
 

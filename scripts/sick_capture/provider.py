@@ -64,10 +64,12 @@ from .events import publish_committed_round, write_flow_manifest
 from .paths import (
     algorithm_state_path,
     cache_root as flow_cache_root,
+    capture_artifact_ref,
     capture_root,
     flow_id,
     flow_manifest_path,
     frame_event_root,
+    resolve_capture_artifact,
 )
 from .regions import (
     RegionConfig,
@@ -1529,10 +1531,13 @@ class ProviderRuntime:
         for frame in index.get("frames", []):
             for camera in frame.get("cameras", []):
                 camera_id = str(camera.get("cameraId", ""))
-                parts = Path(str(camera.get("artifactRef", ""))).parts
+                artifact_ref = str(camera.get("artifactRef", ""))
                 root = camera_roots.get(camera_id)
-                if root is not None and len(parts) >= 2:
-                    sources.append(root.joinpath(*parts))
+                if root is not None:
+                    try:
+                        sources.append(resolve_capture_artifact(root, camera_id, artifact_ref))
+                    except ValueError:
+                        continue
 
         cached = 0
         failures: list[dict[str, str]] = []
@@ -3823,10 +3828,10 @@ class ProviderRuntime:
                             continue
                         height, width = intensity.shape
                         manifest_roi: list[int] | None = None
-                        # v2 layout is <flow>/capture/<camera>/2d/<frame>.png.
+                        # v3 layout is <camera-root>/<flow>/2d/<frame>.png.
                         # Derive the flow from the path itself so cached ROI data
                         # belongs to the same acquisition rather than the camera.
-                        material_id = path.parents[3].name
+                        material_id = path.parents[1].name
                         region_manifest = read_region_manifest(
                             self.profile.storage_root,
                             material_id,
@@ -5179,7 +5184,7 @@ class ProviderRuntime:
         candidates: list[tuple[int, Path]] = []
         for _, _, material_dir in material_dirs[: max(1, material_limit)]:
             for directory in directories:
-                artifact_dir = material_dir / "capture" / camera.camera_id / directory
+                artifact_dir = material_dir / directory
                 try:
                     for path in artifact_dir.iterdir():
                         if path.suffix.lower() not in normalized_suffixes or not path.is_file():
@@ -5277,7 +5282,7 @@ class ProviderRuntime:
                         modified = material_root.stat().st_mtime_ns
                     except OSError:
                         continue
-                    camera_capture_root = material_root / "capture" / camera.camera_id
+                    camera_capture_root = material_root
                     if not camera_capture_root.is_dir():
                         continue
                     materials.setdefault(material_root.name, []).append(
@@ -5384,7 +5389,7 @@ class ProviderRuntime:
                 stat = path.stat()
             except (OSError, ValueError):
                 continue
-            flow_name = material_root.parents[1].name
+            flow_name = material_root.name
             key = (flow_name, sequence)
             frame = grouped.setdefault(
                 key,
@@ -5405,11 +5410,9 @@ class ProviderRuntime:
                     "cameraId": camera.camera_id,
                     "cameraIndex": camera.camera_index,
                     "ip": camera.ip,
-                    "artifactRef": (
-                        path.relative_to(read_root).as_posix()
-                        if active_root
-                        else str(path)
-                    ),
+                    "artifactRef": capture_artifact_ref(
+                        camera.camera_id, flow_name, "2d", path.name
+                    ) if active_root else str(path),
                     "width": width,
                     "height": height,
                     "bytes": stat.st_size,
@@ -5720,7 +5723,12 @@ class ProviderRuntime:
             camera = self.camera_for_identity(parts[2])
             if camera is None:
                 return None
-            candidate = camera.storage_root.joinpath(*parts).resolve()
+            try:
+                candidate = resolve_capture_artifact(
+                    camera.storage_root, camera.camera_id, decoded
+                )
+            except ValueError:
+                return None
         if not candidate.is_file() or candidate.is_symlink():
             return None
         allowed = [self.profile.storage_root, *(camera.storage_root for camera in self.profile.enabled_cameras)]

@@ -22,6 +22,7 @@ from sick_capture.defect_detection import (
 )
 from sick_capture.measurement import MeasurementConfig, build_and_write_flow_measurement
 from sick_capture.paths import (
+    LAYOUT_SCHEMA,
     alignment_path as canonical_alignment_path,
     algorithm_state_path,
     frame_event_root,
@@ -252,7 +253,7 @@ def flow_state(storage_root: Path, material_id: str) -> str | None:
     path = flow_manifest_path(storage_root, material_id)
     try:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        if payload.get("schema") != "steel.flow-storage.v2":
+        if payload.get("schema") != LAYOUT_SCHEMA:
             return None
         return str(payload.get("state", ""))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):

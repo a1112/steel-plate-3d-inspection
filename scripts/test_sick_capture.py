@@ -2994,13 +2994,9 @@ class SickProviderTests(unittest.TestCase):
             camera = profile.enabled_cameras[0]
             try:
                 for flow_id in (2, 10):
-                    image_dir = (
-                        camera.storage_root
-                        / str(flow_id)
-                        / "capture"
-                        / camera.camera_id
-                        / "2d"
-                    )
+                    image_dir = camera_capture_root(
+                        camera.storage_root, str(flow_id), camera.camera_id
+                    ) / "2d"
                     image_dir.mkdir(parents=True)
                     Image.fromarray(np.full((8, 8), 200, dtype=np.uint8)).save(
                         image_dir / "0.png"
@@ -3011,17 +3007,17 @@ class SickProviderTests(unittest.TestCase):
                     suffixes=(".png",),
                     limit=1,
                 )
-                self.assertEqual(recent[0].parents[3].name, "10")
+                self.assertEqual(recent[0].parents[1].name, "10")
             finally:
                 runtime.close()
 
-    def test_latest_file_maps_public_kinds_to_v2_capture_directories(self) -> None:
+    def test_latest_file_maps_public_kinds_to_camera_flow_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile = load_profile(write_profile(Path(directory)))
             runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
             camera = profile.enabled_cameras[0]
-            capture_root = (
-                camera.storage_root / "31" / "capture" / camera.camera_id
+            capture_root = camera_capture_root(
+                camera.storage_root, "31", camera.camera_id
             )
             try:
                 for name in ("3d", "2d", "json"):
@@ -3058,8 +3054,8 @@ class SickProviderTests(unittest.TestCase):
             profile = load_profile(write_profile(Path(directory)))
             runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
             camera = profile.enabled_cameras[0]
-            capture_root = (
-                camera.storage_root / "32" / "capture" / camera.camera_id
+            capture_root = camera_capture_root(
+                camera.storage_root, "32", camera.camera_id
             )
             try:
                 (capture_root / "2d").mkdir(parents=True)
@@ -3106,8 +3102,8 @@ class SickProviderTests(unittest.TestCase):
             profile = load_profile(write_profile(Path(directory)))
             runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
             camera = profile.enabled_cameras[0]
-            capture_root = (
-                camera.storage_root / "33" / "capture" / camera.camera_id
+            capture_root = camera_capture_root(
+                camera.storage_root, "33", camera.camera_id
             )
             try:
                 (capture_root / "2d").mkdir(parents=True)

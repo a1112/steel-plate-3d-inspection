@@ -25,10 +25,12 @@ from .regions import (
 )
 from .paths import (
     cache_root as flow_cache_root,
+    capture_artifact_ref,
     capture_root,
     playback_index_path as canonical_playback_index_path,
     playback_roi_path as canonical_playback_roi_path,
     pyramid_status_path,
+    resolve_capture_artifact,
 )
 from .storage import replace_file
 
@@ -240,15 +242,14 @@ def playback_roi_path(storage_root: Path, material_id: str) -> Path:
 
 
 def _capture_image_identity(source_path: Path) -> tuple[str, str] | None:
-    """Return strict v2 flow/camera identity only for immutable raw 2D files."""
+    """Return v3 camera-root identity only for immutable raw 2D files."""
     try:
-        material_id = source_path.parents[3].name
-        camera_id = source_path.parents[1].name
+        material_id = source_path.parents[1].name
+        camera_id = source_path.parents[2].name
         if (
             not material_id.isdecimal()
             or int(material_id) <= 0
             or source_path.parent.name != "2d"
-            or source_path.parents[2].name != "capture"
             or not camera_id
         ):
             return None
@@ -673,8 +674,12 @@ def build_and_write_playback_index(
                     ),
                     "ip": str(metadata.get("cameraIp", "")),
                     "artifactRef": (
-                        f"{material_id}/capture/{camera_id}/2d/"
-                        f"{storage_index}{image_suffix}"
+                        capture_artifact_ref(
+                            camera_id,
+                            material_id,
+                            "2d",
+                            f"{storage_index}{image_suffix}",
+                        )
                         if root_index == 0
                         else str(intensity_path.resolve())
                     ),
@@ -965,21 +970,17 @@ def warm_flow_image_pyramids(
         for camera in frame.get("cameras", []):
             camera_id = str(camera.get("cameraId", ""))
             artifact = str(camera.get("artifactRef", ""))
-            parts = Path(artifact).parts
             root_value = camera_roots.get(camera_id)
-            if root_value is None or len(parts) < 2:
+            if root_value is None:
                 continue
-            if Path(artifact).is_absolute():
-                source = Path(artifact)
-            else:
-                source = next(
-                    (
-                        root.joinpath(*parts)
-                        for root in _camera_root_candidates(root_value)
-                        if root.joinpath(*parts).is_file()
-                    ),
-                    _camera_root_candidates(root_value)[0].joinpath(*parts),
-                )
+            roots = _camera_root_candidates(root_value)
+            try:
+                candidates = [
+                    resolve_capture_artifact(root, camera_id, artifact) for root in roots
+                ]
+            except ValueError:
+                continue
+            source = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
             try:
                 if not source.is_file() or source.is_symlink():
                     continue

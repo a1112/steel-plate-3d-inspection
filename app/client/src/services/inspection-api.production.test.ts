@@ -712,7 +712,7 @@ describe('persistent production command client', () => {
 
   it('keeps a record-bound raw SICK intensity frame while the ROI index is pending', async () => {
     const fixture = getMockInspectionSnapshot();
-    const sourcePath = 'H:\\steel-sick-data\\2444\\capture\\C5\\2d\\219.png';
+    const sourcePath = 'H:\\C5\\2444\\2d\\219.png';
     const productionSnapshot = {
       ...fixture,
       source: 'sqlite-seaorm',
@@ -739,7 +739,7 @@ describe('persistent production command client', () => {
 
   it('keeps a SICK intensity preview only when the service supplies an explicit ROI', async () => {
     const fixture = getMockInspectionSnapshot();
-    const sourcePath = 'H:\\steel-sick-data\\2444\\capture\\C5\\2d\\219.png';
+    const sourcePath = 'H:\\C5\\2444\\2d\\219.png';
     const productionSnapshot = {
       ...fixture,
       source: 'sqlite-seaorm',

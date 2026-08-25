@@ -84,7 +84,7 @@ python scripts\sick_capture_lg3d.py `
 
 ```powershell
 python scripts\validate_lg3d.py `
-  D:\steel-sick-data\C1\FAT-SICK-001
+  D:\C1\FAT-SICK-001
 ```
 
 每个相机、每个材料生成以下结构：

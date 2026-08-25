@@ -92,7 +92,7 @@ class SickFlowAnalysisServiceTests(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "schema": "steel.flow-storage.v2",
+                        "schema": "steel.camera-storage.v3",
                         "flowNo": 63,
                         "state": "closed",
                         "latestCommittedRound": 120,
