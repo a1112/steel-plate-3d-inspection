@@ -7,7 +7,7 @@ import type { CaptureSurfaceCameraTiles } from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { fetchCaptureStitchHistory, type CaptureStitchResult } from '../services/capture-roi-api';
 import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
-import { cameraBandCropPadding, cameraBandRotationRadians, captureStitchInitialFrameIndex, PlateMap as ProductionPlateMap } from './PlateMap';
+import { cameraBandCropPadding, cameraBandRotationRadians, captureStitchInitialFrameIndex, mergeCameraBandCropWindow, PlateMap as ProductionPlateMap } from './PlateMap';
 
 vi.mock('../services/inspection-world-api', async () => {
   const actual = await vi.importActual<typeof import('../services/inspection-world-api')>('../services/inspection-world-api');
@@ -121,6 +121,13 @@ describe('line-scan image orientation', () => {
   it('keeps a conservative guard around automatically detected steel edges', () => {
     expect(cameraBandCropPadding(20)).toBe(6);
     expect(cameraBandCropPadding(200)).toBe(12);
+  });
+
+  it('keeps one expanding source-coordinate crop window for adjacent frames', () => {
+    const first = mergeCameraBandCropWindow(undefined, { left: 0.27, right: 0.49 });
+    const merged = mergeCameraBandCropWindow(first, { left: 0.25, right: 0.48 });
+    expect(merged).toEqual({ left: 0.25, right: 0.49 });
+    expect(mergeCameraBandCropWindow(merged, { left: 0.26, right: 0.47 })).toBe(merged);
   });
 
   it('lands a switched record on its first complete content-bearing frame', () => {

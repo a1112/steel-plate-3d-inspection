@@ -5,6 +5,7 @@ param(
   [int]$TimeoutSec = 30,
   [int]$ViewportWidth = 1882,
   [int]$ViewportHeight = 994,
+  [string]$RecordPlateNo = "",
   [switch]$ExpectBkv,
   [switch]$TerminalOnly,
   [switch]$HistoryOnly
@@ -120,6 +121,7 @@ const viewportHeight = Number(process.env.STEEL_UI_SMOKE_VIEWPORT_HEIGHT || 994)
 const expectBkv = process.env.STEEL_UI_SMOKE_EXPECT_BKV === '1';
 const terminalOnly = process.env.STEEL_UI_SMOKE_TERMINAL_ONLY === '1';
 const historyOnly = process.env.STEEL_UI_SMOKE_HISTORY_ONLY === '1';
+const recordPlateNo = process.env.STEEL_UI_SMOKE_RECORD_PLATE_NO || '';
 
 function appUrl(app) {
   const url = new URL(clientOrigin);
@@ -387,7 +389,7 @@ async function runUnifiedOnlineModeChecks(page, result) {
   await page.evaluate("(() => { const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); viewport.scrollLeft = Math.min(viewport.scrollWidth - viewport.clientWidth, viewport.scrollWidth * 0.27); viewport.dispatchEvent(new Event('scroll')); return true; })()");
   await requireEventually(
     'crop-stitch-renders-content-bearing-cropped-frames',
-    "(() => { const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); const canvases = [...document.querySelectorAll('.bar-camera-frame.has-production-image canvas')].filter((canvas) => canvas.width > 0 && canvas.height > 0); const readyCanvases = canvases.filter((canvas) => canvas.dataset.renderState === 'ready'); const loadingCanvases = canvases.filter((canvas) => !canvas.dataset.renderState || canvas.dataset.renderState === 'loading'); const errorCanvases = canvases.filter((canvas) => canvas.dataset.renderState === 'error'); const invalidEdgePolicies = canvases.filter((canvas) => !['source-roi', 'guarded-auto-crop'].includes(canvas.dataset.edgePolicy || '')); const brightCanvases = readyCanvases.filter((canvas) => { try { const context = canvas.getContext('2d'); const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data; const stride = Math.max(4, Math.floor(pixels.length / 800 / 4) * 4); for (let offset = 0; offset < pixels.length; offset += stride) { if (Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]) > 40) return true; } } catch {} return false; }); const start = Number(viewport?.dataset.visibleFrameStart || 0); const readyRatio = canvases.length > 0 ? readyCanvases.length / canvases.length : 0; return viewport && start > 0 && readyRatio >= 0.9 && errorCanvases.length === 0 && invalidEdgePolicies.length === 0 && brightCanvases.length >= 6 ? { scrollLeft: viewport.scrollLeft, visibleFrameStart: start, visibleFrameEnd: Number(viewport.dataset.visibleFrameEnd || 0), paintedCanvases: canvases.length, readyCanvases: readyCanvases.length, loadingCanvases: loadingCanvases.length, errorCanvases: errorCanvases.length, readyRatio, brightCanvases: brightCanvases.length, invalidEdgePolicies: invalidEdgePolicies.length } : false; })()",
+    "(() => { const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); const canvases = [...document.querySelectorAll('.bar-camera-frame.has-production-image canvas')].filter((canvas) => canvas.width > 0 && canvas.height > 0); const readyCanvases = canvases.filter((canvas) => canvas.dataset.renderState === 'ready'); const loadingCanvases = canvases.filter((canvas) => !canvas.dataset.renderState || canvas.dataset.renderState === 'loading'); const errorCanvases = canvases.filter((canvas) => canvas.dataset.renderState === 'error'); const invalidEdgePolicies = canvases.filter((canvas) => !['source-roi', 'stable-source-crop'].includes(canvas.dataset.edgePolicy || '')); const brightCanvases = readyCanvases.filter((canvas) => { try { const context = canvas.getContext('2d'); const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data; const stride = Math.max(4, Math.floor(pixels.length / 800 / 4) * 4); for (let offset = 0; offset < pixels.length; offset += stride) { if (Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]) > 40) return true; } } catch {} return false; }); const start = Number(viewport?.dataset.visibleFrameStart || 0); const readyRatio = canvases.length > 0 ? readyCanvases.length / canvases.length : 0; return viewport && start > 0 && readyRatio >= 0.9 && errorCanvases.length === 0 && invalidEdgePolicies.length === 0 && brightCanvases.length >= 6 ? { scrollLeft: viewport.scrollLeft, visibleFrameStart: start, visibleFrameEnd: Number(viewport.dataset.visibleFrameEnd || 0), paintedCanvases: canvases.length, readyCanvases: readyCanvases.length, loadingCanvases: loadingCanvases.length, errorCanvases: errorCanvases.length, readyRatio, brightCanvases: brightCanvases.length, invalidEdgePolicies: invalidEdgePolicies.length } : false; })()",
   );
   result.interactionScreenshots.push(await page.screenshot('online-monitoring-inspection-content'));
 
@@ -406,13 +408,25 @@ async function runUnifiedOnlineModeChecks(page, result) {
   result.interactionScreenshots.push(await page.screenshot('online-monitoring-inspection-vertical'));
   await page.click('.unfold-orientation-switch button:first-child');
 
-  const recordTarget = await page.evaluate("(() => { const rows = [...document.querySelectorAll('.records-table tbody tr')]; const candidates = rows.filter((row) => !row.classList.contains('selected') && row.children.length >= 4); const target = candidates.find((row) => row.children[1]?.textContent.trim() === '3837') || candidates.find((row) => row.textContent.includes('\u5df2\u5b8c\u6210')) || candidates[0]; if (!target) return null; const plateNo = target.children[1].textContent.trim(); target.click(); return plateNo; })()");
+  const recordTarget = await page.evaluate(`(() => { const rows = [...document.querySelectorAll('.records-table tbody tr')].filter((row) => row.children.length >= 4); const candidates = rows.filter((row) => !row.classList.contains('selected')); const requested = ${JSON.stringify(recordPlateNo)}; const target = (requested ? rows.find((row) => row.children[1]?.textContent.trim() === requested) : null) || candidates.find((row) => row.children[1]?.textContent.trim() === '3837') || candidates.find((row) => row.textContent.includes('\u5df2\u5b8c\u6210')) || candidates[0]; if (!target) return null; const plateNo = target.children[1].textContent.trim(); target.click(); return plateNo; })()`);
   if (recordTarget) {
     await requireEventually(
       'record-switch-rebinds-crop-stitch',
       `(() => { const plateNo = document.querySelector('.plate-info-list dd')?.textContent.trim(); const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); const frameCount = Number(viewport?.dataset.frameCount || 0); const contentAnchorFrame = Number(viewport?.dataset.contentAnchorFrame || 0); const visibleFrameStart = Number(viewport?.dataset.visibleFrameStart || 0); const visibleFrameEnd = Number(viewport?.dataset.visibleFrameEnd || 0); const canvases = [...document.querySelectorAll('.bar-camera-frame.has-production-image canvas')].filter((canvas) => canvas.width > 0 && canvas.height > 0); const readyCanvases = canvases.filter((canvas) => canvas.dataset.renderState === 'ready'); const errorCanvases = canvases.filter((canvas) => canvas.dataset.renderState === 'error'); const brightCanvases = readyCanvases.filter((canvas) => { try { const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data; const stride = Math.max(4, Math.floor(pixels.length / 800 / 4) * 4); for (let offset = 0; offset < pixels.length; offset += stride) { if (Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]) > 40) return true; } } catch {} return false; }); const brightCameraIds = [...new Set(brightCanvases.map((canvas) => canvas.closest('.bar-camera-frame')?.dataset.cameraId).filter(Boolean))]; const anchorVisible = visibleFrameStart <= contentAnchorFrame && visibleFrameEnd > contentAnchorFrame; return plateNo === ${JSON.stringify(recordTarget)} && frameCount > 1 && anchorVisible && brightCameraIds.length === 6 && errorCanvases.length === 0 ? { plateNo, frameCount, scrollLeft: viewport.scrollLeft, contentAnchorFrame, visibleFrameStart, visibleFrameEnd, readyCanvases: readyCanvases.length, brightCanvases: brightCanvases.length, brightCameraIds, errorCanvases: errorCanvases.length } : false; })()`,
     );
     result.interactionScreenshots.push(await page.screenshot('online-monitoring-record-switched'));
+    if (recordPlateNo) {
+      await requireEventually(
+        'record-fallback-frames-share-source-coordinate-window',
+        "(() => { const canvases = [...document.querySelectorAll('.bar-camera-frame canvas[data-edge-policy=stable-source-crop]')].filter((canvas) => canvas.dataset.renderState === 'ready'); if (!canvases.length || canvases.some((canvas) => !canvas.dataset.cropLeft || !canvas.dataset.cropRight)) return false; const groups = new Map(); for (const canvas of canvases) { const cameraId = canvas.closest('.bar-camera-frame')?.dataset.cameraId || ''; const window = `${canvas.dataset.cropLeft}:${canvas.dataset.cropRight}`; if (!groups.has(cameraId)) groups.set(cameraId, new Set()); groups.get(cameraId).add(window); } const unstable = [...groups.entries()].filter(([, windows]) => windows.size !== 1); return groups.size > 0 && unstable.length === 0 ? { cameras: groups.size, canvases: canvases.length, windows: Object.fromEntries([...groups.entries()].map(([camera, windows]) => [camera, [...windows]])) } : false; })()",
+      );
+      await page.evaluate("(() => { const lane = document.querySelector('.bar-camera-band'); lane?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); return Boolean(lane); })()");
+      await requireEventually(
+        'record-first-camera-expands-for-seam-inspection',
+        "(() => { const map = document.querySelector('[data-testid=bar-unfolded-map]'); return map?.classList.contains('camera-expanded') && map.dataset.expandedCamera ? { camera: map.dataset.expandedCamera } : false; })()",
+      );
+      result.interactionScreenshots.push(await page.screenshot('online-monitoring-record-expanded'));
+    }
   }
 
   if (historyOnly) {
@@ -640,6 +654,7 @@ try {
   $env:STEEL_UI_SMOKE_EXPECT_BKV = if ($ExpectBkv) { "1" } else { "0" }
   $env:STEEL_UI_SMOKE_TERMINAL_ONLY = if ($TerminalOnly) { "1" } else { "0" }
   $env:STEEL_UI_SMOKE_HISTORY_ONLY = if ($HistoryOnly) { "1" } else { "0" }
+  $env:STEEL_UI_SMOKE_RECORD_PLATE_NO = $RecordPlateNo
 
   $Output = & node $NodePath 2>&1
   $ExitCode = $LASTEXITCODE

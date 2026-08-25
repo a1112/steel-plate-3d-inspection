@@ -1,6 +1,6 @@
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Check, X } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type WheelEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type WheelEvent } from 'react';
 import { DoubleSide, type Mesh, type PerspectiveCamera } from 'three';
 import heightMapBottomImage from '../assets/plate-surfaces/height-map-bottom.png';
 import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
@@ -154,6 +154,26 @@ export function cameraBandCropPadding(sampleSpan: number) {
   // visible guard around the detected steel so dark physical edge pixels are
   // not mistaken for the black sensor background after down-sampling.
   return Math.max(6, Math.round(Math.max(0, sampleSpan) * 0.06));
+}
+
+export interface CameraBandCropWindow {
+  left: number;
+  right: number;
+}
+
+export function mergeCameraBandCropWindow(
+  current: CameraBandCropWindow | undefined,
+  candidate: CameraBandCropWindow,
+) {
+  const left = Math.max(0, Math.min(1, candidate.left));
+  const right = Math.max(0, Math.min(1, candidate.right));
+  if (!Number.isFinite(left) || !Number.isFinite(right) || right - left < 0.04) return current;
+  if (!current) return { left, right };
+  const merged = {
+    left: Math.min(current.left, left),
+    right: Math.max(current.right, right),
+  };
+  return merged.left === current.left && merged.right === current.right ? current : merged;
 }
 
 function captureStitchCameraHasContent(camera: CaptureStitchFrame['cameras'][number]) {
@@ -561,6 +581,9 @@ function CameraBandImage({
   orientation,
   contentLabel = '实际裁剪图',
   cropBlackBorders = false,
+  stableCropWindow,
+  autoCropCameraId,
+  onAutoCropDetected,
   loadDelayMs = 0,
 }: {
   src: string;
@@ -568,9 +591,16 @@ function CameraBandImage({
   orientation: UnfoldOrientation;
   contentLabel?: string;
   cropBlackBorders?: boolean;
+  stableCropWindow?: CameraBandCropWindow;
+  autoCropCameraId?: string;
+  onAutoCropDetected?: (cameraId: string, crop: CameraBandCropWindow) => void;
   loadDelayMs?: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cropWindowRef = useRef(stableCropWindow);
+  const redrawRef = useRef<(() => void) | null>(null);
+
+  cropWindowRef.current = stableCropWindow;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -606,9 +636,9 @@ function CameraBandImage({
       context.imageSmoothingEnabled = true;
       context.imageSmoothingQuality = 'high';
       let sourceX = 0;
-      let sourceY = 0;
+      const sourceY = 0;
       let sourceWidth = image.naturalWidth;
-      let sourceHeight = image.naturalHeight;
+      const sourceHeight = image.naturalHeight;
       if (cropBlackBorders) {
         try {
           const sample = document.createElement('canvas');
@@ -618,39 +648,51 @@ function CameraBandImage({
           if (sampleContext) {
             sampleContext.drawImage(image, 0, 0, sample.width, sample.height);
             const pixels = sampleContext.getImageData(0, 0, sample.width, sample.height).data;
-            let minX = sample.width;
-            let minY = sample.height;
-            let maxX = -1;
-            let maxY = -1;
+            const brightRowsByColumn = new Uint16Array(sample.width);
             for (let y = 0; y < sample.height; y += 1) {
               for (let x = 0; x < sample.width; x += 1) {
                 const offset = (y * sample.width + x) * 4;
                 const luminance = Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
-                if (luminance > 8) {
-                  minX = Math.min(minX, x);
-                  minY = Math.min(minY, y);
-                  maxX = Math.max(maxX, x);
-                  maxY = Math.max(maxY, y);
-                }
+                if (luminance > 8) brightRowsByColumn[x] += 1;
               }
             }
-            if (maxX >= minX && maxY >= minY) {
+            const minimumBrightRows = Math.max(2, Math.round(sample.height * 0.04));
+            let minX = sample.width;
+            let maxX = -1;
+            brightRowsByColumn.forEach((brightRows, x) => {
+              if (brightRows < minimumBrightRows) return;
+              minX = Math.min(minX, x);
+              maxX = Math.max(maxX, x);
+            });
+            if (maxX >= minX && maxX - minX + 1 >= sample.width * 0.04) {
               const paddingX = cameraBandCropPadding(maxX - minX + 1);
-              const paddingY = cameraBandCropPadding(maxY - minY + 1);
               minX = Math.max(0, minX - paddingX);
-              minY = Math.max(0, minY - paddingY);
               maxX = Math.min(sample.width - 1, maxX + paddingX);
-              maxY = Math.min(sample.height - 1, maxY + paddingY);
-              sourceX = (minX / sample.width) * image.naturalWidth;
-              sourceY = (minY / sample.height) * image.naturalHeight;
-              sourceWidth = ((maxX - minX + 1) / sample.width) * image.naturalWidth;
-              sourceHeight = ((maxY - minY + 1) / sample.height) * image.naturalHeight;
+              if (autoCropCameraId) {
+                onAutoCropDetected?.(autoCropCameraId, {
+                  left: minX / sample.width,
+                  right: (maxX + 1) / sample.width,
+                });
+              }
             }
           }
         } catch {
           // Cross-origin images can disallow pixel reads. The full production
           // frame remains usable in that case instead of hiding the lane.
         }
+      }
+      const cropWindow = cropBlackBorders ? cropWindowRef.current : undefined;
+      if (cropWindow && cropWindow.right - cropWindow.left >= 0.04) {
+        // Source Y is the acquisition/progress axis and must remain untouched.
+        // Sharing one source-X window across a camera lane prevents the
+        // rotated frames from acquiring independent vertical offsets.
+        sourceX = cropWindow.left * image.naturalWidth;
+        sourceWidth = (cropWindow.right - cropWindow.left) * image.naturalWidth;
+        canvas.dataset.cropLeft = cropWindow.left.toFixed(6);
+        canvas.dataset.cropRight = cropWindow.right.toFixed(6);
+      } else {
+        delete canvas.dataset.cropLeft;
+        delete canvas.dataset.cropRight;
       }
       const rotation = cameraBandRotationRadians(orientation);
       if (rotation !== 0) {
@@ -662,6 +704,7 @@ function CameraBandImage({
       }
       canvas.dataset.renderState = 'ready';
     };
+    redrawRef.current = draw;
     image.crossOrigin = 'anonymous';
     image.decoding = 'async';
     image.fetchPriority = loadDelayMs > 0 ? 'low' : 'high';
@@ -683,17 +726,22 @@ function CameraBandImage({
       disposed = true;
       if (loadTimer !== null) window.clearTimeout(loadTimer);
       observer?.disconnect();
+      redrawRef.current = null;
       image.onload = null;
       image.onerror = null;
       if (typeof image.removeAttribute === 'function') image.removeAttribute('src');
     };
-  }, [cropBlackBorders, loadDelayMs, orientation, src]);
+  }, [autoCropCameraId, cropBlackBorders, loadDelayMs, onAutoCropDetected, orientation, src]);
+
+  useEffect(() => {
+    redrawRef.current?.();
+  }, [stableCropWindow?.left, stableCropWindow?.right]);
 
   return <canvas
     ref={canvasRef}
     className="bar-camera-band-image"
     aria-label={`${label} ${contentLabel}`}
-    data-edge-policy={cropBlackBorders ? 'guarded-auto-crop' : 'source-roi'}
+    data-edge-policy={cropBlackBorders ? 'stable-source-crop' : 'source-roi'}
     data-load-priority={loadDelayMs > 0 ? 'deferred' : 'high'}
   />;
 }
@@ -757,6 +805,7 @@ function BarUnfoldedMap({
   const FRAME_SPAN_PX = 176;
   const FRAME_OVERSCAN = 3;
   const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
+  const [autoCropWindows, setAutoCropWindows] = useState<Record<string, CameraBandCropWindow>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const scrollProgressRef = useRef(0);
   const atTailRef = useRef(false);
@@ -808,6 +857,18 @@ function BarUnfoldedMap({
       ? { width: `max(100%, ${longitudinalExtent}px)`, height: '100%' }
       : { width: '100%', height: `max(100%, ${longitudinalExtent}px)` }
     : { width: '100%', height: '100%' };
+
+  const reportAutoCrop = useCallback((cameraId: string, crop: CameraBandCropWindow) => {
+    setAutoCropWindows((current) => {
+      const merged = mergeCameraBandCropWindow(current[cameraId], crop);
+      if (!merged || merged === current[cameraId]) return current;
+      return { ...current, [cameraId]: merged };
+    });
+  }, []);
+
+  useEffect(() => {
+    setAutoCropWindows({});
+  }, [stitchKey]);
 
   const readScrollPosition = () => {
     const host = scrollRef.current;
@@ -921,6 +982,7 @@ function BarUnfoldedMap({
               ? jetImagePath ? captureArtifactImageUrl(jetImagePath, 2048) : ''
               : stitchEnabled ? '' : preview ? barSurfaceFileUrl(preview) : captureImage?.url || '';
             const expanded = expandedCamera === lane.cameraId;
+            const stableCropWindow = autoCropWindows[lane.cameraId];
             return <div
               key={lane.cameraId}
               className={`bar-camera-band ${source ? 'has-production-image' : ''} ${expanded ? 'is-expanded' : ''} ${expandedCamera && !expanded ? 'is-collapsed' : ''}`}
@@ -965,6 +1027,9 @@ function BarUnfoldedMap({
                         orientation={orientation}
                         contentLabel={cameraFrame.cropMode === 'algorithm-roi' ? '算法 ROI 裁剪图' : '自动裁黑边图'}
                         cropBlackBorders={cameraFrame.cropMode === 'auto-black-border'}
+                        stableCropWindow={cameraFrame.cropMode === 'auto-black-border' ? stableCropWindow : undefined}
+                        autoCropCameraId={cameraFrame.cropMode === 'auto-black-border' ? lane.cameraId : undefined}
+                        onAutoCropDetected={reportAutoCrop}
                         loadDelayMs={frameIndex === priorityFrameIndex ? 0 : 250}
                       /> : <small>缺帧</small>}
                     </div>;
