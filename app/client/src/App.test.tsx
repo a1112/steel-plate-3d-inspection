@@ -512,17 +512,17 @@ describe('App online severity filters', () => {
     expect(await screen.findByRole('button', { name: '在线监测' })).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: '在线监测' })).toHaveLength(1);
     expect(screen.queryByRole('button', { name: '实时监控' })).not.toBeInTheDocument();
-    expect(screen.getAllByRole('tablist', { name: '在线监测模式' })).toHaveLength(1);
-    expect(screen.getByRole('tab', { name: '检测结果' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByRole('tablist', { name: '在线监测模式' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '实时/回放' })).toHaveAttribute('aria-pressed', 'false');
     expect(container.querySelectorAll('.online-workspace')).toHaveLength(1);
 
-    fireEvent.click(screen.getByRole('tab', { name: '相机实时 / 回放' }));
+    fireEvent.click(screen.getByRole('button', { name: '实时/回放' }));
     expect(await screen.findByRole('heading', { name: '相机监控' })).toBeInTheDocument();
     expect(container.querySelectorAll('.online-workspace')).toHaveLength(0);
     expect(screen.getByRole('tab', { name: '实时' })).toBeInTheDocument();
     expect(screen.getByRole('tab', { name: '回放' })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('tab', { name: '检测结果' }));
+    fireEvent.click(screen.getByRole('button', { name: '返回检测' }));
     expect(container.querySelectorAll('.online-workspace')).toHaveLength(1);
     expect(screen.queryByRole('heading', { name: '相机监控' })).not.toBeInTheDocument();
   });

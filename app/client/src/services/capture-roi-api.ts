@@ -1,5 +1,6 @@
 import type { CaptureImageItem } from '../data/inspection';
 import {
+  captureArtifactImageUrl,
   captureHistoryImageUrl,
   readCaptureHistory,
   type CaptureHistoryCameraFrame,
@@ -25,6 +26,37 @@ export type CaptureRoiPreviewResult = {
   expectedCameraCount: number;
   complete: boolean;
   images: CaptureRoiPreviewImage[];
+};
+
+export type CaptureStitchCameraFrame = {
+  cameraId: string;
+  cameraIp: string;
+  artifactRef: string;
+  frameSequence: number;
+  storageIndex: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  validRoi: [number, number, number, number] | null;
+  url: string;
+  cropMode: 'algorithm-roi' | 'auto-black-border';
+};
+
+export type CaptureStitchFrame = {
+  frameId: string;
+  sequence: number;
+  capturedAt: string;
+  cameras: CaptureStitchCameraFrame[];
+};
+
+export type CaptureStitchResult = {
+  materialId: string;
+  indexed: boolean;
+  totalFrames: number;
+  hasMore: boolean;
+  expectedCameraCount: number;
+  algorithmRoiImageCount: number;
+  autoCropImageCount: number;
+  frames: CaptureStitchFrame[];
 };
 
 type EligibleCamera = {
@@ -111,6 +143,102 @@ function compareFrameQuality(left: EligibleCamera[], right: EligibleCamera[]) {
     || (left[0]?.frame.sequence ?? 0) - (right[0]?.frame.sequence ?? 0);
 }
 
+function compareStitchCameraQuality(
+  left: CaptureHistoryCameraFrame,
+  right: CaptureHistoryCameraFrame,
+) {
+  const leftReady = left.regionState === 'ready'
+    && validRoi(left.validRoi, left.width, left.height) !== null;
+  const rightReady = right.regionState === 'ready'
+    && validRoi(right.validRoi, right.width, right.height) !== null;
+  return Number(leftReady) - Number(rightReady)
+    || Number(left.bytes || 0) - Number(right.bytes || 0);
+}
+
+/**
+ * Builds a strict, record-bound line-scan timeline. Every sequence remains a
+ * synchronized slot across all configured cameras; a missing camera is left
+ * missing instead of being borrowed from another sequence or material.
+ */
+export function selectCaptureStitchHistory(
+  history: CaptureHistoryResult,
+  materialId: string,
+  expectedCameraIds: readonly string[],
+): CaptureStitchResult {
+  const normalizedMaterialId = materialId.trim();
+  const expectedOrder = expectedCameraIds
+    .map(canonicalCameraId)
+    .filter((cameraId, index, values) => cameraId && values.indexOf(cameraId) === index);
+  const expected = new Set(expectedOrder);
+  const bySequence = new Map<number, CaptureStitchFrame>();
+
+  history.frames
+    .filter((frame) => frame.materialId.trim() === normalizedMaterialId)
+    .sort((left, right) => left.sequence - right.sequence
+      || left.capturedAt.localeCompare(right.capturedAt))
+    .forEach((frame) => {
+      const selected = new Map<string, CaptureHistoryCameraFrame>();
+      frame.cameras.forEach((camera) => {
+        const cameraId = canonicalCameraId(camera.cameraId);
+        if (!cameraId || (expected.size > 0 && !expected.has(cameraId))) return;
+        if (!/(?:^|\/)capture\/[^/]+\/2d\/[^/]+\.png$/i.test(camera.artifactRef.trim().replaceAll('\\', '/'))) return;
+        const current = selected.get(cameraId);
+        if (!current || compareStitchCameraQuality(camera, current) > 0) {
+          selected.set(cameraId, camera);
+        }
+      });
+      const order = expectedOrder.length > 0
+        ? expectedOrder
+        : [...selected.keys()].sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+      const cameras = order.flatMap((cameraId) => {
+        const camera = selected.get(cameraId);
+        if (!camera) return [];
+        const roi = camera.regionState === 'ready'
+          ? validRoi(camera.validRoi, camera.width, camera.height)
+          : null;
+        return [{
+          cameraId,
+          cameraIp: camera.ip,
+          artifactRef: camera.artifactRef,
+          frameSequence: frame.sequence,
+          storageIndex: camera.storageIndex ?? frame.sequence,
+          sourceWidth: camera.width,
+          sourceHeight: camera.height,
+          validRoi: roi,
+          url: roi
+            ? captureHistoryImageUrl(camera.artifactRef, 2048, roi)
+            : captureArtifactImageUrl(camera.artifactRef, 2048),
+          cropMode: roi ? 'algorithm-roi' as const : 'auto-black-border' as const,
+        }];
+      });
+      const candidate: CaptureStitchFrame = {
+        frameId: frame.frameId,
+        sequence: frame.sequence,
+        capturedAt: frame.capturedAt,
+        cameras,
+      };
+      const current = bySequence.get(frame.sequence);
+      if (!current || candidate.cameras.length >= current.cameras.length) {
+        bySequence.set(frame.sequence, candidate);
+      }
+    });
+
+  const frames = [...bySequence.values()].sort((left, right) => left.sequence - right.sequence);
+  const cameraFrames = frames.flatMap((frame) => frame.cameras);
+  const algorithmRoiImageCount = cameraFrames.filter((camera) => camera.cropMode === 'algorithm-roi').length;
+  const autoCropImageCount = cameraFrames.length - algorithmRoiImageCount;
+  return {
+    materialId: normalizedMaterialId,
+    indexed: history.indexed === true,
+    totalFrames: Math.max(frames.length, Number(history.total || 0)),
+    hasMore: history.hasMore === true || Number(history.total || 0) > frames.length,
+    expectedCameraCount: expectedOrder.length,
+    algorithmRoiImageCount,
+    autoCropImageCount,
+    frames,
+  };
+}
+
 export function isNumericCaptureFlowId(value: string | undefined): value is string {
   return Boolean(value?.trim() && NUMERIC_FLOW_ID.test(value.trim()));
 }
@@ -194,4 +322,13 @@ export async function fetchCaptureRoiPreviews(
   if (!isNumericCaptureFlowId(normalizedMaterialId)) return null;
   const history = await readCaptureHistory(500, normalizedMaterialId);
   return selectCaptureRoiPreviews(history, normalizedMaterialId, expectedCameraIds);
+}
+
+export async function fetchCaptureStitchHistory(
+  materialId: string,
+  expectedCameraIds: readonly string[],
+): Promise<CaptureStitchResult> {
+  const normalizedMaterialId = materialId.trim();
+  const history = await readCaptureHistory(500, normalizedMaterialId);
+  return selectCaptureStitchHistory(history, normalizedMaterialId, expectedCameraIds);
 }

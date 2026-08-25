@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Activity, Box, Database, History, MonitorCog, MoreHorizontal, Play, Settings2 } from 'lucide-react';
+import { Activity, ArrowLeft, Box, Database, History, MonitorCog, MoreHorizontal, Play, Radio, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
 import {
   formatResourceBreakdown,
@@ -52,6 +52,15 @@ interface AppFooterProps {
   dashboardMode?: RuntimeDashboardMode;
   resourceUsage?: AppResourceUsage | null;
   resourceUsageStale?: boolean;
+  connection?: {
+    endpoint: string;
+    state: 'online' | 'warning' | 'offline';
+    detail?: string;
+  };
+  onlineWorkspace?: {
+    mode: 'inspection' | 'camera';
+    onToggle: () => void;
+  };
 }
 
 const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
@@ -82,6 +91,15 @@ function getDefectSizeLabel(defect: DefectItem) {
   return `${defect.widthMm.toFixed(2)}×${defect.heightMm.toFixed(2)}×${Math.abs(defect.depthMm).toFixed(2)}mm`;
 }
 
+function formatConnectionEndpoint(endpoint: string) {
+  try {
+    const url = new URL(endpoint);
+    return url.port ? `${url.hostname}:${url.port}` : url.hostname;
+  } catch {
+    return endpoint.replace(/^https?:\/\//, '').replace(/\/$/, '') || '--';
+  }
+}
+
 export function AppFooter({
   systemName = DEFAULT_SYSTEM_NAME,
   activeNav,
@@ -97,6 +115,8 @@ export function AppFooter({
   dashboardMode = DEFAULT_DIRECT_DASHBOARD_MODE,
   resourceUsage = null,
   resourceUsageStale = false,
+  connection,
+  onlineWorkspace,
 }: AppFooterProps) {
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
@@ -113,6 +133,12 @@ export function AppFooter({
       `进程明细：${formatResourceBreakdown(resourceUsage)}`,
     ].join('\n')
     : `来源：${resourceSourceLabel}${resourceUsageStale ? '（暂时无法更新）' : ''}`;
+  const connectionLabel = connection?.state === 'online'
+    ? '已连接'
+    : connection?.state === 'offline'
+      ? '未连接'
+      : '连接异常';
+  const connectionEndpoint = connection ? formatConnectionEndpoint(connection.endpoint) : '--';
 
   useEffect(() => {
     if (!moreMenuOpen) return;
@@ -172,6 +198,18 @@ export function AppFooter({
 
   return (
     <footer className={`app-footer ${activeAnalysis ? 'has-analysis-context' : ''}`} data-no-drag>
+      {connection ? (
+        <div
+          className={`app-footer-connection ${connection.state}`}
+          aria-label={`服务连接：${connectionLabel}，IP ${connectionEndpoint}`}
+          title={connection.detail || `检测服务 ${connectionLabel}`}
+        >
+          <i aria-hidden="true" />
+          <span>连接 IP</span>
+          <strong>{connectionEndpoint}</strong>
+          <em>{connectionLabel}</em>
+        </div>
+      ) : null}
       {activeAnalysis ? (
         <div className="app-footer-analysis" aria-label="选中缺陷分析工具">
           {dashboardMode.kind === 'bkv' ? (
@@ -309,6 +347,18 @@ export function AppFooter({
             </div>
           ) : null}
         </div>
+        {onlineWorkspace ? (
+          <button
+            type="button"
+            className={`app-footer-online-workspace ${onlineWorkspace.mode === 'camera' ? 'active' : ''}`}
+            aria-pressed={onlineWorkspace.mode === 'camera'}
+            title={onlineWorkspace.mode === 'camera' ? '返回在线检测结果' : '进入相机实时与历史回放'}
+            onClick={onlineWorkspace.onToggle}
+          >
+            {onlineWorkspace.mode === 'camera' ? <ArrowLeft size={15} /> : <Radio size={15} />}
+            <span>{onlineWorkspace.mode === 'camera' ? '返回检测' : '实时/回放'}</span>
+          </button>
+        ) : null}
       </nav>
     </footer>
   );

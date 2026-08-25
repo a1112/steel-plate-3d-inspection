@@ -3,8 +3,9 @@ import type { ComponentProps } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType } from '../data/inspection';
 import { createSequentialCameraLanes } from '../lib/camera-display';
+import type { CaptureSurfaceCameraTiles } from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
-import { fetchCaptureRoiPreviews, type CaptureRoiPreviewResult } from '../services/capture-roi-api';
+import { fetchCaptureStitchHistory, type CaptureStitchResult } from '../services/capture-roi-api';
 import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { cameraBandRotationRadians, PlateMap as ProductionPlateMap } from './PlateMap';
 
@@ -22,7 +23,7 @@ vi.mock('../services/capture-roi-api', async () => {
   const actual = await vi.importActual<typeof import('../services/capture-roi-api')>('../services/capture-roi-api');
   return {
     ...actual,
-    fetchCaptureRoiPreviews: vi.fn(),
+    fetchCaptureStitchHistory: vi.fn(),
   };
 });
 
@@ -45,12 +46,59 @@ function algorithmRoiUrl(materialId: string, cameraId: string, sequence: number)
   return `http://127.0.0.1:4873/api/capture/file?path=${path}&maxWidth=2048&region=valid&cropX=100&cropY=0&cropWidth=600&cropHeight=1024`;
 }
 
+function captureStitchResult(materialId: string, frameCount = 1): CaptureStitchResult {
+  return {
+    materialId,
+    indexed: true,
+    totalFrames: frameCount,
+    hasMore: false,
+    expectedCameraCount: 6,
+    algorithmRoiImageCount: frameCount * 6,
+    autoCropImageCount: 0,
+    frames: Array.from({ length: frameCount }, (_, frameIndex) => {
+      const sequence = frameIndex + 1;
+      return {
+        frameId: `${materialId}:${String(sequence).padStart(12, '0')}`,
+        sequence,
+        capturedAt: '2026-08-24T02:00:00.000Z',
+        cameras: Array.from({ length: 6 }, (_unused, cameraIndex) => ({
+          cameraId: `C${cameraIndex + 1}`,
+          cameraIp: `192.168.10${cameraIndex + 1}.100`,
+          artifactRef: `${materialId}/capture/C${cameraIndex + 1}/2d/${sequence}.png`,
+          frameSequence: sequence,
+          storageIndex: sequence,
+          sourceWidth: 2560,
+          sourceHeight: 1024,
+          validRoi: [100, 0, 700, 1024],
+          url: algorithmRoiUrl(materialId, `C${cameraIndex + 1}`, sequence),
+          cropMode: 'algorithm-roi' as const,
+        })),
+      };
+    }),
+  };
+}
+
+function emptyCaptureStitchResult(materialId: string): CaptureStitchResult {
+  return {
+    materialId,
+    indexed: true,
+    totalFrames: 0,
+    hasMore: false,
+    expectedCameraCount: 6,
+    algorithmRoiImageCount: 0,
+    autoCropImageCount: 0,
+    frames: [],
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fetchInspectionWorldMeta).mockRejectedValue(new Error('no persisted world'));
   vi.mocked(fetchInspectionWorldDefects).mockRejectedValue(new Error('no persisted world'));
   vi.mocked(fetchInspectionWorldTile).mockImplementation(async (_record, tile) => ({ ...tile, url: 'blob:online-world', revoke: vi.fn() }));
-  vi.mocked(fetchCaptureRoiPreviews).mockResolvedValue(null);
+  vi.mocked(fetchCaptureStitchHistory).mockImplementation(async (materialId) => (
+    emptyCaptureStitchResult(materialId)
+  ));
 });
 
 // These legacy interaction cases intentionally exercise the bundled demo/test
@@ -186,32 +234,8 @@ describe('online inspection world compatibility', () => {
     context.mockRestore();
   });
 
-  it('uses the numeric flow playback index for six algorithm ROI bands without probing missing world metadata', async () => {
-    const roiResult: CaptureRoiPreviewResult = {
-      materialId: '2747',
-      indexed: true,
-      totalFrames: 187,
-      representativeFrameId: '2747:000000008769',
-      expectedCameraCount: 6,
-      complete: true,
-      images: Array.from({ length: 6 }, (_, index) => ({
-        id: `capture-roi:2747:C${index + 1}:8769`,
-        cameraId: `C${index + 1}`,
-        cameraIp: `192.168.10${index + 1}.100`,
-        dataName: 'intensity',
-        sequenceNo: 126,
-        fileType: 'png',
-        path: `2747/capture/C${index + 1}/2d/126.png`,
-        url: algorithmRoiUrl('2747', `C${index + 1}`, 126),
-        createdAt: '2026-08-24T02:00:00.000Z',
-        validRoi: [100, 0, 700, 1024],
-        sourceFrameId: '2747:000000008769',
-        sourceFrameSequence: 8769,
-        sourceWidth: 2560,
-        sourceHeight: 1024,
-      })),
-    };
-    vi.mocked(fetchCaptureRoiPreviews).mockResolvedValue(roiResult);
+  it('uses the current flow history as a horizontally scrollable six-camera crop stitch', async () => {
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('2747', 12));
 
     render(
       <ProductionPlateMap
@@ -223,17 +247,23 @@ describe('online inspection world compatibility', () => {
       />,
     );
 
-    expect(await screen.findByTestId('capture-roi-status')).toHaveTextContent('算法 ROI 6/6');
-    expect(screen.getAllByLabelText(/实际裁剪图/)).toHaveLength(6);
-    expect(fetchCaptureRoiPreviews).toHaveBeenCalledWith(
+    expect(await screen.findByTestId('capture-roi-status')).toHaveTextContent('12/12 轮裁剪拼接');
+    const viewport = screen.getByTestId('capture-stitch-viewport');
+    expect(viewport).toHaveAttribute('data-scroll-axis', 'x');
+    expect(viewport).toHaveAttribute('data-frame-count', '12');
+    expect(document.querySelectorAll('.bar-camera-frame').length).toBeGreaterThan(6);
+    expect(document.querySelectorAll('.bar-camera-frame').length).toBeLessThan(12 * 6);
+    expect(fetchCaptureStitchHistory).toHaveBeenCalledWith(
       '2747',
       ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'],
     );
+    fireEvent.click(screen.getByRole('button', { name: '纵向' }));
+    expect(viewport).toHaveAttribute('data-scroll-axis', 'y');
     expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
   });
 
-  it('keeps raw record images hidden while waiting and upgrades when the ROI index appears', async () => {
+  it('shows record-bound raw gray images while waiting and upgrades when stitch history appears', async () => {
     vi.useFakeTimers();
     const requestedImageUrls: string[] = [];
     const NativeImage = globalThis.Image;
@@ -246,33 +276,9 @@ describe('online inspection world compatibility', () => {
       set src(value: string) { requestedImageUrls.push(value); }
     }
     vi.stubGlobal('Image', RequestedImage);
-    const roiResult: CaptureRoiPreviewResult = {
-      materialId: '2747',
-      indexed: true,
-      totalFrames: 20,
-      representativeFrameId: '2747:000000000020',
-      expectedCameraCount: 6,
-      complete: true,
-      images: Array.from({ length: 6 }, (_, index) => ({
-        id: `roi-${index + 1}`,
-        cameraId: `C${index + 1}`,
-        cameraIp: `192.168.10${index + 1}.100`,
-        dataName: 'intensity',
-        sequenceNo: 20,
-        fileType: 'png',
-        path: `2747/capture/C${index + 1}/2d/20.png`,
-        url: algorithmRoiUrl('2747', `C${index + 1}`, 20),
-        createdAt: '2026-08-24T02:00:00.000Z',
-        validRoi: [100, 0, 700, 1024],
-        sourceFrameId: '2747:000000000020',
-        sourceFrameSequence: 20,
-        sourceWidth: 2560,
-        sourceHeight: 1024,
-      })),
-    };
-    vi.mocked(fetchCaptureRoiPreviews)
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(roiResult);
+    vi.mocked(fetchCaptureStitchHistory)
+      .mockResolvedValueOnce(emptyCaptureStitchResult('2747'))
+      .mockResolvedValueOnce(captureStitchResult('2747', 2));
     try {
       render(
         <ProductionPlateMap
@@ -280,6 +286,7 @@ describe('online inspection world compatibility', () => {
           artifactMode="production"
           inspectionId="INSP-unknown-material-1787509339423"
           captureMaterialId="2747"
+          refreshCaptureRoi
           cameraLanes={createSequentialCameraLanes(6)}
           captureImages={Array.from({ length: 6 }, (_, index) => ({
             id: `raw-${index + 1}`,
@@ -296,22 +303,23 @@ describe('online inspection world compatibility', () => {
       );
       await act(async () => { await Promise.resolve(); });
 
-      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法裁剪图尚未就绪');
-      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
-      expect(requestedImageUrls).toEqual([]);
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('原始灰度 6/6 · 拼接历史尚未就绪');
+      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+      expect(requestedImageUrls).toHaveLength(6);
+      expect(requestedImageUrls.every((url) => url.includes('/raw-'))).toBe(true);
       expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
 
       await act(async () => { await vi.advanceTimersByTimeAsync(8_000); });
 
-      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法 ROI 6/6');
-      expect(requestedImageUrls).toHaveLength(6);
-      expect(requestedImageUrls.every((url) => (
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('2/2 轮裁剪拼接');
+      expect(requestedImageUrls.length).toBeGreaterThan(6);
+      expect(requestedImageUrls.slice(-12).every((url) => (
         url.includes('region=valid')
         && url.includes('cropX=100')
         && url.includes('cropWidth=600')
         && !url.includes('/raw-')
       ))).toBe(true);
-      expect(fetchCaptureRoiPreviews).toHaveBeenCalledTimes(2);
+      expect(fetchCaptureStitchHistory).toHaveBeenCalledTimes(2);
       expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
     } finally {
       vi.stubGlobal('Image', NativeImage);
@@ -319,9 +327,9 @@ describe('online inspection world compatibility', () => {
     }
   });
 
-  it('does not request raw frame images until the ROI catalog probe has settled', async () => {
-    let resolveProbe: ((result: CaptureRoiPreviewResult | null) => void) | undefined;
-    vi.mocked(fetchCaptureRoiPreviews).mockReturnValue(new Promise((resolve) => {
+  it('keeps record-bound raw frames visible while the stitch-history probe is pending', async () => {
+    let resolveProbe: ((result: CaptureStitchResult) => void) | undefined;
+    vi.mocked(fetchCaptureStitchHistory).mockReturnValue(new Promise((resolve) => {
       resolveProbe = resolve;
     }));
     const rawImages = Array.from({ length: 6 }, (_, index) => ({
@@ -345,91 +353,41 @@ describe('online inspection world compatibility', () => {
       />,
     );
 
-    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('正在读取算法 ROI');
-    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('原始灰度 6/6 · 正在读取裁剪拼接');
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(6);
 
-    await act(async () => { resolveProbe?.(null); });
+    await act(async () => { resolveProbe?.(emptyCaptureStitchResult('2822')); });
 
-    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法裁剪图尚未就绪');
-    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('原始灰度 6/6 · 拼接历史尚未就绪');
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(6);
   });
 
-  it('temporarily shows the latest complete ROI flow and keeps probing the current flow', async () => {
-    vi.useFakeTimers();
-    const makeResult = (materialId: string): CaptureRoiPreviewResult => ({
-      materialId,
-      indexed: true,
-      totalFrames: 24,
-      representativeFrameId: `${materialId}:000000000024`,
-      expectedCameraCount: 6,
-      complete: true,
-      images: Array.from({ length: 6 }, (_, index) => ({
-        id: `roi-${materialId}-${index + 1}`,
-        cameraId: `C${index + 1}`,
-        cameraIp: `192.168.10${index + 1}.100`,
-        dataName: 'intensity',
-        sequenceNo: 24,
-        fileType: 'png',
-        path: `${materialId}/capture/C${index + 1}/2d/24.png`,
-        url: algorithmRoiUrl(materialId, `C${index + 1}`, 24),
-        createdAt: '2026-08-24T04:00:00.000Z',
-        validRoi: [100, 0, 700, 1024],
-        sourceFrameId: `${materialId}:000000000024`,
-        sourceFrameSequence: 24,
-        sourceWidth: 2560,
-        sourceHeight: 1024,
-      })),
-    });
-    const currentResult = makeResult('2822');
-    const fallbackResult = makeResult('2818');
-    let currentReady = false;
-    vi.mocked(fetchCaptureRoiPreviews).mockImplementation(async (materialId) => {
-      if (materialId === '2822') return currentReady ? currentResult : null;
-      if (materialId === '2818') return fallbackResult;
-      return null;
-    });
+  it('never borrows stitch images from fallback material records', async () => {
+    vi.mocked(fetchCaptureStitchHistory).mockImplementation(async (materialId) => (
+      materialId === '2818'
+        ? captureStitchResult('2818', 24)
+        : emptyCaptureStitchResult(materialId)
+    ));
 
-    try {
-      render(
-        <ProductionPlateMap
-          {...common}
-          artifactMode="production"
-          captureMaterialId="2822"
-          captureRoiFallbackMaterialIds={['2821', '2818']}
-          cameraLanes={createSequentialCameraLanes(6)}
-        />,
-      );
-      await act(async () => {
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
-      });
+    render(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        captureMaterialId="2822"
+        captureRoiFallbackMaterialIds={['2821', '2818']}
+        cameraLanes={createSequentialCameraLanes(6)}
+      />,
+    );
 
-      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法 ROI 6/6 · 回退流水 2818');
-      expect(vi.mocked(fetchCaptureRoiPreviews).mock.calls.map(([materialId]) => materialId)).toEqual([
-        '2822',
-        '2821',
-        '2818',
-      ]);
-
-      currentReady = true;
-      await act(async () => { await vi.advanceTimersByTimeAsync(8_000); });
-
-      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('算法 ROI 6/6');
-      expect(screen.getByTestId('capture-roi-status')).not.toHaveTextContent('回退流水');
-      expect(fetchCaptureRoiPreviews).toHaveBeenLastCalledWith(
-        '2822',
-        ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'],
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+    await waitFor(() => expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前卷暂无可拼接灰度图'));
+    expect(vi.mocked(fetchCaptureStitchHistory).mock.calls.map(([materialId]) => materialId)).toEqual(['2822']);
+    expect(document.querySelectorAll('.bar-camera-frame')).toHaveLength(0);
   });
 
   it('shows a fail-closed state when neither an algorithm ROI nor a world is persisted', async () => {
     render(<ProductionPlateMap {...common} artifactMode="production" inspectionId="INS-LIVE-1" />);
 
-    expect(await screen.findByText('算法裁剪图尚未就绪')).toBeInTheDocument();
+    expect(await screen.findByText('当前卷暂无可拼接灰度图')).toBeInTheDocument();
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
     expect(screen.getByTestId('bar-unfolded-map')).toBeInTheDocument();
   });
@@ -448,7 +406,7 @@ describe('online inspection world compatibility', () => {
       });
       render(<ProductionPlateMap {...common} artifactMode="production" inspectionId="INS-WORLD-1" />);
       await act(async () => { await Promise.resolve(); });
-      expect(screen.getByText('算法裁剪图尚未就绪')).toBeInTheDocument();
+      expect(screen.getByText('当前卷暂无可拼接灰度图')).toBeInTheDocument();
 
       await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
 
@@ -1094,5 +1052,48 @@ describe('PlateMap', () => {
     fireEvent.click(screen.getByRole('button', { name: /^点云$/ }));
     expect(screen.getByTestId('plate-production-point-cloud')).toHaveAttribute('data-artifact-source', 'production-record');
     expect(screen.queryByTestId('plate-point-cloud-view')).not.toBeInTheDocument();
+  });
+
+  it('keeps the original camera-band layout and only swaps in processed JET images', () => {
+    const surfaceCameraTiles: CaptureSurfaceCameraTiles = {
+      schema: 'steel.ranger3-camera-jet-tiles.v1',
+      cameras: Array.from({ length: 6 }, (_, index) => ({
+        cameraId: `C${index + 1}`,
+        state: 'ready',
+        rows: 2,
+        columns: 2,
+        jet: {
+          palette: 'JET',
+          imagePath: `D:\\capture\\surface-jet-c${index + 1}.png`,
+        },
+      })),
+    };
+    render(
+      <ProductionPlateMap
+        defectTypes={defectTypes}
+        defects={defects}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId="D-TOP"
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        inspectionId="INS-PROD-JET"
+        surfaceMesh={{ ...productionMesh, jetRangeMm: 0.18 }}
+        surfaceCameraTiles={surfaceCameraTiles}
+        cameraLanes={createSequentialCameraLanes(6)}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Jet 平铺' }));
+    expect(screen.getByTestId('surface-jet-unfolded')).toHaveAttribute('data-image-source', 'processed-jet-camera-images');
+    expect(screen.getByRole('region', { name: '6 相机圆周展开缺陷图' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /采集图像/ })).toHaveLength(6);
+    const jetImages = screen.getAllByLabelText(/处理后 JET 图/);
+    expect(jetImages).toHaveLength(6);
   });
 });

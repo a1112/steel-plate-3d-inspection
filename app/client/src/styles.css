@@ -116,6 +116,64 @@ button {
   box-shadow: 0 -6px 18px rgba(0, 4, 14, 0.16);
 }
 
+.app-footer-connection {
+  height: 28px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel-soft);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.app-footer-connection i {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--amber) 78%, transparent);
+}
+
+.app-footer-connection span {
+  color: var(--faint);
+}
+
+.app-footer-connection strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.app-footer-connection em {
+  color: var(--amber);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.app-footer-connection.online i {
+  background: var(--green);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--green) 78%, transparent);
+}
+
+.app-footer-connection.online em {
+  color: var(--green);
+}
+
+.app-footer-connection.offline i {
+  background: var(--red);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--red) 78%, transparent);
+}
+
+.app-footer-connection.offline em {
+  color: var(--red);
+}
+
 .app-footer-context {
   min-width: 0;
   flex: 1 1 auto;
@@ -204,6 +262,19 @@ button {
   border-color: var(--line-strong);
   color: var(--accent-text);
   background: var(--blue-soft);
+}
+
+.app-footer-nav .app-footer-online-workspace {
+  border-color: color-mix(in srgb, var(--cyan) 52%, var(--line));
+  color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 9%, var(--panel-soft));
+}
+
+.app-footer-nav .app-footer-online-workspace:hover,
+.app-footer-nav .app-footer-online-workspace.active {
+  border-color: var(--cyan);
+  color: #fff;
+  background: color-mix(in srgb, var(--cyan) 72%, #075a7d);
 }
 
 .app-footer-more {
@@ -1719,40 +1790,9 @@ button {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
   background: var(--bg);
-}
-
-.online-workspace-tabs {
-  min-height: 40px;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 5px 12px;
-  border-bottom: 1px solid var(--line);
-  background: var(--panel);
-}
-
-.online-workspace-tabs button {
-  min-height: 30px;
-  padding: 0 16px;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  color: var(--muted);
-  background: transparent;
-  cursor: pointer;
-}
-
-.online-workspace-tabs button:hover {
-  color: var(--text);
-  background: var(--surface-input);
-}
-
-.online-workspace-tabs button.active {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
-  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
 }
 
 .online-unified-page > .live-monitor-page {
@@ -2973,6 +3013,138 @@ button {
   gap: 8px;
   color: var(--muted);
   font-size: 10px;
+}
+
+.capture-surface-panel {
+  display: grid;
+  grid-template-rows: 38px auto;
+  margin: 0 8px 8px;
+  overflow: hidden;
+  border: 1px solid rgba(58, 134, 177, 0.32);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-soft) 72%, #02080d);
+}
+
+.capture-surface-panel > header,
+.capture-surface-panel > header > div,
+.capture-surface-actions,
+.capture-surface-content aside {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.capture-surface-panel > header {
+  justify-content: space-between;
+  padding: 0 9px;
+  border-bottom: 1px solid var(--line);
+}
+
+.capture-surface-panel > header > div:first-child > div {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.capture-surface-panel > header strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.capture-surface-panel > header span,
+.capture-surface-panel small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.capture-surface-panel button {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.capture-surface-panel button.active {
+  color: var(--cyan);
+  border-color: color-mix(in srgb, var(--cyan) 60%, var(--line));
+}
+
+.capture-surface-content {
+  min-height: 250px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 230px;
+  gap: 9px;
+  padding: 7px;
+}
+
+.capture-surface-view {
+  min-height: 236px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(58, 134, 177, 0.25);
+  border-radius: 6px;
+  color: var(--muted);
+  background: #07121b;
+  font-size: 10px;
+}
+
+.capture-surface-view canvas,
+.capture-surface-view img {
+  width: 100%;
+  height: 236px;
+  object-fit: contain;
+}
+
+.capture-surface-content aside {
+  align-items: flex-start;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.capture-surface-content aside > span {
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 9px;
+}
+
+.capture-surface-content aside > strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.capture-surface-content .metric-valid {
+  color: #54ddb0;
+  background: rgba(42, 190, 135, 0.13);
+}
+
+.capture-surface-content .preview-only {
+  color: #f6b85f;
+  background: rgba(246, 165, 58, 0.13);
+}
+
+.capture-surface-empty {
+  min-height: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+@media (max-width: 980px) {
+  .capture-surface-content {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .capture-defect-panel {
@@ -4517,6 +4689,28 @@ button {
     0 0 0 1px rgba(47, 125, 255, 0.12);
 }
 
+.bar-unfolded-canvas.has-stitch {
+  overscroll-behavior: contain;
+  scrollbar-color: color-mix(in srgb, var(--cyan) 70%, #44606d) rgba(3, 16, 24, 0.55);
+  scrollbar-width: thin;
+}
+
+.bar-unfolded-map.orientation-horizontal .bar-unfolded-canvas.has-stitch {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.bar-unfolded-map.orientation-vertical .bar-unfolded-canvas.has-stitch {
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.bar-unfolded-scroll-space {
+  position: relative;
+  min-width: 100%;
+  min-height: 100%;
+}
+
 .bar-unfolded-canvas:focus-visible {
   outline: 2px solid var(--blue);
   outline-offset: -2px;
@@ -4560,6 +4754,56 @@ button {
   background:
     repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.1) 0 1px, transparent 1px 8px),
     linear-gradient(90deg, rgba(0, 0, 0, 0.1), rgba(255, 255, 255, 0.1), rgba(0, 0, 0, 0.08));
+}
+
+.bar-camera-band-strip {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  background: #111c22;
+}
+
+.bar-camera-frame {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 0;
+  overflow: hidden;
+  border-right: 1px solid rgba(184, 224, 248, 0.24);
+  background: #17242b;
+}
+
+.bar-camera-frame::after {
+  content: attr(data-frame-sequence);
+  position: absolute;
+  right: 4px;
+  bottom: 2px;
+  z-index: 1;
+  color: rgba(229, 244, 252, 0.56);
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.bar-camera-frame.is-missing {
+  display: grid;
+  place-items: center;
+  background:
+    repeating-linear-gradient(135deg, rgba(255, 255, 255, 0.035) 0 5px, transparent 5px 10px),
+    #111a20;
+}
+
+.bar-camera-frame.is-missing small {
+  color: rgba(220, 235, 244, 0.48);
+  font-size: 9px;
+}
+
+.bar-unfolded-canvas.has-stitch .bar-camera-band > span {
+  position: sticky;
+  left: 10px;
+  z-index: 5;
+  width: max-content;
 }
 
 .bar-camera-band span {
@@ -7303,7 +7547,7 @@ button {
 
 .connection-recovery-fields {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 132px;
+  grid-template-columns: 110px minmax(0, 1fr) 132px;
   gap: 10px;
 }
 
@@ -7315,7 +7559,8 @@ button {
   font-weight: 800;
 }
 
-.connection-recovery-fields input {
+.connection-recovery-fields input,
+.connection-recovery-fields select {
   width: 100%;
   height: 38px;
   padding: 0 11px;
@@ -7325,9 +7570,25 @@ button {
   background: var(--surface-input);
 }
 
-.connection-recovery-fields input:focus {
+.connection-recovery-fields input:focus,
+.connection-recovery-fields select:focus {
   border-color: var(--blue);
   outline: 2px solid color-mix(in srgb, var(--blue) 20%, transparent);
+}
+
+.connection-same-origin {
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--blue) 38%, var(--line));
+  border-radius: 7px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--blue) 8%, var(--panel-soft));
+}
+
+.connection-same-origin span {
+  color: var(--muted);
+  line-height: 1.5;
 }
 
 .connection-recovery-status {
@@ -17994,6 +18255,23 @@ button {
   transform: translateX(-50%);
 }
 
+.bar-unfolded-map.orientation-vertical .bar-camera-frame {
+  left: 0;
+  right: 0;
+  top: auto;
+  bottom: auto;
+  border-right: 0;
+  border-bottom: 1px solid rgba(184, 224, 248, 0.24);
+}
+
+.bar-unfolded-map.orientation-vertical .bar-unfolded-canvas.has-stitch .bar-camera-band > span {
+  position: sticky;
+  left: 50%;
+  top: 10px;
+  width: max-content;
+  transform: translateX(-50%);
+}
+
 .bar-unfolded-map.orientation-vertical .bar-unfolded-note {
   left: 8px;
   right: auto;
@@ -19910,15 +20188,72 @@ button {
   height: 100%;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 4px;
   padding: 2px;
+}
+
+.diameter-metric-summary {
+  display: grid;
+  grid-template-columns: auto repeat(5, minmax(92px, 1fr)) minmax(190px, 1.5fr);
+  align-items: stretch;
+  gap: 4px;
+}
+
+.diameter-metric-summary > span,
+.diameter-metric-summary dl,
+.diameter-metric-summary em {
+  min-width: 0;
+  min-height: 38px;
+  margin: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel-soft);
+}
+
+.diameter-metric-summary > span {
+  display: grid;
+  place-items: center;
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 50%, var(--line));
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.diameter-metric-summary dl {
+  display: grid;
+  gap: 2px;
+}
+
+.diameter-metric-summary dt {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.diameter-metric-summary dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.diameter-metric-summary em {
+  display: flex;
+  align-items: center;
+  color: var(--amber);
+  font-size: 10px;
+  font-style: normal;
+  line-height: 1.3;
 }
 
 .diameter-curve-card {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto auto;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -19978,6 +20313,53 @@ button {
 .diameter-curve-card .diameter-axis {
   stroke: var(--line-strong);
   stroke-width: 1;
+}
+
+.diameter-curve-card .diameter-grid-line {
+  stroke: color-mix(in srgb, var(--line-strong) 55%, transparent);
+  stroke-width: 1;
+}
+
+.diameter-curve-card .diameter-range-envelope {
+  fill: color-mix(in srgb, var(--blue) 12%, transparent);
+  stroke: none;
+}
+
+.diameter-curve-card .diameter-series-line {
+  stroke: var(--diameter-series-color, var(--cyan));
+  stroke-width: 1.35;
+  opacity: .86;
+}
+
+.diameter-curve-card .diameter-series-line.kind-minimum,
+.diameter-curve-card .diameter-series-line.kind-maximum {
+  stroke-width: 1.15;
+  stroke-dasharray: 5 3;
+  opacity: .95;
+}
+
+.diameter-curve-card .diameter-series-line.kind-average,
+.diameter-curve-card .diameter-series-line.kind-legacy {
+  stroke-width: 2.7;
+  opacity: 1;
+}
+
+.diameter-curve-card .diameter-sample-point {
+  fill: var(--cyan);
+  stroke: color-mix(in srgb, var(--panel) 70%, #fff);
+  stroke-width: 1.2;
+}
+
+.diameter-curve-card .diameter-sample-point:hover {
+  r: 5px;
+  fill: #fff;
+  stroke: var(--cyan);
+}
+
+.diameter-curve-card svg text.diameter-axis-title {
+  fill: var(--text);
+  font-size: 10px;
+  font-weight: 800;
 }
 
 .diameter-curve-card .diameter-reference {
@@ -20167,6 +20549,50 @@ button {
     grid-template-columns: minmax(0, 1fr);
     overflow-y: auto;
   }
+
+  .diameter-metric-summary {
+    grid-template-columns: repeat(3, minmax(90px, 1fr));
+  }
+
+  .diameter-metric-summary em {
+    grid-column: 1 / -1;
+  }
+}
+
+.diameter-series-legend {
+  display: flex;
+  align-items: center;
+  gap: 5px 12px;
+  min-height: 28px;
+  padding: 4px 9px;
+  overflow-x: auto;
+  border-top: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+  scrollbar-width: thin;
+}
+
+.diameter-series-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.diameter-series-legend i {
+  display: block;
+  width: 17px;
+  border-top: 2px solid var(--diameter-series-color, var(--cyan));
+}
+
+.diameter-series-legend .kind-minimum i,
+.diameter-series-legend .kind-maximum i {
+  border-top-style: dashed;
+}
+
+.diameter-series-legend .kind-average {
+  color: var(--text);
+  font-weight: 800;
 }
 
 .bkv-reconstruction-view-switch button {

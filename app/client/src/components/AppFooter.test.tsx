@@ -56,6 +56,38 @@ const fullResourceUsage: AppResourceUsage = {
 };
 
 describe('AppFooter', () => {
+  it('shows the service IP and live connection state in the lower-left corner', () => {
+    const { rerender } = render(
+      <AppFooter
+        activeNav="online"
+        connection={{
+          endpoint: 'http://127.0.0.1:4873',
+          state: 'online',
+          detail: '检测服务已就绪',
+        }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText('服务连接：已连接，IP 127.0.0.1:4873')).toHaveTextContent('连接 IP127.0.0.1:4873已连接');
+
+    rerender(
+      <AppFooter
+        activeNav="online"
+        connection={{
+          endpoint: 'http://192.168.1.8:4873',
+          state: 'offline',
+          detail: '检测服务离线',
+        }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText('服务连接：未连接，IP 192.168.1.8:4873')).toHaveClass('offline');
+  });
+
   it('shows compact full-desktop resource usage with runtime details', () => {
     render(
       <AppFooter
@@ -109,6 +141,34 @@ describe('AppFooter', () => {
     expect(screen.getByRole('button', { name: '后台管理' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '采集管理' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '3D 重建' })).toBeInTheDocument();
+  });
+
+  it('places the online real-time/playback toggle at the far right of the footer', () => {
+    const onToggle = vi.fn();
+    const { rerender } = render(
+      <AppFooter
+        activeNav="online"
+        onlineWorkspace={{ mode: 'inspection', onToggle }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    const liveButton = screen.getByRole('button', { name: '实时/回放' });
+    expect(liveButton).toHaveAttribute('aria-pressed', 'false');
+    expect(liveButton).toBe(screen.getByRole('navigation', { name: '非业务功能' }).lastElementChild);
+    fireEvent.click(liveButton);
+    expect(onToggle).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <AppFooter
+        activeNav="online"
+        onlineWorkspace={{ mode: 'camera', onToggle }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole('button', { name: '返回检测' })).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('hides direct-camera tools in BKV mode while keeping backend management visible', () => {

@@ -4,7 +4,7 @@ import type {
   CaptureHistoryFrame,
   CaptureHistoryResult,
 } from '../lib/capture-api';
-import { isNumericCaptureFlowId, selectCaptureRoiPreviews } from './capture-roi-api';
+import { isNumericCaptureFlowId, selectCaptureRoiPreviews, selectCaptureStitchHistory } from './capture-roi-api';
 
 function camera(
   cameraIndex: number,
@@ -137,5 +137,71 @@ describe('capture ROI preview selection', () => {
     expect(selectCaptureRoiPreviews(negative, '2747', ['C1'])).toBeNull();
     expect(selectCaptureRoiPreviews(outside, '2747', ['C1'])).toBeNull();
     expect(selectCaptureRoiPreviews(wrongArtifact, '2747', ['C1'])).toBeNull();
+  });
+});
+
+describe('capture crop-stitch history selection', () => {
+  it('keeps every current-material sequence in order and leaves camera gaps unfilled', () => {
+    const otherMaterial: CaptureHistoryFrame = {
+      ...frame(2, [camera(1, 1000)]),
+      frameId: 'other:000000000002',
+      materialId: 'other',
+    };
+    const result = selectCaptureStitchHistory(
+      history([
+        frame(3, [camera(1, 1000), camera(3, 1000)]),
+        otherMaterial,
+        frame(1, [camera(1, 1000), camera(2, 1000), camera(3, 1000)]),
+      ]),
+      '2747',
+      ['C1', 'C2', 'C3'],
+    );
+
+    expect(result.frames.map((item) => item.sequence)).toEqual([1, 3]);
+    expect(result.frames[1].cameras.map((item) => item.cameraId)).toEqual(['C1', 'C3']);
+    expect(result.frames.flatMap((item) => item.cameras)).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ artifactRef: expect.stringContaining('other/') })]),
+    );
+  });
+
+  it('uses algorithm ROI when valid and auto-black-border cropping otherwise', () => {
+    const result = selectCaptureStitchHistory(
+      history([frame(7, [
+        camera(1, 2000),
+        camera(2, 1800, { validRoi: undefined, regionState: 'background-missing' }),
+      ])]),
+      '2747',
+      ['C1', 'C2'],
+    );
+
+    expect(result).toMatchObject({
+      materialId: '2747',
+      expectedCameraCount: 2,
+      algorithmRoiImageCount: 1,
+      autoCropImageCount: 1,
+    });
+    expect(result.frames[0].cameras[0]).toMatchObject({ cropMode: 'algorithm-roi' });
+    expect(result.frames[0].cameras[0].url).toContain('region=valid');
+    expect(result.frames[0].cameras[1]).toMatchObject({ cropMode: 'auto-black-border', validRoi: null });
+    expect(result.frames[0].cameras[1].url).not.toContain('region=valid');
+  });
+
+  it('deduplicates repeated sequences before reporting image counts and exposes the 500-frame cap', () => {
+    const duplicateSparse = frame(8, [camera(1, 1000)]);
+    const duplicateComplete = {
+      ...frame(8, [camera(1, 1000), camera(2, 1000, { validRoi: undefined })]),
+      frameId: '2747:duplicate-complete',
+    };
+    const source = history([duplicateSparse, duplicateComplete]);
+    source.total = 700;
+    source.hasMore = true;
+
+    const result = selectCaptureStitchHistory(source, '2747', ['C1', 'C2']);
+
+    expect(result.frames).toHaveLength(1);
+    expect(result.frames[0].frameId).toBe('2747:duplicate-complete');
+    expect(result.algorithmRoiImageCount).toBe(1);
+    expect(result.autoCropImageCount).toBe(1);
+    expect(result).toMatchObject({ totalFrames: 700, hasMore: true });
   });
 });

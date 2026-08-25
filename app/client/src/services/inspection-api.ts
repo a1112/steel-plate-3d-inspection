@@ -80,6 +80,7 @@ export type ConnectionConfig = {
   mode: ConnectionMode;
   host: string;
   port: number;
+  protocol?: 'http' | 'https';
   runtime?: ConnectionRuntimeInfo;
 };
 
@@ -1080,10 +1081,38 @@ function matchesLoopbackHost(host: string) {
   return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1' || normalized.endsWith('.localhost');
 }
 
-function formatServiceOrigin(host: string, port: number) {
-  const normalized = host.trim().replace(/^\[|\]$/g, '');
+export function shouldUseSameOriginService(
+  protocol: string,
+  tauriRuntime: boolean,
+  runtimeMode = import.meta.env.MODE,
+) {
+  return runtimeMode !== 'test'
+    && !tauriRuntime
+    && (protocol === 'http:' || protocol === 'https:');
+}
+
+export function isWebHostedRuntime() {
+  if (typeof window === 'undefined') return false;
+  const tauriRuntime = '__TAURI_INTERNALS__' in window || '__TAURI__' in window;
+  return shouldUseSameOriginService(window.location.protocol, tauriRuntime);
+}
+
+function formatServiceOrigin(host: string, port: number, protocol: 'http' | 'https' = 'http') {
+  const rawHost = host.trim();
+  if (/^https?:\/\//i.test(rawHost)) {
+    try {
+      const parsed = new URL(rawHost);
+      const parsedPort = parsed.port ? Number(parsed.port) : port;
+      return formatServiceOrigin(parsed.hostname, parsedPort, parsed.protocol === 'https:' ? 'https' : 'http');
+    } catch {
+      // Keep using the validated connection fields below so the caller gets a
+      // normal failed request instead of an unrelated URL parsing exception.
+    }
+  }
+  const normalized = rawHost.replace(/^\[|\]$/g, '');
   const authority = normalized.includes(':') ? `[${normalized}]` : normalized;
-  return `http://${authority}:${port}`;
+  const defaultPort = protocol === 'https' ? 443 : 80;
+  return `${protocol}://${authority}${port === defaultPort ? '' : `:${port}`}`;
 }
 
 function getSafeLocalStorage() {
@@ -1124,6 +1153,7 @@ export function saveLocalConnectionConfig(config: ConnectionConfig) {
       mode: config.mode,
       host: config.host,
       port: config.port,
+      ...(config.protocol ? { protocol: config.protocol } : {}),
     }));
   }
 }
@@ -1164,11 +1194,22 @@ export function createAdminHeaders(headers: Record<string, string> = {}) {
 }
 
 export function getInspectionServiceOrigin(config = getStoredConnectionConfig()) {
+  if (isWebHostedRuntime()) {
+    return window.location.origin.replace(/\/$/, '');
+  }
   const configuredOrigin = import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN;
   if (configuredOrigin && configuredOrigin.trim().length > 0) {
-    return configuredOrigin;
+    return configuredOrigin.replace(/\/$/, '');
   }
-  return config.host && config.port ? formatServiceOrigin(config.host, config.port) : DEFAULT_SERVICE_ORIGIN;
+  return config.host && config.port
+    ? formatServiceOrigin(config.host, config.port, config.protocol ?? 'http')
+    : DEFAULT_SERVICE_ORIGIN;
+}
+
+export function getConfiguredInspectionServiceOrigin(config = getStoredConnectionConfig()) {
+  return config.host && config.port
+    ? formatServiceOrigin(config.host, config.port, config.protocol ?? 'http')
+    : DEFAULT_SERVICE_ORIGIN;
 }
 
 export function getTriggerGatewayOrigin() {
@@ -1353,9 +1394,7 @@ function normalizeCaptureImage(image: CaptureImageItem, origin: string): Capture
     && /(?:^|\/)\d+\/capture\/C\d+\/2d\/[^/]+\.png$/i.test(normalizedPath);
   if (isSickIntensityFrame) {
     const crop = explicitCaptureCrop(image.url, origin);
-    if (!crop) {
-      imageUrl = '';
-    } else {
+    if (crop) {
       const params = new URLSearchParams({
         path: image.path,
         maxWidth: String(crop.maxWidth),
@@ -2153,21 +2192,24 @@ export async function fetchConnectionConfig(signal?: AbortSignal): Promise<Conne
 }
 
 function connectionDiscoveryOrigins(config: ConnectionConfig) {
+  if (isWebHostedRuntime()) {
+    return [window.location.origin.replace(/\/$/, '')];
+  }
   const origins = new Set<string>();
   const configuredOrigin = import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN?.trim();
   if (configuredOrigin) {
     origins.add(configuredOrigin.replace(/\/$/, ''));
   }
   if (config.host && config.port) {
-    origins.add(formatServiceOrigin(config.host, config.port));
+    origins.add(formatServiceOrigin(config.host, config.port, config.protocol ?? 'http'));
   }
   if (typeof window !== 'undefined') {
     const pageHost = window.location?.hostname?.trim();
     if (pageHost) {
-      origins.add(formatServiceOrigin(pageHost, config.port || 4873));
+      origins.add(formatServiceOrigin(pageHost, config.port || 4873, config.protocol ?? 'http'));
     }
   }
-  origins.add(formatServiceOrigin('127.0.0.1', config.port || 4873));
+  origins.add(formatServiceOrigin('127.0.0.1', config.port || 4873, config.protocol ?? 'http'));
   return [...origins];
 }
 
@@ -2229,7 +2271,12 @@ export async function saveConnectionConfig(config: ConnectionConfig): Promise<vo
   const response = await fetch(`${getInspectionServiceOrigin(config)}/api/config/connection`, {
     method: 'POST',
     headers: createAdminHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ mode: config.mode, host: config.host, port: config.port }),
+    body: JSON.stringify({
+      mode: config.mode,
+      host: config.host,
+      port: config.port,
+      ...(config.protocol ? { protocol: config.protocol } : {}),
+    }),
   });
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '连接设置保存失败'));

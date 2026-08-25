@@ -59,6 +59,7 @@ import {
   type ConnectionConfig,
   type DiscoveredInspectionService,
   type TriggerGatewayStatus,
+  getConfiguredInspectionServiceOrigin,
   getInspectionServiceOrigin,
   getTriggerGatewayOrigin,
   issueInspectionReportArchive,
@@ -72,6 +73,10 @@ import {
   calculateSystemNetworkRates,
   createEmptyCaptureSnapshot,
   readCaptureSnapshot,
+  readCaptureMeasurement,
+  readCaptureSurface,
+  type CaptureFlowMeasurement,
+  type CaptureFlowSurface,
   readSystemNetworkSnapshot,
   type SystemNetworkSnapshot,
 } from './lib/capture-api';
@@ -134,6 +139,41 @@ const REPORT_PAGE_SIZE = 8;
 const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
 const UNKNOWN_SERVICE_ENDPOINT = 'unknown';
 
+function captureSurfaceMesh(surface: CaptureFlowSurface): BarSurfaceMesh {
+  const { rows, columns } = surface.mesh;
+  const vertexCount = Math.floor(surface.mesh.positions.length / 3);
+  const positions = new Float32Array(surface.mesh.positions.length);
+  const uvs = new Float32Array(vertexCount * 2);
+  for (let index = 0; index < vertexCount; index += 1) {
+    const row = Math.floor(index / Math.max(1, columns));
+    const column = index % Math.max(1, columns);
+    const source = index * 3;
+    // ProductionArtifactView treats X as the longitudinal axis and fits each
+    // Y/Z row as a section. The capture surface stores X/Z cross-section and
+    // Y head-relative display position, so adapt axes without changing units.
+    positions[source] = surface.mesh.positions[source + 1] ?? 0;
+    positions[source + 1] = surface.mesh.positions[source] ?? 0;
+    positions[source + 2] = surface.mesh.positions[source + 2] ?? 0;
+    uvs[index * 2] = columns > 1 ? column / (columns - 1) : 0;
+    uvs[index * 2 + 1] = rows > 1 ? row / (rows - 1) : 0;
+  }
+  return {
+    schema: surface.schema,
+    coordinateUnit: 'mm',
+    cameraCount: 1,
+    frameStems: surface.sections.map((section, index) => String(section.anchorOrdinal ?? index)),
+    rows,
+    colsPerCamera: columns,
+    positions,
+    uvs,
+    colors: new Float32Array(surface.mesh.colors),
+    validMask: new Uint8Array(surface.mesh.validMask),
+    indices: new Uint32Array(surface.mesh.indices),
+    jetRangeMm: surface.summary.jetResidualRangeMm,
+    source: 'json',
+  };
+}
+
 export function formatStorageBytes(value?: number | null) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
     return '--';
@@ -175,6 +215,8 @@ type RecordBoundSurfaceArtifact = {
   mesh: BarSurfaceMesh | null;
   status: string;
   cameras?: BarSurfaceCamera[];
+  measurement?: CaptureFlowMeasurement | null;
+  cameraTiles?: CaptureFlowSurface['cameraTiles'] | null;
 };
 
 type AppMode = AppRoute;
@@ -748,6 +790,12 @@ function InspectionDashboard({
   const [triggerGatewayStatus, setTriggerGatewayStatus] = useState<TriggerGatewayStatus | null>(null);
 
   useEffect(() => {
+    if (uiState.activeNav !== 'online') {
+      setOnlineWorkspaceMode('inspection');
+    }
+  }, [uiState.activeNav]);
+
+  useEffect(() => {
     if (terminalMode !== 'online' || uiState.activeNav !== 'report') return undefined;
     const controller = new AbortController();
     const refresh = () => {
@@ -1301,12 +1349,59 @@ function InspectionDashboard({
     });
     let inFlight = false;
     let artifactLoaded = false;
+    const continuouslyRefreshDirectSurface = dashboardMode.kind === 'direct'
+      && snapshotTracking === 'latest';
     const loadRecordArtifact = async () => {
-      if (inFlight || artifactLoaded || controller.signal.aborted) {
+      if (inFlight || (artifactLoaded && !continuouslyRefreshDirectSurface) || controller.signal.aborted) {
         return;
       }
       inFlight = true;
       try {
+        if (dashboardMode.kind === 'direct') {
+          try {
+            const [captureResult, measurementResult] = await Promise.all([
+              readCaptureSurface(materialId),
+              readCaptureMeasurement(materialId).catch(() => null),
+            ]);
+            if (controller.signal.aborted) {
+              return;
+            }
+            if (captureResult.surface.materialId !== materialId) {
+              throw new Error('采集拟合结果与当前流水号不一致，已拒绝展示');
+            }
+            const mesh = captureSurfaceMesh(captureResult.surface);
+            if (mesh.positions.length < 3 || mesh.indices.length < 3) {
+              throw new Error('采集拟合结果没有有效三维网格');
+            }
+            setRecordBoundSurface({
+              inspectionId,
+              loading: false,
+              mesh,
+              cameraTiles: captureResult.surface.cameraTiles ?? null,
+              measurement: measurementResult?.measurement.materialId === materialId
+                ? measurementResult.measurement
+                : null,
+              status: `已绑定流水 ${materialId} 标定曲面 · ${captureResult.surface.summary.acceptedSectionCount}/${captureResult.surface.summary.sectionCount} 截面 · ${captureResult.surface.quality.crossSectionMetricValid ? '截面毫米有效' : '拟合预览'} · JET ±${captureResult.surface.summary.jetResidualRangeMm.toFixed(3)} mm`,
+            });
+            artifactLoaded = true;
+            return;
+          } catch (captureSurfaceError) {
+            if (controller.signal.aborted) {
+              return;
+            }
+            // A just-closed flow may not have its fast artifacts yet. Keep
+            // the existing record-bound manifest path as a strict fallback.
+            setRecordBoundSurface({
+              inspectionId,
+              loading: true,
+              mesh: null,
+              status: captureSurfaceError instanceof Error
+                ? `正在等待流水 ${materialId} 的标定曲面：${captureSurfaceError.message}`
+                : `正在等待流水 ${materialId} 的标定曲面`,
+            });
+            return;
+          }
+        }
         let summaryPath = recordSummaryPath;
         if (!summaryPath) {
           const production = await fetchProductionStatus(controller.signal);
@@ -1663,7 +1758,12 @@ function InspectionDashboard({
   };
 
   const applyDiscoveredConnection = (service: DiscoveredInspectionService) => {
-    updateConnectionDraft({ mode: 'online', host: service.host, port: service.port });
+    updateConnectionDraft({
+      mode: 'online',
+      host: service.host,
+      port: service.port,
+      protocol: service.origin.startsWith('https://') ? 'https' : 'http',
+    });
     setConnectionStatus(`已自动设置 ${service.host}:${service.port}，请保存连接`);
     setConnectionDiscoveryStatus(`已选择${service.scope === 'lan' ? '局域网' : '本机'}地址 ${service.host}`);
   };
@@ -1783,32 +1883,13 @@ function InspectionDashboard({
       ) : null}
       {uiState.activeNav === 'online' ? (
         <div className="online-unified-page">
-          <div className="online-workspace-tabs" role="tablist" aria-label="在线监测模式">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={onlineWorkspaceMode === 'inspection'}
-              className={onlineWorkspaceMode === 'inspection' ? 'active' : ''}
-              onClick={() => setOnlineWorkspaceMode('inspection')}
-            >
-              检测结果
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={onlineWorkspaceMode === 'camera'}
-              className={onlineWorkspaceMode === 'camera' ? 'active' : ''}
-              onClick={() => setOnlineWorkspaceMode('camera')}
-            >
-              相机实时 / 回放
-            </button>
-          </div>
           {onlineWorkspaceMode === 'inspection' ? (
         <div className={`online-workspace ${terminalMode === 'bkv' ? 'runtime-bkv-workspace' : ''}`}>
           <LeftSidebar
             runtimeMode={terminalMode}
             plate={activeSnapshot.currentPlate}
             summary={activeSummary}
+            activeRecordStatus={activeRecordStatus}
             records={filteredRecords}
             inspections={snapshot.inspections}
             selectedRecordId={uiState.selectedRecordId}
@@ -1825,7 +1906,7 @@ function InspectionDashboard({
           />
           <section className="online-main">
             <main className={`dashboard-grid online-dashboard-grid ${rightSidebarCollapsed || !hasCurrentDefects ? 'right-sidebar-collapsed' : ''}`}>
-              <section className={`center-column ${analysisCollapsed || !hasCurrentDefects ? 'analysis-collapsed' : ''}`}>
+              <section className={`center-column ${analysisCollapsed ? 'analysis-collapsed' : ''}`}>
                 <PlateMap
                   defectTypes={snapshot.defectTypes}
                   defects={visibleDefects}
@@ -1850,6 +1931,7 @@ function InspectionDashboard({
                   captureImages={activeSnapshot.captureImages ?? []}
                   cameraLanes={runtimeCameraLanes}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
+                  surfaceCameraTiles={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameraTiles : null}
                   surfaceCameras={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameras : undefined}
                   artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
                   viewMode={plateMapViewMode}
@@ -1908,8 +1990,7 @@ function InspectionDashboard({
                   }}
                   onVisibleRangeChange={setLongitudinalVisibleRange}
                 />
-                {hasCurrentDefects ? (
-                  <AlarmAnalysis
+                <AlarmAnalysis
                     selectedDefect={selectedOnlineDefect}
                     heightProfile={activeSnapshot.heightProfile}
                     captureImages={activeSnapshot.captureImages}
@@ -1917,6 +1998,7 @@ function InspectionDashboard({
                     artifactMode={artifactMode}
                     inspectionId={activeInspection?.inspectionId}
                     surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
+                    diameterArtifact={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.measurement : null}
                     artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
                     headerless
                     collapsed={analysisCollapsed}
@@ -1926,8 +2008,7 @@ function InspectionDashboard({
                       lengthMm: activeSnapshot.currentPlate.lengthMm,
                     }}
                     diameterVisibleRange={longitudinalVisibleRange}
-                  />
-                ) : null}
+                />
               </section>
               {rightSidebarCollapsed || !hasCurrentDefects ? null : <aside className="right-column">
                 <DefectImagePanel
@@ -2067,6 +2148,10 @@ function InspectionDashboard({
         systemName={systemName}
         activeNav={uiState.activeNav}
         dashboardMode={dashboardMode}
+        connection={dashboardMode.requestsOnlineServices ? {
+          ...serviceStatus.inspectionService,
+          endpoint: getConfiguredInspectionServiceOrigin(connectionDraft),
+        } : undefined}
         resourceUsage={resourceUsageState.usage}
         resourceUsageStale={resourceUsageState.stale}
         terminalViews={{
@@ -2074,6 +2159,10 @@ function InspectionDashboard({
         }}
         flowVisible={inspectionFlowVisible}
         onFlowToggle={() => setInspectionFlowVisible((current) => !current)}
+        onlineWorkspace={uiState.activeNav === 'online' && dashboardMode.showsCaptureManagement ? {
+          mode: onlineWorkspaceMode,
+          onToggle: () => setOnlineWorkspaceMode((current) => current === 'inspection' ? 'camera' : 'inspection'),
+        } : undefined}
         analysis={selectedOnlineDefect ? {
           defect: selectedOnlineDefect,
           analysisViewMode,

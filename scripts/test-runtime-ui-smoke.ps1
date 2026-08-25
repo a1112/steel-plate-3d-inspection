@@ -5,7 +5,8 @@ param(
   [int]$TimeoutSec = 30,
   [int]$ViewportWidth = 1882,
   [int]$ViewportHeight = 994,
-  [switch]$ExpectBkv
+  [switch]$ExpectBkv,
+  [switch]$TerminalOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -116,6 +117,7 @@ const timeoutMs = Number(process.env.STEEL_UI_SMOKE_TIMEOUT_MS || 30000);
 const viewportWidth = Number(process.env.STEEL_UI_SMOKE_VIEWPORT_WIDTH || 1882);
 const viewportHeight = Number(process.env.STEEL_UI_SMOKE_VIEWPORT_HEIGHT || 994);
 const expectBkv = process.env.STEEL_UI_SMOKE_EXPECT_BKV === '1';
+const terminalOnly = process.env.STEEL_UI_SMOKE_TERMINAL_ONLY === '1';
 
 function appUrl(app) {
   const url = new URL(clientOrigin);
@@ -375,15 +377,46 @@ async function runUnifiedOnlineModeChecks(page, result) {
   result.interactionScreenshots = [];
 
   const inspection = await requireEventually(
-    'unique-online-monitoring-entry-and-inspection-mode',
-    "(() => { const topLabels = [...document.querySelectorAll('.top-nav button')].map((button) => button.textContent.trim()); const workspace = document.querySelector('.online-workspace-tabs'); const modes = workspace ? [...workspace.querySelectorAll('[role=tab]')] : []; const previewUrls = performance.getEntriesByType('resource').map((entry) => entry.name).filter((name) => name.includes('/api/capture/file') && name.includes('maxWidth=')); const invalidUrls = previewUrls.filter((value) => { const url = new URL(value, location.href); return url.searchParams.get('region') !== 'valid' || Number(url.searchParams.get('cropWidth')) <= 0 || Number(url.searchParams.get('cropHeight')) <= 0; }); const value = { topLabels, modes: modes.map((button) => ({ label: button.textContent.trim(), selected: button.getAttribute('aria-selected') })), previewUrlCount: previewUrls.length, invalidUrls }; return topLabels.filter((label) => label === '\u5728\u7ebf\u76d1\u6d4b').length === 1 && !topLabels.includes('\u5728\u7ebf\u68c0\u6d4b') && !topLabels.includes('\u5b9e\u65f6\u76d1\u63a7') && modes.length === 2 && modes[0].textContent.includes('\u68c0\u6d4b\u7ed3\u679c') && modes[0].getAttribute('aria-selected') === 'true' && modes[1].textContent.includes('\u76f8\u673a\u5b9e\u65f6 / \u56de\u653e') && modes[1].getAttribute('aria-selected') === 'false' && document.querySelector('.online-workspace') && !document.querySelector('.live-monitor-page') && previewUrls.length > 0 && invalidUrls.length === 0 ? value : false; })()",
+    'online-crop-stitch-horizontal-and-footer-entry',
+    "(() => { const topLabels = [...document.querySelectorAll('.top-nav button')].map((button) => button.textContent.trim()); const footerButton = document.querySelector('.app-footer-online-workspace'); const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); const frameCount = Number(viewport?.dataset.frameCount || 0); const laneCount = document.querySelectorAll('.bar-camera-band').length; const frameCells = document.querySelectorAll('.bar-camera-frame').length; const paintedCanvases = [...document.querySelectorAll('.bar-camera-frame canvas')].filter((canvas) => canvas.width > 0 && canvas.height > 0).length; const value = { topLabels, footerLabel: footerButton?.textContent.trim(), footerPressed: footerButton?.getAttribute('aria-pressed'), frameCount, laneCount, frameCells, paintedCanvases, axis: viewport?.dataset.scrollAxis, scrollWidth: viewport?.scrollWidth, clientWidth: viewport?.clientWidth }; return topLabels.filter((label) => label === '\u5728\u7ebf\u76d1\u6d4b').length === 1 && !document.querySelector('.online-workspace-tabs') && footerButton?.textContent.includes('\u5b9e\u65f6/\u56de\u653e') && footerButton.getAttribute('aria-pressed') === 'false' && document.querySelector('.online-workspace') && !document.querySelector('.live-monitor-page') && viewport?.dataset.scrollAxis === 'x' && frameCount > 1 && laneCount === 6 && frameCells > laneCount && frameCells < frameCount * laneCount && paintedCanvases > 0 && viewport.scrollWidth > viewport.clientWidth ? value : false; })()",
   );
   result.interactionScreenshots.push(await page.screenshot('online-monitoring-inspection'));
 
-  await page.click('.online-workspace-tabs button:nth-child(2)');
+  await page.evaluate("(() => { const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); viewport.scrollLeft = Math.min(viewport.scrollWidth - viewport.clientWidth, viewport.scrollWidth * 0.27); viewport.dispatchEvent(new Event('scroll')); return true; })()");
+  await requireEventually(
+    'crop-stitch-renders-content-bearing-cropped-frames',
+    "(() => { const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); const canvases = [...document.querySelectorAll('.bar-camera-frame.has-production-image canvas')].filter((canvas) => canvas.width > 0 && canvas.height > 0); const brightCanvases = canvases.filter((canvas) => { try { const context = canvas.getContext('2d'); const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data; const stride = Math.max(4, Math.floor(pixels.length / 800 / 4) * 4); for (let offset = 0; offset < pixels.length; offset += stride) { if (Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]) > 40) return true; } } catch {} return false; }); const start = Number(viewport?.dataset.visibleFrameStart || 0); return viewport && start > 0 && brightCanvases.length >= 6 ? { scrollLeft: viewport.scrollLeft, visibleFrameStart: start, visibleFrameEnd: Number(viewport.dataset.visibleFrameEnd || 0), paintedCanvases: canvases.length, brightCanvases: brightCanvases.length } : false; })()",
+  );
+  result.interactionScreenshots.push(await page.screenshot('online-monitoring-inspection-content'));
+
+  await page.evaluate("(() => { const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); viewport.scrollLeft = Math.max(1, viewport.scrollWidth - viewport.clientWidth); viewport.dispatchEvent(new Event('scroll')); return true; })()");
+  await requireEventually(
+    'crop-stitch-scrolls-to-later-virtual-frames',
+    "(() => { const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); const start = Number(viewport?.dataset.visibleFrameStart || 0); return viewport && viewport.scrollLeft > 0 && start > 0 && document.querySelectorAll('.bar-camera-frame').length > 0 ? { scrollLeft: viewport.scrollLeft, visibleFrameStart: start, visibleFrameEnd: Number(viewport.dataset.visibleFrameEnd || 0) } : false; })()",
+  );
+  result.interactionScreenshots.push(await page.screenshot('online-monitoring-inspection-scrolled'));
+
+  await page.click('.unfold-orientation-switch button:nth-child(2)');
+  await requireEventually(
+    'crop-stitch-switches-to-vertical-scroll',
+    "(() => { const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); return viewport?.dataset.scrollAxis === 'y' && viewport.scrollHeight > viewport.clientHeight ? { axis: viewport.dataset.scrollAxis, scrollHeight: viewport.scrollHeight, clientHeight: viewport.clientHeight } : false; })()",
+  );
+  result.interactionScreenshots.push(await page.screenshot('online-monitoring-inspection-vertical'));
+  await page.click('.unfold-orientation-switch button:first-child');
+
+  const recordTarget = await page.evaluate("(() => { const rows = [...document.querySelectorAll('.records-table tbody tr')]; const target = rows.find((row) => row.children[1]?.textContent.trim() === '3837') || rows.find((row) => !row.classList.contains('selected') && row.children.length >= 4); if (!target) return null; const plateNo = target.children[1].textContent.trim(); target.click(); return plateNo; })()");
+  if (recordTarget) {
+    await requireEventually(
+      'record-switch-rebinds-crop-stitch',
+      `(() => { const plateNo = document.querySelector('.plate-info-list dd')?.textContent.trim(); const viewport = document.querySelector('[data-testid=capture-stitch-viewport]'); const frameCount = Number(viewport?.dataset.frameCount || 0); return plateNo === ${JSON.stringify(recordTarget)} && frameCount > 1 && viewport.scrollLeft === 0 ? { plateNo, frameCount, scrollLeft: viewport.scrollLeft } : false; })()`,
+    );
+    result.interactionScreenshots.push(await page.screenshot('online-monitoring-record-switched'));
+  }
+
+  await page.click('.app-footer-online-workspace');
   const live = await requireEventually(
     'online-monitoring-camera-live-mode-valid-region-only',
-    "(() => { const mainTabs = [...document.querySelectorAll('.online-workspace-tabs [role=tab]')]; const monitorTabs = [...document.querySelectorAll('.live-monitor-mode-tabs [role=tab]')]; const cards = [...document.querySelectorAll('.live-monitor-grid-card')]; const cardImages = cards.map((card) => [...card.querySelectorAll('img:not([aria-hidden=\"true\"])')].filter((image) => image.naturalWidth > 0 && image.naturalHeight > 0)); const visibleImages = cardImages.flat(); const urls = visibleImages.map((image) => image.currentSrc || image.src).filter((value) => value && value.includes('/api/stream/latest')); const parsedUrls = urls.map((value) => new URL(value, location.href)); const invalidUrls = parsedUrls.filter((url) => url.searchParams.get('region') !== 'valid' || url.searchParams.get('region') === 'raw'); const uniqueIps = [...new Set(parsedUrls.map((url) => url.searchParams.get('ip')).filter(Boolean))]; const hiddenPreloads = cards.reduce((total, card) => total + card.querySelectorAll('img[aria-hidden=\"true\"]').length, 0); const value = { mainMode: mainTabs[1]?.textContent.trim(), monitorModes: monitorTabs.map((button) => ({ label: button.textContent.trim(), selected: button.getAttribute('aria-selected') })), cards: cards.length, visibleImages: visibleImages.length, hiddenPreloads, urls, uniqueIps, invalidUrls: invalidUrls.map((url) => url.href) }; return mainTabs.length === 2 && mainTabs[1].getAttribute('aria-selected') === 'true' && document.querySelector('.live-monitor-page') && monitorTabs.length === 2 && monitorTabs[0].textContent.includes('\u5b9e\u65f6') && monitorTabs[0].getAttribute('aria-selected') === 'true' && monitorTabs[1].textContent.includes('\u56de\u653e') && cards.length === 6 && cardImages.every((images) => images.length === 1) && visibleImages.length === 6 && urls.length === 6 && uniqueIps.length === 6 && invalidUrls.length === 0 ? value : false; })()",
+    "(() => { const footerButton = document.querySelector('.app-footer-online-workspace'); const monitorTabs = [...document.querySelectorAll('.live-monitor-mode-tabs [role=tab]')]; const cards = [...document.querySelectorAll('.live-monitor-grid-card')]; const cardImages = cards.map((card) => [...card.querySelectorAll('img:not([aria-hidden=\"true\"])')].filter((image) => image.naturalWidth > 0 && image.naturalHeight > 0)); const visibleImages = cardImages.flat(); const urls = visibleImages.map((image) => image.currentSrc || image.src).filter((value) => value && value.includes('/api/stream/latest')); const parsedUrls = urls.map((value) => new URL(value, location.href)); const invalidUrls = parsedUrls.filter((url) => url.searchParams.get('region') !== 'valid' || url.searchParams.get('region') === 'raw'); const uniqueIps = [...new Set(parsedUrls.map((url) => url.searchParams.get('ip')).filter(Boolean))]; const hiddenPreloads = cards.reduce((total, card) => total + card.querySelectorAll('img[aria-hidden=\"true\"]').length, 0); const value = { footerLabel: footerButton?.textContent.trim(), monitorModes: monitorTabs.map((button) => ({ label: button.textContent.trim(), selected: button.getAttribute('aria-selected') })), cards: cards.length, visibleImages: visibleImages.length, hiddenPreloads, urls, uniqueIps, invalidUrls: invalidUrls.map((url) => url.href) }; return footerButton?.textContent.includes('\u8fd4\u56de\u68c0\u6d4b') && footerButton.getAttribute('aria-pressed') === 'true' && document.querySelector('.live-monitor-page') && monitorTabs.length === 2 && monitorTabs[0].textContent.includes('\u5b9e\u65f6') && monitorTabs[0].getAttribute('aria-selected') === 'true' && monitorTabs[1].textContent.includes('\u56de\u653e') && cards.length === 6 && cardImages.every((images) => images.length === 1) && visibleImages.length === 6 && urls.length === 6 && uniqueIps.length === 6 && invalidUrls.length === 0 ? value : false; })()",
   );
   result.interactionScreenshots.push(await page.screenshot('online-monitoring-camera-live'));
 
@@ -400,10 +433,10 @@ async function runUnifiedOnlineModeChecks(page, result) {
     "(() => { const tabs = [...document.querySelectorAll('.live-monitor-mode-tabs [role=tab]')]; return tabs.length === 2 && tabs[0].getAttribute('aria-selected') === 'true' && document.querySelector('.live-monitor-camera-grid') ? { live: true, cards: document.querySelectorAll('.live-monitor-grid-card').length } : false; })()",
   );
 
-  await page.click('.online-workspace-tabs button:first-child');
+  await page.click('.app-footer-online-workspace');
   await requireEventually(
-    'returns-to-inspection-results-with-single-top-level-entry',
-    "(() => { const topLabels = [...document.querySelectorAll('.top-nav button')].map((button) => button.textContent.trim()); const tabs = [...document.querySelectorAll('.online-workspace-tabs [role=tab]')]; return topLabels.filter((label) => label === '\u5728\u7ebf\u76d1\u6d4b').length === 1 && !topLabels.includes('\u5728\u7ebf\u68c0\u6d4b') && !topLabels.includes('\u5b9e\u65f6\u76d1\u63a7') && tabs.length === 2 && tabs[0].getAttribute('aria-selected') === 'true' && document.querySelector('.online-workspace') && !document.querySelector('.live-monitor-page') ? { inspection: true, topLabels } : false; })()",
+    'returns-to-inspection-results-through-footer',
+    "(() => { const topLabels = [...document.querySelectorAll('.top-nav button')].map((button) => button.textContent.trim()); const footerButton = document.querySelector('.app-footer-online-workspace'); return topLabels.filter((label) => label === '\u5728\u7ebf\u76d1\u6d4b').length === 1 && !document.querySelector('.online-workspace-tabs') && footerButton?.textContent.includes('\u5b9e\u65f6/\u56de\u653e') && footerButton.getAttribute('aria-pressed') === 'false' && document.querySelector('.online-workspace') && !document.querySelector('.live-monitor-page') ? { inspection: true, topLabels } : false; })()",
   );
 
   return { inspection, live, playback };
@@ -437,6 +470,11 @@ async function runPageCheck(page, check) {
       result.checks.push({ kind: 'expression', expression, ok: true });
     }
 
+    if (check.closeClickSelector) {
+      await page.click(check.closeClickSelector);
+      result.checks.push({ kind: 'close', selector: check.closeClickSelector, ok: true });
+    }
+
     if (check.runInteraction) {
       await check.runInteraction(page, result);
     }
@@ -462,8 +500,9 @@ const standardChecks = [
   {
     id: 'terminal',
     url: appUrl('terminal'),
-    requiredText: ['\u5317\u6ee1\u7279\u94a2\u5c0f\u68d2\u68c0\u6d4b\u7cfb\u7edf', '\u5728\u7ebf\u76d1\u6d4b', '\u68c0\u6d4b\u7ed3\u679c', '\u76f8\u673a\u5b9e\u65f6 / \u56de\u653e', '\u7f3a\u9677\u62a5\u8868'],
+    requiredText: ['\u5317\u6ee1\u7279\u94a2\u5c0f\u68d2\u68c0\u6d4b\u7cfb\u7edf', '\u5728\u7ebf\u76d1\u6d4b', '\u5b9e\u65f6/\u56de\u653e', '\u7f3a\u9677\u62a5\u8868'],
     clickSelector: '[data-testid="receiver-status-button"]',
+    closeClickSelector: '[data-testid="receiver-status-button"]',
     afterClickText: ['\u62a5\u7ea7\u5668\u7f51\u53e3\u8be6\u7ec6\u4fe1\u606f', '\u5b9e\u65f6\u4e0a\u4f20', '\u5b9e\u65f6\u4e0b\u8f7d', '\u5e26\u5bbd\u76d1\u63a7', 'Windows \u7f51\u5361\u5b9e\u65f6\u6536\u53d1\u901f\u7387'],
     requiredExpressions: [
       '(() => { const text = document.body ? document.body.innerText : ""; return text.includes("Windows \u7f51\u5361\u5b9e\u65f6\u6536\u53d1\u901f\u7387") && !text.includes("network monitor pending") && !text.includes("network monitor offline") && !text.includes("/api/system/network \u79bb\u7ebf") && !text.includes("\u672a\u53d1\u73b0\u7f51\u5361") && !text.includes("\u4f30\u7b97\u7f51\u901f"); })()',
@@ -539,7 +578,7 @@ const bkvChecks = [
   },
 ];
 
-const checks = expectBkv ? bkvChecks : standardChecks;
+const checks = expectBkv ? bkvChecks : terminalOnly ? standardChecks.slice(0, 1) : standardChecks;
 
 await fs.mkdir(screenshotDir, { recursive: true });
 const cdp = await createCdpClient();
@@ -594,6 +633,7 @@ try {
   $env:STEEL_UI_SMOKE_VIEWPORT_WIDTH = [string]$ViewportWidth
   $env:STEEL_UI_SMOKE_VIEWPORT_HEIGHT = [string]$ViewportHeight
   $env:STEEL_UI_SMOKE_EXPECT_BKV = if ($ExpectBkv) { "1" } else { "0" }
+  $env:STEEL_UI_SMOKE_TERMINAL_ONLY = if ($TerminalOnly) { "1" } else { "0" }
 
   $Output = & node $NodePath 2>&1
   $ExitCode = $LASTEXITCODE
@@ -622,6 +662,8 @@ try {
   Remove-Item Env:\STEEL_UI_SMOKE_TIMEOUT_MS -ErrorAction SilentlyContinue
   Remove-Item Env:\STEEL_UI_SMOKE_VIEWPORT_WIDTH -ErrorAction SilentlyContinue
   Remove-Item Env:\STEEL_UI_SMOKE_VIEWPORT_HEIGHT -ErrorAction SilentlyContinue
+  Remove-Item Env:\STEEL_UI_SMOKE_EXPECT_BKV -ErrorAction SilentlyContinue
+  Remove-Item Env:\STEEL_UI_SMOKE_TERMINAL_ONLY -ErrorAction SilentlyContinue
 
   if ($BrowserProcess -and -not $BrowserProcess.HasExited) {
     Stop-Process -Id $BrowserProcess.Id -Force -ErrorAction SilentlyContinue
