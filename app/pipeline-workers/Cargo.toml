@@ -1,0 +1,17 @@
+[package]
+name = "steel-pipeline-workers"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "steel-image-worker"
+path = "src/main.rs"
+
+[[bin]]
+name = "steel-defect-worker"
+path = "src/main.rs"
+
+[dependencies]
+ctrlc = "3"
+serde_json = "1"
+steel-runtime-contract = { path = "../runtime-contract" }

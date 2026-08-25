@@ -10,5 +10,5 @@ $Args = @("build", "--manifest-path", (Join-Path $RepoRoot "app\algorithm-servic
 if ($Profile -eq "release") { $Args += "--release" }
 if ($Locked) { $Args += "--locked" }
 & cargo @Args
-if ($LASTEXITCODE -ne 0) { throw "algorithm service build failed with exit code $LASTEXITCODE" }
-Write-Host "Algorithm service built with $Profile profile."
+if ($LASTEXITCODE -ne 0) { throw "BKV image worker build failed with exit code $LASTEXITCODE" }
+Write-Host "Independent BKV image worker built with $Profile profile."

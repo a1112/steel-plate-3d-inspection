@@ -38,6 +38,12 @@ $ProtectedInputs = @(
   (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/client/src-tauri/Cargo.lock'),
   (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/service/Cargo.lock'),
   (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/trigger/Cargo.lock'),
+  (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/camera-worker/Cargo.lock'),
+  (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/result-contract/Cargo.lock'),
+  (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/pipeline-workers/Cargo.lock'),
+  (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/runtime-contract/Cargo.lock'),
+  (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/image-service/Cargo.lock'),
+  (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/tray/Cargo.lock'),
   (Join-Path $PSScriptRoot 'generate-release-sbom.ps1'),
   (Join-Path $PSScriptRoot 'verify-release-sbom.ps1'),
   (Join-Path $PSScriptRoot 'release-sbom-common.ps1')

@@ -10,6 +10,10 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$AlgorithmAcceptanceReport,
   [Parameter(Mandatory = $true)]
+  [string]$SickCaptureProfile,
+  [Parameter(Mandatory = $true)]
+  [string]$PythonExecutable,
+  [Parameter(Mandatory = $true)]
   [ValidatePattern('^[0-9A-Fa-f]{40}$')]
   [string]$ExpectedFirstPartyThumbprint,
   [Parameter(Mandatory = $true)]
@@ -71,6 +75,8 @@ if ($InstallRoot -eq [System.IO.Path]::GetPathRoot($InstallRoot).TrimEnd('\', '/
 $ReleasesRoot = Join-Path $InstallRoot 'releases'
 $SecretEnvFile = (Resolve-Path -LiteralPath $SecretEnvFile).Path
 $AlgorithmAcceptanceReport = (Resolve-Path -LiteralPath $AlgorithmAcceptanceReport).Path
+$SickCaptureProfile = (Resolve-Path -LiteralPath $SickCaptureProfile).Path
+$PythonExecutable = (Resolve-Path -LiteralPath $PythonExecutable).Path
 $ExpectedFirstPartyThumbprint = $ExpectedFirstPartyThumbprint.ToUpperInvariant()
 $NormalizedVendorSignerThumbprints = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 foreach ($Thumbprint in $AllowedVendorSdkSignerThumbprints) {
@@ -99,14 +105,14 @@ if ($StateRoot -eq [System.IO.Path]::GetPathRoot($StateRoot).TrimEnd('\', '/') -
     (Test-PathsOverlap -Left $StateRoot -Right $InstallRoot)) {
   throw "StateRoot must be a non-root path that does not overlap the source package or InstallRoot."
 }
-foreach ($ExternalPolicyPath in @($SecretEnvFile, $AlgorithmAcceptanceReport)) {
+foreach ($ExternalPolicyPath in @($SecretEnvFile, $AlgorithmAcceptanceReport, $SickCaptureProfile, $PythonExecutable)) {
   if ($ExternalPolicyPath.Equals($SourcePackageRootBoundary, [System.StringComparison]::OrdinalIgnoreCase) -or
       $ExternalPolicyPath.StartsWith($SourcePackageRootBoundary + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
       $ExternalPolicyPath.Equals($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
       $ExternalPolicyPath.StartsWith($InstallRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
       $ExternalPolicyPath.Equals($StateRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
       $ExternalPolicyPath.StartsWith($StateRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "SecretEnvFile and AlgorithmAcceptanceReport must be outside the source package, InstallRoot, and StateRoot: $ExternalPolicyPath"
+    throw "SecretEnvFile, AlgorithmAcceptanceReport, SickCaptureProfile, and PythonExecutable must be outside the source package, InstallRoot, and StateRoot: $ExternalPolicyPath"
   }
 }
 $RuntimeRoot = $SourcePackageRoot
@@ -117,6 +123,7 @@ $StateConfigDir = Join-Path $StateRoot "config"
 $RuntimeEnvFile = Join-Path $StateConfigDir "runtime-service.env"
 $StateServiceDir = Join-Path $StateRoot "service"
 $StateCaptureConfigDir = Join-Path $StateRoot "capture-config"
+$InstalledSickCaptureProfile = Join-Path $StateCaptureConfigDir "production-sick-profile.json"
 $StateLogsDir = Join-Path $StateRoot "logs"
 $StateDeploymentDir = Join-Path $StateRoot "deployment"
 $ReportArchiveRoot = Join-Path $StateRoot "reports\inspection"
@@ -127,6 +134,9 @@ $DeploymentBackupsDir = Join-Path $StateDeploymentDir "backups"
 $AlgorithmCalibrationTemplate = Join-Path $CaptureConfigTemplate "calibrations\current-8-time-trigger\ArrayCalibration.xml"
 $AlgorithmCalibration = Join-Path $StateCaptureConfigDir "calibrations\current-8-time-trigger\ArrayCalibration.xml"
 $AlgorithmScript = Join-Path $SourcePackageRoot "scripts\bar_surface_reconstruct.py"
+$SickCaptureScript = Join-Path $SourcePackageRoot "scripts\sick_capture_service.py"
+$SickAlgorithmScript = Join-Path $SourcePackageRoot "scripts\sick_flow_analysis_service.py"
+$SickCapturePackage = Join-Path $SourcePackageRoot "scripts\sick_capture"
 $AlgorithmCore = Join-Path $SourcePackageRoot "algorithm-core\steel_bar_surface_core.exe"
 $AlgorithmAcceptanceValidator = Join-Path $SourcePackageRoot "test-algorithm-acceptance-report.ps1"
 $DatabaseContractValidator = Join-Path $SourcePackageRoot "verify-database-migration-contract.ps1"
@@ -1108,15 +1118,15 @@ function Assert-ReleasePackageIntegrity {
     throw "Release package catalog signature or trusted timestamp is invalid: $($CatalogSignature.Status)"
   }
   $ExpectedRuntimePaths = @(
-    'capture-headless/steel_capture_service.exe',
+    'service/steel-capture-service.exe',
     'service/steel-runtime-supervisor.exe',
     'service/steel-inspection-service.exe',
     'service/steel-trigger-gateway.exe',
     'service/steel-image-service.exe',
-    'service/steel-algorithm-service.exe',
+    'service/steel-image-worker.exe',
+    'service/steel-defect-worker.exe',
     'service/steel-inspection-tray.exe',
-    'algorithm-core/steel_bar_surface_core.exe',
-    'capture-headless/nvt_lvm_sdk.dll'
+    'algorithm-core/steel_bar_surface_core.exe'
   )
   $RuntimeEvidence = @($Manifest.service.signatures)
   if ($RuntimeEvidence.Count -ne $ExpectedRuntimePaths.Count) {
@@ -1137,11 +1147,7 @@ function Assert-ReleasePackageIntegrity {
       throw "Runtime artifact signature or trusted timestamp is invalid: $RelativePath ($($Signature.Status))"
     }
     $ArtifactSignerThumbprint = ([string]$Signature.SignerCertificate.Thumbprint).ToUpperInvariant()
-    if ($RelativePath -eq 'capture-headless/nvt_lvm_sdk.dll') {
-      if (-not $VendorSignerThumbprints.Contains($ArtifactSignerThumbprint)) {
-        throw "Vendor SDK signer is not in the out-of-band allowlist: $RelativePath"
-      }
-    } elseif ($ArtifactSignerThumbprint -cne $FirstPartyThumbprint) {
+    if ($ArtifactSignerThumbprint -cne $FirstPartyThumbprint) {
       throw "First-party runtime signer does not match ExpectedFirstPartyThumbprint: $RelativePath"
     }
   }
@@ -1157,10 +1163,63 @@ function Assert-ReleasePackageIntegrity {
 if (-not (Test-Path -LiteralPath $Supervisor -PathType Leaf)) {
   throw "Missing runtime supervisor: $Supervisor"
 }
-foreach ($RequiredFile in @($AlgorithmConfig, $AlgorithmCalibrationTemplate, $AlgorithmScript, $AlgorithmCore, $AlgorithmAcceptanceValidator, $DatabaseContractValidator, $PackageManifestPath, $IntegrityCatalogPath)) {
+foreach ($RequiredFile in @($AlgorithmConfig, $AlgorithmCalibrationTemplate, $AlgorithmScript, $SickCaptureScript, $SickAlgorithmScript, $AlgorithmCore, $AlgorithmAcceptanceValidator, $DatabaseContractValidator, $PackageManifestPath, $IntegrityCatalogPath, $SickCaptureProfile, $PythonExecutable)) {
   if (-not (Test-Path -LiteralPath $RequiredFile -PathType Leaf)) {
     throw "Missing immutable runtime release dependency: $RequiredFile"
   }
+}
+if (-not (Test-Path -LiteralPath $SickCapturePackage -PathType Container)) {
+  throw "Missing packaged SICK capture Python package: $SickCapturePackage"
+}
+$SickProfilePayload = Get-Content -LiteralPath $SickCaptureProfile -Raw -Encoding utf8 | ConvertFrom-Json
+if ([string]$SickProfilePayload.schema -cnotin @('steel.capture.profile.v1', 'steel.capture.profile.v2') -or
+    [string]$SickProfilePayload.driverMode -cne 'sick-gentl' -or
+    [int]$SickProfilePayload.expectedCameras -le 0) {
+  throw 'SickCaptureProfile must describe a non-empty steel.capture.profile SICK GenTL camera set.'
+}
+if ($SickProfilePayload.captureDefaults.defectDetectionEnabled -ne $true) {
+  throw 'The formal real-camera profile must enable defect detection.'
+}
+$RequiredSickProfileFiles = @(
+  [string]$SickProfilePayload.sick.ctiPath,
+  [string]$SickProfilePayload.captureDefaults.arrayCalibrationPath,
+  [string]$SickProfilePayload.captureDefaults.defectModelManifestPath,
+  [string]$SickProfilePayload.captureDefaults.defectModel2dPath,
+  [string]$SickProfilePayload.captureDefaults.defectModel3dPath,
+  [string]$SickProfilePayload.captureDefaults.defectClassifier2dPath,
+  [string]$SickProfilePayload.captureDefaults.defectClassifier3dPath
+)
+foreach ($ProfileFile in $RequiredSickProfileFiles) {
+  if ([string]::IsNullOrWhiteSpace($ProfileFile) -or
+      -not [System.IO.Path]::IsPathRooted($ProfileFile) -or
+      -not (Test-Path -LiteralPath $ProfileFile -PathType Leaf)) {
+    throw "Every formal SICK CTI, calibration, and defect-model path must be an existing absolute file: $ProfileFile"
+  }
+}
+$SickCtiPath = [string]$SickProfilePayload.sick.ctiPath
+$SickCtiSignature = Get-AuthenticodeSignature -LiteralPath $SickCtiPath
+if ($SickCtiSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+    $null -eq $SickCtiSignature.SignerCertificate -or
+    -not $NormalizedVendorSignerThumbprints.Contains(([string]$SickCtiSignature.SignerCertificate.Thumbprint).ToUpperInvariant())) {
+  throw 'The formal SICK GenTL CTI must have a valid Authenticode signature from the out-of-band vendor signer allowlist.'
+}
+foreach ($Camera in @($SickProfilePayload.cameras)) {
+  $CameraStorage = [string]$Camera.storageRoot
+  if ([string]::IsNullOrWhiteSpace($CameraStorage) -or
+      -not [System.IO.Path]::IsPathRooted($CameraStorage) -or
+      -not (Test-Path -LiteralPath $CameraStorage -PathType Container)) {
+    throw "Every formal SICK camera storageRoot must be an existing absolute directory: $CameraStorage"
+  }
+}
+$PreviousPythonPath = $env:PYTHONPATH
+try {
+  $env:PYTHONPATH = Join-Path $SourcePackageRoot 'scripts'
+  & $PythonExecutable -c 'import sys, harvesters, numpy, PIL, onnxruntime; from sick_capture.profile import load_profile; load_profile(sys.argv[1])' $SickCaptureProfile 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw 'PythonExecutable does not provide the required SICK capture and defect runtime modules.'
+  }
+} finally {
+  if ($null -eq $PreviousPythonPath) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $PreviousPythonPath }
 }
 if ($StorageMinFreePercent -le 0 -or $StorageMinFreePercent -gt 100) {
   throw "StorageMinFreePercent must be within (0, 100]."
@@ -1354,7 +1413,8 @@ $RequiredStateDirectories = @(
   (Join-Path $StateRoot 'work\trigger'),
   (Join-Path $StateRoot 'work\service'),
   (Join-Path $StateRoot 'work\image'),
-  (Join-Path $StateRoot 'work\algorithm'),
+  (Join-Path $StateRoot 'work\image-worker'),
+  (Join-Path $StateRoot 'work\defect-worker'),
   (Join-Path $StateRoot 'result-data'),
   (Join-Path $StateRoot 'algorithm-input')
 )
@@ -1385,6 +1445,12 @@ Assert-ExistingStateTreeTrust -Path $StateRoot
 if (-not (Test-Path -LiteralPath $AlgorithmCalibration -PathType Leaf)) {
   throw "Mutable StateRoot is missing the qualified production calibration: $AlgorithmCalibration"
 }
+if (Test-Path -LiteralPath $InstalledSickCaptureProfile -PathType Leaf) {
+  Set-TrustedPathAcl -Path $InstalledSickCaptureProfile -Mode Mutable
+}
+Copy-Item -LiteralPath $SickCaptureProfile -Destination $InstalledSickCaptureProfile -Force
+Set-TrustedPathAcl -Path $InstalledSickCaptureProfile -Mode PolicyReadOnly
+Assert-TrustedPathAcl -Path $InstalledSickCaptureProfile -Mode PolicyReadOnly
 $RuntimeEnvAtomicNamePattern = '^\.' + [regex]::Escape([System.IO.Path]::GetFileName($RuntimeEnvFile)) + '\.[0-9a-f]{32}\.(?:tmp|replace\.bak)$'
 foreach ($AtomicArtifact in @(Get-ChildItem -LiteralPath $StateConfigDir -File -Force | Where-Object { $_.Name -match $RuntimeEnvAtomicNamePattern })) {
   Assert-NotReparsePoint -Path $AtomicArtifact.FullName
@@ -1688,6 +1754,9 @@ try {
   $AlgorithmConfig = Join-Path $RuntimeRoot 'config\algorithm\bar-surface-production.json'
   $CaptureConfigTemplate = Join-Path $RuntimeRoot 'config\capture'
   $AlgorithmScript = Join-Path $RuntimeRoot 'scripts\bar_surface_reconstruct.py'
+  $SickCaptureScript = Join-Path $RuntimeRoot 'scripts\sick_capture_service.py'
+  $SickAlgorithmScript = Join-Path $RuntimeRoot 'scripts\sick_flow_analysis_service.py'
+  $SickCapturePackage = Join-Path $RuntimeRoot 'scripts\sick_capture'
   $AlgorithmCore = Join-Path $RuntimeRoot 'algorithm-core\steel_bar_surface_core.exe'
   $AlgorithmAcceptanceValidator = Join-Path $RuntimeRoot 'test-algorithm-acceptance-report.ps1'
   $PackageManifestPath = Join-Path $RuntimeRoot 'manifest.json'
@@ -1709,9 +1778,14 @@ $RuntimeEnvironment = @(
   "STEEL_RESULT_PROXY_ONLY=1",
   "STEEL_CAPTURE_MANAGED_BY_SUPERVISOR=1",
   "STEEL_IMAGE_SERVICE_PORT=4874",
-  "STEEL_ALGORITHM_SERVICE_PORT=4875",
+  "STEEL_IMAGE_WORKER_PORT=4875",
+  "STEEL_DEFECT_WORKER_PORT=4876",
+  "STEEL_IMAGE_WORKER_ORIGIN=http://127.0.0.1:4875",
+  "STEEL_DEFECT_WORKER_ORIGIN=http://127.0.0.1:4876",
+  "STEEL_SICK_CAPTURE_PROFILE=$InstalledSickCaptureProfile",
+  "STEEL_PYTHON_EXECUTABLE=$PythonExecutable",
   "STEEL_ALGORITHM_INPUT_ROOTS=$StateRoot\algorithm-input",
-  "STEEL_CAPTURE_PROVIDER=headless-cpp",
+  "STEEL_CAPTURE_PROVIDER=external-api",
   "CAPTURE_SERVICE_ORIGIN=http://127.0.0.1:4317",
   "STEEL_CAPTURE_SERVICE_AUTOSTART=1",
   "STEEL_CAPTURE_RESTART_BUDGET=5",
@@ -1768,7 +1842,7 @@ $BinaryPath = Get-RuntimeServiceBinaryPath -ReleaseRoot $RuntimeRoot -StateRoot 
       (Get-Service -Name $ServiceName).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(120))
     }
   } else {
-    foreach ($Port in 4317, 4873, 4874, 4875, 4881, 4882, 4883) { Assert-PortFree -Port $Port }
+    foreach ($Port in 4317, 4873, 4874, 4875, 4876, 4881, 4882, 4883) { Assert-PortFree -Port $Port }
     $ServiceMutationStarted = $true
   }
   Set-DeploymentJournalPhase -Journal $DeploymentJournal -Phase 'service-stopped' -Path $DeploymentJournalPath -Detail 'The prior service is stopped, or no prior service existed.'

@@ -115,6 +115,15 @@ class SickFlowAnalysisServiceTests(unittest.TestCase):
                 "region": region_path(root, material_id),
                 "playback": playback_index_path(root, material_id),
             }
+            flow_manifest = flow_manifest_path(root, material_id)
+            flow_manifest.parent.mkdir(parents=True, exist_ok=True)
+            flow_manifest.write_text(
+                json.dumps({"schema": "steel.flow-storage.v2", "flowId": material_id}),
+                encoding="utf-8",
+            )
+            for path in paths.values():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
             with (
                 patch.object(
                     service,
@@ -166,9 +175,6 @@ class SickFlowAnalysisServiceTests(unittest.TestCase):
                 ),
                 signature,
             )
-            for path in paths.values():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("{}", encoding="utf-8")
             self.assertTrue(
                 service.fast_artifacts_ready(root, material_id, signature)
             )

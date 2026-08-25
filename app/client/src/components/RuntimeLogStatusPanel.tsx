@@ -7,9 +7,11 @@ import {
   type AdminRuntimeService,
 } from '../services/inspection-api';
 import { Panel } from './Panel';
-import algorithmServiceIcon from '../assets/service-icons/algorithm-service.png';
+import bkvAdapterIcon from '../assets/service-icons/bkv-adapter.png';
 import captureServiceIcon from '../assets/service-icons/capture-service.png';
+import defectWorkerIcon from '../assets/service-icons/defect-worker.png';
 import imageServiceIcon from '../assets/service-icons/image-service.png';
+import imageWorkerIcon from '../assets/service-icons/image-worker.png';
 import inspectionServiceIcon from '../assets/service-icons/inspection-service.png';
 import runtimeSupervisorIcon from '../assets/service-icons/runtime-supervisor.png';
 import triggerGatewayIcon from '../assets/service-icons/trigger-gateway.png';
@@ -17,7 +19,9 @@ import triggerGatewayIcon from '../assets/service-icons/trigger-gateway.png';
 const SERVICE_ICON_BY_ID: Record<string, string> = {
   inspection: inspectionServiceIcon,
   image: imageServiceIcon,
-  algorithm: algorithmServiceIcon,
+  'image-worker': imageWorkerIcon,
+  'defect-worker': defectWorkerIcon,
+  'bkv-adapter': bkvAdapterIcon,
   capture: captureServiceIcon,
   trigger: triggerGatewayIcon,
   supervisor: runtimeSupervisorIcon,
@@ -67,7 +71,13 @@ function logTitle(log: AdminRuntimeLogFile) {
     return '运行宿主';
   }
   if (log.name.includes('algorithm')) {
-    return '算法服务';
+    return 'BKV 兼容适配器';
+  }
+  if (log.name.includes('defect-worker')) {
+    return '缺陷识别 Worker';
+  }
+  if (log.name.includes('image-worker')) {
+    return '图像处理 Worker';
   }
   if (log.name.includes('image')) {
     return '图像服务';

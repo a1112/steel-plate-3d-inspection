@@ -603,7 +603,13 @@ function Get-ReleaseSbomExpectedModel {
     [ordered]@{ id = 'npm-client'; path = 'app/client/package-lock.json'; kind = 'npm' },
     [ordered]@{ id = 'cargo-tauri'; path = 'app/client/src-tauri/Cargo.lock'; kind = 'cargo' },
     [ordered]@{ id = 'cargo-service'; path = 'app/service/Cargo.lock'; kind = 'cargo' },
-    [ordered]@{ id = 'cargo-trigger'; path = 'app/trigger/Cargo.lock'; kind = 'cargo' }
+    [ordered]@{ id = 'cargo-trigger'; path = 'app/trigger/Cargo.lock'; kind = 'cargo' },
+    [ordered]@{ id = 'cargo-camera-worker'; path = 'app/camera-worker/Cargo.lock'; kind = 'cargo' },
+    [ordered]@{ id = 'cargo-result-contract'; path = 'app/result-contract/Cargo.lock'; kind = 'cargo' },
+    [ordered]@{ id = 'cargo-pipeline-workers'; path = 'app/pipeline-workers/Cargo.lock'; kind = 'cargo' },
+    [ordered]@{ id = 'cargo-runtime-contract'; path = 'app/runtime-contract/Cargo.lock'; kind = 'cargo' },
+    [ordered]@{ id = 'cargo-image-service'; path = 'app/image-service/Cargo.lock'; kind = 'cargo' },
+    [ordered]@{ id = 'cargo-tray'; path = 'app/tray/Cargo.lock'; kind = 'cargo' }
   )
   $InputEvidence = @()
   $CargoRecords = @()
@@ -683,22 +689,17 @@ function Get-ReleaseSbomExpectedModel {
   $CommonSha256 = Get-Sha256Hex $CommonPath
 
   $RootRef = "application:$($NpmInventory.rootName)@$($NpmInventory.rootVersion):$($Commit.Substring(0, 12))"
+  $InputProperties = @($InputEvidence | ForEach-Object {
+    [ordered]@{ name = "steel.input.$($_.id).path"; value = [string]$_.path },
+    [ordered]@{ name = "steel.input.$($_.id).sha256"; value = [string]$_.sha256 }
+  })
   $Properties = @(
     [ordered]@{ name = 'steel.sbom.schema'; value = $script:SteelSbomSchema },
     [ordered]@{ name = 'steel.generator.version'; value = $script:SteelSbomGeneratorVersion },
     [ordered]@{ name = 'steel.source.gitCommit'; value = $Commit },
     [ordered]@{ name = 'steel.source.dirty'; value = ([string][bool]$Dirty).ToLowerInvariant() },
-    [ordered]@{ name = 'steel.source.commitTimestamp'; value = $CommitTimestamp },
-    [ordered]@{ name = 'steel.input.npm-client.path'; value = 'app/client/package-lock.json' },
-    [ordered]@{ name = 'steel.input.npm-client.sha256'; value = [string](@($InputEvidence | Where-Object { $_.id -eq 'npm-client' })[0].sha256) },
-    [ordered]@{ name = 'steel.input.cargo-tauri.path'; value = 'app/client/src-tauri/Cargo.lock' },
-    [ordered]@{ name = 'steel.input.cargo-tauri.sha256'; value = [string](@($InputEvidence | Where-Object { $_.id -eq 'cargo-tauri' })[0].sha256) },
-    [ordered]@{ name = 'steel.input.cargo-service.path'; value = 'app/service/Cargo.lock' },
-    [ordered]@{ name = 'steel.input.cargo-service.sha256'; value = [string](@($InputEvidence | Where-Object { $_.id -eq 'cargo-service' })[0].sha256) },
-    [ordered]@{ name = 'steel.input.cargo-trigger.path'; value = 'app/trigger/Cargo.lock' },
-    [ordered]@{ name = 'steel.input.cargo-trigger.sha256'; value = [string](@($InputEvidence | Where-Object { $_.id -eq 'cargo-trigger' })[0].sha256) },
-    [ordered]@{ name = 'steel.input.external-components.path'; value = [string](@($InputEvidence | Where-Object { $_.id -eq 'external-components' })[0].path) },
-    [ordered]@{ name = 'steel.input.external-components.sha256'; value = [string]$ExternalInventory.sha256 },
+    [ordered]@{ name = 'steel.source.commitTimestamp'; value = $CommitTimestamp }
+  ) + $InputProperties + @(
     [ordered]@{ name = 'steel.tool.generate.sha256'; value = $GeneratorSha256 },
     [ordered]@{ name = 'steel.tool.verify.sha256'; value = $VerifierSha256 },
     [ordered]@{ name = 'steel.tool.common.sha256'; value = $CommonSha256 },

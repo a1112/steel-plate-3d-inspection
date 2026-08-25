@@ -5058,6 +5058,18 @@ fn algorithm_calibration_binding_valid(report: &Value, calibration: &Value) -> b
             .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
 }
 
+fn external_worker_ready(response: &CaptureProxyResponse, expected_service: &str) -> bool {
+    if response.status_code != 200 {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&response.body)
+        .ok()
+        .is_some_and(|payload| {
+            payload.get("service").and_then(Value::as_str) == Some(expected_service)
+                && payload.get("ready").and_then(Value::as_bool) == Some(true)
+        })
+}
+
 fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
     if env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1") {
         let image = bounded_health_http_get(
@@ -5065,24 +5077,56 @@ fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
             "/api/health/live",
             Duration::from_millis(800),
         );
-        let algorithm = bounded_health_http_get(
-            "http://127.0.0.1:4875",
-            "/api/health/live",
-            Duration::from_millis(800),
-        );
         let image_ok = image.as_ref().is_ok_and(|response| {
             response.status_code == 200
                 && String::from_utf8_lossy(&response.body).contains("steel-image-service")
         });
-        let algorithm_ok = algorithm.as_ref().is_ok_and(|response| {
-            response.status_code == 200
-                && String::from_utf8_lossy(&response.body).contains("steel-algorithm-service")
+        let bkv_mode = state.capture.provider == CaptureProvider::Bkv;
+        let image_worker_origin = if bkv_mode {
+            env::var("STEEL_BKV_IMAGE_WORKER_ORIGIN")
+                .unwrap_or_else(|_| "http://127.0.0.1:4877".to_string())
+        } else {
+            env::var("STEEL_IMAGE_WORKER_ORIGIN")
+                .or_else(|_| env::var("STEEL_ALGORITHM_SERVICE_ORIGIN"))
+                .unwrap_or_else(|_| "http://127.0.0.1:4875".to_string())
+        };
+        let image_worker = bounded_health_http_get(
+            &image_worker_origin,
+            "/api/health/live",
+            Duration::from_millis(800),
+        );
+        let expected_image_worker = if bkv_mode {
+            "steel-image-worker-bkv"
+        } else {
+            "steel-image-worker"
+        };
+        let image_worker_ok = image_worker
+            .as_ref()
+            .is_ok_and(|response| external_worker_ready(response, expected_image_worker));
+        let defect_worker_origin = env::var("STEEL_DEFECT_WORKER_ORIGIN")
+            .unwrap_or_else(|_| "http://127.0.0.1:4876".to_string());
+        let defect_worker = (!bkv_mode).then(|| {
+            bounded_health_http_get(
+                &defect_worker_origin,
+                "/api/health/live",
+                Duration::from_millis(800),
+            )
         });
+        let defect_worker_ok = bkv_mode
+            || defect_worker.as_ref().is_some_and(|result| {
+                result
+                    .as_ref()
+                    .is_ok_and(|response| external_worker_ready(response, "steel-defect-worker"))
+            });
         let result_root = env::var("STEEL_RESULT_ROOT").ok().map(PathBuf::from);
         let result_ready = result_root
             .as_ref()
             .is_some_and(|root| root.join("catalog.db").is_file());
-        let ready = image_ok && algorithm_ok && result_ready;
+        let result_required = bkv_mode;
+        let ready = image_ok
+            && image_worker_ok
+            && defect_worker_ok
+            && (!result_required || result_ready);
         return (
             ready,
             json!({
@@ -5091,9 +5135,10 @@ fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
                 "status": if ready { "external-processing-services-ready" } else { "external-processing-services-not-ready" },
                 "required": true,
                 "imageService": { "ok": image_ok, "origin": "http://127.0.0.1:4874" },
-                "algorithmService": { "ok": algorithm_ok, "origin": "http://127.0.0.1:4875" },
+                "imageWorker": { "ok": image_worker_ok, "origin": image_worker_origin, "bkvAdapter": bkv_mode },
+                "defectWorker": { "ok": defect_worker_ok, "origin": if bkv_mode { Value::Null } else { json!(defect_worker_origin) }, "required": !bkv_mode },
                 "resultStore": { "ok": result_ready, "root": result_root },
-                "reason": if !image_ok { json!("image_service_unavailable") } else if !algorithm_ok { json!("algorithm_service_unavailable") } else if !result_ready { json!("unified_result_catalog_unavailable") } else { Value::Null }
+                "reason": if !image_ok { json!("image_service_unavailable") } else if !image_worker_ok { json!("image_worker_unavailable") } else if !defect_worker_ok { json!("defect_worker_unavailable") } else if result_required && !result_ready { json!("unified_result_catalog_unavailable") } else { Value::Null }
             }),
         );
     }
@@ -6415,9 +6460,16 @@ fn is_sick_algorithm_reprocess_route(method: &str, path: &str) -> bool {
         )
 }
 
-fn sick_algorithm_reprocess_response(body: &str) -> Vec<u8> {
-    let origin = env::var("STEEL_ALGORITHM_SERVICE_ORIGIN")
-        .unwrap_or_else(|_| "http://127.0.0.1:4875".to_string());
+fn sick_algorithm_reprocess_response(path: &str, body: &str) -> Vec<u8> {
+    let defect_stage = path == "/api/capture/defects/rebuild";
+    let origin = if defect_stage {
+        env::var("STEEL_DEFECT_WORKER_ORIGIN")
+            .unwrap_or_else(|_| "http://127.0.0.1:4876".to_string())
+    } else {
+        env::var("STEEL_IMAGE_WORKER_ORIGIN")
+            .or_else(|_| env::var("STEEL_ALGORITHM_SERVICE_ORIGIN"))
+            .unwrap_or_else(|_| "http://127.0.0.1:4875".to_string())
+    };
     match bounded_local_http_request(
         &origin,
         "POST",
@@ -6437,7 +6489,7 @@ fn sick_algorithm_reprocess_response(body: &str) -> Vec<u8> {
             "application/json; charset=utf-8",
             &json!({
                 "code": 503,
-                "error": "algorithm_service_unavailable",
+                "error": if defect_stage { "defect_worker_unavailable" } else { "image_worker_unavailable" },
                 "detail": format!("{error:?}"),
             })
             .to_string(),
@@ -7932,6 +7984,26 @@ fn runtime_log_status_json(state: &ServiceState) -> String {
         }),
     };
 
+    let bkv_mode = state.capture.provider == CaptureProvider::Bkv;
+    let processing_worker = if bkv_mode {
+        runtime_log_service_probe(
+            "bkv-adapter",
+            "BKV 历史适配器",
+            "http://127.0.0.1:4877",
+            4877,
+            "/api/health/live",
+            true,
+        )
+    } else {
+        runtime_log_service_probe(
+            "image-worker",
+            "图像 Worker",
+            "http://127.0.0.1:4875",
+            4875,
+            "/api/health/live",
+            true,
+        )
+    };
     let services = vec![
         json!({
             "id": "inspection",
@@ -7952,13 +8024,14 @@ fn runtime_log_status_json(state: &ServiceState) -> String {
             "/api/health/live",
             true,
         ),
+        processing_worker,
         runtime_log_service_probe(
-            "algorithm",
-            "算法服务",
-            "http://127.0.0.1:4875",
-            4875,
+            "defect-worker",
+            "缺陷 Worker",
+            "http://127.0.0.1:4876",
+            4876,
             "/api/health/live",
-            true,
+            !bkv_mode,
         ),
         runtime_log_service_probe(
             "capture",
@@ -7966,7 +8039,7 @@ fn runtime_log_status_json(state: &ServiceState) -> String {
             "http://127.0.0.1:4317",
             4317,
             "/health",
-            false,
+            !bkv_mode,
         ),
         runtime_log_service_probe(
             "trigger",
@@ -7981,7 +8054,7 @@ fn runtime_log_status_json(state: &ServiceState) -> String {
         .iter()
         .filter(|service| service.get("required").and_then(Value::as_bool) == Some(true))
         .all(|service| service.get("ok").and_then(Value::as_bool) == Some(true));
-    let required_ready = services_ready && catalog_ready;
+    let required_ready = services_ready && (!bkv_mode || catalog_ready);
 
     let mut logs = Vec::new();
     if let Ok(entries) = fs::read_dir(&log_root) {
@@ -16938,8 +17011,10 @@ fn bkv_online_unified_status_value(state: &ServiceState) -> Result<Value, String
         .records_page(None, None, record_limit as u64, 0)
         .map_err(|error| error.to_string())?;
 
+    let bkv_worker_origin = env::var("STEEL_BKV_IMAGE_WORKER_ORIGIN")
+        .unwrap_or_else(|_| "http://127.0.0.1:4877".to_string());
     let algorithm_status = bounded_local_http_request(
-        "http://127.0.0.1:4875",
+        &bkv_worker_origin,
         "GET",
         "/internal/v1/status",
         "",
@@ -17329,8 +17404,8 @@ fn current_bkv_defect_types(state: &ServiceState) -> Vec<Value> {
         }
     }
 
-    let origin = env::var("STEEL_ALGORITHM_SERVICE_ORIGIN")
-        .unwrap_or_else(|_| "http://127.0.0.1:4875".to_string());
+    let origin = env::var("STEEL_BKV_IMAGE_WORKER_ORIGIN")
+        .unwrap_or_else(|_| "http://127.0.0.1:4877".to_string());
     let fetched = bounded_health_http_get(
         &origin,
         "/internal/v1/defect-types",
@@ -17585,9 +17660,10 @@ static HISTORICAL_RECONSTRUCTIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::
 
 fn request_historical_reconstruction(state: &ServiceState, record_id: &str) -> Result<(), String> {
     if env::var("STEEL_HISTORY_RECONSTRUCTION").as_deref() == Ok("0")
+        || state.capture.provider != CaptureProvider::Bkv
         || !unified_result_store_enabled(state)
     {
-        return Err("historical reconstruction is disabled".to_string());
+        return Err("BKV historical image reconstruction is disabled".to_string());
     }
     let Some(store) = state.standard_record_store.as_ref() else {
         return Err("converted record store unavailable".to_string());
@@ -17599,8 +17675,8 @@ fn request_historical_reconstruction(state: &ServiceState, record_id: &str) -> R
     {
         return Err(format!("converted inspection {record_id} not found"));
     }
-    let origin = env::var("STEEL_ALGORITHM_SERVICE_ORIGIN")
-        .unwrap_or_else(|_| "http://127.0.0.1:4875".to_string());
+    let origin = env::var("STEEL_BKV_IMAGE_WORKER_ORIGIN")
+        .unwrap_or_else(|_| "http://127.0.0.1:4877".to_string());
     let body = json!({"recordId": record_id}).to_string();
     let timeout = Duration::from_secs(
         env::var("STEEL_HISTORY_RECONSTRUCTION_TIMEOUT_SEC")
@@ -18137,8 +18213,9 @@ fn inspection_world_meta_response(state: &ServiceState, query: &str) -> Vec<u8> 
             Ok(converted) => Ok(converted),
             Err(initial_error) => {
                 // Historical recovery initially publishes metadata only.  A
-                // record switch must be able to promote that record through
-                // the algorithm service before the canvas asks for tiles.
+                // record switch may ask the isolated BKV adapter to materialize
+                // historical image tiles. Defect facts remain imported from BKV
+                // and are never inferred by this compatibility path.
                 if request_historical_reconstruction(state, &record_id).is_ok() {
                     load_converted_inspection_world(state, &record_id)
                 } else {
@@ -18466,10 +18543,10 @@ fn inspection_world_defects_response(state: &ServiceState, query: &str) -> Vec<u
         let converted = match load_converted_inspection_world(state, &record_id) {
             Ok(converted) => Ok(converted),
             Err(initial_error) => {
-                // Let the algorithm service materialize a historical BKV
-                // record when its metadata exists but no image artifact has
-                // been published yet.  The fallback below still preserves
-                // defect facts if the source share is unavailable.
+                // Let the isolated BKV adapter materialize historical image
+                // tiles when metadata exists but no image artifact has been
+                // published yet. The fallback below preserves imported defect
+                // facts; this path never runs defect inference.
                 if request_historical_reconstruction(state, &record_id).is_ok() {
                     load_converted_inspection_world(state, &record_id)
                 } else {
@@ -24894,7 +24971,7 @@ fn handle_client<S: Read + Write>(
             trigger_gateway_proxy_http_response(&state, method, raw_path, body, actor)
         }
         _ if is_sick_algorithm_reprocess_route(method, path) => {
-            sick_algorithm_reprocess_response(body)
+            sick_algorithm_reprocess_response(path, body)
         }
         _ if is_capture_json_proxy_route(method, path) => {
             capture_proxy_http_response(

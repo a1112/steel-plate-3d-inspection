@@ -95,8 +95,6 @@ $PackagedDatabaseMigrationIndexHash = (Get-FileHash -LiteralPath $PackagedDataba
   -IndexPath $PackagedDatabaseMigrationIndexPath | Out-String)
 
 $CaptureBuild = Join-Path $RepoRoot "target\capture\$Configuration"
-Copy-RequiredFile (Join-Path $CaptureBuild "steel_capture_service.exe") $CaptureOut
-Copy-RequiredFile (Join-Path $CaptureBuild "nvt_lvm_sdk.dll") $CaptureOut
 Copy-RequiredFile (Join-Path $CaptureBuild "steel_runtime_supervisor.exe") $ServiceOut
 Rename-Item -LiteralPath (Join-Path $ServiceOut "steel_runtime_supervisor.exe") -NewName "steel-runtime-supervisor.exe"
 
@@ -106,8 +104,11 @@ Copy-RequiredFile (Join-Path $ServiceBuild "steel-inspection-service.exe") $Serv
 $TriggerBuild = Join-Path $RepoRoot "target\trigger\$ServiceProfile"
 Copy-RequiredFile (Join-Path $TriggerBuild "steel-trigger-gateway.exe") $TriggerOut
 Copy-RequiredFile (Join-Path $TriggerBuild "steel-trigger-gateway.exe") $ServiceOut
-$AlgorithmServiceBuild = Join-Path $RepoRoot "target\algorithm-service\$ServiceProfile"
-Copy-RequiredFile (Join-Path $AlgorithmServiceBuild "steel-algorithm-service.exe") $ServiceOut
+$PipelineWorkerBuild = Join-Path $RepoRoot "target\pipeline-workers\$ServiceProfile"
+Copy-RequiredFile (Join-Path $PipelineWorkerBuild "steel-image-worker.exe") $ServiceOut
+Copy-RequiredFile (Join-Path $PipelineWorkerBuild "steel-defect-worker.exe") $ServiceOut
+$CameraWorkerBuild = Join-Path $RepoRoot "target\camera-worker\$ServiceProfile"
+Copy-RequiredFile (Join-Path $CameraWorkerBuild "steel-capture-service.exe") $ServiceOut
 $ImageServiceBuild = Join-Path $RepoRoot "target\image-service\$ServiceProfile"
 Copy-RequiredFile (Join-Path $ImageServiceBuild "steel-image-service.exe") $ServiceOut
 $TrayBuild = Join-Path $RepoRoot "target\tray\$ServiceProfile"
@@ -180,30 +181,40 @@ Copy-RequiredFile (Join-Path $RepoRoot "docs\release-deployment-and-operations.m
 Copy-RequiredFile (Join-Path $RepoRoot "docs\production-readiness-gap-and-closure-design.md") $DocsOut
 Copy-RequiredFile (Join-Path $RepoRoot "docs\atomic-upgrade-and-database-migration-design.md") $DocsOut
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\README.md") $ScriptsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\sick_capture_service.py") $ScriptsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\sick_flow_analysis_service.py") $ScriptsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\sick_capture_requirements.txt") $ScriptsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\requirements-sick-defect.txt") $ScriptsOut
+Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\sick_capture") -Destination $ScriptsOut -Recurse -Force
+Copy-RequiredFile (Join-Path $RepoRoot "docs\runtime-boundaries-v2.md") $DocsOut
+Copy-Item -LiteralPath (Join-Path $RepoRoot "models") -Destination $RuntimeRoot -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot "app\runtime-icons") -Destination $RuntimeRoot -Recurse -Force
 
 Write-RuntimeFile "run-capture-headless.ps1" @'
 param(
   [int]$Port = 4317,
-  [string]$StorageRoot = "H:\",
-  [string]$CameraStorageRoot = "H:\"
+  [Parameter(Mandatory = $true)]
+  [string]$CaptureProfile,
+  [Parameter(Mandatory = $true)]
+  [string]$PythonExecutable
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Exe = Join-Path $Root "capture-headless\steel_capture_service.exe"
+$Exe = Join-Path $Root "service\steel-capture-service.exe"
 
 if (-not (Test-Path $Exe -PathType Leaf)) {
   throw "Missing capture executable: $Exe"
 }
 
-$env:CAPTURE_STORAGE_ROOT = $StorageRoot
-$env:CAPTURE_CONFIG_ROOT = Join-Path $Root "config\capture"
-$env:CAPTURE_CAMERA_STORAGE_ROOT = $CameraStorageRoot
-New-Item -ItemType Directory -Force -Path $env:CAPTURE_CONFIG_ROOT | Out-Null
+$env:STEEL_CAPTURE_SERVICE_PORT = [string]$Port
+$env:STEEL_SICK_CAPTURE_PROFILE = (Resolve-Path -LiteralPath $CaptureProfile).Path
+$env:STEEL_PYTHON_EXECUTABLE = (Resolve-Path -LiteralPath $PythonExecutable).Path
+$env:STEEL_SICK_CAPTURE_SCRIPT = Join-Path $Root "scripts\sick_capture_service.py"
 
 Push-Location (Split-Path -Parent $Exe)
 try {
-  & $Exe --port $Port
+  & $Exe
   exit $LASTEXITCODE
 } finally {
   Pop-Location
@@ -215,8 +226,10 @@ param(
   [int]$Port = 4873,
   [int]$CapturePort = 4317,
   [string]$TriggerOrigin = "http://127.0.0.1:4881",
-  [string]$StorageRoot = "H:\",
-  [string]$CameraStorageRoot = "H:\",
+  [Parameter(Mandatory = $true)]
+  [string]$CaptureProfile,
+  [Parameter(Mandatory = $true)]
+  [string]$PythonExecutable,
   [Parameter(Mandatory = $true)]
   [string]$ArtifactAllowedRoots
 )
@@ -231,16 +244,17 @@ if (-not (Test-Path $Exe -PathType Leaf)) {
 
 $env:INSPECTION_SERVICE_HOST = "0.0.0.0"
 $env:INSPECTION_SERVICE_PORT = [string]$Port
-$env:STEEL_CAPTURE_PROVIDER = "headless-cpp"
+$env:STEEL_CAPTURE_PROVIDER = "external-api"
 $env:CAPTURE_SERVICE_ORIGIN = "http://127.0.0.1:$CapturePort"
 $env:TRIGGER_GATEWAY_ORIGIN = $TriggerOrigin
 $env:STEEL_CAPTURE_SERVICE_AUTOSTART = "1"
-$env:STEEL_CAPTURE_SERVICE_EXE = Join-Path $Root "capture-headless\steel_capture_service.exe"
+$env:STEEL_CAPTURE_SERVICE_EXE = Join-Path $Root "service\steel-capture-service.exe"
+$env:STEEL_SICK_CAPTURE_PROFILE = (Resolve-Path -LiteralPath $CaptureProfile).Path
+$env:STEEL_PYTHON_EXECUTABLE = (Resolve-Path -LiteralPath $PythonExecutable).Path
+$env:STEEL_SICK_CAPTURE_SCRIPT = Join-Path $Root "scripts\sick_capture_service.py"
 $env:STEEL_CAPTURE_RESTART_BUDGET = "5"
 $env:STEEL_CAPTURE_RESTART_BACKOFF_MS = "1000"
 $env:STEEL_CAPTURE_READY_TIMEOUT_MS = "15000"
-$env:CAPTURE_STORAGE_ROOT = $StorageRoot
-$env:CAPTURE_CAMERA_STORAGE_ROOT = $CameraStorageRoot
 $env:CAPTURE_CONFIG_ROOT = Join-Path $Root "config\capture"
 $env:STEEL_RUNTIME_PROFILE = "production"
 $env:STEEL_ALGORITHM_MODE = "production"
@@ -487,7 +501,7 @@ Write-Host "  Logs            $LogDir"
 
 Write-RuntimeFile "stop-runtime.ps1" @'
 param(
-  [int[]]$Ports = @(4317, 4873, 4874, 4875, 4881, 1432)
+  [int[]]$Ports = @(4317, 4873, 4874, 4875, 4876, 4881, 1432)
 )
 
 $ErrorActionPreference = "Stop"
@@ -519,7 +533,11 @@ $ProcessNames = @(
   "steel-inspection-service",
   "steel-trigger-gateway",
   "steel_trigger_gateway",
-  "steel_capture_service"
+  "steel_capture_service",
+  "steel-capture-service",
+  "steel-image-service",
+  "steel-image-worker",
+  "steel-defect-worker"
 )
 
 $Processes = @()
@@ -551,7 +569,9 @@ Write-RuntimeFile "README.md" @'
 
 This folder is generated by `scripts/sync-target-runtime.ps1`.
 
-- `capture-headless/`: headless C++ provider plus `nvt_lvm_sdk.dll`.
+- `service/steel-capture-service.exe`: only formal SICK GenTL camera host.
+- `service/steel-image-worker.exe`: actual-camera image and geometry worker.
+- `service/steel-defect-worker.exe`: actual-camera defect inference worker.
 - `service/`: Rust service executable.
 - `trigger/`: standalone trigger gateway executable.
 - `client/`: built frontend files.
@@ -675,10 +695,14 @@ $Manifest = [ordered]@{
   generatedAt = (Get-Date).ToString("o")
   root = "target/runtime"
   configRoot = "target/runtime/config"
-  captureHeadless = "capture-headless/steel_capture_service.exe"
-  formalCapture = "headless-cpp"
-  captureRole = "formal-sdk-owner"
+  captureHeadless = "service/steel-capture-service.exe"
+  formalCapture = "sick-gentl"
+  captureRole = "only-formal-camera-owner"
   service = "service/steel-inspection-service.exe"
+  capture = "service/steel-capture-service.exe"
+  imageService = "service/steel-image-service.exe"
+  imageWorker = "service/steel-image-worker.exe"
+  defectWorker = "service/steel-defect-worker.exe"
   triggerGateway = "trigger/steel-trigger-gateway.exe"
   serviceTriggerGateway = "service/steel-trigger-gateway.exe"
   supervisor = "service/steel-runtime-supervisor.exe"
@@ -744,9 +768,7 @@ $Manifest = [ordered]@{
     stateLayoutVersion = [int]$DatabaseContract.stateLayoutVersion
   }
   migrationArchitecture = $MigrationArchitecture
-  dlls = @{
-    captureSdk = "capture-headless/nvt_lvm_sdk.dll"
-  }
+  dlls = @{}
 }
 $Manifest | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $RuntimeRoot "manifest.json") -Encoding UTF8
 

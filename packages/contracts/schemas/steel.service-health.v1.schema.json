@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "steel.service-health.v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema", "service", "live", "ready", "version"],
+  "properties": {
+    "schema": { "const": "steel.service-health.v1" },
+    "service": { "type": "string", "minLength": 1 },
+    "role": { "enum": ["image", "defect", "acquisition", "business", "artifact", "trigger"] },
+    "live": { "type": "boolean" },
+    "ready": { "type": "boolean" },
+    "version": { "type": "string", "minLength": 1 },
+    "childPid": { "type": ["integer", "null"], "minimum": 1 },
+    "restartCount": { "type": "integer", "minimum": 0 },
+    "detail": { "type": ["string", "null"] }
+  }
+}

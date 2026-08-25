@@ -1,0 +1,11 @@
+[package]
+name = "steel-camera-worker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "steel-capture-service"
+path = "src/main.rs"
+
+[dependencies]
+ctrlc = "3"

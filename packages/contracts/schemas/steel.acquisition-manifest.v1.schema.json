@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "steel.acquisition-manifest.v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema", "inspectionId", "captureId", "complete", "cameras"],
+  "properties": {
+    "schema": { "const": "steel.acquisition-manifest.v1" },
+    "inspectionId": { "type": "string", "minLength": 1 },
+    "captureId": { "type": "string", "minLength": 1 },
+    "complete": { "type": "boolean" },
+    "expectedCameraCount": { "type": "integer", "minimum": 1 },
+    "actualCameraCount": { "type": "integer", "minimum": 0 },
+    "cameras": { "type": "array", "items": { "type": "object" } }
+  }
+}

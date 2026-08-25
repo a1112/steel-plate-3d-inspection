@@ -44,6 +44,7 @@ $AlgorithmCoreOut = Join-Path $OutRoot "algorithm-core"
 $DatabaseOut = Join-Path $OutRoot "database"
 $DesktopOut = Join-Path $OutRoot "desktop-installer"
 $BuildEvidenceOut = Join-Path $OutRoot "build-evidence"
+$RuntimeIconsOut = Join-Path $OutRoot "icons"
 $IntegrityCatalogRelativePath = ""
 $BuildStartedAt = (Get-Date).ToUniversalTime().ToString("o")
 
@@ -71,7 +72,9 @@ foreach ($CargoManifest in @(
   "app\client\src-tauri\Cargo.toml",
   "app\service\Cargo.toml",
   "app\trigger\Cargo.toml",
-  "app\algorithm-service\Cargo.toml",
+  "app\camera-worker\Cargo.toml",
+  "app\pipeline-workers\Cargo.toml",
+  "app\runtime-contract\Cargo.toml",
   "app\image-service\Cargo.toml",
   "app\tray\Cargo.toml"
 )) {
@@ -548,11 +551,13 @@ if (-not $SkipBuild) {
   }
   Invoke-Checked "powershell" $ServiceBuildArgs
   Invoke-Checked "powershell" $TriggerBuildArgs
-  $AlgorithmServiceBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-algorithm-service.ps1"), "-Profile", $ServiceProfile)
+  $PipelineWorkerBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-pipeline-workers.ps1"), "-Profile", $ServiceProfile)
+  $CameraWorkerBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-camera-worker.ps1"), "-Profile", $ServiceProfile)
   $ImageServiceBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-image-service.ps1"), "-Profile", $ServiceProfile)
   $TrayBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-tray.ps1"), "-Profile", $ServiceProfile)
-  if ($FormalReleasePackage) { $AlgorithmServiceBuildArgs += "-Locked"; $ImageServiceBuildArgs += "-Locked"; $TrayBuildArgs += "-Locked" }
-  Invoke-Checked "powershell" $AlgorithmServiceBuildArgs
+  if ($FormalReleasePackage) { $PipelineWorkerBuildArgs += "-Locked"; $CameraWorkerBuildArgs += "-Locked"; $ImageServiceBuildArgs += "-Locked"; $TrayBuildArgs += "-Locked" }
+  Invoke-Checked "powershell" $CameraWorkerBuildArgs
+  Invoke-Checked "powershell" $PipelineWorkerBuildArgs
   Invoke-Checked "powershell" $ImageServiceBuildArgs
   Invoke-Checked "powershell" $TrayBuildArgs
   $ClientBuildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $RepoRoot "scripts\build-client.ps1"))
@@ -588,7 +593,7 @@ if ((Resolve-Path $PackageRoot -ErrorAction SilentlyContinue) -and (Test-Path $O
   Remove-Item -LiteralPath $ResolvedOut -Recurse -Force
 }
 
-New-Item -ItemType Directory -Force -Path $CaptureOut, $ServiceOut, $ClientOut, $ConfigOut, $DocsOut, $ScriptsOut, $AlgorithmCoreOut, $DatabaseOut, $BuildEvidenceOut | Out-Null
+New-Item -ItemType Directory -Force -Path $CaptureOut, $ServiceOut, $ClientOut, $ConfigOut, $DocsOut, $ScriptsOut, $AlgorithmCoreOut, $DatabaseOut, $BuildEvidenceOut, $RuntimeIconsOut | Out-Null
 
 Copy-RequiredFile $DatabaseContractSource (Join-Path $DatabaseOut "contract.json")
 Copy-Item -LiteralPath (Split-Path -Parent $DatabaseMigrationIndexSource) -Destination $DatabaseOut -Recurse -Force
@@ -609,8 +614,10 @@ foreach ($LockFile in @(
   @{ source = "app\client\src-tauri\Cargo.lock"; destination = "tauri-Cargo.lock" },
   @{ source = "app\service\Cargo.lock"; destination = "service-Cargo.lock" },
   @{ source = "app\trigger\Cargo.lock"; destination = "trigger-Cargo.lock" },
+  @{ source = "app\camera-worker\Cargo.lock"; destination = "camera-worker-Cargo.lock" },
   @{ source = "app\result-contract\Cargo.lock"; destination = "result-contract-Cargo.lock" },
-  @{ source = "app\algorithm-service\Cargo.lock"; destination = "algorithm-service-Cargo.lock" },
+  @{ source = "app\pipeline-workers\Cargo.lock"; destination = "pipeline-workers-Cargo.lock" },
+  @{ source = "app\runtime-contract\Cargo.lock"; destination = "runtime-contract-Cargo.lock" },
   @{ source = "app\image-service\Cargo.lock"; destination = "image-service-Cargo.lock" },
   @{ source = "app\tray\Cargo.lock"; destination = "tray-Cargo.lock" }
 )) {
@@ -770,8 +777,10 @@ if ($FormalReleasePackage) {
     [ordered]@{ id = 'cargo-tauri'; sourcePath = 'app/client/src-tauri/Cargo.lock'; evidencePath = 'build-evidence/tauri-Cargo.lock' },
     [ordered]@{ id = 'cargo-service'; sourcePath = 'app/service/Cargo.lock'; evidencePath = 'build-evidence/service-Cargo.lock' },
     [ordered]@{ id = 'cargo-trigger'; sourcePath = 'app/trigger/Cargo.lock'; evidencePath = 'build-evidence/trigger-Cargo.lock' },
+    [ordered]@{ id = 'cargo-camera-worker'; sourcePath = 'app/camera-worker/Cargo.lock'; evidencePath = 'build-evidence/camera-worker-Cargo.lock' },
     [ordered]@{ id = 'cargo-result-contract'; sourcePath = 'app/result-contract/Cargo.lock'; evidencePath = 'build-evidence/result-contract-Cargo.lock' },
-    [ordered]@{ id = 'cargo-algorithm-service'; sourcePath = 'app/algorithm-service/Cargo.lock'; evidencePath = 'build-evidence/algorithm-service-Cargo.lock' },
+    [ordered]@{ id = 'cargo-pipeline-workers'; sourcePath = 'app/pipeline-workers/Cargo.lock'; evidencePath = 'build-evidence/pipeline-workers-Cargo.lock' },
+    [ordered]@{ id = 'cargo-runtime-contract'; sourcePath = 'app/runtime-contract/Cargo.lock'; evidencePath = 'build-evidence/runtime-contract-Cargo.lock' },
     [ordered]@{ id = 'cargo-image-service'; sourcePath = 'app/image-service/Cargo.lock'; evidencePath = 'build-evidence/image-service-Cargo.lock' },
     [ordered]@{ id = 'cargo-tray'; sourcePath = 'app/tray/Cargo.lock'; evidencePath = 'build-evidence/tray-Cargo.lock' }
   )
@@ -813,6 +822,18 @@ if ($FormalReleasePackage) {
     'steel.input.cargo-service.sha256',
     'steel.input.cargo-trigger.path',
     'steel.input.cargo-trigger.sha256',
+    'steel.input.cargo-camera-worker.path',
+    'steel.input.cargo-camera-worker.sha256',
+    'steel.input.cargo-result-contract.path',
+    'steel.input.cargo-result-contract.sha256',
+    'steel.input.cargo-pipeline-workers.path',
+    'steel.input.cargo-pipeline-workers.sha256',
+    'steel.input.cargo-runtime-contract.path',
+    'steel.input.cargo-runtime-contract.sha256',
+    'steel.input.cargo-image-service.path',
+    'steel.input.cargo-image-service.sha256',
+    'steel.input.cargo-tray.path',
+    'steel.input.cargo-tray.sha256',
     'steel.input.external-components.path',
     'steel.input.external-components.sha256',
     'steel.tool.generate.sha256',
@@ -879,8 +900,6 @@ if ($FormalReleasePackage) {
 }
 
 $CaptureBuild = Join-Path $CaptureBuildRoot $Configuration
-Copy-RequiredFile (Join-Path $CaptureBuild "steel_capture_service.exe") $CaptureOut
-Copy-RequiredFile (Join-Path $CaptureBuild "nvt_lvm_sdk.dll") $CaptureOut
 Copy-RequiredFile (Join-Path $CaptureBuild "steel_runtime_supervisor.exe") (Join-Path $ServiceOut "steel-runtime-supervisor.exe")
 
 $ServiceBuild = if ($ServiceProfile -eq "release") {
@@ -895,8 +914,11 @@ $TriggerBuild = if ($ServiceProfile -eq "release") {
   Join-Path $RepoRoot "target\trigger\debug"
 }
 Copy-RequiredFile (Join-Path $TriggerBuild "steel-trigger-gateway.exe") $ServiceOut
-$AlgorithmServiceBuild = if ($ServiceProfile -eq "release") { Join-Path $RepoRoot "target\algorithm-service\release" } else { Join-Path $RepoRoot "target\algorithm-service\debug" }
-Copy-RequiredFile (Join-Path $AlgorithmServiceBuild "steel-algorithm-service.exe") $ServiceOut
+$PipelineWorkerBuild = if ($ServiceProfile -eq "release") { Join-Path $RepoRoot "target\pipeline-workers\release" } else { Join-Path $RepoRoot "target\pipeline-workers\debug" }
+Copy-RequiredFile (Join-Path $PipelineWorkerBuild "steel-image-worker.exe") $ServiceOut
+Copy-RequiredFile (Join-Path $PipelineWorkerBuild "steel-defect-worker.exe") $ServiceOut
+$CameraWorkerBuild = if ($ServiceProfile -eq "release") { Join-Path $RepoRoot "target\camera-worker\release" } else { Join-Path $RepoRoot "target\camera-worker\debug" }
+Copy-RequiredFile (Join-Path $CameraWorkerBuild "steel-capture-service.exe") $ServiceOut
 $ImageServiceBuild = if ($ServiceProfile -eq "release") { Join-Path $RepoRoot "target\image-service\release" } else { Join-Path $RepoRoot "target\image-service\debug" }
 Copy-RequiredFile (Join-Path $ImageServiceBuild "steel-image-service.exe") $ServiceOut
 $TrayBuild = if ($ServiceProfile -eq "release") { Join-Path $RepoRoot "target\tray\release" } else { Join-Path $RepoRoot "target\tray\debug" }
@@ -908,16 +930,17 @@ Copy-RequiredFile (Join-Path $AlgorithmCoreBuild "steel_bar_surface_core.exe") $
 $RuntimeSignatureEvidence = @()
 if ($FormalReleasePackage) {
   $FirstPartyRuntimeArtifacts = @(
-    (Join-Path $CaptureOut "steel_capture_service.exe"),
+    (Join-Path $ServiceOut "steel-capture-service.exe"),
     (Join-Path $ServiceOut "steel-runtime-supervisor.exe"),
     (Join-Path $ServiceOut "steel-inspection-service.exe"),
     (Join-Path $ServiceOut "steel-trigger-gateway.exe"),
     (Join-Path $ServiceOut "steel-image-service.exe"),
-    (Join-Path $ServiceOut "steel-algorithm-service.exe"),
+    (Join-Path $ServiceOut "steel-image-worker.exe"),
+    (Join-Path $ServiceOut "steel-defect-worker.exe"),
     (Join-Path $ServiceOut "steel-inspection-tray.exe"),
     (Join-Path $AlgorithmCoreOut "steel_bar_surface_core.exe")
   )
-  foreach ($ArtifactPath in @($FirstPartyRuntimeArtifacts) + @((Join-Path $CaptureOut "nvt_lvm_sdk.dll"))) {
+  foreach ($ArtifactPath in $FirstPartyRuntimeArtifacts) {
     Assert-PeTargetMachine -Path $ArtifactPath -RustTarget ([string]$ReleasePolicy.rustTarget)
   }
   foreach ($ArtifactPath in $FirstPartyRuntimeArtifacts) {
@@ -928,14 +951,6 @@ if ($FormalReleasePackage) {
       signerThumbprint = [string]$Signature.SignerCertificate.Thumbprint
       timestampSigner = [string]$Signature.TimeStamperCertificate.Subject
     }
-  }
-  $VendorSdkPath = Join-Path $CaptureOut "nvt_lvm_sdk.dll"
-  $VendorSignature = Assert-TimestampedAuthenticodeSignature -Path $VendorSdkPath
-  $RuntimeSignatureEvidence += [ordered]@{
-    path = $VendorSdkPath.Substring($OutRoot.Length + 1).Replace('\', '/')
-    signer = [string]$VendorSignature.SignerCertificate.Subject
-    signerThumbprint = [string]$VendorSignature.SignerCertificate.Thumbprint
-    timestampSigner = [string]$VendorSignature.TimeStamperCertificate.Subject
   }
 }
 
@@ -1007,7 +1022,20 @@ if (Test-Path (Join-Path $RepoRoot "config\algorithm") -PathType Container) {
 if (Test-Path (Join-Path $RepoRoot "config\acceptance") -PathType Container) {
   Copy-Item -LiteralPath (Join-Path $RepoRoot "config\acceptance") -Destination $ConfigOut -Recurse -Force
 }
+if (Test-Path (Join-Path $RepoRoot "config\sites\sick-array-6") -PathType Container) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $ConfigOut "sites") | Out-Null
+  Copy-Item -LiteralPath (Join-Path $RepoRoot "config\sites\sick-array-6") -Destination (Join-Path $ConfigOut "sites") -Recurse -Force
+}
+if (Test-Path (Join-Path $RepoRoot "models") -PathType Container) {
+  Copy-Item -LiteralPath (Join-Path $RepoRoot "models") -Destination $OutRoot -Recurse -Force
+}
+if (Test-Path (Join-Path $RepoRoot "packages\contracts") -PathType Container) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $OutRoot "contracts") | Out-Null
+  Copy-Item -LiteralPath (Join-Path $RepoRoot "packages\contracts\schemas") -Destination (Join-Path $OutRoot "contracts") -Recurse -Force
+}
+Copy-Item -Path (Join-Path $RepoRoot "app\runtime-icons\*") -Destination $RuntimeIconsOut -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\independent-architecture.md") -Destination $DocsOut -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\runtime-boundaries-v2.md") -Destination $DocsOut -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\capture-api-contract.md") -Destination $DocsOut -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\integrated-capture-management-acceptance.md") -Destination $DocsOut -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\qt-to-tauri-migration.md") -Destination $DocsOut -Force
@@ -1058,30 +1086,37 @@ Copy-RequiredFile (Join-Path $RepoRoot "scripts\bar_surface_reconstruct.py") $Sc
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\fit_array_calibration_cross_section.py") $ScriptsOut
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-bar-surface-e2e.ps1") $ScriptsOut
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\build-algorithm-core.ps1") $ScriptsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\sick_capture_service.py") $ScriptsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\sick_flow_analysis_service.py") $ScriptsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\sick_capture_requirements.txt") $ScriptsOut
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\requirements-sick-defect.txt") $ScriptsOut
+Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\sick_capture") -Destination $ScriptsOut -Recurse -Force
 
 Write-PackageFile "run-capture-headless.ps1" @'
 param(
   [int]$Port = 4317,
-  [string]$StorageRoot = "H:\",
-  [string]$CameraStorageRoot = "H:\"
+  [Parameter(Mandatory = $true)]
+  [string]$CaptureProfile,
+  [Parameter(Mandatory = $true)]
+  [string]$PythonExecutable
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Exe = Join-Path $Root "capture-headless\steel_capture_service.exe"
+$Exe = Join-Path $Root "service\steel-capture-service.exe"
 
 if (-not (Test-Path $Exe -PathType Leaf)) {
   throw "Missing capture executable: $Exe"
 }
 
-$env:CAPTURE_STORAGE_ROOT = $StorageRoot
-$env:CAPTURE_CONFIG_ROOT = Join-Path $Root "config\capture"
-$env:CAPTURE_CAMERA_STORAGE_ROOT = $CameraStorageRoot
-New-Item -ItemType Directory -Force -Path $env:CAPTURE_CONFIG_ROOT | Out-Null
+$env:STEEL_CAPTURE_SERVICE_PORT = [string]$Port
+$env:STEEL_SICK_CAPTURE_PROFILE = (Resolve-Path -LiteralPath $CaptureProfile).Path
+$env:STEEL_PYTHON_EXECUTABLE = (Resolve-Path -LiteralPath $PythonExecutable).Path
+$env:STEEL_SICK_CAPTURE_SCRIPT = Join-Path $Root "scripts\sick_capture_service.py"
 
 Push-Location (Split-Path -Parent $Exe)
 try {
-  & $Exe --port $Port
+  & $Exe
   exit $LASTEXITCODE
 } finally {
   Pop-Location
@@ -1136,8 +1171,10 @@ param(
   [int]$Port = 4873,
   [int]$CapturePort = 4317,
   [string]$TriggerOrigin = "http://127.0.0.1:4881",
-  [string]$StorageRoot = "H:\",
-  [string]$CameraStorageRoot = "H:\",
+  [Parameter(Mandatory = $true)]
+  [string]$CaptureProfile,
+  [Parameter(Mandatory = $true)]
+  [string]$PythonExecutable,
   [string]$ConfigRoot = "",
   [Parameter(Mandatory = $true)]
   [string]$ArtifactAllowedRoots
@@ -1146,21 +1183,22 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Exe = Join-Path $Root "service\steel-inspection-service.exe"
-$CaptureExe = Join-Path $Root "capture-headless\steel_capture_service.exe"
+$CaptureExe = Join-Path $Root "service\steel-capture-service.exe"
 if (-not (Test-Path $Exe -PathType Leaf)) { throw "Missing service executable: $Exe" }
 if (-not (Test-Path $CaptureExe -PathType Leaf)) { throw "Missing capture executable: $CaptureExe" }
 
 $env:INSPECTION_SERVICE_HOST = "0.0.0.0"
 $env:INSPECTION_SERVICE_PORT = [string]$Port
-$env:STEEL_CAPTURE_PROVIDER = "headless-cpp"
+$env:STEEL_CAPTURE_PROVIDER = "external-api"
 $env:CAPTURE_SERVICE_ORIGIN = "http://127.0.0.1:$CapturePort"
 $env:STEEL_CAPTURE_SERVICE_AUTOSTART = "1"
 $env:STEEL_CAPTURE_SERVICE_EXE = $CaptureExe
 $env:STEEL_CAPTURE_RESTART_BUDGET = "5"
 $env:STEEL_CAPTURE_RESTART_BACKOFF_MS = "1000"
 $env:STEEL_CAPTURE_READY_TIMEOUT_MS = "15000"
-$env:CAPTURE_STORAGE_ROOT = $StorageRoot
-$env:CAPTURE_CAMERA_STORAGE_ROOT = $CameraStorageRoot
+$env:STEEL_SICK_CAPTURE_PROFILE = (Resolve-Path -LiteralPath $CaptureProfile).Path
+$env:STEEL_PYTHON_EXECUTABLE = (Resolve-Path -LiteralPath $PythonExecutable).Path
+$env:STEEL_SICK_CAPTURE_SCRIPT = Join-Path $Root "scripts\sick_capture_service.py"
 $env:CAPTURE_CONFIG_ROOT = Join-Path $Root "config\capture"
 $env:TRIGGER_GATEWAY_ORIGIN = $TriggerOrigin
 $env:STEEL_RUNTIME_PROFILE = "production"
@@ -1266,8 +1304,10 @@ param(
   [int]$ServicePort = 4873,
   [int]$TriggerPort = 4881,
   [int]$ClientPort = 1432,
-  [string]$StorageRoot = "H:\",
-  [string]$CameraStorageRoot = "H:\",
+  [Parameter(Mandatory = $true)]
+  [string]$CaptureProfile,
+  [Parameter(Mandatory = $true)]
+  [string]$PythonExecutable,
   [Parameter(Mandatory = $true)]
   [string]$ArtifactAllowedRoots,
   [ValidateSet("api", "tcp", "udp", "gray", "secondary", "manual")]
@@ -1375,11 +1415,14 @@ if ($StopExisting) {
   }
 }
 
+$CaptureProfile = (Resolve-Path -LiteralPath $CaptureProfile).Path
+$PythonExecutable = (Resolve-Path -LiteralPath $PythonExecutable).Path
+$CaptureProfilePayload = Get-Content -LiteralPath $CaptureProfile -Raw | ConvertFrom-Json
 $ServiceScript = Join-Path $Root "run-service-managed.ps1"
 $TriggerScript = Join-Path $Root "run-trigger-gateway.ps1"
 
 if (-not (Test-LocalTcpPort -Port $ServicePort)) {
-  Start-PackageScript -Name "service" -ScriptPath $ServiceScript -Arguments @("-Port", [string]$ServicePort, "-CapturePort", [string]$CapturePort, "-TriggerOrigin", "http://127.0.0.1:$TriggerPort", "-StorageRoot", $StorageRoot, "-CameraStorageRoot", $CameraStorageRoot, "-ArtifactAllowedRoots", $ArtifactAllowedRoots)
+  Start-PackageScript -Name "service" -ScriptPath $ServiceScript -Arguments @("-Port", [string]$ServicePort, "-CapturePort", [string]$CapturePort, "-TriggerOrigin", "http://127.0.0.1:$TriggerPort", "-CaptureProfile", $CaptureProfile, "-PythonExecutable", $PythonExecutable, "-ArtifactAllowedRoots", $ArtifactAllowedRoots)
 } else {
   Write-Host "Rust service already listening on port $ServicePort."
 }
@@ -1388,8 +1431,8 @@ if ([string]$CaptureLifecycle.lifecycle.phase -ne "ready") {
   throw "Managed capture lifecycle is '$($CaptureLifecycle.lifecycle.phase)': $($CaptureLifecycle.lifecycle.lastError)"
 }
 $CaptureHealth = Wait-HttpJson -Name "Capture provider" -Uri "http://127.0.0.1:$CapturePort/health" -TimeoutSec 30
-$ExpectedCaptureConfigRoot = Join-Path $Root "config\capture"
-Assert-CaptureProviderMatches -Health $CaptureHealth -ExpectedStorageRoot $StorageRoot -ExpectedConfigRoot $ExpectedCaptureConfigRoot
+$ExpectedCaptureConfigRoot = Split-Path -Parent $CaptureProfile
+Assert-CaptureProviderMatches -Health $CaptureHealth -ExpectedStorageRoot ([string]$CaptureProfilePayload.storageRoot) -ExpectedConfigRoot $ExpectedCaptureConfigRoot
 Write-Host ("Managed capture ready: sdkReady={0}, cameraCount={1}" -f $CaptureHealth.sdkReady, $CaptureHealth.cameraCount)
 $ProductionStatus = Wait-HttpJson -Name "Rust service" -Uri "http://127.0.0.1:$ServicePort/api/production/status" -TimeoutSec 30
 Write-Host ("Service ready: production code={0}" -f $ProductionStatus.code)
@@ -1421,7 +1464,7 @@ Write-Host "  Logs            $LogDir"
 
 Write-PackageFile "stop-runtime.ps1" @'
 param(
-  [int[]]$Ports = @(4317, 4873, 4874, 4875, 4881, 1432)
+  [int[]]$Ports = @(4317, 4873, 4874, 4875, 4876, 4881, 1432)
 )
 
 $ErrorActionPreference = "Stop"
@@ -1453,7 +1496,11 @@ $ProcessNames = @(
   "steel-inspection-service",
   "steel-trigger-gateway",
   "steel_trigger_gateway",
-  "steel_capture_service"
+  "steel_capture_service",
+  "steel-capture-service",
+  "steel-image-service",
+  "steel-image-worker",
+  "steel-defect-worker"
 )
 
 $Processes = @()
@@ -1485,11 +1532,12 @@ Write-PackageFile "README.md" @'
 
 This package keeps runtime boundaries independent:
 
-- `capture-headless/`: C++ capture provider and camera SDK runtime DLL.
-- `service/`: Rust service API executable.
+- `service/steel-capture-service.exe`: the only formal SICK camera process host; it owns the GenTL sidecar lifecycle.
+- `service/`: Rust runtime executables.
 - `service/steel-trigger-gateway.exe`: standalone L2/PLC/API trigger gateway.
 - `service/steel-image-service.exe`: loopback Rust image decode, preview and tile service.
-- `service/steel-algorithm-service.exe`: raw-source adapters and immutable unified-result publisher.
+- `service/steel-image-worker.exe`: real-camera alignment, measurement and surface reconstruction worker.
+- `service/steel-defect-worker.exe`: real-camera defect inference and evidence worker.
 - `service/steel-inspection-tray.exe`: per-user Windows task-tray companion for SCM controls.
 - `client/`: built frontend files.
 - `config/env/`: environment templates.
@@ -1501,7 +1549,7 @@ This package keeps runtime boundaries independent:
 .\service\steel-runtime-supervisor.exe --service --root . --state-root <StateRoot>
 ```
 
-The Supervisor starts image, algorithm, capture, business, and trigger processes in order and stops them in reverse order. The business service is proxy-only in production and exposes:
+The Supervisor starts Artifact, Image Worker, Defect Worker, SICK Capture, Business, and Trigger processes in order and stops them in reverse order. The business service is proxy-only in production and exposes:
 
 ```text
 http://127.0.0.1:4873/api/capture/lifecycle
@@ -1514,7 +1562,7 @@ http://127.0.0.1:4873/api/cameras
 The packaged trigger gateway defaults to `STEEL_RUNTIME_PROFILE=production`. Inject different values for `TRIGGER_SHARED_SECRET` and `TRIGGER_OPERATOR_TOKEN`, each with at least 32 random bytes, through the service manager before starting it; a non-loopback bind also requires `TRIGGER_SOURCE_ALLOWLIST`. The shared secret authenticates PLC/L2 traffic, while the operator token is only for the loopback Rust-to-gateway hop. Production mode mutation is locked unless an explicitly approved maintenance run passes `-AllowModeMutation`.
 
 ```powershell
-.\run-integrated-capture-management.ps1 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction" -TriggerMode manual -OpenBrowser
+.\run-integrated-capture-management.ps1 -CaptureProfile D:\site\sick-capture.json -PythonExecutable D:\python\python.exe -ArtifactAllowedRoots "D:\steel-sick-data;E:\steel-sick-data;F:\steel-sick-data;G:\steel-sick-data;H:\steel-sick-data" -TriggerMode manual -OpenBrowser
 ```
 
 This starts Rust (which owns the capture child and serves the web client) and the trigger gateway, then waits for:
@@ -1686,7 +1734,7 @@ Use `-Mode gray` when a grayscale/sensor-side signal owns the in/out steel decis
 The `client/` folder contains the built web assets. The Rust service serves this folder on its own origin by default:
 
 ```powershell
-.\run-integrated-capture-management.ps1 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction"
+.\run-integrated-capture-management.ps1 -CaptureProfile D:\site\sick-capture.json -PythonExecutable D:\python\python.exe -ArtifactAllowedRoots "D:\steel-sick-data;E:\steel-sick-data;F:\steel-sick-data;G:\steel-sick-data;H:\steel-sick-data"
 ```
 
 Then open:
@@ -1798,18 +1846,20 @@ $Manifest = [ordered]@{
     signatures = $DesktopSignatureEvidence
     timestampRequired = $FormalReleasePackage
   }
-  formalCapture = "headless-cpp"
+  formalCapture = "sick-gentl"
   capture = @{
-    path = "capture-headless/steel_capture_service.exe"
-    sdk = "capture-headless/nvt_lvm_sdk.dll"
-    role = "formal-sdk-owner"
+    path = "service/steel-capture-service.exe"
+    sdk = "external-sick-gentl-cti"
+    role = "only-formal-camera-owner"
   }
   service = @{
     path = "service/steel-inspection-service.exe"
     triggerGateway = "service/steel-trigger-gateway.exe"
     supervisor = "service/steel-runtime-supervisor.exe"
     image = "service/steel-image-service.exe"
-    algorithm = "service/steel-algorithm-service.exe"
+    capture = "service/steel-capture-service.exe"
+    imageWorker = "service/steel-image-worker.exe"
+    defectWorker = "service/steel-defect-worker.exe"
     tray = "service/steel-inspection-tray.exe"
     windowsServiceName = "SteelInspectionRuntime"
     profile = $ServiceProfile
@@ -1821,7 +1871,8 @@ $Manifest = [ordered]@{
   }
   algorithm = @{
     core = "algorithm-core/steel_bar_surface_core.exe"
-    service = "service/steel-algorithm-service.exe"
+    imageWorker = "service/steel-image-worker.exe"
+    defectWorker = "service/steel-defect-worker.exe"
     resultSchema = "steel.inspection-result.v1"
     resultRoot = "state-root/result-data"
     scripts = "scripts"

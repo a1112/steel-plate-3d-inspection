@@ -64,12 +64,13 @@ from scripts.sick_capture.provider import (
     NO_STEEL_FRAME_DISCARDED,
     ProviderRuntime,
     SickCaptureHTTPServer,
-    _build_flow_artifacts,
     _steel_tail_metrics,
 )
+from scripts.sick_capture.image_pipeline import build_flow_image_artifacts
 from scripts.sick_capture.replay import LG3DReplaySource, validate_lg3d_dataset
 from scripts.sick_capture.storage import DualFormatWriter, atomic_summary
 from scripts.sick_capture.paths import (
+    acquisition_manifest_path,
     alignment_path,
     capture_root as camera_capture_root,
     measurement_path,
@@ -633,26 +634,26 @@ class SickAlignmentTests(unittest.TestCase):
             jet_target = root / "surface-jet.png"
             with (
                 patch(
-                    "scripts.sick_capture.provider.build_and_write_flow_alignment",
+                    "scripts.sick_capture.image_pipeline.build_and_write_flow_alignment",
                     return_value=(alignment_target, alignment),
                 ),
                 patch(
-                    "scripts.sick_capture.provider.build_and_write_flow_measurement",
+                    "scripts.sick_capture.image_pipeline.build_and_write_flow_measurement",
                     return_value=(measurement_target, measurement),
                 ),
                 patch(
-                    "scripts.sick_capture.provider.build_and_write_flow_region_map",
+                    "scripts.sick_capture.image_pipeline.build_and_write_flow_region_map",
                     return_value=(region_target, regions),
                 ),
                 patch(
-                    "scripts.sick_capture.provider.build_and_write_flow_surface",
+                    "scripts.sick_capture.image_pipeline.build_and_write_flow_surface",
                     return_value=(surface_target, surface, jet_target),
                 ),
-                patch("scripts.sick_capture.provider._atomic_json") as write_json,
-                patch("scripts.sick_capture.provider.build_and_write_playback_index"),
+                patch("scripts.sick_capture.image_pipeline._atomic_json") as write_json,
+                patch("scripts.sick_capture.image_pipeline.build_and_write_playback_index"),
             ):
                 _alignment_path, _alignment, _measurement_path, result = (
-                    _build_flow_artifacts(
+                    build_flow_image_artifacts(
                         {"C1": root / "C1"},
                         root,
                         "9",
@@ -1400,6 +1401,39 @@ class SickSitePackageTests(unittest.TestCase):
 
 
 class SickEventTests(unittest.TestCase):
+    def test_closed_real_camera_flow_publishes_acquisition_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frame = sample_frame()
+            result = DualFormatWriter().write(root / "camera-1", "11", frame)
+            row = result.provider_row(frame, 3)
+            publish_committed_round(
+                root,
+                "11",
+                "SESSION-11",
+                [row],
+                boundary_phase="steel-out",
+                expected_camera_ids={"C1"},
+            )
+            write_flow_manifest(
+                root,
+                "11",
+                session_id="SESSION-11",
+                state="closed",
+                camera_roots={"C1": root / "camera-1"},
+                latest_round=3,
+            )
+            manifest = json.loads(
+                acquisition_manifest_path(root, "11").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["schema"], "steel.acquisition-manifest.v1")
+            self.assertTrue(manifest["complete"])
+            self.assertEqual(manifest["actualCameraCount"], 1)
+            self.assertEqual(len(manifest["cameras"][0]["artifacts"]), 3)
+            self.assertTrue(
+                all(len(row["sha256"]) == 64 for row in manifest["cameras"][0]["artifacts"])
+            )
+
     def test_committed_event_validates_artifacts_and_reports_partial_camera_round(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
