@@ -1,5 +1,7 @@
 # Camera-local Tiles and Head Alignment Implementation Plan
 
+> **Status: Superseded.** Camera alignment metadata remains valid, but the default dashboard media path is now governed by [Inspection boundaries and responsive thumbnails](../design/inspection-boundaries-responsive-thumbnail.md). Tiles are legacy compatibility only.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Render real-width, head-aligned camera columns from camera-local tiles while keeping Ctrl+wheel zoom and LOD replacement visually stable.

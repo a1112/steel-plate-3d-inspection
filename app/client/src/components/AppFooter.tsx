@@ -137,7 +137,7 @@ export function AppFooter({
     ? '已连接'
     : connection?.state === 'offline'
       ? '未连接'
-      : '连接异常';
+      : '已连接·降级';
   const connectionEndpoint = connection ? formatConnectionEndpoint(connection.endpoint) : '--';
 
   useEffect(() => {

@@ -30,11 +30,13 @@ from sick_capture.paths import (
     measurement_path as canonical_measurement_path,
     playback_index_path as canonical_playback_index_path,
     region_path as canonical_region_path,
+    surface_path as canonical_surface_path,
 )
 from sick_capture.playback import build_and_write_playback_index
 from sick_capture.profile import load_profile
 from sick_capture.regions import build_and_write_flow_region_map
 from sick_capture.storage import atomic_summary
+from sick_capture.surface import build_and_write_flow_surface
 
 
 def lower_process_priority() -> str:
@@ -224,6 +226,7 @@ def fast_artifacts_ready(
             canonical_alignment_path(storage_root, material_id),
             canonical_measurement_path(storage_root, material_id),
             canonical_region_path(storage_root, material_id),
+            canonical_surface_path(storage_root, material_id),
             canonical_playback_index_path(storage_root, material_id),
         )
     )
@@ -236,7 +239,11 @@ def defect_artifact_complete(storage_root: Path, material_id: str) -> bool:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
-    if not isinstance(payload, dict) or payload.get("state") == "database-write-failed":
+    if not isinstance(payload, dict) or payload.get("state") in {
+        "blocked",
+        "database-write-failed",
+        "failed",
+    }:
         return False
     return payload.get("databaseImport", {}).get("state") != "failed"
 
@@ -333,6 +340,26 @@ def _analyze_impl(
         measurement,
     )
     notify_region_commit(database_origin, material_id, region_path, regions)
+    surface_path, surface, jet_path = build_and_write_flow_surface(
+        camera_roots,
+        storage_root,
+        material_id,
+        alignment,
+        calibration_path=calibration_path,
+        config=measurement_config,
+        region_map=regions,
+    )
+    measurement["surface"] = {
+        "path": str(surface_path),
+        "jetPath": str(jet_path) if jet_path.is_file() else "",
+        "state": surface.get("state"),
+        "quality": surface.get("quality"),
+        "summary": surface.get("summary"),
+    }
+    diameter_curves = surface.get("diameterCurves")
+    if isinstance(diameter_curves, dict):
+        measurement.setdefault("surfaceFit", {})["diameterCurves"] = diameter_curves
+    atomic_summary(measurement_path, measurement)
     playback_path, playback = build_and_write_playback_index(
         camera_roots,
         storage_root,
@@ -369,6 +396,7 @@ def _analyze_impl(
             "alignmentPath": str(alignment_path),
             "measurementPath": str(measurement_path),
             "regionPath": str(region_path),
+            "surfacePath": str(surface_path),
             "playbackPath": str(playback_path),
             "defectPath": str(defect_path) if defect_path else "",
             "synchronized": alignment.get("quality", {}).get("synchronized"),
@@ -390,6 +418,7 @@ def _analyze_impl(
                 "alignment": str(alignment_path),
                 "measurement": str(measurement_path),
                 "regions": str(region_path),
+                "surface": str(surface_path),
                 "playback": str(playback_path),
                 "defects": str(defect_path) if defect_path else "",
                 "mode": (

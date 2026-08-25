@@ -26,6 +26,7 @@ import {
   triggerGatewayManualSteelIn,
   writeProductionSteelInfo,
   reviewProductionDefect,
+  shouldUseSameOriginService,
 } from './inspection-api';
 import type {
   BkvArtifact,
@@ -51,6 +52,14 @@ afterEach(() => {
 });
 
 describe('persistent production command client', () => {
+  it('uses the page origin for HTTP and HTTPS web clients but not Tauri', () => {
+    expect(shouldUseSameOriginService('http:', false, 'production')).toBe(true);
+    expect(shouldUseSameOriginService('https:', false, 'production')).toBe(true);
+    expect(shouldUseSameOriginService('https:', true, 'production')).toBe(false);
+    expect(shouldUseSameOriginService('file:', false, 'production')).toBe(false);
+    expect(shouldUseSameOriginService('https:', false, 'test')).toBe(false);
+  });
+
   it('discovers the advertised LAN service and de-duplicates addresses', async () => {
     const discovery = {
       schema: 'steel.inspection-service-discovery.v1',
@@ -701,7 +710,7 @@ describe('persistent production command client', () => {
     );
   });
 
-  it('leaves raw SICK intensity frames empty until the ROI index supplies coordinates', async () => {
+  it('keeps a record-bound raw SICK intensity frame while the ROI index is pending', async () => {
     const fixture = getMockInspectionSnapshot();
     const sourcePath = 'H:\\steel-sick-data\\2444\\capture\\C5\\2d\\219.png';
     const productionSnapshot = {
@@ -723,7 +732,9 @@ describe('persistent production command client', () => {
 
     const snapshot = await fetchInspectionSnapshot();
 
-    expect(snapshot.captureImages?.[0].url).toBe('');
+    expect(snapshot.captureImages?.[0].url).toBe(
+      `http://127.0.0.1:4873/api/production/file?path=${encodeURIComponent(sourcePath)}`,
+    );
   });
 
   it('keeps a SICK intensity preview only when the service supplies an explicit ROI', async () => {

@@ -2,6 +2,7 @@ import { ChevronLeft, ChevronRight, Maximize2, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { CaptureImageItem, ChartPoint, DefectItem } from '../data/inspection';
+import type { CaptureFlowMeasurement } from '../lib/capture-api';
 import { barSurfaceFileUrl, type BarSurfaceMesh } from '../services/bar-surface-api';
 import { bkvOnlineCroppedImageUrl, isBkvOnlineImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
@@ -140,6 +141,7 @@ export function AlarmAnalysis({
   collapsed,
   viewMode = 'diameter',
   diameterMeasurement,
+  diameterArtifact,
   diameterVisibleRange,
 }: {
   selectedDefect: DefectItem | null;
@@ -154,6 +156,7 @@ export function AlarmAnalysis({
   collapsed?: boolean;
   viewMode?: AnalysisViewMode;
   diameterMeasurement?: { nominalDiameterMm: number; lengthMm: number };
+  diameterArtifact?: CaptureFlowMeasurement | null;
   diameterVisibleRange?: [number, number] | null;
 }) {
   const panelClassName = `alarm-analysis-panel analysis-view-${viewMode}`;
@@ -179,10 +182,12 @@ export function AlarmAnalysis({
     ? defectRoiImages
     : artifactMode === 'demo' ? captureImages : [];
   const canMeasureDiameter = Boolean(
-    surfaceMesh
-    && diameterMeasurement
-    && diameterMeasurement.nominalDiameterMm > 0
-    && diameterMeasurement.lengthMm > 0,
+    diameterMeasurement
+    && (diameterArtifact || (
+      surfaceMesh
+      && diameterMeasurement.nominalDiameterMm > 0
+      && diameterMeasurement.lengthMm > 0
+    )),
   );
 
   if (collapsed) return null;
@@ -203,7 +208,8 @@ export function AlarmAnalysis({
         <h3>测径（外径）曲线</h3>
         {canMeasureDiameter ? (
           <DiameterTrendPanel
-            mesh={surfaceMesh!}
+            mesh={surfaceMesh}
+            artifact={diameterArtifact}
             nominalDiameterMm={diameterMeasurement!.nominalDiameterMm}
             lengthMm={diameterMeasurement!.lengthMm}
             visibleRange={diameterVisibleRange}

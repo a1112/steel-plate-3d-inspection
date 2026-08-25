@@ -378,7 +378,7 @@ foreach ($RequiredText in @("Get-NetTCPConnection", "netstat -ano", "1432", ".Id
 }
 
 $IntegratedText = Get-Content (Join-Path $RuntimeRoot "run-integrated-capture-management.ps1") -Raw
-foreach ($RequiredText in @("/health", "/api/production/status", "/api/trigger/status", "run-client-static.ps1", "StopExisting", "stop-runtime.ps1", "Wait-HttpHtml", "Client ready", "Assert-CaptureProviderMatches", "storageRoot", "configRoot")) {
+foreach ($RequiredText in @("/health", "/api/production/status", "/api/trigger/status", "Service-hosted client", '$ServicePort/?app=terminal', "StopExisting", "stop-runtime.ps1", "Wait-HttpHtml", "Client ready", "Assert-CaptureProviderMatches", "storageRoot", "configRoot")) {
   if ($IntegratedText -notmatch [regex]::Escape($RequiredText)) {
     throw "run-integrated-capture-management.ps1 must wait for or invoke $RequiredText"
   }

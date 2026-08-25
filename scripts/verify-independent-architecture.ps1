@@ -1142,7 +1142,7 @@ function Test-PackagedRuntimeContract {
 
   $IntegratedScript = Join-Path $PackageDir "run-integrated-capture-management.ps1"
   $IntegratedText = Get-Content $IntegratedScript -Raw
-  foreach ($RequiredText in @("/health", "/api/production/status", "/api/trigger/status", "run-trigger-gateway.ps1", "run-client-static.ps1", "StopExisting", "stop-runtime.ps1", "Wait-HttpHtml", "Client ready", "Assert-CaptureProviderMatches", "storageRoot", "configRoot")) {
+  foreach ($RequiredText in @("/health", "/api/production/status", "/api/trigger/status", "run-trigger-gateway.ps1", "Service-hosted client", '$ServicePort/?app=terminal', "StopExisting", "stop-runtime.ps1", "Wait-HttpHtml", "Client ready", "Assert-CaptureProviderMatches", "storageRoot", "configRoot")) {
     if ($IntegratedText -notmatch [regex]::Escape($RequiredText)) {
       throw "Integrated runtime script must wait for or invoke $RequiredText"
     }

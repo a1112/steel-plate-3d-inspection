@@ -1,0 +1,11 @@
+{
+  "schema": "steel.site-config.v1",
+  "id": "sick-array-6",
+  "displayName": "北满特钢小棒检测系统",
+  "mode": "direct-camera",
+  "runtimeProfile": "runtime.json",
+  "connectionConfig": "connection.json",
+  "captureConfig": "capture.json",
+  "algorithmConfig": "algorithm.json",
+  "mappingConfig": "mapping.json"
+}

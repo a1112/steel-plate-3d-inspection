@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   createAdminHeaders,
   getInspectionServiceOrigin,
+  isWebHostedRuntime,
   parseBkvCaptureStatus,
   readAdminErrorMessage,
 } from "../services/inspection-api";
@@ -564,6 +565,80 @@ export type CaptureMeasurementCamera = {
   reason?: string;
 };
 
+export type CaptureMeasurementCircleFit = {
+  available?: boolean;
+  centerX?: number;
+  centerZ?: number;
+  radiusMm?: number;
+  diameterMm?: number;
+  meanAbsResidualMm?: number;
+  p95AbsResidualMm?: number;
+  maxAbsResidualMm?: number;
+  roundnessMm?: number;
+  pointCount?: number;
+  robustPointCount?: number;
+  reason?: string;
+};
+
+export type CaptureMeasurementSection = {
+  anchorOrdinal?: number | null;
+  elapsedFromHeadMs?: number | null;
+  positionRatio?: number;
+  rowMappingComplete?: boolean;
+  metricValid?: boolean;
+  qualityGate?: { passed: boolean; reasons: string[] };
+  circleFit?: CaptureMeasurementCircleFit;
+};
+
+export type CaptureDirectionalDiameterSection = {
+  anchorOrdinal?: number | null;
+  elapsedFromHeadMs?: number | null;
+  positionRatio?: number;
+  metricValid?: boolean;
+  qualityGate?: { passed: boolean; reasons: string[] };
+  validAngleCount?: number;
+  diametersMm: Array<number | null>;
+  minimumMm?: number | null;
+  maximumMm?: number | null;
+  averageMm?: number | null;
+};
+
+export type CaptureDirectionalDiameterSeries = {
+  id: string;
+  kind: "fixed-angle" | "aggregate" | string;
+  angleDeg?: number | null;
+  label: string;
+  valuesMm: Array<number | null>;
+};
+
+export type CaptureDirectionalDiameterCurves = {
+  available?: boolean;
+  metricValid?: boolean;
+  model: "opposed-radial-pairs-from-reconstructed-surface" | string;
+  angleConvention: string;
+  longitudinalCoordinate: string;
+  absoluteLongitudinalScaleVerified?: boolean;
+  angularSampleHalfWindowDeg?: number;
+  fixedAnglesDeg: number[];
+  sections: CaptureDirectionalDiameterSection[];
+  series: CaptureDirectionalDiameterSeries[];
+  summary: {
+    metricValid?: boolean;
+    minimumMm?: number | null;
+    maximumMm?: number | null;
+    averageMm?: number | null;
+    validSectionCount?: number;
+    validSampleCount?: number;
+    byAngle?: Array<{
+      angleDeg: number;
+      minimumMm?: number | null;
+      maximumMm?: number | null;
+      averageMm?: number | null;
+      validSampleCount?: number;
+    }>;
+  };
+};
+
 export type CaptureFlowMeasurement = {
   schema: "steel.ranger3-flow-measurement.v1" | string;
   generatedAt: string;
@@ -574,19 +649,36 @@ export type CaptureFlowMeasurement = {
   selectedSection: {
     anchorOrdinal?: number | null;
     elapsedFromHeadMs?: number | null;
-    circleFit?: {
-      available?: boolean;
-      diameterMm?: number;
-      radiusMm?: number;
-      p95AbsResidualMm?: number;
-      reason?: string;
-    };
+    circleFit?: CaptureMeasurementCircleFit;
   };
   cameras: Record<string, CaptureMeasurementCamera>;
   surfaceFit?: {
     available?: boolean;
+    metricValid?: boolean;
     absoluteLongitudinalScaleVerified?: boolean;
     reason?: string | null;
+    model?: string;
+    longitudinalCoordinate?: string;
+    note?: string;
+    maximumCircleResidualMm?: number;
+    sectionsRequested?: number;
+    sectionsAccepted?: number;
+    sectionsRejected?: number;
+    diameterMeanMm?: number;
+    diameterMedianMm?: number;
+    diameterMinimumMm?: number;
+    diameterMaximumMm?: number;
+    diameterStdDevMm?: number;
+    diameterP05Mm?: number;
+    diameterP95Mm?: number;
+    diameterRangeMm?: number;
+    roundnessMaximumMm?: number;
+    fitResidualP95MaximumMm?: number;
+    centerStraightnessMaximumMm?: number;
+    headRelativeTimeSpanMs?: number;
+    fullHeadRelativeTimeSpanMs?: number;
+    sections?: CaptureMeasurementSection[];
+    diameterCurves?: CaptureDirectionalDiameterCurves;
   };
 };
 
@@ -594,6 +686,134 @@ export type CaptureMeasurementResponse = {
   code: number;
   path: string;
   measurement: CaptureFlowMeasurement;
+};
+
+export type CaptureSurfaceCameraTileRowAnchor = {
+  row: number;
+  anchorOrdinal?: number | null;
+  elapsedFromHeadMs?: number | null;
+  positionRatio?: number | null;
+  storageIndex?: number | null;
+  sourceRow?: number | null;
+  sourceGlobalRow?: number | null;
+  timeResidualMs?: number | null;
+  interpolationResidualMs?: number | null;
+  mappingMetricValid?: boolean;
+  acceptedForSurface?: boolean;
+  cropBox?: number[] | null;
+};
+
+export type CaptureSurfaceCameraTile = {
+  cameraId: string;
+  state: "ready" | "unavailable" | string;
+  fixedAngleDeg?: number | null;
+  sourceShape?: number[];
+  cropBox?: number[];
+  sourceOffset?: { x: number; y: number };
+  rows: number;
+  columns: number;
+  coordinateLayout?: string;
+  residualUnit?: "mm" | string;
+  residuals?: Array<number | null>;
+  validMask?: number[];
+  sampleCounts?: number[];
+  angleDegByColumn?: Array<number | null>;
+  rowAnchors?: CaptureSurfaceCameraTileRowAnchor[];
+  coverage?: {
+    validSampleCount?: number;
+    validRatio?: number;
+    coverageAngleIntervalsDeg?: number[][];
+    ownedAngleIntervalsDeg?: number[][];
+    ownedColumnIntervals?: number[][];
+    overlapColumnIntervals?: number[][];
+  };
+  jet?: {
+    palette?: "JET" | string;
+    minimumMm?: number;
+    maximumMm?: number;
+    zeroMm?: number;
+    missingColor?: string;
+    imagePath?: string;
+  };
+  defectMapping?: {
+    coordinateSpace?: string;
+    sourceCropBox?: number[];
+    cameraRequired?: string;
+    tileX?: string;
+    tileXRatio?: string;
+    tileRow?: string;
+    longitudinalCoordinate?: string;
+    angleLookup?: string;
+  };
+  reason?: string;
+};
+
+export type CaptureSurfaceCameraTiles = {
+  schema: "steel.ranger3-camera-jet-tiles.v1" | string;
+  coordinateSpace?: string;
+  angleConvention?: string;
+  rowOrder?: string;
+  residualDefinition?: string;
+  twoDimensionalCropSource?: string;
+  regionManifestPath?: string;
+  cameras: CaptureSurfaceCameraTile[];
+};
+
+export type CaptureFlowSurface = {
+  schema: "steel.ranger3-flow-surface.v1" | string;
+  generatedAt: string;
+  materialId: string;
+  state: "ready" | "unavailable" | string;
+  quality: {
+    crossSectionMetricValid: boolean;
+    absoluteLongitudinalScaleVerified: boolean;
+    geometrySynchronized: boolean;
+    passed: boolean;
+    reasons: string[];
+    angularCoverageRatio: number;
+  };
+  summary: {
+    sectionCount: number;
+    acceptedSectionCount: number;
+    diameterMeanMm: number | null;
+    diameterMinimumMm: number | null;
+    diameterMaximumMm: number | null;
+    diameterStdDevMm: number | null;
+    jetResidualRangeMm: number;
+  };
+  mesh: {
+    rows: number;
+    columns: number;
+    positions: Array<number | null>;
+    colors: number[];
+    indices: number[];
+    validMask: number[];
+  };
+  jet: {
+    palette: "JET" | string;
+    minimumMm: number;
+    maximumMm: number;
+    zeroMm: number;
+    imagePath: string;
+  };
+  cameraTiles?: CaptureSurfaceCameraTiles;
+  diameterCurves?: CaptureDirectionalDiameterCurves;
+  sections: Array<{
+    anchorOrdinal?: number;
+    elapsedFromHeadMs?: number;
+    mappingComplete: boolean;
+    circleFit: {
+      available?: boolean;
+      diameterMm?: number;
+      p95AbsResidualMm?: number;
+    };
+  }>;
+};
+
+export type CaptureSurfaceResponse = {
+  code: number;
+  path: string;
+  surface: CaptureFlowSurface;
 };
 
 export type CaptureDetectedDefect = {
@@ -1152,6 +1372,12 @@ function getCaptureStreamOrigin() {
   // start/stop authorization on 4873 while reading immutable preview bytes
   // directly from the local capture provider.
   const controlOrigin = getCaptureServiceOrigin();
+  if (isWebHostedRuntime()) {
+    // Browser pages must keep preview traffic on the page origin as well;
+    // otherwise an HTTPS UI would be blocked when it tried to read the local
+    // HTTP capture sidecar directly.
+    return controlOrigin;
+  }
   try {
     const host = new URL(controlOrigin).hostname.replace(/^\[|\]$/g, "").toLowerCase();
     const loopback = host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".localhost");
@@ -2543,6 +2769,11 @@ export async function readCaptureMeasurement(
   return readJson<CaptureMeasurementResponse>(
     `/api/capture/measurement?${query.toString()}`,
   );
+}
+
+export async function readCaptureSurface(materialId: string): Promise<CaptureSurfaceResponse> {
+  const query = new URLSearchParams({ materialId: materialId.trim() });
+  return readJson<CaptureSurfaceResponse>(`/api/capture/surface?${query.toString()}`);
 }
 
 export async function readCaptureRegions(materialId: string): Promise<CaptureRegionMap> {

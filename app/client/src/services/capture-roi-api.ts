@@ -9,6 +9,10 @@ import {
 } from '../lib/capture-api';
 
 const NUMERIC_FLOW_ID = /^\d+$/;
+// A virtualized stitch cell is 176 CSS pixels wide. This bounded rendition
+// remains sharp at common DPR values without decoding a 2048px image for
+// every one of the dozens of simultaneously visible cells.
+export const CAPTURE_STITCH_PREVIEW_MAX_WIDTH = 384;
 
 export type CaptureRoiPreviewImage = CaptureImageItem & {
   validRoi: [number, number, number, number];
@@ -36,6 +40,7 @@ export type CaptureStitchCameraFrame = {
   storageIndex: number;
   sourceWidth: number;
   sourceHeight: number;
+  sourceBytes?: number;
   validRoi: [number, number, number, number] | null;
   url: string;
   cropMode: 'algorithm-roi' | 'auto-black-border';
@@ -204,10 +209,11 @@ export function selectCaptureStitchHistory(
           storageIndex: camera.storageIndex ?? frame.sequence,
           sourceWidth: camera.width,
           sourceHeight: camera.height,
+          sourceBytes: camera.bytes,
           validRoi: roi,
           url: roi
-            ? captureHistoryImageUrl(camera.artifactRef, 2048, roi)
-            : captureArtifactImageUrl(camera.artifactRef, 2048),
+            ? captureHistoryImageUrl(camera.artifactRef, CAPTURE_STITCH_PREVIEW_MAX_WIDTH, roi)
+            : captureArtifactImageUrl(camera.artifactRef, CAPTURE_STITCH_PREVIEW_MAX_WIDTH),
           cropMode: roi ? 'algorithm-roi' as const : 'auto-black-border' as const,
         }];
       });

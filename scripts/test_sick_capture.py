@@ -21,6 +21,7 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
+from scripts.sick_capture import cli as sick_capture_cli
 from scripts.sick_capture.alignment import (
     AlignmentConfig,
     build_and_write_flow_alignment,
@@ -39,6 +40,7 @@ from scripts.sick_capture.models import RawFrame
 from scripts.sick_capture.events import publish_committed_round, write_flow_manifest
 from scripts.sick_capture.measurement import (
     MeasurementConfig,
+    build_fixed_angle_diameter_curves,
     build_flow_measurement,
     robust_circle_fit,
     summarize_cylinder_sections,
@@ -62,6 +64,7 @@ from scripts.sick_capture.provider import (
     NO_STEEL_FRAME_DISCARDED,
     ProviderRuntime,
     SickCaptureHTTPServer,
+    _build_flow_artifacts,
     _steel_tail_metrics,
 )
 from scripts.sick_capture.replay import LG3DReplaySource, validate_lg3d_dataset
@@ -100,6 +103,30 @@ def sample_frame(sequence: int = 0) -> RawFrame:
         },
         camera_config={"DeviceScanType": "Linescan3D"},
     )
+
+
+class SickCaptureCliTests(unittest.TestCase):
+    def test_service_history_only_flag_is_forwarded(self) -> None:
+        with patch.object(sick_capture_cli, "serve") as serve:
+            result = sick_capture_cli.service_main(
+                [
+                    "--profile",
+                    "config/sites/sick-array-6/capture.json",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "4317",
+                    "--history-only",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        serve.assert_called_once_with(
+            Path("config/sites/sick-array-6/capture.json"),
+            "127.0.0.1",
+            4317,
+            history_only=True,
+        )
 
 
 def write_profile(root: Path) -> Path:
@@ -443,6 +470,204 @@ class SickAlignmentTests(unittest.TestCase):
         self.assertAlmostEqual(summary["headRelativeTimeSpanMs"], 20.0)
         self.assertAlmostEqual(summary["centerStraightnessMaximumMm"], 0.05)
 
+    def test_cylinder_summary_rejects_bad_edge_sections_without_invalidating_curve(self) -> None:
+        sections = []
+        for index, (diameter, residual) in enumerate(((91.0, 3.2), (100.0, 0.2), (100.2, 0.3))):
+            sections.append(
+                {
+                    "anchorOrdinal": index,
+                    "elapsedFromHeadMs": index * 100.0,
+                    "rowMappingComplete": True,
+                    "circleFit": {
+                        "available": True,
+                        "diameterMm": diameter,
+                        "centerX": 0.0,
+                        "centerZ": 0.0,
+                        "p95AbsResidualMm": residual,
+                        "roundnessMm": residual / 2.0,
+                    },
+                }
+            )
+        summary = summarize_cylinder_sections(sections, 1.0)
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["sectionsAccepted"], 2)
+        self.assertEqual(summary["sectionsRejected"], 1)
+        self.assertFalse(summary["sections"][0]["metricValid"])
+        self.assertAlmostEqual(summary["diameterMeanMm"], 100.1)
+
+    def test_fixed_angle_diameter_curves_use_reconstructed_opposed_radii(self) -> None:
+        angular_bins = 360
+        bin_angles = (
+            np.arange(angular_bins, dtype=np.float64) + 0.5
+        ) * 2.0 * np.pi / angular_bins
+        shaped_residuals = 0.2 * np.cos(2.0 * bin_angles)
+        residual_grid = np.vstack(
+            (
+                np.full(angular_bins, 9.0, dtype=np.float64),
+                shaped_residuals,
+                np.zeros(angular_bins, dtype=np.float64),
+                np.full(angular_bins, -7.0, dtype=np.float64),
+            )
+        )
+        sections = [
+            {
+                "anchorOrdinal": index,
+                "elapsedFromHeadMs": index * 100.0,
+                "acceptedForSurface": index in (1, 2),
+                "circleFit": {
+                    "available": True,
+                    "radiusMm": radius,
+                },
+            }
+            for index, radius in enumerate((45.0, 50.0, 51.0, 46.0))
+        ]
+
+        curves = build_fixed_angle_diameter_curves(sections, residual_grid)
+
+        self.assertEqual(
+            curves["model"],
+            "opposed-radial-pairs-from-reconstructed-surface",
+        )
+        self.assertEqual(curves["fixedAnglesDeg"], [0.0, 30.0, 60.0, 90.0, 120.0, 150.0])
+        self.assertEqual(len(curves["sections"]), 4)
+        self.assertFalse(curves["sections"][0]["metricValid"])
+        self.assertFalse(curves["sections"][3]["metricValid"])
+        self.assertEqual(curves["sections"][0]["diametersMm"], [None] * 6)
+        self.assertIsNone(curves["sections"][0]["minimumMm"])
+        self.assertIsNone(curves["sections"][0]["maximumMm"])
+        self.assertIsNone(curves["sections"][0]["averageMm"])
+        self.assertAlmostEqual(curves["sections"][1]["diametersMm"][0], 100.4, delta=0.002)
+        self.assertAlmostEqual(curves["sections"][1]["diametersMm"][3], 99.6, delta=0.002)
+        self.assertEqual(curves["sections"][2]["diametersMm"], [102.0] * 6)
+        self.assertEqual(curves["sections"][0]["positionRatio"], 0.0)
+        self.assertEqual(curves["sections"][3]["positionRatio"], 1.0)
+        self.assertEqual(curves["summary"]["validSectionCount"], 2)
+        self.assertEqual(curves["summary"]["validSampleCount"], 12)
+        self.assertEqual(curves["series"][0]["id"], "angle-000")
+        self.assertEqual(curves["series"][5]["id"], "angle-150")
+        for series in curves["series"]:
+            self.assertEqual(len(series["valuesMm"]), len(curves["sections"]))
+            self.assertIsNone(series["valuesMm"][0])
+            self.assertIsNone(series["valuesMm"][3])
+
+    def test_fixed_angle_curve_fails_closed_when_directional_coverage_is_insufficient(self) -> None:
+        angular_bins = 180
+        residual_grid = np.full((1, angular_bins), np.nan, dtype=np.float64)
+        # Only the opposed samples for the 0-degree diameter are present.
+        residual_grid[0, (0, angular_bins - 1, 89, 90)] = 0.1
+        sections = [
+            {
+                "anchorOrdinal": 7,
+                "elapsedFromHeadMs": 20.0,
+                "acceptedForSurface": True,
+                "circleFit": {"available": True, "radiusMm": 50.0},
+            }
+        ]
+
+        curves = build_fixed_angle_diameter_curves(sections, residual_grid)
+
+        section = curves["sections"][0]
+        self.assertFalse(section["metricValid"])
+        self.assertIn(
+            "fixed-angle-coverage-insufficient",
+            section["qualityGate"]["reasons"],
+        )
+        self.assertEqual(section["diametersMm"], [None] * 6)
+        self.assertEqual(curves["summary"]["validSectionCount"], 0)
+        self.assertIsNone(curves["summary"]["minimumMm"])
+
+    def test_fixed_angle_curve_fails_closed_when_surface_metric_gate_fails(self) -> None:
+        residual_grid = np.zeros((2, 180), dtype=np.float64)
+        sections = [
+            {
+                "anchorOrdinal": index,
+                "elapsedFromHeadMs": index * 10.0,
+                "acceptedForSurface": True,
+                "circleFit": {"available": True, "radiusMm": 50.0},
+            }
+            for index in range(2)
+        ]
+
+        curves = build_fixed_angle_diameter_curves(
+            sections,
+            residual_grid,
+            surface_metric_valid=False,
+        )
+
+        self.assertFalse(curves["metricValid"])
+        self.assertFalse(curves["available"])
+        for section in curves["sections"]:
+            self.assertEqual(section["diametersMm"], [None] * 6)
+            self.assertIn(
+                "surface-metric-quality-gate-failed",
+                section["qualityGate"]["reasons"],
+            )
+
+    def test_flow_artifacts_mirror_surface_diameter_curves_into_measurement(self) -> None:
+        curves = {
+            "model": "opposed-radial-pairs-from-reconstructed-surface",
+            "fixedAnglesDeg": [0.0, 90.0],
+            "sections": [],
+            "series": [],
+            "summary": {"minimumMm": None, "maximumMm": None, "averageMm": None},
+        }
+        alignment = {"quality": {}, "softSyncAnchors": []}
+        measurement = {"materialId": "9", "surfaceFit": {"available": False}}
+        regions = {
+            "cameras": {},
+            "ownership": {},
+            "qualityGate": {},
+        }
+        surface = {
+            "state": "ready",
+            "quality": {"passed": True},
+            "summary": {"acceptedSectionCount": 2},
+            "diameterCurves": curves,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            alignment_target = root / "alignment.json"
+            measurement_target = root / "measurement.json"
+            region_target = root / "regions.json"
+            surface_target = root / "surface.json"
+            jet_target = root / "surface-jet.png"
+            with (
+                patch(
+                    "scripts.sick_capture.provider.build_and_write_flow_alignment",
+                    return_value=(alignment_target, alignment),
+                ),
+                patch(
+                    "scripts.sick_capture.provider.build_and_write_flow_measurement",
+                    return_value=(measurement_target, measurement),
+                ),
+                patch(
+                    "scripts.sick_capture.provider.build_and_write_flow_region_map",
+                    return_value=(region_target, regions),
+                ),
+                patch(
+                    "scripts.sick_capture.provider.build_and_write_flow_surface",
+                    return_value=(surface_target, surface, jet_target),
+                ),
+                patch("scripts.sick_capture.provider._atomic_json") as write_json,
+                patch("scripts.sick_capture.provider.build_and_write_playback_index"),
+            ):
+                _alignment_path, _alignment, _measurement_path, result = (
+                    _build_flow_artifacts(
+                        {"C1": root / "C1"},
+                        root,
+                        "9",
+                        AlignmentConfig(),
+                        None,
+                        MeasurementConfig(),
+                    )
+                )
+
+        self.assertIs(result["surfaceFit"]["diameterCurves"], curves)
+        self.assertIs(
+            write_json.call_args.args[1]["surfaceFit"]["diameterCurves"],
+            curves,
+        )
+
     @staticmethod
     def _write_camera_flow(
         camera_root: Path,
@@ -528,6 +753,8 @@ class SickAlignmentTests(unittest.TestCase):
             self.assertFalse(manifest["cameras"]["C1"]["head"]["clipped"])
             self.assertEqual(manifest["cameras"]["C2"]["transportGapCount"], 1)
             self.assertEqual(manifest["quality"]["transportFrameGaps"], 1)
+            self.assertIn("geometrySynchronized", manifest["quality"])
+            self.assertFalse(manifest["quality"]["synchronized"])
             self.assertGreaterEqual(len(manifest["softSyncAnchors"]), 2)
 
             path, written = build_and_write_flow_alignment(
@@ -1335,6 +1562,23 @@ class SickStorageTests(unittest.TestCase):
 
 
 class SickProviderTests(unittest.TestCase):
+    def test_history_only_runtime_rejects_device_connection_and_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            backend = FakeBackend()
+            runtime = ProviderRuntime(profile, backend=backend, history_only=True)
+            try:
+                self.assertTrue(backend.started)
+                self.assertEqual(runtime.sessions, {})
+                self.assertEqual(runtime.connect_all()["error"], "history_only")
+                status, capture = runtime.continuous_capture({"expectedCameras": 1})
+                self.assertEqual(status, 409)
+                self.assertEqual(capture["error"], "history_only")
+                self.assertTrue(runtime.health_json()["historyOnly"])
+                self.assertEqual(runtime.health_json()["framesReceived"], 0)
+            finally:
+                runtime.close()
+
     def test_http_server_suppresses_only_cancelled_client_connection_errors(self) -> None:
         server = object.__new__(SickCaptureHTTPServer)
         with patch("http.server.ThreadingHTTPServer.handle_error") as parent:

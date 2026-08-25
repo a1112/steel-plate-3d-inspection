@@ -24,7 +24,7 @@ from urllib import request
 import numpy as np
 from PIL import Image
 
-from .paths import capture_root, defect_manifest_path, defect_root
+from .paths import capture_root, defect_manifest_path, defect_root, surface_path
 
 from .alignment import _atomic_json, _read_json, _numeric_files
 from .playback import detect_valid_grayscale_roi
@@ -34,7 +34,20 @@ from .storage import replace_file
 
 DEFECT_DETECTION_SCHEMA = "steel.sick-flow-defect-detection.v1"
 MODEL_MANIFEST_SCHEMA = "steel.temporary-defect-model-set.v1"
-_DLL_DIRECTORY_HANDLES: list[Any] = []
+_DLL_DIRECTORY_HANDLES: dict[str, Any] = {}
+_DETECTOR_CACHE: dict[tuple[Any, ...], "OnnxYoloDetector"] = {}
+_CLASSIFIER_CACHE: dict[tuple[Any, ...], "OnnxDefectClassifier"] = {}
+
+
+def _ensure_cuda_dll_directory() -> None:
+    cuda_path = os.environ.get("CUDA_PATH", "").strip()
+    if os.name != "nt" or not cuda_path or not hasattr(os, "add_dll_directory"):
+        return
+    cuda_bin = (Path(cuda_path) / "bin").resolve()
+    key = os.path.normcase(str(cuda_bin))
+    if key in _DLL_DIRECTORY_HANDLES or not cuda_bin.is_dir():
+        return
+    _DLL_DIRECTORY_HANDLES[key] = os.add_dll_directory(str(cuda_bin))
 
 
 class ExecutionGateInterrupted(RuntimeError):
@@ -341,11 +354,7 @@ class OnnxYoloDetector:
             raise RuntimeError("onnxruntime-gpu is required for defect detection") from error
         if not path.is_file():
             raise FileNotFoundError(path)
-        cuda_path = os.environ.get("CUDA_PATH", "").strip()
-        if os.name == "nt" and cuda_path:
-            cuda_bin = Path(cuda_path) / "bin"
-            if cuda_bin.is_dir():
-                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(cuda_bin)))
+        _ensure_cuda_dll_directory()
         if hasattr(ort, "preload_dlls"):
             try:
                 ort.preload_dlls()
@@ -423,11 +432,7 @@ class OnnxDefectClassifier:
             raise RuntimeError("onnxruntime-gpu is required for defect recognition") from error
         if not path.is_file():
             raise FileNotFoundError(path)
-        cuda_path = os.environ.get("CUDA_PATH", "").strip()
-        if os.name == "nt" and cuda_path:
-            cuda_bin = Path(cuda_path) / "bin"
-            if cuda_bin.is_dir():
-                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(cuda_bin)))
+        _ensure_cuda_dll_directory()
         if hasattr(ort, "preload_dlls"):
             try:
                 ort.preload_dlls()
@@ -748,12 +753,77 @@ def _defect_position_ratios(
     source_width: int,
     source_height: int,
     camera_alignment: dict[str, Any],
-) -> tuple[float, float, int | None]:
+    camera_surface_tile: dict[str, Any] | None = None,
+) -> tuple[float, float, int | None, dict[str, Any]]:
     camera_number = _camera_number(camera_id)
     center_x = (rect[0] + rect[2]) / 2.0
     center_y = (rect[1] + rect[3]) / 2.0
     local_x_ratio = max(0.0, min(1.0, center_x / max(source_width, 1)))
-    if camera_number is None:
+    surface_mapping: dict[str, Any] = {
+        "available": False,
+        "coordinateSpace": "source-image-pixels",
+    }
+    calibrated_angle: float | None = None
+    tile = camera_surface_tile if isinstance(camera_surface_tile, dict) else {}
+    crop = tile.get("cropBox")
+    angles = tile.get("angleDegByColumn")
+    if isinstance(crop, list) and len(crop) == 4 and isinstance(angles, list) and angles:
+        tile_x = int(round(center_x - float(crop[0])))
+        if 0 <= tile_x < len(angles):
+            candidate_indices = sorted(
+                range(len(angles)), key=lambda index: abs(index - tile_x)
+            )
+            selected_index = next(
+                (index for index in candidate_indices if angles[index] is not None),
+                None,
+            )
+            if selected_index is not None:
+                try:
+                    candidate_angle = float(angles[selected_index]) % 360.0
+                except (TypeError, ValueError):
+                    candidate_angle = math.nan
+                if math.isfinite(candidate_angle):
+                    calibrated_angle = candidate_angle
+                    source_global_row = storage_index * source_height + center_y
+                    row_anchors = [
+                        row
+                        for row in tile.get("rowAnchors", [])
+                        if isinstance(row, dict)
+                        and isinstance(row.get("sourceGlobalRow"), (int, float))
+                    ]
+                    nearest_row = (
+                        min(
+                            row_anchors,
+                            key=lambda row: abs(
+                                float(row["sourceGlobalRow"]) - source_global_row
+                            ),
+                        )
+                        if row_anchors
+                        else None
+                    )
+                    surface_mapping = {
+                        "available": True,
+                        "schema": "steel.surface-defect-mapping.v1",
+                        "coordinateSpace": "source-image-pixels-to-surface-tile",
+                        "cameraId": camera_id,
+                        "sourceX": round(center_x, 3),
+                        "sourceY": round(center_y, 3),
+                        "tileX": selected_index,
+                        "tileXRatio": round(
+                            selected_index / max(1, len(angles) - 1), 8
+                        ),
+                        "arrayAngleDeg": round(candidate_angle, 6),
+                        "tileRow": nearest_row.get("row") if nearest_row else None,
+                        "tilePositionRatio": (
+                            nearest_row.get("positionRatio") if nearest_row else None
+                        ),
+                        "anchorOrdinal": (
+                            nearest_row.get("anchorOrdinal") if nearest_row else None
+                        ),
+                    }
+    if calibrated_angle is not None:
+        circumference_ratio = calibrated_angle / 360.0
+    elif camera_number is None:
         circumference_ratio = local_x_ratio
     else:
         circumference_ratio = (
@@ -773,6 +843,7 @@ def _defect_position_ratios(
         max(0.0, min(1.0, length_ratio)),
         max(0.0, min(1.0, circumference_ratio)),
         camera_number,
+        surface_mapping,
     )
 
 
@@ -808,6 +879,8 @@ def _database_import_payload(
             "cameraIndex": defect.get("cameraIndex"),
             "lengthRatio": defect.get("lengthRatio"),
             "circumferenceRatio": defect.get("circumferenceRatio"),
+            "arrayAngleDeg": defect.get("arrayAngleDeg"),
+            "surfaceMapping": defect.get("surfaceMapping"),
             "imageRect2d": rect,
             "reviewCropRect": review_crop,
             "modalities": defect.get("modalities", []),
@@ -1099,6 +1172,15 @@ def build_flow_defect_detection(
     if execution_gate is not None:
         execution_gate("defect-region-manifest-read")
     region_map = read_region_manifest(storage_root, material_id)
+    try:
+        surface_manifest = _read_json(surface_path(storage_root, material_id))
+    except (OSError, ValueError, json.JSONDecodeError):
+        surface_manifest = {}
+    surface_tiles = {
+        str(row.get("cameraId")): row
+        for row in surface_manifest.get("cameraTiles", {}).get("cameras", [])
+        if isinstance(row, dict) and row.get("cameraId")
+    }
     if settings.require_approved_region_map and not bool(
         region_map and region_map.get("defectDetectionAllowed")
     ):
@@ -1148,7 +1230,24 @@ def build_flow_defect_detection(
     for modality, path in available_models.items():
         if execution_gate is not None:
             execution_gate(f"defect-model-open:{modality}")
-        detectors[modality] = OnnxYoloDetector(path, settings)
+        stat = path.stat()
+        detector_key = (
+            str(path.resolve()),
+            stat.st_size,
+            stat.st_mtime_ns,
+            settings.gpu_device_id,
+            settings.image_size,
+            settings.confidence_threshold,
+            settings.iou_threshold,
+            settings.maximum_detections_per_frame,
+        )
+        detector = _DETECTOR_CACHE.get(detector_key)
+        if detector is None:
+            detector = OnnxYoloDetector(path, settings)
+            _DETECTOR_CACHE[detector_key] = detector
+            while len(_DETECTOR_CACHE) > 8:
+                _DETECTOR_CACHE.pop(next(iter(_DETECTOR_CACHE)))
+        detectors[modality] = detector
     classifiers: dict[str, OnnxDefectClassifier] = {}
     for modality, path in configured_classifiers.items():
         if execution_gate is not None:
@@ -1157,7 +1256,20 @@ def build_flow_defect_detection(
             continue
         if execution_gate is not None:
             execution_gate(f"defect-classifier-open:{modality}")
-        classifiers[modality] = OnnxDefectClassifier(path, settings)
+        stat = path.stat()
+        classifier_key = (
+            str(path.resolve()),
+            stat.st_size,
+            stat.st_mtime_ns,
+            settings.gpu_device_id,
+        )
+        classifier = _CLASSIFIER_CACHE.get(classifier_key)
+        if classifier is None:
+            classifier = OnnxDefectClassifier(path, settings)
+            _CLASSIFIER_CACHE[classifier_key] = classifier
+            while len(_CLASSIFIER_CACHE) > 8:
+                _CLASSIFIER_CACHE.pop(next(iter(_CLASSIFIER_CACHE)))
+        classifiers[modality] = classifier
     classifier_rows = {
         modality: {
             int(row["outputIndex"]): row
@@ -1228,6 +1340,7 @@ def build_flow_defect_detection(
         head = camera_alignment.get("head", {})
         tail = camera_alignment.get("tail", {})
         region_row = (region_map or {}).get("cameras", {}).get(camera_id, {})
+        camera_surface_tile = surface_tiles.get(camera_id)
         stable_crop = region_row.get("stableCrop")
         owned_intervals = region_row.get("ownedColumnIntervals", [])
         if head.get("detected"):
@@ -1389,7 +1502,12 @@ def build_flow_defect_detection(
                         review_path,
                         settings.review_crop_minimum_size,
                     )
-                    length_ratio, circumference_ratio, camera_number = (
+                    (
+                        length_ratio,
+                        circumference_ratio,
+                        camera_number,
+                        surface_mapping,
+                    ) = (
                         _defect_position_ratios(
                             camera_id=camera_id,
                             camera_count=len(camera_roots),
@@ -1398,6 +1516,7 @@ def build_flow_defect_detection(
                             source_width=int(intensity.shape[1]),
                             source_height=int(intensity.shape[0]),
                             camera_alignment=camera_alignment,
+                            camera_surface_tile=camera_surface_tile,
                         )
                     )
                     depth_result = (
@@ -1464,6 +1583,8 @@ def build_flow_defect_detection(
                             "sourceImageHeight": int(intensity.shape[0]),
                             "lengthRatio": round(length_ratio, 8),
                             "circumferenceRatio": round(circumference_ratio, 8),
+                            "arrayAngleDeg": surface_mapping.get("arrayAngleDeg"),
+                            "surfaceMapping": surface_mapping,
                             "coordinateSpace": "source-image-pixels",
                         }
                     )

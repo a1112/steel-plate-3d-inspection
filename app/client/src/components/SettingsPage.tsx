@@ -2,7 +2,7 @@ import { ClipboardCheck, Cpu, Factory, Gauge, LoaderCircle, Monitor, Palette, Ra
 import { useState, type ChangeEvent, type ElementType } from 'react';
 import type { ThemeMode, ThemeStyle } from '../data/inspection';
 import { openParameterManagementWindow } from '../lib/app-windows';
-import type { ConnectionConfig, ConnectionMode, DiscoveredInspectionService } from '../services/inspection-api';
+import { isWebHostedRuntime, type ConnectionConfig, type ConnectionMode, type DiscoveredInspectionService } from '../services/inspection-api';
 import type { InspectionSettings, SettingsErrors } from '../state/operations';
 import { Panel } from './Panel';
 
@@ -193,6 +193,10 @@ export function SettingsPage({
   const setConnectionMode = (mode: ConnectionMode) => onConnectionChange({ mode });
   const handleVolume = (event: ChangeEvent<HTMLInputElement>) => onDraftChange({ alarmVolume: Number(event.target.value) });
   const currentThemeLabel = themeOptions.find((option) => option.id === theme)?.label ?? '深色工业';
+  const webHosted = isWebHostedRuntime();
+  const displayedServiceAddress = webHosted && typeof window !== 'undefined'
+    ? window.location.origin
+    : `${connection.protocol ?? 'http'}://${connection.host}:${connection.port}`;
 
   return (
     <div className={`settings-page ${embedded ? 'settings-page-embedded' : 'workspace-page'}`}>
@@ -241,38 +245,61 @@ export function SettingsPage({
                   演示模式
                 </button>
               </div>
-              <label className="setting-field">
-                <span>服务端 IP</span>
-                <input
-                  aria-label="服务端 IP"
-                  value={connection.host}
-                  disabled={connection.mode === 'demo'}
-                  onChange={(event) => onConnectionChange({ host: event.target.value })}
-                />
-              </label>
-              <label className="setting-field">
-                <span>服务端端口</span>
-                <div className="number-input">
-                  <input
-                    aria-label="服务端端口"
-                    type="number"
-                    min={1}
-                    max={65535}
-                    value={connection.port}
-                    disabled={connection.mode === 'demo'}
-                    onChange={(event) => onConnectionChange({ port: Number(event.target.value) })}
-                  />
-                  <b>port</b>
+              {webHosted ? (
+                <div className="connection-same-origin" role="status">
+                  <strong>网页同源连接</strong>
+                  <span>当前页面与检测 API 共用 {displayedServiceAddress}，无需配置 IP 或 UI 端口。</span>
                 </div>
-              </label>
+              ) : (
+                <>
+                  <label className="setting-field">
+                    <span>连接协议</span>
+                    <select
+                      aria-label="连接协议"
+                      value={connection.protocol ?? 'http'}
+                      disabled={connection.mode === 'demo'}
+                      onChange={(event) => onConnectionChange({ protocol: event.target.value as 'http' | 'https' })}
+                    >
+                      <option value="http">HTTP</option>
+                      <option value="https">HTTPS</option>
+                    </select>
+                  </label>
+                  <label className="setting-field">
+                    <span>服务端 IP</span>
+                    <input
+                      aria-label="服务端 IP"
+                      value={connection.host}
+                      disabled={connection.mode === 'demo'}
+                      onChange={(event) => onConnectionChange({ host: event.target.value })}
+                    />
+                  </label>
+                  <label className="setting-field">
+                    <span>服务端端口</span>
+                    <div className="number-input">
+                      <input
+                        aria-label="服务端端口"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        value={connection.port}
+                        disabled={connection.mode === 'demo'}
+                        onChange={(event) => onConnectionChange({ port: Number(event.target.value) })}
+                      />
+                      <b>port</b>
+                    </div>
+                  </label>
+                </>
+              )}
               <div className="settings-actions">
-                <button type="button" disabled={connection.mode === 'demo' || discoveryBusy} onClick={onConnectionDiscover}>
-                  {discoveryBusy ? <LoaderCircle className="spin" size={16} /> : <Radar size={16} />}
-                  {discoveryBusy ? '正在发现' : '自动发现'}
-                </button>
+                {!webHosted ? (
+                  <button type="button" disabled={connection.mode === 'demo' || discoveryBusy} onClick={onConnectionDiscover}>
+                    {discoveryBusy ? <LoaderCircle className="spin" size={16} /> : <Radar size={16} />}
+                    {discoveryBusy ? '正在发现' : '自动发现'}
+                  </button>
+                ) : null}
                 <button type="button" onClick={onConnectionSave}>
                   <Save size={16} />
-                  保存连接
+                  {webHosted ? '刷新连接' : '保存连接'}
                 </button>
                 <button
                   type="button"
@@ -283,7 +310,7 @@ export function SettingsPage({
                   参数管理
                 </button>
               </div>
-              {discoveryStatus || discoveredServices.length > 0 ? (
+              {!webHosted && (discoveryStatus || discoveredServices.length > 0) ? (
                 <section className="connection-discovery" aria-label="自动发现结果">
                   <header>
                     <strong>局域网服务</strong>
@@ -315,7 +342,7 @@ export function SettingsPage({
                 </div>
                 <div>
                   <dt>服务端地址</dt>
-                  <dd>{connection.host}:{connection.port}</dd>
+                  <dd>{displayedServiceAddress}</dd>
                 </div>
                 <div>
                   <dt>状态</dt>

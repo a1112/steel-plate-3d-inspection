@@ -33,6 +33,7 @@ import {
   readCaptureHistory,
   readCapturePlaybackCacheStatus,
   readCaptureMeasurement,
+  readCaptureSurface,
   readCaptureParam,
   readCaptureLocalTextFile,
   readActiveCaptureCalibration,
@@ -396,6 +397,21 @@ describe("readLatestCaptureFile", () => {
     expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
       materialId: "1",
     });
+  });
+
+  it("reads the synchronized JET surface through Rust", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 0,
+      path: "D:\\steel-sick-data\\1\\derived\\geometry\\surface.json",
+      surface: { schema: "steel.ranger3-flow-surface.v1", materialId: "1" },
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await readCaptureSurface("1");
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:4873/api/capture/surface?materialId=1",
+    );
   });
 
   it("reads and rebuilds temporary defect detection through Rust", async () => {

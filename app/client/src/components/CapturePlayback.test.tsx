@@ -42,6 +42,12 @@ vi.mock('./CaptureDefectDetectionPanel', () => ({
   ),
 }));
 
+vi.mock('./CaptureSurfacePanel', () => ({
+  CaptureSurfacePanel: ({ materialId }: { materialId: string }) => (
+    <div data-testid="surface-panel">{materialId}</div>
+  ),
+}));
+
 const statuses: CaptureCameraStatus[] = [
   { connected: true, deviceId: 1, ip: '192.168.101.144', name: 'C1' },
   { connected: true, deviceId: 2, ip: '192.168.102.206', name: 'C2' },

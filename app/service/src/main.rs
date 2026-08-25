@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as UnixMetadataExt, OpenOptionsExt as UnixOpenOptionsExt};
@@ -2473,6 +2473,49 @@ fn production_record_status(status: &str) -> &'static str {
     }
 }
 
+fn capture_defect_manifest_complete(storage_root: &str, material_id: &str) -> bool {
+    if storage_root.trim().is_empty() || material_id.trim().is_empty() {
+        return false;
+    }
+    let manifest_path = Path::new(storage_root)
+        .join(material_id)
+        .join("derived")
+        .join("defects")
+        .join("manifest.json");
+    let Ok(contents) = fs::read_to_string(manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<Value>(&contents) else {
+        return false;
+    };
+    matches!(
+        manifest.get("state").and_then(Value::as_str),
+        Some("complete" | "degraded")
+    ) && manifest
+        .pointer("/databaseImport/state")
+        .and_then(Value::as_str)
+        == Some("complete")
+}
+
+fn capture_defect_analysis_complete(
+    inspection: &db::entities::production_inspection::Model,
+) -> bool {
+    matches!(
+        inspection.status.as_str(),
+        "algorithm-complete" | "completed"
+    ) || capture_defect_manifest_complete(&inspection.storage_root, &inspection.material_id)
+}
+
+fn production_inspection_record_status(
+    inspection: &db::entities::production_inspection::Model,
+) -> &'static str {
+    if inspection.status == "finished" && !capture_defect_analysis_complete(inspection) {
+        "detecting"
+    } else {
+        production_record_status(&inspection.status)
+    }
+}
+
 fn production_plate_value(
     inspection: &db::entities::production_inspection::Model,
     session: Option<&db::entities::material_session::Model>,
@@ -3454,7 +3497,7 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             "id": inspection.session_id,
             "time": production_time_label(&inspection.started_at, &inspection.material_id),
             "plateNo": inspection.material_id,
-            "status": production_record_status(&inspection.status),
+            "status": production_inspection_record_status(inspection),
             "defectCount": defects.len()
         }));
         plate_inspections.push(json!({
@@ -5186,6 +5229,28 @@ fn production_policy_health_component(state: &ServiceState) -> (bool, Value) {
         );
     }
     let mock_count = state.algorithm_mock_defect_count.parse::<u64>().ok();
+    if env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1") {
+        // The split SICK runtime uses PostgreSQL, whose adapter deliberately
+        // runs under a non-production service profile. Production safety is
+        // enforced by the isolated algorithm service instead: it must run the
+        // production algorithm mode and synthetic defects remain forbidden.
+        let ready = external_processing_policy_ready(&state.algorithm_mode, mock_count);
+        return (
+            ready,
+            json!({
+                "ok": ready,
+                "readyContribution": ready,
+                "status": if ready { "external-processing-policy-enforced" } else { "invalid" },
+                "required": true,
+                "runtimeProfile": state.runtime_profile,
+                "algorithmMode": state.algorithm_mode,
+                "externalProcessing": true,
+                "syntheticFixturesAllowed": false,
+                "mockDefectCount": mock_count,
+                "reason": if ready { Value::Null } else { json!("production_algorithm_policy_invalid") }
+            }),
+        );
+    }
     let ready = state.runtime_profile.eq_ignore_ascii_case("production")
         && state.algorithm_mode.eq_ignore_ascii_case("production")
         && mock_count == Some(0);
@@ -5203,6 +5268,10 @@ fn production_policy_health_component(state: &ServiceState) -> (bool, Value) {
             "reason": if ready { Value::Null } else { json!("production_algorithm_policy_invalid") }
         }),
     )
+}
+
+fn external_processing_policy_ready(algorithm_mode: &str, mock_count: Option<u64>) -> bool {
+    algorithm_mode.eq_ignore_ascii_case("production") && mock_count == Some(0)
 }
 
 fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
@@ -6285,6 +6354,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/capture/continuous-settings"),
     ("GET", "/api/capture/alignment"),
     ("GET", "/api/capture/measurement"),
+    ("GET", "/api/capture/surface"),
     ("GET", "/api/capture/regions"),
     ("GET", "/api/capture/defects"),
     ("GET", "/api/stream/status"),
@@ -6645,8 +6715,7 @@ fn header_end_index(bytes: &[u8]) -> Option<usize> {
         .map(|index| index + 4)
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+fn read_http_request<R: Read>(stream: &mut R) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
@@ -9044,6 +9113,15 @@ fn validate_connection_config_value(value: &Value) -> Result<(), String> {
     }
     validate_text_field(object, "host", "host", "connection", 255)?;
     validate_i64_field(object, "port", "port", "connection", 1, 65_535)?;
+    if let Some(protocol) = field_value(object, "protocol", "protocol") {
+        let protocol = protocol
+            .as_str()
+            .map(str::trim)
+            .ok_or_else(|| "connection.protocol 必须是字符串".to_string())?;
+        if !matches!(protocol, "http" | "https") {
+            return Err("connection.protocol 只能是 http 或 https".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -9493,6 +9571,60 @@ fn configured_service_port() -> u16 {
         .unwrap_or(4873)
 }
 
+fn configured_https_port() -> Option<u16> {
+    env::var("INSPECTION_SERVICE_HTTPS_PORT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+}
+
+fn load_tls_server_config() -> std::io::Result<Arc<rustls::ServerConfig>> {
+    let certificate_path = env::var("INSPECTION_SERVICE_TLS_CERT")
+        .map(PathBuf::from)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "INSPECTION_SERVICE_TLS_CERT is required when HTTPS is enabled",
+            )
+        })?;
+    let private_key_path = env::var("INSPECTION_SERVICE_TLS_KEY")
+        .map(PathBuf::from)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "INSPECTION_SERVICE_TLS_KEY is required when HTTPS is enabled",
+            )
+        })?;
+    let mut certificate_reader = BufReader::new(fs::File::open(&certificate_path)?);
+    let certificates =
+        rustls_pemfile::certs(&mut certificate_reader).collect::<Result<Vec<_>, _>>()?;
+    if certificates.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "TLS certificate file contains no certificates: {}",
+                certificate_path.display()
+            ),
+        ));
+    }
+    let mut private_key_reader = BufReader::new(fs::File::open(&private_key_path)?);
+    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "TLS private key file contains no supported key: {}",
+                private_key_path.display()
+            ),
+        )
+    })?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok(Arc::new(config))
+}
+
 fn configured_service_host() -> String {
     env::var("INSPECTION_SERVICE_HOST")
         .ok()
@@ -9530,24 +9662,36 @@ fn preferred_lan_service_host(bind_host: &str) -> String {
     "127.0.0.1".to_string()
 }
 
-fn service_http_origin(host: &str, port: u16) -> String {
-    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
-        format!("http://[{host}]:{port}")
+fn service_origin(scheme: &str, host: &str, port: u16) -> String {
+    let authority = if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]")
     } else {
-        format!("http://{host}:{port}")
+        host.to_string()
+    };
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    if port == default_port {
+        format!("{scheme}://{authority}")
+    } else {
+        format!("{scheme}://{authority}:{port}")
     }
+}
+
+fn advertised_service_endpoint() -> (&'static str, u16) {
+    configured_https_port()
+        .map(|port| ("https", port))
+        .unwrap_or_else(|| ("http", configured_service_port()))
 }
 
 fn connection_runtime_value(state: &ServiceState) -> Value {
     let bind_host = configured_service_host();
     let advertised_host = preferred_lan_service_host(&bind_host);
-    let port = configured_service_port();
+    let (scheme, port) = advertised_service_endpoint();
     json!({
         "service": "steel-inspection-service",
         "bindHost": bind_host,
         "advertisedHost": advertised_host,
         "port": port,
-        "origin": service_http_origin(&advertised_host, port),
+        "origin": service_origin(scheme, &advertised_host, port),
         "lanAccess": !matches!(bind_host.as_str(), "127.0.0.1" | "::1" | "localhost"),
         "databaseEngine": state.database.engine,
         "databaseStatus": if state.database.fallback_active { "degraded" } else { "up" },
@@ -9567,10 +9711,16 @@ fn connection_discovery_response(state: &ServiceState) -> Vec<u8> {
         .and_then(Value::as_u64)
         .and_then(|value| u16::try_from(value).ok())
         .unwrap_or(4873);
+    let scheme = runtime
+        .get("origin")
+        .and_then(Value::as_str)
+        .filter(|origin| origin.starts_with("https://"))
+        .map(|_| "https")
+        .unwrap_or("http");
     let mut addresses = vec![json!({
         "host": preferred_host,
         "port": port,
-        "origin": service_http_origin(preferred_host, port),
+        "origin": service_origin(scheme, preferred_host, port),
         "scope": if preferred_host == "127.0.0.1" { "loopback" } else { "lan" },
         "preferred": true
     })];
@@ -9578,7 +9728,7 @@ fn connection_discovery_response(state: &ServiceState) -> Vec<u8> {
         addresses.push(json!({
             "host": "127.0.0.1",
             "port": port,
-            "origin": format!("http://127.0.0.1:{port}"),
+            "origin": service_origin(scheme, "127.0.0.1", port),
             "scope": "loopback",
             "preferred": false
         }));
@@ -9608,7 +9758,8 @@ fn read_connection_response(state: &ServiceState) -> Vec<u8> {
         Ok(None) => json!({
             "mode": "online",
             "host": "127.0.0.1",
-            "port": configured_service_port()
+            "port": advertised_service_endpoint().1,
+            "protocol": advertised_service_endpoint().0
         }),
         Err(error) => {
             return http_response(
@@ -14691,14 +14842,165 @@ fn content_type_for_path(path: &Path) -> &'static str {
         .to_ascii_lowercase()
         .as_str()
     {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "wasm" => "application/wasm",
         "json" => "application/json; charset=utf-8",
         "obj" => "text/plain; charset=utf-8",
         "mtl" => "text/plain; charset=utf-8",
         "csv" => "text/csv; charset=utf-8",
         "bsmesh" => "application/octet-stream",
         _ => "application/octet-stream",
+    }
+}
+
+fn configured_web_root() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(value) = env::var("STEEL_WEB_ROOT") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            candidates.push(PathBuf::from(trimmed));
+        }
+    }
+    let workspace = workspace_root();
+    candidates.push(workspace.join("client"));
+    candidates.push(
+        workspace
+            .join("target")
+            .join("client")
+            .join("frontend-dist"),
+    );
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("index.html").is_file())
+        .and_then(|candidate| candidate.canonicalize().ok())
+}
+
+static WEB_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn active_web_root() -> Option<&'static Path> {
+    WEB_ROOT.get_or_init(configured_web_root).as_deref()
+}
+
+fn decode_web_request_path(value: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn resolve_web_asset_path(root: &Path, request_path: &str) -> Result<PathBuf, &'static str> {
+    let decoded = decode_web_request_path(request_path).ok_or("invalid_path_encoding")?;
+    if decoded.contains('\0') || decoded.contains('\\') {
+        return Err("invalid_path");
+    }
+    let relative_text = decoded.trim_start_matches('/');
+    let relative = Path::new(relative_text);
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err("path_outside_web_root");
+    }
+    let requested = if relative_text.is_empty() {
+        root.join("index.html")
+    } else {
+        root.join(relative)
+    };
+    let candidate = if requested.is_dir() {
+        requested.join("index.html")
+    } else if requested.is_file() {
+        requested
+    } else if relative.extension().is_none() {
+        root.join("index.html")
+    } else {
+        return Err("web_asset_not_found");
+    };
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| "web_asset_not_found")?;
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        return Err("path_outside_web_root");
+    }
+    Ok(canonical)
+}
+
+fn web_asset_response(web_root: Option<&Path>, request_path: &str) -> Vec<u8> {
+    let Some(root) = web_root else {
+        return http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            "{\"error\":\"web_client_not_built\"}",
+        );
+    };
+    let path = match resolve_web_asset_path(root, request_path) {
+        Ok(path) => path,
+        Err("web_asset_not_found") => {
+            return http_response(
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                "{\"error\":\"not_found\"}",
+            )
+        }
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({ "error": error }).to_string(),
+            )
+        }
+    };
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let is_index = path.file_name().and_then(|name| name.to_str()) == Some("index.html");
+            http_bytes_response_with_headers(
+                "200 OK",
+                content_type_for_path(&path),
+                &bytes,
+                &[
+                    (
+                        "Cache-Control",
+                        if is_index {
+                            "no-cache"
+                        } else {
+                            "public, max-age=31536000, immutable"
+                        },
+                    ),
+                    ("X-Content-Type-Options", "nosniff"),
+                ],
+            )
+        }
+        Err(_) => http_response(
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            "{\"error\":\"not_found\"}",
+        ),
     }
 }
 
@@ -14710,6 +15012,11 @@ fn path_stays_under(path: &Path, root: &Path) -> bool {
         return false;
     };
     canonical_path.starts_with(canonical_root)
+}
+
+fn path_stays_under_configured_artifact_root(path: &Path) -> bool {
+    env::var_os("STEEL_ARTIFACT_ALLOWED_ROOTS")
+        .is_some_and(|roots| env::split_paths(&roots).any(|root| path_stays_under(path, &root)))
 }
 
 fn file_component_is_link(path: &Path) -> bool {
@@ -15394,7 +15701,8 @@ fn production_file_response_with_bkv_root(
         .unwrap_or_else(|| PathBuf::from(&path_value));
     let allowed = (bkv_path && resolved_bkv.is_some())
         || path_stays_under(&path, &bar_surface_capture_root())
-        || path_stays_under(&path, &algorithm_data_root());
+        || path_stays_under(&path, &algorithm_data_root())
+        || path_stays_under_configured_artifact_root(&path);
     if !allowed {
         return http_response(
             "403 Forbidden",
@@ -24128,8 +24436,11 @@ fn bkv_online_image_response(state: &ServiceState, query: &str) -> Vec<u8> {
     }
 }
 
-fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
-    let peer = stream.peer_addr().ok();
+fn handle_client<S: Read + Write>(
+    mut stream: S,
+    state: Arc<ServiceState>,
+    peer: Option<SocketAddr>,
+) {
     let request_bytes = match read_http_request(&mut stream) {
         Some(request) => request,
         None => return,
@@ -24612,6 +24923,12 @@ fn handle_client(mut stream: TcpStream, state: Arc<ServiceState>) {
                 body,
             )
         }
+        _ if method == "GET"
+            && !path.starts_with("/api/")
+            && !path.starts_with("/internal/") =>
+        {
+            web_asset_response(active_web_root(), path)
+        }
         _ => http_response(
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -24880,6 +25197,24 @@ fn main() -> std::io::Result<()> {
         port,
         preferred_lan_service_host(&host)
     );
+    let https_listener = if let Some(https_port) = configured_https_port() {
+        if https_port == port {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "INSPECTION_SERVICE_HTTPS_PORT must differ from INSPECTION_SERVICE_PORT",
+            ));
+        }
+        let tls_config = load_tls_server_config()?;
+        let listener = TcpListener::bind((host.as_str(), https_port))?;
+        listener.set_nonblocking(true)?;
+        eprintln!(
+            "steel-inspection-service HTTPS listening on {}:{}",
+            host, https_port
+        );
+        Some((listener, tls_config))
+    } else {
+        None
+    };
     let database_path = config_dir.join("steel-inspection.sqlite");
     let runtime = Runtime::new()?;
     let database = runtime
@@ -25045,6 +25380,16 @@ fn main() -> std::io::Result<()> {
     production_tasks::start_worker(Arc::clone(&state));
     start_system_health_alarm_monitor(Arc::clone(&state));
     println!("steel inspection service listening on http://127.0.0.1:{port}");
+    if let Some(web_root) = active_web_root() {
+        println!(
+            "web client available on the service origin from {}",
+            web_root.display()
+        );
+    } else {
+        eprintln!(
+            "web client is not built; set STEEL_WEB_ROOT or build target/client/frontend-dist"
+        );
+    }
     println!(
         "capture provider {} at {}",
         capture_manager.provider.as_str(),
@@ -25067,7 +25412,7 @@ fn main() -> std::io::Result<()> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
     while !shutdown_requested.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 if let Err(error) = stream.set_nonblocking(false) {
                     eprintln!("failed to configure accepted connection: {error}");
                     continue;
@@ -25077,7 +25422,7 @@ fn main() -> std::io::Result<()> {
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
                 if let Err(error) = std::thread::Builder::new()
                     .name("inspection-http-request".to_string())
-                    .spawn(move || handle_client(stream, state))
+                    .spawn(move || handle_client(stream, state, Some(peer)))
                 {
                     eprintln!("failed to start request worker: {error}");
                 }
@@ -25086,6 +25431,31 @@ fn main() -> std::io::Result<()> {
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(error) => eprintln!("failed to accept connection: {error}"),
+        }
+        if let Some((https_listener, tls_config)) = https_listener.as_ref() {
+            match https_listener.accept() {
+                Ok((stream, peer)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
+                    let connection = match rustls::ServerConnection::new(Arc::clone(tls_config)) {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            eprintln!("failed to initialize HTTPS connection: {error}");
+                            continue;
+                        }
+                    };
+                    let stream = rustls::StreamOwned::new(connection, stream);
+                    let state = Arc::clone(&state);
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("inspection-https-request".to_string())
+                        .spawn(move || handle_client(stream, state, Some(peer)))
+                    {
+                        eprintln!("failed to start HTTPS request worker: {error}");
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => eprintln!("failed to accept HTTPS connection: {error}"),
+            }
         }
     }
     capture_manager.shutdown();
@@ -25100,6 +25470,50 @@ mod tests {
 
     static CONVERTED_WORLD_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static SITE_CONFIG_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn defect_manifest_only_completes_online_record_after_database_import() {
+        let sequence = SITE_CONFIG_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = env::temp_dir().join(format!(
+            "steel-defect-status-{}-{sequence}",
+            std::process::id()
+        ));
+        let manifest_path = root
+            .join("42")
+            .join("derived")
+            .join("defects")
+            .join("manifest.json");
+        fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
+            .expect("create defect fixture");
+        fs::write(
+            &manifest_path,
+            json!({
+                "state": "complete",
+                "databaseImport": { "state": "processing" }
+            })
+            .to_string(),
+        )
+        .expect("write pending manifest");
+        assert!(!capture_defect_manifest_complete(
+            root.to_str().expect("fixture root"),
+            "42"
+        ));
+
+        fs::write(
+            &manifest_path,
+            json!({
+                "state": "complete",
+                "databaseImport": { "state": "complete" }
+            })
+            .to_string(),
+        )
+        .expect("write completed manifest");
+        assert!(capture_defect_manifest_complete(
+            root.to_str().expect("fixture root"),
+            "42"
+        ));
+        fs::remove_dir_all(root).expect("remove defect fixture");
+    }
 
     #[test]
     fn production_capture_defaults_to_runtime_camera_topology() {
@@ -26971,6 +27385,15 @@ mod tests {
     }
 
     #[test]
+    fn external_processing_policy_requires_production_models_and_zero_synthetic_defects() {
+        assert!(external_processing_policy_ready("production", Some(0)));
+        assert!(external_processing_policy_ready("PRODUCTION", Some(0)));
+        assert!(!external_processing_policy_ready("validation", Some(0)));
+        assert!(!external_processing_policy_ready("production", Some(1)));
+        assert!(!external_processing_policy_ready("production", None));
+    }
+
+    #[test]
     fn trigger_health_timeout_is_bounded_and_required_trigger_gates_service_readiness() {
         let body = json!({
             "code": 0,
@@ -28603,6 +29026,7 @@ mod tests {
             "GET",
             "/api/capture/measurement"
         ));
+        assert!(is_capture_json_proxy_route("GET", "/api/capture/surface"));
         assert!(is_capture_json_proxy_route("GET", "/api/capture/regions"));
         assert!(is_capture_json_proxy_route("GET", "/api/capture/defects"));
         assert!(is_sick_algorithm_reprocess_route(
@@ -32976,5 +33400,55 @@ mod tests {
             fs::canonicalize(&image_path).expect("canonical image")
         );
         fs::remove_dir_all(base).expect("remove multi-root fixture");
+    }
+
+    #[test]
+    fn web_assets_support_spa_routes_and_reject_path_traversal() {
+        assert_eq!(
+            service_origin("http", "192.168.1.20", 4873),
+            "http://192.168.1.20:4873"
+        );
+        assert_eq!(
+            service_origin("https", "192.168.1.20", 443),
+            "https://192.168.1.20"
+        );
+        assert_eq!(service_origin("https", "::1", 8443), "https://[::1]:8443");
+        let base = env::temp_dir().join(format!(
+            "steel-web-root-test-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let assets = base.join("assets");
+        fs::create_dir_all(&assets).expect("web asset directory");
+        fs::write(
+            base.join("index.html"),
+            b"<!doctype html><title>Steel UI</title>",
+        )
+        .expect("web index fixture");
+        fs::write(assets.join("app.js"), b"console.log('steel');").expect("web script fixture");
+        let root = base.canonicalize().expect("canonical web root");
+
+        assert_eq!(
+            resolve_web_asset_path(&root, "/").expect("root route"),
+            root.join("index.html")
+        );
+        assert_eq!(
+            resolve_web_asset_path(&root, "/records/detail").expect("SPA fallback"),
+            root.join("index.html")
+        );
+        assert_eq!(
+            resolve_web_asset_path(&root, "/assets/app.js").expect("script asset"),
+            root.join("assets").join("app.js")
+        );
+        assert!(resolve_web_asset_path(&root, "/../secret.txt").is_err());
+        assert!(resolve_web_asset_path(&root, "/%2e%2e/secret.txt").is_err());
+
+        let response =
+            String::from_utf8(web_asset_response(Some(&root), "/")).expect("UTF-8 web response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(response.ends_with("<!doctype html><title>Steel UI</title>"));
+
+        fs::remove_dir_all(base).expect("remove web root fixture");
     }
 }

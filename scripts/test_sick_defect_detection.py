@@ -22,6 +22,7 @@ from scripts.sick_capture.defect_detection import (
     DEFECT_DETECTION_SCHEMA,
     DefectDetectionConfig,
     ExecutionGateInterrupted,
+    _defect_position_ratios,
     _legacy_classifier_crop,
     _prepare_review_output,
     _realtime_analysis_has_priority,
@@ -38,6 +39,41 @@ from scripts.sick_capture.defect_detection import (
 
 
 class SickDefectDetectionTests(unittest.TestCase):
+    def test_defect_position_uses_calibrated_surface_column_angle(self) -> None:
+        angles: list[float | None] = [None] * 20
+        angles[7] = 270.0
+        length, circumference, camera_number, mapping = _defect_position_ratios(
+            camera_id="C2",
+            camera_count=6,
+            storage_index=12,
+            rect=[106, 10, 108, 14],
+            source_width=2560,
+            source_height=100,
+            camera_alignment={
+                "head": {"frameIndex": 10},
+                "tail": {"frameIndex": 20},
+            },
+            camera_surface_tile={
+                "cameraId": "C2",
+                "cropBox": [100, 0, 120, 100],
+                "angleDegByColumn": angles,
+                "rowAnchors": [
+                    {
+                        "row": 3,
+                        "sourceGlobalRow": 1212,
+                        "positionRatio": 0.25,
+                        "anchorOrdinal": 8,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(camera_number, 2)
+        self.assertAlmostEqual(circumference, 0.75)
+        self.assertGreater(length, 0.0)
+        self.assertTrue(mapping["available"])
+        self.assertEqual(mapping["arrayAngleDeg"], 270.0)
+        self.assertEqual(mapping["tileRow"], 3)
+
     def test_crop_backfill_yields_before_each_defect(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

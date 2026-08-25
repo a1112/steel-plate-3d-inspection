@@ -43,11 +43,13 @@ function SidebarHarness({
   onRecordSelect = () => undefined,
   large = false,
   selectedPlate = plate,
+  activeRecordStatus = 'completed',
 }: {
   runtimeMode?: 'online' | 'bkv';
   onRecordSelect?: (recordId: string) => void;
   large?: boolean;
   selectedPlate?: SteelPlate;
+  activeRecordStatus?: InspectionRecord['status'];
 }) {
   const [filters, setFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
   const sourceRecords = large ? manyRecords : records;
@@ -69,6 +71,7 @@ function SidebarHarness({
       runtimeMode={runtimeMode}
       plate={selectedPlate}
       summary={summary}
+      activeRecordStatus={activeRecordStatus}
       records={filteredRecords}
       selectedRecordId={plate.plateNo}
       searchFilters={filters}
@@ -82,6 +85,18 @@ function SidebarHarness({
 }
 
 describe('LeftSidebar', () => {
+  it('does not report zero defects while the model result is still pending', () => {
+    render(<SidebarHarness activeRecordStatus="detecting" />);
+
+    expect(screen.getByText('缺陷检测中')).toBeInTheDocument();
+    expect(screen.getByText('缺陷模型正在跟随流水号处理，结果尚未生成')).toBeInTheDocument();
+    expect(screen.queryByText('当前钢管未检出缺陷')).not.toBeInTheDocument();
+    const activeRow = screen.getAllByText('202606131900')
+      .map((element) => element.closest('tr'))
+      .find((row) => row !== null);
+    expect(activeRow).toHaveTextContent('检测中');
+  });
+
   it('shows steel information without a redundant panel heading', () => {
     render(<SidebarHarness />);
 

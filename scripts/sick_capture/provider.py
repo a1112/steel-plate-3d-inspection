@@ -78,6 +78,10 @@ from .regions import (
     stable_horizontal_roi,
 )
 from .storage import DualFormatWriter, atomic_summary
+from .surface import (
+    build_and_write_flow_surface,
+    surface_path as surface_manifest_path,
+)
 
 
 CAPTURE_DISCARDED_NOT_ARMED = 49000
@@ -223,6 +227,29 @@ def _build_flow_artifacts(
         "qualityGate": region_map.get("qualityGate"),
         "ownership": region_map.get("ownership"),
     }
+    surface_path, surface, jet_path = build_and_write_flow_surface(
+        camera_roots,
+        storage_root,
+        material_id,
+        alignment,
+        calibration_path=calibration_path,
+        config=measurement_config,
+        region_map=region_map,
+    )
+    measurement["surface"] = {
+        "path": str(surface_path),
+        "jetPath": str(jet_path) if jet_path.is_file() else "",
+        "state": surface.get("state"),
+        "quality": surface.get("quality"),
+        "summary": surface.get("summary"),
+    }
+    diameter_curves = surface.get("diameterCurves")
+    if isinstance(diameter_curves, dict):
+        # Surface reconstruction is the single metric source for directional
+        # diameter curves.  Mirror the compact curve artifact into the legacy
+        # measurement endpoint so existing diameter clients do not need a
+        # second request; the authoritative copy remains in surface.json.
+        measurement.setdefault("surfaceFit", {})["diameterCurves"] = diameter_curves
     _atomic_json(measurement_path, measurement)
     build_and_write_playback_index(camera_roots, storage_root, material_id)
     return alignment_path, alignment, measurement_path, measurement
@@ -406,8 +433,10 @@ class ProviderRuntime:
         *,
         backend: Any | None = None,
         writer: DualFormatWriter | None = None,
+        history_only: bool = False,
     ) -> None:
         self.profile = profile
+        self.history_only = history_only
         self.backend = backend or SickGenTLBackend(profile)
         artifact_context = _frame_artifact_context(profile)
         self.writer = writer or DualFormatWriter(
@@ -1028,7 +1057,7 @@ class ProviderRuntime:
         except Exception as error:
             self.last_error = str(error)
             self._log("error", "SICK GenTL initialization failed", error=str(error))
-        if profile.auto_connect and not self.last_error:
+        if profile.auto_connect and not self.history_only and not self.last_error:
             self.connect_all()
         if self.capture_mode == "continuous" and self.sessions:
             self._ensure_acquisition_worker()
@@ -1074,6 +1103,14 @@ class ProviderRuntime:
         return None
 
     def connect_all(self) -> dict[str, Any]:
+        if self.history_only:
+            return {
+                "code": 409,
+                "error": "history_only",
+                "expectedCameras": self.profile.expected_cameras,
+                "connectedCameras": 0,
+                "cameras": [self._camera_row(camera) for camera in self.profile.enabled_cameras],
+            }
         results = []
         with self.state_lock:
             for camera in self.profile.enabled_cameras:
@@ -1925,6 +1962,23 @@ class ProviderRuntime:
                 "detail": str(error),
             }
         return 200, {"code": 0, "path": str(path), "measurement": payload}
+
+    def surface_json(self, material_id: str = "") -> tuple[int, dict[str, Any]]:
+        normalized = self._normalized_flow_id(material_id)
+        if normalized is None:
+            return 400, {"code": 400, "error": "invalid_material_id"}
+        path = surface_manifest_path(self.profile.storage_root, normalized)
+        if not path.is_file():
+            return 404, {
+                "code": 404,
+                "error": "surface_not_found",
+                "materialId": normalized,
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as error:
+            return 500, {"code": 500, "error": "surface_invalid", "detail": str(error)}
+        return 200, {"code": 0, "path": str(path), "surface": payload}
 
     def regions_json(self, material_id: str) -> tuple[int, dict[str, Any]]:
         normalized = self._normalized_flow_id(material_id)
@@ -2967,6 +3021,7 @@ class ProviderRuntime:
             # otherwise healthy external provider as malformed and falls back
             # to the legacy eight-camera defaults.
             "provider": "external-api",
+            "historyOnly": self.history_only,
             "connected": connected > 0,
             "ip": self.profile.enabled_cameras[0].ip if self.profile.enabled_cameras else "",
             "ready": provider_ready,
@@ -4902,6 +4957,8 @@ class ProviderRuntime:
         return results
 
     def continuous_capture(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        if self.history_only:
+            return 409, {"code": 409, "error": "history_only"}
         if not self.capture_lock.acquire(blocking=False):
             return 409, {"code": 409, "error": "capture_already_running"}
         try:
@@ -5795,6 +5852,10 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
             material_id = (query.get("materialId") or [""])[0]
             status, payload = self.runtime.measurement_json(material_id)
             self._send_json(status, payload)
+        elif path == "/api/capture/surface":
+            material_id = (query.get("materialId") or [""])[0]
+            status, payload = self.runtime.surface_json(material_id)
+            self._send_json(status, payload)
         elif path == "/api/capture/regions":
             material_id = (query.get("materialId") or [""])[0]
             status, payload = self.runtime.regions_json(material_id)
@@ -5991,7 +6052,13 @@ class SickCaptureHTTPServer(ThreadingHTTPServer):
             super().server_close()
 
 
-def serve(profile_path: Path | str, host: str = "127.0.0.1", port: int = 4317) -> None:
+def serve(
+    profile_path: Path | str,
+    host: str = "127.0.0.1",
+    port: int = 4317,
+    *,
+    history_only: bool = False,
+) -> None:
     if host.lower() != "localhost":
         try:
             address = ipaddress.ip_address(host)
@@ -6000,7 +6067,9 @@ def serve(profile_path: Path | str, host: str = "127.0.0.1", port: int = 4317) -
         if not address.is_loopback:
             raise ValueError("SICK sidecar host must be a loopback address")
     profile = load_profile(profile_path)
-    runtime = ProviderRuntime(profile)
+    if history_only:
+        profile = replace(profile, auto_connect=False)
+    runtime = ProviderRuntime(profile, history_only=history_only)
     server = SickCaptureHTTPServer((host, port), runtime)
     print(
         json.dumps(
@@ -6009,6 +6078,7 @@ def serve(profile_path: Path | str, host: str = "127.0.0.1", port: int = 4317) -
                 "origin": f"http://{host}:{port}",
                 "profile": str(profile.source_path),
                 "expectedCameras": profile.expected_cameras,
+                "historyOnly": history_only,
             },
             ensure_ascii=False,
         ),

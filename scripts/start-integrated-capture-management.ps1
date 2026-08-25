@@ -126,12 +126,14 @@ if ($StopExisting) {
 $CaptureScript = Join-Path $PSScriptRoot "start-capture-stack.ps1"
 $ServiceScript = Join-Path $PSScriptRoot "run-service.ps1"
 $TriggerScript = Join-Path $PSScriptRoot "run-trigger-gateway.ps1"
-$ClientScript = Join-Path $PSScriptRoot "run-client-static.ps1"
+$WebRoot = Join-Path $RepoRoot "target\client\frontend-dist"
 
 if (-not (Test-Path $CaptureScript -PathType Leaf)) { throw "Missing $CaptureScript" }
 if (-not (Test-Path $ServiceScript -PathType Leaf)) { throw "Missing $ServiceScript" }
 if (-not (Test-Path $TriggerScript -PathType Leaf)) { throw "Missing $TriggerScript" }
-if (-not (Test-Path $ClientScript -PathType Leaf)) { throw "Missing $ClientScript" }
+if (-not (Test-Path (Join-Path $WebRoot "index.html") -PathType Leaf)) {
+  throw "Missing built web client in $WebRoot. Run scripts/build-client.ps1 first."
+}
 
 $CaptureExe = Join-Path $RepoRoot "target\capture\$Configuration\steel_capture_service.exe"
 $CaptureConfigRoot = Join-Path $RepoRoot "target\config\capture"
@@ -156,6 +158,7 @@ if (-not (Test-LocalTcpPort -Port $ServicePort)) {
     "-CameraStorageRoot", $CameraStorageRoot,
     "-TriggerOrigin", "http://127.0.0.1:$TriggerPort",
     "-Port", [string]$ServicePort,
+    "-WebRoot", $WebRoot,
     "-Profile", $ServiceProfile,
     "-ArtifactAllowedRoots", $ArtifactAllowedRoots,
     "-ForceParameters"
@@ -199,21 +202,11 @@ if (-not (Test-LocalTcpPort -Port $TriggerPort)) {
 $TriggerStatus = Wait-HttpJson -Name "Trigger gateway" -Uri "http://127.0.0.1:$TriggerPort/api/trigger/status" -TimeoutSec 30
 Write-Host ("Trigger gateway ready: mode={0}, manualAllowed={1}" -f $TriggerStatus.mode, $TriggerStatus.manualAllowed)
 
-if (-not (Test-LocalTcpPort -Port $ClientPort)) {
-  $ClientArgs = @("-Port", [string]$ClientPort)
-  if ($OpenBrowser) {
-    $ClientArgs += "-OpenBrowser"
-  }
-  Start-LongRunningScript -Name "client-static" -ScriptPath $ClientScript -Arguments $ClientArgs | Out-Null
-} else {
-  Write-Host "Client static server already listening on port $ClientPort."
-}
-
-$ClientUrl = "http://127.0.0.1:$ClientPort/?app=terminal"
-Wait-HttpHtml -Name "Static client" -Uri $ClientUrl -TimeoutSec 30 | Out-Null
+$ClientUrl = "http://127.0.0.1:$ServicePort/?app=terminal"
+Wait-HttpHtml -Name "Service-hosted client" -Uri $ClientUrl -TimeoutSec 30 | Out-Null
 Write-Host "Client ready: $ClientUrl"
 
-if ($OpenBrowser -and (Test-LocalTcpPort -Port $ClientPort)) {
+if ($OpenBrowser -and (Test-LocalTcpPort -Port $ServicePort)) {
   Start-Process $ClientUrl | Out-Null
 }
 

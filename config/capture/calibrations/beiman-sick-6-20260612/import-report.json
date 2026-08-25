@@ -1,0 +1,564 @@
+{
+  "schema": "steel.sick-pj-calibration-import.v1",
+  "generatedAt": "2026-08-24T08:47:57.240Z",
+  "sourceRoot": "K:\\PJ-bm(2)\\PJ-bm",
+  "revision": "BEIMAN-SICK6-PJ-20260612-R1",
+  "approved": true,
+  "cameraCount": 6,
+  "captureGroupCount": 3,
+  "verifiedFramePairCount": 18,
+  "rawPayloadCopied": false,
+  "outputs": {
+    "measurementCalibration": "config\\capture\\calibrations\\beiman-sick-6-20260612\\array-calibration.json",
+    "measurementCalibrationSha256": "0e1e43ea85c66c42afb0c7edf4b934326b2284e1a950a70e3f67865d9fae1260",
+    "reconstructionCalibration": "config\\capture\\calibrations\\beiman-sick-6-20260612\\ArrayCalibration.xml",
+    "reconstructionCalibrationSha256": "1fb3f1d93b83835e801cc999614db19cba3c99f3f2afdad7d3e9744a9e97ec4e"
+  },
+  "cameras": [
+    {
+      "cameraId": "C1",
+      "serialNumber": "25440062",
+      "localToArray": [
+        [
+          0.00014137166894056985,
+          0.0,
+          -0.9999999900070256,
+          -24.6337
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.9999999900070256,
+          0.0,
+          0.00014137166894056985,
+          -95.1471
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rotateYDegrees": 89.9919,
+      "translateXmm": -24.6337,
+      "translateZmm": -95.1471,
+      "coordinateA": {
+        "scale": 0.10817056149244308,
+        "offset": -42.705078125
+      },
+      "coordinateC": {
+        "scale": 0.0037132645957171917,
+        "offset": -152.37896728515625,
+        "missingValue": 0
+      },
+      "frameLayout": {
+        "width": 2560,
+        "height": 1024,
+        "lineBytes": 7700,
+        "rangeBytes": 5120,
+        "intensityBytes": 2560,
+        "markBytes": 20
+      }
+    },
+    {
+      "cameraId": "C2",
+      "serialNumber": "25440064",
+      "localToArray": [
+        [
+          0.8648107289710982,
+          0.0,
+          -0.5020980014464085,
+          -82.7089
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.5020980014464085,
+          0.0,
+          0.8648107289710982,
+          -50.0152
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rotateYDegrees": 30.1389,
+      "translateXmm": -82.7089,
+      "translateZmm": -50.0152,
+      "coordinateA": {
+        "scale": 0.10917212814092636,
+        "offset": -38.92288589477539
+      },
+      "coordinateC": {
+        "scale": 0.0037736091762781143,
+        "offset": -87.861328125,
+        "missingValue": 0
+      },
+      "frameLayout": {
+        "width": 2560,
+        "height": 1024,
+        "lineBytes": 7700,
+        "rangeBytes": 5120,
+        "intensityBytes": 2560,
+        "markBytes": 20
+      }
+    },
+    {
+      "cameraId": "C3",
+      "serialNumber": "25440058",
+      "localToArray": [
+        [
+          0.8650218471069797,
+          0.0,
+          0.5017341965898169,
+          -73.943
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          -0.5017341965898169,
+          0.0,
+          0.8650218471069797,
+          43.2949
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rotateYDegrees": -30.1148,
+      "translateXmm": -73.943,
+      "translateZmm": 43.2949,
+      "coordinateA": {
+        "scale": 0.10726702958345413,
+        "offset": -42.56932067871094
+      },
+      "coordinateC": {
+        "scale": 0.0036806559655815363,
+        "offset": -79.08135223388672,
+        "missingValue": 0
+      },
+      "frameLayout": {
+        "width": 2560,
+        "height": 1024,
+        "lineBytes": 7700,
+        "rangeBytes": 5120,
+        "intensityBytes": 2560,
+        "markBytes": 20
+      }
+    },
+    {
+      "cameraId": "C4",
+      "serialNumber": "25440053",
+      "localToArray": [
+        [
+          0.002415533335727882,
+          0.0,
+          0.9999970825950963,
+          29.0644
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          -0.9999970825950963,
+          0.0,
+          0.002415533335727882,
+          86.2648
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rotateYDegrees": -89.8616,
+      "translateXmm": 29.0644,
+      "translateZmm": 86.2648,
+      "coordinateA": {
+        "scale": 0.10620727390050888,
+        "offset": -39.95304870605469
+      },
+      "coordinateC": {
+        "scale": 0.0035984725691378117,
+        "offset": -144.60647583007812,
+        "missingValue": 0
+      },
+      "frameLayout": {
+        "width": 2560,
+        "height": 1024,
+        "lineBytes": 7700,
+        "rangeBytes": 5120,
+        "intensityBytes": 2560,
+        "markBytes": 20
+      }
+    },
+    {
+      "cameraId": "C5",
+      "serialNumber": "25440060",
+      "localToArray": [
+        [
+          -0.8660079499643093,
+          0.0,
+          0.5000302296847806,
+          92.2288
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          -0.5000302296847806,
+          0.0,
+          -0.8660079499643093,
+          16.7033
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rotateYDegrees": -149.998,
+      "translateXmm": 92.2288,
+      "translateZmm": 16.7033,
+      "coordinateA": {
+        "scale": 0.1072329729795456,
+        "offset": -38.57566452026367
+      },
+      "coordinateC": {
+        "scale": 0.0036603447515517473,
+        "offset": -147.3286895751953,
+        "missingValue": 0
+      },
+      "frameLayout": {
+        "width": 2560,
+        "height": 1024,
+        "lineBytes": 7700,
+        "rangeBytes": 5120,
+        "intensityBytes": 2560,
+        "markBytes": 20
+      }
+    },
+    {
+      "cameraId": "C6",
+      "serialNumber": "25440059",
+      "localToArray": [
+        [
+          -0.8640288768407992,
+          0.0,
+          -0.5034422508940097,
+          65.831
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.5034422508940097,
+          0.0,
+          -0.8640288768407992,
+          -66.1829
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rotateYDegrees": -210.228,
+      "translateXmm": 65.831,
+      "translateZmm": -66.1829,
+      "coordinateA": {
+        "scale": 0.10844143480062485,
+        "offset": -52.12236785888672
+      },
+      "coordinateC": {
+        "scale": 0.0037323383148759604,
+        "offset": -156.1887969970703,
+        "missingValue": 0
+      },
+      "frameLayout": {
+        "width": 2560,
+        "height": 1024,
+        "lineBytes": 7700,
+        "rangeBytes": 5120,
+        "intensityBytes": 2560,
+        "markBytes": 20
+      }
+    }
+  ],
+  "sources": [
+    {
+      "group": "pj1",
+      "cameraId": "C1",
+      "serialNumber": "25440062",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\1.xml",
+      "xmlSha256": "ce066585a87e444d689eb5805a20894af02b52fa7250f0b0135782be22f7e9fe",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\1.dat",
+      "datSha256": "ed49975c32adbd63a8ddc0d24509d8c038386b904ce8c16251aba736dbefa416",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj1",
+      "cameraId": "C2",
+      "serialNumber": "25440064",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\2.xml",
+      "xmlSha256": "37fb259972f6141d242a1997cc595d9bb0ca5d77c006e8f32fe0c4ce15b50aa3",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\2.dat",
+      "datSha256": "50da4343a13f8956b94e471ced4404544698aab164c6d9d8f4d1556f07eccdc6",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj1",
+      "cameraId": "C3",
+      "serialNumber": "25440058",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\3.xml",
+      "xmlSha256": "e05e33df62683d702ae20b8a17c3a520aa53d3b76200dde6b4f47f383734307d",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\3.dat",
+      "datSha256": "22b6689bf10d7f6aee45e6fffd7f14474a12e3a1c2b244868be4e60ae096baa7",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj1",
+      "cameraId": "C4",
+      "serialNumber": "25440053",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\4.xml",
+      "xmlSha256": "383f5954894c7164749f29d13a5868022a4ae62f164ca2b2715232f33c6fc39e",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\4.dat",
+      "datSha256": "ee11c31282a5a3beaea63deccbf225624880b0e69ad1cc8b24dfdeb8cb5b633e",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj1",
+      "cameraId": "C5",
+      "serialNumber": "25440060",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\5.xml",
+      "xmlSha256": "e8c7ad33214117a769c181ab33d2c704daa8c98a88b68aad37bfbdbb217176ce",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\5.dat",
+      "datSha256": "0d26871fad8221da71a82401b1fdcf0d2ae53de8f00a8689f63a0706050e9279",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj1",
+      "cameraId": "C6",
+      "serialNumber": "25440059",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\6.xml",
+      "xmlSha256": "2b759b651d9a6840a72699ec652ba1c3a7c23a33b85d5b124b45aa8880362c69",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj1\\6.dat",
+      "datSha256": "eb27f62e65cd64fdec10be8f842c0feb543411b0d0c2da1ac988078f99bdbe0b",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj2",
+      "cameraId": "C1",
+      "serialNumber": "25440062",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\1.xml",
+      "xmlSha256": "57b73e807e5f06fb27716c9b1cd591c82b5367a3680d0526b070b7ef43220885",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\1.dat",
+      "datSha256": "1576cd50cf012b241a7587664eb5bfbc9590a7c747497ca871cdae5f9ae3b9a3",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj2",
+      "cameraId": "C2",
+      "serialNumber": "25440064",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\2.xml",
+      "xmlSha256": "f6b66c4e3b4b13d559e1c8b416c086d4fba9fc919276cf64ae133d4b10637dfe",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\2.dat",
+      "datSha256": "541b39ce6e059ac89a72850fba296bd302b61395e05ccfc417a97373ba099616",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj2",
+      "cameraId": "C3",
+      "serialNumber": "25440058",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\3.xml",
+      "xmlSha256": "103ef20abd4f380f8c38a2e7744d7ec16ed0b002a7859207f5ab9a74c4c12a83",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\3.dat",
+      "datSha256": "1d914d863605e52625846864b86ac05c1f52c155f41ed3aeb361b75a2b38dd9b",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj2",
+      "cameraId": "C4",
+      "serialNumber": "25440053",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\4.xml",
+      "xmlSha256": "6e0cb5b9a21bcfacb23920b65c1fad5edc2c6638a056d751f8c1232b31c96653",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\4.dat",
+      "datSha256": "f8ba815a6a93374e1f9c3138657e98025f1a84703fb9dd9a72ad377420b67864",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj2",
+      "cameraId": "C5",
+      "serialNumber": "25440060",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\5.xml",
+      "xmlSha256": "9746a4f48eaf33a64be1574f1f66ca30c2265a6a5c71db6937814fe311a85af3",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\5.dat",
+      "datSha256": "ea1f6d0b10650e5880450728fc0fcc6f5e6aafcbc062932326d6fcfffe72b53b",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj2",
+      "cameraId": "C6",
+      "serialNumber": "25440059",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\6.xml",
+      "xmlSha256": "f57203278c9658d0b2c7553302c161a0c7a52d7c2c32180bebf5dee5b3496282",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj2\\6.dat",
+      "datSha256": "a01f45337d6b1c5ee0956895ca18d3c824e98f3f804769ff253873fc57334bba",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj3",
+      "cameraId": "C1",
+      "serialNumber": "25440062",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\1.xml",
+      "xmlSha256": "7b3b599272f7957e1141525ec59b8cd35c3d828041cde4e1f6044f3bf6f6d7bc",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\1.dat",
+      "datSha256": "5100e824a0749f6393e48a808e150cebf9388afaa89b194eb301ce38f7f7a357",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj3",
+      "cameraId": "C2",
+      "serialNumber": "25440064",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\2.xml",
+      "xmlSha256": "1d8591c01dd98a7105be7a2db169e3e6cce32946e65bf84c615c1f67cbdfc469",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\2.dat",
+      "datSha256": "d4c893c0ae52c24124c26d8c446866b084e560eb370e661679d14b0e0e359190",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj3",
+      "cameraId": "C3",
+      "serialNumber": "25440058",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\3.xml",
+      "xmlSha256": "8c0e7b8d7554abb8799daf542c8d9629ffe628be9ce54ca66b6025f324d3cd7b",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\3.dat",
+      "datSha256": "a0a09b7a16940e4660f915660a4534371f60ebd570d8dd00bb8945b020436e16",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj3",
+      "cameraId": "C4",
+      "serialNumber": "25440053",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\4.xml",
+      "xmlSha256": "f7b388b2ba8c68c1d712b01b4980e292c9849f2d85e0c12410d0053f0826977d",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\4.dat",
+      "datSha256": "a0ceb79c3df0d2fbf90382f2b6594623bca2707ee64a4c3fd18fd7e757caf040",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj3",
+      "cameraId": "C5",
+      "serialNumber": "25440060",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\5.xml",
+      "xmlSha256": "1e73d4e01c4c2a5d1485624827951d7e7d44a900111a00e8f0a81a8da66e6f8f",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\5.dat",
+      "datSha256": "c9c02d78fda2d489e40c6a2ba5e4cbd64c991692feddcb98ce355b82422dac90",
+      "datBytes": 7884800
+    },
+    {
+      "group": "pj3",
+      "cameraId": "C6",
+      "serialNumber": "25440059",
+      "xml": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\6.xml",
+      "xmlSha256": "952b8f393e8a5d2130c54b5e20156012c83d906cc932e797f50a61813d6c65d6",
+      "dat": "K:\\PJ-bm(2)\\PJ-bm\\pj3\\6.dat",
+      "datSha256": "ad1a3d3621e6e24c0e8231d49be089f27cffbafb4e4c627103ec5aa05975012c",
+      "datBytes": 7884800
+    }
+  ],
+  "stitchValidation": {
+    "passed": true,
+    "method": "middle-row-six-camera-transformed-robust-circle",
+    "groups": [
+      {
+        "group": "pj1",
+        "passed": true,
+        "centerOffsetMm": 0.013613,
+        "circleFit": {
+          "available": true,
+          "centerXmm": 0.00026,
+          "centerZmm": -0.013611,
+          "radiusMm": 68.520534,
+          "diameterMm": 137.041068,
+          "meanAbsResidualMm": 2.650517,
+          "p95AbsResidualMm": 5.665249,
+          "maximumAbsResidualMm": 6.891526,
+          "pointCount": 7274,
+          "robustPointCount": 7274
+        }
+      },
+      {
+        "group": "pj2",
+        "passed": true,
+        "centerOffsetMm": 0.875273,
+        "circleFit": {
+          "available": true,
+          "centerXmm": 0.224985,
+          "centerZmm": 0.845863,
+          "radiusMm": 68.514119,
+          "diameterMm": 137.028238,
+          "meanAbsResidualMm": 2.632223,
+          "p95AbsResidualMm": 5.631404,
+          "maximumAbsResidualMm": 6.915559,
+          "pointCount": 8053,
+          "robustPointCount": 8053
+        }
+      },
+      {
+        "group": "pj3",
+        "passed": true,
+        "centerOffsetMm": 5.513633,
+        "circleFit": {
+          "available": true,
+          "centerXmm": -1.668816,
+          "centerZmm": 5.255017,
+          "radiusMm": 60.020948,
+          "diameterMm": 120.041896,
+          "meanAbsResidualMm": 0.054816,
+          "p95AbsResidualMm": 0.139985,
+          "maximumAbsResidualMm": 0.259618,
+          "pointCount": 5443,
+          "robustPointCount": 5440
+        }
+      }
+    ],
+    "maximumP95ResidualMm": 5.665249,
+    "recommendedMaximumCircleResidualMm": 7.082
+  },
+  "qualityGate": {
+    "passed": true,
+    "reasons": []
+  }
+}

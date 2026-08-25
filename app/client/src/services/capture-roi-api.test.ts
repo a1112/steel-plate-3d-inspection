@@ -181,8 +181,11 @@ describe('capture crop-stitch history selection', () => {
       autoCropImageCount: 1,
     });
     expect(result.frames[0].cameras[0]).toMatchObject({ cropMode: 'algorithm-roi' });
+    expect(result.frames[0].cameras[0].sourceBytes).toBe(2000);
     expect(result.frames[0].cameras[0].url).toContain('region=valid');
+    expect(result.frames[0].cameras[0].url).toContain('maxWidth=384');
     expect(result.frames[0].cameras[1]).toMatchObject({ cropMode: 'auto-black-border', validRoi: null });
+    expect(result.frames[0].cameras[1].url).toContain('maxWidth=384');
     expect(result.frames[0].cameras[1].url).not.toContain('region=valid');
   });
 

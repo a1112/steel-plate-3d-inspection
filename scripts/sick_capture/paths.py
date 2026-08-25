@@ -61,6 +61,14 @@ def measurement_path(storage_root: Path, value: str | int) -> Path:
     return flow_root(storage_root, value) / "derived" / "geometry" / "measurement.json"
 
 
+def surface_path(storage_root: Path, value: str | int) -> Path:
+    return flow_root(storage_root, value) / "derived" / "geometry" / "surface.json"
+
+
+def surface_jet_path(storage_root: Path, value: str | int) -> Path:
+    return flow_root(storage_root, value) / "derived" / "geometry" / "surface-jet.png"
+
+
 def region_path(storage_root: Path, value: str | int) -> Path:
     return flow_root(storage_root, value) / "derived" / "roi" / "manifest.json"
 

@@ -283,6 +283,8 @@ export type BarSurfaceMesh = {
   validMask?: ArrayLike<number>;
   calibratedMask?: ArrayLike<number>;
   indices: ArrayLike<number>;
+  /** Symmetric radial-residual range used by the algorithm JET palette. */
+  jetRangeMm?: number;
   source?: 'core-bsmesh' | 'bkv-bsmesh' | 'json';
   binaryBytes?: number;
 };

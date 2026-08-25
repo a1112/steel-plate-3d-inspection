@@ -1377,7 +1377,6 @@ if ($StopExisting) {
 
 $ServiceScript = Join-Path $Root "run-service-managed.ps1"
 $TriggerScript = Join-Path $Root "run-trigger-gateway.ps1"
-$ClientScript = Join-Path $Root "run-client-static.ps1"
 
 if (-not (Test-LocalTcpPort -Port $ServicePort)) {
   Start-PackageScript -Name "service" -ScriptPath $ServiceScript -Arguments @("-Port", [string]$ServicePort, "-CapturePort", [string]$CapturePort, "-TriggerOrigin", "http://127.0.0.1:$TriggerPort", "-StorageRoot", $StorageRoot, "-CameraStorageRoot", $CameraStorageRoot, "-ArtifactAllowedRoots", $ArtifactAllowedRoots)
@@ -1403,12 +1402,8 @@ if (-not (Test-LocalTcpPort -Port $TriggerPort)) {
 $TriggerStatus = Wait-HttpJson -Name "Trigger gateway" -Uri "http://127.0.0.1:$TriggerPort/api/trigger/status" -TimeoutSec 30
 Write-Host ("Trigger gateway ready: mode={0}, manualAllowed={1}" -f $TriggerStatus.mode, $TriggerStatus.manualAllowed)
 
-if ((Test-Path $ClientScript -PathType Leaf) -and -not (Test-LocalTcpPort -Port $ClientPort)) {
-  Start-PackageScript -Name "client-static" -ScriptPath $ClientScript -Arguments @("-Port", [string]$ClientPort)
-}
-
-$ClientUrl = "http://127.0.0.1:$ClientPort/?app=terminal"
-Wait-HttpHtml -Name "Static client" -Uri $ClientUrl -TimeoutSec 30 | Out-Null
+$ClientUrl = "http://127.0.0.1:$ServicePort/?app=terminal"
+Wait-HttpHtml -Name "Service-hosted client" -Uri $ClientUrl -TimeoutSec 30 | Out-Null
 Write-Host "Client ready: $ClientUrl"
 
 if ($OpenBrowser) {
@@ -1522,13 +1517,13 @@ The packaged trigger gateway defaults to `STEEL_RUNTIME_PROFILE=production`. Inj
 .\run-integrated-capture-management.ps1 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction" -TriggerMode manual -OpenBrowser
 ```
 
-This starts Rust (which owns the capture child), the trigger gateway, and the static client, then waits for:
+This starts Rust (which owns the capture child and serves the web client) and the trigger gateway, then waits for:
 
 ```text
 http://127.0.0.1:4317/health
 http://127.0.0.1:4873/api/production/status
 http://127.0.0.1:4881/api/trigger/status
-http://127.0.0.1:1432/?app=terminal
+http://127.0.0.1:4873/?app=terminal
 ```
 
 The integrated startup always uses the headless C++ capture provider and Tauri/React operator client.
@@ -1688,19 +1683,19 @@ Use `-Mode gray` when a grayscale/sensor-side signal owns the in/out steel decis
 
 ## Client Files
 
-The `client/` folder contains the built web assets. Serve it with the package-local static server:
+The `client/` folder contains the built web assets. The Rust service serves this folder on its own origin by default:
 
 ```powershell
-.\run-client-static.ps1 -Port 1432
+.\run-integrated-capture-management.ps1 -ArtifactAllowedRoots "H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;H:\production;H:\reconstruction"
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:1432/
+http://127.0.0.1:4873/
 ```
 
-The client calls the Rust service on `http://127.0.0.1:4873` by default.
+The web client uses the current HTTP/HTTPS page origin, so it needs no separate IP or UI-port configuration. `run-client-static.ps1` is retained only as a compatibility tool.
 
 ## Stop Processes
 

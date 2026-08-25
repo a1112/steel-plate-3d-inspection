@@ -7,7 +7,7 @@ import type { CaptureSurfaceCameraTiles } from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { fetchCaptureStitchHistory, type CaptureStitchResult } from '../services/capture-roi-api';
 import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
-import { cameraBandRotationRadians, PlateMap as ProductionPlateMap } from './PlateMap';
+import { cameraBandCropPadding, cameraBandRotationRadians, captureStitchInitialFrameIndex, PlateMap as ProductionPlateMap } from './PlateMap';
 
 vi.mock('../services/inspection-world-api', async () => {
   const actual = await vi.importActual<typeof import('../services/inspection-world-api')>('../services/inspection-world-api');
@@ -116,6 +116,23 @@ describe('line-scan image orientation', () => {
   it('keeps acquisition rows vertical and rotates them toward the right in horizontal mode', () => {
     expect(cameraBandRotationRadians('vertical')).toBe(0);
     expect(cameraBandRotationRadians('horizontal')).toBe(-Math.PI / 2);
+  });
+
+  it('keeps a conservative guard around automatically detected steel edges', () => {
+    expect(cameraBandCropPadding(20)).toBe(6);
+    expect(cameraBandCropPadding(200)).toBe(12);
+  });
+
+  it('lands a switched record on its first complete content-bearing frame', () => {
+    const result = captureStitchResult('2747', 4);
+    const frames = result.frames.map((frame, frameIndex) => ({
+      ...frame,
+      cameras: frame.cameras.map((camera, cameraIndex) => ({
+        ...camera,
+        sourceBytes: frameIndex < 2 || (frameIndex === 2 && cameraIndex === 5) ? 24_000 : 180_000,
+      })),
+    }));
+    expect(captureStitchInitialFrameIndex(frames, 6)).toBe(3);
   });
 });
 
@@ -253,6 +270,10 @@ describe('online inspection world compatibility', () => {
     expect(viewport).toHaveAttribute('data-frame-count', '12');
     expect(document.querySelectorAll('.bar-camera-frame').length).toBeGreaterThan(6);
     expect(document.querySelectorAll('.bar-camera-frame').length).toBeLessThan(12 * 6);
+    expect(screen.getAllByLabelText(/算法 ROI 裁剪图/).every((canvas) => (
+      canvas.getAttribute('data-edge-policy') === 'source-roi'
+    ))).toBe(true);
+    expect(document.querySelectorAll('canvas[data-load-priority="high"]')).toHaveLength(6);
     expect(fetchCaptureStitchHistory).toHaveBeenCalledWith(
       '2747',
       ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'],
@@ -310,6 +331,7 @@ describe('online inspection world compatibility', () => {
       expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
 
       await act(async () => { await vi.advanceTimersByTimeAsync(8_000); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); });
 
       expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('2/2 轮裁剪拼接');
       expect(requestedImageUrls.length).toBeGreaterThan(6);

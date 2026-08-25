@@ -9,6 +9,10 @@ param(
   [string]$TriggerOrigin = "",
   [string]$HostAddress = "0.0.0.0",
   [int]$Port = 4873,
+  [int]$HttpsPort = 0,
+  [string]$TlsCertificate = "",
+  [string]$TlsPrivateKey = "",
+  [string]$WebRoot = "",
   [switch]$NoCaptureAutostart,
   [ValidateRange(1, 20)]
   [int]$CaptureRestartBudget = 5,
@@ -114,6 +118,23 @@ if ($ForceParameters -or -not $env:INSPECTION_SERVICE_PORT) {
 }
 if ($ForceParameters -or -not $env:INSPECTION_SERVICE_HOST) {
   $env:INSPECTION_SERVICE_HOST = $HostAddress
+}
+if ($HttpsPort -gt 0) {
+  if (-not (Test-Path -LiteralPath $TlsCertificate -PathType Leaf)) {
+    throw "HTTPS requires a PEM certificate file: $TlsCertificate"
+  }
+  if (-not (Test-Path -LiteralPath $TlsPrivateKey -PathType Leaf)) {
+    throw "HTTPS requires a PEM private key file: $TlsPrivateKey"
+  }
+  $env:INSPECTION_SERVICE_HTTPS_PORT = [string]$HttpsPort
+  $env:INSPECTION_SERVICE_TLS_CERT = (Resolve-Path -LiteralPath $TlsCertificate).Path
+  $env:INSPECTION_SERVICE_TLS_KEY = (Resolve-Path -LiteralPath $TlsPrivateKey).Path
+}
+if ($WebRoot.Trim().Length -gt 0) {
+  if (-not (Test-Path -LiteralPath (Join-Path $WebRoot 'index.html') -PathType Leaf)) {
+    throw "WebRoot must contain index.html: $WebRoot"
+  }
+  $env:STEEL_WEB_ROOT = (Resolve-Path -LiteralPath $WebRoot).Path
 }
 if ($ForceParameters -or -not $env:STEEL_CAPTURE_PROVIDER) {
   $env:STEEL_CAPTURE_PROVIDER = $Provider

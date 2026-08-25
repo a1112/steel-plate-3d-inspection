@@ -1,5 +1,7 @@
 # Unified Inspection Tile World Implementation Plan
 
+> **Status: Superseded.** The default dashboard and new media contract are defined by [Inspection boundaries and responsive thumbnails](../design/inspection-boundaries-responsive-thumbnail.md). This plan remains only as legacy tile migration history.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build one on-demand tiled image world that directly joins line-scan frames, maps database defects into world coordinates, and exposes the same minimum contract for BKV offline data and online MySQL/capture data.

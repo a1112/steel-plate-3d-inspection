@@ -86,6 +86,21 @@ describe('AppFooter', () => {
     );
 
     expect(screen.getByLabelText('服务连接：未连接，IP 192.168.1.8:4873')).toHaveClass('offline');
+
+    rerender(
+      <AppFooter
+        activeNav="online"
+        connection={{
+          endpoint: 'http://127.0.0.1:4873',
+          state: 'warning',
+          detail: '历史数据可用，实时采集未就绪',
+        }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText('服务连接：已连接·降级，IP 127.0.0.1:4873')).toHaveClass('warning');
   });
 
   it('shows compact full-desktop resource usage with runtime details', () => {

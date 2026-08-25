@@ -9,6 +9,7 @@ import {
 } from '../lib/capture-api';
 import { CaptureMeasurementPanel } from './CaptureMeasurementPanel';
 import { CaptureDefectDetectionPanel } from './CaptureDefectDetectionPanel';
+import { CaptureSurfacePanel } from './CaptureSurfacePanel';
 
 interface CapturePlaybackProps {
   statuses: CaptureCameraStatus[];
@@ -269,6 +270,7 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
       )}
 
       {frame?.materialId ? <CaptureMeasurementPanel materialId={frame.materialId} /> : null}
+      {frame?.materialId ? <CaptureSurfacePanel materialId={frame.materialId} /> : null}
       {frame?.materialId ? <CaptureDefectDetectionPanel materialId={frame.materialId} /> : null}
 
       <footer className="capture-playback-timeline">

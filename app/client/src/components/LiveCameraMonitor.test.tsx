@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useState } from 'react';
 import type { CaptureCameraStatus, CaptureHealth } from '../lib/capture-api';
-import { LiveMonitoringPage, StableStreamImage } from './LiveCameraMonitor';
+import { gridStreamRevision, LiveMonitoringPage, StableStreamImage } from './LiveCameraMonitor';
 
 const captureMocks = vi.hoisted(() => ({
   start: vi.fn(async ({ ip }: { ip: string }, _signal?: AbortSignal) => ({ code: 0, running: true, ip })),
@@ -118,7 +118,7 @@ describe('LiveMonitoringPage', () => {
       expect(screen.getByRole('img', { name: '超时保护实时帧' })).toHaveAttribute('src', '/frame-a.png');
 
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(3_500);
+        await vi.advanceTimersByTimeAsync(8_000);
       });
 
       expect(onError).toHaveBeenCalledTimes(1);
@@ -189,13 +189,13 @@ describe('LiveMonitoringPage', () => {
       const initialSources = new Map(initialFrames.map((image) => [image.getAttribute('alt'), image.getAttribute('src')]));
 
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(500);
+        await vi.advanceTimersByTimeAsync(3_000);
       });
 
       const refreshPreloads = [...view.container.querySelectorAll<HTMLImageElement>(
         '.live-monitor-image-preload',
       )];
-      expect(refreshPreloads).toHaveLength(6);
+      expect(refreshPreloads).toHaveLength(2);
       expect(refreshPreloads.every((image) => (
         image.src.includes('region=valid') && image.src.includes('v=1')
       ))).toBe(true);
@@ -210,13 +210,23 @@ describe('LiveMonitoringPage', () => {
       expect(settledFrames).toHaveLength(6);
       settledFrames.forEach((image, index) => {
         expect(image).toHaveAttribute('src', expect.stringContaining('region=valid'));
-        if (index % 2 === 0) {
+        if (index === 0) {
           expect(image).toHaveAttribute('src', expect.stringContaining('v=1'));
         } else {
           expect(image.getAttribute('src')).toBe(initialSources.get(image.getAttribute('alt')));
         }
       });
       expect(view.container.querySelectorAll('.live-monitor-grid-empty')).toHaveLength(0);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      const nextBatch = [...view.container.querySelectorAll<HTMLImageElement>(
+        '.live-monitor-image-preload',
+      )];
+      expect(nextBatch).toHaveLength(3);
+      expect(nextBatch.filter((image) => image.src.includes('192.168.103.100')).length).toBe(1);
+      expect(nextBatch.filter((image) => image.src.includes('192.168.104.100')).length).toBe(1);
 
       view.rerender(<LiveMonitoringPage statuses={sixStatuses.map((status) => ({
         ...status,
@@ -228,6 +238,24 @@ describe('LiveMonitoringPage', () => {
       view.unmount();
       vi.useRealTimers();
     }
+  });
+
+  it('keeps the first-frame window quiet and then rotates grid refreshes in two-camera batches', () => {
+    expect(Array.from({ length: 6 }, (_, index) => gridStreamRevision(5, index, 6))).toEqual([
+      0, 0, 0, 0, 0, 0,
+    ]);
+    expect(Array.from({ length: 6 }, (_, index) => gridStreamRevision(6, index, 6))).toEqual([
+      1, 1, 0, 0, 0, 0,
+    ]);
+    expect(Array.from({ length: 6 }, (_, index) => gridStreamRevision(7, index, 6))).toEqual([
+      1, 1, 1, 1, 0, 0,
+    ]);
+    expect(Array.from({ length: 6 }, (_, index) => gridStreamRevision(8, index, 6))).toEqual([
+      1, 1, 1, 1, 1, 1,
+    ]);
+    expect(Array.from({ length: 6 }, (_, index) => gridStreamRevision(9, index, 6))).toEqual([
+      2, 2, 1, 1, 1, 1,
+    ]);
   });
 
   it('surfaces transport gaps even when all cameras have equal frame counts', () => {

@@ -912,12 +912,25 @@ Equivalent env-file mode:
 scripts/run-client-dev.ps1 -EnvFile config/env/client.env.example
 ```
 
-The client talks to the Rust service. It does not start, link, or own the camera SDK.
+The browser client uses same-origin API calls. In an integrated/runtime launch the
+Rust service serves both the built UI and `/api/*`, so users open
+`http://<server>:4873/` and do not configure a separate UI port or API address.
+Vite proxies `/api` to the development Rust service. Tauri continues to support an
+explicit HTTP or HTTPS service address.
 
-To serve a built frontend without Vite:
+The old standalone static server remains available only for compatibility:
 
 ```powershell
 scripts/run-client-static.ps1 -Port 1432
+```
+
+Native HTTPS is optional and uses a separate TLS listener with the same UI/API:
+
+```powershell
+scripts/run-service.ps1 -Port 4873 -HttpsPort 443 `
+  -TlsCertificate D:\steel-inspection\tls\server-cert.pem `
+  -TlsPrivateKey D:\steel-inspection\tls\server-key.pem `
+  -WebRoot target\client\frontend-dist
 ```
 
 ## Tauri Desktop

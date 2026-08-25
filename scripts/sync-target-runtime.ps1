@@ -443,7 +443,6 @@ if ($StopExisting) {
 
 $ServiceScript = Join-Path $Root "run-service-headless.ps1"
 $TriggerScript = Join-Path $Root "run-trigger-gateway.ps1"
-$ClientScript = Join-Path $Root "run-client-static.ps1"
 
 if (-not (Test-LocalTcpPort -Port $ServicePort)) {
   Start-RuntimeScript -Name "service" -ScriptPath $ServiceScript -Arguments @("-Port", [string]$ServicePort, "-CapturePort", [string]$CapturePort, "-TriggerOrigin", "http://127.0.0.1:$TriggerPort", "-StorageRoot", $StorageRoot, "-CameraStorageRoot", $CameraStorageRoot, "-ArtifactAllowedRoots", $ArtifactAllowedRoots)
@@ -469,12 +468,8 @@ if (-not (Test-LocalTcpPort -Port $TriggerPort)) {
 $TriggerStatus = Wait-HttpJson -Name "Trigger gateway" -Uri "http://127.0.0.1:$TriggerPort/api/trigger/status" -TimeoutSec 30
 Write-Host ("Trigger gateway ready: mode={0}, manualAllowed={1}" -f $TriggerStatus.mode, $TriggerStatus.manualAllowed)
 
-if ((Test-Path $ClientScript -PathType Leaf) -and -not (Test-LocalTcpPort -Port $ClientPort)) {
-  Start-RuntimeScript -Name "client-static" -ScriptPath $ClientScript -Arguments @("-Port", [string]$ClientPort)
-}
-
-$ClientUrl = "http://127.0.0.1:$ClientPort/?app=terminal"
-Wait-HttpHtml -Name "Static client" -Uri $ClientUrl -TimeoutSec 30 | Out-Null
+$ClientUrl = "http://127.0.0.1:$ServicePort/?app=terminal"
+Wait-HttpHtml -Name "Service-hosted client" -Uri $ClientUrl -TimeoutSec 30 | Out-Null
 Write-Host "Client ready: $ClientUrl"
 
 if ($OpenBrowser) {
@@ -583,7 +578,7 @@ One-command integrated startup:
 
 Use `-StopExisting` when restarting the stack on the same ports.
 
-The integrated script waits for capture, service, trigger health endpoints, and the built client page at `http://127.0.0.1:1432/?app=terminal` when `run-client-static.ps1` is present.
+The integrated script waits for capture, service, trigger health endpoints, and the service-hosted client page at `http://127.0.0.1:4873/?app=terminal`.
 
 Stop the target runtime, including the PowerShell static client listener on `1432`:
 

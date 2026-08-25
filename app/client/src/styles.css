@@ -4770,8 +4770,9 @@ button {
   bottom: 0;
   min-width: 0;
   overflow: hidden;
-  border-right: 1px solid rgba(184, 224, 248, 0.24);
+  border-right: 1px solid rgba(184, 224, 248, 0.42);
   background: #17242b;
+  box-shadow: inset 0 0 0 1px rgba(8, 20, 28, 0.34);
 }
 
 .bar-camera-frame::after {
@@ -18209,7 +18210,7 @@ button {
   z-index: 0;
   width: 100%;
   height: 100%;
-  filter: contrast(1.08) brightness(0.82);
+  filter: contrast(1.04) brightness(1);
 }
 
 .bar-camera-band.has-production-image {
@@ -18324,7 +18325,7 @@ button {
 }
 
 .bar-camera-band[role="button"]:hover .bar-camera-band-image {
-  filter: contrast(1.16) brightness(0.94);
+  filter: contrast(1.1) brightness(1.05);
 }
 
 .bar-unfolded-map.camera-expanded {

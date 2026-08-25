@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { createElement } from 'react';
 import { describe, expect, it } from 'vitest';
 import type { CaptureImageItem, DefectItem } from '../data/inspection';
+import type { CaptureFlowMeasurement } from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { AlarmAnalysis } from './AlarmAnalysis';
 
@@ -68,6 +69,31 @@ const diameterMesh: BarSurfaceMesh = {
   indices: new Uint32Array(),
 };
 
+const diameterArtifact: CaptureFlowMeasurement = {
+  schema: 'steel.ranger3-flow-measurement.v1',
+  generatedAt: '2026-08-24T14:21:25.495Z',
+  materialId: '3703',
+  mode: 'metric',
+  metricValid: true,
+  qualityGate: { passed: true, reasons: [] },
+  selectedSection: {},
+  cameras: {},
+  surfaceFit: {
+    available: true,
+    metricValid: true,
+    absoluteLongitudinalScaleVerified: false,
+    sectionsRequested: 3,
+    sectionsAccepted: 2,
+    diameterMeanMm: 45.4,
+    diameterRangeMm: 0.2,
+    sections: [
+      { anchorOrdinal: 0, elapsedFromHeadMs: 0, positionRatio: 0, metricValid: false, circleFit: { available: true, diameterMm: 41.8 } },
+      { anchorOrdinal: 1, elapsedFromHeadMs: 1_000, positionRatio: 0.5, metricValid: true, circleFit: { available: true, diameterMm: 45.3, roundnessMm: 0.2, p95AbsResidualMm: 0.1 } },
+      { anchorOrdinal: 2, elapsedFromHeadMs: 2_000, positionRatio: 1, metricValid: true, circleFit: { available: true, diameterMm: 45.5, roundnessMm: 0.3, p95AbsResidualMm: 0.2 } },
+    ],
+  },
+};
+
 describe('AlarmAnalysis', () => {
   it('renders only one full-width outer-diameter analysis surface', () => {
     const { container } = render(createElement(AlarmAnalysis, {
@@ -99,6 +125,22 @@ describe('AlarmAnalysis', () => {
     expect(screen.getByText('暂无测径（外径）曲线')).toBeInTheDocument();
     expect(screen.queryByText('算法 ROI 小图未就绪')).not.toBeInTheDocument();
     expect(screen.queryByText('暂无生产点云产物')).not.toBeInTheDocument();
+  });
+
+  it('renders the calibrated artifact without secondary nominal diameter or length data', () => {
+    render(createElement(AlarmAnalysis, {
+      selectedDefect: null,
+      heightProfile: [],
+      inspectionId: 'INSP-3703',
+      diameterArtifact,
+      diameterMeasurement: { nominalDiameterMm: 0, lengthMm: 0 },
+      headerless: true,
+    }));
+
+    expect(screen.getByTestId('diameter-trend-grid')).toHaveAttribute('data-measurement-source', 'measurement-artifact');
+    expect(screen.getByTestId('diameter-trend-grid')).toHaveAttribute('data-x-axis-mode', 'head-relative');
+    expect(screen.getByText('2 / 3')).toBeInTheDocument();
+    expect(screen.getByText('无测速仪：横轴按软同步时间归一化，不输出伪长度')).toBeInTheDocument();
   });
 
   it('fully collapses the lower measurement area', () => {

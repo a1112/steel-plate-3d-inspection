@@ -88,6 +88,11 @@ def service_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--profile", required=True, type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4317)
+    parser.add_argument(
+        "--history-only",
+        action="store_true",
+        help="serve historical indexes and files without connecting capture devices",
+    )
     args = parser.parse_args(argv)
-    serve(args.profile, args.host, args.port)
+    serve(args.profile, args.host, args.port, history_only=args.history_only)
     return 0

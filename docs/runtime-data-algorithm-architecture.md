@@ -1,5 +1,7 @@
 # 配置驱动的数据源、采集与算法架构
 
+> 当前模块所有权、依赖方向和响应式图像契约以 [检测系统边界与响应式缩略图决策](design/inspection-boundaries-responsive-thumbnail.md) 为准。
+
 ## 目标
 
 现场是否能够连接相机不应决定前端或 HTTP API 的形态。运行模式只选择数据源并声明能力，采集、算法处理和产物存储分别由配置控制。所有数据源最终提供同一组检测世界接口：
@@ -7,7 +9,8 @@
 - `GET /api/inspection-world/records`
 - `GET /api/inspection-world/meta`
 - `GET /api/inspection-world/defects`
-- `GET /api/inspection-world/tile`
+- `GET /api/inspection-world/preview`（目标主显示契约）
+- `GET /api/inspection-world/tile`（迁移期旧客户端兼容）
 
 前端只使用以上接口，不判断 MySQL、共享目录、离线转换库或相机 SDK。
 

@@ -3700,13 +3700,39 @@ pub async fn recent_preview_capture_files_for_inspection(
     inspection_id: &str,
     limit: u64,
 ) -> Result<Vec<capture_file::Model>, DbErr> {
+    // Camera-local storage indices can legitimately differ by thousands of
+    // frames after recovery or distributed-disk backfill. A global ORDER BY
+    // followed by LIMIT therefore starves lower-index cameras and leaves
+    // their UI lanes blank. Select the latest row per camera/component first.
+    let backend = connection.get_database_backend();
+    let (inspection_first, inspection_second) = if backend == DbBackend::Postgres {
+        ("$1", "$2")
+    } else {
+        ("?", "?")
+    };
+    let sql = format!(
+        "SELECT cf.* FROM capture_file AS cf \
+         INNER JOIN (\
+           SELECT camera_id, data_name, MAX(sequence_no) AS max_sequence_no \
+           FROM capture_file \
+           WHERE inspection_id = {inspection_first} \
+             AND data_name IN ('intensity', 'depth') \
+           GROUP BY camera_id, data_name\
+         ) AS latest \
+           ON latest.camera_id = cf.camera_id \
+          AND latest.data_name = cf.data_name \
+          AND latest.max_sequence_no = cf.sequence_no \
+         WHERE cf.inspection_id = {inspection_second} \
+         ORDER BY cf.camera_id ASC, cf.data_name ASC \
+         LIMIT {}",
+        limit.clamp(12, 256)
+    );
     capture_file::Entity::find()
-        .filter(capture_file::Column::InspectionId.eq(inspection_id))
-        .filter(capture_file::Column::DataName.is_in(["intensity", "depth"]))
-        .order_by_desc(capture_file::Column::SequenceNo)
-        .order_by_asc(capture_file::Column::CameraId)
-        .order_by_asc(capture_file::Column::DataName)
-        .limit(limit.clamp(12, 256))
+        .from_raw_sql(Statement::from_sql_and_values(
+            backend,
+            sql,
+            [inspection_id.into(), inspection_id.into()],
+        ))
         .all(connection)
         .await
 }
@@ -6829,6 +6855,52 @@ mod steel_flow_tests {
                     .await
                     .expect("file count"),
                 3
+            );
+        });
+    }
+
+    #[test]
+    fn recent_preview_keeps_every_camera_when_sequence_indices_are_skewed() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            let files = vec![
+                capture_file_input("SKEW", "C1", 9_000, "depth"),
+                capture_file_input("SKEW", "C1", 9_000, "intensity"),
+                capture_file_input("SKEW", "C2", 80, "depth"),
+                capture_file_input("SKEW", "C2", 80, "intensity"),
+                capture_file_input("SKEW", "C2", 79, "intensity"),
+            ];
+            append_capture_files(&database.connection, files)
+                .await
+                .expect("capture files");
+
+            let previews =
+                recent_preview_capture_files_for_inspection(&database.connection, "INSP-SKEW", 128)
+                    .await
+                    .expect("latest previews");
+
+            assert_eq!(previews.len(), 4);
+            assert_eq!(
+                previews
+                    .iter()
+                    .map(|file| {
+                        (
+                            file.camera_id.as_str(),
+                            file.data_name.as_str(),
+                            file.sequence_no,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("C1", "depth", 9_000),
+                    ("C1", "intensity", 9_000),
+                    ("C2", "depth", 80),
+                    ("C2", "intensity", 80),
+                ]
             );
         });
     }

@@ -149,6 +149,54 @@ export function cameraBandRotationRadians(orientation: UnfoldOrientation) {
   return orientation === 'horizontal' ? -Math.PI / 2 : 0;
 }
 
+export function cameraBandCropPadding(sampleSpan: number) {
+  // Automatic black-border detection is deliberately conservative. Keep a
+  // visible guard around the detected steel so dark physical edge pixels are
+  // not mistaken for the black sensor background after down-sampling.
+  return Math.max(6, Math.round(Math.max(0, sampleSpan) * 0.06));
+}
+
+function captureStitchCameraHasContent(camera: CaptureStitchFrame['cameras'][number]) {
+  if (camera.sourceBytes === undefined) return true;
+  if (!Number.isFinite(camera.sourceBytes) || camera.sourceBytes <= 0) return false;
+  const roiPixels = camera.validRoi
+    ? (camera.validRoi[2] - camera.validRoi[0]) * (camera.validRoi[3] - camera.validRoi[1])
+    : camera.sourceWidth * camera.sourceHeight;
+  // Empty line-scan PNGs from the current cameras are typically about 24 KB.
+  // Combine an absolute floor with a resolution-aware density check so a
+  // partial physical edge is retained without landing on a sensor-black run.
+  return camera.sourceBytes >= Math.max(48 * 1024, roiPixels * 0.02);
+}
+
+export function captureStitchInitialFrameIndex(
+  frames: readonly CaptureStitchFrame[],
+  expectedCameraCount: number,
+) {
+  if (frames.length === 0) return 0;
+  const expected = Math.max(1, Math.trunc(expectedCameraCount));
+  let bestIndex = 0;
+  let bestContentCount = -1;
+  let bestCameraCount = -1;
+  let bestBytes = -1;
+  for (let index = 0; index < frames.length; index += 1) {
+    const frame = frames[index];
+    const contentCount = frame.cameras.filter(captureStitchCameraHasContent).length;
+    const sourceBytes = frame.cameras.reduce((total, camera) => total + (camera.sourceBytes ?? 0), 0);
+    if (contentCount >= expected) return index;
+    if (
+      contentCount > bestContentCount
+      || (contentCount === bestContentCount && frame.cameras.length > bestCameraCount)
+      || (contentCount === bestContentCount && frame.cameras.length === bestCameraCount && sourceBytes > bestBytes)
+    ) {
+      bestIndex = index;
+      bestContentCount = contentCount;
+      bestCameraCount = frame.cameras.length;
+      bestBytes = sourceBytes;
+    }
+  }
+  return bestIndex;
+}
+
 const viewModeOptions: { id: PlateMapViewMode; label: string }[] = [
   { id: '2d', label: '2D' },
   { id: '3d', label: '3D' },
@@ -513,12 +561,14 @@ function CameraBandImage({
   orientation,
   contentLabel = '实际裁剪图',
   cropBlackBorders = false,
+  loadDelayMs = 0,
 }: {
   src: string;
   label: string;
   orientation: UnfoldOrientation;
   contentLabel?: string;
   cropBlackBorders?: boolean;
+  loadDelayMs?: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -527,7 +577,9 @@ function CameraBandImage({
     if (!canvas || !src) {
       return;
     }
+    canvas.dataset.renderState = 'loading';
     let disposed = false;
+    let loadTimer: number | null = null;
     const image = new Image();
     const draw = () => {
       if (disposed || !image.complete || image.naturalWidth <= 0) {
@@ -550,7 +602,9 @@ function CameraBandImage({
       }
       context.setTransform(rasterScale, 0, 0, rasterScale, 0, 0);
       context.clearRect(0, 0, rect.width, rect.height);
-      context.globalAlpha = 0.76;
+      context.globalAlpha = 1;
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
       let sourceX = 0;
       let sourceY = 0;
       let sourceWidth = image.naturalWidth;
@@ -581,8 +635,8 @@ function CameraBandImage({
               }
             }
             if (maxX >= minX && maxY >= minY) {
-              const paddingX = Math.max(2, Math.round((maxX - minX + 1) * 0.02));
-              const paddingY = Math.max(2, Math.round((maxY - minY + 1) * 0.02));
+              const paddingX = cameraBandCropPadding(maxX - minX + 1);
+              const paddingY = cameraBandCropPadding(maxY - minY + 1);
               minX = Math.max(0, minX - paddingX);
               minY = Math.max(0, minY - paddingY);
               maxX = Math.min(sample.width - 1, maxX + paddingX);
@@ -606,25 +660,41 @@ function CameraBandImage({
       } else {
         context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, rect.width, rect.height);
       }
+      canvas.dataset.renderState = 'ready';
     };
     image.crossOrigin = 'anonymous';
     image.decoding = 'async';
-    image.fetchPriority = 'high';
+    image.fetchPriority = loadDelayMs > 0 ? 'low' : 'high';
     image.onload = draw;
-    image.src = src;
+    image.onerror = () => {
+      if (!disposed) canvas.dataset.renderState = 'error';
+    };
+    if (loadDelayMs > 0) {
+      loadTimer = window.setTimeout(() => {
+        loadTimer = null;
+        if (!disposed) image.src = src;
+      }, loadDelayMs);
+    } else {
+      image.src = src;
+    }
     const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(draw) : null;
     observer?.observe(canvas);
     return () => {
       disposed = true;
+      if (loadTimer !== null) window.clearTimeout(loadTimer);
       observer?.disconnect();
       image.onload = null;
+      image.onerror = null;
+      if (typeof image.removeAttribute === 'function') image.removeAttribute('src');
     };
-  }, [cropBlackBorders, orientation, src]);
+  }, [cropBlackBorders, loadDelayMs, orientation, src]);
 
   return <canvas
     ref={canvasRef}
     className="bar-camera-band-image"
     aria-label={`${label} ${contentLabel}`}
+    data-edge-policy={cropBlackBorders ? 'guarded-auto-crop' : 'source-roi'}
+    data-load-priority={loadDelayMs > 0 ? 'deferred' : 'high'}
   />;
 }
 
@@ -723,6 +793,16 @@ function BarUnfoldedMap({
   const visibleCaptureFrames = stitchEnabled
     ? captureFrames.slice(firstVisibleFrame, lastVisibleFrame)
     : [];
+  const contentAnchorFrame = captureStitchInitialFrameIndex(captureFrames, cameraLanes.length);
+  const priorityFrameIndex = stitchEnabled
+    ? Math.max(
+      firstVisibleFrame,
+      Math.min(
+        Math.max(firstVisibleFrame, lastVisibleFrame - 1),
+        Math.floor((scrollWindow.offset + scrollWindow.extent / 2) / FRAME_SPAN_PX),
+      ),
+    )
+    : 0;
   const scrollSpaceStyle: CSSProperties = stitchEnabled
     ? orientation === 'horizontal'
       ? { width: `max(100%, ${longitudinalExtent}px)`, height: '100%' }
@@ -765,6 +845,7 @@ function BarUnfoldedMap({
     const previous = previousLayoutRef.current;
     const recordChanged = previous.stitchKey !== stitchKey;
     const orientationChanged = previous.orientation !== orientation;
+    const recordContentBecameReady = previous.frameCount === 0 && captureFrames.length > 0;
     const appendedAtTail = !recordChanged
       && previous.frameCount > 0
       && captureFrames.length > previous.frameCount
@@ -775,7 +856,11 @@ function BarUnfoldedMap({
       const extent = orientation === 'horizontal' ? host.clientWidth : host.clientHeight;
       const scrollExtent = orientation === 'horizontal' ? host.scrollWidth : host.scrollHeight;
       const maximum = Math.max(0, scrollExtent - extent);
-      const target = appendedAtTail ? maximum : maximum * retainedProgress;
+      const target = appendedAtTail
+        ? maximum
+        : recordChanged || recordContentBecameReady
+          ? Math.min(maximum, contentAnchorFrame * FRAME_SPAN_PX)
+          : maximum * retainedProgress;
       if (orientation === 'horizontal') {
         host.scrollTop = 0;
         host.scrollLeft = target;
@@ -783,7 +868,7 @@ function BarUnfoldedMap({
         host.scrollLeft = 0;
         host.scrollTop = target;
       }
-      if (orientationChanged || recordChanged || appendedAtTail) readScrollPosition();
+      if (orientationChanged || recordChanged || recordContentBecameReady || appendedAtTail) readScrollPosition();
     });
     return () => window.cancelAnimationFrame(frame);
   // readScrollPosition is deliberately kept local so it always uses the
@@ -815,6 +900,7 @@ function BarUnfoldedMap({
         data-testid="capture-stitch-viewport"
         data-scroll-axis={stitchEnabled ? orientation === 'horizontal' ? 'x' : 'y' : 'none'}
         data-frame-count={captureFrames.length}
+        data-content-anchor-frame={contentAnchorFrame}
         data-visible-frame-start={firstVisibleFrame}
         data-visible-frame-end={lastVisibleFrame}
         style={{ '--preview-position': `${previewPercent}%` } as CSSProperties}
@@ -879,6 +965,7 @@ function BarUnfoldedMap({
                         orientation={orientation}
                         contentLabel={cameraFrame.cropMode === 'algorithm-roi' ? '算法 ROI 裁剪图' : '自动裁黑边图'}
                         cropBlackBorders={cameraFrame.cropMode === 'auto-black-border'}
+                        loadDelayMs={frameIndex === priorityFrameIndex ? 0 : 250}
                       /> : <small>缺帧</small>}
                     </div>;
                   })}

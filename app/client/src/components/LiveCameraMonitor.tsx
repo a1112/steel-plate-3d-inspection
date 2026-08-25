@@ -22,8 +22,28 @@ import { CapturePlayback } from './CapturePlayback';
 
 type PreviewKind = 'intensity' | 'depth';
 type MonitorMode = 'live' | 'playback';
-const STREAM_IMAGE_LOAD_TIMEOUT_MS = 3_500;
+const STREAM_IMAGE_LOAD_TIMEOUT_MS = 8_000;
 const STREAM_CONTROL_TIMEOUT_MS = 8_000;
+const GRID_STREAM_BATCH_SIZE = 2;
+
+export function gridStreamRevision(
+  refreshToken: number,
+  cameraIndex: number,
+  cameraCount: number,
+) {
+  const count = Math.max(1, Math.trunc(cameraCount));
+  const index = Math.max(0, Math.min(count - 1, Math.trunc(cameraIndex)));
+  const token = Math.max(0, Math.trunc(refreshToken));
+  // Give every camera one quiet initial-load window, then refresh two lanes at
+  // a time. This prevents decoded lanes from starving cameras still waiting
+  // for their first frame on WebView's bounded per-origin connection pool.
+  if (token < count) return 0;
+  const batchCount = Math.ceil(count / GRID_STREAM_BATCH_SIZE);
+  const cameraBatch = Math.floor(index / GRID_STREAM_BATCH_SIZE);
+  const refreshStep = token - count;
+  if (refreshStep < cameraBatch) return 0;
+  return 1 + Math.floor((refreshStep - cameraBatch) / batchCount);
+}
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === 'AbortError';
@@ -785,7 +805,11 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
               {cameras.map((status, index) => {
                 const label = cameraLabel(status, index);
                 const gridImageUrl = status.connected && playing && canRequestStreamFrame(status)
-                  ? captureStreamImageUrl(status.ip, 'intensity-grid', refreshToken)
+                  ? captureStreamImageUrl(
+                    status.ip,
+                    'intensity-grid',
+                    gridStreamRevision(refreshToken, index, cameras.length),
+                  )
                   : '';
                 return (
                   <section

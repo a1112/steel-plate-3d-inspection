@@ -549,7 +549,7 @@ def build_flow_alignment(
     )
     p95_residual = _percentile(residuals_ms, 95.0)
     maximum_residual = max(residuals_ms, default=None)
-    synchronized = bool(
+    geometry_synchronized = bool(
         all_complete
         and no_clipped_heads
         and no_clipped_tails
@@ -557,8 +557,15 @@ def build_flow_alignment(
         and maximum_residual is not None
         and maximum_residual <= settings.maximum_anchor_residual_ms
         and clipped_anchor_mappings == 0
-        and sum(int(row.get("transportGapCount", 0)) for row in cameras.values()) == 0
     )
+    transport_frame_gaps = sum(
+        int(row.get("transportGapCount", 0)) for row in cameras.values()
+    )
+    # A missing transport frame makes the longitudinal archive incomplete, but
+    # it does not invalidate cross-sections mapped onto intact frames.  Keep the
+    # strict synchronized flag for whole-bar completeness and expose the second
+    # gate explicitly for diameter, overlap ownership and defect processing.
+    synchronized = geometry_synchronized and transport_frame_gaps == 0
 
     for row in cameras.values():
         row.pop("_records", None)
@@ -587,6 +594,7 @@ def build_flow_alignment(
         "quality": {
             "state": "synchronized" if synchronized else "degraded",
             "synchronized": synchronized,
+            "geometrySynchronized": geometry_synchronized,
             "expectedCameras": len(camera_roots),
             "completeCameras": sum(bool(row.get("complete")) for row in cameras.values()),
             "headsDetected": len(usable),
@@ -604,9 +612,7 @@ def build_flow_alignment(
             "commonSteelOverlapMs": round(common_overlap_ms, 6)
             if common_overlap_ms is not None
             else None,
-            "transportFrameGaps": sum(
-                int(row.get("transportGapCount", 0)) for row in cameras.values()
-            ),
+            "transportFrameGaps": transport_frame_gaps,
             "anchorCount": len(anchors),
             "clippedAnchorMappings": clipped_anchor_mappings,
             "anchorResidualP95Ms": round(p95_residual, 6) if p95_residual is not None else None,

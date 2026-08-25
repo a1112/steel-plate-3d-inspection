@@ -55,6 +55,7 @@ interface LeftSidebarProps {
   runtimeMode?: 'online' | 'bkv';
   plate: SteelPlate;
   summary: InspectionSummary;
+  activeRecordStatus?: InspectionRecord['status'];
   records: InspectionRecord[];
   inspections?: PlateInspection[];
   selectedRecordId: string;
@@ -70,10 +71,18 @@ interface LeftSidebarProps {
   onSearchReset: () => void;
 }
 
-function SidebarAlertCard({ summary }: { summary: InspectionSummary }) {
+function SidebarAlertCard({
+  summary,
+  detecting = false,
+}: {
+  summary: InspectionSummary;
+  detecting?: boolean;
+}) {
   const hasSevereDefect = summary.bySeverity.severe > 0;
   const hasDefect = summary.total > 0;
-  const message = hasSevereDefect
+  const message = detecting
+    ? '缺陷模型正在跟随流水号处理，结果尚未生成'
+    : hasSevereDefect
     ? `检测到 ${summary.bySeverity.severe} 个严重缺陷`
     : hasDefect
       ? `当前钢管 ${summary.total} 个缺陷均未达严重等级`
@@ -81,15 +90,15 @@ function SidebarAlertCard({ summary }: { summary: InspectionSummary }) {
 
   return (
     <section
-      className={`sidebar-alert-card ${hasSevereDefect ? '' : 'stable'}`}
-      aria-label={`${hasSevereDefect ? '严重缺陷报警' : '缺陷状态正常'}，${message}`}
+      className={`sidebar-alert-card ${hasSevereDefect || detecting ? '' : 'stable'}`}
+      aria-label={`${detecting ? '缺陷检测中' : hasSevereDefect ? '严重缺陷报警' : '缺陷状态正常'}，${message}`}
     >
       <AlertTriangle size={18} strokeWidth={1.9} />
       <div>
-        <strong>{hasSevereDefect ? '严重缺陷报警' : '缺陷状态正常'}</strong>
+        <strong>{detecting ? '缺陷检测中' : hasSevereDefect ? '严重缺陷报警' : '缺陷状态正常'}</strong>
         <span>{message}</span>
       </div>
-      <b>{hasSevereDefect ? '立即复核' : '跟踪'}</b>
+      <b>{detecting ? '处理中' : hasSevereDefect ? '立即复核' : '跟踪'}</b>
     </section>
   );
 }
@@ -98,6 +107,7 @@ export function LeftSidebar({
   runtimeMode = 'online',
   plate,
   summary,
+  activeRecordStatus = 'completed',
   records,
   inspections = [],
   selectedRecordId,
@@ -204,7 +214,7 @@ export function LeftSidebar({
           <b>硬件控制已禁用</b>
         </div>
       ) : null}
-      <SidebarAlertCard summary={summary} />
+      <SidebarAlertCard summary={summary} detecting={activeRecordStatus === 'detecting'} />
       <Panel title="钢管信息" className="plate-info-panel" headerless>
         <dl className="plate-info-list">
           <div>
@@ -338,7 +348,7 @@ export function LeftSidebar({
                     <td className={record.status === 'detecting' ? 'detecting' : 'completed'}>
                       {record.status === 'detecting' ? '检测中' : runtimeMode === 'bkv' ? '旧记录' : '已完成'}
                     </td>
-                    <td>{record.defectCount}</td>
+                    <td>{record.status === 'detecting' ? '检测中' : record.defectCount}</td>
                   </tr>
                 ))
               ) : (
@@ -378,7 +388,7 @@ export function LeftSidebar({
             <div><dt>检测时间</dt><dd>{hoveredRecord.record.time}</dd></div>
             <div><dt>记录状态</dt><dd className={hoveredRecord.record.status}>{hoveredRecord.record.status === 'detecting' ? '检测中' : runtimeMode === 'bkv' ? 'BKV 旧记录' : '已完成'}</dd></div>
             {cacheStatusEnabled ? <div><dt>数据缓存</dt><dd>{cacheStatusLabel(hoveredCacheProbe)}</dd></div> : null}
-            <div><dt>缺陷总数</dt><dd>{hoveredRecord.record.defectCount}</dd></div>
+            <div><dt>缺陷总数</dt><dd>{hoveredRecord.record.status === 'detecting' ? '检测中' : hoveredRecord.record.defectCount}</dd></div>
             <div><dt>采集产物</dt><dd>{hoveredInspection?.captureImages?.length ?? 0} 件</dd></div>
             <div><dt>规格/钢种</dt><dd>{hoveredInspection?.plate.steelGrade || '—'}</dd></div>
             <div><dt>外径/宽度</dt><dd>{formatWholeMillimetres(hoveredInspection?.plate.widthMm)}</dd></div>

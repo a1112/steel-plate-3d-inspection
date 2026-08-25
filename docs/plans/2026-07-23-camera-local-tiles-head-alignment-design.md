@@ -1,5 +1,7 @@
 # Camera-local tiles and head alignment design
 
+> **Status: Superseded.** Camera alignment metadata remains valid, but the default dashboard media path is now governed by [Inspection boundaries and responsive thumbnails](../design/inspection-boundaries-responsive-thumbnail.md). Tiles are legacy compatibility only.
+
 ## Goal
 
 Render BKV and online line-scan imagery as camera-local tiles, place camera columns by their real source widths, automatically align the first valid steel row at the top of the inspection world, and remove visible flashes during zoom and LOD transitions.

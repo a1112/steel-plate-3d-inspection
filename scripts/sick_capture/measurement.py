@@ -26,6 +26,7 @@ from .playback import detect_valid_grayscale_roi
 
 MEASUREMENT_SCHEMA = "steel.ranger3-flow-measurement.v1"
 CALIBRATION_SCHEMA = "steel.sick-array-calibration.v1"
+DEFAULT_DIAMETER_ANGLES_DEG = (0.0, 30.0, 60.0, 90.0, 120.0, 150.0)
 
 
 @dataclass(frozen=True)
@@ -101,12 +102,23 @@ def _profile(
     intensity = _intensity(intensity_path)
     metadata = _read_json(metadata_path)
     height, width = depth.shape
+    crop = _crop_box(depth, intensity)
+    if crop is None:
+        raise ValueError("stable foreground source unavailable")
+    crop_left, _crop_top, crop_right, _crop_bottom = crop
     center = height // 2 if row_index is None else max(0, min(height - 1, int(row_index)))
     half = max(1, config.row_window // 2)
     top = max(0, center - half)
     bottom = min(height, center + half + 1)
-    step = max(1, math.ceil(width / config.maximum_profile_points))
-    columns = np.arange(0, width, step, dtype=np.int32)
+    # Reconstruct only the same 2D foreground columns shown by playback and
+    # defect inference.  Sampling the full sensor plane admitted static valid
+    # depth outside the bar and made the fitted circle disagree with its 2D
+    # tile.  Base the sampling step on the cropped width as well, so a narrow
+    # bar still retains the configured profile resolution.
+    step = max(
+        1, math.ceil(max(1, crop_right - crop_left) / config.maximum_profile_points)
+    )
+    columns = np.arange(crop_left, crop_right, step, dtype=np.int32)
     window = depth[top:bottom, :][:, columns].astype(np.float64)
     invalid_mask = window == 0
     window[invalid_mask] = np.nan
@@ -123,9 +135,6 @@ def _profile(
             raw_z[valid] * sz + oz,
         )
     )
-    crop = _crop_box(depth, intensity)
-    if crop is None:
-        raise ValueError("stable foreground source unavailable")
     return points, {
         "storageIndex": storage_index,
         "rowIndex": center,
@@ -173,6 +182,23 @@ def _transform_profile(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return global_points[:, [0, 2]]
 
 
+def _anchor_mapping_metric_valid(
+    mapping: dict[str, Any], maximum_residual_ms: float
+) -> bool:
+    if not mapping.get("available") or mapping.get("rowClipped"):
+        return False
+    residual_value = mapping.get(
+        "interpolationResidualMs", mapping.get("timeResidualMs")
+    )
+    if residual_value is None:
+        return True
+    try:
+        residual = float(residual_value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(residual) and abs(residual) <= maximum_residual_ms
+
+
 def robust_circle_fit(points: np.ndarray, minimum_points: int = 8) -> dict[str, Any]:
     points = np.asarray(points, dtype=np.float64)
     points = points[np.all(np.isfinite(points), axis=1)] if points.ndim == 2 else np.empty((0, 2))
@@ -197,7 +223,16 @@ def robust_circle_fit(points: np.ndarray, minimum_points: int = 8) -> dict[str, 
         if next_retained.shape[0] < minimum_points or next_retained.shape[0] == retained.shape[0]:
             break
         retained = next_retained
-    residual = np.abs(np.linalg.norm(retained - center, axis=1) - radius)
+    # Refit once after the final rejection pass.  Without this final solve the
+    # reported diameter can still use the center from the pre-rejection set.
+    x = retained[:, 0]
+    z = retained[:, 1]
+    design = np.column_stack((2.0 * x, 2.0 * z, np.ones(x.size)))
+    solution, *_ = np.linalg.lstsq(design, x * x + z * z, rcond=None)
+    center = solution[:2]
+    radius = float(math.sqrt(max(0.0, solution[2] + np.dot(center, center))))
+    signed_residual = np.linalg.norm(retained - center, axis=1) - radius
+    residual = np.abs(signed_residual)
     return {
         "available": True,
         "centerX": round(float(center[0]), 6),
@@ -207,25 +242,330 @@ def robust_circle_fit(points: np.ndarray, minimum_points: int = 8) -> dict[str, 
         "meanAbsResidualMm": round(float(np.mean(residual)), 6),
         "p95AbsResidualMm": round(float(np.percentile(residual, 95)), 6),
         "maxAbsResidualMm": round(float(np.max(residual)), 6),
+        "roundnessMm": round(
+            float(np.max(signed_residual) - np.min(signed_residual)), 6
+        ),
         "pointCount": int(points.shape[0]),
         "robustPointCount": int(retained.shape[0]),
     }
 
 
-def summarize_cylinder_sections(sections: list[dict[str, Any]]) -> dict[str, Any]:
-    accepted = [
-        section
-        for section in sections
-        if section.get("circleFit", {}).get("available")
-        and math.isfinite(float(section["circleFit"].get("diameterMm", math.nan)))
+def _fixed_angle_radial_residual(
+    residuals: np.ndarray,
+    angle_deg: float,
+    *,
+    minimum_half_window_deg: float = 3.0,
+) -> float | None:
+    """Sample one fixed array angle from a reconstructed radial surface row.
+
+    Surface bins are centred between whole-degree boundaries, so sampling a
+    nominal direction such as 0 degrees from a single bin would introduce an
+    angular-bin bias.  Use a small circular median window around that physical
+    direction.  The window is never narrower than half a source bin.
+    """
+
+    values = np.asarray(residuals, dtype=np.float64).reshape(-1)
+    if values.size <= 0:
+        return None
+    bin_width_deg = 360.0 / float(values.size)
+    half_window_deg = max(
+        float(minimum_half_window_deg),
+        bin_width_deg / 2.0 + np.finfo(np.float64).eps,
+    )
+    centers_deg = (np.arange(values.size, dtype=np.float64) + 0.5) * bin_width_deg
+    angular_delta = np.abs(
+        np.mod(centers_deg - float(angle_deg) + 180.0, 360.0) - 180.0
+    )
+    selected = values[(angular_delta <= half_window_deg) & np.isfinite(values)]
+    if selected.size <= 0:
+        return None
+    return float(np.median(selected))
+
+
+def build_fixed_angle_diameter_curves(
+    sections: list[dict[str, Any]],
+    residual_grid: np.ndarray,
+    fixed_angles_deg: tuple[float, ...] = DEFAULT_DIAMETER_ANGLES_DEG,
+    *,
+    surface_metric_valid: bool = True,
+) -> dict[str, Any]:
+    """Build directional diameter curves from reconstructed surface radii.
+
+    A diameter at fixed angle ``theta`` is the sum of the two opposed radii
+    reconstructed at ``theta`` and ``theta + 180 degrees``.  Values are emitted
+    for every selected longitudinal section so every series remains aligned
+    with ``sections``.  Rejected transition/head/tail sections are deliberately
+    represented by ``null`` values even if their raw residual row contains
+    finite samples.
+    """
+
+    grid = np.asarray(residual_grid, dtype=np.float64)
+    if grid.ndim != 2:
+        raise ValueError("surface residual grid must be 2D")
+    if grid.shape[0] != len(sections):
+        raise ValueError("surface residual rows must align with sections")
+
+    normalized_angles: list[float] = []
+    for raw_angle in fixed_angles_deg:
+        angle = float(raw_angle)
+        if not math.isfinite(angle):
+            raise ValueError("fixed diameter angles must be finite")
+        angle = angle % 180.0
+        if not any(abs(angle - existing) < 1e-9 for existing in normalized_angles):
+            normalized_angles.append(angle)
+    if not normalized_angles:
+        raise ValueError("at least one fixed diameter angle is required")
+
+    elapsed_values: list[float | None] = []
+    for section in sections:
+        try:
+            elapsed = float(section.get("elapsedFromHeadMs"))
+        except (TypeError, ValueError):
+            elapsed = math.nan
+        elapsed_values.append(elapsed if math.isfinite(elapsed) else None)
+    finite_elapsed = [value for value in elapsed_values if value is not None]
+    elapsed_start = min(finite_elapsed, default=0.0)
+    elapsed_end = max(finite_elapsed, default=elapsed_start)
+    elapsed_span = max(0.0, elapsed_end - elapsed_start)
+
+    curve_sections: list[dict[str, Any]] = []
+    angle_values: list[list[float | None]] = [
+        [] for _ in normalized_angles
     ]
+    minimum_values: list[float | None] = []
+    maximum_values: list[float | None] = []
+    average_values: list[float | None] = []
+    all_valid_values: list[float] = []
+    minimum_required_angles = min(
+        len(normalized_angles),
+        max(2, math.ceil(len(normalized_angles) / 2.0)),
+    )
+
+    for row_index, section in enumerate(sections):
+        elapsed = elapsed_values[row_index]
+        if elapsed is not None and elapsed_span > 0.0:
+            position_ratio = (elapsed - elapsed_start) / elapsed_span
+        elif len(sections) > 1:
+            position_ratio = row_index / float(len(sections) - 1)
+        else:
+            position_ratio = 0.0
+
+        fit = section.get("circleFit", {})
+        try:
+            radius_mm = float(fit.get("radiusMm"))
+        except (TypeError, ValueError):
+            radius_mm = math.nan
+        surface_accepted = bool(section.get("acceptedForSurface"))
+        reasons: list[str] = []
+        if not surface_metric_valid:
+            reasons.append("surface-metric-quality-gate-failed")
+        if not surface_accepted:
+            reasons.append("surface-section-rejected")
+        if not bool(fit.get("available")) or not math.isfinite(radius_mm) or radius_mm <= 0.0:
+            reasons.append("circle-fit-unavailable")
+
+        diameters: list[float | None] = [None] * len(normalized_angles)
+        if not reasons:
+            row_residuals = grid[row_index]
+            for angle_index, angle_deg in enumerate(normalized_angles):
+                near_residual = _fixed_angle_radial_residual(
+                    row_residuals, angle_deg
+                )
+                opposite_residual = _fixed_angle_radial_residual(
+                    row_residuals, angle_deg + 180.0
+                )
+                if near_residual is None or opposite_residual is None:
+                    continue
+                diameter = 2.0 * radius_mm + near_residual + opposite_residual
+                if math.isfinite(diameter) and diameter > 0.0:
+                    diameters[angle_index] = round(float(diameter), 6)
+
+        valid_diameters = [value for value in diameters if value is not None]
+        if not reasons and len(valid_diameters) < minimum_required_angles:
+            reasons.append("fixed-angle-coverage-insufficient")
+            # Fail closed as a whole section.  This keeps aggregate curves and
+            # fixed-angle curves from silently using different section sets.
+            diameters = [None] * len(normalized_angles)
+            valid_diameters = []
+
+        metric_valid = not reasons
+        minimum_mm = (
+            round(float(min(valid_diameters)), 6) if valid_diameters else None
+        )
+        maximum_mm = (
+            round(float(max(valid_diameters)), 6) if valid_diameters else None
+        )
+        average_mm = (
+            round(float(np.mean(valid_diameters)), 6) if valid_diameters else None
+        )
+        for angle_index, value in enumerate(diameters):
+            angle_values[angle_index].append(value)
+        minimum_values.append(minimum_mm)
+        maximum_values.append(maximum_mm)
+        average_values.append(average_mm)
+        all_valid_values.extend(valid_diameters)
+        curve_sections.append(
+            {
+                "anchorOrdinal": section.get("anchorOrdinal"),
+                "elapsedFromHeadMs": elapsed,
+                "positionRatio": round(float(position_ratio), 8),
+                "metricValid": metric_valid,
+                "qualityGate": {"passed": metric_valid, "reasons": reasons},
+                "validAngleCount": len(valid_diameters),
+                "diametersMm": diameters,
+                "minimumMm": minimum_mm,
+                "maximumMm": maximum_mm,
+                "averageMm": average_mm,
+            }
+        )
+
+    angle_series: list[dict[str, Any]] = []
+    by_angle: list[dict[str, Any]] = []
+    for angle_index, angle_deg in enumerate(normalized_angles):
+        values = angle_values[angle_index]
+        finite_values = [value for value in values if value is not None]
+        angle_token = (
+            f"{int(round(angle_deg)):03d}"
+            if math.isclose(angle_deg, round(angle_deg), abs_tol=1e-9)
+            else f"{angle_deg:06.2f}".replace(".", "-")
+        )
+        angle_series.append(
+            {
+                "id": f"angle-{angle_token}",
+                "kind": "fixed-angle",
+                "angleDeg": round(angle_deg, 6),
+                "label": f"{angle_deg:g}\u00b0",
+                "valuesMm": values,
+            }
+        )
+        by_angle.append(
+            {
+                "angleDeg": round(angle_deg, 6),
+                "minimumMm": round(float(min(finite_values)), 6)
+                if finite_values
+                else None,
+                "maximumMm": round(float(max(finite_values)), 6)
+                if finite_values
+                else None,
+                "averageMm": round(float(np.mean(finite_values)), 6)
+                if finite_values
+                else None,
+                "validSampleCount": len(finite_values),
+            }
+        )
+
+    series = angle_series + [
+        {
+            "id": "minimum",
+            "kind": "aggregate",
+            "label": "minimum",
+            "valuesMm": minimum_values,
+        },
+        {
+            "id": "maximum",
+            "kind": "aggregate",
+            "label": "maximum",
+            "valuesMm": maximum_values,
+        },
+        {
+            "id": "average",
+            "kind": "aggregate",
+            "label": "average",
+            "valuesMm": average_values,
+        },
+    ]
+    valid_section_count = sum(
+        1 for section in curve_sections if section["metricValid"]
+    )
+    curves_metric_valid = bool(surface_metric_valid and valid_section_count >= 2)
+    return {
+        "available": curves_metric_valid,
+        "metricValid": curves_metric_valid,
+        "model": "opposed-radial-pairs-from-reconstructed-surface",
+        "angleConvention": "array-x-axis-ccw-period-180",
+        "longitudinalCoordinate": "head-relative-time",
+        "absoluteLongitudinalScaleVerified": False,
+        "angularSampleHalfWindowDeg": round(
+            float(
+                max(
+                    3.0,
+                    180.0 / float(grid.shape[1]) + np.finfo(np.float64).eps,
+                )
+                if grid.shape[1]
+                else 3.0
+            ),
+            6,
+        ),
+        "fixedAnglesDeg": [round(value, 6) for value in normalized_angles],
+        "sections": curve_sections,
+        "series": series,
+        "summary": {
+            "metricValid": curves_metric_valid,
+            "minimumMm": round(float(min(all_valid_values)), 6)
+            if all_valid_values
+            else None,
+            "maximumMm": round(float(max(all_valid_values)), 6)
+            if all_valid_values
+            else None,
+            "averageMm": round(float(np.mean(all_valid_values)), 6)
+            if all_valid_values
+            else None,
+            "validSectionCount": valid_section_count,
+            "validSampleCount": len(all_valid_values),
+            "byAngle": by_angle,
+        },
+    }
+
+
+def summarize_cylinder_sections(
+    sections: list[dict[str, Any]],
+    maximum_circle_residual_mm: float = math.inf,
+) -> dict[str, Any]:
+    elapsed_values = [
+        float(section.get("elapsedFromHeadMs", 0.0) or 0.0) for section in sections
+    ]
+    elapsed_start = min(elapsed_values, default=0.0)
+    elapsed_end = max(elapsed_values, default=elapsed_start)
+    elapsed_span = max(0.0, elapsed_end - elapsed_start)
+    evaluated: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
+    for section in sections:
+        fit = section.get("circleFit", {})
+        mapping_complete = bool(section.get("rowMappingComplete", True))
+        time_mapping_valid = bool(section.get("timeMappingValid", True))
+        fit_available = bool(fit.get("available"))
+        diameter = float(fit.get("diameterMm", math.nan))
+        residual = float(fit.get("p95AbsResidualMm", math.inf))
+        reasons: list[str] = []
+        if not mapping_complete:
+            reasons.append("cross-section-mapping-incomplete")
+        if not time_mapping_valid:
+            reasons.append("cross-section-time-residual-out-of-tolerance")
+        if not fit_available or not math.isfinite(diameter):
+            reasons.append("circle-fit-unavailable")
+        if residual > maximum_circle_residual_mm:
+            reasons.append("circle-fit-residual-out-of-tolerance")
+        elapsed = float(section.get("elapsedFromHeadMs", 0.0) or 0.0)
+        evaluated_section = {
+            **section,
+            "positionRatio": round(
+                (elapsed - elapsed_start) / elapsed_span if elapsed_span > 0 else 0.0,
+                8,
+            ),
+            "metricValid": not reasons,
+            "qualityGate": {"passed": not reasons, "reasons": reasons},
+        }
+        evaluated.append(evaluated_section)
+        if not reasons:
+            accepted.append(evaluated_section)
     if len(accepted) < 2:
         return {
             "available": False,
             "reason": "not-enough-valid-sections",
             "sectionsRequested": len(sections),
             "sectionsAccepted": len(accepted),
-            "sections": sections,
+            "sectionsRejected": len(evaluated) - len(accepted),
+            "sections": evaluated,
         }
     diameters = np.asarray(
         [float(section["circleFit"]["diameterMm"]) for section in accepted],
@@ -244,6 +584,14 @@ def summarize_cylinder_sections(sections: list[dict[str, Any]]) -> dict[str, Any
     center_reference = np.median(centers, axis=0)
     straightness = np.linalg.norm(centers - center_reference, axis=1)
     elapsed = [float(section.get("elapsedFromHeadMs", 0.0)) for section in accepted]
+    roundness = np.asarray(
+        [float(section["circleFit"].get("roundnessMm", 0.0)) for section in accepted],
+        dtype=np.float64,
+    )
+    p95_residuals = np.asarray(
+        [float(section["circleFit"].get("p95AbsResidualMm", 0.0)) for section in accepted],
+        dtype=np.float64,
+    )
     return {
         "available": True,
         "model": "cylinder-sections-head-relative-time",
@@ -253,9 +601,17 @@ def summarize_cylinder_sections(sections: list[dict[str, Any]]) -> dict[str, Any
         "diameterMinimumMm": round(float(np.min(diameters)), 6),
         "diameterMaximumMm": round(float(np.max(diameters)), 6),
         "diameterStdDevMm": round(float(np.std(diameters)), 6),
+        "diameterMedianMm": round(float(np.median(diameters)), 6),
+        "diameterP05Mm": round(float(np.percentile(diameters, 5)), 6),
+        "diameterP95Mm": round(float(np.percentile(diameters, 95)), 6),
+        "diameterRangeMm": round(float(np.max(diameters) - np.min(diameters)), 6),
+        "roundnessMaximumMm": round(float(np.max(roundness)), 6),
+        "fitResidualP95MaximumMm": round(float(np.max(p95_residuals)), 6),
         "centerStraightnessMaximumMm": round(float(np.max(straightness)), 6),
         "headRelativeTimeSpanMs": round(max(elapsed) - min(elapsed), 6),
-        "sections": sections,
+        "fullHeadRelativeTimeSpanMs": round(elapsed_span, 6),
+        "sectionsRejected": len(evaluated) - len(accepted),
+        "sections": evaluated,
     }
 
 
@@ -276,6 +632,9 @@ def build_flow_measurement(
     global_profiles: list[np.ndarray] = []
     matrices: dict[str, np.ndarray] = {}
     calibrated = 0
+    maximum_sync_residual_ms = float(
+        alignment.get("settings", {}).get("maximumAnchorResidualMs", 40.0) or 40.0
+    )
     if selected_anchor:
         for camera_id, camera_root in sorted(camera_roots.items()):
             mapping = selected_anchor.get("cameras", {}).get(camera_id, {})
@@ -299,7 +658,11 @@ def build_flow_measurement(
                     {
                         "available": True,
                         "timeResidualMs": mapping.get("timeResidualMs"),
+                        "interpolationResidualMs": mapping.get("interpolationResidualMs"),
                         "rowClipped": bool(mapping.get("rowClipped")),
+                        "mappingMetricValid": _anchor_mapping_metric_valid(
+                            mapping, maximum_sync_residual_ms
+                        ),
                         "localBoundsMm": {
                             "x": [round(float(np.min(profile[:, 0])), 6), round(float(np.max(profile[:, 0])), 6)] if profile.size else None,
                             "z": [round(float(np.min(profile[:, 1])), 6), round(float(np.max(profile[:, 1])), 6)] if profile.size else None,
@@ -317,7 +680,17 @@ def build_flow_measurement(
 
     combined = np.vstack(global_profiles) if global_profiles else np.empty((0, 2))
     circle = robust_circle_fit(combined, settings.minimum_circle_points)
-    alignment_ok = bool(alignment.get("quality", {}).get("synchronized"))
+    alignment_quality = alignment.get("quality", {})
+    whole_flow_geometry_synchronized = bool(
+        alignment_quality.get(
+            "geometrySynchronized", alignment_quality.get("synchronized")
+        )
+    )
+    selected_section_synchronized = bool(
+        selected_anchor
+        and len(cameras) == len(camera_roots)
+        and all(row.get("mappingMetricValid") for row in cameras.values())
+    )
     row_mapping_ok = bool(
         cameras and all(not row.get("rowClipped", True) for row in cameras.values() if row.get("available"))
     )
@@ -328,11 +701,15 @@ def build_flow_measurement(
         <= settings.maximum_circle_residual_mm
     )
     metric_valid = bool(
-        approved and alignment_ok and row_mapping_ok and every_camera_calibrated and residual_ok
+        approved
+        and selected_section_synchronized
+        and row_mapping_ok
+        and every_camera_calibrated
+        and residual_ok
     )
     reasons: list[str] = []
-    if not alignment_ok:
-        reasons.append("flow-not-synchronized")
+    if not selected_section_synchronized:
+        reasons.append("cross-section-not-synchronized")
     if not row_mapping_ok:
         reasons.append("cross-section-row-clipped")
     if not approved:
@@ -342,7 +719,7 @@ def build_flow_measurement(
     if not residual_ok:
         reasons.append("circle-fit-residual-out-of-tolerance")
     section_fits: list[dict[str, Any]] = []
-    if approved and every_camera_calibrated and alignment_ok and anchors:
+    if approved and every_camera_calibrated and anchors:
         count = min(settings.maximum_sections, len(anchors))
         anchor_indices = sorted(
             set(int(value) for value in np.linspace(0, len(anchors) - 1, count))
@@ -351,10 +728,14 @@ def build_flow_measurement(
             anchor = anchors[anchor_index]
             section_points: list[np.ndarray] = []
             section_clipped = False
+            section_time_mapping_valid = True
             for camera_id, camera_root in sorted(camera_roots.items()):
                 mapping = anchor.get("cameras", {}).get(camera_id, {})
-                if not mapping.get("available") or mapping.get("rowClipped"):
+                if not _anchor_mapping_metric_valid(
+                    mapping, maximum_sync_residual_ms
+                ):
                     section_clipped = True
+                    section_time_mapping_valid = False
                     continue
                 try:
                     profile, _ = _profile(
@@ -378,25 +759,28 @@ def build_flow_measurement(
                     "elapsedFromHeadMs": anchor.get("elapsedFromHeadMs"),
                     "rowMappingComplete": not section_clipped
                     and len(section_points) == len(camera_roots),
+                    "timeMappingValid": section_time_mapping_valid,
                     "circleFit": fit,
                 }
             )
-    surface_fit = summarize_cylinder_sections(section_fits)
+    surface_fit = summarize_cylinder_sections(
+        section_fits, settings.maximum_circle_residual_mm
+    )
     surface_metric_valid = bool(
-        metric_valid
+        approved
+        and every_camera_calibrated
         and surface_fit.get("available")
-        and all(section.get("rowMappingComplete") for section in section_fits)
-        and all(
-            float(section.get("circleFit", {}).get("p95AbsResidualMm", math.inf))
-            <= settings.maximum_circle_residual_mm
-            for section in section_fits
-        )
+        and int(surface_fit.get("sectionsAccepted", 0)) >= 2
     )
     surface_fit.update(
         {
             "metricValid": surface_metric_valid,
             "longitudinalCoordinate": "head-relative-time",
             "absoluteLongitudinalScaleVerified": False,
+            "maximumCircleResidualMm": settings.maximum_circle_residual_mm,
+            "maximumAnchorResidualMs": maximum_sync_residual_ms,
+            "sectionSynchronizationPolicy": "per-anchor-interpolated-row-residual",
+            "wholeFlowGeometrySynchronized": whole_flow_geometry_synchronized,
             "note": "Encoder/speed input is required before reporting longitudinal millimetres.",
         }
     )
@@ -407,7 +791,7 @@ def build_flow_measurement(
         "mode": "metric" if metric_valid else "preview",
         "metricValid": metric_valid,
         "qualityGate": {"passed": metric_valid, "reasons": reasons},
-        "alignment": alignment.get("quality", {}),
+        "alignment": alignment_quality,
         "calibration": {
             "path": str(calibration_path) if calibration_path else "",
             "available": bool(calibration),
