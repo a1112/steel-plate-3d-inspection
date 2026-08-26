@@ -64,6 +64,13 @@ export type BarSurfaceManifest = {
     passed?: boolean;
     reasons?: string[];
   };
+  /** Explicit consumer contract; do not infer the surface kind from materialId. */
+  surfaceKind?: 'capture-fused' | 'production-surface' | 'bkv-surface' | string;
+  crossSectionLayout?: 'fused-angular-bins' | 'camera-bands' | string;
+  displayMode?: 'metric' | 'quality-gated-preview' | 'diagnostic-unqualified' | string;
+  metricValid?: boolean;
+  longitudinalAxis?: BarSurfaceMesh['longitudinalAxis'];
+  qualityReasons?: string[];
   realDefectCount?: number;
   syntheticDefectCount?: number;
   materialId: string;
@@ -157,6 +164,12 @@ export type BarSurfaceManifest = {
     contourCrop?: BarSurfaceContourCrop;
     coordinateFrame?: BarSurfaceCoordinateFrame;
     angularSectorFit?: BarSurfaceAngularSectorFit;
+    surfaceKind?: 'capture-fused' | 'production-surface' | 'bkv-surface' | string;
+    crossSectionLayout?: 'fused-angular-bins' | 'camera-bands' | string;
+    displayMode?: 'metric' | 'quality-gated-preview' | 'diagnostic-unqualified' | string;
+    metricValid?: boolean;
+    longitudinalAxis?: BarSurfaceMesh['longitudinalAxis'];
+    qualityReasons?: string[];
   };
   core?: BarSurfaceCoreInfo;
   reports?: {
@@ -285,9 +298,62 @@ export type BarSurfaceMesh = {
   indices: ArrayLike<number>;
   /** Symmetric radial-residual range used by the algorithm JET palette. */
   jetRangeMm?: number;
+  materialId?: string;
+  /** Stable producer identity used by the 3D/section routers. */
+  surfaceKind?: 'capture-fused' | 'production-surface' | 'bkv-surface' | string;
+  /** Layout of rows/columns in the reconstructed cross-section. */
+  crossSectionLayout?: 'fused-angular-bins' | 'camera-bands' | string;
+  displayMode?: 'metric' | 'quality-gated-preview' | 'diagnostic-unqualified' | string;
+  metricValid?: boolean;
+  qualityReasons?: string[];
+  longitudinalAxis?: {
+    source?: string;
+    origin?: string;
+    originElapsedFromHeadMs?: number;
+    endElapsedFromHeadMs?: number;
+    qualifiedDurationMs?: number;
+    displaySpan?: number;
+    displayUnit?: string;
+    absoluteScaleVerified?: boolean;
+  };
+  crossSections?: Array<{
+    row: number;
+    meshRow: number;
+    anchorOrdinal?: number | null;
+    elapsedFromHeadMs?: number | null;
+    positionRatio?: number | null;
+    longitudinalDisplayPosition?: number | null;
+    available: boolean;
+    metricValid: boolean;
+    displayMode?: string;
+    qualityReasons?: string[];
+    validPointCount: number;
+    angularPointCount: number;
+    circleFit?: {
+      available?: boolean;
+      centerX?: number;
+      centerZ?: number;
+      radiusMm?: number;
+      diameterMm?: number;
+      meanAbsResidualMm?: number;
+      p95AbsResidualMm?: number;
+      maxAbsResidualMm?: number;
+      roundnessMm?: number;
+      pointCount?: number;
+      robustPointCount?: number;
+    };
+  }>;
   source?: 'core-bsmesh' | 'bkv-bsmesh' | 'json';
   binaryBytes?: number;
 };
+
+/** Capture-fused meshes have explicit metadata or the capture schema/layout. */
+export function isCaptureFusedSurface(mesh: BarSurfaceMesh | null | undefined) {
+  if (!mesh) return false;
+  return mesh.surfaceKind === 'capture-fused'
+    || mesh.crossSectionLayout === 'fused-angular-bins'
+    || mesh.schema === 'steel.ranger3-flow-surface.v1';
+}
 
 export type BarSurfaceTopology = {
   maxFaceEdgeMm?: number;
@@ -765,6 +831,23 @@ function requireBytes(buffer: ArrayBuffer, offset: number, byteCount: number, la
   }
 }
 
+function manifestMeshMetadata(manifest: BarSurfaceManifest): Pick<
+  BarSurfaceMesh,
+  'materialId' | 'surfaceKind' | 'crossSectionLayout' | 'displayMode'
+  | 'metricValid' | 'qualityReasons' | 'longitudinalAxis'
+> {
+  const mesh = manifest.mesh;
+  return {
+    materialId: manifest.materialId,
+    surfaceKind: manifest.surfaceKind ?? mesh.surfaceKind ?? 'production-surface',
+    crossSectionLayout: manifest.crossSectionLayout ?? mesh.crossSectionLayout,
+    displayMode: manifest.displayMode ?? mesh.displayMode,
+    metricValid: manifest.metricValid ?? mesh.metricValid,
+    qualityReasons: manifest.qualityReasons ?? manifest.qualityGate?.reasons ?? mesh.qualityReasons ?? [],
+    longitudinalAxis: manifest.longitudinalAxis ?? mesh.longitudinalAxis,
+  };
+}
+
 function parseBarSurfaceBsmesh(buffer: ArrayBuffer, manifest: BarSurfaceManifest): BarSurfaceMesh {
   const headerBytes = 40;
   requireBytes(buffer, 0, headerBytes, 'header');
@@ -822,6 +905,7 @@ function parseBarSurfaceBsmesh(buffer: ArrayBuffer, manifest: BarSurfaceManifest
   return {
     schema: 'steel.bar_surface.mesh.bsmesh.v1',
     coordinateUnit: manifest.core?.summary?.coordinateUnit || 'mm',
+    ...manifestMeshMetadata(manifest),
     cameraCount,
     frameStems: [],
     rows,
@@ -869,7 +953,11 @@ export async function fetchBarSurfaceMesh(manifest: BarSurfaceManifest, signal?:
     signal,
   });
   const mesh = await readJsonResponse<BarSurfaceMesh>(response, 'bar surface mesh unavailable');
-  return { ...mesh, source: 'json' };
+  return {
+    ...mesh,
+    ...manifestMeshMetadata(manifest),
+    source: 'json',
+  };
 }
 
 export async function fetchBarSurfaceManifest(relativeOrPath: string, signal?: AbortSignal): Promise<BarSurfaceManifest> {

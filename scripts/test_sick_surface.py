@@ -15,12 +15,212 @@ from scripts.sick_capture.surface import (
     _binned_section,
     _calibration_fixed_angle_deg,
     _camera_overlap_consistency,
+    _camera_radial_quality,
     _camera_tile_payload,
+    _head_aligned_longitudinal_axis,
+    _write_jet_image,
+    apply_surface_quality_gate,
     jet_rgb,
+    measurement_artifact_from_surface,
+    upgrade_surface_display_contract,
 )
+from scripts.sick_capture.paths import camera_surface_jet_path, surface_jet_path
 
 
 class SickSurfaceTests(unittest.TestCase):
+    def test_historical_surface_upgrade_builds_cross_sections_and_diameter_curves(self) -> None:
+        rows = 3
+        columns = 12
+        positions: list[float] = []
+        sections: list[dict[str, object]] = []
+        for row in range(rows):
+            for column in range(columns):
+                angle = (column + 0.5) * 2.0 * math.pi / columns
+                radius = 50.0 + (0.2 if column == 1 else 0.0)
+                positions.extend([radius * math.cos(angle), row * 10.0, radius * math.sin(angle)])
+            sections.append({
+                "anchorOrdinal": row + 4,
+                "elapsedFromHeadMs": row * 100.0,
+                "acceptedForSurface": True,
+                "mappingComplete": True,
+                "mappingMetricValid": True,
+                "qualityGate": {"passed": True, "reasons": []},
+                "circleFit": {
+                    "available": True,
+                    "centerX": 0.0,
+                    "centerZ": 0.0,
+                    "radiusMm": 50.0,
+                    "diameterMm": 100.0,
+                },
+            })
+        surface = {
+            "schema": "steel.ranger3-flow-surface.v1",
+            "materialId": "4034",
+            "quality": {"crossSectionMetricValid": True},
+            "sections": sections,
+            "mesh": {
+                "rows": rows,
+                "columns": columns,
+                "positions": positions,
+                "colors": [0.0] * rows * columns * 3,
+                "validMask": [1] * rows * columns,
+                "indices": [],
+                "longitudinal": {"displayUnit": "preview", "absoluteScaleVerified": False},
+            },
+            "jet": {"palette": "JET"},
+        }
+
+        usable, changed = upgrade_surface_display_contract(surface)
+
+        self.assertTrue(usable)
+        self.assertTrue(changed)
+        self.assertEqual(surface["mesh"]["pointUnit"], "mm")
+        self.assertGreater(len(surface["mesh"]["indices"]), 0)
+        self.assertEqual(len(surface["crossSections"]["sections"]), rows)
+        self.assertAlmostEqual(
+            surface["crossSections"]["sections"][1]["longitudinalDisplayPosition"],
+            10.0,
+        )
+        self.assertEqual(surface["diameterCurves"]["displayMode"], "metric")
+
+    def test_measurement_artifact_reuses_authoritative_surface_diameter_curves(self) -> None:
+        curves = {
+            "metricValid": True,
+            "sections": [
+                {"anchorOrdinal": 4, "positionRatio": 0.0},
+                {"anchorOrdinal": 5, "positionRatio": 1.0},
+            ],
+            "series": [{"id": "average", "valuesMm": [45.0, 45.2]}],
+            "summary": {"averageMm": 45.1},
+        }
+        surface = {
+            "schema": "steel.ranger3-flow-surface.v1",
+            "materialId": "88",
+            "state": "ready",
+            "quality": {
+                "crossSectionMetricValid": True,
+                "metricProjectionVerified": True,
+                "reasons": [],
+            },
+            "summary": {
+                "diameterMeanMm": 45.1,
+                "diameterMinimumMm": 45.0,
+                "diameterMaximumMm": 45.2,
+                "diameterStdDevMm": 0.1,
+            },
+            "diameterCurves": curves,
+            "sections": [
+                {
+                    "anchorOrdinal": 4,
+                    "elapsedFromHeadMs": 10.0,
+                    "mappingComplete": True,
+                    "mappingMetricValid": True,
+                    "acceptedForSurface": True,
+                    "qualityGate": {"passed": True, "reasons": []},
+                    "circleFit": {"available": True, "diameterMm": 45.0},
+                },
+                {
+                    "anchorOrdinal": 5,
+                    "elapsedFromHeadMs": 20.0,
+                    "mappingComplete": True,
+                    "mappingMetricValid": True,
+                    "acceptedForSurface": True,
+                    "qualityGate": {"passed": True, "reasons": []},
+                    "circleFit": {"available": True, "diameterMm": 45.2},
+                },
+            ],
+        }
+        measurement = measurement_artifact_from_surface(surface)
+        self.assertEqual(measurement["materialId"], "88")
+        self.assertTrue(measurement["metricValid"])
+        self.assertIs(measurement["surfaceFit"]["diameterCurves"], curves)
+        self.assertEqual(measurement["surfaceFit"]["sectionsAccepted"], 2)
+        self.assertEqual(measurement["surfaceFit"]["sections"][1]["positionRatio"], 1.0)
+
+    def test_measurement_artifact_fails_closed_without_metric_projection_proof(self) -> None:
+        surface = {
+            "schema": "steel.ranger3-flow-surface.v1",
+            "materialId": "88",
+            "quality": {"crossSectionMetricValid": True, "reasons": []},
+            "sections": [],
+        }
+
+        measurement = measurement_artifact_from_surface(surface)
+
+        self.assertFalse(measurement["metricValid"])
+        self.assertEqual(measurement["mode"], "preview")
+        self.assertIn(
+            "metric-projection-unverified",
+            measurement["qualityGate"]["reasons"],
+        )
+
+    def test_surface_quality_failure_downgrades_aggregate_measurement(self) -> None:
+        measurement = {
+            "mode": "metric",
+            "metricValid": True,
+            "qualityGate": {"passed": True, "reasons": []},
+        }
+
+        apply_surface_quality_gate(
+            measurement,
+            {"quality": {"crossSectionMetricValid": False}},
+        )
+
+        self.assertFalse(measurement["metricValid"])
+        self.assertEqual(measurement["mode"], "preview")
+        self.assertFalse(measurement["qualityGate"]["passed"])
+        self.assertEqual(
+            measurement["qualityGate"]["reasons"],
+            ["surface-quality-gate-failed"],
+        )
+
+    def test_camera_radial_quality_separates_depth_precision_from_calibration_bias(self) -> None:
+        angles = np.linspace(0.0, 2.0 * math.pi, 120, endpoint=False)
+        radii = 10.2 + 0.05 * np.sin(angles * 7.0)
+        points = np.column_stack((radii * np.cos(angles), radii * np.sin(angles)))
+        fit = {"available": True, "centerX": 0.0, "centerZ": 0.0, "radiusMm": 10.0}
+
+        relaxed = _camera_radial_quality(points, fit, 0.3)
+        self.assertTrue(relaxed["depthPrecisionMetricValid"])
+        self.assertTrue(relaxed["calibrationBiasMetricValid"])
+        self.assertAlmostEqual(relaxed["radialBiasMedianMm"], 0.2, places=5)
+        self.assertLess(relaxed["depthPrecisionP95Mm"], 0.06)
+
+        strict = _camera_radial_quality(points, fit, 0.1)
+        self.assertTrue(strict["depthPrecisionMetricValid"])
+        self.assertFalse(strict["calibrationBiasMetricValid"])
+        self.assertFalse(strict["metricValid"])
+
+    def test_jet_images_use_camera_local_jpeg_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "C3"
+            camera_path = camera_surface_jet_path(root, "4018")
+            combined_path = surface_jet_path(root, "4018")
+            self.assertEqual(camera_path, root / "4018" / "jet" / "surface.jpg")
+            self.assertEqual(combined_path, root / "4018" / "jet" / "surface-all.jpg")
+            _write_jet_image(
+                camera_path,
+                np.asarray([[-0.2, 0.0, 0.2]], dtype=np.float64),
+                0.2,
+            )
+            with Image.open(camera_path) as image:
+                self.assertEqual(image.format, "JPEG")
+
+    def test_longitudinal_axis_starts_at_first_complete_head_section(self) -> None:
+        positions, metadata = _head_aligned_longitudinal_axis(
+            [
+                {"elapsedFromHeadMs": 0.0, "acceptedForSurface": False},
+                {"elapsedFromHeadMs": 125.0, "acceptedForSurface": True},
+                {"elapsedFromHeadMs": 625.0, "acceptedForSurface": True},
+                {"elapsedFromHeadMs": 1000.0, "acceptedForSurface": False},
+            ],
+            200.0,
+        )
+        self.assertEqual(positions, [0.0, 0.0, 200.0, 200.0])
+        self.assertEqual(metadata["originElapsedFromHeadMs"], 125.0)
+        self.assertEqual(metadata["headTransitionTrimMs"], 125.0)
+        self.assertFalse(metadata["absoluteScaleVerified"])
+
     def test_jet_palette_has_expected_cold_mid_hot_order(self) -> None:
         self.assertEqual(jet_rgb(0.0), (0, 0, 128))
         self.assertEqual(jet_rgb(0.5), (128, 255, 128))
@@ -125,6 +325,38 @@ class SickSurfaceTests(unittest.TestCase):
         self.assertEqual(tile["defectMapping"]["coordinateSpace"], "source-image-pixels")
         self.assertEqual(tile["coverage"]["overlapColumnIntervals"], [[18.0, 20.0]])
 
+    def test_camera_tile_can_render_rejected_samples_as_diagnostic_jet(self) -> None:
+        samples = [
+            {
+                "available": True,
+                "elapsedFromHeadMs": 0.0,
+                "sourceShape": [20, 10],
+                "frameCropBox": [2, 0, 8, 10],
+                "acceptedForSurface": False,
+                "residualByColumn": {3: 0.25},
+                "angleByColumn": {3: 90.0},
+                "sampleCountByColumn": {3: 1},
+            }
+        ]
+        region_map = {
+            "cameras": {
+                "C1": {"sourceSize": [20, 10], "stableCrop": [2, 0, 8, 10]}
+            }
+        }
+        tile, grid = _camera_tile_payload(
+            "C1",
+            samples,
+            region_map=region_map,
+            fixed_angle_deg=90.0,
+            display_range_mm=0.5,
+            diagnostic_fallback=True,
+        )
+        self.assertAlmostEqual(float(grid[0, 1]), 0.25)
+        self.assertEqual(tile["state"], "ready")
+        self.assertEqual(tile["jet"]["source"], "diagnostic-unqualified")
+        self.assertFalse(tile["jet"]["metricValid"])
+        self.assertFalse(tile["rowAnchors"][0]["acceptedForSurface"])
+
     def test_overlap_consistency_reports_calibration_stitching_error(self) -> None:
         left_angles = np.radians(np.arange(0.5, 101.0, 1.0))
         right_angles = np.radians(np.arange(80.5, 181.0, 1.0))
@@ -136,10 +368,16 @@ class SickSurfaceTests(unittest.TestCase):
         fit = {"available": True, "centerX": 0.0, "centerZ": 0.0, "radiusMm": 50.0}
         failed = _camera_overlap_consistency({"C1": left, "C2": right}, fit, 360, 0.1)
         self.assertFalse(failed["metricValid"])
+        self.assertFalse(failed["pairs"][0]["metricValid"])
+        self.assertIn(
+            "calibrated-camera-pair-overlap-out-of-tolerance",
+            failed["qualityGate"]["reasons"],
+        )
         self.assertGreaterEqual(failed["sampleCount"], 20)
         self.assertAlmostEqual(failed["p95AbsRadialDifferenceMm"], 0.2, places=6)
         passed = _camera_overlap_consistency({"C1": left, "C2": right}, fit, 360, 0.3)
         self.assertTrue(passed["metricValid"])
+        self.assertTrue(passed["pairs"][0]["metricValid"])
 
     def test_profile_uses_grayscale_crop_before_metric_projection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

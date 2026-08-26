@@ -21,6 +21,7 @@ from sick_capture.defect_detection import (
     defect_detection_manifest_path,
 )
 from sick_capture.measurement import MeasurementConfig, build_and_write_flow_measurement
+from sick_capture.material_lock import exclusive_material_job
 from sick_capture.paths import (
     LAYOUT_SCHEMA,
     alignment_path as canonical_alignment_path,
@@ -37,7 +38,10 @@ from sick_capture.playback import build_and_write_playback_index
 from sick_capture.profile import load_profile
 from sick_capture.regions import build_and_write_flow_region_map
 from sick_capture.storage import atomic_summary
-from sick_capture.surface import build_and_write_flow_surface
+from sick_capture.surface import (
+    apply_surface_quality_gate,
+    build_and_write_flow_surface,
+)
 
 
 def lower_process_priority() -> str:
@@ -355,8 +359,11 @@ def _analyze_impl(
         "jetPath": str(jet_path) if jet_path.is_file() else "",
         "state": surface.get("state"),
         "quality": surface.get("quality"),
+        "depthPrecision": surface.get("depthPrecision"),
+        "calibrationAccuracy": surface.get("calibrationAccuracy"),
         "summary": surface.get("summary"),
     }
+    apply_surface_quality_gate(measurement, surface)
     diameter_curves = surface.get("diameterCurves")
     if isinstance(diameter_curves, dict):
         measurement.setdefault("surfaceFit", {})["diameterCurves"] = diameter_curves
@@ -440,7 +447,7 @@ def _analyze_impl(
     )
 
 
-def analyze(
+def _analyze_under_lock(
     camera_roots: dict[str, Path],
     storage_root: Path,
     material_id: str,
@@ -454,7 +461,7 @@ def analyze(
     include_defects: bool = True,
     committed_event_signature: tuple[int, int, int] | None = None,
 ) -> None:
-    """Run one analysis pass while publishing durable progress/failure state."""
+    """Run one owned analysis pass while publishing durable progress/failure state."""
     state_path = algorithm_state_path(storage_root, material_id)
     atomic_summary(
         state_path,
@@ -511,7 +518,43 @@ def analyze(
         raise
 
 
-def analyze_defects_only(
+def analyze(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment_config: AlignmentConfig,
+    measurement_config: MeasurementConfig,
+    defect_detection_config: DefectDetectionConfig,
+    calibration_path: Path | None,
+    database_origin: str,
+    *,
+    final: bool,
+    include_defects: bool = True,
+    committed_event_signature: tuple[int, int, int] | None = None,
+) -> None:
+    """Run one analysis pass with exclusive ownership of derived artifacts."""
+
+    with exclusive_material_job(
+        storage_root,
+        material_id,
+        purpose="flow-analysis",
+    ):
+        _analyze_under_lock(
+            camera_roots,
+            storage_root,
+            material_id,
+            alignment_config,
+            measurement_config,
+            defect_detection_config,
+            calibration_path,
+            database_origin,
+            final=final,
+            include_defects=include_defects,
+            committed_event_signature=committed_event_signature,
+        )
+
+
+def _analyze_defects_only_under_lock(
     camera_roots: dict[str, Path],
     storage_root: Path,
     material_id: str,
@@ -596,6 +639,27 @@ def analyze_defects_only(
             },
         )
         raise
+
+
+def analyze_defects_only(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    defect_detection_config: DefectDetectionConfig,
+) -> None:
+    """Run the defect stage without racing a fast artifact generation."""
+
+    with exclusive_material_job(
+        storage_root,
+        material_id,
+        purpose="flow-defect-analysis",
+    ):
+        _analyze_defects_only_under_lock(
+            camera_roots,
+            storage_root,
+            material_id,
+            defect_detection_config,
+        )
 
 
 def main() -> int:

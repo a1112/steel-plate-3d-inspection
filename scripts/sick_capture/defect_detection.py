@@ -24,7 +24,12 @@ from urllib import request
 import numpy as np
 from PIL import Image
 
-from .paths import capture_root, defect_manifest_path, defect_root, surface_path
+from .paths import (
+    capture_root,
+    defect_image_root,
+    defect_manifest_path,
+    surface_path,
+)
 
 from .alignment import _atomic_json, _read_json, _numeric_files
 from .playback import detect_valid_grayscale_roi
@@ -705,9 +710,16 @@ def _save_review_crop(
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
-        Image.fromarray(intensity[box[1] : box[3], box[0] : box[2]], mode="L").save(
-            temporary, format="PNG", optimize=False
+        output_format = "PNG" if path.suffix.lower() == ".png" else "JPEG"
+        save_options = (
+            {"format": "PNG", "optimize": False}
+            if output_format == "PNG"
+            else {"format": "JPEG", "quality": 88, "optimize": False}
         )
+        Image.fromarray(
+            intensity[box[1] : box[3], box[0] : box[2]],
+            mode="L",
+        ).save(temporary, **save_options)
         replace_file(temporary, path)
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -722,18 +734,20 @@ def _save_review_crop(
     }
 
 
-def _prepare_review_output(output_root: Path) -> None:
-    review_root = output_root / "review"
-    if review_root.is_symlink():
-        raise ValueError(f"review output must not be a symbolic link: {review_root}")
-    if not review_root.is_dir():
+def _prepare_review_output(defect_directory: Path) -> None:
+    if defect_directory.is_symlink():
+        raise ValueError(
+            f"defect image output must not be a symbolic link: {defect_directory}"
+        )
+    if not defect_directory.is_dir():
         return
-    # Review crops are derived artifacts.  A rebuild replaces only PNG files
-    # inside this exact material directory; immutable source frames are never
-    # touched and every retained crop will be regenerated from the manifest.
-    for path in review_root.glob("*.png"):
-        if path.is_file() and not path.is_symlink():
-            path.unlink()
+    # Camera-local defect crops are derived artifacts. A rebuild replaces only
+    # image files inside this exact <camera-root>/<flow>/defect directory;
+    # immutable 2D/3D/JSON acquisition files are never touched.
+    for pattern in ("*.jpg", "*.jpeg", "*.png"):
+        for path in defect_directory.glob(pattern):
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
 
 
 def _camera_number(camera_id: str) -> int | None:
@@ -1291,10 +1305,8 @@ def build_flow_defect_detection(
     stride = settings.frame_stride if gpu else max(
         settings.frame_stride, settings.cpu_frame_stride
     )
-    output_root = defect_root(storage_root, material_id)
     if execution_gate is not None:
         execution_gate("defect-review-output-prepare")
-    _prepare_review_output(output_root)
     defects: list[dict[str, Any]] = []
     processed_frames = 0
     skipped_frames = 0
@@ -1317,6 +1329,8 @@ def build_flow_defect_detection(
         if execution_gate is not None:
             execution_gate(f"defect-camera:{camera_id}")
         flow_root = capture_root(camera_root, material_id, camera_id)
+        review_root = defect_image_root(camera_root, material_id)
+        _prepare_review_output(review_root)
         intensity_files = _numeric_files(
             flow_root / "2d",
             ".png",
@@ -1426,10 +1440,16 @@ def build_flow_defect_detection(
             timings["detectorInferenceSeconds"] += time.perf_counter() - phase_started
             if execution_gate is not None:
                 execution_gate("defect-batch-postprocess")
-            for job, results in zip(detection_jobs, detection_results, strict=True):
+            if len(detection_results) != len(detection_jobs):
+                raise RuntimeError("detector batch result count does not match jobs")
+            for job, results in zip(detection_jobs, detection_results):
                 _modality, _image_key, result_key, _detector, modality_records = job
                 inference_count += len(modality_records)
-                for record, result in zip(modality_records, results, strict=True):
+                if len(results) != len(modality_records):
+                    raise RuntimeError(
+                        "detector result count does not match modality records"
+                    )
+                for record, result in zip(modality_records, results):
                     record[result_key] = result
 
             for record in batch:
@@ -1493,7 +1513,7 @@ def build_flow_defect_detection(
                         continue
                     defect_number = len(defects) + 1
                     defect_id = f"{material_id}-{camera_id}-{defect_number:06d}"
-                    review_path = output_root / "review" / f"{defect_id}.png"
+                    review_path = review_root / f"{defect_id}.jpg"
                     if execution_gate is not None:
                         execution_gate("defect-review-crop-write")
                     review_crop = _save_review_crop(

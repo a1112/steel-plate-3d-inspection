@@ -107,8 +107,19 @@ def surface_path(storage_root: Path, value: str | int) -> Path:
     return flow_root(storage_root, value) / "derived" / "geometry" / "surface.json"
 
 
-def surface_jet_path(storage_root: Path, value: str | int) -> Path:
-    return flow_root(storage_root, value) / "derived" / "geometry" / "surface-jet.png"
+def jet_image_root(camera_storage_root: Path, value: str | int) -> Path:
+    """Return the camera-local JET image directory for one flow."""
+    return flow_root(camera_storage_root, value) / "jet"
+
+
+def surface_jet_path(camera_storage_root: Path, value: str | int) -> Path:
+    """Return the all-camera unfolded JET image on the reference camera disk."""
+    return jet_image_root(camera_storage_root, value) / "surface-all.jpg"
+
+
+def camera_surface_jet_path(camera_storage_root: Path, value: str | int) -> Path:
+    """Return one camera's JET image beside its immutable acquisition data."""
+    return jet_image_root(camera_storage_root, value) / "surface.jpg"
 
 
 def region_path(storage_root: Path, value: str | int) -> Path:
@@ -131,9 +142,15 @@ def defect_manifest_path(storage_root: Path, value: str | int) -> Path:
     return defect_root(storage_root, value) / "manifest.json"
 
 
-def cache_root(storage_root: Path, value: str | int) -> Path:
-    return flow_root(storage_root, value) / "cache"
+def cache_root(camera_storage_root: Path, value: str | int) -> Path:
+    """Return the camera-local JPEG rendition directory for one flow."""
+    return flow_root(camera_storage_root, value) / "cache"
 
 
-def pyramid_status_path(storage_root: Path, value: str | int) -> Path:
-    return cache_root(storage_root, value) / "playback-pyramid" / "status.json"
+def defect_image_root(camera_storage_root: Path, value: str | int) -> Path:
+    """Return the camera-local defect thumbnail directory for one flow."""
+    return flow_root(camera_storage_root, value) / "defect"
+
+
+def pyramid_status_path(camera_storage_root: Path, value: str | int) -> Path:
+    return cache_root(camera_storage_root, value) / "status.json"

@@ -135,6 +135,7 @@ def _boundary_detection(
     config: AlignmentConfig,
     *,
     from_start: bool,
+    intensity_means: dict[int, float] | None = None,
     execution_gate: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     intensity_files = _numeric_files(
@@ -143,26 +144,103 @@ def _boundary_detection(
         execution_gate=execution_gate,
         gate_phase="alignment-boundary-file-scan",
     )
-    selected = (
-        frame_indices[: config.search_frames]
-        if from_start
-        else frame_indices[-config.search_frames :]
-    )
+    initial_search_count = min(len(frame_indices), config.search_frames)
+    search_count = initial_search_count
+    expanded_search = False
     row_blocks: list[np.ndarray] = []
     strength_blocks: list[np.ndarray] = []
     heights: list[tuple[int, int]] = []
-    for index in selected:
-        if execution_gate is not None:
-            execution_gate("alignment-boundary-frame-read")
-        intensity_path = intensity_files.get(index)
-        if intensity_path is None:
+    boundary: int | None = None
+    used_mean_hint = False
+    mean_hint_enabled = True
+    while search_count > 0:
+        selected = (
+            frame_indices[:search_count]
+            if from_start
+            else frame_indices[-search_count:]
+        )
+        # Persisted SICK metadata already contains the whole-frame grayscale
+        # mean.  Use it only as an I/O hint: it identifies the transition
+        # frame, while the selected PNG still provides the exact scan-line
+        # boundary.  Keeping one neighbour handles a transition exactly at a
+        # frame edge.  Older datasets without the mean retain the full scan.
+        means = intensity_means or {}
+        hinted_values = [means.get(index) for index in selected]
+        iteration_used_mean_hint = False
+        if mean_hint_enabled and selected and all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in hinted_values
+        ):
+            numeric_means = [float(value) for value in hinted_values]
+            low = min(numeric_means)
+            high = max(numeric_means)
+            if high > 0.0:
+                if low <= max(0.05, high * 0.10):
+                    transitions = [
+                        numeric_means[position + 1] - numeric_means[position]
+                        for position in range(len(numeric_means) - 1)
+                    ]
+                    if transitions:
+                        pivot = (
+                            max(range(len(transitions)), key=transitions.__getitem__)
+                            if from_start
+                            else min(range(len(transitions)), key=transitions.__getitem__)
+                        )
+                        selected = selected[pivot : pivot + 2]
+                        used_mean_hint = True
+                        iteration_used_mean_hint = True
+                else:
+                    # The bounded window is already foreground throughout.
+                    # The head/tail is clipped, so two edge frames are enough
+                    # to preserve the same clipped-boundary result.
+                    selected = selected[:2] if from_start else selected[-2:]
+                    used_mean_hint = True
+                    iteration_used_mean_hint = True
+        row_blocks = []
+        strength_blocks = []
+        heights = []
+        for index in selected:
+            if execution_gate is not None:
+                execution_gate("alignment-boundary-frame-read")
+            intensity_path = intensity_files.get(index)
+            if intensity_path is None:
+                continue
+            with Image.open(intensity_path) as image:
+                intensity = np.asarray(image.convert("L"))
+            signal, strength = _row_signal(intensity, config)
+            row_blocks.append(signal)
+            strength_blocks.append(strength)
+            heights.append((index, int(signal.size)))
+
+        if not row_blocks:
+            break
+        combined = np.concatenate(row_blocks)
+        if from_start:
+            boundary = _first_stable_start(combined, config.stable_rows)
+        else:
+            reverse_start = _first_stable_start(combined[::-1], config.stable_rows)
+            boundary = (
+                combined.size - 1 - reverse_start
+                if reverse_start is not None
+                else None
+            )
+        if boundary is not None:
+            break
+        if iteration_used_mean_hint:
+            # A whole-frame mean can be raised by sparse reflections that do
+            # not contain the required stable foreground rows. Retry the same
+            # bounded window without the hint before expanding the search.
+            mean_hint_enabled = False
+            used_mean_hint = False
             continue
-        with Image.open(intensity_path) as image:
-            intensity = np.asarray(image.convert("L"))
-        signal, strength = _row_signal(intensity, config)
-        row_blocks.append(signal)
-        strength_blocks.append(strength)
-        heights.append((index, int(signal.size)))
+        if search_count >= len(frame_indices):
+            break
+        # Cameras start persisting at different wall-clock times.  A fixed
+        # pre-roll window can therefore be exhausted before one camera sees
+        # the head (or after another loses the tail). Expand geometrically only
+        # on a miss so the normal post-flow path keeps its bounded I/O cost.
+        search_count = min(len(frame_indices), max(search_count + 1, search_count * 2))
+        expanded_search = True
 
     if not row_blocks:
         return {
@@ -171,23 +249,15 @@ def _boundary_detection(
             "clipped": True,
         }
 
-    combined = np.concatenate(row_blocks)
     combined_strength = np.concatenate(strength_blocks)
-    if from_start:
-        boundary = _first_stable_start(combined, config.stable_rows)
-    else:
-        reverse_start = _first_stable_start(combined[::-1], config.stable_rows)
-        boundary = (
-            combined.size - 1 - reverse_start
-            if reverse_start is not None
-            else None
-        )
     if boundary is None:
         return {
             "detected": False,
             "reason": "stable-foreground-not-found",
             "clipped": True,
             "searchedFrames": [index for index, _ in heights],
+            "initialSearchFrameCount": initial_search_count,
+            "expandedSearch": expanded_search,
         }
 
     local_offset = boundary
@@ -216,7 +286,10 @@ def _boundary_detection(
         "clipped": clipped,
         "confidence": round(confidence, 6),
         "source": "grayscale-intensity",
+        "frameSelection": "metadata-intensity-mean-hint" if used_mean_hint else "bounded-frame-scan",
         "searchedFrames": [index for index, _ in heights],
+        "initialSearchFrameCount": initial_search_count,
+        "expandedSearch": expanded_search,
     }
 
 
@@ -252,6 +325,7 @@ def _frame_records(
                 "transportFrameGapExplicit": "transportFrameGap" in payload,
                 "height": int(payload.get("height", 0) or 0),
                 "width": int(payload.get("width", 0) or 0),
+                "intensityMean": payload.get("data2D_mean"),
                 "metadataPath": str(path),
             }
         )
@@ -379,6 +453,14 @@ def build_flow_alignment(
         flow_root = capture_root(camera_root, material_id, camera_id)
         records = _frame_records(flow_root, execution_gate=execution_gate)
         frame_indices = [int(item["storageIndex"]) for item in records]
+        intensity_means: dict[int, float] = {}
+        for record in records:
+            try:
+                value = float(record.get("intensityMean"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                intensity_means[int(record["storageIndex"])] = value
         if not records:
             cameras[camera_id] = {
                 "cameraId": camera_id,
@@ -394,6 +476,7 @@ def build_flow_alignment(
             frame_indices,
             settings,
             from_start=True,
+            intensity_means=intensity_means,
             execution_gate=execution_gate,
         )
         tail = _boundary_detection(
@@ -401,10 +484,33 @@ def build_flow_alignment(
             frame_indices,
             settings,
             from_start=False,
+            intensity_means=intensity_means,
             execution_gate=execution_gate,
         )
         head_time = _boundary_time(records, head, rate)
         tail_time = _boundary_time(records, tail, rate)
+        if head.get("detected"):
+            head_record = next(
+                (
+                    record
+                    for record in records
+                    if int(record["storageIndex"])
+                    == int(head.get("frameIndex", -1))
+                ),
+                None,
+            )
+            frame_height = int(records[0].get("height", 0) or 0)
+            if (
+                head_record is not None
+                and int(head_record.get("captureRound", 0) or 0) > 0
+                and frame_height > 0
+            ):
+                head["captureRound"] = int(head_record["captureRound"])
+                head["timelinePositionFrames"] = round(
+                    float(head_record["captureRound"])
+                    + float(head.get("row", 0) or 0) / frame_height,
+                    9,
+                )
         elapsed: list[float] = []
         elapsed_records: list[dict[str, Any]] = []
         if head_time is not None:
@@ -567,6 +673,31 @@ def build_flow_alignment(
     # gate explicitly for diameter, overlap ownership and defect processing.
     synchronized = geometry_synchronized and transport_frame_gaps == 0
 
+    reference_head_position = (
+        float(reference.get("head", {}).get("timelinePositionFrames"))
+        if reference is not None
+        and reference.get("head", {}).get("timelinePositionFrames") is not None
+        else None
+    )
+    head_timeline_positions = [
+        float(row.get("head", {}).get("timelinePositionFrames"))
+        for row in usable
+        if row.get("head", {}).get("timelinePositionFrames") is not None
+    ]
+    display_alignment_ready = bool(
+        reference_head_position is not None
+        and len(head_timeline_positions) == len(camera_roots)
+    )
+    aligned_timeline_position = (
+        max(head_timeline_positions) if display_alignment_ready else None
+    )
+    reference_frame_duration_ms = None
+    if reference is not None:
+        reference_height = int(reference.get("frameHeight", 0) or 0)
+        reference_rate = float(reference.get("lineRateHz", 0) or 0)
+        if reference_height > 0 and reference_rate > 0:
+            reference_frame_duration_ms = reference_height / reference_rate * 1000.0
+
     for row in cameras.values():
         row.pop("_records", None)
         row.pop("_elapsed", None)
@@ -575,12 +706,61 @@ def build_flow_alignment(
             head["offsetRowsFromReference"] = int(head["globalRow"]) - int(
                 reference["head"]["globalRow"]
             )
+            timeline_position = head.get("timelinePositionFrames")
+            if (
+                display_alignment_ready
+                and timeline_position is not None
+                and reference_head_position is not None
+                and aligned_timeline_position is not None
+            ):
+                offset_frames = float(timeline_position) - reference_head_position
+                padding_frames = aligned_timeline_position - float(timeline_position)
+                head["offsetFramesFromReference"] = round(offset_frames, 9)
+                head["displayPaddingFrames"] = round(padding_frames, 9)
+                head["displayPaddingRows"] = round(
+                    padding_frames * int(row.get("frameHeight", 0) or 0),
+                    6,
+                )
+                head["alignedTimelinePositionFrames"] = round(
+                    aligned_timeline_position,
+                    9,
+                )
+                head["displayAligned"] = True
+                if reference_frame_duration_ms is not None:
+                    head["offsetMsFromReference"] = round(
+                        offset_frames * reference_frame_duration_ms,
+                        6,
+                    )
 
     return {
         "schema": ALIGNMENT_SCHEMA,
         "generatedAt": _utc_text(),
         "materialId": material_id,
         "referenceCameraId": reference.get("cameraId") if reference else None,
+        "headAlignment": {
+            "mode": "capture-round-and-in-frame-row-padding",
+            "displayAligned": display_alignment_ready,
+            "referenceCameraId": reference.get("cameraId") if reference else None,
+            "referenceTimelinePositionFrames": round(reference_head_position, 9)
+            if reference_head_position is not None
+            else None,
+            "alignedTimelinePositionFrames": round(aligned_timeline_position, 9)
+            if aligned_timeline_position is not None
+            else None,
+            "timelineSpreadFrames": round(
+                max(head_timeline_positions) - min(head_timeline_positions),
+                9,
+            )
+            if head_timeline_positions
+            else None,
+            "maximumDisplayPaddingFrames": round(
+                max(head_timeline_positions) - min(head_timeline_positions),
+                9,
+            )
+            if display_alignment_ready
+            else None,
+            "note": "Display padding aligns detected steel heads without changing immutable source images.",
+        },
         "settings": {
             "searchFrames": settings.search_frames,
             "stableRows": settings.stable_rows,

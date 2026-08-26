@@ -10,10 +10,10 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence, Union
 
 import numpy as np
 from PIL import Image
@@ -38,10 +38,10 @@ from .storage import replace_file
 PLAYBACK_INDEX_SCHEMA = "steel.capture-playback-index.v1"
 PLAYBACK_CATALOG_SCHEMA = "steel.capture-playback-catalog.v1"
 PYRAMID_SCHEMA = "steel.capture-image-pyramid.v1"
-PYRAMID_ALGORITHM = "flow-stable-full-height-valid-region-v4"
+PYRAMID_ALGORITHM = "flow-stable-full-height-valid-region-v5-camera-local-flat-jpeg"
 PYRAMID_WIDTHS = (160, 320, 640, 800, 1280, 2560)
 
-CameraRootValue = Path | Sequence[Path]
+CameraRootValue = Union[Path, Sequence[Path]]
 
 _INDEX_NUMBER_FIELD = re.compile(
     r'"(?P<key>cameraIndex|captureRound|hostUtcNs|width|height|intensityBytes)"\s*:\s*'
@@ -258,14 +258,28 @@ def _capture_image_identity(source_path: Path) -> tuple[str, str] | None:
         return None
 
 
+def capture_image_cache_root(source_path: Path) -> Path:
+    """Resolve ``<camera-root>/<flow>/cache`` beside one raw 2D frame."""
+    if _capture_image_identity(source_path) is None:
+        raise ValueError(
+            f"capture cache source is not a camera-local 2D frame: {source_path}"
+        )
+    return source_path.parents[1] / "cache"
+
+
 def _is_defect_review_image(source_path: Path) -> bool:
     try:
-        return (
+        camera_local = (
+            source_path.parent.name == "defect"
+            and source_path.parents[1].name.isdecimal()
+        )
+        legacy_central = (
             source_path.parent.name == "review"
             and source_path.parents[1].name == "defects"
             and source_path.parents[2].name == "derived"
             and source_path.parents[3].name.isdecimal()
         )
+        return camera_local or legacy_central
     except IndexError:
         return False
 
@@ -274,13 +288,16 @@ def _flow_horizontal_roi(
     source_path: Path,
     cache_root: Path,
     image_width: int | None,
+    metadata_storage_root: Path | None = None,
+    metadata_camera_id: str | None = None,
 ) -> tuple[list[int] | None, Path | None]:
     try:
         identity = _capture_image_identity(source_path)
         if identity is None:
             return None, None
-        material_id, camera_id = identity
-        storage_root = cache_root.parent.parent
+        material_id, inferred_camera_id = identity
+        camera_id = str(metadata_camera_id or inferred_camera_id).strip()
+        storage_root = metadata_storage_root or cache_root.parent.parent
         roi_path = playback_roi_path(storage_root, material_id)
         payload = _read_json(roi_path)
         box = payload.get("cameras", {}).get(camera_id)
@@ -304,6 +321,9 @@ def source_fingerprint(
     path: Path,
     cache_root: Path | None = None,
     crop_box: list[int] | None = None,
+    *,
+    metadata_storage_root: Path | None = None,
+    metadata_camera_id: str | None = None,
 ) -> str:
     stat = path.stat()
     digest = hashlib.sha256()
@@ -327,13 +347,25 @@ def source_fingerprint(
             )
         )
     elif cache_root is not None:
-        flow_roi, _ = _flow_horizontal_roi(path, cache_root, None)
+        flow_roi, _ = _flow_horizontal_roi(
+            path,
+            cache_root,
+            None,
+            metadata_storage_root,
+            metadata_camera_id,
+        )
         digest.update(json.dumps(flow_roi, separators=(",", ":")).encode("ascii"))
     return digest.hexdigest()
 
 
 def pyramid_directory(cache_root: Path, fingerprint: str) -> Path:
-    return cache_root / "playback-pyramid" / "v2" / fingerprint[:2] / fingerprint
+    # JPEG renditions are deliberately flat beneath the camera-local flow
+    # cache: <camera-root>/<flow>/cache/<fingerprint>-w<width>.jpg.
+    return cache_root
+
+
+def pyramid_manifest_path(cache_root: Path, fingerprint: str) -> Path:
+    return pyramid_directory(cache_root, fingerprint) / f"{fingerprint}.json"
 
 
 def read_image_pyramid(
@@ -341,7 +373,7 @@ def read_image_pyramid(
     fingerprint: str,
 ) -> tuple[Path, dict[str, Any]] | None:
     directory = pyramid_directory(cache_root, fingerprint)
-    manifest_path = directory / "manifest.json"
+    manifest_path = pyramid_manifest_path(cache_root, fingerprint)
     if not manifest_path.is_file():
         return None
     try:
@@ -394,17 +426,19 @@ def validate_playback_crop_box(
 
 def read_indexed_playback_crop(
     source_path: Path,
-    cache_root: Path,
+    metadata_storage_root: Path,
     image_width: int,
     image_height: int,
+    *,
+    metadata_camera_id: str | None = None,
 ) -> list[int] | None:
     """Return the committed ready ROI for one immutable v2 capture image."""
     identity = _capture_image_identity(source_path)
     if identity is None:
         return None
-    material_id, camera_id = identity
-    storage_root = cache_root.parent.parent
-    roi_path = playback_roi_path(storage_root, material_id)
+    material_id, inferred_camera_id = identity
+    camera_id = str(metadata_camera_id or inferred_camera_id).strip()
+    roi_path = playback_roi_path(metadata_storage_root, material_id)
     try:
         payload = _read_json(roi_path)
         if (
@@ -430,10 +464,19 @@ def build_image_pyramid(
     source_path: Path,
     cache_root: Path,
     requested_crop_box: list[int] | None = None,
+    *,
+    metadata_storage_root: Path | None = None,
+    metadata_camera_id: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
-    fingerprint = source_fingerprint(source_path, cache_root, requested_crop_box)
+    fingerprint = source_fingerprint(
+        source_path,
+        cache_root,
+        requested_crop_box,
+        metadata_storage_root=metadata_storage_root,
+        metadata_camera_id=metadata_camera_id,
+    )
     directory = pyramid_directory(cache_root, fingerprint)
-    manifest_path = directory / "manifest.json"
+    manifest_path = pyramid_manifest_path(cache_root, fingerprint)
     existing = read_image_pyramid(cache_root, fingerprint)
     if existing is not None:
         return existing
@@ -467,7 +510,11 @@ def build_image_pyramid(
                 else detect_valid_grayscale_roi(plane)
             )
             flow_roi, flow_roi_path = _flow_horizontal_roi(
-                source_path, cache_root, original_width
+                source_path,
+                cache_root,
+                original_width,
+                metadata_storage_root,
+                metadata_camera_id,
             )
             crop_box = list(detected_box or [0, 0, original_width, original_height])
             crop_source = "frame-detected-roi" if detected_box is not None else "full-source"
@@ -500,7 +547,7 @@ def build_image_pyramid(
                 output = io.BytesIO()
                 current.save(output, format="JPEG", quality=84, optimize=False)
                 body = output.getvalue()
-                name = f"w{width}.jpg"
+                name = f"{fingerprint}-w{width}.jpg"
                 _atomic_bytes(directory / name, body)
                 levels.append(
                     {"width": width, "height": height, "file": name, "bytes": len(body)}
@@ -554,16 +601,20 @@ def playback_catalog_path(storage_root: Path) -> Path:
     return storage_root / "catalog.json"
 
 
-def flow_pyramid_cache_status_path(storage_root: Path, material_id: str) -> Path:
-    return pyramid_status_path(storage_root, material_id)
+def flow_pyramid_cache_status_path(
+    camera_storage_root: Path,
+    material_id: str,
+) -> Path:
+    return pyramid_status_path(camera_storage_root, material_id)
 
 
 def write_flow_pyramid_cache_status(
-    storage_root: Path,
+    camera_storage_root: Path,
     payload: dict[str, Any],
 ) -> Path:
     path = flow_pyramid_cache_status_path(
-        storage_root, str(payload.get("materialId", "unknown"))
+        camera_storage_root,
+        str(payload.get("materialId", "unknown")),
     )
     _atomic_compact_json(path, payload)
     return path
@@ -963,7 +1014,11 @@ def warm_flow_image_pyramids(
     """Persist every pyramid level for a completed flow in a low-priority worker."""
     started = time.perf_counter()
     material_id = str(index.get("materialId", ""))
-    cache_root = flow_cache_root(storage_root, material_id)
+    cache_roots: set[Path] = set()
+    for root_value in camera_roots.values():
+        roots = _camera_root_candidates(root_value)
+        if roots:
+            cache_roots.add(flow_cache_root(roots[0], material_id))
     cached = 0
     failures: list[dict[str, str]] = []
     for frame in index.get("frames", []):
@@ -984,7 +1039,14 @@ def warm_flow_image_pyramids(
             try:
                 if not source.is_file() or source.is_symlink():
                     continue
-                build_image_pyramid(source, cache_root)
+                cache_root = capture_image_cache_root(source)
+                cache_roots.add(cache_root)
+                build_image_pyramid(
+                    source,
+                    cache_root,
+                    metadata_storage_root=storage_root,
+                    metadata_camera_id=camera_id,
+                )
                 cached += 1
             except (OSError, ValueError) as error:
                 failures.append({"source": str(source), "error": str(error)})
@@ -997,9 +1059,11 @@ def warm_flow_image_pyramids(
         "cachedImageCount": cached,
         "failureCount": len(failures),
         "failures": failures[:20],
+        "cacheRoots": [str(path) for path in sorted(cache_roots, key=str)],
         "elapsedMs": round((time.perf_counter() - started) * 1000.0, 3),
     }
-    write_flow_pyramid_cache_status(storage_root, result)
+    for cache_root in cache_roots:
+        write_flow_pyramid_cache_status(cache_root.parents[1], result)
     return result
 
 

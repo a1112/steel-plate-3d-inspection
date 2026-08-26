@@ -542,6 +542,7 @@ export type CapturePlaybackCacheStatus = {
   code: number;
   schema: string;
   cacheRoot: string;
+  cacheRoots: string[];
   catalogPath: string;
   catalogAvailable: boolean;
   memoryEntries: number;
@@ -768,9 +769,71 @@ export type CaptureFlowSurface = {
     crossSectionMetricValid: boolean;
     absoluteLongitudinalScaleVerified: boolean;
     geometrySynchronized: boolean;
+    depthPrecisionMetricValid?: boolean;
+    cameraCalibrationBiasMetricValid?: boolean;
+    cameraOverlapMetricValid?: boolean;
     passed: boolean;
     reasons: string[];
     angularCoverageRatio: number;
+  };
+  depthPrecision?: {
+    metricValid?: boolean;
+    definition?: string;
+    thresholdMm?: number;
+    diagnosticSectionCount?: number;
+    cameras?: Record<string, {
+      sampledSectionCount?: number;
+      depthPrecisionP95MedianMm?: number | null;
+      depthPrecisionP95MaximumMm?: number | null;
+      calibrationRadialBiasMedianMm?: number | null;
+      calibrationRadialBiasP95AbsMm?: number | null;
+      depthPrecisionMetricValid?: boolean;
+      calibrationBiasMetricValid?: boolean;
+    }>;
+  };
+  calibrationAccuracy?: {
+    metricValid?: boolean;
+    overlapP95ThresholdMm?: number;
+    radialBiasThresholdMm?: number;
+    diagnosticSectionCount?: number;
+    worstOverlapPair?: {
+      cameras?: string[];
+      anchorOrdinal?: number | null;
+      elapsedFromHeadMs?: number | null;
+      sampleCount?: number;
+      p95AbsRadialDifferenceMm?: number;
+      maximumAbsRadialDifferenceMm?: number;
+      metricValid?: boolean;
+    } | null;
+  };
+  headAlignment?: {
+    referenceCameraId?: string | null;
+    origin?: string;
+    aligned?: boolean;
+    mode?: string;
+    displayAligned?: boolean;
+    referenceTimelinePositionFrames?: number | null;
+    alignedTimelinePositionFrames?: number | null;
+    timelineSpreadFrames?: number | null;
+    maximumDisplayPaddingFrames?: number | null;
+    cameras?: Record<string, {
+      detected?: boolean;
+      clipped?: boolean;
+      confidence?: number | null;
+      frameIndex?: number | null;
+      row?: number | null;
+      globalRow?: number | null;
+      offsetRowsFromReference?: number | null;
+      captureRound?: number | null;
+      timelinePositionFrames?: number | null;
+      offsetFramesFromReference?: number | null;
+      offsetMsFromReference?: number | null;
+      displayPaddingFrames?: number | null;
+      displayPaddingRows?: number | null;
+      alignedTimelinePositionFrames?: number | null;
+      displayAligned?: boolean;
+      expandedSearch?: boolean;
+    }>;
   };
   summary: {
     sectionCount: number;
@@ -784,10 +847,65 @@ export type CaptureFlowSurface = {
   mesh: {
     rows: number;
     columns: number;
+    displayMode?: "metric" | "quality-gated-preview" | "diagnostic-unqualified" | string;
+    metricValid?: boolean;
+    pointUnit?: "mm" | string;
+    crossSectionLayout?: "fused-angular-bins" | string;
+    longitudinal?: {
+      source?: string;
+      origin?: string;
+      originElapsedFromHeadMs?: number;
+      endElapsedFromHeadMs?: number;
+      qualifiedDurationMs?: number;
+      headTransitionTrimMs?: number;
+      tailTransitionTrimMs?: number;
+      commonSteelOverlapMs?: number;
+      displaySpan?: number;
+      displayUnit?: string;
+      absoluteScaleVerified?: boolean;
+    };
     positions: Array<number | null>;
     colors: number[];
     indices: number[];
     validMask: number[];
+  };
+  crossSections?: {
+    schema: "steel.ranger3-cross-sections.v1" | string;
+    coordinateSpace: string;
+    pointSource: string;
+    pointUnit: "mm" | string;
+    angleConvention: string;
+    angularBins: number;
+    displayMode?: "metric" | "quality-gated-preview" | "diagnostic-unqualified" | string;
+    metricValid: boolean;
+    longitudinal?: CaptureFlowSurface["mesh"]["longitudinal"];
+    sections: Array<{
+      row: number;
+      meshRow: number;
+      anchorOrdinal?: number | null;
+      elapsedFromHeadMs?: number | null;
+      positionRatio?: number | null;
+      longitudinalDisplayPosition?: number | null;
+      available: boolean;
+      metricValid: boolean;
+      displayMode?: "metric" | "diagnostic-unqualified" | string;
+      qualityGate?: { passed?: boolean; reasons?: string[] };
+      validPointCount: number;
+      angularPointCount: number;
+      circleFit?: {
+        available?: boolean;
+        centerX?: number;
+        centerZ?: number;
+        radiusMm?: number;
+        diameterMm?: number;
+        meanAbsResidualMm?: number;
+        p95AbsResidualMm?: number;
+        maxAbsResidualMm?: number;
+        roundnessMm?: number;
+        pointCount?: number;
+        robustPointCount?: number;
+      };
+    }>;
   };
   jet: {
     palette: "JET" | string;

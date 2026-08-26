@@ -142,4 +142,47 @@ describe('buildDiameterMeasurements', () => {
     expect(screen.getByLabelText('固定角度测径曲线图例')).toHaveTextContent('0°90°最小最大平均');
     expect(screen.getByText('45.150 mm')).toBeInTheDocument();
   });
+
+  it('renders an explicitly unqualified trend without marking it as valid measurement', () => {
+    const artifact: CaptureFlowMeasurement = {
+      schema: 'steel.ranger3-flow-measurement.v1',
+      generatedAt: '2026-08-25T12:00:00Z',
+      materialId: '4023',
+      mode: 'preview',
+      metricValid: false,
+      qualityGate: { passed: false, reasons: ['surface-quality-gate-failed'] },
+      selectedSection: {},
+      cameras: {},
+      surfaceFit: {
+        available: true,
+        metricValid: false,
+        sectionsRequested: 2,
+        sectionsAccepted: 2,
+        sections: [],
+        diameterCurves: {
+          available: true,
+          metricValid: false,
+          model: 'opposed-radial-pairs-from-reconstructed-surface',
+          angleConvention: 'array-x-axis-ccw-period-180',
+          longitudinalCoordinate: 'head-relative-time',
+          fixedAnglesDeg: [0],
+          sections: [
+            { anchorOrdinal: 0, elapsedFromHeadMs: 0, positionRatio: 0, metricValid: true, diametersMm: [45], averageMm: 45 },
+            { anchorOrdinal: 1, elapsedFromHeadMs: 100, positionRatio: 1, metricValid: true, diametersMm: [45.2], averageMm: 45.2 },
+          ],
+          series: [
+            { id: 'angle-000', kind: 'fixed-angle', angleDeg: 0, label: '0°', valuesMm: [45, 45.2] },
+            { id: 'average', kind: 'aggregate', label: '平均', valuesMm: [45, 45.2] },
+          ],
+          summary: { metricValid: false, minimumMm: 45, maximumMm: 45.2, averageMm: 45.1, validSectionCount: 2 },
+        },
+      },
+    };
+
+    expect(buildDirectionalDiameterLines(artifact, 45, 12_000)).toHaveLength(2);
+    render(createElement(DiameterTrendPanel, { artifact, nominalDiameterMm: 45, lengthMm: 12_000 }));
+    expect(screen.getByTestId('diameter-trend-grid')).toHaveAttribute('data-measurement-valid', 'false');
+    expect(screen.getByText('趋势预览')).toBeInTheDocument();
+    expect(screen.getByText('未通过整卷计量质量门，曲线仅用于趋势查看')).toBeInTheDocument();
+  });
 });

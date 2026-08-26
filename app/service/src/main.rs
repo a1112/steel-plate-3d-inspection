@@ -13855,6 +13855,11 @@ fn safe_imported_defect_id(value: &str) -> Option<String> {
     Some(format!("SICK-{value}"))
 }
 
+fn has_supported_preview_image_extension(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg")
+}
+
 fn write_production_defect_batch_response(
     state: &ServiceState,
     body: &str,
@@ -13983,7 +13988,7 @@ fn write_production_defect_batch_response(
             || numbers[4] < 0.0
             || preview_image_path.len() > 1024
             || (!preview_image_path.is_empty()
-                && !preview_image_path.to_ascii_lowercase().ends_with(".png"))
+                && !has_supported_preview_image_extension(&preview_image_path))
             || geometry_json.len() > 64 * 1024
         {
             return http_response(
@@ -27787,6 +27792,16 @@ mod tests {
         assert_eq!(defect_response["inspectionId"], "INSP-FLOW-IDENTITY");
         assert_eq!(defect_response["materialId"], "2603");
         assert_eq!(defect_response["inserted"], 1);
+    }
+
+    #[test]
+    fn preview_image_path_accepts_supported_case_insensitive_extensions() {
+        for path in ["preview.png", "preview.jpg", "preview.jpeg", "preview.JpG"] {
+            assert!(has_supported_preview_image_extension(path), "{path}");
+        }
+        for path in ["preview.bmp", "preview.png.bak", "preview"] {
+            assert!(!has_supported_preview_image_extension(path), "{path}");
+        }
     }
 
     #[test]

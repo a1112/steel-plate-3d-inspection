@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,11 @@ if str(SCRIPT_ROOT) not in sys.path:
 import sick_flow_analysis_service as service
 from sick_capture.defect_detection import DefectDetectionConfig
 from sick_capture.alignment import AlignmentConfig
+from sick_capture.material_lock import (
+    MaterialJobLockedError,
+    exclusive_material_job,
+    material_job_lock_path,
+)
 from sick_capture.measurement import MeasurementConfig
 from sick_capture.paths import (
     algorithm_state_path,
@@ -25,9 +31,83 @@ from sick_capture.paths import (
     playback_index_path,
     region_path,
 )
+from sick_capture.provider import _derived_artifact_read_gate
 
 
 class SickFlowAnalysisServiceTests(unittest.TestCase):
+    def test_material_job_lock_excludes_live_owner_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = material_job_lock_path(root, "63")
+            with exclusive_material_job(root, "63", purpose="test"):
+                self.assertTrue(lock_path.is_file())
+                with self.assertRaises(MaterialJobLockedError):
+                    with exclusive_material_job(root, "63", purpose="second"):
+                        pass
+            self.assertFalse(lock_path.exists())
+
+    def test_material_job_lock_recovers_stale_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = material_job_lock_path(root, "63")
+            lock_path.parent.mkdir(parents=True)
+            lock_path.write_text(
+                json.dumps({"processId": 2_147_483_647, "token": "stale"}),
+                encoding="utf-8",
+            )
+            with exclusive_material_job(root, "63", purpose="recovery") as owner:
+                self.assertNotEqual(owner.token, "stale")
+            self.assertFalse(lock_path.exists())
+
+    def test_material_job_lock_does_not_steal_a_fresh_unpublished_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = material_job_lock_path(root, "63")
+            lock_path.parent.mkdir(parents=True)
+            lock_path.write_text("", encoding="utf-8")
+
+            with self.assertRaises(MaterialJobLockedError):
+                with exclusive_material_job(root, "63", purpose="second"):
+                    pass
+
+            os.utime(lock_path, (1, 1))
+            with exclusive_material_job(root, "63", purpose="stale-recovery"):
+                pass
+            self.assertFalse(lock_path.exists())
+
+    def test_derived_artifact_gate_hides_partial_or_failed_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = algorithm_state_path(root, "63")
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(
+                json.dumps({"state": "processing", "mode": "final-fast"}),
+                encoding="utf-8",
+            )
+            processing = _derived_artifact_read_gate(root, "63")
+            self.assertEqual(processing[0], 503)
+            self.assertEqual(processing[1]["error"], "derived_artifacts_processing")
+
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "state": "failed",
+                        "mode": "final-fast",
+                        "error": "surface failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            failed = _derived_artifact_read_gate(root, "63")
+            self.assertEqual(failed[0], 409)
+            self.assertEqual(failed[1]["error"], "derived_artifacts_failed")
+
+            state_path.write_text(
+                json.dumps({"state": "failed", "mode": "final-defects"}),
+                encoding="utf-8",
+            )
+            self.assertIsNone(_derived_artifact_read_gate(root, "63"))
+
     def test_recent_materials_uses_numeric_order_not_directory_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

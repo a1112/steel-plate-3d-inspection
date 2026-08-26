@@ -606,16 +606,28 @@ class SickDefectDetectionTests(unittest.TestCase):
         self.assertIsNone(row)
         self.assertEqual(stage, "binary-candidate-review")
 
-    def test_rebuild_replaces_only_generated_review_pngs(self) -> None:
+    def test_rebuild_replaces_only_camera_local_defect_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "defects" / "FLOW-1"
-            review = output / "review"
-            review.mkdir(parents=True)
-            (review / "stale.png").write_bytes(b"stale")
-            (review / "operator-note.txt").write_text("keep", encoding="utf-8")
-            _prepare_review_output(output)
-            self.assertFalse((review / "stale.png").exists())
-            self.assertTrue((review / "operator-note.txt").is_file())
+            defect = Path(directory) / "C1" / "41" / "defect"
+            defect.mkdir(parents=True)
+            (defect / "stale.jpg").write_bytes(b"stale")
+            (defect / "legacy.png").write_bytes(b"stale")
+            (defect / "operator-note.txt").write_text("keep", encoding="utf-8")
+            _prepare_review_output(defect)
+            self.assertFalse((defect / "stale.jpg").exists())
+            self.assertFalse((defect / "legacy.png").exists())
+            self.assertTrue((defect / "operator-note.txt").is_file())
+
+    def test_review_crop_uses_jpeg_for_camera_local_defect_thumbnail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "C1" / "41" / "defect" / "41-C1-1.jpg"
+            intensity = np.full((80, 120), 64, dtype=np.uint8)
+
+            crop = _save_review_crop(intensity, [40, 20, 52, 32], target)
+
+            self.assertGreaterEqual(min(crop["width"], crop["height"]), 64)
+            with Image.open(target) as image:
+                self.assertEqual(image.format, "JPEG")
 
     def test_crop_spanning_boxes_are_boundary_artifacts(self) -> None:
         crop_box = [100, 20, 2100, 1020]

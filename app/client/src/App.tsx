@@ -160,6 +160,25 @@ function captureSurfaceMesh(surface: CaptureFlowSurface): BarSurfaceMesh {
   return {
     schema: surface.schema,
     coordinateUnit: 'mm',
+    materialId: surface.materialId,
+    displayMode: surface.mesh.displayMode,
+    metricValid: surface.mesh.metricValid ?? surface.quality.crossSectionMetricValid,
+    longitudinalAxis: surface.mesh.longitudinal,
+    crossSections: surface.crossSections?.sections.map((section) => ({
+      row: section.row,
+      meshRow: section.meshRow,
+      anchorOrdinal: section.anchorOrdinal,
+      elapsedFromHeadMs: section.elapsedFromHeadMs,
+      positionRatio: section.positionRatio,
+      longitudinalDisplayPosition: section.longitudinalDisplayPosition,
+      available: section.available,
+      metricValid: section.metricValid,
+      displayMode: section.displayMode,
+      qualityReasons: section.qualityGate?.reasons ?? [],
+      validPointCount: section.validPointCount,
+      angularPointCount: section.angularPointCount,
+      circleFit: section.circleFit,
+    })),
     cameraCount: 1,
     frameStems: surface.sections.map((section, index) => String(section.anchorOrdinal ?? index)),
     rows,
@@ -217,6 +236,7 @@ type RecordBoundSurfaceArtifact = {
   cameras?: BarSurfaceCamera[];
   measurement?: CaptureFlowMeasurement | null;
   cameraTiles?: CaptureFlowSurface['cameraTiles'] | null;
+  headAlignment?: CaptureFlowSurface['headAlignment'] | null;
 };
 
 type AppMode = AppRoute;
@@ -1370,18 +1390,25 @@ function InspectionDashboard({
               throw new Error('采集拟合结果与当前流水号不一致，已拒绝展示');
             }
             const mesh = captureSurfaceMesh(captureResult.surface);
-            if (mesh.positions.length < 3 || mesh.indices.length < 3) {
-              throw new Error('采集拟合结果没有有效三维网格');
+            const validPointCount = mesh.validMask
+              ? Array.from(mesh.validMask).reduce(
+                (count, value) => count + (Number(value) !== 0 ? 1 : 0),
+                0,
+              )
+              : Math.floor(mesh.positions.length / 3);
+            if (mesh.positions.length < 3 || validPointCount < 3) {
+              throw new Error('采集拟合结果没有有效三维点或切面');
             }
             setRecordBoundSurface({
               inspectionId,
               loading: false,
               mesh,
               cameraTiles: captureResult.surface.cameraTiles ?? null,
+              headAlignment: captureResult.surface.headAlignment ?? null,
               measurement: measurementResult?.measurement.materialId === materialId
                 ? measurementResult.measurement
                 : null,
-              status: `已绑定流水 ${materialId} 标定曲面 · ${captureResult.surface.summary.acceptedSectionCount}/${captureResult.surface.summary.sectionCount} 截面 · ${captureResult.surface.quality.crossSectionMetricValid ? '截面毫米有效' : '拟合预览'} · JET ±${captureResult.surface.summary.jetResidualRangeMm.toFixed(3)} mm`,
+              status: `已绑定流水 ${materialId} 标定数据 · ${captureResult.surface.summary.acceptedSectionCount}/${captureResult.surface.summary.sectionCount} 截面 · ${mesh.indices.length >= 3 ? `${Math.floor(mesh.indices.length / 3).toLocaleString('zh-CN')} 三角面` : '切面可用、三维曲面不足'} · ${captureResult.surface.headAlignment?.displayAligned ? `头部已对齐（最大补偿 ${(captureResult.surface.headAlignment.maximumDisplayPaddingFrames ?? 0).toFixed(2)} 帧）` : '头部对齐不可用'} · ${captureResult.surface.quality.crossSectionMetricValid ? '截面毫米有效' : '拟合预览'} · JET ±${captureResult.surface.summary.jetResidualRangeMm.toFixed(3)} mm`,
             });
             artifactLoaded = true;
             return;
@@ -1932,6 +1959,7 @@ function InspectionDashboard({
                   cameraLanes={runtimeCameraLanes}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
                   surfaceCameraTiles={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameraTiles : null}
+                  surfaceHeadAlignment={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.headAlignment : null}
                   surfaceCameras={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameras : undefined}
                   artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
                   viewMode={plateMapViewMode}
