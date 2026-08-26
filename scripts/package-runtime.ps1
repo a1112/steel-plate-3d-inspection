@@ -1013,6 +1013,7 @@ if (-not $SkipDesktopBundle) {
 }
 
 Copy-Item -LiteralPath (Join-Path $RepoRoot "config\env") -Destination $ConfigOut -Recurse -Force
+Copy-RequiredFile (Join-Path $RepoRoot "config\service-registry.json") $ConfigOut
 if (Test-Path (Join-Path $RepoRoot "config\capture") -PathType Container) {
   Copy-Item -LiteralPath (Join-Path $RepoRoot "config\capture") -Destination $ConfigOut -Recurse -Force
 }

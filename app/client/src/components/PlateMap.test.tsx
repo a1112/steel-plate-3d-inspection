@@ -311,6 +311,11 @@ describe('online inspection world compatibility', () => {
       'data-head-offset-frames',
       '-2.000000',
     );
+    const ruler = screen.getByRole('slider', { name: '预览位置' });
+    const scrollbar = screen.getByRole('scrollbar', { name: '展开图滚动位置' });
+    expect(screen.getByTestId('bar-unfolded-map')).toContainElement(ruler);
+    expect(ruler).toContainElement(scrollbar);
+    expect(scrollbar).toHaveAttribute('aria-orientation', 'horizontal');
     expect(document.querySelectorAll('.bar-camera-frame').length).toBeGreaterThan(6);
     expect(document.querySelectorAll('.bar-camera-frame').length).toBeLessThan(12 * 6);
     expect(screen.getAllByLabelText(/算法 ROI 裁剪图/).every((canvas) => (
@@ -323,6 +328,7 @@ describe('online inspection world compatibility', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: '纵向' }));
     expect(viewport).toHaveAttribute('data-scroll-axis', 'y');
+    expect(scrollbar).toHaveAttribute('aria-orientation', 'vertical');
     expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
   });

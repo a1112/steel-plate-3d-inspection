@@ -4,6 +4,13 @@ These scripts keep the four runtime boundaries independent.
 
 Environment templates live in `config/env`.
 
+The backend service registry is maintained in `config/service-registry.json`.
+Packaging and target-runtime synchronization copy this file into the runtime
+configuration. The Rust service exposes its resolved registrations, lifecycle
+state, runtime roots, and bounded log tails through the loopback-only
+`GET /api/runtime/status`; the independent Tauri monitor reads that endpoint
+without an administrator session.
+
 ## SICK GenTL capture sidecar
 
 The SICK sidecar uses the vendor GenTL producer and Harvesters to bind a camera
@@ -912,11 +919,11 @@ Equivalent env-file mode:
 scripts/run-client-dev.ps1 -EnvFile config/env/client.env.example
 ```
 
-The browser client uses same-origin API calls. In an integrated/runtime launch the
-Rust service serves both the built UI and `/api/*`, so users open
-`http://<server>:4873/` and do not configure a separate UI port or API address.
-Vite proxies `/api` to the development Rust service. Tauri continues to support an
-explicit HTTP or HTTPS service address.
+The browser and Tauri clients both use the HTTP or HTTPS service address saved in
+connection settings. Integrated/runtime launches still default to the current
+server on port `4873`, while a separately hosted browser UI can target another LAN
+host such as `http://10.50.111.141:4873`; the Rust service exposes the required CORS
+headers. Vite's `/api` proxy remains available as a development compatibility path.
 
 The old standalone static server remains available only for compatibility:
 
@@ -936,8 +943,8 @@ scripts/run-service.ps1 -Port 4873 -HttpsPort 443 `
 ## Tauri Desktop
 
 The development launcher builds and starts the Rust API when port 4873 is not
-already healthy, waits for readiness, starts Vite/Tauri, and stops only the API
-process that it owns:
+already healthy, waits for readiness, starts the inspection Vite/Tauri UI on port
+`1432`, and stops only the API process that it owns:
 
 ```powershell
 scripts/run-tauri-dev.ps1 -ServicePort 4873
@@ -953,6 +960,15 @@ Use `-SkipServiceBuild` after an explicit service build. The launcher uses the
 local Cargo cache by default; on a machine with an empty cache, use
 `-AllowNetworkDependencyFetch` once. `-NoService` keeps the previous frontend-only
 behavior when the API lifecycle is managed elsewhere.
+
+The desktop runtime boundary is process-based. The operator executable is
+`steel-plate-3d-inspection-tauri.exe`. The independent read-only monitor is built
+separately with `scripts/build-server-monitor.ps1` as
+`steel-inspection-server-monitor.exe`; its development frontend binds `1433`,
+while the operator client remains on `1432`. The monitor has its own Rust crate,
+Tauri capability set, tray lifecycle, and `monitor` route. It never stores an
+administrator token and cannot cancel/retry production tasks or control the
+Windows service.
 
 Desktop development is not installation evidence. The locked no-bundle Release completed in 56.64 seconds and produced `target/cargo/release/steel-plate-3d-inspection-tauri.exe` at 23,113,728 bytes with production devtools feature count zero. Tauri selects the WebView2 offline installer, per-machine NSIS mode, no downgrades, and the formal publisher. Formal `build-client.ps1 -Tauri` requires a certificate SHA-1 thumbprint and HTTPS timestamp URL; missing signing inputs fail closed, while `-AllowUnsignedDesktopBundle` is development-only. The EXE is `NotSigned`, depends on `VCRUNTIME140.dll`, and does not close the MSI/NSIS gate.
 

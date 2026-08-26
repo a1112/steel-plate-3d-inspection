@@ -393,6 +393,10 @@ function clampPercent(value: number, min = 0, max = 100) {
   return Math.max(min, Math.min(max, value));
 }
 
+function clampUnit(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
 function closestObservedSectionRow(mesh: BarSurfaceMesh, requestedRow: number) {
   const rowCount = Math.max(1, mesh.rows);
   const columns = Math.max(1, mesh.colsPerCamera * mesh.cameraCount);
@@ -789,6 +793,7 @@ function BarUnfoldedMap({
   hoveredDefectId,
   previewPositionM,
   plateLengthM,
+  onPreviewPositionChange,
   onSelectDefect,
   onHoverDefect,
   onDefectNavigationKeyDown,
@@ -810,6 +815,7 @@ function BarUnfoldedMap({
   hoveredDefectId: string | null;
   previewPositionM: number;
   plateLengthM: number;
+  onPreviewPositionChange: (positionM: number) => void;
   onSelectDefect: (defectId: string) => void;
   onHoverDefect: (defectId: string | null) => void;
   onDefectNavigationKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
@@ -838,7 +844,7 @@ function BarUnfoldedMap({
     frameCount: captureFrames.length,
     alignmentKey: '',
   });
-  const [scrollWindow, setScrollWindow] = useState({ offset: 0, extent: 1 });
+  const [scrollWindow, setScrollWindow] = useState({ offset: 0, extent: 1, total: 1 });
   const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
   const hoveredDefect = defects.find((defect) => defect.id === hoveredDefectId) ?? null;
   const hoveredType = hoveredDefect ? defectTypes.find((type) => type.id === hoveredDefect.typeId) : null;
@@ -947,9 +953,26 @@ function BarUnfoldedMap({
     const maximum = Math.max(0, scrollExtent - extent);
     scrollProgressRef.current = maximum > 0 ? offset / maximum : 0;
     atTailRef.current = maximum <= 0 || maximum - offset <= Math.max(24, extent * 0.08);
-    setScrollWindow((current) => current.offset === offset && current.extent === Math.max(1, extent)
+    const nextExtent = Math.max(1, extent);
+    const total = Math.max(nextExtent, scrollExtent, longitudinalExtent);
+    setScrollWindow((current) => current.offset === offset && current.extent === nextExtent && current.total === total
       ? current
-      : { offset, extent: Math.max(1, extent) });
+      : { offset, extent: nextExtent, total });
+  };
+
+  const scrollToProgress = (progress: number) => {
+    const host = scrollRef.current;
+    if (!host) return;
+    const extent = orientation === 'horizontal' ? host.clientWidth : host.clientHeight;
+    const scrollExtent = orientation === 'horizontal' ? host.scrollWidth : host.scrollHeight;
+    const maximum = Math.max(0, Math.max(scrollExtent, longitudinalExtent) - extent);
+    const target = clampUnit(progress) * maximum;
+    if (orientation === 'horizontal') {
+      host.scrollLeft = target;
+    } else {
+      host.scrollTop = target;
+    }
+    readScrollPosition();
   };
 
   useEffect(() => {
@@ -1173,6 +1196,14 @@ function BarUnfoldedMap({
         ) : null}
         </div>
       </div>
+      <LengthRuler
+        previewPositionM={previewPositionM}
+        plateLengthM={plateLengthM}
+        onPreviewPositionChange={onPreviewPositionChange}
+        orientation={orientation}
+        scrollMetrics={stitchEnabled ? scrollWindow : undefined}
+        onScrollProgressChange={scrollToProgress}
+      />
     </div>
   );
 }
@@ -1182,17 +1213,33 @@ function LengthRuler({
   plateLengthM,
   onPreviewPositionChange,
   orientation,
+  scrollMetrics,
+  onScrollProgressChange,
 }: {
   previewPositionM: number;
   plateLengthM: number;
   onPreviewPositionChange: (positionM: number) => void;
   orientation: UnfoldOrientation;
+  scrollMetrics?: { offset: number; extent: number; total: number };
+  onScrollProgressChange?: (progress: number) => void;
 }) {
   const activePointerId = useRef<number | null>(null);
   const mouseDragging = useRef(false);
+  const scrollDrag = useRef<{ pointerId: number; grabOffsetRatio: number } | null>(null);
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
   const safePositionM = clampPreviewPositionM(previewPositionM, safePlateLengthM);
   const previewPercent = (safePositionM / safePlateLengthM) * 100;
+  const visibleFraction = scrollMetrics
+    ? clampUnit(scrollMetrics.extent / Math.max(scrollMetrics.total, 1))
+    : 1;
+  const maximumScrollOffset = scrollMetrics
+    ? Math.max(0, scrollMetrics.total - scrollMetrics.extent)
+    : 0;
+  const scrollProgress = maximumScrollOffset > 0 && scrollMetrics
+    ? clampUnit(scrollMetrics.offset / maximumScrollOffset)
+    : 0;
+  const scrollStartRatio = scrollProgress * (1 - visibleFraction);
+  const scrollEnabled = Boolean(scrollMetrics && maximumScrollOffset > 1 && onScrollProgressChange);
 
   const updateFromPointer = (clientX: number, clientY: number, element: HTMLElement) => {
     const rect = element.getBoundingClientRect();
@@ -1266,6 +1313,77 @@ function LengthRuler({
     }
   };
 
+  const updateScrollFromPointer = (clientX: number, clientY: number, element: HTMLElement) => {
+    if (!scrollEnabled || !onScrollProgressChange || !scrollDrag.current) return;
+    const rect = element.getBoundingClientRect();
+    const extent = orientation === 'horizontal' ? rect.width : rect.height;
+    if (extent <= 0) return;
+    const pointerRatio = clampUnit(
+      orientation === 'horizontal'
+        ? (clientX - rect.left) / rect.width
+        : (clientY - rect.top) / rect.height,
+    );
+    const availableTrack = Math.max(0.0001, 1 - visibleFraction);
+    const nextStartRatio = Math.max(
+      0,
+      Math.min(availableTrack, pointerRatio - scrollDrag.current.grabOffsetRatio),
+    );
+    onScrollProgressChange(nextStartRatio / availableTrack);
+  };
+
+  const handleScrollPointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!scrollEnabled) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const pointerRatio = clampUnit(
+      orientation === 'horizontal'
+        ? (event.clientX - rect.left) / Math.max(1, rect.width)
+        : (event.clientY - rect.top) / Math.max(1, rect.height),
+    );
+    const thumb = (event.target as HTMLElement).closest('.ruler-scrollbar-thumb');
+    scrollDrag.current = {
+      pointerId: event.pointerId,
+      grabOffsetRatio: thumb
+        ? Math.max(0, Math.min(visibleFraction, pointerRatio - scrollStartRatio))
+        : visibleFraction / 2,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    updateScrollFromPointer(event.clientX, event.clientY, event.currentTarget);
+  };
+
+  const handleScrollPointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    event.stopPropagation();
+    if (scrollDrag.current?.pointerId !== event.pointerId) return;
+    updateScrollFromPointer(event.clientX, event.clientY, event.currentTarget);
+  };
+
+  const stopScrollDragging = (event: PointerEvent<HTMLDivElement>) => {
+    event.stopPropagation();
+    if (scrollDrag.current?.pointerId !== event.pointerId) return;
+    scrollDrag.current = null;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+  };
+
+  const handleScrollKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    event.stopPropagation();
+    if (!scrollEnabled || !onScrollProgressChange) return;
+    const step = event.shiftKey ? 0.2 : 0.05;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      onScrollProgressChange(clampUnit(scrollProgress - step));
+    } else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      onScrollProgressChange(clampUnit(scrollProgress + step));
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      onScrollProgressChange(0);
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      onScrollProgressChange(1);
+    }
+  };
+
   return (
     <div
       className={`length-ruler orientation-${orientation}`}
@@ -1304,6 +1422,33 @@ function LengthRuler({
       >
         <span className="ruler-preview-label">{safePositionM.toFixed(2)}m</span>
       </div>
+      {scrollMetrics ? (
+        <div
+          className={`ruler-scrollbar ${scrollEnabled ? '' : 'is-disabled'}`.trim()}
+          role="scrollbar"
+          tabIndex={scrollEnabled ? 0 : -1}
+          aria-label="展开图滚动位置"
+          aria-orientation={orientation}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(scrollProgress * 100)}
+          aria-valuetext={scrollEnabled ? `已滚动 ${Math.round(scrollProgress * 100)}%` : '已显示全部图像'}
+          aria-disabled={!scrollEnabled}
+          onPointerDown={handleScrollPointerDown}
+          onPointerMove={handleScrollPointerMove}
+          onPointerUp={stopScrollDragging}
+          onPointerCancel={stopScrollDragging}
+          onKeyDown={handleScrollKeyDown}
+        >
+          <i className="ruler-scrollbar-track" />
+          <b
+            className="ruler-scrollbar-thumb"
+            style={orientation === 'horizontal'
+              ? { left: `${scrollStartRatio * 100}%`, width: `${visibleFraction * 100}%` }
+              : { top: `${scrollStartRatio * 100}%`, height: `${visibleFraction * 100}%` }}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2393,6 +2538,7 @@ export function PlateMap({
               hoveredDefectId={hoveredDefectId}
               previewPositionM={previewPositionM}
               plateLengthM={safePlateLengthM}
+              onPreviewPositionChange={onPreviewPositionChange}
               onSelectDefect={onSelectDefect}
               onHoverDefect={setHoveredDefectId}
               onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
@@ -2406,12 +2552,6 @@ export function PlateMap({
               imageMode="jet"
               cameraTiles={surfaceCameraTiles}
               headAlignment={surfaceHeadAlignment}
-            />
-            <LengthRuler
-              previewPositionM={previewPositionM}
-              plateLengthM={safePlateLengthM}
-              onPreviewPositionChange={onPreviewPositionChange}
-              orientation={unfoldOrientation}
             />
           </div>
         ) : (
@@ -2517,6 +2657,7 @@ export function PlateMap({
             hoveredDefectId={hoveredDefectId}
             previewPositionM={previewPositionM}
             plateLengthM={safePlateLengthM}
+            onPreviewPositionChange={onPreviewPositionChange}
             onSelectDefect={onSelectDefect}
             onHoverDefect={setHoveredDefectId}
             onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
@@ -2530,7 +2671,6 @@ export function PlateMap({
             headAlignment={surfaceHeadAlignment}
             cropBlackBorders
           />
-          <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} orientation={unfoldOrientation} />
         </div>
       )}
       {viewMode === '3d' && threeDisplayMode === 'texture' && textureStatus ? (

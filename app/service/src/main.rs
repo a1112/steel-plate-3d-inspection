@@ -33,6 +33,7 @@ mod machine_site_config;
 mod npz_surface;
 mod production_tasks;
 mod runtime_profile;
+mod service_registry;
 mod site_config;
 mod standard_record_store;
 
@@ -266,6 +267,7 @@ struct ServiceState {
     trigger_health_required: bool,
     runtime_profile: String,
     runtime_config: Arc<runtime_profile::RuntimeProfile>,
+    service_registry: Arc<service_registry::ServiceRegistry>,
     site_configs: site_config::SiteConfigStore,
     machine_site_store: Arc<dyn machine_site_config::MachineSiteStore>,
     machine_name: String,
@@ -5123,10 +5125,8 @@ fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
             .as_ref()
             .is_some_and(|root| root.join("catalog.db").is_file());
         let result_required = bkv_mode;
-        let ready = image_ok
-            && image_worker_ok
-            && defect_worker_ok
-            && (!result_required || result_ready);
+        let ready =
+            image_ok && image_worker_ok && defect_worker_ok && (!result_required || result_ready);
         return (
             ready,
             json!({
@@ -7867,7 +7867,9 @@ fn admin_services_json(state: &ServiceState) -> String {
                 "status": if capture_running { "normal" } else { "warning" },
                 "detail": capture_origin
             }
-        ]
+        ],
+        "registry": state.service_registry.public_value(),
+        "services": runtime_service_values(state)
     })
     .to_string()
 }
@@ -7932,29 +7934,222 @@ fn runtime_log_tail(path: &Path) -> (String, bool) {
 }
 
 fn runtime_log_service_probe(
-    id: &str,
-    name: &str,
-    origin: &str,
-    port: u16,
-    health_path: &str,
+    registration: &service_registry::ServiceRegistration,
     required: bool,
 ) -> Value {
-    let probe = bounded_health_http_get(origin, health_path, Duration::from_millis(350));
-    let (ok, reason) = match probe {
-        Ok(response) if response.status_code == 200 => (true, Value::Null),
-        Ok(response) => (false, json!(format!("http_{}", response.status_code))),
-        Err(error) => (false, json!(error.as_str())),
+    let origin = registration.resolved_origin();
+    let port = registration.port();
+    let started = Instant::now();
+    let probe = bounded_health_http_get(
+        &origin,
+        &registration.health_path,
+        Duration::from_millis(350),
+    );
+    let (ok, reason, response_status) = match probe {
+        Ok(response) if response.status_code == 200 => (true, Value::Null, response.status_code),
+        Ok(response) => (
+            false,
+            json!(format!("http_{}", response.status_code)),
+            response.status_code,
+        ),
+        Err(error) => (false, json!(error.as_str()), 0),
     };
+    let phase = if ok { "ready" } else { "degraded" };
     json!({
-        "id": id,
-        "name": name,
+        "id": registration.id,
+        "name": registration.name,
+        "role": registration.role,
+        "kind": registration.kind,
         "origin": origin,
         "port": port,
+        "healthPath": registration.health_path,
         "ok": ok,
         "required": required,
         "status": if ok { "running" } else { "unavailable" },
-        "reason": reason
+        "responseStatus": response_status,
+        "latencyMs": started.elapsed().as_millis(),
+        "reason": reason,
+        "lifecycle": {
+            "source": registration.lifecycle,
+            "phase": phase,
+            "desiredRunning": required
+        }
     })
+}
+
+fn runtime_monitor_operations(registration: &service_registry::ServiceRegistration) -> Value {
+    json!([
+        {
+            "id": "refresh-status",
+            "label": "刷新状态",
+            "effect": "query",
+            "scope": "service",
+            "enabled": true
+        },
+        {
+            "id": "copy-origin",
+            "label": "复制地址",
+            "effect": "local",
+            "scope": "service",
+            "enabled": true
+        },
+        {
+            "id": "view-logs",
+            "label": "查看日志",
+            "effect": "local",
+            "scope": "service",
+            "enabled": !registration.log_files.is_empty(),
+            "reason": if registration.log_files.is_empty() {
+                Value::String("service_has_no_registered_log_files".to_string())
+            } else {
+                Value::Null
+            }
+        }
+    ])
+}
+
+fn attach_runtime_monitor_contract(
+    value: &mut Value,
+    registration: &service_registry::ServiceRegistration,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "operations".to_string(),
+        runtime_monitor_operations(registration),
+    );
+    object.insert(
+        "control".to_string(),
+        json!({
+            "mode": "observe",
+            "owner": registration.lifecycle,
+            "reason": "lifecycle_mutation_requires_authenticated_owner"
+        }),
+    );
+}
+
+fn runtime_service_values(state: &ServiceState) -> Vec<Value> {
+    state
+        .service_registry
+        .services
+        .iter()
+        .map(|registration| {
+            let mut required = registration.required_for_provider(state.capture.provider.as_str());
+            if registration.id == "trigger" {
+                required = state.trigger_health_required;
+            }
+            let origin = registration.resolved_origin();
+            let mut service = match registration.kind.as_str() {
+                "inspection" => json!({
+                    "id": registration.id,
+                    "name": registration.name,
+                    "role": registration.role,
+                    "kind": registration.kind,
+                    "origin": origin,
+                    "port": registration.port(),
+                    "healthPath": registration.health_path,
+                    "ok": true,
+                    "required": required,
+                    "status": "running",
+                    "responseStatus": 200,
+                    "uptimeMs": current_time_millis().saturating_sub(state.started_at),
+                    "reason": Value::Null,
+                    "lifecycle": {
+                        "source": registration.lifecycle,
+                        "phase": "ready",
+                        "desiredRunning": true,
+                        "pid": std::process::id(),
+                        "startedAt": state.started_at.to_string()
+                    }
+                }),
+                "capture" => {
+                    let mut status = serde_json::from_str::<Value>(&state.capture.status_json())
+                        .unwrap_or_else(|_| json!({}));
+                    if let Some(object) = status.as_object_mut() {
+                        let running = object
+                            .get("running")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let phase = object
+                            .get("lifecycle")
+                            .and_then(|value| value.get("phase"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| {
+                                if running {
+                                    "ready".to_string()
+                                } else {
+                                    "stopped".to_string()
+                                }
+                            });
+                        object.insert("id".to_string(), json!(registration.id));
+                        object.insert("name".to_string(), json!(registration.name));
+                        object.insert("role".to_string(), json!(registration.role));
+                        object.insert("kind".to_string(), json!(registration.kind));
+                        object.insert("healthPath".to_string(), json!(registration.health_path));
+                        object.insert("required".to_string(), json!(required));
+                        object.insert("ok".to_string(), json!(running));
+                        object.insert("status".to_string(), json!(phase));
+                        object.insert("reason".to_string(), Value::Null);
+                    }
+                    status
+                }
+                _ => runtime_log_service_probe(registration, required),
+            };
+            attach_runtime_monitor_contract(&mut service, registration);
+            service
+        })
+        .collect()
+}
+
+fn runtime_log_service_for_file<'a>(
+    registry: &'a service_registry::ServiceRegistry,
+    name: &str,
+) -> Option<(&'a str, &'a str)> {
+    registry
+        .services
+        .iter()
+        .find(|service| service.matches_log_file(name))
+        .map(|service| (service.id.as_str(), service.name.as_str()))
+}
+
+fn runtime_log_values(log_root: &Path, registry: &service_registry::ServiceRegistry) -> Vec<Value> {
+    let mut logs = Vec::new();
+    let Ok(entries) = fs::read_dir(log_root) else {
+        return logs;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let (service_id, service_name) = runtime_log_service_for_file(registry, name)
+            .map(|(id, service)| (json!(id), json!(service)))
+            .unwrap_or((Value::Null, json!("未注册日志")));
+        let (tail, truncated) = runtime_log_tail(&path);
+        logs.push(json!({
+            "name": name,
+            "serviceId": service_id,
+            "serviceName": service_name,
+            "bytes": metadata.len(),
+            "modifiedAt": runtime_file_timestamp(&metadata),
+            "tail": tail,
+            "truncated": truncated
+        }));
+    }
+    logs.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .cmp(&right.get("name").and_then(Value::as_str))
+    });
+    logs
 }
 
 fn runtime_log_status_json(state: &ServiceState) -> String {
@@ -7985,114 +8180,34 @@ fn runtime_log_status_json(state: &ServiceState) -> String {
     };
 
     let bkv_mode = state.capture.provider == CaptureProvider::Bkv;
-    let processing_worker = if bkv_mode {
-        runtime_log_service_probe(
-            "bkv-adapter",
-            "BKV 历史适配器",
-            "http://127.0.0.1:4877",
-            4877,
-            "/api/health/live",
-            true,
-        )
-    } else {
-        runtime_log_service_probe(
-            "image-worker",
-            "图像 Worker",
-            "http://127.0.0.1:4875",
-            4875,
-            "/api/health/live",
-            true,
-        )
-    };
-    let services = vec![
-        json!({
-            "id": "inspection",
-            "name": "业务服务",
-            "origin": format!("http://127.0.0.1:{}", env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string())),
-            "port": env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string()),
-            "uptimeMs": current_time_millis().saturating_sub(state.started_at),
-            "ok": true,
-            "required": true,
-            "status": "running",
-            "reason": Value::Null
-        }),
-        runtime_log_service_probe(
-            "image",
-            "Rust 图像服务",
-            "http://127.0.0.1:4874",
-            4874,
-            "/api/health/live",
-            true,
-        ),
-        processing_worker,
-        runtime_log_service_probe(
-            "defect-worker",
-            "缺陷 Worker",
-            "http://127.0.0.1:4876",
-            4876,
-            "/api/health/live",
-            !bkv_mode,
-        ),
-        runtime_log_service_probe(
-            "capture",
-            "采集服务",
-            "http://127.0.0.1:4317",
-            4317,
-            "/health",
-            !bkv_mode,
-        ),
-        runtime_log_service_probe(
-            "trigger",
-            "触发网关",
-            "http://127.0.0.1:4881",
-            4881,
-            "/health",
-            false,
-        ),
-    ];
+    let services = runtime_service_values(state);
     let services_ready = services
         .iter()
         .filter(|service| service.get("required").and_then(Value::as_bool) == Some(true))
         .all(|service| service.get("ok").and_then(Value::as_bool) == Some(true));
     let required_ready = services_ready && (!bkv_mode || catalog_ready);
 
-    let mut logs = Vec::new();
-    if let Ok(entries) = fs::read_dir(&log_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            let (tail, truncated) = runtime_log_tail(&path);
-            logs.push(json!({
-                "name": name,
-                "bytes": metadata.len(),
-                "modifiedAt": runtime_file_timestamp(&metadata),
-                "tail": tail,
-                "truncated": truncated
-            }));
-        }
-    }
-    logs.sort_by(|left, right| {
-        left.get("name")
-            .and_then(Value::as_str)
-            .cmp(&right.get("name").and_then(Value::as_str))
-    });
+    let logs = runtime_log_values(&log_root, &state.service_registry);
 
     json!({
         "schema": "steel.runtime-log-status.v1",
         "updatedAt": current_time_string(),
         "status": if required_ready { "running" } else { "degraded" },
+        "monitorProtocol": {
+            "schema": "steel.runtime-monitor-capabilities.v1",
+            "version": 1,
+            "selectionKey": "serviceId",
+            "logScopes": ["service", "all"],
+            "operationEffects": ["query", "local", "mutation"],
+            "mutationPolicy": "capability-only",
+            "readAccess": "loopback-or-private-network"
+        },
+        "registry": state.service_registry.public_value(),
         "runtime": {
             "stateRoot": state_root,
             "logRoot": log_root,
-            "supervisor": supervisor
+            "supervisor": supervisor,
+            "taskWorker": task_worker_health_component(state).1
         },
         "resultStore": {
             "root": result_root,
@@ -8104,6 +8219,32 @@ fn runtime_log_status_json(state: &ServiceState) -> String {
         "logs": logs
     })
     .to_string()
+}
+
+fn runtime_monitor_peer_allowed(peer: Option<SocketAddr>) -> bool {
+    peer.is_some_and(|address| match address.ip() {
+        IpAddr::V4(address) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+    })
+}
+
+fn read_runtime_status_response(state: &ServiceState, peer: Option<SocketAddr>) -> Vec<u8> {
+    if !runtime_monitor_peer_allowed(peer) {
+        return http_response(
+            "403 Forbidden",
+            "application/json; charset=utf-8",
+            "{\"error\":\"runtime_status_private_network_only\"}",
+        );
+    }
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &runtime_log_status_json(state),
+    )
 }
 
 fn read_admin_runtime_log_status_response(state: &ServiceState) -> Vec<u8> {
@@ -24193,6 +24334,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "GET", "path": "/api/health/ready", "scope": "service" },
             { "method": "GET", "path": "/api/health/ready/details", "scope": "service" },
             { "method": "GET", "path": "/api/health/details", "scope": "service" },
+            { "method": "GET", "path": "/api/runtime/status", "scope": "service" },
             { "method": "GET", "path": "/api/services", "scope": "service" },
             { "method": "GET", "path": "/api/system/network", "scope": "service" },
             { "method": "GET", "path": "/api/system/resources", "scope": "service" },
@@ -24600,6 +24742,7 @@ fn handle_client<S: Read + Write>(
         _ if health_endpoint.is_some() => {
             service_health_response(&state, health_endpoint.expect("health endpoint guard"))
         }
+        ("GET", "/api/runtime/status") => read_runtime_status_response(&state, peer),
         ("GET", "/api/system/network") => system_network_status_response(),
         ("GET", "/api/system/resources") => app_resource_usage::app_resource_usage_response(),
         ("GET", "/api/runtime-profile") => runtime_profile_response(&state),
@@ -24607,9 +24750,11 @@ fn handle_client<S: Read + Write>(
             "200 OK",
             "application/json; charset=utf-8",
             &format!(
-                "{{\"api\":{{\"name\":\"steel-inspection-service\",\"running\":true,\"port\":{}}},\"capture\":{}}}",
+                "{{\"api\":{{\"name\":\"steel-inspection-service\",\"running\":true,\"port\":{}}},\"capture\":{},\"registry\":{},\"services\":{}}}",
                 env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string()),
-                state.capture.status_json()
+                state.capture.status_json(),
+                state.service_registry.public_value(),
+                serde_json::to_string(&runtime_service_values(&state)).unwrap_or_else(|_| "[]".to_string())
             ),
         ),
         ("GET", "/api/capture/lifecycle") => http_response(
@@ -25411,6 +25556,8 @@ fn main() -> std::io::Result<()> {
     let bkv_manager = configured_bkv_manager(capture_manager.provider, &runtime_config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let standard_record_store = configured_standard_record_store(&runtime_config);
+    let service_registry = service_registry::ServiceRegistry::load(&workspace_root(), &config_dir)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     CaptureServiceManager::start_supervisor(&capture_manager);
     let config_json = runtime
         .block_on(db::get_config(&database.connection, "capture"))
@@ -25446,6 +25593,7 @@ fn main() -> std::io::Result<()> {
         runtime_profile: env::var("STEEL_RUNTIME_PROFILE")
             .unwrap_or_else(|_| "production".to_string()),
         runtime_config: Arc::new(runtime_config),
+        service_registry: Arc::new(service_registry),
         site_configs,
         machine_site_store,
         machine_name: machine_site_config::machine_name(),
@@ -25488,6 +25636,11 @@ fn main() -> std::io::Result<()> {
         println!("database running in explicit non-production SQLite fallback mode");
     }
     println!("service config directory {}", config_dir.display());
+    println!(
+        "service registry {} ({} services)",
+        state.service_registry.path.display(),
+        state.service_registry.services.len()
+    );
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_signal = Arc::clone(&shutdown_requested);
     ctrlc::set_handler(move || shutdown_signal.store(true, Ordering::Release))
@@ -25672,6 +25825,51 @@ mod tests {
             "/api/production/file",
         )
         .is_ok());
+    }
+
+    #[test]
+    fn runtime_status_is_private_network_read_only_and_exposes_configured_registry() {
+        let state = production_test_state();
+        let denied =
+            read_runtime_status_response(&state, Some(SocketAddr::from(([8, 8, 8, 8], 48_73))));
+        assert!(response_text(denied).starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        assert_eq!(
+            response_json(read_runtime_status_response(
+                &state,
+                Some(SocketAddr::from(([10, 50, 111, 141], 49_01))),
+            ))["monitorProtocol"]["readAccess"],
+            "loopback-or-private-network"
+        );
+        assert_eq!(
+            response_json(read_runtime_status_response(
+                &state,
+                Some(SocketAddr::from(([127, 0, 0, 1], 49_01))),
+            ))["schema"],
+            "steel.runtime-log-status.v1"
+        );
+        let status = response_json(read_runtime_status_response(
+            &state,
+            Some(SocketAddr::from(([127, 0, 0, 1], 49_01))),
+        ));
+        assert_eq!(
+            status["registry"]["schema"],
+            service_registry::REGISTRY_SCHEMA
+        );
+        assert_eq!(status["services"][0]["id"], "inspection");
+        assert_eq!(status["services"][0]["lifecycle"]["phase"], "ready");
+        assert_eq!(
+            status["monitorProtocol"]["schema"],
+            "steel.runtime-monitor-capabilities.v1"
+        );
+        assert_eq!(
+            status["monitorProtocol"]["mutationPolicy"],
+            "capability-only"
+        );
+        assert_eq!(status["services"][0]["control"]["mode"], "observe");
+        assert_eq!(
+            status["services"][0]["operations"][0]["id"],
+            "refresh-status"
+        );
     }
 
     #[test]
@@ -26638,6 +26836,7 @@ mod tests {
                     8
                 },
             )),
+            service_registry: Arc::new(service_registry::ServiceRegistry::default_for_tests()),
             site_configs: site_config::SiteConfigStore::new(site_config_root)
                 .expect("test site config store"),
             machine_site_store: Arc::new(machine_site_config::MemoryMachineSiteStore::default()),

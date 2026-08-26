@@ -62,11 +62,30 @@ function serviceStatusLabel(service: AdminRuntimeService) {
   return service.required ? '不可用' : '未启动';
 }
 
+function serviceLifecycleLabel(service: AdminRuntimeService) {
+  const phase = service.lifecycle?.phase ?? service.status;
+  switch (phase) {
+    case 'starting': return '启动中';
+    case 'ready':
+    case 'running':
+    case 'healthy': return '运行中';
+    case 'collecting': return '采集中';
+    case 'stopping': return '停止中';
+    case 'stopped': return '已停止';
+    case 'degraded': return '降级';
+    case 'unavailable': return '不可用';
+    default: return phase || '未知';
+  }
+}
+
 function serviceStatusClass(service: AdminRuntimeService) {
   return service.ok ? 'normal' : service.required ? 'error' : 'warning';
 }
 
 function logTitle(log: AdminRuntimeLogFile) {
+  if (log.serviceName) {
+    return log.serviceName;
+  }
   if (log.name === 'supervisor.log') {
     return '运行宿主';
   }
@@ -174,6 +193,8 @@ export function RuntimeLogStatusPanel() {
           <div><span>统一结果库</span><strong className={payload?.resultStore.ready ? 'normal' : 'warning'}>{payload?.resultStore.ready ? '已就绪' : '未就绪'}</strong></div>
           <div><span>目录大小</span><strong>{formatBytes(payload?.resultStore.bytes ?? 0)}</strong></div>
           <div><span>日志目录</span><strong title={payload?.runtime.logRoot}>{payload?.runtime.logRoot ?? '-'}</strong></div>
+          <div><span>服务注册</span><strong title={payload?.registry?.path}>{payload?.registry?.path ?? '-'}</strong></div>
+          <div><span>Task Worker</span><strong className={payload?.runtime.taskWorker?.running ? 'normal' : 'warning'}>{payload?.runtime.taskWorker?.status ?? '未接入'}</strong></div>
         </div>
       </Panel>
 
@@ -185,6 +206,7 @@ export function RuntimeLogStatusPanel() {
               <div>
                 <strong>{service.name}</strong>
                 <span>{service.origin}</span>
+                <small>生命周期：{serviceLifecycleLabel(service)} · {service.role ?? service.kind ?? 'service'}</small>
               </div>
               <em>{serviceStatusLabel(service)}</em>
               {!service.ok && service.reason ? <small>{service.reason}</small> : null}

@@ -1,0 +1,98 @@
+{
+  "schema": "steel.service-registry.v1",
+  "version": 1,
+  "services": [
+    {
+      "id": "inspection",
+      "name": "业务服务",
+      "role": "api-config-capture-orchestrator",
+      "kind": "inspection",
+      "defaultOrigin": "http://127.0.0.1:4873",
+      "portEnv": "INSPECTION_SERVICE_PORT",
+      "healthPath": "/api/health/live",
+      "required": true,
+      "lifecycle": "service",
+      "logFiles": ["inspection-service-*.out.log", "inspection-service-*.err.log"]
+    },
+    {
+      "id": "image",
+      "name": "Rust 图像服务",
+      "role": "artifact-image-service",
+      "kind": "probe",
+      "defaultOrigin": "http://127.0.0.1:4874",
+      "portEnv": "STEEL_IMAGE_SERVICE_PORT",
+      "healthPath": "/api/health/live",
+      "required": true,
+      "lifecycle": "health-probe",
+      "logFiles": ["image-service*.log"]
+    },
+    {
+      "id": "image-worker",
+      "name": "图像 Worker",
+      "role": "image-processing-worker",
+      "kind": "probe",
+      "defaultOrigin": "http://127.0.0.1:4875",
+      "originEnv": "STEEL_IMAGE_WORKER_ORIGIN",
+      "portEnv": "STEEL_IMAGE_WORKER_PORT",
+      "healthPath": "/api/health/live",
+      "required": true,
+      "requiredWhen": "non-bkv",
+      "lifecycle": "health-probe",
+      "logFiles": ["image-worker*.log"]
+    },
+    {
+      "id": "bkv-adapter",
+      "name": "BKV 历史适配器",
+      "role": "bkv-history-image-worker",
+      "kind": "probe",
+      "defaultOrigin": "http://127.0.0.1:4877",
+      "originEnv": "STEEL_BKV_IMAGE_WORKER_ORIGIN",
+      "portEnv": "STEEL_BKV_IMAGE_WORKER_PORT",
+      "healthPath": "/api/health/live",
+      "required": true,
+      "requiredWhen": "bkv",
+      "lifecycle": "health-probe",
+      "logFiles": ["bkv-image-worker*.log"]
+    },
+    {
+      "id": "defect-worker",
+      "name": "缺陷 Worker",
+      "role": "defect-processing-worker",
+      "kind": "probe",
+      "defaultOrigin": "http://127.0.0.1:4876",
+      "originEnv": "STEEL_DEFECT_WORKER_ORIGIN",
+      "portEnv": "STEEL_DEFECT_WORKER_PORT",
+      "healthPath": "/api/health/live",
+      "required": true,
+      "requiredWhen": "non-bkv",
+      "lifecycle": "health-probe",
+      "logFiles": ["defect-worker*.log"]
+    },
+    {
+      "id": "capture",
+      "name": "采集服务",
+      "role": "camera-capture-provider",
+      "kind": "capture",
+      "defaultOrigin": "http://127.0.0.1:4317",
+      "originEnv": "CAPTURE_SERVICE_ORIGIN",
+      "portEnv": "CAPTURE_SERVICE_PORT",
+      "healthPath": "/health",
+      "required": true,
+      "requiredWhen": "non-bkv",
+      "lifecycle": "capture-supervisor",
+      "logFiles": ["capture-child.log", "sick-capture*.log"]
+    },
+    {
+      "id": "trigger",
+      "name": "触发网关",
+      "role": "production-trigger-gateway",
+      "kind": "probe",
+      "defaultOrigin": "http://127.0.0.1:4881",
+      "originEnv": "TRIGGER_GATEWAY_ORIGIN",
+      "healthPath": "/health",
+      "required": false,
+      "lifecycle": "health-probe",
+      "logFiles": ["trigger*.log"]
+    }
+  ]
+}

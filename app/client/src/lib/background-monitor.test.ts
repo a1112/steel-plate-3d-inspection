@@ -133,4 +133,61 @@ describe('background monitor snapshot derivation', () => {
     expect(snapshot.serviceAvailable).toBe(true);
     expect(snapshot.detail).toBe('任务状态接口暂时不可用');
   });
+
+  it('surfaces configured service lifecycle, runtime roots and required failures', () => {
+    const snapshot = deriveBackgroundMonitorSnapshot({
+      origin: 'http://127.0.0.1:4873',
+      health: health(),
+      production: production(),
+      taskPage: taskPage(),
+      runtimeStatus: {
+        schema: 'steel.runtime-log-status.v1',
+        updatedAt: '2026-08-26T07:00:00Z',
+        status: 'degraded',
+        registry: {
+          schema: 'steel.service-registry.v1',
+          version: 1,
+          path: 'C:/runtime/config/service-registry.json',
+          services: [],
+        },
+        runtime: {
+          stateRoot: 'C:/runtime/state',
+          logRoot: 'C:/runtime/logs',
+          taskWorker: { status: 'running' },
+          supervisor: { status: 'running' },
+        },
+        resultStore: { ready: true, bytes: 0 },
+        services: [
+          {
+            id: 'image',
+            name: '图像服务',
+            origin: 'http://127.0.0.1:4874',
+            port: 4874,
+            ok: false,
+            required: true,
+            status: 'unavailable',
+            reason: 'monitor_service_unreachable',
+          },
+        ],
+        logs: [
+          {
+            name: 'image-service.log',
+            serviceId: 'image',
+            serviceName: '图像服务',
+            bytes: 12,
+            modifiedAt: '2026-08-26T07:00:00Z',
+            tail: 'connection refused',
+          },
+        ],
+      },
+      now: 2_000,
+    });
+
+    expect(snapshot.state).toBe('degraded');
+    expect(snapshot.detail).toContain('图像服务');
+    expect(snapshot.serviceCount).toBe(1);
+    expect(snapshot.healthyServiceCount).toBe(0);
+    expect(snapshot.runtime?.logRoot).toBe('C:/runtime/logs');
+    expect(snapshot.logs?.[0].tail).toBe('connection refused');
+  });
 });

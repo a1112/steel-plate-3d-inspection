@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "steel.runtime-monitor-capabilities.v1.schema.json",
+  "title": "Steel Runtime Monitor Capabilities",
+  "description": "Capability contract embedded in the loopback-only runtime status response. Consumers must only expose lifecycle mutations explicitly declared as enabled mutation operations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "selectionKey",
+    "logScopes",
+    "operationEffects",
+    "mutationPolicy",
+    "readAccess"
+  ],
+  "properties": {
+    "schema": { "const": "steel.runtime-monitor-capabilities.v1" },
+    "version": { "const": 1 },
+    "selectionKey": { "const": "serviceId" },
+    "logScopes": {
+      "type": "array",
+      "items": { "enum": ["service", "all"] },
+      "uniqueItems": true
+    },
+    "operationEffects": {
+      "type": "array",
+      "items": { "enum": ["query", "local", "mutation"] },
+      "uniqueItems": true
+    },
+    "mutationPolicy": { "const": "capability-only" },
+    "readAccess": { "const": "loopback-or-private-network" }
+  },
+  "$defs": {
+    "operation": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "effect", "scope", "enabled"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 96 },
+        "label": { "type": "string", "maxLength": 160 },
+        "effect": { "enum": ["query", "local", "mutation"] },
+        "scope": { "enum": ["service", "monitor"] },
+        "enabled": { "type": "boolean" },
+        "reason": { "type": ["string", "null"], "maxLength": 240 },
+        "endpoint": { "type": ["string", "null"], "maxLength": 240 },
+        "method": { "type": ["string", "null"], "maxLength": 16 }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["observe", "control"] },
+        "owner": { "type": "string", "maxLength": 160 },
+        "reason": { "type": ["string", "null"], "maxLength": 240 }
+      }
+    }
+  }
+}

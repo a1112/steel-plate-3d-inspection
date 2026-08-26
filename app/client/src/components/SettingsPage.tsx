@@ -8,7 +8,7 @@ import { Panel } from './Panel';
 
 type NumberSettingKey = 'severeDepthMm' | 'reviewDepthMm' | 'minDefectWidthMm' | 'cameraExposureUs' | 'encoderPulsePerMeter' | 'alarmVolume';
 type BooleanSettingKey = 'autoReview' | 'saveRawImages';
-type SettingsSection = 'theme' | 'connection' | 'grading' | 'acquisition' | 'status';
+export type SettingsSection = 'theme' | 'connection' | 'grading' | 'acquisition' | 'status';
 
 const settingsSections: Array<{ id: SettingsSection; label: string; hint: string; icon: ElementType }> = [
   { id: 'theme', label: '主题外观', hint: '界面配色与显示风格', icon: Palette },
@@ -164,6 +164,7 @@ export function SettingsPage({
   onReset,
   onApplyToPlate,
   embedded = false,
+  initialSection = 'theme',
 }: {
   theme: ThemeMode;
   themeStyle?: ThemeStyle;
@@ -186,17 +187,16 @@ export function SettingsPage({
   onReset: () => void;
   onApplyToPlate: () => void;
   embedded?: boolean;
+  initialSection?: SettingsSection;
 }) {
-  const [activeSection, setActiveSection] = useState<SettingsSection>('theme');
+  const [activeSection, setActiveSection] = useState<SettingsSection>(initialSection);
   const setNumber = (key: NumberSettingKey) => (value: number) => onDraftChange({ [key]: value });
   const setBoolean = (key: BooleanSettingKey) => (checked: boolean) => onDraftChange({ [key]: checked });
   const setConnectionMode = (mode: ConnectionMode) => onConnectionChange({ mode });
   const handleVolume = (event: ChangeEvent<HTMLInputElement>) => onDraftChange({ alarmVolume: Number(event.target.value) });
   const currentThemeLabel = themeOptions.find((option) => option.id === theme)?.label ?? '深色工业';
   const webHosted = isWebHostedRuntime();
-  const displayedServiceAddress = webHosted && typeof window !== 'undefined'
-    ? window.location.origin
-    : `${connection.protocol ?? 'http'}://${connection.host}:${connection.port}`;
+  const displayedServiceAddress = `${connection.protocol ?? 'http'}://${connection.host}:${connection.port}`;
 
   return (
     <div className={`settings-page ${embedded ? 'settings-page-embedded' : 'workspace-page'}`}>
@@ -246,60 +246,55 @@ export function SettingsPage({
                 </button>
               </div>
               {webHosted ? (
-                <div className="connection-same-origin" role="status">
-                  <strong>网页同源连接</strong>
-                  <span>当前页面与检测 API 共用 {displayedServiceAddress}，无需配置 IP 或 UI 端口。</span>
+                <div className="connection-browser-target" role="status">
+                  <strong>网页可配置服务地址</strong>
+                  <span>当前页面将直接访问 {displayedServiceAddress}；目标检测服务需允许浏览器跨域访问。</span>
                 </div>
-              ) : (
-                <>
-                  <label className="setting-field">
-                    <span>连接协议</span>
-                    <select
-                      aria-label="连接协议"
-                      value={connection.protocol ?? 'http'}
-                      disabled={connection.mode === 'demo'}
-                      onChange={(event) => onConnectionChange({ protocol: event.target.value as 'http' | 'https' })}
-                    >
-                      <option value="http">HTTP</option>
-                      <option value="https">HTTPS</option>
-                    </select>
-                  </label>
-                  <label className="setting-field">
-                    <span>服务端 IP</span>
-                    <input
-                      aria-label="服务端 IP"
-                      value={connection.host}
-                      disabled={connection.mode === 'demo'}
-                      onChange={(event) => onConnectionChange({ host: event.target.value })}
-                    />
-                  </label>
-                  <label className="setting-field">
-                    <span>服务端端口</span>
-                    <div className="number-input">
-                      <input
-                        aria-label="服务端端口"
-                        type="number"
-                        min={1}
-                        max={65535}
-                        value={connection.port}
-                        disabled={connection.mode === 'demo'}
-                        onChange={(event) => onConnectionChange({ port: Number(event.target.value) })}
-                      />
-                      <b>port</b>
-                    </div>
-                  </label>
-                </>
-              )}
+              ) : null}
+              <label className="setting-field">
+                <span>连接协议</span>
+                <select
+                  aria-label="连接协议"
+                  value={connection.protocol ?? 'http'}
+                  disabled={connection.mode === 'demo'}
+                  onChange={(event) => onConnectionChange({ protocol: event.target.value as 'http' | 'https' })}
+                >
+                  <option value="http">HTTP</option>
+                  <option value="https">HTTPS</option>
+                </select>
+              </label>
+              <label className="setting-field">
+                <span>服务端 IP</span>
+                <input
+                  aria-label="服务端 IP"
+                  value={connection.host}
+                  disabled={connection.mode === 'demo'}
+                  onChange={(event) => onConnectionChange({ host: event.target.value })}
+                />
+              </label>
+              <label className="setting-field">
+                <span>服务端端口</span>
+                <div className="number-input">
+                  <input
+                    aria-label="服务端端口"
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={connection.port}
+                    disabled={connection.mode === 'demo'}
+                    onChange={(event) => onConnectionChange({ port: Number(event.target.value) })}
+                  />
+                  <b>port</b>
+                </div>
+              </label>
               <div className="settings-actions">
-                {!webHosted ? (
-                  <button type="button" disabled={connection.mode === 'demo' || discoveryBusy} onClick={onConnectionDiscover}>
-                    {discoveryBusy ? <LoaderCircle className="spin" size={16} /> : <Radar size={16} />}
-                    {discoveryBusy ? '正在发现' : '自动发现'}
-                  </button>
-                ) : null}
+                <button type="button" disabled={connection.mode === 'demo' || discoveryBusy} onClick={onConnectionDiscover}>
+                  {discoveryBusy ? <LoaderCircle className="spin" size={16} /> : <Radar size={16} />}
+                  {discoveryBusy ? '正在发现' : '自动发现'}
+                </button>
                 <button type="button" onClick={onConnectionSave}>
                   <Save size={16} />
-                  {webHosted ? '刷新连接' : '保存连接'}
+                  保存连接
                 </button>
                 <button
                   type="button"
@@ -310,7 +305,7 @@ export function SettingsPage({
                   参数管理
                 </button>
               </div>
-              {!webHosted && (discoveryStatus || discoveredServices.length > 0) ? (
+              {discoveryStatus || discoveredServices.length > 0 ? (
                 <section className="connection-discovery" aria-label="自动发现结果">
                   <header>
                     <strong>局域网服务</strong>

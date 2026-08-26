@@ -26,6 +26,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(1_800);
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_TASKS: usize = 16;
+const MAX_LOG_TAIL_CHARS: usize = 64 * 1024;
 const RECENT_FAILURE_WINDOW_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -39,6 +40,49 @@ pub(crate) struct BackgroundTaskSnapshot {
     pub progress: f64,
     pub updated_at: String,
     pub error: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackgroundMonitorService {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub kind: String,
+    pub origin: String,
+    pub port: u16,
+    pub health_path: String,
+    pub ok: bool,
+    pub required: bool,
+    pub status: String,
+    pub response_status: u16,
+    pub latency_ms: u64,
+    pub uptime_ms: Option<u64>,
+    pub reason: Option<String>,
+    pub lifecycle: Option<Value>,
+    pub operations: Vec<Value>,
+    pub control: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackgroundMonitorLog {
+    pub name: String,
+    pub service_id: Option<String>,
+    pub service_name: Option<String>,
+    pub bytes: u64,
+    pub modified_at: String,
+    pub tail: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackgroundMonitorRuntime {
+    pub state_root: Option<String>,
+    pub log_root: String,
+    pub task_worker: Option<Value>,
+    pub supervisor: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -58,6 +102,13 @@ pub(crate) struct BackgroundMonitorSnapshot {
     pub detail: String,
     pub updated_at_unix_ms: u64,
     pub tasks: Vec<BackgroundTaskSnapshot>,
+    pub services: Vec<BackgroundMonitorService>,
+    pub logs: Vec<BackgroundMonitorLog>,
+    pub runtime: Option<BackgroundMonitorRuntime>,
+    pub registry: Option<Value>,
+    pub monitor_protocol: Option<Value>,
+    pub service_count: u64,
+    pub healthy_service_count: u64,
 }
 
 impl Default for BackgroundMonitorSnapshot {
@@ -77,6 +128,13 @@ impl Default for BackgroundMonitorSnapshot {
             detail: "正在连接后台检测服务".to_string(),
             updated_at_unix_ms: unix_time_millis(),
             tasks: Vec::new(),
+            services: Vec::new(),
+            logs: Vec::new(),
+            runtime: None,
+            registry: None,
+            monitor_protocol: None,
+            service_count: 0,
+            healthy_service_count: 0,
         }
     }
 }
@@ -326,6 +384,155 @@ fn task_snapshot(value: &Value) -> Option<BackgroundTaskSnapshot> {
     })
 }
 
+fn value_text(value: &Value, key: &str, fallback: &str, max_chars: usize) -> String {
+    bounded_text(
+        value.get(key).and_then(Value::as_str).unwrap_or(fallback),
+        max_chars,
+    )
+}
+
+fn value_u64(value: &Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(|item| item.as_u64().or_else(|| item.as_str()?.parse().ok()))
+        .unwrap_or(0)
+}
+
+fn service_snapshot(value: &Value) -> Option<BackgroundMonitorService> {
+    let id = value_text(value, "id", "", 96);
+    if id.is_empty() {
+        return None;
+    }
+    let origin = value_text(value, "origin", "", 180);
+    let health_path = value_text(value, "healthPath", "/api/health/live", 160);
+    let response_status = value_u64(value, "responseStatus").min(u64::from(u16::MAX)) as u16;
+    let port = value_u64(value, "port").min(u64::from(u16::MAX)) as u16;
+    let reason = value
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(|item| bounded_text(item, 240))
+        .filter(|item| !item.is_empty());
+    Some(BackgroundMonitorService {
+        id,
+        name: value_text(value, "name", "未命名服务", 160),
+        role: value_text(value, "role", "service", 96),
+        kind: value_text(value, "kind", "probe", 48),
+        origin,
+        port,
+        health_path,
+        ok: value.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        required: value
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        status: value_text(value, "status", "unknown", 48),
+        response_status,
+        latency_ms: value_u64(value, "latencyMs"),
+        uptime_ms: value
+            .get("uptimeMs")
+            .and_then(|item| item.as_u64().or_else(|| item.as_str()?.parse().ok())),
+        reason,
+        lifecycle: value.get("lifecycle").cloned(),
+        operations: value
+            .get("operations")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().take(16).cloned().collect())
+            .unwrap_or_default(),
+        control: value.get("control").cloned(),
+    })
+}
+
+fn log_snapshot(value: &Value) -> Option<BackgroundMonitorLog> {
+    let name = value_text(value, "name", "", 180);
+    if name.is_empty() {
+        return None;
+    }
+    let optional_text = |key: &str, max_chars: usize| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|item| bounded_text(item, max_chars))
+            .filter(|item| !item.is_empty())
+    };
+    Some(BackgroundMonitorLog {
+        name,
+        service_id: optional_text("serviceId", 96),
+        service_name: optional_text("serviceName", 160),
+        bytes: value_u64(value, "bytes"),
+        modified_at: value_text(value, "modifiedAt", "", 64),
+        tail: value_text(value, "tail", "", MAX_LOG_TAIL_CHARS),
+        truncated: value
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn runtime_snapshot(value: &Value) -> Option<BackgroundMonitorRuntime> {
+    let runtime = value.get("runtime")?.as_object()?;
+    Some(BackgroundMonitorRuntime {
+        state_root: runtime
+            .get("stateRoot")
+            .and_then(Value::as_str)
+            .map(|item| bounded_text(item, 260)),
+        log_root: runtime
+            .get("logRoot")
+            .and_then(Value::as_str)
+            .map(|item| bounded_text(item, 260))
+            .unwrap_or_default(),
+        task_worker: runtime.get("taskWorker").cloned(),
+        supervisor: runtime.get("supervisor").cloned(),
+    })
+}
+
+fn runtime_payload_snapshots(
+    value: Option<&Value>,
+) -> (
+    Vec<BackgroundMonitorService>,
+    Vec<BackgroundMonitorLog>,
+    Option<BackgroundMonitorRuntime>,
+    Option<Value>,
+    Option<Value>,
+    bool,
+    Vec<String>,
+) {
+    let Some(value) = value else {
+        return (Vec::new(), Vec::new(), None, None, None, false, Vec::new());
+    };
+    let services = value
+        .get("services")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(service_snapshot)
+        .take(32)
+        .collect::<Vec<_>>();
+    let logs = value
+        .get("logs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(log_snapshot)
+        .take(64)
+        .collect::<Vec<_>>();
+    let failed_required = services
+        .iter()
+        .filter(|service| service.required && !service.ok)
+        .map(|service| service.name.clone())
+        .collect::<Vec<_>>();
+    let degraded = value.get("status").and_then(Value::as_str) == Some("degraded")
+        || !failed_required.is_empty();
+    (
+        services,
+        logs,
+        runtime_snapshot(value),
+        value.get("registry").cloned(),
+        value.get("monitorProtocol").cloned(),
+        degraded,
+        failed_required,
+    )
+}
+
 fn task_is_recent(task: &BackgroundTaskSnapshot, now: u64) -> bool {
     task.updated_at
         .parse::<u64>()
@@ -339,6 +546,7 @@ fn snapshot_from_payloads(
     health: &Value,
     production: Option<&Value>,
     task_page: Option<&Value>,
+    runtime_status: Option<&Value>,
     now: u64,
 ) -> BackgroundMonitorSnapshot {
     let service_ready = health.get("ok").and_then(Value::as_bool).unwrap_or(false);
@@ -387,11 +595,21 @@ fn snapshot_from_payloads(
         });
     let active_tasks = listed_active_tasks.max(u64::from(active_task_id.is_some()));
     let task_data_available = production.is_some() && task_page.is_some();
+    let (
+        services,
+        logs,
+        runtime,
+        registry,
+        monitor_protocol,
+        runtime_degraded,
+        failed_required_services,
+    ) = runtime_payload_snapshots(runtime_status);
     let state = if !service_ready
         || !worker_running
         || !task_data_available
         || failed_tasks > 0
         || blocked_tasks > 0
+        || runtime_degraded
     {
         "degraded"
     } else if active_tasks > 0 || queue_depth > 0 {
@@ -411,6 +629,16 @@ fn snapshot_from_payloads(
         ),
         _ if !worker_running => "生产任务工作线程未运行".to_string(),
         _ if !task_data_available => "任务状态接口暂时不可用".to_string(),
+        _ if runtime_degraded && !failed_required_services.is_empty() => format!(
+            "注册服务未就绪：{}",
+            failed_required_services
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("、")
+        ),
+        _ if runtime_degraded => "服务运行状态需要关注".to_string(),
         _ => format!(
             "最近任务异常 {} 项，阻塞 {} 项",
             failed_tasks, blocked_tasks
@@ -431,6 +659,13 @@ fn snapshot_from_payloads(
         detail,
         updated_at_unix_ms: now,
         tasks,
+        service_count: services.len() as u64,
+        healthy_service_count: services.iter().filter(|service| service.ok).count() as u64,
+        services,
+        logs,
+        runtime,
+        registry,
+        monitor_protocol,
     }
 }
 
@@ -454,6 +689,13 @@ fn offline_snapshot(origin: &str, error: &str) -> BackgroundMonitorSnapshot {
         },
         updated_at_unix_ms: unix_time_millis(),
         tasks: Vec::new(),
+        services: Vec::new(),
+        logs: Vec::new(),
+        runtime: None,
+        registry: None,
+        monitor_protocol: None,
+        service_count: 0,
+        healthy_service_count: 0,
     }
 }
 
@@ -471,11 +713,16 @@ fn poll_snapshot(origin: &str) -> BackgroundMonitorSnapshot {
         .ok()
         .filter(|(status, _)| (200..300).contains(status))
         .map(|(_, value)| value);
+    let runtime_status = bounded_json_get(origin, "/api/runtime/status")
+        .ok()
+        .filter(|(status, _)| (200..300).contains(status))
+        .map(|(_, value)| value);
     snapshot_from_payloads(
         origin,
         &health,
         production.as_ref(),
         tasks.as_ref(),
+        runtime_status.as_ref(),
         unix_time_millis(),
     )
 }
@@ -769,6 +1016,7 @@ mod tests {
             &healthy_payload(),
             Some(&production),
             Some(&page),
+            None,
             now,
         );
         assert_eq!(snapshot.state, "degraded");
@@ -790,6 +1038,7 @@ mod tests {
             &healthy_payload(),
             Some(&production),
             Some(&page),
+            None,
             1,
         );
         assert_eq!(healthy.state, "healthy");
@@ -800,6 +1049,7 @@ mod tests {
             &healthy_payload(),
             Some(&queued),
             Some(&page),
+            None,
             1,
         );
         assert_eq!(busy.state, "busy");
@@ -810,14 +1060,73 @@ mod tests {
             &healthy_payload(),
             Some(&active_only),
             Some(&page),
+            None,
             1,
         );
         assert_eq!(active.state, "busy");
         assert_eq!(active.active_tasks, 1);
 
-        let missing = snapshot_from_payloads(DEFAULT_ORIGIN, &healthy_payload(), None, None, 1);
+        let missing =
+            snapshot_from_payloads(DEFAULT_ORIGIN, &healthy_payload(), None, None, None, 1);
         assert_eq!(missing.state, "degraded");
         assert_eq!(missing.detail, "任务状态接口暂时不可用");
+    }
+
+    #[test]
+    fn runtime_capability_contract_survives_the_tauri_snapshot_boundary() {
+        let runtime = json!({
+            "status": "running",
+            "monitorProtocol": {
+                "schema": "steel.runtime-monitor-capabilities.v1",
+                "version": 1,
+                "selectionKey": "serviceId",
+                "logScopes": ["service", "all"],
+                "operationEffects": ["query", "local", "mutation"],
+                "mutationPolicy": "capability-only",
+                "readAccess": "loopback-or-private-network"
+            },
+            "services": [{
+                "id": "inspection",
+                "name": "业务服务",
+                "role": "api",
+                "kind": "inspection",
+                "origin": "http://127.0.0.1:4873",
+                "port": 4873,
+                "healthPath": "/api/health/live",
+                "ok": true,
+                "required": true,
+                "status": "running",
+                "responseStatus": 200,
+                "operations": [{
+                    "id": "refresh-status",
+                    "effect": "query",
+                    "scope": "service",
+                    "enabled": true
+                }],
+                "control": { "mode": "observe", "owner": "service" }
+            }],
+            "logs": []
+        });
+        let production = json!({"tasks":{"queueDepth":0,"worker":{"running":true}}});
+        let page = json!({"tasks":[]});
+        let snapshot = snapshot_from_payloads(
+            DEFAULT_ORIGIN,
+            &healthy_payload(),
+            Some(&production),
+            Some(&page),
+            Some(&runtime),
+            1,
+        );
+
+        assert_eq!(snapshot.services[0].operations[0]["id"], "refresh-status");
+        assert_eq!(
+            snapshot.services[0].control.as_ref().unwrap()["mode"],
+            "observe"
+        );
+        assert_eq!(
+            snapshot.monitor_protocol.as_ref().unwrap()["mutationPolicy"],
+            "capability-only"
+        );
     }
 
     #[test]

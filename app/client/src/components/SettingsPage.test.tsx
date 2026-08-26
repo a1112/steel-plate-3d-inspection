@@ -56,6 +56,33 @@ describe('SettingsPage', () => {
     expect(screen.queryByRole('button', { name: '选择深色工业主题' })).not.toBeInTheDocument();
   });
 
+  it('opens directly on connection settings when requested by the footer shortcut', () => {
+    const settings = createDefaultSettings();
+    render(
+      <SettingsPage
+        embedded
+        initialSection="connection"
+        theme="light"
+        draft={settings}
+        saved={settings}
+        errors={{}}
+        connection={{ mode: 'online', host: '10.50.111.141', port: 4873, protocol: 'http' }}
+        onThemeChange={vi.fn()}
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onReset={vi.fn()}
+        onApplyToPlate={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /连接设置/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('heading', { name: '连接设置' })).toBeInTheDocument();
+    expect(screen.getByLabelText('服务端 IP')).toHaveValue('10.50.111.141');
+    expect(screen.getByLabelText('服务端端口')).toHaveValue(4873);
+    expect(screen.getByText('http://10.50.111.141:4873')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择浅色巡检主题' })).not.toBeInTheDocument();
+  });
+
   it('discovers LAN services and applies the selected IP to connection settings', () => {
     const settings = createDefaultSettings();
     const onConnectionDiscover = vi.fn();

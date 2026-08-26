@@ -91,7 +91,7 @@ import { LeftSidebar } from './components/LeftSidebar';
 import { LiveMonitoringPage } from './components/LiveCameraMonitor';
 import { PlateMap, type PlateMapViewMode } from './components/PlateMap';
 import { ReportPage } from './components/ReportPage';
-import { SettingsPage } from './components/SettingsPage';
+import { SettingsPage, type SettingsSection } from './components/SettingsPage';
 import { DefectFilterPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
 import { BackgroundMonitorApp } from './components/BackgroundMonitorApp';
@@ -401,8 +401,7 @@ export default function App() {
     const themeStyle = readStoredThemeStyle();
     return (
       <div className={`app-shell theme-${theme} style-${themeStyle} standalone-tool-shell background-monitor-standalone-shell`}>
-        <StandaloneWindowTitlebar kind="monitor" title="后台任务监控" systemName={systemName} />
-        <BackgroundMonitorApp />
+        <BackgroundMonitorApp systemName={systemName} />
       </div>
     );
   }
@@ -804,6 +803,7 @@ function InspectionDashboard({
     revision: 0,
   });
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSection>('theme');
   const [bkvConversionStatusOpen, setBkvConversionStatusOpen] = useState(false);
   const [inspectionFlowVisible, setInspectionFlowVisible] = useState(false);
   const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>(terminalMode === 'bkv' ? 'history' : 'latest');
@@ -2212,7 +2212,14 @@ function InspectionDashboard({
           onCollapsedChange: setAnalysisCollapsed,
         } : null}
         onNavChange={(activeNav) => setState({ activeNav })}
-        onSettingsOpen={() => setSettingsModalOpen(true)}
+        onSettingsOpen={() => {
+          setSettingsInitialSection('theme');
+          setSettingsModalOpen(true);
+        }}
+        onConnectionSettingsOpen={() => {
+          setSettingsInitialSection('connection');
+          setSettingsModalOpen(true);
+        }}
       />
       {settingsModalOpen ? (
         <div
@@ -2236,6 +2243,7 @@ function InspectionDashboard({
             </header>
             <SettingsPage
               embedded
+              initialSection={settingsInitialSection}
               theme={uiState.theme}
               themeStyle={uiState.themeStyle}
               draft={settingsDraft}
