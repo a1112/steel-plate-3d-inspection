@@ -14,6 +14,7 @@ import {
   fetchInspectionReportArchives,
   fetchInspectionSnapshot,
   fetchProductionDefectHistory,
+  fetchProductionTasks,
   formatProductionDateTime,
   formatProductionRecordTime,
   fetchBkvStatus,
@@ -913,6 +914,27 @@ describe('persistent production command client', () => {
     });
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:4873/api/health/details',
+      { headers: { Accept: 'application/json' }, signal: undefined },
+    );
+  });
+
+  it('reads a bounded page of production tasks without admin credentials', async () => {
+    const payload = {
+      code: 0,
+      total: 1,
+      limit: 100,
+      offset: 0,
+      tasks: [{ taskId: 'TASK-1', kind: 'capture-once', status: 'running' }],
+      taskWorker: { running: true, activeTaskId: 'TASK-1', capacity: 128 },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const page = await fetchProductionTasks(500);
+
+    expect(page.taskWorker.activeTaskId).toBe('TASK-1');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4873/api/production/tasks?limit=100',
       { headers: { Accept: 'application/json' }, signal: undefined },
     );
   });

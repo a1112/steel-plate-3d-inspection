@@ -94,6 +94,7 @@ import { ReportPage } from './components/ReportPage';
 import { SettingsPage } from './components/SettingsPage';
 import { DefectFilterPanel } from './components/StatisticsPanel';
 import { ParameterManagementApp } from './components/ParameterManagementApp';
+import { BackgroundMonitorApp } from './components/BackgroundMonitorApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { BarSurfaceApp } from './components/BarSurfaceApp';
 import { BkvReconstructionApp } from './components/BkvReconstructionApp';
@@ -321,6 +322,7 @@ export default function App() {
   const systemName = resolveSystemName(runtimeProfile?.siteDisplayName);
 
   useEffect(() => {
+    if (requestedAppMode === 'monitor') return;
     const controller = new AbortController();
     let disposed = false;
     const timeout = window.setTimeout(() => controller.abort(), 3_500);
@@ -353,7 +355,7 @@ export default function App() {
       window.clearTimeout(timeout);
       controller.abort();
     };
-  }, [runtimeProfileRevision]);
+  }, [requestedAppMode, runtimeProfileRevision]);
 
   const reportConnectionIssue = useCallback((detail: string) => {
     setConnectionIssue(detail);
@@ -393,6 +395,17 @@ export default function App() {
     url.searchParams.set('app', 'terminal');
     window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
   }, [requestedAppMode, runtimeProfile]);
+
+  if (requestedAppMode === 'monitor') {
+    const theme = readStoredTheme();
+    const themeStyle = readStoredThemeStyle();
+    return (
+      <div className={`app-shell theme-${theme} style-${themeStyle} standalone-tool-shell background-monitor-standalone-shell`}>
+        <StandaloneWindowTitlebar kind="monitor" title="后台任务监控" systemName={systemName} />
+        <BackgroundMonitorApp />
+      </div>
+    );
+  }
 
   if (!runtimeProfile) {
     return (

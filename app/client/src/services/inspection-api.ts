@@ -903,6 +903,7 @@ export type ProductionEventInput = {
 export type ProductionTaskSummary = {
   id?: string;
   taskId: string;
+  idempotencyKey?: string;
   kind: string;
   materialId: string;
   sessionId: string;
@@ -913,12 +914,38 @@ export type ProductionTaskSummary = {
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | 'blocked' | string;
   phase?: string;
   progress?: number;
+  attempts?: number;
+  maxAttempts?: number;
   cancelRequested?: boolean;
   error?: string;
+  actor?: string;
+  createdAt?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  updatedAt?: string;
 };
 
 export type ProductionTaskDetail = ProductionTaskSummary & {
   result?: ProductionCommandResult | null;
+};
+
+export type ProductionTaskWorker = {
+  running: boolean;
+  activeTaskId?: string | null;
+  lastHeartbeatAt?: string | null;
+  heartbeatAgeMs?: number | null;
+  lastError?: string;
+  recoveredTasks?: number | null;
+  capacity?: number;
+};
+
+export type ProductionTaskPage = {
+  code: number;
+  total: number;
+  limit: number;
+  offset: number;
+  tasks: ProductionTaskDetail[];
+  taskWorker: ProductionTaskWorker;
 };
 
 export type ProductionCommandResult = {
@@ -992,6 +1019,8 @@ export type TriggerGatewayStatus = {
 export type ServiceHealthCheck = {
   ok: boolean;
   status: string;
+  running?: boolean;
+  busy?: boolean;
   level?: 'ok' | 'warning' | 'critical' | 'simulated' | string;
   reason?: string | null;
   warningReason?: string | null;
@@ -1949,6 +1978,25 @@ export async function fetchProductionStatus(signal?: AbortSignal): Promise<Produ
     throw new Error(await readAdminErrorMessage(response, '生产采集状态接口异常'));
   }
   return response.json() as Promise<ProductionStatus>;
+}
+
+export async function fetchProductionTasks(
+  limit = 16,
+  signal?: AbortSignal,
+): Promise<ProductionTaskPage> {
+  const config = getStoredConnectionConfig();
+  const boundedLimit = Math.min(100, Math.max(1, Math.trunc(limit) || 16));
+  const response = await fetch(
+    `${getInspectionServiceOrigin(config)}/api/production/tasks?limit=${boundedLimit}`,
+    {
+      headers: { Accept: 'application/json' },
+      signal,
+    },
+  );
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '生产任务列表读取失败'));
+  }
+  return response.json() as Promise<ProductionTaskPage>;
 }
 
 export async function fetchServiceHealthDetails(signal?: AbortSignal): Promise<ServiceHealthDetails> {

@@ -8,6 +8,7 @@ function createWindowApi() {
   const api: TauriWindowApi = {
     isAvailable: true,
     close: vi.fn(async () => {}),
+    hide: vi.fn(async () => {}),
     isFullscreen: vi.fn(async () => fullscreen),
     minimize: vi.fn(async () => {}),
     setTitle: vi.fn(async () => {}),

@@ -19,7 +19,7 @@ flowchart LR
   SUP -.管理.-> G["steel-trigger-gateway"]
 ```
 
-业务服务在生产模式只读统一结果库，不读取 BKV、共享目录或采集原始目录，也不启动算法/采集子进程。Supervisor 按图像、算法、采集、业务、触发网关的顺序启动并按反向顺序停止；托盘程序只控制 SCM，不持有管理员凭据。
+业务服务在生产模式只读统一结果库，不读取 BKV、共享目录或采集原始目录，也不启动算法/采集子进程。Supervisor 按图像、算法、采集、业务、触发网关的顺序启动并按反向顺序停止。`steel-inspection-tray.exe` 只控制 SCM，不持有管理员凭据；独立的 Tauri 服务器任务监控只读健康、队列和最近任务状态，不执行 SCM 或生产任务写操作。
 
 ## 统一结果协议
 
@@ -45,6 +45,7 @@ flowchart LR
 - 生产 BKV 调试使用未纳入 Git 的环境文件，例如 `scripts/run-tauri-dev.ps1 -EnvFile config/env/bkv-online.env.local`。脚本在导入环境文件后重新绑定本地结果库、状态根和服务端口，避免业务服务误连原始 BKV 源。
 - 后台管理的“运行日志”页调用受 `admin.services` 保护的 `/api/admin/runtime/logs`，展示 Supervisor 状态、4873/4874/4875/4317/4881 进程探针、统一结果目录就绪状态，以及日志文件最近 240 行；前端每 5 秒轮询并在切换页签/卸载时取消旧请求。
 - Windows 服务安装脚本为 Supervisor 注入 `STEEL_RESULT_ROOT`、`STEEL_ALGORITHM_INPUT_ROOTS` 和代理模式标志，并创建 `result-data`、`algorithm-input`、`work/image`、`work/algorithm` 目录。
-- `steel-inspection-tray.exe` 支持查看状态、打开日志/数据目录、打开 Tauri、启动/停止/重启 SCM，以及当前用户登录自启动；退出托盘不会停止后台服务。
+- `steel-inspection-tray.exe` 支持查看状态、打开日志/数据目录、打开 Tauri、启动/停止/重启 SCM，以及当前用户登录自启动；退出该托盘不会停止后台服务。
+- `steel-inspection-server-monitor.exe` 是部署在服务器交互式用户会话中的独立 Tauri 进程，不依赖操作客户端存活。它每 5 秒在 Rust 后台线程读取 `/api/health/details`、`/api/production/status` 和最近任务列表；关闭监控窗口只会隐藏到自身托盘，显式退出也不会停止后台 Windows 服务。该程序不保存管理员令牌，也不提供任务取消、重试或服务启停。
 
 生产就绪条件同时要求 4874 图像服务、4875 算法服务和 `catalog.db` 可用；缺任一项，业务服务 readiness 失败。
