@@ -3,7 +3,7 @@ import type { ComponentProps } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType } from '../data/inspection';
 import { createSequentialCameraLanes } from '../lib/camera-display';
-import type { CaptureSurfaceCameraTiles } from '../lib/capture-api';
+import type { CaptureFlowSurface, CaptureSurfaceCameraTiles } from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { fetchCaptureStitchHistory, type CaptureStitchResult } from '../services/capture-roi-api';
 import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
@@ -88,6 +88,28 @@ function emptyCaptureStitchResult(materialId: string): CaptureStitchResult {
     algorithmRoiImageCount: 0,
     autoCropImageCount: 0,
     frames: [],
+  };
+}
+
+function headAlignment(): NonNullable<CaptureFlowSurface['headAlignment']> {
+  return {
+    referenceCameraId: 'C1',
+    origin: 'detected-steel-head',
+    aligned: true,
+    mode: 'capture-round-and-in-frame-row-padding',
+    displayAligned: true,
+    alignedTimelinePositionFrames: 4,
+    timelineSpreadFrames: 2,
+    maximumDisplayPaddingFrames: 2,
+    cameras: Object.fromEntries(Array.from({ length: 6 }, (_, index) => {
+      const cameraId = `C${index + 1}`;
+      return [cameraId, {
+        detected: true,
+        offsetFramesFromReference: index === 1 ? -2 : 0,
+        displayPaddingFrames: index === 1 ? 2 : 0,
+        displayAligned: true,
+      }];
+    })),
   };
 }
 
@@ -268,6 +290,7 @@ describe('online inspection world compatibility', () => {
         inspectionId="INSP-unknown-material-1787509339423"
         captureMaterialId="2747"
         cameraLanes={createSequentialCameraLanes(6)}
+        surfaceHeadAlignment={headAlignment()}
       />,
     );
 
@@ -275,6 +298,19 @@ describe('online inspection world compatibility', () => {
     const viewport = screen.getByTestId('capture-stitch-viewport');
     expect(viewport).toHaveAttribute('data-scroll-axis', 'x');
     expect(viewport).toHaveAttribute('data-frame-count', '12');
+    expect(viewport).toHaveAttribute('data-head-aligned', 'true');
+    expect(viewport).toHaveAttribute('data-head-display-padding-applied', 'true');
+    expect(screen.getByTestId('head-alignment-summary')).toHaveTextContent(
+      '头部已对齐参考 C1 · 最大补偿 2.00 帧',
+    );
+    const c1First = document.querySelector('.bar-camera-frame[data-camera-id="C1"][data-frame-sequence="1"]');
+    const c2First = document.querySelector('.bar-camera-frame[data-camera-id="C2"][data-frame-sequence="1"]');
+    expect(c1First).toHaveStyle({ left: '0px' });
+    expect(c2First).toHaveStyle({ left: '352px' });
+    expect(screen.getByRole('button', { name: /camera2 采集图像/ })).toHaveAttribute(
+      'data-head-offset-frames',
+      '-2.000000',
+    );
     expect(document.querySelectorAll('.bar-camera-frame').length).toBeGreaterThan(6);
     expect(document.querySelectorAll('.bar-camera-frame').length).toBeLessThan(12 * 6);
     expect(screen.getAllByLabelText(/算法 ROI 裁剪图/).every((canvas) => (
@@ -1077,10 +1113,80 @@ describe('PlateMap', () => {
     expect(screen.getByTestId('plate-production-surface')).toHaveAttribute('data-artifact-source', 'production-record');
     expect(screen.getByTestId('plate-production-surface')).toHaveAttribute('data-artifact-points', '4');
     expect(screen.getByTestId('plate-production-surface')).toHaveAttribute('data-artifact-triangles', '2');
+    expect(screen.getByTestId('plate-production-surface')).toHaveAttribute('data-artifact-color-mode', 'neutral');
 
     fireEvent.click(screen.getByRole('button', { name: /^点云$/ }));
     expect(screen.getByTestId('plate-production-point-cloud')).toHaveAttribute('data-artifact-source', 'production-record');
     expect(screen.queryByTestId('plate-point-cloud-view')).not.toBeInTheDocument();
+  });
+
+  it('uses the fused capture cross-section view for a record-bound SICK mesh', () => {
+    const onPreviewPositionChange = vi.fn();
+    render(
+      <ProductionPlateMap
+        defectTypes={defectTypes}
+        defects={defects}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId="D-TOP"
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        inspectionId="INS-4034"
+        surfaceMesh={{
+          ...productionMesh,
+          materialId: '4034',
+          metricValid: false,
+          displayMode: 'diagnostic-unqualified',
+          validMask: new Uint8Array([1, 1, 1, 1]),
+          longitudinalAxis: { absoluteScaleVerified: false },
+        }}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={onPreviewPositionChange}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '切面' }));
+    expect(screen.getByTestId('capture-section-view')).toBeInTheDocument();
+    expect(screen.queryByTestId('bkv-reconstruction-section')).not.toBeInTheDocument();
+    expect(screen.getByText(/头部进度/)).toBeInTheDocument();
+  });
+
+  it('keeps point-cloud and section modes available when isolated rows have no triangles', () => {
+    render(
+      <ProductionPlateMap
+        defectTypes={defectTypes}
+        defects={defects}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId="D-TOP"
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        inspectionId="INS-SECTION-ONLY"
+        surfaceMesh={{
+          ...productionMesh,
+          materialId: 'SECTION-ONLY',
+          indices: new Uint32Array(),
+          validMask: new Uint8Array([1, 1, 1, 1]),
+          metricValid: false,
+          displayMode: 'diagnostic-unqualified',
+        }}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '3D' }));
+    expect(screen.getByTestId('plate-production-surface-empty')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^点云$/ }));
+    expect(screen.getByTestId('plate-production-point-cloud')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '切面' }));
+    expect(screen.getByTestId('capture-section-view')).toBeInTheDocument();
   });
 
   it('keeps the original camera-band layout and only swaps in processed JET images', () => {
@@ -1110,6 +1216,7 @@ describe('PlateMap', () => {
         inspectionId="INS-PROD-JET"
         surfaceMesh={{ ...productionMesh, jetRangeMm: 0.18 }}
         surfaceCameraTiles={surfaceCameraTiles}
+        surfaceHeadAlignment={headAlignment()}
         cameraLanes={createSequentialCameraLanes(6)}
         onToggleType={vi.fn()}
         onSurfaceModeChange={vi.fn()}
@@ -1120,6 +1227,10 @@ describe('PlateMap', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Jet 平铺' }));
     expect(screen.getByTestId('surface-jet-unfolded')).toHaveAttribute('data-image-source', 'processed-jet-camera-images');
+    expect(screen.getByTestId('capture-stitch-viewport')).toHaveAttribute(
+      'data-head-display-padding-applied',
+      'false',
+    );
     expect(screen.getByRole('region', { name: '6 相机圆周展开缺陷图' })).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: /采集图像/ })).toHaveLength(6);
     const jetImages = screen.getAllByLabelText(/处理后 JET 图/);

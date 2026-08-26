@@ -104,7 +104,7 @@ export function buildDirectionalDiameterLines(
   lengthMm: number,
 ): DiameterCurveLine[] {
   const curves = artifact.surfaceFit?.diameterCurves;
-  if (!artifact.surfaceFit?.metricValid || !curves || curves.metricValid === false) return [];
+  if (!curves || curves.available === false) return [];
   const sections = curves.sections ?? [];
   const fitByAnchor = new Map(
     (artifact.surfaceFit?.sections ?? []).map((section, index) => [
@@ -345,10 +345,11 @@ export function DiameterTrendPanel({ mesh, artifact, nominalDiameterMm, lengthMm
   const averageDiameter = curveSummary?.averageMm ?? surface?.diameterMeanMm ?? diameters.reduce((sum, value) => sum + value, 0) / diameters.length;
   const roundnessMaximum = Math.max(...allSamples.map((sample) => sample.roundnessMm));
   const residualMaximum = Math.max(...allSamples.map((sample) => sample.fitResidualP95Mm));
+  const measurementQualified = Boolean(surface?.metricValid && curveSummary?.metricValid !== false);
   return (
-    <div className="diameter-trend-grid" data-testid="diameter-trend-grid" data-measurement-unit="mm" data-measurement-source={artifact ? 'measurement-artifact' : 'surface-fallback'} data-curve-model={directionalContract ? 'fixed-angle-reconstructed-surface' : 'circle-fit-legacy'} data-fixed-angle-series={directionalLines.filter((line) => line.kind === 'fixed-angle').length} data-section-count={allSamples.length} data-visible-section-count={samples.length} data-x-axis-scope={normalizedRange ? 'visible' : 'global'} data-x-axis-mode={axisMode} data-x-axis-start-ratio={rangeStartRatio.toFixed(4)} data-x-axis-end-ratio={rangeEndRatio.toFixed(4)} data-x-axis-start-mm={(rangeStartRatio * lengthMm).toFixed(0)} data-x-axis-end-mm={(rangeEndRatio * lengthMm).toFixed(0)}>
+    <div className="diameter-trend-grid" data-testid="diameter-trend-grid" data-measurement-unit="mm" data-measurement-source={artifact ? 'measurement-artifact' : 'surface-fallback'} data-measurement-valid={measurementQualified ? 'true' : 'false'} data-curve-model={directionalContract ? 'fixed-angle-reconstructed-surface' : 'circle-fit-legacy'} data-fixed-angle-series={directionalLines.filter((line) => line.kind === 'fixed-angle').length} data-section-count={allSamples.length} data-visible-section-count={samples.length} data-x-axis-scope={normalizedRange ? 'visible' : 'global'} data-x-axis-mode={axisMode} data-x-axis-start-ratio={rangeStartRatio.toFixed(4)} data-x-axis-end-ratio={rangeEndRatio.toFixed(4)} data-x-axis-start-mm={(rangeStartRatio * lengthMm).toFixed(0)} data-x-axis-end-mm={(rangeEndRatio * lengthMm).toFixed(0)}>
       <div className="diameter-metric-summary">
-        <span className="valid">计量有效</span>
+        <span className={measurementQualified ? 'valid' : 'preview'}>{measurementQualified ? '计量有效' : '趋势预览'}</span>
         <dl><dt>有效截面</dt><dd>{curveSummary?.validSectionCount ?? surface?.sectionsAccepted ?? allSamples.length} / {surface?.sectionsRequested ?? allSamples.length}</dd></dl>
         {directionalContract ? <dl><dt>固定角度</dt><dd>{directionalLines.filter((line) => line.kind === 'fixed-angle').length} 条</dd></dl> : null}
         <dl><dt>最小外径</dt><dd>{format(minimumDiameter)} mm</dd></dl>
@@ -356,7 +357,7 @@ export function DiameterTrendPanel({ mesh, artifact, nominalDiameterMm, lengthMm
         <dl><dt>最大外径</dt><dd>{format(maximumDiameter)} mm</dd></dl>
         <dl><dt>最大圆度</dt><dd>{format(surface?.roundnessMaximumMm ?? roundnessMaximum)} mm</dd></dl>
         <dl><dt>拟合 P95</dt><dd>{format(surface?.fitResidualP95MaximumMm ?? residualMaximum)} mm</dd></dl>
-        <em>{axisMode === 'head-relative' ? '无测速仪：横轴按软同步时间归一化，不输出伪长度' : '编码器长度坐标已验证'}</em>
+        <em>{!measurementQualified ? '未通过整卷计量质量门，曲线仅用于趋势查看' : axisMode === 'head-relative' ? '无测速仪：横轴按软同步时间归一化，不输出伪长度' : '编码器长度坐标已验证'}</em>
       </div>
       <DiameterCurve lines={visibleLines} nominalDiameterMm={nominalDiameterMm} axisMode={axisMode} axisStart={axisStart} axisEnd={axisEnd} />
     </div>

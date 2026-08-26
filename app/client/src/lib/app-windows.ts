@@ -1,7 +1,7 @@
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
 export type AppWindowKind = 'capture' | 'parameters' | 'bar-surface';
-export type AppRoute = 'terminal' | AppWindowKind;
+export type AppRoute = 'terminal' | AppWindowKind | 'monitor';
 
 export type AppWindowResult = {
   opened: boolean;
@@ -43,7 +43,7 @@ export function resolveAppRoute(search: string, hash: string): AppRoute {
   const queryParams = new URLSearchParams(search);
   const hashParams = new URLSearchParams(hash.replace(/^#\??/, ''));
   const app = queryParams.get('app') ?? hashParams.get('app');
-  if (app === 'capture' || app === 'parameters' || app === 'bar-surface') {
+  if (app === 'capture' || app === 'parameters' || app === 'bar-surface' || app === 'monitor') {
     return app;
   }
   if (app === 'bar' || app === '3d' || app === 'reconstruction') {

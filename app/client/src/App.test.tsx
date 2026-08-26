@@ -153,6 +153,57 @@ describe('App disconnected startup', () => {
   });
 });
 
+describe('App background monitor route', () => {
+  it('renders the dedicated task monitor and its read-only service endpoints', async () => {
+    window.history.replaceState(null, '', '/?app=monitor');
+    const requestedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(directRuntimeProfile), { status: 200 });
+      }
+      if (url.includes('/api/health/details')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          status: 'ready',
+          service: 'steel-inspection-service',
+          uptimeMs: 1000,
+          checks: { taskWorker: { ok: true, status: 'idle', running: true } },
+        }), { status: 200 });
+      }
+      if (url.includes('/api/production/status')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          tasks: { queueDepth: 0, capacity: 128, worker: { running: true } },
+        }), { status: 200 });
+      }
+      if (url.includes('/api/production/tasks')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          total: 0,
+          limit: 16,
+          offset: 0,
+          tasks: [],
+          taskWorker: { running: true, capacity: 128 },
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByTestId('background-monitor-app')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '后台任务监控' })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(requestedUrls.some((url) => url.includes('/api/health/details'))).toBe(true);
+      expect(requestedUrls.some((url) => url.includes('/api/production/tasks'))).toBe(true);
+    });
+    expect(requestedUrls.some((url) => url.includes('/api/runtime-profile'))).toBe(false);
+    expect(screen.queryByRole('alertdialog', { name: '未连接到检测服务' })).not.toBeInTheDocument();
+  });
+});
+
 describe('App BKV provider selection', () => {
   it('uses the unified standard record catalog in BKV online mode', async () => {
     window.history.replaceState(null, '', '/?app=terminal&view=online');

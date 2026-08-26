@@ -18,9 +18,11 @@ const MAX_ZOOM = 10;
 const ZOOM_FACTOR = 1.2;
 const NORMALIZED_LONGITUDINAL_SPAN = 4.2;
 const NORMALIZED_CROSS_SPAN = 1.35;
-const DEFAULT_DEPTH_EXAGGERATION = 3;
+// Start from the measured geometry. Operators may opt into exaggeration for
+// visual inspection, but the default view must not amplify metric deviations.
+const DEFAULT_DEPTH_EXAGGERATION = 1;
 
-export type ArtifactColorMode = 'source' | 'radial-jet' | 'texture';
+export type ArtifactColorMode = 'source' | 'neutral' | 'radial-jet' | 'texture';
 export type ArtifactOrientation = 'horizontal' | 'vertical';
 
 export type RadialJetSummary = {
@@ -202,7 +204,10 @@ export function buildDepthExaggeratedPositions(
   return output;
 }
 
-function normalizePositions(values: ArrayLike<number>) {
+export function normalizeArtifactPositions(
+  values: ArrayLike<number>,
+  validMask?: ArrayLike<number>,
+) {
   const normalized = new Float32Array(values.length);
   if (values.length < 3) {
     return normalized;
@@ -213,26 +218,38 @@ function normalizePositions(values: ArrayLike<number>) {
   let maxX = Number.NEGATIVE_INFINITY;
   let maxY = Number.NEGATIVE_INFINITY;
   let maxZ = Number.NEGATIVE_INFINITY;
+  let boundedPointCount = 0;
   for (let index = 0; index + 2 < values.length; index += 3) {
+    const pointIndex = Math.floor(index / 3);
+    if (validMask && pointIndex < validMask.length && Number(validMask[pointIndex]) === 0) {
+      continue;
+    }
     const x = Number(values[index]);
     const y = Number(values[index + 1]);
     const z = Number(values[index + 2]);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
     minX = Math.min(minX, x);
     minY = Math.min(minY, y);
     minZ = Math.min(minZ, z);
     maxX = Math.max(maxX, x);
     maxY = Math.max(maxY, y);
     maxZ = Math.max(maxZ, z);
+    boundedPointCount += 1;
   }
+  if (boundedPointCount === 0) return normalized;
   const centerX = (minX + maxX) / 2;
   const centerY = (minY + maxY) / 2;
   const centerZ = (minZ + maxZ) / 2;
-  const largestSpan = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 1);
-  const scale = 4.2 / largestSpan;
+  // The backend's longitudinal coordinate is deliberately a head-relative
+  // display axis until an encoder is connected. Fit that axis and the metric
+  // circular cross-section independently; one unusually large calibrated
+  // centre offset must not make the tube look cropped or fill the viewport.
+  const longitudinalScale = NORMALIZED_LONGITUDINAL_SPAN / Math.max(maxX - minX, 1e-6);
+  const crossSectionScale = NORMALIZED_CROSS_SPAN / Math.max(maxY - minY, maxZ - minZ, 1e-6);
   for (let index = 0; index + 2 < values.length; index += 3) {
-    normalized[index] = (Number(values[index]) - centerX) * scale;
-    normalized[index + 1] = (Number(values[index + 1]) - centerY) * scale;
-    normalized[index + 2] = (Number(values[index + 2]) - centerZ) * scale;
+    normalized[index] = (Number(values[index]) - centerX) * longitudinalScale;
+    normalized[index + 1] = (Number(values[index + 1]) - centerY) * crossSectionScale;
+    normalized[index + 2] = (Number(values[index + 2]) - centerZ) * crossSectionScale;
   }
   return normalized;
 }
@@ -249,7 +266,9 @@ function createArtifactGeometry(
   const jet = colorMode === 'radial-jet'
     ? buildRadialJetColors(mesh, radialUnitScale)
     : null;
-  const sourceColors: ArrayLike<number> = jet?.colors ?? mesh.colors;
+  const sourceColors: ArrayLike<number> = colorMode === 'neutral' || colorMode === 'texture'
+    ? new Float32Array()
+    : jet?.colors ?? mesh.colors;
   const hasColors = sourceColors.length >= pointCount * 3;
   const validMask = mesh.validMask;
   const surfacePositions = indexed
@@ -284,7 +303,10 @@ function createArtifactGeometry(
     colors = validColors;
   }
 
-  geometry.setAttribute('position', new Float32BufferAttribute(normalizePositions(positions), 3));
+  geometry.setAttribute('position', new Float32BufferAttribute(
+    normalizeArtifactPositions(positions, indexed ? validMask : undefined),
+    3,
+  ));
   const renderedPointCount = Math.floor(positions.length / 3);
   if (colors.length >= renderedPointCount * 3) {
     geometry.setAttribute('color', new Float32BufferAttribute(new Float32Array(colors), 3));
@@ -301,7 +323,7 @@ function createArtifactGeometry(
     }
     geometry.setAttribute('uv', new Float32BufferAttribute(uvs, 2));
     geometry.setIndex(new Uint32BufferAttribute(new Uint32Array(mesh.indices), 1));
-    if (colorMode === 'source') {
+    if (colorMode === 'source' || colorMode === 'neutral') {
       geometry.computeVertexNormals();
     }
   }
@@ -409,6 +431,15 @@ export function ProductionArtifactView({
   const { geometry, jetSummary } = artifact;
   const hasColors = geometry.getAttribute('color') !== undefined;
   const pointCount = geometry.getAttribute('position')?.count ?? 0;
+  const validPointCount = useMemo(
+    () => mesh.validMask
+      ? Array.from(mesh.validMask).reduce(
+        (count, value) => count + (Number(value) !== 0 ? 1 : 0),
+        0,
+      )
+      : Math.floor(mesh.positions.length / 3),
+    [mesh],
+  );
   const renderDpr = clamp(
     (typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1)
       * (1 + Math.min(0.75, Math.log2(Math.max(1, zoom)) / 4)),
@@ -528,6 +559,7 @@ export function ProductionArtifactView({
       data-artifact-axis-center={axisCenter.toFixed(4)}
       data-artifact-pan-x={pan.x.toFixed(4)}
       data-artifact-pan-y={pan.y.toFixed(4)}
+      data-artifact-metric-valid={mesh.metricValid === true ? 'true' : 'false'}
       data-visible-range-start={visibleRange[0].toFixed(4)}
       data-visible-range-end={visibleRange[1].toFixed(4)}
       aria-label={ariaLabel}
@@ -622,8 +654,14 @@ export function ProductionArtifactView({
         </group>
       </Canvas>
       <span className="production-artifact-tag">
-        生产记录产物 · {pointCount.toLocaleString('zh-CN')} 点 · {orientation === 'horizontal' ? '横向' : '纵向'} · {zoom.toFixed(2)}x
+        生产记录产物 · {validPointCount.toLocaleString('zh-CN')} 有效点 · {orientation === 'horizontal' ? '横向' : '纵向'} · {zoom.toFixed(2)}x
       </span>
+      {mesh.displayMode ? (
+        <span className={`production-artifact-quality-tag ${mesh.metricValid ? 'is-metric' : 'is-preview'}`}>
+          {mesh.metricValid ? '计量有效' : '趋势预览'} · {mesh.rows} 切面
+          {mesh.longitudinalAxis?.absoluteScaleVerified === true ? ' · 长度尺度已标定' : ' · 头部相对进度'}
+        </span>
+      ) : null}
       {colorMode === 'texture' ? (
         <span className="production-artifact-texture-tag">
           {textureUrl ? '2D 检测图像贴图' : '贴图准备中 · 暂用基础色'}
@@ -668,7 +706,7 @@ export function ProductionArtifactView({
         onPointerUp={(event) => event.stopPropagation()}
         onWheel={(event) => event.stopPropagation()}
       >
-        <div className="production-artifact-length-ruler" aria-label="三维长度毫米刻度">
+        <div className="production-artifact-length-ruler" aria-label={lengthMm > 0 ? '三维长度毫米刻度' : '三维头部相对进度刻度'}>
           {rulerTicks.map((tick, index) => (
             <span key={`${index}:${tick.worldRatio}`} style={{ left: `${tick.screenRatio * 100}%` }}>
               <i />
@@ -683,11 +721,15 @@ export function ProductionArtifactView({
             aria-label="三维长度方向滚动条"
             aria-orientation="horizontal"
             aria-valuemin={0}
-            aria-valuemax={Math.round(lengthMm)}
-            aria-valuenow={Math.round(visibleRange[0] * lengthMm)}
+            aria-valuemax={lengthMm > 0 ? Math.round(lengthMm) : 100}
+            aria-valuenow={lengthMm > 0
+              ? Math.round(visibleRange[0] * lengthMm)
+              : Math.round(visibleRange[0] * 100)}
             aria-valuetext={visibleFraction >= 0.995
               ? '全长'
-              : `${Math.round(visibleRange[0] * lengthMm)} 至 ${Math.round(visibleRange[1] * lengthMm)} 毫米`}
+              : lengthMm > 0
+                ? `${Math.round(visibleRange[0] * lengthMm)} 至 ${Math.round(visibleRange[1] * lengthMm)} 毫米`
+                : `头部进度 ${Math.round(visibleRange[0] * 100)}% 至 ${Math.round(visibleRange[1] * 100)}%`}
             aria-disabled={visibleFraction >= 0.995}
             onPointerDown={(event) => {
               if (visibleFraction >= 0.995) return;
@@ -728,7 +770,9 @@ export function ProductionArtifactView({
               <span
                 className="production-artifact-scrollbar-focus"
                 style={{ left: `${clamp(focusPositionRatio, 0, 1) * 100}%` }}
-                title={`当前缺陷位置 ${Math.round(clamp(focusPositionRatio, 0, 1) * lengthMm)} mm`}
+                title={lengthMm > 0
+                  ? `当前缺陷位置 ${Math.round(clamp(focusPositionRatio, 0, 1) * lengthMm)} mm`
+                  : `当前缺陷位于头部进度 ${Math.round(clamp(focusPositionRatio, 0, 1) * 100)}%`}
               />
             ) : null}
             <b

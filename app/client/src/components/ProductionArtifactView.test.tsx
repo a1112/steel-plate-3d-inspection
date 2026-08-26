@@ -4,6 +4,7 @@ import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import {
   buildDepthExaggeratedPositions,
   buildRadialJetColors,
+  normalizeArtifactPositions,
   ProductionArtifactView,
 } from './ProductionArtifactView';
 
@@ -71,6 +72,22 @@ function radialFixture(): BarSurfaceMesh {
 }
 
 describe('ProductionArtifactView', () => {
+  it('fits bounds from valid vertices so null-fill zeros cannot crop an offset surface', () => {
+    const normalized = normalizeArtifactPositions(
+      new Float32Array([
+        0, 0, 0,
+        100, 40, 0,
+        200, 60, 0,
+      ]),
+      new Uint8Array([0, 1, 1]),
+    );
+
+    expect(normalized[3]).toBeCloseTo(-2.1, 5);
+    expect(normalized[6]).toBeCloseTo(2.1, 5);
+    expect(normalized[4]).toBeCloseTo(-0.675, 5);
+    expect(normalized[7]).toBeCloseTo(0.675, 5);
+  });
+
   it('moves observed points along the fitted section normal while preserving nominal fill points', () => {
     const observedMesh = radialFixture();
     const enhanced = buildDepthExaggeratedPositions(observedMesh, 3);
@@ -110,7 +127,7 @@ describe('ProductionArtifactView', () => {
 
     expect(screen.getByTestId('point-cloud')).toHaveAttribute('data-artifact-points', '2');
     expect(screen.getByTestId('point-cloud')).toHaveAttribute('data-artifact-triangles', '0');
-    expect(screen.getByText('生产记录产物 · 2 点 · 横向 · 1.00x')).toBeInTheDocument();
+    expect(screen.getByText('生产记录产物 · 2 有效点 · 横向 · 1.00x')).toBeInTheDocument();
   });
 
   it('keeps the complete topology in surface mode', () => {
@@ -125,6 +142,29 @@ describe('ProductionArtifactView', () => {
 
     expect(screen.getByTestId('surface')).toHaveAttribute('data-artifact-points', '4');
     expect(screen.getByTestId('surface')).toHaveAttribute('data-artifact-triangles', '1');
+  });
+
+  it('renders an unverified capture surface with neutral material and percentage scale', () => {
+    const mesh = {
+      ...fixture(),
+      displayMode: 'diagnostic-unqualified',
+      metricValid: false,
+      longitudinalAxis: { absoluteScaleVerified: false },
+    };
+    render(
+      <ProductionArtifactView
+        mesh={mesh}
+        mode="surface"
+        testId="capture-preview"
+        ariaLabel="采集三维预览"
+        colorMode="neutral"
+      />,
+    );
+
+    expect(screen.getByTestId('capture-preview')).toHaveAttribute('data-artifact-color-mode', 'neutral');
+    expect(screen.getByText(/趋势预览 · 2 切面 · 头部相对进度/)).toBeInTheDocument();
+    expect(screen.getByLabelText('三维头部相对进度刻度')).toHaveTextContent('100%');
+    expect(screen.getByRole('scrollbar', { name: '三维长度方向滚动条' })).toHaveAttribute('aria-valuemax', '100');
   });
 
   it('exposes the fitted-circle Jet legend in surface mode', () => {
@@ -142,7 +182,7 @@ describe('ProductionArtifactView', () => {
       'data-artifact-color-mode',
       'radial-jet',
     );
-    expect(screen.getByTestId('jet-surface')).toHaveAttribute('data-artifact-depth-exaggeration', '3.0');
+    expect(screen.getByTestId('jet-surface')).toHaveAttribute('data-artifact-depth-exaggeration', '1.0');
     fireEvent.change(screen.getByRole('slider', { name: '三维深度增强倍数' }), { target: { value: '6' } });
     expect(screen.getByTestId('jet-surface')).toHaveAttribute('data-artifact-depth-exaggeration', '6.0');
     expect(screen.getByLabelText('Jet 拟合圆径向偏差图例')).toHaveTextContent(

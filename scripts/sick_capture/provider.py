@@ -15,7 +15,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -27,10 +27,29 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import numpy as np
 from PIL import Image
 
+from .alignment import (
+    AlignmentConfig,
+    _atomic_json,
+    alignment_manifest_path,
+    build_and_write_flow_alignment,
+)
+from .defect_detection import (
+    DefectDetectionConfig,
+    build_and_write_flow_defect_detection,
+    defect_detection_manifest_path,
+)
 from .gentl import SickGenTLBackend
+from .measurement import (
+    MeasurementConfig,
+    build_and_write_flow_measurement,
+    measurement_manifest_path,
+)
+from .material_lock import exclusive_material_job
 from .playback import (
     _capture_image_identity,
+    build_and_write_playback_index,
     build_image_pyramid,
+    capture_image_cache_root,
     flow_pyramid_cache_status_path,
     playback_catalog_path,
     playback_index_path,
@@ -46,25 +65,28 @@ from .profile import CameraProfile, SickCaptureProfile, load_profile, sha256_fil
 from .events import publish_committed_round, write_flow_manifest
 from .paths import (
     algorithm_state_path,
-    alignment_path as alignment_manifest_path,
-    cache_root as flow_cache_root,
     capture_artifact_ref,
     capture_root,
-    defect_manifest_path as defect_detection_manifest_path,
     flow_id,
     flow_manifest_path,
     frame_event_root,
     resolve_capture_artifact,
-    measurement_path as measurement_manifest_path,
-    surface_path as surface_manifest_path,
 )
 from .regions import (
+    RegionConfig,
+    build_and_write_flow_region_map,
     detect_valid_sensor_roi,
     read_region_manifest,
     region_manifest_path,
     stable_horizontal_roi,
 )
 from .storage import DualFormatWriter, atomic_summary
+from .surface import (
+    apply_surface_quality_gate,
+    build_and_write_flow_surface,
+    measurement_artifact_from_surface,
+    surface_path as surface_manifest_path,
+)
 
 
 CAPTURE_DISCARDED_NOT_ARMED = 49000
@@ -75,16 +97,6 @@ SICK_COMPONENT_SCHEMA_MISMATCH = 49101
 SICK_STORAGE_FAILED = 49102
 LIVE_PREVIEW_BLACK_MAX = 8.0
 LIVE_PREVIEW_MAX_FPS = 2.0
-
-
-@dataclass(frozen=True, slots=True)
-class CaptureSyncPolicy:
-    """Acquisition-only timing policy; contains no geometry or defect logic."""
-
-    search_frames: int
-    stable_rows: int
-    anchor_interval_frames: int
-    maximum_anchor_residual_ms: float
 
 
 _STORAGE_PROCESS_WRITER: DualFormatWriter | None = None
@@ -133,6 +145,62 @@ def _process_is_running(process_id: int) -> bool:
         return False
 
 
+def _derived_artifact_read_gate(
+    storage_root: Path,
+    material_id: str,
+) -> tuple[int, dict[str, Any]] | None:
+    """Hide a flow's canonical artifacts while a replacement is incomplete.
+
+    Individual JSON/JPEG files are atomically replaced, but the complete set is
+    published over several steps.  ``algorithm-state.json`` is the commit
+    marker: readers may continue only after the fast artifact pass has reached
+    a durable terminal state.  A defect-only pass does not replace geometry and
+    therefore does not gate alignment/measurement/surface reads.
+    """
+
+    path = algorithm_state_path(storage_root, material_id)
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return 500, {
+            "code": 500,
+            "error": "algorithm_state_invalid",
+            "materialId": material_id,
+            "detail": str(error),
+        }
+    if not isinstance(value, dict):
+        return 500, {
+            "code": 500,
+            "error": "algorithm_state_invalid",
+            "materialId": material_id,
+        }
+    state = str(value.get("state", "")).strip().lower()
+    mode = str(value.get("mode", "")).strip().lower()
+    if state == "processing":
+        return 503, {
+            "code": 503,
+            "error": "derived_artifacts_processing",
+            "state": state,
+            "mode": mode,
+            "materialId": material_id,
+            "retryAfterMs": 2000,
+            "algorithmStatePath": str(path),
+        }
+    if state == "failed" and mode != "final-defects":
+        return 409, {
+            "code": 409,
+            "error": "derived_artifacts_failed",
+            "state": state,
+            "mode": mode,
+            "materialId": material_id,
+            "detail": str(value.get("error", "flow artifact generation failed")),
+            "algorithmStatePath": str(path),
+        }
+    return None
+
+
 def _initialize_storage_process_writer(
     jpeg_quality: int,
     fsync: bool,
@@ -175,6 +243,212 @@ def _initialize_flow_analysis_process() -> None:
         # Priority lowering is a protective optimization. Analysis remains
         # correct on platforms that do not expose either mechanism.
         pass
+
+
+def _build_flow_artifacts_under_lock(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment_config: AlignmentConfig,
+    calibration_path: Path | None,
+    measurement_config: MeasurementConfig,
+) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
+    alignment_path, alignment = build_and_write_flow_alignment(
+        camera_roots,
+        storage_root,
+        material_id,
+        config=alignment_config,
+    )
+    measurement_path, measurement = build_and_write_flow_measurement(
+        camera_roots,
+        storage_root,
+        material_id,
+        alignment,
+        calibration_path=calibration_path,
+        config=measurement_config,
+    )
+    region_path, region_map = build_and_write_flow_region_map(
+        camera_roots,
+        storage_root,
+        material_id,
+        measurement,
+    )
+    stable_crops = {
+        camera_id: row.get("stableCrop")
+        for camera_id, row in region_map.get("cameras", {}).items()
+        if isinstance(row, dict) and row.get("stableCrop")
+    }
+    measurement["twoDimensionalCrop"] = stable_crops
+    measurement["regions"] = {
+        "manifestPath": str(region_path),
+        "schema": region_map.get("schema"),
+        "state": region_map.get("state"),
+        "backgroundReady": region_map.get("backgroundReady"),
+        "defectDetectionAllowed": region_map.get("defectDetectionAllowed"),
+        "qualityGate": region_map.get("qualityGate"),
+        "ownership": region_map.get("ownership"),
+    }
+    surface_path, surface, jet_path = build_and_write_flow_surface(
+        camera_roots,
+        storage_root,
+        material_id,
+        alignment,
+        calibration_path=calibration_path,
+        config=measurement_config,
+        region_map=region_map,
+    )
+    measurement["surface"] = {
+        "path": str(surface_path),
+        "jetPath": str(jet_path) if jet_path.is_file() else "",
+        "state": surface.get("state"),
+        "quality": surface.get("quality"),
+        "depthPrecision": surface.get("depthPrecision"),
+        "calibrationAccuracy": surface.get("calibrationAccuracy"),
+        "summary": surface.get("summary"),
+    }
+    apply_surface_quality_gate(measurement, surface)
+    diameter_curves = surface.get("diameterCurves")
+    if isinstance(diameter_curves, dict):
+        # Surface reconstruction is the single metric source for directional
+        # diameter curves.  Mirror the compact curve artifact into the legacy
+        # measurement endpoint so existing diameter clients do not need a
+        # second request; the authoritative copy remains in surface.json.
+        measurement.setdefault("surfaceFit", {})["diameterCurves"] = diameter_curves
+    _atomic_json(measurement_path, measurement)
+    build_and_write_playback_index(camera_roots, storage_root, material_id)
+    return alignment_path, alignment, measurement_path, measurement
+
+
+def _build_flow_artifacts(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment_config: AlignmentConfig,
+    calibration_path: Path | None,
+    measurement_config: MeasurementConfig,
+) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
+    """Replace one flow's geometry as an atomic reader-visible job."""
+
+    with exclusive_material_job(
+        storage_root,
+        material_id,
+        purpose="provider-flow-analysis",
+    ):
+        state_path = algorithm_state_path(storage_root, material_id)
+        started_at_unix_ms = int(time.time() * 1000)
+        atomic_summary(
+            state_path,
+            {
+                "schema": "steel.flow-algorithm-state.v1",
+                "flowNo": int(material_id),
+                "flowId": material_id,
+                "state": "processing",
+                "mode": "provider-rebuild",
+                "startedAtUnixMs": started_at_unix_ms,
+            },
+        )
+        try:
+            result = _build_flow_artifacts_under_lock(
+                camera_roots,
+                storage_root,
+                material_id,
+                alignment_config,
+                calibration_path,
+                measurement_config,
+            )
+        except Exception as error:
+            atomic_summary(
+                state_path,
+                {
+                    "schema": "steel.flow-algorithm-state.v1",
+                    "flowNo": int(material_id),
+                    "flowId": material_id,
+                    "state": "failed",
+                    "mode": "provider-rebuild",
+                    "startedAtUnixMs": started_at_unix_ms,
+                    "failedAtUnixMs": int(time.time() * 1000),
+                    "error": f"{type(error).__name__}: {error}",
+                },
+            )
+            raise
+        alignment_path, _alignment, measurement_path, measurement = result
+        atomic_summary(
+            state_path,
+            {
+                "schema": "steel.flow-algorithm-state.v1",
+                "flowNo": int(material_id),
+                "flowId": material_id,
+                "state": "derived-ready",
+                "mode": "provider-rebuild",
+                "startedAtUnixMs": started_at_unix_ms,
+                "completedAtUnixMs": int(time.time() * 1000),
+                "alignmentPath": str(alignment_path),
+                "measurementPath": str(measurement_path),
+                "metricValid": bool(measurement.get("metricValid")),
+            },
+        )
+        return result
+
+
+def _build_flow_defect_artifact_under_lock(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment: dict[str, Any],
+    defect_detection_config: DefectDetectionConfig,
+) -> tuple[Path, dict[str, Any]]:
+    try:
+        return build_and_write_flow_defect_detection(
+            camera_roots,
+            storage_root,
+            material_id,
+            alignment,
+            config=defect_detection_config,
+        )
+    except Exception as error:
+        # A temporary learned model must never invalidate already completed
+        # alignment, measurement, playback or immutable capture artifacts.
+        defect_path = defect_detection_manifest_path(storage_root, material_id)
+        defects = {
+            "schema": "steel.sick-flow-defect-detection.v1",
+            "generatedAt": _utc_text(),
+            "materialId": material_id,
+            "state": "failed",
+            "temporaryModel": True,
+            "error": str(error),
+            "quality": {
+                "reviewRequired": True,
+                "fineGrainedClassification": False,
+                "gpuAcceleration": False,
+            },
+            "statistics": {"defectCount": 0},
+            "defects": [],
+        }
+        _atomic_json(defect_path, defects)
+        return defect_path, defects
+
+
+def _build_flow_defect_artifact(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment: dict[str, Any],
+    defect_detection_config: DefectDetectionConfig,
+) -> tuple[Path, dict[str, Any]]:
+    """Replace defect artifacts without racing geometry or another defect pass."""
+
+    with exclusive_material_job(
+        storage_root,
+        material_id,
+        purpose="provider-flow-defect-analysis",
+    ):
+        return _build_flow_defect_artifact_under_lock(
+            camera_roots,
+            storage_root,
+            material_id,
+            alignment,
+            defect_detection_config,
+        )
 
 
 def _write_storage_shared_frame(
@@ -300,6 +574,14 @@ def _integer(payload: dict[str, Any], key: str, default: int, minimum: int, maxi
     if not minimum <= value <= maximum:
         raise ValueError(f"{key} must be between {minimum} and {maximum}")
     return value
+
+
+def _profile_relative_path(profile: SickCaptureProfile, value: Any) -> Path | None:
+    text = os.path.expandvars(str(value or "").strip())
+    if not text:
+        return None
+    candidate = Path(text)
+    return candidate if candidate.is_absolute() else profile.source_path.parent / candidate
 
 
 class ProviderRuntime:
@@ -467,21 +749,27 @@ class ProviderRuntime:
                 ),
             ),
         )
-        self.alignment_config = CaptureSyncPolicy(
-            search_frames=max(1, int(
+        self.alignment_config = AlignmentConfig(
+            search_frames=int(
                 capture_defaults.get(
                     "alignmentSearchFrames",
                     max(self.steel_pre_roll_frames + self.steel_entry_rounds, 8),
                 )
-            )),
-            stable_rows=max(1, int(capture_defaults.get("alignmentStableRows", 8))),
-            anchor_interval_frames=max(1, int(
+            ),
+            stable_rows=int(capture_defaults.get("alignmentStableRows", 8)),
+            sample_step=int(capture_defaults.get("alignmentSampleStep", 4)),
+            depth_valid_ratio=float(
+                capture_defaults.get("alignmentDepthValidRatio", 0.005)
+            ),
+            intensity_threshold=self.steel_bright_threshold,
+            intensity_ratio=self.steel_bright_ratio,
+            anchor_interval_frames=int(
                 capture_defaults.get("softSyncAnchorIntervalFrames", 16)
-            )),
-            maximum_anchor_residual_ms=max(1.0, float(
+            ),
+            maximum_anchor_residual_ms=float(
                 capture_defaults.get("softSyncMaximumResidualMs", 40.0)
-            )),
-        )
+            ),
+        ).bounded()
         calibration_value = os.path.expandvars(
             str(capture_defaults.get("arrayCalibrationPath", "")).strip()
         )
@@ -494,6 +782,112 @@ class ProviderRuntime:
             if calibration_value
             else None
         )
+        self.measurement_config = MeasurementConfig(
+            row_window=int(capture_defaults.get("measurementRowWindow", 16)),
+            maximum_profile_points=int(
+                capture_defaults.get("measurementMaximumProfilePoints", 320)
+            ),
+            maximum_sections=int(capture_defaults.get("measurementMaximumSections", 12)),
+            minimum_circle_points=int(
+                capture_defaults.get("measurementMinimumCirclePoints", 48)
+            ),
+            maximum_circle_residual_mm=float(
+                capture_defaults.get("measurementMaximumCircleResidualMm", 0.5)
+            ),
+        ).bounded()
+        self.defect_detection_config = DefectDetectionConfig(
+            enabled=_truthy(
+                os.environ.get(
+                    "SICK_DEFECT_DETECTION_ENABLED",
+                    capture_defaults.get("defectDetectionEnabled"),
+                ),
+                False,
+            ),
+            model_2d_path=_profile_relative_path(
+                profile,
+                os.environ.get(
+                    "SICK_DEFECT_MODEL_2D",
+                    capture_defaults.get("defectModel2dPath", ""),
+                ),
+            ),
+            model_3d_path=_profile_relative_path(
+                profile,
+                os.environ.get(
+                    "SICK_DEFECT_MODEL_3D",
+                    capture_defaults.get("defectModel3dPath", ""),
+                ),
+            ),
+            classifier_2d_path=_profile_relative_path(
+                profile,
+                os.environ.get(
+                    "SICK_DEFECT_CLASSIFIER_2D",
+                    capture_defaults.get("defectClassifier2dPath", ""),
+                ),
+            ),
+            classifier_3d_path=_profile_relative_path(
+                profile,
+                os.environ.get(
+                    "SICK_DEFECT_CLASSIFIER_3D",
+                    capture_defaults.get("defectClassifier3dPath", ""),
+                ),
+            ),
+            model_manifest_path=_profile_relative_path(
+                profile,
+                capture_defaults.get("defectModelManifestPath", ""),
+            ),
+            image_size=int(capture_defaults.get("defectImageSize", 640)),
+            confidence_threshold=float(
+                capture_defaults.get("defectConfidenceThreshold", 0.25)
+            ),
+            iou_threshold=float(capture_defaults.get("defectIouThreshold", 0.25)),
+            merge_iou_threshold=float(
+                capture_defaults.get("defectMergeIouThreshold", 0.20)
+            ),
+            maximum_detections_per_frame=int(
+                capture_defaults.get("defectMaximumPerFrame", 100)
+            ),
+            inference_batch_size=int(
+                capture_defaults.get("defectInferenceBatchSize", 8)
+            ),
+            preprocess_workers=int(
+                capture_defaults.get("defectPreprocessWorkers", 2)
+            ),
+            classification_confidence_threshold=float(
+                capture_defaults.get(
+                    "defectClassificationConfidenceThreshold", 0.55
+                )
+            ),
+            frame_stride=int(capture_defaults.get("defectFrameStride", 1)),
+            cpu_frame_stride=int(capture_defaults.get("defectCpuFrameStride", 8)),
+            gpu_device_id=int(
+                os.environ.get(
+                    "SICK_DEFECT_GPU_DEVICE",
+                    capture_defaults.get("defectGpuDevice", 1),
+                )
+            ),
+            depth_exposure=float(capture_defaults.get("defectDepthExposure", 300.0)),
+            depth_baseline_sample_step=int(
+                capture_defaults.get("defectDepthBaselineSampleStep", 4)
+            ),
+            review_crop_minimum_size=int(
+                capture_defaults.get("defectReviewCropMinimumSize", 64)
+            ),
+            capture_origin=os.environ.get(
+                "SICK_CAPTURE_ORIGIN", "http://127.0.0.1:4317"
+            ),
+            database_origin=os.environ.get(
+                "STEEL_INSPECTION_SERVICE_ORIGIN", self.service_origin
+            ),
+            maximum_idle_wait_seconds=float(
+                capture_defaults.get("defectMaximumIdleWaitSeconds", 300.0)
+            ),
+            maximum_pending_storage_rounds=int(
+                capture_defaults.get("defectMaximumPendingStorageRounds", 0)
+            ),
+            require_approved_region_map=_truthy(
+                capture_defaults.get("defectRequireApprovedRegionMap", True), True
+            ),
+        ).bounded()
         self.storage_process_workers = max(
             0,
             min(profile.expected_cameras, configured_storage_process_workers),
@@ -717,11 +1111,12 @@ class ProviderRuntime:
         )
         self.history_refresh_future: Future[tuple[list[dict[str, Any]], bool]] | None = None
         # Capture publishes committed-frame events only.  Alignment,
-        # measurement and defect work belongs to steel-image-worker and
-        # steel-defect-worker;
+        # measurement and defect workers belong to steel-algorithm-service;
         # keeping ProcessPoolExecutors here previously left orphan workers and
         # could drive the acquisition host to 100% CPU.
         self.alignment_lock = threading.RLock()
+        self.alignment_futures: dict[str, Future[Any]] = {}
+        self.defect_detection_futures: dict[str, Future[Any]] = {}
         self.alignment_status: dict[str, Any] = {
             "state": "idle",
             "materialId": "",
@@ -740,7 +1135,7 @@ class ProviderRuntime:
             "updatedAt": _utc_text(),
         }
         self.defect_detection_status: dict[str, Any] = {
-            "state": "worker-owned",
+            "state": "idle" if self.defect_detection_config.enabled else "disabled",
             "materialId": "",
             "path": "",
             "defectCount": 0,
@@ -761,6 +1156,7 @@ class ProviderRuntime:
         self.playback_cache_build_ms: deque[float] = deque(maxlen=120)
         self.playback_compute_pool = ProcessPoolExecutor(
             max_workers=2,
+            max_tasks_per_child=32,
             initializer=_initialize_flow_analysis_process,
         )
         self.playback_warm_stop = threading.Event()
@@ -770,6 +1166,7 @@ class ProviderRuntime:
         )
         self.playback_warm_compute_pool = ProcessPoolExecutor(
             max_workers=1,
+            max_tasks_per_child=128,
             initializer=_initialize_flow_analysis_process,
         )
         self.playback_warm_futures: dict[str, Future[Any]] = {}
@@ -1209,6 +1606,67 @@ class ProviderRuntime:
                 recoveredFlowCount=recovered,
             )
 
+    def _alignment_worker(
+        self, material_id: str
+    ) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
+        # steel-out is observed before the capture loop enqueues its final
+        # post-roll round.  Require a short quiet period after the bounded
+        # storage queue drains so the manifest never races that last write.
+        deadline = time.monotonic() + 120.0
+        quiet_since: float | None = None
+        while time.monotonic() < deadline:
+            with self.storage_queue_lock:
+                # Back-to-back bars may keep the global queue permanently
+                # non-empty.  Only this flow's writes must settle before its
+                # immutable alignment/measurement manifests are generated.
+                idle = self.storage_queue_pending_by_material.get(material_id, 0) == 0
+            if idle:
+                quiet_since = quiet_since or time.monotonic()
+                if time.monotonic() - quiet_since >= 0.75:
+                    break
+            else:
+                quiet_since = None
+            time.sleep(0.1)
+        else:
+            raise TimeoutError(
+                f"storage queue did not settle before alignment: {material_id}"
+            )
+        with self.alignment_lock:
+            if self.alignment_status.get("materialId") == material_id:
+                self.alignment_status = {
+                    **self.alignment_status,
+                    "state": "building",
+                    "updatedAt": _utc_text(),
+                }
+        camera_roots = {
+            camera.camera_id: camera.storage_root
+            for camera in self.profile.enabled_cameras
+        }
+        with self.alignment_lock:
+            self.measurement_status = {
+                "state": "building",
+                "materialId": material_id,
+                "path": str(
+                    measurement_manifest_path(self.profile.storage_root, material_id)
+                ),
+                "metricValid": False,
+                "qualityGate": None,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+        alignment_path, alignment, measurement_path, measurement = (
+            self.alignment_compute_pool.submit(
+                _build_flow_artifacts,
+                camera_roots,
+                self.profile.storage_root,
+                material_id,
+                self.alignment_config,
+                self.array_calibration_path,
+                self.measurement_config,
+            ).result()
+        )
+        return alignment_path, alignment, measurement_path, measurement
+
     def _set_playback_warm_status(self, **values: Any) -> None:
         with self.history_lock:
             self.playback_warm_status = {
@@ -1225,7 +1683,14 @@ class ProviderRuntime:
             camera.camera_id: camera.storage_root
             for camera in self.profile.enabled_cameras
         }
-        sources: list[Path] = []
+        cache_roots = {
+            camera.camera_id: flow_pyramid_cache_status_path(
+                camera.storage_root,
+                material_id,
+            ).parent
+            for camera in self.profile.enabled_cameras
+        }
+        sources: list[tuple[Path, str]] = []
         for frame in index.get("frames", []):
             for camera in frame.get("cameras", []):
                 camera_id = str(camera.get("cameraId", ""))
@@ -1233,7 +1698,12 @@ class ProviderRuntime:
                 root = camera_roots.get(camera_id)
                 if root is not None:
                     try:
-                        sources.append(resolve_capture_artifact(root, camera_id, artifact_ref))
+                        sources.append(
+                            (
+                                resolve_capture_artifact(root, camera_id, artifact_ref),
+                                camera_id,
+                            )
+                        )
                     except ValueError:
                         continue
 
@@ -1248,7 +1718,7 @@ class ProviderRuntime:
             sourceImageCount=len(sources),
             failureCount=0,
         )
-        for source in sources:
+        for source, camera_id in sources:
             while not self.playback_warm_stop.is_set():
                 with self.state_lock:
                     steel_present = self.steel_present
@@ -1275,10 +1745,13 @@ class ProviderRuntime:
                 self._set_playback_warm_status(state=state)
             try:
                 if source.is_file() and not source.is_symlink():
+                    cache_root = capture_image_cache_root(source)
                     self.playback_warm_compute_pool.submit(
                         build_image_pyramid,
                         source,
-                        flow_cache_root(self.profile.storage_root, material_id),
+                        cache_root,
+                        metadata_storage_root=self.profile.storage_root,
+                        metadata_camera_id=camera_id,
                     ).result()
                     cached += 1
             except Exception as error:
@@ -1297,10 +1770,14 @@ class ProviderRuntime:
             "cachedImageCount": cached,
             "failureCount": len(failures),
             "failures": failures[:20],
+            "cacheRoots": [
+                str(path) for path in sorted(set(cache_roots.values()), key=str)
+            ],
             "elapsedMs": round((time.perf_counter() - started) * 1000.0, 3),
             "throttledForAcquisition": True,
         }
-        write_flow_pyramid_cache_status(self.profile.storage_root, result)
+        for camera in self.profile.enabled_cameras:
+            write_flow_pyramid_cache_status(camera.storage_root, result)
         self._set_playback_warm_status(state="ready", **result)
         return result
 
@@ -1323,16 +1800,21 @@ class ProviderRuntime:
             raise RuntimeError(str(response.get("error", "region commit rejected")))
 
     def _schedule_playback_warm(self, material_id: str) -> bool:
-        status_path = flow_pyramid_cache_status_path(
-            self.profile.storage_root, material_id
-        )
-        if status_path.is_file():
+        status_paths = [
+            flow_pyramid_cache_status_path(camera.storage_root, material_id)
+            for camera in self.profile.enabled_cameras
+        ]
+        if status_paths and all(path.is_file() for path in status_paths):
             try:
-                status = json.loads(status_path.read_text(encoding="utf-8-sig"))
-                if (
+                statuses = [
+                    json.loads(path.read_text(encoding="utf-8-sig"))
+                    for path in status_paths
+                ]
+                if all(
                     int(status.get("failureCount", 0)) == 0
                     and int(status.get("cachedImageCount", 0))
-                    >= int(status.get("sourceImageCount", 1))
+                    >= int(status.get("sourceImageCount", 0))
+                    for status in statuses
                 ):
                     return False
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -1345,6 +1827,252 @@ class ProviderRuntime:
                 self._playback_warm_worker, material_id
             )
             self.playback_warm_futures[material_id] = future
+        return True
+
+    def _schedule_flow_defect_detection(
+        self, material_id: str, alignment: dict[str, Any]
+    ) -> bool:
+        normalized = material_id.strip()
+        if not normalized or _safe_segment(normalized) != normalized:
+            return False
+        if not self.defect_detection_config.enabled:
+            with self.alignment_lock:
+                self.defect_detection_status = {
+                    **self.defect_detection_status,
+                    "state": "disabled",
+                    "materialId": normalized,
+                    "updatedAt": _utc_text(),
+                }
+            return False
+        with self.alignment_lock:
+            existing = self.defect_detection_futures.get(normalized)
+            if existing is not None and not existing.done():
+                return False
+            self.defect_detection_status = {
+                "state": "waiting-for-capture-idle",
+                "materialId": normalized,
+                "path": str(
+                    defect_detection_manifest_path(
+                        self.profile.storage_root, normalized
+                    )
+                ),
+                "defectCount": 0,
+                "temporaryModel": True,
+                "gpuAcceleration": False,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+            camera_roots = {
+                camera.camera_id: camera.storage_root
+                for camera in self.profile.enabled_cameras
+            }
+            future = self.defect_detection_compute_pool.submit(
+                _build_flow_defect_artifact,
+                camera_roots,
+                self.profile.storage_root,
+                normalized,
+                alignment,
+                self.defect_detection_config,
+            )
+            self.defect_detection_futures[normalized] = future
+
+        def completed(done: Future[Any]) -> None:
+            try:
+                defect_path, defects = done.result()
+                quality = defects.get("quality", {})
+                with self.alignment_lock:
+                    if self.defect_detection_status.get("materialId") == normalized:
+                        self.defect_detection_status = {
+                            "state": defects.get("state", "complete"),
+                            "materialId": normalized,
+                            "path": str(defect_path),
+                            "defectCount": int(
+                                defects.get("statistics", {}).get("defectCount", 0)
+                            ),
+                            "temporaryModel": True,
+                            "gpuAcceleration": bool(
+                                quality.get("gpuAcceleration", False)
+                            ),
+                            "error": str(defects.get("error", "")),
+                            "updatedAt": _utc_text(),
+                        }
+                self._log(
+                    "info",
+                    "flow defect detection completed",
+                    materialId=normalized,
+                    path=str(defect_path),
+                    state=defects.get("state"),
+                    defectCount=int(
+                        defects.get("statistics", {}).get("defectCount", 0)
+                    ),
+                )
+            except Exception as error:
+                with self.alignment_lock:
+                    if self.defect_detection_status.get("materialId") == normalized:
+                        self.defect_detection_status = {
+                            **self.defect_detection_status,
+                            "state": "failed",
+                            "error": str(error),
+                            "updatedAt": _utc_text(),
+                        }
+                self._log(
+                    "warning",
+                    "flow defect detection failed",
+                    materialId=normalized,
+                    error=str(error),
+                )
+
+        future.add_done_callback(completed)
+        return True
+
+    def _schedule_defect_rebuild(self, material_id: str) -> bool:
+        normalized = material_id.strip()
+        if not normalized or _safe_segment(normalized) != normalized:
+            return False
+        path = alignment_manifest_path(self.profile.storage_root, normalized)
+        if path.is_file():
+            try:
+                alignment = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False
+            return self._schedule_flow_defect_detection(normalized, alignment)
+        return self._schedule_flow_alignment(normalized)
+
+    def _schedule_flow_alignment(self, material_id: str) -> bool:
+        normalized = material_id.strip()
+        if not normalized or _safe_segment(normalized) != normalized:
+            return False
+        with self.alignment_lock:
+            existing = self.alignment_futures.get(normalized)
+            if existing is not None and not existing.done():
+                return False
+            self.alignment_status = {
+                "state": "waiting-for-storage",
+                "materialId": normalized,
+                "path": str(alignment_manifest_path(self.profile.storage_root, normalized)),
+                "quality": None,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+            self.measurement_status = {
+                "state": "waiting-for-alignment",
+                "materialId": normalized,
+                "path": str(
+                    measurement_manifest_path(self.profile.storage_root, normalized)
+                ),
+                "metricValid": False,
+                "qualityGate": None,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+            self.defect_detection_status = {
+                "state": (
+                    "waiting-for-alignment"
+                    if self.defect_detection_config.enabled
+                    else "disabled"
+                ),
+                "materialId": normalized,
+                "path": str(
+                    defect_detection_manifest_path(
+                        self.profile.storage_root, normalized
+                    )
+                ),
+                "defectCount": 0,
+                "temporaryModel": True,
+                "gpuAcceleration": False,
+                "error": "",
+                "updatedAt": _utc_text(),
+            }
+            future = self.alignment_pool.submit(self._alignment_worker, normalized)
+            self.alignment_futures[normalized] = future
+
+        def completed(done: Future[Any]) -> None:
+            try:
+                path, manifest, measurement_path, measurement = done.result()
+                quality = manifest.get("quality")
+                with self.alignment_lock:
+                    self.alignment_status = {
+                        "state": "ready",
+                        "materialId": normalized,
+                        "path": str(path),
+                        "quality": quality,
+                        "error": "",
+                        "updatedAt": _utc_text(),
+                    }
+                    self.measurement_status = {
+                        "state": "ready",
+                        "materialId": normalized,
+                        "path": str(measurement_path),
+                        "metricValid": bool(measurement.get("metricValid")),
+                        "qualityGate": measurement.get("qualityGate"),
+                        "error": "",
+                        "updatedAt": _utc_text(),
+                    }
+                self._log(
+                    "info",
+                    "flow soft alignment completed",
+                    materialId=normalized,
+                    path=str(path),
+                    synchronized=bool(
+                        isinstance(quality, dict) and quality.get("synchronized")
+                    ),
+                )
+                try:
+                    self._commit_region_manifest(normalized)
+                except Exception as error:
+                    self._log(
+                        "warning",
+                        "flow region database commit failed",
+                        materialId=normalized,
+                        error=str(error),
+                    )
+                self._schedule_playback_warm(normalized)
+                self._schedule_flow_defect_detection(normalized, manifest)
+            except Exception as error:
+                with self.alignment_lock:
+                    self.alignment_status = {
+                        "state": "failed",
+                        "materialId": normalized,
+                        "path": str(
+                            alignment_manifest_path(self.profile.storage_root, normalized)
+                        ),
+                        "quality": None,
+                        "error": str(error),
+                        "updatedAt": _utc_text(),
+                    }
+                    self.measurement_status = {
+                        "state": "failed",
+                        "materialId": normalized,
+                        "path": str(
+                            measurement_manifest_path(self.profile.storage_root, normalized)
+                        ),
+                        "metricValid": False,
+                        "qualityGate": None,
+                        "error": str(error),
+                        "updatedAt": _utc_text(),
+                    }
+                    self.defect_detection_status = {
+                        "state": "failed",
+                        "materialId": normalized,
+                        "path": str(
+                            defect_detection_manifest_path(
+                                self.profile.storage_root, normalized
+                            )
+                        ),
+                        "defectCount": 0,
+                        "temporaryModel": True,
+                        "gpuAcceleration": False,
+                        "error": str(error),
+                        "updatedAt": _utc_text(),
+                    }
+                self._log(
+                    "warning",
+                    "flow soft alignment failed",
+                    materialId=normalized,
+                    error=str(error),
+                )
+
+        future.add_done_callback(completed)
         return True
 
     @staticmethod
@@ -1364,6 +2092,9 @@ class ProviderRuntime:
         if not normalized:
             with self.alignment_lock:
                 return 200, {"code": 0, **self.alignment_status}
+        gated = _derived_artifact_read_gate(self.profile.storage_root, normalized)
+        if gated is not None:
+            return gated
         path = alignment_manifest_path(self.profile.storage_root, normalized)
         if not path.is_file():
             with self.alignment_lock:
@@ -1395,8 +2126,28 @@ class ProviderRuntime:
         if not normalized:
             with self.alignment_lock:
                 return 200, {"code": 0, **self.measurement_status}
+        gated = _derived_artifact_read_gate(self.profile.storage_root, normalized)
+        if gated is not None:
+            return gated
         path = measurement_manifest_path(self.profile.storage_root, normalized)
         if not path.is_file():
+            surface = surface_manifest_path(self.profile.storage_root, normalized)
+            if surface.is_file():
+                try:
+                    surface_payload = json.loads(surface.read_text(encoding="utf-8-sig"))
+                    measurement = measurement_artifact_from_surface(surface_payload)
+                except (OSError, ValueError, TypeError) as error:
+                    return 500, {
+                        "code": 500,
+                        "error": "surface_measurement_invalid",
+                        "detail": str(error),
+                    }
+                return 200, {
+                    "code": 0,
+                    "path": str(surface),
+                    "measurement": measurement,
+                    "derivedFromSurface": True,
+                }
             with self.alignment_lock:
                 status = dict(self.measurement_status)
             if status.get("materialId") == normalized and status.get("state") in {
@@ -1424,6 +2175,9 @@ class ProviderRuntime:
         normalized = self._normalized_flow_id(material_id)
         if normalized is None:
             return 400, {"code": 400, "error": "invalid_material_id"}
+        gated = _derived_artifact_read_gate(self.profile.storage_root, normalized)
+        if gated is not None:
+            return gated
         path = surface_manifest_path(self.profile.storage_root, normalized)
         if not path.is_file():
             return 404, {
@@ -1441,6 +2195,9 @@ class ProviderRuntime:
         normalized = self._normalized_flow_id(material_id)
         if normalized is None:
             return 400, {"code": 400, "error": "invalid_material_id"}
+        gated = _derived_artifact_read_gate(self.profile.storage_root, normalized)
+        if gated is not None:
+            return gated
         payload = read_region_manifest(self.profile.storage_root, normalized)
         if payload is None:
             return 404, {
@@ -3077,44 +3834,55 @@ class ProviderRuntime:
         frame: Any,
     ) -> None:
         intensity = np.asarray(frame.intensity)
+        if intensity.size == 0:
+            return
         preview_black_max = max(
             LIVE_PREVIEW_BLACK_MAX,
             self.profile.black_frame_threshold,
         )
-        if intensity.size == 0 or float(np.max(intensity)) <= preview_black_max:
-            return
         visible_ratio = float(
             np.count_nonzero(intensity > self.steel_bright_threshold)
         ) / float(intensity.size)
-        # Isolated dust/sensor specks in an otherwise black image previously
-        # replaced the last good preview and looked like a black flicker.
-        if visible_ratio < self.steel_bright_ratio:
-            return
-        detected_roi = detect_valid_sensor_roi(
-            intensity,
-            np.asarray(frame.depth_raw),
-            threshold=self.steel_bright_threshold,
-            minimum_occupancy=max(0.0005, self.steel_bright_ratio / 4.0),
-            minimum_width=min(64, int(intensity.shape[1])),
+        visible_frame = bool(
+            float(np.max(intensity)) > preview_black_max
+            and visible_ratio >= self.steel_bright_ratio
         )
         height, width = intensity.shape
-        if detected_roi is None:
-            return
-        with self.stream_lock:
-            samples = self.stream_roi_samples.setdefault(camera.key, deque(maxlen=8))
-            if (
-                camera.key not in self.stream_valid_rois
-                and detected_roi[3] - detected_roi[1] >= height * 0.8
-            ):
-                samples.append(detected_roi)
-                if len(samples) >= 8:
-                    stable = stable_horizontal_roi(list(samples), width, height)
-                    if stable is not None:
-                        self.stream_valid_rois[camera.key] = stable
-            display_roi = self.stream_valid_rois.get(
-                camera.key,
-                [detected_roi[0], 0, detected_roi[2], height],
+        if visible_frame:
+            detected_roi = detect_valid_sensor_roi(
+                intensity,
+                np.asarray(frame.depth_raw),
+                threshold=self.steel_bright_threshold,
+                minimum_occupancy=max(0.0005, self.steel_bright_ratio / 4.0),
+                minimum_width=min(64, int(intensity.shape[1])),
             )
+            if detected_roi is None:
+                return
+            with self.stream_lock:
+                samples = self.stream_roi_samples.setdefault(camera.key, deque(maxlen=8))
+                if (
+                    camera.key not in self.stream_valid_rois
+                    and detected_roi[3] - detected_roi[1] >= height * 0.8
+                ):
+                    samples.append(detected_roi)
+                    if len(samples) >= 8:
+                        stable = stable_horizontal_roi(list(samples), width, height)
+                        if stable is not None:
+                            self.stream_valid_rois[camera.key] = stable
+                display_roi = self.stream_valid_rois.get(
+                    camera.key,
+                    [detected_roi[0], 0, detected_roi[2], height],
+                )
+        else:
+            # A real but dark camera frame must still make a new subscription
+            # ready; otherwise the UI reports an endless loading state while
+            # the camera is healthy and simply sees no steel.  Once a useful
+            # frame exists, keep it instead of replacing it with black/sparse
+            # noise between steel records.
+            with self.stream_lock:
+                if "intensity-grid" in self.stream_latest.get(camera.key, {}):
+                    return
+            display_roi = [0, 0, width, height]
         crop_left, _crop_top, crop_right, _crop_bottom = display_roi
         valid_intensity = intensity[:, crop_left:crop_right]
         valid_depth = np.asarray(frame.depth_raw)[:, crop_left:crop_right]
@@ -3141,7 +3909,7 @@ class ProviderRuntime:
                 valid_intensity,
                 depth=False,
                 max_width=800,
-                minimum_visible_max=LIVE_PREVIEW_BLACK_MAX,
+                minimum_visible_max=(LIVE_PREVIEW_BLACK_MAX if visible_frame else None),
             )
             if grid_preview is None:
                 return
@@ -4053,6 +4821,23 @@ class ProviderRuntime:
                 selected.append(camera)
         return selected
 
+    def _prepare_capture_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Resolve one valid flow id before a capture round starts.
+
+        Production captures inherit the active steel flow when the caller does
+        not repeat it.  Standalone diagnostics have no active steel, so assign
+        one numeric id to the whole request instead of letting each writer fall
+        back to the invalid legacy value ``diagnostic``.
+        """
+        request = dict(payload)
+        material_id = str(request.get("materialId", self.active_material_id)).strip()
+        if not material_id:
+            if bool(request.get("productionLayout", False)):
+                raise ValueError("production capture requires a positive numeric materialId")
+            material_id = str(time.time_ns())
+        request["materialId"] = flow_id(material_id)
+        return request
+
     def _capture_one(
         self,
         camera: CameraProfile,
@@ -4460,8 +5245,9 @@ class ProviderRuntime:
                     "error": "capture_mode_disabled",
                 }
 
-            rounds = _integer(payload, "rounds", 1, 1, 10_000)
-            interval_ms = _integer(payload, "intervalMs", 0, 0, 600_000)
+            request = self._prepare_capture_request(payload)
+            rounds = _integer(request, "rounds", 1, 1, 10_000)
+            interval_ms = _integer(request, "intervalMs", 0, 0, 600_000)
             results: list[dict[str, Any]] = []
             started_at = _utc_text()
             started_monotonic_ns = time.monotonic_ns()
@@ -4469,7 +5255,7 @@ class ProviderRuntime:
                 results.extend(
                     self._run_capture_round(
                         selected,
-                        payload,
+                        request,
                         round_index,
                         save_generation,
                     )
@@ -4492,9 +5278,9 @@ class ProviderRuntime:
                 }
                 for row in results
             )
-            material_id = str(payload.get("materialId", self.active_material_id or "diagnostic"))
-            session_id = str(payload.get("sessionId", self.active_session_id or "diagnostic"))
-            production_layout = bool(payload.get("productionLayout", False))
+            material_id = str(request["materialId"])
+            session_id = str(request.get("sessionId", self.active_session_id or "diagnostic"))
+            production_layout = bool(request.get("productionLayout", False))
             if production_layout:
                 summary_path = (
                     self.profile.storage_root
@@ -4506,7 +5292,7 @@ class ProviderRuntime:
             else:
                 summary_path = (
                     self.profile.storage_root
-                    / _safe_segment(str(payload.get("outputDir", "continuous-test")))
+                    / _safe_segment(str(request.get("outputDir", "continuous-test")))
                     / "summary.json"
                 )
             failed_code = next(
@@ -4539,11 +5325,11 @@ class ProviderRuntime:
                 "discardedFrames": discarded_frames,
                 "blackFrames": black_frames,
                 "rounds": rounds,
-                "retries": int(payload.get("retries", 0) or 0),
+                "retries": int(request.get("retries", 0) or 0),
                 "cameraCount": len(selected),
                 "expectedCameras": expected,
                 "expectedMet": failures == 0 and complete_frames == rounds * expected,
-                "connectFirst": bool(payload.get("connectFirst", False)),
+                "connectFirst": bool(request.get("connectFirst", False)),
                 "saveSdkDerived": False,
                 "roundIntervalMs": interval_ms,
                 "elapsedMs": round((time.monotonic_ns() - started_monotonic_ns) / 1_000_000, 3),
@@ -5036,10 +5822,26 @@ class ProviderRuntime:
         identity = _capture_image_identity(path)
         if identity is None:
             return None
-        material_id, _camera_id = identity
+        material_id, _inferred_camera_id = identity
+        resolved_parent = path.parent.resolve()
+        camera_id = next(
+            (
+                camera.camera_id
+                for camera in self.profile.enabled_cameras
+                if (capture_root(
+                    camera.storage_root,
+                    material_id,
+                    camera.camera_id,
+                ) / "2d").resolve()
+                == resolved_parent
+            ),
+            "",
+        )
+        if not camera_id:
+            return None
         try:
             stat = path.stat()
-            cache_root = flow_cache_root(self.profile.storage_root, material_id)
+            cache_root = capture_image_cache_root(path)
             if crop_box is not None:
                 # A query-supplied rectangle is only a coordinate echo.  The
                 # algorithm's committed per-flow ROI remains authoritative so
@@ -5053,14 +5855,21 @@ class ProviderRuntime:
                     )
                     indexed_crop = read_indexed_playback_crop(
                         path,
-                        cache_root,
+                        self.profile.storage_root,
                         source.width,
                         source.height,
+                        metadata_camera_id=camera_id,
                     )
                 if indexed_crop is None or requested_crop != indexed_crop:
                     return None
                 crop_box = indexed_crop
-            fingerprint = source_fingerprint(path, cache_root, crop_box)
+            fingerprint = source_fingerprint(
+                path,
+                cache_root,
+                crop_box,
+                metadata_storage_root=self.profile.storage_root,
+                metadata_camera_id=camera_id,
+            )
         except (OSError, ValueError, TypeError):
             return None
         key = (str(path), stat.st_mtime_ns, max_width, fingerprint)
@@ -5086,6 +5895,8 @@ class ProviderRuntime:
                         path,
                         cache_root,
                         crop_box,
+                        metadata_storage_root=self.profile.storage_root,
+                        metadata_camera_id=camera_id,
                     ).result()
                 else:
                     manifest_path, manifest = existing
@@ -5139,10 +5950,21 @@ class ProviderRuntime:
     def playback_cache_status_json(self) -> dict[str, Any]:
         with self.history_lock:
             build_samples = list(self.playback_cache_build_ms)
+            # Playback pyramids live beside each camera's immutable 2D frames.
+            # Keep the historical singular string for clients that only know
+            # the old field, but make it an explicit per-camera template rather
+            # than advertising the removed flow-central cache directory. The
+            # concrete roots for the configured cameras are exposed separately
+            # and the warm status includes the roots used for a specific flow.
+            cache_roots = [
+                str(camera.storage_root / "<flow-id>" / "cache")
+                for camera in self.profile.enabled_cameras
+            ]
             return {
                 "code": 0,
                 "schema": "steel.capture-playback-cache-status.v1",
-                "cacheRoot": str(self.profile.storage_root / "<flow-id>" / "cache"),
+                "cacheRoot": "<camera-root>/<flow-id>/cache",
+                "cacheRoots": cache_roots,
                 "catalogPath": str(playback_catalog_path(self.profile.storage_root)),
                 "catalogAvailable": playback_catalog_path(self.profile.storage_root).is_file(),
                 "memoryEntries": len(self.playback_image_cache),

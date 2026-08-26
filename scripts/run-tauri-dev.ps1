@@ -9,6 +9,7 @@ param(
   [switch]$AllowNetworkDependencyFetch,
   [string]$DataRoot = "D:\Data",
   [string]$SickCaptureProfile = "",
+  [switch]$SickCaptureHistoryOnly,
   [string]$PythonExecutable = "D:\project\py312\python.exe",
   [string]$CargoRegistryMirror = "https://rsproxy.cn/index/"
 )
@@ -71,6 +72,9 @@ if ($SickCaptureProfile -and $SickCaptureProfile.Trim().Length -gt 0) {
     $env:STEEL_TRIGGER_HEALTH_REQUIRED = "0"
   }
 }
+if ($SickCaptureHistoryOnly -and -not $SickCaptureProfile) {
+  throw "-SickCaptureHistoryOnly requires -SickCaptureProfile."
+}
 
 function Test-InspectionServiceReady {
   try {
@@ -108,13 +112,17 @@ try {
     if (Test-HttpReady "http://127.0.0.1:4317/health") {
       Write-Host "Using SICK capture service already running at http://127.0.0.1:4317."
     } else {
+      $SickCaptureArguments = @(
+        (Join-Path $RepoRoot "scripts\sick_capture_service.py"),
+        "--profile", $SickCaptureProfile,
+        "--host", "127.0.0.1",
+        "--port", "4317"
+      )
+      if ($SickCaptureHistoryOnly) {
+        $SickCaptureArguments += "--history-only"
+      }
       $SickCaptureLauncher = Start-Process -FilePath $PythonExecutable `
-        -ArgumentList @(
-          (Join-Path $RepoRoot "scripts\sick_capture_service.py"),
-          "--profile", $SickCaptureProfile,
-          "--host", "127.0.0.1",
-          "--port", "4317"
-        ) `
+        -ArgumentList $SickCaptureArguments `
         -WorkingDirectory $RepoRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $LogRoot "sick-capture.out.log") `
@@ -138,7 +146,8 @@ try {
       if (-not (Test-HttpReady "http://127.0.0.1:4317/health")) {
         throw "SICK capture service did not become ready within $ServiceReadyTimeoutSec seconds."
       }
-      Write-Host "SICK capture service ready at http://127.0.0.1:4317 (PID $($SickCaptureLauncher.Id))."
+      $SickCaptureMode = if ($SickCaptureHistoryOnly) { "history-only; cameras remain disconnected" } else { "live" }
+      Write-Host "SICK capture service ready at http://127.0.0.1:4317 (PID $($SickCaptureLauncher.Id), mode: $SickCaptureMode)."
     }
   }
   if (-not $NoProcessingServices) {

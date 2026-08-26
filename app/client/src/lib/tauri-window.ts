@@ -6,6 +6,7 @@ type UnlistenFn = () => void;
 export type TauriWindowApi = {
   isAvailable: boolean;
   close: () => Promise<void>;
+  hide: () => Promise<void>;
   isFullscreen: () => Promise<boolean>;
   minimize: () => Promise<void>;
   setTitle: (title: string) => Promise<void>;
@@ -19,6 +20,7 @@ export type TauriWindowApi = {
 const unavailableWindowApi: TauriWindowApi = {
   isAvailable: false,
   close: async () => {},
+  hide: async () => {},
   isFullscreen: async () => false,
   minimize: async () => {},
   setTitle: async () => {},
@@ -39,6 +41,7 @@ export function getTauriWindowApi(): TauriWindowApi {
   return {
     isAvailable: true,
     close: () => appWindow.close(),
+    hide: () => appWindow.hide(),
     isFullscreen: () => appWindow.isFullscreen(),
     minimize: () => appWindow.minimize(),
     setTitle: (title) => appWindow.setTitle(title),

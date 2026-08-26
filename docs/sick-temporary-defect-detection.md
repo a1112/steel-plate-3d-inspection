@@ -40,8 +40,11 @@
 
 ```text
 D:\steel-sick-data\<流水号>\derived\defects\manifest.json
-D:\steel-sick-data\<流水号>\derived\defects\review\*.png
+<camera-root>\<流水号>\defect\*.jpg
 ```
+
+其中 `manifest.json` 是中央缺陷清单；复核小图按相机写入各自的
+`<camera-root>/<流水号>/defect/` 目录，manifest 中的 `reviewImage` 保存对应的相机本地路径。
 
 原始 `2d/*.png`、`3d/*.npz` 和 `json/*.json` 均只读，不会被算法覆盖。结果接口为：
 
@@ -80,4 +83,4 @@ D:\project\py312\python.exe scripts\sick_defect_history_backfill.py `
   --minimum-crop-size 64
 ```
 
-运行进度保存在 `D:\steel-sick-data\system\jobs\defect-history-backfill\status.json`。所有缓存缺陷图均为 PNG，宽、高分别不小于 64 像素；前端通过 `/api/defects/history` 分页读取数据库事实，并优先使用 `/api/capture/file` 返回的缺陷小图。人工复核通过 `/api/defects/review` 写回 `pending`、`confirmed` 或 `false-positive`，重跑模型不会覆盖已复核结论。
+运行进度保存在 `D:\steel-sick-data\system\jobs\defect-history-backfill\status.json`。所有复核缺陷图均为各相机 `defect/*.jpg` 下的 JPEG，宽、高分别不小于 64 像素；中央 manifest 记录每张图的路径和检测结果。前端通过 `/api/defects/history` 分页读取数据库事实，并优先使用 `/api/capture/file` 返回的缺陷小图。人工复核通过 `/api/defects/review` 写回 `pending`、`confirmed` 或 `false-positive`，重跑模型不会覆盖已复核结论。

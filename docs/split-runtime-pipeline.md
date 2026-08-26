@@ -1,63 +1,51 @@
-# 实际相机唯一生产链路与独立运行架构
+# 原始数据处理链路与独立运行架构
 
-## 固定生产数据流
+## 固定数据流
 
 ```mermaid
 flowchart LR
-  SICK["实际 SICK GenTL 相机阵列"] --> CAP["steel-capture-service :4317"]
-  CAP -->|steel.acquisition-manifest.v1| IMG["steel-image-worker :4875"]
-  IMG -->|steel.image-result.v1| DEF["steel-defect-worker :4876"]
-  DEF -->|steel.defect-report.v1| BUS["steel-inspection-service :4873"]
-  BUS --> FINAL["业务最终 PASS / FAIL"]
-  BUS --> UI["Tauri 前端"]
-  IMG --> ART["steel-image-service :4874"]
-  ART --> UI
-  TRG["steel-trigger-gateway :4881"] --> BUS
+  BKV["BKV MySQL / 共享图像目录"] --> A["steel-algorithm-service :4875"]
+  CAP["steel-capture-service :4317"] --> A
+  V2["steel.standard-record.v2"] --> A
+  A --> R["统一结果库\nresult.json + catalog.db + blobs"]
+  R --> S["steel-inspection-service :4873"]
+  R --> I["steel-image-service :4874"]
+  S --> T["Tauri 前端"]
+  I --> T
+  SUP["steel-runtime-supervisor.exe"] -.管理.-> A
+  SUP -.管理.-> I
+  SUP -.管理.-> CAP
+  SUP -.管理.-> S
+  SUP -.管理.-> G["steel-trigger-gateway"]
 ```
 
-正式生产只有这一条物理输入线路。采集进程独占相机和 CTI；图像 Worker
-只消费已提交的采集清单；缺陷 Worker 只消费实际相机产生的图像结果；只有业务
-服务可以生成最终生产判定。模拟、文件回放、旧 LVM/NVT 线路和 BKV 历史数据均
-不得进入生产 PASS/FAIL。
+业务服务在生产模式只读统一结果库，不读取 BKV、共享目录或采集原始目录，也不启动算法/采集子进程。Supervisor 按图像、算法、采集、业务、触发网关的顺序启动并按反向顺序停止。`steel-inspection-tray.exe` 只控制 SCM，不持有管理员凭据；独立的 Tauri 服务器任务监控只读健康、队列和最近任务状态，不执行 SCM 或生产任务写操作。
 
-## 正式进程数量
+## 统一结果协议
 
-正式常驻后台共 7 个 EXE：1 个 Supervisor 加 6 个受管子进程：
+`steel.inspection-result.v1` 由 `app/result-contract` 定义。算法服务发布任务时先写入同一 NTFS 卷上的 `staging/<job>`，校验来源文件大小与 SHA-256，将二维全分辨率文件放入 `blobs/<sha256>`，再原子切换到 `records/<inspectionId>`，最后在 SQLite 事务中更新 `catalog.db` 的代数、记录、缺陷和制品索引。失败任务不会出现在业务查询中；重复的来源修订、算法版本和制品指纹直接返回已有代数。
 
-- `steel-runtime-supervisor.exe`
-- `steel-image-service.exe`
-- `steel-image-worker.exe`
-- `steel-defect-worker.exe`
-- `steel-capture-service.exe`
-- `steel-inspection-service.exe`
-- `steel-trigger-gateway.exe`
+业务服务使用 `catalog.db` 的索引查询记录摘要/缺陷/制品。图像服务只接受记录 ID、制品 ID 或算法暂存句柄，检查制品必须是结果库 `blobs/` 下的内容寻址文件，按需生成 JPEG 缩略图/瓦片并通过 ETag 和长期缓存头返回。任何接口都不接受前端任意本机路径。
 
-桌面端和托盘是用户会话程序；`steel_bar_surface_core.exe` 是按需计算助手，不是
-常驻服务。因此正式发行目录包含 10 个 EXE。若另行构建独立 BKV 兼容项目，目录
-总数可为 11 个，但 `steel-image-worker-bkv.exe` 不属于正式生产链路。
+二维世界瓦片当前使用 `steel.inspection-world-cache.v3` 布局：固定 `512×512`，仅提供 `L0` 至 `L3`，按相机独立、按可视范围生成；边缘不足 512 的区域按实际剩余宽高输出。缓存 URL 带布局版本，旧版 128 像素瓦片不会被浏览器或磁盘缓存误用。
 
-## BKV 独立兼容项目
+## 输入适配器
 
-`steel-image-worker-bkv.exe` 使用 4877 端口，可导入并展示历史图片、历史缺陷类型
-和已有缺陷事实。它不由正式 Supervisor 启动、不接触实际相机、不执行缺陷重新
-识别，也不能影响实际相机的生产判定。历史图片缺失时允许进行图片物化，但该
-兼容路径不会调用缺陷算法核心。
+算法服务内置三个只读适配器：
 
-## 持久化交接协议
+- BKV MySQL 与六路 `CamImageSource*` 目录（生产凭据由环境文件注入）；
+- 采集服务完成清单；
+- 既有 `steel.standard-record.v2` 记录迁移。
 
-1. `steel.acquisition-manifest.v1`：相机采集提交后的不可变深度、强度和元数据制品。
-2. `steel.image-result.v1`：对采集制品进行对齐、ROI、测量和表面处理后的结果。
-3. `steel.defect-report.v1`：缺陷 Worker 基于实际相机图像结果产生的识别报告。
-4. Business 最终结果：业务服务结合物料、流程和缺陷报告落库并生成 PASS/FAIL。
+输入修订和文件哈希构成幂等发布依据。算法核心仍由现有 Python/C++ 程序执行，Rust 服务负责持久化、重试、隔离失败和统一结果转换。
 
-每个交接均通过文件路径、大小和 SHA-256 约束来源修订。图像与缺陷结果是可重建
-的派生制品；原始采集提交不可变。
+## 本地启动与部署
 
-## 本地与硬件服务器分工
+- `scripts/run-tauri-dev.ps1` 先启动 4874/4875，再启动仅代理模式的业务服务和 Tauri 静态客户端；可用 `-NoProcessingServices` 调试已有后台。脚本会在 `target/run/tauri-dev/logs` 保存各进程输出，并在启动后请求算法服务重扫输入。
+- 生产 BKV 调试使用未纳入 Git 的环境文件，例如 `scripts/run-tauri-dev.ps1 -EnvFile config/env/bkv-online.env.local`。脚本在导入环境文件后重新绑定本地结果库、状态根和服务端口，避免业务服务误连原始 BKV 源。
+- 后台管理的“运行日志”页调用受 `admin.services` 保护的 `/api/admin/runtime/logs`，展示 Supervisor 状态、4873/4874/4875/4317/4881 进程探针、统一结果目录就绪状态，以及日志文件最近 240 行；前端每 5 秒轮询并在切换页签/卸载时取消旧请求。
+- Windows 服务安装脚本为 Supervisor 注入 `STEEL_RESULT_ROOT`、`STEEL_ALGORITHM_INPUT_ROOTS` 和代理模式标志，并创建 `result-data`、`algorithm-input`、`work/image`、`work/algorithm` 目录。
+- `steel-inspection-tray.exe` 支持查看状态、打开日志/数据目录、打开 Tauri、启动/停止/重启 SCM，以及当前用户登录自启动；退出该托盘不会停止后台服务。
+- `steel-inspection-server-monitor.exe` 是部署在服务器交互式用户会话中的独立 Tauri 进程，不依赖操作客户端存活。它每 5 秒在 Rust 后台线程读取 `/api/health/details`、`/api/production/status` 和最近任务列表；关闭监控窗口只会隐藏到自身托盘，显式退出也不会停止后台 Windows 服务。该程序不保存管理员令牌，也不提供任务取消、重试或服务启停。
 
-本机负责代码、契约、构建、静态边界与无硬件测试。安装器要求显式传入经过审核
-的 SICK profile 和 Python 路径，并校验 CTI、阵列标定、模型清单、四个 ONNX 模型
-及每个相机的存储目录。实际相机连通性、CTI/SDK、CUDA、模型精度、吞吐与长稳
-测试在硬件服务器上完成。
-
-更详细的边界说明见 `docs/runtime-boundaries-v2.md`。
+生产就绪条件同时要求 4874 图像服务、4875 算法服务和 `catalog.db` 可用；缺任一项，业务服务 readiness 失败。

@@ -29,6 +29,19 @@ CALIBRATION_SCHEMA = "steel.sick-array-calibration.v1"
 DEFAULT_DIAMETER_ANGLES_DEG = (0.0, 30.0, 60.0, 90.0, 120.0, 150.0)
 
 
+def _calibration_metric_projection_valid(calibration: dict[str, Any]) -> bool:
+    """Return whether calibration is approved for metric projection.
+
+    ``approved`` identifies the calibration record selected by the operator;
+    ``metricProjectionVerified`` is the separate unit/projection acceptance
+    gate.  Both are required before any result may be labelled as metric.
+    """
+    return bool(
+        calibration.get("approved", False)
+        and calibration.get("metricProjectionVerified", False)
+    )
+
+
 @dataclass(frozen=True)
 class MeasurementConfig:
     row_window: int = 16
@@ -357,8 +370,6 @@ def build_fixed_angle_diameter_curves(
             radius_mm = math.nan
         surface_accepted = bool(section.get("acceptedForSurface"))
         reasons: list[str] = []
-        if not surface_metric_valid:
-            reasons.append("surface-metric-quality-gate-failed")
         if not surface_accepted:
             reasons.append("surface-section-rejected")
         if not bool(fit.get("available")) or not math.isfinite(radius_mm) or radius_mm <= 0.0:
@@ -477,10 +488,26 @@ def build_fixed_angle_diameter_curves(
     valid_section_count = sum(
         1 for section in curve_sections if section["metricValid"]
     )
-    curves_metric_valid = bool(surface_metric_valid and valid_section_count >= 2)
+    curves_available = valid_section_count >= 2
+    curves_metric_valid = bool(surface_metric_valid and curves_available)
     return {
-        "available": curves_metric_valid,
+        "available": curves_available,
         "metricValid": curves_metric_valid,
+        "displayMode": (
+            "metric"
+            if curves_metric_valid
+            else "diagnostic-unqualified"
+            if curves_available
+            else "unavailable"
+        ),
+        "qualityGate": {
+            "passed": curves_metric_valid,
+            "reasons": []
+            if curves_metric_valid
+            else ["surface-metric-quality-gate-failed"]
+            if curves_available and not surface_metric_valid
+            else ["not-enough-valid-sections"],
+        },
         "model": "opposed-radial-pairs-from-reconstructed-surface",
         "angleConvention": "array-x-axis-ccw-period-180",
         "longitudinalCoordinate": "head-relative-time",
@@ -626,6 +653,10 @@ def build_flow_measurement(
     settings = (config or MeasurementConfig()).bounded()
     calibration = _load_calibration(calibration_path)
     approved = bool(calibration.get("approved", False))
+    metric_projection_verified = bool(
+        calibration.get("metricProjectionVerified", False)
+    )
+    calibration_metric_valid = _calibration_metric_projection_valid(calibration)
     anchors = list(alignment.get("softSyncAnchors", []))
     selected_anchor = anchors[len(anchors) // 2] if anchors else None
     cameras: dict[str, Any] = {}
@@ -701,7 +732,7 @@ def build_flow_measurement(
         <= settings.maximum_circle_residual_mm
     )
     metric_valid = bool(
-        approved
+        calibration_metric_valid
         and selected_section_synchronized
         and row_mapping_ok
         and every_camera_calibrated
@@ -714,6 +745,8 @@ def build_flow_measurement(
         reasons.append("cross-section-row-clipped")
     if not approved:
         reasons.append("approved-array-calibration-missing")
+    if not metric_projection_verified:
+        reasons.append("metric-projection-unverified")
     if not every_camera_calibrated:
         reasons.append("camera-extrinsics-incomplete")
     if not residual_ok:
@@ -767,7 +800,7 @@ def build_flow_measurement(
         section_fits, settings.maximum_circle_residual_mm
     )
     surface_metric_valid = bool(
-        approved
+        calibration_metric_valid
         and every_camera_calibrated
         and surface_fit.get("available")
         and int(surface_fit.get("sectionsAccepted", 0)) >= 2
@@ -775,6 +808,8 @@ def build_flow_measurement(
     surface_fit.update(
         {
             "metricValid": surface_metric_valid,
+            "metricProjectionVerified": metric_projection_verified,
+            "calibrationMetricValid": calibration_metric_valid,
             "longitudinalCoordinate": "head-relative-time",
             "absoluteLongitudinalScaleVerified": False,
             "maximumCircleResidualMm": settings.maximum_circle_residual_mm,
@@ -796,6 +831,8 @@ def build_flow_measurement(
             "path": str(calibration_path) if calibration_path else "",
             "available": bool(calibration),
             "approved": approved,
+            "metricProjectionVerified": metric_projection_verified,
+            "metricProjectionValid": calibration_metric_valid,
             "calibratedCameras": calibrated,
             "expectedCameras": len(camera_roots),
             "revision": calibration.get("revision"),

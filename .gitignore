@@ -3,8 +3,10 @@ dist/
 src-tauri/gen/
 app/client/node_modules/
 app/client/src-tauri/gen/
+app/server-monitor/gen/
 app/src-tauri/gen/
 target/
+/bin/
 app/capture/build/
 app/service/build/
 .vite/

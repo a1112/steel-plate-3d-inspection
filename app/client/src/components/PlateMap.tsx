@@ -7,7 +7,7 @@ import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
 import type { CaptureImageItem, DefectItem, DefectType } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import { createSequentialCameraLanes, type CameraDisplayLane } from '../lib/camera-display';
-import { captureArtifactImageUrl, type CaptureSurfaceCameraTiles } from '../lib/capture-api';
+import { captureArtifactImageUrl, type CaptureFlowSurface, type CaptureSurfaceCameraTiles } from '../lib/capture-api';
 import { barSurfaceFileUrl, type BarSurfaceCamera, type BarSurfaceMesh } from '../services/bar-surface-api';
 import {
   fetchCaptureStitchHistory,
@@ -26,6 +26,7 @@ import { clampPreviewPositionM, DEFAULT_PLATE_LENGTH_M, type SurfaceDisplayMode 
 import { Panel } from './Panel';
 import { ProductionArtifactView, type ArtifactOrientation } from './ProductionArtifactView';
 import { BkvSectionView } from './BkvReconstructionApp';
+import { CaptureSectionView } from './CaptureSectionView';
 import { InspectionWorldCanvas, type InspectionWorldTileLoading } from './InspectionWorldCanvas';
 
 interface PlateMapProps {
@@ -52,6 +53,7 @@ interface PlateMapProps {
   cameraLanes?: CameraDisplayLane[];
   surfaceMesh?: BarSurfaceMesh | null;
   surfaceCameraTiles?: CaptureSurfaceCameraTiles | null;
+  surfaceHeadAlignment?: CaptureFlowSurface['headAlignment'] | null;
   surfaceCameras?: BarSurfaceCamera[];
   artifactStatus?: string;
   viewMode?: PlateMapViewMode;
@@ -761,6 +763,25 @@ function cameraIdentityNumber(value: string) {
   return match ? Number(match[1]) : null;
 }
 
+type CaptureHeadAlignment = NonNullable<CaptureFlowSurface['headAlignment']>;
+type CaptureHeadAlignmentCamera = NonNullable<CaptureHeadAlignment['cameras']>[string];
+
+function headAlignmentCamera(
+  alignment: CaptureFlowSurface['headAlignment'] | null | undefined,
+  cameraId: string,
+): CaptureHeadAlignmentCamera | undefined {
+  const target = cameraIdentityNumber(cameraId);
+  if (target === null) return undefined;
+  return Object.entries(alignment?.cameras ?? {}).find(
+    ([candidate]) => cameraIdentityNumber(candidate) === target,
+  )?.[1];
+}
+
+function signedFrameOffset(value: number) {
+  if (Math.abs(value) < 0.0005) return '参考头';
+  return `头偏移 ${value > 0 ? '+' : ''}${value.toFixed(2)} 帧`;
+}
+
 function BarUnfoldedMap({
   defects,
   defectTypes,
@@ -780,6 +801,7 @@ function BarUnfoldedMap({
   cameraLanes,
   imageMode = 'gray',
   cameraTiles,
+  headAlignment,
   cropBlackBorders = false,
 }: {
   defects: DefectItem[];
@@ -800,6 +822,7 @@ function BarUnfoldedMap({
   cameraLanes: CameraDisplayLane[];
   imageMode?: Plate2DDisplayMode;
   cameraTiles?: CaptureSurfaceCameraTiles | null;
+  headAlignment?: CaptureFlowSurface['headAlignment'] | null;
   cropBlackBorders?: boolean;
 }) {
   const FRAME_SPAN_PX = 176;
@@ -809,7 +832,12 @@ function BarUnfoldedMap({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const scrollProgressRef = useRef(0);
   const atTailRef = useRef(false);
-  const previousLayoutRef = useRef({ orientation, stitchKey, frameCount: captureFrames.length });
+  const previousLayoutRef = useRef({
+    orientation,
+    stitchKey,
+    frameCount: captureFrames.length,
+    alignmentKey: '',
+  });
   const [scrollWindow, setScrollWindow] = useState({ offset: 0, extent: 1 });
   const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
   const hoveredDefect = defects.find((defect) => defect.id === hoveredDefectId) ?? null;
@@ -829,9 +857,39 @@ function BarUnfoldedMap({
     return images;
   }, [captureImages]);
   const stitchEnabled = captureFrames.length > 0;
-  const longitudinalExtent = Math.max(FRAME_SPAN_PX, captureFrames.length * FRAME_SPAN_PX);
+  const displayHeadAlignmentApplied = Boolean(
+    imageMode === 'gray'
+    && stitchEnabled
+    && headAlignment?.displayAligned
+    && cameraLanes.every((lane) => {
+      const padding = headAlignmentCamera(
+        headAlignment,
+        lane.cameraId,
+      )?.displayPaddingFrames;
+      return typeof padding === 'number' && Number.isFinite(padding);
+    }),
+  );
+  const maximumHeadPaddingFrames = displayHeadAlignmentApplied
+    ? Math.max(
+      0,
+      ...cameraLanes.map((lane) => Number(
+        headAlignmentCamera(headAlignment, lane.cameraId)?.displayPaddingFrames ?? 0,
+      )),
+    )
+    : 0;
+  const alignmentKey = displayHeadAlignmentApplied
+    ? `${headAlignment?.alignedTimelinePositionFrames ?? ''}:${maximumHeadPaddingFrames}`
+    : '';
+  const longitudinalExtent = Math.max(
+    FRAME_SPAN_PX,
+    (captureFrames.length + maximumHeadPaddingFrames) * FRAME_SPAN_PX,
+  );
   const firstVisibleFrame = stitchEnabled
-    ? Math.max(0, Math.floor(scrollWindow.offset / FRAME_SPAN_PX) - FRAME_OVERSCAN)
+    ? Math.max(
+      0,
+      Math.floor(scrollWindow.offset / FRAME_SPAN_PX - maximumHeadPaddingFrames)
+      - FRAME_OVERSCAN,
+    )
     : 0;
   const lastVisibleFrame = stitchEnabled
     ? Math.min(
@@ -842,7 +900,17 @@ function BarUnfoldedMap({
   const visibleCaptureFrames = stitchEnabled
     ? captureFrames.slice(firstVisibleFrame, lastVisibleFrame)
     : [];
-  const contentAnchorFrame = captureStitchInitialFrameIndex(captureFrames, cameraLanes.length);
+  const detectedContentAnchorFrame = captureStitchInitialFrameIndex(
+    captureFrames,
+    cameraLanes.length,
+  );
+  const alignedTimelinePosition = Number(headAlignment?.alignedTimelinePositionFrames);
+  const firstCaptureSequence = Number(captureFrames[0]?.sequence);
+  const contentAnchorFrame = displayHeadAlignmentApplied
+    && Number.isFinite(alignedTimelinePosition)
+    && Number.isFinite(firstCaptureSequence)
+    ? Math.max(0, alignedTimelinePosition - firstCaptureSequence)
+    : detectedContentAnchorFrame;
   const priorityFrameIndex = stitchEnabled
     ? Math.max(
       firstVisibleFrame,
@@ -906,20 +974,26 @@ function BarUnfoldedMap({
     const previous = previousLayoutRef.current;
     const recordChanged = previous.stitchKey !== stitchKey;
     const orientationChanged = previous.orientation !== orientation;
+    const alignmentChanged = previous.alignmentKey !== alignmentKey;
     const recordContentBecameReady = previous.frameCount === 0 && captureFrames.length > 0;
     const appendedAtTail = !recordChanged
       && previous.frameCount > 0
       && captureFrames.length > previous.frameCount
       && atTailRef.current;
-    const retainedProgress = recordChanged ? 0 : scrollProgressRef.current;
-    previousLayoutRef.current = { orientation, stitchKey, frameCount: captureFrames.length };
+    const retainedProgress = recordChanged || alignmentChanged ? 0 : scrollProgressRef.current;
+    previousLayoutRef.current = {
+      orientation,
+      stitchKey,
+      frameCount: captureFrames.length,
+      alignmentKey,
+    };
     const frame = window.requestAnimationFrame(() => {
       const extent = orientation === 'horizontal' ? host.clientWidth : host.clientHeight;
       const scrollExtent = orientation === 'horizontal' ? host.scrollWidth : host.scrollHeight;
       const maximum = Math.max(0, scrollExtent - extent);
       const target = appendedAtTail
         ? maximum
-        : recordChanged || recordContentBecameReady
+        : recordChanged || recordContentBecameReady || alignmentChanged
           ? Math.min(maximum, contentAnchorFrame * FRAME_SPAN_PX)
           : maximum * retainedProgress;
       if (orientation === 'horizontal') {
@@ -929,13 +1003,13 @@ function BarUnfoldedMap({
         host.scrollLeft = 0;
         host.scrollTop = target;
       }
-      if (orientationChanged || recordChanged || recordContentBecameReady || appendedAtTail) readScrollPosition();
+      if (orientationChanged || recordChanged || recordContentBecameReady || alignmentChanged || appendedAtTail) readScrollPosition();
     });
     return () => window.cancelAnimationFrame(frame);
   // readScrollPosition is deliberately kept local so it always uses the
   // orientation committed by this render.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [captureFrames.length, orientation, stitchKey]);
+  }, [alignmentKey, captureFrames.length, contentAnchorFrame, orientation, stitchKey]);
 
   const handleMapWheel = (event: WheelEvent<HTMLDivElement>) => {
     if (!stitchEnabled) {
@@ -962,6 +1036,9 @@ function BarUnfoldedMap({
         data-scroll-axis={stitchEnabled ? orientation === 'horizontal' ? 'x' : 'y' : 'none'}
         data-frame-count={captureFrames.length}
         data-content-anchor-frame={contentAnchorFrame}
+        data-head-aligned={headAlignment?.displayAligned ? 'true' : 'false'}
+        data-head-display-padding-applied={displayHeadAlignmentApplied ? 'true' : 'false'}
+        data-head-spread-frames={headAlignment?.timelineSpreadFrames ?? undefined}
         data-visible-frame-start={firstVisibleFrame}
         data-visible-frame-end={lastVisibleFrame}
         style={{ '--preview-position': `${previewPercent}%` } as CSSProperties}
@@ -983,13 +1060,25 @@ function BarUnfoldedMap({
               : stitchEnabled ? '' : preview ? barSurfaceFileUrl(preview) : captureImage?.url || '';
             const expanded = expandedCamera === lane.cameraId;
             const stableCropWindow = autoCropWindows[lane.cameraId];
+            const cameraHead = headAlignmentCamera(headAlignment, lane.cameraId);
+            const headOffsetFrames = Number(cameraHead?.offsetFramesFromReference);
+            const displayPaddingFrames = displayHeadAlignmentApplied
+              ? Math.max(0, Number(cameraHead?.displayPaddingFrames ?? 0))
+              : 0;
+            const alignmentLabel = cameraHead?.displayAligned
+              && Number.isFinite(headOffsetFrames)
+              ? `${signedFrameOffset(headOffsetFrames)} · 已对齐`
+              : '';
             return <div
               key={lane.cameraId}
               className={`bar-camera-band ${source ? 'has-production-image' : ''} ${expanded ? 'is-expanded' : ''} ${expandedCamera && !expanded ? 'is-collapsed' : ''}`}
               role="button"
               tabIndex={0}
               aria-label={`${lane.cameraId} 采集图像${expanded ? '，已展开，双击恢复' : '，双击展开'}`}
-              title={expanded ? `双击恢复 ${cameraLanes.length} 相机展开图` : `双击展开 ${lane.cameraId}；悬停查看采集轮廓`}
+              title={`${expanded ? `双击恢复 ${cameraLanes.length} 相机展开图` : `双击展开 ${lane.cameraId}；悬停查看采集轮廓`}${alignmentLabel ? `；${alignmentLabel}` : ''}`}
+              data-head-offset-frames={Number.isFinite(headOffsetFrames) ? headOffsetFrames.toFixed(6) : undefined}
+              data-head-display-padding-frames={cameraHead?.displayAligned ? Number(cameraHead.displayPaddingFrames ?? 0).toFixed(6) : undefined}
+              data-head-aligned={cameraHead?.displayAligned ? 'true' : 'false'}
               onDoubleClick={() => setExpandedCamera((current) => current === lane.cameraId ? null : lane.cameraId)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
@@ -1018,8 +1107,8 @@ function BarUnfoldedMap({
                       data-frame-sequence={frame.sequence}
                       data-camera-id={lane.shortLabel}
                       style={orientation === 'horizontal'
-                        ? { left: frameIndex * FRAME_SPAN_PX, width: FRAME_SPAN_PX }
-                        : { top: frameIndex * FRAME_SPAN_PX, height: FRAME_SPAN_PX }}
+                        ? { left: (frameIndex + displayPaddingFrames) * FRAME_SPAN_PX, width: FRAME_SPAN_PX }
+                        : { top: (frameIndex + displayPaddingFrames) * FRAME_SPAN_PX, height: FRAME_SPAN_PX }}
                     >
                       {cameraFrame ? <CameraBandImage
                         src={cameraFrame.url}
@@ -1036,7 +1125,7 @@ function BarUnfoldedMap({
                   })}
                 </div>
               ) : null}
-              <span>{lane.shortLabel}</span>
+              <span>{lane.shortLabel}{alignmentLabel ? ` · ${alignmentLabel}` : ''}</span>
             </div>;
           })}
         </div>
@@ -1860,6 +1949,7 @@ export function PlateMap({
   cameraLanes = DEFAULT_CAMERA_LANES,
   surfaceMesh,
   surfaceCameraTiles,
+  surfaceHeadAlignment,
   surfaceCameras = [],
   artifactStatus,
   viewMode: controlledViewMode,
@@ -2144,6 +2234,22 @@ export function PlateMap({
           <button type="button" className={unfoldOrientation === 'vertical' ? 'active' : ''} aria-pressed={unfoldOrientation === 'vertical'} onClick={() => setUnfoldOrientation('vertical')}>纵向</button>
         </div>
       ) : null}
+      {surfaceHeadAlignment ? (
+        <div
+          className={`head-alignment-summary ${surfaceHeadAlignment.displayAligned ? 'is-aligned' : 'is-unavailable'}`}
+          role="status"
+          data-testid="head-alignment-summary"
+          data-head-aligned={surfaceHeadAlignment.displayAligned ? 'true' : 'false'}
+        >
+          <strong>{surfaceHeadAlignment.displayAligned ? '头部已对齐' : '头部未对齐'}</strong>
+          <span>
+            参考 {surfaceHeadAlignment.referenceCameraId || '--'}
+            {typeof surfaceHeadAlignment.maximumDisplayPaddingFrames === 'number'
+              ? ` · 最大补偿 ${surfaceHeadAlignment.maximumDisplayPaddingFrames.toFixed(2)} 帧`
+              : ''}
+          </span>
+        </div>
+      ) : null}
       {integratedToolbar ? <PlateMapActions viewMode={viewMode} onViewModeChange={setViewMode} /> : null}
       <PlateDisplaySubModes
         viewMode={viewMode}
@@ -2159,7 +2265,9 @@ export function PlateMap({
 
       {viewMode === '3d' ? (
         artifactMode === 'production' ? (
-          surfaceMesh && surfaceMesh.positions.length >= 3 && surfaceMesh.indices.length >= 3 ? (
+          surfaceMesh
+          && surfaceMesh.positions.length >= 3
+          && (threeDisplayMode === 'points' || surfaceMesh.indices.length >= 3) ? (
             <ProductionArtifactView
               mesh={surfaceMesh}
               mode={threeDisplayMode === 'points' ? 'points' : 'surface'}
@@ -2178,7 +2286,9 @@ export function PlateMap({
                 ? 'radial-jet'
                 : threeDisplayMode === 'texture'
                   ? 'texture'
-                  : 'source'}
+                  : threeDisplayMode === 'surface'
+                    ? 'neutral'
+                    : 'source'}
               textureUrl={textureUrl}
               radialUnitScale={surfaceMesh.coordinateUnit === 'mm'
                 ? 1
@@ -2188,7 +2298,11 @@ export function PlateMap({
                 : nominalDiameterMm > 0 ? 'mm' : '显示坐标'}
               orientation={artifactOrientation}
               onZoomChange={setProductionZoom}
-              lengthMm={safePlateLengthM * 1000}
+              lengthMm={surfaceMesh.materialId
+                ? surfaceMesh.longitudinalAxis?.absoluteScaleVerified === true
+                  ? safePlateLengthM * 1000
+                  : 0
+                : safePlateLengthM * 1000}
               onVisibleRangeChange={onVisibleRangeChange}
               focusPositionRatio={selectedDefectPositionRatio}
               focusRevision={worldFocusRequest?.revision}
@@ -2232,19 +2346,33 @@ export function PlateMap({
         )
       ) : viewMode === 'section' ? (
         surfaceMesh && surfaceMesh.positions.length >= 3 ? (
-          <BkvSectionView
-            mesh={surfaceMesh}
-            row={closestObservedSectionRow(
-              surfaceMesh,
-              previewPositionM / Math.max(safePlateLengthM, 0.001) * (surfaceMesh.rows - 1),
-            )}
-            onRowChange={(row) => onPreviewPositionChange(
-              row / Math.max(1, surfaceMesh.rows - 1) * safePlateLengthM,
-            )}
-            recordId={inspectionId || '当前记录'}
-            nominalDiameterMm={nominalDiameterMm}
-            lengthMm={safePlateLengthM * 1000}
-          />
+          surfaceMesh.materialId ? (
+            <CaptureSectionView
+              mesh={surfaceMesh}
+              row={closestObservedSectionRow(
+                surfaceMesh,
+                previewPositionM / Math.max(safePlateLengthM, 0.001) * (surfaceMesh.rows - 1),
+              )}
+              onRowChange={(row) => onPreviewPositionChange(
+                row / Math.max(1, surfaceMesh.rows - 1) * safePlateLengthM,
+              )}
+              recordId={inspectionId || surfaceMesh.materialId || '当前记录'}
+            />
+          ) : (
+            <BkvSectionView
+              mesh={surfaceMesh}
+              row={closestObservedSectionRow(
+                surfaceMesh,
+                previewPositionM / Math.max(safePlateLengthM, 0.001) * (surfaceMesh.rows - 1),
+              )}
+              onRowChange={(row) => onPreviewPositionChange(
+                row / Math.max(1, surfaceMesh.rows - 1) * safePlateLengthM,
+              )}
+              recordId={inspectionId || '当前记录'}
+              nominalDiameterMm={nominalDiameterMm}
+              lengthMm={safePlateLengthM * 1000}
+            />
+          )
         ) : (
           <div className={`production-artifact-empty${artifactLoading ? ' is-loading' : ''}`} role="status">
             <strong>{artifactLoading ? '正在准备切面数据' : '暂无可提取切面的三维表面'}</strong>
@@ -2277,6 +2405,7 @@ export function PlateMap({
               cameraLanes={cameraLanes}
               imageMode="jet"
               cameraTiles={surfaceCameraTiles}
+              headAlignment={surfaceHeadAlignment}
             />
             <LengthRuler
               previewPositionM={previewPositionM}
@@ -2398,6 +2527,7 @@ export function PlateMap({
             captureFrames={captureStitchResult?.frames ?? []}
             stitchKey={captureMaterialId?.trim() || inspectionId || ''}
             cameraLanes={cameraLanes}
+            headAlignment={surfaceHeadAlignment}
             cropBlackBorders
           />
           <LengthRuler previewPositionM={previewPositionM} plateLengthM={safePlateLengthM} onPreviewPositionChange={onPreviewPositionChange} orientation={unfoldOrientation} />

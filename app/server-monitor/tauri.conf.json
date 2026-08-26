@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "北满特钢后台任务监控",
+  "version": "0.1.0",
+  "identifier": "com.bkgy.steel-inspection.server-monitor",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../client run dev",
+    "devUrl": "http://localhost:1432",
+    "beforeBuildCommand": "npm --prefix ../client run build",
+    "features": [],
+    "frontendDist": "../../target/client/frontend-dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "background-monitor",
+        "title": "北满特钢后台任务监控",
+        "url": "index.html?app=monitor",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1040,
+        "minHeight": 680,
+        "center": true,
+        "resizable": true,
+        "maximizable": true,
+        "minimizable": true,
+        "closable": true,
+        "decorations": false,
+        "transparent": false,
+        "shadow": true,
+        "devtools": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' customprotocol: asset:; connect-src ipc: http://ipc.localhost http://*:* https://*:*; img-src 'self' asset: http://asset.localhost http://*:* https://*:* blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "北科工研",
+    "shortDescription": "独立服务器后台任务监控与系统托盘",
+    "longDescription": "独立轮询钢材检测后台健康状态、持久任务队列与最近任务，并通过 Tauri 系统托盘常驻。",
+    "icon": [
+      "../client/src-tauri/icons/32x32.png",
+      "../client/src-tauri/icons/128x128.png",
+      "../client/src-tauri/icons/128x128@2x.png",
+      "../client/src-tauri/icons/icon.icns",
+      "../client/src-tauri/icons/icon.ico"
+    ]
+  }
+}

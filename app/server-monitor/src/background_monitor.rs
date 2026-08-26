@@ -1,0 +1,843 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tauri::{App, AppHandle, Emitter, Manager, State};
+
+const TRAY_ID: &str = "background-monitor-tray";
+const MENU_STATUS: &str = "background-monitor-status";
+const MENU_TASKS: &str = "background-monitor-tasks";
+const MENU_ISSUES: &str = "background-monitor-issues";
+const MENU_OPEN_MONITOR: &str = "background-monitor-open";
+const MENU_HIDE_WINDOWS: &str = "background-monitor-hide";
+const MENU_QUIT: &str = "background-monitor-quit";
+const MONITOR_EVENT: &str = "background-monitor-updated";
+pub(crate) const MONITOR_WINDOW: &str = "background-monitor";
+const DEFAULT_ORIGIN: &str = "http://127.0.0.1:4873";
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(1_800);
+const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_TASKS: usize = 16;
+const RECENT_FAILURE_WINDOW_MS: u64 = 30 * 60 * 1000;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackgroundTaskSnapshot {
+    pub task_id: String,
+    pub kind: String,
+    pub material_id: String,
+    pub status: String,
+    pub phase: String,
+    pub progress: f64,
+    pub updated_at: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackgroundMonitorSnapshot {
+    pub schema: &'static str,
+    pub state: &'static str,
+    pub origin: String,
+    pub service_available: bool,
+    pub service_ready: bool,
+    pub worker_running: bool,
+    pub queue_depth: u64,
+    pub active_tasks: u64,
+    pub failed_tasks: u64,
+    pub blocked_tasks: u64,
+    pub active_task_id: Option<String>,
+    pub detail: String,
+    pub updated_at_unix_ms: u64,
+    pub tasks: Vec<BackgroundTaskSnapshot>,
+}
+
+impl Default for BackgroundMonitorSnapshot {
+    fn default() -> Self {
+        Self {
+            schema: "steel.tauri-background-monitor.v1",
+            state: "initializing",
+            origin: DEFAULT_ORIGIN.to_string(),
+            service_available: false,
+            service_ready: false,
+            worker_running: false,
+            queue_depth: 0,
+            active_tasks: 0,
+            failed_tasks: 0,
+            blocked_tasks: 0,
+            active_task_id: None,
+            detail: "正在连接后台检测服务".to_string(),
+            updated_at_unix_ms: unix_time_millis(),
+            tasks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TrayUi {
+    tray: TrayIcon,
+    status: MenuItem<tauri::Wry>,
+    tasks: MenuItem<tauri::Wry>,
+    issues: MenuItem<tauri::Wry>,
+}
+
+pub(crate) struct BackgroundMonitorState {
+    snapshot: Mutex<BackgroundMonitorSnapshot>,
+    origin: Mutex<String>,
+    tray: Mutex<Option<TrayUi>>,
+    exiting: AtomicBool,
+    refresh_requested: AtomicBool,
+}
+
+impl Default for BackgroundMonitorState {
+    fn default() -> Self {
+        let origin = std::env::var("INSPECTION_SERVICE_ORIGIN")
+            .ok()
+            .and_then(|value| normalize_monitor_origin(&value).ok())
+            .unwrap_or_else(|| DEFAULT_ORIGIN.to_string());
+        let snapshot = BackgroundMonitorSnapshot {
+            origin: origin.clone(),
+            ..BackgroundMonitorSnapshot::default()
+        };
+        Self {
+            snapshot: Mutex::new(snapshot),
+            origin: Mutex::new(origin),
+            tray: Mutex::new(None),
+            exiting: AtomicBool::new(false),
+            refresh_requested: AtomicBool::new(true),
+        }
+    }
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    value.trim().chars().take(max_chars).collect()
+}
+
+fn normalize_monitor_origin(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let authority = trimmed
+        .strip_prefix("http://")
+        .ok_or_else(|| "后台托盘监控仅支持 http 服务地址".to_string())?;
+    if authority.is_empty()
+        || authority.contains(['/', '\\', '@', '?', '#', '\r', '\n'])
+        || authority.chars().any(char::is_whitespace)
+    {
+        return Err("后台托盘监控服务地址无效".to_string());
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let parsed = port
+                .parse::<u16>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "后台托盘监控服务端口无效".to_string())?;
+            (host, parsed)
+        }
+        None => (authority, 80),
+    };
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '-'))
+    {
+        return Err("后台托盘监控服务主机无效".to_string());
+    }
+    let host = host.to_ascii_lowercase();
+    if !matches!(host.as_str(), "127.0.0.1" | "localhost") {
+        return Err("后台托盘监控仅允许连接服务器本机回环地址".to_string());
+    }
+    Ok(format!("http://{host}:{port}"))
+}
+
+fn monitor_origin_endpoint(origin: &str) -> Result<(String, u16), String> {
+    let normalized = normalize_monitor_origin(origin)?;
+    let authority = normalized
+        .strip_prefix("http://")
+        .ok_or_else(|| "monitor_origin_invalid".to_string())?;
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| "monitor_origin_invalid".to_string())?;
+    Ok((
+        host.to_string(),
+        port.parse::<u16>()
+            .map_err(|_| "monitor_origin_invalid".to_string())?,
+    ))
+}
+
+fn remaining_timeout(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| "monitor_request_timeout".to_string())
+}
+
+fn bounded_json_get(origin: &str, path: &str) -> Result<(u16, Value), String> {
+    let (host, port) = monitor_origin_endpoint(origin)?;
+    let deadline = Instant::now()
+        .checked_add(REQUEST_TIMEOUT)
+        .ok_or_else(|| "monitor_request_timeout".to_string())?;
+    let addresses = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|_| "monitor_service_unreachable".to_string())?;
+    let mut stream = None;
+    for address in addresses {
+        let remaining = remaining_timeout(deadline)?;
+        if let Ok(candidate) = TcpStream::connect_timeout(&address, remaining) {
+            stream = Some(candidate);
+            break;
+        }
+    }
+    let mut stream = stream.ok_or_else(|| "monitor_service_unreachable".to_string())?;
+    stream
+        .set_read_timeout(Some(remaining_timeout(deadline)?))
+        .map_err(|_| "monitor_request_timeout".to_string())?;
+    stream
+        .set_write_timeout(Some(remaining_timeout(deadline)?))
+        .map_err(|_| "monitor_request_timeout".to_string())?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| "monitor_service_unreachable".to_string())?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        stream
+            .set_read_timeout(Some(remaining_timeout(deadline)?))
+            .map_err(|_| "monitor_request_timeout".to_string())?;
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&buffer[..count]);
+                if response.len() > MAX_HTTP_RESPONSE_BYTES {
+                    return Err("monitor_response_too_large".to_string());
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err("monitor_request_timeout".to_string())
+            }
+            Err(_) => return Err("monitor_response_invalid".to_string()),
+        }
+    }
+    parse_json_http_response(&response)
+}
+
+fn parse_json_http_response(response: &[u8]) -> Result<(u16, Value), String> {
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "monitor_response_invalid".to_string())?;
+    let header = std::str::from_utf8(&response[..separator])
+        .map_err(|_| "monitor_response_invalid".to_string())?;
+    let status = header
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| "monitor_response_invalid".to_string())?;
+    let body = response
+        .get(separator + 4..)
+        .ok_or_else(|| "monitor_response_invalid".to_string())?;
+    let value = serde_json::from_slice(body).map_err(|_| "monitor_response_invalid".to_string())?;
+    Ok((status, value))
+}
+
+fn task_snapshot(value: &Value) -> Option<BackgroundTaskSnapshot> {
+    let task_id = value
+        .get("taskId")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(|value| bounded_text(value, 96))
+        .filter(|value| !value.is_empty())?;
+    Some(BackgroundTaskSnapshot {
+        task_id,
+        kind: bounded_text(
+            value
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            48,
+        ),
+        material_id: bounded_text(
+            value
+                .get("materialId")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            64,
+        ),
+        status: bounded_text(
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            32,
+        )
+        .to_ascii_lowercase(),
+        phase: bounded_text(
+            value
+                .get("phase")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            64,
+        ),
+        progress: value
+            .get("progress")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        updated_at: bounded_text(
+            value
+                .get("updatedAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            64,
+        ),
+        error: bounded_text(
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("blockedReason").and_then(Value::as_str))
+                .unwrap_or_default(),
+            240,
+        ),
+    })
+}
+
+fn task_is_recent(task: &BackgroundTaskSnapshot, now: u64) -> bool {
+    task.updated_at
+        .parse::<u64>()
+        .ok()
+        .map(|updated| now.saturating_sub(updated) <= RECENT_FAILURE_WINDOW_MS)
+        .unwrap_or(true)
+}
+
+fn snapshot_from_payloads(
+    origin: &str,
+    health: &Value,
+    production: Option<&Value>,
+    task_page: Option<&Value>,
+    now: u64,
+) -> BackgroundMonitorSnapshot {
+    let service_ready = health.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let health_worker = health
+        .pointer("/checks/taskWorker/running")
+        .and_then(Value::as_bool);
+    let production_worker = production
+        .and_then(|value| value.pointer("/tasks/worker/running"))
+        .and_then(Value::as_bool);
+    let worker_running = health_worker.or(production_worker).unwrap_or(false);
+
+    let tasks = task_page
+        .and_then(|value| value.get("tasks"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(task_snapshot)
+        .take(MAX_TASKS)
+        .collect::<Vec<_>>();
+    let queued_in_page = tasks.iter().filter(|task| task.status == "queued").count() as u64;
+    let queue_depth = production
+        .and_then(|value| value.pointer("/tasks/queueDepth"))
+        .and_then(Value::as_u64)
+        .unwrap_or(queued_in_page);
+    let listed_active_tasks = tasks.iter().filter(|task| task.status == "running").count() as u64;
+    let failed_tasks = tasks
+        .iter()
+        .filter(|task| {
+            matches!(task.status.as_str(), "failed" | "interrupted") && task_is_recent(task, now)
+        })
+        .count() as u64;
+    let blocked_tasks = tasks
+        .iter()
+        .filter(|task| task.status == "blocked" && task_is_recent(task, now))
+        .count() as u64;
+    let active_task_id = production
+        .and_then(|value| value.pointer("/tasks/worker/activeTaskId"))
+        .and_then(Value::as_str)
+        .map(|value| bounded_text(value, 96))
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            tasks
+                .iter()
+                .find(|task| task.status == "running")
+                .map(|task| task.task_id.clone())
+        });
+    let active_tasks = listed_active_tasks.max(u64::from(active_task_id.is_some()));
+    let task_data_available = production.is_some() && task_page.is_some();
+    let state = if !service_ready
+        || !worker_running
+        || !task_data_available
+        || failed_tasks > 0
+        || blocked_tasks > 0
+    {
+        "degraded"
+    } else if active_tasks > 0 || queue_depth > 0 {
+        "busy"
+    } else {
+        "healthy"
+    };
+    let detail = match state {
+        "healthy" => "后台服务与生产任务队列运行正常".to_string(),
+        "busy" => format!("正在执行 {active_tasks} 项任务，队列等待 {queue_depth} 项"),
+        _ if !service_ready => bounded_text(
+            health
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("服务尚未就绪"),
+            120,
+        ),
+        _ if !worker_running => "生产任务工作线程未运行".to_string(),
+        _ if !task_data_available => "任务状态接口暂时不可用".to_string(),
+        _ => format!(
+            "最近任务异常 {} 项，阻塞 {} 项",
+            failed_tasks, blocked_tasks
+        ),
+    };
+    BackgroundMonitorSnapshot {
+        schema: "steel.tauri-background-monitor.v1",
+        state,
+        origin: origin.to_string(),
+        service_available: true,
+        service_ready,
+        worker_running,
+        queue_depth,
+        active_tasks,
+        failed_tasks,
+        blocked_tasks,
+        active_task_id,
+        detail,
+        updated_at_unix_ms: now,
+        tasks,
+    }
+}
+
+fn offline_snapshot(origin: &str, error: &str) -> BackgroundMonitorSnapshot {
+    BackgroundMonitorSnapshot {
+        schema: "steel.tauri-background-monitor.v1",
+        state: "offline",
+        origin: origin.to_string(),
+        service_available: false,
+        service_ready: false,
+        worker_running: false,
+        queue_depth: 0,
+        active_tasks: 0,
+        failed_tasks: 0,
+        blocked_tasks: 0,
+        active_task_id: None,
+        detail: match error {
+            "monitor_request_timeout" => "后台检测服务连接超时".to_string(),
+            "monitor_service_unreachable" => "后台检测服务不可达".to_string(),
+            _ => "后台检测服务响应无效".to_string(),
+        },
+        updated_at_unix_ms: unix_time_millis(),
+        tasks: Vec::new(),
+    }
+}
+
+fn poll_snapshot(origin: &str) -> BackgroundMonitorSnapshot {
+    let health = match bounded_json_get(origin, "/api/health/details") {
+        Ok((status, value)) if (200..300).contains(&status) || status == 503 => value,
+        Ok(_) => return offline_snapshot(origin, "monitor_response_invalid"),
+        Err(error) => return offline_snapshot(origin, &error),
+    };
+    let production = bounded_json_get(origin, "/api/production/status")
+        .ok()
+        .filter(|(status, _)| (200..300).contains(status))
+        .map(|(_, value)| value);
+    let tasks = bounded_json_get(origin, "/api/production/tasks?limit=16")
+        .ok()
+        .filter(|(status, _)| (200..300).contains(status))
+        .map(|(_, value)| value);
+    snapshot_from_payloads(
+        origin,
+        &health,
+        production.as_ref(),
+        tasks.as_ref(),
+        unix_time_millis(),
+    )
+}
+
+fn state_label(state: &str) -> &'static str {
+    match state {
+        "healthy" => "正常",
+        "busy" => "任务运行中",
+        "degraded" => "需要关注",
+        "offline" => "服务离线",
+        _ => "正在连接",
+    }
+}
+
+fn update_tray_ui(ui: &TrayUi, snapshot: &BackgroundMonitorSnapshot) {
+    let _ = ui
+        .status
+        .set_text(format!("状态：{}", state_label(snapshot.state)));
+    let _ = ui.tasks.set_text(format!(
+        "任务：运行 {} · 排队 {}",
+        snapshot.active_tasks, snapshot.queue_depth
+    ));
+    let _ = ui.issues.set_text(format!(
+        "关注：异常 {} · 阻塞 {}",
+        snapshot.failed_tasks, snapshot.blocked_tasks
+    ));
+    let tooltip = format!(
+        "北满特钢任务监控 · {} · 运行 {} · 排队 {} · 异常 {}",
+        state_label(snapshot.state),
+        snapshot.active_tasks,
+        snapshot.queue_depth,
+        snapshot.failed_tasks + snapshot.blocked_tasks
+    );
+    let _ = ui.tray.set_tooltip(Some(tooltip));
+}
+
+fn publish_snapshot(app: &AppHandle, snapshot: BackgroundMonitorSnapshot) {
+    let state = app.state::<BackgroundMonitorState>();
+    if let Ok(mut current) = state.snapshot.lock() {
+        *current = snapshot.clone();
+    }
+    if let Ok(tray) = state.tray.lock() {
+        if let Some(ui) = tray.as_ref() {
+            update_tray_ui(ui, &snapshot);
+        }
+    }
+    let _ = app.emit(MONITOR_EVENT, snapshot);
+}
+
+fn open_monitor_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(MONITOR_WINDOW) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn hide_all_windows(app: &AppHandle) {
+    for window in app.webview_windows().values() {
+        let _ = window.hide();
+    }
+}
+
+fn handle_menu_event(app: &AppHandle, id: &str) {
+    match id {
+        MENU_OPEN_MONITOR => open_monitor_window(app),
+        MENU_HIDE_WINDOWS => hide_all_windows(app),
+        MENU_QUIT => {
+            app.state::<BackgroundMonitorState>()
+                .exiting
+                .store(true, Ordering::SeqCst);
+            app.exit(0);
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn install(app: &mut App) -> tauri::Result<()> {
+    let status = MenuItem::with_id(app, MENU_STATUS, "状态：正在连接", false, None::<&str>)?;
+    let tasks = MenuItem::with_id(
+        app,
+        MENU_TASKS,
+        "任务：运行 0 · 排队 0",
+        false,
+        None::<&str>,
+    )?;
+    let issues = MenuItem::with_id(
+        app,
+        MENU_ISSUES,
+        "关注：异常 0 · 阻塞 0",
+        false,
+        None::<&str>,
+    )?;
+    let open_monitor =
+        MenuItem::with_id(app, MENU_OPEN_MONITOR, "打开任务监控", true, None::<&str>)?;
+    let hide = MenuItem::with_id(app, MENU_HIDE_WINDOWS, "隐藏监控窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(
+        app,
+        MENU_QUIT,
+        "退出任务监控（后台服务继续）",
+        true,
+        None::<&str>,
+    )?;
+    let separator_one = PredefinedMenuItem::separator(app)?;
+    let separator_two = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &status,
+            &tasks,
+            &issues,
+            &separator_one,
+            &open_monitor,
+            &hide,
+            &separator_two,
+            &quit,
+        ],
+    )?;
+
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .menu(&menu)
+        .tooltip("北满特钢任务监控 · 正在连接")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| handle_menu_event(app, event.id().as_ref()))
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => open_monitor_window(tray.app_handle()),
+            _ => {}
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    let tray = builder.build(app)?;
+    let ui = TrayUi {
+        tray,
+        status,
+        tasks,
+        issues,
+    };
+    if let Ok(mut current) = app.state::<BackgroundMonitorState>().tray.lock() {
+        *current = Some(ui);
+    }
+    Ok(())
+}
+
+pub(crate) fn start_worker(app: AppHandle) {
+    let _ = thread::Builder::new()
+        .name("tauri-background-monitor".to_string())
+        .spawn(move || loop {
+            let state = app.state::<BackgroundMonitorState>();
+            if state.exiting.load(Ordering::SeqCst) {
+                break;
+            }
+            state.refresh_requested.store(false, Ordering::SeqCst);
+            let origin = state
+                .origin
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_else(|_| DEFAULT_ORIGIN.to_string());
+            publish_snapshot(&app, poll_snapshot(&origin));
+            let slices = (POLL_INTERVAL.as_millis() / 100) as usize;
+            for _ in 0..slices.max(1) {
+                if state.exiting.load(Ordering::SeqCst)
+                    || state.refresh_requested.swap(false, Ordering::SeqCst)
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+}
+
+pub(crate) fn should_hide_monitor_window(window_label: &str, exiting: bool) -> bool {
+    window_label == MONITOR_WINDOW && !exiting
+}
+
+pub(crate) fn is_exiting(state: State<'_, BackgroundMonitorState>) -> bool {
+    state.exiting.load(Ordering::SeqCst)
+}
+
+#[tauri::command]
+pub(crate) fn configure_background_monitor(
+    origin: String,
+    state: State<'_, BackgroundMonitorState>,
+) -> Result<BackgroundMonitorSnapshot, String> {
+    let normalized = normalize_monitor_origin(&origin)?;
+    let origin_changed = {
+        let mut configured_origin = state
+            .origin
+            .lock()
+            .map_err(|_| "后台监控地址状态不可用".to_string())?;
+        let changed = *configured_origin != normalized;
+        *configured_origin = normalized.clone();
+        changed
+    };
+    state.refresh_requested.store(true, Ordering::SeqCst);
+    let mut snapshot = state
+        .snapshot
+        .lock()
+        .map_err(|_| "后台监控状态不可用".to_string())?;
+    if origin_changed {
+        *snapshot = BackgroundMonitorSnapshot {
+            origin: normalized,
+            ..BackgroundMonitorSnapshot::default()
+        };
+    } else {
+        snapshot.origin = normalized;
+    }
+    Ok(snapshot.clone())
+}
+
+#[tauri::command]
+pub(crate) fn read_background_monitor(
+    state: State<'_, BackgroundMonitorState>,
+) -> Result<BackgroundMonitorSnapshot, String> {
+    state
+        .snapshot
+        .lock()
+        .map(|value| value.clone())
+        .map_err(|_| "后台监控状态不可用".to_string())
+}
+
+#[tauri::command]
+pub(crate) fn refresh_background_monitor(
+    state: State<'_, BackgroundMonitorState>,
+) -> Result<BackgroundMonitorSnapshot, String> {
+    state.refresh_requested.store(true, Ordering::SeqCst);
+    read_background_monitor(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn healthy_payload() -> Value {
+        json!({
+            "ok": true,
+            "status": "ready",
+            "checks": { "taskWorker": { "running": true } }
+        })
+    }
+
+    #[test]
+    fn monitor_origin_accepts_bounded_http_authorities_only() {
+        assert_eq!(
+            normalize_monitor_origin("http://127.0.0.1:4873/"),
+            Ok("http://127.0.0.1:4873".to_string())
+        );
+        assert_eq!(
+            normalize_monitor_origin("http://LOCALHOST"),
+            Ok("http://localhost:80".to_string())
+        );
+        for invalid in [
+            "https://127.0.0.1:4873",
+            "http://inspection-host:4873",
+            "http://user@127.0.0.1:4873",
+            "http://127.0.0.1:4873/private",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:4873\r\nInjected: yes",
+        ] {
+            assert!(normalize_monitor_origin(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn task_snapshot_marks_busy_and_recent_failures() {
+        let now = 1_800_000_000_000_u64;
+        let production = json!({
+            "tasks": {
+                "queueDepth": 2,
+                "worker": { "running": true, "activeTaskId": "TASK-1" }
+            }
+        });
+        let page = json!({
+            "tasks": [
+                {"taskId":"TASK-1","kind":"capture-once","materialId":"63","status":"running","phase":"capture","progress":0.5,"updatedAt":now.to_string()},
+                {"taskId":"TASK-2","kind":"algorithm-run","materialId":"62","status":"failed","error":"boom","updatedAt":now.to_string()},
+                {"taskId":"TASK-3","kind":"steel-out","materialId":"61","status":"blocked","blockedReason":"dependency failed","updatedAt":now.to_string()}
+            ]
+        });
+        let snapshot = snapshot_from_payloads(
+            DEFAULT_ORIGIN,
+            &healthy_payload(),
+            Some(&production),
+            Some(&page),
+            now,
+        );
+        assert_eq!(snapshot.state, "degraded");
+        assert_eq!(snapshot.queue_depth, 2);
+        assert_eq!(snapshot.active_tasks, 1);
+        assert_eq!(snapshot.failed_tasks, 1);
+        assert_eq!(snapshot.blocked_tasks, 1);
+        assert_eq!(snapshot.active_task_id.as_deref(), Some("TASK-1"));
+        assert_eq!(snapshot.tasks[0].progress, 0.5);
+        assert_eq!(snapshot.tasks[2].error, "dependency failed");
+    }
+
+    #[test]
+    fn task_snapshot_reports_healthy_busy_and_missing_task_data() {
+        let production = json!({"tasks":{"queueDepth":0,"worker":{"running":true}}});
+        let page = json!({"tasks":[]});
+        let healthy = snapshot_from_payloads(
+            DEFAULT_ORIGIN,
+            &healthy_payload(),
+            Some(&production),
+            Some(&page),
+            1,
+        );
+        assert_eq!(healthy.state, "healthy");
+
+        let queued = json!({"tasks":{"queueDepth":3,"worker":{"running":true}}});
+        let busy = snapshot_from_payloads(
+            DEFAULT_ORIGIN,
+            &healthy_payload(),
+            Some(&queued),
+            Some(&page),
+            1,
+        );
+        assert_eq!(busy.state, "busy");
+
+        let active_only = json!({"tasks":{"queueDepth":0,"worker":{"running":true,"activeTaskId":"TASK-ACTIVE"}}});
+        let active = snapshot_from_payloads(
+            DEFAULT_ORIGIN,
+            &healthy_payload(),
+            Some(&active_only),
+            Some(&page),
+            1,
+        );
+        assert_eq!(active.state, "busy");
+        assert_eq!(active.active_tasks, 1);
+
+        let missing = snapshot_from_payloads(DEFAULT_ORIGIN, &healthy_payload(), None, None, 1);
+        assert_eq!(missing.state, "degraded");
+        assert_eq!(missing.detail, "任务状态接口暂时不可用");
+    }
+
+    #[test]
+    fn parses_bounded_json_http_responses() {
+        let body = br#"{"ok":true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let (status, value) = parse_json_http_response(response.as_bytes()).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(value["ok"], json!(true));
+        assert!(parse_json_http_response(b"invalid").is_err());
+    }
+
+    #[test]
+    fn monitor_window_hides_while_the_independent_process_keeps_running() {
+        assert!(should_hide_monitor_window(MONITOR_WINDOW, false));
+        assert!(!should_hide_monitor_window("other", false));
+        assert!(!should_hide_monitor_window(MONITOR_WINDOW, true));
+    }
+}

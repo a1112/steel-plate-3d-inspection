@@ -48,10 +48,13 @@ from scripts.sick_capture.measurement import (
 from scripts.sick_capture.playback import (
     build_and_write_playback_index,
     build_image_pyramid,
+    capture_image_cache_root,
     detect_valid_grayscale_roi,
+    read_indexed_playback_crop,
     read_indexed_history,
     rebuild_playback_history,
     select_pyramid_image,
+    warm_flow_image_pyramids,
 )
 from scripts.sick_capture.profile import CameraProfile, load_profile
 from scripts.sick_capture.regions import (
@@ -72,7 +75,10 @@ from scripts.sick_capture.storage import DualFormatWriter, atomic_summary
 from scripts.sick_capture.paths import (
     acquisition_manifest_path,
     alignment_path,
+    algorithm_state_path,
+    cache_root as camera_cache_root,
     capture_root as camera_capture_root,
+    defect_image_root,
     measurement_path,
     playback_roi_path,
 )
@@ -166,7 +172,9 @@ def write_profile(root: Path) -> Path:
                 "firmware": "1.2.3",
                 "ip": "192.0.2.10",
                 "role": "test",
-                "storageRoot": str(root / "storage" / "C1"),
+                # Production roots are named camera1..camera8 while the public
+                # camera ids remain C1..C8. Keep that distinction in fixtures.
+                "storageRoot": str(root / "storage" / "camera1"),
                 "enabled": True,
                 "nodeOverrides": {},
             }
@@ -577,7 +585,7 @@ class SickAlignmentTests(unittest.TestCase):
         self.assertEqual(curves["summary"]["validSectionCount"], 0)
         self.assertIsNone(curves["summary"]["minimumMm"])
 
-    def test_fixed_angle_curve_fails_closed_when_surface_metric_gate_fails(self) -> None:
+    def test_fixed_angle_curve_preserves_unqualified_trend_when_surface_metric_gate_fails(self) -> None:
         residual_grid = np.zeros((2, 180), dtype=np.float64)
         sections = [
             {
@@ -596,13 +604,15 @@ class SickAlignmentTests(unittest.TestCase):
         )
 
         self.assertFalse(curves["metricValid"])
-        self.assertFalse(curves["available"])
+        self.assertTrue(curves["available"])
+        self.assertEqual(curves["displayMode"], "diagnostic-unqualified")
+        self.assertIn(
+            "surface-metric-quality-gate-failed",
+            curves["qualityGate"]["reasons"],
+        )
         for section in curves["sections"]:
-            self.assertEqual(section["diametersMm"], [None] * 6)
-            self.assertIn(
-                "surface-metric-quality-gate-failed",
-                section["qualityGate"]["reasons"],
-            )
+            self.assertEqual(section["diametersMm"], [100.0] * 6)
+            self.assertTrue(section["metricValid"])
 
     def test_flow_artifacts_mirror_surface_diameter_curves_into_measurement(self) -> None:
         curves = {
@@ -662,12 +672,17 @@ class SickAlignmentTests(unittest.TestCase):
                         MeasurementConfig(),
                     )
                 )
+                state = json.loads(
+                    algorithm_state_path(root, "9").read_text(encoding="utf-8")
+                )
 
         self.assertIs(result["surfaceFit"]["diameterCurves"], curves)
         self.assertIs(
             write_json.call_args.args[1]["surfaceFit"]["diameterCurves"],
             curves,
         )
+        self.assertEqual(state["state"], "derived-ready")
+        self.assertEqual(state["mode"], "provider-rebuild")
 
     @staticmethod
     def _write_camera_flow(
@@ -751,6 +766,34 @@ class SickAlignmentTests(unittest.TestCase):
             self.assertEqual(manifest["referenceCameraId"], "C1")
             self.assertEqual(manifest["cameras"]["C1"]["head"]["globalRow"], 4)
             self.assertEqual(manifest["cameras"]["C2"]["head"]["globalRow"], 14)
+            self.assertEqual(
+                manifest["cameras"]["C1"]["head"]["offsetRowsFromReference"],
+                0,
+            )
+            self.assertEqual(
+                manifest["cameras"]["C2"]["head"]["offsetRowsFromReference"],
+                10,
+            )
+            self.assertAlmostEqual(
+                manifest["cameras"]["C2"]["head"]["offsetFramesFromReference"],
+                10 / 12,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                manifest["cameras"]["C1"]["head"]["displayPaddingFrames"],
+                10 / 12,
+                places=6,
+            )
+            self.assertEqual(
+                manifest["cameras"]["C2"]["head"]["displayPaddingFrames"],
+                0,
+            )
+            self.assertTrue(manifest["headAlignment"]["displayAligned"])
+            self.assertAlmostEqual(
+                manifest["headAlignment"]["timelineSpreadFrames"],
+                10 / 12,
+                places=6,
+            )
             self.assertFalse(manifest["cameras"]["C1"]["head"]["clipped"])
             self.assertEqual(manifest["cameras"]["C2"]["transportGapCount"], 1)
             self.assertEqual(manifest["quality"]["transportFrameGaps"], 1)
@@ -768,6 +811,35 @@ class SickAlignmentTests(unittest.TestCase):
             self.assertEqual(written["materialId"], material_id)
             self.assertEqual(path, alignment_path(root, material_id))
             self.assertFalse((camera_capture_root(c1, material_id, "C1") / "alignment.json").exists())
+
+    def test_flow_alignment_expands_boundary_search_after_initial_window_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            material_id = "7"
+            camera_root = root / "C1"
+            self._write_camera_flow(
+                camera_root,
+                material_id,
+                camera_id="C1",
+                clock_offset=1_000_000_000,
+                head_global_row=16,
+                frame_ids=[1, 2, 3],
+            )
+            manifest = build_flow_alignment(
+                {"C1": camera_root},
+                material_id,
+                config=AlignmentConfig(
+                    search_frames=1,
+                    stable_rows=3,
+                    sample_step=1,
+                ),
+            )
+            head = manifest["cameras"]["C1"]["head"]
+            self.assertTrue(head["detected"])
+            self.assertEqual(head["globalRow"], 16)
+            self.assertTrue(head["expandedSearch"])
+            self.assertEqual(head["initialSearchFrameCount"], 1)
+            self.assertEqual(head["searchedFrames"], [0, 1])
 
     def test_current_flow_measurement_emits_crop_preview_but_blocks_uncalibrated_metric(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -845,6 +917,7 @@ class SickAlignmentTests(unittest.TestCase):
                         "schema": "steel.sick-array-calibration.v1",
                         "revision": "TEST-APPROVED",
                         "approved": True,
+                        "metricProjectionVerified": True,
                         "cameras": {
                             "C1": {
                                 "serialNumber": "SICK-METRIC-001",
@@ -1036,6 +1109,10 @@ class SickPlaybackTests(unittest.TestCase):
             manifest_path, manifest = build_image_pyramid(source, root / "cache")
             selected_path, level = select_pyramid_image(manifest_path, manifest, 320)
             self.assertTrue(selected_path.is_file())
+            self.assertEqual(manifest_path.parent, root / "cache")
+            self.assertEqual(selected_path.parent, root / "cache")
+            self.assertEqual(selected_path.suffix, ".jpg")
+            self.assertTrue(selected_path.name.startswith(manifest["sourceFingerprint"]))
             self.assertEqual(manifest["validRoi"], [104, 0, 296, 120])
             self.assertTrue(manifest["blackBorderCropped"])
             self.assertGreaterEqual(level["width"], 160)
@@ -1113,12 +1190,13 @@ class SickPlaybackTests(unittest.TestCase):
     def test_pyramid_uses_stable_flow_horizontal_roi(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = camera_capture_root(root / "C1", "8", "C1") / "2d" / "0.png"
+            camera_root = root / "camera1"
+            source = camera_capture_root(camera_root, "8", "C1") / "2d" / "0.png"
             source.parent.mkdir(parents=True)
             image = np.zeros((120, 400), dtype=np.uint8)
             image[30:80, 180:230] = 80
             Image.fromarray(image, mode="L").save(source)
-            cache_root = root / "8" / "cache"
+            cache_root = camera_cache_root(camera_root, "8")
             roi_path = playback_roi_path(root, "8")
             roi_path.parent.mkdir(parents=True)
             roi_path.write_text(
@@ -1126,24 +1204,103 @@ class SickPlaybackTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            _, manifest = build_image_pyramid(source, cache_root)
+            _, manifest = build_image_pyramid(
+                source,
+                cache_root,
+                metadata_storage_root=root,
+                metadata_camera_id="C1",
+            )
+            self.assertEqual(capture_image_cache_root(source), cache_root)
             self.assertEqual(manifest["validRoi"], [100, 0, 300, 120])
             self.assertEqual(manifest["frameDetectedRoi"], [164, 26, 246, 84])
             self.assertEqual(manifest["flowHorizontalRoi"], [100, 0, 300, 0])
 
+    def test_indexed_crop_uses_configured_camera_id_not_storage_folder_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = (
+                camera_capture_root(root / "camera1", "8", "C1")
+                / "2d"
+                / "0.png"
+            )
+            source.parent.mkdir(parents=True)
+            Image.fromarray(np.full((120, 400), 64, dtype=np.uint8), mode="L").save(
+                source
+            )
+            write_ready_playback_roi(root, "8", "C1", [100, 0, 300, 120])
+
+            crop = read_indexed_playback_crop(
+                source,
+                root,
+                400,
+                120,
+                metadata_camera_id="C1",
+            )
+
+            self.assertEqual(crop, [100, 0, 300, 120])
+
     def test_defect_review_pyramid_preserves_the_complete_minimum_crop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "9" / "derived" / "defects" / "review" / "9-C1-1.png"
+            source = defect_image_root(root / "C1", "9") / "9-C1-1.jpg"
             source.parent.mkdir(parents=True)
             image = np.zeros((64, 64), dtype=np.uint8)
             image[24:40, 26:38] = 100
             Image.fromarray(image, mode="L").save(source)
 
-            _, manifest = build_image_pyramid(source, root / "9" / "cache")
+            _, manifest = build_image_pyramid(
+                source,
+                camera_cache_root(root / "C1", "9"),
+                metadata_storage_root=root,
+            )
             self.assertEqual(manifest["validRoi"], [0, 0, 64, 64])
             self.assertEqual(manifest["cropSize"], [64, 64])
             self.assertFalse(manifest["blackBorderCropped"])
+
+    def test_flow_pyramid_warm_writes_jpegs_to_each_camera_flow_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            material_id = "19"
+            camera_roots = {
+                "C1": root / "camera1",
+                "C2": root / "camera2",
+            }
+            cameras = []
+            for camera_id, camera_root in camera_roots.items():
+                source = (
+                    camera_capture_root(camera_root, material_id, camera_id)
+                    / "2d"
+                    / "0.png"
+                )
+                source.parent.mkdir(parents=True)
+                Image.fromarray(
+                    np.full((48, 192), 60, dtype=np.uint8),
+                    mode="L",
+                ).save(source)
+                cameras.append(
+                    {
+                        "cameraId": camera_id,
+                        "artifactRef": f"{material_id}/capture/{camera_id}/2d/0.png",
+                    }
+                )
+
+            result = warm_flow_image_pyramids(
+                camera_roots,
+                root,
+                {
+                    "materialId": material_id,
+                    "frameCount": 1,
+                    "frames": [{"cameras": cameras}],
+                },
+            )
+
+            self.assertEqual(result["cachedImageCount"], 2)
+            for camera_root in camera_roots.values():
+                cache = camera_cache_root(camera_root, material_id)
+                self.assertTrue(list(cache.glob("*.jpg")))
+                self.assertTrue((cache / "status.json").is_file())
+                self.assertFalse(any(path.is_dir() for path in cache.iterdir()))
+            self.assertFalse((root / material_id / "cache").exists())
 
     def test_playback_index_groups_cameras_by_capture_round_not_storage_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1612,6 +1769,42 @@ class SickProviderTests(unittest.TestCase):
                 self.assertEqual(runtime.health_json()["framesReceived"], 0)
             finally:
                 runtime.close()
+
+    def test_playback_cache_status_describes_camera_local_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            # This endpoint only reads counters and profile paths. Construct
+            # those fields directly so the contract test does not start the
+            # acquisition/process pools just to inspect a static response.
+            runtime = object.__new__(ProviderRuntime)
+            runtime.profile = profile
+            runtime.history_lock = threading.RLock()
+            runtime.playback_cache_build_ms = []
+            runtime.playback_image_cache = {}
+            runtime.playback_cache_memory_hits = 0
+            runtime.playback_cache_disk_hits = 0
+            runtime.playback_cache_builds = 0
+            runtime.playback_cache_build_failures = 0
+            runtime.playback_warm_status = {}
+
+            status = runtime.playback_cache_status_json()
+            expected_roots = [
+                str(camera.storage_root / "<flow-id>" / "cache")
+                for camera in profile.enabled_cameras
+            ]
+
+            # Keep the legacy string field for older clients, but make its
+            # value an explicit camera-local template rather than the
+            # removed central <storage-root>/<flow-id>/cache path.
+            self.assertEqual(
+                status["cacheRoot"],
+                "<camera-root>/<flow-id>/cache",
+            )
+            self.assertEqual(status["cacheRoots"], expected_roots)
+            self.assertNotIn(
+                str(profile.storage_root / "<flow-id>" / "cache"),
+                status["cacheRoots"],
+            )
 
     def test_http_server_suppresses_only_cancelled_client_connection_errors(self) -> None:
         server = object.__new__(SickCaptureHTTPServer)
@@ -2240,6 +2433,44 @@ class SickProviderTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_diagnostic_capture_generates_one_numeric_flow_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend())
+            try:
+                status, summary = runtime.continuous_capture(
+                    {
+                        "expectedCameras": 1,
+                        "rounds": 1,
+                        "outputDir": "diagnostic-default-id",
+                    }
+                )
+                self.assertEqual(status, 200)
+                material_id = summary["materialId"]
+                self.assertTrue(material_id.isdecimal())
+                self.assertGreater(int(material_id), 0)
+                self.assertTrue(
+                    (
+                        profile.storage_root
+                        / "diagnostic-default-id"
+                        / "C1"
+                        / material_id
+                        / "json"
+                        / "0.json"
+                    ).is_file()
+                )
+
+                invalid_status, invalid = runtime.continuous_capture(
+                    {
+                        "expectedCameras": 1,
+                        "materialId": "diagnostic",
+                    }
+                )
+                self.assertEqual(invalid_status, 400)
+                self.assertIn("positive numeric", invalid["error"])
+            finally:
+                runtime.close()
+
     def test_production_capture_requires_steel_in_and_writes_provider_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile = load_profile(write_profile(Path(directory)))
@@ -2307,9 +2538,25 @@ class SickProviderTests(unittest.TestCase):
                 self.assertEqual((playback["width"], playback["height"]), (3, 2))
                 playback_path = runtime.allowed_file(playback["artifactRef"])
                 self.assertIsNotNone(playback_path)
-                optimized = runtime.optimized_playback_image(playback_path, 160)
+                write_ready_playback_roi(
+                    profile.storage_root,
+                    "43",
+                    "C1",
+                    [0, 0, 3, 2],
+                )
+                optimized = runtime.optimized_playback_image(
+                    playback_path,
+                    160,
+                    [0, 0, 3, 2],
+                )
                 self.assertEqual(optimized[0], "image/jpeg")
                 self.assertGreater(len(optimized[1]), 0)
+                camera_cache = camera_cache_root(
+                    profile.enabled_cameras[0].storage_root,
+                    "43",
+                )
+                self.assertTrue(list(camera_cache.glob("*.jpg")))
+                self.assertFalse((profile.storage_root / "43" / "cache").exists())
             finally:
                 runtime.close()
             self.assertTrue(backend.closed)
@@ -3268,6 +3515,32 @@ class SickProviderTests(unittest.TestCase):
                     expected,
                 )
                 self.assertEqual(runtime.stream_frame_counts[camera.key], 1)
+            finally:
+                runtime.close()
+
+    def test_live_preview_publishes_initial_black_frame_as_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = ProviderRuntime(profile, backend=FakeBackend(FakeSession))
+            camera = profile.enabled_cameras[0]
+            try:
+                with runtime.stream_lock:
+                    runtime.stream_subscriptions[camera.key] = {"fpsLimit": 30}
+                    runtime.stream_camera_key = camera.key
+                    runtime.stream_options = {"fpsLimit": 30}
+                frame = sample_frame(1)
+                black = replace(frame, intensity=np.zeros_like(frame.intensity))
+
+                runtime._publish_stream_frame(camera, black)
+
+                preview = runtime.stream_latest_bytes(camera.ip, "intensity-grid")
+                self.assertIsNotNone(preview)
+                self.assertTrue(preview.startswith(b"\x89PNG\r\n\x1a\n"))
+                self.assertEqual(runtime.stream_frame_counts[camera.key], 1)
+                with patch.object(runtime, "_acquisition_running", return_value=True):
+                    status = runtime.stream_status(camera.ip)
+                self.assertTrue(status["ready"])
+                self.assertFalse(status["warmingUp"])
             finally:
                 runtime.close()
 

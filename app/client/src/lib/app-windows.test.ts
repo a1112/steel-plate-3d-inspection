@@ -77,5 +77,6 @@ describe('application tool navigation', () => {
     expect(resolveAppRoute('', '#app=capture')).toBe('capture');
     expect(resolveAppRoute('', '#app=parameters')).toBe('parameters');
     expect(resolveAppRoute('', '#app=bar-surface')).toBe('bar-surface');
+    expect(resolveAppRoute('', '#app=monitor')).toBe('monitor');
   });
 });
