@@ -6059,19 +6059,6 @@ button {
   outline-offset: -2px;
 }
 
-.bar-unfolded-canvas::before {
-  content: '';
-  position: absolute;
-  inset: 6px 8px;
-  z-index: 2;
-  pointer-events: none;
-  border: 1px solid rgba(219, 239, 255, 0.5);
-  border-radius: 2px;
-  box-shadow:
-    0 0 0 1px rgba(47, 125, 255, 0.22),
-    inset 0 0 18px rgba(255, 255, 255, 0.08);
-}
-
 .bar-camera-bands {
   position: absolute;
   inset: 0;
@@ -6083,7 +6070,7 @@ button {
 .bar-camera-band {
   position: relative;
   min-height: 0;
-  border-top: 1px solid rgba(236, 247, 255, 0.18);
+  border-top: 0;
   background:
     repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.12) 0 1px, transparent 1px 7px),
     linear-gradient(90deg, rgba(0, 0, 0, 0.14), rgba(255, 255, 255, 0.08), rgba(0, 0, 0, 0.1));
@@ -6113,21 +6100,9 @@ button {
   bottom: 0;
   min-width: 0;
   overflow: hidden;
-  border-right: 1px solid rgba(184, 224, 248, 0.42);
+  border-right: 0;
   background: #17242b;
-  box-shadow: inset 0 0 0 1px rgba(8, 20, 28, 0.34);
-}
-
-.bar-camera-frame::after {
-  content: attr(data-frame-sequence);
-  position: absolute;
-  right: 4px;
-  bottom: 2px;
-  z-index: 1;
-  color: rgba(229, 244, 252, 0.56);
-  font-size: 8px;
-  font-variant-numeric: tabular-nums;
-  pointer-events: none;
+  box-shadow: none;
 }
 
 .bar-camera-frame.is-missing {
@@ -19687,7 +19662,7 @@ button {
 
 .bar-unfolded-map.orientation-vertical .bar-camera-band {
   border-top: 0;
-  border-left: 1px solid rgba(236, 247, 255, 0.18);
+  border-left: 0;
 }
 
 .bar-unfolded-map.orientation-vertical .bar-camera-band:first-child {
@@ -19706,7 +19681,7 @@ button {
   top: auto;
   bottom: auto;
   border-right: 0;
-  border-bottom: 1px solid rgba(184, 224, 248, 0.24);
+  border-bottom: 0;
 }
 
 .bar-unfolded-map.orientation-vertical .bar-unfolded-canvas.has-stitch .bar-camera-band > span {
@@ -19749,27 +19724,6 @@ button {
 .bar-camera-band[role="button"] {
   cursor: zoom-in;
   outline: none;
-}
-
-.bar-camera-band[role="button"]::after {
-  content: '';
-  position: absolute;
-  inset: 2px;
-  z-index: 3;
-  pointer-events: none;
-  border: 2px solid transparent;
-  border-radius: 3px;
-  transition: border-color 120ms ease, box-shadow 120ms ease;
-}
-
-.bar-camera-band[role="button"]:hover::after,
-.bar-camera-band[role="button"]:focus-visible::after {
-  border-color: rgba(31, 210, 255, 0.92);
-  box-shadow: inset 0 0 20px rgba(31, 210, 255, 0.2), 0 0 8px rgba(31, 210, 255, 0.46);
-}
-
-.bar-camera-band[role="button"]:hover .bar-camera-band-image {
-  filter: contrast(1.1) brightness(1.05);
 }
 
 .bar-unfolded-map.camera-expanded {
@@ -21981,6 +21935,141 @@ button {
   font-size: 11px;
 }
 
+/* Multi-series diameter chart adapted from StraightnessGauge's dual-canvas
+   cross-section renderer: the static plot and pointer feedback redraw
+   independently so dense production curves remain responsive. */
+.diameter-canvas-chart {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 118px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.diameter-canvas-background,
+.diameter-canvas-foreground {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.diameter-canvas-foreground {
+  z-index: 2;
+}
+
+.diameter-canvas-legend {
+  position: absolute;
+  top: 5px;
+  left: 58px;
+  right: 8px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.diameter-canvas-legend::-webkit-scrollbar {
+  display: none;
+}
+
+.diameter-canvas-legend button {
+  flex: 0 0 auto;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--faint);
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  font-size: 9px;
+  font-weight: 850;
+  opacity: .52;
+  cursor: pointer;
+}
+
+.diameter-canvas-legend button.active {
+  color: var(--text);
+  border-color: var(--line);
+  opacity: 1;
+}
+
+.diameter-canvas-legend button:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 1px;
+}
+
+.diameter-canvas-legend i,
+.diameter-canvas-tooltip i {
+  width: 12px;
+  height: 0;
+  display: inline-block;
+  border-top: 2px solid var(--diameter-series-color, var(--cyan));
+}
+
+.diameter-canvas-tooltip {
+  position: absolute;
+  top: 48px;
+  z-index: 5;
+  min-width: 142px;
+  max-width: 190px;
+  display: grid;
+  gap: 3px;
+  padding: 6px 7px;
+  transform: translateX(-50%);
+  border: 1px solid color-mix(in srgb, var(--blue) 55%, var(--line));
+  border-radius: 5px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  box-shadow: var(--shadow);
+  font-size: 9px;
+  pointer-events: none;
+}
+
+.diameter-canvas-tooltip strong {
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+}
+
+.diameter-canvas-tooltip span {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.diameter-canvas-tooltip b {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.diameter-canvas-accessible-summary {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .defect-strip-analysis-panel .panel-body {
   padding: 0;
 }
@@ -22137,11 +22226,8 @@ button {
   font-weight: 900;
 }
 
-.diameter-analysis-panel .diameter-curve-card svg {
-  min-height: 0;
-}
-
-.diameter-analysis-panel .diameter-curve-card {
+.diameter-analysis-panel .diameter-curve-card,
+.diameter-analysis-panel .diameter-canvas-chart {
   border: 0;
   border-radius: 0;
 }
@@ -22634,4 +22720,678 @@ button {
 .app-shell .diameter-analysis-panel > .panel-body,
 .app-shell .defect-list-panel.display-mode-distribution > .panel-body {
   padding: 0;
+}
+
+/* Standalone diameter analysis ------------------------------------------------ */
+.diameter-page {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: clamp(220px, 19vw, 270px) minmax(0, 1fr) clamp(240px, 22vw, 310px);
+  gap: 7px;
+  padding: 7px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.diameter-page.embedded {
+  width: 100%;
+  height: 100%;
+  grid-template-columns: minmax(0, 1fr) clamp(240px, 22vw, 310px);
+  gap: 6px;
+  padding: 6px 0 0;
+  background: transparent;
+}
+
+.diameter-page-left,
+.diameter-page-center,
+.diameter-page-right {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.diameter-page-left {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.diameter-page-center {
+  grid-template-rows: auto minmax(255px, 1.2fr) minmax(230px, .86fr);
+}
+
+.diameter-page-right {
+  grid-template-rows: auto minmax(190px, 1fr) auto auto 46px;
+}
+
+.diameter-page .panel-header {
+  height: 36px;
+  padding: 0 9px 0 14px;
+}
+
+.diameter-page .panel-header h2 {
+  font-size: 15px;
+}
+
+.diameter-page .panel-header h2::before {
+  left: -8px;
+  top: 3px;
+  width: 3px;
+  height: 17px;
+}
+
+.diameter-page .panel-header > span,
+.diameter-page .panel-header small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.diameter-page .panel-body {
+  height: calc(100% - 36px);
+  padding: 9px;
+}
+
+.diameter-material-panel .panel-body,
+.diameter-record-search .panel-body,
+.diameter-tolerance-panel .panel-body,
+.diameter-quality-panel .panel-body,
+.diameter-verdict-panel .panel-body {
+  height: auto;
+}
+
+.diameter-material-panel dl,
+.diameter-quality-panel dl {
+  margin: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.diameter-material-panel dl > div,
+.diameter-quality-panel dl > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+}
+
+.diameter-material-panel dt,
+.diameter-quality-panel dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.diameter-material-panel dd,
+.diameter-quality-panel dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 900;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diameter-record-search .panel-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px;
+}
+
+.diameter-record-search label {
+  min-width: 0;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--panel-soft);
+}
+
+.diameter-record-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  color: var(--text);
+  background: transparent;
+  font-size: 10px;
+}
+
+.diameter-record-search button {
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--panel);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.diameter-records-panel .panel-body {
+  min-height: 0;
+  padding: 0;
+}
+
+.diameter-records-list {
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.diameter-records-list button {
+  width: 100%;
+  min-width: 0;
+  min-height: 45px;
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: 2px 6px;
+  padding: 6px 8px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+}
+
+.diameter-records-list button:hover {
+  background: color-mix(in srgb, var(--blue) 6%, var(--panel));
+}
+
+.diameter-records-list button.active {
+  box-shadow: inset 3px 0 var(--blue);
+  background: color-mix(in srgb, var(--blue) 13%, var(--panel));
+}
+
+.diameter-records-list span,
+.diameter-records-list strong,
+.diameter-records-list small,
+.diameter-records-list b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diameter-records-list span {
+  grid-row: 1 / span 2;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.diameter-records-list strong {
+  font-size: 11px;
+}
+
+.diameter-records-list small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.diameter-records-list b {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  color: var(--green);
+  font-size: 9px;
+}
+
+.diameter-records-list b.detecting {
+  color: var(--blue);
+}
+
+.diameter-page-heading {
+  min-width: 0;
+  min-height: 66px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.diameter-page-heading div:first-child {
+  min-width: 0;
+}
+
+.diameter-page-heading span,
+.diameter-page-heading p {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.diameter-page-heading h1 {
+  margin: 1px 0;
+  color: var(--text);
+  font-size: 21px;
+  line-height: 1.1;
+}
+
+.diameter-page-heading p {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diameter-page-quality-chip {
+  flex: 0 0 auto;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--green) 46%, var(--line));
+  border-radius: 999px;
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, var(--panel));
+}
+
+.diameter-page-quality-chip.preview {
+  border-color: color-mix(in srgb, var(--amber) 50%, var(--line));
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 8%, var(--panel));
+}
+
+.diameter-page-quality-chip span {
+  color: inherit;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.diameter-page-trend .panel-body {
+  padding: 0;
+}
+
+.diameter-page-trend .diameter-trend-grid,
+.diameter-page-trend .diameter-curve-card,
+.diameter-page-trend .diameter-canvas-chart {
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+.diameter-page-lower {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(245px, .84fr) minmax(320px, 1.16fr);
+  gap: 7px;
+}
+
+.diameter-cross-section-panel .panel-body,
+.diameter-extrema-panel .panel-body {
+  min-height: 0;
+  padding: 0;
+}
+
+.diameter-cross-section-gauge {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  padding: 4px 8px 7px;
+}
+
+.diameter-cross-section-gauge svg {
+  width: 100%;
+  height: 100%;
+  min-height: 140px;
+}
+
+.diameter-cross-section-gauge svg line {
+  stroke: color-mix(in srgb, var(--line-strong) 65%, transparent);
+  stroke-width: .8;
+}
+
+.diameter-cross-section-gauge svg .nominal {
+  fill: none;
+  stroke: var(--blue);
+  stroke-width: 1.4;
+  stroke-dasharray: 4 3;
+}
+
+.diameter-cross-section-gauge svg .measured {
+  fill: color-mix(in srgb, var(--cyan) 8%, transparent);
+  stroke: var(--cyan);
+  stroke-width: 2.2;
+}
+
+.diameter-cross-section-gauge svg .center {
+  fill: var(--red);
+}
+
+.diameter-cross-section-gauge svg text {
+  fill: var(--muted);
+  font-size: 9px;
+}
+
+.diameter-cross-section-gauge dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.diameter-cross-section-gauge dl > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  border-right: 1px solid var(--line);
+}
+
+.diameter-cross-section-gauge dl > div:last-child {
+  border-right: 0;
+}
+
+.diameter-cross-section-gauge dt {
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.diameter-cross-section-gauge dd {
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diameter-extrema-table-wrap {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+}
+
+.diameter-extrema-panel table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.diameter-extrema-panel th,
+.diameter-extrema-panel td {
+  height: 31px;
+  padding: 4px 6px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  overflow: hidden;
+  font-size: 10px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diameter-extrema-panel th:first-child,
+.diameter-extrema-panel td:first-child {
+  text-align: left;
+}
+
+.diameter-extrema-panel th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-weight: 900;
+}
+
+.diameter-extrema-panel tbody tr {
+  cursor: pointer;
+}
+
+.diameter-extrema-panel tbody tr:hover,
+.diameter-extrema-panel tbody tr.active {
+  background: color-mix(in srgb, var(--blue) 10%, var(--panel));
+}
+
+.diameter-verdict-panel .panel-body {
+  padding: 7px 10px 10px;
+}
+
+.diameter-verdict {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: 2px 10px;
+  color: var(--amber);
+}
+
+.diameter-verdict-panel.qualified .diameter-verdict {
+  color: var(--green);
+}
+
+.diameter-verdict svg {
+  grid-row: 1 / span 2;
+}
+
+.diameter-verdict > span {
+  color: inherit;
+  font-size: 24px;
+  font-weight: 950;
+}
+
+.diameter-verdict small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diameter-summary-panel .panel-body {
+  min-height: 0;
+  padding: 7px;
+}
+
+.diameter-page-metrics {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.diameter-page-metrics dl {
+  min-width: 0;
+  min-height: 43px;
+  margin: 0;
+  display: grid;
+  align-content: center;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel-soft);
+}
+
+.diameter-page-metrics dt {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.diameter-page-metrics dd {
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 950;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diameter-tolerance-panel .panel-body {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.diameter-tolerance-panel label {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.diameter-tolerance-panel input {
+  min-width: 0;
+  height: 25px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  background: var(--panel-soft);
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.diameter-tolerance-panel b {
+  font-size: 8px;
+}
+
+.diameter-tolerance-panel dl {
+  grid-column: 1 / -1;
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.diameter-tolerance-panel dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--line);
+  font-size: 9px;
+}
+
+.diameter-tolerance-panel dt {
+  color: var(--muted);
+}
+
+.diameter-tolerance-panel dd {
+  margin: 0;
+  color: var(--text);
+  font-weight: 900;
+}
+
+.diameter-export-button {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid color-mix(in srgb, var(--blue) 65%, var(--line));
+  border-radius: 6px;
+  color: #fff;
+  background: var(--blue);
+  font-size: 13px;
+  font-weight: 900;
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--blue) 24%, transparent);
+}
+
+.diameter-export-button:disabled {
+  border-color: var(--line);
+  color: var(--muted);
+  background: var(--panel-soft);
+  box-shadow: none;
+}
+
+.diameter-page-empty {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  place-content: center;
+  gap: 5px;
+  padding: 12px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 11px;
+  text-align: center;
+}
+
+.diameter-page-empty strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.diameter-page-empty.compact {
+  min-height: 80px;
+}
+
+@media (max-width: 1180px) {
+  .diameter-page {
+    grid-template-columns: 220px minmax(0, 1fr) 230px;
+    gap: 5px;
+    padding: 5px;
+  }
+
+  .diameter-page-left,
+  .diameter-page-center,
+  .diameter-page-right,
+  .diameter-page-lower {
+    gap: 5px;
+  }
+
+  .diameter-page-metrics dd {
+    font-size: 12px;
+  }
+
+  .diameter-cross-section-gauge dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .diameter-cross-section-gauge dl > div:nth-child(2) {
+    border-right: 0;
+  }
+
+  .diameter-cross-section-gauge dl > div:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--line);
+  }
+}
+
+@media (max-width: 900px) {
+  .diameter-page {
+    grid-template-columns: 210px minmax(560px, 1fr);
+    overflow: auto;
+  }
+
+  .diameter-page-right {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(4, minmax(180px, 1fr));
+    grid-template-rows: auto;
+  }
+
+  .diameter-export-button {
+    min-height: 80px;
+  }
 }

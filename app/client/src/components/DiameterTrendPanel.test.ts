@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { createElement } from 'react';
 import { describe, expect, it } from 'vitest';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
@@ -64,7 +64,12 @@ describe('buildDiameterMeasurements', () => {
     expect(container.querySelector('.diameter-curve-card > header')).toBeNull();
     expect(container.querySelector('.diameter-trend-header')).toBeNull();
     expect(container.querySelector('.diameter-curve-card > footer')).toBeNull();
-    expect(container.querySelectorAll('.diameter-sample-hit title')).toHaveLength(2);
+    expect(container.querySelectorAll('canvas')).toHaveLength(2);
+    expect(screen.getByRole('group', { name: '测径曲线图例' })).toBeInTheDocument();
+    const fittedSeries = screen.getByRole('button', { name: '圆拟合外径' });
+    expect(fittedSeries).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(fittedSeries);
+    expect(fittedSeries).toHaveAttribute('aria-pressed', 'false');
     expect(screen.queryByText('外径偏差变化')).not.toBeInTheDocument();
     expect(screen.queryByText('圆度误差变化')).not.toBeInTheDocument();
   });
@@ -81,8 +86,6 @@ describe('buildDiameterMeasurements', () => {
     expect(grid).toHaveAttribute('data-x-axis-scope', 'visible');
     expect(grid).toHaveAttribute('data-x-axis-start-mm', '3000');
     expect(grid).toHaveAttribute('data-x-axis-end-mm', '9000');
-    expect(screen.getByRole('img')).toHaveTextContent('3000');
-    expect(screen.getByRole('img')).toHaveTextContent('9000 mm');
   });
 
   it('uses accepted algorithm sections and a head-relative axis when no encoder is connected', () => {
@@ -150,7 +153,15 @@ describe('buildDiameterMeasurements', () => {
     expect(grid).toHaveAttribute('data-x-axis-mode', 'head-relative');
     expect(screen.queryByText('2 / 3')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('固定角度测径曲线图例')).not.toBeInTheDocument();
-    expect(document.querySelectorAll('.diameter-sample-hit title').length).toBeGreaterThan(0);
+    expect(screen.getAllByRole('button', { pressed: true })).toHaveLength(5);
+    const chart = screen.getByRole('img', { name: '测径（外径）曲线，按头部相对位置变化' });
+    Object.defineProperty(chart, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ left: 0, top: 0, right: 600, bottom: 300, width: 600, height: 300, x: 0, y: 0, toJSON: () => ({}) }),
+    });
+    fireEvent.pointerMove(chart, { clientX: 330, clientY: 150 });
+    expect(document.querySelector('.diameter-canvas-tooltip')).toHaveTextContent('%');
+    expect(document.querySelectorAll('.diameter-canvas-tooltip span')).toHaveLength(5);
   });
 
   it('renders an explicitly unqualified trend without marking it as valid measurement', () => {

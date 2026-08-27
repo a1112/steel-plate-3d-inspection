@@ -141,7 +141,8 @@ describe('AlarmAnalysis', () => {
     expect(screen.getByTestId('diameter-trend-grid')).toHaveAttribute('data-measurement-source', 'measurement-artifact');
     expect(screen.getByTestId('diameter-trend-grid')).toHaveAttribute('data-x-axis-mode', 'head-relative');
     expect(screen.queryByText('2 / 3')).not.toBeInTheDocument();
-    expect(document.querySelectorAll('.diameter-sample-hit title')).toHaveLength(2);
+    expect(document.querySelectorAll('.diameter-canvas-chart canvas')).toHaveLength(2);
+    expect(screen.getByRole('img', { name: '测径（外径）曲线，按头部相对位置变化' })).toHaveTextContent('圆拟合外径 2 个截面');
   });
 
   it('fully collapses the lower measurement area', () => {

@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  getRememberedCaptureImage,
+  hasRememberedCaptureImageUrl,
   prefetchCaptureImageUrls,
+  rememberCaptureImage,
   resetCaptureImagePrefetchForTests,
 } from './capture-image-prefetch';
 
@@ -74,5 +77,37 @@ describe('capture image prefetch queue', () => {
     cancel();
     await vi.advanceTimersByTimeAsync(500);
     expect(FakeImage.instances).toHaveLength(0);
+  });
+
+  it('retains the decoded image so a virtualized canvas can repaint without another request', async () => {
+    prefetchCaptureImageUrls(['/already-loaded.jpg'], { delayMs: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const image = FakeImage.instances[0];
+    image.resolve();
+    await vi.runAllTimersAsync();
+
+    expect(getRememberedCaptureImage('/already-loaded.jpg')).toBe(image);
+    expect(hasRememberedCaptureImageUrl('/already-loaded.jpg')).toBe(true);
+    expect(FakeImage.instances).toHaveLength(1);
+  });
+
+  it('accepts images decoded by a visible canvas and rejects incomplete images', () => {
+    const ready = new FakeImage();
+    ready.resolve();
+    rememberCaptureImage('/visible.jpg', ready as unknown as HTMLImageElement);
+    expect(getRememberedCaptureImage('/visible.jpg')).toBe(ready);
+
+    const incomplete = new FakeImage();
+    rememberCaptureImage('/incomplete.jpg', incomplete as unknown as HTMLImageElement);
+    expect(getRememberedCaptureImage('/incomplete.jpg')).toBeUndefined();
+    expect(hasRememberedCaptureImageUrl('/incomplete.jpg')).toBe(false);
+
+    rememberCaptureImage(
+      '/api/capture/render?path=frame.png&level=original',
+      ready as unknown as HTMLImageElement,
+    );
+    expect(hasRememberedCaptureImageUrl('/api/capture/render?path=frame.png&level=original')).toBe(true);
+    expect(getRememberedCaptureImage('/api/capture/render?path=frame.png&level=original')).toBeUndefined();
   });
 });

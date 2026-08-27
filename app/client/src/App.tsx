@@ -85,6 +85,7 @@ import { BrandHeader, type BkvDataHealth } from './components/BrandHeader';
 import { AppFooter } from './components/AppFooter';
 import { AlarmAnalysis, type AnalysisViewMode } from './components/AlarmAnalysis';
 import { buildDiameterMetricSummary } from './components/DiameterTrendPanel';
+import { DiameterAnalysisPage } from './components/DiameterAnalysisPage';
 import { AlarmCenter } from './components/AlarmCenter';
 import { DefectDetectionList } from './components/DefectDetectionList';
 import { DefectImagePanel } from './components/DefectImagePanel';
@@ -1936,9 +1937,9 @@ function InspectionDashboard({
           onClose={() => setBkvConversionStatusOpen(false)}
         />
       ) : null}
-      {uiState.activeNav === 'online' ? (
+      {uiState.activeNav === 'online' || uiState.activeNav === 'diameter' ? (
         <div className="online-unified-page">
-          {onlineWorkspaceMode === 'inspection' ? (
+          {uiState.activeNav === 'diameter' || onlineWorkspaceMode === 'inspection' ? (
         <div className={`online-workspace ${terminalMode === 'bkv' ? 'runtime-bkv-workspace' : ''}`}>
           <LeftSidebar
             runtimeMode={terminalMode}
@@ -1961,6 +1962,28 @@ function InspectionDashboard({
             onSearchReset={resetRecordSearchFilters}
           />
           <section className="online-main">
+            {uiState.activeNav === 'diameter' ? (
+              <DiameterAnalysisPage
+                embedded
+                plate={activeSnapshot.currentPlate}
+                records={snapshot.records}
+                selectedRecordId={uiState.selectedRecordId}
+                inspectionId={activeInspection?.inspectionId}
+                measurement={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.measurement : null}
+                mesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
+                loading={recordBoundSurface.loading}
+                artifactStatus={recordBoundSurface.status}
+                onRecordSelect={selectRecordById}
+                onExport={(payload) => {
+                  downloadTextFile(
+                    `diameter-${activeSnapshot.currentPlate.plateNo || 'record'}.json`,
+                    JSON.stringify(payload, null, 2),
+                    'application/json;charset=utf-8',
+                  );
+                  setToast('测径报告已导出');
+                }}
+              />
+            ) : (
             <main className={`dashboard-grid online-dashboard-grid ${rightSidebarCollapsed || !hasCurrentDefects ? 'right-sidebar-collapsed' : ''}`}>
               <section className={`center-column ${analysisCollapsed ? 'analysis-collapsed' : ''}`}>
                 <PlateMap
@@ -2106,6 +2129,7 @@ function InspectionDashboard({
                 />
               </aside>}
             </main>
+            )}
           </section>
         </div>
           ) : (

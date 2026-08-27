@@ -308,11 +308,17 @@ describe('online inspection world compatibility', () => {
     expect(viewport).toHaveAttribute('data-prefetch-image-count', '24');
     expect(viewport).toHaveAttribute('data-head-aligned', 'true');
     expect(viewport).toHaveAttribute('data-head-display-padding-applied', 'true');
+    expect(viewport).toHaveAttribute('data-head-retained-context-frames', '0.35');
+    expect(viewport).toHaveAttribute('data-timeline-origin-frames', '2.650000');
     expect(screen.queryByTestId('head-alignment-summary')).not.toBeInTheDocument();
     const c1First = document.querySelector('.bar-camera-frame[data-camera-id="C1"][data-frame-sequence="1"]');
     const c2First = document.querySelector('.bar-camera-frame[data-camera-id="C2"][data-frame-sequence="1"]');
-    expect(c1First).toHaveStyle({ left: '0px' });
-    expect(c2First).toHaveStyle({ left: '352px' });
+    expect(Number.parseFloat((c1First as HTMLElement).style.left)).toBeCloseTo(-466.4, 5);
+    expect(Number.parseFloat((c2First as HTMLElement).style.left)).toBeCloseTo(-114.4, 5);
+    const c1AlignedHead = document.querySelector('.bar-camera-frame[data-camera-id="C1"][data-frame-sequence="4"]');
+    const c2AlignedHead = document.querySelector('.bar-camera-frame[data-camera-id="C2"][data-frame-sequence="2"]');
+    expect(Number.parseFloat((c1AlignedHead as HTMLElement).style.left)).toBeCloseTo(61.6, 5);
+    expect(Number.parseFloat((c2AlignedHead as HTMLElement).style.left)).toBeCloseTo(61.6, 5);
     expect(screen.getByRole('button', { name: /camera2 采集图像/ })).toHaveAttribute(
       'data-head-offset-frames',
       '-2.000000',
@@ -328,6 +334,10 @@ describe('online inspection world compatibility', () => {
       canvas.getAttribute('data-edge-policy') === 'source-roi'
     ))).toBe(true);
     expect(document.querySelectorAll('canvas[data-load-priority="high"]')).toHaveLength(6);
+    fireEvent.doubleClick(screen.getByLabelText('C2 裁剪拼接帧'));
+    expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-expanded-camera', 'camera2');
+    fireEvent.doubleClick(screen.getByLabelText('C2 裁剪拼接帧'));
+    expect(screen.getByTestId('bar-unfolded-map')).not.toHaveAttribute('data-expanded-camera');
     expect(fetchCaptureStitchHistory).toHaveBeenCalledWith(
       '2747',
       ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'],
@@ -1321,15 +1331,30 @@ describe('PlateMap', () => {
       '4033',
       expect.any(Array),
     ));
+    expect(screen.getByTestId('surface-gray-unfolded')).toHaveAttribute('data-image-source', 'per-frame-two-level-gray');
+    const grayViewport = screen.getByTestId('capture-stitch-viewport');
+    const grayCanvas = screen.getAllByLabelText(/2D 去背景图/)[0];
+    grayCanvas.dataset.hasPaintedFrame = 'true';
+    Object.defineProperty(grayViewport, 'scrollLeft', { configurable: true, value: 320, writable: true });
+    const grayOrigin = grayViewport.getAttribute('data-timeline-origin-frames');
     fireEvent.click(screen.getByRole('button', { name: 'Jet' }));
     expect(screen.getByTestId('surface-jet-unfolded')).toHaveAttribute('data-image-source', 'per-frame-two-level-jet');
-    expect(screen.getByTestId('capture-stitch-viewport')).toHaveAttribute(
+    const jetViewport = screen.getByTestId('capture-stitch-viewport');
+    expect(jetViewport).toBe(grayViewport);
+    expect(jetViewport.scrollLeft).toBe(320);
+    expect(jetViewport).toHaveAttribute(
       'data-head-display-padding-applied',
       'true',
     );
+    expect(jetViewport).toHaveAttribute('data-image-mode', 'jet');
+    expect(jetViewport).toHaveAttribute('data-timeline-origin-frames', grayOrigin);
     expect(screen.getByRole('region', { name: '6 相机圆周展开缺陷图' })).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: /采集图像/ })).toHaveLength(6);
     const jetImages = screen.getAllByLabelText(/JET/);
     expect(jetImages).toHaveLength(6);
+    expect(jetImages[0]).toBe(grayCanvas);
+    expect(jetImages[0]).toHaveAttribute('data-has-painted-frame', 'true');
+    expect(jetImages[0]).toHaveAttribute('data-render-state', 'loading-retaining-frame');
+    expect(jetImages[0].getAttribute('data-pending-image-source')).toContain('modality=jet');
   });
 });

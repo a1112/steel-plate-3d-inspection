@@ -112,6 +112,18 @@ describe('compact online detection layout CSS contract', () => {
     ).toBe('minmax(0, 1fr)');
   });
 
+  it('keeps the unfolded image free of decorative contour overlays', () => {
+    expect(stylesCss).not.toContain('.bar-unfolded-canvas::before');
+    expect(stylesCss).not.toContain('.bar-camera-band[role="button"]::after');
+    expect(stylesCss).not.toContain('.bar-camera-band[role="button"]:hover .bar-camera-band-image');
+    expect(stylesCss).not.toContain('.bar-camera-frame::after');
+    expectDeclaration('.bar-camera-band', 'border-top', '0');
+    expectDeclaration('.bar-camera-frame', 'border-right', '0');
+    expectDeclaration('.bar-camera-frame', 'box-shadow', 'none');
+    expectDeclaration('.bar-unfolded-map.orientation-vertical .bar-camera-band', 'border-left', '0');
+    expectDeclaration('.bar-unfolded-map.orientation-vertical .bar-camera-frame', 'border-bottom', '0');
+  });
+
   it('preserves compact defect filter sizing across every themed style cascade', () => {
     const selector = ".app-shell[class*='style-'] .defect-filter-panel .panel-body";
     expectDeclaration(selector, 'height', 'auto');
