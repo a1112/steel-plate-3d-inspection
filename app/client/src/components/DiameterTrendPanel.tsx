@@ -1,7 +1,8 @@
-import { useMemo, type CSSProperties } from 'react';
+import { useMemo } from 'react';
 import type { CaptureFlowMeasurement } from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { fitSurfaceCircle } from './ProductionArtifactView';
+import { DiameterCanvasChart } from './DiameterCanvasChart';
 
 export type DiameterMeasurement = {
   row: number;
@@ -244,83 +245,6 @@ export function buildDiameterMetricSummary(artifact?: CaptureFlowMeasurement | n
   };
 }
 
-function DiameterCurve({ lines, nominalDiameterMm, axisMode, axisStart, axisEnd }: {
-  lines: DiameterCurveLine[];
-  nominalDiameterMm: number;
-  axisMode: 'length-mm' | 'head-relative';
-  axisStart: number;
-  axisEnd: number;
-}) {
-  const values = lines.flatMap((line) => line.samples.map((sample) => sample.diameterMm));
-  const dataMinimum = Math.min(...values);
-  const dataMaximum = Math.max(...values);
-  const dataMean = values.reduce((sum, value) => sum + value, 0) / values.length;
-  const span = Math.max(0.01, dataMaximum - dataMinimum);
-  const showNominal = nominalDiameterMm > 0 && Math.abs(nominalDiameterMm - dataMean) <= Math.max(10, dataMean * 0.3);
-  const scaleValues = showNominal ? [...values, nominalDiameterMm] : values;
-  const minimum = Math.min(...scaleValues) - span * 0.18;
-  const maximum = Math.max(...scaleValues) + span * 0.18;
-  const width = 1200;
-  const height = 250;
-  const left = 62;
-  const right = 24;
-  const top = 20;
-  const bottom = 42;
-  const chartWidth = width - left - right;
-  const chartHeight = height - top - bottom;
-  const axisValue = (sample: DiameterMeasurement) => axisMode === 'length-mm' ? sample.positionMm : sample.positionRatio * 100;
-  const x = (sample: DiameterMeasurement) => left + ((axisValue(sample) - axisStart) / Math.max(0.0001, axisEnd - axisStart)) * chartWidth;
-  const y = (value: number) => top + (maximum - value) / Math.max(0.001, maximum - minimum) * chartHeight;
-  const minimumLine = lines.find((line) => line.kind === 'minimum');
-  const maximumLine = lines.find((line) => line.kind === 'maximum');
-  const envelopePoints = minimumLine && maximumLine
-    ? [
-        ...maximumLine.samples.map((sample) => `${x(sample)},${y(sample.diameterMm)}`),
-        ...[...minimumLine.samples].reverse().map((sample) => `${x(sample)},${y(sample.diameterMm)}`),
-      ].join(' ')
-    : '';
-
-  return (
-    <section className="diameter-curve-card">
-      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label={`测径（外径）曲线，按${axisMode === 'length-mm' ? '钢管长度位置' : '头部相对位置'}变化`}>
-        {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
-          const value = maximum - ratio * (maximum - minimum);
-          return <g key={ratio}>
-            <line x1={left} y1={y(value)} x2={width - right} y2={y(value)} className="diameter-grid-line" />
-            <text x={left - 6} y={y(value) + 4} textAnchor="end">{format(value)}</text>
-          </g>;
-        })}
-        {showNominal ? <line x1={left} y1={y(nominalDiameterMm)} x2={width - right} y2={y(nominalDiameterMm)} className="diameter-reference" /> : null}
-        <line x1={left} y1={top} x2={left} y2={height - bottom} className="diameter-axis" />
-        <line x1={left} y1={height - bottom} x2={width - right} y2={height - bottom} className="diameter-axis" />
-        {envelopePoints ? <polygon points={envelopePoints} className="diameter-range-envelope" /> : null}
-        {lines.map((line) => <polyline
-          key={line.id}
-          points={line.samples.map((sample) => `${x(sample)},${y(sample.diameterMm)}`).join(' ')}
-          fill="none"
-          className={`diameter-series-line kind-${line.kind}`}
-          style={{ '--diameter-series-color': line.color } as CSSProperties}
-          vectorEffect="non-scaling-stroke"
-        />)}
-        {lines.flatMap((line) => line.samples.map((sample) => <circle
-          key={`${line.id}:${sample.row}:${sample.positionRatio}`}
-          cx={x(sample)}
-          cy={y(sample.diameterMm)}
-          r="7"
-          className="diameter-sample-hit"
-          style={{ '--diameter-series-color': line.color } as CSSProperties}
-          vectorEffect="non-scaling-stroke"
-        >
-          <title>{`${line.label} · ${axisMode === 'length-mm' ? `${format(sample.positionMm, 0)} mm` : `${format(sample.positionRatio * 100, 1)}% / ${format(sample.elapsedFromHeadMs, 0)} ms`}：外径 ${format(sample.diameterMm)} mm，圆度 ${format(sample.roundnessMm)} mm，P95残差 ${format(sample.fitResidualP95Mm)} mm`}</title>
-        </circle>))}
-        <text x={left} y={height - 13}>{axisMode === 'length-mm' ? `${format(axisStart, 0)} mm` : `${format(axisStart, 1)}%`}</text>
-        <text x={width - right} y={height - 13} textAnchor="end">{axisMode === 'length-mm' ? `${format(axisEnd, 0)} mm` : `${format(axisEnd, 1)}%`}</text>
-        <text x={width / 2} y={height - 8} textAnchor="middle" className="diameter-axis-title">{axisMode === 'length-mm' ? '距头部长度' : '头部相对位置（无测速仪）'}</text>
-      </svg>
-    </section>
-  );
-}
-
 export function DiameterTrendPanel({ mesh, artifact, nominalDiameterMm, lengthMm, visibleRange = null }: {
   mesh?: BarSurfaceMesh | null;
   artifact?: CaptureFlowMeasurement | null;
@@ -392,7 +316,7 @@ export function DiameterTrendPanel({ mesh, artifact, nominalDiameterMm, lengthMm
   const measurementQualified = buildDiameterMetricSummary(artifact)?.qualified ?? false;
   return (
     <div className="diameter-trend-grid" data-testid="diameter-trend-grid" data-measurement-unit="mm" data-measurement-source={artifact ? 'measurement-artifact' : 'surface-fallback'} data-measurement-valid={measurementQualified ? 'true' : 'false'} data-curve-model={directionalContract ? 'fixed-angle-reconstructed-surface' : 'circle-fit-legacy'} data-fixed-angle-series={directionalLines.filter((line) => line.kind === 'fixed-angle').length} data-section-count={allSamples.length} data-visible-section-count={samples.length} data-x-axis-scope={normalizedRange ? 'visible' : 'global'} data-x-axis-mode={axisMode} data-x-axis-start-ratio={rangeStartRatio.toFixed(4)} data-x-axis-end-ratio={rangeEndRatio.toFixed(4)} data-x-axis-start-mm={(rangeStartRatio * lengthMm).toFixed(0)} data-x-axis-end-mm={(rangeEndRatio * lengthMm).toFixed(0)}>
-      <DiameterCurve lines={visibleLines} nominalDiameterMm={nominalDiameterMm} axisMode={axisMode} axisStart={axisStart} axisEnd={axisEnd} />
+      <DiameterCanvasChart lines={visibleLines} nominalDiameterMm={nominalDiameterMm} axisMode={axisMode} axisStart={axisStart} axisEnd={axisEnd} />
     </div>
   );
 }

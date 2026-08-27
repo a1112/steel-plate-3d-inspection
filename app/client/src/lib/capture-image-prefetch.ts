@@ -11,7 +11,8 @@
 const DEFAULT_MAX_CONCURRENT = 2;
 const DEFAULT_MAX_URLS = 48;
 const DEFAULT_DELAY_MS = 160;
-const MAX_REMEMBERED_URLS = 256;
+const MAX_REMEMBERED_URLS = 2048;
+const MAX_REMEMBERED_IMAGES = 384;
 
 type PrefetchJob = {
   cancelled: boolean;
@@ -30,6 +31,7 @@ type IdleWindow = Window & typeof globalThis & {
 };
 
 const rememberedUrls = new Map<string, true>();
+const rememberedImages = new Map<string, HTMLImageElement>();
 const pendingRequests = new Map<string, PendingRequest>();
 const pendingQueue: string[] = [];
 let activeRequestCount = 0;
@@ -40,7 +42,8 @@ function idleWindow(): IdleWindow | null {
   return typeof window === 'undefined' ? null : window as IdleWindow;
 }
 
-function rememberUrl(url: string) {
+export function rememberCaptureImage(url: string, image: HTMLImageElement) {
+  if (!image.complete || image.naturalWidth <= 0) return;
   rememberedUrls.delete(url);
   rememberedUrls.set(url, true);
   while (rememberedUrls.size > MAX_REMEMBERED_URLS) {
@@ -48,6 +51,37 @@ function rememberUrl(url: string) {
     if (typeof oldest !== 'string') break;
     rememberedUrls.delete(oldest);
   }
+  // Expanded-camera originals can be very large. The immutable HTTP cache is
+  // enough for those; retain decoded Image objects only for strip thumbnails.
+  if (/[?&]level=original(?:&|$)/.test(url)) return;
+  rememberedImages.delete(url);
+  rememberedImages.set(url, image);
+  while (rememberedImages.size > MAX_REMEMBERED_IMAGES) {
+    const oldest = rememberedImages.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    rememberedImages.delete(oldest);
+  }
+}
+
+/**
+ * Return an already decoded capture image and refresh its LRU position.
+ * Virtualized camera frames use this to repaint synchronously when they
+ * re-enter the viewport instead of flashing an empty canvas first.
+ */
+export function getRememberedCaptureImage(url: string) {
+  const image = rememberedImages.get(url);
+  if (!image) return undefined;
+  if (!image.complete || image.naturalWidth <= 0) {
+    rememberedImages.delete(url);
+    return undefined;
+  }
+  rememberedImages.delete(url);
+  rememberedImages.set(url, image);
+  return image;
+}
+
+export function hasRememberedCaptureImageUrl(url: string) {
+  return rememberedUrls.has(url);
 }
 
 function removeJobFromRequest(url: string, job: PrefetchJob) {
@@ -99,7 +133,11 @@ function finishRequest(url: string, succeeded: boolean) {
   if (!request || request.state !== 'loading') return;
   pendingRequests.delete(url);
   activeRequestCount = Math.max(0, activeRequestCount - 1);
-  if (succeeded) rememberUrl(url);
+  if (succeeded && request.image) {
+    request.image.onload = null;
+    request.image.onerror = null;
+    rememberCaptureImage(url, request.image);
+  }
   // A failed rendition is not remembered. It may become available after the
   // background full-flow generator commits the file, so a later viewport pass
   // is allowed to retry it.
@@ -212,6 +250,7 @@ export function resetCaptureImagePrefetchForTests() {
   pendingRequests.clear();
   pendingQueue.length = 0;
   rememberedUrls.clear();
+  rememberedImages.clear();
   activeRequestCount = 0;
   if (pumpTimer !== null && typeof window !== 'undefined') window.clearTimeout(pumpTimer);
   const host = idleWindow();

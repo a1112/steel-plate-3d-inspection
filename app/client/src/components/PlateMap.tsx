@@ -1,6 +1,6 @@
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Check, X } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type MutableRefObject, type PointerEvent, type ReactNode, type WheelEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type MutableRefObject, type PointerEvent, type ReactNode, type WheelEvent } from 'react';
 import { DoubleSide, type Mesh, type PerspectiveCamera } from 'three';
 import heightMapBottomImage from '../assets/plate-surfaces/height-map-bottom.png';
 import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
@@ -14,7 +14,12 @@ import {
   type CaptureStitchFrame,
   type CaptureStitchResult,
 } from '../services/capture-roi-api';
-import { prefetchCaptureImageUrls } from '../lib/capture-image-prefetch';
+import {
+  getRememberedCaptureImage,
+  hasRememberedCaptureImageUrl,
+  prefetchCaptureImageUrls,
+  rememberCaptureImage,
+} from '../lib/capture-image-prefetch';
 import {
   fetchInspectionWorldDefects,
   fetchInspectionWorldMeta,
@@ -644,7 +649,7 @@ function CameraBandImage({
 
   cropWindowRef.current = stableCropWindow;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) {
       return;
@@ -655,18 +660,28 @@ function CameraBandImage({
       canvas.width = Math.max(1, canvas.width);
       canvas.height = Math.max(1, canvas.height);
     };
-    // A record or modality switch must never leave the previous frame painted
-    // while its replacement is rebuilding or unavailable.
-    clear();
     if (!src) {
+      clear();
       canvas.dataset.renderState = 'empty';
+      delete canvas.dataset.imageCacheHit;
+      delete canvas.dataset.hasPaintedFrame;
+      delete canvas.dataset.pendingImageSource;
       return;
     }
-    canvas.dataset.renderState = 'loading';
+    const rememberedImage = getRememberedCaptureImage(src);
+    const previouslyLoaded = Boolean(rememberedImage) || hasRememberedCaptureImageUrl(src);
+    const retainingPaintedFrame = canvas.dataset.hasPaintedFrame === 'true';
+    if (!rememberedImage && !retainingPaintedFrame) clear();
+    canvas.dataset.renderState = rememberedImage
+      ? 'restoring-from-cache'
+      : retainingPaintedFrame ? 'loading-retaining-frame' : 'loading';
+    canvas.dataset.imageCacheHit = rememberedImage ? 'true' : 'false';
+    canvas.dataset.imageCacheState = rememberedImage ? 'decoded' : previouslyLoaded ? 'http' : 'miss';
+    canvas.dataset.pendingImageSource = src;
     let disposed = false;
     let loadTimer: number | null = null;
     let retryCount = 0;
-    const image = new Image();
+    const image = rememberedImage ?? new Image();
     const draw = () => {
       if (disposed || !image.complete || image.naturalWidth <= 0) {
         return;
@@ -758,32 +773,44 @@ function CameraBandImage({
       } else {
         context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, rect.width, rect.height);
       }
+      canvas.dataset.hasPaintedFrame = 'true';
       canvas.dataset.renderState = 'ready';
+      delete canvas.dataset.pendingImageSource;
     };
     redrawRef.current = draw;
-    image.crossOrigin = 'anonymous';
-    image.decoding = 'async';
-    image.fetchPriority = loadDelayMs > 0 ? 'low' : 'high';
-    image.onload = draw;
+    if (!rememberedImage) {
+      image.crossOrigin = 'anonymous';
+      image.decoding = 'async';
+      image.fetchPriority = loadDelayMs > 0 && !previouslyLoaded ? 'low' : 'high';
+    }
+    image.onload = () => {
+      rememberCaptureImage(src, image);
+      draw();
+    };
     const requestImage = () => {
       if (!disposed) image.src = src;
     };
     image.onerror = () => {
       if (disposed) return;
-      clear();
       if (retryCount < 5) {
         const retryDelayMs = Math.min(8_000, 750 * (2 ** retryCount));
         retryCount += 1;
-        canvas.dataset.renderState = 'waiting-for-rendition';
+        canvas.dataset.renderState = retainingPaintedFrame
+          ? 'waiting-for-rendition-retaining-frame'
+          : 'waiting-for-rendition';
         loadTimer = window.setTimeout(() => {
           loadTimer = null;
           requestImage();
         }, retryDelayMs);
       } else {
-        canvas.dataset.renderState = 'error';
+        canvas.dataset.renderState = retainingPaintedFrame ? 'error-retaining-frame' : 'error';
       }
     };
-    if (loadDelayMs > 0) {
+    if (rememberedImage) {
+      // Layout effects run before paint. Reusing the decoded Image object here
+      // lets a virtualized frame return without exposing an empty canvas.
+      draw();
+    } else if (loadDelayMs > 0 && !previouslyLoaded) {
       loadTimer = window.setTimeout(() => {
         loadTimer = null;
         requestImage();
@@ -800,7 +827,7 @@ function CameraBandImage({
       redrawRef.current = null;
       image.onload = null;
       image.onerror = null;
-      if (typeof image.removeAttribute === 'function') image.removeAttribute('src');
+      if (!image.complete && typeof image.removeAttribute === 'function') image.removeAttribute('src');
     };
   }, [autoCropCameraId, cropBlackBorders, loadDelayMs, onAutoCropDetected, orientation, src]);
 
@@ -933,6 +960,7 @@ function BarUnfoldedMap({
 }) {
   const FRAME_SPAN_PX = 176;
   const FRAME_OVERSCAN = 3;
+  const HEAD_CONTEXT_FRAMES = 0.35;
   const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
   const [mapDragging, setMapDragging] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -996,28 +1024,8 @@ function BarUnfoldedMap({
     )
     : 0;
   const alignmentKey = displayHeadAlignmentApplied
-    ? `${headAlignment?.alignedTimelinePositionFrames ?? ''}:${maximumHeadPaddingFrames}`
+    ? `${headAlignment?.alignedTimelinePositionFrames ?? ''}:${maximumHeadPaddingFrames}:${HEAD_CONTEXT_FRAMES}`
     : '';
-  const longitudinalExtent = Math.max(
-    FRAME_SPAN_PX,
-    (captureFrames.length + maximumHeadPaddingFrames) * FRAME_SPAN_PX,
-  );
-  const firstVisibleFrame = stitchEnabled
-    ? Math.max(
-      0,
-      Math.floor(scrollWindow.offset / FRAME_SPAN_PX - maximumHeadPaddingFrames)
-      - FRAME_OVERSCAN,
-    )
-    : 0;
-  const lastVisibleFrame = stitchEnabled
-    ? Math.min(
-      captureFrames.length,
-      Math.ceil((scrollWindow.offset + scrollWindow.extent) / FRAME_SPAN_PX) + FRAME_OVERSCAN,
-    )
-    : 0;
-  const visibleCaptureFrames = stitchEnabled
-    ? captureFrames.slice(firstVisibleFrame, lastVisibleFrame)
-    : [];
   const detectedContentAnchorFrame = captureStitchInitialFrameIndex(
     captureFrames,
     cameraLanes.length,
@@ -1029,12 +1037,38 @@ function BarUnfoldedMap({
     && Number.isFinite(firstCaptureSequence)
     ? Math.max(0, alignedTimelinePosition - firstCaptureSequence)
     : detectedContentAnchorFrame;
+  // Keep only a short pre-head context in the rendered timeline. Applying the
+  // origin to frame positions (instead of relying on scrollLeft) makes gray
+  // and JET use exactly the same stable aligned window after mode switches.
+  const timelineOriginFrames = displayHeadAlignmentApplied
+    ? Math.max(0, contentAnchorFrame - HEAD_CONTEXT_FRAMES)
+    : 0;
+  const longitudinalExtent = Math.max(
+    FRAME_SPAN_PX,
+    (captureFrames.length + maximumHeadPaddingFrames - timelineOriginFrames) * FRAME_SPAN_PX,
+  );
+  const firstVisibleFrame = stitchEnabled
+    ? Math.max(
+      0,
+      Math.floor(timelineOriginFrames + scrollWindow.offset / FRAME_SPAN_PX - maximumHeadPaddingFrames)
+      - FRAME_OVERSCAN,
+    )
+    : 0;
+  const lastVisibleFrame = stitchEnabled
+    ? Math.min(
+      captureFrames.length,
+      Math.ceil(timelineOriginFrames + (scrollWindow.offset + scrollWindow.extent) / FRAME_SPAN_PX) + FRAME_OVERSCAN,
+    )
+    : 0;
+  const visibleCaptureFrames = stitchEnabled
+    ? captureFrames.slice(firstVisibleFrame, lastVisibleFrame)
+    : [];
   const priorityFrameIndex = stitchEnabled
     ? Math.max(
       firstVisibleFrame,
       Math.min(
         Math.max(firstVisibleFrame, lastVisibleFrame - 1),
-        Math.floor((scrollWindow.offset + scrollWindow.extent / 2) / FRAME_SPAN_PX),
+        Math.floor(timelineOriginFrames + (scrollWindow.offset + scrollWindow.extent / 2) / FRAME_SPAN_PX),
       ),
     )
     : 0;
@@ -1169,7 +1203,7 @@ function BarUnfoldedMap({
       const target = appendedAtTail
         ? maximum
         : recordChanged || recordContentBecameReady || alignmentChanged
-          ? Math.min(maximum, contentAnchorFrame * FRAME_SPAN_PX)
+          ? 0
           : maximum * retainedProgress;
       if (orientation === 'horizontal') {
         host.scrollTop = 0;
@@ -1184,7 +1218,7 @@ function BarUnfoldedMap({
   // readScrollPosition is deliberately kept local so it always uses the
   // orientation committed by this render.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [alignmentKey, captureFrames.length, contentAnchorFrame, orientation, stitchKey]);
+  }, [alignmentKey, captureFrames.length, orientation, stitchKey, timelineOriginFrames]);
 
   const handleMapWheel = (event: WheelEvent<HTMLDivElement>) => {
     if (!stitchEnabled) {
@@ -1202,7 +1236,7 @@ function BarUnfoldedMap({
   const handleMapPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (!stitchEnabled || event.button !== 0) return;
     const target = event.target as HTMLElement;
-    if (target.closest('button, input, select, textarea, a')) return;
+    if (target.closest('[role="button"], button, input, select, textarea, a')) return;
     mapDragRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -1254,6 +1288,9 @@ function BarUnfoldedMap({
         data-head-aligned={headAlignment?.displayAligned ? 'true' : 'false'}
         data-head-display-padding-applied={displayHeadAlignmentApplied ? 'true' : 'false'}
         data-head-spread-frames={headAlignment?.timelineSpreadFrames ?? undefined}
+        data-head-retained-context-frames={displayHeadAlignmentApplied ? HEAD_CONTEXT_FRAMES : undefined}
+        data-timeline-origin-frames={timelineOriginFrames.toFixed(6)}
+        data-image-mode={imageMode}
         data-visible-frame-start={firstVisibleFrame}
         data-visible-frame-end={lastVisibleFrame}
         data-prefetch-frame-count={prefetchFrameIndexes.length}
@@ -1293,11 +1330,14 @@ function BarUnfoldedMap({
               role="button"
               tabIndex={0}
               aria-label={`${lane.cameraId} 采集图像${expanded ? '，已展开，双击恢复' : '，双击展开'}`}
-              title={`${expanded ? `双击恢复 ${cameraLanes.length} 相机展开图` : `双击展开 ${lane.cameraId}；悬停查看采集轮廓`}${alignmentLabel ? `；${alignmentLabel}` : ''}`}
+              title={`${expanded ? `双击恢复 ${cameraLanes.length} 相机展开图` : `双击展开 ${lane.cameraId}`}${alignmentLabel ? `；${alignmentLabel}` : ''}`}
               data-head-offset-frames={Number.isFinite(headOffsetFrames) ? headOffsetFrames.toFixed(6) : undefined}
               data-head-display-padding-frames={cameraHead?.displayAligned ? Number(cameraHead.displayPaddingFrames ?? 0).toFixed(6) : undefined}
               data-head-aligned={cameraHead?.displayAligned ? 'true' : 'false'}
-              onDoubleClick={() => setExpandedCamera((current) => current === lane.cameraId ? null : lane.cameraId)}
+              data-camera-id={lane.cameraId}
+              onDoubleClick={() => {
+                setExpandedCamera((current) => current === lane.cameraId ? null : lane.cameraId);
+              }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
                   event.preventDefault();
@@ -1331,8 +1371,8 @@ function BarUnfoldedMap({
                       data-frame-storage-index={cameraFrame?.storageIndex}
                       data-camera-id={lane.shortLabel}
                       style={orientation === 'horizontal'
-                        ? { left: (frameIndex + displayPaddingFrames) * FRAME_SPAN_PX, width: FRAME_SPAN_PX }
-                        : { top: (frameIndex + displayPaddingFrames) * FRAME_SPAN_PX, height: FRAME_SPAN_PX }}
+                        ? { left: (frameIndex + displayPaddingFrames - timelineOriginFrames) * FRAME_SPAN_PX, width: FRAME_SPAN_PX }
+                        : { top: (frameIndex + displayPaddingFrames - timelineOriginFrames) * FRAME_SPAN_PX, height: FRAME_SPAN_PX }}
                     >
                       {cameraFrame ? <CameraBandImage
                         src={imageMode === 'jet'
@@ -2762,42 +2802,43 @@ export function PlateMap({
             <span>{artifactStatus || '当前记录尚未生成 NPZ 三维表面。'}</span>
           </div>
         )
+      ) : captureStitchResult?.frames.length && (twoDDisplayMode === 'jet' || !shouldRenderWorldStack) ? (
+        <div
+          className={`bar-unfolded-layout orientation-${unfoldOrientation}`}
+          data-testid={twoDDisplayMode === 'jet' ? 'surface-jet-unfolded' : 'surface-gray-unfolded'}
+          data-image-source={`per-frame-two-level-${twoDDisplayMode}`}
+        >
+          {twoDDisplayMode === 'gray' && artifactMode === 'production' && worldUnavailable ? <span className="live-preview-badge" data-testid="capture-roi-status">
+            {`${captureStitchResult.hasMore ? '最近 ' : ''}${captureStitchResult.frames.length}/${captureStitchResult.totalFrames} 轮对齐拼接 · 两级可重建图像 ${captureStitchResult.renderableImageCount}`}
+          </span> : null}
+          <BarUnfoldedMap
+            defects={defects}
+            defectTypes={defectTypes}
+            selectedDefectId={selectedDefectId}
+            hoveredDefectId={hoveredDefectId}
+            previewPositionM={previewPositionM}
+            plateLengthM={safePlateLengthM}
+            onPreviewPositionChange={onPreviewPositionChange}
+            onSelectDefect={onSelectDefect}
+            onHoverDefect={setHoveredDefectId}
+            onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
+            onDefectNavigationWheel={handleDefectNavigationWheel}
+            orientation={unfoldOrientation}
+            surfaceCameras={displayedSurfaceCameras}
+            captureImages={displayedCaptureImages}
+            captureFrames={captureStitchResult.frames}
+            stitchKey={captureMaterialId?.trim() || inspectionId || ''}
+            cameraLanes={cameraLanes}
+            imageMode={twoDDisplayMode}
+            headAlignment={surfaceHeadAlignment}
+            viewportMemory={twoDViewportMemory}
+          />
+        </div>
       ) : twoDDisplayMode === 'jet' ? (
-        captureStitchResult?.frames.length ? (
-          <div
-            className={`bar-unfolded-layout orientation-${unfoldOrientation}`}
-            data-testid="surface-jet-unfolded"
-            data-image-source="per-frame-two-level-jet"
-          >
-            <BarUnfoldedMap
-              defects={defects}
-              defectTypes={defectTypes}
-              selectedDefectId={selectedDefectId}
-              hoveredDefectId={hoveredDefectId}
-              previewPositionM={previewPositionM}
-              plateLengthM={safePlateLengthM}
-              onPreviewPositionChange={onPreviewPositionChange}
-              onSelectDefect={onSelectDefect}
-              onHoverDefect={setHoveredDefectId}
-              onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
-              onDefectNavigationWheel={handleDefectNavigationWheel}
-              orientation={unfoldOrientation}
-              surfaceCameras={surfaceCameras}
-              captureImages={[]}
-              captureFrames={captureStitchResult?.frames ?? []}
-              stitchKey={captureMaterialId?.trim() || inspectionId || ''}
-              cameraLanes={cameraLanes}
-              imageMode="jet"
-              headAlignment={surfaceHeadAlignment}
-              viewportMemory={twoDViewportMemory}
-            />
-          </div>
-        ) : (
-          <div className={`production-artifact-empty${artifactLoading ? ' is-loading' : ''}`} role="status" data-testid="surface-jet-unfolded-empty">
-            <strong>{artifactLoading ? '正在准备处理后 JET 图像' : '暂无可用的处理后 JET 图像'}</strong>
-            <span>{artifactStatus || '逐帧 JET 使用与 2D 去背景完全一致的裁剪和六相机对齐；缓存缺失时从原始 3D 重建。'}</span>
-          </div>
-        )
+        <div className={`production-artifact-empty${artifactLoading ? ' is-loading' : ''}`} role="status" data-testid="surface-jet-unfolded-empty">
+          <strong>{artifactLoading ? '正在准备处理后 JET 图像' : '暂无可用的处理后 JET 图像'}</strong>
+          <span>{artifactStatus || '逐帧 JET 使用与 2D 去背景完全一致的裁剪和六相机对齐；缓存缺失时从原始 3D 重建。'}</span>
+        </div>
       ) : shouldRenderWorldStack ? (
         <div className="inspection-world-stack" data-testid="inspection-world-stack">
           {displayedWorld ? <InspectionWorldCanvas
