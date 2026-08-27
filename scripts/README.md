@@ -927,6 +927,23 @@ scripts/test-bar-surface-e2e.ps1 `
 
 ## Client Only
 
+For a usable administration UI backed only by the Rust business API, with
+capture startup and capture service controls fenced on the server, run:
+
+```powershell
+scripts/start-background-management.ps1
+```
+
+This is intentionally different from the integrated runtime: it does not start
+the capture executable or trigger gateway. The launcher waits for the loopback
+API, asserts that lifecycle `running=false`, `desiredRunning=false`, `pid=null`,
+`autostart=false`, `controlAllowed=false`, and then opens
+`/?app=parameters&service=page`. That route binds the browser to the API that
+served the page instead of using a stale saved connection. Use `-ProbeOnly` for
+a start/check/stop acceptance probe and `-SkipBuild` to reuse existing artifacts.
+The dedicated `target/cargo-background-management` build directory avoids Windows
+executable-lock conflicts with an already running development service.
+
 ```powershell
 scripts/build-client.ps1
 scripts/run-client-dev.ps1 -ServicePort 4873 -VitePort 1432

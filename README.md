@@ -156,6 +156,21 @@ Or with an env file:
 scripts/run-service.ps1 -EnvFile config/env/headless-cpp.env.example
 ```
 
+Start a standalone browser-based administration surface without starting any
+capture provider, trigger gateway, or production workflow:
+
+```powershell
+scripts/start-background-management.ps1
+```
+
+The launcher binds the business API to loopback, builds and serves the admin UI,
+and verifies through `/api/capture/lifecycle` that capture autostart, capture PID,
+and capture control are all disabled before opening the browser. Press `Ctrl+C`
+to stop it. Use `-SkipBuild` after a successful build, `-NoBrowser` for console-only
+operation, or `-Detach` to leave the business API running in the background. Its
+service build is isolated under `target/cargo-background-management`, so a running
+development service cannot lock the executable being rebuilt.
+
 Run the standalone trigger gateway in another terminal. Rust readiness remains false until the required gateway is reachable:
 
 ```powershell

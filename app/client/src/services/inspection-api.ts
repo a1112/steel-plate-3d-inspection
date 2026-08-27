@@ -221,6 +221,8 @@ export type AdminServices = {
     name?: string;
     provider?: 'headless-cpp' | 'external-api' | 'simulated' | string;
     managed?: boolean;
+    controlAllowed?: boolean;
+    managementOnly?: boolean;
     running?: boolean;
     port?: number;
     origin?: string;
@@ -1259,7 +1261,39 @@ function getSafeLocalStorage() {
   }
 }
 
+function getPageBoundConnectionConfig(): ConnectionConfig | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  const queryParams = new URLSearchParams(window.location.search);
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#\??/, ''));
+  if ((queryParams.get('service') ?? hashParams.get('service')) !== 'page') {
+    return null;
+  }
+  const protocol = window.location.protocol === 'https:'
+    ? 'https'
+    : window.location.protocol === 'http:'
+      ? 'http'
+      : null;
+  const host = window.location.hostname.trim();
+  if (!protocol || !host) {
+    return null;
+  }
+  return {
+    mode: 'online',
+    host,
+    port: window.location.port
+      ? Number(window.location.port)
+      : protocol === 'https' ? 443 : 80,
+    protocol,
+  };
+}
+
 function getStoredConnectionConfig(): ConnectionConfig {
+  const pageBound = getPageBoundConnectionConfig();
+  if (pageBound) {
+    return pageBound;
+  }
   const storage = getSafeLocalStorage();
   if (!storage) {
     return createDefaultConnectionConfig();

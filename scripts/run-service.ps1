@@ -14,6 +14,7 @@ param(
   [string]$TlsPrivateKey = "",
   [string]$WebRoot = "",
   [switch]$NoCaptureAutostart,
+  [switch]$ManagementOnly,
   [ValidateRange(1, 20)]
   [int]$CaptureRestartBudget = 5,
   [ValidateRange(100, 30000)]
@@ -31,6 +32,8 @@ param(
   [int]$DatabaseConnectTimeoutMs = 5000,
   [ValidateSet("debug", "release")]
   [string]$Profile = "debug",
+  [string]$ServiceExe = "",
+  [string]$ServicePidFile = "",
   [string]$ConfigRoot = "",
   [string]$ArtifactAllowedRoots = "",
   [string]$AlgorithmRoot = "",
@@ -53,6 +56,17 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 . (Join-Path $PSScriptRoot "lib-env.ps1")
 
 Import-EnvFile $EnvFile
+
+if ($ManagementOnly) {
+  # Management-only is a one-way safety mode: the business API and admin UI
+  # remain available, while neither startup policy nor an admin service action
+  # may launch or mutate the physical capture process.
+  $NoCaptureAutostart = $true
+  $ResultProxyOnly = $true
+  $env:STEEL_BACKGROUND_MANAGEMENT_ONLY = "1"
+  $env:STEEL_CAPTURE_SERVICE_AUTOSTART = "0"
+  $env:STEEL_CAPTURE_MANAGED_BY_SUPERVISOR = "0"
+}
 
 # These values are intentionally applied after EnvFile import.  The Tauri
 # development launcher owns the local split-runtime directories and must not
@@ -81,6 +95,11 @@ if ($ResultProxyOnly) {
   $env:STEEL_RESULT_PROXY_ONLY = "1"
   $env:STEEL_IMAGE_PROXY = "1"
   $env:STEEL_CAPTURE_MANAGED_BY_SUPERVISOR = "1"
+}
+if ($ManagementOnly) {
+  # Result-proxy compatibility must not turn capture-supervisor ownership back
+  # on after the management-only fence was selected.
+  $env:STEEL_CAPTURE_MANAGED_BY_SUPERVISOR = "0"
 }
 
 if (-not [string]::IsNullOrWhiteSpace($RuntimeProfile)) {
@@ -199,10 +218,27 @@ if ($ForceParameters -or -not $env:STEEL_ALGORITHM_PROCESS_TIMEOUT_SEC) {
 }
 
 $env:STEEL_SERVICE_CONFIG_DIR = $ConfigRoot
-$ServiceExe = Join-Path $RepoRoot "target\cargo\$Profile\steel-inspection-service.exe"
-if (-not (Test-Path $ServiceExe -PathType Leaf)) {
+if ([string]::IsNullOrWhiteSpace($ServiceExe)) {
+  $ServiceExe = Join-Path $RepoRoot "target\cargo\$Profile\steel-inspection-service.exe"
+}
+if (-not (Test-Path -LiteralPath $ServiceExe -PathType Leaf)) {
   throw "Missing $ServiceExe. Run scripts/build-service.ps1 -Profile $Profile first."
 }
+$ServiceExe = (Resolve-Path -LiteralPath $ServiceExe).Path
 
-& $ServiceExe
-exit $LASTEXITCODE
+if ([string]::IsNullOrWhiteSpace($ServicePidFile)) {
+  & $ServiceExe
+  exit $LASTEXITCODE
+}
+
+$ServicePidFile = [System.IO.Path]::GetFullPath($ServicePidFile)
+$servicePidDirectory = Split-Path -Parent $ServicePidFile
+New-Item -ItemType Directory -Force -Path $servicePidDirectory | Out-Null
+$serviceProcess = Start-Process -FilePath $ServiceExe -WorkingDirectory $RepoRoot -NoNewWindow -PassThru
+try {
+  [System.IO.File]::WriteAllText($ServicePidFile, [string]$serviceProcess.Id)
+  $serviceProcess.WaitForExit()
+  exit $serviceProcess.ExitCode
+} finally {
+  Remove-Item -LiteralPath $ServicePidFile -Force -ErrorAction SilentlyContinue
+}

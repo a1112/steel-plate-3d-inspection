@@ -70,6 +70,22 @@ describe('persistent production command client', () => {
     expect(getInspectionServiceOrigin()).toBe('http://10.50.111.141:4873');
   });
 
+  it('binds the standalone background-management route to its serving API', () => {
+    window.localStorage.setItem('steel-inspection-connection-config', JSON.stringify({
+      mode: 'online',
+      host: '10.50.111.141',
+      port: 4873,
+      protocol: 'http',
+    }));
+    const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    try {
+      window.history.replaceState({}, '', '/?app=parameters&service=page');
+      expect(getInspectionServiceOrigin()).toBe(window.location.origin);
+    } finally {
+      window.history.replaceState({}, '', originalUrl);
+    }
+  });
+
   it('discovers the advertised LAN service and de-duplicates addresses', async () => {
     const discovery = {
       schema: 'steel.inspection-service-discovery.v1',

@@ -11388,6 +11388,17 @@ button {
   gap: 10px;
 }
 
+.admin-management-only-note {
+  margin: 10px 0 0;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--blue) 28%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--blue) 8%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .admin-camera-actions {
   display: flex;
   align-items: center;

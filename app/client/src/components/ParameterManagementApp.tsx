@@ -1713,6 +1713,8 @@ export function ParameterManagementApp() {
     );
   }
 
+  const captureControlsDisabled = adminServices?.capture.controlAllowed === false;
+
   return (
     <main className="workspace-page parameter-page">
       <header className="parameter-header">
@@ -2009,6 +2011,10 @@ export function ParameterManagementApp() {
         <Panel title="采集服务" className="parameter-card parameter-capture-service-card">
           <dl className="parameter-facts">
             <div>
+              <dt>运行模式</dt>
+              <dd>{adminServices?.capture.managementOnly ? '独立后台管理（采集锁定）' : '完整运行模式'}</dd>
+            </div>
+            <div>
               <dt>生命周期</dt>
               <dd>
                 <span className={adminServices?.capture.running ? 'status-dot online' : 'status-dot warning'} />
@@ -2036,16 +2042,21 @@ export function ParameterManagementApp() {
               </dd>
             </div>
           </dl>
+          {captureControlsDisabled ? (
+            <p className="admin-management-only-note" role="status">
+              当前入口只运行后台管理与业务 API，不会启动采集；采集服务控制已锁定。
+            </p>
+          ) : null}
           <div className="admin-service-actions">
-            <button type="button" onClick={() => void controlCapture('start')}>
+            <button type="button" disabled={captureControlsDisabled} onClick={() => void controlCapture('start')}>
               <Play size={16} />
               启动采集服务
             </button>
-            <button type="button" className="danger" onClick={() => void controlCapture('stop')}>
+            <button type="button" className="danger" disabled={captureControlsDisabled} onClick={() => void controlCapture('stop')}>
               <Square size={16} />
               停止采集服务
             </button>
-            <button type="button" onClick={() => void controlCapture('restart')}>
+            <button type="button" disabled={captureControlsDisabled} onClick={() => void controlCapture('restart')}>
               <RefreshCw size={16} />
               重启采集服务
             </button>

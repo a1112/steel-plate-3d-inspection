@@ -657,6 +657,7 @@ describe('ParameterManagementApp', () => {
   let sessionPermissionsOverride: string[] | null = null;
   let runtimeProfileValidationFailure = false;
   let failBkvImportStatus = false;
+  let managementOnly = false;
 
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -675,6 +676,7 @@ describe('ParameterManagementApp', () => {
     sessionPermissionsOverride = null;
     runtimeProfileValidationFailure = false;
     failBkvImportStatus = false;
+    managementOnly = false;
     setAdminOverviewSiteMode('bkv');
     storage.clear();
     storage.set('steel-inspection-admin-session', JSON.stringify(adminSession));
@@ -838,7 +840,27 @@ describe('ParameterManagementApp', () => {
         return { ok: true, json: async () => ({ code: 0, action: 'restart', success: true, running: true, restarted: true, services: { ...adminServices, capture: { ...adminServices.capture, running: true } } }) };
       }
       if (url.includes('/api/admin/services')) {
-        return { ok: true, json: async () => adminServices };
+        return {
+          ok: true,
+          json: async () => managementOnly
+            ? {
+                ...adminServices,
+                capture: {
+                  ...adminServices.capture,
+                  running: false,
+                  controlAllowed: false,
+                  managementOnly: true,
+                  lifecycle: {
+                    ...adminServices.capture.lifecycle,
+                    phase: 'stopped',
+                    desiredRunning: false,
+                    autostart: false,
+                    pid: null,
+                  },
+                },
+              }
+            : adminServices,
+        };
       }
       if (url.includes('/api/admin/site-configs/detail')) {
         return {
@@ -1954,6 +1976,24 @@ describe('ParameterManagementApp', () => {
       );
     });
     expect(await screen.findByText('采集服务已重启')).toBeInTheDocument();
+  });
+
+  it('keeps capture controls locked in standalone background-management mode', async () => {
+    managementOnly = true;
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '服务' }));
+
+    expect(screen.getByText('独立后台管理（采集锁定）')).toBeInTheDocument();
+    expect(screen.getByText('当前入口只运行后台管理与业务 API，不会启动采集；采集服务控制已锁定。')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /启动采集服务/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /停止采集服务/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /重启采集服务/ })).toBeDisabled();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/services/capture/'),
+      expect.anything(),
+    );
   });
 
   it('opens the backend directly with default access when no password was configured', async () => {

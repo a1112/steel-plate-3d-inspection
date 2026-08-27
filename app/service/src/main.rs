@@ -364,6 +364,7 @@ struct CaptureServiceManager {
     provider: CaptureProvider,
     process: Mutex<Option<controlled_process::ManagedChild>>,
     lifecycle: Mutex<CaptureLifecycleState>,
+    control_allowed: bool,
     supervisor_shutdown: AtomicBool,
     simulated_capture_mode: Mutex<String>,
     simulated_continuous_line_rate: Mutex<f64>,
@@ -389,9 +390,8 @@ struct CaptureLifecycleState {
 
 impl CaptureLifecycleState {
     fn new(provider: CaptureProvider) -> Self {
-        let autostart = provider.is_embedded()
-            || (provider.is_managed()
-                && env::var("STEEL_CAPTURE_SERVICE_AUTOSTART").as_deref() != Ok("0"));
+        let autostart =
+            provider.is_embedded() || (provider.is_managed() && capture_autostart_allowed(true));
         Self::with_policy(provider, true, autostart)
     }
 
@@ -423,6 +423,30 @@ impl CaptureLifecycleState {
             next_restart_at: None,
         }
     }
+}
+
+fn capture_autostart_policy(configured: bool, environment: Option<&str>) -> bool {
+    configured && !environment.is_some_and(|value| value.trim() == "0")
+}
+
+fn capture_autostart_allowed(configured: bool) -> bool {
+    capture_autostart_policy(
+        configured,
+        env::var("STEEL_CAPTURE_SERVICE_AUTOSTART").ok().as_deref(),
+    )
+}
+
+fn background_management_only_policy(environment: Option<&str>) -> bool {
+    environment.is_some_and(|value| {
+        let normalized = value.trim();
+        normalized == "1"
+            || normalized.eq_ignore_ascii_case("true")
+            || normalized.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn background_management_only() -> bool {
+    background_management_only_policy(env::var("STEEL_BACKGROUND_MANAGEMENT_ONLY").ok().as_deref())
 }
 
 #[derive(Clone, Default)]
@@ -1254,6 +1278,7 @@ impl CaptureServiceManager {
         let origin = capture_origin(port);
         let host = capture_host_from_origin(&origin).unwrap_or_else(|| "127.0.0.1".to_string());
         let port = capture_port_from_origin(&origin).unwrap_or(port);
+        let management_only = background_management_only();
         let manager = Self {
             host,
             port,
@@ -1262,9 +1287,10 @@ impl CaptureServiceManager {
             process: Mutex::new(None),
             lifecycle: Mutex::new(CaptureLifecycleState::with_policy(
                 provider,
-                capture.enabled,
-                capture.autostart,
+                capture.enabled && !management_only,
+                capture_autostart_allowed(capture.autostart),
             )),
+            control_allowed: !management_only,
             supervisor_shutdown: AtomicBool::new(false),
             simulated_capture_mode: Mutex::new("continuous".to_string()),
             simulated_continuous_line_rate: Mutex::new(300.0),
@@ -1355,6 +1381,26 @@ impl CaptureServiceManager {
 
     fn supervisor_tick(&self) {
         if self.supervisor_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Management-only is an absolute server-side fence.  Apply it before
+        // embedded, external, and Windows-Supervisor provider handling so no
+        // runtime profile can restore a desired-running capture state.
+        if !self.control_allowed {
+            if let Ok(mut process) = self.process.lock() {
+                if let Some(mut child) = process.take() {
+                    let _ = child.terminate();
+                }
+            }
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.phase = "disabled";
+                lifecycle.desired_running = false;
+                lifecycle.autostart = false;
+                lifecycle.pid = None;
+                lifecycle.ready_at = None;
+                lifecycle.next_restart_at = None;
+            }
             return;
         }
 
@@ -1582,6 +1628,13 @@ impl CaptureServiceManager {
     }
 
     fn start(&self) -> bool {
+        if !self.control_allowed {
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.last_error =
+                    "capture controls are disabled in background management mode".to_string();
+            }
+            return false;
+        }
         if self.provider == CaptureProvider::Bkv {
             return true;
         }
@@ -1604,6 +1657,13 @@ impl CaptureServiceManager {
     }
 
     fn stop(&self) -> bool {
+        if !self.control_allowed {
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.last_error =
+                    "capture controls are disabled in background management mode".to_string();
+            }
+            return false;
+        }
         if env::var("STEEL_CAPTURE_MANAGED_BY_SUPERVISOR").as_deref() == Ok("1") {
             return true;
         }
@@ -1645,6 +1705,9 @@ impl CaptureServiceManager {
     }
 
     fn restart(&self) -> bool {
+        if !self.control_allowed {
+            return false;
+        }
         let _ = self.stop();
         self.start()
     }
@@ -1699,6 +1762,8 @@ impl CaptureServiceManager {
             "name": "capture-service",
             "provider": self.provider.as_str(),
             "managed": self.provider.is_managed(),
+            "controlAllowed": self.control_allowed,
+            "managementOnly": !self.control_allowed,
             "running": running,
             "port": self.port,
             "origin": self.origin,
@@ -26379,6 +26444,66 @@ mod tests {
     }
 
     #[test]
+    fn capture_autostart_environment_can_only_inhibit_runtime_configuration() {
+        assert!(capture_autostart_policy(true, None));
+        assert!(capture_autostart_policy(true, Some("1")));
+        assert!(!capture_autostart_policy(true, Some("0")));
+        assert!(!capture_autostart_policy(true, Some(" 0 ")));
+        assert!(!capture_autostart_policy(false, None));
+        assert!(!capture_autostart_policy(false, Some("1")));
+    }
+
+    #[test]
+    fn background_management_mode_recognizes_only_explicit_true_values() {
+        assert!(!background_management_only_policy(None));
+        assert!(!background_management_only_policy(Some("0")));
+        assert!(background_management_only_policy(Some("1")));
+        assert!(background_management_only_policy(Some(" true ")));
+        assert!(background_management_only_policy(Some("YES")));
+    }
+
+    #[test]
+    fn inhibited_capture_lifecycle_stays_stopped_until_an_explicit_action() {
+        let lifecycle = CaptureLifecycleState::with_policy(
+            CaptureProvider::HeadlessCpp,
+            true,
+            capture_autostart_policy(true, Some("0")),
+        );
+
+        assert_eq!(lifecycle.phase, "stopped");
+        assert!(!lifecycle.autostart);
+        assert!(!lifecycle.desired_running);
+    }
+
+    #[test]
+    fn background_management_manager_rejects_capture_start() {
+        let manager = CaptureServiceManager {
+            host: "127.0.0.1".to_string(),
+            port: 4317,
+            origin: "http://127.0.0.1:4317".to_string(),
+            provider: CaptureProvider::HeadlessCpp,
+            process: Mutex::new(None),
+            lifecycle: Mutex::new(CaptureLifecycleState::with_policy(
+                CaptureProvider::HeadlessCpp,
+                true,
+                false,
+            )),
+            control_allowed: false,
+            supervisor_shutdown: AtomicBool::new(false),
+            simulated_capture_mode: Mutex::new("continuous".to_string()),
+            simulated_continuous_line_rate: Mutex::new(300.0),
+        };
+
+        manager.supervisor_tick();
+        assert!(!manager.start());
+        let lifecycle = manager.lifecycle.lock().unwrap().clone();
+        assert_eq!(lifecycle.phase, "disabled");
+        assert!(!lifecycle.autostart);
+        assert!(!lifecycle.desired_running);
+        assert!(lifecycle.last_error.contains("background management mode"));
+    }
+
+    #[test]
     fn bkv_capture_provider_is_explicit_offline_and_never_uses_capture_api() {
         let provider = CaptureProvider::from_env_value("bkv");
         assert_eq!(provider, CaptureProvider::Bkv);
@@ -26811,6 +26936,7 @@ mod tests {
                 provider,
                 process: Mutex::new(None),
                 lifecycle: Mutex::new(CaptureLifecycleState::new(provider)),
+                control_allowed: true,
                 supervisor_shutdown: AtomicBool::new(false),
                 simulated_capture_mode: Mutex::new("continuous".to_string()),
                 simulated_continuous_line_rate: Mutex::new(300.0),
