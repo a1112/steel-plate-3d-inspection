@@ -1,5 +1,5 @@
 import { Activity, Box, Camera, Database } from 'lucide-react';
-import type { ElementType, MouseEvent } from 'react';
+import type { ElementType, MouseEvent, ReactNode } from 'react';
 import { useMemo } from 'react';
 import { canStartTitlebarDrag } from '../lib/titlebar-drag';
 import { getTauriWindowApi } from '../lib/tauri-window';
@@ -17,10 +17,12 @@ export function StandaloneWindowTitlebar({
   kind,
   title,
   systemName = DEFAULT_SYSTEM_NAME,
+  toolbar,
 }: {
   kind: 'capture' | 'parameters' | 'bar-surface' | 'monitor';
   title: string;
   systemName?: string;
+  toolbar?: ReactNode;
 }) {
   const windowApi = useMemo(() => getTauriWindowApi(), []);
   const Icon = titlebarIcons[kind];
@@ -45,9 +47,12 @@ export function StandaloneWindowTitlebar({
       <div className="standalone-window-title">
         <Icon size={17} />
         <span>{systemName}</span>
-        <strong>{title}</strong>
+        <h1>{title}</h1>
       </div>
-      <WindowControls />
+      <div className="standalone-window-toolbar" data-no-drag>
+        {toolbar}
+        <WindowControls />
+      </div>
     </header>
   );
 }

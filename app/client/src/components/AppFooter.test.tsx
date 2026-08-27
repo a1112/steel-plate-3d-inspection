@@ -57,6 +57,7 @@ const fullResourceUsage: AppResourceUsage = {
 
 describe('AppFooter', () => {
   it('shows the service IP and live connection state in the lower-left corner', () => {
+    const onConnectionSettingsOpen = vi.fn();
     const { rerender } = render(
       <AppFooter
         activeNav="online"
@@ -67,10 +68,14 @@ describe('AppFooter', () => {
         }}
         onNavChange={vi.fn()}
         onSettingsOpen={vi.fn()}
+        onConnectionSettingsOpen={onConnectionSettingsOpen}
       />,
     );
 
-    expect(screen.getByLabelText('服务连接：已连接，IP 127.0.0.1:4873')).toHaveTextContent('连接 IP127.0.0.1:4873已连接');
+    const connectionButton = screen.getByRole('button', { name: '服务连接：已连接，IP 127.0.0.1:4873' });
+    expect(connectionButton).toHaveTextContent('连接 IP127.0.0.1:4873已连接');
+    fireEvent.click(connectionButton);
+    expect(onConnectionSettingsOpen).toHaveBeenCalledTimes(1);
 
     rerender(
       <AppFooter
@@ -82,6 +87,7 @@ describe('AppFooter', () => {
         }}
         onNavChange={vi.fn()}
         onSettingsOpen={vi.fn()}
+        onConnectionSettingsOpen={onConnectionSettingsOpen}
       />,
     );
 
@@ -97,6 +103,7 @@ describe('AppFooter', () => {
         }}
         onNavChange={vi.fn()}
         onSettingsOpen={vi.fn()}
+        onConnectionSettingsOpen={onConnectionSettingsOpen}
       />,
     );
 

@@ -105,6 +105,14 @@ local state plus logs are written below
 Set `STEEL_SIM_STATE_DIR` to override that location. Press `Ctrl+C` to stop both
 the backend processes and client.
 
+Service registration is configuration-driven from
+[`config/service-registry.json`](config/service-registry.json). The Rust
+service resolves each service origin/port and lifecycle policy from that file,
+and exposes a loopback-only `GET /api/runtime/status` snapshot containing
+service readiness, supervisor/task-worker runtime state, and bounded log tails.
+The independent Tauri server monitor consumes this snapshot; it does not own
+or mutate the service process.
+
 Development and test profiles support SQLite, MySQL, and PostgreSQL through
 SeaORM. Remote development databases can opt into an explicit SQLite fallback:
 
@@ -188,9 +196,12 @@ scripts/run-tauri-dev.ps1 -EnvFile config/env/bkv-online.env.local
 
 The launcher writes debug service output below `target/run/tauri-dev/logs`,
 requests an initial algorithm rescan, and keeps the Tauri client on the local
-4873 API. In **后台管理 -> 运行日志**, administrators can watch the split
-service probes, result catalog readiness, Supervisor status, and bounded log
-tails; the page refreshes every five seconds and cancels stale requests.
+4873 API. The operator client uses frontend port `1432`. The independent
+`steel-inspection-server-monitor.exe` uses frontend port `1433` in development
+and is built with `scripts/build-server-monitor.ps1`; it does not share the
+operator process, start production tasks, or control the Windows service. See
+[`app/server-monitor/README.md`](app/server-monitor/README.md) for its build and
+runtime boundary.
 
 To start the already-built headless capture, Rust, trigger, and static-client processes together, use:
 

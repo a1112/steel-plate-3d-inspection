@@ -38,7 +38,9 @@ if (($env:Path -split ";" | ForEach-Object { $_.TrimEnd("\") }) -notcontains $No
 
 $ServiceOrigin = "http://127.0.0.1:$ServicePort"
 $ImageServicePort = 4874
-$AlgorithmServicePort = 4875
+$ImageWorkerPort = 4875
+$DefectWorkerPort = 4876
+$BkvWorkerPort = 4877
 $ProcessingRoot = Join-Path $RunDir "processing"
 $ResultRoot = Join-Path $DataRoot "inspection-results"
 $AlgorithmInputRoot = Join-Path $ProcessingRoot "algorithm-input"
@@ -47,7 +49,9 @@ $LogRoot = Join-Path $RunDir "logs"
 $env:STEEL_RUNTIME_STATE_ROOT = $RunDir
 $env:STEEL_RUNTIME_LOG_DIR = $LogRoot
 $ImageServiceLauncher = $null
-$AlgorithmServiceLauncher = $null
+$ImageWorkerLauncher = $null
+$DefectWorkerLauncher = $null
+$BkvWorkerLauncher = $null
 $ServiceLauncher = $null
 $SickCaptureLauncher = $null
 $OwnedServicePid = $null
@@ -148,7 +152,11 @@ try {
   }
   if (-not $NoProcessingServices) {
     & (Join-Path $PSScriptRoot "build-image-service.ps1") -Profile debug
-    & (Join-Path $PSScriptRoot "build-algorithm-service.ps1") -Profile debug
+    if ($SickCaptureProfile) {
+      & (Join-Path $PSScriptRoot "build-pipeline-workers.ps1") -Profile debug
+    } else {
+      & (Join-Path $PSScriptRoot "build-algorithm-service.ps1") -Profile debug
+    }
     New-Item -ItemType Directory -Force -Path $RunDir, $LogRoot, $DataRoot, $ResultRoot, $AlgorithmInputRoot, $InspectionWorldCacheRoot | Out-Null
     $env:STEEL_RESULT_ROOT = $ResultRoot
     $env:STEEL_ALGORITHM_INPUT_ROOTS = $AlgorithmInputRoot
@@ -156,40 +164,52 @@ try {
     $env:STEEL_INSPECTION_WORLD_CACHE_ROOT = $InspectionWorldCacheRoot
     $env:STEEL_INSPECTION_WORLD_HISTORY_LIMIT = "399"
     $env:STEEL_IMAGE_SERVICE_PORT = [string]$ImageServicePort
-    $env:STEEL_ALGORITHM_SERVICE_PORT = [string]$AlgorithmServicePort
     $env:STEEL_RESULT_PROXY_ONLY = "1"
     $env:STEEL_IMAGE_PROXY = "1"
     $env:STEEL_CAPTURE_MANAGED_BY_SUPERVISOR = "1"
-    # Historical BKV records are metadata-first.  The algorithm service owns
-    # the bounded raw-frame promotion when the user switches to one of them.
-    $env:STEEL_HISTORY_RECONSTRUCTION = "1"
-    $env:STEEL_ALGORITHM_SERVICE_ORIGIN = "http://127.0.0.1:$AlgorithmServicePort"
-    if (-not $env:STEEL_BKV_HISTORY_RUNS_ROOT) {
-      $HistoryRunsRoot = "D:\steel-inspection\algorithm-data\runs"
-      if (Test-Path $HistoryRunsRoot -PathType Container) {
-        $env:STEEL_BKV_HISTORY_RUNS_ROOT = $HistoryRunsRoot
-      }
-    }
-    if (-not $env:STEEL_BKV_IMAGE_HOST) {
-      $env:STEEL_BKV_IMAGE_HOST = "\\10.5.241.17"
-    }
-    if (-not $env:STEEL_BKV_REFRESH_INTERVAL_MS) {
-      $env:STEEL_BKV_REFRESH_INTERVAL_MS = "10000"
-    }
-    if (-not $env:STEEL_BKV_MYSQL_HOST) {
-      Write-Warning "BKV MySQL environment is not loaded; the record list will refresh from the unified result catalog only. Pass -EnvFile with the machine-local BKV credentials to enable online synchronization."
-    }
     $ImageExe = Join-Path $RepoRoot "target\image-service\debug\steel-image-service.exe"
-    $AlgorithmExe = Join-Path $RepoRoot "target\algorithm-service\debug\steel-algorithm-service.exe"
     $ImageServiceLauncher = Start-Process -FilePath $ImageExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru `
       -RedirectStandardOutput (Join-Path $LogRoot "image-service.out.log") `
       -RedirectStandardError (Join-Path $LogRoot "image-service.err.log")
-    $AlgorithmServiceLauncher = Start-Process -FilePath $AlgorithmExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru `
-      -RedirectStandardOutput (Join-Path $LogRoot "algorithm-service.out.log") `
-      -RedirectStandardError (Join-Path $LogRoot "algorithm-service.err.log")
+    if ($SickCaptureProfile) {
+      $env:STEEL_IMAGE_WORKER_PORT = [string]$ImageWorkerPort
+      $env:STEEL_DEFECT_WORKER_PORT = [string]$DefectWorkerPort
+      $env:STEEL_IMAGE_WORKER_ORIGIN = "http://127.0.0.1:$ImageWorkerPort"
+      $env:STEEL_DEFECT_WORKER_ORIGIN = "http://127.0.0.1:$DefectWorkerPort"
+      $ImageWorkerExe = Join-Path $RepoRoot "target\pipeline-workers\debug\steel-image-worker.exe"
+      $DefectWorkerExe = Join-Path $RepoRoot "target\pipeline-workers\debug\steel-defect-worker.exe"
+      $ImageWorkerLauncher = Start-Process -FilePath $ImageWorkerExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $LogRoot "image-worker.out.log") `
+        -RedirectStandardError (Join-Path $LogRoot "image-worker.err.log")
+      $DefectWorkerLauncher = Start-Process -FilePath $DefectWorkerExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $LogRoot "defect-worker.out.log") `
+        -RedirectStandardError (Join-Path $LogRoot "defect-worker.err.log")
+    } else {
+      # BKV remains an independent offline import/display adapter. It never
+      # starts real-camera processing or defect inference.
+      $env:STEEL_HISTORY_RECONSTRUCTION = "1"
+      $env:STEEL_BKV_IMAGE_WORKER_PORT = [string]$BkvWorkerPort
+      $env:STEEL_BKV_IMAGE_WORKER_ORIGIN = "http://127.0.0.1:$BkvWorkerPort"
+      if (-not $env:STEEL_BKV_HISTORY_RUNS_ROOT) {
+        $HistoryRunsRoot = "D:\steel-inspection\algorithm-data\runs"
+        if (Test-Path $HistoryRunsRoot -PathType Container) {
+          $env:STEEL_BKV_HISTORY_RUNS_ROOT = $HistoryRunsRoot
+        }
+      }
+      if (-not $env:STEEL_BKV_IMAGE_HOST) { $env:STEEL_BKV_IMAGE_HOST = "\\10.5.241.17" }
+      if (-not $env:STEEL_BKV_REFRESH_INTERVAL_MS) { $env:STEEL_BKV_REFRESH_INTERVAL_MS = "10000" }
+      if (-not $env:STEEL_BKV_MYSQL_HOST) {
+        Write-Warning "BKV MySQL environment is not loaded; only the unified result catalog will be used."
+      }
+      $BkvWorkerExe = Join-Path $RepoRoot "target\algorithm-service\debug\steel-image-worker-bkv.exe"
+      $BkvWorkerLauncher = Start-Process -FilePath $BkvWorkerExe -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $LogRoot "bkv-image-worker.out.log") `
+        -RedirectStandardError (Join-Path $LogRoot "bkv-image-worker.err.log")
+    }
     $ProcessingDeadline = (Get-Date).AddSeconds($ServiceReadyTimeoutSec)
-    while ((Get-Date) -lt $ProcessingDeadline -and (-not (Test-HttpReady "http://127.0.0.1:$ImageServicePort/api/health/live") -or -not (Test-HttpReady "http://127.0.0.1:$AlgorithmServicePort/api/health/live"))) { Start-Sleep -Milliseconds 250 }
-    if (-not (Test-HttpReady "http://127.0.0.1:$ImageServicePort/api/health/live") -or -not (Test-HttpReady "http://127.0.0.1:$AlgorithmServicePort/api/health/live")) { throw "Image or algorithm service did not become ready." }
+    $RequiredWorkerPorts = if ($SickCaptureProfile) { @($ImageWorkerPort, $DefectWorkerPort) } else { @($BkvWorkerPort) }
+    while ((Get-Date) -lt $ProcessingDeadline -and (-not (Test-HttpReady "http://127.0.0.1:$ImageServicePort/api/health/live") -or @($RequiredWorkerPorts | Where-Object { -not (Test-HttpReady "http://127.0.0.1:$_/api/health/live") }).Count -gt 0)) { Start-Sleep -Milliseconds 250 }
+    if (-not (Test-HttpReady "http://127.0.0.1:$ImageServicePort/api/health/live") -or @($RequiredWorkerPorts | Where-Object { -not (Test-HttpReady "http://127.0.0.1:$_/api/health/live") }).Count -gt 0) { throw "Artifact or processing worker did not become ready." }
   }
   if (-not $NoService) {
     if (Test-InspectionServiceReady) {
@@ -267,12 +287,12 @@ try {
     }
   }
 
-  if (-not $NoProcessingServices) {
+  if (-not $NoProcessingServices -and -not $SickCaptureProfile) {
     try {
-      Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://127.0.0.1:$AlgorithmServicePort/internal/v1/reprocess" -Body "{}" -ContentType "application/json" -TimeoutSec 5 | Out-Null
-      Write-Host "Algorithm input scan requested."
+      Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://127.0.0.1:$BkvWorkerPort/internal/v1/reprocess" -Body "{}" -ContentType "application/json" -TimeoutSec 5 | Out-Null
+      Write-Host "BKV adapter input scan requested."
     } catch {
-      Write-Warning "Algorithm input scan request failed: $($_.Exception.Message)"
+      Write-Warning "BKV adapter input scan request failed: $($_.Exception.Message)"
     }
   }
 
@@ -311,6 +331,8 @@ try {
     Stop-ProcessTree -RootProcessId $ServiceLauncher.Id
   }
   if ($ImageServiceLauncher -and -not $ImageServiceLauncher.HasExited) { Stop-ProcessTree -RootProcessId $ImageServiceLauncher.Id }
-  if ($AlgorithmServiceLauncher -and -not $AlgorithmServiceLauncher.HasExited) { Stop-ProcessTree -RootProcessId $AlgorithmServiceLauncher.Id }
+  if ($ImageWorkerLauncher -and -not $ImageWorkerLauncher.HasExited) { Stop-ProcessTree -RootProcessId $ImageWorkerLauncher.Id }
+  if ($DefectWorkerLauncher -and -not $DefectWorkerLauncher.HasExited) { Stop-ProcessTree -RootProcessId $DefectWorkerLauncher.Id }
+  if ($BkvWorkerLauncher -and -not $BkvWorkerLauncher.HasExited) { Stop-ProcessTree -RootProcessId $BkvWorkerLauncher.Id }
   if ($SickCaptureLauncher -and -not $SickCaptureLauncher.HasExited) { Stop-ProcessTree -RootProcessId $SickCaptureLauncher.Id }
 }

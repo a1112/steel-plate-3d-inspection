@@ -501,9 +501,14 @@ bool is_public_environment_name(const std::string &name) {
       "STEEL_RESULT_PROXY_ONLY",
       "STEEL_CAPTURE_MANAGED_BY_SUPERVISOR",
       "STEEL_IMAGE_SERVICE_PORT",
-      "STEEL_ALGORITHM_SERVICE_PORT",
+      "STEEL_IMAGE_WORKER_PORT",
+      "STEEL_DEFECT_WORKER_PORT",
+      "STEEL_IMAGE_WORKER_ORIGIN",
+      "STEEL_DEFECT_WORKER_ORIGIN",
       "STEEL_IMAGE_PROXY",
       "STEEL_ALGORITHM_INPUT_ROOTS",
+      "STEEL_SICK_CAPTURE_PROFILE",
+      "STEEL_PYTHON_EXECUTABLE",
       "BAR_SURFACE_MOCK_DEFECT_COUNT",
       "STEEL_ALGORITHM_ACCEPTANCE_REPORT",
       "STEEL_ALGORITHM_CALIBRATION_PATH",
@@ -649,7 +654,14 @@ bool configure_environment(std::string &error) {
   SetEnvironmentVariableW(L"STEEL_RESULT_PROXY_ONLY", L"1");
   SetEnvironmentVariableW(L"STEEL_CAPTURE_MANAGED_BY_SUPERVISOR", L"1");
   SetEnvironmentVariableW(L"STEEL_IMAGE_SERVICE_PORT", L"4874");
-  SetEnvironmentVariableW(L"STEEL_ALGORITHM_SERVICE_PORT", L"4875");
+  SetEnvironmentVariableW(L"STEEL_IMAGE_WORKER_PORT", L"4875");
+  SetEnvironmentVariableW(L"STEEL_DEFECT_WORKER_PORT", L"4876");
+  SetEnvironmentVariableW(L"STEEL_IMAGE_WORKER_ORIGIN", L"http://127.0.0.1:4875");
+  SetEnvironmentVariableW(L"STEEL_DEFECT_WORKER_ORIGIN", L"http://127.0.0.1:4876");
+  SetEnvironmentVariableW(L"STEEL_SICK_CAPTURE_SCRIPT",
+                          (g_runtime_root / "scripts" / "sick_capture_service.py").c_str());
+  SetEnvironmentVariableW(L"STEEL_SICK_ALGORITHM_SCRIPT",
+                          (g_runtime_root / "scripts" / "sick_flow_analysis_service.py").c_str());
   SetEnvironmentVariableW(L"STEEL_IMAGE_PROXY", L"1");
   SetEnvironmentVariableW(L"STEEL_ALGORITHM_INPUT_ROOTS",
                           (g_state_root / "algorithm-input").c_str());
@@ -660,7 +672,7 @@ bool configure_environment(std::string &error) {
                           (g_state_root / "capture-config").c_str());
   SetEnvironmentVariableW(
       L"STEEL_CAPTURE_SERVICE_EXE",
-      (g_runtime_root / "capture-headless" / "steel_capture_service.exe").c_str());
+      (g_runtime_root / "service" / "steel-capture-service.exe").c_str());
   SetEnvironmentVariableW(L"TEMP", (g_state_root / "temp").c_str());
   SetEnvironmentVariableW(L"TMP", (g_state_root / "temp").c_str());
   return true;
@@ -678,7 +690,7 @@ bool validate_production_environment(std::string &error) {
   if (!require_exact(L"STEEL_RUNTIME_PROFILE", L"production") ||
       !require_exact(L"STEEL_ALGORITHM_MODE", L"production") ||
       !require_exact(L"BAR_SURFACE_MOCK_DEFECT_COUNT", L"0") ||
-      !require_exact(L"STEEL_CAPTURE_PROVIDER", L"headless-cpp") ||
+      !require_exact(L"STEEL_CAPTURE_PROVIDER", L"external-api") ||
       !require_exact(L"STEEL_CAPTURE_SERVICE_AUTOSTART", L"1") ||
       !require_exact(L"TRIGGER_ALLOW_MODE_MUTATION", L"0") ||
       !require_exact(L"STEEL_TRIGGER_HEALTH_REQUIRED", L"1")) {
@@ -698,15 +710,19 @@ bool validate_production_environment(std::string &error) {
                                       g_state_root / "capture-config") ||
       !capture_executable ||
       !path_equals(fs::path(*capture_executable),
-                   g_runtime_root / "capture-headless" /
-                       "steel_capture_service.exe")) {
+                   g_runtime_root / "service" /
+                       "steel-capture-service.exe")) {
     error = "trusted mutable state environment paths do not match --state-root";
     return false;
   }
 
   for (const auto name : {L"STEEL_ALGORITHM_ACCEPTANCE_REPORT",
                           L"STEEL_ALGORITHM_CALIBRATION_PATH",
-                          L"STEEL_BAR_SURFACE_CORE_EXE"}) {
+                          L"STEEL_BAR_SURFACE_CORE_EXE",
+                          L"STEEL_SICK_CAPTURE_PROFILE",
+                          L"STEEL_PYTHON_EXECUTABLE",
+                          L"STEEL_SICK_CAPTURE_SCRIPT",
+                          L"STEEL_SICK_ALGORITHM_SCRIPT"}) {
     const auto value = environment_value(name);
     if (!value || value->empty() || !fs::is_regular_file(fs::path(*value))) {
       error = "required production file environment is invalid: " + narrow(name);
@@ -718,6 +734,13 @@ bool validate_production_environment(std::string &error) {
       !path_is_same_or_descendant(fs::path(*calibration_path),
                                   g_state_root / "capture-config")) {
     error = "STEEL_ALGORITHM_CALIBRATION_PATH must be inside mutable capture state";
+    return false;
+  }
+  const auto sick_profile = environment_value(L"STEEL_SICK_CAPTURE_PROFILE");
+  if (!sick_profile ||
+      !path_is_same_or_descendant(fs::path(*sick_profile),
+                                  g_state_root / "capture-config")) {
+    error = "STEEL_SICK_CAPTURE_PROFILE must be inside mutable capture state";
     return false;
   }
   const auto release_commit = environment_value(L"STEEL_RELEASE_COMMIT");
@@ -772,7 +795,9 @@ bool validate_production_environment(std::string &error) {
 
 bool child_inherits_environment_name(const ChildSpec &spec, const std::wstring &name) {
   if (_wcsicmp(name.c_str(), L"STEEL_RUNTIME_SECRET_ENV_FILE") == 0) return false;
-  if (name.rfind(L"STEEL_BKV_", 0) == 0) return spec.name == L"algorithm";
+  // The formal camera runtime never passes BKV credentials to any child.
+  // BKV import/display is packaged and launched as an independent adapter.
+  if (name.rfind(L"STEEL_BKV_", 0) == 0) return false;
   const bool shared = _wcsicmp(name.c_str(), L"TRIGGER_SHARED_SECRET") == 0;
   const bool operator_token = _wcsicmp(name.c_str(), L"TRIGGER_OPERATOR_TOKEN") == 0;
   const bool database = _wcsicmp(name.c_str(), L"STEEL_DATABASE_URL") == 0;
@@ -813,11 +838,14 @@ std::vector<ChildSpec> child_specs() {
       {L"image", g_runtime_root / "service" / "steel-image-service.exe",
        g_state_root / "work" / "image", L"", 4874, "/api/health/live", "\"status\":\"live\"",
        15000},
-      {L"algorithm", g_runtime_root / "service" / "steel-algorithm-service.exe",
-       g_state_root / "work" / "algorithm", L"", 4875, "/api/health/live", "\"status\":\"live\"",
+      {L"image-worker", g_runtime_root / "service" / "steel-image-worker.exe",
+       g_state_root / "work" / "image-worker", L"", 4875, "/api/health/live", "\"ready\":true",
        20000},
-      {L"capture", g_runtime_root / "capture-headless" / "steel_capture_service.exe",
-       g_state_root / "work" / "capture", L"--port 4317", 4317, "/health", "\"service\":\"steel_capture_service\"",
+      {L"defect-worker", g_runtime_root / "service" / "steel-defect-worker.exe",
+       g_state_root / "work" / "defect-worker", L"", 4876, "/api/health/live", "\"ready\":true",
+       20000},
+      {L"capture", g_runtime_root / "service" / "steel-capture-service.exe",
+       g_state_root / "work" / "capture", L"", 4317, "/health", "\"ready\":true",
        30000},
       {L"service", g_runtime_root / "service" / "steel-inspection-service.exe",
        g_state_root / "work" / "service", L"", 4873, "/api/health/live", "\"status\":\"live\"",
@@ -834,10 +862,14 @@ bool validate_runtime(std::string &error) {
       return false;
     }
   }
-  for (const auto &path : {g_runtime_root / "capture-headless" /
-                               "steel_capture_service.exe",
+  for (const auto &path : {g_runtime_root / "service" /
+                               "steel-capture-service.exe",
                            g_runtime_root / "service" / "steel-image-service.exe",
-                           g_runtime_root / "service" / "steel-algorithm-service.exe",
+                           g_runtime_root / "service" / "steel-image-worker.exe",
+                           g_runtime_root / "service" / "steel-defect-worker.exe",
+                           g_runtime_root / "scripts" / "sick_capture_service.py",
+                           g_runtime_root / "scripts" / "sick_flow_analysis_service.py",
+                           g_runtime_root / "scripts" / "sick_capture",
                            g_runtime_root / "algorithm-core" / "steel_bar_surface_core.exe",
                            g_runtime_root / "config" / "capture",
                            g_runtime_root / "config" / "algorithm" /
@@ -870,7 +902,8 @@ bool validate_state_root(std::string &error) {
                            g_state_root / "temp",
                            g_state_root / "work" / "capture",
                            g_state_root / "work" / "image",
-                           g_state_root / "work" / "algorithm",
+                           g_state_root / "work" / "image-worker",
+                           g_state_root / "work" / "defect-worker",
                            g_state_root / "work" / "trigger",
                            g_state_root / "work" / "service"}) {
     if (!fs::exists(path)) {

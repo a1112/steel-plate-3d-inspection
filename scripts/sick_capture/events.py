@@ -7,7 +7,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .paths import LAYOUT_SCHEMA, flow_manifest_path, frame_event_path
+from .paths import (
+    LAYOUT_SCHEMA,
+    acquisition_manifest_path,
+    flow_manifest_path,
+    frame_event_path,
+)
 from .storage import atomic_summary
 
 
@@ -117,5 +122,81 @@ def write_flow_manifest(
     if latest_round is not None:
         payload["latestCommittedRound"] = int(latest_round)
     path = flow_manifest_path(storage_root, flow_no)
+    atomic_summary(path, payload)
+    if (
+        state == "closed"
+        and latest_round is not None
+        and frame_event_path(storage_root, flow_no, latest_round).is_file()
+    ):
+        _write_acquisition_manifest(
+            storage_root,
+            flow_no,
+            session_id=session_id,
+            latest_round=latest_round,
+        )
+    return path
+
+
+def _artifact(kind: str, raw_path: str, checksum: str = "") -> dict[str, Any]:
+    path = Path(raw_path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    digest = checksum.strip().lower()
+    if len(digest) != 64:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "kind": kind,
+        "uri": path.resolve().as_uri(),
+        "path": str(path),
+        "size": path.stat().st_size,
+        "sha256": digest,
+    }
+
+
+def _write_acquisition_manifest(
+    storage_root: Path,
+    flow_no: str | int,
+    *,
+    session_id: str,
+    latest_round: int,
+) -> Path:
+    event_path = frame_event_path(storage_root, flow_no, latest_round)
+    event = json.loads(event_path.read_text(encoding="utf-8-sig"))
+    if event.get("complete") is not True:
+        raise ValueError("closed flow cannot publish an incomplete acquisition manifest")
+    cameras = []
+    for frame in event.get("frames", []):
+        checksums = frame.get("checksums", {})
+        if not isinstance(checksums, dict):
+            checksums = {}
+        cameras.append(
+            {
+                "cameraId": frame.get("cameraId"),
+                "cameraKey": frame.get("cameraKey"),
+                "sequenceNo": frame.get("sequenceNo"),
+                "captureRound": frame.get("captureRound"),
+                "capturedAt": frame.get("capturedAt"),
+                "artifacts": [
+                    _artifact("depth", str(frame.get("depthPath", "")), str(checksums.get("depth", ""))),
+                    _artifact("intensity", str(frame.get("intensityPath", "")), str(checksums.get("intensity", ""))),
+                    _artifact("metadata", str(frame.get("metadataPath", "")), str(checksums.get("metadata", ""))),
+                ],
+            }
+        )
+    material_id = str(int(flow_no))
+    payload = {
+        "schema": "steel.acquisition-manifest.v1",
+        "inspectionId": material_id,
+        "captureId": f"{session_id}:{material_id}",
+        "sessionId": session_id,
+        "sourceType": "sick-gentl",
+        "complete": True,
+        "expectedCameraCount": int(event.get("expectedCameraCount", len(cameras))),
+        "actualCameraCount": len(cameras),
+        "latestCommittedRound": latest_round,
+        "committedEvent": _artifact("frame-committed-event", str(event_path)),
+        "cameras": cameras,
+    }
+    path = acquisition_manifest_path(storage_root, flow_no)
     atomic_summary(path, payload)
     return path

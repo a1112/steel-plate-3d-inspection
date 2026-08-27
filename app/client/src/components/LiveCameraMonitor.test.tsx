@@ -371,11 +371,15 @@ describe('LiveMonitoringPage', () => {
     expect(screen.getByLabelText('历史六相机画面')).toBeInTheDocument();
     expect(screen.getByRole('img', { name: 'C1 历史灰度图' })).toHaveAttribute(
       'src',
-      expect.stringMatching(/maxWidth=\d+.*region=valid.*cropX=100/),
+      expect.stringMatching(
+        /path=1%2Fcapture%2FC1%2F2d%2F1\.png.*modality=gray.*level=thumbnail/,
+      ),
     );
     expect(screen.getByRole('img', { name: 'C2 历史灰度图' })).toHaveAttribute(
       'src',
-      expect.stringMatching(/maxWidth=\d+.*region=valid.*cropX=200.*cropWidth=600.*cropHeight=1280/),
+      expect.stringMatching(
+        /path=1%2Fcapture%2FC2%2F2d%2F1\.png.*modality=gray.*level=thumbnail/,
+      ),
     );
   });
 

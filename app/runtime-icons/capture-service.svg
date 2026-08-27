@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="c-bg" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse"><stop stop-color="#173E5A"/><stop offset="1" stop-color="#050A12"/></linearGradient>
+    <linearGradient id="c-metal" x1="68" y1="48" x2="188" y2="120" gradientUnits="userSpaceOnUse"><stop stop-color="#B8D7E8"/><stop offset=".35" stop-color="#477793"/><stop offset="1" stop-color="#122A3C"/></linearGradient>
+    <radialGradient id="c-lens"><stop stop-color="#D5FEFF"/><stop offset=".35" stop-color="#23D7FF"/><stop offset=".7" stop-color="#235BFF"/><stop offset="1" stop-color="#07111D"/></radialGradient>
+    <linearGradient id="c-scan" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#34E8FF" stop-opacity=".92"/><stop offset="1" stop-color="#2AE18A" stop-opacity=".12"/></linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#c-bg)"/>
+  <path d="M48 63c0-14 11-25 25-25h110c14 0 25 11 25 25v50H48V63Z" fill="url(#c-metal)" stroke="#8DCAE8" stroke-width="4"/>
+  <path d="M62 54h132v18H62z" fill="#D9F3FF" opacity=".28"/>
+  <g fill="#07111D" stroke="#73DFFF" stroke-width="4">
+    <circle cx="79" cy="111" r="24"/><circle cx="128" cy="111" r="24"/><circle cx="177" cy="111" r="24"/>
+  </g>
+  <g fill="url(#c-lens)"><circle cx="79" cy="111" r="14"/><circle cx="128" cy="111" r="14"/><circle cx="177" cy="111" r="14"/></g>
+  <path d="m66 129-26 79h78L91 129Zm49 0-26 79h78l-26-79Zm49 0-26 79h78l-26-79Z" fill="url(#c-scan)"/>
+  <path d="M31 206h194l-15 20H46l-15-20Z" fill="#506B7B" stroke="#A9EFFF" stroke-width="3"/>
+  <circle cx="128" cy="55" r="5" fill="#2AE18A"/>
+</svg>

@@ -245,6 +245,8 @@ export type AdminServices = {
       nextRestartAt?: string | null;
     };
   };
+  registry?: AdminRuntimeServiceRegistry;
+  services?: AdminRuntimeService[];
   diagnostics?: Array<{
     id: string;
     label: string;
@@ -255,6 +257,8 @@ export type AdminServices = {
 
 export type AdminRuntimeLogFile = {
   name: string;
+  serviceId?: string | null;
+  serviceName?: string | null;
   bytes: number;
   modifiedAt?: string;
   tail: string;
@@ -269,16 +273,101 @@ export type AdminRuntimeService = {
   ok: boolean;
   required: boolean;
   status: string;
+  role?: string;
+  kind?: string;
+  healthPath?: string;
+  responseStatus?: number;
+  latencyMs?: number;
+  uptimeMs?: number;
+  lifecycle?: {
+    source?: string;
+    phase?: string;
+    desiredRunning?: boolean;
+    pid?: number | null;
+    startedAt?: string | null;
+    readyAt?: string | null;
+    lastExitAt?: string | null;
+    lastExitCode?: number | null;
+    lastError?: string;
+    restartCount?: number;
+    consecutiveFailures?: number;
+    restartBudget?: number;
+    restartBudgetExhausted?: boolean;
+    nextRestartAt?: string | null;
+    [key: string]: unknown;
+  } | null;
+  operations?: AdminRuntimeServiceOperation[];
+  control?: AdminRuntimeServiceControl | null;
   reason?: string | null;
+};
+
+export type AdminRuntimeServiceOperation = {
+  id: string;
+  label?: string;
+  effect: 'query' | 'local' | 'mutation' | string;
+  scope: 'service' | 'monitor' | string;
+  enabled: boolean;
+  reason?: string | null;
+  endpoint?: string | null;
+  method?: string | null;
+};
+
+export type AdminRuntimeServiceControl = {
+  mode: 'observe' | 'control' | string;
+  owner?: string;
+  reason?: string | null;
+};
+
+export type AdminRuntimeMonitorProtocol = {
+  schema: 'steel.runtime-monitor-capabilities.v1' | string;
+  version: number;
+  selectionKey: 'serviceId' | string;
+  logScopes: string[];
+  operationEffects: string[];
+  mutationPolicy: 'capability-only' | string;
+  readAccess?: 'loopback-or-private-network' | string;
+};
+
+export type AdminRuntimeServiceRegistry = {
+  schema: 'steel.service-registry.v1' | string;
+  version: number;
+  path?: string;
+  services: Array<{
+    id: string;
+    name: string;
+    role?: string;
+    kind?: string;
+    defaultOrigin?: string;
+    originEnv?: string;
+    portEnv?: string;
+    healthPath?: string;
+    required?: boolean;
+    requiredWhen?: string;
+    lifecycle?: string;
+    logFiles?: string[];
+  }>;
 };
 
 export type AdminRuntimeLogStatus = {
   schema: 'steel.runtime-log-status.v1' | string;
   updatedAt: string;
   status: 'running' | 'degraded' | string;
+  monitorProtocol?: AdminRuntimeMonitorProtocol;
+  registry?: AdminRuntimeServiceRegistry;
   runtime: {
     stateRoot?: string | null;
     logRoot: string;
+    taskWorker?: {
+      ok?: boolean;
+      status?: string;
+      running?: boolean;
+      busy?: boolean;
+      heartbeatFresh?: boolean;
+      heartbeatAgeMs?: number | null;
+      recoveredTasks?: number;
+      reason?: string | null;
+      [key: string]: unknown;
+    } | null;
     supervisor?: {
       status?: string;
       reason?: string;
@@ -1096,6 +1185,21 @@ const defectPreviewImages: Record<string, string> = {
 };
 
 export function createDefaultConnectionConfig(): ConnectionConfig {
+  const configuredOrigin = import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN?.trim();
+  if (configuredOrigin) {
+    try {
+      const parsed = new URL(configuredOrigin);
+      const protocol = parsed.protocol === 'https:' ? 'https' : 'http';
+      return {
+        mode: 'online',
+        host: parsed.hostname,
+        port: parsed.port ? Number(parsed.port) : protocol === 'https' ? 443 : 80,
+        protocol,
+      };
+    } catch {
+      // Fall through to the page host when the build-time default is invalid.
+    }
+  }
   const pageHost = typeof window !== 'undefined' ? window.location?.hostname?.trim() : '';
   const host = pageHost && !matchesLoopbackHost(pageHost) ? pageHost : '127.0.0.1';
   return {
@@ -1110,7 +1214,7 @@ function matchesLoopbackHost(host: string) {
   return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1' || normalized.endsWith('.localhost');
 }
 
-export function shouldUseSameOriginService(
+export function isBrowserHostedClient(
   protocol: string,
   tauriRuntime: boolean,
   runtimeMode = import.meta.env.MODE,
@@ -1123,7 +1227,7 @@ export function shouldUseSameOriginService(
 export function isWebHostedRuntime() {
   if (typeof window === 'undefined') return false;
   const tauriRuntime = '__TAURI_INTERNALS__' in window || '__TAURI__' in window;
-  return shouldUseSameOriginService(window.location.protocol, tauriRuntime);
+  return isBrowserHostedClient(window.location.protocol, tauriRuntime);
 }
 
 function formatServiceOrigin(host: string, port: number, protocol: 'http' | 'https' = 'http') {
@@ -1223,16 +1327,14 @@ export function createAdminHeaders(headers: Record<string, string> = {}) {
 }
 
 export function getInspectionServiceOrigin(config = getStoredConnectionConfig()) {
-  if (isWebHostedRuntime()) {
-    return window.location.origin.replace(/\/$/, '');
+  if (config.host && config.port) {
+    return formatServiceOrigin(config.host, config.port, config.protocol ?? 'http');
   }
   const configuredOrigin = import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN;
   if (configuredOrigin && configuredOrigin.trim().length > 0) {
     return configuredOrigin.replace(/\/$/, '');
   }
-  return config.host && config.port
-    ? formatServiceOrigin(config.host, config.port, config.protocol ?? 'http')
-    : DEFAULT_SERVICE_ORIGIN;
+  return DEFAULT_SERVICE_ORIGIN;
 }
 
 export function getConfiguredInspectionServiceOrigin(config = getStoredConnectionConfig()) {
@@ -2240,9 +2342,6 @@ export async function fetchConnectionConfig(signal?: AbortSignal): Promise<Conne
 }
 
 function connectionDiscoveryOrigins(config: ConnectionConfig) {
-  if (isWebHostedRuntime()) {
-    return [window.location.origin.replace(/\/$/, '')];
-  }
   const origins = new Set<string>();
   const configuredOrigin = import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN?.trim();
   if (configuredOrigin) {
@@ -2672,6 +2771,23 @@ export async function fetchAdminRuntimeLogStatus(signal?: AbortSignal): Promise<
   });
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '运行日志接口异常'));
+  }
+  return response.json() as Promise<AdminRuntimeLogStatus>;
+}
+
+/**
+ * Public, loopback-only runtime status used by the independent server
+ * monitor. It intentionally carries no administrator session or mutation
+ * capability; the service enforces the loopback boundary.
+ */
+export async function fetchRuntimeStatus(signal?: AbortSignal): Promise<AdminRuntimeLogStatus> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/runtime/status`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '运行时状态接口异常'));
   }
   return response.json() as Promise<AdminRuntimeLogStatus>;
 }

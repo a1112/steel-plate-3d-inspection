@@ -81,6 +81,10 @@ def flow_manifest_path(storage_root: Path, value: str | int) -> Path:
     return flow_root(storage_root, value) / "flow.json"
 
 
+def acquisition_manifest_path(storage_root: Path, value: str | int) -> Path:
+    return flow_root(storage_root, value) / "acquisition" / "manifest.json"
+
+
 def frame_event_root(storage_root: Path, value: str | int) -> Path:
     return flow_root(storage_root, value) / "events" / "frame-committed"
 
@@ -134,12 +138,20 @@ def playback_roi_path(storage_root: Path, value: str | int) -> Path:
     return flow_root(storage_root, value) / "derived" / "playback" / "roi.json"
 
 
+def image_result_path(storage_root: Path, value: str | int) -> Path:
+    return flow_root(storage_root, value) / "derived" / "image" / "result.json"
+
+
 def defect_root(storage_root: Path, value: str | int) -> Path:
     return flow_root(storage_root, value) / "derived" / "defects"
 
 
 def defect_manifest_path(storage_root: Path, value: str | int) -> Path:
     return defect_root(storage_root, value) / "manifest.json"
+
+
+def defect_report_path(storage_root: Path, value: str | int) -> Path:
+    return defect_root(storage_root, value) / "report.json"
 
 
 def cache_root(camera_storage_root: Path, value: str | int) -> Path:
@@ -201,5 +213,5 @@ def defect_image_root(camera_storage_root: Path, value: str | int) -> Path:
     return flow_root(camera_storage_root, value) / "defect"
 
 
-def pyramid_status_path(camera_storage_root: Path, value: str | int) -> Path:
-    return cache_root(camera_storage_root, value) / "status.json"
+def pyramid_status_path(storage_root: Path, value: str | int) -> Path:
+    return cache_root(storage_root, value) / "status.json"

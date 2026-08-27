@@ -46,6 +46,7 @@ interface AppFooterProps {
   onFlowToggle?: () => void;
   onNavChange: (next: NavKey) => void;
   onSettingsOpen: () => void;
+  onConnectionSettingsOpen?: () => void;
   onParameterManagementOpen?: () => unknown;
   onCaptureManagementOpen?: () => unknown;
   onBarSurfaceOpen?: () => unknown;
@@ -109,6 +110,7 @@ export function AppFooter({
   onFlowToggle,
   onNavChange,
   onSettingsOpen,
+  onConnectionSettingsOpen,
   onParameterManagementOpen = openParameterManagementWindow,
   onCaptureManagementOpen = openCaptureManagementWindow,
   onBarSurfaceOpen = openBarSurfaceWindow,
@@ -199,16 +201,19 @@ export function AppFooter({
   return (
     <footer className={`app-footer ${activeAnalysis ? 'has-analysis-context' : ''}`} data-no-drag>
       {connection ? (
-        <div
+        <button
+          type="button"
           className={`app-footer-connection ${connection.state}`}
           aria-label={`服务连接：${connectionLabel}，IP ${connectionEndpoint}`}
-          title={connection.detail || `检测服务 ${connectionLabel}`}
+          aria-haspopup="dialog"
+          title={`${connection.detail || `检测服务 ${connectionLabel}`}；点击配置服务 IP`}
+          onClick={onConnectionSettingsOpen ?? onSettingsOpen}
         >
           <i aria-hidden="true" />
           <span>连接 IP</span>
           <strong>{connectionEndpoint}</strong>
           <em>{connectionLabel}</em>
-        </div>
+        </button>
       ) : null}
       {activeAnalysis ? (
         <div className="app-footer-analysis" aria-label="选中缺陷分析工具">

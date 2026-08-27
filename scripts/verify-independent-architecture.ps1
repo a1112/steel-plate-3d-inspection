@@ -961,15 +961,15 @@ function Test-PackagedRuntimeContract {
     }
 
     $RuntimeSignedPaths = @(
-      "capture-headless/steel_capture_service.exe",
+      "service/steel-capture-service.exe",
       "service/steel-runtime-supervisor.exe",
       "service/steel-inspection-service.exe",
       "service/steel-trigger-gateway.exe",
       "service/steel-image-service.exe",
-      "service/steel-algorithm-service.exe",
+      "service/steel-image-worker.exe",
+      "service/steel-defect-worker.exe",
       "service/steel-inspection-tray.exe",
-      "algorithm-core/steel_bar_surface_core.exe",
-      "capture-headless/nvt_lvm_sdk.dll"
+      "algorithm-core/steel_bar_surface_core.exe"
     )
     $RuntimeEvidence = @($Manifest.service.signatures)
     if ($RuntimeEvidence.Count -ne $RuntimeSignedPaths.Count) {
@@ -988,11 +988,7 @@ function Test-PackagedRuntimeContract {
       if ([string]$Evidence[0].signerThumbprint -cne $ActualRuntimeThumbprint) {
         throw "Runtime signature evidence does not match the signed artifact: $RelativePath"
       }
-      if ($RelativePath -eq "capture-headless/nvt_lvm_sdk.dll") {
-        if ($ApprovedVendorSdkSignerThumbprints -cnotcontains $ActualRuntimeThumbprint) {
-          throw "Vendor SDK signer is not in the out-of-band allowlist."
-        }
-      } elseif ($ActualRuntimeThumbprint -cne $ApprovedFirstPartyThumbprint) {
+      if ($ActualRuntimeThumbprint -cne $ApprovedFirstPartyThumbprint) {
         throw "First-party runtime artifact is not signed by the out-of-band approved release signer: $RelativePath"
       }
     }
@@ -1010,14 +1006,16 @@ function Test-PackagedRuntimeContract {
 
   $RequiredManifestValues = @{
     "capture.path" = $Manifest.capture.path
-    "capture.sdk" = $Manifest.capture.sdk
     "service.path" = $Manifest.service.path
     "service.triggerGateway" = $Manifest.service.triggerGateway
     "service.supervisor" = $Manifest.service.supervisor
     "service.image" = $Manifest.service.image
-    "service.algorithm" = $Manifest.service.algorithm
+    "service.capture" = $Manifest.service.capture
+    "service.imageWorker" = $Manifest.service.imageWorker
+    "service.defectWorker" = $Manifest.service.defectWorker
     "service.tray" = $Manifest.service.tray
-    "algorithm.service" = $Manifest.algorithm.service
+    "algorithm.imageWorker" = $Manifest.algorithm.imageWorker
+    "algorithm.defectWorker" = $Manifest.algorithm.defectWorker
     "algorithm.resultSchema" = $Manifest.algorithm.resultSchema
     "algorithm.resultRoot" = $Manifest.algorithm.resultRoot
     "client.path" = $Manifest.client.path
@@ -1158,9 +1156,9 @@ function Test-PackagedRuntimeContract {
       throw "Packaged $CaptureScriptName must not default to H:\steel-capture-data; production frames must land under H:\camera1..camera8."
     }
     $RequiredStorageTexts = if ($CaptureScriptName -eq "run-integrated-capture-management.ps1") {
-      @('[string]$StorageRoot = "H:\"', '[string]$CameraStorageRoot = "H:\"', "-CameraStorageRoot")
+      @('[string]$CaptureProfile', '[string]$PythonExecutable', '-CaptureProfile')
     } else {
-      @('[string]$StorageRoot = "H:\"', '[string]$CameraStorageRoot = "H:\"', '$env:CAPTURE_CAMERA_STORAGE_ROOT = $CameraStorageRoot')
+      @('[string]$CaptureProfile', '[string]$PythonExecutable', 'STEEL_SICK_CAPTURE_PROFILE')
     }
     foreach ($RequiredText in $RequiredStorageTexts) {
       if ($CaptureText -notmatch [regex]::Escape($RequiredText)) {

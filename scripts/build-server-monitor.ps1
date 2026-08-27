@@ -33,7 +33,8 @@ try {
     "build",
     "--manifest-path", $ManifestPath,
     "--target-dir", $CargoTargetDirectory,
-    "--locked"
+    "--locked",
+    "--features", "custom-protocol"
   )
   if ($Profile -eq "release") { $CargoArgs += "--release" }
   if (-not $AllowNetwork) { $CargoArgs += "--offline" }

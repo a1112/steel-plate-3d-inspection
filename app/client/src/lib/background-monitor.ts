@@ -3,8 +3,10 @@ import { listen } from '@tauri-apps/api/event';
 import {
   fetchProductionStatus,
   fetchProductionTasks,
+  fetchRuntimeStatus,
   fetchServiceHealthDetails,
   getInspectionServiceOrigin,
+  type AdminRuntimeLogStatus,
   type ProductionStatus,
   type ProductionTaskDetail,
   type ProductionTaskPage,
@@ -32,6 +34,12 @@ export type BackgroundMonitorTask = {
   error: string;
 };
 
+export type BackgroundMonitorService = AdminRuntimeLogStatus['services'][number];
+export type BackgroundMonitorLog = AdminRuntimeLogStatus['logs'][number];
+export type BackgroundMonitorRuntime = AdminRuntimeLogStatus['runtime'];
+export type BackgroundMonitorRegistry = NonNullable<AdminRuntimeLogStatus['registry']>;
+export type BackgroundMonitorProtocol = NonNullable<AdminRuntimeLogStatus['monitorProtocol']>;
+
 export type BackgroundMonitorSnapshot = {
   schema: 'steel.tauri-background-monitor.v1';
   state: BackgroundMonitorStateName;
@@ -47,6 +55,13 @@ export type BackgroundMonitorSnapshot = {
   detail: string;
   updatedAtUnixMs: number;
   tasks: BackgroundMonitorTask[];
+  services?: BackgroundMonitorService[];
+  logs?: BackgroundMonitorLog[];
+  runtime?: BackgroundMonitorRuntime | null;
+  registry?: BackgroundMonitorRegistry | null;
+  monitorProtocol?: BackgroundMonitorProtocol | null;
+  serviceCount?: number;
+  healthyServiceCount?: number;
 };
 
 export type BackgroundMonitorInputs = {
@@ -54,6 +69,7 @@ export type BackgroundMonitorInputs = {
   health: ServiceHealthDetails;
   production?: ProductionStatus | null;
   taskPage?: ProductionTaskPage | null;
+  runtimeStatus?: AdminRuntimeLogStatus | null;
   now?: number;
 };
 
@@ -81,6 +97,13 @@ export function createInitialBackgroundMonitorSnapshot(
     detail: '正在连接后台检测服务',
     updatedAtUnixMs: Date.now(),
     tasks: [],
+    services: [],
+    logs: [],
+    runtime: null,
+    registry: null,
+    monitorProtocol: null,
+    serviceCount: 0,
+    healthyServiceCount: 0,
   };
 }
 
@@ -114,6 +137,7 @@ export function deriveBackgroundMonitorSnapshot({
   health,
   production,
   taskPage,
+  runtimeStatus,
   now = Date.now(),
 }: BackgroundMonitorInputs): BackgroundMonitorSnapshot {
   const tasks = (taskPage?.tasks ?? []).slice(0, 16).map(toMonitorTask);
@@ -136,11 +160,18 @@ export function deriveBackgroundMonitorSnapshot({
     ?? null;
   const activeTasks = Math.max(listedActiveTasks, activeTaskId ? 1 : 0);
   const taskDataAvailable = Boolean(production && taskPage);
+  const services = runtimeStatus?.services ?? [];
+  const logs = runtimeStatus?.logs ?? [];
+  const failedRequiredServices = services.filter((service) => service.required && !service.ok);
+  const runtimeDegraded = Boolean(
+    runtimeStatus && (runtimeStatus.status === 'degraded' || failedRequiredServices.length > 0),
+  );
   const state: BackgroundMonitorStateName = !health.ok
     || !workerRunning
     || !taskDataAvailable
     || failedTasks > 0
     || blockedTasks > 0
+    || runtimeDegraded
     ? 'degraded'
     : activeTasks > 0 || queueDepth > 0
       ? 'busy'
@@ -155,6 +186,10 @@ export function deriveBackgroundMonitorSnapshot({
           ? '生产任务工作线程未运行'
           : !taskDataAvailable
             ? '任务状态接口暂时不可用'
+            : runtimeDegraded
+              ? failedRequiredServices.length > 0
+                ? `注册服务未就绪：${failedRequiredServices.slice(0, 3).map((service) => service.name || service.id).join('、')}`
+                : '服务运行状态需要关注'
             : `最近任务异常 ${failedTasks} 项，阻塞 ${blockedTasks} 项`;
 
   return {
@@ -172,6 +207,13 @@ export function deriveBackgroundMonitorSnapshot({
     detail,
     updatedAtUnixMs: now,
     tasks,
+    services,
+    logs,
+    runtime: runtimeStatus?.runtime ?? null,
+    registry: runtimeStatus?.registry ?? null,
+    monitorProtocol: runtimeStatus?.monitorProtocol ?? null,
+    serviceCount: services.length,
+    healthyServiceCount: services.filter((service) => service.ok).length,
   };
 }
 
@@ -179,15 +221,17 @@ async function readBrowserBackgroundMonitor(): Promise<BackgroundMonitorSnapshot
   const origin = browserOrigin;
   try {
     const health = await fetchServiceHealthDetails();
-    const [productionResult, tasksResult] = await Promise.allSettled([
+    const [productionResult, tasksResult, runtimeResult] = await Promise.allSettled([
       fetchProductionStatus(),
       fetchProductionTasks(16),
+      fetchRuntimeStatus(),
     ]);
     return deriveBackgroundMonitorSnapshot({
       origin,
       health,
       production: productionResult.status === 'fulfilled' ? productionResult.value : null,
       taskPage: tasksResult.status === 'fulfilled' ? tasksResult.value : null,
+      runtimeStatus: runtimeResult.status === 'fulfilled' ? runtimeResult.value : null,
     });
   } catch (error) {
     return {

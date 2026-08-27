@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "steel.pipeline-task.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "taskId", "inspectionId", "stage", "inputManifestRef", "inputManifestSha256"],
+  "properties": {
+    "schema": { "const": "steel.pipeline-task.v1" },
+    "taskId": { "type": "string", "minLength": 1 },
+    "inspectionId": { "type": "string", "minLength": 1 },
+    "stage": { "enum": ["image", "defect"] },
+    "inputManifestRef": { "type": "string", "minLength": 1 },
+    "inputManifestSha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+    "attempt": { "type": "integer", "minimum": 0, "default": 0 }
+  }
+}

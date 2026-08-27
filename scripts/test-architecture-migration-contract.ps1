@@ -931,7 +931,7 @@ foreach ($Missing in @(Get-MissingLiterals $CaptureApiText @(
   'export type CaptureImageKind = "depth" | "intensity" | "metadata" | "sdk-derived";',
   '"/api/calibration/apply-all"',
   '"/api/calibration/rollback"',
-  'cameraCalibrations.length !== 8',
+  'cameraCalibrations.length !== expectedCameras',
   '!item.expectedSn',
   '!item.rollbackPath',
   'uniqueExpectedSns',
@@ -968,7 +968,7 @@ foreach ($Missing in @(Get-MissingLiterals $CaptureDiagnosticText @(
 }
 foreach ($Missing in @(Get-MissingLiterals ($BarSurfaceApiText + $BarSurfaceAppText + $TaskProductionText + $ServiceProductionText) @(
   "operation: 'calibration-capture-fit'",
-  'autoActivate: true',
+  'algorithm_value_bool(request, "autoActivate", true)',
   'write_production_calibration_capture_fit_response',
   'calibration_capture_data_dir',
   '"completeFrames"',
@@ -1014,12 +1014,12 @@ foreach ($Missing in @(Get-MissingLiterals $CaptureProviderText @(
   $QtCapabilityMissing.Add("C++ provider: $Missing") | Out-Null
 }
 foreach ($Missing in @(Get-MissingLiterals $PackageRuntimeText @(
-  'formalCapture = "headless-cpp"',
-  'role = "formal-sdk-owner"'
+  'formalCapture = "sick-gentl"',
+  'role = "only-formal-camera-owner"'
 ))) {
   $QtCapabilityMissing.Add("Formal runtime: $Missing") | Out-Null
 }
-Add-ContractCheck $Checks "qt-capability-formal-chain" "Former Qt operations are covered by the Tauri-to-Rust-to-C++ chain: parameterized preview, real merged logs, per-camera batch evidence, target-gated automatic calibration, four latest artifact kinds, safe eight-camera calibration and durable rollback, with Qt source and runtime branches removed." ($QtCapabilityMissing.Count -eq 0) @($CaptureApiPath, $SystemStatusPath, $CaptureDiagnosticPath, $BarSurfaceApiPath, $BarSurfaceAppPath, $ServicePath, $CaptureProviderPath, $PackageRuntimePath) @($QtCapabilityMissing)
+Add-ContractCheck $Checks "qt-capability-formal-chain" "Former Qt operations remain covered while the formal runtime is restricted to the actual SICK GenTL camera line; legacy capture and BKV compatibility cannot enter the production chain." ($QtCapabilityMissing.Count -eq 0) @($CaptureApiPath, $SystemStatusPath, $CaptureDiagnosticPath, $BarSurfaceApiPath, $BarSurfaceAppPath, $ServicePath, $CaptureProviderPath, $PackageRuntimePath) @($QtCapabilityMissing)
 
 $CalibrationLedgerMissing = [System.Collections.Generic.List[string]]::new()
 foreach ($Missing in @(Get-MissingLiterals $CalibrationOperationsText @(

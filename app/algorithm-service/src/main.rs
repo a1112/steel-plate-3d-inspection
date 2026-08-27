@@ -20,7 +20,7 @@ use steel_inspection_result_contract::{
     UnifiedResult, RESULT_SCHEMA,
 };
 
-const DEFAULT_PORT: u16 = 4875;
+const DEFAULT_PORT: u16 = 4877;
 
 #[derive(Default)]
 struct Counters {
@@ -41,34 +41,10 @@ struct State {
     scan_interval: Duration,
     bkv_refresh_interval: Duration,
     processor: String,
-    algorithm_core: Option<PathBuf>,
     mysql_runtime: Option<tokio::runtime::Runtime>,
     bkv: Option<BkvAdapter>,
     history_reconstruction: Mutex<HashSet<String>>,
     processed_inputs: Mutex<HashMap<PathBuf, String>>,
-    sick_worker: Option<SickWorkerConfig>,
-    sick_worker_status: Mutex<SickWorkerStatus>,
-    sick_reprocess_flows: Mutex<HashSet<String>>,
-}
-
-#[derive(Clone)]
-struct SickWorkerConfig {
-    python: PathBuf,
-    script: PathBuf,
-    profile: PathBuf,
-    capture_origin: String,
-    database_origin: String,
-    poll_seconds: String,
-    settle_seconds: String,
-    tile_frames: String,
-}
-
-#[derive(Default)]
-struct SickWorkerStatus {
-    running: bool,
-    pid: Option<u32>,
-    restarts: u64,
-    last_error: Option<String>,
 }
 
 struct BkvAdapter {
@@ -80,7 +56,8 @@ struct BkvAdapter {
 }
 
 fn main() -> std::io::Result<()> {
-    let port = env::var("STEEL_ALGORITHM_SERVICE_PORT")
+    let port = env::var("STEEL_BKV_IMAGE_WORKER_PORT")
+        .or_else(|_| env::var("STEEL_ALGORITHM_SERVICE_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PORT);
@@ -99,7 +76,6 @@ fn main() -> std::io::Result<()> {
     let bkv = mysql_runtime
         .block_on(BkvAdapter::from_env(result_root.join("staging")))
         .map_err(io_error)?;
-    let sick_worker = sick_worker_config();
     let state = Arc::new(State {
         publisher,
         input_roots,
@@ -118,19 +94,13 @@ fn main() -> std::io::Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30_000),
         ),
-        processor: env::var("STEEL_ALGORITHM_PROCESSOR")
-            .unwrap_or_else(|_| "standard-record-import-v1".into()),
-        algorithm_core: env::var("STEEL_BAR_SURFACE_CORE_EXE")
-            .ok()
-            .map(PathBuf::from)
-            .filter(|p| p.is_file()),
+        processor: env::var("STEEL_BKV_IMPORT_PROCESSOR")
+            .or_else(|_| env::var("STEEL_ALGORITHM_PROCESSOR"))
+            .unwrap_or_else(|_| "bkv-standard-record-import-v1".into()),
         mysql_runtime: bkv.as_ref().map(|_| mysql_runtime),
         bkv,
         history_reconstruction: Mutex::new(HashSet::new()),
         processed_inputs: Mutex::new(HashMap::new()),
-        sick_worker,
-        sick_worker_status: Mutex::new(SickWorkerStatus::default()),
-        sick_reprocess_flows: Mutex::new(HashSet::new()),
     });
     // Keep the runtime alive only when the adapter connected successfully.
     // When no BKV environment is configured, local capture/standard-record adapters remain active.
@@ -139,19 +109,12 @@ fn main() -> std::io::Result<()> {
         .name("algorithm-source-adapter".into())
         .spawn(move || source_adapter_loop(worker_state))
         .map_err(io_error)?;
-    if state.sick_worker.is_some() {
-        let sick_state = Arc::clone(&state);
-        thread::Builder::new()
-            .name("sick-flow-algorithm-worker".into())
-            .spawn(move || sick_worker_loop(sick_state))
-            .map_err(io_error)?;
-    }
     let signal_state = Arc::clone(&state);
     ctrlc::set_handler(move || signal_state.shutdown.store(true, Ordering::Release))
         .map_err(io_error)?;
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     listener.set_nonblocking(true)?;
-    println!("steel algorithm service listening on http://127.0.0.1:{port}");
+    println!("steel BKV image worker listening on http://127.0.0.1:{port}");
     while !state.shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -165,210 +128,6 @@ fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-fn sick_worker_config() -> Option<SickWorkerConfig> {
-    let profile = env::var("STEEL_SICK_CAPTURE_PROFILE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)?;
-    if !profile.is_file() {
-        eprintln!(
-            "SICK algorithm worker disabled: profile does not exist: {}",
-            profile.display()
-        );
-        return None;
-    }
-    let workspace = workspace_root();
-    let script = env::var("STEEL_SICK_ALGORITHM_SCRIPT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace.join("scripts/sick_flow_analysis_service.py"));
-    if !script.is_file() {
-        eprintln!(
-            "SICK algorithm worker disabled: script does not exist: {}",
-            script.display()
-        );
-        return None;
-    }
-    let configured_python = env::var("STEEL_PYTHON_EXECUTABLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"D:\project\py312\python.exe"));
-    let python = if configured_python.is_file() {
-        configured_python
-    } else {
-        PathBuf::from("python")
-    };
-    Some(SickWorkerConfig {
-        python,
-        script,
-        profile,
-        capture_origin: env::var("CAPTURE_SERVICE_ORIGIN")
-            .unwrap_or_else(|_| "http://127.0.0.1:4317".into()),
-        database_origin: env::var("INSPECTION_SERVICE_ORIGIN")
-            .unwrap_or_else(|_| "http://127.0.0.1:4873".into()),
-        poll_seconds: env::var("STEEL_SICK_ALGORITHM_POLL_SECONDS").unwrap_or_else(|_| "1".into()),
-        settle_seconds: env::var("STEEL_SICK_ALGORITHM_SETTLE_SECONDS")
-            .unwrap_or_else(|_| "2".into()),
-        tile_frames: env::var("STEEL_SICK_ALGORITHM_TILE_FRAMES").unwrap_or_else(|_| "16".into()),
-    })
-}
-
-fn sick_worker_loop(state: Arc<State>) {
-    let Some(config) = state.sick_worker.clone() else {
-        return;
-    };
-    while !state.shutdown.load(Ordering::Acquire) {
-        let child = Command::new(&config.python)
-            .arg(&config.script)
-            .arg("--profile")
-            .arg(&config.profile)
-            .arg("--capture-origin")
-            .arg(&config.capture_origin)
-            .arg("--database-origin")
-            .arg(&config.database_origin)
-            .arg("--poll-seconds")
-            .arg(&config.poll_seconds)
-            .arg("--settle-seconds")
-            .arg(&config.settle_seconds)
-            .arg("--tile-frames")
-            .arg(&config.tile_frames)
-            .current_dir(workspace_root())
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn();
-        let mut child = match child {
-            Ok(child) => child,
-            Err(error) => {
-                let mut status = state
-                    .sick_worker_status
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                status.running = false;
-                status.pid = None;
-                status.last_error = Some(format!("SICK algorithm worker start failed: {error}"));
-                drop(status);
-                thread::sleep(Duration::from_secs(5));
-                continue;
-            }
-        };
-        {
-            let mut status = state
-                .sick_worker_status
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            status.running = true;
-            status.pid = Some(child.id());
-            status.last_error = None;
-        }
-        loop {
-            if state.shutdown.load(Ordering::Acquire) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return;
-            }
-            match child.try_wait() {
-                Ok(None) => thread::sleep(Duration::from_millis(500)),
-                Ok(Some(exit)) => {
-                    let mut status = state
-                        .sick_worker_status
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    status.running = false;
-                    status.pid = None;
-                    status.restarts = status.restarts.saturating_add(1);
-                    status.last_error =
-                        Some(format!("SICK algorithm worker exited unexpectedly: {exit}"));
-                    break;
-                }
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let mut status = state
-                        .sick_worker_status
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    status.running = false;
-                    status.pid = None;
-                    status.restarts = status.restarts.saturating_add(1);
-                    status.last_error =
-                        Some(format!("SICK algorithm worker status failed: {error}"));
-                    break;
-                }
-            }
-        }
-        thread::sleep(Duration::from_secs(2));
-    }
-}
-
-fn request_sick_flow_reprocess(state: &Arc<State>, material_id: &str) -> Result<u32, String> {
-    if material_id.is_empty()
-        || !material_id.bytes().all(|byte| byte.is_ascii_digit())
-        || material_id
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .is_none()
-    {
-        return Err("positive numeric materialId required".into());
-    }
-    let config = state
-        .sick_worker
-        .clone()
-        .ok_or_else(|| "SICK flow worker is not configured".to_string())?;
-    {
-        let mut active = state
-            .sick_reprocess_flows
-            .lock()
-            .map_err(|_| "SICK reprocess lock poisoned".to_string())?;
-        if !active.insert(material_id.to_string()) {
-            return Err(format!("flow {material_id} is already being reprocessed"));
-        }
-    }
-    let mut child = match Command::new(&config.python)
-        .arg(&config.script)
-        .arg("--profile")
-        .arg(&config.profile)
-        .arg("--capture-origin")
-        .arg(&config.capture_origin)
-        .arg("--database-origin")
-        .arg(&config.database_origin)
-        .arg("--once")
-        .arg(material_id)
-        .arg("--final")
-        .current_dir(workspace_root())
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            if let Ok(mut active) = state.sick_reprocess_flows.lock() {
-                active.remove(material_id);
-            }
-            return Err(format!("could not start SICK flow reprocess: {error}"));
-        }
-    };
-    let pid = child.id();
-    let flow_id = material_id.to_string();
-    let child_state = Arc::clone(state);
-    thread::spawn(move || {
-        let result = child.wait();
-        if let Ok(mut active) = child_state.sick_reprocess_flows.lock() {
-            active.remove(&flow_id);
-        }
-        if let Ok(status) = result {
-            if !status.success() {
-                if let Ok(mut worker_status) = child_state.sick_worker_status.lock() {
-                    worker_status.last_error = Some(format!(
-                        "SICK flow {flow_id} reprocess exited with {status}"
-                    ));
-                }
-            }
-        }
-    });
-    Ok(pid)
 }
 
 fn io_error(error: impl std::fmt::Display) -> std::io::Error {
@@ -1217,7 +976,7 @@ fn process_record(state: &State, record_path: &Path) -> Result<(), String> {
                 .map(|n| format!("C{n}"))
                 .collect()
         });
-    let default_session = format!("algorithm-{inspection_id}");
+    let default_session = format!("bkv-import-{inspection_id}");
     let default_material = inspection_id.clone();
     let default_source_record = inspection_id.clone();
     let result = UnifiedResult {
@@ -1233,7 +992,7 @@ fn process_record(state: &State, record_path: &Path) -> Result<(), String> {
             .and_then(Value::as_str)
             .unwrap_or(&default_material)
             .into(),
-        source: "algorithm-service".into(),
+        source: "bkv-import".into(),
         source_record_id: source
             .get("sourceRecordId")
             .and_then(Value::as_str)
@@ -1254,7 +1013,7 @@ fn process_record(state: &State, record_path: &Path) -> Result<(), String> {
         config_hash: source
             .get("configHash")
             .and_then(Value::as_str)
-            .unwrap_or("algorithm-default")
+            .unwrap_or("bkv-import-only")
             .into(),
         algorithm_version: state.processor.clone(),
         published_at: utc_now(),
@@ -1274,9 +1033,6 @@ fn process_record(state: &State, record_path: &Path) -> Result<(), String> {
             source_provenance: provenance,
         })
         .map_err(|e| e.to_string())?;
-    if let Some(core) = &state.algorithm_core {
-        run_core_if_requested(core, &source, record_dir);
-    }
     let mut counters = state.counters.lock().unwrap_or_else(|p| p.into_inner());
     counters.scanned = counters.scanned.saturating_add(1);
     counters.published = counters.published.saturating_add(1);
@@ -1337,23 +1093,6 @@ fn load_defects(record_dir: &Path, source: &Value, inspection_id: &str) -> Vec<R
         .unwrap_or_default()
 }
 
-fn run_core_if_requested(core: &Path, source: &Value, record_dir: &Path) {
-    let Some(manifest) = source.get("algorithmManifest").and_then(Value::as_str) else {
-        return;
-    };
-    let manifest_path = record_dir.join(manifest);
-    if !manifest_path.is_file() {
-        return;
-    }
-    let _ = Command::new(core)
-        .arg("--manifest")
-        .arg(manifest_path)
-        .current_dir(record_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
 fn handle_client(mut stream: TcpStream, state: Arc<State>) {
     let bytes = read_http_request(&mut stream);
     let request = String::from_utf8_lossy(&bytes);
@@ -1371,55 +1110,90 @@ fn handle_client(mut stream: TcpStream, state: Arc<State>) {
         (key == "recordId" && !value.is_empty()).then(|| value.to_string())
     });
     let response = match (method, path) {
-        ("GET", "/api/health/live") | ("GET", "/health") => response(200, &json!({"status":"live","service":"steel-algorithm-service","schema":"steel.algorithm-service.health.v1"}).to_string()),
+        ("GET", "/api/health/live") | ("GET", "/health") => response(
+            200,
+            &json!({
+                "status":"live",
+                "live":true,
+                "ready":true,
+                "service":"steel-image-worker-bkv",
+                "role":"bkv-adapter",
+                "schema":"steel.service-health.v1",
+                "version":env!("CARGO_PKG_VERSION"),
+                "compatibilityService":"steel-algorithm-service",
+                "productionCameraPipeline":false,
+                "defectInference":false
+            })
+            .to_string(),
+        ),
         ("GET", "/internal/v1/status") => response(200, &status_json(&state)),
         ("GET", "/internal/v1/defect-types") => {
             match (state.mysql_runtime.as_ref(), state.bkv.as_ref()) {
-                (Some(runtime), Some(adapter)) => match runtime.block_on(adapter.load_defect_types()) {
-                    Ok(defect_types) => response(200, &json!({
-                        "schema": "steel.bkv.defect-types.v1",
-                        "defectTypes": defect_types,
-                    }).to_string()),
-                    Err(error) => response(503, &json!({"error":"bkv_defect_types_unavailable","detail":error}).to_string()),
+                (Some(runtime), Some(adapter)) => match runtime
+                    .block_on(adapter.load_defect_types())
+                {
+                    Ok(defect_types) => response(
+                        200,
+                        &json!({
+                            "schema": "steel.bkv.defect-types.v1",
+                            "defectTypes": defect_types,
+                        })
+                        .to_string(),
+                    ),
+                    Err(error) => response(
+                        503,
+                        &json!({"error":"bkv_defect_types_unavailable","detail":error}).to_string(),
+                    ),
                 },
                 _ => response(404, &json!({"error":"bkv_source_disabled"}).to_string()),
             }
         }
         ("POST", "/internal/v1/reprocess") => {
             let payload = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
-            if let Some(material_id) = payload.get("materialId").and_then(Value::as_str) {
-                match request_sick_flow_reprocess(&state, material_id.trim()) {
-                    Ok(pid) => response(202, &json!({
-                        "accepted": true,
-                        "service": "steel-algorithm-service",
-                        "processor": "sick-flow-event-v2",
-                        "materialId": material_id.trim(),
-                        "pid": pid,
-                    }).to_string()),
-                    Err(error) => response(409, &json!({
-                        "accepted": false,
-                        "service": "steel-algorithm-service",
-                        "materialId": material_id.trim(),
-                        "error": error,
-                    }).to_string()),
-                }
+            if payload.get("materialId").is_some() {
+                response(
+                    409,
+                    &json!({
+                        "accepted":false,
+                        "service":"steel-image-worker-bkv",
+                        "error":"production_camera_reprocess_not_supported"
+                    })
+                    .to_string(),
+                )
             } else {
                 scan_sources(&state);
-                response(202, &json!({"accepted":true,"service":"steel-algorithm-service"}).to_string())
+                response(
+                    202,
+                    &json!({"accepted":true,"service":"steel-image-worker-bkv"}).to_string(),
+                )
             }
         }
-        ("POST", "/internal/v1/run") => { scan_sources(&state); response(202, &json!({"accepted":true}).to_string()) }
+        ("POST", "/internal/v1/run") => {
+            scan_sources(&state);
+            response(202, &json!({"accepted":true}).to_string())
+        }
         ("POST", "/internal/v1/reconstruct") => {
             let record_id = serde_json::from_str::<Value>(body)
                 .ok()
-                .and_then(|value| value.get("recordId").and_then(Value::as_str).map(str::to_owned))
+                .and_then(|value| {
+                    value
+                        .get("recordId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
                 .or(query_record_id);
             match record_id {
                 Some(record_id) => match reconstruct_history_record(&state, &record_id) {
                     Ok(payload) => response(200, &payload.to_string()),
-                    Err(error) => response(422, &json!({"accepted":false,"recordId":record_id,"error":error}).to_string()),
+                    Err(error) => response(
+                        422,
+                        &json!({"accepted":false,"recordId":record_id,"error":error}).to_string(),
+                    ),
                 },
-                None => response(400, &json!({"accepted":false,"error":"recordId_required"}).to_string()),
+                None => response(
+                    400,
+                    &json!({"accepted":false,"error":"recordId_required"}).to_string(),
+                ),
             }
         }
         _ => response(404, &json!({"error":"not_found"}).to_string()),
@@ -1462,14 +1236,14 @@ fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
 
 fn status_json(state: &State) -> String {
     let counters = state.counters.lock().unwrap_or_else(|p| p.into_inner());
-    let sick_worker = state
-        .sick_worker_status
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
     let bkv = state.bkv.as_ref();
     json!({
-        "schema":"steel.algorithm-service.status.v1",
-        "service":"steel-algorithm-service",
+        "schema":"steel.bkv-image-worker.status.v1",
+        "service":"steel-image-worker-bkv",
+        "compatibilityService":"steel-algorithm-service",
+        "role":"bkv-adapter",
+        "productionCameraPipeline":false,
+        "defectInference":false,
         "ready":true,
         "resultRoot":state.publisher.root(),
         "inputRoots":state.input_roots,
@@ -1481,15 +1255,6 @@ fn status_json(state: &State) -> String {
             "recordLimit": bkv.map(|adapter| adapter.record_limit).unwrap_or(0),
             "imageRootCount": bkv.map(|adapter| adapter.image_roots.len()).unwrap_or(0),
             "onlineImageRoots": bkv.map(|adapter| adapter.image_roots.iter().filter(|root| root.is_dir()).count()).unwrap_or(0),
-        },
-        "sickFlowWorker": {
-            "configured": state.sick_worker.is_some(),
-            "running": sick_worker.running,
-            "pid": sick_worker.pid,
-            "restarts": sick_worker.restarts,
-            "lastError": sick_worker.last_error,
-            "profile": state.sick_worker.as_ref().map(|worker| &worker.profile),
-            "boundary": "frame-committed-events-to-derived-artifacts"
         },
         "counters":{
             "scanned":counters.scanned,

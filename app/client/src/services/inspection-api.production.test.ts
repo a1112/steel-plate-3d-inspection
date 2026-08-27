@@ -27,7 +27,8 @@ import {
   triggerGatewayManualSteelIn,
   writeProductionSteelInfo,
   reviewProductionDefect,
-  shouldUseSameOriginService,
+  getInspectionServiceOrigin,
+  isBrowserHostedClient,
 } from './inspection-api';
 import type {
   BkvArtifact,
@@ -53,12 +54,20 @@ afterEach(() => {
 });
 
 describe('persistent production command client', () => {
-  it('uses the page origin for HTTP and HTTPS web clients but not Tauri', () => {
-    expect(shouldUseSameOriginService('http:', false, 'production')).toBe(true);
-    expect(shouldUseSameOriginService('https:', false, 'production')).toBe(true);
-    expect(shouldUseSameOriginService('https:', true, 'production')).toBe(false);
-    expect(shouldUseSameOriginService('file:', false, 'production')).toBe(false);
-    expect(shouldUseSameOriginService('https:', false, 'test')).toBe(false);
+  it('detects browser-hosted clients without forcing their service address to the page origin', () => {
+    expect(isBrowserHostedClient('http:', false, 'production')).toBe(true);
+    expect(isBrowserHostedClient('https:', false, 'production')).toBe(true);
+    expect(isBrowserHostedClient('https:', true, 'production')).toBe(false);
+    expect(isBrowserHostedClient('file:', false, 'production')).toBe(false);
+    expect(isBrowserHostedClient('https:', false, 'test')).toBe(false);
+
+    window.localStorage.setItem('steel-inspection-connection-config', JSON.stringify({
+      mode: 'online',
+      host: '10.50.111.141',
+      port: 4873,
+      protocol: 'http',
+    }));
+    expect(getInspectionServiceOrigin()).toBe('http://10.50.111.141:4873');
   });
 
   it('discovers the advertised LAN service and de-duplicates addresses', async () => {

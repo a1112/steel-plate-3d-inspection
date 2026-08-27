@@ -485,10 +485,13 @@ def _sql_literal(value: str) -> str:
 
 def _database_sql(storage_root: Path, camera_roots: dict[str, Path]) -> str:
     commands = ["BEGIN;", "LOCK TABLE steel_flow IN SHARE ROW EXCLUSIVE MODE;"]
-    roots = ",".join(
-        f"({_sql_literal(camera_id)},{_sql_literal(str(root).rstrip('\\/') + os.sep)})"
-        for camera_id, root in camera_roots.items()
-    )
+    root_values: list[str] = []
+    for camera_id, root in camera_roots.items():
+        normalized_root = str(root).rstrip("\\/") + os.sep
+        root_values.append(
+            f"({_sql_literal(camera_id)},{_sql_literal(normalized_root)})"
+        )
+    roots = ",".join(root_values)
     commands.append(
         "UPDATE steel_flow_image AS image SET "
         "material_id=image.flow_no::text, "

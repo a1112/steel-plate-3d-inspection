@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "steel.image-result.v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema", "inspectionId", "sourceManifestSha256", "artifacts", "complete"],
+  "properties": {
+    "schema": { "const": "steel.image-result.v1" },
+    "inspectionId": { "type": "string", "minLength": 1 },
+    "sourceManifestSha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+    "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } },
+    "complete": { "type": "boolean" }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": ["kind", "uri", "size", "sha256"],
+      "properties": {
+        "kind": { "type": "string" },
+        "uri": { "type": "string" },
+        "size": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
+      }
+    }
+  }
+}

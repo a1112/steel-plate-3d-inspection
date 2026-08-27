@@ -3,7 +3,6 @@ import { useState } from 'react';
 import type { ThemeMode } from '../data/inspection';
 import {
   discoverInspectionServices,
-  isWebHostedRuntime,
   type ConnectionConfig,
 } from '../services/inspection-api';
 
@@ -26,10 +25,10 @@ export function ConnectionRecoveryDialog({
     mode: 'online',
     host: initialConnection.host,
     port: initialConnection.port,
+    protocol: initialConnection.protocol,
   }));
   const [discoveryBusy, setDiscoveryBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
-  const webHosted = isWebHostedRuntime();
   const hostValid = draft.host.trim().length > 0;
   const portValid = Number.isInteger(draft.port) && draft.port >= 1 && draft.port <= 65535;
 
@@ -77,70 +76,65 @@ export function ConnectionRecoveryDialog({
 
         <p id="connection-recovery-detail">{error}</p>
         <p className="connection-recovery-hint">
-          {webHosted
-            ? '系统已使用本地预览数据进入主界面。网页端会自动重试当前页面的同源服务，无需配置 IP 或 UI 端口。'
-            : '系统已使用本地预览数据进入主界面。请配置采集主机的局域网 IP 后重试。'}
+          系统已使用本地预览数据进入主界面。请配置检测服务的 IP 和端口后重试。
         </p>
 
-        {!webHosted ? (
-          <div className="connection-recovery-fields">
-            <label>
-              <span>协议</span>
-              <select
-                aria-label="连接协议"
-                value={draft.protocol ?? 'http'}
-                onChange={(event) => setDraft((current) => ({ ...current, protocol: event.target.value as 'http' | 'https' }))}
-              >
-                <option value="http">HTTP</option>
-                <option value="https">HTTPS</option>
-              </select>
-            </label>
-            <label>
-              <span>服务端 IP</span>
-              <input
-                autoFocus
-                aria-label="服务端 IP"
-                value={draft.host}
-                placeholder="例如 192.168.1.20"
-                onChange={(event) => setDraft((current) => ({ ...current, host: event.target.value }))}
-              />
-            </label>
-            <label>
-              <span>端口</span>
-              <input
-                aria-label="服务端端口"
-                type="number"
-                min={1}
-                max={65535}
-                value={draft.port}
-                onChange={(event) => setDraft((current) => ({ ...current, port: Number(event.target.value) }))}
-              />
-            </label>
-          </div>
-        ) : (
-          <div className="connection-recovery-status" role="status">
-            当前服务地址：{typeof window !== 'undefined' ? window.location.origin : '同源服务'}
-          </div>
-        )}
+        <div className="connection-recovery-fields">
+          <label>
+            <span>协议</span>
+            <select
+              aria-label="连接协议"
+              value={draft.protocol ?? 'http'}
+              onChange={(event) => setDraft((current) => ({ ...current, protocol: event.target.value as 'http' | 'https' }))}
+            >
+              <option value="http">HTTP</option>
+              <option value="https">HTTPS</option>
+            </select>
+          </label>
+          <label>
+            <span>服务端 IP</span>
+            <input
+              autoFocus
+              aria-label="服务端 IP"
+              value={draft.host}
+              placeholder="例如 192.168.1.20"
+              onChange={(event) => setDraft((current) => ({ ...current, host: event.target.value }))}
+            />
+          </label>
+          <label>
+            <span>端口</span>
+            <input
+              aria-label="服务端端口"
+              type="number"
+              min={1}
+              max={65535}
+              value={draft.port}
+              onChange={(event) => setDraft((current) => ({ ...current, port: Number(event.target.value) }))}
+            />
+          </label>
+        </div>
 
         {status ? <div className="connection-recovery-status" role="status">{status}</div> : null}
 
         <footer>
           <button type="button" className="secondary" onClick={onDismiss}>直接进入</button>
-          {!webHosted ? (
-            <button type="button" className="secondary" disabled={discoveryBusy || retrying} onClick={() => void discover()}>
-              {discoveryBusy ? <LoaderCircle className="spin" size={16} /> : <Radar size={16} />}
-              {discoveryBusy ? '正在发现' : '自动发现'}
-            </button>
-          ) : null}
+          <button type="button" className="secondary" disabled={discoveryBusy || retrying} onClick={() => void discover()}>
+            {discoveryBusy ? <LoaderCircle className="spin" size={16} /> : <Radar size={16} />}
+            {discoveryBusy ? '正在发现' : '自动发现'}
+          </button>
           <button
             type="button"
             className="primary"
             disabled={!hostValid || !portValid || discoveryBusy || retrying}
-            onClick={() => onRetry({ mode: 'online', host: draft.host.trim(), port: draft.port })}
+            onClick={() => onRetry({
+              mode: 'online',
+              host: draft.host.trim(),
+              port: draft.port,
+              ...(draft.protocol ? { protocol: draft.protocol } : {}),
+            })}
           >
             {retrying ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
-            {retrying ? '正在重试' : webHosted ? '重新连接' : '保存并重试'}
+            {retrying ? '正在重试' : '保存并重试'}
           </button>
         </footer>
       </section>

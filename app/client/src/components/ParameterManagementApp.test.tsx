@@ -422,11 +422,12 @@ const adminRuntimeLogStatus = {
   services: [
     { id: 'inspection', name: '业务服务', origin: 'http://127.0.0.1:4873', port: 4873, ok: true, required: true, status: 'running' },
     { id: 'image', name: 'Rust 图像服务', origin: 'http://127.0.0.1:4874', port: 4874, ok: true, required: true, status: 'running' },
-    { id: 'algorithm', name: '算法服务', origin: 'http://127.0.0.1:4875', port: 4875, ok: true, required: true, status: 'running' },
+    { id: 'image-worker', name: '图像 Worker', origin: 'http://127.0.0.1:4875', port: 4875, ok: true, required: true, status: 'running' },
+    { id: 'defect-worker', name: '缺陷 Worker', origin: 'http://127.0.0.1:4876', port: 4876, ok: true, required: true, status: 'running' },
     { id: 'capture', name: '采集服务', origin: 'http://127.0.0.1:4317', port: 4317, ok: false, required: false, status: 'unavailable', reason: 'unreachable' },
   ],
   logs: [
-    { name: 'algorithm-service.out.log', bytes: 128, modifiedAt: '1782879115000', tail: 'scan completed: 3 records' },
+    { name: 'image-worker.out.log', bytes: 128, modifiedAt: '1782879115000', tail: 'image results completed: 3 records' },
     { name: 'supervisor.log', bytes: 256, modifiedAt: '1782879115000', tail: 'runtime supervisor running' },
   ],
 };
@@ -1310,7 +1311,7 @@ describe('ParameterManagementApp', () => {
     expect(screen.getByText('统一结果库')).toBeInTheDocument();
     expect(screen.getByText('已就绪')).toBeInTheDocument();
     expect(screen.getByText('Rust 图像服务')).toBeInTheDocument();
-    expect(screen.getByText('scan completed: 3 records')).toBeInTheDocument();
+    expect(screen.getByText('image results completed: 3 records')).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:4873/api/admin/runtime/logs',
       expect.objectContaining({ headers: expect.objectContaining({ Accept: 'application/json' }) }),

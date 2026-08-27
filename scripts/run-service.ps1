@@ -112,6 +112,12 @@ if ($ConfigRoot.Trim().Length -eq 0) {
   $ConfigRoot = Join-Path $RepoRoot "target\config\service"
 }
 New-Item -ItemType Directory -Force -Path $ConfigRoot | Out-Null
+$ServiceRegistrySource = Join-Path $RepoRoot "config\service-registry.json"
+$ServiceRegistryDestination = Join-Path $ConfigRoot "service-registry.json"
+if (-not (Test-Path -LiteralPath $ServiceRegistryDestination -PathType Leaf) -and
+    (Test-Path -LiteralPath $ServiceRegistrySource -PathType Leaf)) {
+  Copy-Item -LiteralPath $ServiceRegistrySource -Destination $ServiceRegistryDestination -Force
+}
 
 if ($ForceParameters -or -not $env:INSPECTION_SERVICE_PORT) {
   $env:INSPECTION_SERVICE_PORT = [string]$Port

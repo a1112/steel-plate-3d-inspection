@@ -36,8 +36,8 @@ $TestPolicyRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("steel-runtime-po
 $TestDataRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("steel-runtime-data-test-" + [Guid]::NewGuid().ToString("N"))
 try {
   foreach ($Directory in @(
-    "capture-headless",
     "service",
+    "scripts\sick_capture",
     "algorithm-core",
     "config\capture",
     "config\capture\calibrations\current-8-time-trigger",
@@ -46,12 +46,15 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $TestRoot $Directory) | Out-Null
   }
   foreach ($File in @(
-    "capture-headless\steel_capture_service.exe",
+    "service\steel-capture-service.exe",
     "service\steel-image-service.exe",
-    "service\steel-algorithm-service.exe",
+    "service\steel-image-worker.exe",
+    "service\steel-defect-worker.exe",
     "service\steel-trigger-gateway.exe",
     "service\steel-inspection-service.exe",
-    "algorithm-core\steel_bar_surface_core.exe"
+    "algorithm-core\steel_bar_surface_core.exe",
+    "scripts\sick_capture_service.py",
+    "scripts\sick_flow_analysis_service.py"
   )) {
     New-Item -ItemType File -Force -Path (Join-Path $TestRoot $File) | Out-Null
   }
@@ -70,7 +73,8 @@ try {
     "result-data",
     "algorithm-input",
     "work\image",
-    "work\algorithm",
+    "work\image-worker",
+    "work\defect-worker",
     "work\trigger",
     "work\service"
   )) {
@@ -86,6 +90,9 @@ try {
     New-Item -ItemType Directory -Force -Path $Directory | Out-Null
   }
   $PayloadCalibrationPath = Join-Path $TestRoot "config\capture\calibrations\current-8-time-trigger\ArrayCalibration.xml"
+  $SickCaptureProfilePath = Join-Path $TestStateRoot "capture-config\production-sick-profile.json"
+  $PythonExecutablePath = Join-Path $TestPolicyRoot "python.exe"
+  New-Item -ItemType File -Force -Path $SickCaptureProfilePath, $PythonExecutablePath | Out-Null
   $CalibrationPath = Join-Path $TestStateRoot "capture-config\calibrations\current-8-time-trigger\ArrayCalibration.xml"
   $AcceptanceReportPath = Join-Path $TestPolicyRoot "algorithm-acceptance.json"
   $AlgorithmCorePath = Join-Path $TestRoot "algorithm-core\steel_bar_surface_core.exe"
@@ -432,7 +439,7 @@ try {
       'Wait-RuntimePortsReleased',
       'Get-NetTCPConnection',
       'Get-NetUDPEndpoint',
-      '4317, 4873, 4874, 4875, 4881, 4882, 4883',
+      '4317, 4873, 4874, 4875, 4876, 4881, 4882, 4883',
       'SteelStateRoot',
       'config\runtime-service.env'
     )) {
@@ -455,7 +462,9 @@ try {
     ('STEEL_RELEASE_COMMIT=' + ('a' * 40)),
     'INSPECTION_SERVICE_HOST=0.0.0.0',
     'INSPECTION_SERVICE_PORT=4873',
-    'STEEL_CAPTURE_PROVIDER=headless-cpp',
+    'STEEL_CAPTURE_PROVIDER=external-api',
+    "STEEL_SICK_CAPTURE_PROFILE=$SickCaptureProfilePath",
+    "STEEL_PYTHON_EXECUTABLE=$PythonExecutablePath",
     'CAPTURE_SERVICE_ORIGIN=http://127.0.0.1:4317',
     'STEEL_CAPTURE_SERVICE_AUTOSTART=1',
     'STEEL_CAPTURE_RESTART_BUDGET=5',

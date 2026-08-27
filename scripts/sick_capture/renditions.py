@@ -52,6 +52,19 @@ JET_RANGE_MM = 1.0
 _LEGACY_CACHE_FILE = re.compile(r"^[0-9a-f]{64}(?:-w[0-9]+)?\.(?:jpg|json)$", re.IGNORECASE)
 
 
+def rendition_measurement_config(defaults: dict[str, Any]) -> MeasurementConfig:
+    """Build the small geometry policy needed by readable JET renditions."""
+    return MeasurementConfig(
+        row_window=int(defaults.get("measurementRowWindow", 16)),
+        maximum_profile_points=int(defaults.get("measurementMaximumProfilePoints", 320)),
+        maximum_sections=int(defaults.get("measurementMaximumSections", 12)),
+        minimum_circle_points=int(defaults.get("measurementMinimumCirclePoints", 48)),
+        maximum_circle_residual_mm=float(
+            defaults.get("measurementMaximumCircleResidualMm", 0.5)
+        ),
+    ).bounded()
+
+
 class _BoundedMemoryLRU:
     """Small process-local cache for data read from immutable capture files.
 

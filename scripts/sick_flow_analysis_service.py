@@ -27,10 +27,13 @@ from sick_capture.material_lock import exclusive_material_job
 from sick_capture.paths import (
     LAYOUT_SCHEMA,
     alignment_path as canonical_alignment_path,
+    acquisition_manifest_path,
     algorithm_state_path,
+    defect_report_path,
     frame_event_root,
     frame_event_path,
     flow_manifest_path,
+    image_result_path,
     measurement_path as canonical_measurement_path,
     playback_index_path as canonical_playback_index_path,
     region_path as canonical_region_path,
@@ -418,6 +421,76 @@ def notify_region_commit(
         raise RuntimeError(str(result.get("error", "region commit rejected")))
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _artifact(kind: str, path: Path) -> dict[str, object]:
+    if not path.is_file():
+        raise FileNotFoundError(f"required {kind} artifact is missing: {path}")
+    return {
+        "kind": kind,
+        "uri": path.resolve().as_uri(),
+        "path": str(path),
+        "size": path.stat().st_size,
+        "sha256": _sha256_file(path),
+    }
+
+
+def publish_image_result(
+    storage_root: Path,
+    material_id: str,
+    source_manifest: Path,
+    artifacts: list[tuple[str, Path]],
+    *,
+    complete: bool,
+) -> tuple[Path, dict[str, object]]:
+    if not source_manifest.is_file():
+        raise FileNotFoundError(f"capture manifest is missing: {source_manifest}")
+    path = image_result_path(storage_root, material_id)
+    payload: dict[str, object] = {
+        "schema": "steel.image-result.v1",
+        "inspectionId": material_id,
+        "sourceManifest": str(source_manifest),
+        "sourceManifestSha256": _sha256_file(source_manifest),
+        "artifacts": [_artifact(kind, artifact_path) for kind, artifact_path in artifacts],
+        "complete": complete,
+        "productionCameraPipeline": True,
+    }
+    atomic_summary(path, payload)
+    return path, payload
+
+
+def publish_defect_report(
+    storage_root: Path,
+    material_id: str,
+    defect_manifest: Path,
+    defects: dict[str, object],
+) -> tuple[Path, dict[str, object]]:
+    image_path = image_result_path(storage_root, material_id)
+    if not image_path.is_file():
+        raise FileNotFoundError(f"image result is missing: {image_path}")
+    path = defect_report_path(storage_root, material_id)
+    defect_rows = defects.get("defects", [])
+    payload: dict[str, object] = {
+        "schema": "steel.defect-report.v1",
+        "inspectionId": material_id,
+        "imageResult": str(image_path),
+        "imageResultSha256": _sha256_file(image_path),
+        "sourceDefectManifest": _artifact("defect-manifest", defect_manifest),
+        "defects": defect_rows if isinstance(defect_rows, list) else [],
+        "complete": defects.get("state") in {"ready", "complete"},
+        "state": defects.get("state"),
+        "productionCameraPipeline": True,
+    }
+    atomic_summary(path, payload)
+    return path, payload
+
+
 def _analyze_impl(
     camera_roots: dict[str, Path],
     storage_root: Path,
@@ -481,7 +554,29 @@ def _analyze_impl(
         storage_root,
         material_id,
     )
+    image_artifacts = [
+        ("alignment", alignment_path),
+        ("measurement", measurement_path),
+        ("region-map", region_path),
+        ("surface", surface_path),
+        ("playback-index", playback_path),
+    ]
+    if jet_path.is_file():
+        image_artifacts.append(("surface-preview", jet_path))
+    source_manifest = acquisition_manifest_path(storage_root, material_id)
+    if not source_manifest.is_file():
+        # Compatibility for flows captured before acquisition-manifest.v1 was
+        # enabled. New production captures always use the contract manifest.
+        source_manifest = flow_manifest_path(storage_root, material_id)
+    image_contract_path, _ = publish_image_result(
+        storage_root,
+        material_id,
+        source_manifest,
+        image_artifacts,
+        complete=final,
+    )
     defect_path: Path | None = None
+    defect_contract_path: Path | None = None
     defects: dict[str, object] = {"state": "waiting-for-flow-close", "statistics": {"defectCount": 0}}
     if final and include_defects:
         defect_path, defects = build_and_write_flow_defect_detection(
@@ -490,6 +585,9 @@ def _analyze_impl(
             material_id,
             alignment,
             config=defect_detection_config,
+        )
+        defect_contract_path, _ = publish_defect_report(
+            storage_root, material_id, defect_path, defects
         )
     state_path = algorithm_state_path(storage_root, material_id)
     atomic_summary(
@@ -514,7 +612,9 @@ def _analyze_impl(
             "regionPath": str(region_path),
             "surfacePath": str(surface_path),
             "playbackPath": str(playback_path),
+            "imageResultPath": str(image_contract_path),
             "defectPath": str(defect_path) if defect_path else "",
+            "defectReportPath": str(defect_contract_path) if defect_contract_path else "",
             "synchronized": alignment.get("quality", {}).get("synchronized"),
             "metricValid": measurement.get("metricValid"),
             "regionState": regions.get("state"),
@@ -536,7 +636,9 @@ def _analyze_impl(
                 "regions": str(region_path),
                 "surface": str(surface_path),
                 "playback": str(playback_path),
+                "imageResult": str(image_contract_path),
                 "defects": str(defect_path) if defect_path else "",
+                "defectReport": str(defect_contract_path) if defect_contract_path else "",
                 "mode": (
                     "final"
                     if final and include_defects
@@ -700,6 +802,9 @@ def _analyze_defects_only_under_lock(
             alignment,
             config=defect_detection_config,
         )
+        report_path, report = publish_defect_report(
+            storage_root, material_id, defect_path, defects
+        )
         atomic_summary(
             state_path,
             {
@@ -710,6 +815,7 @@ def _analyze_defects_only_under_lock(
                 "state": "ready",
                 "mode": "final",
                 "defectPath": str(defect_path),
+                "defectReportPath": str(report_path),
                 "defectState": defects.get("state"),
                 "defectCount": int(
                     defects.get("statistics", {}).get("defectCount", 0)
@@ -723,6 +829,8 @@ def _analyze_defects_only_under_lock(
                     "event": "flow-defects-ready",
                     "materialId": material_id,
                     "path": str(defect_path),
+                    "report": str(report_path),
+                    "complete": report.get("complete"),
                     "state": defects.get("state"),
                     "defectCount": defects.get("statistics", {}).get(
                         "defectCount", 0
@@ -772,6 +880,16 @@ def analyze_defects_only(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--role",
+        choices=("combined", "image", "defect"),
+        default="combined",
+        help=(
+            "combined preserves the legacy single-process loop; image produces "
+            "alignment/measurement/region/surface artifacts; defect consumes "
+            "completed image artifacts and runs model inference"
+        ),
+    )
     parser.add_argument("--profile", required=True)
     parser.add_argument("--capture-origin", default="http://127.0.0.1:4317")
     parser.add_argument("--database-origin", default="http://127.0.0.1:4873")
@@ -893,17 +1011,26 @@ def main() -> int:
     ).bounded()
 
     if args.once:
-        analyze(
-            camera_roots,
-            profile.storage_root,
-            args.once,
-            alignment_config,
-            measurement_config,
-            defect_detection_config,
-            active_calibration_path(),
-            args.database_origin,
-            final=args.final,
-        )
+        if args.role == "defect":
+            analyze_defects_only(
+                camera_roots,
+                profile.storage_root,
+                args.once,
+                defect_detection_config,
+            )
+        else:
+            analyze(
+                camera_roots,
+                profile.storage_root,
+                args.once,
+                alignment_config,
+                measurement_config,
+                defect_detection_config,
+                active_calibration_path(),
+                args.database_origin,
+                final=args.final,
+                include_defects=args.role == "combined",
+            )
         return 0
 
     stop = threading.Event()
@@ -948,8 +1075,13 @@ def main() -> int:
     defect_backlog_deferred_count = 0
     last_queue_error = ""
     status_write_error = ""
+    status_owner = {
+        "combined": "flow-analysis",
+        "image": "image-worker",
+        "defect": "defect-worker",
+    }[args.role]
     realtime_status_path = (
-        profile.storage_root / "system" / "jobs" / "flow-analysis" / "status.json"
+        profile.storage_root / "system" / "jobs" / status_owner / "status.json"
     )
 
     def write_queue_status() -> None:
@@ -961,6 +1093,7 @@ def main() -> int:
             queued_ids = sorted(queued_defects, key=int, reverse=True)
             payload = {
                 "schema": "steel.flow-analysis-queue.v1",
+                "role": args.role,
                 "state": "stopping" if stop.is_set() else "running",
                 "updatedAtUnixMs": int(time.time() * 1000),
                 "currentFastFlow": current_fast_flow or None,
@@ -1116,12 +1249,14 @@ def main() -> int:
                 defect_queue.task_done()
                 write_queue_status()
 
-    defect_thread = threading.Thread(
-        target=defect_worker,
-        name="sick-realtime-defect-queue",
-        daemon=True,
-    )
-    defect_thread.start()
+    defect_thread: threading.Thread | None = None
+    if args.role in {"combined", "defect"}:
+        defect_thread = threading.Thread(
+            target=defect_worker,
+            name="sick-realtime-defect-queue",
+            daemon=True,
+        )
+        defect_thread.start()
     write_queue_status()
 
     def status_heartbeat() -> None:
@@ -1300,6 +1435,12 @@ def main() -> int:
             signature = committed_signature(profile.storage_root, material_id)
             if signature is None:
                 continue
+            if args.role == "defect":
+                if final and fast_artifacts_ready(
+                    profile.storage_root, material_id, signature
+                ):
+                    defect_candidates[material_id] = signature
+                continue
             if (
                 final
                 and processed_row is None
@@ -1308,11 +1449,13 @@ def main() -> int:
                 )
             ):
                 processed[material_id] = (signature, state)
-                defect_candidates[material_id] = signature
+                if args.role == "combined":
+                    defect_candidates[material_id] = signature
                 continue
             if processed_row == (signature, state):
                 if final:
-                    defect_candidates[material_id] = signature
+                    if args.role == "combined":
+                        defect_candidates[material_id] = signature
                 continue
             # Existing algorithms are whole-flow calculations rather than
             # append-only reducers. One early pass is enough to publish live
@@ -1354,7 +1497,7 @@ def main() -> int:
                     processed[material_id] = (signature, state)
                     with queue_state_lock:
                         fast_processed_count += 1
-                    if final:
+                    if final and args.role == "combined":
                         defect_candidates[material_id] = signature
                 else:
                     observed.pop(material_id, None)
@@ -1378,20 +1521,22 @@ def main() -> int:
             # Re-read the numeric material list after every expensive fast
             # pass so a newly closed live flow can never sit behind the rest
             # of a startup/history backlog captured by this iteration.
-                break
+            break
         prune_realtime_state(recent_ids)
-        for material_id in sorted(defect_candidates, key=int, reverse=True):
-            enqueue_defect(material_id, defect_candidates[material_id])
+        if args.role in {"combined", "defect"}:
+            for material_id in sorted(defect_candidates, key=int, reverse=True):
+                enqueue_defect(material_id, defect_candidates[material_id])
         # Realtime/current flows always get the first chance each round. The
         # history worker is asynchronous, bounded to one flow, and never adds
         # historical defect jobs to the realtime defect queue.
-        if not recent_expensive_pass:
+        if args.role in {"combined", "image"} and not recent_expensive_pass:
             schedule_history_analysis(set(recent_ids))
         write_queue_status()
         stop.wait(max(0.25, args.poll_seconds))
     write_queue_status()
     history_executor.shutdown(wait=False, cancel_futures=True)
-    defect_thread.join(timeout=2.0)
+    if defect_thread is not None:
+        defect_thread.join(timeout=2.0)
     heartbeat_thread.join(timeout=2.0)
     return 0
 

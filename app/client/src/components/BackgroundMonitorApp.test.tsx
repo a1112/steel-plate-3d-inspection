@@ -17,6 +17,96 @@ const monitorApi = vi.hoisted(() => {
     activeTaskId: 'TASK-ACTIVE',
     detail: '正在执行 1 项任务，队列等待 2 项',
     updatedAtUnixMs: 1_800_000_000_000,
+    services: [
+      {
+        id: 'inspection',
+        name: '检测服务',
+        role: 'api',
+        kind: 'inspection',
+        origin: 'http://127.0.0.1:4873',
+        port: 4873,
+        healthPath: '/api/health/live',
+        ok: true,
+        required: true,
+        status: 'running',
+        responseStatus: 200,
+        latencyMs: 2,
+        uptimeMs: 1000,
+        reason: null,
+        lifecycle: { source: 'service', phase: 'ready', desiredRunning: true, pid: 1234 },
+        operations: [
+          { id: 'refresh-status', label: '刷新状态', effect: 'query', scope: 'service', enabled: true },
+          { id: 'copy-origin', label: '复制地址', effect: 'local', scope: 'service', enabled: true },
+          { id: 'view-logs', label: '查看日志', effect: 'local', scope: 'service', enabled: true },
+        ],
+        control: { mode: 'observe', owner: 'service' },
+      },
+      {
+        id: 'capture',
+        name: '采集服务',
+        role: 'camera-capture-provider',
+        kind: 'capture',
+        origin: 'http://127.0.0.1:4317',
+        port: 4317,
+        healthPath: '/health',
+        ok: false,
+        required: true,
+        status: 'stopped',
+        responseStatus: 0,
+        latencyMs: 0,
+        reason: 'capture_process_not_running',
+        lifecycle: { source: 'capture-supervisor', phase: 'stopped', desiredRunning: true },
+        operations: [
+          { id: 'refresh-status', label: '刷新状态', effect: 'query', scope: 'service', enabled: true },
+          { id: 'copy-origin', label: '复制地址', effect: 'local', scope: 'service', enabled: true },
+          { id: 'view-logs', label: '查看日志', effect: 'local', scope: 'service', enabled: true },
+        ],
+        control: { mode: 'observe', owner: 'capture-supervisor' },
+      },
+    ],
+    logs: [
+      {
+        name: 'inspection-service.out',
+        serviceId: 'inspection',
+        serviceName: '检测服务',
+        bytes: 2048,
+        modifiedAt: '1800000002000',
+        tail: 'service started\nworker heartbeat ok',
+        truncated: false,
+      },
+      {
+        name: 'capture-child.log',
+        serviceId: 'capture',
+        serviceName: '采集服务',
+        bytes: 512,
+        modifiedAt: '1800000003000',
+        tail: 'capture process stopped',
+        truncated: false,
+      },
+    ],
+    runtime: {
+      stateRoot: 'C:/runtime/state',
+      logRoot: 'C:/runtime/logs',
+      taskWorker: { status: 'running', running: true, heartbeatAgeMs: 80 },
+      supervisor: { status: 'running', reason: '' },
+    },
+    registry: {
+      schema: 'steel.service-registry.v1',
+      version: 1,
+      path: 'C:/runtime/config/service-registry.json',
+      services: [],
+    },
+    monitorProtocol: {
+      schema: 'steel.runtime-monitor-capabilities.v1',
+      version: 1,
+      selectionKey: 'serviceId',
+      logScopes: ['service', 'all'],
+      operationEffects: ['query', 'local', 'mutation'],
+      mutationPolicy: 'capability-only',
+      readAccess: 'loopback-or-private-network',
+    },
+    serviceCount: 2,
+    healthyServiceCount: 1,
     tasks: [
       {
         taskId: 'TASK-ACTIVE',
@@ -119,31 +209,33 @@ describe('BackgroundMonitorApp', () => {
     cleanup();
   });
 
-  it('renders health, worker, queue, attention and filters the read-only task table', async () => {
+  it('renders concise title stats, selectable services, details and scoped logs', async () => {
     render(<BackgroundMonitorApp origin="http://127.0.0.1:4873" />);
 
     expect(await screen.findByText('后台任务监控')).toBeInTheDocument();
     await waitFor(() => expect(monitorApi.read).toHaveBeenCalled());
     expect(monitorApi.configure).not.toHaveBeenCalled();
 
-    expect(screen.getByLabelText('运行健康')).toHaveTextContent('任务运行中');
-    expect(screen.getByLabelText('Worker')).toHaveTextContent('在线');
-    expect(screen.getByLabelText('队列')).toHaveTextContent('2');
-    expect(screen.getByLabelText('关注计数')).toHaveTextContent('2');
-    expect(screen.getByTestId('background-monitor-active-task')).toHaveTextContent('TASK-ACTIVE');
-    expect(screen.getByTestId('background-monitor-task-TASK-ACTIVE')).toBeInTheDocument();
-    expect(screen.getByTestId('background-monitor-task-TASK-FAILED')).toBeInTheDocument();
+    expect(screen.getByText(/^服务/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('1/2');
+    expect(screen.getByText(/^关注/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('2');
+    expect(screen.getByTestId('background-monitor-service-inspection')).toHaveTextContent('检测服务');
+    expect(screen.getByTestId('background-monitor-service-capture')).toHaveTextContent('采集服务');
+    expect(screen.getByTestId('background-monitor-service-detail')).toHaveTextContent('inspection');
+    expect(screen.getByTestId('background-monitor-runtime')).toHaveTextContent('只读观察');
+    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('worker heartbeat ok');
+    expect(screen.queryByText('capture process stopped')).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('任务状态过滤'), { target: { value: 'failed' } });
-    expect(screen.queryByTestId('background-monitor-task-TASK-ACTIVE')).not.toBeInTheDocument();
-    expect(screen.getByTestId('background-monitor-task-TASK-FAILED')).toBeInTheDocument();
-    expect(screen.getByText('算法进程退出码 1')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('background-monitor-service-capture'));
+    expect(screen.getByTestId('background-monitor-service-detail')).toHaveTextContent('capture');
+    expect(screen.getByTestId('background-monitor-service-detail')).toHaveTextContent('capture_process_not_running');
+    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('capture process stopped');
 
-    fireEvent.change(screen.getByLabelText('任务状态过滤'), { target: { value: 'all' } });
-    fireEvent.change(screen.getByLabelText('搜索后台任务'), { target: { value: 'PIPE-003' } });
-    expect(screen.queryByTestId('background-monitor-task-TASK-FAILED')).not.toBeInTheDocument();
-    expect(screen.getByTestId('background-monitor-task-TASK-BLOCKED')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /取消|重试/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '全部日志' }));
+    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('worker heartbeat ok');
+    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('capture process stopped');
+    expect(screen.queryByText('当前活动任务')).not.toBeInTheDocument();
+    expect(screen.queryByText('任务列表')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('后台监控摘要')).not.toBeInTheDocument();
   });
 
   it('refreshes from the native monitor, reacts to events, and hides to tray', async () => {
@@ -152,17 +244,16 @@ describe('BackgroundMonitorApp', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '刷新后台任务监控' }));
     await waitFor(() => expect(monitorApi.refresh).toHaveBeenCalled());
-    expect(await screen.findByText('后台服务与生产任务队列运行正常')).toBeInTheDocument();
-    expect(screen.getByLabelText('关注计数')).toHaveTextContent('0');
+    await waitFor(() => expect(screen.getByText(/^关注/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('0'));
 
     await act(async () => {
       monitorApi.emit(monitorApi.baseSnapshot);
     });
-    await waitFor(() => expect(screen.getByLabelText('关注计数')).toHaveTextContent('2'));
+    await waitFor(() => expect(screen.getByText(/^关注/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('2'));
 
     fireEvent.click(screen.getByRole('button', { name: '隐藏到托盘' }));
     expect(windowApi.hide).toHaveBeenCalledTimes(1);
-    expect(screen.getByText('独立服务器进程 · 只读监控')).toBeInTheDocument();
+    expect(screen.getByText(/独立服务器进程 · 能力协议 1 · 只读监控/)).toBeInTheDocument();
 
     unmount();
     expect(monitorApi.unlisten).toHaveBeenCalledTimes(1);
