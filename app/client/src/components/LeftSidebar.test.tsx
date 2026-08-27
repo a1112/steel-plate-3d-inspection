@@ -44,12 +44,14 @@ function SidebarHarness({
   large = false,
   selectedPlate = plate,
   activeRecordStatus = 'completed',
+  showDiameterSummary = false,
 }: {
   runtimeMode?: 'online' | 'bkv';
   onRecordSelect?: (recordId: string) => void;
   large?: boolean;
   selectedPlate?: SteelPlate;
   activeRecordStatus?: InspectionRecord['status'];
+  showDiameterSummary?: boolean;
 }) {
   const [filters, setFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
   const sourceRecords = large ? manyRecords : records;
@@ -77,6 +79,18 @@ function SidebarHarness({
       searchFilters={filters}
       filteredCount={filteredRecords.length}
       totalCount={sourceRecords.length}
+      diameterSummary={showDiameterSummary ? {
+        qualified: true,
+        validSectionCount: 28,
+        requestedSectionCount: 30,
+        fixedAngleCount: 6,
+        minimumDiameterMm: 76.669,
+        averageDiameterMm: 77.175,
+        maximumDiameterMm: 78.116,
+        maximumRoundnessMm: 1.709,
+        fitResidualP95MaximumMm: 0.618,
+        qualityNote: '无测速仪：横轴按软同步时间归一化，不输出伪长度',
+      } : null}
       onRecordSelect={onRecordSelect}
       onSearchChange={(patch) => setFilters((current) => ({ ...current, ...patch }))}
       onSearchReset={() => setFilters(emptyRecordSearchFilters)}
@@ -107,6 +121,29 @@ describe('LeftSidebar', () => {
     expect(screen.getByText('12749 mm')).toBeInTheDocument();
     expect(screen.getByText('12 mm')).toBeInTheDocument();
     expect(screen.queryByText(/691\\.629|12748\\.696|12\\.4/)).not.toBeInTheDocument();
+  });
+
+  it('shows the inspection serial number as its own record column', () => {
+    render(<SidebarHarness />);
+
+    expect(screen.getByRole('columnheader', { name: '流水号' })).toBeInTheDocument();
+    const row = screen.getByText('R-001').closest('tr');
+    expect(row).toHaveTextContent('19:00R-001202606131900检测中检测中');
+  });
+
+  it('places the current diameter summary above the record query title', () => {
+    render(<SidebarHarness showDiameterSummary />);
+
+    const diameterSummary = screen.getByRole('status', { name: '当前记录测径摘要' });
+    expect(diameterSummary.closest('.record-search-panel')).not.toBeNull();
+    const panelHeader = diameterSummary.closest('.record-search-panel')!.querySelector('.panel-header')!;
+    expect(diameterSummary.compareDocumentPosition(panelHeader) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(diameterSummary).toHaveTextContent('计量有效');
+    expect(diameterSummary).toHaveTextContent('28/30');
+    expect(diameterSummary).toHaveTextContent('76.669');
+    expect(diameterSummary).toHaveTextContent('77.175');
+    expect(diameterSummary).toHaveTextContent('78.116');
+    expect(diameterSummary).toHaveAttribute('title', expect.stringContaining('无测速仪'));
   });
 
   it('does not present missing dimensions as valid zero measurements', () => {

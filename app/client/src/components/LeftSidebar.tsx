@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom';
 import type { InspectionRecord, InspectionSummary, PlateInspection, SteelPlate } from '../data/inspection';
 import { fetchInspectionWorldMeta, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { emptyRecordSearchFilters, type RecordSearchFilters } from '../state/record-search';
+import type { DiameterMetricSummary } from './DiameterTrendPanel';
 import { Panel } from './Panel';
 
 type RecordSearchField = keyof RecordSearchFilters;
@@ -51,6 +52,10 @@ function formatWholeMillimetres(value: number | null | undefined) {
     : '待录入';
 }
 
+function formatDiameterMetric(value: number | null) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(3) : '--';
+}
+
 interface LeftSidebarProps {
   runtimeMode?: 'online' | 'bkv';
   plate: SteelPlate;
@@ -65,6 +70,7 @@ interface LeftSidebarProps {
   recordsRefreshing?: boolean;
   recordsSynchronizedAt?: number | null;
   showCacheStatus?: boolean;
+  diameterSummary?: DiameterMetricSummary | null;
   onRecordSelect: (recordId: string) => void;
   onRecordsRefresh?: () => void;
   onSearchChange: (patch: Partial<RecordSearchFilters>) => void;
@@ -117,6 +123,7 @@ export function LeftSidebar({
   recordsRefreshing = false,
   recordsSynchronizedAt = null,
   showCacheStatus,
+  diameterSummary = null,
   onRecordSelect,
   onRecordsRefresh,
   onSearchChange,
@@ -247,6 +254,25 @@ export function LeftSidebar({
       <Panel
         title="记录查询"
         className="record-search-panel"
+        beforeHeader={diameterSummary ? (
+          <div
+            className="record-diameter-summary"
+            role="status"
+            aria-label="当前记录测径摘要"
+            title={diameterSummary.qualityNote}
+          >
+            <span className={diameterSummary.qualified ? 'valid' : 'preview'}>
+              {diameterSummary.qualified ? '计量有效' : '趋势预览'}
+            </span>
+            <dl><dt>有效截面</dt><dd>{diameterSummary.validSectionCount}/{diameterSummary.requestedSectionCount}</dd></dl>
+            <dl><dt>固定角度</dt><dd>{diameterSummary.fixedAngleCount || '--'}{diameterSummary.fixedAngleCount ? '条' : ''}</dd></dl>
+            <dl><dt>最小外径</dt><dd>{formatDiameterMetric(diameterSummary.minimumDiameterMm)}</dd></dl>
+            <dl><dt>平均外径</dt><dd>{formatDiameterMetric(diameterSummary.averageDiameterMm)}</dd></dl>
+            <dl><dt>最大外径</dt><dd>{formatDiameterMetric(diameterSummary.maximumDiameterMm)}</dd></dl>
+            <dl><dt>最大圆度</dt><dd>{formatDiameterMetric(diameterSummary.maximumRoundnessMm)}</dd></dl>
+            <dl><dt>拟合 P95</dt><dd>{formatDiameterMetric(diameterSummary.fitResidualP95MaximumMm)}</dd></dl>
+          </div>
+        ) : null}
         action={
           <select
             className="record-search-field-select"
@@ -323,6 +349,7 @@ export function LeftSidebar({
             <thead>
               <tr>
                 <th>时间</th>
+                <th>流水号</th>
                 <th>钢管号</th>
                 <th>状态</th>
                 <th>缺陷数</th>
@@ -344,6 +371,7 @@ export function LeftSidebar({
                     onBlur={() => setHoveredRecord(null)}
                   >
                     <td>{record.time}</td>
+                    <td title={record.id}>{record.id}</td>
                     <td>{record.plateNo}</td>
                     <td className={record.status === 'detecting' ? 'detecting' : 'completed'}>
                       {record.status === 'detecting' ? '检测中' : runtimeMode === 'bkv' ? '旧记录' : '已完成'}
@@ -353,12 +381,12 @@ export function LeftSidebar({
                 ))
               ) : (
                 <tr className="records-empty-row">
-                  <td colSpan={4}>无匹配记录</td>
+                  <td colSpan={5}>无匹配记录</td>
                 </tr>
               )}
               {visibleRecords.length < records.length ? (
                 <tr className="records-load-more-row">
-                  <td colSpan={4}>
+                  <td colSpan={5}>
                     <button
                       type="button"
                       aria-label="加载更多检测记录"

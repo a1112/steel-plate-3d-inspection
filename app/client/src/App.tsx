@@ -84,6 +84,7 @@ import { createSequentialCameraLanes } from './lib/camera-display';
 import { BrandHeader, type BkvDataHealth } from './components/BrandHeader';
 import { AppFooter } from './components/AppFooter';
 import { AlarmAnalysis, type AnalysisViewMode } from './components/AlarmAnalysis';
+import { buildDiameterMetricSummary } from './components/DiameterTrendPanel';
 import { AlarmCenter } from './components/AlarmCenter';
 import { DefectDetectionList } from './components/DefectDetectionList';
 import { DefectImagePanel } from './components/DefectImagePanel';
@@ -1513,6 +1514,12 @@ function InspectionDashboard({
   }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeRecordStatus, activeSnapshot.currentPlate.plateNo, artifactMode, dashboardMode.kind, plateMapViewMode, snapshotTracking, terminalMode]);
 
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
+  const activeDiameterSummary = useMemo(
+    () => recordBoundSurface.inspectionId === activeInspection?.inspectionId
+      ? buildDiameterMetricSummary(recordBoundSurface.measurement)
+      : null,
+    [activeInspection?.inspectionId, recordBoundSurface.inspectionId, recordBoundSurface.measurement],
+  );
   const currentPlateDefects = useMemo(
     () => applyInspectionSettingsToDefects(activeSnapshot.defects, savedSettings),
     [activeSnapshot.defects, savedSettings],
@@ -1781,6 +1788,14 @@ function InspectionDashboard({
     }
   };
 
+  const refreshConnection = () => {
+    saveLocalConnectionConfig({
+      ...connectionDraft,
+      host: connectionDraft.host.trim(),
+    });
+    window.location.reload();
+  };
+
   const discoverConnections = async () => {
     setConnectionDiscoveryBusy(true);
     setConnectionDiscoveryStatus('正在扫描当前局域网服务');
@@ -1939,6 +1954,7 @@ function InspectionDashboard({
             recordsRefreshing={recordsRefreshing}
             recordsSynchronizedAt={recordsSynchronizedAt}
             showCacheStatus={dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online'}
+            diameterSummary={activeDiameterSummary}
             onRecordSelect={selectRecordById}
             onRecordsRefresh={onRecordsRefresh}
             onSearchChange={updateRecordSearchFilters}
@@ -2264,6 +2280,7 @@ function InspectionDashboard({
                 }
               }}
               onConnectionChange={updateConnectionDraft}
+              onConnectionRefresh={refreshConnection}
               onConnectionSave={() => void saveConnection()}
               onConnectionDiscover={() => void discoverConnections()}
               onConnectionAutoSet={applyDiscoveredConnection}

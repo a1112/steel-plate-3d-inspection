@@ -105,10 +105,11 @@ describe('AlarmAnalysis', () => {
       viewMode: 'overview',
     }));
 
-    expect(screen.getByRole('heading', { name: '测径（外径）曲线' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '测径（外径）曲线' })).not.toBeInTheDocument();
     expect(screen.getByRole('img', { name: '测径（外径）曲线，按钢管长度位置变化' })).toBeInTheDocument();
-    expect(screen.getByText('名义外径 200.000 mm')).toBeInTheDocument();
+    expect(container.querySelector('.diameter-curve-card > footer')).toBeNull();
     expect(container.querySelector('.diameter-only-analysis')).not.toBeNull();
+    expect(container.querySelector('.diameter-analysis-panel > .panel-body')).toHaveStyle({ padding: '0px' });
     expect(container.querySelector('.analysis-grid')).toBeNull();
     expect(screen.queryByRole('heading', { name: '灰度图' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: '点云图' })).not.toBeInTheDocument();
@@ -139,8 +140,8 @@ describe('AlarmAnalysis', () => {
 
     expect(screen.getByTestId('diameter-trend-grid')).toHaveAttribute('data-measurement-source', 'measurement-artifact');
     expect(screen.getByTestId('diameter-trend-grid')).toHaveAttribute('data-x-axis-mode', 'head-relative');
-    expect(screen.getByText('2 / 3')).toBeInTheDocument();
-    expect(screen.getByText('无测速仪：横轴按软同步时间归一化，不输出伪长度')).toBeInTheDocument();
+    expect(screen.queryByText('2 / 3')).not.toBeInTheDocument();
+    expect(document.querySelectorAll('.diameter-sample-hit title')).toHaveLength(2);
   });
 
   it('fully collapses the lower measurement area', () => {

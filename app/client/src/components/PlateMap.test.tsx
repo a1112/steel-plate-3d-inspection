@@ -308,9 +308,7 @@ describe('online inspection world compatibility', () => {
     expect(viewport).toHaveAttribute('data-prefetch-image-count', '24');
     expect(viewport).toHaveAttribute('data-head-aligned', 'true');
     expect(viewport).toHaveAttribute('data-head-display-padding-applied', 'true');
-    expect(screen.getByTestId('head-alignment-summary')).toHaveTextContent(
-      '头部已对齐参考 C1 · 最大补偿 2.00 帧',
-    );
+    expect(screen.queryByTestId('head-alignment-summary')).not.toBeInTheDocument();
     const c1First = document.querySelector('.bar-camera-frame[data-camera-id="C1"][data-frame-sequence="1"]');
     const c2First = document.querySelector('.bar-camera-frame[data-camera-id="C2"][data-frame-sequence="1"]');
     expect(c1First).toHaveStyle({ left: '0px' });
@@ -334,11 +332,86 @@ describe('online inspection world compatibility', () => {
       '2747',
       ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'],
     );
+    Object.defineProperties(viewport, {
+      clientWidth: { configurable: true, value: 600 },
+      scrollWidth: { configurable: true, value: 2400 },
+      scrollLeft: { configurable: true, value: 600, writable: true },
+    });
+    const dragPointerDown = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.defineProperties(dragPointerDown, {
+      button: { value: 0 },
+      clientX: { value: 500 },
+      clientY: { value: 200 },
+      pointerId: { value: 41 },
+    });
+    fireEvent(viewport, dragPointerDown);
+    expect(viewport).toHaveClass('is-dragging');
+    const dragPointerMove = new Event('pointermove', { bubbles: true, cancelable: true });
+    Object.defineProperties(dragPointerMove, {
+      clientX: { value: 350 },
+      clientY: { value: 200 },
+      pointerId: { value: 41 },
+    });
+    fireEvent(viewport, dragPointerMove);
+    expect(viewport.scrollLeft).toBe(750);
+    const dragPointerUp = new Event('pointerup', { bubbles: true, cancelable: true });
+    Object.defineProperties(dragPointerUp, {
+      clientX: { value: 350 },
+      clientY: { value: 200 },
+      pointerId: { value: 41 },
+    });
+    fireEvent(viewport, dragPointerUp);
+    expect(viewport).not.toHaveClass('is-dragging');
     fireEvent.click(screen.getByRole('button', { name: '纵向' }));
     expect(viewport).toHaveAttribute('data-scroll-axis', 'y');
     expect(scrollbar).toHaveAttribute('aria-orientation', 'vertical');
     expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
+  });
+
+  it('marks a frame ROI with a rectangle and repeats the defect on the distance ruler', async () => {
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('4034', 3));
+    const onSelectDefect = vi.fn();
+    const frameDefect: DefectItem = {
+      ...defects[0],
+      id: 'SICK-4034-C2-000001',
+      plateNo: '4034',
+      cameraId: 'C2',
+      cameraIndex: 2,
+      distanceHeadMm: 3_000,
+      artifacts: {
+        schema: 'steel.surface.defect.artifacts.v1',
+        cameraId: 'C2',
+        frameId: '2',
+        sequenceNo: 2,
+        roi: { x: 200, y: 100, width: 50, height: 120 },
+      },
+    };
+
+    render(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        inspectionId="INSP-4034"
+        captureMaterialId="4034"
+        cameraLanes={createSequentialCameraLanes(6)}
+        defects={[frameDefect]}
+        defectTypes={defectTypes}
+        defectTypeCounts={{ pit: 1 }}
+        selectedDefectId={frameDefect.id}
+        onSelectDefect={onSelectDefect}
+      />,
+    );
+
+    const frameMarker = await screen.findByRole('button', { name: /凹坑矩形标记，C2 文件序号 2/ });
+    expect(frameMarker).toHaveClass('selected');
+    expect(frameMarker).toHaveStyle({ left: '9.765625%', width: '11.71875%' });
+    const rulerMarker = screen.getByRole('button', { name: '凹坑位置，距头3000毫米' });
+    expect(rulerMarker).toHaveClass('selected');
+    fireEvent.click(frameMarker);
+    fireEvent.click(rulerMarker);
+    expect(onSelectDefect).toHaveBeenNthCalledWith(1, frameDefect.id);
+    expect(onSelectDefect).toHaveBeenNthCalledWith(2, frameDefect.id);
   });
 
   it('does not show record-bound raw PNGs while rebuilding stitch cache and upgrades when history appears', async () => {
@@ -1248,7 +1321,7 @@ describe('PlateMap', () => {
       '4033',
       expect.any(Array),
     ));
-    fireEvent.click(screen.getByRole('button', { name: '逐帧 JET' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Jet' }));
     expect(screen.getByTestId('surface-jet-unfolded')).toHaveAttribute('data-image-source', 'per-frame-two-level-jet');
     expect(screen.getByTestId('capture-stitch-viewport')).toHaveAttribute(
       'data-head-display-padding-applied',

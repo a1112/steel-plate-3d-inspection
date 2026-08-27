@@ -24,6 +24,19 @@ export type DiameterCurveLine = {
   samples: DiameterMeasurement[];
 };
 
+export type DiameterMetricSummary = {
+  qualified: boolean;
+  validSectionCount: number;
+  requestedSectionCount: number;
+  fixedAngleCount: number;
+  minimumDiameterMm: number | null;
+  averageDiameterMm: number | null;
+  maximumDiameterMm: number | null;
+  maximumRoundnessMm: number | null;
+  fitResidualP95MaximumMm: number | null;
+  qualityNote: string;
+};
+
 const FIXED_ANGLE_COLORS = ['#00d8ff', '#8bda55', '#ffd166', '#ff8c42', '#ef5da8', '#9d8cff'];
 
 export function buildDiameterMeasurements(mesh: BarSurfaceMesh, nominalDiameterMm: number, lengthMm: number) {
@@ -191,6 +204,46 @@ const qualityReasonLabels: Record<string, string> = {
   'not-enough-valid-sections': '有效测径截面不足',
 };
 
+function finiteOrNull(...values: Array<number | null | undefined>) {
+  const value = values.find((candidate) => typeof candidate === 'number' && Number.isFinite(candidate));
+  return value ?? null;
+}
+
+export function buildDiameterMetricSummary(artifact?: CaptureFlowMeasurement | null): DiameterMetricSummary | null {
+  const surface = artifact?.surfaceFit;
+  if (!surface?.available) return null;
+  const curveSummary = surface.diameterCurves?.summary;
+  const sectionDiameters = (surface.sections ?? []).flatMap((section) => {
+    const value = Number(section.circleFit?.diameterMm);
+    return section.metricValid !== false && Number.isFinite(value) ? [value] : [];
+  });
+  const sectionMinimum = sectionDiameters.length ? Math.min(...sectionDiameters) : null;
+  const sectionMaximum = sectionDiameters.length ? Math.max(...sectionDiameters) : null;
+  const sectionAverage = sectionDiameters.length
+    ? sectionDiameters.reduce((sum, value) => sum + value, 0) / sectionDiameters.length
+    : null;
+  const qualified = Boolean(surface.metricValid && curveSummary?.metricValid !== false);
+  const qualityNote = !qualified
+    ? '未通过整卷计量质量门，曲线仅用于趋势查看'
+    : surface.absoluteLongitudinalScaleVerified
+      ? '编码器长度坐标已验证'
+      : '无测速仪：横轴按软同步时间归一化，不输出伪长度';
+  return {
+    qualified,
+    validSectionCount: curveSummary?.validSectionCount ?? surface.sectionsAccepted ?? sectionDiameters.length,
+    requestedSectionCount: surface.sectionsRequested ?? sectionDiameters.length,
+    fixedAngleCount: surface.diameterCurves?.series?.filter((series) => series.kind === 'fixed-angle').length
+      ?? surface.diameterCurves?.fixedAnglesDeg?.length
+      ?? 0,
+    minimumDiameterMm: finiteOrNull(curveSummary?.minimumMm, surface.diameterMinimumMm, sectionMinimum),
+    averageDiameterMm: finiteOrNull(curveSummary?.averageMm, surface.diameterMeanMm, sectionAverage),
+    maximumDiameterMm: finiteOrNull(curveSummary?.maximumMm, surface.diameterMaximumMm, sectionMaximum),
+    maximumRoundnessMm: finiteOrNull(surface.roundnessMaximumMm),
+    fitResidualP95MaximumMm: finiteOrNull(surface.fitResidualP95MaximumMm),
+    qualityNote,
+  };
+}
+
 function DiameterCurve({ lines, nominalDiameterMm, axisMode, axisStart, axisEnd }: {
   lines: DiameterCurveLine[];
   nominalDiameterMm: number;
@@ -249,23 +302,21 @@ function DiameterCurve({ lines, nominalDiameterMm, axisMode, axisStart, axisEnd 
           style={{ '--diameter-series-color': line.color } as CSSProperties}
           vectorEffect="non-scaling-stroke"
         />)}
-        {lines.filter((line) => line.kind === 'average' || line.kind === 'legacy').flatMap((line) => line.samples.map((sample) => <circle key={`${line.id}:${sample.row}:${sample.positionRatio}`} cx={x(sample)} cy={y(sample.diameterMm)} r="3.2" className="diameter-sample-point" vectorEffect="non-scaling-stroke">
+        {lines.flatMap((line) => line.samples.map((sample) => <circle
+          key={`${line.id}:${sample.row}:${sample.positionRatio}`}
+          cx={x(sample)}
+          cy={y(sample.diameterMm)}
+          r="7"
+          className="diameter-sample-hit"
+          style={{ '--diameter-series-color': line.color } as CSSProperties}
+          vectorEffect="non-scaling-stroke"
+        >
           <title>{`${line.label} · ${axisMode === 'length-mm' ? `${format(sample.positionMm, 0)} mm` : `${format(sample.positionRatio * 100, 1)}% / ${format(sample.elapsedFromHeadMs, 0)} ms`}：外径 ${format(sample.diameterMm)} mm，圆度 ${format(sample.roundnessMm)} mm，P95残差 ${format(sample.fitResidualP95Mm)} mm`}</title>
         </circle>))}
         <text x={left} y={height - 13}>{axisMode === 'length-mm' ? `${format(axisStart, 0)} mm` : `${format(axisStart, 1)}%`}</text>
         <text x={width - right} y={height - 13} textAnchor="end">{axisMode === 'length-mm' ? `${format(axisEnd, 0)} mm` : `${format(axisEnd, 1)}%`}</text>
         <text x={width / 2} y={height - 8} textAnchor="middle" className="diameter-axis-title">{axisMode === 'length-mm' ? '距头部长度' : '头部相对位置（无测速仪）'}</text>
       </svg>
-      {lines.length > 1 ? <div className="diameter-series-legend" aria-label="固定角度测径曲线图例">
-        {lines.map((line) => <span key={line.id} className={`kind-${line.kind}`}><i style={{ '--diameter-series-color': line.color } as CSSProperties} />{line.label}</span>)}
-      </div> : null}
-      <footer>
-        <span>{showNominal ? `名义外径 ${format(nominalDiameterMm)} mm` : '名义外径未配置'}</span>
-        <span>最小 {format(dataMinimum)} mm</span>
-        <span>平均 {format(dataMean)} mm</span>
-        <span>最大 {format(dataMaximum)} mm</span>
-        <strong>极差 {format(dataMaximum - dataMinimum)} mm</strong>
-      </footer>
     </section>
   );
 }
@@ -338,27 +389,9 @@ export function DiameterTrendPanel({ mesh, artifact, nominalDiameterMm, lengthMm
     </div>;
   }
 
-  const diameters = allSamples.map((sample) => sample.diameterMm);
-  const curveSummary = surface?.diameterCurves?.summary;
-  const minimumDiameter = curveSummary?.minimumMm ?? surface?.diameterMinimumMm ?? Math.min(...diameters);
-  const maximumDiameter = curveSummary?.maximumMm ?? surface?.diameterMaximumMm ?? Math.max(...diameters);
-  const averageDiameter = curveSummary?.averageMm ?? surface?.diameterMeanMm ?? diameters.reduce((sum, value) => sum + value, 0) / diameters.length;
-  const roundnessMaximum = Math.max(...allSamples.map((sample) => sample.roundnessMm));
-  const residualMaximum = Math.max(...allSamples.map((sample) => sample.fitResidualP95Mm));
-  const measurementQualified = Boolean(surface?.metricValid && curveSummary?.metricValid !== false);
+  const measurementQualified = buildDiameterMetricSummary(artifact)?.qualified ?? false;
   return (
     <div className="diameter-trend-grid" data-testid="diameter-trend-grid" data-measurement-unit="mm" data-measurement-source={artifact ? 'measurement-artifact' : 'surface-fallback'} data-measurement-valid={measurementQualified ? 'true' : 'false'} data-curve-model={directionalContract ? 'fixed-angle-reconstructed-surface' : 'circle-fit-legacy'} data-fixed-angle-series={directionalLines.filter((line) => line.kind === 'fixed-angle').length} data-section-count={allSamples.length} data-visible-section-count={samples.length} data-x-axis-scope={normalizedRange ? 'visible' : 'global'} data-x-axis-mode={axisMode} data-x-axis-start-ratio={rangeStartRatio.toFixed(4)} data-x-axis-end-ratio={rangeEndRatio.toFixed(4)} data-x-axis-start-mm={(rangeStartRatio * lengthMm).toFixed(0)} data-x-axis-end-mm={(rangeEndRatio * lengthMm).toFixed(0)}>
-      <div className="diameter-metric-summary">
-        <span className={measurementQualified ? 'valid' : 'preview'}>{measurementQualified ? '计量有效' : '趋势预览'}</span>
-        <dl><dt>有效截面</dt><dd>{curveSummary?.validSectionCount ?? surface?.sectionsAccepted ?? allSamples.length} / {surface?.sectionsRequested ?? allSamples.length}</dd></dl>
-        {directionalContract ? <dl><dt>固定角度</dt><dd>{directionalLines.filter((line) => line.kind === 'fixed-angle').length} 条</dd></dl> : null}
-        <dl><dt>最小外径</dt><dd>{format(minimumDiameter)} mm</dd></dl>
-        <dl><dt>平均外径</dt><dd>{format(averageDiameter)} mm</dd></dl>
-        <dl><dt>最大外径</dt><dd>{format(maximumDiameter)} mm</dd></dl>
-        <dl><dt>最大圆度</dt><dd>{format(surface?.roundnessMaximumMm ?? roundnessMaximum)} mm</dd></dl>
-        <dl><dt>拟合 P95</dt><dd>{format(surface?.fitResidualP95MaximumMm ?? residualMaximum)} mm</dd></dl>
-        <em>{!measurementQualified ? '未通过整卷计量质量门，曲线仅用于趋势查看' : axisMode === 'head-relative' ? '无测速仪：横轴按软同步时间归一化，不输出伪长度' : '编码器长度坐标已验证'}</em>
-      </div>
       <DiameterCurve lines={visibleLines} nominalDiameterMm={nominalDiameterMm} axisMode={axisMode} axisStart={axisStart} axisEnd={axisEnd} />
     </div>
   );

@@ -3,7 +3,7 @@ import { createElement } from 'react';
 import { describe, expect, it } from 'vitest';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import type { CaptureFlowMeasurement } from '../lib/capture-api';
-import { buildArtifactDiameterMeasurements, buildDiameterMeasurements, buildDirectionalDiameterLines, DiameterTrendPanel } from './DiameterTrendPanel';
+import { buildArtifactDiameterMeasurements, buildDiameterMeasurements, buildDiameterMetricSummary, buildDirectionalDiameterLines, DiameterTrendPanel } from './DiameterTrendPanel';
 
 function mesh(): BarSurfaceMesh {
   return {
@@ -62,7 +62,9 @@ describe('buildDiameterMeasurements', () => {
     expect(screen.getAllByRole('img')).toHaveLength(1);
     expect(screen.getByRole('img', { name: '测径（外径）曲线，按钢管长度位置变化' })).toBeInTheDocument();
     expect(container.querySelector('.diameter-curve-card > header')).toBeNull();
-    expect(container.querySelector('.diameter-curve-card > footer')).toHaveTextContent('名义外径 200.000 mm');
+    expect(container.querySelector('.diameter-trend-header')).toBeNull();
+    expect(container.querySelector('.diameter-curve-card > footer')).toBeNull();
+    expect(container.querySelectorAll('.diameter-sample-hit title')).toHaveLength(2);
     expect(screen.queryByText('外径偏差变化')).not.toBeInTheDocument();
     expect(screen.queryByText('圆度误差变化')).not.toBeInTheDocument();
   });
@@ -131,16 +133,24 @@ describe('buildDiameterMeasurements', () => {
     };
     expect(buildArtifactDiameterMeasurements(artifact, 45, 12_000)).toHaveLength(2);
     expect(buildDirectionalDiameterLines(artifact, 45, 12_000)).toHaveLength(5);
+    expect(buildDiameterMetricSummary(artifact)).toMatchObject({
+      qualified: true,
+      validSectionCount: 2,
+      requestedSectionCount: 3,
+      fixedAngleCount: 2,
+      minimumDiameterMm: 45,
+      averageDiameterMm: 45.15,
+      maximumDiameterMm: 45.3,
+    });
     render(createElement(DiameterTrendPanel, { artifact, nominalDiameterMm: 45, lengthMm: 12_000 }));
     const grid = screen.getByTestId('diameter-trend-grid');
     expect(grid).toHaveAttribute('data-measurement-source', 'measurement-artifact');
     expect(grid).toHaveAttribute('data-curve-model', 'fixed-angle-reconstructed-surface');
     expect(grid).toHaveAttribute('data-fixed-angle-series', '2');
     expect(grid).toHaveAttribute('data-x-axis-mode', 'head-relative');
-    expect(screen.getByText(/无测速仪：横轴按软同步时间归一化/)).toBeInTheDocument();
-    expect(screen.getByText('2 / 3')).toBeInTheDocument();
-    expect(screen.getByLabelText('固定角度测径曲线图例')).toHaveTextContent('0°90°最小最大平均');
-    expect(screen.getByText('45.150 mm')).toBeInTheDocument();
+    expect(screen.queryByText('2 / 3')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('固定角度测径曲线图例')).not.toBeInTheDocument();
+    expect(document.querySelectorAll('.diameter-sample-hit title').length).toBeGreaterThan(0);
   });
 
   it('renders an explicitly unqualified trend without marking it as valid measurement', () => {
@@ -180,9 +190,9 @@ describe('buildDiameterMeasurements', () => {
     };
 
     expect(buildDirectionalDiameterLines(artifact, 45, 12_000)).toHaveLength(2);
+    expect(buildDiameterMetricSummary(artifact)).toMatchObject({ qualified: false, qualityNote: '未通过整卷计量质量门，曲线仅用于趋势查看' });
     render(createElement(DiameterTrendPanel, { artifact, nominalDiameterMm: 45, lengthMm: 12_000 }));
     expect(screen.getByTestId('diameter-trend-grid')).toHaveAttribute('data-measurement-valid', 'false');
-    expect(screen.getByText('趋势预览')).toBeInTheDocument();
-    expect(screen.getByText('未通过整卷计量质量门，曲线仅用于趋势查看')).toBeInTheDocument();
+    expect(screen.queryByText('趋势预览')).not.toBeInTheDocument();
   });
 });
