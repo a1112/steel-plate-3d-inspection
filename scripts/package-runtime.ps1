@@ -1043,6 +1043,7 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\qt-to-tauri-migration.md") -De
 Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\release-deployment-and-operations.md") -Destination $DocsOut -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\production-readiness-gap-and-closure-design.md") -Destination $DocsOut -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\atomic-upgrade-and-database-migration-design.md") -Destination $DocsOut -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot "docs\10.50.111.141-server-continuation.md") -Destination $DocsOut -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\README.md") -Destination $ScriptsOut -Force
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\run-client-static.ps1") $OutRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-capture-api.ps1") $OutRoot
@@ -1071,6 +1072,7 @@ Copy-RequiredFile (Join-Path $RepoRoot "scripts\install-runtime-service.ps1") $O
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\uninstall-runtime-service.ps1") $OutRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-runtime-ui-smoke.ps1") $OutRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-hardware-acceptance.ps1") $OutRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-sick-server-continuation.ps1") $OutRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-calibration-acceptance.ps1") $OutRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-calibration-crash-recovery.ps1") $OutRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-calibration-integrity-generation.ps1") $OutRoot
@@ -1936,6 +1938,7 @@ $Manifest = [ordered]@{
     uninstallRuntimeService = "uninstall-runtime-service.ps1"
     runtimeUiSmokeTest = "test-runtime-ui-smoke.ps1"
     realHardwareAcceptanceTest = "test-real-hardware-acceptance.ps1"
+    sickServerContinuationTest = "test-sick-server-continuation.ps1"
     realCalibrationAcceptanceTest = "test-real-calibration-acceptance.ps1"
     realCalibrationCrashRecoveryTest = "test-real-calibration-crash-recovery.ps1"
     realCalibrationIntegrityGenerationTest = "test-real-calibration-integrity-generation.ps1"

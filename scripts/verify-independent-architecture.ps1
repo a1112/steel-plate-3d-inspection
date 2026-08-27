@@ -1051,6 +1051,7 @@ function Test-PackagedRuntimeContract {
     "scripts.uninstallRuntimeService" = $Manifest.scripts.uninstallRuntimeService
     "scripts.runtimeUiSmokeTest" = $Manifest.scripts.runtimeUiSmokeTest
     "scripts.realHardwareAcceptanceTest" = $Manifest.scripts.realHardwareAcceptanceTest
+    "scripts.sickServerContinuationTest" = $Manifest.scripts.sickServerContinuationTest
     "scripts.realCalibrationAcceptanceTest" = $Manifest.scripts.realCalibrationAcceptanceTest
     "scripts.realCalibrationCrashRecoveryTest" = $Manifest.scripts.realCalibrationCrashRecoveryTest
     "scripts.realCalibrationIntegrityGenerationTest" = $Manifest.scripts.realCalibrationIntegrityGenerationTest

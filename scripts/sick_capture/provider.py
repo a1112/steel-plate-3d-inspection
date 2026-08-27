@@ -737,6 +737,12 @@ class ProviderRuntime:
             camera.key: deque(maxlen=120) for camera in profile.enabled_cameras
         }
         self.state_lock = threading.RLock()
+        self.connection_lock = threading.Lock()
+        self.connection_in_progress = False
+        self.connection_attempt_count = 0
+        self.last_connection_attempt_at = ""
+        self.last_connection_completed_at = ""
+        self.last_connection_code: int | None = None
         self.acquisition_stop = threading.Event()
         self.acquisition_thread: threading.Thread | None = None
         self.continuous_round = 0
@@ -1034,27 +1040,94 @@ class ProviderRuntime:
                 return camera
         return None
 
-    def connect_all(self) -> dict[str, Any]:
+    def _connection_status_json(self) -> dict[str, Any]:
+        with self.state_lock:
+            unconnected_cameras = [
+                {
+                    "cameraKey": camera.key,
+                    "ip": camera.ip,
+                    "serialNumber": camera.serial_number,
+                    "error": self.session_errors.get(camera.key, ""),
+                }
+                for camera in self.profile.enabled_cameras
+                if camera.key not in self.sessions
+            ]
+            failed_cameras = [
+                camera
+                for camera in unconnected_cameras
+                if camera["error"]
+            ]
+            return {
+                "schema": "steel.sick-camera-connection.v1",
+                "historyOnly": self.history_only,
+                "inProgress": self.connection_in_progress,
+                "attemptCount": self.connection_attempt_count,
+                "lastAttemptAt": self.last_connection_attempt_at or None,
+                "lastCompletedAt": self.last_connection_completed_at or None,
+                "lastCode": self.last_connection_code,
+                "expectedCameras": self.profile.expected_cameras,
+                "connectedCameras": len(self.sessions),
+                "unconnectedCameras": unconnected_cameras,
+                "failedCameras": failed_cameras,
+            }
+
+    def connect_all(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        try:
+            expected = _integer(
+                payload,
+                "expectedCameras",
+                self.profile.expected_cameras,
+                1,
+                24,
+            )
+        except ValueError as error:
+            return {
+                "code": 422,
+                "error": "invalid_expected_camera_count",
+                "message": str(error),
+                **self._connection_status_json(),
+            }
+        if expected != self.profile.expected_cameras:
+            return {
+                "code": 409,
+                "error": "expected_camera_count_mismatch",
+                "requestedCameras": expected,
+                **self._connection_status_json(),
+            }
         if self.history_only:
             return {
                 "code": 409,
                 "error": "history_only",
-                "expectedCameras": self.profile.expected_cameras,
-                "connectedCameras": 0,
                 "cameras": [self._camera_row(camera) for camera in self.profile.enabled_cameras],
+                **self._connection_status_json(),
             }
-        results = []
+        if not self.connection_lock.acquire(blocking=False):
+            return {
+                "code": 409,
+                "error": "camera_connection_in_progress",
+                **self._connection_status_json(),
+            }
+
         with self.state_lock:
+            self.connection_in_progress = True
+            self.connection_attempt_count += 1
+            self.last_connection_attempt_at = _utc_text()
+        try:
+            results = []
             for camera in self.profile.enabled_cameras:
-                if camera.key in self.sessions:
+                with self.state_lock:
+                    connected_session = self.sessions.get(camera.key)
+                if connected_session is not None:
                     results.append(self._camera_row(camera))
                     continue
                 session = None
                 try:
                     session = self.backend.connect(camera)
                     session.start()
-                    self.sessions[camera.key] = session
-                    self.session_errors.pop(camera.key, None)
+                    with self.state_lock:
+                        self.sessions[camera.key] = session
+                        self.session_errors.pop(camera.key, None)
                     self._log(
                         "info",
                         "SICK camera connected",
@@ -1067,8 +1140,8 @@ class ProviderRuntime:
                             session.close()
                         except Exception:
                             pass
-                    self.session_errors[camera.key] = str(error)
-                    self.last_error = str(error)
+                    with self.state_lock:
+                        self.session_errors[camera.key] = str(error)
                     self._log(
                         "error",
                         "SICK camera connection failed",
@@ -1077,13 +1150,36 @@ class ProviderRuntime:
                         error=str(error),
                     )
                 results.append(self._camera_row(camera))
-        connected = len(self.sessions)
-        return {
-            "code": 0 if connected == self.profile.expected_cameras else 49110,
-            "expectedCameras": self.profile.expected_cameras,
-            "connectedCameras": connected,
-            "cameras": results,
-        }
+            with self.state_lock:
+                connected = len(self.sessions)
+                code = 0 if connected == self.profile.expected_cameras else 49110
+                self.last_connection_code = code
+                if code == 0:
+                    self.last_error = ""
+                else:
+                    failures = [
+                        f"{camera.key}: {self.session_errors.get(camera.key, 'not connected')}"
+                        for camera in self.profile.enabled_cameras
+                        if camera.key not in self.sessions
+                    ]
+                    self.last_error = "; ".join(failures)
+                self.connection_in_progress = False
+                self.last_connection_completed_at = _utc_text()
+            return {
+                "code": code,
+                "cameras": results,
+                **self._connection_status_json(),
+            }
+        except Exception as error:
+            with self.state_lock:
+                self.last_connection_code = 500
+                self.last_error = f"camera connection attempt failed: {error}"
+            raise
+        finally:
+            with self.state_lock:
+                self.connection_in_progress = False
+                self.last_connection_completed_at = _utc_text()
+            self.connection_lock.release()
 
     def disconnect(self, identity: str = "", *, force: bool = False) -> dict[str, Any]:
         if self.capture_lock.locked() and not force:
@@ -3078,6 +3174,7 @@ class ProviderRuntime:
         boundary_phase: str,
         require_steel_signal: bool = False,
         force: bool = False,
+        save_generation: int | None = None,
         production_event_id: str | None = None,
     ) -> bool:
         received_count = sum(bool(row.get("frameReceived")) for row in rows)
@@ -3107,6 +3204,22 @@ class ProviderRuntime:
                 self.storage_queue_backpressure_seconds += time.monotonic() - wait_started
             if not self.storage_queue_accepting or self.acquisition_stop.is_set():
                 return False
+            if save_generation is not None:
+                # Validate the production arm while the queue admission lock
+                # is held. This closes the narrow race where steel-out lands
+                # after a frame's post-fetch check but before this round is
+                # counted as pending. If admission wins first, steel-out can
+                # observe and drain the queued round; if steel-out wins, this
+                # stale generation is rejected before any write is scheduled.
+                with self.state_lock:
+                    still_armed = (
+                        self.save_enabled
+                        and self.save_generation == save_generation
+                        and self.active_material_id == material_id
+                        and self.active_session_id == session_id
+                    )
+                if not still_armed:
+                    return False
             self.storage_queue_pending_rounds += 1
             self.storage_queue_pending_by_material[material_id] = (
                 self.storage_queue_pending_by_material.get(material_id, 0) + 1
@@ -3485,6 +3598,7 @@ class ProviderRuntime:
             "framesReceived": self.frames_received,
             "framesCommitted": self.frames_committed,
             "framesFailed": self.frames_failed,
+            "cameraConnection": self._connection_status_json(),
             "databaseCommit": {
                 "schema": "steel.capture-database-commit.v1",
                 "capacityRounds": self.database_commit_capacity_rounds,
@@ -4983,6 +5097,7 @@ class ProviderRuntime:
                                 # per camera created unequal six-camera frame
                                 # sets whenever one valid view was darker.
                                 require_steel_signal=False,
+                                save_generation=save_generation,
                             )
                     self._evaluate_grayscale_steel(results)
                     with self.state_lock:
@@ -6675,11 +6790,25 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"code": 400, "error": str(error)})
             return
         if path in {"/api/cameras/connect-all", "/api/camera/connect-all"}:
-            result = self.runtime.connect_all()
-            self._send_json(200 if result["code"] == 0 else 503, result)
+            result = self.runtime.connect_all(payload)
+            status = (
+                200
+                if result["code"] == 0
+                else result["code"]
+                if result["code"] in {409, 422}
+                else 503
+            )
+            self._send_json(status, result)
         elif path == "/api/camera/connect":
-            result = self.runtime.connect_all()
-            self._send_json(200 if result["code"] == 0 else 503, result)
+            result = self.runtime.connect_all(payload)
+            status = (
+                200
+                if result["code"] == 0
+                else result["code"]
+                if result["code"] in {409, 422}
+                else 503
+            )
+            self._send_json(status, result)
         elif path in {"/api/camera/disconnect", "/api/cameras/disconnect-all"}:
             identity = str(payload.get("ip", payload.get("cameraId", "")))
             self._send_json(200, self.runtime.disconnect(identity))

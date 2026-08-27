@@ -1757,6 +1757,19 @@ class SickStorageTests(unittest.TestCase):
 
 
 class SickProviderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Unit tests must never post synthetic capture commits to a developer
+        # or server instance that happens to be listening on the default 4873
+        # port.  Besides mutating that service, a slow listener leaves urllib
+        # sockets pending long enough to emit ResourceWarning during teardown.
+        callback = patch.object(
+            ProviderRuntime,
+            "_post_service_json",
+            return_value={"code": 0},
+        )
+        callback.start()
+        self.addCleanup(callback.stop)
+
     @staticmethod
     def _history_runtime_fixture(profile) -> ProviderRuntime:
         runtime = object.__new__(ProviderRuntime)
@@ -1796,6 +1809,123 @@ class SickProviderTests(unittest.TestCase):
                 self.assertEqual(runtime.health_json()["framesReceived"], 0)
             finally:
                 runtime.close()
+
+    def test_connect_all_rejects_wrong_expected_count_before_device_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = replace(
+                load_profile(write_profile(Path(directory))),
+                auto_connect=False,
+            )
+            backend = FakeBackend()
+            runtime = ProviderRuntime(profile, backend=backend)
+            try:
+                result = runtime.connect_all({"expectedCameras": 2})
+
+                self.assertEqual(result["code"], 409)
+                self.assertEqual(result["error"], "expected_camera_count_mismatch")
+                self.assertEqual(result["requestedCameras"], 2)
+                self.assertEqual(result["expectedCameras"], 1)
+                self.assertEqual(result["attemptCount"], 0)
+                self.assertEqual(runtime.sessions, {})
+
+                malformed = runtime.connect_all({"expectedCameras": "six"})
+                self.assertEqual(malformed["code"], 422)
+                self.assertEqual(malformed["error"], "invalid_expected_camera_count")
+
+                runtime.connection_lock.acquire()
+                try:
+                    busy = runtime.connect_all({"expectedCameras": 1})
+                finally:
+                    runtime.connection_lock.release()
+                self.assertEqual(busy["code"], 409)
+                self.assertEqual(busy["error"], "camera_connection_in_progress")
+                self.assertEqual(busy["attemptCount"], 0)
+            finally:
+                runtime.close()
+
+    def test_connection_diagnostics_preserve_failure_and_clear_after_recovery(self) -> None:
+        class RecoveringBackend(FakeBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail = True
+
+            def connect(self, camera: CameraProfile) -> FakeSession:
+                if self.fail:
+                    raise TimeoutError(f"{camera.key} network unreachable")
+                return super().connect(camera)
+
+        with tempfile.TemporaryDirectory() as directory:
+            profile = replace(
+                load_profile(write_profile(Path(directory))),
+                auto_connect=False,
+            )
+            backend = RecoveringBackend()
+            runtime = ProviderRuntime(profile, backend=backend)
+            try:
+                failed = runtime.connect_all({"expectedCameras": 1})
+                self.assertEqual(failed["code"], 49110)
+                self.assertEqual(failed["attemptCount"], 1)
+                self.assertFalse(failed["inProgress"])
+                self.assertEqual(failed["connectedCameras"], 0)
+                self.assertEqual(failed["failedCameras"][0]["cameraKey"], "C1")
+                self.assertIn("network unreachable", failed["failedCameras"][0]["error"])
+                self.assertIn("C1: C1 network unreachable", runtime.health_json()["lastError"])
+
+                backend.fail = False
+                recovered = runtime.connect_all({"expectedCameras": 1})
+                health = runtime.health_json()
+                self.assertEqual(recovered["code"], 0)
+                self.assertEqual(recovered["attemptCount"], 2)
+                self.assertFalse(recovered["inProgress"])
+                self.assertEqual(recovered["failedCameras"], [])
+                self.assertEqual(health["cameraConnection"]["lastCode"], 0)
+                self.assertIsNone(health["lastError"])
+            finally:
+                runtime.close()
+
+    def test_health_remains_readable_while_camera_connection_is_blocked(self) -> None:
+        class BlockingBackend(FakeBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def connect(self, camera: CameraProfile) -> FakeSession:
+                self.entered.set()
+                if not self.release.wait(timeout=2):
+                    raise TimeoutError("test connection release timed out")
+                return super().connect(camera)
+
+        with tempfile.TemporaryDirectory() as directory:
+            profile = replace(
+                load_profile(write_profile(Path(directory))),
+                auto_connect=False,
+            )
+            backend = BlockingBackend()
+            runtime = ProviderRuntime(profile, backend=backend)
+            result: dict[str, object] = {}
+
+            def connect() -> None:
+                result.update(runtime.connect_all({"expectedCameras": 1}))
+
+            worker = threading.Thread(target=connect)
+            worker.start()
+            try:
+                self.assertTrue(backend.entered.wait(timeout=1))
+                started = time.monotonic()
+                health = runtime.health_json()
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertTrue(health["cameraConnection"]["inProgress"])
+
+                duplicate = runtime.connect_all({"expectedCameras": 1})
+                self.assertEqual(duplicate["code"], 409)
+                self.assertEqual(duplicate["error"], "camera_connection_in_progress")
+            finally:
+                backend.release.set()
+                worker.join(timeout=2)
+                runtime.close()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result["code"], 0)
 
     def test_playback_warm_status_replace_drops_previous_flow_details(self) -> None:
         runtime = object.__new__(ProviderRuntime)
@@ -3908,7 +4038,7 @@ class SickProviderTests(unittest.TestCase):
                     "&maxWidth=160&region=valid"
                     "&cropX=16&cropY=0&cropWidth=32&cropHeight=64"
                 )
-                with request.urlopen(valid_url, timeout=2) as valid_response:
+                with request.urlopen(valid_url, timeout=5) as valid_response:
                     with Image.open(io.BytesIO(valid_response.read())) as cropped:
                         self.assertEqual(valid_response.status, 200)
                         self.assertEqual(cropped.size, (32, 64))
@@ -3932,24 +4062,26 @@ class SickProviderTests(unittest.TestCase):
                                 f"{valid_region_base}{query_suffix}",
                                 timeout=2,
                             )
-                        self.assertEqual(rejected.exception.code, 422)
-                        self.assertEqual(
-                            rejected.exception.headers["Cache-Control"],
-                            "no-store",
-                        )
-                        error_payload = json.loads(rejected.exception.read())
-                        self.assertEqual(
-                            error_payload["error"],
-                            "capture_valid_region_not_ready",
-                        )
+                        with rejected.exception as rejected_response:
+                            self.assertEqual(rejected_response.code, 422)
+                            self.assertEqual(
+                                rejected_response.headers["Cache-Control"],
+                                "no-store",
+                            )
+                            error_payload = json.loads(rejected_response.read())
+                            self.assertEqual(
+                                error_payload["error"],
+                                "capture_valid_region_not_ready",
+                            )
                 roi_path.unlink()
                 with self.assertRaises(HTTPError) as missing_indexed_roi:
                     request.urlopen(valid_url, timeout=2)
-                self.assertEqual(missing_indexed_roi.exception.code, 422)
-                self.assertEqual(
-                    json.loads(missing_indexed_roi.exception.read())["error"],
-                    "capture_valid_region_not_ready",
-                )
+                with missing_indexed_roi.exception as missing_response:
+                    self.assertEqual(missing_response.code, 422)
+                    self.assertEqual(
+                        json.loads(missing_response.read())["error"],
+                        "capture_valid_region_not_ready",
+                    )
                 with request.urlopen(
                     request.Request(
                         f"{origin}/api/steel/event",

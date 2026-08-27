@@ -135,6 +135,7 @@ if ($IsTargetRuntimeManifest) {
     uninstallRuntimeService = $Manifest.uninstallRuntimeService
     runtimeUiSmokeTest = $Manifest.runtimeUiSmokeTest
     realHardwareAcceptanceTest = $Manifest.realHardwareAcceptanceTest
+    sickServerContinuationTest = $Manifest.sickServerContinuationTest
     realCalibrationAcceptanceTest = $Manifest.realCalibrationAcceptanceTest
     realCalibrationCrashRecoveryTest = $Manifest.realCalibrationCrashRecoveryTest
     realCalibrationIntegrityGenerationTest = $Manifest.realCalibrationIntegrityGenerationTest
@@ -187,6 +188,7 @@ if ($IsTargetRuntimeManifest) {
     uninstallRuntimeService = $Manifest.scripts.uninstallRuntimeService
     runtimeUiSmokeTest = $Manifest.scripts.runtimeUiSmokeTest
     realHardwareAcceptanceTest = $Manifest.scripts.realHardwareAcceptanceTest
+    sickServerContinuationTest = $Manifest.scripts.sickServerContinuationTest
     realCalibrationAcceptanceTest = $Manifest.scripts.realCalibrationAcceptanceTest
     realCalibrationCrashRecoveryTest = $Manifest.scripts.realCalibrationCrashRecoveryTest
     realCalibrationIntegrityGenerationTest = $Manifest.scripts.realCalibrationIntegrityGenerationTest
@@ -248,6 +250,7 @@ $ScriptNames = if ($IsTargetRuntimeManifest) {
     "test-architecture-migration-contract.ps1",
     "test-runtime-acceptance.ps1",
     "test-real-hardware-acceptance.ps1",
+    "test-sick-server-continuation.ps1",
     "test-real-calibration-acceptance.ps1",
     "test-real-calibration-crash-recovery.ps1",
     "test-real-calibration-integrity-generation.ps1",
@@ -290,6 +293,7 @@ $ScriptNames = if ($IsTargetRuntimeManifest) {
     "test-architecture-migration-contract.ps1",
     "test-runtime-acceptance.ps1",
     "test-real-hardware-acceptance.ps1",
+    "test-sick-server-continuation.ps1",
     "test-real-calibration-acceptance.ps1",
     "test-real-calibration-crash-recovery.ps1",
     "test-real-calibration-integrity-generation.ps1",
@@ -606,6 +610,13 @@ $RealHardwareText = Get-Content (Join-Path $RuntimeRoot "test-real-hardware-acce
 foreach ($RequiredText in @("/api/production/capture-once", "/api/system/network", "totalUploadMbps", "totalDownloadMbps", "totalBandwidthMbps", "uploadMbps", "downloadMbps", "H:\camera", "saveSdkDerived", "productionLayout", "productionSummary", "summaryOutput", "latestInspection", "steel.production.summary.v1", "captureFiles")) {
   if ($RealHardwareText -notmatch [regex]::Escape($RequiredText)) {
     throw "test-real-hardware-acceptance.ps1 must verify $RequiredText"
+  }
+}
+
+$SickServerContinuationText = Get-Content (Join-Path $RuntimeRoot "test-sick-server-continuation.ps1") -Raw
+foreach ($RequiredText in @("steel.sick-server-continuation.v1", "ProfileOnly", "expectedCameras = 6", "CONNECT SICK CAMERAS 6/6", "camera_connection_in_progress", "historyOnly", "RunCapture", "Rounds 1", "SkipPreset")) {
+  if ($SickServerContinuationText -notmatch [regex]::Escape($RequiredText)) {
+    throw "test-sick-server-continuation.ps1 must verify $RequiredText"
   }
 }
 

@@ -158,6 +158,7 @@ Copy-RequiredFile (Join-Path $RepoRoot "scripts\install-runtime-service.ps1") $R
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\uninstall-runtime-service.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-runtime-ui-smoke.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-hardware-acceptance.ps1") $RuntimeRoot
+Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-sick-server-continuation.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-calibration-acceptance.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-calibration-crash-recovery.ps1") $RuntimeRoot
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\test-real-calibration-integrity-generation.ps1") $RuntimeRoot
@@ -181,6 +182,7 @@ Copy-RequiredFile (Join-Path $RepoRoot "docs\qt-to-tauri-migration.md") $DocsOut
 Copy-RequiredFile (Join-Path $RepoRoot "docs\release-deployment-and-operations.md") $DocsOut
 Copy-RequiredFile (Join-Path $RepoRoot "docs\production-readiness-gap-and-closure-design.md") $DocsOut
 Copy-RequiredFile (Join-Path $RepoRoot "docs\atomic-upgrade-and-database-migration-design.md") $DocsOut
+Copy-RequiredFile (Join-Path $RepoRoot "docs\10.50.111.141-server-continuation.md") $DocsOut
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\README.md") $ScriptsOut
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\sick_capture_service.py") $ScriptsOut
 Copy-RequiredFile (Join-Path $RepoRoot "scripts\sick_flow_analysis_service.py") $ScriptsOut
@@ -740,6 +742,7 @@ $Manifest = [ordered]@{
   uninstallRuntimeService = "uninstall-runtime-service.ps1"
   runtimeUiSmokeTest = "test-runtime-ui-smoke.ps1"
   realHardwareAcceptanceTest = "test-real-hardware-acceptance.ps1"
+  sickServerContinuationTest = "test-sick-server-continuation.ps1"
   realCalibrationAcceptanceTest = "test-real-calibration-acceptance.ps1"
   realCalibrationCrashRecoveryTest = "test-real-calibration-crash-recovery.ps1"
   realCalibrationIntegrityGenerationTest = "test-real-calibration-integrity-generation.ps1"

@@ -56,6 +56,21 @@ Run the hardware-independent contract tests with:
 python -m unittest scripts.test_sick_capture -v
 ```
 
+For the `10.50.111.141` six-camera continuation, collect one read-only evidence
+bundle without starting, stopping, or connecting capture:
+
+```powershell
+scripts\test-sick-server-continuation.ps1
+```
+
+The report combines the reviewed six-camera identities, CTI hash, camera network,
+the unique `4317` listener, sidecar health/camera/storage responses, and Rust
+health/production status. `-ConnectCameras` is rejected unless the live sidecar,
+SDK, unique-listener, and production-idle gates pass and the exact maintenance
+confirmation `CONNECT SICK CAMERAS 6/6` is supplied. `-RunCapture` additionally
+requires all readiness checks and performs exactly one `-SkipPreset` round. Use
+`-ProfileOnly -SkipNetworkProbe` for a hardware-independent configuration check.
+
 ## BKV offline runtime manifest
 
 The full six-camera `1908500` JPG/NPZ dataset is versioned in the private

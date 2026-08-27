@@ -452,6 +452,15 @@ Content-Type: application/json
 
 `/api/camera/connect-all` is accepted as an alias. The provider discovers cameras, connects them sequentially, and keeps software trigger mode enabled.
 
+For the profile-bound SICK sidecar, `expectedCameras` is a safety assertion rather
+than a hint. A value different from the active profile is rejected with HTTP 409
+and `expected_camera_count_mismatch` before any device is opened. Malformed values
+return HTTP 422. Only one connection attempt may run at a time; a concurrent request
+returns HTTP 409 without blocking health reads. `/health.cameraConnection` reports
+the attempt count, in-progress flag, last attempt/completion timestamps, last code,
+and profile-bound unconnected/failed camera identities. A successful retry clears
+the previous connection error.
+
 ```http
 POST /api/camera/disconnect
 Content-Type: application/json
