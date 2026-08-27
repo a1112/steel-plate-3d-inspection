@@ -12,6 +12,7 @@ import {
   CaptureAdminApiError,
   calculateSystemNetworkRates,
   captureHistoryImageUrl,
+  captureRenderImageUrl,
   captureStreamImageUrl,
   chooseCaptureLocalDirectory,
   chooseCaptureLocalFile,
@@ -338,6 +339,12 @@ describe("readLatestCaptureFile", () => {
     );
     expect(captureHistoryImageUrl("63/capture/C1/2d/1.png", 2048, [665, 0, 1144, 1024])).toBe(
       "http://127.0.0.1:4873/api/capture/file?path=63%2Fcapture%2FC1%2F2d%2F1.png&maxWidth=2048&region=valid&cropX=665&cropY=0&cropWidth=479&cropHeight=1024",
+    );
+    expect(captureRenderImageUrl("63/capture/C1/2d/1.png", "gray", "thumbnail")).toBe(
+      "http://127.0.0.1:4873/api/capture/render?path=63%2Fcapture%2FC1%2F2d%2F1.png&modality=gray&level=thumbnail",
+    );
+    expect(captureRenderImageUrl("63/capture/C1/2d/1.png", "jet", "original")).toBe(
+      "http://127.0.0.1:4873/api/capture/render?path=63%2Fcapture%2FC1%2F2d%2F1.png&modality=jet&level=original",
     );
 
     await readCapturePlaybackCacheStatus();

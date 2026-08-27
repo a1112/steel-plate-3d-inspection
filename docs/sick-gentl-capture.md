@@ -100,7 +100,7 @@ python scripts\validate_lg3d.py `
   metadata/<one-based-sequence>.json
 ```
 
-LG_3D 目录严格使用 NPZ 键 `array` 和质量 95 的 JPEG。Steel 目录中的深度
+LG_3D 目录严格使用 ZIP DEFLATE 压缩的 NPZ（键为 `array`）和质量 95 的 JPEG。Steel 目录中的深度
 PNG 仍是无损 `uint16` 原始 C16，不应标成毫米图。二进制文件先发布，LG_3D
 元数据随后发布，`metadata/<sequence>.json` 最后写入并带有 `complete=true`，
 它是 Steel 侧的完整帧提交标志。中断留下的二进制孤儿文件不会被当作完整帧，

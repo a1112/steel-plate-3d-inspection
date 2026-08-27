@@ -1,0 +1,267 @@
+{
+  "schema": "steel.sick-array-calibration-optimization.v1",
+  "generatedAt": "2026-08-26T07:23:55.400Z",
+  "revision": "BEIMAN-SICK6-PJ-20260612-R2",
+  "passed": false,
+  "accuracyClaim": "relative-only; certified nominal diameters unavailable",
+  "objectGrouping": {
+    "sameRod": [
+      "pj1",
+      "pj2"
+    ],
+    "differentRod": [
+      "pj3"
+    ]
+  },
+  "bounds": {
+    "rotateYDegrees": 0.25,
+    "translateXmm": 2.0,
+    "translateZmm": 2.0
+  },
+  "gaugeCamera": "C1",
+  "optimizer": {
+    "success": true,
+    "message": "CONVERGENCE: REL_REDUCTION_OF_F_<=_FACTR*EPSMCH",
+    "iterations": 55,
+    "objective": 8.924808178707892
+  },
+  "detectedTargetRows": {
+    "pj1": [
+      0,
+      256,
+      512
+    ],
+    "pj2": [
+      0,
+      256,
+      512
+    ],
+    "pj3": [
+      0,
+      256,
+      512
+    ]
+  },
+  "baseHeldOut": {
+    "groups": [
+      {
+        "group": "pj1",
+        "rowCount": 1,
+        "meanDiameterMm": 137.061038,
+        "maximumP95ResidualMm": 5.671582,
+        "fits": [
+          {
+            "available": true,
+            "centerX": -0.001967,
+            "centerZ": -0.009999,
+            "radiusMm": 68.530519,
+            "diameterMm": 137.061038,
+            "meanAbsResidualMm": 2.657373,
+            "p95AbsResidualMm": 5.671582,
+            "maxAbsResidualMm": 6.920307,
+            "roundnessMm": 10.614743,
+            "pointCount": 1821,
+            "robustPointCount": 1821
+          }
+        ]
+      },
+      {
+        "group": "pj2",
+        "rowCount": 1,
+        "meanDiameterMm": 137.037134,
+        "maximumP95ResidualMm": 5.66465,
+        "fits": [
+          {
+            "available": true,
+            "centerX": 0.225705,
+            "centerZ": 0.818183,
+            "radiusMm": 68.518567,
+            "diameterMm": 137.037134,
+            "meanAbsResidualMm": 2.636614,
+            "p95AbsResidualMm": 5.66465,
+            "maxAbsResidualMm": 6.959829,
+            "roundnessMm": 10.703781,
+            "pointCount": 1737,
+            "robustPointCount": 1737
+          }
+        ]
+      },
+      {
+        "group": "pj3",
+        "rowCount": 1,
+        "meanDiameterMm": 120.048624,
+        "maximumP95ResidualMm": 0.145597,
+        "fits": [
+          {
+            "available": true,
+            "centerX": -1.664527,
+            "centerZ": 5.253608,
+            "radiusMm": 60.024312,
+            "diameterMm": 120.048624,
+            "meanAbsResidualMm": 0.05544,
+            "p95AbsResidualMm": 0.145597,
+            "maxAbsResidualMm": 0.271837,
+            "roundnessMm": 0.522566,
+            "pointCount": 1751,
+            "robustPointCount": 1750
+          }
+        ]
+      }
+    ]
+  },
+  "candidateHeldOut": {
+    "groups": [
+      {
+        "group": "pj1",
+        "rowCount": 1,
+        "meanDiameterMm": 137.006633,
+        "maximumP95ResidualMm": 5.679146,
+        "fits": [
+          {
+            "available": true,
+            "centerX": -0.058722,
+            "centerZ": 0.052291,
+            "radiusMm": 68.503316,
+            "diameterMm": 137.006633,
+            "meanAbsResidualMm": 2.658555,
+            "p95AbsResidualMm": 5.679146,
+            "maxAbsResidualMm": 6.916889,
+            "roundnessMm": 10.600223,
+            "pointCount": 1821,
+            "robustPointCount": 1821
+          }
+        ]
+      },
+      {
+        "group": "pj2",
+        "rowCount": 1,
+        "meanDiameterMm": 136.998769,
+        "maximumP95ResidualMm": 5.649308,
+        "fits": [
+          {
+            "available": true,
+            "centerX": 0.169774,
+            "centerZ": 0.878544,
+            "radiusMm": 68.499385,
+            "diameterMm": 136.998769,
+            "meanAbsResidualMm": 2.637592,
+            "p95AbsResidualMm": 5.649308,
+            "maxAbsResidualMm": 6.941872,
+            "roundnessMm": 10.692977,
+            "pointCount": 1737,
+            "robustPointCount": 1737
+          }
+        ]
+      },
+      {
+        "group": "pj3",
+        "rowCount": 1,
+        "meanDiameterMm": 120.009345,
+        "maximumP95ResidualMm": 0.153999,
+        "fits": [
+          {
+            "available": true,
+            "centerX": -1.705999,
+            "centerZ": 5.323022,
+            "radiusMm": 60.004673,
+            "diameterMm": 120.009345,
+            "meanAbsResidualMm": 0.058692,
+            "p95AbsResidualMm": 0.153999,
+            "maxAbsResidualMm": 0.306233,
+            "roundnessMm": 0.567192,
+            "pointCount": 1751,
+            "robustPointCount": 1750
+          }
+        ]
+      }
+    ]
+  },
+  "diameterDriftMm": {
+    "pj1": 0.054405,
+    "pj2": 0.038365,
+    "pj3": 0.039279
+  },
+  "pj1Pj2PositionDifferenceMm": 0.007864,
+  "runtimeRegression": {
+    "passed": false,
+    "flows": [
+      {
+        "flowId": "4033",
+        "passed": false,
+        "diameterDriftMm": 0.168753,
+        "baseMetricValid": true,
+        "candidateMetricValid": true,
+        "baseCircleFit": {
+          "available": true,
+          "centerX": -63.797438,
+          "centerZ": -20.786999,
+          "radiusMm": 38.595847,
+          "diameterMm": 77.191694,
+          "meanAbsResidualMm": 0.141776,
+          "p95AbsResidualMm": 0.340858,
+          "maxAbsResidualMm": 0.679617,
+          "roundnessMm": 1.335396,
+          "pointCount": 1333,
+          "robustPointCount": 1330
+        },
+        "candidateCircleFit": {
+          "available": true,
+          "centerX": -63.890265,
+          "centerZ": -20.617894,
+          "radiusMm": 38.511471,
+          "diameterMm": 77.022941,
+          "meanAbsResidualMm": 0.175132,
+          "p95AbsResidualMm": 0.406201,
+          "maxAbsResidualMm": 0.863843,
+          "roundnessMm": 1.375127,
+          "pointCount": 1333,
+          "robustPointCount": 1331
+        }
+      },
+      {
+        "flowId": "4034",
+        "passed": false,
+        "diameterDriftMm": 0.162714,
+        "baseMetricValid": true,
+        "candidateMetricValid": true,
+        "baseCircleFit": {
+          "available": true,
+          "centerX": -64.315627,
+          "centerZ": -20.999129,
+          "radiusMm": 38.577329,
+          "diameterMm": 77.154658,
+          "meanAbsResidualMm": 0.166311,
+          "p95AbsResidualMm": 0.323775,
+          "maxAbsResidualMm": 0.691821,
+          "roundnessMm": 1.350019,
+          "pointCount": 1364,
+          "robustPointCount": 1354
+        },
+        "candidateCircleFit": {
+          "available": true,
+          "centerX": -64.407713,
+          "centerZ": -20.835274,
+          "radiusMm": 38.495972,
+          "diameterMm": 76.991944,
+          "meanAbsResidualMm": 0.148603,
+          "p95AbsResidualMm": 0.355087,
+          "maxAbsResidualMm": 0.629283,
+          "roundnessMm": 1.248581,
+          "pointCount": 1364,
+          "robustPointCount": 1361
+        }
+      }
+    ]
+  },
+  "gates": {
+    "sourceHashesAndSerials": true,
+    "optimizerConverged": true,
+    "boundsNotHit": false,
+    "heldOutP95AtMost1mm": false,
+    "heldOutWorstResidualImproved": false,
+    "diameterDriftAtMost0_01mm": false,
+    "pj1Pj2PositionDifferenceNotWorse": true,
+    "runtime4033And4034Regression": false
+  },
+  "candidatePath": "D:\\project\\steel-plate-3d-inspection-main\\config\\capture\\calibrations\\candidates\\BEIMAN-SICK6-PJ-20260612-R2\\array-calibration.json"
+}

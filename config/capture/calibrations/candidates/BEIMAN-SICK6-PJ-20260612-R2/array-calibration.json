@@ -1,0 +1,294 @@
+{
+  "schema": "steel.sick-array-calibration.v1",
+  "revision": "BEIMAN-SICK6-PJ-20260612-R2",
+  "approved": false,
+  "approvedAt": null,
+  "approvedBy": null,
+  "approvalScope": "six-camera-cross-section-stitching-and-diameter",
+  "rotationConvention": "right-handed-y-column-vector",
+  "metricProjectionVerified": true,
+  "longitudinalScaleVerified": false,
+  "coordinateFrame": {
+    "x": "cross-section-horizontal-mm",
+    "y": "bar-motion-unscaled",
+    "z": "cross-section-vertical-mm"
+  },
+  "source": {
+    "kind": "site-provided-sick-pj-bundle",
+    "root": "K:\\PJ-bm(2)\\PJ-bm",
+    "parameterFile": "K:\\PJ-bm(2)\\PJ-bm\\拼接参数.txt",
+    "parameterSha256": "2985ab099f64aee3323068027a4d2e87277de9db93ce57e8d92bc39f9c8b9d85",
+    "captureGroups": [
+      "pj1",
+      "pj2",
+      "pj3"
+    ]
+  },
+  "target": {
+    "type": "site-calibration-object",
+    "nominalDiameterMm": null,
+    "certificate": null
+  },
+  "cameras": {
+    "C1": {
+      "serialNumber": "25440062",
+      "localToArray": [
+        [
+          0.00014137166894056985,
+          0.0,
+          -0.9999999900070256,
+          -24.6337
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.9999999900070256,
+          0.0,
+          0.00014137166894056985,
+          -95.1471
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "coordinateA": {
+        "scale": 0.10817056149244308,
+        "offset": -42.705078125
+      },
+      "coordinateC": {
+        "scale": 0.0037132645957171917,
+        "offset": -152.37896728515625,
+        "missingValue": 0
+      },
+      "optimizationDelta": {
+        "rotateYDegrees": 0.0,
+        "translateXmm": 0.0,
+        "translateZmm": 0.0
+      }
+    },
+    "C2": {
+      "serialNumber": "25440064",
+      "localToArray": [
+        [
+          0.8638516328490327,
+          0.0,
+          -0.5037463214992841,
+          -82.76450365341708
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.5037463214992841,
+          0.0,
+          0.8638516328490327,
+          -50.16791869213645
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "coordinateA": {
+        "scale": 0.10917212814092636,
+        "offset": -38.92288589477539
+      },
+      "coordinateC": {
+        "scale": 0.0037736091762781143,
+        "offset": -87.861328125,
+        "missingValue": 0
+      },
+      "optimizationDelta": {
+        "rotateYDegrees": 0.109265703,
+        "translateXmm": -0.055603653,
+        "translateZmm": -0.152718692
+      }
+    },
+    "C3": {
+      "serialNumber": "25440058",
+      "localToArray": [
+        [
+          0.8636213700594116,
+          0.0,
+          0.504140981449341,
+          -73.86631153150272
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          -0.504140981449341,
+          0.0,
+          0.8636213700594116,
+          43.51179533100735
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "coordinateA": {
+        "scale": 0.10726702958345413,
+        "offset": -42.56932067871094
+      },
+      "coordinateC": {
+        "scale": 0.0036806559655815363,
+        "offset": -79.08135223388672,
+        "missingValue": 0
+      },
+      "optimizationDelta": {
+        "rotateYDegrees": -0.159545387,
+        "translateXmm": 0.076688468,
+        "translateZmm": 0.216895331
+      }
+    },
+    "C4": {
+      "serialNumber": "25440053",
+      "localToArray": [
+        [
+          -0.0013002689874340835,
+          0.0,
+          0.9999991546499228,
+          29.286656403291477
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          -0.9999991546499228,
+          0.0,
+          -0.0013002689874340835,
+          86.35080190046341
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "coordinateA": {
+        "scale": 0.10620727390050888,
+        "offset": -39.95304870605469
+      },
+      "coordinateC": {
+        "scale": 0.0035984725691378117,
+        "offset": -144.60647583007812,
+        "missingValue": 0
+      },
+      "optimizationDelta": {
+        "rotateYDegrees": -0.212899946,
+        "translateXmm": 0.222256403,
+        "translateZmm": 0.0860019
+      }
+    },
+    "C5": {
+      "serialNumber": "25440060",
+      "localToArray": [
+        [
+          -0.868181492736625,
+          0.0,
+          0.4962468092286393,
+          92.22605986511607
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          -0.4962468092286393,
+          0.0,
+          -0.868181492736625,
+          16.383726585688937
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "coordinateA": {
+        "scale": 0.1072329729795456,
+        "offset": -38.57566452026367
+      },
+      "coordinateC": {
+        "scale": 0.0036603447515517473,
+        "offset": -147.3286895751953,
+        "missingValue": 0
+      },
+      "optimizationDelta": {
+        "rotateYDegrees": -0.25,
+        "translateXmm": -0.002740135,
+        "translateZmm": -0.319573414
+      }
+    },
+    "C6": {
+      "serialNumber": "25440059",
+      "localToArray": [
+        [
+          -0.8633901323320389,
+          0.0,
+          -0.5045368959666522,
+          65.77254953903649
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.5045368959666522,
+          0.0,
+          -0.8633901323320389,
+          -66.21283571299203
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "coordinateA": {
+        "scale": 0.10844143480062485,
+        "offset": -52.12236785888672
+      },
+      "coordinateC": {
+        "scale": 0.0037323383148759604,
+        "offset": -156.1887969970703,
+        "missingValue": 0
+      },
+      "optimizationDelta": {
+        "rotateYDegrees": -0.072615311,
+        "translateXmm": -0.058450461,
+        "translateZmm": -0.029935713
+      }
+    }
+  },
+  "accuracyClaim": "relative-stitching-only-no-certified-nominal-diameter",
+  "rejectionReason": "strict-relative-and-runtime-gates-not-all-passed"
+}

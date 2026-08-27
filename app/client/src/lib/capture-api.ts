@@ -543,14 +543,47 @@ export type CapturePlaybackCacheStatus = {
   schema: string;
   cacheRoot: string;
   cacheRoots: string[];
+  renditionRoots: Array<{ cameraId: string; gray: string; jet: string }>;
+  levels: ["thumbnail", "original"];
+  modalities: ["gray", "jet"];
+  generationPolicy: "full-flow-after-alignment";
+  onDemandBuild: "recovery-only";
   catalogPath: string;
   catalogAvailable: boolean;
   memoryEntries: number;
   memoryHits: number;
   diskHits: number;
-  pyramidsBuilt: number;
+  renditionsBuilt: number;
   buildFailures: number;
   averageBuildMs?: number | null;
+  twoLevelWarm?: Record<string, unknown>;
+  fullHistory?: {
+    state: string;
+    policy: "full-history-after-alignment";
+    catalogMaterialCount: number;
+    catalogScannedCount: number;
+    discoveredFlowCount: number;
+    orphanFlowCount: number;
+    rebuildableFlowCount: number;
+    unreadyFlowCount: number;
+    completedFlowCount: number;
+    skippedCompleteFlowCount: number;
+    failedFlowCount: number;
+    retryCount: number;
+    pendingRetryCount: number;
+    currentMaterialId: string;
+    currentSourceFrameCount: number;
+    currentCommittedFrameCount: number;
+    currentFailureCount: number;
+    discoveryComplete: boolean;
+    lastError: string;
+    queueProgress: {
+      position: number;
+      total: number;
+      depth: number;
+      capacity: number;
+    };
+  };
 };
 
 export type CaptureMeasurementCamera = {
@@ -2945,6 +2978,22 @@ export function captureHistoryImageUrl(
     }
   }
   return `${getCaptureServiceOrigin()}/api/capture/file?${query.toString()}`;
+}
+
+export type CaptureRenderModality = "gray" | "jet";
+export type CaptureRenderLevel = "thumbnail" | "original";
+
+export function captureRenderImageUrl(
+  artifactRef: string,
+  modality: CaptureRenderModality,
+  level: CaptureRenderLevel,
+) {
+  const query = new URLSearchParams({
+    path: artifactRef,
+    modality,
+    level,
+  });
+  return `${getCaptureServiceOrigin()}/api/capture/render?${query.toString()}`;
 }
 
 export function captureArtifactImageUrl(artifactRef: string, maxWidth = 320) {

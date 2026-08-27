@@ -92,14 +92,12 @@ describe('capture ROI preview selection', () => {
       validRoi: [100, 0, 700, 1024],
     });
     expect(result?.images[0].url).toContain(
-      '/api/capture/file?path=2747%2Fcapture%2FC1%2F2d%2F80.png&maxWidth=2048&region=valid',
+      '/api/capture/render?path=2747%2Fcapture%2FC1%2F2d%2F80.png&modality=gray&level=original',
     );
     const previewUrl = new URL(result!.images[0].url);
     expect(Object.fromEntries(previewUrl.searchParams)).toMatchObject({
-      cropX: '100',
-      cropY: '0',
-      cropWidth: '600',
-      cropHeight: '1024',
+      modality: 'gray',
+      level: 'original',
     });
   });
 
@@ -164,7 +162,7 @@ describe('capture crop-stitch history selection', () => {
     );
   });
 
-  it('uses algorithm ROI when valid and auto-black-border cropping otherwise', () => {
+  it('keeps raw-rebuild sources renderable even when legacy ROI metadata is unavailable', () => {
     const result = selectCaptureStitchHistory(
       history([frame(7, [
         camera(1, 2000),
@@ -177,16 +175,14 @@ describe('capture crop-stitch history selection', () => {
     expect(result).toMatchObject({
       materialId: '2747',
       expectedCameraCount: 2,
-      algorithmRoiImageCount: 1,
-      autoCropImageCount: 1,
+      renderableImageCount: 2,
     });
-    expect(result.frames[0].cameras[0]).toMatchObject({ cropMode: 'algorithm-roi' });
     expect(result.frames[0].cameras[0].sourceBytes).toBe(2000);
-    expect(result.frames[0].cameras[0].url).toContain('region=valid');
-    expect(result.frames[0].cameras[0].url).toContain('maxWidth=384');
-    expect(result.frames[0].cameras[1]).toMatchObject({ cropMode: 'auto-black-border', validRoi: null });
-    expect(result.frames[0].cameras[1].url).toContain('maxWidth=384');
-    expect(result.frames[0].cameras[1].url).not.toContain('region=valid');
+    expect(result.frames[0].cameras[0].url).toContain('modality=gray');
+    expect(result.frames[0].cameras[0].url).toContain('level=thumbnail');
+    expect(result.frames[0].cameras[1]).toMatchObject({ validRoi: null });
+    expect(result.frames[0].cameras[1].url).toContain('level=thumbnail');
+    expect(result.frames[0].cameras[1].url).not.toContain('/api/capture/file');
   });
 
   it('deduplicates repeated sequences before reporting image counts and exposes the 500-frame cap', () => {
@@ -203,8 +199,7 @@ describe('capture crop-stitch history selection', () => {
 
     expect(result.frames).toHaveLength(1);
     expect(result.frames[0].frameId).toBe('2747:duplicate-complete');
-    expect(result.algorithmRoiImageCount).toBe(1);
-    expect(result.autoCropImageCount).toBe(1);
+    expect(result.renderableImageCount).toBe(2);
     expect(result).toMatchObject({ totalFrames: 700, hasMore: true });
   });
 });

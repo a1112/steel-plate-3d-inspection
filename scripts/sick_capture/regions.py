@@ -23,7 +23,7 @@ from .paths import capture_root, region_path
 
 
 REGION_MAP_SCHEMA = "steel.capture-region-map.v1"
-REGION_ALGORITHM = "stable-depth-grayscale-horizontal-v1"
+REGION_ALGORITHM = "stable-2d-grayscale-horizontal-v2"
 
 
 @dataclass(frozen=True)
@@ -326,7 +326,6 @@ def build_flow_region_map(
     for camera_id, camera_root in sorted(camera_roots.items()):
         flow_root = capture_root(camera_root, material_id, camera_id)
         intensity_files = _numeric_files(flow_root / "2d", ".png")
-        depth_files = _numeric_files(flow_root / "3d", ".npz")
         available_indices = sorted(intensity_files)
         sampled_indices = (
             available_indices
@@ -343,16 +342,10 @@ def build_flow_region_map(
             try:
                 with Image.open(intensity_path) as opened:
                     intensity = np.asarray(opened.convert("L"))
-                depth = None
-                depth_path = depth_files.get(storage_index)
-                if depth_path is not None:
-                    with np.load(depth_path, allow_pickle=False) as payload:
-                        if payload.files:
-                            depth = np.asarray(payload[payload.files[0]])
                 source_height, source_width = intensity.shape
                 roi = detect_valid_sensor_roi(
                     intensity,
-                    depth,
+                    None,
                     threshold=settings.intensity_threshold,
                     minimum_occupancy=settings.minimum_occupancy,
                     horizontal_padding=settings.horizontal_padding,
@@ -378,7 +371,7 @@ def build_flow_region_map(
             "validFullHeightFrameCount": sum(
                 1 for roi in rois if source_height and roi[3] - roi[1] >= source_height * settings.minimum_full_height_ratio
             ),
-            "foregroundPixelPolicy": "valid-depth-primary-grayscale-fallback",
+            "foregroundPixelPolicy": "2d-grayscale-only-row-envelope-compatible",
             "ownedColumnIntervals": [],
             "overlapColumnIntervals": [],
         }

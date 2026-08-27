@@ -6394,8 +6394,11 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/roi/load"),
 ];
 
-const CAPTURE_BINARY_PROXY_ROUTES: &[(&str, &str)] =
-    &[("GET", "/api/capture/file"), ("GET", "/api/stream/latest")];
+const CAPTURE_BINARY_PROXY_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/api/capture/file"),
+    ("GET", "/api/capture/render"),
+    ("GET", "/api/stream/latest"),
+];
 
 fn is_capture_json_proxy_route(method: &str, path: &str) -> bool {
     CAPTURE_JSON_PROXY_ROUTES.contains(&(method, path))
@@ -10815,7 +10818,9 @@ fn capture_proxy_http_response(
     if tracks_capture_activity {
         capture.set_collecting(true);
     }
-    let proxy_response = if method == "POST" && path == "/api/capture/continuous-test" {
+    let proxy_response = if method == "GET" && path == "/api/capture/render" {
+        capture.proxy_response_with_read_timeout(method, raw_path, body, Duration::from_secs(180))
+    } else if method == "POST" && path == "/api/capture/continuous-test" {
         let payload = serde_json::from_str::<Value>(body.trim()).unwrap_or_else(|_| json!({}));
         capture.proxy_response_with_read_timeout(
             method,
@@ -10861,12 +10866,14 @@ fn capture_proxy_http_response(
                 .to_string(),
             );
         }
-        let cache_headers: &[(&str, &str)] =
-            if method == "GET" && path == "/api/capture/file" && response.status_code == 200 {
-                &[("Cache-Control", "public, max-age=31536000, immutable")]
-            } else {
-                &[("Cache-Control", "no-store")]
-            };
+        let cache_headers: &[(&str, &str)] = if method == "GET"
+            && matches!(path, "/api/capture/file" | "/api/capture/render")
+            && response.status_code == 200
+        {
+            &[("Cache-Control", "public, max-age=31536000, immutable")]
+        } else {
+            &[("Cache-Control", "no-store")]
+        };
         return http_bytes_response_with_headers(
             &capture_proxy_status(response.status_code),
             &response.content_type,
@@ -29058,6 +29065,7 @@ mod tests {
         ));
         assert!(!is_capture_json_proxy_route("POST", "/api/capture/latest"));
         assert!(!is_capture_json_proxy_route("GET", "/api/capture/file"));
+        assert!(is_capture_binary_proxy_route("GET", "/api/capture/render"));
         assert!(is_capture_json_proxy_route("POST", "/api/stream/start"));
         assert!(is_capture_json_proxy_route(
             "POST",

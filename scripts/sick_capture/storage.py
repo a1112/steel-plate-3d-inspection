@@ -86,9 +86,10 @@ def atomic_npz(path: Path, array: np.ndarray, *, fsync: bool) -> str:
     temporary = _temporary_path(path)
     try:
         encoded = io.BytesIO()
-        # ZIP_STORED keeps the established .npz contract while avoiding the
-        # multi-second DEFLATE cost observed on full steel frames.
-        np.savez(encoded, array=array)
+        # Raw 3D frames are always persisted with ZIP DEFLATE.  Keeping the
+        # established NPZ/``array`` contract makes this transparent to all
+        # existing readers while preventing an uncompressed capture path.
+        np.savez_compressed(encoded, array=array)
         payload = encoded.getbuffer()
         digest = hashlib.sha256(payload).hexdigest()
         with temporary.open("wb") as stream:
@@ -171,7 +172,8 @@ class FrameWriteResult:
             "lines": frame.height,
             "depthDataFormat": frame.depth_data_format,
             "intensityDataFormat": frame.intensity_data_format,
-            "depthPersistenceMode": "single-lg3d-npz-store",
+            "depthPersistenceMode": "single-lg3d-npz-deflate",
+            "depthCompression": "zip-deflate",
             "output": str(self.steel_depth),
             "depthOutput": str(self.steel_depth),
             "intensityOutput": str(self.steel_intensity),
@@ -474,6 +476,8 @@ class DualFormatWriter:
             "schema": "steel.sick-frame.v1",
             "complete": True,
             "legacyCompatible": True,
+            "depthPersistenceMode": "single-lg3d-npz-deflate",
+            "depthCompression": "zip-deflate",
             "intensityPersistenceMode": "single-2d-png",
             "intensityPngCompressLevel": png_compress_level,
             "sequenceNo": steel_sequence,

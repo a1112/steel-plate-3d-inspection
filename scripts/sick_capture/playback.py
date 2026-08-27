@@ -616,7 +616,14 @@ def write_flow_pyramid_cache_status(
         camera_storage_root,
         str(payload.get("materialId", "unknown")),
     )
-    _atomic_compact_json(path, payload)
+    merged = payload
+    try:
+        existing = _read_json(path)
+        if existing.get("schema") == "steel.capture-readable-rendition-status.v2":
+            merged = {**existing, "warm": payload, "warmUpdatedAt": _utc_text()}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    _atomic_compact_json(path, merged)
     return path
 
 

@@ -9,15 +9,9 @@ import { CapturePlayback } from './CapturePlayback';
 
 const playbackMocks = vi.hoisted(() => ({
   readHistory: vi.fn(),
-  imageUrl: vi.fn((
-    artifactRef: string,
-    maxWidth: number,
-    roi: readonly [number, number, number, number],
-  ) => (
-    `/api/capture/file?path=${encodeURIComponent(artifactRef)}`
-    + `&maxWidth=${maxWidth}&region=valid`
-    + `&cropX=${roi[0]}&cropY=${roi[1]}`
-    + `&cropWidth=${roi[2] - roi[0]}&cropHeight=${roi[3] - roi[1]}`
+  imageUrl: vi.fn((artifactRef: string, modality: string, level: string) => (
+    `/api/capture/render?path=${encodeURIComponent(artifactRef)}`
+    + `&modality=${modality}&level=${level}`
   )),
 }));
 
@@ -26,7 +20,7 @@ vi.mock('../lib/capture-api', async (importOriginal) => {
   return {
     ...original,
     readCaptureHistory: playbackMocks.readHistory,
-    captureHistoryImageUrl: playbackMocks.imageUrl,
+    captureRenderImageUrl: playbackMocks.imageUrl,
   };
 });
 
@@ -112,7 +106,7 @@ describe('CapturePlayback', () => {
     expect(readyImage).toHaveAttribute(
       'src',
       expect.stringMatching(
-        /path=63%2Fcapture%2FC1%2F2d%2F12\.png&maxWidth=\d+&region=valid&cropX=100&cropY=20&cropWidth=600&cropHeight=980/,
+        /path=63%2Fcapture%2FC1%2F2d%2F12\.png&modality=gray&level=thumbnail/,
       ),
     );
     expect(readyImage).toHaveAttribute('width', '600');
@@ -123,12 +117,13 @@ describe('CapturePlayback', () => {
     expect(playbackMocks.imageUrl).toHaveBeenCalled();
     expect(playbackMocks.imageUrl).toHaveBeenCalledWith(
       '63/capture/C1/2d/12.png',
-      expect.any(Number),
-      [100, 20, 700, 1000],
+      'gray',
+      'thumbnail',
     );
-    for (const [artifactRef, , roi] of playbackMocks.imageUrl.mock.calls) {
+    for (const [artifactRef, modality, level] of playbackMocks.imageUrl.mock.calls) {
       expect(artifactRef).toBe('63/capture/C1/2d/12.png');
-      expect(roi).toEqual([100, 20, 700, 1000]);
+      expect(modality).toBe('gray');
+      expect(level).toBe('thumbnail');
     }
   });
 });

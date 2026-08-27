@@ -1,12 +1,13 @@
 import { Camera, ChevronLeft, ChevronRight, HardDrive, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type WheelEvent } from 'react';
 import {
-  captureHistoryImageUrl,
+  captureRenderImageUrl,
   readCaptureHistory,
   type CaptureCameraStatus,
   type CaptureHistoryCameraFrame,
   type CaptureHistoryResult,
 } from '../lib/capture-api';
+import { prefetchCaptureImageUrls } from '../lib/capture-image-prefetch';
 import { CaptureMeasurementPanel } from './CaptureMeasurementPanel';
 import { CaptureDefectDetectionPanel } from './CaptureDefectDetectionPanel';
 import { CaptureSurfacePanel } from './CaptureSurfacePanel';
@@ -25,8 +26,6 @@ function timeLabel(value: string) {
     ? value
     : date.toLocaleString('zh-CN', { hour12: false });
 }
-
-type PlaybackViewport = { width: number; height: number };
 
 function readyPlaybackRoi(
   saved: CaptureHistoryCameraFrame,
@@ -58,26 +57,6 @@ function playbackImageSize(saved: CaptureHistoryCameraFrame, roi: [number, numbe
   };
 }
 
-function playbackRequestWidth(
-  saved: CaptureHistoryCameraFrame,
-  viewport: PlaybackViewport,
-) {
-  const cellWidth = viewport.width > 0 ? Math.max(160, (viewport.width - 16) / 3) : 560;
-  const cellHeight = viewport.height > 0 ? Math.max(100, (viewport.height - 8) / 2 - 59) : 300;
-  const roi = readyPlaybackRoi(saved);
-  const roiWidth = roi ? roi[2] - roi[0] : 0;
-  const roiHeight = roi ? roi[3] - roi[1] : 0;
-  const indexedWidth = Number(saved.playbackWidth || 0);
-  const indexedHeight = Number(saved.playbackHeight || 0);
-  const hasIndexedSize = indexedWidth > 0 && indexedHeight > 0;
-  const sourceWidth = hasIndexedSize ? indexedWidth : roiWidth;
-  const sourceHeight = hasIndexedSize ? indexedHeight : roiHeight;
-  const aspect = sourceHeight > 0 ? sourceWidth / sourceHeight : 1;
-  const renderedWidth = Math.min(cellWidth, cellHeight * aspect);
-  const pixelRatio = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-  return Math.max(160, Math.min(800, Math.ceil(renderedWidth * pixelRatio)));
-}
-
 export function CapturePlayback({ statuses }: CapturePlaybackProps) {
   const cameras = useMemo(
     () => statuses.filter((status) => status.enabled !== false),
@@ -89,9 +68,7 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
   const [switching, setSwitching] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [viewport, setViewport] = useState<PlaybackViewport>({ width: 0, height: 0 });
   const switchRevision = useRef(0);
-  const gridRef = useRef<HTMLDivElement | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -112,29 +89,6 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
   useEffect(() => {
     void load();
   }, [load]);
-
-  useEffect(() => {
-    const grid = gridRef.current;
-    if (!grid) return undefined;
-    const update = () => {
-      const bounds = grid.getBoundingClientRect();
-      setViewport((current) => (
-        Math.abs(current.width - bounds.width) < 1 && Math.abs(current.height - bounds.height) < 1
-          ? current
-          : { width: bounds.width, height: bounds.height }
-      ));
-    };
-    update();
-    const observer = typeof ResizeObserver === 'undefined'
-      ? null
-      : new ResizeObserver(update);
-    observer?.observe(grid);
-    window.addEventListener('resize', update);
-    return () => {
-      observer?.disconnect();
-      window.removeEventListener('resize', update);
-    };
-  }, [history]);
 
   const frames = history?.frames ?? [];
   const frame = frames[frameIndex] ?? null;
@@ -161,7 +115,7 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
       const urls = target.cameras.flatMap((camera) => {
         const roi = readyPlaybackRoi(camera);
         return roi
-          ? [captureHistoryImageUrl(camera.artifactRef, playbackRequestWidth(camera, viewport), roi)]
+          ? [captureRenderImageUrl(camera.artifactRef, 'gray', 'thumbnail')]
           : [];
       });
       const preload = urls.map((url) => new Promise<void>((resolve) => {
@@ -180,29 +134,23 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
       });
     }, 70);
     return () => window.clearTimeout(timer);
-  }, [frameIndex, frames, requestedFrameIndex, viewport]);
+  }, [frameIndex, frames, requestedFrameIndex]);
 
   useEffect(() => {
     if (!frames.length) return undefined;
-    const timer = window.setTimeout(() => {
-      for (const neighborIndex of [frameIndex - 1, frameIndex + 1]) {
-        const neighbor = frames[neighborIndex];
-        if (!neighbor) continue;
-        for (const camera of neighbor.cameras) {
-          const roi = readyPlaybackRoi(camera);
-          if (!roi) continue;
-          const image = new Image();
-          image.decoding = 'async';
-          image.src = captureHistoryImageUrl(
-            camera.artifactRef,
-            playbackRequestWidth(camera, viewport),
-            roi,
-          );
-        }
-      }
-    }, 180);
-    return () => window.clearTimeout(timer);
-  }, [frameIndex, frames, viewport]);
+    const urls = [-2, -1, 1, 2].flatMap((offset) => {
+      const neighbor = frames[frameIndex + offset];
+      if (!neighbor) return [];
+      return neighbor.cameras.flatMap((camera) => {
+        if (!readyPlaybackRoi(camera)) return [];
+        return [captureRenderImageUrl(camera.artifactRef, 'gray', 'thumbnail')];
+      });
+    });
+    return prefetchCaptureImageUrls(urls, {
+      maxUrls: 24,
+      delayMs: 180,
+    });
+  }, [frameIndex, frames]);
 
   return (
     <section className="capture-playback" aria-label="历史采集回放" onWheel={handleWheel}>
@@ -220,7 +168,7 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
       </header>
 
       {frame ? (
-        <div ref={gridRef} className="capture-playback-grid" aria-label="历史六相机画面">
+        <div className="capture-playback-grid" aria-label="历史六相机画面">
           {cameras.map((camera, index) => {
             const saved = frame.cameras.find((item) => (
               readyPlaybackRoi(item) !== null
@@ -238,11 +186,7 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
                 <div>
                   {saved && roi && size ? (
                     <img
-                      src={captureHistoryImageUrl(
-                        saved.artifactRef,
-                        playbackRequestWidth(saved, viewport),
-                        roi,
-                      )}
+                      src={captureRenderImageUrl(saved.artifactRef, 'gray', 'thumbnail')}
                       alt={`${label} 历史灰度图`}
                       width={size.width}
                       height={size.height}

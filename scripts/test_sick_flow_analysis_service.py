@@ -115,6 +115,41 @@ class SickFlowAnalysisServiceTests(unittest.TestCase):
                 (root / name).mkdir()
             self.assertEqual(service.recent_materials(root, 3), ["100", "12", "9"])
 
+    def test_all_materials_and_history_cursor_are_numeric_and_restartable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("9", "100", "12", "FLOW-0000000200", "system"):
+                (root / name).mkdir()
+            self.assertEqual(service.all_materials(root), ["9", "12", "100"])
+            self.assertEqual(service.load_history_cursor(root), "")
+            service.save_history_cursor(
+                root,
+                "12",
+                catalog_count=3,
+                checked_count=4,
+            )
+            self.assertEqual(service.load_history_cursor(root), "12")
+            payload = json.loads(
+                service.history_cursor_path(root).read_text(encoding="utf-8-sig")
+            )
+            self.assertEqual(payload["schema"], service.HISTORY_CURSOR_SCHEMA)
+            self.assertEqual(payload["catalogCount"], 3)
+            self.assertEqual(payload["checkedCount"], 4)
+
+    def test_history_cursor_round_robin_excludes_realtime_window(self) -> None:
+        materials = ["1", "2", "3", "4"]
+        self.assertEqual(
+            service.next_history_material(materials, "2", {"4"}),
+            "3",
+        )
+        self.assertEqual(
+            service.next_history_material(materials, "4", {"1", "2"}),
+            "3",
+        )
+        self.assertIsNone(
+            service.next_history_material(materials, "2", set(materials))
+        )
+
     def test_committed_signature_does_not_advance_on_partial_round(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

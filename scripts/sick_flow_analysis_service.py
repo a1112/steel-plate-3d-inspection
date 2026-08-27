@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 import queue
@@ -15,6 +16,7 @@ from pathlib import Path
 from urllib import request
 
 from sick_capture.alignment import AlignmentConfig, build_and_write_flow_alignment
+from sick_capture.calibration_pointer import resolve_active_array_calibration
 from sick_capture.defect_detection import (
     DefectDetectionConfig,
     build_and_write_flow_defect_detection,
@@ -42,6 +44,11 @@ from sick_capture.surface import (
     apply_surface_quality_gate,
     build_and_write_flow_surface,
 )
+
+
+HISTORY_CURSOR_SCHEMA = "steel.flow-analysis-history-cursor.v1"
+HISTORY_CURSOR_FILENAME = "history-cursor.json"
+DEFAULT_MAXIMUM_DEFECT_BACKLOG = 64
 
 
 def lower_process_priority() -> str:
@@ -211,11 +218,14 @@ def fast_artifacts_ready(
         return False
     if not isinstance(state, dict):
         return False
-    recorded = (
-        int(state.get("committedEventCount", -1)),
-        int(state.get("latestCommittedRound", -1)),
-        int(state.get("latestCommittedEventMtimeNs", -1)),
-    )
+    try:
+        recorded = (
+            int(state.get("committedEventCount", -1)),
+            int(state.get("latestCommittedRound", -1)),
+            int(state.get("latestCommittedEventMtimeNs", -1)),
+        )
+    except (TypeError, ValueError):
+        return False
     if recorded != signature:
         return False
     if str(state.get("state", "")) not in {
@@ -276,6 +286,104 @@ def recent_materials(first_root: Path, limit: int) -> list[str]:
     # flow from the realtime analysis window.
     rows.sort(key=lambda path: int(path.name), reverse=True)
     return [path.name for path in rows[:limit]]
+
+
+def all_materials(first_root: Path) -> list[str]:
+    """Return the numeric flow catalog in ascending durable-id order.
+
+    The catalog is intentionally kept as a bounded list of ids, not as a
+    queue of work.  A flow is inspected only when the round-robin cursor lands
+    on it, so a large history cannot enqueue thousands of analyses at once.
+    """
+    try:
+        rows = [
+            path.name
+            for path in first_root.iterdir()
+            if path.is_dir() and path.name.isdigit()
+        ]
+    except OSError:
+        return []
+    rows.sort(key=int)
+    return rows
+
+
+def history_cursor_path(storage_root: Path) -> Path:
+    return (
+        Path(storage_root)
+        / "system"
+        / "jobs"
+        / "flow-analysis"
+        / HISTORY_CURSOR_FILENAME
+    )
+
+
+def load_history_cursor(storage_root: Path) -> str:
+    """Load the last inspected id; a missing/corrupt cursor starts at oldest."""
+    try:
+        payload = json.loads(
+            history_cursor_path(storage_root).read_text(encoding="utf-8-sig")
+        )
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema") == HISTORY_CURSOR_SCHEMA
+            and str(payload.get("lastScannedMaterialId", "")).isdigit()
+        ):
+            return str(int(payload["lastScannedMaterialId"]))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return ""
+
+
+def save_history_cursor(
+    storage_root: Path,
+    material_id: str,
+    *,
+    catalog_count: int,
+    checked_count: int,
+) -> None:
+    """Persist a small checkpoint after each historical candidate inspection."""
+    atomic_summary(
+        history_cursor_path(storage_root),
+        {
+            "schema": HISTORY_CURSOR_SCHEMA,
+            "updatedAtUnixMs": int(time.time() * 1000),
+            "lastScannedMaterialId": str(material_id),
+            "catalogCount": max(0, int(catalog_count)),
+            "checkedCount": max(0, int(checked_count)),
+        },
+    )
+
+
+def next_history_material(
+    materials: list[str],
+    last_scanned_material_id: str,
+    excluded: set[str] | None = None,
+) -> str | None:
+    """Return one round-robin id after the persisted cursor.
+
+    ``materials`` must be ascending numeric ids.  The cursor is an id rather
+    than an array offset, so insertion of a newer flow cannot invalidate a
+    restart checkpoint.  ``excluded`` is used for the recent realtime window.
+    """
+    if not materials:
+        return None
+    excluded_ids = excluded or set()
+    try:
+        cursor = int(last_scanned_material_id)
+    except (TypeError, ValueError):
+        cursor = -1
+    start = 0
+    for index, material_id in enumerate(materials):
+        if int(material_id) > cursor:
+            start = index
+            break
+    else:
+        start = 0
+    for offset in range(len(materials)):
+        candidate = materials[(start + offset) % len(materials)]
+        if candidate not in excluded_ids:
+            return candidate
+    return None
 
 
 def notify_region_commit(
@@ -670,6 +778,25 @@ def main() -> int:
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--settle-seconds", type=float, default=20.0)
     parser.add_argument("--recent-flows", type=int, default=128)
+    parser.add_argument(
+        "--full-history",
+        dest="full_history",
+        action="store_true",
+        default=True,
+        help="continuously inspect all older closed flows (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-full-history",
+        dest="full_history",
+        action="store_false",
+        help="disable the background closed-flow history backfill",
+    )
+    parser.add_argument(
+        "--maximum-defect-backlog",
+        type=int,
+        default=DEFAULT_MAXIMUM_DEFECT_BACKLOG,
+        help="bound queued final defect jobs (default: 64)",
+    )
     parser.add_argument("--maximum-storage-backlog", type=int, default=16)
     parser.add_argument("--tile-frames", type=int, default=16)
     parser.add_argument("--once", default="")
@@ -706,6 +833,14 @@ def main() -> int:
     if calibration_text:
         candidate = Path(calibration_text)
         calibration_path = candidate if candidate.is_absolute() else profile.source_path.parent / candidate
+
+    def active_calibration_path() -> Path:
+        return Path(
+            resolve_active_array_calibration(
+                profile.storage_root,
+                calibration_path,
+            )["path"]
+        )
 
     def configured_path(key: str) -> Path | None:
         text = os.path.expandvars(str(defaults.get(key, "")).strip())
@@ -765,7 +900,7 @@ def main() -> int:
             alignment_config,
             measurement_config,
             defect_detection_config,
-            calibration_path,
+            active_calibration_path(),
             args.database_origin,
             final=args.final,
         )
@@ -787,8 +922,30 @@ def main() -> int:
     queue_serial = 0
     current_fast_flow = ""
     current_defect_flow = ""
+    current_history_flow = ""
     fast_processed_count = 0
     defect_processed_count = 0
+    history_checked_count = 0
+    history_completed_count = 0
+    history_skipped_count = 0
+    history_failed_count = 0
+    history_last_flow = ""
+    history_last_error = ""
+    history_catalog: list[str] = []
+    history_catalog_updated_at = 0.0
+    history_cursor = load_history_cursor(profile.storage_root)
+    history_future: Future[dict[str, object]] | None = None
+    history_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="sick-history-backfill",
+    )
+    history_refresh_seconds = max(15.0, args.poll_seconds * 8.0)
+    first_root = profile.storage_root
+    maximum_defect_backlog = max(
+        1,
+        min(1024, int(args.maximum_defect_backlog)),
+    )
+    defect_backlog_deferred_count = 0
     last_queue_error = ""
     status_write_error = ""
     realtime_status_path = (
@@ -815,6 +972,25 @@ def main() -> int:
                 "fastProcessedFlowCount": fast_processed_count,
                 "defectProcessedFlowCount": defect_processed_count,
                 "recentFlowWindow": max(1, args.recent_flows),
+                "maximumDefectBacklog": maximum_defect_backlog,
+                "defectBacklogDeferredCount": defect_backlog_deferred_count,
+                "fullHistoryEnabled": bool(args.full_history),
+                "historyState": (
+                    "disabled"
+                    if not args.full_history
+                    else "building"
+                    if current_history_flow
+                    else "idle"
+                ),
+                "currentHistoryFlow": current_history_flow or None,
+                "historyLastFlow": history_last_flow or None,
+                "historyCatalogCount": len(history_catalog),
+                "historyCheckedFlowCount": history_checked_count,
+                "historyCompletedFlowCount": history_completed_count,
+                "historySkippedFlowCount": history_skipped_count,
+                "historyFailedFlowCount": history_failed_count,
+                "historyCursor": history_cursor or None,
+                "historyLastError": history_last_error or None,
                 "maximumStorageBacklog": max(0, args.maximum_storage_backlog),
                 "processPriority": process_priority,
                 "lastError": last_queue_error or status_write_error or None,
@@ -846,7 +1022,7 @@ def main() -> int:
     def enqueue_defect(
         material_id: str, signature: tuple[int, int, int]
     ) -> None:
-        nonlocal queue_serial
+        nonlocal queue_serial, defect_backlog_deferred_count
         if defect_artifact_complete(profile.storage_root, material_id):
             defect_completed[material_id] = signature
             return
@@ -857,10 +1033,39 @@ def main() -> int:
                 return
             if queued_defects.get(material_id) == signature:
                 return
+            if (
+                material_id not in queued_defects
+                and len(queued_defects) >= maximum_defect_backlog
+            ):
+                defect_backlog_deferred_count += 1
+                return
             queued_defects[material_id] = signature
             queue_serial += 1
             defect_queue.put((-int(material_id), queue_serial, material_id, signature))
         write_queue_status()
+
+    def prune_realtime_state(recent_ids: list[str]) -> None:
+        """Keep long-running service bookkeeping bounded to recent flows."""
+        keep = set(recent_ids)
+        keep.update(queued_defects)
+        if current_fast_flow:
+            keep.add(current_fast_flow)
+        if current_defect_flow:
+            keep.add(current_defect_flow)
+        limit = max(256, max(1, args.recent_flows) * 2)
+        for mapping in (
+            observed,
+            processed,
+            defect_completed,
+            defect_retry_after,
+        ):
+            if len(mapping) <= limit:
+                continue
+            for material_id in list(mapping):
+                if len(mapping) <= limit:
+                    break
+                if material_id not in keep:
+                    mapping.pop(material_id, None)
 
     def defect_worker() -> None:
         nonlocal current_defect_flow, defect_processed_count, last_queue_error
@@ -929,11 +1134,159 @@ def main() -> int:
         daemon=True,
     )
     heartbeat_thread.start()
-    first_root = profile.storage_root
+
+    def refresh_history_catalog(force: bool = False) -> None:
+        nonlocal history_catalog, history_catalog_updated_at
+        if not args.full_history:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and history_catalog
+            and now - history_catalog_updated_at < history_refresh_seconds
+        ):
+            return
+        catalog = all_materials(first_root)
+        with queue_state_lock:
+            history_catalog = catalog
+            history_catalog_updated_at = now
+
+    def run_history_analysis(
+        material_id: str,
+        signature: tuple[int, int, int],
+    ) -> dict[str, object]:
+        """Run one final-fast pass outside the realtime polling thread."""
+        try:
+            analyze(
+                camera_roots,
+                profile.storage_root,
+                material_id,
+                alignment_config,
+                measurement_config,
+                defect_detection_config,
+                active_calibration_path(),
+                args.database_origin,
+                final=True,
+                include_defects=False,
+                committed_event_signature=signature,
+            )
+            after = committed_signature(profile.storage_root, material_id)
+            after_state = flow_state(profile.storage_root, material_id)
+            ready = bool(
+                after == signature
+                and after_state == "closed"
+                and fast_artifacts_ready(
+                    profile.storage_root,
+                    material_id,
+                    signature,
+                )
+            )
+            return {
+                "materialId": material_id,
+                "signature": signature,
+                "ready": ready,
+                "error": "" if ready else "history-fast-artifacts-not-ready",
+            }
+        except Exception as error:
+            return {
+                "materialId": material_id,
+                "signature": signature,
+                "ready": False,
+                "error": f"{type(error).__name__}: {error}",
+            }
+
+    def finish_history_future() -> None:
+        nonlocal history_future
+        nonlocal current_history_flow, history_completed_count
+        nonlocal history_failed_count, history_last_flow, history_last_error
+        if history_future is None or not history_future.done():
+            return
+        future = history_future
+        history_future = None
+        material_id = current_history_flow
+        current_history_flow = ""
+        try:
+            result = future.result()
+        except Exception as error:
+            history_failed_count += 1
+            history_last_error = f"{material_id}: {type(error).__name__}: {error}"
+            history_last_flow = material_id
+            return
+        result_material = str(result.get("materialId", material_id))
+        history_last_flow = result_material
+        if bool(result.get("ready")):
+            history_completed_count += 1
+            history_last_error = ""
+        else:
+            history_failed_count += 1
+            history_last_error = (
+                f"{result_material}: {str(result.get('error', 'history analysis failed'))}"
+            )
+
+    def schedule_history_analysis(excluded_recent: set[str]) -> bool:
+        nonlocal history_future, current_history_flow, history_cursor
+        nonlocal history_checked_count, history_skipped_count
+        nonlocal history_last_flow, history_last_error
+        if not args.full_history or history_future is not None:
+            return False
+        refresh_history_catalog()
+        with queue_state_lock:
+            candidate = next_history_material(
+                history_catalog,
+                history_cursor,
+                excluded_recent,
+            )
+        if candidate is None:
+            return False
+
+        # Advance/persist before the expensive work. If the process stops in
+        # the middle of this flow, the next restart continues round-robin and
+        # will revisit this still-incomplete flow after one catalog rotation.
+        history_cursor = candidate
+        history_checked_count += 1
+        try:
+            save_history_cursor(
+                profile.storage_root,
+                candidate,
+                catalog_count=len(history_catalog),
+                checked_count=history_checked_count,
+            )
+        except OSError as error:
+            # The cursor is a recovery aid, not a reason to stop realtime
+            # analysis. Keep the in-memory cursor and report the persistence
+            # problem for the next status heartbeat.
+            history_last_error = f"history cursor: {type(error).__name__}: {error}"
+        state = flow_state(profile.storage_root, candidate)
+        if state != "closed":
+            history_skipped_count += 1
+            history_last_flow = candidate
+            return False
+        signature = committed_signature(profile.storage_root, candidate)
+        if signature is None:
+            history_skipped_count += 1
+            history_last_flow = candidate
+            return False
+        if fast_artifacts_ready(profile.storage_root, candidate, signature):
+            history_skipped_count += 1
+            history_last_flow = candidate
+            return False
+
+        current_history_flow = candidate
+        history_future = history_executor.submit(
+            run_history_analysis,
+            candidate,
+            signature,
+        )
+        return True
+
     while not stop.is_set():
+        finish_history_future()
+        refresh_history_catalog()
         now = time.monotonic()
         defect_candidates: dict[str, tuple[int, int, int]] = {}
-        for material_id in recent_materials(first_root, max(1, args.recent_flows)):
+        recent_ids = recent_materials(first_root, max(1, args.recent_flows))
+        recent_expensive_pass = False
+        for material_id in recent_ids:
             state = flow_state(profile.storage_root, material_id)
             if state not in {"capturing", "closed"}:
                 continue
@@ -980,6 +1333,7 @@ def main() -> int:
             try:
                 with queue_state_lock:
                     current_fast_flow = material_id
+                    recent_expensive_pass = True
                 write_queue_status()
                 analyze(
                     camera_roots,
@@ -988,7 +1342,7 @@ def main() -> int:
                     alignment_config,
                     measurement_config,
                     defect_detection_config,
-                    calibration_path,
+                    active_calibration_path(),
                     args.database_origin,
                     final=final,
                     include_defects=False,
@@ -1024,11 +1378,19 @@ def main() -> int:
             # Re-read the numeric material list after every expensive fast
             # pass so a newly closed live flow can never sit behind the rest
             # of a startup/history backlog captured by this iteration.
-            break
+                break
+        prune_realtime_state(recent_ids)
         for material_id in sorted(defect_candidates, key=int, reverse=True):
             enqueue_defect(material_id, defect_candidates[material_id])
+        # Realtime/current flows always get the first chance each round. The
+        # history worker is asynchronous, bounded to one flow, and never adds
+        # historical defect jobs to the realtime defect queue.
+        if not recent_expensive_pass:
+            schedule_history_analysis(set(recent_ids))
+        write_queue_status()
         stop.wait(max(0.25, args.poll_seconds))
     write_queue_status()
+    history_executor.shutdown(wait=False, cancel_futures=True)
     defect_thread.join(timeout=2.0)
     heartbeat_thread.join(timeout=2.0)
     return 0

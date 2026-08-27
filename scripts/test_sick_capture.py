@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from collections import deque
 import hashlib
 import io
 import json
@@ -11,12 +12,13 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from typing import Callable
 from urllib import request
 from urllib.error import HTTPError
 from urllib.parse import quote
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 from PIL import Image
@@ -1614,7 +1616,7 @@ class SickStorageTests(unittest.TestCase):
                 {"state": "ready"},
             )
 
-    def test_dual_writer_preserves_exact_lg3d_contract_and_raw_depth(self) -> None:
+    def test_dual_writer_preserves_exact_lg3d_contract_and_compressed_raw_depth(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             camera_root = Path(directory) / "C1"
             result = DualFormatWriter(
@@ -1645,6 +1647,11 @@ class SickStorageTests(unittest.TestCase):
 
             validation = validate_lg3d_dataset(base)
             self.assertEqual(validation.frame_count, 1)
+            with zipfile.ZipFile(result.lg3d_depth) as archive:
+                self.assertEqual(
+                    {entry.filename: entry.compress_type for entry in archive.infolist()},
+                    {"array.npy": zipfile.ZIP_DEFLATED},
+                )
             with np.load(result.lg3d_depth, allow_pickle=False) as package:
                 self.assertEqual(package.files, ["array"])
                 np.testing.assert_array_equal(package["array"], sample_frame().depth_raw)
@@ -1656,6 +1663,8 @@ class SickStorageTests(unittest.TestCase):
             self.assertFalse((base / "metadata").exists())
             metadata = json.loads(result.steel_metadata.read_text(encoding="utf-8"))
             self.assertTrue(metadata["complete"])
+            self.assertEqual(metadata["depthPersistenceMode"], "single-lg3d-npz-deflate")
+            self.assertEqual(metadata["depthCompression"], "zip-deflate")
             self.assertEqual(metadata["depthDataFormat"], "Coord3D_C16")
             self.assertEqual(metadata["captureRound"], 9)
             self.assertEqual(metadata["syncGroupId"], "FLOW-0000000001:round-000000000009")
@@ -1719,6 +1728,29 @@ class SickStorageTests(unittest.TestCase):
 
 
 class SickProviderTests(unittest.TestCase):
+    @staticmethod
+    def _history_runtime_fixture(profile) -> ProviderRuntime:
+        runtime = object.__new__(ProviderRuntime)
+        runtime.profile = profile
+        runtime.history_lock = threading.RLock()
+        runtime.playback_warm_stop = threading.Event()
+        runtime.playback_warm_futures = {}
+        runtime.playback_history_flow_queue = deque(maxlen=4)
+        runtime.playback_history_retry_pending = deque()
+        runtime.playback_history_queued = set()
+        runtime.playback_history_catalog_ids = []
+        runtime.playback_history_eligible_ids = []
+        runtime.playback_history_scan_cursor = 0
+        runtime.playback_history_catalog_mtime_ns = 0
+        runtime.playback_history_completed = set()
+        runtime.playback_history_skipped_complete = set()
+        runtime.playback_history_failed = set()
+        runtime.playback_history_retry_counts = {}
+        runtime.playback_history_unready_ids = set()
+        runtime.playback_history_unready_queue = deque()
+        runtime.playback_history_status = {}
+        return runtime
+
     def test_history_only_runtime_rejects_device_connection_and_capture(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile = load_profile(write_profile(Path(directory)))
@@ -1735,6 +1767,166 @@ class SickProviderTests(unittest.TestCase):
                 self.assertEqual(runtime.health_json()["framesReceived"], 0)
             finally:
                 runtime.close()
+
+    def test_playback_warm_status_replace_drops_previous_flow_details(self) -> None:
+        runtime = object.__new__(ProviderRuntime)
+        runtime.history_lock = threading.RLock()
+        runtime.playback_warm_status = {
+            "materialId": "41",
+            "legacyCleanup": {"deleted": ["large-old-result"]},
+        }
+
+        runtime._set_playback_warm_status(
+            replace=True,
+            state="building",
+            materialId="42",
+            sourceFrameCount=10,
+        )
+
+        self.assertEqual(runtime.playback_warm_status["materialId"], "42")
+        self.assertEqual(runtime.playback_warm_status["state"], "building")
+        self.assertNotIn("legacyCleanup", runtime.playback_warm_status)
+
+    def test_playback_warm_does_not_overwrite_unconsumed_done_future(self) -> None:
+        runtime = object.__new__(ProviderRuntime)
+        runtime.history_lock = threading.RLock()
+        finished = Mock()
+        finished.done.return_value = True
+        runtime.playback_warm_futures = {"42": finished}
+
+        with patch.object(
+            runtime,
+            "_flow_ready_for_full_renditions",
+            return_value=True,
+        ):
+            self.assertFalse(runtime._schedule_playback_warm("42"))
+
+        self.assertIs(runtime.playback_warm_futures["42"], finished)
+
+    def test_finishing_old_warm_future_preserves_newer_mapping(self) -> None:
+        runtime = object.__new__(ProviderRuntime)
+        runtime.history_lock = threading.RLock()
+        old_future = Mock()
+        old_future.result.return_value = {"state": "ready"}
+        newer_future = Mock()
+        runtime.playback_warm_futures = {"42": newer_future}
+
+        runtime._finish_full_history_future("42", old_future)
+
+        self.assertIs(runtime.playback_warm_futures["42"], newer_future)
+
+    def test_full_history_ready_hint_does_not_bypass_authoritative_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            profile.storage_root.mkdir(parents=True, exist_ok=True)
+            (profile.storage_root / "catalog.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {"materialId": "1"},
+                            {"materialId": "2"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runtime = self._history_runtime_fixture(profile)
+            with patch.object(
+                runtime,
+                "_flow_ready_for_full_renditions",
+                return_value=True,
+            ), patch.object(
+                runtime,
+                "_flow_two_level_renditions_ready_hint",
+                side_effect=lambda material_id: material_id == "2",
+            ):
+                self.assertTrue(runtime._discover_full_history_catalog())
+
+            self.assertEqual(runtime.playback_history_eligible_ids, ["1", "2"])
+            self.assertEqual(runtime.playback_history_completed, set())
+            audit = Mock(return_value=True)
+            with patch.object(
+                runtime,
+                "_flow_ready_for_full_renditions",
+                return_value=True,
+            ), patch.object(
+                runtime,
+                "_flow_two_level_renditions_complete",
+                audit,
+            ):
+                runtime._advance_full_history_rebuild()
+
+            self.assertEqual(
+                [call.args[0] for call in audit.call_args_list],
+                ["1", "2"],
+            )
+            self.assertEqual(runtime.playback_history_completed, {"1", "2"})
+
+    def test_full_history_unhinted_flows_precede_ready_hints_in_catalog_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            profile.storage_root.mkdir(parents=True, exist_ok=True)
+            (profile.storage_root / "catalog.json").write_text(
+                json.dumps(
+                    {
+                        "materials": [
+                            {"materialId": "3"},
+                            {"materialId": "1"},
+                            {"materialId": "4"},
+                            {"materialId": "2"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runtime = self._history_runtime_fixture(profile)
+            with patch.object(
+                runtime,
+                "_flow_ready_for_full_renditions",
+                return_value=True,
+            ), patch.object(
+                runtime,
+                "_flow_two_level_renditions_ready_hint",
+                side_effect=lambda material_id: material_id in {"1", "2"},
+            ):
+                self.assertTrue(runtime._discover_full_history_catalog())
+
+            self.assertEqual(
+                runtime.playback_history_eligible_ids,
+                ["3", "4", "1", "2"],
+            )
+
+    def test_full_history_skips_refill_queue_without_waiting_for_next_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            runtime = self._history_runtime_fixture(profile)
+            runtime.playback_history_eligible_ids = [str(index) for index in range(1, 7)]
+            audit = Mock(return_value=True)
+            with patch.object(
+                runtime,
+                "_discover_full_history_catalog",
+                return_value=True,
+            ), patch.object(
+                runtime,
+                "_flow_ready_for_full_renditions",
+                return_value=True,
+            ), patch.object(
+                runtime,
+                "_flow_two_level_renditions_complete",
+                audit,
+            ):
+                runtime._advance_full_history_rebuild()
+
+            self.assertEqual(
+                [call.args[0] for call in audit.call_args_list],
+                ["1", "2", "3", "4", "5", "6"],
+            )
+            self.assertEqual(
+                runtime.playback_history_completed,
+                {str(index) for index in range(1, 7)},
+            )
+            self.assertEqual(runtime.playback_history_status["state"], "complete")
+            self.assertEqual(len(runtime.playback_history_flow_queue), 0)
 
     def test_playback_cache_status_describes_camera_local_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1759,14 +1951,23 @@ class SickProviderTests(unittest.TestCase):
                 for camera in profile.enabled_cameras
             ]
 
-            # Keep the legacy string field for older clients, but make its
-            # value an explicit camera-local template rather than the
-            # removed central <storage-root>/<flow-id>/cache path.
             self.assertEqual(
                 status["cacheRoot"],
                 "<camera-root>/<flow-id>/cache",
             )
             self.assertEqual(status["cacheRoots"], expected_roots)
+            self.assertEqual(status["schema"], "steel.capture-two-level-cache-status.v2")
+            self.assertEqual(status["levels"], ["thumbnail", "original"])
+            self.assertEqual(status["modalities"], ["gray", "jet"])
+            self.assertEqual(status["generationPolicy"], "full-flow-after-alignment")
+            self.assertEqual(status["onDemandBuild"], "recovery-only")
+            self.assertIn("renditionsBuilt", status)
+            self.assertIn("twoLevelWarm", status)
+            self.assertIn("fullHistory", status)
+            self.assertIn("queueProgress", status["fullHistory"])
+            self.assertEqual(status["fullHistory"]["queueProgress"]["capacity"], 4)
+            self.assertNotIn("pyramidsBuilt", status)
+            self.assertNotIn("fullPyramidWarm", status)
             self.assertNotIn(
                 str(profile.storage_root / "<flow-id>" / "cache"),
                 status["cacheRoots"],

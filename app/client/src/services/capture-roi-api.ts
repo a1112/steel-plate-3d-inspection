@@ -1,7 +1,6 @@
 import type { CaptureImageItem } from '../data/inspection';
 import {
-  captureArtifactImageUrl,
-  captureHistoryImageUrl,
+  captureRenderImageUrl,
   readCaptureHistory,
   type CaptureHistoryCameraFrame,
   type CaptureHistoryFrame,
@@ -9,10 +8,6 @@ import {
 } from '../lib/capture-api';
 
 const NUMERIC_FLOW_ID = /^\d+$/;
-// A virtualized stitch cell is 176 CSS pixels wide. This bounded rendition
-// remains sharp at common DPR values without decoding a 2048px image for
-// every one of the dozens of simultaneously visible cells.
-export const CAPTURE_STITCH_PREVIEW_MAX_WIDTH = 384;
 
 export type CaptureRoiPreviewImage = CaptureImageItem & {
   validRoi: [number, number, number, number];
@@ -43,7 +38,10 @@ export type CaptureStitchCameraFrame = {
   sourceBytes?: number;
   validRoi: [number, number, number, number] | null;
   url: string;
-  cropMode: 'algorithm-roi' | 'auto-black-border';
+  grayThumbnailUrl: string;
+  grayOriginalUrl: string;
+  jetThumbnailUrl: string;
+  jetOriginalUrl: string;
 };
 
 export type CaptureStitchFrame = {
@@ -59,8 +57,7 @@ export type CaptureStitchResult = {
   totalFrames: number;
   hasMore: boolean;
   expectedCameraCount: number;
-  algorithmRoiImageCount: number;
-  autoCropImageCount: number;
+  renderableImageCount: number;
   frames: CaptureStitchFrame[];
 };
 
@@ -103,7 +100,7 @@ function eligibleCamera(
   if (
     !roi
     || camera.regionState !== 'ready'
-    || !/(?:^|\/)capture\/[^/]+\/2d\/[^/]+\.png$/i.test(artifactRef)
+    || !/(?:^|\/)capture\/[^/]+\/2d\/[0-9]+\.png$/i.test(artifactRef)
   ) return null;
   const pixels = Math.max(1, (roi[2] - roi[0]) * (roi[3] - roi[1]));
   return {
@@ -186,7 +183,7 @@ export function selectCaptureStitchHistory(
       frame.cameras.forEach((camera) => {
         const cameraId = canonicalCameraId(camera.cameraId);
         if (!cameraId || (expected.size > 0 && !expected.has(cameraId))) return;
-        if (!/(?:^|\/)capture\/[^/]+\/2d\/[^/]+\.png$/i.test(camera.artifactRef.trim().replaceAll('\\', '/'))) return;
+        if (!/(?:^|\/)capture\/[^/]+\/2d\/[0-9]+\.png$/i.test(camera.artifactRef.trim().replaceAll('\\', '/'))) return;
         const current = selected.get(cameraId);
         if (!current || compareStitchCameraQuality(camera, current) > 0) {
           selected.set(cameraId, camera);
@@ -211,10 +208,11 @@ export function selectCaptureStitchHistory(
           sourceHeight: camera.height,
           sourceBytes: camera.bytes,
           validRoi: roi,
-          url: roi
-            ? captureHistoryImageUrl(camera.artifactRef, CAPTURE_STITCH_PREVIEW_MAX_WIDTH, roi)
-            : captureArtifactImageUrl(camera.artifactRef, CAPTURE_STITCH_PREVIEW_MAX_WIDTH),
-          cropMode: roi ? 'algorithm-roi' as const : 'auto-black-border' as const,
+          url: captureRenderImageUrl(camera.artifactRef, 'gray', 'thumbnail'),
+          grayThumbnailUrl: captureRenderImageUrl(camera.artifactRef, 'gray', 'thumbnail'),
+          grayOriginalUrl: captureRenderImageUrl(camera.artifactRef, 'gray', 'original'),
+          jetThumbnailUrl: captureRenderImageUrl(camera.artifactRef, 'jet', 'thumbnail'),
+          jetOriginalUrl: captureRenderImageUrl(camera.artifactRef, 'jet', 'original'),
         }];
       });
       const candidate: CaptureStitchFrame = {
@@ -231,16 +229,13 @@ export function selectCaptureStitchHistory(
 
   const frames = [...bySequence.values()].sort((left, right) => left.sequence - right.sequence);
   const cameraFrames = frames.flatMap((frame) => frame.cameras);
-  const algorithmRoiImageCount = cameraFrames.filter((camera) => camera.cropMode === 'algorithm-roi').length;
-  const autoCropImageCount = cameraFrames.length - algorithmRoiImageCount;
   return {
     materialId: normalizedMaterialId,
     indexed: history.indexed === true,
     totalFrames: Math.max(frames.length, Number(history.total || 0)),
     hasMore: history.hasMore === true || Number(history.total || 0) > frames.length,
     expectedCameraCount: expectedOrder.length,
-    algorithmRoiImageCount,
-    autoCropImageCount,
+    renderableImageCount: cameraFrames.length,
     frames,
   };
 }
@@ -309,7 +304,7 @@ export function selectCaptureRoiPreviews(
       sequenceNo: camera.storageIndex ?? frame.sequence,
       fileType: 'png',
       path: camera.artifactRef,
-      url: captureHistoryImageUrl(camera.artifactRef, 2048, roi),
+      url: captureRenderImageUrl(camera.artifactRef, 'gray', 'original'),
       createdAt: camera.storedAt || frame.capturedAt,
       validRoi: roi,
       sourceFrameId: frame.frameId,

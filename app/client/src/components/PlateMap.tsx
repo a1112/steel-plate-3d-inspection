@@ -7,13 +7,14 @@ import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
 import type { CaptureImageItem, DefectItem, DefectType } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import { createSequentialCameraLanes, type CameraDisplayLane } from '../lib/camera-display';
-import { captureArtifactImageUrl, type CaptureFlowSurface, type CaptureSurfaceCameraTiles } from '../lib/capture-api';
+import { captureRenderImageUrl, type CaptureFlowSurface, type CaptureSurfaceCameraTiles } from '../lib/capture-api';
 import { barSurfaceFileUrl, type BarSurfaceCamera, type BarSurfaceMesh } from '../services/bar-surface-api';
 import {
   fetchCaptureStitchHistory,
   type CaptureStitchFrame,
   type CaptureStitchResult,
 } from '../services/capture-roi-api';
+import { prefetchCaptureImageUrls } from '../lib/capture-image-prefetch';
 import {
   fetchInspectionWorldDefects,
   fetchInspectionWorldMeta,
@@ -176,6 +177,35 @@ export function mergeCameraBandCropWindow(
     right: Math.max(current.right, right),
   };
   return merged.left === current.left && merged.right === current.right ? current : merged;
+}
+
+const CAPTURE_PREFETCH_SIDE_FRAMES = 4;
+const CAPTURE_PREFETCH_MAX_IMAGES = 48;
+
+/**
+ * Returns only frames outside the rendered overscan window. Keeping the
+ * overscan frames in the visible React tree and prefetching the next four
+ * slots on each side gives scroll-ahead coverage without multiplying DOM
+ * nodes for a long line-scan record.
+ */
+export function capturePrefetchFrameIndexes(
+  frameCount: number,
+  firstVisibleFrame: number,
+  lastVisibleFrame: number,
+  sideFrames = CAPTURE_PREFETCH_SIDE_FRAMES,
+) {
+  const count = Math.max(0, Math.floor(frameCount));
+  const start = Math.max(0, Math.min(count, Math.floor(firstVisibleFrame)));
+  const end = Math.max(start, Math.min(count, Math.ceil(lastVisibleFrame)));
+  const radius = Math.max(0, Math.floor(sideFrames));
+  const indexes: number[] = [];
+  for (let index = Math.max(0, start - radius); index < start; index += 1) {
+    indexes.push(index);
+  }
+  for (let index = end; index < Math.min(count, end + radius); index += 1) {
+    indexes.push(index);
+  }
+  return indexes;
 }
 
 function captureStitchCameraHasContent(camera: CaptureStitchFrame['cameras'][number]) {
@@ -606,12 +636,26 @@ function CameraBandImage({
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !src) {
+    if (!canvas) {
+      return;
+    }
+    const clear = () => {
+      // Reassigning the bitmap dimensions clears pixels and resets transforms
+      // without requiring a 2D context (also safe in WebView/jsdom startup).
+      canvas.width = Math.max(1, canvas.width);
+      canvas.height = Math.max(1, canvas.height);
+    };
+    // A record or modality switch must never leave the previous frame painted
+    // while its replacement is rebuilding or unavailable.
+    clear();
+    if (!src) {
+      canvas.dataset.renderState = 'empty';
       return;
     }
     canvas.dataset.renderState = 'loading';
     let disposed = false;
     let loadTimer: number | null = null;
+    let retryCount = 0;
     const image = new Image();
     const draw = () => {
       if (disposed || !image.complete || image.naturalWidth <= 0) {
@@ -711,16 +755,31 @@ function CameraBandImage({
     image.decoding = 'async';
     image.fetchPriority = loadDelayMs > 0 ? 'low' : 'high';
     image.onload = draw;
+    const requestImage = () => {
+      if (!disposed) image.src = src;
+    };
     image.onerror = () => {
-      if (!disposed) canvas.dataset.renderState = 'error';
+      if (disposed) return;
+      clear();
+      if (retryCount < 5) {
+        const retryDelayMs = Math.min(8_000, 750 * (2 ** retryCount));
+        retryCount += 1;
+        canvas.dataset.renderState = 'waiting-for-rendition';
+        loadTimer = window.setTimeout(() => {
+          loadTimer = null;
+          requestImage();
+        }, retryDelayMs);
+      } else {
+        canvas.dataset.renderState = 'error';
+      }
     };
     if (loadDelayMs > 0) {
       loadTimer = window.setTimeout(() => {
         loadTimer = null;
-        if (!disposed) image.src = src;
+        requestImage();
       }, loadDelayMs);
     } else {
-      image.src = src;
+      requestImage();
     }
     const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(draw) : null;
     observer?.observe(canvas);
@@ -800,7 +859,6 @@ function BarUnfoldedMap({
   stitchKey = '',
   cameraLanes,
   imageMode = 'gray',
-  cameraTiles,
   headAlignment,
   cropBlackBorders = false,
 }: {
@@ -821,14 +879,12 @@ function BarUnfoldedMap({
   stitchKey?: string;
   cameraLanes: CameraDisplayLane[];
   imageMode?: Plate2DDisplayMode;
-  cameraTiles?: CaptureSurfaceCameraTiles | null;
   headAlignment?: CaptureFlowSurface['headAlignment'] | null;
   cropBlackBorders?: boolean;
 }) {
   const FRAME_SPAN_PX = 176;
   const FRAME_OVERSCAN = 3;
   const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
-  const [autoCropWindows, setAutoCropWindows] = useState<Record<string, CameraBandCropWindow>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const scrollProgressRef = useRef(0);
   const atTailRef = useRef(false);
@@ -858,8 +914,7 @@ function BarUnfoldedMap({
   }, [captureImages]);
   const stitchEnabled = captureFrames.length > 0;
   const displayHeadAlignmentApplied = Boolean(
-    imageMode === 'gray'
-    && stitchEnabled
+    stitchEnabled
     && headAlignment?.displayAligned
     && cameraLanes.every((lane) => {
       const padding = headAlignmentCamera(
@@ -920,23 +975,53 @@ function BarUnfoldedMap({
       ),
     )
     : 0;
+  const prefetchFrameIndexes = useMemo(
+    () => stitchEnabled
+      ? capturePrefetchFrameIndexes(
+        captureFrames.length,
+        firstVisibleFrame,
+        lastVisibleFrame,
+      )
+      : [],
+    [captureFrames.length, firstVisibleFrame, lastVisibleFrame, stitchEnabled],
+  );
+  const prefetchImageUrls = useMemo(() => {
+    if (!stitchEnabled || prefetchFrameIndexes.length === 0) return [];
+    const expandedCameraNumber = expandedCamera ? cameraIdentityNumber(expandedCamera) : null;
+    const urls: string[] = [];
+    prefetchFrameIndexes.forEach((frameIndex) => {
+      const frame = captureFrames[frameIndex];
+      if (!frame) return;
+      frame.cameras.forEach((cameraFrame) => {
+        const cameraNumber = cameraIdentityNumber(cameraFrame.cameraId);
+        const level = expandedCameraNumber !== null && cameraNumber === expandedCameraNumber
+          ? 'original'
+          : 'thumbnail';
+        urls.push(captureRenderImageUrl(
+          cameraFrame.artifactRef,
+          imageMode,
+          level,
+        ));
+      });
+    });
+    return [...new Set(urls)].slice(0, CAPTURE_PREFETCH_MAX_IMAGES);
+  }, [captureFrames, expandedCamera, imageMode, prefetchFrameIndexes, stitchEnabled]);
+
+  useEffect(() => {
+    if (prefetchImageUrls.length === 0) return undefined;
+    // The scheduler starts from an idle callback (or a short delayed timer)
+    // and uses low fetch priority, so visible canvases always win the network
+    // slot. Cleanup cancels requests made irrelevant by scroll/record changes.
+    return prefetchCaptureImageUrls(prefetchImageUrls, {
+      maxUrls: CAPTURE_PREFETCH_MAX_IMAGES,
+      delayMs: 160,
+    });
+  }, [prefetchImageUrls]);
   const scrollSpaceStyle: CSSProperties = stitchEnabled
     ? orientation === 'horizontal'
       ? { width: `max(100%, ${longitudinalExtent}px)`, height: '100%' }
       : { width: '100%', height: `max(100%, ${longitudinalExtent}px)` }
     : { width: '100%', height: '100%' };
-
-  const reportAutoCrop = useCallback((cameraId: string, crop: CameraBandCropWindow) => {
-    setAutoCropWindows((current) => {
-      const merged = mergeCameraBandCropWindow(current[cameraId], crop);
-      if (!merged || merged === current[cameraId]) return current;
-      return { ...current, [cameraId]: merged };
-    });
-  }, []);
-
-  useEffect(() => {
-    setAutoCropWindows({});
-  }, [stitchKey]);
 
   const readScrollPosition = () => {
     const host = scrollRef.current;
@@ -1041,6 +1126,8 @@ function BarUnfoldedMap({
         data-head-spread-frames={headAlignment?.timelineSpreadFrames ?? undefined}
         data-visible-frame-start={firstVisibleFrame}
         data-visible-frame-end={lastVisibleFrame}
+        data-prefetch-frame-count={prefetchFrameIndexes.length}
+        data-prefetch-image-count={prefetchImageUrls.length}
         style={{ '--preview-position': `${previewPercent}%` } as CSSProperties}
         onKeyDown={onDefectNavigationKeyDown}
         onScroll={readScrollPosition}
@@ -1053,13 +1140,10 @@ function BarUnfoldedMap({
             const preview = camera?.relative.intensityPreview || camera?.latest.intensityPreview || '';
             const captureImage = captureImageByCamera.get(lane.cameraId);
             const laneNumber = cameraIdentityNumber(lane.cameraId) ?? cameraIdentityNumber(lane.shortLabel);
-            const jetTile = cameraTiles?.cameras.find((tile) => cameraIdentityNumber(tile.cameraId) === laneNumber);
-            const jetImagePath = jetTile?.state === 'ready' ? jetTile.jet?.imagePath?.trim() : '';
-            const source = imageMode === 'jet'
-              ? jetImagePath ? captureArtifactImageUrl(jetImagePath, 2048) : ''
-              : stitchEnabled ? '' : preview ? barSurfaceFileUrl(preview) : captureImage?.url || '';
+            const source = imageMode === 'gray' && !stitchEnabled
+              ? preview ? barSurfaceFileUrl(preview) : captureImage?.url || ''
+              : '';
             const expanded = expandedCamera === lane.cameraId;
-            const stableCropWindow = autoCropWindows[lane.cameraId];
             const cameraHead = headAlignmentCamera(headAlignment, lane.cameraId);
             const headOffsetFrames = Number(cameraHead?.offsetFramesFromReference);
             const displayPaddingFrames = displayHeadAlignmentApplied
@@ -1094,7 +1178,7 @@ function BarUnfoldedMap({
                 contentLabel={imageMode === 'jet' ? '处理后 JET 图' : '实际裁剪图'}
                 cropBlackBorders={imageMode === 'gray' && cropBlackBorders}
               /> : null}
-              {imageMode === 'gray' && stitchEnabled ? (
+              {stitchEnabled ? (
                 <div className="bar-camera-band-strip" aria-label={`${lane.shortLabel} 裁剪拼接帧`}>
                   {visibleCaptureFrames.map((frame, visibleIndex) => {
                     const frameIndex = firstVisibleFrame + visibleIndex;
@@ -1111,14 +1195,13 @@ function BarUnfoldedMap({
                         : { top: (frameIndex + displayPaddingFrames) * FRAME_SPAN_PX, height: FRAME_SPAN_PX }}
                     >
                       {cameraFrame ? <CameraBandImage
-                        src={cameraFrame.url}
+                        src={imageMode === 'jet'
+                          ? expanded ? cameraFrame.jetOriginalUrl : cameraFrame.jetThumbnailUrl
+                          : expanded ? cameraFrame.grayOriginalUrl : cameraFrame.grayThumbnailUrl}
                         label={`${lane.shortLabel} 第 ${frame.sequence} 轮`}
                         orientation={orientation}
-                        contentLabel={cameraFrame.cropMode === 'algorithm-roi' ? '算法 ROI 裁剪图' : '自动裁黑边图'}
-                        cropBlackBorders={cameraFrame.cropMode === 'auto-black-border'}
-                        stableCropWindow={cameraFrame.cropMode === 'auto-black-border' ? stableCropWindow : undefined}
-                        autoCropCameraId={cameraFrame.cropMode === 'auto-black-border' ? lane.cameraId : undefined}
-                        onAutoCropDetected={reportAutoCrop}
+                        contentLabel={imageMode === 'jet' ? '逐帧 JET 图' : '2D 去背景图'}
+                        cropBlackBorders={false}
                         loadDelayMs={frameIndex === priorityFrameIndex ? 0 : 250}
                       /> : <small>缺帧</small>}
                     </div>;
@@ -1434,8 +1517,8 @@ function PlateDisplaySubModes({
   if (viewMode === '2d') {
     return (
       <div className="plate-display-submodes" role="group" aria-label="2D 显示子模式">
-        <button type="button" className={twoDMode === 'gray' ? 'active' : ''} aria-pressed={twoDMode === 'gray'} onClick={() => onTwoDModeChange('gray')}>灰度平铺</button>
-        <button type="button" className={twoDMode === 'jet' ? 'active jet' : 'jet'} aria-pressed={twoDMode === 'jet'} onClick={() => onTwoDModeChange('jet')}>Jet 平铺</button>
+        <button type="button" className={twoDMode === 'gray' ? 'active' : ''} aria-pressed={twoDMode === 'gray'} onClick={() => onTwoDModeChange('gray')}>2D 去背景</button>
+        <button type="button" className={twoDMode === 'jet' ? 'active jet' : 'jet'} aria-pressed={twoDMode === 'jet'} onClick={() => onTwoDModeChange('jet')}>逐帧 JET</button>
       </div>
     );
   }
@@ -1948,7 +2031,6 @@ export function PlateMap({
   captureImages = [],
   cameraLanes = DEFAULT_CAMERA_LANES,
   surfaceMesh,
-  surfaceCameraTiles,
   surfaceHeadAlignment,
   surfaceCameras = [],
   artifactStatus,
@@ -1999,11 +2081,14 @@ export function PlateMap({
     || captureStitchState.status === 'idle'
     || captureStitchState.status === 'loading'
   );
-  // History is strictly bound to the selected material. A record-bound raw
-  // snapshot remains the one-frame fallback when the history index is absent.
+  // Online monitoring is stitch-only. Record-bound raw PNGs describe just one
+  // frame per camera and must not impersonate the multi-frame playback view
+  // while its index or committed two-level cache is rebuilt from source images.
   const recordBoundRawImages = artifactMode === 'production' ? captureImages : [];
-  const displayedCaptureImages = recordBoundRawImages;
-  const productionCameraImageCount = surfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
+  const allowSingleFrameImageFallback = artifactMode !== 'production';
+  const displayedCaptureImages = allowSingleFrameImageFallback ? recordBoundRawImages : [];
+  const displayedSurfaceCameras = allowSingleFrameImageFallback ? surfaceCameras : [];
+  const productionCameraImageCount = displayedSurfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
   const capturedCameraImageCount = new Set(
     captureStitchResult?.frames.flatMap((frame) => frame.cameras.map((camera) => camera.cameraId))
       ?? displayedCaptureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId),
@@ -2226,7 +2311,7 @@ export function PlateMap({
       {integratedToolbar ? null : <div className={`record-artifact-provenance ${artifactMode}`} role="note">
         {artifactMode === 'demo'
           ? '演示/测试数据：允许使用内置表面与模拟点云，不代表当前生产结果。'
-          : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；算法 ROI 图像 ${displayedCameraImageCount}/${cameraLanes.length} 路。`}
+          : `生产记录 ${inspectionId || '未绑定'}：数据库采集产物 ${captureImages.length} 件；两级缓存图像 ${displayedCameraImageCount}/${cameraLanes.length} 路。`}
       </div>}
       {viewMode === '2d' && (!shouldRenderWorldStack || twoDDisplayMode === 'jet') ? (
         <div className="unfold-orientation-switch" role="group" aria-label="二维展开方向">
@@ -2380,11 +2465,11 @@ export function PlateMap({
           </div>
         )
       ) : twoDDisplayMode === 'jet' ? (
-        surfaceCameraTiles?.cameras.some((tile) => tile.state === 'ready' && Boolean(tile.jet?.imagePath?.trim())) ? (
+        captureStitchResult?.frames.length ? (
           <div
             className={`bar-unfolded-layout orientation-${unfoldOrientation}`}
             data-testid="surface-jet-unfolded"
-            data-image-source="processed-jet-camera-images"
+            data-image-source="per-frame-two-level-jet"
           >
             <BarUnfoldedMap
               defects={defects}
@@ -2404,7 +2489,6 @@ export function PlateMap({
               stitchKey={captureMaterialId?.trim() || inspectionId || ''}
               cameraLanes={cameraLanes}
               imageMode="jet"
-              cameraTiles={surfaceCameraTiles}
               headAlignment={surfaceHeadAlignment}
             />
             <LengthRuler
@@ -2417,7 +2501,7 @@ export function PlateMap({
         ) : (
           <div className={`production-artifact-empty${artifactLoading ? ' is-loading' : ''}`} role="status" data-testid="surface-jet-unfolded-empty">
             <strong>{artifactLoading ? '正在准备处理后 JET 图像' : '暂无可用的处理后 JET 图像'}</strong>
-            <span>{artifactStatus || 'JET 平铺仅替换为算法处理后的逐相机 JET 图像，平铺布局与灰度图保持一致。'}</span>
+            <span>{artifactStatus || '逐帧 JET 使用与 2D 去背景完全一致的裁剪和六相机对齐；缓存缺失时从原始 3D 重建。'}</span>
           </div>
         )
       ) : shouldRenderWorldStack ? (
@@ -2503,12 +2587,12 @@ export function PlateMap({
         <div className={`bar-unfolded-layout orientation-${unfoldOrientation}`}>
           {artifactMode === 'production' && worldUnavailable ? <span className="live-preview-badge" data-testid="capture-roi-status">
             {captureStitchResult
-              ? `${captureStitchResult.hasMore ? '最近 ' : ''}${captureStitchResult.frames.length}/${captureStitchResult.totalFrames} 轮裁剪拼接 · 算法 ROI ${captureStitchResult.algorithmRoiImageCount} · 自动裁黑边 ${captureStitchResult.autoCropImageCount}`
+              ? `${captureStitchResult.hasMore ? '最近 ' : ''}${captureStitchResult.frames.length}/${captureStitchResult.totalFrames} 轮对齐拼接 · 两级可重建图像 ${captureStitchResult.renderableImageCount}`
               : captureStitchPending
-                ? `原始灰度 ${rawCameraImageCount}/${cameraLanes.length} · 正在读取裁剪拼接`
+                ? '拼接缓存准备中 · 正在校验索引并从原图按需重建'
                 : rawCameraImageCount > 0
-                  ? `原始灰度 ${rawCameraImageCount}/${cameraLanes.length} · 拼接历史尚未就绪`
-                  : '当前卷暂无可拼接灰度图'}
+                  ? `拼接缓存尚未就绪 · 已发现 ${rawCameraImageCount}/${cameraLanes.length} 路原图，等待重建`
+                  : '当前记录缺少可重建的拼接原图'}
           </span> : null}
           <BarUnfoldedMap
             defects={defects}
@@ -2522,7 +2606,7 @@ export function PlateMap({
             onDefectNavigationKeyDown={handleDefectNavigationKeyDown}
             onDefectNavigationWheel={handleDefectNavigationWheel}
             orientation={unfoldOrientation}
-            surfaceCameras={surfaceCameras}
+            surfaceCameras={displayedSurfaceCameras}
             captureImages={displayedCaptureImages}
             captureFrames={captureStitchResult?.frames ?? []}
             stitchKey={captureMaterialId?.trim() || inspectionId || ''}

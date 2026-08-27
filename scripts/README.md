@@ -8,7 +8,26 @@ Environment templates live in `config/env`.
 
 The SICK sidecar uses the vendor GenTL producer and Harvesters to bind a camera
 by exact serial number, read `Coord3D_C16` plus `Mono8`, and commit each frame to
-both the native Steel layout and the `LG_3D` NPZ/JPEG/JSON layout.
+the native Steel/LG_3D layout. Every raw 3D NPZ is ZIP-DEFLATE compressed while
+retaining the compatible `array` key; intensity PNG storage is also losslessly
+compressed.
+
+Historical SICK archives can be normalized in parallel with
+`recompress_sick_3d_history.py`. The command only scans numeric
+`<camera-root>/<flow>/3d/<index>.npz` paths, verifies array equality before an
+atomic replacement, and updates matching frame metadata and committed-event
+checksums. Omit `--apply` for an inventory-only dry run.
+
+```powershell
+py -3.12 scripts\recompress_sick_3d_history.py `
+  --profile config\sites\sick-array-6\capture.json `
+  --workers 24 `
+  --apply
+```
+
+For multi-million-frame stores, run disjoint flow shards in parallel. Each
+process still uses a thread pool, and `flowNo % shardCount` guarantees that one
+flow's frame metadata and committed events have only one writer.
 
 ```powershell
 python -m pip install -r scripts\sick_capture_requirements.txt

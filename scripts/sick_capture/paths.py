@@ -147,6 +147,55 @@ def cache_root(camera_storage_root: Path, value: str | int) -> Path:
     return flow_root(camera_storage_root, value) / "cache"
 
 
+def rendition_root(
+    camera_storage_root: Path,
+    value: str | int,
+    modality: str,
+) -> Path:
+    """Return the readable two-level rendition root for gray or JET images."""
+    normalized = modality.strip().lower()
+    if normalized == "gray":
+        return cache_root(camera_storage_root, value)
+    if normalized == "jet":
+        return jet_image_root(camera_storage_root, value)
+    raise ValueError(f"unsupported rendition modality: {modality!r}")
+
+
+def rendition_image_path(
+    camera_storage_root: Path,
+    value: str | int,
+    modality: str,
+    level: str,
+    storage_index: int,
+) -> Path:
+    """Return ``thumbnail/0.jpg`` or ``original/0.jpg`` style paths."""
+    normalized = level.strip().lower()
+    if normalized not in {"thumbnail", "original"}:
+        raise ValueError(f"unsupported rendition level: {level!r}")
+    if storage_index < 0:
+        raise ValueError("storage index cannot be negative")
+    return rendition_root(camera_storage_root, value, modality) / normalized / f"{storage_index}.jpg"
+
+
+def rendition_metadata_path(
+    camera_storage_root: Path,
+    value: str | int,
+    modality: str,
+    storage_index: int,
+) -> Path:
+    if storage_index < 0:
+        raise ValueError("storage index cannot be negative")
+    return rendition_root(camera_storage_root, value, modality) / "metadata" / f"{storage_index}.json"
+
+
+def rendition_status_path(
+    camera_storage_root: Path,
+    value: str | int,
+    modality: str,
+) -> Path:
+    return rendition_root(camera_storage_root, value, modality) / "status.json"
+
+
 def defect_image_root(camera_storage_root: Path, value: str | int) -> Path:
     """Return the camera-local defect thumbnail directory for one flow."""
     return flow_root(camera_storage_root, value) / "defect"
