@@ -1,8 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConnectionRecoveryDialog } from './ConnectionRecoveryDialog';
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -27,6 +28,29 @@ describe('ConnectionRecoveryDialog', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '直接进入' }));
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it('automatically saves and refreshes after the IP entry settles', () => {
+    vi.useFakeTimers();
+    const onRetry = vi.fn();
+    render(
+      <ConnectionRecoveryDialog
+        error="Failed to fetch"
+        initialConnection={{ mode: 'online', host: '127.0.0.1', port: 4873 }}
+        theme="dark"
+        onDismiss={vi.fn()}
+        onRetry={onRetry}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('服务端 IP'), { target: { value: '10.50.111.141' } });
+    expect(screen.getByRole('status')).toHaveTextContent('停止输入后将自动保存并刷新');
+    expect(onRetry).not.toHaveBeenCalled();
+
+    act(() => vi.advanceTimersByTime(800));
+
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith({ mode: 'online', host: '10.50.111.141', port: 4873 });
   });
 
   it('fills the preferred address returned by automatic discovery', async () => {

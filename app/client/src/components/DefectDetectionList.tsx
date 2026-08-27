@@ -171,14 +171,16 @@ export function DefectDetectionList({
     top: number;
     left: number;
   } | null>(null);
-  const [displayMode, setDisplayMode] = useState<'list' | 'distribution'>('list');
+  const [displayMode, setDisplayMode] = useState<'list' | 'distribution'>('distribution');
   const distributionLengthMm = pipeLengthMm > 0
     ? pipeLengthMm
     : Math.max(0, ...defects.map((defect) => defect.distanceHeadMm));
-  const lengthTicks = Array.from({ length: 5 }, (_, index) => ({
-    ratio: index / 4,
-    value: Math.round(distributionLengthMm * index / 4),
-  }));
+  const lengthTicks = distributionLengthMm > 0
+    ? Array.from({ length: 5 }, (_, index) => ({
+        ratio: index / 4,
+        value: Math.round(distributionLengthMm * index / 4),
+      }))
+    : [{ ratio: 0, value: 0 }];
   const defectColorByType = new Map(defectTypes.map((type) => [type.id, type.color]));
 
   const handleSelect = (event: ChangeEvent<HTMLSelectElement>, key: 'severity') => {
@@ -223,7 +225,8 @@ export function DefectDetectionList({
   return (
     <Panel
       title="缺陷检测列表"
-      className="defect-list-panel"
+      className={`defect-list-panel display-mode-${displayMode}`}
+      bodyStyle={displayMode === 'distribution' ? { padding: 0 } : undefined}
       action={
         <div className="defect-list-actions">
           <div className="defect-list-view-switch" role="group" aria-label="缺陷列表显示方式">

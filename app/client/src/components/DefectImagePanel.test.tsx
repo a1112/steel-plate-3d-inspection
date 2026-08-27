@@ -57,6 +57,38 @@ describe('DefectImagePanel review workflow', () => {
     await waitFor(() => expect(onReviewDefect).toHaveBeenCalledWith(defect, 'confirmed', '人工确认'));
   });
 
+  it('prefers the LAN-normalized preview over a raw Windows ROI path', () => {
+    const productionDefect: DefectItem = {
+      ...defect,
+      artifacts: {
+        ...defect.artifacts!,
+        roiImage: 'E:\\C2\\4034\\defect\\4034-C2-000001.jpg',
+      },
+    };
+
+    render(<DefectImagePanel inspectionId="INSP-4034" defect={productionDefect} />);
+
+    expect(screen.getByRole('img', { name: /划伤/ })).toHaveAttribute('src', defect.previewImageUrl);
+  });
+
+  it('routes a raw Windows ROI path through the capture file service', () => {
+    const rawPathDefect: DefectItem = {
+      ...defect,
+      previewImageUrl: '',
+      artifacts: {
+        ...defect.artifacts!,
+        roiImage: 'E:\\C2\\4034\\defect\\4034-C2-000001.jpg',
+      },
+    };
+
+    render(<DefectImagePanel defect={rawPathDefect} />);
+
+    const source = screen.getByRole('img', { name: /划伤/ }).getAttribute('src') ?? '';
+    expect(source).toContain('/api/capture/file?');
+    expect(source).toContain('E%3A%5CC2%5C4034%5Cdefect%5C4034-C2-000001.jpg');
+    expect(source).not.toContain('/api/algorithm/bar-surface/file');
+  });
+
   it('treats a cancelled note prompt as cancellation instead of writing an empty review', () => {
     const onReviewDefect = vi.fn().mockResolvedValue(undefined);
     vi.spyOn(window, 'prompt').mockReturnValue(null);

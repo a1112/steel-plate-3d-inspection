@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { PanelRightClose } from 'lucide-react';
 import type { DefectItem, DefectReviewStatus } from '../data/inspection';
-import { barSurfaceFileUrl } from '../services/bar-surface-api';
+import { captureArtifactImageUrl } from '../lib/capture-api';
 import { bkvOnlineCroppedImageUrl, isBkvOnlineImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import { Panel } from './Panel';
@@ -24,7 +24,7 @@ function explicitRoiArtifactUrl(value: string | undefined) {
   if (!source || isBkvOnlineImageUrl(source)) return '';
   return /^(?:https?:|data:|blob:)/i.test(source) || source.startsWith('/')
     ? source
-    : barSurfaceFileUrl(source);
+    : captureArtifactImageUrl(source, 2048);
 }
 
 function defectRoiImageUrl(defect: DefectItem, inspectionId?: string) {
@@ -32,13 +32,16 @@ function defectRoiImageUrl(defect: DefectItem, inspectionId?: string) {
   const roiImage = defect.artifacts?.roiImage;
   const previewImage = defect.previewImageUrl?.trim() ?? '';
 
-  const explicitRoiImage = explicitRoiArtifactUrl(roiImage);
-  if (explicitRoiImage) return explicitRoiImage;
-
   const bkvRoiImage = bkvOnlineCroppedImageUrl(roiImage, roi);
   if (bkvRoiImage) return bkvRoiImage;
 
+  // Snapshot URLs are normalized against the currently selected LAN service.
+  // Prefer that verified route over a raw Windows artifact path, which used to
+  // be sent to the unrelated bar-surface file endpoint.
   if (previewImage && !isBkvOnlineImageUrl(previewImage)) return previewImage;
+
+  const explicitRoiImage = explicitRoiArtifactUrl(roiImage);
+  if (explicitRoiImage) return explicitRoiImage;
 
   const bkvPreview = bkvOnlineCroppedImageUrl(previewImage, roi);
   if (bkvPreview) return bkvPreview;

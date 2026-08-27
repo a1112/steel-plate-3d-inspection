@@ -203,9 +203,13 @@ export function AlarmAnalysis({
   }
 
   return (
-    <Panel title="测径（外径）曲线" className={`${panelClassName} diameter-analysis-panel`} headerless={headerless}>
+    <Panel
+      title="测径（外径）曲线"
+      className={`${panelClassName} diameter-analysis-panel`}
+      bodyStyle={{ padding: 0 }}
+      headerless={headerless}
+    >
       <div className="diameter-only-analysis">
-        <h3>测径（外径）曲线</h3>
         {canMeasureDiameter ? (
           <DiameterTrendPanel
             mesh={surfaceMesh}

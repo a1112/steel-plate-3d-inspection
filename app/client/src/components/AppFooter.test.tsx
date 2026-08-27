@@ -161,8 +161,10 @@ describe('AppFooter', () => {
 
     expect(screen.getByRole('button', { name: '配置中心' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '后台管理' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '采集管理' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '采集管理' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '3D 重建' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
+    expect(screen.getByRole('menuitem', { name: '采集管理' })).toBeInTheDocument();
   });
 
   it('places the online real-time/playback toggle at the far right of the footer', () => {
@@ -226,7 +228,8 @@ describe('AppFooter', () => {
       />,
     );
 
-    expect(screen.getByLabelText('选中缺陷分析工具')).toHaveTextContent('凹坑');
+    expect(screen.queryByLabelText('选中缺陷分析工具')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('BKV 下方分析视图')).toBeInTheDocument();
     expect(screen.queryByRole('group', { name: '主检测视图' })).not.toBeInTheDocument();
     expect(screen.getByRole('group', { name: 'BKV 下方视图' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '测径（外径）' })).toHaveAttribute('aria-pressed', 'true');
@@ -334,7 +337,8 @@ describe('AppFooter', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '配置中心' }));
     fireEvent.click(screen.getByRole('button', { name: '后台管理' }));
-    fireEvent.click(screen.getByRole('button', { name: '采集管理' }));
+    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '采集管理' }));
     fireEvent.click(screen.getByRole('button', { name: '3D 重建' }));
 
     expect(onSettingsOpen).toHaveBeenCalledTimes(1);
@@ -355,15 +359,15 @@ describe('AppFooter', () => {
       />,
     );
 
-    const flowButton = screen.getByRole('button', { name: '全流程' });
+    expect(screen.queryByRole('button', { name: '全流程' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
+    const flowButton = screen.getByRole('menuitem', { name: '全流程' });
     expect(flowButton).toHaveAttribute('aria-pressed', 'false');
     fireEvent.click(flowButton);
     expect(onFlowToggle).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps only lower defect-analysis view switchers in the footer', () => {
-    const onAnalysisViewModeChange = vi.fn();
-    const onCollapsedChange = vi.fn();
+  it('removes direct-camera selected-defect information and analysis controls from the footer', () => {
     render(
       <AppFooter
         activeNav="online"
@@ -371,22 +375,20 @@ describe('AppFooter', () => {
           defect,
           analysisViewMode: 'overview',
           collapsed: true,
-          onAnalysisViewModeChange,
-          onCollapsedChange,
+          onAnalysisViewModeChange: vi.fn(),
+          onCollapsedChange: vi.fn(),
         }}
         onNavChange={vi.fn()}
         onSettingsOpen={vi.fn()}
       />,
     );
 
-    expect(screen.getByLabelText('选中缺陷分析工具')).toHaveTextContent('凹坑');
-    expect(screen.getByLabelText('选中缺陷分析工具')).toHaveTextContent('0.42×0.36×0.12mm');
+    expect(screen.queryByLabelText('选中缺陷分析工具')).not.toBeInTheDocument();
+    expect(screen.queryByText('当前缺陷')).not.toBeInTheDocument();
+    expect(screen.queryByText('0.42×0.36×0.12mm')).not.toBeInTheDocument();
     expect(screen.queryByRole('group', { name: '主检测视图' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '3D' })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '测径（外径）' }));
-
-    expect(onAnalysisViewModeChange).toHaveBeenCalledWith('diameter');
-    expect(onCollapsedChange).toHaveBeenCalledWith(false);
+    expect(screen.queryByRole('button', { name: '测径（外径）' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '收起缺陷分析区' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '展开缺陷分析区' })).not.toBeInTheDocument();
   });

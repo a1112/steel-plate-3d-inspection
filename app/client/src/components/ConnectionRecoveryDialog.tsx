@@ -1,5 +1,5 @@
 import { AlertTriangle, LoaderCircle, Radar, RefreshCw, X } from 'lucide-react';
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type { ThemeMode } from '../data/inspection';
 import {
   discoverInspectionServices,
@@ -29,8 +29,30 @@ export function ConnectionRecoveryDialog({
   }));
   const [discoveryBusy, setDiscoveryBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [hostEdited, setHostEdited] = useState(false);
   const hostValid = draft.host.trim().length > 0;
   const portValid = Number.isInteger(draft.port) && draft.port >= 1 && draft.port <= 65535;
+
+  const retryDraft = useCallback(() => {
+    setHostEdited(false);
+    onRetry({
+      mode: 'online',
+      host: draft.host.trim(),
+      port: draft.port,
+      ...(draft.protocol ? { protocol: draft.protocol } : {}),
+    });
+  }, [draft.host, draft.port, draft.protocol, onRetry]);
+
+  useEffect(() => {
+    if (!hostEdited || !hostValid || !portValid || discoveryBusy || retrying) {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      setStatus(`正在连接 ${draft.host.trim()}:${draft.port} 并刷新数据…`);
+      retryDraft();
+    }, 800);
+    return () => window.clearTimeout(timeout);
+  }, [draft.host, draft.port, discoveryBusy, hostEdited, hostValid, portValid, retryDraft, retrying]);
 
   const discover = async () => {
     setDiscoveryBusy(true);
@@ -98,7 +120,11 @@ export function ConnectionRecoveryDialog({
               aria-label="服务端 IP"
               value={draft.host}
               placeholder="例如 192.168.1.20"
-              onChange={(event) => setDraft((current) => ({ ...current, host: event.target.value }))}
+              onChange={(event) => {
+                setDraft((current) => ({ ...current, host: event.target.value }));
+                setHostEdited(true);
+                setStatus('IP 已更新，停止输入后将自动保存并刷新');
+              }}
             />
           </label>
           <label>
@@ -126,12 +152,7 @@ export function ConnectionRecoveryDialog({
             type="button"
             className="primary"
             disabled={!hostValid || !portValid || discoveryBusy || retrying}
-            onClick={() => onRetry({
-              mode: 'online',
-              host: draft.host.trim(),
-              port: draft.port,
-              ...(draft.protocol ? { protocol: draft.protocol } : {}),
-            })}
+            onClick={retryDraft}
           >
             {retrying ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
             {retrying ? '正在重试' : '保存并重试'}

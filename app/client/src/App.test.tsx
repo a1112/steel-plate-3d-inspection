@@ -344,6 +344,7 @@ describe('App BKV provider selection', () => {
     await waitFor(() => expect(canvas).toHaveAttribute('data-locatable-defects', '1'));
     expect(Number(canvas.getAttribute('data-view-scale'))).toBeCloseTo(1000 / 600, 6);
 
+    fireEvent.click(screen.getByTitle('列表'));
     const selectedDefectRow = container.querySelector('.defect-table tbody tr');
     expect(selectedDefectRow).not.toBeNull();
     fireEvent.click(selectedDefectRow!);
@@ -587,6 +588,7 @@ describe('App online severity filters', () => {
     expect(severeCard).toHaveAttribute('aria-pressed', 'true');
     expect(reviewCard).toHaveAttribute('aria-pressed', 'true');
     expect(minorCard).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(screen.getByTitle('列表'));
     expect(getDefectTableRows(container)).toHaveLength(12);
     expect(container.querySelector('.defect-list-panel .pager')).not.toBeInTheDocument();
 

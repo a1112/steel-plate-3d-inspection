@@ -1,9 +1,11 @@
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 
 interface PanelProps {
   title: string;
   children: ReactNode;
   className?: string;
+  beforeHeader?: ReactNode;
+  bodyStyle?: CSSProperties;
   leadingAction?: ReactNode;
   action?: ReactNode;
   headerless?: boolean;
@@ -13,6 +15,8 @@ export function Panel({
   title,
   children,
   className = '',
+  beforeHeader,
+  bodyStyle,
   leadingAction,
   action,
   headerless = false,
@@ -23,6 +27,7 @@ export function Panel({
       data-layout-card
       data-card-label={title}
     >
+      {beforeHeader}
       {headerless ? null : (
         <div className="panel-header">
           {leadingAction}
@@ -30,7 +35,7 @@ export function Panel({
           {action}
         </div>
       )}
-      <div className="panel-body">{children}</div>
+      <div className="panel-body" style={bodyStyle}>{children}</div>
     </section>
   );
 }

@@ -68,6 +68,8 @@ describe('DefectDetectionList algorithm defects', () => {
       />,
     );
 
+    fireEvent.click(screen.getByTitle('列表'));
+
     expect(screen.getByText('camera8')).toBeInTheDocument();
     expect(screen.getByText('夹杂')).toBeInTheDocument();
     expect(screen.getByText('模拟')).toBeInTheDocument();
@@ -87,6 +89,8 @@ describe('DefectDetectionList algorithm defects', () => {
       />,
     );
 
+    fireEvent.click(screen.getByTitle('列表'));
+
     expect(screen.getByText('凹陷候选')).toBeInTheDocument();
     expect(screen.getByText('候选')).toBeInTheDocument();
     expect(screen.queryByText('模拟')).not.toBeInTheDocument();
@@ -105,6 +109,8 @@ describe('DefectDetectionList algorithm defects', () => {
         onClearFilters={vi.fn()}
       />,
     );
+
+    fireEvent.click(screen.getByTitle('列表'));
 
     fireEvent.mouseEnter(screen.getByRole('row', { name: '夹杂，camera8，距头10666mm，待复核' }));
 
@@ -129,6 +135,8 @@ describe('DefectDetectionList algorithm defects', () => {
         onClearFilters={vi.fn()}
       />,
     );
+
+    fireEvent.click(screen.getByTitle('列表'));
 
     fireEvent.mouseEnter(screen.getByRole('row', { name: /凹陷候选，camera1/ }));
     const image = screen.getByRole('img', { name: '凹陷候选缺陷图像' });
@@ -155,6 +163,8 @@ describe('DefectDetectionList algorithm defects', () => {
         onClearFilters={vi.fn()}
       />,
     );
+
+    fireEvent.click(screen.getByTitle('列表'));
 
     fireEvent.mouseEnter(screen.getByRole('row', { name: /凹陷候选，camera1/ }));
     expect(screen.getByRole('img', { name: '凹陷候选缺陷图像' })).toHaveAttribute(
@@ -189,6 +199,8 @@ describe('DefectDetectionList algorithm defects', () => {
       />,
     );
 
+    fireEvent.click(screen.getByTitle('列表'));
+
     fireEvent.mouseEnter(screen.getByRole('row', { name: /凹陷候选，camera1/ }));
 
     const tooltip = screen.getByRole('tooltip');
@@ -217,8 +229,10 @@ describe('DefectDetectionList algorithm defects', () => {
       />,
     );
 
-    fireEvent.click(screen.getByTitle('分布图'));
-    expect(screen.getByRole('img', { name: '缺陷分布图，共 2 个缺陷' })).toBeInTheDocument();
+    expect(screen.getByTitle('分布图')).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('img', { name: '缺陷分布图，共 2 个缺陷' }).closest('.defect-list-panel')).toHaveClass('display-mode-distribution');
+    expect(screen.getByRole('img', { name: '缺陷分布图，共 2 个缺陷' }).parentElement).toHaveClass('panel-body');
+    expect(screen.getByRole('img', { name: '缺陷分布图，共 2 个缺陷' }).parentElement).toHaveStyle({ padding: '0px' });
     expect(screen.getByLabelText('钢管长度刻度，0.0 至 12.0 米')).toBeInTheDocument();
     expect(screen.getByText('12.0 m')).toBeInTheDocument();
     expect(screen.getByLabelText('相机区域 C1 至 C6')).toHaveTextContent('C1C2C3C4C5C6');

@@ -1,7 +1,11 @@
-import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultSettings, validateSettings } from '../state/operations';
 import { SettingsPage } from './SettingsPage';
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 function renderSettingsPage(onThemeChange = vi.fn(), onThemeStyleChange = vi.fn()) {
   const settings = createDefaultSettings();
@@ -81,6 +85,37 @@ describe('SettingsPage', () => {
     expect(screen.getByLabelText('服务端端口')).toHaveValue(4873);
     expect(screen.getByText('http://10.50.111.141:4873')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '选择浅色巡检主题' })).not.toBeInTheDocument();
+  });
+
+  it('automatically refreshes after the server IP entry settles', () => {
+    vi.useFakeTimers();
+    const settings = createDefaultSettings();
+    const onConnectionRefresh = vi.fn();
+    render(
+      <SettingsPage
+        embedded
+        initialSection="connection"
+        theme="light"
+        draft={settings}
+        saved={settings}
+        errors={{}}
+        connection={{ mode: 'online', host: '127.0.0.1', port: 4873, protocol: 'http' }}
+        onThemeChange={vi.fn()}
+        onDraftChange={vi.fn()}
+        onConnectionChange={vi.fn()}
+        onConnectionRefresh={onConnectionRefresh}
+        onSave={vi.fn()}
+        onReset={vi.fn()}
+        onApplyToPlate={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('服务端 IP'), { target: { value: '10.50.111.141' } });
+    expect(onConnectionRefresh).not.toHaveBeenCalled();
+
+    act(() => vi.advanceTimersByTime(800));
+
+    expect(onConnectionRefresh).toHaveBeenCalledTimes(1);
   });
 
   it('discovers LAN services and applies the selected IP to connection settings', () => {

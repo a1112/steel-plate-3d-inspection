@@ -8,7 +8,6 @@ import {
   type AppResourceUsage,
 } from '../lib/app-resource-usage';
 import type { RuntimeDashboardMode } from '../lib/runtime-dashboard-mode';
-import { severityLabels, surfaceLabels } from '../data/inspection';
 import {
   openBarSurfaceWindow,
   openCaptureManagementWindow,
@@ -75,10 +74,6 @@ const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
   supportsOfflineReplay: false,
 };
 
-const analysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
-  { id: 'diameter', label: '测径（外径）' },
-];
-
 const bkvAnalysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
   { id: 'diameter', label: '测径（外径）' },
   { id: 'defects', label: '缺陷' },
@@ -87,10 +82,6 @@ const bkvAnalysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
 const defaultTerminalViews: FooterTerminalViews = {
   bkv: { available: false, active: false },
 };
-
-function getDefectSizeLabel(defect: DefectItem) {
-  return `${defect.widthMm.toFixed(2)}×${defect.heightMm.toFixed(2)}×${Math.abs(defect.depthMm).toFixed(2)}mm`;
-}
 
 function formatConnectionEndpoint(endpoint: string) {
   try {
@@ -123,6 +114,7 @@ export function AppFooter({
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const activeAnalysis = activeNav === 'online' ? analysis : null;
+  const visibleAnalysis = dashboardMode.kind === 'bkv' ? activeAnalysis : null;
   const resourceSourceLabel = resourceUsage
     ? resourceUsage.precision === 'full' ? '完整桌面应用' : '浏览器服务进程'
     : '等待采样';
@@ -199,7 +191,7 @@ export function AppFooter({
   };
 
   return (
-    <footer className={`app-footer ${activeAnalysis ? 'has-analysis-context' : ''}`} data-no-drag>
+    <footer className={`app-footer ${visibleAnalysis ? 'has-analysis-context' : ''}`} data-no-drag>
       {connection ? (
         <button
           type="button"
@@ -215,50 +207,21 @@ export function AppFooter({
           <em>{connectionLabel}</em>
         </button>
       ) : null}
-      {activeAnalysis ? (
-        <div className="app-footer-analysis" aria-label="选中缺陷分析工具">
-          {dashboardMode.kind === 'bkv' ? (
-            <div className="app-footer-view-group bkv-analysis-views" role="group" aria-label="BKV 下方视图">
-              {bkvAnalysisViewOptions.map((option) => (
-                <button
-                  key={option.id}
-                  type="button"
-                  className={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id ? 'active' : ''}
-                  aria-pressed={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id}
-                  onClick={() => changeAnalysisView(option.id)}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-          ) : null}
-          <div className="app-footer-defect-summary" title={`缺陷 ${activeAnalysis.defect.id} · ${activeAnalysis.defect.plateNo}`}>
-            <span className="app-footer-kicker">当前缺陷</span>
-            <strong>{activeAnalysis.defect.typeLabel}</strong>
-            <em className={activeAnalysis.defect.severity}>{severityLabels[activeAnalysis.defect.severity]}</em>
-            <span>{surfaceLabels[activeAnalysis.defect.surface]}</span>
-            <b>{getDefectSizeLabel(activeAnalysis.defect)}</b>
-            <span>距头 {activeAnalysis.defect.distanceHeadMm}mm</span>
-            <span>操作 {activeAnalysis.defect.operatorSideMm}mm</span>
-            <span>传动 {activeAnalysis.defect.driveSideMm}mm</span>
-            <span>周期 {activeAnalysis.defect.typeId === 'roll' ? '是' : '否'}</span>
+      {visibleAnalysis ? (
+        <div className="app-footer-analysis" aria-label="BKV 下方分析视图">
+          <div className="app-footer-view-group bkv-analysis-views" role="group" aria-label="BKV 下方视图">
+            {bkvAnalysisViewOptions.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                className={!visibleAnalysis.collapsed && visibleAnalysis.analysisViewMode === option.id ? 'active' : ''}
+                aria-pressed={!visibleAnalysis.collapsed && visibleAnalysis.analysisViewMode === option.id}
+                onClick={() => changeAnalysisView(option.id)}
+              >
+                {option.label}
+              </button>
+            ))}
           </div>
-          {dashboardMode.kind === 'bkv' ? null : (
-            <div className="app-footer-view-group analysis-views" role="group" aria-label="缺陷分析视图">
-                <span>分析</span>
-                {analysisViewOptions.map((option) => (
-                <button
-                  key={option.id}
-                  type="button"
-                  className={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id ? 'active' : ''}
-                  aria-pressed={!activeAnalysis.collapsed && activeAnalysis.analysisViewMode === option.id}
-                  onClick={() => changeAnalysisView(option.id)}
-                >
-                  {option.label}
-                </button>
-                ))}
-            </div>
-          )}
         </div>
       ) : (
         <div className="app-footer-context" aria-label="系统工具栏">
@@ -277,18 +240,6 @@ export function AppFooter({
           <strong>{resourceUsage ? resourceUsage.processCount : '--'}</strong> 进程
         </span>
       </div>
-      {onFlowToggle ? (
-        <button
-          type="button"
-          className={`app-footer-flow-button ${flowVisible ? 'active' : ''}`}
-          aria-pressed={flowVisible}
-          title={flowVisible ? '关闭完整检测流程工具' : '打开完整检测流程工具'}
-          onClick={onFlowToggle}
-        >
-          <Play size={14} />
-          <span>全流程</span>
-        </button>
-      ) : null}
       <nav className="app-footer-nav" aria-label="非业务功能">
         <button type="button" onClick={onSettingsOpen}>
           <Settings2 size={15} />
@@ -298,12 +249,6 @@ export function AppFooter({
           <Database size={15} />
           <span>后台管理</span>
         </button>
-        {dashboardMode.showsCaptureManagement ? (
-          <button type="button" onClick={() => void runWindowAction('采集管理', onCaptureManagementOpen)}>
-            <MonitorCog size={15} />
-            <span>采集管理</span>
-          </button>
-        ) : null}
         {dashboardMode.showsReconstruction ? (
           <button type="button" onClick={() => void runWindowAction('3D 重建', onBarSurfaceOpen)}>
             <Box size={15} />
@@ -324,6 +269,34 @@ export function AppFooter({
           </button>
           {moreMenuOpen ? (
             <div className="app-footer-more-menu" role="menu" aria-label="更多功能菜单">
+              {onFlowToggle ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={flowVisible ? 'active' : ''}
+                  aria-pressed={flowVisible}
+                  onClick={() => {
+                    onFlowToggle();
+                    setMoreMenuOpen(false);
+                  }}
+                >
+                  <Play size={15} />
+                  <span>全流程</span>
+                </button>
+              ) : null}
+              {dashboardMode.showsCaptureManagement ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMoreMenuOpen(false);
+                    void runWindowAction('采集管理', onCaptureManagementOpen);
+                  }}
+                >
+                  <MonitorCog size={15} />
+                  <span>采集管理</span>
+                </button>
+              ) : null}
               <button
                 type="button"
                 role="menuitem"

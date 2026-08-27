@@ -1,5 +1,5 @@
 import { ClipboardCheck, Cpu, Factory, Gauge, LoaderCircle, Monitor, Palette, Radar, RadioTower, RotateCcw, Save, Send, Server, Sparkles } from 'lucide-react';
-import { useState, type ChangeEvent, type ElementType } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type ElementType } from 'react';
 import type { ThemeMode, ThemeStyle } from '../data/inspection';
 import { openParameterManagementWindow } from '../lib/app-windows';
 import { isWebHostedRuntime, type ConnectionConfig, type ConnectionMode, type DiscoveredInspectionService } from '../services/inspection-api';
@@ -157,6 +157,7 @@ export function SettingsPage({
   onThemeStyleChange = () => undefined,
   onDraftChange,
   onConnectionChange = () => undefined,
+  onConnectionRefresh = () => undefined,
   onConnectionSave = () => undefined,
   onConnectionDiscover = () => undefined,
   onConnectionAutoSet = () => undefined,
@@ -180,6 +181,7 @@ export function SettingsPage({
   onThemeStyleChange?: (themeStyle: ThemeStyle) => void;
   onDraftChange: (patch: Partial<InspectionSettings>) => void;
   onConnectionChange?: (patch: Partial<ConnectionConfig>) => void;
+  onConnectionRefresh?: () => void;
   onConnectionSave?: () => void;
   onConnectionDiscover?: () => void;
   onConnectionAutoSet?: (service: DiscoveredInspectionService) => void;
@@ -190,6 +192,29 @@ export function SettingsPage({
   initialSection?: SettingsSection;
 }) {
   const [activeSection, setActiveSection] = useState<SettingsSection>(initialSection);
+  const [connectionHostEdited, setConnectionHostEdited] = useState(false);
+  const connectionRefreshRef = useRef(onConnectionRefresh);
+  useEffect(() => {
+    connectionRefreshRef.current = onConnectionRefresh;
+  }, [onConnectionRefresh]);
+  useEffect(() => {
+    if (
+      !connectionHostEdited
+      || connection.mode === 'demo'
+      || connection.host.trim().length === 0
+      || !Number.isInteger(connection.port)
+      || connection.port < 1
+      || connection.port > 65535
+      || discoveryBusy
+    ) {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      setConnectionHostEdited(false);
+      connectionRefreshRef.current();
+    }, 800);
+    return () => window.clearTimeout(timeout);
+  }, [connection.host, connection.mode, connection.port, connectionHostEdited, discoveryBusy]);
   const setNumber = (key: NumberSettingKey) => (value: number) => onDraftChange({ [key]: value });
   const setBoolean = (key: BooleanSettingKey) => (checked: boolean) => onDraftChange({ [key]: checked });
   const setConnectionMode = (mode: ConnectionMode) => onConnectionChange({ mode });
@@ -269,8 +294,12 @@ export function SettingsPage({
                   aria-label="服务端 IP"
                   value={connection.host}
                   disabled={connection.mode === 'demo'}
-                  onChange={(event) => onConnectionChange({ host: event.target.value })}
+                  onChange={(event) => {
+                    onConnectionChange({ host: event.target.value });
+                    setConnectionHostEdited(true);
+                  }}
                 />
+                <em>修改 IP 后停止输入 0.8 秒，将自动保存到本机并刷新界面</em>
               </label>
               <label className="setting-field">
                 <span>服务端端口</span>
