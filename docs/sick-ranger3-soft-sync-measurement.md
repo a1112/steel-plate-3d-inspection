@@ -32,3 +32,9 @@
 裁剪先使用灰度连通占比排除孤立亮点，再组合“流级稳定左右边界”和“当前帧头尾边界”。缓存目录中的指纹 JSON 清单保存 `originalSize`、`validRoi`、`frameDetectedRoi` 和 `flowHorizontalRoi`，算法测量结果中的 `sourceCoordinateOffset` 可将裁剪坐标还原到原始相机坐标。
 
 回放前端根据 2×3 网格单元的实际 CSS 像素、裁剪后宽高比和设备像素比请求最小够用层级。拖动时间轴时先合并 70 ms 内的连续选择，只预载最终目标的六路图像；六路加载完成或达到保护超时后再整体切换，并在空闲时预取相邻帧。
+
+## 重叠统计与 2D 去重显示
+
+区域清单 `derived/roi/manifest.json` 的 `ownership.overlapPairCount` 表示存在几何重叠的唯一无序相机对数量，明细仍保存在 `ownership.pairs`。缺陷清单的 `statistics.overlapDuplicateFilteredCount` 表示候选中心落入本相机重叠列、但该列归属另一台相机而被过滤的候选数量；它与普通裁剪边界过滤数分开统计。两项都是 `steel.capture-region-map.v1` 和 `steel.sick-flow-defect-detection.v1` 的向后兼容增量字段，不需要数据库迁移。
+
+主 2D 展开图默认“保留重叠”。区域归属完整有效时可切换到“去除重叠”：每台相机只绘制 `ownedColumnIntervals`，多个保留区间按原顺序连续拼接，缺陷框同步映射到拼接后的列坐标。旧区域清单可从 `ownership.pairs.length` 得到重叠区数量；旧缺陷清单没有重复候选统计时界面显示 `--`。区域归属缺失或无效时去重按钮禁用，原始重叠图像继续显示。

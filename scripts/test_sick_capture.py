@@ -60,6 +60,8 @@ from scripts.sick_capture.playback import (
 )
 from scripts.sick_capture.profile import CameraProfile, load_profile
 from scripts.sick_capture.regions import (
+    RegionConfig,
+    _calibrated_ownership,
     build_flow_region_map,
     detect_valid_sensor_roi,
     stable_horizontal_roi,
@@ -1051,6 +1053,47 @@ class SickAlignmentTests(unittest.TestCase):
 
 
 class SickPlaybackTests(unittest.TestCase):
+    def test_calibrated_overlap_counts_each_camera_pair_once(self) -> None:
+        def camera_profile(start_degrees: float, stop_degrees: float) -> tuple[list[list[float]], list[int]]:
+            angles = np.radians(np.linspace(start_degrees, stop_degrees, 32))
+            return (
+                np.column_stack((np.cos(angles), np.sin(angles))).tolist(),
+                np.linspace(5, 94, 32, dtype=np.int32).tolist(),
+            )
+
+        first_profile, first_columns = camera_profile(-110.0, 110.0)
+        second_profile, second_columns = camera_profile(70.0, 290.0)
+        cameras = {
+            "C1": {"sourceSize": [100, 20], "stableCrop": [0, 0, 100, 20]},
+            "C2": {"sourceSize": [100, 20], "stableCrop": [0, 0, 100, 20]},
+        }
+        ownership = _calibrated_ownership(
+            {
+                "metricValid": True,
+                "qualityGate": {"reasons": []},
+                "calibration": {"approved": True, "calibratedCameras": 2},
+                "selectedSection": {
+                    "circleFit": {"available": True, "centerX": 0.0, "centerZ": 0.0}
+                },
+                "cameras": {
+                    "C1": {
+                        "arrayProfile": first_profile,
+                        "validProfileColumns": first_columns,
+                    },
+                    "C2": {
+                        "arrayProfile": second_profile,
+                        "validProfileColumns": second_columns,
+                    },
+                },
+            },
+            cameras,
+            RegionConfig(angle_bin_count=720),
+        )
+
+        self.assertTrue(ownership["ready"])
+        self.assertEqual(ownership["overlapPairCount"], 1)
+        self.assertEqual(len(ownership["pairs"]), 1)
+
     def test_black_frame_has_no_valid_roi_and_cannot_expand_to_full_frame(self) -> None:
         black = np.zeros((128, 320), dtype=np.uint8)
         self.assertIsNone(detect_valid_grayscale_roi(black))

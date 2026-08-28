@@ -32,6 +32,7 @@ if __package__:
         alignment_manifest_path,
         build_and_write_flow_alignment,
     )
+    from .sick_capture.calibration_pointer import resolve_active_array_calibration
     from .sick_capture.defect_detection import (
         DefectDetectionConfig,
         ExecutionGateInterrupted,
@@ -40,8 +41,18 @@ if __package__:
         defect_detection_manifest_path,
         import_defect_manifest,
     )
+    from .sick_capture.material_lock import exclusive_material_job
+    from .sick_capture.measurement import (
+        MeasurementConfig,
+        build_and_write_flow_measurement,
+        measurement_manifest_path,
+    )
     from .sick_capture.paths import capture_root
     from .sick_capture.profile import load_profile
+    from .sick_capture.regions import (
+        build_and_write_flow_region_map,
+        region_manifest_path,
+    )
 else:
     from sick_capture.alignment import (
         AlignmentConfig,
@@ -49,6 +60,7 @@ else:
         alignment_manifest_path,
         build_and_write_flow_alignment,
     )
+    from sick_capture.calibration_pointer import resolve_active_array_calibration
     from sick_capture.defect_detection import (
         DefectDetectionConfig,
         ExecutionGateInterrupted,
@@ -57,12 +69,22 @@ else:
         defect_detection_manifest_path,
         import_defect_manifest,
     )
+    from sick_capture.material_lock import exclusive_material_job
+    from sick_capture.measurement import (
+        MeasurementConfig,
+        build_and_write_flow_measurement,
+        measurement_manifest_path,
+    )
     from sick_capture.paths import capture_root
     from sick_capture.profile import load_profile
+    from sick_capture.regions import (
+        build_and_write_flow_region_map,
+        region_manifest_path,
+    )
 
 
 BACKFILL_SCHEMA = "steel.sick-defect-history-backfill.v1"
-BACKFILL_VERSION = 1
+BACKFILL_VERSION = 2
 STATUS_UPDATE_LOCK = threading.RLock()
 
 
@@ -174,11 +196,12 @@ def configured_path(profile_path: Path, defaults: dict[str, Any], key: str) -> P
 
 def create_configs(
     profile_path: Path,
+    storage_root: Path,
     defaults: dict[str, Any],
     capture_origin: str,
     database_origin: str,
     gpu_device: int | None,
-) -> tuple[AlignmentConfig, DefectDetectionConfig]:
+) -> tuple[AlignmentConfig, MeasurementConfig, DefectDetectionConfig, Path]:
     alignment = AlignmentConfig(
         search_frames=int(defaults.get("alignmentSearchFrames", 12)),
         stable_rows=int(defaults.get("alignmentStableRows", 8)),
@@ -188,6 +211,17 @@ def create_configs(
         intensity_ratio=float(defaults.get("steelBrightPixelRatio", 0.02)),
         anchor_interval_frames=int(defaults.get("softSyncAnchorIntervalFrames", 16)),
         maximum_anchor_residual_ms=float(defaults.get("softSyncMaximumResidualMs", 40.0)),
+    ).bounded()
+    measurement = MeasurementConfig(
+        row_window=int(defaults.get("measurementRowWindow", 16)),
+        maximum_profile_points=int(
+            defaults.get("measurementMaximumProfilePoints", 320)
+        ),
+        maximum_sections=int(defaults.get("measurementMaximumSections", 12)),
+        minimum_circle_points=int(defaults.get("measurementMinimumCirclePoints", 48)),
+        maximum_circle_residual_mm=float(
+            defaults.get("measurementMaximumCircleResidualMm", 0.5)
+        ),
     ).bounded()
     defects = DefectDetectionConfig(
         enabled=bool(defaults.get("defectDetectionEnabled", False)),
@@ -238,7 +272,11 @@ def create_configs(
             defaults.get("defectRequireApprovedRegionMap", True)
         ),
     ).bounded()
-    return alignment, defects
+    base_calibration = configured_path(profile_path, defaults, "arrayCalibrationPath")
+    active_calibration = Path(
+        resolve_active_array_calibration(storage_root, base_calibration)["path"]
+    )
+    return alignment, measurement, defects, active_calibration
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -246,6 +284,63 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"JSON object expected: {path}")
     return value
+
+
+def ensure_overlap_region_manifest(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment: dict[str, Any],
+    measurement_config: MeasurementConfig,
+    calibration_path: Path,
+    *,
+    execution_gate: Callable[[str], None] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Ensure historical ownership exists and carries the additive pair count."""
+
+    measurement_path = measurement_manifest_path(storage_root, material_id)
+    if measurement_path.is_file():
+        if execution_gate is not None:
+            execution_gate("measurement-manifest-read")
+        measurement = read_json(measurement_path)
+    else:
+        if execution_gate is not None:
+            execution_gate("measurement-build")
+        _, measurement = build_and_write_flow_measurement(
+            camera_roots,
+            storage_root,
+            material_id,
+            alignment,
+            calibration_path=calibration_path,
+            config=measurement_config,
+        )
+
+    manifest_path = region_manifest_path(storage_root, material_id)
+    if manifest_path.is_file():
+        if execution_gate is not None:
+            execution_gate("region-manifest-read")
+        regions = read_json(manifest_path)
+        ownership = regions.get("ownership")
+        pairs = ownership.get("pairs") if isinstance(ownership, dict) else None
+        if isinstance(pairs, list):
+            pair_count = len(pairs)
+            changed = ownership.get("overlapPairCount") != pair_count
+            if changed:
+                ownership["overlapPairCount"] = pair_count
+                if execution_gate is not None:
+                    execution_gate("region-count-write")
+                _atomic_json(manifest_path, regions)
+            return regions, changed
+
+    if execution_gate is not None:
+        execution_gate("region-build")
+    _, regions = build_and_write_flow_region_map(
+        camera_roots,
+        storage_root,
+        material_id,
+        measurement,
+    )
+    return regions, True
 
 
 def ensure_minimum_review_crops(
@@ -317,6 +412,50 @@ def update_status(
             )
 
 
+def capture_gate_disposition(
+    steel: dict[str, Any], health: dict[str, Any]
+) -> dict[str, Any]:
+    """Classify whether historical work can safely use the capture disks."""
+
+    queue = health.get("storageQueue", {})
+    if not isinstance(queue, dict):
+        queue = {}
+    reported_steel_present = bool(steel.get("present"))
+    history_only = bool(health.get("historyOnly"))
+    # A history-only provider cannot acquire or persist a live frame. Its
+    # durable steel state may still describe the last interrupted live flow,
+    # so that stale flag must not pause a disk-safe historical rebuild.
+    live_steel_present = reported_steel_present and not history_only
+    pending_rounds = int(queue.get("pendingRounds", 0) or 0)
+    active_rounds = int(queue.get("activeRounds", 0) or 0)
+    if live_steel_present:
+        reason = "steel-present"
+    elif pending_rounds > 0:
+        reason = "storage-queue-pending"
+    elif active_rounds > 0:
+        reason = "storage-writer-active"
+    else:
+        reason = "idle"
+    return {
+        "available": True,
+        "idle": not live_steel_present and pending_rounds == 0 and active_rounds == 0,
+        "reason": reason,
+        "capturePhase": str(steel.get("phase", "unknown")),
+        "historyOnly": history_only,
+        "steelPresent": live_steel_present,
+        "reportedSteelPresent": reported_steel_present,
+        "materialId": str(steel.get("materialId", "")),
+        "queue": {
+            "pendingRounds": pending_rounds,
+            "activeRounds": active_rounds,
+            "highWaterRounds": int(queue.get("highWaterRounds", 0) or 0),
+            "failedRounds": int(queue.get("failedRounds", 0) or 0),
+            "backpressureWaits": int(queue.get("backpressureWaits", 0) or 0),
+        },
+        "observedAt": utc_text(),
+    }
+
+
 def capture_gate_snapshot(capture_origin: str) -> dict[str, Any]:
     """Read the strict live-capture gate without touching historical storage."""
     origin = capture_origin.strip().rstrip("/")
@@ -327,36 +466,7 @@ def capture_gate_snapshot(capture_origin: str) -> dict[str, Any]:
             health = json.loads(response.read().decode("utf-8"))
         if not isinstance(steel, dict) or not isinstance(health, dict):
             raise ValueError("capture status response must be a JSON object")
-        queue = health.get("storageQueue", {})
-        if not isinstance(queue, dict):
-            queue = {}
-        steel_present = bool(steel.get("present"))
-        pending_rounds = int(queue.get("pendingRounds", 0) or 0)
-        active_rounds = int(queue.get("activeRounds", 0) or 0)
-        if steel_present:
-            reason = "steel-present"
-        elif pending_rounds > 0:
-            reason = "storage-queue-pending"
-        elif active_rounds > 0:
-            reason = "storage-writer-active"
-        else:
-            reason = "idle"
-        return {
-            "available": True,
-            "idle": not steel_present and pending_rounds == 0 and active_rounds == 0,
-            "reason": reason,
-            "capturePhase": str(steel.get("phase", "unknown")),
-            "steelPresent": steel_present,
-            "materialId": str(steel.get("materialId", "")),
-            "queue": {
-                "pendingRounds": pending_rounds,
-                "activeRounds": active_rounds,
-                "highWaterRounds": int(queue.get("highWaterRounds", 0) or 0),
-                "failedRounds": int(queue.get("failedRounds", 0) or 0),
-                "backpressureWaits": int(queue.get("backpressureWaits", 0) or 0),
-            },
-            "observedAt": utc_text(),
-        }
+        return capture_gate_disposition(steel, health)
     except Exception as error:
         return {
             "available": False,
@@ -687,8 +797,9 @@ def main() -> int:
     camera_roots = {
         camera.camera_id: camera.storage_root for camera in profile.enabled_cameras
     }
-    alignment_config, defect_config = create_configs(
+    alignment_config, measurement_config, defect_config, calibration_path = create_configs(
         profile.source_path,
+        profile.storage_root,
         defaults,
         args.capture_origin,
         args.database_origin,
@@ -752,6 +863,8 @@ def main() -> int:
         "materialLimit": args.limit,
         "materialCount": 0,
         "currentMaterialId": "",
+        "regionManifestsUpdated": 0,
+        "regionOverlapPairCount": 0,
         "importedManifests": 0,
         "importedDefects": 0,
         "cropsRebuilt": 0,
@@ -962,36 +1075,56 @@ def main() -> int:
                         ):
                             status["skippedMaterials"] += 1
                             continue
-                    alignment_path = alignment_manifest_path(
-                        profile.storage_root, material_id
-                    )
-                    execution_gate("alignment-manifest-check")
-                    if alignment_path.is_file():
-                        execution_gate("alignment-manifest-read")
-                        alignment = read_json(alignment_path)
-                    else:
-                        _, alignment = build_and_write_flow_alignment(
+                    with exclusive_material_job(
+                        profile.storage_root,
+                        material_id,
+                        purpose="defect-history-backfill",
+                    ):
+                        alignment_path = alignment_manifest_path(
+                            profile.storage_root, material_id
+                        )
+                        execution_gate("alignment-manifest-check")
+                        if alignment_path.is_file():
+                            execution_gate("alignment-manifest-read")
+                            alignment = read_json(alignment_path)
+                        else:
+                            _, alignment = build_and_write_flow_alignment(
+                                camera_roots,
+                                profile.storage_root,
+                                material_id,
+                                config=alignment_config,
+                                execution_gate=execution_gate,
+                            )
+                        regions, region_updated = ensure_overlap_region_manifest(
                             camera_roots,
                             profile.storage_root,
                             material_id,
-                            config=alignment_config,
+                            alignment,
+                            measurement_config,
+                            calibration_path,
                             execution_gate=execution_gate,
                         )
-                    _, manifest = build_and_write_flow_defect_detection(
-                        camera_roots,
-                        profile.storage_root,
-                        material_id,
-                        alignment,
-                        config=defect_config,
-                        execution_gate=execution_gate,
+                        _, manifest = build_and_write_flow_defect_detection(
+                            camera_roots,
+                            profile.storage_root,
+                            material_id,
+                            alignment,
+                            config=defect_config,
+                            execution_gate=execution_gate,
+                        )
+                        manifest["historyBackfill"] = {
+                            "version": BACKFILL_VERSION,
+                            "minimumCropSize": minimum_crop,
+                            "overlapStatistics": True,
+                            "completedAt": utc_text(),
+                        }
+                        execution_gate("history-marker-write")
+                        _atomic_json(manifest_path, manifest)
+                    if region_updated:
+                        status["regionManifestsUpdated"] += 1
+                    status["regionOverlapPairCount"] += int(
+                        regions.get("ownership", {}).get("overlapPairCount", 0)
                     )
-                    manifest["historyBackfill"] = {
-                        "version": BACKFILL_VERSION,
-                        "minimumCropSize": minimum_crop,
-                        "completedAt": utc_text(),
-                    }
-                    execution_gate("history-marker-write")
-                    _atomic_json(manifest_path, manifest)
                     status["reprocessedMaterials"] += 1
                     status["reprocessedDefects"] += int(
                         manifest.get("statistics", {}).get("defectCount", 0)

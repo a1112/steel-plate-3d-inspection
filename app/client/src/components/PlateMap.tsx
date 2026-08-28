@@ -8,7 +8,15 @@ import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
 import type { CaptureImageItem, DefectItem, DefectType } from '../data/inspection';
 import { severityLabels, surfaceLabels } from '../data/inspection';
 import { createSequentialCameraLanes, type CameraDisplayLane } from '../lib/camera-display';
-import { captureRenderImageUrl, type CaptureFlowSurface, type CaptureSurfaceCameraTiles } from '../lib/capture-api';
+import {
+  captureRenderImageUrl,
+  readCaptureDefects,
+  readCaptureRegions,
+  type CaptureFlowSurface,
+  type CaptureRegionCamera,
+  type CaptureRegionMap,
+  type CaptureSurfaceCameraTiles,
+} from '../lib/capture-api';
 import { barSurfaceFileUrl, type BarSurfaceCamera, type BarSurfaceMesh } from '../services/bar-surface-api';
 import {
   fetchCaptureStitchHistory,
@@ -88,7 +96,9 @@ const surfaceModeOptions: { id: SurfaceDisplayMode; label: string }[] = [
 export type PlateMapViewMode = '2d' | '3d' | 'section';
 type Plate3DDisplayMode = 'surface' | 'points' | 'texture' | 'jet';
 type Plate2DDisplayMode = 'gray' | 'jet';
+type OverlapDisplayMode = 'overlap' | 'deduplicated';
 type UnfoldOrientation = 'horizontal' | 'vertical';
+export type NormalizedColumnInterval = [number, number];
 type DisplayWorld = {
   recordId: string;
   meta: InspectionWorldMeta;
@@ -99,6 +109,13 @@ type CaptureStitchState = {
   materialId: string;
   status: 'idle' | 'loading' | 'ready' | 'missing' | 'error';
   result: CaptureStitchResult | null;
+};
+
+type CaptureOverlapState = {
+  materialId: string;
+  regionMap: CaptureRegionMap | null;
+  duplicateFilteredCount: number | null;
+  loading: boolean;
 };
 
 type TwoDViewportMemory = {
@@ -159,6 +176,145 @@ function useCaptureStitchHistory(
     };
   }, [cameraKey, enabled, keepRefreshing, materialId]);
   return state;
+}
+
+function useCaptureOverlapData(
+  materialId: string | undefined,
+  enabled: boolean,
+  keepRefreshing: boolean,
+) {
+  const [state, setState] = useState<CaptureOverlapState>({
+    materialId: '',
+    regionMap: null,
+    duplicateFilteredCount: null,
+    loading: false,
+  });
+  useEffect(() => {
+    const normalizedMaterialId = materialId?.trim() || '';
+    if (!enabled || !normalizedMaterialId) {
+      setState({
+        materialId: normalizedMaterialId,
+        regionMap: null,
+        duplicateFilteredCount: null,
+        loading: false,
+      });
+      return undefined;
+    }
+    let cancelled = false;
+    let timer: number | undefined;
+    setState({
+      materialId: normalizedMaterialId,
+      regionMap: null,
+      duplicateFilteredCount: null,
+      loading: true,
+    });
+
+    const schedule = (delayMs: number) => {
+      if (!cancelled) timer = window.setTimeout(() => void refresh(), delayMs);
+    };
+    const refresh = async () => {
+      const [regionResult, defectResult] = await Promise.allSettled([
+        readCaptureRegions(normalizedMaterialId),
+        readCaptureDefects(normalizedMaterialId),
+      ]);
+      if (cancelled) return;
+      const regionMap = regionResult.status === 'fulfilled' ? regionResult.value : null;
+      const detection = defectResult.status === 'fulfilled' ? defectResult.value.detection : undefined;
+      const duplicateFilteredCount = typeof detection?.statistics?.overlapDuplicateFilteredCount === 'number'
+        ? detection.statistics.overlapDuplicateFilteredCount
+        : null;
+      setState((current) => ({
+        materialId: normalizedMaterialId,
+        regionMap: regionMap ?? (current.materialId === normalizedMaterialId ? current.regionMap : null),
+        duplicateFilteredCount: duplicateFilteredCount
+          ?? (current.materialId === normalizedMaterialId ? current.duplicateFilteredCount : null),
+        loading: false,
+      }));
+      const defectSettled = defectResult.status === 'fulfilled' && Boolean(
+        defectResult.value.detection
+        || ['failed', 'disabled'].includes(defectResult.value.state || ''),
+      );
+      if (keepRefreshing || !regionMap || !defectSettled) schedule(8_000);
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [enabled, keepRefreshing, materialId]);
+  return state;
+}
+
+export function normalizeOwnedColumnIntervals(
+  intervals: readonly number[][] | undefined,
+  cropBox: readonly number[] | null | undefined,
+): NormalizedColumnInterval[] {
+  if (!cropBox || cropBox.length !== 4 || !cropBox.every(Number.isFinite)) return [];
+  const cropLeft = Number(cropBox[0]);
+  const cropRight = Number(cropBox[2]);
+  const cropWidth = cropRight - cropLeft;
+  if (cropWidth <= 0 || !intervals) return [];
+  const normalized = intervals.flatMap((interval): NormalizedColumnInterval[] => {
+    if (!Array.isArray(interval) || interval.length !== 2 || !interval.every(Number.isFinite)) return [];
+    const left = Math.max(cropLeft, Math.min(cropRight, Number(interval[0])));
+    const right = Math.max(cropLeft, Math.min(cropRight, Number(interval[1])));
+    return right > left ? [[(left - cropLeft) / cropWidth, (right - cropLeft) / cropWidth]] : [];
+  }).sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  const merged: NormalizedColumnInterval[] = [];
+  normalized.forEach(([left, right]) => {
+    const previous = merged.at(-1);
+    if (previous && left <= previous[1] + 1e-6) {
+      previous[1] = Math.max(previous[1], right);
+    } else {
+      merged.push([left, right]);
+    }
+  });
+  return merged;
+}
+
+export function remapOwnedColumnRange(
+  left: number,
+  right: number,
+  intervals: readonly NormalizedColumnInterval[],
+): NormalizedColumnInterval | null {
+  if (!Number.isFinite(left) || !Number.isFinite(right) || right <= left) return null;
+  const center = (left + right) / 2;
+  const totalWidth = intervals.reduce((total, interval) => total + interval[1] - interval[0], 0);
+  if (totalWidth <= 0) return null;
+  let offset = 0;
+  for (const interval of intervals) {
+    const width = interval[1] - interval[0];
+    if (center >= interval[0] && center <= interval[1]) {
+      const clippedLeft = Math.max(interval[0], left);
+      const clippedRight = Math.min(interval[1], right);
+      if (clippedRight <= clippedLeft) return null;
+      return [
+        (offset + clippedLeft - interval[0]) / totalWidth,
+        (offset + clippedRight - interval[0]) / totalWidth,
+      ];
+    }
+    offset += width;
+  }
+  return null;
+}
+
+export function restoreOwnedColumnRatio(
+  displayedRatio: number,
+  intervals: readonly NormalizedColumnInterval[],
+) {
+  if (!Number.isFinite(displayedRatio)) return null;
+  const totalWidth = intervals.reduce((total, interval) => total + interval[1] - interval[0], 0);
+  if (totalWidth <= 0) return null;
+  const target = Math.max(0, Math.min(1, displayedRatio)) * totalWidth;
+  let offset = 0;
+  for (const [left, right] of intervals) {
+    const width = right - left;
+    if (target <= offset + width || right === intervals.at(-1)?.[1]) {
+      return Math.max(left, Math.min(right, left + target - offset));
+    }
+    offset += width;
+  }
+  return null;
 }
 
 export function cameraBandRotationRadians(orientation: UnfoldOrientation) {
@@ -635,6 +791,7 @@ function CameraBandImage({
   contentLabel = '实际裁剪图',
   cropBlackBorders = false,
   stableCropWindow,
+  sourceIntervals,
   autoCropCameraId,
   onAutoCropDetected,
   loadDelayMs = 0,
@@ -645,15 +802,19 @@ function CameraBandImage({
   contentLabel?: string;
   cropBlackBorders?: boolean;
   stableCropWindow?: CameraBandCropWindow;
+  sourceIntervals?: readonly NormalizedColumnInterval[];
   autoCropCameraId?: string;
   onAutoCropDetected?: (cameraId: string, crop: CameraBandCropWindow) => void;
   loadDelayMs?: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const cropWindowRef = useRef(stableCropWindow);
+  const sourceIntervalsRef = useRef(sourceIntervals);
   const redrawRef = useRef<(() => void) | null>(null);
+  const sourceIntervalKey = sourceIntervals?.map((interval) => interval.join(':')).join(',') ?? '';
 
   cropWindowRef.current = stableCropWindow;
+  sourceIntervalsRef.current = sourceIntervals;
 
   useLayoutEffect(() => {
     const canvas = canvasRef.current;
@@ -771,13 +932,57 @@ function CameraBandImage({
         delete canvas.dataset.cropLeft;
         delete canvas.dataset.cropRight;
       }
+      const visibleIntervals = sourceIntervalsRef.current?.filter(
+        (interval) => interval[1] - interval[0] > 1e-6,
+      ) ?? [];
+      const visibleWidth = visibleIntervals.reduce(
+        (total, interval) => total + interval[1] - interval[0],
+        0,
+      );
+      if (visibleIntervals.length > 0 && visibleWidth > 0) {
+        canvas.dataset.sourceIntervals = visibleIntervals
+          .map((interval) => `${interval[0].toFixed(6)}:${interval[1].toFixed(6)}`)
+          .join(',');
+      } else {
+        delete canvas.dataset.sourceIntervals;
+      }
       const rotation = cameraBandRotationRadians(orientation);
       if (rotation !== 0) {
         context.translate(0, rect.height);
         context.rotate(rotation);
-        context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, rect.height, rect.width);
+      }
+      const destinationWidth = rotation !== 0 ? rect.height : rect.width;
+      const destinationHeight = rotation !== 0 ? rect.width : rect.height;
+      if (visibleIntervals.length > 0 && visibleWidth > 0) {
+        let destinationX = 0;
+        visibleIntervals.forEach(([left, right]) => {
+          const intervalWidth = right - left;
+          const renderedWidth = destinationWidth * intervalWidth / visibleWidth;
+          context.drawImage(
+            image,
+            left * image.naturalWidth,
+            sourceY,
+            intervalWidth * image.naturalWidth,
+            sourceHeight,
+            destinationX,
+            0,
+            renderedWidth,
+            destinationHeight,
+          );
+          destinationX += renderedWidth;
+        });
       } else {
-        context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, rect.width, rect.height);
+        context.drawImage(
+          image,
+          sourceX,
+          sourceY,
+          sourceWidth,
+          sourceHeight,
+          0,
+          0,
+          destinationWidth,
+          destinationHeight,
+        );
       }
       canvas.dataset.hasPaintedFrame = 'true';
       canvas.dataset.renderState = 'ready';
@@ -839,13 +1044,17 @@ function CameraBandImage({
 
   useEffect(() => {
     redrawRef.current?.();
-  }, [stableCropWindow?.left, stableCropWindow?.right]);
+  }, [sourceIntervalKey, stableCropWindow?.left, stableCropWindow?.right]);
 
   return <canvas
     ref={canvasRef}
     className="bar-camera-band-image"
     aria-label={`${label} ${contentLabel}`}
     data-edge-policy={cropBlackBorders ? 'stable-source-crop' : 'source-roi'}
+    data-overlap-policy={sourceIntervals?.length ? 'owned-columns-concatenated' : 'overlap-retained'}
+    data-source-intervals={sourceIntervals?.length
+      ? sourceIntervals.map(([start, end]) => `${start.toFixed(6)}:${end.toFixed(6)}`).join(',')
+      : undefined}
     data-load-priority={loadDelayMs > 0 ? 'deferred' : 'high'}
   />;
 }
@@ -863,6 +1072,17 @@ function captureImageCameraName(image: CaptureImageItem) {
 function cameraIdentityNumber(value: string) {
   const match = value.match(/(?:camera|camimagesource|cam|c|相机)[-_ ]?(\d+)/i);
   return match ? Number(match[1]) : null;
+}
+
+function captureRegionCamera(
+  regionMap: CaptureRegionMap | null | undefined,
+  cameraId: string,
+): CaptureRegionCamera | undefined {
+  const target = cameraIdentityNumber(cameraId);
+  if (target === null) return undefined;
+  return Object.values(regionMap?.cameras ?? {}).find(
+    (camera) => cameraIdentityNumber(camera.cameraId) === target,
+  );
 }
 
 type CaptureHeadAlignment = NonNullable<CaptureFlowSurface['headAlignment']>;
@@ -888,6 +1108,7 @@ function defectFrameRectStyle(
   defect: DefectItem,
   cameraFrame: CaptureStitchFrame['cameras'][number],
   orientation: UnfoldOrientation,
+  sourceIntervals?: readonly NormalizedColumnInterval[],
 ): CSSProperties | null {
   const roi = defect.artifacts?.roi;
   if (!roi || ![roi.x, roi.y, roi.width, roi.height].every(Number.isFinite)
@@ -903,18 +1124,24 @@ function defectFrameRectStyle(
   const right = Math.max(left, Math.min(cropRight, roi.x + roi.width));
   const bottom = Math.max(top, Math.min(cropBottom, roi.y + roi.height));
   if (right <= left || bottom <= top) return null;
+  const sourceLeftRatio = (left - cropLeft) / cropWidth;
+  const sourceRightRatio = (right - cropLeft) / cropWidth;
+  const mappedColumns = sourceIntervals?.length
+    ? remapOwnedColumnRange(sourceLeftRatio, sourceRightRatio, sourceIntervals)
+    : [sourceLeftRatio, sourceRightRatio] as NormalizedColumnInterval;
+  if (!mappedColumns) return null;
   if (orientation === 'horizontal') {
     return {
       left: `${(top - cropTop) / cropHeight * 100}%`,
-      top: `${(cropRight - right) / cropWidth * 100}%`,
+      top: `${(1 - mappedColumns[1]) * 100}%`,
       width: `${Math.max(1.2, (bottom - top) / cropHeight * 100)}%`,
-      height: `${Math.max(8, (right - left) / cropWidth * 100)}%`,
+      height: `${Math.max(8, (mappedColumns[1] - mappedColumns[0]) * 100)}%`,
     };
   }
   return {
-    left: `${(left - cropLeft) / cropWidth * 100}%`,
+    left: `${mappedColumns[0] * 100}%`,
     top: `${(top - cropTop) / cropHeight * 100}%`,
-    width: `${Math.max(8, (right - left) / cropWidth * 100)}%`,
+    width: `${Math.max(8, (mappedColumns[1] - mappedColumns[0]) * 100)}%`,
     height: `${Math.max(1.2, (bottom - top) / cropHeight * 100)}%`,
   };
 }
@@ -939,6 +1166,8 @@ function BarUnfoldedMap({
   cameraLanes,
   imageMode = 'gray',
   headAlignment,
+  regionMap,
+  deduplicateOverlap = false,
   cropBlackBorders = false,
   viewportMemory,
 }: {
@@ -961,6 +1190,8 @@ function BarUnfoldedMap({
   cameraLanes: CameraDisplayLane[];
   imageMode?: Plate2DDisplayMode;
   headAlignment?: CaptureFlowSurface['headAlignment'] | null;
+  regionMap?: CaptureRegionMap | null;
+  deduplicateOverlap?: boolean;
   cropBlackBorders?: boolean;
   viewportMemory?: MutableRefObject<TwoDViewportMemory>;
 }) {
@@ -1367,7 +1598,14 @@ function BarUnfoldedMap({
   };
 
   return (
-    <div className={`bar-unfolded-map orientation-${orientation} ${expandedCamera ? 'camera-expanded' : ''}`} data-testid="bar-unfolded-map" data-orientation={orientation} data-expanded-camera={expandedCamera || undefined} style={{ '--camera-count': cameraLanes.length } as CSSProperties}>
+    <div
+      className={`bar-unfolded-map orientation-${orientation} ${expandedCamera ? 'camera-expanded' : ''}`}
+      data-testid="bar-unfolded-map"
+      data-orientation={orientation}
+      data-overlap-display-mode={deduplicateOverlap ? 'deduplicated' : 'overlap'}
+      data-expanded-camera={expandedCamera || undefined}
+      style={{ '--camera-count': cameraLanes.length } as CSSProperties}
+    >
       <div
         ref={scrollRef}
         className={`bar-unfolded-canvas ${stitchEnabled ? 'has-stitch' : ''} ${mapDragging ? 'is-dragging' : ''}`}
@@ -1401,6 +1639,7 @@ function BarUnfoldedMap({
         <div className="bar-camera-bands">
           {cameraLanes.map((lane) => {
             const camera = surfaceCameras.find((item) => item.name.toLowerCase() === lane.cameraId);
+            const regionCamera = captureRegionCamera(regionMap, lane.cameraId);
             const preview = camera?.relative.intensityPreview || camera?.latest.intensityPreview || '';
             const captureImage = captureImageByCamera.get(lane.cameraId);
             const laneNumber = cameraIdentityNumber(lane.cameraId) ?? cameraIdentityNumber(lane.shortLabel);
@@ -1458,6 +1697,12 @@ function BarUnfoldedMap({
                         || defect.artifacts?.sequenceNo === cameraFrame?.storageIndex)
                     ));
                     const probeKey = `${frame.frameId}:${lane.cameraId}`;
+                    const ownedSourceIntervals = deduplicateOverlap && cameraFrame && regionCamera
+                      ? normalizeOwnedColumnIntervals(
+                          regionCamera.ownedColumnIntervals,
+                          cameraFrame.validRoi ?? regionCamera.stableCrop,
+                        )
+                      : undefined;
                     return <div
                       key={`${frame.frameId}:${lane.cameraId}`}
                       className={`bar-camera-frame ${cameraFrame ? 'has-production-image' : 'is-missing'}`}
@@ -1472,7 +1717,7 @@ function BarUnfoldedMap({
                         const rect = event.currentTarget.getBoundingClientRect();
                         const localX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
                         const localY = Math.max(0, Math.min(rect.height, event.clientY - rect.top));
-                        const pixel = mapFramePointerToCapturePixel({
+                        const displayedPixel = mapFramePointerToCapturePixel({
                           localX,
                           localY,
                           displayWidth: rect.width,
@@ -1482,6 +1727,25 @@ function BarUnfoldedMap({
                           validRoi: cameraFrame.validRoi,
                           orientation,
                         });
+                        const restoredColumnRatio = ownedSourceIntervals?.length
+                          ? restoreOwnedColumnRatio(displayedPixel.cropXRatio, ownedSourceIntervals)
+                          : null;
+                        const [cropLeft, , cropRight] = cameraFrame.validRoi
+                          ?? [0, 0, cameraFrame.sourceWidth, cameraFrame.sourceHeight];
+                        const cropWidth = Math.max(1, cropRight - cropLeft);
+                        const pixel = restoredColumnRatio === null
+                          ? displayedPixel
+                          : {
+                              ...displayedPixel,
+                              cropXRatio: restoredColumnRatio,
+                              sourceX: Math.max(
+                                cropLeft,
+                                Math.min(
+                                  cropRight - 1,
+                                  Math.round(cropLeft + restoredColumnRatio * (cropWidth - 1)),
+                                ),
+                              ),
+                            };
                         setDepthProbe((current) => ({
                           key: probeKey,
                           cameraId: lane.shortLabel,
@@ -1514,11 +1778,17 @@ function BarUnfoldedMap({
                         label={`${lane.shortLabel} 第 ${frame.sequence} 轮`}
                         orientation={orientation}
                         contentLabel={imageMode === 'jet' ? '逐帧 JET 图' : '2D 去背景图'}
+                        sourceIntervals={ownedSourceIntervals}
                         cropBlackBorders={false}
                         loadDelayMs={frameIndex === priorityFrameIndex ? 0 : 250}
                       /> : <small>缺帧</small>}
                       {cameraFrame ? frameDefects.map((defect) => {
-                        const rectStyle = defectFrameRectStyle(defect, cameraFrame, orientation);
+                        const rectStyle = defectFrameRectStyle(
+                          defect,
+                          cameraFrame,
+                          orientation,
+                          ownedSourceIntervals,
+                        );
                         const type = defectTypes.find((item) => item.id === defect.typeId);
                         if (!rectStyle) return null;
                         return <button
@@ -1978,17 +2248,29 @@ function PlateDisplaySubModes({
   viewMode,
   threeMode,
   twoDMode,
+  overlapMode,
+  showOverlapMode,
+  overlapAvailable,
+  overlapPairCount,
+  overlapDuplicateFilteredCount,
   artifactOrientation,
   onThreeModeChange,
   onTwoDModeChange,
+  onOverlapModeChange,
   onArtifactOrientationChange,
 }: {
   viewMode: PlateMapViewMode;
   threeMode: Plate3DDisplayMode;
   twoDMode: Plate2DDisplayMode;
+  overlapMode: OverlapDisplayMode;
+  showOverlapMode: boolean;
+  overlapAvailable: boolean;
+  overlapPairCount: number | null;
+  overlapDuplicateFilteredCount: number | null;
   artifactOrientation: ArtifactOrientation;
   onThreeModeChange: (mode: Plate3DDisplayMode) => void;
   onTwoDModeChange: (mode: Plate2DDisplayMode) => void;
+  onOverlapModeChange: (mode: OverlapDisplayMode) => void;
   onArtifactOrientationChange: (orientation: ArtifactOrientation) => void;
 }) {
   if (viewMode === '3d') {
@@ -2036,10 +2318,43 @@ function PlateDisplaySubModes({
   }
   if (viewMode === '2d') {
     return (
-      <div className="plate-display-submodes" role="group" aria-label="2D 显示子模式">
-        <button type="button" className={twoDMode === 'gray' ? 'active' : ''} aria-pressed={twoDMode === 'gray'} onClick={() => onTwoDModeChange('gray')}>灰度</button>
-        <button type="button" className={twoDMode === 'jet' ? 'active jet' : 'jet'} aria-pressed={twoDMode === 'jet'} onClick={() => onTwoDModeChange('jet')}>Jet</button>
-      </div>
+      <>
+        <div className="plate-display-submodes" role="group" aria-label="2D 显示子模式">
+          <button type="button" className={twoDMode === 'gray' ? 'active' : ''} aria-pressed={twoDMode === 'gray'} onClick={() => onTwoDModeChange('gray')}>灰度</button>
+          <button type="button" className={twoDMode === 'jet' ? 'active jet' : 'jet'} aria-pressed={twoDMode === 'jet'} onClick={() => onTwoDModeChange('jet')}>Jet</button>
+        </div>
+        {showOverlapMode ? <>
+          <div className="overlap-display-switch" role="group" aria-label="重叠区域显示模式">
+            <button
+              type="button"
+              className={overlapMode === 'overlap' ? 'active' : ''}
+              aria-pressed={overlapMode === 'overlap'}
+              onClick={() => onOverlapModeChange('overlap')}
+            >
+              保留重叠
+            </button>
+            <button
+              type="button"
+              className={overlapMode === 'deduplicated' ? 'active' : ''}
+              aria-pressed={overlapMode === 'deduplicated'}
+              disabled={!overlapAvailable}
+              title={overlapAvailable ? '仅显示每台相机负责的标定区域' : '当前记录缺少完整、有效的相机区域归属'}
+              onClick={() => onOverlapModeChange('deduplicated')}
+            >
+              去除重叠
+            </button>
+          </div>
+          <div
+            className={`overlap-count-summary ${overlapAvailable ? 'is-ready' : 'is-unavailable'}`}
+            role="status"
+            aria-label={`重叠统计：重叠区 ${overlapPairCount ?? '不可用'}，去重候选 ${overlapDuplicateFilteredCount ?? '不可用'}`}
+          >
+            <span>重叠区 <strong>{overlapPairCount ?? '--'}</strong></span>
+            <i aria-hidden="true" />
+            <span>去重候选 <strong>{overlapDuplicateFilteredCount ?? '--'}</strong></span>
+          </div>
+        </> : null}
+      </>
     );
   }
   return null;
@@ -2572,6 +2887,7 @@ export function PlateMap({
   );
   const [threeDisplayMode, setThreeDisplayMode] = useState<Plate3DDisplayMode>('surface');
   const [twoDDisplayMode, setTwoDDisplayMode] = useState<Plate2DDisplayMode>('gray');
+  const [overlapDisplayMode, setOverlapDisplayMode] = useState<OverlapDisplayMode>('overlap');
   const [artifactOrientation, setArtifactOrientation] = useState<ArtifactOrientation>('horizontal');
   const [productionZoom, setProductionZoom] = useState(1);
   const twoDViewportMemory = useRef<TwoDViewportMemory>({ stitchKey: '', orientation: 'horizontal', scrollProgress: 0 });
@@ -2588,10 +2904,18 @@ export function PlateMap({
     && viewMode === '2d'
     && !requireInspectionWorld
     && Boolean(captureMaterialId?.trim());
+  const overlapFeatureVisible = artifactMode === 'production'
+    && !requireInspectionWorld
+    && Boolean(captureMaterialId?.trim());
   const captureStitchState = useCaptureStitchHistory(
     captureMaterialId,
     cameraLanes.map((lane) => lane.shortLabel),
     captureStitchEligible,
+    refreshCaptureRoi,
+  );
+  const captureOverlapState = useCaptureOverlapData(
+    captureMaterialId,
+    overlapFeatureVisible && viewMode === '2d',
     refreshCaptureRoi,
   );
   const captureStitchResult = captureStitchState.materialId === captureMaterialId?.trim()
@@ -2602,6 +2926,25 @@ export function PlateMap({
     || captureStitchState.status === 'idle'
     || captureStitchState.status === 'loading'
   );
+  const captureRegionMap = captureOverlapState.materialId === captureMaterialId?.trim()
+    ? captureOverlapState.regionMap
+    : null;
+  const overlapPairCount = captureRegionMap?.ownership.ready
+    ? captureRegionMap.ownership.overlapPairCount ?? captureRegionMap.ownership.pairs.length
+    : null;
+  const overlapDuplicateFilteredCount = captureOverlapState.materialId === captureMaterialId?.trim()
+    ? captureOverlapState.duplicateFilteredCount
+    : null;
+  const overlapAvailable = Boolean(
+    captureRegionMap?.ownership.ready
+    && cameraLanes.length > 0
+    && cameraLanes.every((lane) => {
+      const camera = captureRegionCamera(captureRegionMap, lane.cameraId);
+      return camera?.state === 'ready'
+        && normalizeOwnedColumnIntervals(camera.ownedColumnIntervals, camera.stableCrop).length > 0;
+    }),
+  );
+  const effectiveOverlapDisplayMode = overlapAvailable ? overlapDisplayMode : 'overlap';
   // Online monitoring is stitch-only. Record-bound raw PNGs describe just one
   // frame per camera and must not impersonate the multi-frame playback view
   // while its index or committed two-level cache is rebuilt from source images.
@@ -2845,9 +3188,15 @@ export function PlateMap({
         viewMode={viewMode}
         threeMode={threeDisplayMode}
         twoDMode={twoDDisplayMode}
+        overlapMode={effectiveOverlapDisplayMode}
+        showOverlapMode={overlapFeatureVisible}
+        overlapAvailable={overlapAvailable}
+        overlapPairCount={overlapPairCount}
+        overlapDuplicateFilteredCount={overlapDuplicateFilteredCount}
         artifactOrientation={artifactOrientation}
         onThreeModeChange={setThreeDisplayMode}
         onTwoDModeChange={setTwoDDisplayMode}
+        onOverlapModeChange={setOverlapDisplayMode}
         onArtifactOrientationChange={setArtifactOrientation}
       />
       {toolbarExtra}
@@ -2998,6 +3347,8 @@ export function PlateMap({
             cameraLanes={cameraLanes}
             imageMode={twoDDisplayMode}
             headAlignment={surfaceHeadAlignment}
+            regionMap={captureRegionMap}
+            deduplicateOverlap={effectiveOverlapDisplayMode === 'deduplicated'}
             viewportMemory={twoDViewportMemory}
           />
         </div>
@@ -3115,6 +3466,8 @@ export function PlateMap({
             stitchKey={captureMaterialId?.trim() || inspectionId || ''}
             cameraLanes={cameraLanes}
             headAlignment={surfaceHeadAlignment}
+            regionMap={captureRegionMap}
+            deduplicateOverlap={effectiveOverlapDisplayMode === 'deduplicated'}
             cropBlackBorders
             viewportMemory={twoDViewportMemory}
           />

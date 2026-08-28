@@ -657,6 +657,28 @@ def candidate_spans_crop_boundary(
     return spans_horizontal or spans_vertical
 
 
+def candidate_region_disposition(
+    center_x: float,
+    owned_intervals: Any,
+    overlap_intervals: Any,
+) -> str:
+    """Classify a candidate center against calibrated single-camera ownership."""
+
+    def contains(intervals: Any) -> bool:
+        return isinstance(intervals, list) and any(
+            isinstance(interval, list)
+            and len(interval) == 2
+            and float(interval[0]) <= center_x < float(interval[1])
+            for interval in intervals
+        )
+
+    # Legacy or diagnostic manifests without ownership retain the historical
+    # behavior and leave candidates reviewable.
+    if not owned_intervals or contains(owned_intervals):
+        return "owned"
+    return "overlap-duplicate" if contains(overlap_intervals) else "boundary"
+
+
 def _depth_deviation(normalized: np.ndarray, rect: list[int], crop_box: list[int]) -> dict[str, Any]:
     left, top, right, bottom = crop_box
     x1 = max(0, rect[0] - left)
@@ -1179,6 +1201,7 @@ def build_flow_defect_detection(
             "statistics": {
                 "cameraCount": len(camera_roots),
                 "processedFrames": 0,
+                "overlapDuplicateFilteredCount": 0,
                 "defectCount": 0,
             },
             "defects": [],
@@ -1218,6 +1241,7 @@ def build_flow_defect_detection(
                 "cameraCount": len(camera_roots),
                 "defectCount": 0,
                 "processedFrames": 0,
+                "overlapDuplicateFilteredCount": 0,
             },
             "defects": [],
         }
@@ -1315,6 +1339,7 @@ def build_flow_defect_detection(
     raw_candidate_count = 0
     pseudo_defect_count = 0
     boundary_artifact_count = 0
+    overlap_duplicate_count = 0
     capture_idle_state: dict[str, float | None] = {"since": None}
     timings = {
         "captureWaitSeconds": 0.0,
@@ -1357,6 +1382,7 @@ def build_flow_defect_detection(
         camera_surface_tile = surface_tiles.get(camera_id)
         stable_crop = region_row.get("stableCrop")
         owned_intervals = region_row.get("ownedColumnIntervals", [])
+        overlap_intervals = region_row.get("overlapColumnIntervals", [])
         if head.get("detected"):
             indices = [index for index in indices if index >= int(head["frameIndex"])]
         if tail.get("detected"):
@@ -1493,11 +1519,13 @@ def build_flow_defect_detection(
                         execution_gate("defect-candidate-postprocess")
                     raw_candidate_count += 1
                     center_x = (candidate["rect"][0] + candidate["rect"][2]) / 2.0
-                    if owned_intervals and not any(
-                        float(interval[0]) <= center_x < float(interval[1])
-                        for interval in owned_intervals
-                        if isinstance(interval, list) and len(interval) == 2
-                    ):
+                    region_disposition = candidate_region_disposition(
+                        center_x, owned_intervals, overlap_intervals
+                    )
+                    if region_disposition == "overlap-duplicate":
+                        overlap_duplicate_count += 1
+                        continue
+                    if region_disposition == "boundary":
                         boundary_artifact_count += 1
                         continue
                     if candidate_spans_crop_boundary(candidate, crop_box):
@@ -1689,6 +1717,7 @@ def build_flow_defect_detection(
             "inferenceCount": inference_count,
             "recognitionInferenceCount": recognition_inference_count,
             "rawCandidateCount": raw_candidate_count,
+            "overlapDuplicateFilteredCount": overlap_duplicate_count,
             "boundaryArtifactFilteredCount": boundary_artifact_count,
             "pseudoDefectFilteredCount": pseudo_defect_count,
             "defectCount": len(defects),

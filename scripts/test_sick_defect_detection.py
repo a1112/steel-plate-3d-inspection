@@ -12,8 +12,10 @@ import numpy as np
 from PIL import Image
 
 from scripts.sick_defect_history_backfill import (
+    capture_gate_disposition,
     capture_gate_heartbeat_loop,
     ensure_minimum_review_crops,
+    ensure_overlap_region_manifest,
     final_outcome,
     wait_for_strict_capture_idle,
 )
@@ -29,6 +31,7 @@ from scripts.sick_capture.defect_detection import (
     _save_review_crop,
     build_and_write_flow_defect_detection,
     build_flow_defect_detection,
+    candidate_region_disposition,
     candidate_spans_crop_boundary,
     decode_yolov5_predictions,
     flatten_depth_for_detection,
@@ -36,9 +39,79 @@ from scripts.sick_capture.defect_detection import (
     merge_modal_candidates,
     resolve_candidate_classification,
 )
+from scripts.sick_capture.measurement import MeasurementConfig, measurement_manifest_path
+from scripts.sick_capture.regions import region_manifest_path
 
 
 class SickDefectDetectionTests(unittest.TestCase):
+    def test_history_only_capture_ignores_stale_steel_presence(self) -> None:
+        snapshot = capture_gate_disposition(
+            {"present": True, "phase": "steel-in-saving", "materialId": "4035"},
+            {
+                "historyOnly": True,
+                "storageQueue": {"pendingRounds": 0, "activeRounds": 0},
+            },
+        )
+
+        self.assertTrue(snapshot["idle"])
+        self.assertEqual(snapshot["reason"], "idle")
+        self.assertFalse(snapshot["steelPresent"])
+        self.assertTrue(snapshot["reportedSteelPresent"])
+
+    def test_history_backfill_adds_pair_count_to_existing_region_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage_root = Path(directory)
+            measurement_path = measurement_manifest_path(storage_root, "42")
+            measurement_path.parent.mkdir(parents=True)
+            measurement_path.write_text("{}", encoding="utf-8")
+            manifest_path = region_manifest_path(storage_root, "42")
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "ownership": {
+                            "ready": True,
+                            "reasons": [],
+                            "pairs": [{"cameras": ["C1", "C2"]}],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            regions, changed = ensure_overlap_region_manifest(
+                {},
+                storage_root,
+                "42",
+                {},
+                MeasurementConfig(),
+                storage_root / "calibration.json",
+            )
+            unchanged, changed_again = ensure_overlap_region_manifest(
+                {},
+                storage_root,
+                "42",
+                {},
+                MeasurementConfig(),
+                storage_root / "calibration.json",
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(regions["ownership"]["overlapPairCount"], 1)
+        self.assertFalse(changed_again)
+        self.assertEqual(unchanged["ownership"]["overlapPairCount"], 1)
+
+    def test_classifies_non_owner_overlap_separately_from_other_boundaries(self) -> None:
+        owned = [[20, 60]]
+        overlap = [[0, 30], [80, 100]]
+
+        self.assertEqual(candidate_region_disposition(25, owned, overlap), "owned")
+        self.assertEqual(
+            candidate_region_disposition(85, owned, overlap), "overlap-duplicate"
+        )
+        self.assertEqual(candidate_region_disposition(70, owned, overlap), "boundary")
+        self.assertEqual(candidate_region_disposition(85, [], overlap), "owned")
+
     def test_defect_position_uses_calibrated_surface_column_angle(self) -> None:
         angles: list[float | None] = [None] * 20
         angles[7] = 270.0
@@ -664,6 +737,9 @@ class SickDefectDetectionTests(unittest.TestCase):
         self.assertEqual(result["schema"], DEFECT_DETECTION_SCHEMA)
         self.assertEqual(result["state"], "disabled")
         self.assertTrue(result["quality"]["reviewRequired"])
+        self.assertEqual(
+            result["statistics"]["overlapDuplicateFilteredCount"], 0
+        )
 
     def test_production_region_gate_blocks_before_model_loading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -679,6 +755,9 @@ class SickDefectDetectionTests(unittest.TestCase):
             )
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["statistics"]["processedFrames"], 0)
+        self.assertEqual(
+            result["statistics"]["overlapDuplicateFilteredCount"], 0
+        )
         self.assertIn("region-manifest-missing", result["qualityGate"]["reasons"])
 
     def test_blocked_sick_array_reports_six_actual_cameras(self) -> None:

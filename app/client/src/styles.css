@@ -21800,6 +21800,69 @@ button {
   background: linear-gradient(90deg, #174ea6, #00a8e8 30%, #56b949 55%, #f0a21c 78%, #d63535);
 }
 
+.overlap-display-switch {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--panel-soft);
+}
+
+.overlap-display-switch button {
+  height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 3px;
+  color: var(--text-muted);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.overlap-display-switch button.active {
+  color: #fff;
+  background: var(--blue);
+}
+
+.overlap-display-switch button:disabled {
+  color: color-mix(in srgb, var(--text-muted) 52%, transparent);
+  cursor: not-allowed;
+}
+
+.overlap-count-summary {
+  height: 28px;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text-muted);
+  background: var(--panel-soft);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.overlap-count-summary strong {
+  color: var(--cyan);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.overlap-count-summary i {
+  width: 1px;
+  height: 12px;
+  background: var(--line-strong);
+}
+
+.overlap-count-summary.is-unavailable strong {
+  color: var(--text-muted);
+}
+
 .plate-texture-status {
   position: absolute;
   right: 14px;

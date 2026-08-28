@@ -202,7 +202,12 @@ def _calibrated_ownership(
     if not circle.get("available"):
         reasons.append("calibrated-circle-fit-unavailable")
     if reasons:
-        return {"ready": False, "reasons": list(dict.fromkeys(reasons)), "pairs": []}
+        return {
+            "ready": False,
+            "reasons": list(dict.fromkeys(reasons)),
+            "overlapPairCount": 0,
+            "pairs": [],
+        }
 
     center = np.asarray([circle["centerX"], circle["centerZ"]], dtype=np.float64)
     bins = settings.angle_bin_count
@@ -235,7 +240,12 @@ def _calibrated_ownership(
         columns_by_camera[camera_id] = columns
         angle_bins_by_camera[camera_id] = np.mod(np.rint(angles * bins / (2 * np.pi)).astype(np.int32), bins)
     if reasons or len(coverage) != expected:
-        return {"ready": False, "reasons": list(dict.fromkeys(reasons)), "pairs": []}
+        return {
+            "ready": False,
+            "reasons": list(dict.fromkeys(reasons)),
+            "overlapPairCount": 0,
+            "pairs": [],
+        }
 
     camera_ids = sorted(coverage)
     coverage_count = np.sum(np.stack([coverage[camera_id] for camera_id in camera_ids]), axis=0)
@@ -245,6 +255,7 @@ def _calibrated_ownership(
             "ready": False,
             "reasons": ["calibrated-circumference-coverage-gap"],
             "maximumCoverageGapDegrees": round(gap_degrees, 6),
+            "overlapPairCount": 0,
             "pairs": [],
         }
     owner = np.full(bins, "", dtype=object)
@@ -300,6 +311,7 @@ def _calibrated_ownership(
             "ready": False,
             "reasons": list(dict.fromkeys(reasons)),
             "maximumCoverageGapDegrees": round(gap_degrees, 6),
+            "overlapPairCount": len(pairs),
             "pairs": pairs,
         }
     return {
@@ -309,6 +321,7 @@ def _calibrated_ownership(
         "contextHaloPixels": 64,
         "angleBinCount": bins,
         "maximumCoverageGapDegrees": round(gap_degrees, 6),
+        "overlapPairCount": len(pairs),
         "pairs": pairs,
     }
 
@@ -378,6 +391,7 @@ def build_flow_region_map(
     ownership = _calibrated_ownership(measurement, cameras, settings) if not reasons else {
         "ready": False,
         "reasons": reasons,
+        "overlapPairCount": 0,
         "pairs": [],
     }
     all_reasons = list(dict.fromkeys([*reasons, *ownership.get("reasons", [])]))

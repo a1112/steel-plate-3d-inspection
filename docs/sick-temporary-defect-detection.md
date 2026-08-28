@@ -83,4 +83,6 @@ D:\project\py312\python.exe scripts\sick_defect_history_backfill.py `
   --minimum-crop-size 64
 ```
 
+版本 2 回填会在推理前补齐缺失的测量与区域清单，并为已有区域清单原子补写 `ownership.overlapPairCount`；重跑后的缺陷清单包含 `statistics.overlapDuplicateFilteredCount`。历史只读采集进程不会因上次遗留的进钢状态阻塞回填，但任何真实采集模式、有钢状态或非空落盘队列仍会立即暂停历史任务。
+
 运行进度保存在 `D:\steel-sick-data\system\jobs\defect-history-backfill\status.json`。所有复核缺陷图均为各相机 `defect/*.jpg` 下的 JPEG，宽、高分别不小于 64 像素；中央 manifest 记录每张图的路径和检测结果。前端通过 `/api/defects/history` 分页读取数据库事实，并优先使用 `/api/capture/file` 返回的缺陷小图。人工复核通过 `/api/defects/review` 写回 `pending`、`confirmed` 或 `false-positive`，重跑模型不会覆盖已复核结论。

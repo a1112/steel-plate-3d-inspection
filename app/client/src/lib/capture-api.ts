@@ -526,6 +526,12 @@ export type CaptureRegionCamera = {
   overlapColumnIntervals: number[][];
 };
 
+export type CaptureRegionOverlapPair = {
+  cameras: string[];
+  angleIntervalsDeg: number[][];
+  binCount: number;
+};
+
 export type CaptureRegionMap = {
   schema: "steel.capture-region-map.v1";
   materialId: string;
@@ -534,7 +540,12 @@ export type CaptureRegionMap = {
   defectDetectionAllowed: boolean;
   qualityGate: { passed: boolean; reasons: string[] };
   calibration: { revision?: string | null; approved: boolean; sha256: string };
-  ownership: { ready: boolean; reasons: string[]; pairs: unknown[] };
+  ownership: {
+    ready: boolean;
+    reasons: string[];
+    overlapPairCount?: number;
+    pairs: CaptureRegionOverlapPair[];
+  };
   cameras: Record<string, CaptureRegionCamera>;
 };
 
@@ -1009,6 +1020,7 @@ export type CaptureFlowDefectDetection = {
     inferenceCount?: number;
     recognitionInferenceCount?: number;
     rawCandidateCount?: number;
+    overlapDuplicateFilteredCount?: number;
     boundaryArtifactFilteredCount?: number;
     pseudoDefectFilteredCount?: number;
     defectCount?: number;

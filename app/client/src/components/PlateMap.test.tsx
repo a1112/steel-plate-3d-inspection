@@ -3,12 +3,26 @@ import type { ComponentProps } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType } from '../data/inspection';
 import { createSequentialCameraLanes } from '../lib/camera-display';
-import type { CaptureFlowSurface } from '../lib/capture-api';
+import {
+  readCaptureDefects,
+  readCaptureRegions,
+  type CaptureFlowSurface,
+  type CaptureRegionMap,
+} from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { fetchCaptureStitchHistory, type CaptureStitchResult } from '../services/capture-roi-api';
 import { readCaptureRawDepthValue, sampleJetResidualMm } from '../services/capture-depth-probe';
 import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
-import { cameraBandCropPadding, cameraBandRotationRadians, capturePrefetchFrameIndexes, captureStitchInitialFrameIndex, mergeCameraBandCropWindow, PlateMap as ProductionPlateMap } from './PlateMap';
+import { cameraBandCropPadding, cameraBandRotationRadians, capturePrefetchFrameIndexes, captureStitchInitialFrameIndex, mergeCameraBandCropWindow, normalizeOwnedColumnIntervals, PlateMap as ProductionPlateMap, remapOwnedColumnRange, restoreOwnedColumnRatio } from './PlateMap';
+
+vi.mock('../lib/capture-api', async () => {
+  const actual = await vi.importActual<typeof import('../lib/capture-api')>('../lib/capture-api');
+  return {
+    ...actual,
+    readCaptureDefects: vi.fn(),
+    readCaptureRegions: vi.fn(),
+  };
+});
 
 vi.mock('../services/inspection-world-api', async () => {
   const actual = await vi.importActual<typeof import('../services/inspection-world-api')>('../services/inspection-world-api');
@@ -124,6 +138,41 @@ function headAlignment(): NonNullable<CaptureFlowSurface['headAlignment']> {
   };
 }
 
+function captureRegionMap(materialId: string): CaptureRegionMap {
+  return {
+    schema: 'steel.capture-region-map.v1',
+    materialId,
+    state: 'ready',
+    backgroundReady: true,
+    defectDetectionAllowed: true,
+    qualityGate: { passed: true, reasons: [] },
+    calibration: { revision: 'cal-1', approved: true, sha256: 'a'.repeat(64) },
+    ownership: {
+      ready: true,
+      reasons: [],
+      overlapPairCount: 6,
+      pairs: Array.from({ length: 6 }, (_, index) => ({
+        cameras: [`C${index + 1}`, `C${(index + 1) % 6 + 1}`],
+        angleIntervalsDeg: [[index * 60, index * 60 + 10]],
+        binCount: 100,
+      })),
+    },
+    cameras: Object.fromEntries(Array.from({ length: 6 }, (_, index) => {
+      const cameraId = `C${index + 1}`;
+      return [cameraId, {
+        cameraId,
+        state: 'ready',
+        sourceSize: [2560, 1024],
+        stableCrop: [100, 0, 700, 1024],
+        sourceOffset: { x: 100, y: 0 },
+        displaySize: [600, 1024],
+        ownedColumnIntervals: [[100, 550]],
+        overlapColumnIntervals: [[500, 700]],
+      }];
+    })),
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fetchInspectionWorldMeta).mockRejectedValue(new Error('no persisted world'));
@@ -134,6 +183,8 @@ beforeEach(() => {
   ));
   vi.mocked(sampleJetResidualMm).mockResolvedValue(0.25);
   vi.mocked(readCaptureRawDepthValue).mockResolvedValue(1842);
+  vi.mocked(readCaptureRegions).mockRejectedValue(new Error('no region map'));
+  vi.mocked(readCaptureDefects).mockRejectedValue(new Error('no defect manifest'));
 });
 
 // These legacy interaction cases intentionally exercise the bundled demo/test
@@ -148,6 +199,23 @@ const defectTypes: DefectType[] = [
 ];
 
 describe('line-scan image orientation', () => {
+  it('normalizes owned source columns and remaps a defect into concatenated space', () => {
+    const intervals = normalizeOwnedColumnIntervals(
+      [[90, 180], [170, 240], [300, 360], [500, 510]],
+      [100, 0, 400, 1024],
+    );
+
+    expect(intervals).toEqual([
+      [0, 140 / 300],
+      [200 / 300, 260 / 300],
+    ]);
+    const remapped = remapOwnedColumnRange(0.7, 0.8, intervals);
+    expect(remapped?.[0]).toBeCloseTo(150 / 200);
+    expect(remapped?.[1]).toBeCloseTo(180 / 200);
+    expect(remapOwnedColumnRange(0.5, 0.6, intervals)).toBeNull();
+    expect(restoreOwnedColumnRatio(0.75, intervals)).toBeCloseTo(210 / 300);
+  });
+
   it('keeps acquisition rows vertical and rotates them toward the right in horizontal mode', () => {
     expect(cameraBandRotationRadians('vertical')).toBe(0);
     expect(cameraBandRotationRadians('horizontal')).toBe(-Math.PI / 2);
@@ -1357,6 +1425,103 @@ describe('PlateMap', () => {
     expect(screen.getByTestId('plate-production-point-cloud')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '切面' }));
     expect(screen.getByTestId('capture-section-view')).toBeInTheDocument();
+  });
+
+  it('shows overlap counts and concatenates owned camera columns in the 2D deduplicated mode', async () => {
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('4034'));
+    vi.mocked(readCaptureRegions).mockResolvedValue(captureRegionMap('4034'));
+    vi.mocked(readCaptureDefects).mockResolvedValue({
+      code: 0,
+      detection: {
+        schema: 'steel.sick-flow-defect-detection.v1',
+        generatedAt: '2026-08-27T10:00:00Z',
+        materialId: '4034',
+        state: 'complete',
+        temporaryModel: true,
+        quality: {
+          reviewRequired: true,
+          fineGrainedClassification: false,
+        },
+        statistics: {
+          overlapDuplicateFilteredCount: 4,
+          defectCount: 0,
+        },
+        defects: [],
+      },
+    });
+    render(
+      <ProductionPlateMap
+        defectTypes={defectTypes}
+        defects={[]}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId={null}
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        inspectionId="INS-OVERLAP"
+        captureMaterialId="4034"
+        cameraLanes={createSequentialCameraLanes(6)}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('重叠区')).toBeInTheDocument();
+    expect(screen.getByRole('status', { name: /重叠区 6，去重候选 4/ })).toBeInTheDocument();
+    const deduplicate = screen.getByRole('button', { name: '去除重叠' });
+    expect(deduplicate).toBeEnabled();
+    expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-overlap-display-mode', 'overlap');
+
+    fireEvent.click(deduplicate);
+
+    expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-overlap-display-mode', 'deduplicated');
+    expect(screen.getAllByLabelText(/2D 去背景图/)[0]).toHaveAttribute(
+      'data-overlap-policy',
+      'owned-columns-concatenated',
+    );
+    expect(screen.getAllByLabelText(/2D 去背景图/)[0]).toHaveAttribute(
+      'data-source-intervals',
+      '0.000000:0.750000',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Jet' }));
+    expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-overlap-display-mode', 'deduplicated');
+    expect(screen.getAllByLabelText(/JET/)[0]).toHaveAttribute(
+      'data-overlap-policy',
+      'owned-columns-concatenated',
+    );
+  });
+
+  it('keeps the existing 2D image visible when calibrated ownership is unavailable', async () => {
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('4035'));
+    render(
+      <ProductionPlateMap
+        defectTypes={defectTypes}
+        defects={[]}
+        defectTypeCounts={defectTypeCounts}
+        hiddenTypeIds={new Set()}
+        selectedDefectId={null}
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        inspectionId="INS-NO-OVERLAP"
+        captureMaterialId="4035"
+        cameraLanes={createSequentialCameraLanes(6)}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    const deduplicate = await screen.findByRole('button', { name: '去除重叠' });
+    expect(deduplicate).toBeDisabled();
+    expect(screen.getByRole('status', { name: /重叠区 不可用，去重候选 不可用/ })).toBeInTheDocument();
+    expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-overlap-display-mode', 'overlap');
+    expect(screen.getAllByLabelText(/2D 去背景图/)[0]).toHaveAttribute('data-overlap-policy', 'overlap-retained');
   });
 
   it('uses the same aligned frame timeline for two-level JET images', async () => {
