@@ -29,6 +29,7 @@ Assert-Condition ($Template -match '(?m)^localPort = 4873\r?$') "FRP must publis
 Assert-Condition ($Template -match '(?m)^customDomains = \["kacg6rxr\.zjz-service\.cn"\]\r?$') "FRP domain changed unexpectedly."
 Assert-Condition ($Template -match '(?m)^transport\.tls\.enable = true\r?$') "FRP control transport must enable TLS."
 Assert-Condition ($Template -match '(?m)^useCompression = false\r?$') "FRP must avoid recompressing image responses."
+Assert-Condition ($Template -match '(?m)^transport\.poolCount = 5\r?$') "FRP must pre-create work connections for first-request latency."
 Assert-Condition ($Template -match '(?m)^path = "/api/health/live"\r?$') "FRP must health-check the live endpoint."
 
 $RunRoot = Join-Path $RepoRoot ("target\test\frp-client-contract\" + (Get-Date -Format "yyyyMMdd-HHmmss-fff"))

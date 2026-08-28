@@ -55,6 +55,7 @@ user = "本机填写托管平台分配的技术用户 ID"
 loginFailExit = true
 
 transport.protocol = "tcp"
+transport.poolCount = 5
 transport.tls.enable = true
 
 [metadatas]

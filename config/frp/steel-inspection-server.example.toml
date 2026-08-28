@@ -7,6 +7,9 @@ user = "REPLACE_WITH_FRP_USER"
 loginFailExit = true
 
 transport.protocol = "tcp"
+# Pre-create the hosted server's default maximum number of work connections so
+# the first browser/image request does not wait for a new FRP work connection.
+transport.poolCount = 5
 transport.tls.enable = true
 
 [metadatas]
