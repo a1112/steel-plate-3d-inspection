@@ -34,6 +34,7 @@ param(
   [string]$Profile = "debug",
   [string]$ServiceExe = "",
   [string]$ServicePidFile = "",
+  [switch]$Detach,
   [string]$ConfigRoot = "",
   [string]$ArtifactAllowedRoots = "",
   [string]$AlgorithmRoot = "",
@@ -227,6 +228,9 @@ if (-not (Test-Path -LiteralPath $ServiceExe -PathType Leaf)) {
 $ServiceExe = (Resolve-Path -LiteralPath $ServiceExe).Path
 
 if ([string]::IsNullOrWhiteSpace($ServicePidFile)) {
+  if ($Detach) {
+    throw "-Detach requires -ServicePidFile so the background service remains trackable."
+  }
   & $ServiceExe
   exit $LASTEXITCODE
 }
@@ -234,6 +238,30 @@ if ([string]::IsNullOrWhiteSpace($ServicePidFile)) {
 $ServicePidFile = [System.IO.Path]::GetFullPath($ServicePidFile)
 $servicePidDirectory = Split-Path -Parent $ServicePidFile
 New-Item -ItemType Directory -Force -Path $servicePidDirectory | Out-Null
+$detachedStdoutPath = $null
+$detachedStderrPath = $null
+if ($Detach) {
+  $detachedLogDirectory = if ($RuntimeLogDir.Trim().Length -gt 0) {
+    [System.IO.Path]::GetFullPath($RuntimeLogDir)
+  } else {
+    Join-Path $servicePidDirectory "logs"
+  }
+  New-Item -ItemType Directory -Force -Path $detachedLogDirectory | Out-Null
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+  $detachedStdoutPath = Join-Path $detachedLogDirectory "inspection-service-$stamp.out.log"
+  $detachedStderrPath = Join-Path $detachedLogDirectory "inspection-service-$stamp.err.log"
+  $serviceProcess = Start-Process `
+    -FilePath $ServiceExe `
+    -WorkingDirectory $RepoRoot `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput $detachedStdoutPath `
+    -RedirectStandardError $detachedStderrPath `
+    -PassThru
+  [System.IO.File]::WriteAllText($ServicePidFile, [string]$serviceProcess.Id)
+  Write-Host "steel-inspection-service detached with PID $($serviceProcess.Id)"
+  Write-Host "service logs: $detachedStdoutPath"
+  exit 0
+}
 $serviceProcess = Start-Process -FilePath $ServiceExe -WorkingDirectory $RepoRoot -NoNewWindow -PassThru
 try {
   [System.IO.File]::WriteAllText($ServicePidFile, [string]$serviceProcess.Id)

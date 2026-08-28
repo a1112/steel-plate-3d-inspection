@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 import json
 import os
 import queue
@@ -13,14 +14,23 @@ import threading
 import time
 import hashlib
 from pathlib import Path
+from typing import Callable
 from urllib import request
 
 from sick_capture.alignment import AlignmentConfig, build_and_write_flow_alignment
 from sick_capture.calibration_pointer import resolve_active_array_calibration
 from sick_capture.defect_detection import (
     DefectDetectionConfig,
+    ExecutionGateInterrupted,
+    _capture_is_idle,
     build_and_write_flow_defect_detection,
+    configured_legacy_model_hash,
     defect_detection_manifest_path,
+)
+from sick_capture.depth_geometry_runtime import (
+    DepthGeometryConfigChanged,
+    backfill_is_paused,
+    load_depth_geometry_config_snapshot,
 )
 from sick_capture.measurement import MeasurementConfig, build_and_write_flow_measurement
 from sick_capture.material_lock import exclusive_material_job
@@ -51,6 +61,8 @@ from sick_capture.surface import (
 
 HISTORY_CURSOR_SCHEMA = "steel.flow-analysis-history-cursor.v1"
 HISTORY_CURSOR_FILENAME = "history-cursor.json"
+DEPTH_HISTORY_CURSOR_SCHEMA = "steel.depth-geometry-history-cursor.v1"
+DEPTH_HISTORY_CURSOR_FILENAME = "depth-geometry-history-cursor.json"
 DEFAULT_MAXIMUM_DEFECT_BACKLOG = 64
 
 
@@ -250,7 +262,12 @@ def fast_artifacts_ready(
     )
 
 
-def defect_artifact_complete(storage_root: Path, material_id: str) -> bool:
+def defect_artifact_complete(
+    storage_root: Path,
+    material_id: str,
+    expected_geometry_config_hash: str | None = None,
+    expected_legacy_model_hash: str | None = None,
+) -> bool:
     """A failed database import is retryable and is not a completed defect job."""
     path = defect_detection_manifest_path(storage_root, material_id)
     try:
@@ -263,7 +280,27 @@ def defect_artifact_complete(storage_root: Path, material_id: str) -> bool:
         "failed",
     }:
         return False
-    return payload.get("databaseImport", {}).get("state") != "failed"
+    if expected_geometry_config_hash:
+        geometry = payload.get("defectGroups", {}).get("geometry", {})
+        if not isinstance(geometry, dict) or (
+            str(geometry.get("configHash", "")) != expected_geometry_config_hash
+        ) or str(geometry.get("state", "")).lower() in {
+            "failed",
+            "unavailable",
+            "database-write-failed",
+        }:
+            return False
+    if expected_legacy_model_hash:
+        legacy = payload.get("defectGroups", {}).get("legacy", {})
+        if not isinstance(legacy, dict) or (
+            str(legacy.get("modelHash", "")) != expected_legacy_model_hash
+        ) or str(legacy.get("state", "")).lower() in {
+            "failed",
+            "unavailable",
+            "database-write-failed",
+        }:
+            return False
+    return payload.get("databaseImport", {}).get("state") not in {"failed", "partial"}
 
 
 def flow_state(storage_root: Path, material_id: str) -> str | None:
@@ -389,6 +426,89 @@ def next_history_material(
     return None
 
 
+def depth_history_cursor_path(storage_root: Path) -> Path:
+    return (
+        Path(storage_root)
+        / "system"
+        / "jobs"
+        / "depth-geometry-backfill"
+        / DEPTH_HISTORY_CURSOR_FILENAME
+    )
+
+
+def load_depth_history_cursor(
+    storage_root: Path,
+    config_hash: str,
+    legacy_model_hash: str = "",
+) -> str:
+    try:
+        payload = json.loads(
+            depth_history_cursor_path(storage_root).read_text(encoding="utf-8-sig")
+        )
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema") == DEPTH_HISTORY_CURSOR_SCHEMA
+            and payload.get("configHash") == config_hash
+            and (
+                not legacy_model_hash
+                or payload.get("legacyModelHash") == legacy_model_hash
+            )
+            and str(payload.get("lastScannedMaterialId", "")).isdigit()
+        ):
+            return str(int(payload["lastScannedMaterialId"]))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return ""
+
+
+def save_depth_history_cursor(
+    storage_root: Path,
+    material_id: str,
+    config_hash: str,
+    *,
+    revision: int,
+    catalog_count: int,
+    checked_count: int,
+    legacy_model_hash: str = "",
+) -> None:
+    atomic_summary(
+        depth_history_cursor_path(storage_root),
+        {
+            "schema": DEPTH_HISTORY_CURSOR_SCHEMA,
+            "updatedAtUnixMs": int(time.time() * 1000),
+            "configHash": config_hash,
+            "legacyModelHash": legacy_model_hash or None,
+            "algorithmRevision": revision,
+            "lastScannedMaterialId": str(material_id),
+            "catalogCount": max(0, int(catalog_count)),
+            "checkedCount": max(0, int(checked_count)),
+            "order": "newest-first",
+        },
+    )
+
+
+def next_depth_history_material(
+    materials: list[str],
+    last_scanned_material_id: str,
+    excluded: set[str] | None = None,
+) -> str | None:
+    """Return the next newest-first history id, wrapping after the oldest."""
+    if not materials:
+        return None
+    excluded_ids = excluded or set()
+    descending = sorted(materials, key=int, reverse=True)
+    try:
+        cursor = int(last_scanned_material_id)
+    except (TypeError, ValueError):
+        cursor = 2**63 - 1
+    ordered = [value for value in descending if int(value) < cursor]
+    ordered.extend(value for value in descending if int(value) >= cursor)
+    for candidate in ordered:
+        if candidate not in excluded_ids:
+            return candidate
+    return None
+
+
 def notify_region_commit(
     database_origin: str,
     material_id: str,
@@ -483,7 +603,7 @@ def publish_defect_report(
         "imageResultSha256": _sha256_file(image_path),
         "sourceDefectManifest": _artifact("defect-manifest", defect_manifest),
         "defects": defect_rows if isinstance(defect_rows, list) else [],
-        "complete": defects.get("state") in {"ready", "complete"},
+        "complete": defects.get("state") in {"ready", "complete", "degraded"},
         "state": defects.get("state"),
         "productionCameraPipeline": True,
     }
@@ -769,6 +889,7 @@ def _analyze_defects_only_under_lock(
     storage_root: Path,
     material_id: str,
     defect_detection_config: DefectDetectionConfig,
+    execution_gate: Callable[[str], None] | None = None,
 ) -> None:
     """Run the heavy model stage without blocking realtime derived artifacts."""
     state_path = algorithm_state_path(storage_root, material_id)
@@ -801,6 +922,7 @@ def _analyze_defects_only_under_lock(
             material_id,
             alignment,
             config=defect_detection_config,
+            execution_gate=execution_gate,
         )
         report_path, report = publish_defect_report(
             storage_root, material_id, defect_path, defects
@@ -840,6 +962,20 @@ def _analyze_defects_only_under_lock(
             ),
             flush=True,
         )
+    except (ExecutionGateInterrupted, DepthGeometryConfigChanged):
+        atomic_summary(
+            state_path,
+            {
+                **previous,
+                "schema": "steel.flow-algorithm-state.v1",
+                "flowNo": int(material_id),
+                "flowId": material_id,
+                "state": "queued-for-defect",
+                "mode": "final-defects",
+                "defectInterruptedAtUnixMs": int(time.time() * 1000),
+            },
+        )
+        raise
     except Exception as error:
         atomic_summary(
             state_path,
@@ -862,6 +998,7 @@ def analyze_defects_only(
     storage_root: Path,
     material_id: str,
     defect_detection_config: DefectDetectionConfig,
+    execution_gate: Callable[[str], None] | None = None,
 ) -> None:
     """Run the defect stage without racing a fast artifact generation."""
 
@@ -875,6 +1012,7 @@ def analyze_defects_only(
             storage_root,
             material_id,
             defect_detection_config,
+            execution_gate,
         )
 
 
@@ -1008,6 +1146,9 @@ def main() -> int:
         require_approved_region_map=bool(
             defaults.get("defectRequireApprovedRegionMap", True)
         ),
+        depth_geometry_profile_path=(
+            profile.source_path if profile.expected_cameras == 6 else None
+        ),
     ).bounded()
 
     if args.once:
@@ -1042,13 +1183,15 @@ def main() -> int:
     defect_completed: dict[str, tuple[int, int, int]] = {}
     defect_retry_after: dict[str, float] = {}
     defect_queue: queue.PriorityQueue[
-        tuple[int, int, str, tuple[int, int, int]]
+        tuple[int, int, int, str, tuple[int, int, int], bool, str]
     ] = queue.PriorityQueue()
     queue_state_lock = threading.RLock()
     queued_defects: dict[str, tuple[int, int, int]] = {}
+    queued_defect_history: dict[str, bool] = {}
     queue_serial = 0
     current_fast_flow = ""
     current_defect_flow = ""
+    current_defect_is_history = False
     current_history_flow = ""
     fast_processed_count = 0
     defect_processed_count = 0
@@ -1061,6 +1204,30 @@ def main() -> int:
     history_catalog: list[str] = []
     history_catalog_updated_at = 0.0
     history_cursor = load_history_cursor(profile.storage_root)
+    geometry_snapshot = (
+        load_depth_geometry_config_snapshot(profile.source_path)
+        if defect_detection_config.depth_geometry_profile_path is not None
+        else None
+    )
+    active_geometry_hash = geometry_snapshot.sha256 if geometry_snapshot else ""
+    active_geometry_revision = geometry_snapshot.revision if geometry_snapshot else 0
+    active_legacy_model_hash = configured_legacy_model_hash(
+        defect_detection_config,
+        None,
+    )
+    legacy_model_hash_checked_at = time.monotonic()
+    depth_history_cursor = (
+        load_depth_history_cursor(
+            profile.storage_root,
+            active_geometry_hash,
+            active_legacy_model_hash,
+        )
+        if active_geometry_hash
+        else ""
+    )
+    depth_history_checked_count = 0
+    depth_history_completed_count = 0
+    depth_history_preempted_count = 0
     history_future: Future[dict[str, object]] | None = None
     history_executor = ThreadPoolExecutor(
         max_workers=1,
@@ -1098,6 +1265,9 @@ def main() -> int:
                 "updatedAtUnixMs": int(time.time() * 1000),
                 "currentFastFlow": current_fast_flow or None,
                 "currentDefectFlow": current_defect_flow or None,
+                "currentDefectKind": (
+                    "history" if current_defect_is_history else "live"
+                ) if current_defect_flow else None,
                 "pendingDefectFlows": max(
                     0, len(queued_ids) - (1 if current_defect_flow else 0)
                 ),
@@ -1124,6 +1294,28 @@ def main() -> int:
                 "historyFailedFlowCount": history_failed_count,
                 "historyCursor": history_cursor or None,
                 "historyLastError": history_last_error or None,
+                "depthGeometryBackfill": {
+                    "enabled": bool(
+                        args.full_history and active_geometry_hash
+                    ),
+                    "state": (
+                        "paused"
+                        if backfill_is_paused(profile.storage_root)
+                        else "running"
+                        if current_defect_is_history
+                        else "idle"
+                    ),
+                    "configHash": active_geometry_hash or None,
+                    "legacyModelHash": active_legacy_model_hash or None,
+                    "algorithmRevision": active_geometry_revision or None,
+                    "order": "newest-first",
+                    "cursor": depth_history_cursor or None,
+                    "checkedFlowCount": depth_history_checked_count,
+                    "completedFlowCount": depth_history_completed_count,
+                    "preemptedFlowCount": depth_history_preempted_count,
+                    "livePriority": True,
+                    "gpuDeviceId": defect_detection_config.gpu_device_id,
+                },
                 "maximumStorageBacklog": max(0, args.maximum_storage_backlog),
                 "processPriority": process_priority,
                 "lastError": last_queue_error or status_write_error or None,
@@ -1153,10 +1345,19 @@ def main() -> int:
                         )
 
     def enqueue_defect(
-        material_id: str, signature: tuple[int, int, int]
+        material_id: str,
+        signature: tuple[int, int, int],
+        *,
+        history: bool = False,
+        geometry_hash: str = "",
     ) -> None:
         nonlocal queue_serial, defect_backlog_deferred_count
-        if defect_artifact_complete(profile.storage_root, material_id):
+        if defect_artifact_complete(
+            profile.storage_root,
+            material_id,
+            geometry_hash or None,
+            active_legacy_model_hash or None,
+        ):
             defect_completed[material_id] = signature
             return
         with queue_state_lock:
@@ -1173,8 +1374,19 @@ def main() -> int:
                 defect_backlog_deferred_count += 1
                 return
             queued_defects[material_id] = signature
+            queued_defect_history[material_id] = history
             queue_serial += 1
-            defect_queue.put((-int(material_id), queue_serial, material_id, signature))
+            defect_queue.put(
+                (
+                    1 if history else 0,
+                    -int(material_id),
+                    queue_serial,
+                    material_id,
+                    signature,
+                    history,
+                    geometry_hash,
+                )
+            )
         write_queue_status()
 
     def prune_realtime_state(recent_ids: list[str]) -> None:
@@ -1201,12 +1413,20 @@ def main() -> int:
                     mapping.pop(material_id, None)
 
     def defect_worker() -> None:
-        nonlocal current_defect_flow, defect_processed_count, last_queue_error
+        nonlocal current_defect_flow, current_defect_is_history
+        nonlocal defect_processed_count, last_queue_error
+        nonlocal depth_history_completed_count, depth_history_preempted_count
         while not stop.is_set():
             try:
-                _priority, _serial, material_id, signature = defect_queue.get(
-                    timeout=0.5
-                )
+                (
+                    _tier,
+                    _priority,
+                    _serial,
+                    material_id,
+                    signature,
+                    history,
+                    job_geometry_hash,
+                ) = defect_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             with queue_state_lock:
@@ -1214,18 +1434,91 @@ def main() -> int:
                     defect_queue.task_done()
                     continue
                 current_defect_flow = material_id
+                current_defect_is_history = history
             write_queue_status()
+            gate_state = {"lastProbe": 0.0, "captureIdle": False}
+            restart_after_config_change = False
+
+            def history_execution_gate(phase: str) -> None:
+                if not history:
+                    return
+                if stop.is_set() or backfill_is_paused(profile.storage_root):
+                    raise ExecutionGateInterrupted("geometry history backfill paused")
+                with queue_state_lock:
+                    live_waiting = any(
+                        not is_history
+                        for candidate, is_history in queued_defect_history.items()
+                        if candidate != material_id
+                    )
+                if live_waiting:
+                    raise ExecutionGateInterrupted(
+                        "live defect analysis preempted geometry history backfill"
+                    )
+                now = time.monotonic()
+                if now - float(gate_state["lastProbe"]) >= 0.2:
+                    gate_state["captureIdle"] = _capture_is_idle(
+                        defect_detection_config.capture_origin,
+                        0,
+                        None,
+                    )
+                    gate_state["lastProbe"] = now
+                if not bool(gate_state["captureIdle"]):
+                    raise ExecutionGateInterrupted(
+                        f"capture active during geometry history I/O: {phase}"
+                    )
+
             try:
                 analyze_defects_only(
                     camera_roots,
                     profile.storage_root,
                     material_id,
-                    defect_detection_config,
+                    replace(
+                        defect_detection_config,
+                        history_rebuild=history,
+                    ),
+                    execution_gate=history_execution_gate if history else None,
                 )
                 with queue_state_lock:
                     defect_completed[material_id] = signature
                     defect_processed_count += 1
+                    if history:
+                        depth_history_completed_count += 1
                     last_queue_error = ""
+            except ExecutionGateInterrupted as error:
+                with queue_state_lock:
+                    if history:
+                        depth_history_preempted_count += 1
+                    last_queue_error = ""
+                print(
+                    json.dumps(
+                        {
+                            "event": "flow-defect-analysis-interrupted",
+                            "materialId": material_id,
+                            "history": history,
+                            "reason": str(error),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            except DepthGeometryConfigChanged as error:
+                restart_after_config_change = True
+                with queue_state_lock:
+                    if history:
+                        depth_history_preempted_count += 1
+                    last_queue_error = ""
+                print(
+                    json.dumps(
+                        {
+                            "event": "flow-defect-analysis-config-restart",
+                            "materialId": material_id,
+                            "history": history,
+                            "reason": str(error),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
             except Exception as error:
                 with queue_state_lock:
                     defect_retry_after[material_id] = time.monotonic() + 10.0
@@ -1245,9 +1538,32 @@ def main() -> int:
                 with queue_state_lock:
                     if queued_defects.get(material_id) == signature:
                         queued_defects.pop(material_id, None)
+                    queued_defect_history.pop(material_id, None)
                     current_defect_flow = ""
+                    current_defect_is_history = False
                 defect_queue.task_done()
                 write_queue_status()
+            if restart_after_config_change and not stop.is_set():
+                # Requeue the same whole-flow job under the newest immutable
+                # snapshot. PriorityQueue still lets any waiting live flow run
+                # before a restarted history job.
+                try:
+                    next_geometry_hash = load_depth_geometry_config_snapshot(
+                        profile.source_path
+                    ).sha256
+                    enqueue_defect(
+                        material_id,
+                        signature,
+                        history=history,
+                        geometry_hash=next_geometry_hash,
+                    )
+                except Exception as error:
+                    with queue_state_lock:
+                        defect_retry_after[material_id] = time.monotonic() + 10.0
+                        last_queue_error = (
+                            f"{material_id}: config restart failed: "
+                            f"{type(error).__name__}: {error}"
+                        )
 
     defect_thread: threading.Thread | None = None
     if args.role in {"combined", "defect"}:
@@ -1414,9 +1730,116 @@ def main() -> int:
         )
         return True
 
-    while not stop.is_set():
-        finish_history_future()
+    def refresh_depth_geometry_revision() -> None:
+        nonlocal geometry_snapshot, active_geometry_hash
+        nonlocal active_geometry_revision, depth_history_cursor
+        if defect_detection_config.depth_geometry_profile_path is None:
+            return
+        current = load_depth_geometry_config_snapshot(profile.source_path)
+        if current.sha256 == active_geometry_hash:
+            return
+        with queue_state_lock:
+            geometry_snapshot = current
+            active_geometry_hash = current.sha256
+            active_geometry_revision = current.revision
+            depth_history_cursor = load_depth_history_cursor(
+                profile.storage_root,
+                active_geometry_hash,
+                active_legacy_model_hash,
+            )
+            # A flow signature describes immutable capture input, not an
+            # algorithm revision. Clear the in-memory shortcut so every recent
+            # flow is reconsidered immediately under the new revision.
+            defect_completed.clear()
+
+    def refresh_legacy_model_revision() -> None:
+        nonlocal active_legacy_model_hash, legacy_model_hash_checked_at
+        nonlocal depth_history_cursor
+        now = time.monotonic()
+        if now - legacy_model_hash_checked_at < max(5.0, args.poll_seconds * 2.0):
+            return
+        legacy_model_hash_checked_at = now
+        current_hash = configured_legacy_model_hash(defect_detection_config, None)
+        if current_hash == active_legacy_model_hash:
+            return
+        with queue_state_lock:
+            active_legacy_model_hash = current_hash
+            # A legacy model/settings revision requires a newest-first audit,
+            # even when the geometry config hash itself is unchanged.
+            depth_history_cursor = ""
+            defect_completed.clear()
+
+    def schedule_depth_geometry_history(excluded_recent: set[str]) -> bool:
+        nonlocal depth_history_cursor, depth_history_checked_count
+        if (
+            not args.full_history
+            or args.role not in {"combined", "defect"}
+            or not active_geometry_hash
+            or backfill_is_paused(profile.storage_root)
+        ):
+            return False
+        with queue_state_lock:
+            if current_defect_flow or queued_defects:
+                return False
+        # Do not enumerate or probe an old material while capture owns any
+        # camera disk or still has a committed round waiting for storage.
+        if not _capture_is_idle(
+            defect_detection_config.capture_origin,
+            0,
+            None,
+        ):
+            return False
         refresh_history_catalog()
+        candidate = next_depth_history_material(
+            history_catalog,
+            depth_history_cursor,
+            excluded_recent,
+        )
+        if candidate is None:
+            return False
+        depth_history_cursor = candidate
+        depth_history_checked_count += 1
+        save_depth_history_cursor(
+            profile.storage_root,
+            candidate,
+            active_geometry_hash,
+            revision=active_geometry_revision,
+            catalog_count=len(history_catalog),
+            checked_count=depth_history_checked_count,
+            legacy_model_hash=active_legacy_model_hash,
+        )
+        if flow_state(profile.storage_root, candidate) != "closed":
+            return False
+        signature = committed_signature(profile.storage_root, candidate)
+        if signature is None or not fast_artifacts_ready(
+            profile.storage_root, candidate, signature
+        ):
+            return False
+        if defect_artifact_complete(
+            profile.storage_root,
+            candidate,
+            active_geometry_hash,
+            active_legacy_model_hash,
+        ):
+            return False
+        enqueue_defect(
+            candidate,
+            signature,
+            history=True,
+            geometry_hash=active_geometry_hash,
+        )
+        return True
+
+    while not stop.is_set():
+        refresh_depth_geometry_revision()
+        refresh_legacy_model_revision()
+        finish_history_future()
+        if args.role == "image" or _capture_is_idle(
+            defect_detection_config.capture_origin,
+            0,
+            None,
+        ):
+            refresh_history_catalog()
         now = time.monotonic()
         defect_candidates: dict[str, tuple[int, int, int]] = {}
         recent_ids = recent_materials(first_root, max(1, args.recent_flows))
@@ -1525,12 +1948,18 @@ def main() -> int:
         prune_realtime_state(recent_ids)
         if args.role in {"combined", "defect"}:
             for material_id in sorted(defect_candidates, key=int, reverse=True):
-                enqueue_defect(material_id, defect_candidates[material_id])
+                enqueue_defect(
+                    material_id,
+                    defect_candidates[material_id],
+                    geometry_hash=active_geometry_hash,
+                )
         # Realtime/current flows always get the first chance each round. The
         # history worker is asynchronous, bounded to one flow, and never adds
         # historical defect jobs to the realtime defect queue.
         if args.role in {"combined", "image"} and not recent_expensive_pass:
             schedule_history_analysis(set(recent_ids))
+        if not recent_expensive_pass:
+            schedule_depth_geometry_history(set(recent_ids))
         write_queue_status()
         stop.wait(max(0.25, args.poll_seconds))
     write_queue_status()

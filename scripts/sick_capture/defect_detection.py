@@ -32,6 +32,17 @@ from .paths import (
 )
 
 from .alignment import _atomic_json, _read_json, _numeric_files
+from .defect_comparison import compose_dual_manifest
+from .depth_geometry import (
+    DEPTH_GEOMETRY_SOURCE,
+    DepthGeometryConfig,
+    build_flow_depth_geometry,
+)
+from .depth_geometry_runtime import (
+    DepthGeometryConfigChanged,
+    config_checkpoint,
+    load_depth_geometry_config_snapshot,
+)
 from .playback import detect_valid_grayscale_roi
 from .regions import read_region_manifest, region_manifest_path
 from .storage import replace_file
@@ -42,6 +53,7 @@ MODEL_MANIFEST_SCHEMA = "steel.temporary-defect-model-set.v1"
 _DLL_DIRECTORY_HANDLES: dict[str, Any] = {}
 _DETECTOR_CACHE: dict[tuple[Any, ...], "OnnxYoloDetector"] = {}
 _CLASSIFIER_CACHE: dict[tuple[Any, ...], "OnnxDefectClassifier"] = {}
+_LEGACY_MODEL_HASH_CACHE: dict[tuple[Any, ...], str] = {}
 
 
 def _ensure_cuda_dll_directory() -> None:
@@ -88,6 +100,8 @@ class DefectDetectionConfig:
     maximum_pending_storage_rounds: int = 0
     require_approved_region_map: bool = False
     realtime_priority_status_path: Path | None = None
+    depth_geometry_profile_path: Path | None = None
+    history_rebuild: bool = False
 
     def bounded(self) -> "DefectDetectionConfig":
         return DefectDetectionConfig(
@@ -134,6 +148,8 @@ class DefectDetectionConfig:
             ),
             require_approved_region_map=bool(self.require_approved_region_map),
             realtime_priority_status_path=self.realtime_priority_status_path,
+            depth_geometry_profile_path=self.depth_geometry_profile_path,
+            history_rebuild=bool(self.history_rebuild),
         )
 
 
@@ -886,12 +902,18 @@ def _defect_position_ratios(
 def _database_import_payload(
     manifest: dict[str, Any],
     *,
+    source: str | None = None,
+    defects: Iterable[dict[str, Any]] | None = None,
     execution_gate: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     model_set = manifest.get("modelSet", {})
     model_id = str(model_set.get("id", "temporary-defect-model"))
+    resolved_source = str(
+        source or manifest.get("source") or "sick-temporary-defect-model"
+    )
     rows: list[dict[str, Any]] = []
-    for defect in manifest.get("defects", []):
+    candidate_rows = defects if defects is not None else manifest.get("defects", [])
+    for defect in candidate_rows:
         if execution_gate is not None:
             execution_gate("defect-database-payload-row")
         if not isinstance(defect, dict):
@@ -909,7 +931,11 @@ def _database_import_payload(
             "coordinateSpace": defect.get("coordinateSpace", "source-image-pixels"),
             "className": defect.get("className"),
             "classificationState": classification_state,
-            "classificationVersion": model_id,
+            "classificationVersion": (
+                manifest.get("configHash")
+                if resolved_source == "sick-depth-geometry"
+                else model_id
+            ),
             "classificationConfidence": defect.get("recognitionConfidence"),
             "detectionConfidence": defect.get("confidence"),
             "cameraIndex": defect.get("cameraIndex"),
@@ -917,11 +943,24 @@ def _database_import_payload(
             "circumferenceRatio": defect.get("circumferenceRatio"),
             "arrayAngleDeg": defect.get("arrayAngleDeg"),
             "surfaceMapping": defect.get("surfaceMapping"),
+            "globalPositionAvailable": manifest.get("globalPositionAvailable"),
+            "riskTags": manifest.get("riskTags", []),
             "imageRect2d": rect,
             "reviewCropRect": review_crop,
             "modalities": defect.get("modalities", []),
             "modelConfidence": defect.get("modelConfidence", {}),
             "depthDeviation": depth,
+            "scoreKind": defect.get(
+                "scoreKind",
+                "geometry-rule" if resolved_source == "sick-depth-geometry" else "model-confidence",
+            ),
+            "candidatePolarity": defect.get("candidatePolarity"),
+            "pixelSpan": defect.get("pixelSpan"),
+            "horizontalSpanMm": defect.get("horizontalSpanMm"),
+            # No encoder is available. These fields intentionally remain null
+            # instead of turning frame/row pixels into invented millimetres.
+            "longitudinalSpanMm": defect.get("longitudinalSpanMm"),
+            "areaMm2": defect.get("areaMm2"),
             "artifacts": {
                 "schema": "steel.surface.defect.artifacts.v1",
                 "cameraId": defect.get("cameraId", ""),
@@ -934,6 +973,7 @@ def _database_import_payload(
                     "height": max(0, int(rect.get("bottom", 0)) - int(rect.get("top", 0))),
                 },
                 "roiImage": defect.get("reviewImage", ""),
+                "depthRoiImage": defect.get("residualReviewImage", ""),
             },
         }
         signed_depth = (
@@ -941,6 +981,13 @@ def _database_import_payload(
             if isinstance(depth, dict) and depth.get("available")
             else 0.0
         )
+        horizontal_span = defect.get("horizontalSpanMm")
+        try:
+            horizontal_span_mm = float(horizontal_span)
+            if not np.isfinite(horizontal_span_mm) or horizontal_span_mm < 0:
+                horizontal_span_mm = 0.0
+        except (TypeError, ValueError):
+            horizontal_span_mm = 0.0
         rows.append(
             {
                 "id": defect.get("id"),
@@ -953,7 +1000,11 @@ def _database_import_payload(
                 "xMm": 0.0,
                 "yMm": 0.0,
                 "zMm": signed_depth,
-                "widthMm": 0.0,
+                "widthMm": (
+                    horizontal_span_mm
+                    if resolved_source == "sick-depth-geometry"
+                    else 0.0
+                ),
                 "heightMm": 0.0,
                 "depthMm": signed_depth,
                 "confidence": defect.get("confidence", 0.0),
@@ -963,14 +1014,52 @@ def _database_import_payload(
         )
     return {
         "schema": "steel.capture-defect-import.v1",
-        "source": "sick-temporary-defect-model",
+        "source": resolved_source,
         "materialId": manifest.get("materialId", ""),
         "manifestPath": manifest.get("manifestPath", ""),
         "generatedAt": manifest.get("generatedAt", ""),
-        "modelId": model_id,
+        "modelId": (
+            str(manifest.get("configHash", ""))
+            if resolved_source == "sick-depth-geometry"
+            else model_id
+        ),
+        "algorithmRevision": str(
+            manifest.get("algorithmRevision")
+            or manifest.get("configHash")
+            or ""
+        ),
         "replacePending": True,
         "defects": rows,
     }
+
+
+def _post_database_import_payload(
+    payload: dict[str, Any],
+    origin: str,
+    *,
+    timeout_seconds: float,
+    execution_gate: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    body = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    call = request.Request(
+        f"{origin}/internal/v1/defect-batch",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    if execution_gate is not None:
+        execution_gate("defect-database-post")
+    with request.urlopen(call, timeout=timeout_seconds) as response:
+        result = _read_response_json(response.read())
+        if response.status != 200 or int(result.get("code", -1)) != 0:
+            raise RuntimeError(
+                f"defect database import failed: HTTP {response.status}: {result}"
+            )
+    return {"state": "complete", **result}
 
 
 def import_defect_manifest(
@@ -985,26 +1074,92 @@ def import_defect_manifest(
         return {"state": "disabled", "imported": 0, "updated": 0, "deleted": 0}
     if execution_gate is not None:
         execution_gate("defect-database-payload")
-    body = json.dumps(
-        _database_import_payload(manifest, execution_gate=execution_gate),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    call = request.Request(
-        f"{origin}/internal/v1/defect-batch",
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json; charset=utf-8"},
-    )
-    if execution_gate is not None:
-        execution_gate("defect-database-post")
-    with request.urlopen(call, timeout=timeout_seconds) as response:
-        payload = _read_response_json(response.read())
-        if response.status != 200 or int(payload.get("code", -1)) != 0:
-            raise RuntimeError(
-                f"defect database import failed: HTTP {response.status}: {payload}"
+    groups = manifest.get("defectGroups")
+    if isinstance(groups, dict):
+        results: dict[str, Any] = {}
+        imported = updated = deleted = 0
+        for group_name, default_source in (
+            ("geometry", "sick-depth-geometry"),
+            ("legacy", "sick-temporary-defect-model"),
+        ):
+            group = groups.get(group_name)
+            if not isinstance(group, dict):
+                continue
+            if str(group.get("state", "")).lower() in {
+                "failed",
+                "unavailable",
+                "database-write-failed",
+            }:
+                results[group_name] = {
+                    "state": "skipped",
+                    "reason": "algorithm-group-not-complete",
+                }
+                continue
+            rows = group.get("defects", [])
+            group_manifest = {
+                **manifest,
+                "source": str(group.get("source") or default_source),
+                "algorithmRevision": group.get(
+                    "algorithmRevision", manifest.get("algorithmRevision")
+                ),
+                "configHash": group.get("configHash", manifest.get("configHash")),
+                "globalPositionAvailable": group.get(
+                    "globalPositionAvailable",
+                    manifest.get("globalPositionAvailable"),
+                ),
+                "riskTags": group.get("riskTags", manifest.get("riskTags", [])),
+                "defects": rows if isinstance(rows, list) else [],
+            }
+            payload = _database_import_payload(
+                group_manifest,
+                source=group_manifest["source"],
+                execution_gate=execution_gate,
             )
-    return {"state": "complete", **payload}
+            try:
+                result = _post_database_import_payload(
+                    payload,
+                    origin,
+                    timeout_seconds=timeout_seconds,
+                    execution_gate=execution_gate,
+                )
+            except (ExecutionGateInterrupted, DepthGeometryConfigChanged):
+                raise
+            except Exception as error:
+                # A geometry database failure must not suppress the independent
+                # legacy import (and vice versa). The partial state remains
+                # retryable by the flow worker.
+                results[group_name] = {
+                    "state": "failed",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                continue
+            results[group_name] = result
+            imported += int(result.get("imported", 0) or 0)
+            updated += int(result.get("updated", 0) or 0)
+            deleted += int(result.get("deleted", 0) or 0)
+        result_states = {
+            str(result.get("state", "")) for result in results.values()
+        }
+        return {
+            "state": (
+                "failed"
+                if result_states and result_states <= {"failed"}
+                else "partial"
+                if result_states & {"failed", "skipped"}
+                else "complete"
+            ),
+            "imported": imported,
+            "updated": updated,
+            "deleted": deleted,
+            "groups": results,
+        }
+    payload = _database_import_payload(manifest, execution_gate=execution_gate)
+    return _post_database_import_payload(
+        payload,
+        origin,
+        timeout_seconds=timeout_seconds,
+        execution_gate=execution_gate,
+    )
 
 
 def _selected_indices(indices: list[int], stride: int) -> list[int]:
@@ -1176,7 +1331,7 @@ def _prepare_detection_frame(
     return record, timing
 
 
-def build_flow_defect_detection(
+def _build_legacy_flow_defect_detection(
     camera_roots: dict[str, Path],
     storage_root: Path,
     material_id: str,
@@ -1218,7 +1373,16 @@ def build_flow_defect_detection(
         for row in surface_manifest.get("cameraTiles", {}).get("cameras", [])
         if isinstance(row, dict) and row.get("cameraId")
     }
-    if settings.require_approved_region_map and not bool(
+    region_gate_passed = bool(region_map and region_map.get("defectDetectionAllowed"))
+    region_gate_reasons = (
+        region_map.get("qualityGate", {}).get("reasons", [])
+        if region_map
+        else ["region-manifest-missing"]
+    )
+    # The global gate controls positioning and cross-camera ownership. Local
+    # camera inference is still emitted for review when synchronization fails.
+    use_global_region_map = region_gate_passed or not settings.require_approved_region_map
+    if settings.depth_geometry_profile_path is None and settings.require_approved_region_map and not bool(
         region_map and region_map.get("defectDetectionAllowed")
     ):
         reasons = (
@@ -1378,11 +1542,26 @@ def build_flow_defect_detection(
         camera_alignment = alignment.get("cameras", {}).get(camera_id, {})
         head = camera_alignment.get("head", {})
         tail = camera_alignment.get("tail", {})
-        region_row = (region_map or {}).get("cameras", {}).get(camera_id, {})
+        region_row = (
+            (region_map or {}).get("cameras", {}).get(camera_id, {})
+            if use_global_region_map
+            else {}
+        )
         camera_surface_tile = surface_tiles.get(camera_id)
         stable_crop = region_row.get("stableCrop")
-        owned_intervals = region_row.get("ownedColumnIntervals", [])
-        overlap_intervals = region_row.get("overlapColumnIntervals", [])
+        # Ownership intervals are a global cross-camera result. Once that gate
+        # fails they are untrusted, so retain every camera-local candidate and
+        # expose the deduplication risk instead of filtering from stale ranges.
+        owned_intervals = (
+            region_row.get("ownedColumnIntervals", [])
+            if use_global_region_map
+            else []
+        )
+        overlap_intervals = (
+            region_row.get("overlapColumnIntervals", [])
+            if use_global_region_map
+            else []
+        )
         if head.get("detected"):
             indices = [index for index in indices if index >= int(head["frameIndex"])]
         if tail.get("detected"):
@@ -1567,6 +1746,11 @@ def build_flow_defect_detection(
                             camera_surface_tile=camera_surface_tile,
                         )
                     )
+                    if not use_global_region_map:
+                        surface_mapping = {
+                            "available": False,
+                            "reason": "global-sync-or-overlap-quality-gate-failed",
+                        }
                     depth_result = (
                         _depth_deviation(normalized_depth, candidate["rect"], crop_box)
                         if normalized_depth is not None
@@ -1575,6 +1759,7 @@ def build_flow_defect_detection(
                     defects.append(
                         {
                             "id": defect_id,
+                            "source": "sick-temporary-defect-model",
                             "cameraId": camera_id,
                             "cameraIndex": camera_number,
                             "storageIndex": storage_index,
@@ -1629,8 +1814,14 @@ def build_flow_defect_detection(
                             "reviewImageHeight": review_crop["height"],
                             "sourceImageWidth": int(intensity.shape[1]),
                             "sourceImageHeight": int(intensity.shape[0]),
-                            "lengthRatio": round(length_ratio, 8),
-                            "circumferenceRatio": round(circumference_ratio, 8),
+                            "lengthRatio": (
+                                round(length_ratio, 8) if use_global_region_map else None
+                            ),
+                            "circumferenceRatio": (
+                                round(circumference_ratio, 8)
+                                if use_global_region_map
+                                else None
+                            ),
                             "arrayAngleDeg": surface_mapping.get("arrayAngleDeg"),
                             "surfaceMapping": surface_mapping,
                             "coordinateSpace": "source-image-pixels",
@@ -1642,7 +1833,11 @@ def build_flow_defect_detection(
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     capture_wait_ms = timings["captureWaitSeconds"] * 1000.0
     compute_elapsed_ms = max(0.0, elapsed_ms - capture_wait_ms)
-    state = "complete" if gpu and stride == settings.frame_stride else "degraded"
+    state = (
+        "complete"
+        if gpu and stride == settings.frame_stride and use_global_region_map
+        else "degraded"
+    )
     return {
         **base,
         "state": state,
@@ -1696,6 +1891,16 @@ def build_flow_defect_detection(
         },
         "regionManifestPath": str(region_manifest_path(storage_root, material_id)),
         "regionQualityGate": (region_map or {}).get("qualityGate"),
+        "globalPositionAvailable": use_global_region_map,
+        "riskTags": (
+            []
+            if use_global_region_map
+            else [
+                "global-position-unavailable",
+                "cross-camera-deduplication-unavailable",
+                *[str(reason) for reason in region_gate_reasons],
+            ]
+        ),
         "quality": {
             "reviewRequired": True,
             "fineGrainedClassification": bool(classifiers),
@@ -1705,7 +1910,9 @@ def build_flow_defect_detection(
             "pausedForAcquisition": bool(settings.capture_origin),
             "validityPolicy": "invalid-depth-preserved-never-zero-filled",
             "reason": (
-                "temporary migrated models require operator review"
+                "global quality gate failed; camera-local candidates require review"
+                if not use_global_region_map
+                else "temporary migrated models require operator review"
                 if gpu
                 else "CUDA unavailable; CPU fallback uses bounded frame sampling"
             ),
@@ -1739,6 +1946,423 @@ def build_flow_defect_detection(
     }
 
 
+def configured_legacy_model_hash(
+    settings: DefectDetectionConfig,
+    execution_gate: Callable[[str], None] | None,
+) -> str:
+    files = (
+        ("detector2d", settings.model_2d_path),
+        ("detector3d", settings.model_3d_path),
+        ("classifier2d", settings.classifier_2d_path),
+        ("classifier3d", settings.classifier_3d_path),
+        ("manifest", settings.model_manifest_path),
+    )
+    file_signatures: list[tuple[Any, ...]] = []
+    for name, path in files:
+        if execution_gate is not None:
+            execution_gate(f"legacy-model-fingerprint-stat:{name}")
+        if path is None or not path.is_file():
+            file_signatures.append((name, None))
+            continue
+        stat = path.stat()
+        file_signatures.append(
+            (name, str(path.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+        )
+    setting_fingerprint = {
+        "imageSize": settings.image_size,
+        "confidenceThreshold": settings.confidence_threshold,
+        "iouThreshold": settings.iou_threshold,
+        "mergeIouThreshold": settings.merge_iou_threshold,
+        "maximumDetectionsPerFrame": settings.maximum_detections_per_frame,
+        "classificationConfidenceThreshold": (
+            settings.classification_confidence_threshold
+        ),
+        "frameStride": settings.frame_stride,
+        "cpuFrameStride": settings.cpu_frame_stride,
+        "depthExposure": settings.depth_exposure,
+        "depthBaselineSampleStep": settings.depth_baseline_sample_step,
+    }
+    cache_key: tuple[Any, ...] = (
+        json.dumps(setting_fingerprint, sort_keys=True, separators=(",", ":")),
+        *file_signatures,
+    )
+    cached = _LEGACY_MODEL_HASH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    inputs: dict[str, Any] = {
+        "settings": setting_fingerprint,
+        "files": {},
+    }
+    for name, path in files:
+        if execution_gate is not None:
+            execution_gate(f"legacy-model-fingerprint:{name}")
+        inputs["files"][name] = (
+            _sha256_file(path, execution_gate=execution_gate)
+            if path is not None and path.is_file()
+            else None
+        )
+    encoded = json.dumps(
+        inputs, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    result = hashlib.sha256(encoded).hexdigest()
+    _LEGACY_MODEL_HASH_CACHE[cache_key] = result
+    while len(_LEGACY_MODEL_HASH_CACHE) > 8:
+        _LEGACY_MODEL_HASH_CACHE.pop(next(iter(_LEGACY_MODEL_HASH_CACHE)))
+    return result
+
+
+def _save_geometry_roi(path: Path, value: Any) -> None:
+    array = np.asarray(value, dtype=np.uint8)
+    if array.ndim not in {2, 3} or array.size == 0:
+        raise ValueError("geometry review ROI must be a non-empty image")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        Image.fromarray(array).save(temporary, format="PNG", optimize=False)
+        replace_file(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _prepare_geometry_defects(
+    manifest: dict[str, Any],
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment: dict[str, Any],
+    *,
+    algorithm_revision: int,
+    config_sha256: str,
+    execution_gate: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    provisional_labels = {
+        "pit": "凹坑候选",
+        "pit-compact": "凹坑候选",
+        "groove": "沟槽候选",
+        "groove-elongated": "沟槽候选",
+        "bulge": "凸起候选",
+        "bulge-compact": "凸起候选",
+        "ridge": "脊状凸起候选",
+        "ridge-elongated": "脊状凸起候选",
+    }
+    region_map = read_region_manifest(storage_root, material_id)
+    global_position_available = bool(
+        region_map and region_map.get("defectDetectionAllowed")
+    )
+    region_reasons = (
+        region_map.get("qualityGate", {}).get("reasons", [])
+        if region_map
+        else ["region-manifest-missing"]
+    )
+    if execution_gate is not None:
+        execution_gate("depth-geometry-surface-manifest-read")
+    try:
+        surface_manifest = _read_json(surface_path(storage_root, material_id))
+    except (OSError, ValueError, json.JSONDecodeError):
+        surface_manifest = {}
+    surface_tiles = {
+        str(row.get("cameraId")): row
+        for row in surface_manifest.get("cameraTiles", {}).get("cameras", [])
+        if isinstance(row, dict) and row.get("cameraId")
+    }
+    prepared: list[dict[str, Any]] = []
+    overlap_filtered = 0
+    boundary_filtered = 0
+    for source_row in manifest.get("defects", []):
+        if execution_gate is not None:
+            execution_gate("depth-geometry-artifact")
+        if not isinstance(source_row, dict):
+            continue
+        defect = dict(source_row)
+        camera_id = str(defect.get("cameraId", ""))
+        frame_index = int(defect.get("storageIndex", defect.get("peakFrame", 0)) or 0)
+        bbox = defect.get("bbox", [0, 0, 0, 0])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            bbox = [0, 0, 0, 0]
+        rect = [int(value) for value in bbox]
+        provisional_class = str(
+            defect.get("provisionalClass", "depth-geometry-candidate")
+        )
+        region_row = (region_map or {}).get("cameras", {}).get(camera_id, {})
+        if global_position_available:
+            center_x = (rect[0] + rect[2]) / 2.0
+            disposition = candidate_region_disposition(
+                center_x,
+                region_row.get("ownedColumnIntervals", []),
+                region_row.get("overlapColumnIntervals", []),
+            )
+            if disposition == "overlap-duplicate":
+                overlap_filtered += 1
+                continue
+            if disposition == "boundary":
+                boundary_filtered += 1
+                continue
+        defect.update(
+            {
+                "source": DEPTH_GEOMETRY_SOURCE,
+                "algorithmRevision": algorithm_revision,
+                "configHash": config_sha256,
+                "storageIndex": frame_index,
+                "classId": provisional_class,
+                "className": provisional_labels.get(
+                    provisional_class,
+                    str(defect.get("class", defect.get("type", "几何异常候选"))),
+                ),
+                "classificationStage": "geometry-rule",
+                "fineGrainedClass": None,
+                "candidatePolarity": defect.get("polarity"),
+                "imageRect2d": {
+                    "left": rect[0],
+                    "top": rect[1],
+                    "right": rect[2],
+                    "bottom": rect[3],
+                },
+                "depthDeviation": {
+                    "available": True,
+                    "signedMm": defect.get("signedDepthMm"),
+                    "absoluteMm": defect.get("absoluteDepthMm"),
+                    "p05Mm": defect.get("p05DepthMm"),
+                    "p95Mm": defect.get("p95DepthMm"),
+                },
+                "lengthRatio": None,
+                "circumferenceRatio": None,
+                "arrayAngleDeg": None,
+                "surfaceMapping": {
+                    "available": False,
+                    "reason": (
+                        "camera-local-geometry-coordinate"
+                        if global_position_available
+                        else "global-sync-or-overlap-quality-gate-failed"
+                    ),
+                },
+                "globalPositionAvailable": False,
+                "coordinateSpace": "source-image-pixels",
+                "longitudinalSpanMm": None,
+                "areaMm2": None,
+            }
+        )
+        camera_root = camera_roots.get(camera_id)
+        if camera_root is not None:
+            flow_root = capture_root(camera_root, material_id, camera_id)
+            intensity_path = flow_root / "2d" / f"{frame_index}.png"
+            defect["source2d"] = str(intensity_path)
+            defect["source3d"] = str(flow_root / "3d" / f"{frame_index}.npz")
+            defect["metadataPath"] = str(flow_root / "json" / f"{frame_index}.json")
+            review_root = (
+                defect_image_root(camera_root, material_id)
+                / "geometry"
+                / config_sha256[:16]
+            )
+            intensity_value = defect.pop("intensityRoi", None)
+            residual_value = defect.pop("residualJetRoi", None)
+            if intensity_value is not None:
+                review_path = review_root / f"{defect['id']}-intensity.png"
+                _save_geometry_roi(review_path, intensity_value)
+                defect["reviewImage"] = str(review_path)
+                intensity_array = np.asarray(intensity_value, dtype=np.uint8)
+                defect["reviewImageWidth"] = int(intensity_array.shape[1])
+                defect["reviewImageHeight"] = int(intensity_array.shape[0])
+            if residual_value is not None:
+                residual_path = review_root / f"{defect['id']}-residual.png"
+                _save_geometry_roi(residual_path, residual_value)
+                defect["residualReviewImage"] = str(residual_path)
+                if not defect.get("reviewImage"):
+                    defect["reviewImage"] = str(residual_path)
+            source_shape: tuple[int, int] | None = None
+            if intensity_path.is_file():
+                if execution_gate is not None:
+                    execution_gate("depth-geometry-review-intensity-read")
+                try:
+                    with Image.open(intensity_path) as image:
+                        intensity = np.asarray(image.convert("L"))
+                    source_shape = (int(intensity.shape[0]), int(intensity.shape[1]))
+                    if not defect.get("reviewImage"):
+                        review_path = review_root / f"{defect['id']}-intensity.png"
+                        review_crop = _save_review_crop(
+                            intensity,
+                            rect,
+                            review_path,
+                        )
+                        defect["reviewImage"] = str(review_path)
+                        defect["reviewCropRect"] = review_crop
+                        defect["reviewImageWidth"] = review_crop["width"]
+                        defect["reviewImageHeight"] = review_crop["height"]
+                    defect["sourceImageWidth"] = source_shape[1]
+                    defect["sourceImageHeight"] = source_shape[0]
+                except (OSError, ValueError):
+                    source_shape = None
+            if global_position_available and source_shape is not None:
+                length_ratio, circumference_ratio, camera_number, mapping = (
+                    _defect_position_ratios(
+                        camera_id=camera_id,
+                        camera_count=len(camera_roots),
+                        storage_index=frame_index,
+                        rect=rect,
+                        source_width=source_shape[1],
+                        source_height=source_shape[0],
+                        camera_alignment=alignment.get("cameras", {}).get(
+                            camera_id, {}
+                        ),
+                        camera_surface_tile=surface_tiles.get(camera_id),
+                    )
+                )
+                defect["cameraIndex"] = camera_number
+                defect["lengthRatio"] = round(length_ratio, 8)
+                defect["circumferenceRatio"] = round(circumference_ratio, 8)
+                defect["arrayAngleDeg"] = mapping.get("arrayAngleDeg")
+                defect["surfaceMapping"] = mapping
+                defect["globalPositionAvailable"] = True
+        prepared.append(defect)
+    manifest["defects"] = prepared
+    manifest["algorithmRevision"] = algorithm_revision
+    manifest["configHash"] = config_sha256
+    manifest["source"] = DEPTH_GEOMETRY_SOURCE
+    manifest["globalPositionAvailable"] = global_position_available
+    manifest["riskTags"] = (
+        []
+        if global_position_available
+        else [
+            "global-position-unavailable",
+            "cross-camera-deduplication-unavailable",
+            *[str(reason) for reason in region_reasons],
+        ]
+    )
+    statistics = manifest.setdefault("statistics", {})
+    statistics["defectCount"] = len(prepared)
+    statistics["overlapDuplicateFilteredCount"] = overlap_filtered
+    statistics["boundaryArtifactFilteredCount"] = boundary_filtered
+    return manifest
+
+
+def build_flow_defect_detection(
+    camera_roots: dict[str, Path],
+    storage_root: Path,
+    material_id: str,
+    alignment: dict[str, Any],
+    *,
+    config: DefectDetectionConfig,
+    execution_gate: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Run local depth geometry and the legacy model as independent groups."""
+    settings = config.bounded()
+    profile_path = settings.depth_geometry_profile_path
+    # Compatibility for unit tests and sites that have not opted into the
+    # SICK depth configuration yet.
+    if profile_path is None:
+        return _build_legacy_flow_defect_detection(
+            camera_roots,
+            storage_root,
+            material_id,
+            alignment,
+            config=settings,
+            execution_gate=execution_gate,
+        )
+
+    snapshot = load_depth_geometry_config_snapshot(profile_path)
+    guarded = config_checkpoint(profile_path, snapshot, execution_gate)
+    geometry_settings = DepthGeometryConfig.from_mapping(snapshot.value)
+    existing: dict[str, Any] = {}
+    path = defect_detection_manifest_path(storage_root, material_id)
+    if settings.history_rebuild and path.is_file():
+        guarded("defect-existing-manifest-read")
+        try:
+            existing = _read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            existing = {}
+
+    existing_legacy = (
+        existing.get("defectGroups", {}).get("legacy", {})
+        if isinstance(existing.get("defectGroups"), dict)
+        else {}
+    )
+    legacy_manifest: dict[str, Any]
+    reuse_legacy = False
+    expected_model_hash = ""
+    if settings.history_rebuild and isinstance(existing_legacy, dict) and existing_legacy:
+        expected_model_hash = configured_legacy_model_hash(settings, guarded)
+        reuse_legacy = existing_legacy.get("modelHash") == expected_model_hash
+    if reuse_legacy:
+        legacy_manifest = {
+            "schema": DEFECT_DETECTION_SCHEMA,
+            "materialId": material_id,
+            **existing_legacy,
+            "defects": existing_legacy.get("defects", []),
+        }
+    else:
+        try:
+            legacy_manifest = _build_legacy_flow_defect_detection(
+                camera_roots,
+                storage_root,
+                material_id,
+                alignment,
+                config=settings,
+                execution_gate=guarded,
+            )
+            legacy_manifest["modelHash"] = (
+                expected_model_hash
+                or configured_legacy_model_hash(settings, guarded)
+            )
+        except DepthGeometryConfigChanged:
+            raise
+        except Exception as error:
+            legacy_manifest = {
+                "schema": DEFECT_DETECTION_SCHEMA,
+                "materialId": material_id,
+                "state": "failed",
+                "source": "sick-temporary-defect-model",
+                "error": f"{type(error).__name__}: {error}",
+                "statistics": {"defectCount": 0},
+                "defects": [],
+            }
+
+    try:
+        geometry_manifest = build_flow_depth_geometry(
+            camera_roots,
+            storage_root,
+            material_id,
+            alignment,
+            geometry_settings,
+            guarded,
+        )
+        geometry_manifest = _prepare_geometry_defects(
+            geometry_manifest,
+            camera_roots,
+            storage_root,
+            material_id,
+            alignment,
+            algorithm_revision=snapshot.revision,
+            config_sha256=snapshot.sha256,
+            execution_gate=guarded,
+        )
+    except DepthGeometryConfigChanged:
+        raise
+    except Exception as error:
+        geometry_manifest = {
+            "schema": "steel.sick-depth-geometry.v1",
+            "materialId": material_id,
+            "source": DEPTH_GEOMETRY_SOURCE,
+            "state": "failed",
+            "algorithmRevision": snapshot.revision,
+            "configHash": snapshot.sha256,
+            "error": f"{type(error).__name__}: {error}",
+            "statistics": {"defectCount": 0},
+            "defects": [],
+        }
+    manifest = compose_dual_manifest(
+        legacy_manifest,
+        geometry_manifest,
+        minimum_iou=settings.merge_iou_threshold,
+    )
+    manifest["generatedAt"] = _utc_text()
+    manifest["materialId"] = material_id
+    return manifest
+
+
 def build_and_write_flow_defect_detection(
     camera_roots: dict[str, Path],
     storage_root: Path,
@@ -1748,18 +2372,31 @@ def build_and_write_flow_defect_detection(
     config: DefectDetectionConfig,
     execution_gate: Callable[[str], None] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
+    settings = config.bounded()
+    job_gate = execution_gate
+    if settings.depth_geometry_profile_path is not None:
+        if execution_gate is not None:
+            execution_gate("depth-geometry-config-snapshot-read")
+        job_snapshot = load_depth_geometry_config_snapshot(
+            settings.depth_geometry_profile_path
+        )
+        job_gate = config_checkpoint(
+            settings.depth_geometry_profile_path,
+            job_snapshot,
+            execution_gate,
+        )
     manifest = build_flow_defect_detection(
         camera_roots,
         storage_root,
         material_id,
         alignment,
-        config=config,
-        execution_gate=execution_gate,
+        config=settings,
+        execution_gate=job_gate,
     )
     path = defect_detection_manifest_path(storage_root, material_id)
     manifest["manifestPath"] = str(path)
-    if execution_gate is not None:
-        execution_gate("defect-manifest-initial-write")
+    if job_gate is not None:
+        job_gate("defect-manifest-initial-write")
     _atomic_json(path, manifest)
     if manifest.get("state") == "blocked":
         # A newly failed region quality gate must also withdraw stale pending
@@ -1767,14 +2404,14 @@ def build_and_write_flow_defect_detection(
         # contract preserves confirmed/false-positive operator decisions while
         # an empty defect batch removes only unreviewed machine candidates.
         try:
-            if execution_gate is not None:
-                execution_gate("defect-blocked-database-import")
+            if job_gate is not None:
+                job_gate("defect-blocked-database-import")
             manifest["databaseImport"] = import_defect_manifest(
                 manifest,
-                config.database_origin,
-                execution_gate=execution_gate,
+                settings.database_origin,
+                execution_gate=job_gate,
             )
-        except ExecutionGateInterrupted:
+        except (ExecutionGateInterrupted, DepthGeometryConfigChanged):
             raise
         except Exception as error:
             manifest["databaseImport"] = {
@@ -1784,28 +2421,36 @@ def build_and_write_flow_defect_detection(
         manifest["databaseImport"]["blockedReason"] = manifest.get(
             "blockedReason", "region-quality-gate-failed"
         )
-        if execution_gate is not None:
-            execution_gate("defect-blocked-manifest-final-write")
+        if job_gate is not None:
+            job_gate("defect-blocked-manifest-final-write")
         _atomic_json(path, manifest)
         return path, manifest
     try:
-        if execution_gate is not None:
-            execution_gate("defect-database-import")
+        if job_gate is not None:
+            job_gate("defect-database-import")
         manifest["databaseImport"] = import_defect_manifest(
             manifest,
-            config.database_origin,
-            execution_gate=execution_gate,
+            settings.database_origin,
+            execution_gate=job_gate,
         )
-    except ExecutionGateInterrupted:
+        if settings.database_origin and manifest["databaseImport"].get("state") == "failed":
+            manifest["state"] = "database-write-failed"
+        elif (
+            settings.database_origin
+            and manifest["databaseImport"].get("state") == "partial"
+            and manifest.get("state") == "complete"
+        ):
+            manifest["state"] = "degraded"
+    except (ExecutionGateInterrupted, DepthGeometryConfigChanged):
         raise
     except Exception as error:
         manifest["databaseImport"] = {
             "state": "failed",
             "error": f"{type(error).__name__}: {error}",
         }
-        if config.database_origin:
+        if settings.database_origin:
             manifest["state"] = "database-write-failed"
-    if execution_gate is not None:
-        execution_gate("defect-manifest-final-write")
+    if job_gate is not None:
+        job_gate("defect-manifest-final-write")
     _atomic_json(path, manifest)
     return path, manifest

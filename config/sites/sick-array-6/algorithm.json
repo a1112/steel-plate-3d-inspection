@@ -12,5 +12,36 @@
     "tileSize": 128,
     "detectHeadAlignment": true,
     "cacheTiles": true
+  },
+  "depthGeometry": {
+    "schema": "steel.sick-depth-geometry-config.v1",
+    "enabled": true,
+    "revision": 1,
+    "candidatePolicy": "review-only",
+    "baseline": {
+      "maximumFrames": 32,
+      "rowSampleStep": 4
+    },
+    "thresholds": {
+      "minimumAbsoluteDeviationMm": 0.35,
+      "columnNoiseMultiplier": 6.0,
+      "minimumNeighborhoodSupport": 3,
+      "minimumComponentPoints": 6,
+      "elongatedAspectRatio": 3.0
+    },
+    "merge": {
+      "maximumFrameGap": 1,
+      "minimumIoU": 0.2
+    },
+    "reviewCropMinimumSize": 64,
+    "qualityGatePolicy": "camera-local-with-global-risk-tag",
+    "longitudinalScale": null,
+    "historyBackfill": {
+      "automatic": true,
+      "order": "newest-first",
+      "livePriority": true,
+      "pauseHistoricalIoWhileCaptureActive": true,
+      "gpuDeviceId": 1
+    }
   }
 }

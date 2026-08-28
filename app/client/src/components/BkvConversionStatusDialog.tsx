@@ -6,6 +6,7 @@ import {
   type BkvOnlineStatus,
 } from '../services/bkv-online-api';
 import { getInspectionServiceOrigin } from '../services/inspection-api';
+import { RequestedSizeImage } from './RequestedSizeImage';
 
 type BkvConversionStatusDialogProps = {
   snapshot: InspectionSnapshot;
@@ -280,9 +281,11 @@ export function BkvConversionStatusDialog({
             {previewImages.map((image) => (
               <figure key={image.id}>
                 <div>
-                  <img
+                  <RequestedSizeImage
                     src={image.url}
                     alt={`${image.label} 实际${image.kind}图像`}
+                    requestWidth={480}
+                    requestHeight={256}
                     loading="lazy"
                     decoding="async"
                   />

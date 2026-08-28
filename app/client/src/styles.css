@@ -11653,6 +11653,112 @@ button {
   align-content: start;
 }
 
+.admin-depth-geometry-card {
+  overflow: auto;
+}
+
+.admin-depth-geometry-head,
+.admin-depth-geometry-meta,
+.admin-depth-geometry-actions,
+.admin-depth-geometry-backfill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.admin-depth-geometry-head {
+  margin-bottom: 12px;
+}
+
+.admin-depth-geometry-head > div,
+.admin-depth-geometry-backfill > div:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.admin-depth-geometry-head strong,
+.admin-depth-geometry-backfill strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.admin-depth-geometry-head span,
+.admin-depth-geometry-backfill span,
+.admin-depth-geometry-backfill em {
+  color: var(--muted);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.admin-depth-geometry-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.admin-depth-geometry-form label {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.admin-depth-geometry-form label span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.admin-depth-geometry-form input {
+  width: 100%;
+  height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 10px;
+  color: var(--text);
+  background: var(--panel-soft);
+  font: inherit;
+  font-weight: 850;
+  outline: none;
+}
+
+.admin-depth-geometry-form input:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent);
+}
+
+.admin-depth-geometry-meta {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.admin-depth-geometry-actions {
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.admin-depth-geometry-actions button.primary,
+.admin-depth-geometry-backfill-actions button.primary {
+  color: #fff;
+  background: var(--blue);
+}
+
+.admin-depth-geometry-backfill {
+  align-items: flex-end;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.admin-depth-geometry-backfill-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .admin-alarm-rules-form {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   align-content: start;
@@ -23652,9 +23758,102 @@ button {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-rows: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   padding-top: 10px;
   overflow: hidden;
+}
+
+.defect-analysis-groups,
+.defect-analysis-comparison {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
+}
+
+.defect-analysis-groups {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 6px 8px;
+}
+
+.defect-analysis-group-tabs {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel-soft);
+}
+
+.defect-analysis-group-tabs button {
+  min-height: 27px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 3px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.defect-analysis-group-tabs button.active {
+  color: #fff;
+  background: var(--blue);
+}
+
+.defect-analysis-group-counts {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.defect-analysis-group-counts strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.defect-analysis-unique-warning {
+  color: #ffc05c;
+}
+
+.defect-analysis-comparison {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 6px;
+  padding: 7px 10px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.defect-analysis-comparison strong,
+.defect-analysis-comparison b {
+  color: var(--text);
+}
+
+.defect-analysis-comparison em {
+  color: #ffc05c;
+  font-style: normal;
+}
+
+.defect-analysis-comparison-details {
+  flex-basis: 100%;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .defect-analysis-header,

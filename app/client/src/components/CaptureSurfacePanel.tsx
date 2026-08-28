@@ -14,6 +14,7 @@ import {
   readCaptureSurface,
   type CaptureFlowSurface,
 } from '../lib/capture-api';
+import { RequestedSizeImage } from './RequestedSizeImage';
 
 interface CaptureSurfacePanelProps {
   materialId: string;
@@ -138,9 +139,11 @@ export function CaptureSurfacePanel({ materialId }: CaptureSurfacePanelProps) {
                 <SurfaceMesh surface={surface} />
               </Canvas>
             ) : mode === 'jet' && surface.jet.imagePath ? (
-              <img
+              <RequestedSizeImage
                 src={captureArtifactImageUrl(surface.jet.imagePath, 1440)}
                 alt={`${materialId} JET 径向偏差展开图`}
+                requestWidth={1440}
+                requestHeight={720}
                 decoding="async"
                 loading="eager"
               />

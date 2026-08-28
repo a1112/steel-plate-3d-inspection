@@ -16,6 +16,8 @@ import {
   exportAdminRecordsCsv,
   fetchAdminCameras,
   fetchAdminDefectTypes,
+  fetchAdminDepthGeometry,
+  fetchAdminDepthGeometryBackfillStatus,
   fetchAdminDiagnostics,
   fetchAdminAlarmRules,
   fetchAdminExternalIntegrations,
@@ -48,6 +50,9 @@ import {
   saveAdminAlarmRules,
   saveAdminCamera,
   saveAdminDefectType,
+  saveAdminDepthGeometry,
+  pauseAdminDepthGeometryBackfill,
+  resumeAdminDepthGeometryBackfill,
   saveAdminExternalIntegrations,
   saveAdminInspectionSettings,
   saveAdminRole,
@@ -70,6 +75,8 @@ import {
   type AdminDatabaseMaintenanceResult,
   type AdminDefectType,
   type AdminDefectTypeInput,
+  type AdminDepthGeometryBackfillStatus,
+  type AdminDepthGeometryConfig,
   type AdminDiagnostics,
   type AdminExternalIntegrationEndpoint,
   type AdminExternalIntegrations,
@@ -450,6 +457,40 @@ function createDefaultInspectionSettingsDraft(): AdminInspectionSettings {
   };
 }
 
+function createDefaultDepthGeometryConfig(): AdminDepthGeometryConfig {
+  return {
+    schema: 'steel.sick-depth-geometry-config.v1',
+    enabled: true,
+    revision: 1,
+    candidatePolicy: 'review-only',
+    baseline: {
+      maximumFrames: 32,
+      rowSampleStep: 4,
+    },
+    thresholds: {
+      minimumAbsoluteDeviationMm: 0.35,
+      columnNoiseMultiplier: 6,
+      minimumNeighborhoodSupport: 3,
+      minimumComponentPoints: 6,
+      elongatedAspectRatio: 3,
+    },
+    merge: {
+      maximumFrameGap: 1,
+      minimumIoU: 0.2,
+    },
+    reviewCropMinimumSize: 64,
+    qualityGatePolicy: 'camera-local-with-global-risk-tag',
+    longitudinalScale: null,
+    historyBackfill: {
+      automatic: true,
+      order: 'newest-first',
+      livePriority: true,
+      pauseHistoricalIoWhileCaptureActive: true,
+      gpuDeviceId: 1,
+    },
+  };
+}
+
 function createDefaultAlarmRulesDraft(): AdminAlarmRules {
   return {
     enabled: true,
@@ -619,6 +660,10 @@ export function ParameterManagementApp() {
   const [adminCameras, setAdminCameras] = useState<AdminCameraConfig[]>([]);
   const [adminDefectTypes, setAdminDefectTypes] = useState<AdminDefectType[]>([]);
   const [inspectionSettingsDraft, setInspectionSettingsDraft] = useState<AdminInspectionSettings>(() => createDefaultInspectionSettingsDraft());
+  const [depthGeometryDraft, setDepthGeometryDraft] = useState<AdminDepthGeometryConfig>(() => createDefaultDepthGeometryConfig());
+  const [depthGeometryHash, setDepthGeometryHash] = useState('');
+  const [depthGeometryBackfill, setDepthGeometryBackfill] = useState<AdminDepthGeometryBackfillStatus | null>(null);
+  const [depthGeometryBusy, setDepthGeometryBusy] = useState(false);
   const [alarmRulesDraft, setAlarmRulesDraft] = useState<AdminAlarmRules>(() => createDefaultAlarmRulesDraft());
   const [externalIntegrationsDraft, setExternalIntegrationsDraft] = useState<AdminExternalIntegrations>(() => createDefaultExternalIntegrationsDraft());
   const [loginSessions, setLoginSessions] = useState<AdminLoginSession[]>([]);
@@ -753,6 +798,26 @@ export function ParameterManagementApp() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!authSession) return undefined;
+    let cancelled = false;
+    void Promise.all([
+      fetchAdminDepthGeometry(),
+      fetchAdminDepthGeometryBackfillStatus(),
+    ]).then(([configResponse, backfill]) => {
+      if (cancelled) return;
+      setDepthGeometryDraft(configResponse.config);
+      setDepthGeometryHash(configResponse.configHash ?? configResponse.expectedHash ?? configResponse.config.configHash ?? '');
+      setDepthGeometryBackfill(backfill);
+    }).catch(() => {
+      // Older services do not expose the depth-geometry admin API yet. Keep
+      // the seeded draft visible and let the rest of the admin console load.
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [authSession]);
+
   const login = async () => {
     try {
       const session = await loginAdmin(loginDraft.userId.trim(), loginDraft.password);
@@ -789,6 +854,9 @@ export function ParameterManagementApp() {
     setDatabaseIntegrity(null);
     setDatabaseMaintenance(null);
     setInspectionSettingsDraft(createDefaultInspectionSettingsDraft());
+    setDepthGeometryDraft(createDefaultDepthGeometryConfig());
+    setDepthGeometryHash('');
+    setDepthGeometryBackfill(null);
     setAlarmRulesDraft(createDefaultAlarmRulesDraft());
     setExternalIntegrationsDraft(createDefaultExternalIntegrationsDraft());
     setMessage('已退出后台管理');
@@ -1142,6 +1210,53 @@ export function ParameterManagementApp() {
       setMessage('检测规则已保存');
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '检测规则保存失败');
+    }
+  };
+
+  const setDepthGeometryNumber = (
+    section: 'baseline' | 'thresholds' | 'merge',
+    key: string,
+    value: number,
+  ) => {
+    setDepthGeometryDraft((current) => ({
+      ...current,
+      [section]: {
+        ...current[section],
+        [key]: value,
+      },
+    } as AdminDepthGeometryConfig));
+  };
+
+  const saveDepthGeometry = async () => {
+    setDepthGeometryBusy(true);
+    try {
+      const saved = await saveAdminDepthGeometry(depthGeometryDraft, depthGeometryHash);
+      setDepthGeometryDraft(saved.config);
+      setDepthGeometryHash(saved.configHash ?? saved.expectedHash ?? saved.config.configHash ?? '');
+      setDepthGeometryBackfill(await fetchAdminDepthGeometryBackfillStatus());
+      setConfigRevisions(await fetchConfigRevisions({ limit: 30 }));
+      setAdminOverview(await fetchAdminOverview());
+      await loadAuditLogs(0);
+      setMessage('3D 深度几何规则已保存，历史回填已按新版本排队');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '3D 深度几何规则保存失败');
+    } finally {
+      setDepthGeometryBusy(false);
+    }
+  };
+
+  const controlDepthGeometryBackfill = async (action: 'pause' | 'resume') => {
+    setDepthGeometryBusy(true);
+    try {
+      const result = action === 'pause'
+        ? await pauseAdminDepthGeometryBackfill()
+        : await resumeAdminDepthGeometryBackfill();
+      setDepthGeometryBackfill(result);
+      setMessage(action === 'pause' ? '3D 深度几何历史回填已暂停' : '3D 深度几何历史回填已恢复');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '3D 深度几何历史回填控制失败');
+    } finally {
+      setDepthGeometryBusy(false);
     }
   };
 
@@ -2562,6 +2677,83 @@ export function ParameterManagementApp() {
                 <Save size={16} />
                 保存规则
               </button>
+            </div>
+          </div>
+        </Panel>
+        ) : null}
+
+        {selectedConfigurationModule === 'algorithm' ? (
+        <Panel title="3D depth geometry" className="parameter-card parameter-depth-geometry-card">
+          <div className="admin-depth-geometry-head">
+            <div>
+              <strong>Depth-based candidate detector</strong>
+              <span>Review-only candidates; changing the config creates a revision and restarts analysis from the beginning.</span>
+            </div>
+            <label className="admin-toggle-field">
+              <input
+                type="checkbox"
+                checked={depthGeometryDraft.enabled}
+                onChange={(event) => setDepthGeometryDraft((current) => ({ ...current, enabled: event.target.checked }))}
+              />
+              <span>Enabled</span>
+            </label>
+          </div>
+          <div className="admin-depth-geometry-form">
+            <label>
+              <span>Baseline frames</span>
+              <input type="number" min={1} max={32} value={depthGeometryDraft.baseline.maximumFrames} onChange={(event) => setDepthGeometryNumber('baseline', 'maximumFrames', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Row sample step</span>
+              <input type="number" min={1} max={64} value={depthGeometryDraft.baseline.rowSampleStep} onChange={(event) => setDepthGeometryNumber('baseline', 'rowSampleStep', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Minimum deviation (mm)</span>
+              <input aria-label="Minimum deviation (mm)" type="number" min={0.01} max={10} step={0.01} value={depthGeometryDraft.thresholds.minimumAbsoluteDeviationMm} onChange={(event) => setDepthGeometryNumber('thresholds', 'minimumAbsoluteDeviationMm', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Column noise multiplier</span>
+              <input type="number" min={0.1} max={50} step={0.1} value={depthGeometryDraft.thresholds.columnNoiseMultiplier} onChange={(event) => setDepthGeometryNumber('thresholds', 'columnNoiseMultiplier', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Neighborhood support</span>
+              <input type="number" min={1} max={9} value={depthGeometryDraft.thresholds.minimumNeighborhoodSupport} onChange={(event) => setDepthGeometryNumber('thresholds', 'minimumNeighborhoodSupport', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Minimum component points</span>
+              <input type="number" min={1} max={10000} value={depthGeometryDraft.thresholds.minimumComponentPoints} onChange={(event) => setDepthGeometryNumber('thresholds', 'minimumComponentPoints', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Elongated aspect ratio</span>
+              <input type="number" min={1} max={100} step={0.1} value={depthGeometryDraft.thresholds.elongatedAspectRatio} onChange={(event) => setDepthGeometryNumber('thresholds', 'elongatedAspectRatio', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Merge frame gap</span>
+              <input type="number" min={0} max={32} value={depthGeometryDraft.merge.maximumFrameGap} onChange={(event) => setDepthGeometryNumber('merge', 'maximumFrameGap', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Merge IoU</span>
+              <input type="number" min={0} max={1} step={0.01} value={depthGeometryDraft.merge.minimumIoU} onChange={(event) => setDepthGeometryNumber('merge', 'minimumIoU', Number(event.target.value))} />
+            </label>
+          </div>
+          <div className="admin-depth-geometry-meta">
+            <span>Revision: {depthGeometryDraft.revision ?? '-'}</span>
+            <span>Config hash: {depthGeometryHash || 'not available'}</span>
+            <span>Longitudinal scale: {depthGeometryDraft.longitudinalScale == null ? 'pixel-space (no encoder)' : `${depthGeometryDraft.longitudinalScale} mm/px`}</span>
+          </div>
+          <div className="admin-depth-geometry-actions">
+            <button type="button" onClick={() => setDepthGeometryDraft(createDefaultDepthGeometryConfig())} disabled={depthGeometryBusy}>Reset defaults</button>
+            <button type="button" className="primary" onClick={() => void saveDepthGeometry()} disabled={depthGeometryBusy}><Save size={16} />Save depth config</button>
+          </div>
+          <div className="admin-depth-geometry-backfill" aria-label="Depth geometry history backfill">
+            <div>
+              <strong>Automatic history backfill</strong>
+              <span>{depthGeometryBackfill?.state ?? 'status unavailable'}{depthGeometryBackfill?.currentMaterialId ? ` · ${depthGeometryBackfill.currentMaterialId}` : ''}</span>
+              {depthGeometryBackfill?.pauseReason ? <em>{depthGeometryBackfill.pauseReason}</em> : null}
+            </div>
+            <div className="admin-depth-geometry-backfill-actions">
+              <button type="button" onClick={() => void controlDepthGeometryBackfill('pause')} disabled={depthGeometryBusy || depthGeometryBackfill?.state === 'paused'}><Square size={14} />Pause</button>
+              <button type="button" className="primary" onClick={() => void controlDepthGeometryBackfill('resume')} disabled={depthGeometryBusy || depthGeometryBackfill?.state !== 'paused'}><Play size={14} />Resume</button>
             </div>
           </div>
         </Panel>

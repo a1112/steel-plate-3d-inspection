@@ -150,6 +150,60 @@ class SickFlowAnalysisServiceTests(unittest.TestCase):
             service.next_history_material(materials, "2", set(materials))
         )
 
+    def test_depth_history_cursor_is_hash_scoped_and_newest_first(self) -> None:
+        materials = ["1", "2", "3", "4"]
+        self.assertEqual(
+            service.next_depth_history_material(materials, "", {"4"}),
+            "3",
+        )
+        self.assertEqual(
+            service.next_depth_history_material(materials, "3", {"4"}),
+            "2",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service.save_depth_history_cursor(
+                root,
+                "3",
+                "config-a",
+                revision=2,
+                catalog_count=4,
+                checked_count=1,
+                legacy_model_hash="legacy-a",
+            )
+            self.assertEqual(
+                service.load_depth_history_cursor(root, "config-a", "legacy-a"), "3"
+            )
+            self.assertEqual(service.load_depth_history_cursor(root, "config-b"), "")
+            self.assertEqual(
+                service.load_depth_history_cursor(root, "config-a", "legacy-b"), ""
+            )
+
+    def test_defect_completion_requires_current_geometry_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = service.defect_detection_manifest_path(root, "63")
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "state": "complete",
+                        "defectGroups": {
+                            "geometry": {"configHash": "current"},
+                            "legacy": {},
+                        },
+                        "databaseImport": {"state": "complete"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(service.defect_artifact_complete(root, "63", "current"))
+            self.assertFalse(service.defect_artifact_complete(root, "63", "changed"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["databaseImport"]["state"] = "partial"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertFalse(service.defect_artifact_complete(root, "63", "current"))
+
     def test_committed_signature_does_not_advance_on_partial_round(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -239,31 +293,25 @@ class SickFlowAnalysisServiceTests(unittest.TestCase):
             for path in paths.values():
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("{}", encoding="utf-8")
-            with (
-                patch.object(
-                    service,
-                    "build_and_write_flow_alignment",
-                    return_value=(paths["alignment"], {"quality": {"synchronized": True}}),
-                ),
-                patch.object(
-                    service,
-                    "build_and_write_flow_measurement",
-                    return_value=(paths["measurement"], {"metricValid": True}),
-                ),
-                patch.object(
-                    service,
-                    "build_and_write_flow_region_map",
-                    return_value=(paths["region"], {"state": "ready"}),
-                ),
-                patch.object(
-                    service,
-                    "build_and_write_playback_index",
-                    return_value=(paths["playback"], {"frameCount": 20}),
-                ),
-                patch.object(
-                    service, "build_and_write_flow_defect_detection"
-                ) as defect_builder,
-            ):
+            with patch.object(
+                service,
+                "build_and_write_flow_alignment",
+                return_value=(paths["alignment"], {"quality": {"synchronized": True}}),
+            ), patch.object(
+                service,
+                "build_and_write_flow_measurement",
+                return_value=(paths["measurement"], {"metricValid": True}),
+            ), patch.object(
+                service,
+                "build_and_write_flow_region_map",
+                return_value=(paths["region"], {"state": "ready"}),
+            ), patch.object(
+                service,
+                "build_and_write_playback_index",
+                return_value=(paths["playback"], {"frameCount": 20}),
+            ), patch.object(
+                service, "build_and_write_flow_defect_detection"
+            ) as defect_builder:
                 service.analyze(
                     {},
                     root,

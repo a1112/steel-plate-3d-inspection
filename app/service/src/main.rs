@@ -28,6 +28,7 @@ mod bkv_online;
 mod calibration_operations;
 mod controlled_process;
 mod db;
+mod image_rendition;
 mod inspection_world;
 mod machine_site_config;
 mod npz_surface;
@@ -140,6 +141,8 @@ const SECURITY_POLICY_CONFIG_KEY: &str = "security_policy";
 const INSPECTION_SETTINGS_CONFIG_KEY: &str = "inspection_settings";
 const ALARM_RULES_CONFIG_KEY: &str = "alarm_rules";
 const EXTERNAL_INTEGRATIONS_CONFIG_KEY: &str = "external_integrations";
+const DEPTH_GEOMETRY_CONFIG_KEY: &str = "depth_geometry";
+const DEPTH_GEOMETRY_CONFIG_SCHEMA: &str = "steel.sick-depth-geometry-config.v1";
 const CONFIG_JSON_MAX_BYTES: usize = 128 * 1024;
 const CAPTURE_CAMERA_MAX_COUNT: usize = 16;
 const CAPTURE_SUPERVISOR_POLL_MS: u64 = 500;
@@ -148,6 +151,7 @@ const CAPTURE_RESTART_BUDGET_DEFAULT: u32 = 5;
 const CAPTURE_RESTART_BACKOFF_MS_DEFAULT: u64 = 1_000;
 const CAPTURE_RESTART_BACKOFF_MAX_MS: u64 = 30_000;
 const CAPTURE_RESTART_STABLE_MS: u128 = 30_000;
+static DEPTH_GEOMETRY_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const TASK_WORKER_IDLE_HEARTBEAT_MAX_AGE_MS: u128 = 5_000;
 const DEFAULT_TRIGGER_GATEWAY_ORIGIN: &str = "http://127.0.0.1:4881";
 const TRIGGER_HEALTH_TIMEOUT_MS: u64 = 1_200;
@@ -543,6 +547,30 @@ const DEFECT_TYPES: &[DefectType] = &[
         label: "夹杂",
         color: "#a63a1f",
         shape: "circle",
+    },
+    DefectType {
+        id: "pit-compact",
+        label: "\u{7d27}\u{51d1}\u{51f9}\u{5751}\u{5019}\u{9009}",
+        color: "#7c4dff",
+        shape: "circle",
+    },
+    DefectType {
+        id: "groove-elongated",
+        label: "\u{7ec6}\u{957f}\u{6c9f}\u{69fd}\u{5019}\u{9009}",
+        color: "#00a6a6",
+        shape: "rect",
+    },
+    DefectType {
+        id: "bulge-compact",
+        label: "\u{7d27}\u{51d1}\u{51f8}\u{8d77}\u{5019}\u{9009}",
+        color: "#e25c2a",
+        shape: "diamond",
+    },
+    DefectType {
+        id: "ridge-elongated",
+        label: "\u{7ec6}\u{957f}\u{810a}\u{72b6}\u{5019}\u{9009}",
+        color: "#c2185b",
+        shape: "rect",
     },
     DefectType {
         id: "review",
@@ -2328,12 +2356,17 @@ fn build_snapshot_json() -> String {
     let defect_types = DEFECT_TYPES
         .iter()
         .map(|item| {
+            let review_only = matches!(
+                item.id,
+                "pit-compact" | "groove-elongated" | "bulge-compact" | "ridge-elongated"
+            );
             format!(
-                "{{\"id\":\"{}\",\"label\":\"{}\",\"color\":\"{}\",\"shape\":\"{}\"}}",
+                "{{\"id\":\"{}\",\"label\":\"{}\",\"color\":\"{}\",\"shape\":\"{}\",\"reviewOnly\":{}}}",
                 item.id,
                 json_escape(item.label),
                 item.color,
-                item.shape
+                item.shape,
+                review_only
             )
         })
         .collect::<Vec<_>>()
@@ -2628,6 +2661,10 @@ fn production_defect_label(type_id: &str, geometry: &Value) -> String {
         "bubble" => "气泡",
         "inclusion" => "夹杂",
         "longitudinal" => "纵裂",
+        "pit-compact" => "紧凑凹坑候选",
+        "groove-elongated" => "细长沟槽候选",
+        "bulge-compact" => "紧凑凸起候选",
+        "ridge-elongated" => "细长脊状候选",
         value if value.trim().is_empty() => "未知缺陷",
         value => value,
     }
@@ -2661,6 +2698,442 @@ fn production_defect_surface(camera_id: &str) -> &'static str {
     }
 }
 
+fn production_defect_metric_value(geometry: &Value, source: &str, key: &str) -> Value {
+    if source.eq_ignore_ascii_case("sick-depth-geometry") {
+        // The depth detector has no encoder-derived longitudinal scale. Do
+        // not leak stale or pixel-derived values from an older manifest.
+        Value::Null
+    } else {
+        geometry.get(key).cloned().unwrap_or(Value::Null)
+    }
+}
+
+fn production_defect_metric_availability(
+    geometry: &Value,
+    source: &str,
+    horizontal_span_mm: &Value,
+    longitudinal_mm: &Value,
+    longitudinal_span_mm: &Value,
+    area_mm2: &Value,
+) -> Value {
+    if source.eq_ignore_ascii_case("sick-depth-geometry") {
+        return json!({
+            "longitudinal": false,
+            "longitudinalMm": false,
+            "longitudinalSpanMm": false,
+            "area": false,
+            "areaMm2": false,
+            "horizontal": horizontal_span_mm.is_number(),
+            "horizontalSpanMm": horizontal_span_mm.is_number(),
+            "reason": "encoder-unavailable"
+        });
+    }
+    geometry
+        .get("metricAvailability")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "longitudinal": longitudinal_mm.is_number() && longitudinal_span_mm.is_number(),
+                "longitudinalMm": longitudinal_mm.is_number(),
+                "longitudinalSpanMm": longitudinal_span_mm.is_number(),
+                "area": area_mm2.is_number(),
+                "areaMm2": area_mm2.is_number(),
+                "horizontal": horizontal_span_mm.is_number(),
+                "horizontalSpanMm": horizontal_span_mm.is_number()
+            })
+        })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProductionDefectRect {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ProductionDefectComparisonCandidate {
+    id: String,
+    source: String,
+    inspection_id: String,
+    material_id: String,
+    inspection_key: String,
+    camera_key: String,
+    frame_key: Option<String>,
+    frame_value: Option<Value>,
+    rect: Option<ProductionDefectRect>,
+    global_position_available: Option<bool>,
+    risk_tags: Vec<String>,
+    value: Value,
+}
+
+fn production_defect_rect(value: &Value) -> Option<ProductionDefectRect> {
+    let object = value.as_object()?;
+    let (left, top, right, bottom) = if let (Some(left), Some(top), Some(right), Some(bottom)) = (
+        object.get("left").and_then(Value::as_f64),
+        object.get("top").and_then(Value::as_f64),
+        object.get("right").and_then(Value::as_f64),
+        object.get("bottom").and_then(Value::as_f64),
+    ) {
+        (left, top, right, bottom)
+    } else {
+        let x = object.get("x").and_then(Value::as_f64)?;
+        let y = object.get("y").and_then(Value::as_f64)?;
+        let width = object.get("width").and_then(Value::as_f64)?;
+        let height = object.get("height").and_then(Value::as_f64)?;
+        (x, y, x + width, y + height)
+    };
+    if [left, top, right, bottom]
+        .into_iter()
+        .any(|number| !number.is_finite())
+        || right <= left
+        || bottom <= top
+    {
+        return None;
+    }
+    Some(ProductionDefectRect {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+fn production_defect_comparison_rect(geometry: &Value) -> Option<ProductionDefectRect> {
+    geometry
+        .get("imageRect2d")
+        .or_else(|| geometry.get("imageRect"))
+        .and_then(production_defect_rect)
+        .or_else(|| {
+            geometry
+                .get("artifacts")
+                .and_then(|artifacts| artifacts.get("imageRect2d"))
+                .and_then(production_defect_rect)
+        })
+        .or_else(|| {
+            geometry
+                .get("artifacts")
+                .and_then(|artifacts| artifacts.get("roi"))
+                .and_then(production_defect_rect)
+        })
+}
+
+fn production_defect_frame_key(value: &Value) -> Option<String> {
+    let text = match value {
+        Value::String(value) => value.trim().to_string(),
+        Value::Number(value) => value.to_string(),
+        _ => return None,
+    };
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(integer) = text.parse::<i128>() {
+        return Some(integer.to_string());
+    }
+    Some(text)
+}
+
+fn production_defect_comparison_frame(geometry: &Value) -> (Option<String>, Option<Value>) {
+    let artifacts = geometry.get("artifacts");
+    for (object, keys) in [
+        (
+            geometry,
+            [
+                "storageIndex",
+                "frameId",
+                "frameIndex",
+                "imageIndex",
+                "sequenceNo",
+                "peakFrameIndex",
+                "peakFrame",
+            ],
+        ),
+        (
+            artifacts.unwrap_or(&Value::Null),
+            [
+                "frameId",
+                "sequenceNo",
+                "storageIndex",
+                "frameIndex",
+                "imageIndex",
+                "peakFrameIndex",
+                "peakFrame",
+            ],
+        ),
+    ] {
+        for key in keys {
+            let Some(value) = object.get(key).cloned() else {
+                continue;
+            };
+            if let Some(frame_key) = production_defect_frame_key(&value) {
+                return (Some(frame_key), Some(value));
+            }
+        }
+    }
+    (None, None)
+}
+
+fn production_defect_comparison_camera(
+    defect: &db::entities::production_defect::Model,
+    geometry: &Value,
+) -> String {
+    geometry
+        .get("cameraId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            geometry
+                .get("artifacts")
+                .and_then(|artifacts| artifacts.get("cameraId"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or(&defect.camera_id)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn production_defect_comparison_candidate(
+    defect: &db::entities::production_defect::Model,
+    value: Value,
+) -> ProductionDefectComparisonCandidate {
+    let geometry =
+        serde_json::from_str::<Value>(&defect.geometry_json).unwrap_or_else(|_| json!({}));
+    let (frame_key, frame_value) = production_defect_comparison_frame(&geometry);
+    let inspection_key = format!(
+        "{}:{}",
+        defect.inspection_id.trim().to_ascii_lowercase(),
+        defect.material_id.trim().to_ascii_lowercase()
+    );
+    let risk_tags = geometry
+        .get("riskTags")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    ProductionDefectComparisonCandidate {
+        id: defect.id.clone(),
+        source: defect.source.clone(),
+        inspection_id: defect.inspection_id.clone(),
+        material_id: defect.material_id.clone(),
+        inspection_key,
+        camera_key: production_defect_comparison_camera(defect, &geometry),
+        frame_key,
+        frame_value,
+        rect: production_defect_comparison_rect(&geometry),
+        global_position_available: geometry
+            .get("globalPositionAvailable")
+            .and_then(Value::as_bool),
+        risk_tags,
+        value,
+    }
+}
+
+fn production_defect_rect_iou(left: ProductionDefectRect, right: ProductionDefectRect) -> f64 {
+    let intersection_width = (left.right.min(right.right) - left.left.max(right.left)).max(0.0);
+    let intersection_height = (left.bottom.min(right.bottom) - left.top.max(right.top)).max(0.0);
+    let intersection = intersection_width * intersection_height;
+    let left_area = (left.right - left.left) * (left.bottom - left.top);
+    let right_area = (right.right - right.left) * (right.bottom - right.top);
+    intersection / (left_area + right_area - intersection).max(1e-12)
+}
+
+fn production_defect_is_geometry_source(source: &str) -> bool {
+    source.eq_ignore_ascii_case("sick-depth-geometry")
+}
+
+fn production_defect_group_value(
+    source: &str,
+    candidates: &[&ProductionDefectComparisonCandidate],
+) -> Value {
+    let mut sources = candidates
+        .iter()
+        .map(|candidate| candidate.source.clone())
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+    let source_value = if sources.len() == 1 {
+        json!(sources[0])
+    } else {
+        Value::Null
+    };
+    let algorithm_revisions = candidates
+        .iter()
+        .filter_map(|candidate| {
+            candidate
+                .value
+                .get("algorithmRevision")
+                .filter(|value| !value.is_null())
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    let algorithm_revision = if algorithm_revisions
+        .windows(2)
+        .all(|window| window[0] == window[1])
+    {
+        algorithm_revisions.first().cloned().unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let global_position_available = if !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| candidate.global_position_available == Some(true))
+    {
+        Value::Bool(true)
+    } else if !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| candidate.global_position_available == Some(false))
+    {
+        Value::Bool(false)
+    } else {
+        Value::Null
+    };
+    let mut risk_tags = candidates
+        .iter()
+        .flat_map(|candidate| candidate.risk_tags.iter().cloned())
+        .collect::<Vec<_>>();
+    risk_tags.sort();
+    risk_tags.dedup();
+    json!({
+        "schema": "steel.sick-defect-group.v1",
+        "name": source,
+        "source": source_value,
+        "sources": sources,
+        "state": "complete",
+        "algorithmRevision": algorithm_revision,
+        "globalPositionAvailable": global_position_available,
+        "riskTags": risk_tags,
+        "count": candidates.len(),
+        "defects": candidates.iter().map(|candidate| candidate.value.clone()).collect::<Vec<_>>()
+    })
+}
+
+fn production_defect_groups_and_comparison(
+    candidates: &[ProductionDefectComparisonCandidate],
+) -> (Value, Value) {
+    let geometry = candidates
+        .iter()
+        .filter(|candidate| production_defect_is_geometry_source(&candidate.source))
+        .collect::<Vec<_>>();
+    let legacy = candidates
+        .iter()
+        .filter(|candidate| !production_defect_is_geometry_source(&candidate.source))
+        .collect::<Vec<_>>();
+    let mut possible = Vec::new();
+    for (geometry_index, geometry_candidate) in geometry.iter().enumerate() {
+        for (legacy_index, legacy_candidate) in legacy.iter().enumerate() {
+            if geometry_candidate.inspection_key.is_empty()
+                || geometry_candidate.inspection_key != legacy_candidate.inspection_key
+                || geometry_candidate.camera_key != legacy_candidate.camera_key
+                || geometry_candidate.frame_key.is_none()
+                || geometry_candidate.frame_key != legacy_candidate.frame_key
+            {
+                continue;
+            }
+            let Some(left) = geometry_candidate.rect else {
+                continue;
+            };
+            let Some(right) = legacy_candidate.rect else {
+                continue;
+            };
+            let iou = production_defect_rect_iou(left, right);
+            if iou >= 0.20 {
+                possible.push((iou, geometry_index, legacy_index));
+            }
+        }
+    }
+    possible.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| geometry[left.1].id.cmp(&geometry[right.1].id))
+            .then_with(|| legacy[left.2].id.cmp(&legacy[right.2].id))
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let mut used_geometry = HashSet::new();
+    let mut used_legacy = HashSet::new();
+    let mut matches = Vec::new();
+    for (iou, geometry_index, legacy_index) in possible {
+        if used_geometry.contains(&geometry_index) || used_legacy.contains(&legacy_index) {
+            continue;
+        }
+        used_geometry.insert(geometry_index);
+        used_legacy.insert(legacy_index);
+        let geometry_candidate = geometry[geometry_index];
+        let legacy_candidate = legacy[legacy_index];
+        let frame_value = geometry_candidate
+            .frame_value
+            .clone()
+            .or_else(|| legacy_candidate.frame_value.clone())
+            .unwrap_or(Value::Null);
+        matches.push(json!({
+            "geometryId": geometry_candidate.id,
+            "legacyId": legacy_candidate.id,
+            "cameraId": geometry_candidate.value.get("cameraId").cloned().unwrap_or(Value::Null),
+            "inspectionId": geometry_candidate.inspection_id,
+            "materialId": geometry_candidate.material_id,
+            "storageIndex": frame_value,
+            "frameId": geometry_candidate.frame_value.clone().or_else(|| legacy_candidate.frame_value.clone()),
+            "iou": (iou * 100_000_000.0).round() / 100_000_000.0
+        }));
+    }
+    let geometry_only = geometry
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used_geometry.contains(index))
+        .map(|(_, candidate)| json!(candidate.id))
+        .collect::<Vec<_>>();
+    let legacy_only = legacy
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used_legacy.contains(index))
+        .map(|(_, candidate)| json!(candidate.id))
+        .collect::<Vec<_>>();
+    let matched = matches.len();
+    let geometry_only_count = geometry_only.len();
+    let legacy_only_count = legacy_only.len();
+    let mut risk_tags = geometry
+        .iter()
+        .flat_map(|candidate| candidate.risk_tags.iter().cloned())
+        .collect::<Vec<_>>();
+    risk_tags.sort();
+    risk_tags.dedup();
+    let comparison = json!({
+        "schema": "steel.sick-defect-group-comparison.v1",
+        "minimumIoU": 0.20,
+        "iouThreshold": 0.20,
+        "matched": matched,
+        "geometryOnly": geometry_only_count,
+        "legacyOnly": legacy_only_count,
+        "matches": matches,
+        "geometryOnlyIds": geometry_only,
+        "legacyOnlyIds": legacy_only,
+        "matchedCount": matched,
+        "geometryOnlyCount": geometry_only_count,
+        "legacyOnlyCount": legacy_only_count,
+        "estimatedUniqueCount": matched + geometry_only_count + legacy_only_count,
+        "cameraLocal": geometry.iter().all(|candidate| candidate.global_position_available != Some(true)),
+        "riskTags": risk_tags,
+        "warning": "Matched pairs are a same-camera/same-frame estimate within each inspection/material in the current response page; both original candidates are retained."
+    });
+    (
+        json!({
+            "geometry": production_defect_group_value("geometry", &geometry),
+            "legacy": production_defect_group_value("legacy", &legacy)
+        }),
+        comparison,
+    )
+}
+
 fn production_defect_value(
     defect: &db::entities::production_defect::Model,
     inspection: &db::entities::production_inspection::Model,
@@ -2673,6 +3146,24 @@ fn production_defect_value(
     let geometry_length_ratio = geometry.get("lengthRatio").and_then(Value::as_f64);
     let geometry_circumference_ratio = geometry.get("circumferenceRatio").and_then(Value::as_f64);
     let geometry_camera_index = geometry.get("cameraIndex").and_then(Value::as_i64);
+    let longitudinal_mm =
+        production_defect_metric_value(&geometry, &defect.source, "longitudinalMm");
+    let longitudinal_span_mm =
+        production_defect_metric_value(&geometry, &defect.source, "longitudinalSpanMm");
+    let area_mm2 = production_defect_metric_value(&geometry, &defect.source, "areaMm2");
+    let horizontal_span_mm = geometry
+        .get("horizontalSpanMm")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let pixel_span = geometry.get("pixelSpan").cloned().unwrap_or(Value::Null);
+    let metric_availability = production_defect_metric_availability(
+        &geometry,
+        &defect.source,
+        &horizontal_span_mm,
+        &longitudinal_mm,
+        &longitudinal_span_mm,
+        &area_mm2,
+    );
     let defect_artifacts = geometry
         .get("artifacts")
         .filter(|value| value.is_object())
@@ -2720,7 +3211,16 @@ fn production_defect_value(
         "confidence": defect.confidence,
         "detectionConfidence": defect.confidence,
         "source": defect.source,
+        "algorithmRevision": defect.algorithm_revision,
         "sourceDefectId": defect.source_defect_id,
+        "horizontalSpanMm": horizontal_span_mm,
+        "pixelSpan": pixel_span,
+        "longitudinalMm": longitudinal_mm,
+        "longitudinalSpanMm": longitudinal_span_mm,
+        "areaMm2": area_mm2,
+        "metricAvailability": metric_availability,
+        "active": defect.active,
+        "supersededAt": defect.superseded_at,
         "reviewStatus": defect.review_status,
         "reviewedBy": defect.reviewed_by,
         "reviewedAt": defect.reviewed_at,
@@ -2748,10 +3248,21 @@ fn production_defect_history_response(state: &ServiceState, query: &str) -> Vec<
     let offset = query_value(query, "offset")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    let defects = match state.runtime.block_on(db::list_recent_production_defects(
+    let source = query_value(query, "source")
+        .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("all"));
+    let active = query_value(query, "active").and_then(|value| {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    });
+    let filter = db::ProductionDefectHistoryFilter { source, active };
+    let defects = match state.runtime.block_on(db::list_recent_production_defects_filtered(
         &state.database.connection,
         limit,
         offset,
+        &filter,
     )) {
         Ok(rows) => rows,
         Err(error) => {
@@ -2784,17 +3295,28 @@ fn production_defect_history_response(state: &ServiceState, query: &str) -> Vec<
             )
         }
     };
-    let items = defects
-        .iter()
-        .filter_map(|defect| {
-            let inspection = inspections.get(&defect.inspection_id)?;
-            let plate = production_plate_value(inspection, None);
-            Some(production_defect_value(defect, inspection, &plate))
-        })
-        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(defects.len());
+    let mut comparison_candidates = Vec::with_capacity(defects.len());
+    for defect in &defects {
+        let Some(inspection) = inspections.get(&defect.inspection_id) else {
+            continue;
+        };
+        let plate = production_plate_value(inspection, None);
+        let value = production_defect_value(defect, inspection, &plate);
+        comparison_candidates.push(production_defect_comparison_candidate(
+            defect,
+            value.clone(),
+        ));
+        items.push(value);
+    }
+    let (defect_groups, comparison) =
+        production_defect_groups_and_comparison(&comparison_candidates);
     let total = state
         .runtime
-        .block_on(db::count_production_defects(&state.database.connection))
+        .block_on(db::count_production_defects_filtered(
+            &state.database.connection,
+            &filter,
+        ))
         .unwrap_or(items.len() as u64);
     http_response_with_headers(
         "200 OK",
@@ -2805,7 +3327,11 @@ fn production_defect_history_response(state: &ServiceState, query: &str) -> Vec<
             "total":total,
             "limit":limit,
             "offset":offset,
-            "defects":items
+            "source":filter.source,
+            "active":filter.active,
+            "defects":items,
+            "defectGroups":defect_groups,
+            "comparison":comparison
         })
         .to_string(),
         &[("Cache-Control", "private, no-cache")],
@@ -2938,7 +3464,11 @@ fn production_defect_types_value() -> Value {
         { "id": "burnt", "label": "烂钢", "color": "#9b6bff", "shape": "star" },
         { "id": "edge", "label": "边裂", "color": "#ffd166", "shape": "diamond" },
         { "id": "bubble", "label": "气泡", "color": "#ff69b4", "shape": "circle" },
-        { "id": "inclusion", "label": "夹杂", "color": "#8a96a3", "shape": "rect" }
+        { "id": "inclusion", "label": "夹杂", "color": "#8a96a3", "shape": "rect" },
+        { "id": "pit-compact", "label": "\u{7d27}\u{51d1}\u{51f9}\u{5751}\u{5019}\u{9009}", "color": "#7c4dff", "shape": "circle", "reviewOnly": true },
+        { "id": "groove-elongated", "label": "\u{7ec6}\u{957f}\u{6c9f}\u{69fd}\u{5019}\u{9009}", "color": "#00a6a6", "shape": "rect", "reviewOnly": true },
+        { "id": "bulge-compact", "label": "\u{7d27}\u{51d1}\u{51f8}\u{8d77}\u{5019}\u{9009}", "color": "#e25c2a", "shape": "diamond", "reviewOnly": true },
+        { "id": "ridge-elongated", "label": "\u{7ec6}\u{957f}\u{810a}\u{72b6}\u{5019}\u{9009}", "color": "#c2185b", "shape": "rect", "reviewOnly": true }
     ])
 }
 
@@ -3463,6 +3993,8 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
         "detectedAt": ""
     });
     let mut current_defects = Vec::new();
+    let mut current_defect_groups = Value::Null;
+    let mut current_comparison = Value::Null;
     let mut current_capture_images = Vec::new();
     let mut current_bkv_artifacts = Vec::new();
 
@@ -3504,6 +4036,13 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             .iter()
             .map(|defect| production_defect_value(defect, inspection, &plate))
             .collect::<Vec<_>>();
+        let comparison_candidates = production_defects
+            .iter()
+            .zip(defects.iter())
+            .map(|(defect, value)| production_defect_comparison_candidate(defect, value.clone()))
+            .collect::<Vec<_>>();
+        let (defect_groups, comparison) =
+            production_defect_groups_and_comparison(&comparison_candidates);
         let (legacy_capture_images, bkv_artifacts) =
             if state.capture.provider == CaptureProvider::Bkv {
                 let artifacts = files
@@ -3557,6 +4096,8 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
         if index == 0 {
             current_plate = plate.clone();
             current_defects = defects.clone();
+            current_defect_groups = defect_groups.clone();
+            current_comparison = comparison.clone();
             current_capture_images = legacy_capture_images.clone();
             current_bkv_artifacts = bkv_artifacts.clone();
         }
@@ -3570,6 +4111,8 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
         plate_inspections.push(json!({
             "plate": plate,
             "defects": defects,
+            "defectGroups": defect_groups,
+            "comparison": comparison,
             "heightProfile": [],
             "captureImages": legacy_capture_images,
             "bkvArtifacts": bkv_artifacts,
@@ -3585,6 +4128,8 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             "currentPlate": current_plate,
             "defectTypes": production_defect_types_value(),
             "defects": current_defects,
+            "defectGroups": current_defect_groups,
+            "comparison": current_comparison,
             "records": records,
             "status": production_device_status_value(state),
             "summary": summarize_defect_values(&current_defects),
@@ -3767,6 +4312,38 @@ fn http_bytes_response_with_headers(
     .into_bytes();
     response.extend_from_slice(body);
     response
+}
+
+fn requested_image_rendition_response(
+    content_type: &str,
+    body: &[u8],
+    query: &str,
+) -> Option<Vec<u8>> {
+    let bounds = image_rendition::requested_bounds(query)?;
+    let rendition = image_rendition::render(body, content_type, bounds)?;
+    let source_size = format!("{}x{}", rendition.source_size.0, rendition.source_size.1);
+    let output_size = format!("{}x{}", rendition.output_size.0, rendition.output_size.1);
+    let server_timing = format!(
+        "resize;dur={:.2}, encode;dur={:.2}",
+        rendition.resize.as_secs_f64() * 1000.0,
+        rendition.encode.as_secs_f64() * 1000.0,
+    );
+    Some(http_bytes_response_with_headers(
+        "200 OK",
+        rendition.content_type,
+        rendition.bytes.as_slice(),
+        &[
+            ("Cache-Control", "public, max-age=31536000, immutable"),
+            ("X-Steel-Rendition-Cache", rendition.cache_status),
+            ("X-Steel-Source-Size", source_size.as_str()),
+            ("X-Steel-Rendition-Size", output_size.as_str()),
+            ("Server-Timing", server_timing.as_str()),
+            (
+                "Access-Control-Expose-Headers",
+                "Content-Length, Server-Timing, X-Steel-Rendition-Cache, X-Steel-Source-Size, X-Steel-Rendition-Size",
+            ),
+        ],
+    ))
 }
 
 fn http_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
@@ -4808,6 +5385,779 @@ fn sha256_file_hex(path: &Path) -> Option<String> {
         digest.update(&buffer[..read]);
     }
     Some(format!("{:x}", digest.finalize()))
+}
+
+fn sha256_bytes_hex(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
+}
+
+fn sha256_json_value_hex(value: &Value) -> String {
+    // serde_json's default map is key ordered. Compact serialization matches
+    // the Python worker's canonical sort_keys/separators representation, so
+    // the admin API, manifests and history cursor expose one effective hash.
+    serde_json::to_vec(value)
+        .map(|bytes| sha256_bytes_hex(&bytes))
+        .unwrap_or_default()
+}
+
+fn depth_geometry_explicit_config_path() -> Option<PathBuf> {
+    env::var("STEEL_DEPTH_GEOMETRY_CONFIG")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn depth_geometry_state_config_path() -> Option<PathBuf> {
+    env::var("STEEL_RUNTIME_STATE_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|root| {
+            root.join("config")
+                .join("algorithm")
+                .join("depth-geometry.json")
+        })
+}
+
+fn depth_geometry_algorithm_profile_path(state: &ServiceState) -> PathBuf {
+    let parent = state
+        .runtime_config
+        .profile_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(workspace_root);
+    let relative = state.runtime_config.algorithm.config_path.trim();
+    if relative.is_empty() {
+        parent.join("algorithm.json")
+    } else {
+        parent.join(relative)
+    }
+}
+
+fn depth_geometry_write_target(state: &ServiceState) -> (PathBuf, bool) {
+    if let Some(path) = depth_geometry_explicit_config_path() {
+        return (path, true);
+    }
+    if let Some(path) = depth_geometry_state_config_path() {
+        return (path, true);
+    }
+    (depth_geometry_algorithm_profile_path(state), false)
+}
+
+fn depth_geometry_value_from_document(document: &Value) -> Result<Value, String> {
+    let object = document
+        .as_object()
+        .ok_or_else(|| "depth geometry config must be a JSON object".to_string())?;
+    if let Some(value) = object.get("depthGeometry") {
+        if !value.is_object() {
+            return Err("algorithm profile depthGeometry must be a JSON object".to_string());
+        }
+        Ok(value.clone())
+    } else {
+        Ok(document.clone())
+    }
+}
+
+fn depth_geometry_read_snapshot(
+    state: &ServiceState,
+) -> Result<(Value, Vec<u8>, PathBuf, &'static str), String> {
+    if let Some(path) = depth_geometry_explicit_config_path() {
+        if path.is_file() {
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("depth geometry config read failed: {error}"))?;
+            let document = serde_json::from_slice::<Value>(&bytes)
+                .map_err(|error| format!("depth geometry config JSON invalid: {error}"))?;
+            let config = depth_geometry_value_from_document(&document)?;
+            return Ok((config, bytes, path, "explicit"));
+        }
+    }
+    if let Some(path) = depth_geometry_state_config_path() {
+        if path.is_file() {
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("depth geometry config read failed: {error}"))?;
+            let document = serde_json::from_slice::<Value>(&bytes)
+                .map_err(|error| format!("depth geometry config JSON invalid: {error}"))?;
+            let config = depth_geometry_value_from_document(&document)?;
+            return Ok((config, bytes, path, "runtime-state"));
+        }
+    }
+    let path = depth_geometry_algorithm_profile_path(state);
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "algorithm profile read failed ({}): {error}",
+            path.display()
+        )
+    })?;
+    let document = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|error| format!("algorithm profile JSON invalid: {error}"))?;
+    let config = depth_geometry_value_from_document(&document)?;
+    Ok((config, bytes, path, "algorithm-profile"))
+}
+
+fn depth_geometry_revision(config: &Value) -> u64 {
+    config
+        .get("revision")
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or(0)
+}
+
+fn normalize_depth_geometry_config(value: &Value, revision: u64) -> Result<Value, String> {
+    let mut config = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "depth geometry config must be a JSON object".to_string())?;
+    match config.get("schema").and_then(Value::as_str) {
+        None => {
+            config.insert(
+                "schema".to_string(),
+                Value::String(DEPTH_GEOMETRY_CONFIG_SCHEMA.to_string()),
+            );
+        }
+        Some(schema) if schema == DEPTH_GEOMETRY_CONFIG_SCHEMA => {}
+        Some(_) => return Err("unsupported depth geometry config schema".to_string()),
+    }
+    if let Some(enabled) = config.get("enabled") {
+        if !enabled.is_boolean() {
+            return Err("depth geometry enabled must be boolean".to_string());
+        }
+    } else {
+        config.insert("enabled".to_string(), Value::Bool(true));
+    }
+    if let Some(policy) = config.get("candidatePolicy") {
+        if policy.as_str() != Some("review-only") {
+            return Err("depth geometry candidatePolicy must be review-only".to_string());
+        }
+    } else {
+        config.insert(
+            "candidatePolicy".to_string(),
+            Value::String("review-only".to_string()),
+        );
+    }
+    let bounded_number = |object: &serde_json::Map<String, Value>,
+                          section: &str,
+                          key: &str,
+                          minimum: f64,
+                          maximum: f64,
+                          integer: bool|
+     -> Result<(), String> {
+        let value = object
+            .get(key)
+            .and_then(Value::as_f64)
+            .ok_or_else(|| format!("depth geometry {section}.{key} must be numeric"))?;
+        if !value.is_finite()
+            || value < minimum
+            || value > maximum
+            || (integer && value.fract() != 0.0)
+        {
+            return Err(format!(
+                "depth geometry {section}.{key} must be between {minimum} and {maximum}"
+            ));
+        }
+        Ok(())
+    };
+    {
+        let baseline = config
+            .get("baseline")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "depth geometry baseline must be a JSON object".to_string())?;
+        bounded_number(baseline, "baseline", "maximumFrames", 1.0, 32.0, true)?;
+        bounded_number(baseline, "baseline", "rowSampleStep", 1.0, 64.0, true)?;
+
+        let thresholds = config
+            .get("thresholds")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "depth geometry thresholds must be a JSON object".to_string())?;
+        bounded_number(
+            thresholds,
+            "thresholds",
+            "minimumAbsoluteDeviationMm",
+            0.01,
+            10.0,
+            false,
+        )?;
+        bounded_number(
+            thresholds,
+            "thresholds",
+            "columnNoiseMultiplier",
+            0.1,
+            50.0,
+            false,
+        )?;
+        bounded_number(
+            thresholds,
+            "thresholds",
+            "minimumNeighborhoodSupport",
+            1.0,
+            9.0,
+            true,
+        )?;
+        bounded_number(
+            thresholds,
+            "thresholds",
+            "minimumComponentPoints",
+            1.0,
+            1_000_000.0,
+            true,
+        )?;
+        bounded_number(
+            thresholds,
+            "thresholds",
+            "elongatedAspectRatio",
+            1.0,
+            100.0,
+            false,
+        )?;
+
+        let merge = config
+            .get("merge")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "depth geometry merge must be a JSON object".to_string())?;
+        bounded_number(merge, "merge", "maximumFrameGap", 0.0, 32.0, true)?;
+        bounded_number(merge, "merge", "minimumIoU", 0.0, 1.0, false)?;
+    }
+    if config
+        .get("longitudinalScale")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(
+            "depth geometry longitudinalScale must remain null until an encoder is configured"
+                .to_string(),
+        );
+    }
+    if let Some(size) = config.get("reviewCropMinimumSize") {
+        let value = size
+            .as_f64()
+            .filter(|value| value.fract() == 0.0 && (8.0..=1024.0).contains(value))
+            .ok_or_else(|| {
+                "depth geometry reviewCropMinimumSize must be between 8 and 1024".to_string()
+            })?;
+        let _ = value;
+    }
+    if config.get("historyBackfill").is_some() {
+        let backfill = config
+            .get_mut("historyBackfill")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| "depth geometry historyBackfill must be a JSON object".to_string())?;
+        for key in [
+            "automatic",
+            "livePriority",
+            "pauseHistoricalIoWhileCaptureActive",
+        ] {
+            match backfill.get(key) {
+                Some(Value::Bool(true)) => {}
+                Some(Value::Bool(false)) => {
+                    return Err(format!(
+                        "depth geometry historyBackfill.{key} must remain true"
+                    ));
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "depth geometry historyBackfill.{key} must be boolean"
+                    ));
+                }
+                None => {
+                    backfill.insert(key.to_string(), Value::Bool(true));
+                }
+            }
+        }
+        if backfill.get("gpuDeviceId").and_then(Value::as_i64) != Some(1) {
+            return Err("depth geometry historyBackfill.gpuDeviceId must be 1".to_string());
+        }
+    }
+    config.insert("revision".to_string(), json!(revision));
+    Ok(Value::Object(config))
+}
+
+fn depth_geometry_config_response(state: &ServiceState) -> Vec<u8> {
+    match depth_geometry_read_snapshot(state) {
+        Ok((config, _bytes, path, source)) => http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "schema": "steel.sick-depth-geometry-admin.v1",
+                "code": 0,
+                "config": config,
+                "revision": depth_geometry_revision(&config),
+                "configHash": sha256_json_value_hex(&config),
+                "expectedHash": sha256_json_value_hex(&config),
+                "source": source,
+                "path": path.display().to_string()
+            })
+            .to_string(),
+        ),
+        Err(error) => http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 503,
+                "error": "depth_geometry_config_unavailable",
+                "detail": error
+            })
+            .to_string(),
+        ),
+    }
+}
+
+fn write_depth_geometry_config_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
+    if body.trim().is_empty() || body.len() > CONFIG_JSON_MAX_BYTES {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"invalid_depth_geometry_config\"}",
+        );
+    }
+    let payload = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 400,
+                    "error": "invalid_depth_geometry_config",
+                    "detail": error.to_string()
+                })
+                .to_string(),
+            )
+        }
+    };
+    let Some(expected_hash) = payload
+        .get("expectedHash")
+        .or_else(|| payload.get("expected_hash"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"missing_expected_hash\"}",
+        );
+    };
+    let Some(candidate) = payload.get("config") else {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            "{\"code\":400,\"error\":\"missing_depth_geometry_config\"}",
+        );
+    };
+
+    let lock = DEPTH_GEOMETRY_CONFIG_LOCK.get_or_init(|| Mutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            "{\"code\":500,\"error\":\"depth_geometry_config_lock_poisoned\"}",
+        );
+    };
+    let (current, previous_bytes, _current_path, current_source) =
+        match depth_geometry_read_snapshot(state) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return http_response(
+                    "503 Service Unavailable",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "code": 503,
+                        "error": "depth_geometry_config_unavailable",
+                        "detail": error
+                    })
+                    .to_string(),
+                )
+            }
+        };
+    let current_hash = sha256_json_value_hex(&current);
+    if !expected_hash.eq_ignore_ascii_case(&current_hash) {
+        return http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": "depth_geometry_config_conflict",
+                "expectedHash": expected_hash,
+                "currentHash": current_hash.clone(),
+                "configHash": current_hash,
+                "revision": depth_geometry_revision(&current)
+            })
+            .to_string(),
+        );
+    }
+    let next_revision = depth_geometry_revision(&current)
+        .checked_add(1)
+        .ok_or_else(|| "depth geometry revision exhausted".to_string());
+    let next_revision = match next_revision {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({"code":409,"error":"depth_geometry_revision_exhausted","detail":error})
+                    .to_string(),
+            )
+        }
+    };
+    let normalized = match normalize_depth_geometry_config(candidate, next_revision) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 400,
+                    "error": "invalid_depth_geometry_config",
+                    "detail": error
+                })
+                .to_string(),
+            )
+        }
+    };
+    let standalone_target = depth_geometry_write_target(state);
+    let (target_path, target_is_standalone) = standalone_target;
+    let target_previous = fs::read(&target_path).ok();
+    let target_bytes = if target_is_standalone {
+        match serde_json::to_vec_pretty(&normalized) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return http_response(
+                    "500 Internal Server Error",
+                    "application/json; charset=utf-8",
+                    &json!({"code":500,"error":"depth_geometry_config_serialize_failed","detail":error.to_string()}).to_string(),
+                )
+            }
+        }
+    } else {
+        let mut document = match serde_json::from_slice::<Value>(&previous_bytes) {
+            Ok(value) => value,
+            Err(error) => return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({"code":503,"error":"algorithm_profile_invalid","detail":error.to_string()})
+                    .to_string(),
+            ),
+        };
+        let Some(object) = document.as_object_mut() else {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                "{\"code\":503,\"error\":\"algorithm_profile_invalid\"}",
+            );
+        };
+        object.insert("depthGeometry".to_string(), normalized.clone());
+        match serde_json::to_vec_pretty(&document) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return http_response(
+                    "500 Internal Server Error",
+                    "application/json; charset=utf-8",
+                    &json!({"code":500,"error":"algorithm_profile_serialize_failed","detail":error.to_string()}).to_string(),
+                )
+            }
+        }
+    };
+    if let Some(parent) = target_path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"code":500,"error":"depth_geometry_config_directory_failed","detail":error.to_string()}).to_string(),
+            );
+        }
+    }
+    if let Err(error) = write_bytes_atomic(&target_path, &target_bytes) {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code":500,"error":"depth_geometry_config_write_failed","detail":error})
+                .to_string(),
+        );
+    }
+    let config_text = normalized.to_string();
+    if let Err(error) = state.runtime.block_on(db::append_config_revision(
+        &state.database.connection,
+        DEPTH_GEOMETRY_CONFIG_KEY,
+        &config_text,
+        actor,
+        "save",
+    )) {
+        if let Some(previous) = target_previous {
+            let _ = write_bytes_atomic(&target_path, &previous);
+        } else {
+            let _ = fs::remove_file(&target_path);
+        }
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code":500,"error":"depth_geometry_revision_failed","detail":error.to_string()}).to_string(),
+        );
+    }
+    let _ = state.runtime.block_on(db::append_audit_log(
+        &state.database.connection,
+        actor,
+        "depth_geometry.update",
+        &target_path.display().to_string(),
+        &json!({
+            "revision": next_revision,
+            "previousHash": current_hash,
+            "source": current_source,
+            "target": target_path.display().to_string()
+        })
+        .to_string(),
+        "info",
+    ));
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "message": "depth geometry config saved",
+            "config": normalized,
+            "revision": next_revision,
+            "configHash": sha256_json_value_hex(&normalized),
+            "expectedHash": sha256_json_value_hex(&normalized),
+            "path": target_path.display().to_string(),
+            "restartRequested": true
+        })
+        .to_string(),
+    )
+}
+
+fn depth_geometry_storage_root(state: &ServiceState) -> Option<PathBuf> {
+    for name in [
+        "STEEL_SICK_STORAGE_ROOT",
+        "STEEL_CAPTURE_STORAGE_ROOT",
+        "CAPTURE_CAMERA_STORAGE_ROOT",
+        "STEEL_RESULT_ROOT",
+    ] {
+        if let Some(value) = env::var(name).ok().filter(|value| !value.trim().is_empty()) {
+            return Some(PathBuf::from(value));
+        }
+    }
+    if let Some(relative) = state.runtime_config.capture_profile.as_deref() {
+        let path = state
+            .runtime_config
+            .profile_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(workspace_root)
+            .join(relative);
+        if let Ok(bytes) = fs::read(path) {
+            if let Ok(document) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(root) = document
+                    .get("storageRoot")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(PathBuf::from(root));
+                }
+            }
+        }
+    }
+    for value in [
+        state.runtime_config.storage.result_root.as_str(),
+        state.runtime_config.storage.source_root.as_str(),
+    ] {
+        if !value.trim().is_empty() {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
+}
+
+fn depth_geometry_backfill_status_response(state: &ServiceState) -> Vec<u8> {
+    let Some(root) = depth_geometry_storage_root(state) else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 503,
+                "error": "depth_geometry_backfill_status_unavailable",
+                "detail": "storage root is not configured"
+            })
+            .to_string(),
+        );
+    };
+    let candidates = [
+        root.join("system")
+            .join("jobs")
+            .join("defect-worker")
+            .join("status.json"),
+        root.join("system")
+            .join("jobs")
+            .join("flow-analysis")
+            .join("status.json"),
+        root.join("system")
+            .join("jobs")
+            .join("depth-geometry-backfill")
+            .join("status.json"),
+        root.join("system")
+            .join("jobs")
+            .join("defect-history-backfill")
+            .join("status.json"),
+    ];
+    for path in candidates {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_slice::<Value>(&bytes) else {
+            return http_response(
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 503,
+                    "error": "depth_geometry_backfill_status_invalid",
+                    "path": path.display().to_string()
+                })
+                .to_string(),
+            );
+        };
+        let status = document
+            .get("depthGeometryBackfill")
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or(document);
+        return http_response(
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "schema": "steel.sick-depth-geometry-backfill-admin.v1",
+                "code": 0,
+                "available": true,
+                "path": path.display().to_string(),
+                "status": status
+            })
+            .to_string(),
+        );
+    }
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "schema": "steel.sick-depth-geometry-backfill-admin.v1",
+            "code": 0,
+            "available": false,
+            "state": "idle",
+            "root": root.display().to_string()
+        })
+        .to_string(),
+    )
+}
+
+fn write_depth_geometry_backfill_control_response(
+    state: &ServiceState,
+    body: &str,
+    path_action: Option<&str>,
+    actor: &str,
+) -> Vec<u8> {
+    let Some(root) = depth_geometry_storage_root(state) else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({"code":503,"error":"depth_geometry_backfill_control_unavailable","detail":"storage root is not configured"}).to_string(),
+        );
+    };
+    let payload = if body.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str::<Value>(body.trim()) {
+            Ok(value) => value,
+            Err(error) => {
+                return http_response(
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    &json!({"code":400,"error":"invalid_depth_geometry_backfill_control","detail":error.to_string()}).to_string(),
+                )
+            }
+        }
+    };
+    let paused = match path_action.or_else(|| payload.get("action").and_then(Value::as_str)) {
+        Some("pause") => true,
+        Some("resume") => false,
+        Some(_) if payload.get("paused").and_then(Value::as_bool).is_some() => payload
+            .get("paused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        Some(_) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code":400,"error":"invalid_depth_geometry_backfill_action"}).to_string(),
+            )
+        }
+        None => match payload.get("paused").and_then(Value::as_bool) {
+            Some(value) => value,
+            None => {
+                return http_response(
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    &json!({"code":400,"error":"missing_depth_geometry_backfill_action"})
+                        .to_string(),
+                )
+            }
+        },
+    };
+    let control_path = root
+        .join("system")
+        .join("jobs")
+        .join("depth-geometry-backfill")
+        .join("control.json");
+    if let Some(parent) = control_path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"code":500,"error":"depth_geometry_backfill_control_directory_failed","detail":error.to_string()}).to_string(),
+            );
+        }
+    }
+    let control = json!({
+        "schema": "steel.sick-depth-geometry-backfill-control.v1",
+        "paused": paused,
+        "updatedAtUnixMs": current_time_millis(),
+        "actor": actor
+    });
+    let bytes = match serde_json::to_vec_pretty(&control) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"code":500,"error":"depth_geometry_backfill_control_serialize_failed","detail":error.to_string()}).to_string(),
+            )
+        }
+    };
+    if let Err(error) = write_bytes_atomic(&control_path, &bytes) {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json; charset=utf-8",
+            &json!({"code":500,"error":"depth_geometry_backfill_control_write_failed","detail":error}).to_string(),
+        );
+    }
+    let _ = state.runtime.block_on(db::append_audit_log(
+        &state.database.connection,
+        actor,
+        if paused {
+            "depth_geometry.backfill_paused"
+        } else {
+            "depth_geometry.backfill_resumed"
+        },
+        &control_path.display().to_string(),
+        &control.to_string(),
+        "info",
+    ));
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "paused": paused,
+            "controlPath": control_path.display().to_string(),
+            "control": control
+        })
+        .to_string(),
+    )
 }
 
 fn algorithm_config_path() -> PathBuf {
@@ -6965,6 +8315,13 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("GET", "/api/admin/runtime-profile")
         | ("POST", "/api/admin/runtime-profile/validate")
         | ("POST", "/api/admin/runtime-profile")
+        | ("GET", "/api/admin/algorithm/depth-geometry")
+        | ("PUT", "/api/admin/algorithm/depth-geometry")
+        | ("GET", "/api/admin/algorithm/depth-geometry/backfill")
+        | ("GET", "/api/admin/algorithm/depth-geometry/backfill/status")
+        | ("POST", "/api/admin/algorithm/depth-geometry/backfill")
+        | ("POST", "/api/admin/algorithm/depth-geometry/backfill/pause")
+        | ("POST", "/api/admin/algorithm/depth-geometry/backfill/resume")
         | ("GET", "/api/admin/site-configs")
         | ("GET", "/api/admin/site-configs/detail")
         | ("POST", "/api/admin/site-configs")
@@ -11145,6 +12502,17 @@ fn capture_proxy_http_response(
                 .to_string(),
             );
         }
+        if method == "GET"
+            && matches!(path, "/api/capture/file" | "/api/capture/render")
+            && response.status_code == 200
+        {
+            let (_, query) = split_path_and_query(raw_path);
+            if let Some(rendition) =
+                requested_image_rendition_response(&response.content_type, &response.body, query)
+            {
+                return rendition;
+            }
+        }
         let cache_headers: &[(&str, &str)] = if method == "GET"
             && matches!(path, "/api/capture/file" | "/api/capture/render")
             && response.status_code == 200
@@ -14235,7 +15603,30 @@ fn write_production_defect_batch_response(
             )
         }
     };
-    let source = "sick-temporary-defect-model".to_string();
+    let source = value_string(&payload, &["source", "algorithmSource", "algorithm_source"])
+        .if_empty("sick-temporary-defect-model");
+    let algorithm_revision = value_string(
+        &payload,
+        &[
+            "algorithmRevision",
+            "algorithm_revision",
+            "configHash",
+            "config_hash",
+        ],
+    );
+    if source.is_empty()
+        || source.len() > 64
+        || !source.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+        || algorithm_revision.len() > 128
+    {
+        return http_response(
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json!({"code":400,"error":"invalid_defect_batch_algorithm_identity"}).to_string(),
+        );
+    }
     let mut imports = Vec::with_capacity(rows.len());
     for row in rows {
         let source_id = value_string(row, &["sourceDefectId", "source_defect_id", "id"]);
@@ -14254,6 +15645,16 @@ fn write_production_defect_batch_response(
             .to_ascii_lowercase();
         let confidence = value_f64(row, &["confidence", "score"]);
         let preview_image_path = value_string(row, &["previewImagePath", "preview_image_path"]);
+        let row_algorithm_revision = value_string(
+            row,
+            &[
+                "algorithmRevision",
+                "algorithm_revision",
+                "configHash",
+                "config_hash",
+            ],
+        )
+        .if_empty(&algorithm_revision);
         let geometry = row.get("geometry").cloned().unwrap_or_else(|| json!({}));
         let geometry_json = geometry.to_string();
         let numbers = [
@@ -14287,6 +15688,7 @@ fn write_production_defect_batch_response(
         imports.push(db::ImportedProductionDefectInput {
             id,
             source: source.clone(),
+            algorithm_revision: row_algorithm_revision,
             source_defect_id: source_id,
             preview_image_path,
             defect: db::ProductionDefectInput {
@@ -14324,8 +15726,13 @@ fn write_production_defect_batch_response(
                 "production.defects.imported",
                 &inspection.id,
                 &format!(
-                    "material={} inserted={} updated={} deleted={}",
-                    material_id, result.inserted, result.updated, result.deleted
+                    "material={} source={} inserted={} updated={} deleted={} superseded={}",
+                    material_id,
+                    source,
+                    result.inserted,
+                    result.updated,
+                    result.deleted,
+                    result.superseded
                 ),
                 "info",
             ));
@@ -14340,6 +15747,7 @@ fn write_production_defect_batch_response(
                     "inserted":result.inserted,
                     "updated":result.updated,
                     "deleted":result.deleted,
+                    "superseded":result.superseded,
                     "total":result.defects.len()
                 })
                 .to_string(),
@@ -16038,7 +17446,15 @@ fn production_file_response_with_bkv_root(
     };
     match body {
         Some(body) => {
-            http_bytes_response_with_headers("200 OK", content_type_for_path(&path), &body, &[])
+            requested_image_rendition_response(content_type_for_path(&path), &body, query)
+                .unwrap_or_else(|| {
+                    http_bytes_response_with_headers(
+                        "200 OK",
+                        content_type_for_path(&path),
+                        &body,
+                        &[],
+                    )
+                })
         }
         None => http_response(
             "404 Not Found",
@@ -21572,18 +22988,22 @@ fn inspection_record_detail_json(detail: db::AdminInspectionRecordDetail) -> Str
     let mut record = inspection_record_json(&detail.record);
     let plate = production_plate_value(&detail.record.inspection, detail.record.session.as_ref());
     if let Some(object) = record.as_object_mut() {
-        object.insert(
-            "defects".to_string(),
-            Value::Array(
-                detail
-                    .defects
-                    .iter()
-                    .map(|defect| {
-                        production_defect_value(defect, &detail.record.inspection, &plate)
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-        );
+        let defect_values = detail
+            .defects
+            .iter()
+            .map(|defect| production_defect_value(defect, &detail.record.inspection, &plate))
+            .collect::<Vec<_>>();
+        let comparison_candidates = detail
+            .defects
+            .iter()
+            .zip(defect_values.iter())
+            .map(|(defect, value)| production_defect_comparison_candidate(defect, value.clone()))
+            .collect::<Vec<_>>();
+        let (defect_groups, comparison) =
+            production_defect_groups_and_comparison(&comparison_candidates);
+        object.insert("defects".to_string(), Value::Array(defect_values));
+        object.insert("defectGroups".to_string(), defect_groups);
+        object.insert("comparison".to_string(), comparison);
         object.insert(
             "captureFiles".to_string(),
             Value::Array(
@@ -24436,6 +25856,13 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "GET", "path": "/api/admin/runtime-profile", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/runtime-profile/validate", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/runtime-profile", "scope": "admin-config" },
+            { "method": "GET", "path": "/api/admin/algorithm/depth-geometry", "scope": "admin-config" },
+            { "method": "PUT", "path": "/api/admin/algorithm/depth-geometry", "scope": "admin-config" },
+            { "method": "GET", "path": "/api/admin/algorithm/depth-geometry/backfill", "scope": "admin-config" },
+            { "method": "GET", "path": "/api/admin/algorithm/depth-geometry/backfill/status", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/algorithm/depth-geometry/backfill", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/algorithm/depth-geometry/backfill/pause", "scope": "admin-config" },
+            { "method": "POST", "path": "/api/admin/algorithm/depth-geometry/backfill/resume", "scope": "admin-config" },
             { "method": "GET", "path": "/api/admin/site-configs", "scope": "admin-config" },
             { "method": "GET", "path": "/api/admin/site-configs/detail", "scope": "admin-config" },
             { "method": "POST", "path": "/api/admin/site-configs", "scope": "admin-config" },
@@ -24535,6 +25962,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/production/defect", "scope": "production" },
             { "method": "POST", "path": "/internal/v1/defect-batch", "scope": "capture" },
             { "method": "GET", "path": "/api/defects/history", "scope": "production" },
+            { "method": "GET", "path": "/api/production/defects/history", "scope": "production" },
             { "method": "POST", "path": "/api/defects/review", "scope": "production" },
             { "method": "GET", "path": "/api/production/file", "scope": "production" },
             { "method": "GET", "path": "/api/steel/status", "scope": "capture" },
@@ -24970,6 +26398,25 @@ fn handle_client<S: Read + Write>(
         ("POST", "/api/admin/external-integrations") => {
             write_external_integrations_response(&state, body, actor)
         }
+        ("GET", "/api/admin/algorithm/depth-geometry") => {
+            depth_geometry_config_response(&state)
+        }
+        ("PUT", "/api/admin/algorithm/depth-geometry") => {
+            write_depth_geometry_config_response(&state, body, actor)
+        }
+        ("GET", "/api/admin/algorithm/depth-geometry/backfill")
+        | ("GET", "/api/admin/algorithm/depth-geometry/backfill/status") => {
+            depth_geometry_backfill_status_response(&state)
+        }
+        ("POST", "/api/admin/algorithm/depth-geometry/backfill") => {
+            write_depth_geometry_backfill_control_response(&state, body, None, actor)
+        }
+        ("POST", "/api/admin/algorithm/depth-geometry/backfill/pause") => {
+            write_depth_geometry_backfill_control_response(&state, body, Some("pause"), actor)
+        }
+        ("POST", "/api/admin/algorithm/depth-geometry/backfill/resume") => {
+            write_depth_geometry_backfill_control_response(&state, body, Some("resume"), actor)
+        }
         ("GET", "/api/admin/config/revisions") => read_config_revisions_response(&state, query),
         ("GET", "/api/admin/config/revisions/detail") => {
             read_config_revision_detail_response(&state, query)
@@ -25116,7 +26563,10 @@ fn handle_client<S: Read + Write>(
                 )
             }
         }
-        ("GET", "/api/defects/history") => production_defect_history_response(&state, query),
+        ("GET", "/api/defects/history")
+        | ("GET", "/api/production/defects/history") => {
+            production_defect_history_response(&state, query)
+        }
         ("POST", "/api/defects/review") => {
             write_production_defect_review_response(&state, body, actor)
         }
@@ -29402,6 +30852,16 @@ mod tests {
             ("GET", "/api/admin/runtime-profile"),
             ("POST", "/api/admin/runtime-profile/validate"),
             ("POST", "/api/admin/runtime-profile"),
+            ("GET", "/api/admin/algorithm/depth-geometry"),
+            ("PUT", "/api/admin/algorithm/depth-geometry"),
+            ("GET", "/api/admin/algorithm/depth-geometry/backfill"),
+            ("GET", "/api/admin/algorithm/depth-geometry/backfill/status"),
+            ("POST", "/api/admin/algorithm/depth-geometry/backfill"),
+            ("POST", "/api/admin/algorithm/depth-geometry/backfill/pause"),
+            (
+                "POST",
+                "/api/admin/algorithm/depth-geometry/backfill/resume",
+            ),
             ("GET", "/api/admin/bkv-import/jobs"),
             ("POST", "/api/admin/bkv-import/jobs"),
             ("POST", "/api/admin/bkv-import/jobs/retry"),
@@ -32448,6 +33908,292 @@ mod tests {
         assert_eq!(production_defect_label("pit", &depression), "凹陷候选");
         assert_eq!(production_defect_label("foreign", &protrusion), "凸起候选");
         assert_eq!(production_defect_label("pit", &json!({})), "凹坑");
+    }
+
+    #[test]
+    fn depth_geometry_defect_metrics_fail_closed_without_an_encoder() {
+        let inspection = db::entities::production_inspection::Model {
+            id: "INSP-METRICS".to_string(),
+            material_id: "MAT-METRICS".to_string(),
+            session_id: "SESSION-METRICS".to_string(),
+            status: "completed".to_string(),
+            storage_root: String::new(),
+            summary_path: String::new(),
+            started_at: "1000".to_string(),
+            finished_at: "2000".to_string(),
+            capture_count: 0,
+            defect_count: 1,
+            raw_payload: "{}".to_string(),
+        };
+        let plate = json!({
+            "widthMm": 1000.0,
+            "lengthMm": 12000.0,
+        });
+        let geometry = db::entities::production_defect::Model {
+            id: "DEPTH-METRICS".to_string(),
+            inspection_id: inspection.id.clone(),
+            material_id: inspection.material_id.clone(),
+            camera_id: "camera1".to_string(),
+            defect_type: "depth-geometry-candidate".to_string(),
+            severity: "review".to_string(),
+            x_mm: 0.0,
+            y_mm: 20.0,
+            z_mm: -0.4,
+            width_mm: 0.0,
+            height_mm: 0.0,
+            depth_mm: -0.4,
+            confidence: 0.9,
+            geometry_json: json!({
+                "horizontalSpanMm": 4.5,
+                "pixelSpan": { "width": 8, "height": 4 },
+                "longitudinalMm": 240.0,
+                "longitudinalSpanMm": 12.0,
+                "areaMm2": 30.0,
+            })
+            .to_string(),
+            source: "sick-depth-geometry".to_string(),
+            algorithm_revision: "geometry-r1".to_string(),
+            source_defect_id: "DEPTH-METRICS".to_string(),
+            preview_image_path: String::new(),
+            review_status: "pending".to_string(),
+            reviewed_by: String::new(),
+            reviewed_at: String::new(),
+            review_note: String::new(),
+            created_at: "1000".to_string(),
+            updated_at: "1000".to_string(),
+            active: true,
+            superseded_at: String::new(),
+        };
+        let value = production_defect_value(&geometry, &inspection, &plate);
+        for key in ["longitudinalMm", "longitudinalSpanMm", "areaMm2"] {
+            assert!(value[key].is_null(), "{key} must be unavailable");
+            assert_eq!(value["metricAvailability"][key], false);
+        }
+        assert_eq!(value["horizontalSpanMm"], 4.5);
+        assert_eq!(value["pixelSpan"], json!({ "width": 8, "height": 4 }));
+        assert_eq!(value["metricAvailability"]["horizontal"], true);
+        assert_eq!(value["metricAvailability"]["longitudinal"], false);
+        assert_eq!(value["metricAvailability"]["area"], false);
+
+        let mut legacy = geometry;
+        legacy.source = "sick-temporary-defect-model".to_string();
+        let legacy_value = production_defect_value(&legacy, &inspection, &plate);
+        assert_eq!(legacy_value["longitudinalMm"], 240.0);
+        assert_eq!(legacy_value["longitudinalSpanMm"], 12.0);
+        assert_eq!(legacy_value["areaMm2"], 30.0);
+        assert_eq!(legacy_value["widthMm"], 0.0);
+        assert_eq!(legacy_value["depthMm"], -0.4);
+    }
+
+    #[test]
+    fn production_defect_history_comparison_is_deterministic_and_one_to_one() {
+        let candidate = |id: &str,
+                         source: &str,
+                         camera: &str,
+                         frame: Option<i64>,
+                         rect: Option<(f64, f64, f64, f64)>| {
+            ProductionDefectComparisonCandidate {
+                id: id.to_string(),
+                source: source.to_string(),
+                inspection_id: "INSP-1".to_string(),
+                material_id: "MAT-1".to_string(),
+                inspection_key: "inspection-1:material-1".to_string(),
+                camera_key: camera.to_ascii_lowercase(),
+                frame_key: frame.map(|value| value.to_string()),
+                frame_value: frame.map(|value| json!(value)),
+                rect: rect.map(|(left, top, right, bottom)| ProductionDefectRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                }),
+                global_position_available: None,
+                risk_tags: Vec::new(),
+                value: json!({
+                    "id": id,
+                    "cameraId": camera,
+                    "algorithmRevision": "test-revision"
+                }),
+            }
+        };
+        let candidates = vec![
+            candidate(
+                "g2",
+                "sick-depth-geometry",
+                "CAM-1",
+                Some(10),
+                Some((0.0, 0.0, 8.0, 8.0)),
+            ),
+            candidate(
+                "g1",
+                "sick-depth-geometry",
+                "CAM-1",
+                Some(10),
+                Some((0.0, 0.0, 10.0, 10.0)),
+            ),
+            candidate(
+                "l1",
+                "sick-temporary-defect-model",
+                "cam-1",
+                Some(10),
+                Some((0.0, 0.0, 10.0, 10.0)),
+            ),
+            candidate(
+                "l2",
+                "sick-temporary-defect-model",
+                "CAM-1",
+                Some(10),
+                Some((20.0, 20.0, 30.0, 30.0)),
+            ),
+            candidate(
+                "l3",
+                "sick-temporary-defect-model",
+                "CAM-1",
+                Some(11),
+                Some((0.0, 0.0, 10.0, 10.0)),
+            ),
+        ];
+        assert!(production_defect_is_geometry_source(&candidates[0].source));
+        assert_eq!(candidates[0].frame_key, candidates[2].frame_key);
+        assert_eq!(candidates[0].camera_key, candidates[2].camera_key);
+        assert_eq!(
+            production_defect_rect_iou(candidates[0].rect.unwrap(), candidates[2].rect.unwrap()),
+            0.64
+        );
+        let (groups, comparison) = production_defect_groups_and_comparison(&candidates);
+        assert_eq!(groups["geometry"]["defects"].as_array().unwrap().len(), 2);
+        assert_eq!(groups["legacy"]["defects"].as_array().unwrap().len(), 3);
+        assert_eq!(comparison["matched"], 1);
+        assert_eq!(comparison["geometryOnly"], 1);
+        assert_eq!(comparison["legacyOnly"], 2);
+        assert_eq!(comparison["estimatedUniqueCount"], 4);
+        assert_eq!(comparison["matches"][0]["geometryId"], "g1");
+        assert_eq!(comparison["matches"][0]["legacyId"], "l1");
+        assert_eq!(comparison["matches"][0]["storageIndex"], 10);
+        assert_eq!(comparison["geometryOnlyIds"], json!(["g2"]));
+        assert_eq!(comparison["legacyOnlyIds"], json!(["l2", "l3"]));
+
+        let mut cross_inspection = candidates.clone();
+        cross_inspection[2].inspection_key = "inspection-2:material-2".to_string();
+        let (_, cross_comparison) = production_defect_groups_and_comparison(&cross_inspection);
+        assert_eq!(cross_comparison["matched"], 0);
+        assert_eq!(cross_comparison["geometryOnly"], 2);
+        assert_eq!(cross_comparison["legacyOnly"], 3);
+    }
+
+    #[test]
+    fn production_defect_comparison_reads_rect_and_frame_from_geometry_json() {
+        let defect = db::entities::production_defect::Model {
+            id: "G-JSON".to_string(),
+            inspection_id: "INSP-JSON".to_string(),
+            material_id: "MAT-JSON".to_string(),
+            camera_id: "CAM-1".to_string(),
+            defect_type: "candidate".to_string(),
+            severity: "review".to_string(),
+            x_mm: 0.0,
+            y_mm: 0.0,
+            z_mm: 0.0,
+            width_mm: 0.0,
+            height_mm: 0.0,
+            depth_mm: 0.0,
+            confidence: 0.0,
+            geometry_json: json!({
+                "imageRect2d": { "left": 1, "top": 2, "right": 11, "bottom": 12 },
+                "artifacts": { "cameraId": "CAM-2", "frameId": "0007" }
+            })
+            .to_string(),
+            source: "sick-depth-geometry".to_string(),
+            algorithm_revision: "r1".to_string(),
+            source_defect_id: "G-JSON".to_string(),
+            preview_image_path: String::new(),
+            review_status: "pending".to_string(),
+            reviewed_by: String::new(),
+            reviewed_at: String::new(),
+            review_note: String::new(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            active: true,
+            superseded_at: String::new(),
+        };
+        let candidate = production_defect_comparison_candidate(
+            &defect,
+            json!({ "id": "G-JSON", "cameraId": "CAM-2" }),
+        );
+        assert_eq!(candidate.inspection_key, "insp-json:mat-json");
+        assert_eq!(candidate.camera_key, "cam-2");
+        assert_eq!(candidate.frame_key.as_deref(), Some("7"));
+        assert_eq!(candidate.frame_value, Some(json!("0007")));
+        assert_eq!(
+            candidate
+                .rect
+                .map(|rect| (rect.left, rect.top, rect.right, rect.bottom)),
+            Some((1.0, 2.0, 11.0, 12.0))
+        );
+    }
+
+    #[test]
+    fn production_defect_catalog_includes_provisional_review_types() {
+        let catalog = production_defect_types_value();
+        for id in [
+            "pit-compact",
+            "groove-elongated",
+            "bulge-compact",
+            "ridge-elongated",
+        ] {
+            assert!(DEFECT_TYPES.iter().any(|item| item.id == id));
+            let item = catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+                .unwrap_or_else(|| panic!("missing production defect type {id}"));
+            assert_eq!(item["reviewOnly"], true);
+            assert!(item["label"]
+                .as_str()
+                .is_some_and(|label| !label.is_empty()));
+            assert!(item["color"]
+                .as_str()
+                .is_some_and(|color| !color.is_empty()));
+        }
+    }
+
+    #[test]
+    fn depth_geometry_config_keeps_history_backfill_safety_flags_enabled() {
+        let config = json!({
+            "schema": DEPTH_GEOMETRY_CONFIG_SCHEMA,
+            "enabled": true,
+            "baseline": { "maximumFrames": 32, "rowSampleStep": 4 },
+            "thresholds": {
+                "minimumAbsoluteDeviationMm": 0.35,
+                "columnNoiseMultiplier": 6.0,
+                "minimumNeighborhoodSupport": 3,
+                "minimumComponentPoints": 6,
+                "elongatedAspectRatio": 3.0
+            },
+            "merge": { "maximumFrameGap": 1, "minimumIoU": 0.2 },
+            "longitudinalScale": null,
+            "historyBackfill": {
+                "automatic": true,
+                "livePriority": true,
+                "pauseHistoricalIoWhileCaptureActive": true,
+                "gpuDeviceId": 1
+            }
+        });
+        let normalized = normalize_depth_geometry_config(&config, 2).expect("valid config");
+        assert_eq!(normalized["revision"], 2);
+        for key in [
+            "automatic",
+            "livePriority",
+            "pauseHistoricalIoWhileCaptureActive",
+        ] {
+            assert_eq!(normalized["historyBackfill"][key], true);
+        }
+
+        let mut unsafe_config = config;
+        unsafe_config["historyBackfill"]["livePriority"] = Value::Bool(false);
+        let error = normalize_depth_geometry_config(&unsafe_config, 2)
+            .expect_err("unsafe backfill policy must be rejected");
+        assert!(error.contains("historyBackfill.livePriority"));
     }
 
     #[test]

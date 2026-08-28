@@ -194,6 +194,19 @@ def configured_path(profile_path: Path, defaults: dict[str, Any], key: str) -> P
     return candidate if candidate.is_absolute() else profile_path.parent / candidate
 
 
+def depth_geometry_config_available(profile_path: Path) -> bool:
+    try:
+        payload = json.loads(
+            (profile_path.parent / "algorithm.json").read_text(encoding="utf-8-sig")
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    geometry = payload.get("depthGeometry") if isinstance(payload, dict) else None
+    return isinstance(geometry, dict) and (
+        geometry.get("schema") == "steel.sick-depth-geometry-config.v1"
+    )
+
+
 def create_configs(
     profile_path: Path,
     storage_root: Path,
@@ -271,6 +284,10 @@ def create_configs(
         require_approved_region_map=bool(
             defaults.get("defectRequireApprovedRegionMap", True)
         ),
+        depth_geometry_profile_path=(
+            profile_path if depth_geometry_config_available(profile_path) else None
+        ),
+        history_rebuild=True,
     ).bounded()
     base_calibration = configured_path(profile_path, defaults, "arrayCalibrationPath")
     active_calibration = Path(

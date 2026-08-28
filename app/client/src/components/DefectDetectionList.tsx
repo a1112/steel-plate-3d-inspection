@@ -8,6 +8,7 @@ import { bkvOnlineCroppedImageUrl, isBkvOnlineImageUrl } from '../services/bkv-o
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import type { ReportFilters } from '../state/operations';
 import { Panel } from './Panel';
+import { RequestedSizeImage } from './RequestedSizeImage';
 
 const DEFECT_POPOVER_WIDTH = 330;
 const DEFECT_POPOVER_HEIGHT = 318;
@@ -131,7 +132,12 @@ function DefectListHoverCard({
         <em className={defect.severity}>{severityLabels[defect.severity]}</em>
       </header>
       <figure className={preview.url ? '' : 'is-empty'}>
-        {preview.url ? <img src={preview.url} alt={`${defect.typeLabel}缺陷图像`} /> : <span>{preview.source}</span>}
+        {preview.url ? <RequestedSizeImage
+          src={preview.url}
+          alt={`${defect.typeLabel}缺陷图像`}
+          requestWidth={330}
+          requestHeight={176}
+        /> : <span>{preview.source}</span>}
         <figcaption>
           <b>{getDefectCameraLabel(defect)}</b>
           {preview.url ? <span>{preview.source}</span> : null}

@@ -44,6 +44,7 @@ import {
 } from '../services/inspection-world-api';
 import { clampPreviewPositionM, DEFAULT_PLATE_LENGTH_M, type SurfaceDisplayMode } from '../state/inspection-ui';
 import { Panel } from './Panel';
+import { RequestedSizeImage, requestedSizeImageUrl } from './RequestedSizeImage';
 import { ProductionArtifactView, type ArtifactOrientation } from './ProductionArtifactView';
 import { BkvSectionView } from './BkvReconstructionApp';
 import { CaptureSectionView } from './CaptureSectionView';
@@ -747,7 +748,12 @@ function DefectHoverCard({
       </div>
       {defect.previewImageUrl ? (
         <div className="defect-hover-preview">
-          <img src={defect.previewImageUrl} alt={`${defect.typeLabel}缺陷小图`} />
+          <RequestedSizeImage
+            src={defect.previewImageUrl}
+            alt={`${defect.typeLabel}缺陷小图`}
+            requestWidth={256}
+            requestHeight={160}
+          />
         </div>
       ) : null}
       <dl>
@@ -835,8 +841,14 @@ function CameraBandImage({
       delete canvas.dataset.pendingImageSource;
       return;
     }
-    const rememberedImage = getRememberedCaptureImage(src);
-    const previouslyLoaded = Boolean(rememberedImage) || hasRememberedCaptureImageUrl(src);
+    const initialRect = canvas.getBoundingClientRect();
+    const requestedSource = requestedSizeImageUrl(
+      src,
+      initialRect.width > 0 ? initialRect.width : 256,
+      initialRect.height > 0 ? initialRect.height : 128,
+    );
+    const rememberedImage = getRememberedCaptureImage(requestedSource);
+    const previouslyLoaded = Boolean(rememberedImage) || hasRememberedCaptureImageUrl(requestedSource);
     const retainingPaintedFrame = canvas.dataset.hasPaintedFrame === 'true';
     if (!rememberedImage && !retainingPaintedFrame) clear();
     canvas.dataset.renderState = rememberedImage
@@ -844,7 +856,7 @@ function CameraBandImage({
       : retainingPaintedFrame ? 'loading-retaining-frame' : 'loading';
     canvas.dataset.imageCacheHit = rememberedImage ? 'true' : 'false';
     canvas.dataset.imageCacheState = rememberedImage ? 'decoded' : previouslyLoaded ? 'http' : 'miss';
-    canvas.dataset.pendingImageSource = src;
+    canvas.dataset.pendingImageSource = requestedSource;
     let disposed = false;
     let loadTimer: number | null = null;
     let retryCount = 0;
@@ -995,11 +1007,11 @@ function CameraBandImage({
       image.fetchPriority = loadDelayMs > 0 && !previouslyLoaded ? 'low' : 'high';
     }
     image.onload = () => {
-      rememberCaptureImage(src, image);
+      rememberCaptureImage(requestedSource, image);
       draw();
     };
     const requestImage = () => {
-      if (!disposed) image.src = src;
+      if (!disposed) image.src = requestedSource;
     };
     image.onerror = () => {
       if (disposed) return;

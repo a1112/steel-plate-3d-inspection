@@ -24,7 +24,7 @@ use entities::{
 };
 
 pub const DEVELOPMENT_DEFAULT_ADMIN_PASSWORD: &str = "admin123";
-pub const DATABASE_SCHEMA_VERSION: i64 = 4;
+pub const DATABASE_SCHEMA_VERSION: i64 = 5;
 pub const NON_PRODUCTION_DATABASE_ENGINES: [&str; 3] = ["sqlite", "mysql", "postgres"];
 pub const PRODUCTION_DATABASE_ENGINES: [&str; 2] = ["sqlite", "mysql"];
 
@@ -639,6 +639,7 @@ pub struct ProductionDefectInput {
 pub struct ImportedProductionDefectInput {
     pub id: String,
     pub source: String,
+    pub algorithm_revision: String,
     pub source_defect_id: String,
     pub preview_image_path: String,
     pub defect: ProductionDefectInput,
@@ -649,6 +650,7 @@ pub struct ProductionDefectImportResult {
     pub inserted: u64,
     pub updated: u64,
     pub deleted: u64,
+    pub superseded: u64,
     pub defects: Vec<production_defect::Model>,
 }
 
@@ -3753,7 +3755,35 @@ pub async fn list_recent_production_defects(
     limit: u64,
     offset: u64,
 ) -> Result<Vec<production_defect::Model>, DbErr> {
-    production_defect::Entity::find()
+    list_recent_production_defects_filtered(
+        connection,
+        limit,
+        offset,
+        &ProductionDefectHistoryFilter::default(),
+    )
+    .await
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProductionDefectHistoryFilter {
+    pub source: Option<String>,
+    pub active: Option<bool>,
+}
+
+pub async fn list_recent_production_defects_filtered(
+    connection: &DatabaseConnection,
+    limit: u64,
+    offset: u64,
+    filter: &ProductionDefectHistoryFilter,
+) -> Result<Vec<production_defect::Model>, DbErr> {
+    let mut query = production_defect::Entity::find();
+    if let Some(source) = filter.source.as_deref() {
+        query = query.filter(production_defect::Column::Source.eq(source));
+    }
+    if let Some(active) = filter.active {
+        query = query.filter(production_defect::Column::Active.eq(active));
+    }
+    query
         .order_by_desc(production_defect::Column::CreatedAt)
         .order_by_asc(production_defect::Column::Id)
         .limit(limit.clamp(1, 10_000))
@@ -3763,7 +3793,21 @@ pub async fn list_recent_production_defects(
 }
 
 pub async fn count_production_defects(connection: &DatabaseConnection) -> Result<u64, DbErr> {
-    production_defect::Entity::find().count(connection).await
+    count_production_defects_filtered(connection, &ProductionDefectHistoryFilter::default()).await
+}
+
+pub async fn count_production_defects_filtered(
+    connection: &DatabaseConnection,
+    filter: &ProductionDefectHistoryFilter,
+) -> Result<u64, DbErr> {
+    let mut query = production_defect::Entity::find();
+    if let Some(source) = filter.source.as_deref() {
+        query = query.filter(production_defect::Column::Source.eq(source));
+    }
+    if let Some(active) = filter.active {
+        query = query.filter(production_defect::Column::Active.eq(active));
+    }
+    query.count(connection).await
 }
 
 pub async fn production_inspections_by_ids(
@@ -3825,7 +3869,10 @@ where
         active.depth_mm = Set(input.defect.depth_mm);
         active.confidence = Set(input.defect.confidence);
         active.geometry_json = Set(input.defect.geometry_json);
+        active.algorithm_revision = Set(input.algorithm_revision);
         active.preview_image_path = Set(input.preview_image_path);
+        active.active = Set(true);
+        active.superseded_at = Set(String::new());
         active.updated_at = Set(now);
         Ok((active.update(connection).await?, false))
     } else {
@@ -3845,6 +3892,7 @@ where
             confidence: Set(input.defect.confidence),
             geometry_json: Set(input.defect.geometry_json),
             source: Set(input.source),
+            algorithm_revision: Set(input.algorithm_revision),
             source_defect_id: Set(input.source_defect_id),
             preview_image_path: Set(input.preview_image_path),
             review_status: Set("pending".to_string()),
@@ -3853,6 +3901,8 @@ where
             review_note: Set(String::new()),
             created_at: Set(now.clone()),
             updated_at: Set(now),
+            active: Set(true),
+            superseded_at: Set(String::new()),
         }
         .insert(connection)
         .await?;
@@ -3893,9 +3943,32 @@ pub async fn import_production_defects(
             .filter(production_defect::Column::Source.eq(source))
             .filter(production_defect::Column::ReviewStatus.eq("pending"));
         if !retained_ids.is_empty() {
-            delete = delete.filter(production_defect::Column::Id.is_not_in(retained_ids));
+            delete = delete.filter(production_defect::Column::Id.is_not_in(retained_ids.clone()));
         }
         delete.exec(&transaction).await?.rows_affected
+    } else {
+        0
+    };
+
+    let superseded = if replace_pending {
+        let mut update = production_defect::Entity::update_many()
+            .col_expr(production_defect::Column::Active, Expr::value(false))
+            .col_expr(
+                production_defect::Column::SupersededAt,
+                Expr::value(now_millis_string()),
+            )
+            .col_expr(
+                production_defect::Column::UpdatedAt,
+                Expr::value(now_millis_string()),
+            )
+            .filter(production_defect::Column::InspectionId.eq(inspection_id))
+            .filter(production_defect::Column::Source.eq(source))
+            .filter(production_defect::Column::ReviewStatus.ne("pending"))
+            .filter(production_defect::Column::Active.eq(true));
+        if !retained_ids.is_empty() {
+            update = update.filter(production_defect::Column::Id.is_not_in(retained_ids.clone()));
+        }
+        update.exec(&transaction).await?.rows_affected
     } else {
         0
     };
@@ -3914,6 +3987,7 @@ pub async fn import_production_defects(
     }
     let count = production_defect::Entity::find()
         .filter(production_defect::Column::InspectionId.eq(inspection_id))
+        .filter(production_defect::Column::Active.eq(true))
         .count(&transaction)
         .await?;
     let mut inspection_active: production_inspection::ActiveModel = inspection.into();
@@ -3924,6 +3998,7 @@ pub async fn import_production_defects(
         inserted,
         updated,
         deleted,
+        superseded,
         defects,
     })
 }
@@ -4037,6 +4112,7 @@ where
         confidence: Set(input.confidence),
         geometry_json: Set(input.geometry_json),
         source: Set("production-api".to_string()),
+        algorithm_revision: Set(String::new()),
         source_defect_id: Set(String::new()),
         preview_image_path: Set(String::new()),
         review_status: Set("pending".to_string()),
@@ -4045,6 +4121,8 @@ where
         review_note: Set(String::new()),
         created_at: Set(now.clone()),
         updated_at: Set(now),
+        active: Set(true),
+        superseded_at: Set(String::new()),
     }
     .insert(connection)
     .await
@@ -4897,6 +4975,7 @@ pub async fn import_bkv_batch(
             confidence: Set(defect.confidence),
             geometry_json: Set(defect.provenance_json.clone()),
             source: Set("bkv-import".to_string()),
+            algorithm_revision: Set(String::new()),
             source_defect_id: Set(defect.id.clone()),
             preview_image_path: Set(String::new()),
             review_status: Set("pending".to_string()),
@@ -4905,6 +4984,8 @@ pub async fn import_bkv_batch(
             review_note: Set(String::new()),
             created_at: Set(now.clone()),
             updated_at: Set(now.clone()),
+            active: Set(true),
+            superseded_at: Set(String::new()),
         }
         .insert(&transaction)
         .await?;
@@ -5485,6 +5566,60 @@ async fn migrate_schema_v3_to_v4(connection: &DatabaseConnection) -> Result<(), 
     .await
 }
 
+async fn migrate_schema_v4_to_v5(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    let migration_id = "v4-to-v5-production-defect-algorithm-revision";
+    let started_at = now_millis_string();
+    let engine = match connection.get_database_backend() {
+        DbBackend::Sqlite => "sqlite",
+        DbBackend::MySql => "mysql",
+        DbBackend::Postgres => "postgres",
+    };
+    execute(
+        connection,
+        &format!(
+            "INSERT INTO steel_schema_migration \
+             (migration_id, from_version, to_version, engine, checksum, release_version, release_commit, transaction_id, state, started_at, applied_at, error) \
+             VALUES ('{migration_id}', 4, 5, '{engine}', 'production-defect-algorithm-revision-v5', '', '', '{migration_id}', 'applying', '{started_at}', '', '')"
+        ),
+    )
+    .await?;
+    execute(
+        connection,
+        &format!(
+            "UPDATE steel_schema_state SET dirty = 1, active_migration_id = '{migration_id}', updated_at = '{started_at}' WHERE singleton_id = 1"
+        ),
+    )
+    .await?;
+    for migration in [
+        "ALTER TABLE production_defect ADD COLUMN algorithm_revision VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_defect ADD COLUMN active BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE production_defect ADD COLUMN superseded_at VARCHAR(64) NOT NULL DEFAULT ''",
+    ] {
+        execute_compatible_migration(connection, migration).await?;
+    }
+    for index in [
+        "CREATE INDEX idx_production_defect_active ON production_defect(inspection_id, source, active, updated_at)",
+        "CREATE INDEX idx_production_defect_algorithm_revision ON production_defect(source, algorithm_revision, updated_at)",
+    ] {
+        execute_compatible_migration(connection, index).await?;
+    }
+    let applied_at = now_millis_string();
+    execute(
+        connection,
+        &format!(
+            "UPDATE steel_schema_migration SET state = 'applied', applied_at = '{applied_at}' WHERE migration_id = '{migration_id}'"
+        ),
+    )
+    .await?;
+    execute(
+        connection,
+        &format!(
+            "UPDATE steel_schema_state SET current_version = 5, dirty = 0, active_migration_id = '', updated_at = '{applied_at}' WHERE singleton_id = 1"
+        ),
+    )
+    .await
+}
+
 async fn prepare_schema(
     connection: &DatabaseConnection,
     production_policy: bool,
@@ -5503,6 +5638,10 @@ async fn prepare_schema(
         }
         if current_version == 3 && DATABASE_SCHEMA_VERSION >= 4 {
             migrate_schema_v3_to_v4(connection).await?;
+            current_version = 4;
+        }
+        if current_version == 4 && DATABASE_SCHEMA_VERSION >= 5 {
+            migrate_schema_v4_to_v5(connection).await?;
         }
         return validate_schema_ledger(connection).await;
     }
@@ -5819,6 +5958,7 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             confidence DOUBLE PRECISION NOT NULL,
             geometry_json TEXT NOT NULL,
             source VARCHAR(64) NOT NULL DEFAULT 'production-api',
+            algorithm_revision VARCHAR(128) NOT NULL DEFAULT '',
             source_defect_id VARCHAR(128) NOT NULL DEFAULT '',
             preview_image_path VARCHAR(1024) NOT NULL DEFAULT '',
             review_status VARCHAR(32) NOT NULL DEFAULT 'pending',
@@ -5826,7 +5966,9 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             reviewed_at VARCHAR(64) NOT NULL DEFAULT '',
             review_note VARCHAR(1024) NOT NULL DEFAULT '',
             created_at VARCHAR(64) NOT NULL,
-            updated_at VARCHAR(64) NOT NULL DEFAULT ''
+            updated_at VARCHAR(64) NOT NULL DEFAULT '',
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            superseded_at VARCHAR(64) NOT NULL DEFAULT ''
         )",
     )
     .await?;
@@ -5839,6 +5981,9 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
         "ALTER TABLE production_defect ADD COLUMN reviewed_at VARCHAR(64) NOT NULL DEFAULT ''",
         "ALTER TABLE production_defect ADD COLUMN review_note VARCHAR(1024) NOT NULL DEFAULT ''",
         "ALTER TABLE production_defect ADD COLUMN updated_at VARCHAR(64) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_defect ADD COLUMN algorithm_revision VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_defect ADD COLUMN active BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE production_defect ADD COLUMN superseded_at VARCHAR(64) NOT NULL DEFAULT ''",
     ] {
         execute_compatible_migration(connection, migration).await?;
     }
@@ -5936,6 +6081,8 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
         "CREATE INDEX idx_production_defect_inspection ON production_defect(inspection_id)",
         "CREATE INDEX idx_production_defect_source ON production_defect(source, source_defect_id)",
         "CREATE INDEX idx_production_defect_review ON production_defect(review_status, updated_at)",
+        "CREATE INDEX idx_production_defect_active ON production_defect(inspection_id, source, active, updated_at)",
+        "CREATE INDEX idx_production_defect_algorithm_revision ON production_defect(source, algorithm_revision, updated_at)",
         "CREATE INDEX idx_production_alarm_status_created ON production_alarm(status, created_at)",
         "CREATE INDEX idx_production_alarm_severity_created ON production_alarm(severity, created_at)",
         "CREATE INDEX idx_production_alarm_inspection ON production_alarm(inspection_id)",
@@ -6711,6 +6858,7 @@ mod steel_flow_tests {
         ImportedProductionDefectInput {
             id: id.to_string(),
             source: "sick-temporary-defect-model".to_string(),
+            algorithm_revision: "legacy-test-revision".to_string(),
             source_defect_id: id.trim_start_matches("SICK-").to_string(),
             preview_image_path: preview.to_string(),
             defect: ProductionDefectInput {
@@ -6943,6 +7091,7 @@ mod steel_flow_tests {
             .await
             .expect("first import");
             assert_eq!((first.inserted, first.updated, first.deleted), (2, 0, 0));
+            assert!(first.defects.iter().all(|defect| defect.active));
 
             review_production_defect(
                 &database.connection,
@@ -6971,8 +7120,13 @@ mod steel_flow_tests {
             .await
             .expect("rebuild import");
             assert_eq!(
-                (rebuilt.inserted, rebuilt.updated, rebuilt.deleted),
-                (0, 1, 1)
+                (
+                    rebuilt.inserted,
+                    rebuilt.updated,
+                    rebuilt.deleted,
+                    rebuilt.superseded
+                ),
+                (0, 1, 1, 0)
             );
             let retained = production_defect::Entity::find_by_id("SICK-63-C1-000001")
                 .one(&database.connection)
@@ -6983,6 +7137,116 @@ mod steel_flow_tests {
             assert_eq!(retained.defect_type, "scratch");
             assert_eq!(retained.preview_image_path, "D:/defects/rebuilt.png");
             assert_eq!(retained.review_note, "verified");
+            assert!(retained.active);
+            assert!(retained.superseded_at.is_empty());
+
+            let emptied = import_production_defects(
+                &database.connection,
+                "INSP-HISTORY",
+                "sick-temporary-defect-model",
+                true,
+                Vec::new(),
+            )
+            .await
+            .expect("empty rebuild");
+            assert_eq!(
+                (
+                    emptied.inserted,
+                    emptied.updated,
+                    emptied.deleted,
+                    emptied.superseded
+                ),
+                (0, 0, 0, 1)
+            );
+            let superseded = production_defect::Entity::find_by_id("SICK-63-C1-000001")
+                .one(&database.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!superseded.active);
+            assert!(!superseded.superseded_at.is_empty());
+        });
+    }
+
+    #[test]
+    fn production_defect_history_filters_source_and_active_state() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            production_inspection::ActiveModel {
+                id: Set("INSP-FILTER".to_string()),
+                material_id: Set("FILTER-MATERIAL".to_string()),
+                session_id: Set("FILTER-SESSION".to_string()),
+                status: Set("completed".to_string()),
+                storage_root: Set(String::new()),
+                summary_path: Set(String::new()),
+                started_at: Set("1000".to_string()),
+                finished_at: Set("2000".to_string()),
+                capture_count: Set(0),
+                defect_count: Set(0),
+                raw_payload: Set("{}".to_string()),
+            }
+            .insert(&database.connection)
+            .await
+            .expect("inspection");
+
+            let mut geometry = imported_defect("SICK-GEOMETRY-1", "");
+            geometry.source = "sick-depth-geometry".to_string();
+            geometry.algorithm_revision = "geometry-r1".to_string();
+            geometry.defect.inspection_id = "INSP-FILTER".to_string();
+            geometry.defect.material_id = "FILTER-MATERIAL".to_string();
+            geometry.source_defect_id = "GEOMETRY-1".to_string();
+            let mut legacy = imported_defect("SICK-LEGACY-1", "");
+            legacy.defect.inspection_id = "INSP-FILTER".to_string();
+            legacy.defect.material_id = "FILTER-MATERIAL".to_string();
+            legacy.source_defect_id = "LEGACY-1".to_string();
+            import_production_defects(
+                &database.connection,
+                "INSP-FILTER",
+                "sick-depth-geometry",
+                true,
+                vec![geometry],
+            )
+            .await
+            .expect("geometry import");
+            import_production_defects(
+                &database.connection,
+                "INSP-FILTER",
+                "sick-temporary-defect-model",
+                true,
+                vec![legacy],
+            )
+            .await
+            .expect("legacy import");
+
+            let geometry_rows = list_recent_production_defects_filtered(
+                &database.connection,
+                100,
+                0,
+                &ProductionDefectHistoryFilter {
+                    source: Some("sick-depth-geometry".to_string()),
+                    active: Some(true),
+                },
+            )
+            .await
+            .expect("geometry history");
+            assert_eq!(geometry_rows.len(), 1);
+            assert_eq!(geometry_rows[0].algorithm_revision, "geometry-r1");
+            assert_eq!(
+                count_production_defects_filtered(
+                    &database.connection,
+                    &ProductionDefectHistoryFilter {
+                        source: Some("sick-temporary-defect-model".to_string()),
+                        active: Some(false),
+                    },
+                )
+                .await
+                .expect("legacy inactive count"),
+                0
+            );
         });
     }
 
@@ -7094,6 +7358,12 @@ mod steel_flow_tests {
             execute(&database, "DROP INDEX idx_production_defect_review")
                 .await
                 .expect("review index");
+            execute(&database, "DROP INDEX idx_production_defect_active")
+                .await
+                .expect("active index");
+            execute(&database, "DROP INDEX idx_production_defect_algorithm_revision")
+                .await
+                .expect("revision index");
             for column in [
                 "source",
                 "source_defect_id",
@@ -7133,6 +7403,59 @@ mod steel_flow_tests {
                 .query_one(Statement::from_string(
                     DbBackend::Sqlite,
                     "SELECT state FROM steel_schema_migration WHERE migration_id = 'v2-to-v3-production-defect-review'".to_string(),
+                ))
+                .await
+                .expect("migration query")
+                .expect("migration row")
+                .try_get::<String>("", "state")
+                .expect("migration state");
+            assert_eq!(migration, "applied");
+        });
+    }
+
+    #[test]
+    fn schema_v4_adds_algorithm_revision_and_active_columns() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database = Database::connect("sqlite::memory:")
+                .await
+                .expect("database");
+            create_schema(&database).await.expect("schema");
+            create_schema_ledger(&database).await.expect("ledger");
+            execute(&database, "DROP INDEX idx_production_defect_active")
+                .await
+                .expect("active index");
+            execute(&database, "DROP INDEX idx_production_defect_algorithm_revision")
+                .await
+                .expect("revision index");
+            for column in ["algorithm_revision", "active", "superseded_at"] {
+                execute(
+                    &database,
+                    &format!("ALTER TABLE production_defect DROP COLUMN {column}"),
+                )
+                .await
+                .expect("drop v5 column");
+            }
+            execute(
+                &database,
+                "UPDATE steel_schema_state SET current_version = 4 WHERE singleton_id = 1",
+            )
+            .await
+            .expect("downgrade fixture");
+
+            assert_eq!(
+                prepare_schema(&database, false).await.unwrap(),
+                DATABASE_SCHEMA_VERSION
+            );
+            let row = production_defect::Entity::find()
+                .one(&database)
+                .await
+                .expect("query migrated entity");
+            assert!(row.is_none());
+            let migration = database
+                .query_one(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT state FROM steel_schema_migration WHERE migration_id = 'v4-to-v5-production-defect-algorithm-revision'".to_string(),
                 ))
                 .await
                 .expect("migration query")

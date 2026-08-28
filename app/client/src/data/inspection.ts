@@ -7,6 +7,41 @@ export type ThemeStyle = 'default' | 'soft' | 'tech' | 'industrial' | 'modern';
 export type Severity = 'severe' | 'review' | 'minor';
 export type Surface = 'top' | 'bottom';
 export type DefectReviewStatus = 'pending' | 'confirmed' | 'false-positive';
+export type DefectAnalysisTab = 'all' | 'geometry' | 'legacy' | 'comparison';
+
+/**
+ * The two production detectors intentionally remain separate in the UI.  A
+ * candidate can be present in both groups (the legacy detector is not treated
+ * as ground truth), therefore callers must not silently de-duplicate these
+ * arrays when presenting the combined count.
+ */
+export type DefectAlgorithmGroup = 'geometry' | 'legacy';
+
+export interface DefectComparison {
+  schema?: string;
+  minimumIoU?: number;
+  matched: number;
+  geometryOnly: number;
+  legacyOnly: number;
+  estimatedUniqueCount: number;
+  /** Detailed pairs/IDs emitted by the comparison manifest. */
+  matches?: Array<{
+    geometryId?: string | null;
+    legacyId?: string | null;
+    cameraId?: string | null;
+    storageIndex?: number | null;
+    iou?: number;
+  }>;
+  geometryOnlyIds?: Array<string | null>;
+  legacyOnlyIds?: Array<string | null>;
+  matchedCount?: number;
+  geometryOnlyCount?: number;
+  legacyOnlyCount?: number;
+  iouThreshold?: number;
+  cameraLocal?: boolean;
+  warning?: string;
+  riskTags?: string[];
+}
 
 export interface SteelPlate {
   plateNo: string;
@@ -52,14 +87,58 @@ export interface DefectItem {
   classificationState?: 'candidate-only' | 'classified' | string;
   classificationVersion?: string;
   candidatePolarity?: 'depression' | 'protrusion' | string;
+  horizontalSpanMm?: number | null;
+  longitudinalMm?: number | null;
+  longitudinalSpanMm?: number | null;
+  areaMm2?: number | null;
+  pixelSpan?: {
+    width?: number;
+    height?: number;
+    major?: number;
+    minor?: number;
+  } | null;
+  metricAvailability?: {
+    horizontal?: boolean;
+    longitudinal?: boolean;
+    longitudinalMm?: boolean;
+    longitudinalSpanMm?: boolean;
+    area?: boolean;
+    areaMm2?: boolean;
+    reason?: string;
+  } | null;
   synthetic?: boolean;
   source?: string;
   sourceDefectId?: string;
+  /** Database lifecycle state for a config-versioned candidate. */
+  active?: boolean;
+  algorithmRevision?: string;
+  supersededAt?: string | null;
   reviewStatus?: DefectReviewStatus;
   reviewedBy?: string;
   reviewedAt?: string;
   reviewNote?: string;
   artifacts?: DefectArtifacts;
+}
+
+export type DefectGroupValue = DefectItem[] | {
+  defects: DefectItem[];
+  count?: number;
+  source?: string;
+  schema?: string;
+  state?: string;
+  algorithmRevision?: string | number | null;
+  configHash?: string | null;
+  modelHash?: string | null;
+  globalPositionAvailable?: boolean;
+  riskTags?: string[];
+  error?: string | null;
+  quality?: Record<string, unknown>;
+  statistics?: Record<string, unknown>;
+};
+
+export interface DefectGroups {
+  geometry?: DefectGroupValue | null;
+  legacy?: DefectGroupValue | null;
 }
 
 export interface DefectArtifacts {
@@ -139,6 +218,8 @@ export interface InspectionSnapshot {
   inspections: PlateInspection[];
   captureImages?: CaptureImageItem[];
   source?: string;
+  defectGroups?: DefectGroups | null;
+  comparison?: DefectComparison | null;
 }
 
 export interface PlateInspection {
@@ -150,6 +231,8 @@ export interface PlateInspection {
   summaryPath?: string;
   captureSummaryPath?: string;
   source?: string;
+  defectGroups?: DefectGroups | null;
+  comparison?: DefectComparison | null;
 }
 
 export const severityLabels: Record<Severity, string> = {
@@ -164,6 +247,10 @@ export const surfaceLabels: Record<Surface, string> = {
 };
 
 const defectTypes: DefectType[] = [
+  { id: 'pit-compact', label: '凹坑候选', color: '#2563eb', shape: 'circle' },
+  { id: 'groove-elongated', label: '沟槽候选', color: '#06b6d4', shape: 'rect' },
+  { id: 'bulge-compact', label: '凸起候选', color: '#f97316', shape: 'circle' },
+  { id: 'ridge-elongated', label: '脊状凸起候选', color: '#a855f7', shape: 'rect' },
   { id: 'pit', label: '凹坑', color: '#2f6bff', shape: 'circle' },
   { id: 'roll', label: '辊印', color: '#ff7f1f', shape: 'square' },
   { id: 'scratch', label: '划伤', color: '#24a647', shape: 'rect' },
@@ -177,6 +264,10 @@ const defectTypes: DefectType[] = [
 ];
 
 const defectPreviewImages: Record<string, string> = {
+  'pit-compact': defectPitImage,
+  'groove-elongated': defectScratchImage,
+  'bulge-compact': defectPitImage,
+  'ridge-elongated': defectScratchImage,
   pit: defectPitImage,
   bubble: defectPitImage,
   scratch: defectScratchImage,
@@ -630,6 +721,8 @@ export function getPlateInspectionSnapshot(snapshot: InspectionSnapshot, recordS
     summary: summarizeDefects(inspection.defects),
     heightProfile: inspection.heightProfile,
     captureImages: inspection.captureImages,
+    defectGroups: inspection.defectGroups ?? snapshot.defectGroups,
+    comparison: inspection.comparison ?? snapshot.comparison,
   };
 }
 
@@ -650,4 +743,87 @@ export function getInspectionByRecordSelector(snapshot: InspectionSnapshot, reco
 
 export function getAllDefects(snapshot: InspectionSnapshot): DefectItem[] {
   return snapshot.inspections.flatMap((inspection) => inspection.defects);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function groupItems(value: DefectGroupValue | null | undefined): DefectItem[] | undefined {
+  if (Array.isArray(value)) return value.filter((defect): defect is DefectItem => isRecord(defect));
+  if (!isRecord(value) || !Array.isArray(value.defects)) return undefined;
+  return value.defects.filter((defect): defect is DefectItem => isRecord(defect));
+}
+
+function sourceGroup(defect: DefectItem): DefectAlgorithmGroup | undefined {
+  const source = (defect.source ?? '').toLowerCase();
+  if (source.includes('geometry') || source.includes('depth')) return 'geometry';
+  if (source.includes('legacy') || source.includes('temporary') || source.includes('yolo')) return 'legacy';
+  return undefined;
+}
+
+/**
+ * Normalize old snapshots (which only contained `defects`) and new snapshots
+ * with explicit detector groups into one stable shape for the analysis page.
+ */
+export function resolveDefectGroups(
+  defects: DefectItem[] | null | undefined,
+  groups?: DefectGroups | null,
+  comparison?: DefectComparison | null,
+) {
+  const baseDefects = Array.isArray(defects)
+    ? defects.filter((defect): defect is DefectItem => isRecord(defect))
+    : [];
+  const explicitGeometry = groupItems(groups?.geometry);
+  const explicitLegacy = groupItems(groups?.legacy);
+  const geometry = explicitGeometry ?? baseDefects.filter((defect) => sourceGroup(defect) === 'geometry');
+  const legacy = explicitLegacy ?? baseDefects.filter((defect) => sourceGroup(defect) === 'legacy');
+  const hasExplicitGroups = explicitGeometry !== undefined || explicitLegacy !== undefined;
+  const all = hasExplicitGroups ? [...geometry, ...legacy] : baseDefects;
+  const fallbackComparison: DefectComparison = {
+    matched: 0,
+    geometryOnly: geometry.length,
+    legacyOnly: legacy.length,
+    estimatedUniqueCount: geometry.length + legacy.length,
+  };
+  const comparisonRecord = comparison && isRecord(comparison) ? comparison as unknown as Record<string, unknown> : undefined;
+  const comparisonMatches = comparisonRecord && Array.isArray(comparisonRecord.matches)
+    ? comparisonRecord.matches.filter(isRecord)
+    : undefined;
+  const geometryOnlyIds = comparisonRecord && Array.isArray(comparisonRecord.geometryOnlyIds)
+    ? comparisonRecord.geometryOnlyIds.map((id) => typeof id === 'string' ? id : null)
+    : undefined;
+  const legacyOnlyIds = comparisonRecord && Array.isArray(comparisonRecord.legacyOnlyIds)
+    ? comparisonRecord.legacyOnlyIds.map((id) => typeof id === 'string' ? id : null)
+    : undefined;
+  const comparisonRiskTags = comparisonRecord && Array.isArray(comparisonRecord.riskTags)
+    ? comparisonRecord.riskTags.filter((tag): tag is string => typeof tag === 'string')
+    : undefined;
+  const nonNegativeCount = (value: unknown, fallback: number) => (
+    typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : fallback
+  );
+  const normalizedComparison: DefectComparison = comparisonRecord ? {
+    ...comparison as DefectComparison,
+    matched: nonNegativeCount(comparisonRecord.matched, comparisonMatches?.length ?? fallbackComparison.matched),
+    geometryOnly: nonNegativeCount(comparisonRecord.geometryOnly, geometryOnlyIds?.length ?? fallbackComparison.geometryOnly),
+    legacyOnly: nonNegativeCount(comparisonRecord.legacyOnly, legacyOnlyIds?.length ?? fallbackComparison.legacyOnly),
+    estimatedUniqueCount: nonNegativeCount(
+      comparisonRecord.estimatedUniqueCount,
+      nonNegativeCount(comparisonRecord.matched, comparisonMatches?.length ?? fallbackComparison.matched)
+        + nonNegativeCount(comparisonRecord.geometryOnly, geometryOnlyIds?.length ?? fallbackComparison.geometryOnly)
+        + nonNegativeCount(comparisonRecord.legacyOnly, legacyOnlyIds?.length ?? fallbackComparison.legacyOnly),
+    ),
+    ...(comparisonMatches ? { matches: comparisonMatches as DefectComparison['matches'] } : {}),
+    ...(geometryOnlyIds ? { geometryOnlyIds } : {}),
+    ...(legacyOnlyIds ? { legacyOnlyIds } : {}),
+    cameraLocal: typeof comparisonRecord.cameraLocal === 'boolean' ? comparisonRecord.cameraLocal : undefined,
+    warning: typeof comparisonRecord.warning === 'string' ? comparisonRecord.warning : undefined,
+    ...(comparisonRiskTags ? { riskTags: comparisonRiskTags } : {}),
+  } : fallbackComparison;
+  return {
+    geometry,
+    legacy,
+    all,
+    comparison: normalizedComparison,
+  };
 }

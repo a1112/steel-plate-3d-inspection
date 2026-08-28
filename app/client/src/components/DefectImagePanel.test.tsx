@@ -51,7 +51,7 @@ describe('DefectImagePanel review workflow', () => {
 
     expect(screen.getByRole('img', { name: /划伤/ })).toHaveAttribute(
       'src',
-      defect.previewImageUrl,
+      `${defect.previewImageUrl}&maxWidth=960&maxHeight=640`,
     );
     fireEvent.click(screen.getByRole('button', { name: '确认缺陷' }));
     await waitFor(() => expect(onReviewDefect).toHaveBeenCalledWith(defect, 'confirmed', '人工确认'));
@@ -68,7 +68,10 @@ describe('DefectImagePanel review workflow', () => {
 
     render(<DefectImagePanel inspectionId="INSP-4034" defect={productionDefect} />);
 
-    expect(screen.getByRole('img', { name: /划伤/ })).toHaveAttribute('src', defect.previewImageUrl);
+    expect(screen.getByRole('img', { name: /划伤/ })).toHaveAttribute(
+      'src',
+      `${defect.previewImageUrl}&maxWidth=960&maxHeight=640`,
+    );
   });
 
   it('routes a raw Windows ROI path through the capture file service', () => {

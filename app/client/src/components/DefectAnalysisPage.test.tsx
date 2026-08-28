@@ -149,4 +149,82 @@ describe('DefectAnalysisPage', () => {
     await waitFor(() => expect(confirmButton).toBeEnabled());
     promptSpy.mockRestore();
   });
+
+  it('keeps geometry and legacy detector candidates separate and reports overlap', () => {
+    renderPage({
+      defectGroups: {
+        geometry: {
+          defects: [defects[0]],
+          state: 'degraded',
+          globalPositionAvailable: false,
+          riskTags: ['global-position-unavailable'],
+        },
+        legacy: [defects[1]],
+      },
+      comparison: {
+        matched: 1,
+        geometryOnly: 0,
+        legacyOnly: 0,
+        estimatedUniqueCount: 1,
+        cameraLocal: true,
+        warning: 'same-camera estimate',
+      },
+    });
+
+    expect(screen.getByRole('tab', { name: 'All (2)' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('Estimated unique: 1 (overlap retained)')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Geometry (1)' }));
+    expect(screen.getAllByRole('button', { name: /划伤.*C2/ }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: /凹坑.*C6/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Comparison' }));
+    expect(screen.getByText('Matched: 1')).toBeInTheDocument();
+    expect(screen.getByText('Estimated unique: 1')).toBeInTheDocument();
+    expect(screen.getByText('Camera-local estimate: cross-camera matching unavailable.')).toBeInTheDocument();
+    expect(screen.getByText('Risk tags: global-position-unavailable')).toBeInTheDocument();
+    expect(screen.getByText('same-camera estimate')).toBeInTheDocument();
+  });
+
+  it('keeps the analysis view usable when optional groups or comparison are null', () => {
+    renderPage({
+      selectedDefectId: null,
+      defectGroups: { geometry: null, legacy: null },
+      comparison: null,
+    });
+
+    expect(screen.getByRole('tab', { name: 'All (2)' })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.click(screen.getByRole('tab', { name: 'Comparison' }));
+    expect(screen.getByText('Matched: 0')).toBeInTheDocument();
+    expect(screen.getByText('Geometry only: 0')).toBeInTheDocument();
+    expect(screen.getByText('Legacy only: 0')).toBeInTheDocument();
+  });
+
+  it('does not present geometry pixel progress as encoder-derived millimetres', () => {
+    const geometryDefect: DefectItem = {
+      ...defects[0],
+      source: 'sick-depth-geometry',
+      xRatio: 0.2,
+      longitudinalMm: null,
+      longitudinalSpanMm: null,
+      areaMm2: null,
+      horizontalSpanMm: 1.25,
+      metricAvailability: {
+        horizontal: true,
+        longitudinal: false,
+        longitudinalMm: false,
+        longitudinalSpanMm: false,
+        area: false,
+        areaMm2: false,
+        reason: 'encoder-unavailable',
+      },
+    };
+    renderPage({
+      defects: [geometryDefect],
+      defectGroups: { geometry: [geometryDefect], legacy: [] },
+      selectedDefectId: geometryDefect.id,
+    });
+
+    expect(screen.getAllByText(/Head-relative 20\.0%/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Horizontal 1\.3 mm · Longitudinal --/).length).toBeGreaterThan(0);
+    expect(screen.queryByText('2.40 m')).not.toBeInTheDocument();
+  });
 });

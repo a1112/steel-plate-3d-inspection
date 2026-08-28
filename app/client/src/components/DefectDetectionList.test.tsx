@@ -169,7 +169,7 @@ describe('DefectDetectionList algorithm defects', () => {
     fireEvent.mouseEnter(screen.getByRole('row', { name: /凹陷候选，camera1/ }));
     expect(screen.getByRole('img', { name: '凹陷候选缺陷图像' })).toHaveAttribute(
       'src',
-      cached.previewImageUrl,
+      `${cached.previewImageUrl}&maxWidth=384&maxHeight=192`,
     );
     expect(screen.getByRole('tooltip')).toHaveTextContent('检测记录缺陷小图');
   });

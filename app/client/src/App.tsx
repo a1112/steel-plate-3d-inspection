@@ -2008,6 +2008,8 @@ function InspectionDashboard({
                 inspectionId={activeInspection?.inspectionId}
                 selectedDefectId={selectedOnlineDefectId}
                 expectedCameraCount={runtimeProfile.cameraCount}
+                defectGroups={activeSnapshot.defectGroups}
+                comparison={activeSnapshot.comparison}
                 onSelectDefect={selectDefectById}
                 onReviewDefect={reviewDefect}
               />

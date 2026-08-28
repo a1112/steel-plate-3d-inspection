@@ -16,6 +16,11 @@ import {
   fetchInspectionReportArchives,
   fetchInspectionSnapshot,
   fetchProductionDefectHistory,
+  fetchAdminDepthGeometry,
+  fetchAdminDepthGeometryBackfillStatus,
+  pauseAdminDepthGeometryBackfill,
+  resumeAdminDepthGeometryBackfill,
+  saveAdminDepthGeometry,
   fetchProductionTasks,
   formatProductionDateTime,
   formatProductionRecordTime,
@@ -858,9 +863,79 @@ describe('persistent production command client', () => {
       'http://127.0.0.1:4873/api/capture/file?path=defect-crop.png',
     );
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://127.0.0.1:4873/api/defects/history?limit=5000',
+      'http://127.0.0.1:4873/api/defects/history?limit=5000&active=true',
       expect.objectContaining({ headers: { Accept: 'application/json' } }),
     );
+  });
+
+  it('supports source and active history filters for versioned candidates', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      schema: 'steel.production-defect-history.v1',
+      code: 0,
+      total: 0,
+      defects: [],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchProductionDefectHistory(100, undefined, { source: 'sick-depth-geometry', active: true });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4873/api/defects/history?limit=100&source=sick-depth-geometry&active=true',
+      expect.objectContaining({ headers: { Accept: 'application/json' } }),
+    );
+  });
+
+  it('reads and updates the depth geometry admin config with an optimistic hash', async () => {
+    const config = {
+      schema: 'steel.sick-depth-geometry-config.v1',
+      enabled: true,
+      baseline: { maximumFrames: 32, rowSampleStep: 4 },
+      thresholds: {
+        minimumAbsoluteDeviationMm: 0.35,
+        columnNoiseMultiplier: 6,
+        minimumNeighborhoodSupport: 3,
+        minimumComponentPoints: 6,
+        elongatedAspectRatio: 3,
+      },
+      merge: { maximumFrameGap: 1, minimumIoU: 0.2 },
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ config, configHash: 'hash-v1' }))
+      .mockResolvedValueOnce(jsonResponse({ config: { ...config, revision: 2 }, configHash: 'hash-v2' }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const read = await fetchAdminDepthGeometry();
+    const saved = await saveAdminDepthGeometry({ ...read.config, revision: 2 }, 'hash-v1');
+
+    expect(read.config.thresholds.minimumComponentPoints).toBe(6);
+    expect(saved.config.revision).toBe(2);
+    expect(fetchMock.mock.calls[1][0]).toBe('http://127.0.0.1:4873/api/admin/algorithm/depth-geometry');
+    const request = fetchMock.mock.calls[1][1] as RequestInit;
+    expect(request).toEqual(expect.objectContaining({ method: 'PUT' }));
+    expect(JSON.parse(String(request.body))).toEqual({
+      config: { ...read.config, revision: 2 },
+      expectedHash: 'hash-v1',
+    });
+  });
+
+  it('uses the depth geometry backfill status, pause, and resume routes', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ status: { state: 'running', progress: 0.25 } }))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, paused: true, controlPath: 'control.json', control: {} }))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, paused: false, controlPath: 'control.json', control: {} }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchAdminDepthGeometryBackfillStatus()).resolves.toMatchObject({ state: 'running' });
+    await expect(pauseAdminDepthGeometryBackfill()).resolves.toMatchObject({ state: 'paused' });
+    await expect(resumeAdminDepthGeometryBackfill()).resolves.toMatchObject({ state: 'running' });
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, (init as RequestInit).method ?? 'GET'])).toEqual([
+      ['http://127.0.0.1:4873/api/admin/algorithm/depth-geometry/backfill', 'GET'],
+      ['http://127.0.0.1:4873/api/admin/algorithm/depth-geometry/backfill/pause', 'POST'],
+      ['http://127.0.0.1:4873/api/admin/algorithm/depth-geometry/backfill/resume', 'POST'],
+    ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1].body))).toEqual({});
+    expect(JSON.parse(String(fetchMock.mock.calls[2][1].body))).toEqual({});
   });
 
   it('writes defect review with the current authenticated operator session', async () => {

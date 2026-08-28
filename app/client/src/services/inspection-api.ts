@@ -4,6 +4,8 @@ import defectScratchImage from '../assets/mock-defects/defect-scratch.png';
 import { getMockInspectionSnapshot } from '../data/inspection';
 import type {
   CaptureImageItem,
+  DefectComparison,
+  DefectGroups,
   DefectItem,
   DefectReviewStatus,
   InspectionSnapshot,
@@ -701,6 +703,17 @@ export type AdminDefectDetail = {
   previewX: number;
   previewY: number;
   previewImageUrl?: string;
+  source?: string;
+  sourceDefectId?: string;
+  horizontalSpanMm?: number | null;
+  longitudinalMm?: number | null;
+  longitudinalSpanMm?: number | null;
+  areaMm2?: number | null;
+  pixelSpan?: { width?: number; height?: number; major?: number; minor?: number } | null;
+  metricAvailability?: import('../data/inspection').DefectItem['metricAvailability'];
+  active?: boolean;
+  algorithmRevision?: string;
+  supersededAt?: string | null;
   artifacts?: import('../data/inspection').DefectArtifacts;
 };
 
@@ -1996,10 +2009,16 @@ function normalizeInspectionSnapshot(snapshot: unknown, origin: string): Inspect
       ...(legacySeqNo === undefined ? {} : { legacySeqNo }),
       ...(replay ? { replay } : {}),
       defects: snapshot.defects.map((defect) => withPreviewImage(defect, false, origin)),
+      ...(snapshot.defectGroups
+        ? { defectGroups: withPreviewImagesInGroups(snapshot.defectGroups, false, origin) }
+        : {}),
       captureImages: [],
       inspections: bkvInspections.map((inspection) => ({
         ...inspection,
         defects: inspection.defects.map((defect) => withPreviewImage(defect, false, origin)),
+        ...(inspection.defectGroups
+          ? { defectGroups: withPreviewImagesInGroups(inspection.defectGroups, false, origin) }
+          : {}),
         captureImages: [],
         bkvArtifacts: inspection.bkvArtifacts.map((raw) => {
           const artifact = parseBkvArtifact(raw);
@@ -2020,11 +2039,17 @@ function normalizeInspectionSnapshot(snapshot: unknown, origin: string): Inspect
   const inspections = snapshot.inspections.map((inspection) => ({
     ...inspection,
     defects: inspection.defects.map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
+    ...(inspection.defectGroups
+      ? { defectGroups: withPreviewImagesInGroups(inspection.defectGroups, allowMockFallback, origin) }
+      : {}),
     captureImages: inspection.captureImages?.map((image) => normalizeCaptureImage(image, origin)),
   }));
   const normalized = normalizeSnapshotTimes({
     ...snapshot,
     defects: snapshot.defects.map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
+    ...(snapshot.defectGroups
+      ? { defectGroups: withPreviewImagesInGroups(snapshot.defectGroups, allowMockFallback, origin) }
+      : {}),
     captureImages: snapshot.captureImages?.map((image) => normalizeCaptureImage(image, origin)),
     inspections,
   });
@@ -2061,11 +2086,19 @@ export type DefectReviewInput = {
 export type ProductionDefectHistory = {
   total: number;
   defects: DefectItem[];
+  defectGroups?: DefectGroups;
+  comparison?: DefectComparison;
+};
+
+export type ProductionDefectHistoryFilter = {
+  source?: string;
+  active?: boolean;
 };
 
 export async function fetchProductionDefectHistory(
   limit = 5_000,
   signal?: AbortSignal,
+  filter: ProductionDefectHistoryFilter = {},
 ): Promise<ProductionDefectHistory> {
   const config = getStoredConnectionConfig();
   if (config.mode === 'demo') {
@@ -2077,6 +2110,8 @@ export async function fetchProductionDefectHistory(
   // every 15-second report refresh.
   const requestedLimit = Math.max(1, Math.min(10_000, Math.round(limit)));
   const query = new URLSearchParams({ limit: String(requestedLimit) });
+  if (filter.source?.trim()) query.set('source', filter.source.trim());
+  query.set('active', String(filter.active ?? true));
   const response = await fetch(`${origin}/api/defects/history?${query.toString()}`, {
     headers: { Accept: 'application/json' },
     signal,
@@ -2099,6 +2134,10 @@ export async function fetchProductionDefectHistory(
       .slice(0, requestedLimit)
       .map((defect) => withPreviewImage(defect, false, origin))
       .map((defect) => [defect.id, defect])).values()],
+    ...(isRecord(payload.defectGroups)
+      ? { defectGroups: withPreviewImagesInGroups(payload.defectGroups as DefectGroups, false, origin) }
+      : {}),
+    ...(isRecord(payload.comparison) ? { comparison: payload.comparison as unknown as DefectComparison } : {}),
   };
 }
 
@@ -2693,6 +2732,203 @@ export async function saveAdminInspectionSettings(settings: AdminInspectionSetti
   }
   const payload = (await response.json()) as { settings: AdminInspectionSettings };
   return payload.settings;
+}
+
+function withPreviewImagesInGroups(
+  groups: DefectGroups | null | undefined,
+  allowMockFallback: boolean,
+  origin: string,
+): DefectGroups | undefined {
+  if (!isRecord(groups)) return undefined;
+  const typedGroups = groups as DefectGroups;
+  const normalize = (value: DefectGroups['geometry']) => {
+    if (!value) return undefined;
+    if (Array.isArray(value)) {
+      return value
+        .filter((defect): defect is DefectItem => isRecord(defect))
+        .map((defect) => withPreviewImage(defect, allowMockFallback, origin));
+    }
+    if (!isRecord(value)) return undefined;
+    return {
+      ...value,
+      defects: (Array.isArray(value.defects) ? value.defects : [])
+        .filter((defect): defect is DefectItem => isRecord(defect))
+        .map((defect) => withPreviewImage(defect, allowMockFallback, origin)),
+    };
+  };
+  const geometry = normalize(typedGroups.geometry);
+  const legacy = normalize(typedGroups.legacy);
+  return {
+    ...(geometry ? { geometry } : {}),
+    ...(legacy ? { legacy } : {}),
+  };
+}
+
+export type AdminDepthGeometryConfig = {
+  schema?: 'steel.sick-depth-geometry-config.v1' | string;
+  enabled: boolean;
+  revision?: number | string;
+  candidatePolicy?: 'review-only' | string;
+  baseline: {
+    maximumFrames: number;
+    rowSampleStep: number;
+  };
+  thresholds: {
+    minimumAbsoluteDeviationMm: number;
+    columnNoiseMultiplier: number;
+    minimumNeighborhoodSupport: number;
+    minimumComponentPoints: number;
+    elongatedAspectRatio: number;
+  };
+  merge: {
+    maximumFrameGap: number;
+    minimumIoU: number;
+  };
+  reviewCropMinimumSize?: number;
+  qualityGatePolicy?: string;
+  longitudinalScale?: number | null;
+  historyBackfill?: {
+    automatic?: boolean;
+    order?: string;
+    livePriority?: boolean;
+    pauseHistoricalIoWhileCaptureActive?: boolean;
+    gpuDeviceId?: number;
+  };
+  configHash?: string;
+  source?: string;
+};
+
+export type AdminDepthGeometryResponse = {
+  code?: number;
+  config?: AdminDepthGeometryConfig;
+  depthGeometry?: AdminDepthGeometryConfig;
+  expectedHash?: string;
+  configHash?: string;
+  revision?: string | number;
+};
+
+export type AdminDepthGeometryBackfillStatus = {
+  schema?: string;
+  state: 'idle' | 'running' | 'paused' | 'completed' | 'failed' | string;
+  paused?: boolean;
+  controlPath?: string;
+  control?: Record<string, unknown>;
+  phase?: string;
+  currentMaterialId?: string | null;
+  pauseReason?: string | null;
+  capturePhase?: string;
+  captureQueue?: { pendingRounds?: number; activeRounds?: number };
+  reprocessedMaterials?: number;
+  materialCount?: number;
+  completedMaterials?: number;
+  failedMaterials?: number;
+  progress?: number;
+  configHash?: string;
+  algorithmRevision?: string | number;
+  updatedAt?: string;
+};
+
+function depthGeometryBackfillStatusFromResponse(payload: unknown): AdminDepthGeometryBackfillStatus {
+  if (!isRecord(payload)) return { state: 'idle' };
+  const nested = isRecord(payload.status)
+    ? payload.status
+    : isRecord(payload.backfill)
+      ? payload.backfill
+      : payload;
+  if (typeof nested.state === 'string') return nested as AdminDepthGeometryBackfillStatus;
+  if (typeof payload.paused === 'boolean') {
+    return {
+      ...payload,
+      state: payload.paused ? 'paused' : 'running',
+    } as AdminDepthGeometryBackfillStatus;
+  }
+  return { ...payload, state: 'idle' } as AdminDepthGeometryBackfillStatus;
+}
+
+function depthGeometryConfigFromResponse(payload: AdminDepthGeometryResponse): AdminDepthGeometryConfig {
+  const direct = payload as unknown as Partial<AdminDepthGeometryConfig>;
+  const config = payload.config
+    ?? payload.depthGeometry
+    ?? (typeof direct.enabled === 'boolean' && direct.baseline && direct.thresholds && direct.merge
+      ? payload as unknown as AdminDepthGeometryConfig
+      : undefined);
+  if (!config) throw new Error('3D 深度几何配置响应异常');
+  return config;
+}
+
+export async function fetchAdminDepthGeometry(
+  signal?: AbortSignal,
+): Promise<AdminDepthGeometryResponse & { config: AdminDepthGeometryConfig }> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/algorithm/depth-geometry`, {
+    headers: createAdminHeaders({ Accept: 'application/json' }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '3D 深度几何配置读取失败'));
+  }
+  const payload = await response.json() as AdminDepthGeometryResponse;
+  return { ...payload, config: depthGeometryConfigFromResponse(payload) };
+}
+
+export async function saveAdminDepthGeometry(
+  value: AdminDepthGeometryConfig,
+  expectedHash?: string,
+): Promise<AdminDepthGeometryResponse & { config: AdminDepthGeometryConfig }> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/algorithm/depth-geometry`, {
+    method: 'PUT',
+    headers: createAdminHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+    body: JSON.stringify({
+      config: value,
+      ...(expectedHash?.trim() ? { expectedHash: expectedHash.trim() } : {}),
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '3D 深度几何配置保存失败'));
+  }
+  const payload = await response.json() as AdminDepthGeometryResponse;
+  return { ...payload, config: depthGeometryConfigFromResponse(payload) };
+}
+
+// Explicitly named aliases make the API discoverable for callers that use the
+// operation-oriented naming convention used by the other admin helpers.
+export const fetchAdminDepthGeometryConfig = fetchAdminDepthGeometry;
+export const saveAdminDepthGeometryConfig = saveAdminDepthGeometry;
+
+export async function fetchAdminDepthGeometryBackfillStatus(
+  signal?: AbortSignal,
+): Promise<AdminDepthGeometryBackfillStatus> {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/algorithm/depth-geometry/backfill`, {
+    headers: createAdminHeaders({ Accept: 'application/json' }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '3D 深度几何回填状态读取失败'));
+  }
+  return depthGeometryBackfillStatusFromResponse(await response.json());
+}
+
+async function controlAdminDepthGeometryBackfill(action: 'pause' | 'resume') {
+  const config = getStoredConnectionConfig();
+  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/admin/algorithm/depth-geometry/backfill/${action}`, {
+    method: 'POST',
+    headers: createAdminHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+    body: JSON.stringify({}),
+  });
+  if (!response.ok) {
+    throw new Error(await readAdminErrorMessage(response, `3D 深度几何回填${action === 'pause' ? '暂停' : '恢复'}失败`));
+  }
+  return depthGeometryBackfillStatusFromResponse(await response.json());
+}
+
+export function pauseAdminDepthGeometryBackfill() {
+  return controlAdminDepthGeometryBackfill('pause');
+}
+
+export function resumeAdminDepthGeometryBackfill() {
+  return controlAdminDepthGeometryBackfill('resume');
 }
 
 export async function fetchAdminAlarmRules(signal?: AbortSignal): Promise<AdminAlarmRules> {

@@ -8,6 +8,7 @@ import { bkvOnlineCroppedImageUrl, isBkvOnlineImageUrl } from '../services/bkv-o
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import { DiameterTrendPanel } from './DiameterTrendPanel';
 import { Panel } from './Panel';
+import { RequestedSizeImage } from './RequestedSizeImage';
 
 export type AnalysisViewMode = 'overview' | 'image' | 'point-cloud' | 'profile' | 'diameter' | 'defects';
 
@@ -63,7 +64,7 @@ function CaptureImagePreview({
 }) {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const visibleImages = captureImages
-    .filter((image) => image.url && (image.dataName === 'depth' || image.dataName === 'intensity'))
+    .filter((image) => image.url && !/^(?:npz|npy|bin|json|d3img)$/i.test(image.fileType))
     .slice(0, 12);
   const selectedImage = selectedIndex === null ? null : visibleImages[selectedIndex] ?? null;
   const activeSelectedIndex = selectedIndex ?? 0;
@@ -86,7 +87,14 @@ function CaptureImagePreview({
       {visibleImages.map((image, index) => (
         <figure key={`${image.id}-${image.dataName}`} className="capture-image-preview-card">
           <button type="button" className="capture-image-preview-open" onClick={() => setSelectedIndex(index)} aria-label={`打开 ${image.cameraId || image.cameraIp} ${image.dataName} #${image.sequenceNo}`}>
-            <img src={image.url} alt={`${image.cameraId} ${image.dataName}`} loading="lazy" />
+            <RequestedSizeImage
+              src={image.url}
+              alt={`${image.cameraId} ${image.dataName}`}
+              loading="lazy"
+              decoding="async"
+              requestWidth={320}
+              requestHeight={160}
+            />
             <figcaption>
               <strong>{image.cameraId || image.cameraIp}</strong>
               <span>{image.dataName === 'depth' ? '深度' : '亮度'} #{image.sequenceNo}</span>
@@ -108,7 +116,13 @@ function CaptureImagePreview({
               <button type="button" onClick={() => setSelectedIndex(null)} aria-label="关闭图像弹窗"><X size={18} /></button>
             </header>
             <div className="capture-image-viewer-stage">
-              <img src={selectedImage.url} alt={`${selectedImage.cameraId} ${selectedImage.dataName} #${selectedImage.sequenceNo}`} />
+              <RequestedSizeImage
+                src={selectedImage.url}
+                alt={`${selectedImage.cameraId} ${selectedImage.dataName} #${selectedImage.sequenceNo}`}
+                decoding="async"
+                requestWidth={1280}
+                requestHeight={720}
+              />
               {visibleImages.length > 1 ? (
                 <>
                   <button type="button" className="previous" onClick={() => setSelectedIndex((activeSelectedIndex - 1 + visibleImages.length) % visibleImages.length)} aria-label="上一张"><ChevronLeft size={24} /></button>

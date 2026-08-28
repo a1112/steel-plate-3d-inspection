@@ -508,6 +508,7 @@ pub mod production_defect {
         pub confidence: f64,
         pub geometry_json: String,
         pub source: String,
+        pub algorithm_revision: String,
         pub source_defect_id: String,
         pub preview_image_path: String,
         pub review_status: String,
@@ -516,6 +517,8 @@ pub mod production_defect {
         pub review_note: String,
         pub created_at: String,
         pub updated_at: String,
+        pub active: bool,
+        pub superseded_at: String,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

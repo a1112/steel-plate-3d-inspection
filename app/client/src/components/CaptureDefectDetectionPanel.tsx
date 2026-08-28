@@ -7,6 +7,7 @@ import {
   rebuildCaptureDefects,
   type CaptureFlowDefectDetection,
 } from '../lib/capture-api';
+import { RequestedSizeImage } from './RequestedSizeImage';
 
 interface CaptureDefectDetectionPanelProps {
   materialId: string;
@@ -134,11 +135,13 @@ export function CaptureDefectDetectionPanel({ materialId }: CaptureDefectDetecti
             {detection.defects.length ? detection.defects.slice(0, 12).map((defect) => (
               <div key={defect.id}>
                 {defect.reviewImage ? (
-                  <img
+                  <RequestedSizeImage
                     src={captureArtifactImageUrl(defect.reviewImage, 192)}
                     alt={`${defect.cameraId} 第 ${defect.storageIndex} 帧 ${defect.className} 缺陷小图`}
                     width={defect.reviewImageWidth || 64}
                     height={defect.reviewImageHeight || 64}
+                    requestWidth={defect.reviewImageWidth || 64}
+                    requestHeight={defect.reviewImageHeight || 64}
                     loading="lazy"
                     decoding="async"
                   />

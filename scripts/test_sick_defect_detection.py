@@ -24,6 +24,7 @@ from scripts.sick_capture.defect_detection import (
     DEFECT_DETECTION_SCHEMA,
     DefectDetectionConfig,
     ExecutionGateInterrupted,
+    _database_import_payload,
     _defect_position_ratios,
     _legacy_classifier_crop,
     _prepare_review_output,
@@ -33,6 +34,7 @@ from scripts.sick_capture.defect_detection import (
     build_flow_defect_detection,
     candidate_region_disposition,
     candidate_spans_crop_boundary,
+    configured_legacy_model_hash,
     decode_yolov5_predictions,
     flatten_depth_for_detection,
     import_defect_manifest,
@@ -40,10 +42,120 @@ from scripts.sick_capture.defect_detection import (
     resolve_candidate_classification,
 )
 from scripts.sick_capture.measurement import MeasurementConfig, measurement_manifest_path
+from scripts.sick_capture.depth_geometry_runtime import DepthGeometryConfigChanged
 from scripts.sick_capture.regions import region_manifest_path
 
 
 class SickDefectDetectionTests(unittest.TestCase):
+    def test_config_change_before_commit_restarts_without_writing_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = root / "capture.json"
+            profile_path.write_text("{}", encoding="utf-8")
+            algorithm_path = root / "algorithm.json"
+            seed = {
+                "depthGeometry": {
+                    "schema": "steel.sick-depth-geometry-config.v1",
+                    "revision": 1,
+                }
+            }
+            algorithm_path.write_text(json.dumps(seed), encoding="utf-8")
+
+            def build_then_change(*_args: object, **_kwargs: object) -> dict[str, object]:
+                changed = json.loads(json.dumps(seed))
+                changed["depthGeometry"]["revision"] = 2
+                algorithm_path.write_text(json.dumps(changed), encoding="utf-8")
+                return {
+                    "state": "complete",
+                    "statistics": {"defectCount": 0},
+                    "defects": [],
+                }
+
+            with patch(
+                "scripts.sick_capture.depth_geometry_runtime.mutable_depth_geometry_config_path",
+                return_value=None,
+            ), patch(
+                "scripts.sick_capture.defect_detection.build_flow_defect_detection",
+                side_effect=build_then_change,
+            ), patch(
+                "scripts.sick_capture.defect_detection._atomic_json"
+            ) as writer:
+                with self.assertRaises(DepthGeometryConfigChanged):
+                    build_and_write_flow_defect_detection(
+                        {},
+                        root,
+                        "42",
+                        {"cameras": {}},
+                        config=DefectDetectionConfig(
+                            depth_geometry_profile_path=profile_path,
+                        ),
+                    )
+
+            writer.assert_not_called()
+
+    def test_legacy_model_hash_changes_with_file_or_effective_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "detector.onnx"
+            model.write_bytes(b"model-a")
+            base = DefectDetectionConfig(model_2d_path=model)
+            first = configured_legacy_model_hash(base, None)
+            self.assertEqual(first, configured_legacy_model_hash(base, None))
+
+            model.write_bytes(b"model-b-expanded")
+            changed_file = configured_legacy_model_hash(base, None)
+            self.assertNotEqual(first, changed_file)
+            changed_settings = configured_legacy_model_hash(
+                DefectDetectionConfig(model_2d_path=model, merge_iou_threshold=0.7),
+                None,
+            )
+            self.assertNotEqual(changed_file, changed_settings)
+
+    def test_geometry_database_payload_keeps_only_calibrated_horizontal_metric(self) -> None:
+        payload = _database_import_payload(
+            {
+                "materialId": "42",
+                "source": "sick-depth-geometry",
+                "configHash": "config-a",
+                "globalPositionAvailable": False,
+                "riskTags": ["global-position-unavailable"],
+                "defects": [
+                    {
+                        "id": "g-1",
+                        "cameraId": "C1",
+                        "storageIndex": 7,
+                        "classId": "pit",
+                        "className": "凹坑候选",
+                        "candidatePolarity": "depression",
+                        "confidence": 0.8,
+                        "horizontalSpanMm": 1.25,
+                        "longitudinalSpanMm": None,
+                        "areaMm2": None,
+                        "imageRect2d": {
+                            "left": 1,
+                            "top": 2,
+                            "right": 5,
+                            "bottom": 8,
+                        },
+                        "depthDeviation": {
+                            "available": True,
+                            "signedMm": -0.7,
+                        },
+                    }
+                ],
+            }
+        )
+
+        row = payload["defects"][0]
+        self.assertEqual(row["widthMm"], 1.25)
+        self.assertEqual(row["xMm"], 0.0)
+        self.assertIsNone(row["geometry"]["longitudinalSpanMm"])
+        self.assertIsNone(row["geometry"]["areaMm2"])
+        self.assertEqual(row["geometry"]["candidatePolarity"], "depression")
+        self.assertFalse(row["geometry"]["globalPositionAvailable"])
+        self.assertEqual(
+            row["geometry"]["riskTags"], ["global-position-unavailable"]
+        )
+
     def test_history_only_capture_ignores_stale_steel_presence(self) -> None:
         snapshot = capture_gate_disposition(
             {"present": True, "phase": "steel-in-saving", "materialId": "4035"},
@@ -324,6 +436,37 @@ class SickDefectDetectionTests(unittest.TestCase):
             urlopen.assert_called_once()
         self.assertEqual(phases.count("defect-database-payload-row"), 2)
 
+    def test_dual_group_database_import_continues_after_one_group_fails(self) -> None:
+        manifest = {
+            "materialId": "64",
+            "defectGroups": {
+                "geometry": {
+                    "state": "ready",
+                    "source": "sick-depth-geometry",
+                    "configHash": "geometry-a",
+                    "defects": [{"id": "g-1"}],
+                },
+                "legacy": {
+                    "state": "complete",
+                    "source": "sick-temporary-defect-model",
+                    "defects": [{"id": "l-1"}],
+                },
+            },
+        }
+        with patch(
+            "scripts.sick_capture.defect_detection._post_database_import_payload",
+            side_effect=[
+                OSError("geometry unavailable"),
+                {"state": "complete", "imported": 1, "updated": 0, "deleted": 0},
+            ],
+        ) as post:
+            result = import_defect_manifest(manifest, "http://database.test")
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(result["state"], "partial")
+        self.assertEqual(result["groups"]["geometry"]["state"], "failed")
+        self.assertEqual(result["groups"]["legacy"]["state"], "complete")
+
     def test_strict_backfill_gate_heartbeats_until_queue_is_stably_idle(self) -> None:
         snapshots = [
             {
@@ -467,15 +610,12 @@ class SickDefectDetectionTests(unittest.TestCase):
             "materialId": "2844",
             "queue": {"pendingRounds": 9, "activeRounds": 1},
         }
-        with (
-            patch(
-                "scripts.sick_defect_history_backfill.capture_gate_snapshot",
-                return_value=snapshot,
-            ),
-            patch(
-                "scripts.sick_defect_history_backfill.update_status",
-                side_effect=publish,
-            ),
+        with patch(
+            "scripts.sick_defect_history_backfill.capture_gate_snapshot",
+            return_value=snapshot,
+        ), patch(
+            "scripts.sick_defect_history_backfill.update_status",
+            side_effect=publish,
         ):
             capture_gate_heartbeat_loop(
                 "http://capture.test",

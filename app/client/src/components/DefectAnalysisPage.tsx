@@ -1,8 +1,17 @@
 import { CheckCircle2, ChevronLeft, ChevronRight, Grid2X2, Image as ImageIcon, Maximize2, XCircle } from 'lucide-react';
 import { useEffect, useMemo, useState, type CSSProperties } from 'react';
-import type { DefectItem, DefectReviewStatus, DefectType, SteelPlate } from '../data/inspection';
-import { severityLabels } from '../data/inspection';
+import type {
+  DefectAnalysisTab,
+  DefectComparison,
+  DefectGroups,
+  DefectItem,
+  DefectReviewStatus,
+  DefectType,
+  SteelPlate,
+} from '../data/inspection';
+import { resolveDefectGroups, severityLabels } from '../data/inspection';
 import { fetchCaptureStitchHistory, type CaptureStitchCameraFrame } from '../services/capture-roi-api';
+import { RequestedSizeImage } from './RequestedSizeImage';
 
 type DefectAnalysisDisplayMode = 'cards' | 'large';
 
@@ -15,6 +24,8 @@ type DefectAnalysisPageProps = {
   expectedCameraCount: number;
   onSelectDefect: (defectId: string) => void;
   onReviewDefect?: (defect: DefectItem, status: DefectReviewStatus, note: string) => Promise<void>;
+  defectGroups?: DefectGroups | null;
+  comparison?: DefectComparison | null;
 };
 
 type DefectMedia = {
@@ -45,6 +56,37 @@ function defectPositionMm(defect: DefectItem, plateLengthMm: number) {
     return Math.max(0, Math.min(plateLengthMm, defect.xRatio * plateLengthMm));
   }
   return 0;
+}
+
+function lacksEncoderLongitudinalMetric(defect: DefectItem) {
+  return defect.source?.toLowerCase() === 'sick-depth-geometry'
+    && defect.metricAvailability?.longitudinalMm !== true;
+}
+
+function defectPositionLabel(defect: DefectItem, plateLengthMm: number) {
+  if (lacksEncoderLongitudinalMetric(defect)) {
+    return Number.isFinite(defect.xRatio)
+      ? `Head-relative ${(Math.max(0, Math.min(1, defect.xRatio)) * 100).toFixed(1)}%`
+      : 'Head-relative --';
+  }
+  const metric = typeof defect.longitudinalMm === 'number' && Number.isFinite(defect.longitudinalMm)
+    ? defect.longitudinalMm
+    : defectPositionMm(defect, plateLengthMm);
+  return `${(metric / 1_000).toFixed(2)} m`;
+}
+
+function defectSizeLabel(defect: DefectItem) {
+  if (defect.source?.toLowerCase() === 'sick-depth-geometry') {
+    const horizontal = typeof defect.horizontalSpanMm === 'number' && Number.isFinite(defect.horizontalSpanMm)
+      ? `${defect.horizontalSpanMm.toFixed(1)} mm`
+      : '--';
+    const longitudinal = typeof defect.longitudinalSpanMm === 'number'
+      && Number.isFinite(defect.longitudinalSpanMm)
+      ? `${defect.longitudinalSpanMm.toFixed(1)} mm`
+      : '--';
+    return `Horizontal ${horizontal} · Longitudinal ${longitudinal}`;
+  }
+  return `${defect.widthMm.toFixed(1)} × ${defect.heightMm.toFixed(1)} mm`;
 }
 
 function confidenceValue(defect: DefectItem) {
@@ -104,7 +146,13 @@ function AnalysisImage({ src, alt, emptyLabel, large = false }: {
   return (
     <div className={`defect-analysis-image ${large ? 'large' : ''} ${!src || failed ? 'empty' : ''}`}>
       {src && !failed
-        ? <img src={src} alt={alt} onError={() => setFailed(true)} />
+        ? <RequestedSizeImage
+            src={src}
+            alt={alt}
+            requestWidth={large ? 960 : 384}
+            requestHeight={large ? 640 : 256}
+            onError={() => setFailed(true)}
+          />
         : <span>{failed ? `${emptyLabel}读取失败` : `${emptyLabel}未就绪`}</span>}
       {src && !failed ? <i className="defect-analysis-crosshair" aria-hidden="true" /> : null}
     </div>
@@ -144,8 +192,8 @@ function DefectPairCard({ defect, media, selected, plateLengthMm, showGray, show
         </figure> : null}
       </div>
       <footer>
-        <span>{(defectPositionMm(defect, plateLengthMm) / 1_000).toFixed(2)} m</span>
-        <span>{defect.widthMm.toFixed(1)} × {defect.heightMm.toFixed(1)} mm</span>
+        <span>{defectPositionLabel(defect, plateLengthMm)}</span>
+        <span>{defectSizeLabel(defect)}</span>
         <b>{confidenceLabel(defect)}</b>
       </footer>
     </button>
@@ -190,12 +238,15 @@ function DefectDistribution({ defects, selectedDefectId, defectTypes, cameraCoun
           <div className="defect-analysis-length-guides" aria-hidden="true">
             {tickValues.map((ratio) => <i key={ratio} style={{ top: `${ratio * 100}%` }} />)}
           </div>
-          {defects.map((defect) => {
+          {defects.map((defect, index) => {
             const camera = Math.max(1, Math.min(cameraCount, cameraNumber(defect)));
             const position = defectPositionMm(defect, plateLengthMm);
+            const positionAccessibleLabel = lacksEncoderLongitudinalMetric(defect)
+              ? defectPositionLabel(defect, plateLengthMm)
+              : `${(position / 1_000).toFixed(2)}米`;
             const tone = reviewTone(defect);
             return <button
-              key={defect.id}
+              key={`${defect.source ?? 'candidate'}-${defect.id}-${index}`}
               type="button"
               className={`defect-analysis-dot ${tone} ${defect.id === selectedDefectId ? 'selected' : ''}`}
               style={{
@@ -203,15 +254,15 @@ function DefectDistribution({ defects, selectedDefectId, defectTypes, cameraCoun
                 top: `${plateLengthMm > 0 ? Math.max(1, Math.min(99, position / plateLengthMm * 100)) : 50}%`,
                 '--defect-color': typeColors.get(defect.typeId) ?? '#64748b',
               } as CSSProperties}
-              aria-label={`${defect.typeLabel}，C${camera}，位置${(position / 1_000).toFixed(2)}米`}
-              title={`${defect.typeLabel} · C${camera} · ${(position / 1_000).toFixed(2)} m`}
+              aria-label={`${defect.typeLabel}，C${camera}，位置${positionAccessibleLabel}`}
+              title={`${defect.typeLabel} · C${camera} · ${positionAccessibleLabel}`}
               onClick={() => onSelect(defect.id)}
             />;
           })}
           {selected ? (
             <div className="defect-analysis-selected-callout">
               <strong>{reviewLabel(selected)} · {selected.typeLabel}</strong>
-              <span>C{cameraNumber(selected)} · {(defectPositionMm(selected, plateLengthMm) / 1_000).toFixed(2)} m</span>
+              <span>C{cameraNumber(selected)} · {defectPositionLabel(selected, plateLengthMm)}</span>
               <b>置信度 {confidenceLabel(selected)}</b>
             </div>
           ) : null}
@@ -235,14 +286,57 @@ export function DefectAnalysisPage({
   expectedCameraCount,
   onSelectDefect,
   onReviewDefect,
+  defectGroups,
+  comparison,
 }: DefectAnalysisPageProps) {
   const [displayMode, setDisplayMode] = useState<DefectAnalysisDisplayMode>('large');
+  const [analysisTab, setAnalysisTab] = useState<DefectAnalysisTab>('all');
   const [showGray, setShowGray] = useState(true);
   const [showJet, setShowJet] = useState(true);
   const [page, setPage] = useState(1);
   const [captureFrames, setCaptureFrames] = useState<CaptureStitchCameraFrame[]>([]);
   const [reviewing, setReviewing] = useState(false);
   const plateLengthMm = plate.lengthMm > 0 ? plate.lengthMm : 12_000;
+  const groups = useMemo(
+    () => resolveDefectGroups(defects, defectGroups, comparison),
+    [comparison, defectGroups, defects],
+  );
+  const explicitGroups = Boolean(defectGroups?.geometry || defectGroups?.legacy);
+  const totalCandidateCount = explicitGroups
+    ? groups.geometry.length + groups.legacy.length
+    : groups.all.length;
+  const groupRiskTags = useMemo(() => {
+    const values = [defectGroups?.geometry, defectGroups?.legacy];
+    const tags = values.flatMap((value) => (
+      value && !Array.isArray(value) && Array.isArray(value.riskTags) ? value.riskTags : []
+    ));
+    const comparisonTags = Array.isArray(groups.comparison.riskTags)
+      ? groups.comparison.riskTags
+      : [];
+    return Array.from(new Set(
+      [...tags, ...comparisonTags]
+        .filter((tag): tag is string => typeof tag === 'string' && tag.trim().length > 0)
+        .map((tag) => tag.trim()),
+    ));
+  }, [defectGroups, groups.comparison.riskTags]);
+  const groupErrors = useMemo(() => {
+    const values = [defectGroups?.geometry, defectGroups?.legacy];
+    return values.flatMap((value) => (
+      value && !Array.isArray(value) && typeof value.error === 'string' && value.error.trim()
+        ? [value.error.trim()]
+        : []
+    ));
+  }, [defectGroups]);
+  const geometryGroupGlobalPositionAvailable = defectGroups?.geometry && !Array.isArray(defectGroups.geometry)
+    ? defectGroups.geometry.globalPositionAvailable
+    : undefined;
+  const cameraLocalEstimate = groups.comparison.cameraLocal === true
+    || (groups.comparison.cameraLocal === undefined && geometryGroupGlobalPositionAvailable === false);
+  const displayDefects = analysisTab === 'geometry'
+    ? groups.geometry
+    : analysisTab === 'legacy'
+      ? groups.legacy
+      : groups.all;
   const cameraIds = useMemo(
     () => Array.from({ length: Math.max(1, expectedCameraCount) }, (_, index) => `C${index + 1}`),
     [expectedCameraCount],
@@ -271,13 +365,13 @@ export function DefectAnalysisPage({
 
   useEffect(() => {
     setPage(1);
-  }, [plate.plateNo]);
+  }, [analysisTab, plate.plateNo]);
 
-  const selectedDefect = defects.find((defect) => defect.id === selectedDefectId) ?? defects[0] ?? null;
-  const selectedIndex = selectedDefect ? defects.findIndex((defect) => defect.id === selectedDefect.id) : -1;
-  const pageCount = Math.max(1, Math.ceil(defects.length / CARD_PAGE_SIZE));
+  const selectedDefect = displayDefects.find((defect) => defect.id === selectedDefectId) ?? displayDefects[0] ?? null;
+  const selectedIndex = selectedDefect ? displayDefects.findIndex((defect) => defect.id === selectedDefect.id) : -1;
+  const pageCount = Math.max(1, Math.ceil(displayDefects.length / CARD_PAGE_SIZE));
   const safePage = Math.min(page, pageCount);
-  const pageDefects = defects.slice((safePage - 1) * CARD_PAGE_SIZE, safePage * CARD_PAGE_SIZE);
+  const pageDefects = displayDefects.slice((safePage - 1) * CARD_PAGE_SIZE, safePage * CARD_PAGE_SIZE);
   const selectedMedia = selectedDefect ? mediaForDefect(selectedDefect, captureFrames) : null;
 
   const toggleGray = () => {
@@ -291,11 +385,11 @@ export function DefectAnalysisPage({
   };
 
   const navigateDefect = (direction: -1 | 1) => {
-    if (!defects.length) return;
+    if (!displayDefects.length) return;
     const nextIndex = selectedIndex < 0
       ? 0
-      : (selectedIndex + direction + defects.length) % defects.length;
-    onSelectDefect(defects[nextIndex].id);
+      : (selectedIndex + direction + displayDefects.length) % displayDefects.length;
+    onSelectDefect(displayDefects[nextIndex].id);
   };
 
   const submitReview = async (status: DefectReviewStatus) => {
@@ -315,17 +409,84 @@ export function DefectAnalysisPage({
 
   return (
     <main className="defect-analysis-page" aria-label="缺陷分析模式">
+      <header className="defect-analysis-groups" aria-label="Defect detector groups">
+        <div className="defect-analysis-group-tabs" role="tablist" aria-label="Defect detector groups">
+          {([
+            ['all', 'All'],
+            ['geometry', 'Geometry'],
+            ['legacy', 'Legacy'],
+            ['comparison', 'Comparison'],
+          ] as const).map(([tab, label]) => (
+            <button
+              key={tab}
+              type="button"
+              role="tab"
+              aria-selected={analysisTab === tab}
+              className={analysisTab === tab ? 'active' : ''}
+              onClick={() => setAnalysisTab(tab)}
+            >
+              {label}
+              {tab === 'all'
+                ? ` (${totalCandidateCount})`
+                : tab === 'geometry'
+                  ? ` (${groups.geometry.length})`
+                  : tab === 'legacy'
+                    ? ` (${groups.legacy.length})`
+                    : ''}
+            </button>
+          ))}
+        </div>
+        <div className="defect-analysis-group-counts" aria-live="polite">
+          <strong>Total candidates: {totalCandidateCount}</strong>
+          <span>Geometry: {groups.geometry.length}</span>
+          <span>Legacy: {groups.legacy.length}</span>
+          {explicitGroups ? (
+            <span className="defect-analysis-unique-warning">
+              Estimated unique: {groups.comparison.estimatedUniqueCount}
+              {groups.comparison.estimatedUniqueCount !== totalCandidateCount ? ' (overlap retained)' : ''}
+            </span>
+          ) : null}
+        </div>
+      </header>
+      {analysisTab === 'comparison' ? (
+        <section className="defect-analysis-comparison" aria-label="Detector comparison">
+          <strong>Detector comparison</strong>
+          <span>Matched: {groups.comparison.matched}</span>
+          <span>Geometry only: {groups.comparison.geometryOnly}</span>
+          <span>Legacy only: {groups.comparison.legacyOnly}</span>
+          <b>Estimated unique: {groups.comparison.estimatedUniqueCount}</b>
+          {cameraLocalEstimate ? <em>Camera-local estimate: cross-camera matching unavailable.</em> : null}
+          {groups.comparison.warning ? <em>{groups.comparison.warning}</em> : null}
+          {groupRiskTags.length ? (
+            <span className="defect-analysis-comparison-details">Risk tags: {groupRiskTags.join(', ')}</span>
+          ) : null}
+          {groupErrors.length ? (
+            <em>Detector group error: {groupErrors.join('; ')}</em>
+          ) : null}
+          {groups.comparison.matches?.length ? (
+            <span className="defect-analysis-comparison-details">
+              Pairs: {groups.comparison.matches.map((match) => `${match.geometryId ?? '-'} ↔ ${match.legacyId ?? '-'}`).join(', ')}
+            </span>
+          ) : null}
+          {groups.comparison.geometryOnlyIds?.length ? (
+            <span className="defect-analysis-comparison-details">Geometry IDs: {groups.comparison.geometryOnlyIds.filter(Boolean).join(', ')}</span>
+          ) : null}
+          {groups.comparison.legacyOnlyIds?.length ? (
+            <span className="defect-analysis-comparison-details">Legacy IDs: {groups.comparison.legacyOnlyIds.filter(Boolean).join(', ')}</span>
+          ) : null}
+        </section>
+      ) : null}
       <div className="defect-analysis-layout">
         <section className="defect-analysis-workspace">
-          {defects.length === 0 ? (
+          {displayDefects.length === 0 ? (
             <div className="defect-analysis-empty"><CheckCircle2 size={30} /><strong>当前记录未检出缺陷</strong><span>选择左侧其他检测记录继续查看。</span></div>
           ) : selectedDefect ? <>
             <div className="defect-analysis-toolbar">
               <div className="defect-large-meta">
                 <span className={`defect-analysis-status ${reviewTone(selectedDefect)}`}>{reviewLabel(selectedDefect)}</span>
                 <strong>{selectedDefect.typeLabel} · C{cameraNumber(selectedDefect)} · {sequenceNumber(selectedDefect) == null ? '--' : String(sequenceNumber(selectedDefect)).padStart(4, '0')}</strong>
-                <span>位置 {(defectPositionMm(selectedDefect, plateLengthMm) / 1_000).toFixed(2)} m</span>
-                <span>尺寸 {selectedDefect.widthMm.toFixed(1)} × {selectedDefect.heightMm.toFixed(1)} mm</span>
+                <span>位置 {defectPositionLabel(selectedDefect, plateLengthMm)}</span>
+                <span>尺寸 {defectSizeLabel(selectedDefect)}</span>
                 <b>置信度 {confidenceLabel(selectedDefect)}</b>
               </div>
               <div className="defect-analysis-toolbar-controls">
@@ -342,8 +503,8 @@ export function DefectAnalysisPage({
             {displayMode === 'cards' ? (
             <div className="defect-card-mode">
               <div className="defect-card-grid">
-                {pageDefects.map((defect) => <DefectPairCard
-                  key={defect.id}
+                {pageDefects.map((defect, index) => <DefectPairCard
+                  key={`${defect.source ?? 'candidate'}-${defect.id}-${index}`}
                   defect={defect}
                   media={mediaForDefect(defect, captureFrames)}
                   selected={defect.id === selectedDefect?.id}
@@ -374,9 +535,9 @@ export function DefectAnalysisPage({
                 </> : null}
               </div>
               <div className="defect-filmstrip" aria-label="缺陷候选缩略图">
-                {defects.slice(0, 12).map((defect, index) => {
+                {displayDefects.slice(0, 12).map((defect, index) => {
                   const media = mediaForDefect(defect, captureFrames);
-                  return <button key={defect.id} type="button" className={defect.id === selectedDefect.id ? 'selected' : ''} onClick={() => onSelectDefect(defect.id)}>
+                  return <button key={`${defect.source ?? 'candidate'}-${defect.id}-${index}`} type="button" className={defect.id === selectedDefect.id ? 'selected' : ''} onClick={() => onSelectDefect(defect.id)}>
                     <b>{String(index + 1).padStart(2, '0')}</b>
                     <span className={showGray && showJet ? '' : 'single'}>{showGray ? <AnalysisImage src={media.grayThumbnailUrl} alt={`${defect.typeLabel}缩略原图`} emptyLabel="原图" /> : null}{showJet ? <AnalysisImage src={media.jetThumbnailUrl} alt={`${defect.typeLabel}缩略 JET`} emptyLabel="JET" /> : null}</span>
                     <small>C{cameraNumber(defect)} · {sequenceNumber(defect) ?? '--'}</small>
@@ -389,7 +550,7 @@ export function DefectAnalysisPage({
         </section>
 
         <DefectDistribution
-          defects={defects}
+          defects={displayDefects}
           selectedDefectId={selectedDefect?.id ?? null}
           defectTypes={defectTypes}
           cameraCount={Math.max(1, expectedCameraCount)}

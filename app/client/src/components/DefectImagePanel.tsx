@@ -5,6 +5,7 @@ import { captureArtifactImageUrl } from '../lib/capture-api';
 import { bkvOnlineCroppedImageUrl, isBkvOnlineImageUrl } from '../services/bkv-online-api';
 import { inspectionWorldFrameUrl } from '../services/inspection-world-api';
 import { Panel } from './Panel';
+import { RequestedSizeImage } from './RequestedSizeImage';
 
 type Props = {
   inspectionId?: string;
@@ -168,10 +169,13 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse, onRe
           ) : null}
           {reviewError ? <div className="defect-review-error" role="alert">{reviewError}</div> : null}
           <div className={`defect-image-viewport ${actualSize ? 'actual-size' : ''}`}>
-            <img
+            <RequestedSizeImage
               src={imageUrl}
               alt={`${defect.typeLabel} C${cameraId} 第 ${sequenceNo} 帧缺陷图像`}
               data-roi={roiLabel(roi)}
+              requestWidth={960}
+              requestHeight={640}
+              disableRequestedSize={actualSize}
               onError={() => setFailed(true)}
             />
           </div>

@@ -994,9 +994,68 @@ export type CaptureDetectedDefect = {
   confidence: number;
   severity: "review" | string;
   modalities: Array<"2d" | "3d" | string>;
+  source?: string;
+  active?: boolean;
+  algorithmRevision?: string;
+  supersededAt?: string | null;
+  candidatePolarity?: "depression" | "protrusion" | string;
+  signedDepthMm?: number | null;
+  absoluteDepthMm?: number | null;
+  pointCount?: number;
+  horizontalSpanMm?: number | null;
+  longitudinalMm?: number | null;
+  longitudinalSpanMm?: number | null;
+  areaMm2?: number | null;
+  pixelSpan?: { width?: number; height?: number; major?: number; minor?: number } | null;
   reviewImage?: string;
   reviewImageWidth?: number;
   reviewImageHeight?: number;
+};
+
+export type CaptureDefectGroup = CaptureDetectedDefect[] | {
+  defects: CaptureDetectedDefect[];
+  count?: number;
+  source?: string;
+  schema?: string;
+  state?: string;
+  algorithmRevision?: string | number | null;
+  configHash?: string | null;
+  modelHash?: string | null;
+  globalPositionAvailable?: boolean;
+  riskTags?: string[];
+  error?: string | null;
+  quality?: Record<string, unknown>;
+  statistics?: Record<string, unknown>;
+};
+
+export type CaptureDefectGroups = {
+  geometry?: CaptureDefectGroup | null;
+  legacy?: CaptureDefectGroup | null;
+};
+
+export type CaptureDefectComparison = {
+  schema?: string;
+  minimumIoU?: number;
+  matched: number;
+  geometryOnly: number;
+  legacyOnly: number;
+  estimatedUniqueCount: number;
+  matches?: Array<{
+    geometryId?: string | null;
+    legacyId?: string | null;
+    cameraId?: string | null;
+    storageIndex?: number | null;
+    iou?: number;
+  }>;
+  geometryOnlyIds?: Array<string | null>;
+  legacyOnlyIds?: Array<string | null>;
+  matchedCount?: number;
+  geometryOnlyCount?: number;
+  legacyOnlyCount?: number;
+  iouThreshold?: number;
+  cameraLocal?: boolean;
+  warning?: string;
+  riskTags?: string[];
 };
 
 export type CaptureFlowDefectDetection = {
@@ -1014,6 +1073,10 @@ export type CaptureFlowDefectDetection = {
     sampled?: boolean;
     reason?: string;
   };
+  defectGroups?: CaptureDefectGroups | null;
+  comparison?: CaptureDefectComparison | null;
+  algorithmRevision?: string;
+  algorithmConfigHash?: string;
   statistics?: {
     processedFrames?: number;
     skippedFrames?: number;
@@ -1045,6 +1108,8 @@ export type CaptureDefectDetectionResponse = {
   code: number;
   path?: string;
   detection?: CaptureFlowDefectDetection;
+  defectGroups?: CaptureDefectGroups | null;
+  comparison?: CaptureDefectComparison | null;
   state?: string;
   materialId?: string;
   defectCount?: number;
