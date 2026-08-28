@@ -34,6 +34,7 @@ The versioned payload, schema ledger, persistent upgrade journal, crash recovery
 The release, two-stage installation, offline prerequisites, supervisor acceptance, operations, and evidence SOP is in [docs/release-deployment-and-operations.md](docs/release-deployment-and-operations.md).
 The real SICK GenTL bring-up, single-camera sidecar integration, LG_3D-compatible storage contract, and FAT checklist are in [docs/sick-gentl-capture.md](docs/sick-gentl-capture.md).
 The current `10.50.111.141` handoff state and the safe six-camera continuation procedure are in [docs/10.50.111.141-server-continuation.md](docs/10.50.111.141-server-continuation.md).
+The independent server-side FRP HTTP tunnel setup, local-only credential handling, and startup verification are in [docs/frp-server-http-tunnel.md](docs/frp-server-http-tunnel.md).
 
 ## Migration Status
 

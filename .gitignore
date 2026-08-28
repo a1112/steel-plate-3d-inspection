@@ -15,6 +15,7 @@ app/service/build/
 *.local
 *.local.env
 *.local.json
+*.local.toml
 __pycache__/
 *.py[cod]
 logFile.ini

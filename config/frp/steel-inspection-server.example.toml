@@ -1,0 +1,17 @@
+# Copy this file to a deployment-local *.local.toml file before editing it.
+# Never commit the real FRP password.
+
+serverAddr = "frp-gz.zjz-service.cn"
+serverPort = 7000
+user = "1042815796"
+
+[metadatas]
+password = "REPLACE_WITH_FRP_PASSWORD"
+
+[[proxies]]
+# Keep this name distinct from the development-machine proxy named https_test.
+name = "steel_inspection_server"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 4873
+customDomains = ["kacg6rxr.zjz-service.cn"]
