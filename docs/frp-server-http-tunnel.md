@@ -41,7 +41,9 @@ Copy-Item `
 notepad.exe $Config
 ```
 
-只在服务器本地文件中把 `REPLACE_WITH_FRP_PASSWORD` 替换为 FRP 账号密码。
+只在服务器本地文件中替换 `REPLACE_WITH_FRP_USER` 和
+`REPLACE_WITH_FRP_PASSWORD`。托管平台的技术 `user` 可能与网页登录名不同；
+必须使用配置管理页为该代理分配的技术用户 ID。用户名和密码都只能保存在本机。
 域名已经写入模板，不要替换为开发机的 `n9yhdrvz.zjz-service.cn`。
 
 最终的服务器本地配置结构如下：
@@ -49,7 +51,11 @@ notepad.exe $Config
 ```toml
 serverAddr = "frp-gz.zjz-service.cn"
 serverPort = 7000
-user = "1042815796"
+user = "本机填写托管平台分配的技术用户 ID"
+loginFailExit = true
+
+transport.protocol = "tcp"
+transport.tls.enable = true
 
 [metadatas]
 password = "在服务器本地填写 FRP 密码"
@@ -60,15 +66,34 @@ type = "http"
 localIP = "127.0.0.1"
 localPort = 4873
 customDomains = ["kacg6rxr.zjz-service.cn"]
+
+[proxies.transport]
+useEncryption = false
+useCompression = false
+
+[proxies.healthCheck]
+type = "http"
+path = "/api/health/live"
+intervalSeconds = 10
+timeoutSeconds = 3
+maxFailed = 3
 ```
 
-`*.local.toml` 已加入仓库忽略规则。真实密码只能保存在服务器本地配置中，
+`*.local.toml` 已加入仓库忽略规则。真实用户名和密码只能保存在服务器本地配置中，
 不得提交到 Git；本仓库是公开仓库。
 
 ## 3. 安装并前台验证
 
-下载与当前已验证环境一致的官方 FRP `v0.71.0` Windows amd64 版本，将
-`frpc.exe` 放到 `C:\Program Files\frp`。先确认服务器业务服务可访问：
+仓库安装器固定官方 FRP `v0.71.0` Windows amd64 版本并校验发布包
+SHA-256；测试脚本还会用官方 `frpc verify` 验证模板。先执行：
+
+```powershell
+Set-Location 'D:\project\steel-plate-3d-inspection-main'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install-frp-client.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-frp-client-contract.ps1
+```
+
+再确认服务器业务服务可访问：
 
 ```powershell
 Invoke-WebRequest `
@@ -78,18 +103,22 @@ Invoke-WebRequest `
   Select-Object StatusCode
 ```
 
-验证配置并以前台方式启动：
+验证本机配置，然后启动为隐藏的独立进程：
 
 ```powershell
-$Frpc = 'C:\Program Files\frp\frpc.exe'
 $Config = 'C:\ProgramData\SteelInspection\frp\steel-inspection-server.local.toml'
 
-& $Frpc verify -c $Config
-& $Frpc -c $Config
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\run-frp-client.ps1 `
+  -ConfigPath $Config `
+  -VerifyOnly
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\run-frp-client.ps1 `
+  -ConfigPath $Config `
+  -Detach
 ```
 
-日志必须依次出现 `login to server success`、
-`proxy added: [steel_inspection_server]` 和 `start proxy success`。如果平台提示
+启动器会限制本机配置 ACL，要求日志依次出现 `login to server success`、
+`proxy added: [steel_inspection_server]` 和 `start proxy success`，并从公网域名
+回测 `/api/health/live` 为 HTTP 200 后才报告成功。如果平台提示
 代理名称或域名已被占用，应在管理页重新创建独立配置，不要停止或修改开发机的
 `https_test`。
 

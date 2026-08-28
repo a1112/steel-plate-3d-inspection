@@ -188,6 +188,19 @@ scripts/run-service.ps1 -EnvFile config/env/bkv.env.example
 scripts/run-client-dev.ps1 -EnvFile config/env/client.env.example
 ```
 
+Optional remote access through the independently registered FRPS proxy:
+
+```powershell
+scripts/install-frp-client.ps1
+scripts/test-frp-client-contract.ps1
+scripts/run-frp-client.ps1 -ConfigPath config/frp/steel-inspection-server.local.toml -VerifyOnly
+scripts/run-frp-client.ps1 -ConfigPath config/frp/steel-inspection-server.local.toml -Detach
+```
+
+The `*.local.toml` file contains the deployment account and must not be
+committed. The FRP proxy targets only the unified service on loopback port
+`4873`; see `docs/frp-server-http-tunnel.md` for the assigned server and domain.
+
 The client switches to compatibility behavior from the sanitized
 `GET /api/runtime-profile` capabilities. Read-only material and whitelisted
 artifact endpoints are local display APIs, matching the existing inspection

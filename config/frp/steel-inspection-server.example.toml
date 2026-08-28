@@ -1,9 +1,13 @@
 # Copy this file to a deployment-local *.local.toml file before editing it.
-# Never commit the real FRP password.
+# Never commit the real FRP username or password.
 
 serverAddr = "frp-gz.zjz-service.cn"
 serverPort = 7000
-user = "1042815796"
+user = "REPLACE_WITH_FRP_USER"
+loginFailExit = true
+
+transport.protocol = "tcp"
+transport.tls.enable = true
 
 [metadatas]
 password = "REPLACE_WITH_FRP_PASSWORD"
@@ -15,3 +19,15 @@ type = "http"
 localIP = "127.0.0.1"
 localPort = 4873
 customDomains = ["kacg6rxr.zjz-service.cn"]
+
+[proxies.transport]
+# Image responses are already encoded; another compression layer reduces throughput.
+useEncryption = false
+useCompression = false
+
+[proxies.healthCheck]
+type = "http"
+path = "/api/health/live"
+intervalSeconds = 10
+timeoutSeconds = 3
+maxFailed = 3
