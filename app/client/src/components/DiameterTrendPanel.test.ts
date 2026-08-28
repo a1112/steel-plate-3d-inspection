@@ -68,11 +68,11 @@ describe('buildDiameterMeasurements', () => {
     expect(container.querySelectorAll('canvas')).toHaveLength(2);
     expect(screen.getByRole('img', { name: '测径（外径）曲线，按钢管长度位置变化' }))
       .toHaveAttribute('data-selected-axis-value', '3000.000');
-    expect(screen.getByRole('group', { name: '测径曲线图例' })).toBeInTheDocument();
-    const fittedSeries = screen.getByRole('button', { name: '圆拟合外径' });
-    expect(fittedSeries).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('group', { name: '测径曲线多选' })).toBeInTheDocument();
+    const fittedSeries = screen.getByRole('checkbox', { name: '圆拟合外径' });
+    expect(fittedSeries).toBeChecked();
     fireEvent.click(fittedSeries);
-    expect(fittedSeries).toHaveAttribute('aria-pressed', 'false');
+    expect(fittedSeries).not.toBeChecked();
     expect(screen.queryByText('外径偏差变化')).not.toBeInTheDocument();
     expect(screen.queryByText('圆度误差变化')).not.toBeInTheDocument();
   });
@@ -156,7 +156,10 @@ describe('buildDiameterMeasurements', () => {
     expect(grid).toHaveAttribute('data-x-axis-mode', 'head-relative');
     expect(screen.queryByText('2 / 3')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('固定角度测径曲线图例')).not.toBeInTheDocument();
-    expect(screen.getAllByRole('button', { pressed: true })).toHaveLength(5);
+    expect(screen.getAllByRole('checkbox', { checked: true })).toHaveLength(5);
+    fireEvent.click(screen.getByRole('checkbox', { name: '0°' }));
+    expect(screen.getByRole('checkbox', { name: '0°' })).not.toBeChecked();
+    expect(screen.getAllByRole('checkbox', { checked: true })).toHaveLength(4);
     const chart = screen.getByRole('img', { name: '测径（外径）曲线，按头部相对位置变化' });
     Object.defineProperty(chart, 'getBoundingClientRect', {
       configurable: true,
@@ -164,7 +167,7 @@ describe('buildDiameterMeasurements', () => {
     });
     fireEvent.pointerMove(chart, { clientX: 330, clientY: 150 });
     expect(document.querySelector('.diameter-canvas-tooltip')).toHaveTextContent('%');
-    expect(document.querySelectorAll('.diameter-canvas-tooltip span')).toHaveLength(5);
+    expect(document.querySelectorAll('.diameter-canvas-tooltip span')).toHaveLength(4);
   });
 
   it('renders an explicitly unqualified trend without marking it as valid measurement', () => {

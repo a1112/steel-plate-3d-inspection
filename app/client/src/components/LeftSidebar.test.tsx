@@ -206,9 +206,8 @@ describe('LeftSidebar', () => {
     expect(screen.getByText('202606131858')).toBeInTheDocument();
     expect(screen.queryByText('检测中')).not.toBeInTheDocument();
     expect(screen.getByText('已完成')).toBeInTheDocument();
-    const matchCount = screen.getByText(
-      (_, element) => element?.classList.contains('record-search-count') === true && element.textContent === '匹配 1 / 2',
-    );
+    const matchCount = screen.getByLabelText('记录数量 1');
+    expect(matchCount).toHaveTextContent(/^1$/);
     expect(matchCount.closest('.records-panel .panel-header')).not.toBeNull();
     expect(matchCount.closest('.record-search-form')).toBeNull();
   });

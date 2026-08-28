@@ -11,6 +11,7 @@ import type {
 } from '../data/inspection';
 import { resolveDefectGroups, severityLabels } from '../data/inspection';
 import { fetchCaptureStitchHistory, type CaptureStitchCameraFrame } from '../services/capture-roi-api';
+import { bkvOnlineCroppedImageUrl, isBkvOnlineImageUrl } from '../services/bkv-online-api';
 import { RequestedSizeImage } from './RequestedSizeImage';
 
 type DefectAnalysisDisplayMode = 'cards' | 'large';
@@ -33,6 +34,21 @@ type DefectMedia = {
   grayOriginalUrl: string;
   jetThumbnailUrl: string;
   jetOriginalUrl: string;
+  grayContext: DefectImageContext | null;
+  jetContext: DefectImageContext | null;
+};
+
+type DefectImageContext = {
+  imageWidth: number;
+  imageHeight: number;
+  viewX: number;
+  viewY: number;
+  viewWidth: number;
+  viewHeight: number;
+  roiX: number;
+  roiY: number;
+  roiWidth: number;
+  roiHeight: number;
 };
 
 const CARD_PAGE_SIZE = 9;
@@ -122,44 +138,222 @@ function matchFrame(defect: DefectItem, frames: CaptureStitchCameraFrame[]) {
   }) ?? null;
 }
 
-function mediaForDefect(defect: DefectItem, captureFrames: CaptureStitchCameraFrame[]): DefectMedia {
-  const cameraFrame = matchFrame(defect, captureFrames);
-  const preview = defect.previewImageUrl?.trim() ?? '';
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+function bkvDefectImageContext(defect: DefectItem): DefectImageContext | null {
+  const roi = defect.artifacts?.roi;
+  if (!roi
+    || ![roi.x, roi.y, roi.width, roi.height].every(Number.isFinite)
+    || roi.x < 0
+    || roi.y < 0
+    || roi.width <= 0
+    || roi.height <= 0) return null;
+
+  // BKV images use a 1024 x 1024 source coordinate space. The image endpoint
+  // expands a requested ROI to at least 256 x 128 pixels and keeps it inside
+  // the source image. Mirror that geometry so the SVG overlay stays exact.
+  const sourceWidth = 1024;
+  const sourceHeight = 1024;
+  const roiX = Math.round(roi.x);
+  const roiY = Math.round(roi.y);
+  const roiWidth = Math.max(1, Math.round(roi.width));
+  const roiHeight = Math.max(1, Math.round(roi.height));
+  const contextWidth = Math.min(sourceWidth, Math.max(256, roiWidth));
+  const contextHeight = Math.min(sourceHeight, Math.max(128, roiHeight));
+  const centerX = Math.min(sourceWidth, roiX + Math.floor(roiWidth / 2));
+  const centerY = Math.min(sourceHeight, roiY + Math.floor(roiHeight / 2));
+  const cropX = Math.min(
+    Math.max(0, centerX - Math.floor(contextWidth / 2)),
+    sourceWidth - contextWidth,
+  );
+  const cropY = Math.min(
+    Math.max(0, centerY - Math.floor(contextHeight / 2)),
+    sourceHeight - contextHeight,
+  );
+  const scale = Math.min(1, 512 / contextWidth, 512 / contextHeight);
+  const imageWidth = contextWidth * scale;
+  const imageHeight = contextHeight * scale;
+  const mappedRoiX = clamp((roiX - cropX) * scale, 0, imageWidth - 1);
+  const mappedRoiY = clamp((roiY - cropY) * scale, 0, imageHeight - 1);
+
   return {
-    grayThumbnailUrl: cameraFrame?.grayThumbnailUrl || preview,
-    grayOriginalUrl: cameraFrame?.grayOriginalUrl || preview,
-    jetThumbnailUrl: cameraFrame?.jetThumbnailUrl || defect.artifacts?.depthRoiImage || '',
-    jetOriginalUrl: cameraFrame?.jetOriginalUrl || defect.artifacts?.depthRoiImage || '',
+    imageWidth,
+    imageHeight,
+    viewX: 0,
+    viewY: 0,
+    viewWidth: imageWidth,
+    viewHeight: imageHeight,
+    roiX: mappedRoiX,
+    roiY: mappedRoiY,
+    roiWidth: Math.max(1, Math.min(roiWidth * scale, imageWidth - mappedRoiX)),
+    roiHeight: Math.max(1, Math.min(roiHeight * scale, imageHeight - mappedRoiY)),
   };
 }
 
-function AnalysisImage({ src, alt, emptyLabel, large = false }: {
+export function defectImageContext(
+  defect: DefectItem,
+  cameraFrame: CaptureStitchCameraFrame | null,
+): DefectImageContext | null {
+  const roi = defect.artifacts?.roi;
+  if (!cameraFrame || !roi || ![roi.x, roi.y, roi.width, roi.height].every(Number.isFinite)) return null;
+  const fallbackOffsetX = cameraFrame.validRoi?.[0] ?? 0;
+  const fallbackOffsetY = cameraFrame.validRoi?.[1] ?? 0;
+  const offsetX = Number(cameraFrame.sourceOffset?.x ?? fallbackOffsetX);
+  const offsetY = Number(cameraFrame.sourceOffset?.y ?? fallbackOffsetY);
+  const fallbackWidth = cameraFrame.validRoi
+    ? cameraFrame.validRoi[2] - cameraFrame.validRoi[0]
+    : cameraFrame.sourceWidth;
+  const fallbackHeight = cameraFrame.validRoi
+    ? cameraFrame.validRoi[3] - cameraFrame.validRoi[1]
+    : cameraFrame.sourceHeight;
+  const imageWidth = Number(cameraFrame.displaySize?.[0] ?? fallbackWidth);
+  const imageHeight = Number(cameraFrame.displaySize?.[1] ?? fallbackHeight);
+  if (![offsetX, offsetY, imageWidth, imageHeight].every(Number.isFinite)
+    || imageWidth <= 1 || imageHeight <= 1) return null;
+
+  const candidates = [
+    { left: roi.x - offsetX, top: roi.y - offsetY },
+    // Some historical records already store ROI coordinates relative to the
+    // rendered crop. Use those coordinates when source-space mapping lands
+    // outside the displayed image.
+    { left: roi.x, top: roi.y },
+  ];
+  const mapped = candidates.find(({ left, top }) => (
+    left + Math.max(1, roi.width) > 0
+    && top + Math.max(1, roi.height) > 0
+    && left < imageWidth
+    && top < imageHeight
+  ));
+  if (!mapped) return null;
+  const sourceLeft = mapped.left;
+  const sourceTop = mapped.top;
+  const sourceRight = sourceLeft + Math.max(1, roi.width);
+  const sourceBottom = sourceTop + Math.max(1, roi.height);
+  const roiX = clamp(sourceLeft, 0, imageWidth - 1);
+  const roiY = clamp(sourceTop, 0, imageHeight - 1);
+  const roiWidth = Math.max(1, clamp(sourceRight, roiX + 1, imageWidth) - roiX);
+  const roiHeight = Math.max(1, clamp(sourceBottom, roiY + 1, imageHeight) - roiY);
+  const viewWidth = Math.min(imageWidth, Math.max(160, roiWidth * 7));
+  const viewHeight = Math.min(imageHeight, Math.max(128, roiHeight * 7));
+  const viewX = clamp(roiX + roiWidth / 2 - viewWidth / 2, 0, imageWidth - viewWidth);
+  const viewY = clamp(roiY + roiHeight / 2 - viewHeight / 2, 0, imageHeight - viewHeight);
+  return {
+    imageWidth,
+    imageHeight,
+    viewX,
+    viewY,
+    viewWidth,
+    viewHeight,
+    roiX,
+    roiY,
+    roiWidth,
+    roiHeight,
+  };
+}
+
+function mediaForDefect(defect: DefectItem, captureFrames: CaptureStitchCameraFrame[]): DefectMedia {
+  const cameraFrame = matchFrame(defect, captureFrames);
+  const preview = defect.previewImageUrl?.trim() ?? '';
+  const roi = defect.artifacts?.roi;
+  const grayBkvSource = [
+    defect.artifacts?.roiImage,
+    preview,
+    defect.artifacts?.sourceFrame?.intensity,
+  ].find((source) => isBkvOnlineImageUrl(source));
+  const jetBkvSource = [
+    defect.artifacts?.depthRoiImage,
+    defect.artifacts?.sourceFrame?.depth,
+  ].find((source) => isBkvOnlineImageUrl(source));
+  const grayBkvUrl = bkvOnlineCroppedImageUrl(grayBkvSource, roi);
+  const jetBkvUrl = bkvOnlineCroppedImageUrl(jetBkvSource, roi);
+  const bkvContext = grayBkvUrl ? bkvDefectImageContext(defect) : null;
+  const captureContext = defectImageContext(defect, cameraFrame);
+  return {
+    grayThumbnailUrl: grayBkvUrl || cameraFrame?.grayThumbnailUrl || preview,
+    grayOriginalUrl: grayBkvUrl || cameraFrame?.grayOriginalUrl || preview,
+    jetThumbnailUrl: jetBkvUrl || cameraFrame?.jetThumbnailUrl || defect.artifacts?.depthRoiImage || '',
+    jetOriginalUrl: jetBkvUrl || cameraFrame?.jetOriginalUrl || defect.artifacts?.depthRoiImage || '',
+    grayContext: bkvContext || captureContext,
+    jetContext: jetBkvUrl && bkvContext ? bkvContext : captureContext,
+  };
+}
+
+function AnalysisImage({ src, alt, emptyLabel, context, large = false, onDoubleClick, onWheel }: {
   src: string;
   alt: string;
   emptyLabel: string;
+  context?: DefectImageContext | null;
   large?: boolean;
+  onDoubleClick?: () => void;
+  onWheel?: (direction: -1 | 1) => void;
 }) {
   const [failed, setFailed] = useState(false);
 
   useEffect(() => setFailed(false), [src]);
 
   return (
-    <div className={`defect-analysis-image ${large ? 'large' : ''} ${!src || failed ? 'empty' : ''}`}>
+    <div
+      className={`defect-analysis-image ${large ? 'large' : ''} ${!src || failed ? 'empty' : ''}`}
+      onDoubleClick={onDoubleClick ? (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onDoubleClick();
+      } : undefined}
+      onWheel={onWheel ? (event) => {
+        if (event.deltaY === 0) return;
+        event.preventDefault();
+        event.stopPropagation();
+        onWheel(event.deltaY > 0 ? 1 : -1);
+      } : undefined}
+    >
       {src && !failed
-        ? <RequestedSizeImage
+        ? context ? (
+          <svg
+            className="defect-analysis-context-image"
+            role="img"
+            aria-label={alt}
+            viewBox={`${context.viewX} ${context.viewY} ${context.viewWidth} ${context.viewHeight}`}
+            preserveAspectRatio="xMidYMid meet"
+            data-context-window={`${context.viewX},${context.viewY},${context.viewWidth},${context.viewHeight}`}
+            data-defect-roi={`${context.roiX},${context.roiY},${context.roiWidth},${context.roiHeight}`}
+          >
+            <title>{alt}</title>
+            <image
+              href={src}
+              x="0"
+              y="0"
+              width={context.imageWidth}
+              height={context.imageHeight}
+              preserveAspectRatio="none"
+              onError={() => setFailed(true)}
+            />
+            <rect
+              className="defect-analysis-roi-box"
+              x={context.roiX}
+              y={context.roiY}
+              width={context.roiWidth}
+              height={context.roiHeight}
+              vectorEffect="non-scaling-stroke"
+              aria-hidden="true"
+            />
+          </svg>
+        ) : (
+          <RequestedSizeImage
             src={src}
             alt={alt}
             requestWidth={large ? 960 : 384}
             requestHeight={large ? 640 : 256}
             onError={() => setFailed(true)}
           />
+        )
         : <span>{failed ? `${emptyLabel}读取失败` : `${emptyLabel}未就绪`}</span>}
-      {src && !failed ? <i className="defect-analysis-crosshair" aria-hidden="true" /> : null}
     </div>
   );
 }
 
-function DefectPairCard({ defect, media, selected, plateLengthMm, showGray, showJet, onSelect }: {
+function DefectPairCard({ defect, media, selected, plateLengthMm, showGray, showJet, onSelect, onOpenLarge }: {
   defect: DefectItem;
   media: DefectMedia;
   selected: boolean;
@@ -167,6 +361,7 @@ function DefectPairCard({ defect, media, selected, plateLengthMm, showGray, show
   showGray: boolean;
   showJet: boolean;
   onSelect: () => void;
+  onOpenLarge: () => void;
 }) {
   const sequence = sequenceNumber(defect);
   return (
@@ -184,11 +379,11 @@ function DefectPairCard({ defect, media, selected, plateLengthMm, showGray, show
       <div className={`defect-pair-images ${showGray && showJet ? '' : 'single'}`}>
         {showGray ? <figure>
           <figcaption>原始小图</figcaption>
-          <AnalysisImage src={media.grayThumbnailUrl} alt={`${defect.typeLabel}原始小图`} emptyLabel="原始小图" />
+          <AnalysisImage src={media.grayThumbnailUrl} alt={`${defect.typeLabel}原始小图`} emptyLabel="原始小图" context={media.grayContext} onDoubleClick={onOpenLarge} />
         </figure> : null}
         {showJet ? <figure>
           <figcaption>JET</figcaption>
-          <AnalysisImage src={media.jetThumbnailUrl} alt={`${defect.typeLabel} JET 小图`} emptyLabel="JET" />
+          <AnalysisImage src={media.jetThumbnailUrl} alt={`${defect.typeLabel} JET 小图`} emptyLabel="JET" context={media.jetContext} onDoubleClick={onOpenLarge} />
         </figure> : null}
       </div>
       <footer>
@@ -512,6 +707,10 @@ export function DefectAnalysisPage({
                   showGray={showGray}
                   showJet={showJet}
                   onSelect={() => onSelectDefect(defect.id)}
+                  onOpenLarge={() => {
+                    onSelectDefect(defect.id);
+                    setDisplayMode('large');
+                  }}
                 />)}
               </div>
               <div className="defect-analysis-pagination">
@@ -523,8 +722,8 @@ export function DefectAnalysisPage({
           ) : selectedDefect && selectedMedia ? (
             <div className="defect-large-mode">
               <div className={`defect-large-pair ${showGray && showJet ? '' : 'single'}`}>
-                {showGray ? <figure><figcaption><ImageIcon size={14} />原始大图</figcaption><AnalysisImage large src={selectedMedia.grayOriginalUrl} alt={`${selectedDefect.typeLabel}原始大图`} emptyLabel="原始大图" /></figure> : null}
-                {showJet ? <figure><figcaption><ImageIcon size={14} />JET 大图</figcaption><AnalysisImage large src={selectedMedia.jetOriginalUrl} alt={`${selectedDefect.typeLabel} JET 大图`} emptyLabel="JET 大图" /></figure> : null}
+                {showGray ? <figure><figcaption><ImageIcon size={14} />原始大图</figcaption><AnalysisImage large src={selectedMedia.grayOriginalUrl} alt={`${selectedDefect.typeLabel}原始大图`} emptyLabel="原始大图" context={selectedMedia.grayContext} onDoubleClick={() => setDisplayMode('cards')} onWheel={navigateDefect} /></figure> : null}
+                {showJet ? <figure><figcaption><ImageIcon size={14} />JET 大图</figcaption><AnalysisImage large src={selectedMedia.jetOriginalUrl} alt={`${selectedDefect.typeLabel} JET 大图`} emptyLabel="JET 大图" context={selectedMedia.jetContext} onDoubleClick={() => setDisplayMode('cards')} onWheel={navigateDefect} /></figure> : null}
               </div>
               <div className="defect-large-actions">
                 <button type="button" onClick={() => navigateDefect(-1)}><ChevronLeft size={15} />上一处</button>
@@ -539,7 +738,7 @@ export function DefectAnalysisPage({
                   const media = mediaForDefect(defect, captureFrames);
                   return <button key={`${defect.source ?? 'candidate'}-${defect.id}-${index}`} type="button" className={defect.id === selectedDefect.id ? 'selected' : ''} onClick={() => onSelectDefect(defect.id)}>
                     <b>{String(index + 1).padStart(2, '0')}</b>
-                    <span className={showGray && showJet ? '' : 'single'}>{showGray ? <AnalysisImage src={media.grayThumbnailUrl} alt={`${defect.typeLabel}缩略原图`} emptyLabel="原图" /> : null}{showJet ? <AnalysisImage src={media.jetThumbnailUrl} alt={`${defect.typeLabel}缩略 JET`} emptyLabel="JET" /> : null}</span>
+                    <span className={showGray && showJet ? '' : 'single'}>{showGray ? <AnalysisImage src={media.grayThumbnailUrl} alt={`${defect.typeLabel}缩略原图`} emptyLabel="原图" context={media.grayContext} /> : null}{showJet ? <AnalysisImage src={media.jetThumbnailUrl} alt={`${defect.typeLabel}缩略 JET`} emptyLabel="JET" context={media.jetContext} /> : null}</span>
                     <small>C{cameraNumber(defect)} · {sequenceNumber(defect) ?? '--'}</small>
                   </button>;
                 })}

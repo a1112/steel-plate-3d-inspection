@@ -301,7 +301,7 @@ function buildCalibratedProjection(
 }
 
 function cameraImageUrl(camera: CaptureStitchCameraFrame, modality: CaptureTextureModality) {
-  return modality === 'jet' ? camera.jetThumbnailUrl : camera.grayThumbnailUrl;
+  return modality === 'jet' ? camera.jetOriginalUrl : camera.grayOriginalUrl;
 }
 
 function planRasterSize(longitudinalPixels: number, circumferencePixels: number) {

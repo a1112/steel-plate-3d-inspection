@@ -1,7 +1,13 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DefectItem, DefectType, SteelPlate } from '../data/inspection';
+import { fetchCaptureStitchHistory } from '../services/capture-roi-api';
 import { DefectAnalysisPage } from './DefectAnalysisPage';
+
+vi.mock('../services/capture-roi-api', async () => {
+  const actual = await vi.importActual<typeof import('../services/capture-roi-api')>('../services/capture-roi-api');
+  return { ...actual, fetchCaptureStitchHistory: vi.fn() };
+});
 
 const plate: SteelPlate = {
   plateNo: 'DEMO-4034',
@@ -100,6 +106,10 @@ function renderPage(overrides: Partial<React.ComponentProps<typeof DefectAnalysi
 }
 
 describe('DefectAnalysisPage', () => {
+  beforeEach(() => {
+    vi.mocked(fetchCaptureStitchHistory).mockReset();
+  });
+
   it('opens in paired large-image mode with the camera-length distribution', () => {
     renderPage();
 
@@ -124,6 +134,140 @@ describe('DefectAnalysisPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '凹坑，C6，位置9.60米' }));
     expect(onSelectDefect).toHaveBeenCalledWith('D-002');
+  });
+
+  it('toggles between large images and cards by double-clicking an image', () => {
+    renderPage();
+
+    fireEvent.doubleClick(screen.getByRole('img', { name: '划伤原始大图' }));
+    expect(screen.getByRole('button', { name: '卡片' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('img', { name: '划伤原始小图' })).toBeInTheDocument();
+
+    fireEvent.doubleClick(screen.getByRole('img', { name: '划伤原始小图' }));
+    expect(screen.getByRole('button', { name: '大图' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('img', { name: '划伤原始大图' })).toBeInTheDocument();
+  });
+
+  it('switches to the previous or next defect by scrolling over a large image', () => {
+    const thirdDefect: DefectItem = {
+      ...defects[0],
+      id: 'D-003',
+      typeLabel: '裂纹',
+      distanceHeadMm: 6_000,
+    };
+    const { onSelectDefect } = renderPage({
+      defects: [...defects, thirdDefect],
+      selectedDefectId: 'D-002',
+    });
+
+    const [grayLargeImage, jetLargeImage] = Array.from(
+      document.querySelectorAll<HTMLElement>('.defect-analysis-image.large'),
+    );
+    expect(grayLargeImage).toBeDefined();
+    expect(jetLargeImage).toBeDefined();
+    fireEvent.wheel(grayLargeImage, { deltaY: 120 });
+    expect(onSelectDefect).toHaveBeenCalledWith('D-003');
+    fireEvent.wheel(jetLargeImage, { deltaY: -120 });
+    expect(onSelectDefect).toHaveBeenCalledWith('D-001');
+  });
+
+  it('centers gray and JET images on the real defect ROI with surrounding context and a red box', async () => {
+    const focusedDefect: DefectItem = {
+      ...defects[0],
+      plateNo: '4034',
+      artifacts: {
+        ...defects[0].artifacts!,
+        roi: { x: 130, y: 200, width: 30, height: 18 },
+      },
+    };
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue({
+      materialId: '4034',
+      indexed: true,
+      totalFrames: 1,
+      hasMore: false,
+      expectedCameraCount: 6,
+      renderableImageCount: 1,
+      frames: [{
+        frameId: '4034:113',
+        sequence: 113,
+        capturedAt: '2026-08-27T14:00:00.000Z',
+        cameras: [{
+          cameraId: 'C2',
+          cameraIp: '192.168.102.100',
+          artifactRef: '4034/capture/C2/2d/113.png',
+          frameSequence: 113,
+          storageIndex: 113,
+          sourceWidth: 2560,
+          sourceHeight: 1024,
+          validRoi: [100, 0, 700, 1024],
+          displaySize: [600, 1024],
+          sourceOffset: { x: 100, y: 0 },
+          url: '/gray-thumbnail.jpg',
+          grayThumbnailUrl: '/gray-thumbnail.jpg',
+          grayOriginalUrl: '/gray-original.jpg',
+          jetThumbnailUrl: '/jet-thumbnail.jpg',
+          jetOriginalUrl: '/jet-original.jpg',
+        }],
+      }],
+    });
+
+    renderPage({
+      plate: { ...plate, plateNo: '4034' },
+      defects: [focusedDefect],
+      selectedDefectId: focusedDefect.id,
+    });
+
+    await waitFor(() => expect(
+      screen.getByRole('img', { name: '划伤原始大图' }),
+    ).toHaveAttribute('data-context-window', '0,145,210,128'));
+    const gray = screen.getByRole('img', { name: '划伤原始大图' });
+    const jet = screen.getByRole('img', { name: '划伤 JET 大图' });
+    expect(gray).toHaveAttribute('data-defect-roi', '30,200,30,18');
+    expect(jet).toHaveAttribute('data-context-window', '0,145,210,128');
+    expect(document.querySelectorAll('.defect-analysis-roi-box')).toHaveLength(4);
+    expect(document.querySelector('.defect-analysis-crosshair')).not.toBeInTheDocument();
+  });
+
+  it('uses the BKV defect crop with context instead of an unrelated full capture frame', async () => {
+    const focusedDefect: DefectItem = {
+      ...defects[0],
+      plateNo: '4034',
+      previewImageUrl: '/api/bkv-online/image?camera=2&seq=4034&index=113&kind=2d',
+      artifacts: {
+        ...defects[0].artifacts!,
+        roi: { x: 10, y: 20, width: 30, height: 18 },
+        sourceFrame: {
+          intensity: '/api/bkv-online/image?camera=2&seq=4034&index=113&kind=2d',
+          depth: '/api/bkv-online/image?camera=2&seq=4034&index=113&kind=depth',
+        },
+      },
+    };
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue({
+      materialId: '4034',
+      indexed: true,
+      totalFrames: 0,
+      hasMore: false,
+      expectedCameraCount: 6,
+      renderableImageCount: 0,
+      frames: [],
+    });
+
+    renderPage({
+      plate: { ...plate, plateNo: '4034' },
+      defects: [focusedDefect],
+      selectedDefectId: focusedDefect.id,
+    });
+    fireEvent.click(screen.getByRole('button', { name: '卡片' }));
+
+    const gray = await screen.findByRole('img', { name: '划伤原始小图' });
+    expect(gray).toHaveAttribute('data-context-window', '0,0,256,128');
+    expect(gray).toHaveAttribute('data-defect-roi', '10,20,30,18');
+    const image = gray.querySelector('image');
+    const grayUrl = new URL(image?.getAttribute('href') ?? '');
+    expect(grayUrl.searchParams.get('cropX')).toBe('10');
+    expect(grayUrl.searchParams.get('cropY')).toBe('20');
+    expect(grayUrl.searchParams.get('cropWidth')).toBe('30');
+    expect(grayUrl.searchParams.get('cropHeight')).toBe('18');
   });
 
   it('allows gray or JET-only viewing but never hides both image types', () => {

@@ -132,6 +132,7 @@ describe('deduplicated capture cylinder texture', () => {
       }),
     ]);
     expect(plan?.tiles[0].url).toContain('modality=gray');
+    expect(plan?.tiles.every((tile) => tile.url.includes('level=original'))).toBe(true);
   });
 
   it('uses calibrated column angles to reverse cameras whose source order runs backwards', () => {
@@ -231,6 +232,7 @@ describe('deduplicated capture cylinder texture', () => {
       gray?.tiles.map(({ url: _url, ...tile }) => tile),
     );
     expect(jet?.tiles.every((tile) => tile.url.includes('modality=jet'))).toBe(true);
+    expect(jet?.tiles.every((tile) => tile.url.includes('level=original'))).toBe(true);
   });
 
   it('fails closed when calibrated ownership is incomplete', () => {

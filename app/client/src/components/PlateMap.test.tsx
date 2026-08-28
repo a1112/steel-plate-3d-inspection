@@ -406,6 +406,7 @@ describe('online inspection world compatibility', () => {
 
   it('uses the current flow history as a horizontally scrollable six-camera crop stitch', async () => {
     const stitch = captureStitchResult('2747', 12);
+    const onVisibleRangeChange = vi.fn();
     stitch.frames.forEach((frame, frameIndex) => frame.cameras.forEach((camera) => {
       camera.sourceBytes = frameIndex >= 9 ? 24 * 1024 : 256 * 1024;
     }));
@@ -419,6 +420,7 @@ describe('online inspection world compatibility', () => {
         captureMaterialId="2747"
         cameraLanes={createSequentialCameraLanes(6)}
         surfaceHeadAlignment={headAlignment()}
+        onVisibleRangeChange={onVisibleRangeChange}
       />,
     );
 
@@ -457,6 +459,22 @@ describe('online inspection world compatibility', () => {
     expect(screen.getByTestId('bar-unfolded-map')).toContainElement(ruler);
     expect(ruler).toContainElement(scrollbar);
     expect(scrollbar).toHaveAttribute('aria-orientation', 'horizontal');
+    Object.defineProperty(ruler, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        left: 0,
+        top: 0,
+        right: 600,
+        bottom: 24,
+        width: 600,
+        height: 24,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      }),
+    });
+    fireEvent.click(scrollbar, { clientX: 450, clientY: 20 });
+    expect(common.onPreviewPositionChange).toHaveBeenLastCalledWith(9);
     expect(document.querySelectorAll('.bar-camera-frame').length).toBeGreaterThan(6);
     expect(document.querySelectorAll('.bar-camera-frame').length).toBeLessThan(12 * 6);
     expect(screen.getAllByLabelText(/2D 去背景图/).every((canvas) => (
@@ -478,6 +496,9 @@ describe('online inspection world compatibility', () => {
       scrollLeft: { configurable: true, value: 600, writable: true },
     });
     fireEvent(window, new Event('resize'));
+    expect(onVisibleRangeChange).toHaveBeenLastCalledWith([0.25, 0.5]);
+    expect(viewport).toHaveAttribute('data-visible-range-start', '0.250000');
+    expect(viewport).toHaveAttribute('data-visible-range-end', '0.500000');
     const cameraBand = screen.getByRole('button', { name: 'camera2 采集图像，双击展开' });
     expect(cameraBand.querySelector(':scope > span')).toHaveTextContent('C2');
     expect(cameraBand.querySelector(':scope > span')).not.toHaveTextContent('头偏移');
@@ -504,14 +525,33 @@ describe('online inspection world compatibility', () => {
     });
     fireEvent(cameraBand, steadyPointerUp);
     expect(viewport.scrollLeft).toBe(600);
-    fireEvent.doubleClick(cameraBand);
+    const secondPointerDown = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.defineProperties(secondPointerDown, {
+      button: { value: 0 },
+      clientX: { value: 496 },
+      clientY: { value: 200 },
+      pointerId: { value: 42 },
+    });
+    fireEvent(cameraBand, secondPointerDown);
+    const secondPointerUp = new Event('pointerup', { bubbles: true, cancelable: true });
+    Object.defineProperties(secondPointerUp, {
+      clientX: { value: 496 },
+      clientY: { value: 200 },
+      pointerId: { value: 42 },
+    });
+    fireEvent(cameraBand, secondPointerUp);
     expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-expanded-camera', 'camera2');
     expect(viewport).toHaveAttribute('data-expanded-preserve-aspect', 'true');
     expect(viewport).toHaveAttribute('data-frame-pixel-aspect', '1.706667');
     expect(viewport).toHaveAttribute('data-frame-span-px', '614.400');
-    fireEvent.doubleClick(cameraBand);
+    fireEvent.keyDown(cameraBand, { key: 'Enter' });
     expect(screen.getByTestId('bar-unfolded-map')).not.toHaveAttribute('data-expanded-camera');
     expect(viewport).toHaveAttribute('data-frame-span-px', '176.000');
+    fireEvent.pointerMove(cameraBand, { pointerId: 43, clientX: 420, clientY: 200 });
+    fireEvent.keyDown(window, { code: 'Space', key: ' ' });
+    expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-expanded-camera', 'camera2');
+    fireEvent.keyDown(window, { code: 'Space', key: ' ' });
+    expect(screen.getByTestId('bar-unfolded-map')).not.toHaveAttribute('data-expanded-camera');
     const dragPointerDown = new Event('pointerdown', { bubbles: true, cancelable: true });
     Object.defineProperties(dragPointerDown, {
       button: { value: 0 },
@@ -538,9 +578,9 @@ describe('online inspection world compatibility', () => {
     fireEvent(cameraBand, dragPointerUp);
     expect(viewport).not.toHaveClass('is-dragging');
     expect(screen.getByTestId('bar-unfolded-map')).not.toHaveAttribute('data-expanded-camera');
-    fireEvent.doubleClick(cameraBand);
+    fireEvent.keyDown(cameraBand, { key: 'Enter' });
     expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-expanded-camera', 'camera2');
-    fireEvent.doubleClick(cameraBand);
+    fireEvent.keyDown(cameraBand, { key: 'Enter' });
     expect(screen.getByTestId('bar-unfolded-map')).not.toHaveAttribute('data-expanded-camera');
     fireEvent.click(screen.getByRole('button', { name: '纵向' }));
     expect(viewport).toHaveAttribute('data-scroll-axis', 'y');

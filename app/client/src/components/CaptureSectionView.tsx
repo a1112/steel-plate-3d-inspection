@@ -1,5 +1,5 @@
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { useMemo, useState, type PointerEvent } from 'react';
+import { useMemo, useState, type PointerEvent, type WheelEvent } from 'react';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { fitSurfaceCircle } from './ProductionArtifactView';
 
@@ -268,6 +268,16 @@ export function CaptureSectionView({
     const dy = (event.clientY - rect.top - rect.height / 2) / rect.height;
     setHoverAngle(normalizeAngle(Math.atan2(-dy, dx)));
   };
+  const handleSectionWheel = (event: WheelEvent<SVGSVGElement>) => {
+    if (event.deltaY === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const nextRow = Math.max(
+      0,
+      Math.min(mesh.rows - 1, section.row + (event.deltaY > 0 ? 1 : -1)),
+    );
+    if (nextRow !== section.row) onRowChange(nextRow);
+  };
 
   const renderDiameter = (
     diameter: CaptureSectionDiameter | null,
@@ -296,6 +306,7 @@ export function CaptureSectionView({
           preserveAspectRatio="xMidYMid meet"
           onPointerMove={handleSectionPointerMove}
           onPointerLeave={() => setHoverAngle(null)}
+          onWheel={handleSectionWheel}
         >
           <line x1={-extent} y1={0} x2={extent} y2={0} className="section-axis" />
           <line x1={0} y1={-extent} x2={0} y2={extent} className="section-axis" />

@@ -366,24 +366,27 @@ export function DiameterCanvasChart({
     >
       <canvas ref={backgroundRef} className="diameter-canvas-background" aria-hidden="true" />
       <canvas ref={foregroundRef} className="diameter-canvas-foreground" aria-hidden="true" />
-      <div className="diameter-canvas-legend" role="group" aria-label="测径曲线图例">
+      <div className="diameter-canvas-legend" role="group" aria-label="测径曲线多选">
         {lines.map((line) => {
           const visible = !hiddenSeries.has(line.id);
-          return <button
+          return <label
             key={line.id}
-            type="button"
             className={visible ? 'active' : ''}
-            aria-pressed={visible}
-            onClick={() => setHiddenSeries((current) => {
-              const next = new Set(current);
-              if (next.has(line.id)) next.delete(line.id);
-              else next.add(line.id);
-              return next;
-            })}
           >
+            <input
+              type="checkbox"
+              checked={visible}
+              onChange={() => setHiddenSeries((current) => {
+                const next = new Set(current);
+                if (next.has(line.id)) next.delete(line.id);
+                else next.add(line.id);
+                return next;
+              })}
+            />
+            <span className="diameter-series-check" aria-hidden="true" />
             <i style={{ '--diameter-series-color': line.color } as CSSProperties} />
-            {line.label}
-          </button>;
+            <span>{line.label}</span>
+          </label>;
         })}
       </div>
       {hover?.entries.length ? (

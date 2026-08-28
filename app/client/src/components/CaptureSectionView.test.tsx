@@ -117,6 +117,12 @@ describe('CaptureSectionView', () => {
     fireEvent.click(screen.getByRole('button', { name: '下一个切面' }));
     expect(onRowChange).toHaveBeenCalledWith(2);
 
+    const sectionChart = screen.getByRole('img', { name: '4034 360 度融合横截面' });
+    fireEvent.wheel(sectionChart, { deltaY: 120 });
+    expect(onRowChange).toHaveBeenCalledWith(2);
+    fireEvent.wheel(sectionChart, { deltaY: -120 });
+    expect(onRowChange).toHaveBeenCalledWith(0);
+
     fireEvent.change(screen.getByRole('slider', { name: '切面位置' }), { target: { value: '0' } });
     expect(onRowChange).toHaveBeenCalledWith(0);
     fireEvent.input(screen.getByRole('slider', { name: '切面位置' }), { target: { value: '2' } });

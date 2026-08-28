@@ -178,6 +178,10 @@ describe('capture crop-stitch history selection', () => {
       renderableImageCount: 2,
     });
     expect(result.frames[0].cameras[0].sourceBytes).toBe(2000);
+    expect(result.frames[0].cameras[0]).toMatchObject({
+      displaySize: [600, 1024],
+      sourceOffset: { x: 100, y: 0 },
+    });
     expect(result.frames[0].cameras[0].url).toContain('modality=gray');
     expect(result.frames[0].cameras[0].url).toContain('level=thumbnail');
     expect(result.frames[0].cameras[1]).toMatchObject({ validRoi: null });

@@ -92,6 +92,20 @@ describe('compact online detection layout CSS contract', () => {
     expectDeclaration('.severity-filter-inline', 'height', '24px');
   });
 
+  it('keeps the online record list edge-to-edge with a reveal-on-hover scrollbar', () => {
+    expectDeclaration('.left-column.runtime-online .records-panel .panel-body', 'padding', '0');
+    expectDeclaration('.left-column.runtime-online .records-table-wrap', 'scrollbar-gutter', 'auto');
+    expectDeclaration('.left-column.runtime-online .records-table-wrap', 'scrollbar-width', 'thin');
+    expectDeclaration('.left-column.runtime-online .records-table-wrap', 'scrollbar-color', 'transparent transparent');
+    expectDeclaration('.left-column.runtime-online .records-table-wrap::-webkit-scrollbar', 'width', '5px');
+    expectDeclaration('.left-column.runtime-online .records-table-wrap::-webkit-scrollbar-thumb', 'background', 'transparent');
+    expectDeclaration(
+      '.left-column.runtime-online .records-table-wrap:hover::-webkit-scrollbar-thumb',
+      'background',
+      'rgba(99, 131, 156, 0.46)',
+    );
+  });
+
   it('keeps the expanded analysis area short and the collapsed layout single-row', () => {
     expectDeclaration('.center-column', 'grid-template-rows', 'minmax(0, 1fr) minmax(150px, 0.25fr)');
     expectDeclaration('.theme-dark .center-column', 'grid-template-rows', 'minmax(0, 1fr) minmax(150px, 0.25fr)');

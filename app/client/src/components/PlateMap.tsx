@@ -1417,6 +1417,7 @@ function BarUnfoldedMap({
   longitudinalAxis,
   cropBlackBorders = false,
   viewportMemory,
+  onVisibleRangeChange,
 }: {
   defects: DefectItem[];
   defectTypes: DefectType[];
@@ -1443,6 +1444,7 @@ function BarUnfoldedMap({
   longitudinalAxis?: BarSurfaceMesh['longitudinalAxis'] | null;
   cropBlackBorders?: boolean;
   viewportMemory?: MutableRefObject<TwoDViewportMemory>;
+  onVisibleRangeChange?: (range: [number, number] | null) => void;
 }) {
   const FRAME_SPAN_PX = 176;
   const FRAME_OVERSCAN = 3;
@@ -1488,8 +1490,26 @@ function BarUnfoldedMap({
     scrollLeft: number;
     scrollTop: number;
     moved: boolean;
+    cameraId: string | null;
+  } | null>(null);
+  const mapPointerRef = useRef<{
+    cameraId: string;
+    clientX: number;
+    clientY: number;
+  } | null>(null);
+  const cameraClickRef = useRef<{
+    cameraId: string;
+    at: number;
+    clientX: number;
+    clientY: number;
+  } | null>(null);
+  const suppressNativeDoubleClickUntilRef = useRef(0);
+  const pendingZoomAnchorRef = useRef<{
+    timelineFrame: number;
+    viewportOffsetPx: number;
   } | null>(null);
   const scrollProgressRef = useRef(0);
+  const publishedVisibleRangeRef = useRef('');
   const initialScrollProgressRef = useRef(
     viewportMemory?.current.stitchKey === stitchKey
       && viewportMemory.current.orientation === orientation
@@ -1766,6 +1786,38 @@ function BarUnfoldedMap({
       : { width: '100%', height: `max(100%, ${longitudinalExtent}px)` }
     : { width: '100%', height: '100%' };
 
+  const toggleCameraAtPoint = useCallback((cameraId: string, clientX: number, clientY: number) => {
+    const host = scrollRef.current;
+    if (host && stitchEnabled) {
+      const rect = host.getBoundingClientRect();
+      const viewportExtent = orientation === 'horizontal' ? host.clientWidth : host.clientHeight;
+      const pointerOffset = clampUnit(
+        (orientation === 'horizontal' ? clientX - rect.left : clientY - rect.top)
+          / Math.max(1, viewportExtent),
+      ) * Math.max(1, viewportExtent);
+      const scrollOffset = orientation === 'horizontal' ? host.scrollLeft : host.scrollTop;
+      pendingZoomAnchorRef.current = {
+        timelineFrame: timelineOriginFrames + (scrollOffset + pointerOffset) / frameSpanPx,
+        viewportOffsetPx: pointerOffset,
+      };
+    }
+    setExpandedCamera((current) => current === cameraId ? null : cameraId);
+  }, [frameSpanPx, orientation, stitchEnabled, timelineOriginFrames]);
+
+  useEffect(() => {
+    const handleSpaceZoom = (event: globalThis.KeyboardEvent) => {
+      if (event.code !== 'Space' || event.repeat || event.defaultPrevented) return;
+      const active = document.activeElement as HTMLElement | null;
+      if (active?.matches('input, textarea, select, button') || active?.isContentEditable) return;
+      const pointer = mapPointerRef.current;
+      if (!pointer) return;
+      event.preventDefault();
+      toggleCameraAtPoint(pointer.cameraId, pointer.clientX, pointer.clientY);
+    };
+    window.addEventListener('keydown', handleSpaceZoom);
+    return () => window.removeEventListener('keydown', handleSpaceZoom);
+  }, [toggleCameraAtPoint]);
+
   const readScrollPosition = () => {
     const host = scrollRef.current;
     if (!host) return;
@@ -1786,6 +1838,21 @@ function BarUnfoldedMap({
     const nextExtent = Math.max(1, extent);
     const total = Math.max(nextExtent, scrollExtent, longitudinalExtent);
     const nextCrossExtent = Math.max(1, crossExtent);
+    const visibleFraction = Math.min(1, nextExtent / Math.max(total, 1));
+    const visibleStart = maximum > 0
+      ? (offset / maximum) * (1 - visibleFraction)
+      : 0;
+    const visibleEnd = Math.min(1, visibleStart + visibleFraction);
+    const nextVisibleRange = stitchEnabled && visibleFraction < 0.995
+      ? [visibleStart, visibleEnd] as [number, number]
+      : null;
+    const visibleRangeKey = nextVisibleRange
+      ? `${nextVisibleRange[0].toFixed(6)}:${nextVisibleRange[1].toFixed(6)}`
+      : 'all';
+    if (publishedVisibleRangeRef.current !== visibleRangeKey) {
+      publishedVisibleRangeRef.current = visibleRangeKey;
+      onVisibleRangeChange?.(nextVisibleRange);
+    }
     setScrollWindow((current) => current.offset === offset
       && current.extent === nextExtent
       && current.total === total
@@ -1793,6 +1860,11 @@ function BarUnfoldedMap({
       ? current
       : { offset, extent: nextExtent, total, crossExtent: nextCrossExtent });
   };
+
+  useEffect(() => () => {
+    publishedVisibleRangeRef.current = '';
+    onVisibleRangeChange?.(null);
+  }, [onVisibleRangeChange]);
 
   const scrollToProgress = (progress: number) => {
     const host = scrollRef.current;
@@ -1855,11 +1927,23 @@ function BarUnfoldedMap({
       const extent = orientation === 'horizontal' ? host.clientWidth : host.clientHeight;
       const scrollExtent = orientation === 'horizontal' ? host.scrollWidth : host.scrollHeight;
       const maximum = Math.max(0, scrollExtent - extent);
+      const zoomAnchor = displayScaleChanged ? pendingZoomAnchorRef.current : null;
+      pendingZoomAnchorRef.current = null;
+      const anchoredTarget = zoomAnchor
+        ? Math.max(
+            0,
+            Math.min(
+              maximum,
+              (zoomAnchor.timelineFrame - timelineOriginFrames) * frameSpanPx
+                - zoomAnchor.viewportOffsetPx,
+            ),
+          )
+        : null;
       const target = appendedAtTail
         ? maximum
         : recordChanged || recordContentBecameReady || alignmentChanged
           ? 0
-          : maximum * retainedProgress;
+          : anchoredTarget ?? maximum * retainedProgress;
       if (orientation === 'horizontal') {
         host.scrollTop = 0;
         host.scrollLeft = target;
@@ -1896,6 +1980,11 @@ function BarUnfoldedMap({
   const handleMapPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (!stitchEnabled || event.button !== 0) return;
     const target = event.target as HTMLElement;
+    const cameraBand = target.closest<HTMLElement>('.bar-camera-band');
+    const cameraId = cameraBand?.dataset.cameraId ?? null;
+    if (cameraId) {
+      mapPointerRef.current = { cameraId, clientX: event.clientX, clientY: event.clientY };
+    }
     if (target.closest('button, input, select, textarea, a')) return;
     mapDragRef.current = {
       pointerId: event.pointerId,
@@ -1904,6 +1993,7 @@ function BarUnfoldedMap({
       scrollLeft: event.currentTarget.scrollLeft,
       scrollTop: event.currentTarget.scrollTop,
       moved: false,
+      cameraId,
     };
     setFrameDefectHover(null);
     setDepthProbe(null);
@@ -1912,6 +2002,11 @@ function BarUnfoldedMap({
   };
 
   const handleMapPointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    const cameraBand = (event.target as HTMLElement).closest<HTMLElement>('.bar-camera-band');
+    const cameraId = cameraBand?.dataset.cameraId;
+    if (cameraId) {
+      mapPointerRef.current = { cameraId, clientX: event.clientX, clientY: event.clientY };
+    }
     const drag = mapDragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     const delta = orientation === 'horizontal'
@@ -1940,6 +2035,25 @@ function BarUnfoldedMap({
     setMapDragging(false);
     if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    if (!drag.moved && drag.cameraId) {
+      const now = Date.now();
+      const previousClick = cameraClickRef.current;
+      const isDoubleClick = previousClick?.cameraId === drag.cameraId
+        && now - previousClick.at <= 450
+        && Math.hypot(event.clientX - previousClick.clientX, event.clientY - previousClick.clientY) <= 10;
+      if (isDoubleClick) {
+        cameraClickRef.current = null;
+        suppressNativeDoubleClickUntilRef.current = now + 500;
+        toggleCameraAtPoint(drag.cameraId, event.clientX, event.clientY);
+      } else {
+        cameraClickRef.current = {
+          cameraId: drag.cameraId,
+          at: now,
+          clientX: event.clientX,
+          clientY: event.clientY,
+        };
+      }
     }
   };
 
@@ -1977,6 +2091,18 @@ function BarUnfoldedMap({
         data-frame-span-px={frameSpanPx.toFixed(3)}
         data-frame-pixel-aspect={expandedFrameAspect?.toFixed(6)}
         data-expanded-preserve-aspect={expandedCamera ? 'true' : undefined}
+        data-visible-range-start={scrollWindow.total > 1
+          ? ((scrollWindow.offset / Math.max(1, scrollWindow.total - scrollWindow.extent))
+            * (1 - Math.min(1, scrollWindow.extent / scrollWindow.total))).toFixed(6)
+          : '0.000000'}
+        data-visible-range-end={scrollWindow.total > 1
+          ? Math.min(
+              1,
+              (scrollWindow.offset / Math.max(1, scrollWindow.total - scrollWindow.extent))
+                * (1 - Math.min(1, scrollWindow.extent / scrollWindow.total))
+                + Math.min(1, scrollWindow.extent / scrollWindow.total),
+            ).toFixed(6)
+          : '1.000000'}
         data-image-mode={imageMode}
         data-visible-frame-start={firstVisibleFrame}
         data-visible-frame-end={lastVisibleFrame}
@@ -1990,6 +2116,9 @@ function BarUnfoldedMap({
         onPointerMove={handleMapPointerMove}
         onPointerUp={stopMapDragging}
         onPointerCancel={stopMapDragging}
+        onPointerLeave={() => {
+          if (!mapDragRef.current) mapPointerRef.current = null;
+        }}
       >
         <div className="bar-unfolded-scroll-space" data-testid="capture-stitch-scroll-space" style={scrollSpaceStyle}>
         <div className="bar-camera-bands">
@@ -2021,12 +2150,18 @@ function BarUnfoldedMap({
               onDoubleClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                setExpandedCamera((current) => current === lane.cameraId ? null : lane.cameraId);
+                if (Date.now() < suppressNativeDoubleClickUntilRef.current) return;
+                toggleCameraAtPoint(lane.cameraId, event.clientX, event.clientY);
               }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
                   event.preventDefault();
-                  setExpandedCamera((current) => current === lane.cameraId ? null : lane.cameraId);
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  toggleCameraAtPoint(
+                    lane.cameraId,
+                    rect.left + rect.width / 2,
+                    rect.top + rect.height / 2,
+                  );
                 }
               }}
             >
@@ -2428,6 +2563,11 @@ function LengthRuler({
     }
   };
 
+  const handleRulerClick = (event: MouseEvent<HTMLDivElement>) => {
+    if ((event.target as HTMLElement).closest('button')) return;
+    updateFromPointer(event.clientX, event.clientY, event.currentTarget);
+  };
+
   const updateScrollFromPointer = (clientX: number, clientY: number, element: HTMLElement) => {
     if (!scrollEnabled || !onScrollProgressChange || !scrollDrag.current) return;
     const rect = element.getBoundingClientRect();
@@ -2518,6 +2658,7 @@ function LengthRuler({
       onMouseMove={handleMouseMove}
       onMouseUp={stopMouseDragging}
       onMouseLeave={stopMouseDragging}
+      onClick={handleRulerClick}
       onKeyDown={handleKeyDown}
     >
       {[0, 3, 6, 9, 12].map((meter) => (
@@ -3796,6 +3937,7 @@ export function PlateMap({
             measurement={surfaceMeasurement}
             longitudinalAxis={surfaceMesh?.longitudinalAxis}
             viewportMemory={twoDViewportMemory}
+            onVisibleRangeChange={onVisibleRangeChange}
           />
         </div>
       ) : twoDDisplayMode === 'jet' ? (
@@ -3918,6 +4060,7 @@ export function PlateMap({
             longitudinalAxis={surfaceMesh?.longitudinalAxis}
             cropBlackBorders
             viewportMemory={twoDViewportMemory}
+            onVisibleRangeChange={onVisibleRangeChange}
           />
         </div>
       )}

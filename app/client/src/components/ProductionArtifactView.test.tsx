@@ -383,7 +383,7 @@ describe('ProductionArtifactView', () => {
     expect(onZoomChange).toHaveBeenLastCalledWith(10);
   });
 
-  it('keeps the longitudinal position under the pointer while the horizontal pipe stays vertically centred', () => {
+  it('keeps both axes under the pointer while zooming the horizontal pipe', () => {
     render(
       <ProductionArtifactView
         mesh={fixture()}
@@ -405,10 +405,10 @@ describe('ProductionArtifactView', () => {
     const end = Number(view.getAttribute('data-visible-range-end'));
     expect(start + 0.75 * (end - start)).toBeCloseTo(0.75, 3);
     expect(Number(view.getAttribute('data-artifact-axis-center'))).toBeCloseTo(0.5417, 3);
-    expect(view).toHaveAttribute('data-artifact-pan-y', '0.0000');
+    expect(Number(view.getAttribute('data-artifact-pan-y'))).toBeCloseTo(-0.1239, 3);
 
     fireEvent.wheel(view, { deltaY: -100, clientX: 750, clientY: 480 });
-    expect(view).toHaveAttribute('data-artifact-pan-y', '0.0000');
+    expect(Number(view.getAttribute('data-artifact-pan-y'))).toBeCloseTo(0.0344, 3);
   });
 
   it('exposes a millimetre ruler and scrolls the visible pipe-length range after zoom', () => {

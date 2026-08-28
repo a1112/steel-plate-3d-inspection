@@ -37,6 +37,8 @@ export type CaptureStitchCameraFrame = {
   sourceHeight: number;
   sourceBytes?: number;
   validRoi: [number, number, number, number] | null;
+  displaySize?: [number, number];
+  sourceOffset?: { x: number; y: number };
   url: string;
   grayThumbnailUrl: string;
   grayOriginalUrl: string;
@@ -208,6 +210,16 @@ export function selectCaptureStitchHistory(
           sourceHeight: camera.height,
           sourceBytes: camera.bytes,
           validRoi: roi,
+          displaySize: Array.isArray(camera.displaySize)
+            && camera.displaySize.length === 2
+            && camera.displaySize.every(Number.isFinite)
+            ? [Number(camera.displaySize[0]), Number(camera.displaySize[1])] as [number, number]
+            : roi ? [roi[2] - roi[0], camera.height] as [number, number] : undefined,
+          sourceOffset: camera.sourceOffset
+            && Number.isFinite(camera.sourceOffset.x)
+            && Number.isFinite(camera.sourceOffset.y)
+            ? { x: Number(camera.sourceOffset.x), y: Number(camera.sourceOffset.y) }
+            : roi ? { x: roi[0], y: roi[1] } : undefined,
           url: captureRenderImageUrl(camera.artifactRef, 'gray', 'thumbnail'),
           grayThumbnailUrl: captureRenderImageUrl(camera.artifactRef, 'gray', 'thumbnail'),
           grayOriginalUrl: captureRenderImageUrl(camera.artifactRef, 'gray', 'original'),

@@ -4,8 +4,8 @@ import {
   BufferGeometry,
   DoubleSide,
   Float32BufferAttribute,
-  LinearFilter,
   LinearMipmapLinearFilter,
+  NearestFilter,
   RepeatWrapping,
   SRGBColorSpace,
   TextureLoader,
@@ -450,7 +450,9 @@ function ArtifactTextureMaterial({ textureUrl }: { textureUrl: string }) {
     texture.colorSpace = SRGBColorSpace;
     texture.generateMipmaps = true;
     texture.minFilter = LinearMipmapLinearFilter;
-    texture.magFilter = LinearFilter;
+    // Preserve the captured pixels while zooming in. Linear magnification made
+    // the inspection texture look soft even when the original raster was sharp.
+    texture.magFilter = NearestFilter;
     texture.wrapT = RepeatWrapping;
     texture.anisotropy = Math.min(16, gl.capabilities.getMaxAnisotropy());
     texture.needsUpdate = true;
@@ -630,22 +632,30 @@ export function ProductionArtifactView({
       1 - nextVisibleFraction / 2,
     ));
 
-    if (hasPointerPosition && orientation === 'vertical') {
+    if (hasPointerPosition) {
       const aspect = Math.max(rect.width / rect.height, 0.25);
-      const fitWidth = spans.crossSection;
-      const fitHeight = spans.longitudinal;
+      const fitWidth = orientation === 'horizontal'
+        ? spans.longitudinal
+        : spans.crossSection;
+      const fitHeight = orientation === 'horizontal'
+        ? spans.crossSection
+        : spans.longitudinal;
       const baseViewHeight = Math.max(fitWidth / aspect, fitHeight) * 1.18;
       const baseViewWidth = baseViewHeight * aspect;
-      const cursorX = (pointerX - 0.5) * baseViewWidth;
       const zoomDelta = 1 / next - 1 / zoom;
-      setPan((current) => ({
-        x: current.x + cursorX * zoomDelta,
-        y: 0,
-      }));
-    } else if (orientation === 'horizontal') {
-      // Length navigation remains pointer-anchored, while the pipe's cross-section
-      // stays vertically centred at every zoom level.
-      setPan((current) => current.y === 0 ? current : { ...current, y: 0 });
+      if (orientation === 'horizontal') {
+        const cursorY = (0.5 - pointerY) * baseViewHeight;
+        setPan((current) => ({
+          x: 0,
+          y: current.y + cursorY * zoomDelta,
+        }));
+      } else {
+        const cursorX = (pointerX - 0.5) * baseViewWidth;
+        setPan((current) => ({
+          x: current.x + cursorX * zoomDelta,
+          y: 0,
+        }));
+      }
     }
     setZoom(next);
     onZoomChange?.(next);
@@ -719,12 +729,15 @@ export function ProductionArtifactView({
           }
           setRoll((current) => current + rotationDelta * 0.012);
         } else {
-          setPan((current) => ({
-            x: orientation === 'vertical'
-              ? current.x + deltaX * 0.006 / zoom
-              : current.x,
-            y: 0,
-          }));
+          setPan((current) => orientation === 'vertical'
+            ? {
+                x: current.x + deltaX * 0.006 / zoom,
+                y: 0,
+              }
+            : {
+                x: 0,
+                y: current.y - deltaY * 0.006 / zoom,
+              });
         }
         drag.current = {
           ...drag.current,

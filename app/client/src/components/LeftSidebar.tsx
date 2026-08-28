@@ -346,8 +346,8 @@ export function LeftSidebar({
               <Search size={13} />
               {searchOpen ? '退出查询' : '查询'}
             </button>
-            <div className="record-search-count">
-              匹配 <strong>{filteredCount}</strong> / {totalCount}
+            <div className="record-search-count" aria-label={`记录数量 ${filteredCount}`}>
+              <strong>{filteredCount}</strong>
             </div>
             {onRecordsRefresh ? (
               <button
