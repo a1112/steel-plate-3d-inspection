@@ -42,6 +42,8 @@ import {
   type AppResourceUsageState,
 } from './hooks/use-app-resource-usage';
 import {
+  activateInspectionServiceFallback,
+  activateStoredInspectionServiceFallback,
   createDefaultConnectionConfig,
   discoverInspectionServices,
   fetchConnectionConfig,
@@ -63,6 +65,8 @@ import {
   getConfiguredInspectionServiceOrigin,
   getInspectionServiceOrigin,
   getTriggerGatewayOrigin,
+  isInspectionServiceFallbackActive,
+  isWebHostedRuntime,
   issueInspectionReportArchive,
   reviewProductionDefect,
   type InspectionReportArchiveSummary,
@@ -344,9 +348,19 @@ export default function App() {
       .catch((error: unknown) => {
         if (!disposed) {
           window.clearTimeout(timeout);
+          if (activateStoredInspectionServiceFallback()) {
+            setConnectionRetrying(true);
+            setRuntimeProfileRevision((current) => current + 1);
+            return;
+          }
+          const browserConnectionLabel = isWebHostedRuntime()
+            ? isInspectionServiceFallbackActive()
+              ? '备用服务地址连接失败。'
+              : '当前页面的同源反向代理连接失败。'
+            : '';
           const detail = controller.signal.aborted
-            ? '连接检测服务超时，请检查服务端 IP、端口和防火墙'
-            : error instanceof Error ? error.message : '运行配置读取失败';
+            ? `${browserConnectionLabel}连接检测服务超时，请检查服务端 IP、端口和防火墙`
+            : `${browserConnectionLabel}${error instanceof Error ? error.message : '运行配置读取失败'}`;
           setRuntimeProfile(createDisconnectedRuntimeProfile());
           setRuntimeProfileError(detail);
           setConnectionIssue(detail);
@@ -368,7 +382,7 @@ export default function App() {
   }, []);
 
   const retryConnection = useCallback((connection: ConnectionConfig) => {
-    saveLocalConnectionConfig(connection);
+    activateInspectionServiceFallback(connection);
     setConnectionRetrying(true);
     setRuntimeProfile(null);
     setRuntimeProfileError('');

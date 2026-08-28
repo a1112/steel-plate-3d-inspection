@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import type { ThemeMode } from '../data/inspection';
 import {
   discoverInspectionServices,
+  isWebHostedRuntime,
   type ConnectionConfig,
 } from '../services/inspection-api';
 
@@ -98,7 +99,9 @@ export function ConnectionRecoveryDialog({
 
         <p id="connection-recovery-detail">{error}</p>
         <p className="connection-recovery-hint">
-          系统已使用本地预览数据进入主界面。请配置检测服务的 IP 和端口后重试。
+          {isWebHostedRuntime()
+            ? '系统已优先尝试当前页面的同源反向代理。代理不可用时，请配置检测服务的 IP 和端口后重试。'
+            : '系统已使用本地预览数据进入主界面。请配置检测服务的 IP 和端口后重试。'}
         </p>
 
         <div className="connection-recovery-fields">

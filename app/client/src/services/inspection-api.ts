@@ -1261,6 +1261,9 @@ function getSafeLocalStorage() {
   }
 }
 
+const BROWSER_FALLBACK_ENABLED_KEY = 'steel-inspection-browser-fallback-enabled';
+let activeBrowserFallbackOrigin: string | null = null;
+
 function getPageBoundConnectionConfig(): ConnectionConfig | null {
   if (typeof window === 'undefined') {
     return null;
@@ -1325,6 +1328,58 @@ export function saveLocalConnectionConfig(config: ConnectionConfig) {
   }
 }
 
+/**
+ * Use an explicitly configured service only after the browser's same-origin
+ * reverse proxy has failed. Desktop runtimes continue to use the saved
+ * address directly.
+ */
+export function activateInspectionServiceFallback(config: ConnectionConfig) {
+  saveLocalConnectionConfig(config);
+  if (!isWebHostedRuntime() || getPageBoundConnectionConfig()) {
+    return;
+  }
+  activeBrowserFallbackOrigin = formatServiceOrigin(
+    config.host,
+    config.port,
+    config.protocol ?? 'http',
+  );
+  getSafeLocalStorage()?.setItem(BROWSER_FALLBACK_ENABLED_KEY, 'true');
+}
+
+/**
+ * After a same-origin failure, reuse a fallback that the user explicitly
+ * confirmed during an earlier recovery flow. Returns true only when a new
+ * fallback was activated for this page session.
+ */
+export function activateStoredInspectionServiceFallback() {
+  if (
+    activeBrowserFallbackOrigin
+    || !isWebHostedRuntime()
+    || getPageBoundConnectionConfig()
+    || getSafeLocalStorage()?.getItem(BROWSER_FALLBACK_ENABLED_KEY) !== 'true'
+  ) {
+    return false;
+  }
+  const config = getStoredConnectionConfig();
+  if (!config.host || !config.port) {
+    return false;
+  }
+  activeBrowserFallbackOrigin = formatServiceOrigin(
+    config.host,
+    config.port,
+    config.protocol ?? 'http',
+  );
+  return true;
+}
+
+export function isInspectionServiceFallbackActive() {
+  return activeBrowserFallbackOrigin !== null;
+}
+
+export function preferSameOriginInspectionService() {
+  activeBrowserFallbackOrigin = null;
+}
+
 function getStoredAdminSession(): AdminAuthSession | null {
   const storage = getSafeLocalStorage();
   if (!storage) {
@@ -1361,6 +1416,13 @@ export function createAdminHeaders(headers: Record<string, string> = {}) {
 }
 
 export function getInspectionServiceOrigin(config = getStoredConnectionConfig()) {
+  const pageBound = getPageBoundConnectionConfig();
+  if (pageBound) {
+    return formatServiceOrigin(pageBound.host, pageBound.port, pageBound.protocol ?? 'http');
+  }
+  if (isWebHostedRuntime()) {
+    return activeBrowserFallbackOrigin ?? window.location.origin.replace(/\/$/, '');
+  }
   if (config.host && config.port) {
     return formatServiceOrigin(config.host, config.port, config.protocol ?? 'http');
   }
@@ -2377,6 +2439,9 @@ export async function fetchConnectionConfig(signal?: AbortSignal): Promise<Conne
 
 function connectionDiscoveryOrigins(config: ConnectionConfig) {
   const origins = new Set<string>();
+  if (isWebHostedRuntime()) {
+    origins.add(window.location.origin.replace(/\/$/, ''));
+  }
   const configuredOrigin = import.meta.env.VITE_INSPECTION_SERVICE_ORIGIN?.trim();
   if (configuredOrigin) {
     origins.add(configuredOrigin.replace(/\/$/, ''));

@@ -7,6 +7,8 @@ import {
 } from '../lib/capture-api';
 import { getMockInspectionSnapshot } from '../data/inspection';
 import {
+  activateInspectionServiceFallback,
+  activateStoredInspectionServiceFallback,
   captureProductionOnce,
   discoverInspectionServices,
   fetchConnectionConfig,
@@ -29,6 +31,7 @@ import {
   reviewProductionDefect,
   getInspectionServiceOrigin,
   isBrowserHostedClient,
+  preferSameOriginInspectionService,
 } from './inspection-api';
 import type {
   BkvArtifact,
@@ -45,16 +48,18 @@ function jsonResponse(body: unknown, status = 200) {
 }
 
 beforeEach(() => {
+  preferSameOriginInspectionService();
   window.localStorage.clear();
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe('persistent production command client', () => {
-  it('detects browser-hosted clients without forcing their service address to the page origin', () => {
+  it('uses same-origin first in browsers and activates an explicit address only as fallback', () => {
     expect(isBrowserHostedClient('http:', false, 'production')).toBe(true);
     expect(isBrowserHostedClient('https:', false, 'production')).toBe(true);
     expect(isBrowserHostedClient('https:', true, 'production')).toBe(false);
@@ -67,6 +72,21 @@ describe('persistent production command client', () => {
       port: 4873,
       protocol: 'http',
     }));
+    vi.stubEnv('MODE', 'production');
+
+    expect(getInspectionServiceOrigin()).toBe(window.location.origin);
+
+    activateInspectionServiceFallback({
+      mode: 'online',
+      host: '10.50.111.141',
+      port: 4873,
+      protocol: 'http',
+    });
+    expect(getInspectionServiceOrigin()).toBe('http://10.50.111.141:4873');
+
+    preferSameOriginInspectionService();
+    expect(getInspectionServiceOrigin()).toBe(window.location.origin);
+    expect(activateStoredInspectionServiceFallback()).toBe(true);
     expect(getInspectionServiceOrigin()).toBe('http://10.50.111.141:4873');
   });
 
