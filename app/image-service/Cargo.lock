@@ -449,6 +449,7 @@ name = "steel-image-service"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "hashlink",
  "image",
  "rusqlite",
  "serde_json",

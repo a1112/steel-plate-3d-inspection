@@ -25,8 +25,21 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(128 * 1024 * 1024);
+    let decoded_cache_bytes = env::var("STEEL_IMAGE_DECODE_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256 * 1024 * 1024);
+    let catalog_cache_entries = env::var("STEEL_IMAGE_CATALOG_CACHE_ENTRIES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(65_536);
 
-    let state = Arc::new(AppState::new(result_root, cache_bytes)?);
+    let state = Arc::new(AppState::with_cache_limits(
+        result_root,
+        cache_bytes,
+        decoded_cache_bytes,
+        catalog_cache_entries,
+    )?);
     let signal_state = Arc::clone(&state);
     ctrlc::set_handler(move || signal_state.shutdown.store(true, Ordering::Release))
         .map_err(io_error)?;

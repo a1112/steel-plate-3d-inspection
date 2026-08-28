@@ -1,13 +1,14 @@
 use crate::catalog::{ArtifactQuery, ResolveError};
-use crate::http::{binary_response, error_json};
-use crate::image_codec::{render_contained_jpeg, CodecError};
+use crate::http::{binary_response, error_json, Response};
+use crate::image_codec::{render_contained_jpeg, CodecError, RenderTiming};
 use crate::state::AppState;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const RENDITION_SCHEMA: &str = "steel.thumbnail.v1";
-const ENCODER_REVISION: &str = "image-jpeg-v1";
+const ENCODER_REVISION: &str = "image-jpeg-v2-adaptive-staged-triangle";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Profile {
@@ -61,7 +62,18 @@ impl Profile {
     }
 }
 
-pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: &str) -> Vec<u8> {
+#[derive(Default)]
+struct RequestTiming {
+    catalog: Duration,
+    encoded_cache: Duration,
+    build_wait: Duration,
+    cache_store: Duration,
+    render: Option<RenderTiming>,
+}
+
+pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: &str) -> Response {
+    let request_started = Instant::now();
+    let mut timing = RequestTiming::default();
     let Some(record_id) = params
         .get("recordId")
         .or_else(|| params.get("inspectionId"))
@@ -103,6 +115,7 @@ pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: 
         .get("live")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true"));
 
+    let catalog_started = Instant::now();
     let source = match state.catalog.resolve(ArtifactQuery {
         record_id,
         camera_id,
@@ -112,6 +125,7 @@ pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: 
         Ok(source) => source,
         Err(error) => return resolve_error(error),
     };
+    timing.catalog = catalog_started.elapsed();
     let revision = params
         .get("revision")
         .map(String::as_str)
@@ -133,9 +147,11 @@ pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: 
     };
 
     if !live {
+        let cache_started = Instant::now();
         if let Some(bytes) = state.cache.get(&key) {
+            timing.encoded_cache += cache_started.elapsed();
             return preview_response(
-                &bytes,
+                bytes,
                 &key,
                 if_none_match,
                 cache_control,
@@ -143,16 +159,23 @@ pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: 
                 revision,
                 "hit",
                 None,
+                &timing,
+                request_started.elapsed(),
             );
         }
+        timing.encoded_cache += cache_started.elapsed();
     }
 
     let gate = state.cache.build_lock(&key);
+    let wait_started = Instant::now();
     let _guard = gate.lock().unwrap_or_else(|error| error.into_inner());
+    timing.build_wait = wait_started.elapsed();
     if !live {
+        let cache_started = Instant::now();
         if let Some(bytes) = state.cache.get(&key) {
+            timing.encoded_cache += cache_started.elapsed();
             return preview_response(
-                &bytes,
+                bytes,
                 &key,
                 if_none_match,
                 cache_control,
@@ -160,17 +183,28 @@ pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: 
                 revision,
                 "coalesced-hit",
                 None,
+                &timing,
+                request_started.elapsed(),
             );
         }
+        timing.encoded_cache += cache_started.elapsed();
     }
 
     let (max_width, max_height) = profile.bounds();
-    let rendered = match render_contained_jpeg(&source.blob_path, max_width, max_height) {
+    let rendered = match render_contained_jpeg(
+        &state.decoded_cache,
+        &source.identity,
+        &source.blob_path,
+        max_width,
+        max_height,
+    ) {
         Ok(rendered) => rendered,
         Err(CodecError::Decode) => return error_json(422, "image_decode_failed"),
         Err(CodecError::Encode) => return error_json(422, "preview_encode_failed"),
     };
+    timing.render = Some(rendered.timing);
     let bytes = Arc::new(rendered.bytes);
+    let cache_store_started = Instant::now();
     let cache_status = if live {
         "bypass"
     } else if state.cache.store(&key, Arc::clone(&bytes)).is_ok() {
@@ -179,8 +213,9 @@ pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: 
         state.cache.insert_memory(key.clone(), Arc::clone(&bytes));
         "miss-memory-only"
     };
+    timing.cache_store = cache_store_started.elapsed();
     preview_response(
-        &bytes,
+        bytes,
         &key,
         if_none_match,
         cache_control,
@@ -188,6 +223,8 @@ pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: 
         revision,
         cache_status,
         Some((rendered.source_size, rendered.rendition_size)),
+        &timing,
+        request_started.elapsed(),
     )
 }
 
@@ -226,7 +263,7 @@ fn rendition_key(
 
 #[allow(clippy::too_many_arguments)]
 fn preview_response(
-    bytes: &[u8],
+    bytes: Arc<Vec<u8>>,
     key: &str,
     if_none_match: &str,
     cache_control: &str,
@@ -234,13 +271,21 @@ fn preview_response(
     revision: &str,
     cache_status: &str,
     sizes: Option<((u32, u32), (u32, u32))>,
-) -> Vec<u8> {
+    timing: &RequestTiming,
+    total: Duration,
+) -> Response {
     let mut headers = vec![
         ("X-Steel-Rendition-Schema", RENDITION_SCHEMA.to_string()),
         ("X-Steel-Rendition-Profile", profile.name().to_string()),
         ("X-Steel-Source-Revision", revision.to_string()),
         ("X-Steel-Rendition-Cache", cache_status.to_string()),
+        ("X-Steel-Encoder-Revision", ENCODER_REVISION.to_string()),
+        ("Server-Timing", server_timing(timing, total)),
     ];
+    if let Some(render) = timing.render.as_ref() {
+        headers.push(("X-Steel-Decode-Cache", render.decode_cache.to_string()));
+        headers.push(("X-Steel-Resize-Mode", render.resize_mode.to_string()));
+    }
     if let Some((source, rendition)) = sizes {
         headers.push(("X-Steel-Source-Size", format!("{}x{}", source.0, source.1)));
         headers.push((
@@ -257,7 +302,26 @@ fn preview_response(
     )
 }
 
-fn resolve_error(error: ResolveError) -> Vec<u8> {
+fn server_timing(timing: &RequestTiming, total: Duration) -> String {
+    let millis = |duration: Duration| duration.as_secs_f64() * 1000.0;
+    let mut values = vec![
+        format!("total;dur={:.2}", millis(total)),
+        format!("catalog;dur={:.2}", millis(timing.catalog)),
+        format!("encoded-cache;dur={:.2}", millis(timing.encoded_cache)),
+        format!("build-wait;dur={:.2}", millis(timing.build_wait)),
+    ];
+    if let Some(render) = timing.render.as_ref() {
+        values.extend([
+            format!("decode;dur={:.2}", millis(render.decode)),
+            format!("resize;dur={:.2}", millis(render.resize)),
+            format!("encode;dur={:.2}", millis(render.encode)),
+            format!("cache-store;dur={:.2}", millis(timing.cache_store)),
+        ]);
+    }
+    values.join(", ")
+}
+
+fn resolve_error(error: ResolveError) -> Response {
     match error {
         ResolveError::CatalogUnavailable => error_json(503, "catalog_unavailable"),
         ResolveError::NotFound => error_json(404, "artifact_not_found"),
@@ -362,7 +426,7 @@ mod tests {
             ("profile".to_string(), "xs".to_string()),
             ("revision".to_string(), "revision-1".to_string()),
         ]);
-        let first = serve(&state, &params, "");
+        let first = serve(&state, &params, "").into_bytes();
         let separator = first
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -371,10 +435,13 @@ mod tests {
         assert!(headers.starts_with("HTTP/1.1 200 OK"));
         assert!(headers.contains("X-Steel-Rendition-Profile: xs"));
         assert!(headers.contains("X-Steel-Rendition-Cache: miss"));
+        assert!(headers.contains("X-Steel-Decode-Cache: miss"));
+        assert!(headers.contains("X-Steel-Resize-Mode: staged-triangle"));
+        assert!(headers.contains("Server-Timing: total;dur="));
         let rendered = image::load_from_memory(&first[separator + 4..]).expect("preview jpeg");
         assert_eq!((rendered.width(), rendered.height()), (512, 128));
 
-        let second = serve(&state, &params, "");
+        let second = serve(&state, &params, "").into_bytes();
         let second_headers = String::from_utf8_lossy(
             &second[..second
                 .windows(4)
@@ -383,12 +450,27 @@ mod tests {
         );
         assert!(second_headers.contains("X-Steel-Rendition-Cache: hit"));
 
+        let mut resized_params = params.clone();
+        resized_params.insert("profile".to_string(), "sm".to_string());
+        let resized = serve(&state, &resized_params, "").into_bytes();
+        let resized_separator = resized
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("second profile response separator");
+        let resized_headers = String::from_utf8_lossy(&resized[..resized_separator]);
+        assert!(resized_headers.contains("X-Steel-Decode-Cache: hit"));
+        assert_eq!(state.catalog.stats().database_queries, 1);
+        assert!(state.catalog.stats().cache_hits >= 2);
+        assert_eq!(state.decoded_cache.stats().misses, 1);
+        assert_eq!(state.decoded_cache.stats().hits, 1);
+
         let jet_params = HashMap::from([
             ("recordId".to_string(), "coil-1".to_string()),
             ("cameraId".to_string(), "C1".to_string()),
             ("colorMode".to_string(), "jet".to_string()),
         ]);
-        let jet = String::from_utf8_lossy(&serve(&state, &jet_params, "")).into_owned();
+        let jet_response = serve(&state, &jet_params, "").into_bytes();
+        let jet = String::from_utf8_lossy(&jet_response).into_owned();
         assert!(jet.starts_with("HTTP/1.1 404 Not Found"));
         assert!(jet.contains("artifact_not_found"));
 

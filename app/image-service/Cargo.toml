@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ctrlc = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
+hashlink = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 sha2 = "0.10"

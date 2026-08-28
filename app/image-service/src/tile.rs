@@ -1,5 +1,5 @@
 use crate::catalog::{ArtifactQuery, ResolveError};
-use crate::http::{binary_response, error_json};
+use crate::http::{binary_response, error_json, Response};
 use crate::image_codec::{render_tile_jpeg, CodecError};
 use crate::state::AppState;
 use sha2::{Digest, Sha256};
@@ -9,7 +9,7 @@ use std::sync::Arc;
 const TILE_SIZE: u32 = 512;
 const MAX_TILE_LEVEL: u32 = 3;
 
-pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: &str) -> Vec<u8> {
+pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: &str) -> Response {
     let Some(record_id) = params
         .get("recordId")
         .or_else(|| params.get("inspectionId"))
@@ -63,7 +63,7 @@ pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: 
         )
     );
     if let Some(bytes) = state.cache.get(&key) {
-        return tile_response(&bytes, &key, if_none_match);
+        return tile_response(bytes, &key, if_none_match);
     }
     let bytes = match render_tile_jpeg(&source.blob_path, level, x, y, TILE_SIZE) {
         Ok(Some(bytes)) => bytes,
@@ -73,10 +73,10 @@ pub fn serve(state: &AppState, params: &HashMap<String, String>, if_none_match: 
     };
     let bytes = Arc::new(bytes);
     state.cache.insert_memory(key.clone(), Arc::clone(&bytes));
-    tile_response(&bytes, &key, if_none_match)
+    tile_response(bytes, &key, if_none_match)
 }
 
-fn tile_response(bytes: &[u8], key: &str, if_none_match: &str) -> Vec<u8> {
+fn tile_response(bytes: Arc<Vec<u8>>, key: &str, if_none_match: &str) -> Response {
     binary_response(
         bytes,
         &format!("\"{key}\""),

@@ -1,13 +1,25 @@
-use std::collections::{HashMap, VecDeque};
+use hashlink::LinkedHashMap;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct RenditionCache {
     root: PathBuf,
-    memory: Mutex<ByteLruCache>,
+    memory: Mutex<ByteLruCache<Vec<u8>>>,
     flights: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    memory_hits: AtomicU64,
+    disk_hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+pub struct RenditionCacheStats {
+    pub memory_hits: u64,
+    pub disk_hits: u64,
+    pub misses: u64,
 }
 
 impl RenditionCache {
@@ -17,18 +29,27 @@ impl RenditionCache {
             root,
             memory: Mutex::new(ByteLruCache::new(max_memory_bytes)),
             flights: Mutex::new(HashMap::new()),
+            memory_hits: AtomicU64::new(0),
+            disk_hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         })
     }
 
     pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         if let Ok(mut memory) = self.memory.lock() {
             if let Some(bytes) = memory.get(key) {
+                self.memory_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(bytes);
             }
         }
-        let bytes = fs::read(self.disk_path(key))
+        let Some(bytes) = fs::read(self.disk_path(key))
             .ok()
-            .filter(|bytes| !bytes.is_empty())?;
+            .filter(|bytes| !bytes.is_empty())
+        else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        self.disk_hits.fetch_add(1, Ordering::Relaxed);
         let bytes = Arc::new(bytes);
         self.insert_memory(key.to_string(), Arc::clone(&bytes));
         Some(bytes)
@@ -36,7 +57,16 @@ impl RenditionCache {
 
     pub fn insert_memory(&self, key: String, bytes: Arc<Vec<u8>>) {
         if let Ok(mut memory) = self.memory.lock() {
-            memory.insert(key, bytes);
+            let byte_size = bytes.len();
+            memory.insert(key, bytes, byte_size);
+        }
+    }
+
+    pub fn stats(&self) -> RenditionCacheStats {
+        RenditionCacheStats {
+            memory_hits: self.memory_hits.load(Ordering::Relaxed),
+            disk_hits: self.disk_hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
         }
     }
 
@@ -82,53 +112,42 @@ impl RenditionCache {
     }
 }
 
-struct ByteLruCache {
+pub(crate) struct ByteLruCache<T> {
     max_bytes: usize,
     current_bytes: usize,
-    entries: HashMap<String, Arc<Vec<u8>>>,
-    order: VecDeque<String>,
+    entries: LinkedHashMap<String, (Arc<T>, usize)>,
 }
 
-impl ByteLruCache {
-    fn new(max_bytes: usize) -> Self {
+impl<T> ByteLruCache<T> {
+    pub(crate) fn new(max_bytes: usize) -> Self {
         Self {
             max_bytes,
             current_bytes: 0,
-            entries: HashMap::new(),
-            order: VecDeque::new(),
+            entries: LinkedHashMap::new(),
         }
     }
 
-    fn get(&mut self, key: &str) -> Option<Arc<Vec<u8>>> {
-        let bytes = self.entries.get(key).cloned()?;
-        self.touch(key);
-        Some(bytes)
+    pub(crate) fn get(&mut self, key: &str) -> Option<Arc<T>> {
+        self.entries
+            .to_back(key)
+            .map(|(value, _)| Arc::clone(value))
     }
 
-    fn insert(&mut self, key: String, bytes: Arc<Vec<u8>>) {
-        if bytes.len() > self.max_bytes || self.max_bytes == 0 {
+    pub(crate) fn insert(&mut self, key: String, value: Arc<T>, byte_size: usize) {
+        if byte_size > self.max_bytes || self.max_bytes == 0 {
             return;
         }
-        if let Some(previous) = self.entries.remove(&key) {
-            self.current_bytes = self.current_bytes.saturating_sub(previous.len());
-            self.order.retain(|candidate| candidate != &key);
+        if let Some((_, previous_size)) = self.entries.remove(&key) {
+            self.current_bytes = self.current_bytes.saturating_sub(previous_size);
         }
-        self.current_bytes = self.current_bytes.saturating_add(bytes.len());
-        self.order.push_back(key.clone());
-        self.entries.insert(key, bytes);
+        self.current_bytes = self.current_bytes.saturating_add(byte_size);
+        self.entries.insert(key, (value, byte_size));
         while self.current_bytes > self.max_bytes {
-            let Some(oldest) = self.order.pop_front() else {
+            let Some((_, (_, removed_size))) = self.entries.pop_front() else {
                 break;
             };
-            if let Some(removed) = self.entries.remove(&oldest) {
-                self.current_bytes = self.current_bytes.saturating_sub(removed.len());
-            }
+            self.current_bytes = self.current_bytes.saturating_sub(removed_size);
         }
-    }
-
-    fn touch(&mut self, key: &str) {
-        self.order.retain(|candidate| candidate != key);
-        self.order.push_back(key.to_string());
     }
 }
 
@@ -140,10 +159,10 @@ mod tests {
     #[test]
     fn evicts_by_bytes_and_refreshes_recent_entries() {
         let mut cache = ByteLruCache::new(6);
-        cache.insert("a".into(), Arc::new(vec![1; 3]));
-        cache.insert("b".into(), Arc::new(vec![2; 3]));
+        cache.insert("a".into(), Arc::new(vec![1; 3]), 3);
+        cache.insert("b".into(), Arc::new(vec![2; 3]), 3);
         assert!(cache.get("a").is_some());
-        cache.insert("c".into(), Arc::new(vec![3; 3]));
+        cache.insert("c".into(), Arc::new(vec![3; 3]), 3);
         assert!(cache.get("a").is_some());
         assert!(cache.get("b").is_none());
         assert!(cache.get("c").is_some());
