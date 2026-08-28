@@ -117,6 +117,7 @@ type DisplayWorld = {
 };
 
 const MAP_DRAG_THRESHOLD_PX = 8;
+const LIVE_ARTIFACT_REFRESH_MS = 2_000;
 
 type CaptureStitchState = {
   materialId: string;
@@ -174,7 +175,7 @@ function useCaptureStitchHistory(
           status: result.frames.length > 0 ? 'ready' : 'missing',
           result: result.frames.length > 0 ? result : null,
         });
-        if (keepRefreshing) schedule(8_000);
+        if (keepRefreshing) schedule(LIVE_ARTIFACT_REFRESH_MS);
       } catch {
         if (cancelled) return;
         failures += 1;
@@ -247,7 +248,9 @@ function useCaptureOverlapData(
         defectResult.value.detection
         || ['failed', 'disabled'].includes(defectResult.value.state || ''),
       );
-      if (keepRefreshing || !regionMap || !defectSettled) schedule(8_000);
+      if (keepRefreshing || !regionMap || !defectSettled) {
+        schedule(keepRefreshing ? LIVE_ARTIFACT_REFRESH_MS : 8_000);
+      }
     };
     void refresh();
     return () => {

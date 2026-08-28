@@ -2067,6 +2067,7 @@ export async function fetchInspectionSnapshot(
   const origin = getInspectionServiceOrigin(config);
   const response = await fetch(`${origin}/api/inspection/snapshot`, {
     headers: { Accept: 'application/json' },
+    cache: 'no-store',
     signal,
   });
   if (!response.ok) {
@@ -2769,6 +2770,9 @@ export type AdminDepthGeometryConfig = {
   enabled: boolean;
   revision?: number | string;
   candidatePolicy?: 'review-only' | string;
+  longitudinalEdgeGuardFrames?: number;
+  cameraWorkers?: number;
+  maximumCandidatesPerFlow?: number;
   baseline: {
     maximumFrames: number;
     rowSampleStep: number;

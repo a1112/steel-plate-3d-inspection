@@ -8,8 +8,9 @@ The backend service registry is maintained in `config/service-registry.json`.
 Packaging and target-runtime synchronization copy this file into the runtime
 configuration. The Rust service exposes its resolved registrations, lifecycle
 state, runtime roots, and bounded log tails through the loopback-only
-`GET /api/runtime/status`; the independent Tauri monitor reads that endpoint
-without an administrator session.
+`GET /api/runtime/status`. The independent Tauri supervisor loads the same
+registry, probes and manages each process without an administrator session,
+and exposes its own loopback-only status/control API on port `4899`.
 
 ## SICK GenTL capture sidecar
 
@@ -408,7 +409,11 @@ In another terminal:
 scripts/run-service.ps1 -Provider external-api -CaptureOrigin http://127.0.0.1:4317
 ```
 
-Equivalent env-file mode:
+The normal launcher no longer starts a BKV worker implicitly. Pass
+`-SickCaptureProfile` for direct-camera processing or `-NoProcessingServices`
+for backend/admin-only debugging. The following compatibility path is
+temporarily deprecated and requires the explicit marker from its ignored local
+environment file:
 
 ```powershell
 scripts/run-service.ps1 -EnvFile config/env/external-api.env.example
@@ -1017,7 +1022,7 @@ scripts/run-tauri-dev.ps1 -ServicePort 4873
 Equivalent env-file mode:
 
 ```powershell
-scripts/run-tauri-dev.ps1 -EnvFile config/bkv-online.env.local
+scripts/run-tauri-dev.ps1 -EnvFile config/env/bkv-online.env.local
 ```
 
 Use `-SkipServiceBuild` after an explicit service build. The launcher uses the
@@ -1026,13 +1031,16 @@ local Cargo cache by default; on a machine with an empty cache, use
 behavior when the API lifecycle is managed elsewhere.
 
 The desktop runtime boundary is process-based. The operator executable is
-`steel-plate-3d-inspection-tauri.exe`. The independent read-only monitor is built
+`steel-plate-3d-inspection-tauri.exe`. The independent lifecycle supervisor is built
 separately with `scripts/build-server-monitor.ps1` as
 `steel-inspection-server-monitor.exe`; its development frontend binds `1433`,
 while the operator client remains on `1432`. The monitor has its own Rust crate,
-Tauri capability set, tray lifecycle, and `monitor` route. It never stores an
-administrator token and cannot cancel/retry production tasks or control the
-Windows service.
+Tauri capability set, tray lifecycle, and `monitor` route. It directly probes
+registered services, supports start/stop/restart and startup modes, automatically
+relaunches dead normal-mode processes, and persists lifecycle audit events. It
+never stores an administrator token and cannot cancel/retry production tasks or
+control the Windows service. The main-client footer uses the monitor's
+`127.0.0.1:4899` API for the same real status and controls.
 
 Desktop development is not installation evidence. The locked no-bundle Release completed in 56.64 seconds and produced `target/cargo/release/steel-plate-3d-inspection-tauri.exe` at 23,113,728 bytes with production devtools feature count zero. Tauri selects the WebView2 offline installer, per-machine NSIS mode, no downgrades, and the formal publisher. Formal `build-client.ps1 -Tauri` requires a certificate SHA-1 thumbprint and HTTPS timestamp URL; missing signing inputs fail closed, while `-AllowUnsignedDesktopBundle` is development-only. The EXE is `NotSigned`, depends on `VCRUNTIME140.dll`, and does not close the MSI/NSIS gate.
 

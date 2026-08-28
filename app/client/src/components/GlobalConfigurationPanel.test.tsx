@@ -11,6 +11,8 @@ vi.mock('./RuntimeProfileManagementPanel', () => ({
 const activeSite = {
   id: 'bkv-default',
   displayName: 'BKV 六相机现场',
+  deprecated: false,
+  deprecationNotice: '',
   mode: 'bkv' as const,
   cameraCount: 6,
   active: true,
@@ -28,6 +30,8 @@ const activeSite = {
 const standbySite = {
   id: 'bkv-standby',
   displayName: 'BKV 备用现场',
+  deprecated: false,
+  deprecationNotice: '',
   mode: 'bkv' as const,
   cameraCount: 6,
   active: false,
@@ -45,6 +49,7 @@ const standbySite = {
 describe('GlobalConfigurationPanel', () => {
   const fetchMock = vi.fn();
   let blocking = false;
+  let deprecatedStandby = false;
   let pendingSiteId: string | null = null;
   let restartRequired = false;
 
@@ -56,16 +61,21 @@ describe('GlobalConfigurationPanel', () => {
       displayName: id === source.id ? source.displayName : `${source.displayName} 副本`,
       pending: pendingSiteId === id,
       restartRequired,
+      deprecated: deprecatedStandby && id === standbySite.id,
+      deprecationNotice: deprecatedStandby && id === standbySite.id
+        ? 'BKV online 已隔离并暂时停用'
+        : '',
       availability: {
         ...source.availability,
-        error: blocking && id === standbySite.id ? 1 : 0,
-        blocking: blocking && id === standbySite.id ? 1 : 0,
+        error: (blocking || deprecatedStandby) && id === standbySite.id ? 1 : 0,
+        blocking: (blocking || deprecatedStandby) && id === standbySite.id ? 1 : 0,
       },
     };
   };
 
   beforeEach(() => {
     blocking = false;
+    deprecatedStandby = false;
     pendingSiteId = null;
     restartRequired = false;
     fetchMock.mockReset();
@@ -112,12 +122,12 @@ describe('GlobalConfigurationPanel', () => {
               siteId: site.id,
               depth: 'default',
               checkedAt: 1,
-              checks: blocking && site.id === standbySite.id
+              checks: (blocking || deprecatedStandby) && site.id === standbySite.id
                 ? [{
-                    id: 'storage.convertedRoot',
-                    label: '标准数据目录',
+                    id: deprecatedStandby ? 'site.deprecated' : 'storage.convertedRoot',
+                    label: deprecatedStandby ? '配置生命周期' : '标准数据目录',
                     status: 'error',
-                    message: '目录不可写',
+                    message: deprecatedStandby ? site.deprecationNotice : '目录不可写',
                     blocking: true,
                   }]
                 : [{
@@ -248,6 +258,20 @@ describe('GlobalConfigurationPanel', () => {
     expect(await within(detail).findByText('目录不可写')).toBeInTheDocument();
     expect(within(detail).getByRole('button', { name: '切换到此配置' })).toBeDisabled();
     expect(within(detail).getByText('存在阻断项，无法切换')).toBeInTheDocument();
+  });
+
+  it('marks a deprecated BKV online configuration and prevents activation', async () => {
+    deprecatedStandby = true;
+    render(<GlobalConfigurationPanel canEdit />);
+    await screen.findByTestId('site-config-detail');
+
+    fireEvent.click(screen.getByRole('button', { name: /BKV 备用现场/ }));
+
+    const detail = await screen.findByTestId('site-config-detail');
+    expect(await within(detail).findByText('BKV online 已隔离')).toBeInTheDocument();
+    expect(within(detail).getAllByText('BKV online 已隔离并暂时停用')).toHaveLength(2);
+    expect(within(detail).getByRole('button', { name: '切换到此配置' })).toBeDisabled();
+    expect(screen.getAllByText('已弃用').length).toBeGreaterThan(0);
   });
 
   it('shows restart-required state and protects a pending configuration after activation', async () => {

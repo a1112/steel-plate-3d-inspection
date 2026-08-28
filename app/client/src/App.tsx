@@ -12,6 +12,7 @@ import {
   filterDefectsBySurfaceMode,
   getPageCount,
   getVisibleDefects,
+  followLatestRecord,
   paginateItems,
   selectRecord,
   selectDefect,
@@ -106,6 +107,7 @@ import { BackgroundMonitorApp } from './components/BackgroundMonitorApp';
 import { CaptureManagementApp, SystemStatusPage } from './components/SystemStatusPage';
 import { BarSurfaceApp } from './components/BarSurfaceApp';
 import { BkvReconstructionApp } from './components/BkvReconstructionApp';
+import { ProcessingLogPage } from './components/ProcessingLogPage';
 import {
   buildStandardBkvInspectionSnapshot,
   mergeStandardBkvDefects,
@@ -142,6 +144,9 @@ import {
 } from './lib/runtime-dashboard-mode';
 import { resolveSystemName } from './lib/system-brand';
 import './styles.css';
+
+const LATEST_DATA_REFRESH_MS = 2_000;
+const HISTORY_CATALOG_REFRESH_MS = 8_000;
 import './styles/theme-system.css';
 
 const REPORT_PAGE_SIZE = 8;
@@ -1025,8 +1030,7 @@ function InspectionDashboard({
         onSnapshotChange(nextSnapshot);
         setSnapshotSyncState(`已同步 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`);
         if (snapshotTracking === 'latest') {
-          const latestRecordId = nextSnapshot.records[0]?.id ?? nextSnapshot.currentPlate.plateNo;
-          setUiState((current) => selectRecord(current, nextSnapshot, latestRecordId));
+          setUiState((current) => followLatestRecord(current, nextSnapshot));
         }
       } catch (error) {
         if (!cancelled) {
@@ -1037,10 +1041,21 @@ function InspectionDashboard({
       }
     };
 
-    const timer = window.setInterval(() => void refreshSnapshot(), 8000);
+    const refreshInterval = snapshotTracking === 'latest'
+      ? LATEST_DATA_REFRESH_MS
+      : HISTORY_CATALOG_REFRESH_MS;
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') void refreshSnapshot();
+    };
+    void refreshSnapshot();
+    const timer = window.setInterval(() => void refreshSnapshot(), refreshInterval);
+    window.addEventListener('focus', refreshWhenVisible);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      window.removeEventListener('focus', refreshWhenVisible);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
     };
   }, [dashboardMode.kind, dashboardMode.requestsOnlineServices, onSnapshotChange, snapshotTracking]);
 
@@ -1392,12 +1407,18 @@ function InspectionDashboard({
     }
 
     const controller = new AbortController();
-    setRecordBoundSurface({
-      inspectionId,
-      loading: true,
-      mesh: null,
-      status: '正在核对检测记录绑定的算法产物…',
-    });
+    setRecordBoundSurface((current) => current.inspectionId === inspectionId
+      ? {
+          ...current,
+          loading: current.mesh === null,
+          status: '正在刷新检测记录绑定的算法产物…',
+        }
+      : {
+          inspectionId,
+          loading: true,
+          mesh: null,
+          status: '正在核对检测记录绑定的算法产物…',
+        });
     let inFlight = false;
     let artifactLoaded = false;
     const continuouslyRefreshDirectSurface = dashboardMode.kind === 'direct'
@@ -1430,7 +1451,7 @@ function InspectionDashboard({
             if (mesh.positions.length < 3 || validPointCount < 3) {
               throw new Error('采集拟合结果没有有效三维点或切面');
             }
-            setRecordBoundSurface({
+            setRecordBoundSurface((current) => ({
               inspectionId,
               loading: false,
               mesh,
@@ -1438,9 +1459,11 @@ function InspectionDashboard({
               headAlignment: captureResult.surface.headAlignment ?? null,
               measurement: measurementResult?.measurement.materialId === materialId
                 ? measurementResult.measurement
-                : null,
+                : current.inspectionId === inspectionId
+                  ? current.measurement
+                  : null,
               status: `已绑定流水 ${materialId} 标定数据 · ${captureResult.surface.summary.acceptedSectionCount}/${captureResult.surface.summary.sectionCount} 截面 · ${mesh.indices.length >= 3 ? `${Math.floor(mesh.indices.length / 3).toLocaleString('zh-CN')} 三角面` : '切面可用、三维曲面不足'} · ${captureResult.surface.headAlignment?.displayAligned ? `头部已对齐（最大补偿 ${(captureResult.surface.headAlignment.maximumDisplayPaddingFrames ?? 0).toFixed(2)} 帧）` : '头部对齐不可用'} · ${captureResult.surface.quality.crossSectionMetricValid ? '截面毫米有效' : '拟合预览'} · JET ±${captureResult.surface.summary.jetResidualRangeMm.toFixed(3)} mm`,
-            });
+            }));
             artifactLoaded = true;
             return;
           } catch (captureSurfaceError) {
@@ -1449,14 +1472,23 @@ function InspectionDashboard({
             }
             // A just-closed flow may not have its fast artifacts yet. Keep
             // the existing record-bound manifest path as a strict fallback.
-            setRecordBoundSurface({
-              inspectionId,
-              loading: true,
-              mesh: null,
-              status: captureSurfaceError instanceof Error
-                ? `正在等待流水 ${materialId} 的标定曲面：${captureSurfaceError.message}`
-                : `正在等待流水 ${materialId} 的标定曲面`,
-            });
+            setRecordBoundSurface((current) => current.inspectionId === inspectionId
+              && current.mesh
+              ? {
+                  ...current,
+                  loading: false,
+                  status: captureSurfaceError instanceof Error
+                    ? `流水 ${materialId} 新产物尚未提交，保留上一版：${captureSurfaceError.message}`
+                    : `流水 ${materialId} 新产物尚未提交，保留上一版`,
+                }
+              : {
+                  inspectionId,
+                  loading: true,
+                  mesh: null,
+                  status: captureSurfaceError instanceof Error
+                    ? `正在等待流水 ${materialId} 的标定曲面：${captureSurfaceError.message}`
+                    : `正在等待流水 ${materialId} 的标定曲面`,
+                });
             return;
           }
         }
@@ -1529,6 +1561,45 @@ function InspectionDashboard({
       window.clearInterval(timer);
     };
   }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeRecordStatus, activeSnapshot.currentPlate.plateNo, artifactMode, dashboardMode.kind, plateMapViewMode, snapshotTracking, terminalMode]);
+
+  useEffect(() => {
+    const inspectionId = activeInspection?.inspectionId?.trim() || '';
+    const materialId = activeSnapshot.currentPlate.plateNo.trim();
+    if (
+      dashboardMode.kind !== 'direct'
+      || snapshotTracking !== 'latest'
+      || !inspectionId
+      || !materialId
+    ) return undefined;
+
+    let cancelled = false;
+    let inFlight = false;
+    const refreshMeasurement = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const result = await readCaptureMeasurement(materialId);
+        if (cancelled || result.measurement.materialId !== materialId) return;
+        setRecordBoundSurface((current) => current.inspectionId === inspectionId
+          ? { ...current, measurement: result.measurement }
+          : current);
+      } catch {
+        // A live flow normally has no measurement until enough synchronized
+        // sections are committed. Keep the last valid curve while waiting.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refreshMeasurement();
+    const timer = window.setInterval(
+      () => void refreshMeasurement(),
+      LATEST_DATA_REFRESH_MS,
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeInspection?.inspectionId, activeSnapshot.currentPlate.plateNo, dashboardMode.kind, snapshotTracking]);
 
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
   const activeDisplayLengthM = activePlateLengthM > 0 ? activePlateLengthM : DEFAULT_PLATE_LENGTH_M;
@@ -2036,7 +2107,7 @@ function InspectionDashboard({
                       .filter((materialId) => materialId !== activeSnapshot.currentPlate.plateNo)
                       .slice(0, 6)
                     : []}
-                  refreshCaptureRoi={snapshotTracking === 'latest' && activeRecordStatus === 'detecting'}
+                  refreshCaptureRoi={snapshotTracking === 'latest'}
                   captureImages={activeSnapshot.captureImages ?? []}
                   cameraLanes={runtimeCameraLanes}
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
@@ -2060,7 +2131,7 @@ function InspectionDashboard({
                         <div className="snapshot-follow-summary" aria-label="检测数据状态">
                           <i className={snapshotTracking === 'latest' ? 'live' : 'history'} />
                           <strong>{snapshotTracking === 'latest' ? '实时跟随最新检测' : `固定查看 ${activeSnapshot.currentPlate.plateNo}`}</strong>
-                          <span>{snapshotSyncState} · 每 8 秒刷新</span>
+                          <span>{snapshotSyncState} · 图像/缺陷/测径每 2 秒刷新</span>
                         </div>
                         <div className="snapshot-follow-actions" role="group" aria-label="检测记录跟随模式">
                           <button type="button" className={snapshotTracking === 'latest' ? 'active' : ''} onClick={followLatestSnapshot}>
@@ -2249,6 +2320,8 @@ function InspectionDashboard({
             />
           ) : uiState.activeNav === 'alarms' ? (
             <AlarmCenter />
+          ) : uiState.activeNav === 'processing' ? (
+            <ProcessingLogPage />
           ) : (
             <SystemStatusPage
               status={deviceStatus}

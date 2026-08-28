@@ -19,6 +19,8 @@ export type SiteConfigAvailability = {
 export type SiteConfigSummary = {
   id: string;
   displayName: string;
+  deprecated?: boolean;
+  deprecationNotice?: string;
   mode: SiteMode;
   cameraCount: number;
   active: boolean;
@@ -31,6 +33,8 @@ export type SiteConfigDocument = {
   schema: 'steel.site-config.v1' | string;
   id: string;
   displayName: string;
+  deprecated?: boolean;
+  deprecationNotice?: string;
   mode: SiteMode;
   runtimeProfile: string;
   connectionConfig: string;

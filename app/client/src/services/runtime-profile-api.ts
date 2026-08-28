@@ -43,6 +43,8 @@ export type RuntimeProfileDocument = {
 export type PublicRuntimeProfile = {
   schema: 'steel.runtime-profile.public.v1' | string;
   siteDisplayName?: string;
+  siteDeprecated?: boolean;
+  siteDeprecationNotice?: string;
   profileId: string;
   displayName: string;
   provider: string;

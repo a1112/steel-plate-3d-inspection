@@ -781,7 +781,7 @@ describe('online inspection world compatibility', () => {
       expect(requestedImageUrls).toHaveLength(0);
       expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
 
-      await act(async () => { await vi.advanceTimersByTimeAsync(8_000); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
       await act(async () => { await vi.advanceTimersByTimeAsync(250); });
 
       expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('2/2 轮对齐拼接');

@@ -3,20 +3,24 @@ import {
   AlertTriangle,
   CheckCircle2,
   Clock3,
-  Copy,
-  Eye,
   FileText,
+  Play,
   RefreshCw,
+  RotateCw,
   Server,
+  Square,
   XCircle,
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import {
   configureBackgroundMonitor,
+  controlBackgroundService,
   hasNativeBackgroundMonitor,
   listenBackgroundMonitor,
   readBackgroundMonitor,
   refreshBackgroundMonitor,
+  setBackgroundServiceStartupMode,
+  type BackgroundServiceStartupMode,
   type BackgroundMonitorSnapshot,
 } from '../lib/background-monitor';
 import { getTauriWindowApi } from '../lib/tauri-window';
@@ -154,13 +158,6 @@ function serviceStatusTone(ok: boolean, status: string) {
   return 'error';
 }
 
-function formatRuntimeBytes(value: number) {
-  const bytes = Math.max(0, numberValue(value));
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 function readError(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback;
 }
@@ -182,11 +179,6 @@ export type BackgroundMonitorAppProps = {
   systemName?: string;
 };
 
-/**
- * Read-only view of the Rust-owned durable task worker. Mutating task actions
- * intentionally do not belong in this surface; operations stay in the admin
- * and capture management windows.
- */
 export function BackgroundMonitorApp({
   origin = getInspectionServiceOrigin(),
   className = '',
@@ -199,6 +191,7 @@ export function BackgroundMonitorApp({
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
   const [logScope, setLogScope] = useState<'service' | 'all'>('service');
   const [operationMessage, setOperationMessage] = useState<string | null>(null);
+  const [operationBusy, setOperationBusy] = useState(false);
   const windowApi = useMemo(() => getTauriWindowApi(), []);
 
   useEffect(() => {
@@ -249,7 +242,7 @@ export function BackgroundMonitorApp({
   const tone = monitorTone(state);
   const StateIcon = monitorStateIcon(state);
   const services = snapshot?.services ?? [];
-  const logs = snapshot?.logs ?? [];
+  const lifecycleLogs = snapshot?.lifecycleLogs ?? [];
   const runtime = snapshot?.runtime ?? null;
   const registry = snapshot?.registry ?? null;
   const healthyServiceCount = snapshot?.healthyServiceCount ?? services.filter((service) => service.ok).length;
@@ -258,8 +251,8 @@ export function BackgroundMonitorApp({
   const workerStatus = stringValue(runtime?.taskWorker?.status, runtime?.taskWorker?.running ? 'running' : '未知');
   const selectedService = services.find((service) => service.id === selectedServiceId) ?? services[0] ?? null;
   const visibleLogs = logScope === 'all' || !selectedService
-    ? logs
-    : logs.filter((log) => log.serviceId === selectedService.id);
+    ? lifecycleLogs
+    : lifecycleLogs.filter((log) => log.serviceId === selectedService.id);
 
   useEffect(() => {
     if (!services.length) {
@@ -294,24 +287,37 @@ export function BackgroundMonitorApp({
     }
   };
 
-  const handleCopyOrigin = async () => {
-    if (!selectedService?.origin) return;
+  const handleServiceAction = async (action: 'start' | 'stop' | 'restart') => {
+    if (!selectedService) return;
+    setOperationBusy(true);
+    setOperationMessage(null);
     try {
-      await navigator.clipboard.writeText(selectedService.origin);
-      setOperationMessage(`已复制 ${selectedService.name || selectedService.id} 的服务地址`);
+      const result = await controlBackgroundService(selectedService.id, action);
+      setOperationMessage(result.message);
+      await refreshBackgroundMonitor();
     } catch (error) {
-      setOperationMessage(readError(error, '复制服务地址失败'));
+      setOperationMessage(readError(error, '服务生命周期操作失败'));
+    } finally {
+      setOperationBusy(false);
+    }
+  };
+
+  const handleStartupModeChange = async (mode: BackgroundServiceStartupMode) => {
+    if (!selectedService) return;
+    setOperationBusy(true);
+    setOperationMessage(null);
+    try {
+      const result = await setBackgroundServiceStartupMode(selectedService.id, mode);
+      setOperationMessage(result.message);
+      await refreshBackgroundMonitor();
+    } catch (error) {
+      setOperationMessage(readError(error, '启动模式设置失败'));
+    } finally {
+      setOperationBusy(false);
     }
   };
 
   const operation = (id: string) => selectedService?.operations?.find((item) => item.id === id);
-
-  const handleViewLogs = () => {
-    setLogScope('service');
-    globalThis.setTimeout(() => {
-      document.getElementById('background-monitor-logs')?.scrollIntoView({ block: 'start' });
-    }, 0);
-  };
 
   return (
     <>
@@ -358,7 +364,7 @@ export function BackgroundMonitorApp({
         <Panel
           title="运行服务"
           className="background-monitor-runtime-panel background-monitor-services-panel"
-          action={<span className="background-monitor-task-count">运行 {healthyServiceCount} / {serviceCount}</span>}
+          action={<span className="background-monitor-task-count">实时探针 {healthyServiceCount} / {serviceCount}</span>}
         >
           {services.length ? (
             <div className="background-monitor-service-list" data-testid="background-monitor-services">
@@ -384,7 +390,7 @@ export function BackgroundMonitorApp({
                     </div>
                     <div className="background-monitor-service-facts">
                       <span>{stringValue(service.origin, '-')} · {stringValue(service.healthPath, '/api/health/live')}</span>
-                      <span>{service.required ? '必需' : '可选'} · {stringValue(service.role, 'service')} · {stringValue(service.lifecycle?.phase, status)}</span>
+                      <span>{service.required ? '必需' : '可选'} · {stringValue(service.role, 'service')} · 启动模式 {service.startupMode === 'normal' ? '正常' : service.startupMode === 'disabled' ? '禁用' : '手动'}</span>
                     </div>
                     {service.reason ? <p>{service.reason}</p> : null}
                   </button>
@@ -417,15 +423,31 @@ export function BackgroundMonitorApp({
               </div>
 
               <div className="background-monitor-quick-actions" aria-label="服务快捷操作">
-                <button type="button" onClick={() => void handleRefresh()} disabled={refreshing || operation('refresh-status')?.enabled === false}>
+                <button type="button" onClick={() => void handleServiceAction('start')} disabled={operationBusy || operation('start')?.enabled === false}>
+                  <Play size={15} />启动
+                </button>
+                <button type="button" onClick={() => void handleServiceAction('stop')} disabled={operationBusy || operation('stop')?.enabled === false}>
+                  <Square size={14} />停止
+                </button>
+                <button type="button" onClick={() => void handleServiceAction('restart')} disabled={operationBusy || operation('restart')?.enabled === false}>
+                  <RotateCw size={15} />重启
+                </button>
+                <button type="button" onClick={() => void handleRefresh()} disabled={refreshing || operationBusy || operation('refresh-status')?.enabled === false}>
                   <RefreshCw size={15} />刷新状态
                 </button>
-                <button type="button" onClick={() => void handleCopyOrigin()} disabled={operation('copy-origin')?.enabled === false}>
-                  <Copy size={15} />复制地址
-                </button>
-                <button type="button" onClick={handleViewLogs} disabled={operation('view-logs')?.enabled === false}>
-                  <Eye size={15} />查看日志
-                </button>
+                <label className="background-monitor-startup-mode">
+                  <span>启动模式</span>
+                  <select
+                    aria-label="启动模式"
+                    value={stringValue(selectedService.startupMode, 'manual')}
+                    disabled={operationBusy || !selectedService.managed}
+                    onChange={(event) => void handleStartupModeChange(event.target.value as BackgroundServiceStartupMode)}
+                  >
+                    <option value="normal">正常（自动拉起）</option>
+                    <option value="manual">手动</option>
+                    <option value="disabled">禁用</option>
+                  </select>
+                </label>
               </div>
 
               <dl className="background-monitor-runtime-facts" data-testid="background-monitor-runtime">
@@ -435,8 +457,9 @@ export function BackgroundMonitorApp({
                 <div><dt>运行时长</dt><dd>{formatRuntimeDuration(selectedService.uptimeMs)}</dd></div>
                 <div><dt>生命周期</dt><dd>{stringValue(selectedService.lifecycle?.phase, selectedService.status)} · {stringValue(selectedService.lifecycle?.source, selectedService.control?.owner ?? 'unknown')}</dd></div>
                 <div><dt>进程</dt><dd>{selectedService.lifecycle?.pid == null ? '-' : String(selectedService.lifecycle.pid)}</dd></div>
-                <div><dt>控制边界</dt><dd>{selectedService.control?.mode === 'control' ? '允许协议操作' : '只读观察'} · {stringValue(selectedService.control?.owner, '未声明')}</dd></div>
-                <div><dt>日志</dt><dd>{logs.filter((log) => log.serviceId === selectedService.id).length} 个文件</dd></div>
+                <div><dt>控制边界</dt><dd>{selectedService.control?.mode === 'control' ? '允许生命周期操作' : '只读观察'} · {stringValue(selectedService.control?.owner, '未声明')}</dd></div>
+                <div><dt>启动模式</dt><dd>{selectedService.startupMode === 'normal' ? '正常 · 进程退出自动拉起' : selectedService.startupMode === 'disabled' ? '禁用 · 保持停止' : '手动 · 不自动拉起'}</dd></div>
+                <div><dt>监控日志</dt><dd>{lifecycleLogs.filter((log) => log.serviceId === selectedService.id).length} 条</dd></div>
               </dl>
 
               {selectedService.reason ? <div className="background-monitor-service-reason"><AlertTriangle size={14} />{selectedService.reason}</div> : null}
@@ -457,38 +480,38 @@ export function BackgroundMonitorApp({
         </Panel>
 
         <Panel
-          title="运行日志"
+          title="服务监控日志"
           className="background-monitor-runtime-panel background-monitor-logs-panel"
           action={(
             <div className="background-monitor-log-scope" aria-label="日志范围">
               <button type="button" className={logScope === 'service' ? 'is-active' : ''} onClick={() => setLogScope('service')} disabled={!selectedService}>当前服务</button>
-              <button type="button" className={logScope === 'all' ? 'is-active' : ''} onClick={() => setLogScope('all')}>全部日志</button>
-              <span>{visibleLogs.length} 个文件</span>
+              <button type="button" className={logScope === 'all' ? 'is-active' : ''} onClick={() => setLogScope('all')}>全部服务</button>
+              <span title="启动、停止、重启、异常退出和自动拉起均由 supervisor 实时记录">实时审计 · {visibleLogs.length} 条</span>
             </div>
           )}
         >
           {visibleLogs.length ? (
             <div className="background-monitor-log-list" id="background-monitor-logs" data-testid="background-monitor-logs">
               {visibleLogs.map((log) => (
-                <details className="background-monitor-log-entry" key={log.name}>
-                  <summary>
-                    <span><FileText size={14} />{stringValue(log.serviceName, '未注册日志')} · {log.name}</span>
-                    <em>{formatRuntimeBytes(log.bytes)}</em>
-                  </summary>
-                  <div className="background-monitor-log-meta">
-                    <span>{log.serviceId ? `服务 ${log.serviceId}` : '未关联服务'}</span>
-                    <time>{formatBackgroundMonitorTime(log.modifiedAt)}</time>
-                    {log.truncated ? <span>已截断</span> : null}
+                <article className={`background-monitor-log-entry is-${log.outcome}`} key={log.id}>
+                  <div className="background-monitor-lifecycle-event">
+                    <span><FileText size={14} /><strong>{stringValue(log.serviceName, log.serviceId)}</strong> · {log.action}</span>
+                    <time>{formatBackgroundMonitorTime(log.timestamp)}</time>
                   </div>
-                  <pre>{log.tail || '暂无日志内容'}</pre>
-                </details>
+                  <p>{log.message}</p>
+                  <div className="background-monitor-log-meta">
+                    <span>来源 {log.source}</span>
+                    <span>{log.pid ? `PID ${log.pid}` : '无进程号'}</span>
+                    <span>{log.outcome === 'success' ? '成功' : log.outcome === 'failed' ? '失败' : '告警'}</span>
+                  </div>
+                </article>
               ))}
             </div>
           ) : (
             <div className="background-monitor-empty background-monitor-runtime-empty">
               <FileText size={22} />
-              <strong>{loading ? '正在读取运行日志' : logScope === 'service' && selectedService ? '当前服务暂无运行日志' : '尚未发现运行日志文件'}</strong>
-              <span>{selectedService && logScope === 'service' ? `${selectedService.name || selectedService.id} · ${runtime?.logRoot ?? '日志目录未上报'}` : runtime?.logRoot ?? '日志目录未上报'}</span>
+              <strong>{loading ? '正在读取服务监控日志' : logScope === 'service' && selectedService ? '当前服务暂无生命周期操作记录' : '尚未产生生命周期操作记录'}</strong>
+              <span>{runtime?.logRoot ?? 'supervisor 日志目录未上报'}</span>
             </div>
           )}
         </Panel>

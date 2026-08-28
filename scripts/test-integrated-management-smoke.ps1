@@ -333,6 +333,9 @@ try {
 
   $ServiceStatus = Wait-HttpJson -Name "Rust service" -Uri "$ServiceOrigin/api/production/status"
   Assert-Condition ($ServiceStatus.Json.code -eq 0) "Rust service production status failed."
+  $RuntimeProfile = Invoke-HttpJson -Method GET -Uri "$ServiceOrigin/api/runtime-profile"
+  $ExpectedCameras = [int]$RuntimeProfile.Json.cameraCount
+  Assert-Condition ($ExpectedCameras -gt 0) "Runtime profile did not expose a positive camera count."
 
   $NetworkStatus = Invoke-HttpJson -Method GET -Uri "$ServiceOrigin/api/system/network"
   $NetworkSummary = Get-NetworkRateSummary -NetworkJson $NetworkStatus.Json
@@ -408,7 +411,7 @@ try {
 
   $CaptureGuard = Invoke-HttpJson -Method POST -Uri "$ServiceOrigin/api/production/capture-once" -Body @{
     materialId = $MaterialId
-    expectedCameras = 8
+    expectedCameras = $ExpectedCameras
     rounds = 1
     steelStateAware = $true
     requireSteelPresent = $true
@@ -445,7 +448,7 @@ try {
     payload = @{
       requestId = "smoke-capture-$RunId"
       materialId = $MaterialId
-      expectedCameras = 8
+      expectedCameras = $ExpectedCameras
       rounds = 1
       lines = 1000
       width = 0
@@ -467,13 +470,13 @@ try {
   $CaptureOnce = $CaptureTask.Json.task.result
   Assert-Condition ($CaptureOnce.code -eq 0) "Persistent production capture-once failed."
   Assert-Condition ($CaptureOnce.provider.parallel -eq $true) "Production capture-once did not report parallel provider capture."
-  Assert-Condition ($CaptureOnce.provider.workerCount -eq 8) "Production capture-once worker count was not exactly eight cameras."
+  Assert-Condition ($CaptureOnce.provider.workerCount -eq $ExpectedCameras) "Production capture-once worker count did not match the active runtime profile."
   Assert-Condition ($CaptureOnce.provider.failures -eq 0) "Production capture-once provider reported failures."
-  Assert-Condition ($CaptureOnce.provider.successes -eq 8) "Production capture-once did not report exactly eight successful cameras."
-  Assert-Condition ($CaptureOnce.provider.completeFrames -eq 8) "Production capture-once did not produce exactly eight complete frames."
-  Assert-Condition ($CaptureOnce.provider.metadataFrames -eq 8) "Production capture-once did not produce exactly eight metadata commits."
+  Assert-Condition ($CaptureOnce.provider.successes -eq $ExpectedCameras) "Production capture-once successes did not match the active runtime profile."
+  Assert-Condition ($CaptureOnce.provider.completeFrames -eq $ExpectedCameras) "Production capture-once complete frames did not match the active runtime profile."
+  Assert-Condition ($CaptureOnce.provider.metadataFrames -eq $ExpectedCameras) "Production capture-once metadata commits did not match the active runtime profile."
   Assert-Condition ($CaptureOnce.provider.saveSdkDerived -eq $false) "Production capture-once should keep sdk-derived disabled by default."
-  Assert-Condition ($CaptureOnce.record.captureFileRows -eq 24) "Production capture summary did not record exactly three files for each of eight cameras."
+  Assert-Condition ($CaptureOnce.record.captureFileRows -eq ($ExpectedCameras * 3)) "Production capture summary did not record exactly three files per active camera."
 
   $SteelOutBody = $EventBody.Clone()
   $SteelOutBody.requestId = "smoke-steel-out-$RunId"
@@ -541,6 +544,7 @@ try {
         error = $CaptureGuard.Json.error
       }
       captureOnce = @{
+        expectedCameras = $ExpectedCameras
         code = $CaptureOnce.code
         provider = $CaptureOnce.provider.provider
         parallel = $CaptureOnce.provider.parallel

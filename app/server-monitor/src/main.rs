@@ -1,10 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod background_monitor;
+mod service_supervisor;
 
 use background_monitor::{
-    configure_background_monitor, read_background_monitor, refresh_background_monitor,
-    BackgroundMonitorState, MONITOR_WINDOW,
+    configure_background_monitor, control_background_service, read_background_monitor,
+    refresh_background_monitor, set_background_service_startup_mode, BackgroundMonitorState,
+    MONITOR_WINDOW,
 };
 use tauri::Manager;
 
@@ -14,7 +16,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             configure_background_monitor,
             read_background_monitor,
-            refresh_background_monitor
+            refresh_background_monitor,
+            control_background_service,
+            set_background_service_startup_mode
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window(MONITOR_WINDOW) {
@@ -22,6 +26,7 @@ fn main() {
             }
             background_monitor::install(app)?;
             background_monitor::start_worker(app.handle().clone());
+            background_monitor::start_control_server(app.handle().clone())?;
             Ok(())
         })
         .on_window_event(|window, event| {

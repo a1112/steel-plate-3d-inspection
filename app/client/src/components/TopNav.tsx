@@ -1,4 +1,4 @@
-import { BellRing, ClipboardList, Gauge, ScanSearch, Ruler } from 'lucide-react';
+import { BellRing, ClipboardList, Gauge, ScanSearch, Ruler, Workflow } from 'lucide-react';
 import type { ElementType, MouseEvent } from 'react';
 import type { InspectionUiState } from '../state/inspection-ui';
 
@@ -10,6 +10,7 @@ const navItems: Array<{ id: NavKey; label: string; icon: ElementType }> = [
   { id: 'diameter', label: '测径分析', icon: Ruler },
   { id: 'report', label: '缺陷报表', icon: ClipboardList },
   { id: 'alarms', label: '报警中心', icon: BellRing },
+  { id: 'processing', label: '采集算法日志', icon: Workflow },
 ];
 
 export function TopNav({

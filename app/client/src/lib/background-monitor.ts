@@ -34,11 +34,36 @@ export type BackgroundMonitorTask = {
   error: string;
 };
 
-export type BackgroundMonitorService = AdminRuntimeLogStatus['services'][number];
+export type BackgroundServiceStartupMode = 'normal' | 'manual' | 'disabled';
+
+export type BackgroundMonitorService = AdminRuntimeLogStatus['services'][number] & {
+  startupMode?: BackgroundServiceStartupMode | string;
+  autoRestart?: boolean;
+  managed?: boolean;
+};
 export type BackgroundMonitorLog = AdminRuntimeLogStatus['logs'][number];
 export type BackgroundMonitorRuntime = AdminRuntimeLogStatus['runtime'];
 export type BackgroundMonitorRegistry = NonNullable<AdminRuntimeLogStatus['registry']>;
 export type BackgroundMonitorProtocol = NonNullable<AdminRuntimeLogStatus['monitorProtocol']>;
+
+export type BackgroundServiceLifecycleEvent = {
+  id: number;
+  timestamp: string;
+  serviceId: string;
+  serviceName: string;
+  action: string;
+  outcome: string;
+  source: string;
+  message: string;
+  pid?: number | null;
+};
+
+export type BackgroundServiceActionResult = {
+  success: boolean;
+  serviceId: string;
+  action: string;
+  message: string;
+};
 
 export type BackgroundMonitorSnapshot = {
   schema: 'steel.tauri-background-monitor.v1';
@@ -57,6 +82,7 @@ export type BackgroundMonitorSnapshot = {
   tasks: BackgroundMonitorTask[];
   services?: BackgroundMonitorService[];
   logs?: BackgroundMonitorLog[];
+  lifecycleLogs?: BackgroundServiceLifecycleEvent[];
   runtime?: BackgroundMonitorRuntime | null;
   registry?: BackgroundMonitorRegistry | null;
   monitorProtocol?: BackgroundMonitorProtocol | null;
@@ -99,6 +125,7 @@ export function createInitialBackgroundMonitorSnapshot(
     tasks: [],
     services: [],
     logs: [],
+    lifecycleLogs: [],
     runtime: null,
     registry: null,
     monitorProtocol: null,
@@ -209,6 +236,7 @@ export function deriveBackgroundMonitorSnapshot({
     tasks,
     services,
     logs,
+    lifecycleLogs: [],
     runtime: runtimeStatus?.runtime ?? null,
     registry: runtimeStatus?.registry ?? null,
     monitorProtocol: runtimeStatus?.monitorProtocol ?? null,
@@ -259,6 +287,82 @@ export function readBackgroundMonitor(): Promise<BackgroundMonitorSnapshot> {
 export function refreshBackgroundMonitor(): Promise<BackgroundMonitorSnapshot> {
   if (!isTauri()) return readBrowserBackgroundMonitor();
   return invoke<BackgroundMonitorSnapshot>('refresh_background_monitor');
+}
+
+const serviceSupervisorOrigin = (
+  import.meta.env.VITE_SERVICE_SUPERVISOR_ORIGIN || 'http://127.0.0.1:4899'
+).replace(/\/$/, '');
+
+async function readSupervisorResponse<T>(response: Response): Promise<T> {
+  const payload = await response.json().catch(() => null) as ({ message?: string } & T) | null;
+  if (!response.ok || !payload) {
+    throw new Error(payload?.message || `服务 supervisor 请求失败（HTTP ${response.status}）`);
+  }
+  return payload;
+}
+
+export async function readServiceSupervisorSnapshot(
+  signal?: AbortSignal,
+): Promise<BackgroundMonitorSnapshot> {
+  const response = await fetch(`${serviceSupervisorOrigin}/api/status`, {
+    method: 'GET',
+    headers: { 'X-Steel-Monitor-Client': 'main-ui-v1' },
+    cache: 'no-store',
+    signal,
+  });
+  return readSupervisorResponse<BackgroundMonitorSnapshot>(response);
+}
+
+export async function controlServiceSupervisor(
+  serviceId: string,
+  action: 'start' | 'stop' | 'restart',
+): Promise<BackgroundServiceActionResult> {
+  const response = await fetch(
+    `${serviceSupervisorOrigin}/api/services/${encodeURIComponent(serviceId)}/${action}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Steel-Monitor-Client': 'main-ui-v1',
+      },
+      body: '{}',
+    },
+  );
+  return readSupervisorResponse<BackgroundServiceActionResult>(response);
+}
+
+export async function setServiceSupervisorStartupMode(
+  serviceId: string,
+  mode: BackgroundServiceStartupMode,
+): Promise<BackgroundServiceActionResult> {
+  const response = await fetch(
+    `${serviceSupervisorOrigin}/api/services/${encodeURIComponent(serviceId)}/startup-mode`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Steel-Monitor-Client': 'main-ui-v1',
+      },
+      body: JSON.stringify({ mode }),
+    },
+  );
+  return readSupervisorResponse<BackgroundServiceActionResult>(response);
+}
+
+export function controlBackgroundService(
+  serviceId: string,
+  action: 'start' | 'stop' | 'restart',
+): Promise<BackgroundServiceActionResult> {
+  if (!isTauri()) return controlServiceSupervisor(serviceId, action);
+  return invoke<BackgroundServiceActionResult>('control_background_service', { serviceId, action });
+}
+
+export function setBackgroundServiceStartupMode(
+  serviceId: string,
+  mode: BackgroundServiceStartupMode,
+): Promise<BackgroundServiceActionResult> {
+  if (!isTauri()) return setServiceSupervisorStartupMode(serviceId, mode);
+  return invoke<BackgroundServiceActionResult>('set_background_service_startup_mode', { serviceId, mode });
 }
 
 export async function listenBackgroundMonitor(

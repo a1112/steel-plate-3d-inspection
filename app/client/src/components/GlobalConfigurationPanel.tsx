@@ -243,6 +243,7 @@ export function GlobalConfigurationPanel({
   const activateDisabled = !canEdit
     || busy
     || !detail
+    || Boolean(detail.site.deprecated)
     || protectedSite
     || blockingCount > 0;
 
@@ -309,6 +310,7 @@ export function GlobalConfigurationPanel({
                   <span>
                     {site.active ? <b className="active">运行中</b> : null}
                     {site.pending ? <b className="pending">待重启</b> : null}
+                    {site.deprecated ? <b className="deprecated">已弃用</b> : null}
                   </span>
                 </span>
               </button>
@@ -404,8 +406,19 @@ export function GlobalConfigurationPanel({
                   <div className="site-config-state-tags">
                     {detail.site.active ? <b className="active">当前运行</b> : null}
                     {detail.site.pending ? <b className="pending">待重启生效</b> : null}
+                    {detail.site.deprecated ? <b className="deprecated">已弃用</b> : null}
                   </div>
                 </header>
+
+                {detail.site.deprecated ? (
+                  <div className="site-config-deprecation-notice" role="alert">
+                    <strong>BKV online 已隔离</strong>
+                    <span>
+                      {detail.site.deprecationNotice
+                        || '此配置仅保留查看与迁移能力，不能切换为运行配置。'}
+                    </span>
+                  </div>
+                ) : null}
 
                 <div className="site-config-facts">
                   <div className="site-config-mode-fact" data-testid="site-config-mode-setting">

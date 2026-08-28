@@ -161,6 +161,7 @@ describe('AppFooter', () => {
 
     expect(screen.getByRole('button', { name: '配置中心' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '后台管理' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '服务状态' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '采集管理' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '3D 重建' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '更多功能' }));

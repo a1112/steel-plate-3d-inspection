@@ -1,5 +1,5 @@
 {
   "schema": "steel.project-config.v1",
-  "activeSiteConfig": "config/sites/bkv-default/site.json",
+  "activeSiteConfig": "config/sites/sick-array-6/site.json",
   "pendingRestart": false
 }

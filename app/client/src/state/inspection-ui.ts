@@ -49,7 +49,7 @@ export function persistThemeStyle(themeStyle: ThemeStyle, storage?: Pick<Storage
 export interface InspectionUiState {
   theme: ThemeMode;
   themeStyle: ThemeStyle;
-  activeNav: 'online' | 'defects' | 'diameter' | 'report' | 'alarms' | 'settings' | 'status';
+  activeNav: 'online' | 'defects' | 'diameter' | 'report' | 'alarms' | 'processing' | 'settings' | 'status';
   selectedRecordId: string;
   selectedDefectId: string | null;
   hiddenDefectTypeIds: Set<string>;
@@ -142,6 +142,39 @@ export function selectRecord(
     selectedRecordId: selectedRecord?.id || selectedInspection.inspectionId?.trim() || selectedInspection.plate.plateNo,
     selectedDefectId: inspection.defects[0]?.id ?? null,
     previewPositionM: getDefectPreviewPositionM(inspection.defects[0]),
+    defectPage: 1,
+  };
+}
+
+/**
+ * Follow the newest production record without resetting an operator's place
+ * on every polling response. A genuinely new record selects its first defect;
+ * updates to the same record preserve the selected defect and viewport while
+ * that defect still exists.
+ */
+export function followLatestRecord(
+  state: InspectionUiState,
+  snapshot: InspectionSnapshot,
+): InspectionUiState {
+  const latestRecordId = snapshot.records[0]?.id ?? snapshot.currentPlate.plateNo;
+  const selected = selectRecord(state, snapshot, latestRecordId);
+  if (selected === state || state.selectedRecordId !== selected.selectedRecordId) {
+    return selected;
+  }
+  const latest = getPlateInspectionSnapshot(snapshot, latestRecordId);
+  if (state.selectedDefectId === null && latest.defects.length === 0) {
+    return state;
+  }
+  const retained = latest.defects.find((defect) => defect.id === state.selectedDefectId);
+  if (retained) {
+    return state;
+  }
+  const first = latest.defects[0];
+  return {
+    ...state,
+    selectedRecordId: selected.selectedRecordId,
+    selectedDefectId: first?.id ?? null,
+    previewPositionM: getDefectPreviewPositionM(first),
     defectPage: 1,
   };
 }

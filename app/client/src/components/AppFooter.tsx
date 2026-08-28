@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Activity, ArrowLeft, Box, Database, Download, History, MonitorCog, MoreHorizontal, Play, Radio, Settings2 } from 'lucide-react';
+import { Activity, ArrowLeft, Box, Database, Download, History, MonitorCog, MoreHorizontal, Play, Radio, ServerCog, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
 import {
   formatResourceBreakdown,
@@ -18,6 +18,7 @@ import type { AnalysisViewMode } from './AlarmAnalysis';
 import type { NavKey } from './TopNav';
 import { DEFAULT_SYSTEM_NAME } from '../lib/system-brand';
 import { SoftwareUpdateDialog } from './SoftwareUpdateDialog';
+import { ServiceStatusDialog } from './ServiceStatusDialog';
 
 interface FooterAnalysisContext {
   defect: DefectItem;
@@ -114,6 +115,7 @@ export function AppFooter({
 }: AppFooterProps) {
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [softwareUpdateOpen, setSoftwareUpdateOpen] = useState(false);
+  const [serviceStatusOpen, setServiceStatusOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const activeAnalysis = activeNav === 'online' ? analysis : null;
   const visibleAnalysis = dashboardMode.kind === 'bkv' ? activeAnalysis : null;
@@ -252,6 +254,10 @@ export function AppFooter({
           <Database size={15} />
           <span>后台管理</span>
         </button>
+        <button type="button" onClick={() => setServiceStatusOpen(true)}>
+          <ServerCog size={15} />
+          <span>服务状态</span>
+        </button>
         {dashboardMode.showsReconstruction ? (
           <button type="button" onClick={() => void runWindowAction('3D 重建', onBarSurfaceOpen)}>
             <Box size={15} />
@@ -354,6 +360,7 @@ export function AppFooter({
       </nav>
       </footer>
       {softwareUpdateOpen ? <SoftwareUpdateDialog onClose={() => setSoftwareUpdateOpen(false)} /> : null}
+      {serviceStatusOpen ? <ServiceStatusDialog onClose={() => setServiceStatusOpen(false)} /> : null}
     </>
   );
 }

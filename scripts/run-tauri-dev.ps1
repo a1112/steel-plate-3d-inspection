@@ -21,6 +21,14 @@ $RunDir = Join-Path $RepoRoot "target\run\tauri-dev"
 . (Join-Path $PSScriptRoot "lib-env.ps1")
 
 Import-EnvFile $EnvFile
+$DeprecatedBkvOnlineEnabled = $env:STEEL_ENABLE_DEPRECATED_BKV_ONLINE -eq "1"
+if (-not $SickCaptureProfile -and -not $NoProcessingServices -and -not $DeprecatedBkvOnlineEnabled) {
+  Write-Warning "BKV online is deprecated and isolated; no BKV processing worker will be started. Pass -SickCaptureProfile for direct-camera processing or -NoProcessingServices for management-only debugging."
+  $NoProcessingServices = $true
+}
+if ($DeprecatedBkvOnlineEnabled) {
+  Write-Warning "Deprecated BKV online compatibility mode is explicitly enabled. Use it only for controlled migration or verification."
+}
 # Tauri debug mode always talks to the locally started inspection service.
 # Keeping this deterministic prevents an EnvFile production origin from
 # bypassing the split image/algorithm services started below.
@@ -185,8 +193,9 @@ try {
         -RedirectStandardOutput (Join-Path $LogRoot "defect-worker.out.log") `
         -RedirectStandardError (Join-Path $LogRoot "defect-worker.err.log")
     } else {
-      # BKV remains an independent offline import/display adapter. It never
-      # starts real-camera processing or defect inference.
+      # Deprecated BKV online remains an explicitly enabled, independent
+      # import/display adapter. It never starts real-camera processing or
+      # defect inference, and the business service does not inherit its keys.
       $env:STEEL_HISTORY_RECONSTRUCTION = "1"
       $env:STEEL_BKV_IMAGE_WORKER_PORT = [string]$BkvWorkerPort
       $env:STEEL_BKV_IMAGE_WORKER_ORIGIN = "http://127.0.0.1:$BkvWorkerPort"

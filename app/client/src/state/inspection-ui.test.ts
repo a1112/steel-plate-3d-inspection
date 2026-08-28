@@ -4,6 +4,7 @@ import {
   clampPreviewPositionM,
   createInitialUiState,
   filterDefectsBySurfaceMode,
+  followLatestRecord,
   getVisibleDefects,
   paginateItems,
   persistTheme,
@@ -69,6 +70,51 @@ describe('inspection UI state helpers', () => {
     expect(cleanPlate.selectedRecordId).toBe('202606131820');
     expect(cleanPlate.selectedDefectId).toBeNull();
     expect(cleanPlate.previewPositionM).toBe(0);
+  });
+
+  it('follows live updates without resetting a retained defect or viewport', () => {
+    const snapshot = getMockInspectionSnapshot();
+    const initial = {
+      ...createInitialUiState(snapshot),
+      selectedRecordId: snapshot.records[0].id,
+      selectedDefectId: snapshot.defects[1].id,
+      previewPositionM: 4.75,
+      defectPage: 3,
+    };
+    const refreshed = {
+      ...snapshot,
+      defects: [
+        { ...snapshot.defects[0], id: 'D-LIVE-NEW' },
+        ...snapshot.defects,
+      ],
+      inspections: snapshot.inspections.map((inspection, index) => index === 0
+        ? {
+            ...inspection,
+            defects: [
+              { ...inspection.defects[0], id: 'D-LIVE-NEW' },
+              ...inspection.defects,
+            ],
+          }
+        : inspection),
+    };
+
+    const followed = followLatestRecord(initial, refreshed);
+
+    expect(followed.selectedRecordId).toBe(initial.selectedRecordId);
+    expect(followed.selectedDefectId).toBe(initial.selectedDefectId);
+    expect(followed.previewPositionM).toBe(4.75);
+    expect(followed.defectPage).toBe(3);
+  });
+
+  it('switches live following to a genuinely newer record', () => {
+    const snapshot = getMockInspectionSnapshot();
+    const previous = selectRecord(createInitialUiState(snapshot), snapshot, snapshot.records[1].id);
+
+    const followed = followLatestRecord(previous, snapshot);
+
+    expect(followed.selectedRecordId).toBe(snapshot.records[0].id);
+    expect(followed.selectedDefectId).toBe(snapshot.inspections[0].defects[0]?.id ?? null);
+    expect(followed.defectPage).toBe(1);
   });
 
   it('uses the inspection id to distinguish repeated inspections of the same plate', () => {

@@ -2394,8 +2394,8 @@ pub async fn latest_production_inspection(
     connection: &DatabaseConnection,
 ) -> Result<Option<production_inspection::Model>, DbErr> {
     production_inspection::Entity::find()
-        .order_by_desc(production_inspection::Column::FinishedAt)
         .order_by_desc(production_inspection::Column::StartedAt)
+        .order_by_desc(production_inspection::Column::Id)
         .one(connection)
         .await
 }
@@ -2405,8 +2405,8 @@ pub async fn list_recent_production_inspections(
     limit: u64,
 ) -> Result<Vec<production_inspection::Model>, DbErr> {
     production_inspection::Entity::find()
-        .order_by_desc(production_inspection::Column::FinishedAt)
         .order_by_desc(production_inspection::Column::StartedAt)
+        .order_by_desc(production_inspection::Column::Id)
         .limit(limit)
         .all(connection)
         .await

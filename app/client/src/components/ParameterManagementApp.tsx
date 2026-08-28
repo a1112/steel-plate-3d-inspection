@@ -463,15 +463,18 @@ function createDefaultDepthGeometryConfig(): AdminDepthGeometryConfig {
     enabled: true,
     revision: 1,
     candidatePolicy: 'review-only',
+    longitudinalEdgeGuardFrames: 8,
+    cameraWorkers: 4,
+    maximumCandidatesPerFlow: 100,
     baseline: {
       maximumFrames: 32,
       rowSampleStep: 4,
     },
     thresholds: {
-      minimumAbsoluteDeviationMm: 0.35,
+      minimumAbsoluteDeviationMm: 1.2,
       columnNoiseMultiplier: 6,
       minimumNeighborhoodSupport: 3,
-      minimumComponentPoints: 6,
+      minimumComponentPoints: 16,
       elongatedAspectRatio: 3,
     },
     merge: {
@@ -479,7 +482,7 @@ function createDefaultDepthGeometryConfig(): AdminDepthGeometryConfig {
       minimumIoU: 0.2,
     },
     reviewCropMinimumSize: 64,
-    qualityGatePolicy: 'camera-local-with-global-risk-tag',
+    qualityGatePolicy: 'global-owned-only',
     longitudinalScale: null,
     historyBackfill: {
       automatic: true,
@@ -1225,6 +1228,13 @@ export function ParameterManagementApp() {
         [key]: value,
       },
     } as AdminDepthGeometryConfig));
+  };
+
+  const setDepthGeometryTopLevelNumber = (
+    key: 'longitudinalEdgeGuardFrames' | 'cameraWorkers' | 'maximumCandidatesPerFlow',
+    value: number,
+  ) => {
+    setDepthGeometryDraft((current) => ({ ...current, [key]: value }));
   };
 
   const saveDepthGeometry = async () => {
@@ -2699,6 +2709,18 @@ export function ParameterManagementApp() {
             </label>
           </div>
           <div className="admin-depth-geometry-form">
+            <label>
+              <span>Head/tail guard frames</span>
+              <input type="number" min={0} max={64} value={depthGeometryDraft.longitudinalEdgeGuardFrames ?? 8} onChange={(event) => setDepthGeometryTopLevelNumber('longitudinalEdgeGuardFrames', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Camera workers</span>
+              <input type="number" min={1} max={6} value={depthGeometryDraft.cameraWorkers ?? 4} onChange={(event) => setDepthGeometryTopLevelNumber('cameraWorkers', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Maximum candidates per flow</span>
+              <input type="number" min={1} max={100} value={depthGeometryDraft.maximumCandidatesPerFlow ?? 100} onChange={(event) => setDepthGeometryTopLevelNumber('maximumCandidatesPerFlow', Number(event.target.value))} />
+            </label>
             <label>
               <span>Baseline frames</span>
               <input type="number" min={1} max={32} value={depthGeometryDraft.baseline.maximumFrames} onChange={(event) => setDepthGeometryNumber('baseline', 'maximumFrames', Number(event.target.value))} />

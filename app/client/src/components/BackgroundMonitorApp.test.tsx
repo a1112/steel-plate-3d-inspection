@@ -36,10 +36,14 @@ const monitorApi = vi.hoisted(() => {
         lifecycle: { source: 'service', phase: 'ready', desiredRunning: true, pid: 1234 },
         operations: [
           { id: 'refresh-status', label: '刷新状态', effect: 'query', scope: 'service', enabled: true },
-          { id: 'copy-origin', label: '复制地址', effect: 'local', scope: 'service', enabled: true },
-          { id: 'view-logs', label: '查看日志', effect: 'local', scope: 'service', enabled: true },
+          { id: 'start', label: '启动', effect: 'mutation', scope: 'service', enabled: false },
+          { id: 'stop', label: '停止', effect: 'mutation', scope: 'service', enabled: true },
+          { id: 'restart', label: '重启', effect: 'mutation', scope: 'service', enabled: true },
         ],
         control: { mode: 'observe', owner: 'service' },
+        startupMode: 'normal',
+        autoRestart: true,
+        managed: true,
       },
       {
         id: 'capture',
@@ -58,10 +62,14 @@ const monitorApi = vi.hoisted(() => {
         lifecycle: { source: 'capture-supervisor', phase: 'stopped', desiredRunning: true },
         operations: [
           { id: 'refresh-status', label: '刷新状态', effect: 'query', scope: 'service', enabled: true },
-          { id: 'copy-origin', label: '复制地址', effect: 'local', scope: 'service', enabled: true },
-          { id: 'view-logs', label: '查看日志', effect: 'local', scope: 'service', enabled: true },
+          { id: 'start', label: '启动', effect: 'mutation', scope: 'service', enabled: true },
+          { id: 'stop', label: '停止', effect: 'mutation', scope: 'service', enabled: false },
+          { id: 'restart', label: '重启', effect: 'mutation', scope: 'service', enabled: false },
         ],
         control: { mode: 'observe', owner: 'capture-supervisor' },
+        startupMode: 'normal',
+        autoRestart: true,
+        managed: true,
       },
     ],
     logs: [
@@ -82,6 +90,30 @@ const monitorApi = vi.hoisted(() => {
         modifiedAt: '1800000003000',
         tail: 'capture process stopped',
         truncated: false,
+      },
+    ],
+    lifecycleLogs: [
+      {
+        id: 2,
+        timestamp: '1800000003000',
+        serviceId: 'capture',
+        serviceName: '采集服务',
+        action: 'stop',
+        outcome: 'success',
+        source: 'monitor-ui',
+        message: '采集服务已停止',
+        pid: 4321,
+      },
+      {
+        id: 1,
+        timestamp: '1800000002000',
+        serviceId: 'inspection',
+        serviceName: '检测服务',
+        action: 'start',
+        outcome: 'success',
+        source: 'startup',
+        message: '检测服务启动命令已执行',
+        pid: 1234,
       },
     ],
     runtime: {
@@ -160,6 +192,8 @@ const monitorApi = vi.hoisted(() => {
     configure: vi.fn().mockResolvedValue(baseSnapshot),
     read: vi.fn().mockResolvedValue(baseSnapshot),
     refresh: vi.fn().mockResolvedValue(refreshedSnapshot),
+    control: vi.fn().mockResolvedValue({ success: true, serviceId: 'capture', action: 'restart', message: '采集服务已重启' }),
+    setMode: vi.fn().mockResolvedValue({ success: true, serviceId: 'capture', action: 'startup-mode', message: '启动模式已设置' }),
     listen: vi.fn(async (handler: (snapshot: typeof baseSnapshot) => void) => {
       eventHandler = handler;
       return unlisten;
@@ -187,10 +221,12 @@ const windowApi = vi.hoisted(() => ({
 
 vi.mock('../lib/background-monitor', () => ({
   configureBackgroundMonitor: monitorApi.configure,
+  controlBackgroundService: monitorApi.control,
   hasNativeBackgroundMonitor: monitorApi.hasNative,
   listenBackgroundMonitor: monitorApi.listen,
   readBackgroundMonitor: monitorApi.read,
   refreshBackgroundMonitor: monitorApi.refresh,
+  setBackgroundServiceStartupMode: monitorApi.setMode,
 }));
 
 vi.mock('../lib/tauri-window', () => ({
@@ -217,22 +253,29 @@ describe('BackgroundMonitorApp', () => {
     expect(monitorApi.configure).not.toHaveBeenCalled();
 
     expect(screen.getByText(/^服务/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('1/2');
+    expect(screen.getByText('实时探针 1 / 2')).toBeInTheDocument();
+    expect(screen.getByText('实时审计 · 1 条')).toBeInTheDocument();
     expect(screen.getByText(/^关注/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('2');
     expect(screen.getByTestId('background-monitor-service-inspection')).toHaveTextContent('检测服务');
     expect(screen.getByTestId('background-monitor-service-capture')).toHaveTextContent('采集服务');
     expect(screen.getByTestId('background-monitor-service-detail')).toHaveTextContent('inspection');
     expect(screen.getByTestId('background-monitor-runtime')).toHaveTextContent('只读观察');
-    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('worker heartbeat ok');
-    expect(screen.queryByText('capture process stopped')).not.toBeInTheDocument();
+    expect(screen.getByTestId('background-monitor-runtime')).toHaveTextContent('进程退出自动拉起');
+    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('检测服务启动命令已执行');
+    expect(screen.queryByText('采集服务已停止')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId('background-monitor-service-capture'));
     expect(screen.getByTestId('background-monitor-service-detail')).toHaveTextContent('capture');
     expect(screen.getByTestId('background-monitor-service-detail')).toHaveTextContent('capture_process_not_running');
-    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('capture process stopped');
+    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('采集服务已停止');
+    fireEvent.click(screen.getByRole('button', { name: '启动' }));
+    await waitFor(() => expect(monitorApi.control).toHaveBeenCalledWith('capture', 'start'));
+    fireEvent.change(screen.getByRole('combobox', { name: '启动模式' }), { target: { value: 'manual' } });
+    await waitFor(() => expect(monitorApi.setMode).toHaveBeenCalledWith('capture', 'manual'));
 
-    fireEvent.click(screen.getByRole('button', { name: '全部日志' }));
-    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('worker heartbeat ok');
-    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('capture process stopped');
+    fireEvent.click(screen.getByRole('button', { name: '全部服务' }));
+    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('检测服务启动命令已执行');
+    expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('采集服务已停止');
     expect(screen.queryByText('当前活动任务')).not.toBeInTheDocument();
     expect(screen.queryByText('任务列表')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('后台监控摘要')).not.toBeInTheDocument();

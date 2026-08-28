@@ -27,6 +27,10 @@ pub struct SiteConfigDocument {
     pub schema: String,
     pub id: String,
     pub display_name: String,
+    #[serde(default)]
+    pub deprecated: bool,
+    #[serde(default)]
+    pub deprecation_notice: String,
     pub mode: SiteMode,
     pub runtime_profile: String,
     pub connection_config: String,
@@ -59,6 +63,8 @@ pub struct ActiveSiteResolution {
     pub runtime_profile_path: PathBuf,
     pub site_id: String,
     pub site_display_name: String,
+    pub site_deprecated: bool,
+    pub site_deprecation_notice: String,
     pub site_mode: SiteMode,
     pub pending_restart: bool,
     pub compatibility: bool,
@@ -245,6 +251,8 @@ impl SiteConfigStore {
                 schema: SITE_CONFIG_SCHEMA.to_string(),
                 id: request.id.clone(),
                 display_name: display_name.to_string(),
+                deprecated: false,
+                deprecation_notice: String::new(),
                 mode: request.mode.clone(),
                 runtime_profile: "runtime.json".to_string(),
                 connection_config: "connection.json".to_string(),
@@ -356,6 +364,17 @@ impl SiteConfigStore {
             "现场配置结构",
             format!("Schema {}", package.document.schema),
         ));
+        if package.document.deprecated {
+            checks.push(SiteConfigCheck::blocking(
+                "site.deprecated",
+                "配置生命周期",
+                if package.document.deprecation_notice.trim().is_empty() {
+                    "此现场配置已弃用，仅保留查看与迁移能力，不能切换为运行配置".to_string()
+                } else {
+                    package.document.deprecation_notice.clone()
+                },
+            ));
+        }
 
         let runtime = check_json_reference(
             &package,
@@ -688,6 +707,8 @@ pub fn resolve_active_site(
             runtime_profile_path,
             site_id: document.id,
             site_display_name: document.display_name,
+            site_deprecated: document.deprecated,
+            site_deprecation_notice: document.deprecation_notice,
             site_mode: document.mode,
             pending_restart: project.pending_restart,
             compatibility: false,
@@ -726,6 +747,8 @@ pub fn resolve_active_site(
         runtime_profile_path,
         site_id,
         site_display_name,
+        site_deprecated: false,
+        site_deprecation_notice: String::new(),
         site_mode,
         pending_restart: project.pending_restart,
         compatibility: true,
@@ -783,6 +806,8 @@ pub fn resolve_site_by_id(
         runtime_profile_path,
         site_id: document.id,
         site_display_name: document.display_name,
+        site_deprecated: document.deprecated,
+        site_deprecation_notice: document.deprecation_notice,
         site_mode: document.mode,
         pending_restart: project.pending_restart,
         compatibility: false,
@@ -860,7 +885,13 @@ fn check_bkv_configuration(runtime: Option<&Value>, checks: &mut Vec<SiteConfigC
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
-    if data_source.is_empty() {
+    if data_source == "bkv-online-mysql" {
+        checks.push(SiteConfigCheck::blocking(
+            "bkv.online.deprecated",
+            "BKV online 数据源",
+            "BKV online 已隔离并暂时弃用；仅允许使用本地转换结果进行兼容读取与迁移",
+        ));
+    } else if data_source.is_empty() {
         checks.push(SiteConfigCheck::blocking(
             "bkv.dataSource",
             "BKV 数据源",
@@ -1165,7 +1196,7 @@ fn runtime_template(id: &str, display_name: &str, mode: &SiteMode) -> Value {
         "id": id,
         "displayName": display_name,
         "provider": provider,
-        "dataSource": if mode == &SiteMode::Bkv { "bkv-online-mysql" } else { "online-production" },
+        "dataSource": if mode == &SiteMode::Bkv { "converted-local" } else { "online-production" },
         "cameraConnection": camera_connection,
         "cameraCount": camera_count,
         "cameras": (1..=camera_count).map(|camera| json!({
@@ -1176,10 +1207,12 @@ fn runtime_template(id: &str, display_name: &str, mode: &SiteMode) -> Value {
             "sourceDirectory": format!("camera{camera}")
         })).collect::<Vec<_>>(),
         "storage": {
-            "sourceRoot": "",
-            "convertedRoot": "",
-            "catalogPath": "",
-            "converterOrigin": ""
+            "layoutVersion": 2,
+            "sourceRoot": if mode == &SiteMode::Bkv { "data/source" } else { "" },
+            "convertedRoot": if mode == &SiteMode::Bkv { "data/converted" } else { "" },
+            "catalogPath": if mode == &SiteMode::Bkv { "data/converted/catalog.db" } else { "" },
+            "cacheRoot": if mode == &SiteMode::Bkv { "data/cache" } else { "" },
+            "converterOrigin": if mode == &SiteMode::Bkv { "http://127.0.0.1:4893" } else { "" }
         },
         "capture": {
             "enabled": mode == &SiteMode::DirectCamera,
@@ -1206,9 +1239,9 @@ fn connection_template(mode: &SiteMode) -> Value {
     json!({
         "schema": "steel.site-connection.v1",
         "provider": if mode == &SiteMode::Bkv { "bkv" } else { "headless-cpp" },
-        "dataSource": if mode == &SiteMode::Bkv { "bkv-online-mysql" } else { "online-production" },
+        "dataSource": if mode == &SiteMode::Bkv { "converted-local" } else { "online-production" },
         "host": "127.0.0.1",
-        "port": if mode == &SiteMode::Bkv { 3306 } else { 4873 },
+        "port": if mode == &SiteMode::Bkv { 4893 } else { 4873 },
         "database": "",
         "username": "",
         "password": "",
@@ -1360,6 +1393,56 @@ mod tests {
                 "{file_name} must be owned by the site package"
             );
         }
+        let runtime: serde_json::Value = serde_json::from_slice(
+            &fs::read(package.root.join("runtime.json")).expect("runtime config"),
+        )
+        .expect("runtime JSON");
+        assert_eq!(runtime["dataSource"], "converted-local");
+        assert_eq!(
+            runtime["storage"]["converterOrigin"],
+            "http://127.0.0.1:4893"
+        );
+    }
+
+    #[test]
+    fn deprecated_bkv_online_package_is_blocked_from_activation() {
+        let fixture = SiteConfigFixture::new();
+        fixture.create_bkv("bkv-online-old");
+        let package = fixture.store.get("bkv-online-old").expect("BKV site");
+        let mut site: serde_json::Value =
+            serde_json::from_slice(&fs::read(package.root.join("site.json")).expect("site config"))
+                .expect("site JSON");
+        site["deprecated"] = json!(true);
+        site["deprecationNotice"] = json!("BKV online 已隔离");
+        fs::write(
+            package.root.join("site.json"),
+            serde_json::to_vec_pretty(&site).expect("site bytes"),
+        )
+        .expect("write site");
+        let mut runtime: serde_json::Value = serde_json::from_slice(
+            &fs::read(package.root.join("runtime.json")).expect("runtime config"),
+        )
+        .expect("runtime JSON");
+        runtime["dataSource"] = json!("bkv-online-mysql");
+        fs::write(
+            package.root.join("runtime.json"),
+            serde_json::to_vec_pretty(&runtime).expect("runtime bytes"),
+        )
+        .expect("write runtime");
+
+        let report = fixture
+            .store
+            .check("bkv-online-old", CheckDepth::Default)
+            .expect("default check");
+
+        assert!(report
+            .checks
+            .iter()
+            .any(|item| item.id == "site.deprecated" && item.blocking));
+        assert!(report
+            .checks
+            .iter()
+            .any(|item| item.id == "bkv.online.deprecated" && item.blocking));
     }
 
     fn archive_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {

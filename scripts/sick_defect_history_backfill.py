@@ -16,10 +16,11 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib import request
 
 import numpy as np
@@ -41,7 +42,13 @@ if __package__:
         defect_detection_manifest_path,
         import_defect_manifest,
     )
-    from .sick_capture.material_lock import exclusive_material_job
+    from .sick_capture.depth_geometry_runtime import (
+        load_depth_geometry_config_snapshot,
+    )
+    from .sick_capture.material_lock import (
+        MaterialJobLockedError,
+        exclusive_material_job,
+    )
     from .sick_capture.measurement import (
         MeasurementConfig,
         build_and_write_flow_measurement,
@@ -69,7 +76,10 @@ else:
         defect_detection_manifest_path,
         import_defect_manifest,
     )
-    from sick_capture.material_lock import exclusive_material_job
+    from sick_capture.depth_geometry_runtime import (
+        load_depth_geometry_config_snapshot,
+    )
+    from sick_capture.material_lock import MaterialJobLockedError, exclusive_material_job
     from sick_capture.measurement import (
         MeasurementConfig,
         build_and_write_flow_measurement,
@@ -204,6 +214,62 @@ def depth_geometry_config_available(profile_path: Path) -> bool:
     geometry = payload.get("depthGeometry") if isinstance(payload, dict) else None
     return isinstance(geometry, dict) and (
         geometry.get("schema") == "steel.sick-depth-geometry-config.v1"
+    )
+
+
+def can_skip_history_backfill(
+    manifest: Mapping[str, Any] | None,
+    minimum_crop_size: int,
+    depth_geometry_config_hash: str | None,
+    depth_geometry_config_revision: int | None,
+) -> bool:
+    """Return whether a completed manifest is safe to reuse.
+
+    The geometry snapshot is part of the resumability identity.  In
+    particular, an older marker without either geometry field is never
+    considered complete, even when its crop and database work succeeded.
+    Revision is intentionally compared strictly (including its JSON type) so
+    a malformed marker cannot silently resume under a different snapshot.
+    """
+
+    if not isinstance(manifest, Mapping):
+        return False
+    marker = manifest.get("historyBackfill")
+    database_import = manifest.get("databaseImport")
+    if not isinstance(marker, Mapping) or not isinstance(database_import, Mapping):
+        return False
+    if marker.get("version") != BACKFILL_VERSION:
+        return False
+    try:
+        marker_crop_size = int(marker.get("minimumCropSize", 0))
+    except (TypeError, ValueError):
+        return False
+    if marker_crop_size < max(0, int(minimum_crop_size)):
+        return False
+    if database_import.get("state") != "complete":
+        return False
+    # Presence is checked separately from equality: a legacy marker with no
+    # geometry identity must be rebuilt even when the current job has no
+    # geometry snapshot (both values would otherwise compare as None).
+    if (
+        "depthGeometryConfigHash" not in marker
+        or "depthGeometryConfigRevision" not in marker
+    ):
+        return False
+    if not (
+        marker.get("depthGeometryConfigHash") == depth_geometry_config_hash
+        and marker.get("depthGeometryConfigRevision")
+        == depth_geometry_config_revision
+    ):
+        return False
+    if depth_geometry_config_hash is None:
+        return True
+    groups = manifest.get("defectGroups")
+    geometry = groups.get("geometry") if isinstance(groups, Mapping) else None
+    return bool(
+        isinstance(geometry, Mapping)
+        and geometry.get("configHash") == depth_geometry_config_hash
+        and geometry.get("algorithmRevision") == depth_geometry_config_revision
     )
 
 
@@ -845,6 +911,22 @@ def main() -> int:
         # flow while even one live storage round is queued or being written.
         maximum_pending_storage_rounds=0,
     ).bounded()
+    # Take the same immutable/mutable depth-geometry snapshot used by
+    # defect_detection before publishing job status.  The hash and revision
+    # become part of this backfill run's resumability identity.
+    depth_geometry_snapshot = None
+    if defect_config.depth_geometry_profile_path is not None:
+        depth_geometry_snapshot = load_depth_geometry_config_snapshot(
+            defect_config.depth_geometry_profile_path
+        )
+    depth_geometry_config_hash = (
+        depth_geometry_snapshot.sha256 if depth_geometry_snapshot is not None else None
+    )
+    depth_geometry_config_revision = (
+        depth_geometry_snapshot.revision
+        if depth_geometry_snapshot is not None
+        else None
+    )
     minimum_crop = max(64, min(1024, args.minimum_crop_size))
     job_root = profile.storage_root / "system" / "jobs" / "defect-history-backfill"
     status_path = job_root / "status.json"
@@ -875,6 +957,8 @@ def main() -> int:
         "preprocessWorkers": defect_config.preprocess_workers,
         "processPriority": process_priority,
         "minimumCropSize": minimum_crop,
+        "depthGeometryConfigHash": depth_geometry_config_hash,
+        "depthGeometryConfigRevision": depth_geometry_config_revision,
         "minimumMaterial": args.minimum_material,
         "maximumMaterial": args.maximum_material,
         "materialLimit": args.limit,
@@ -888,6 +972,8 @@ def main() -> int:
         "reprocessedMaterials": 0,
         "reprocessedDefects": 0,
         "skippedMaterials": 0,
+        "deferredLockedMaterials": 0,
+        "materialLockDeferrals": 0,
         "failures": [],
     }
     update_status(status_path, status)
@@ -1040,7 +1126,10 @@ def main() -> int:
 
         if not stopped and args.mode in {"all", "rebuild"}:
             update_status(status_path, status, phase="rebuild")
-            for material_id in materials:
+            rebuild_queue = deque(materials)
+            deferred_material_ids: set[str] = set()
+            while rebuild_queue:
+                material_id = rebuild_queue.popleft()
                 if stopped:
                     break
                 if not wait_for_strict_capture_idle(
@@ -1083,14 +1172,17 @@ def main() -> int:
                             raise
                         except Exception:
                             existing = {}
-                        marker = existing.get("historyBackfill", {})
-                        if (
-                            marker.get("version") == BACKFILL_VERSION
-                            and int(marker.get("minimumCropSize", 0)) >= minimum_crop
-                            and existing.get("databaseImport", {}).get("state")
-                            == "complete"
+                        if can_skip_history_backfill(
+                            existing,
+                            minimum_crop,
+                            depth_geometry_config_hash,
+                            depth_geometry_config_revision,
                         ):
                             status["skippedMaterials"] += 1
+                            deferred_material_ids.discard(material_id)
+                            status["deferredLockedMaterials"] = len(
+                                deferred_material_ids
+                            )
                             continue
                     with exclusive_material_job(
                         profile.storage_root,
@@ -1129,9 +1221,21 @@ def main() -> int:
                             config=defect_config,
                             execution_gate=execution_gate,
                         )
+                        geometry_groups = manifest.get("defectGroups", {})
+                        geometry_group = (
+                            geometry_groups.get("geometry", {})
+                            if isinstance(geometry_groups, dict)
+                            else {}
+                        )
                         manifest["historyBackfill"] = {
                             "version": BACKFILL_VERSION,
                             "minimumCropSize": minimum_crop,
+                            "depthGeometryConfigHash": geometry_group.get(
+                                "configHash", depth_geometry_config_hash
+                            ),
+                            "depthGeometryConfigRevision": geometry_group.get(
+                                "algorithmRevision", depth_geometry_config_revision
+                            ),
                             "overlapStatistics": True,
                             "completedAt": utc_text(),
                         }
@@ -1146,8 +1250,32 @@ def main() -> int:
                     status["reprocessedDefects"] += int(
                         manifest.get("statistics", {}).get("defectCount", 0)
                     )
+                    deferred_material_ids.discard(material_id)
+                    status["deferredLockedMaterials"] = len(
+                        deferred_material_ids
+                    )
                 except BackfillInterrupted:
                     break
+                except MaterialJobLockedError:
+                    # Realtime analysis owns this material.  Preserve that work and
+                    # retry after the other historical materials instead of turning
+                    # ordinary lock contention into a permanent backfill failure.
+                    deferred_material_ids.add(material_id)
+                    rebuild_queue.append(material_id)
+                    status["deferredLockedMaterials"] = len(
+                        deferred_material_ids
+                    )
+                    status["materialLockDeferrals"] += 1
+                    update_status(
+                        status_path,
+                        status,
+                        state="waiting",
+                        phase="rebuild-material-lock",
+                        currentMaterialId="",
+                        nextMaterialId=material_id,
+                    )
+                    if len(rebuild_queue) == 1:
+                        time.sleep(1.0)
                 except Exception as error:
                     status["failures"].append(
                         {

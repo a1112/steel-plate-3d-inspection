@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -85,11 +86,12 @@ class DepthGeometryConfig:
     roi: tuple[int, int, int, int] | None = None
     baseline_max_frames: int = 32
     baseline_row_step: int = 4
-    minimum_depth_mm: float = 0.35
+    minimum_depth_mm: float = 1.2
     noise_multiplier: float = 6.0
     support_window: int = 3
     minimum_support: int = 3
-    minimum_component_points: int = 6
+    minimum_component_points: int = 16
+    maximum_candidates_per_flow: int = 100
     cross_frame_max_gap: int = 1
     cross_frame_merge_pixels: int = 2
     minimum_merge_iou: float = 0.20
@@ -101,6 +103,13 @@ class DepthGeometryConfig:
     review_crop_minimum_size: int = 64
     jet_range_mm: float = 2.0
     max_frames: int = 0
+    # Alignment head/tail detections identify the first/last frame that may
+    # contain steel, but those frames are often partial transition blocks.
+    # Keep a bounded temporal guard around the reliable detections.
+    longitudinal_edge_guard_frames: int = 8
+    # Camera flows are independent filesystems/streams.  Bound parallelism so
+    # six-camera processing cannot create an unbounded decode fan-out.
+    camera_workers: int = 4
     # A stable version can be raised by the administrator when rule semantics
     # change without changing the threshold values.
     rule_version: str = "1"
@@ -130,7 +139,7 @@ class DepthGeometryConfig:
             ),
             baseline_row_step=_bounded_int(self.baseline_row_step, 1, 64, 4),
             minimum_depth_mm=max(
-                0.0, _float_or(self.minimum_depth_mm, 0.35)
+                0.0, _float_or(self.minimum_depth_mm, 1.2)
             ),
             noise_multiplier=max(
                 0.0, _float_or(self.noise_multiplier, 6.0)
@@ -138,7 +147,10 @@ class DepthGeometryConfig:
             support_window=3,
             minimum_support=_bounded_int(self.minimum_support, 1, 9, 3),
             minimum_component_points=_bounded_int(
-                self.minimum_component_points, 1, 1_000_000, 6
+                self.minimum_component_points, 1, 1_000_000, 16
+            ),
+            maximum_candidates_per_flow=_bounded_int(
+                self.maximum_candidates_per_flow, 1, 100, 100
             ),
             cross_frame_max_gap=_bounded_int(self.cross_frame_max_gap, 0, 32, 1),
             cross_frame_merge_pixels=_bounded_int(
@@ -161,6 +173,10 @@ class DepthGeometryConfig:
             ),
             jet_range_mm=max(0.01, _float_or(self.jet_range_mm, 2.0)),
             max_frames=_bounded_int(self.max_frames, 0, 10_000_000, 0),
+            longitudinal_edge_guard_frames=_bounded_int(
+                self.longitudinal_edge_guard_frames, 0, 64, 8
+            ),
+            camera_workers=_bounded_int(self.camera_workers, 1, 6, 4),
             rule_version=str(self.rule_version or "1"),
         )
 
@@ -1273,32 +1289,13 @@ def detect_depth_geometry(
                     }
                 )
 
-    parents, find, union = _union_find(len(component_rows))
-    # Components are generated frame-order-first, so checking previous rows
-    # keeps cross-frame merging bounded and deterministic.
-    for right_index, right_component in enumerate(component_rows):
-        for left_index in range(right_index):
-            left_component = component_rows[left_index]
-            if (
-                right_component["firstFrameNumber"]
-                - left_component["lastFrameNumber"]
-                > settings.cross_frame_max_gap
-            ):
-                continue
-            if _components_overlap(
-                left_component,
-                right_component,
-                settings.cross_frame_merge_pixels,
-                settings.minimum_merge_iou,
-            ):
-                union(left_index, right_index)
-    grouped: dict[int, list[dict[str, Any]]] = {}
-    for index, component in enumerate(component_rows):
-        grouped.setdefault(find(index), []).append(component)
+    raw_groups = _group_component_rows(component_rows, settings)
+    groups, candidate_overflow = _limit_candidate_groups(raw_groups, settings)
+    raw_candidate_count = len(raw_groups)
 
     defects: list[dict[str, Any]] = []
     roi_height = max(1, int(bottom - top))
-    for members in grouped.values():
+    for members in groups:
         all_points: list[np.ndarray] = []
         all_values: list[np.ndarray] = []
         all_global_rows: list[np.ndarray] = []
@@ -1567,7 +1564,9 @@ def detect_depth_geometry(
             "cameraCount": 1,
             "frameCount": len(decoded),
             "processedFrames": len(decoded),
+            "rawCandidateCount": raw_candidate_count,
             "candidateCount": len(defects),
+            "candidateOverflowCount": candidate_overflow,
             "defectCount": len(defects),
         },
         "defects": defects,
@@ -1677,15 +1676,20 @@ def _group_component_rows(
     if not component_rows:
         return []
     _parents, find, union = _union_find(len(component_rows))
+    # A component can only touch the immediately preceding physical frame;
+    # index by frame number instead of comparing every pair in the flow.
+    # This preserves _components_overlap semantics while avoiding O(N^2)
+    # behavior on noisy historical material.
+    indices_by_frame: dict[int, list[int]] = {}
     for right_index, right_component in enumerate(component_rows):
-        for left_index in range(right_index):
+        right_frame = int(right_component["firstFrameNumber"])
+        left_indices = (
+            indices_by_frame.get(right_frame - 1, [])
+            if settings.cross_frame_max_gap >= 1
+            else []
+        )
+        for left_index in left_indices:
             left_component = component_rows[left_index]
-            if (
-                right_component["firstFrameNumber"]
-                - left_component["lastFrameNumber"]
-                > settings.cross_frame_max_gap
-            ):
-                continue
             if _components_overlap(
                 left_component,
                 right_component,
@@ -1693,10 +1697,182 @@ def _group_component_rows(
                 settings.minimum_merge_iou,
             ):
                 union(left_index, right_index)
+        indices_by_frame.setdefault(right_frame, []).append(right_index)
     grouped: dict[int, list[dict[str, Any]]] = {}
     for index, component in enumerate(component_rows):
         grouped.setdefault(find(index), []).append(component)
     return list(grouped.values())
+
+
+def _group_candidate_priority(
+    members: Sequence[dict[str, Any]],
+    settings: DepthGeometryConfig,
+) -> tuple[Any, ...]:
+    """Sort strongest review candidates first with deterministic tie-breaks."""
+
+    arrays = [
+        np.abs(np.asarray(member.get("values", []), dtype=np.float64))
+        for member in members
+    ]
+    arrays = [value[np.isfinite(value)] for value in arrays if value.size]
+    values = np.concatenate(arrays) if arrays else np.asarray([], dtype=np.float64)
+    point_count = int(values.size)
+    peak = float(np.max(values)) if point_count else 0.0
+    p95 = float(np.percentile(values, 95.0)) if point_count else 0.0
+    support_score = min(
+        1.0,
+        point_count / max(1.0, settings.minimum_component_points * 4.0),
+    )
+    depth_score = min(
+        1.0,
+        p95 / max(settings.minimum_depth_mm * 4.0, 1e-6),
+    )
+    first = members[0] if members else {}
+    return (
+        -(0.5 * support_score + 0.5 * depth_score),
+        -p95,
+        -point_count,
+        -peak,
+        int(first.get("frameNumber", 0)),
+        int(first.get("minRow", 0)),
+        int(first.get("minColumn", 0)),
+        str(first.get("polarity", "")),
+    )
+
+
+def _limit_candidate_groups(
+    groups: Sequence[Sequence[dict[str, Any]]],
+    settings: DepthGeometryConfig,
+) -> tuple[list[Sequence[dict[str, Any]]], int]:
+    raw_count = len(groups)
+    limit = settings.maximum_candidates_per_flow
+    selected = sorted(
+        groups,
+        key=lambda members: _group_candidate_priority(members, settings),
+    )[:limit]
+    return selected, max(0, raw_count - len(selected))
+
+
+def _group_peak_source_bbox(
+    members: Sequence[dict[str, Any]],
+    roi: tuple[int, int, int, int],
+) -> list[int]:
+    """Return the source-image bbox on the group's strongest frame.
+
+    Region ownership depends only on source columns.  Computing this small
+    descriptor before ranking lets overlap/boundary artifacts be discarded
+    without decoding or retaining their review ROIs, so they cannot consume
+    the final review budget ahead of an interior defect.
+    """
+
+    left, top, _right, _bottom = roi
+    peak_member: dict[str, Any] | None = None
+    peak_absolute = -1.0
+    for member in members:
+        values = np.asarray(member.get("values", []), dtype=np.float64)
+        if not values.size:
+            continue
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            continue
+        absolute = np.where(finite, np.abs(values), -np.inf)
+        member_offset = int(np.argmax(absolute))
+        member_peak = float(absolute[member_offset])
+        if member_peak > peak_absolute:
+            peak_absolute = member_peak
+            peak_member = member
+    if peak_member is None:
+        return [left, top, left, top]
+    peak_frame = int(peak_member.get("frameNumber", 0))
+    peak_frame_points = [
+        np.asarray(member.get("points", []), dtype=np.int32)
+        for member in members
+        if int(member.get("frameNumber", 0)) == peak_frame
+    ]
+    peak_frame_points = [
+        points
+        for points in peak_frame_points
+        if points.ndim == 2 and points.shape[0] and points.shape[1] >= 2
+    ]
+    points = (
+        np.concatenate(peak_frame_points, axis=0)
+        if peak_frame_points
+        else np.empty((0, 2), dtype=np.int32)
+    )
+    if points.ndim != 2 or points.shape[0] == 0 or points.shape[1] < 2:
+        return [left, top, left, top]
+    # Include every group member on the peak frame, matching the bbox emitted
+    # by _geometry_defects_from_groups for transitive cross-frame merges.
+    return [
+        left + int(np.min(points[:, 1])),
+        top + int(np.min(points[:, 0])),
+        left + int(np.max(points[:, 1])) + 1,
+        top + int(np.max(points[:, 0])) + 1,
+    ]
+
+
+def _filter_candidate_groups_by_disposition(
+    groups: Sequence[Sequence[dict[str, Any]]],
+    *,
+    camera_id: str,
+    roi: tuple[int, int, int, int],
+    candidate_disposition: Callable[[str, Sequence[int]], str] | None,
+) -> tuple[list[Sequence[dict[str, Any]]], int, int, int]:
+    if candidate_disposition is None:
+        return list(groups), 0, 0, 0
+    eligible: list[Sequence[dict[str, Any]]] = []
+    overlap_filtered = 0
+    boundary_filtered = 0
+    quality_gate_filtered = 0
+    for members in groups:
+        disposition = str(
+            candidate_disposition(
+                str(camera_id),
+                _group_peak_source_bbox(members, roi),
+            )
+        )
+        if disposition == "overlap-duplicate":
+            overlap_filtered += 1
+        elif disposition == "boundary":
+            boundary_filtered += 1
+        elif disposition == "quality-gate":
+            quality_gate_filtered += 1
+        else:
+            eligible.append(members)
+    return eligible, overlap_filtered, boundary_filtered, quality_gate_filtered
+
+
+def _defect_candidate_priority(defect: Mapping[str, Any]) -> tuple[Any, ...]:
+    peak = defect.get("peakPixel", {})
+    peak = peak if isinstance(peak, Mapping) else {}
+    return (
+        -float(defect.get("ruleScore", 0.0) or 0.0),
+        -float(defect.get("p95AbsoluteDepthMm", 0.0) or 0.0),
+        -int(defect.get("pointCount", 0) or 0),
+        -float(defect.get("absoluteDepthMm", 0.0) or 0.0),
+        str(defect.get("cameraId", "")),
+        int(defect.get("peakFrame", 0) or 0),
+        int(peak.get("row", 0) or 0),
+        int(peak.get("column", 0) or 0),
+        str(defect.get("id", "")),
+    )
+
+
+def _limit_flow_defects(
+    defects: Sequence[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    selected = sorted(defects, key=_defect_candidate_priority)[: max(1, int(limit))]
+    selected.sort(
+        key=lambda item: (
+            str(item.get("cameraId", "")),
+            int(item.get("peakFrame", 0) or 0),
+            int(item.get("peakPixel", {}).get("row", 0) or 0),
+            int(item.get("peakPixel", {}).get("column", 0) or 0),
+            str(item.get("id", "")),
+        )
+    )
+    return selected
 
 
 def _geometry_defects_from_groups(
@@ -1980,6 +2156,7 @@ def _stream_camera_depth_geometry(
     settings: DepthGeometryConfig,
     calibration: Mapping[str, Any] | None = None,
     execution_gate: Callable[[str], None] | None = None,
+    candidate_disposition: Callable[[str, Sequence[int]], str] | None = None,
 ) -> dict[str, Any]:
     """Process a file-backed camera in two bounded passes.
 
@@ -2099,7 +2276,24 @@ def _stream_camera_depth_geometry(
         # metadata across iterations.
         del decoded, value, valid, residual, threshold, rows
 
-    groups = _group_component_rows(component_rows, settings)
+    raw_groups = _group_component_rows(component_rows, settings)
+    raw_candidate_count = len(raw_groups)
+    (
+        eligible_groups,
+        overlap_filtered,
+        boundary_filtered,
+        quality_gate_filtered,
+    ) = (
+        _filter_candidate_groups_by_disposition(
+            raw_groups,
+            camera_id=camera_id,
+            roi=(left, top, right, bottom),
+            candidate_disposition=candidate_disposition,
+        )
+    )
+    eligible_candidate_count = len(eligible_groups)
+    groups, _eligible_overflow = _limit_candidate_groups(eligible_groups, settings)
+    del raw_groups, component_rows
     calibration_info = _calibration_from(settings, calibration)
     if calibration is None and not settings.calibration_valid and not calibration_info[0]:
         if calibration_metadata is not None:
@@ -2230,11 +2424,57 @@ def _stream_camera_depth_geometry(
             "cameraCount": 1,
             "frameCount": len(frame_numbers),
             "processedFrames": len(frame_numbers),
+            "rawCandidateCount": raw_candidate_count,
+            "eligibleCandidateCount": eligible_candidate_count,
             "candidateCount": len(defects),
+            "candidateOverflowCount": max(0, raw_candidate_count - len(defects)),
             "defectCount": len(defects),
+            "overlapDuplicateFilteredCount": overlap_filtered,
+            "boundaryArtifactFilteredCount": boundary_filtered,
+            "qualityGateFilteredCount": quality_gate_filtered,
         },
         "defects": defects,
     }
+
+
+def _aligned_frame_indices(
+    indices: Sequence[int],
+    camera_alignment: Mapping[str, Any] | None,
+    edge_guard_frames: int,
+) -> list[int]:
+    """Apply alignment boundaries and reliable head/tail transition guards.
+
+    Alignment frame indexes describe the first/last frame that may contain
+    steel.  Those boundary blocks can still be partial, so a detected and
+    non-clipped boundary gets a bounded guard on the steel-facing side.  A
+    clipped boundary keeps the historical frame-index filter but deliberately
+    receives no additional guard: the capture itself does not provide enough
+    evidence to know which side of the boundary is safe to discard.
+    """
+
+    result = [int(value) for value in indices]
+    if not isinstance(camera_alignment, Mapping):
+        return result
+    guard = max(0, int(edge_guard_frames))
+    for name, is_head in (("head", True), ("tail", False)):
+        boundary = camera_alignment.get(name)
+        if not isinstance(boundary, Mapping) or not bool(boundary.get("detected")):
+            continue
+        try:
+            frame_index = int(boundary.get("frameIndex"))
+        except (TypeError, ValueError):
+            # Preserve the valid portion of the other boundary when a stale
+            # alignment record is malformed rather than failing the flow.
+            continue
+        if is_head:
+            result = [value for value in result if value >= frame_index]
+            if not bool(boundary.get("clipped")) and guard:
+                result = [value for value in result if value >= frame_index + guard]
+        else:
+            result = [value for value in result if value <= frame_index]
+            if not bool(boundary.get("clipped")) and guard:
+                result = [value for value in result if value <= frame_index - guard]
+    return result
 
 
 def build_flow_depth_geometry(
@@ -2244,6 +2484,7 @@ def build_flow_depth_geometry(
     alignment: Mapping[str, Any] | None,
     config: DepthGeometryConfig | Mapping[str, Any],
     execution_gate: Callable[[str], None] | None = None,
+    candidate_disposition: Callable[[str, Sequence[int]], str] | None = None,
 ) -> dict[str, Any]:
     """Build the per-camera geometry artifact from immutable flow files.
 
@@ -2278,15 +2519,30 @@ def build_flow_depth_geometry(
             "cameraCount": len(camera_roots),
             "frameCount": 0,
             "processedFrames": 0,
+            "rawCandidateCount": 0,
+            "eligibleCandidateCount": 0,
+            "preFlowCapCandidateCount": 0,
             "candidateCount": 0,
+            "candidateOverflowCount": 0,
             "defectCount": 0,
+            "overlapDuplicateFilteredCount": 0,
+            "boundaryArtifactFilteredCount": 0,
+            "qualityGateFilteredCount": 0,
         },
     }
     if not settings.enabled:
         return base
     alignment_map = alignment if isinstance(alignment, Mapping) else {}
-    for camera_id, root_value in sorted(camera_roots.items(), key=lambda item: str(item[0])):
-        camera = str(camera_id)
+    alignment_cameras = alignment_map.get("cameras", {})
+    if not isinstance(alignment_cameras, Mapping):
+        alignment_cameras = {}
+    camera_items = sorted(
+        ((str(camera_id), root_value) for camera_id, root_value in camera_roots.items()),
+        key=lambda item: item[0],
+    )
+
+    def build_camera(item: tuple[str, str | Path]) -> tuple[str, dict[str, Any]]:
+        camera, root_value = item
         if execution_gate is not None:
             execution_gate(f"depth-geometry-camera:{camera}")
         flow = capture_root(Path(root_value), material_id, camera)
@@ -2303,13 +2559,12 @@ def build_flow_depth_geometry(
             phase="depth-geometry-metadata-directory-scan",
         )
         indices = sorted(set(depth_files) & set(metadata_files))
-        camera_alignment = alignment_map.get("cameras", {}).get(camera, {})
-        head = camera_alignment.get("head", {}) if isinstance(camera_alignment, Mapping) else {}
-        tail = camera_alignment.get("tail", {}) if isinstance(camera_alignment, Mapping) else {}
-        if bool(head.get("detected")):
-            indices = [index for index in indices if index >= int(head.get("frameIndex", 0))]
-        if bool(tail.get("detected")):
-            indices = [index for index in indices if index <= int(tail.get("frameIndex", 0))]
+        camera_alignment = alignment_cameras.get(camera, {})
+        indices = _aligned_frame_indices(
+            indices,
+            camera_alignment,
+            settings.longitudinal_edge_guard_frames,
+        )
         if settings.max_frames > 0 and len(indices) > settings.max_frames:
             eligible_indices = list(indices)
             positions = _sample_indices(len(eligible_indices), settings.max_frames)
@@ -2325,7 +2580,24 @@ def build_flow_depth_geometry(
             indices=indices,
             settings=settings,
             execution_gate=execution_gate,
+            candidate_disposition=candidate_disposition,
         )
+        return camera, camera_artifact
+
+    # Submit in camera order and consume futures in that same order.  The
+    # filesystem/decode work is parallel, while artifact insertion and defect
+    # concatenation remain deterministic for callers and JSON hashes.
+    if camera_items:
+        with ThreadPoolExecutor(
+            max_workers=settings.camera_workers,
+            thread_name_prefix="depth-geometry-camera",
+        ) as executor:
+            futures = [executor.submit(build_camera, item) for item in camera_items]
+            camera_results = [future.result() for future in futures]
+    else:
+        camera_results = []
+
+    for camera, camera_artifact in camera_results:
         base["cameras"][camera] = camera_artifact
         base["defects"].extend(camera_artifact.get("defects", []))
         statistics = camera_artifact.get("statistics", {})
@@ -2333,12 +2605,57 @@ def build_flow_depth_geometry(
         base["statistics"]["processedFrames"] += int(
             statistics.get("processedFrames", 0) or 0
         )
-        base["statistics"]["candidateCount"] += int(
+        base["statistics"]["rawCandidateCount"] += int(
+            statistics.get(
+                "rawCandidateCount", statistics.get("candidateCount", 0)
+            )
+            or 0
+        )
+        base["statistics"]["eligibleCandidateCount"] += int(
+            statistics.get(
+                "eligibleCandidateCount",
+                statistics.get("rawCandidateCount", statistics.get("candidateCount", 0)),
+            )
+            or 0
+        )
+        base["statistics"]["preFlowCapCandidateCount"] += int(
             statistics.get("candidateCount", 0) or 0
         )
-        base["statistics"]["defectCount"] += int(
-            statistics.get("defectCount", 0) or 0
+        base["statistics"]["overlapDuplicateFilteredCount"] += int(
+            statistics.get("overlapDuplicateFilteredCount", 0) or 0
         )
+        base["statistics"]["boundaryArtifactFilteredCount"] += int(
+            statistics.get("boundaryArtifactFilteredCount", 0) or 0
+        )
+        base["statistics"]["qualityGateFilteredCount"] += int(
+            statistics.get("qualityGateFilteredCount", 0) or 0
+        )
+    base["defects"] = _limit_flow_defects(
+        base["defects"], settings.maximum_candidates_per_flow
+    )
+    selected_ids = {str(item.get("id", "")) for item in base["defects"]}
+    for camera_artifact in base["cameras"].values():
+        camera_defects = [
+            item
+            for item in camera_artifact.get("defects", [])
+            if str(item.get("id", "")) in selected_ids
+        ]
+        camera_artifact["defects"] = camera_defects
+        camera_statistics = camera_artifact.setdefault("statistics", {})
+        camera_statistics["candidateCount"] = len(camera_defects)
+        camera_statistics["defectCount"] = len(camera_defects)
+        camera_statistics["candidateOverflowCount"] = max(
+            0,
+            int(camera_statistics.get("rawCandidateCount", 0) or 0)
+            - len(camera_defects),
+        )
+    final_count = len(base["defects"])
+    base["statistics"]["candidateCount"] = final_count
+    base["statistics"]["defectCount"] = final_count
+    base["statistics"]["candidateOverflowCount"] = max(
+        0,
+        int(base["statistics"]["rawCandidateCount"]) - final_count,
+    )
     return base
 
 

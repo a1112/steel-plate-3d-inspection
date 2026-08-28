@@ -25,7 +25,7 @@
     "resultRoot": "",
     "resultCatalogPath": ""
   },
-  "capture": { "enabled": true, "autostart": false },
+  "capture": { "enabled": true, "autostart": true },
   "algorithm": {
     "enabled": true,
     "autoProcessLatest": true,

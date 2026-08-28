@@ -1,7 +1,10 @@
+use crate::service_supervisor::{
+    ServiceLifecycleEvent, ServiceSupervisor, SupervisorServiceSnapshot, SupervisorSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
@@ -22,12 +25,14 @@ const MENU_QUIT: &str = "background-monitor-quit";
 const MONITOR_EVENT: &str = "background-monitor-updated";
 pub(crate) const MONITOR_WINDOW: &str = "background-monitor";
 const DEFAULT_ORIGIN: &str = "http://127.0.0.1:4873";
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(1_800);
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_TASKS: usize = 16;
 const MAX_LOG_TAIL_CHARS: usize = 64 * 1024;
 const RECENT_FAILURE_WINDOW_MS: u64 = 30 * 60 * 1000;
+const RETIRED_SERVICE_IDS: [&str; 1] = ["bkv-adapter"];
+const CONTROL_SERVER_ADDRESS: &str = "127.0.0.1:4899";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -62,6 +67,9 @@ pub(crate) struct BackgroundMonitorService {
     pub lifecycle: Option<Value>,
     pub operations: Vec<Value>,
     pub control: Option<Value>,
+    pub startup_mode: String,
+    pub auto_restart: bool,
+    pub managed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -85,6 +93,17 @@ pub(crate) struct BackgroundMonitorRuntime {
     pub supervisor: Option<Value>,
 }
 
+#[derive(Default)]
+struct RuntimePayloadSnapshots {
+    services: Vec<BackgroundMonitorService>,
+    logs: Vec<BackgroundMonitorLog>,
+    runtime: Option<BackgroundMonitorRuntime>,
+    registry: Option<Value>,
+    monitor_protocol: Option<Value>,
+    degraded: bool,
+    failed_required_services: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BackgroundMonitorSnapshot {
@@ -104,6 +123,7 @@ pub(crate) struct BackgroundMonitorSnapshot {
     pub tasks: Vec<BackgroundTaskSnapshot>,
     pub services: Vec<BackgroundMonitorService>,
     pub logs: Vec<BackgroundMonitorLog>,
+    pub lifecycle_logs: Vec<ServiceLifecycleEvent>,
     pub runtime: Option<BackgroundMonitorRuntime>,
     pub registry: Option<Value>,
     pub monitor_protocol: Option<Value>,
@@ -130,6 +150,7 @@ impl Default for BackgroundMonitorSnapshot {
             tasks: Vec::new(),
             services: Vec::new(),
             logs: Vec::new(),
+            lifecycle_logs: Vec::new(),
             runtime: None,
             registry: None,
             monitor_protocol: None,
@@ -153,6 +174,7 @@ pub(crate) struct BackgroundMonitorState {
     tray: Mutex<Option<TrayUi>>,
     exiting: AtomicBool,
     refresh_requested: AtomicBool,
+    supervisor: Mutex<ServiceSupervisor>,
 }
 
 impl Default for BackgroundMonitorState {
@@ -171,6 +193,7 @@ impl Default for BackgroundMonitorState {
             tray: Mutex::new(None),
             exiting: AtomicBool::new(false),
             refresh_requested: AtomicBool::new(true),
+            supervisor: Mutex::new(ServiceSupervisor::load()),
         }
     }
 }
@@ -439,6 +462,15 @@ fn service_snapshot(value: &Value) -> Option<BackgroundMonitorService> {
             .map(|items| items.iter().take(16).cloned().collect())
             .unwrap_or_default(),
         control: value.get("control").cloned(),
+        startup_mode: value_text(value, "startupMode", "manual", 32),
+        auto_restart: value
+            .get("autoRestart")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        managed: value
+            .get("managed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -485,19 +517,9 @@ fn runtime_snapshot(value: &Value) -> Option<BackgroundMonitorRuntime> {
     })
 }
 
-fn runtime_payload_snapshots(
-    value: Option<&Value>,
-) -> (
-    Vec<BackgroundMonitorService>,
-    Vec<BackgroundMonitorLog>,
-    Option<BackgroundMonitorRuntime>,
-    Option<Value>,
-    Option<Value>,
-    bool,
-    Vec<String>,
-) {
+fn runtime_payload_snapshots(value: Option<&Value>) -> RuntimePayloadSnapshots {
     let Some(value) = value else {
-        return (Vec::new(), Vec::new(), None, None, None, false, Vec::new());
+        return RuntimePayloadSnapshots::default();
     };
     let services = value
         .get("services")
@@ -505,6 +527,7 @@ fn runtime_payload_snapshots(
         .into_iter()
         .flatten()
         .filter_map(service_snapshot)
+        .filter(|service| !RETIRED_SERVICE_IDS.contains(&service.id.as_str()))
         .take(32)
         .collect::<Vec<_>>();
     let logs = value
@@ -513,6 +536,11 @@ fn runtime_payload_snapshots(
         .into_iter()
         .flatten()
         .filter_map(log_snapshot)
+        .filter(|log| {
+            !log.service_id
+                .as_deref()
+                .is_some_and(|id| RETIRED_SERVICE_IDS.contains(&id))
+        })
         .take(64)
         .collect::<Vec<_>>();
     let failed_required = services
@@ -522,15 +550,15 @@ fn runtime_payload_snapshots(
         .collect::<Vec<_>>();
     let degraded = value.get("status").and_then(Value::as_str) == Some("degraded")
         || !failed_required.is_empty();
-    (
+    RuntimePayloadSnapshots {
         services,
         logs,
-        runtime_snapshot(value),
-        value.get("registry").cloned(),
-        value.get("monitorProtocol").cloned(),
+        runtime: runtime_snapshot(value),
+        registry: value.get("registry").cloned(),
+        monitor_protocol: value.get("monitorProtocol").cloned(),
         degraded,
-        failed_required,
-    )
+        failed_required_services: failed_required,
+    }
 }
 
 fn task_is_recent(task: &BackgroundTaskSnapshot, now: u64) -> bool {
@@ -595,15 +623,15 @@ fn snapshot_from_payloads(
         });
     let active_tasks = listed_active_tasks.max(u64::from(active_task_id.is_some()));
     let task_data_available = production.is_some() && task_page.is_some();
-    let (
+    let RuntimePayloadSnapshots {
         services,
         logs,
         runtime,
         registry,
         monitor_protocol,
-        runtime_degraded,
+        degraded: runtime_degraded,
         failed_required_services,
-    ) = runtime_payload_snapshots(runtime_status);
+    } = runtime_payload_snapshots(runtime_status);
     let state = if !service_ready
         || !worker_running
         || !task_data_available
@@ -663,6 +691,7 @@ fn snapshot_from_payloads(
         healthy_service_count: services.iter().filter(|service| service.ok).count() as u64,
         services,
         logs,
+        lifecycle_logs: Vec::new(),
         runtime,
         registry,
         monitor_protocol,
@@ -691,6 +720,7 @@ fn offline_snapshot(origin: &str, error: &str) -> BackgroundMonitorSnapshot {
         tasks: Vec::new(),
         services: Vec::new(),
         logs: Vec::new(),
+        lifecycle_logs: Vec::new(),
         runtime: None,
         registry: None,
         monitor_protocol: None,
@@ -725,6 +755,101 @@ fn poll_snapshot(origin: &str) -> BackgroundMonitorSnapshot {
         runtime_status.as_ref(),
         unix_time_millis(),
     )
+}
+
+fn supervisor_service_snapshot(value: SupervisorServiceSnapshot) -> BackgroundMonitorService {
+    BackgroundMonitorService {
+        id: value.id,
+        name: value.name,
+        role: value.role,
+        kind: value.kind,
+        origin: value.origin,
+        port: value.port,
+        health_path: value.health_path,
+        ok: value.ok,
+        required: value.required,
+        status: value.status,
+        response_status: value.response_status,
+        latency_ms: value.latency_ms,
+        uptime_ms: value.uptime_ms,
+        reason: value.reason,
+        lifecycle: Some(value.lifecycle),
+        operations: value.operations,
+        control: Some(value.control),
+        startup_mode: value.startup_mode,
+        auto_restart: value.auto_restart,
+        managed: value.managed,
+    }
+}
+
+fn apply_supervisor_snapshot(
+    snapshot: &mut BackgroundMonitorSnapshot,
+    supervisor: SupervisorSnapshot,
+) {
+    snapshot.services = supervisor
+        .services
+        .into_iter()
+        .filter(|service| !RETIRED_SERVICE_IDS.contains(&service.id.as_str()))
+        .map(supervisor_service_snapshot)
+        .collect();
+    snapshot.service_count = snapshot.services.len() as u64;
+    snapshot.healthy_service_count = snapshot
+        .services
+        .iter()
+        .filter(|service| service.ok)
+        .count() as u64;
+    snapshot.lifecycle_logs = supervisor.lifecycle_logs;
+    snapshot.registry = Some(supervisor.registry);
+    let task_worker = snapshot
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.task_worker.clone());
+    snapshot.runtime = Some(BackgroundMonitorRuntime {
+        state_root: Some(supervisor.state_root.to_string_lossy().into_owned()),
+        log_root: supervisor.log_root.to_string_lossy().into_owned(),
+        task_worker,
+        supervisor: Some(serde_json::json!({
+            "status": "running",
+            "owner": "tauri-service-supervisor",
+            "controlOrigin": format!("http://{CONTROL_SERVER_ADDRESS}"),
+            "pollIntervalMs": POLL_INTERVAL.as_millis()
+        })),
+    });
+    snapshot.monitor_protocol = Some(serde_json::json!({
+        "schema": "steel.runtime-monitor-capabilities.v1",
+        "version": 2,
+        "selectionKey": "serviceId",
+        "logScopes": ["service", "all"],
+        "operationEffects": ["query", "mutation"],
+        "mutationPolicy": "tauri-supervisor-owned",
+        "readAccess": "loopback-only",
+        "controlOrigin": format!("http://{CONTROL_SERVER_ADDRESS}")
+    }));
+    let failed_required = snapshot
+        .services
+        .iter()
+        .filter(|service| service.required && !service.ok && service.startup_mode != "disabled")
+        .map(|service| service.name.clone())
+        .collect::<Vec<_>>();
+    if !failed_required.is_empty() {
+        snapshot.state = if snapshot.service_available {
+            "degraded"
+        } else {
+            "offline"
+        };
+        snapshot.detail = format!(
+            "注册服务未就绪：{}",
+            failed_required
+                .into_iter()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("、")
+        );
+    } else if snapshot.service_available && snapshot.active_tasks == 0 && snapshot.queue_depth == 0
+    {
+        snapshot.state = "healthy";
+        snapshot.detail = "服务 supervisor 与生产任务队列运行正常".to_string();
+    }
 }
 
 fn state_label(state: &str) -> &'static str {
@@ -889,7 +1014,25 @@ pub(crate) fn start_worker(app: AppHandle) {
                 .lock()
                 .map(|value| value.clone())
                 .unwrap_or_else(|_| DEFAULT_ORIGIN.to_string());
-            publish_snapshot(&app, poll_snapshot(&origin));
+            let supervisor_snapshot = state.supervisor.lock().ok().map(|mut supervisor| {
+                supervisor.reconcile();
+                supervisor.snapshot()
+            });
+            if let Some(supervisor_snapshot) = supervisor_snapshot.as_ref() {
+                let mut service_snapshot = state
+                    .snapshot
+                    .lock()
+                    .map(|snapshot| snapshot.clone())
+                    .unwrap_or_default();
+                service_snapshot.updated_at_unix_ms = unix_time_millis();
+                apply_supervisor_snapshot(&mut service_snapshot, supervisor_snapshot.clone());
+                publish_snapshot(&app, service_snapshot);
+            }
+            let mut snapshot = poll_snapshot(&origin);
+            if let Some(supervisor_snapshot) = supervisor_snapshot {
+                apply_supervisor_snapshot(&mut snapshot, supervisor_snapshot);
+            }
+            publish_snapshot(&app, snapshot);
             let slices = (POLL_INTERVAL.as_millis() / 100) as usize;
             for _ in 0..slices.max(1) {
                 if state.exiting.load(Ordering::SeqCst)
@@ -900,6 +1043,197 @@ pub(crate) fn start_worker(app: AppHandle) {
                 thread::sleep(Duration::from_millis(100));
             }
         });
+}
+
+fn control_origin_allowed(value: &str) -> bool {
+    let origin = value.trim();
+    matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost" | "null"
+    ) || origin
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| origin.strip_prefix("http://localhost:"))
+        .is_some_and(|port| port.parse::<u16>().is_ok())
+}
+
+fn control_http_response(status: &str, origin: Option<&str>, body: &str) -> Vec<u8> {
+    let allow_origin = origin
+        .filter(|value| control_origin_allowed(value))
+        .unwrap_or("http://127.0.0.1:4873");
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: {allow_origin}\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Steel-Monitor-Client\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn handle_control_client(mut stream: TcpStream, app: &AppHandle) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut sent_continue = false;
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                request.extend_from_slice(&buffer[..count]);
+                if request.len() > 64 * 1024 {
+                    break;
+                }
+                if let Some(separator) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let header = String::from_utf8_lossy(&request[..separator]);
+                    let content_length = header
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if !sent_continue
+                        && content_length > 0
+                        && header.lines().any(|line| {
+                            line.split_once(':').is_some_and(|(name, value)| {
+                                name.eq_ignore_ascii_case("expect")
+                                    && value.trim().eq_ignore_ascii_case("100-continue")
+                            })
+                        })
+                    {
+                        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                        sent_continue = true;
+                    }
+                    if request.len() >= separator + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&request);
+    let Some(header_end) = text.find("\r\n\r\n") else {
+        let body = serde_json::json!({"success":false,"message":"请求无效"}).to_string();
+        let _ = stream.write_all(&control_http_response("400 Bad Request", None, &body));
+        return;
+    };
+    let header = &text[..header_end];
+    let mut lines = header.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or_default();
+    let path = request_parts.next().unwrap_or_default();
+    let origin = lines.find_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("origin"))
+            .map(|(_, value)| value.trim())
+    });
+    let monitor_client = header.lines().find_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-steel-monitor-client"))
+            .map(|(_, value)| value.trim())
+    });
+    if origin.is_some_and(|value| !control_origin_allowed(value)) {
+        let body =
+            serde_json::json!({"success":false,"message":"来源不允许控制本机服务"}).to_string();
+        let _ = stream.write_all(&control_http_response("403 Forbidden", None, &body));
+        return;
+    }
+    if method == "OPTIONS" {
+        let _ = stream.write_all(&control_http_response("204 No Content", origin, ""));
+        return;
+    }
+    if method == "POST" && monitor_client != Some("main-ui-v1") {
+        let body = serde_json::json!({"success":false,"message":"服务控制请求缺少受信客户端标识"})
+            .to_string();
+        let _ = stream.write_all(&control_http_response("403 Forbidden", origin, &body));
+        return;
+    }
+    let response = if method == "GET" && path == "/api/health" {
+        Ok(serde_json::json!({
+            "ok": true,
+            "schema": "steel.tauri-service-supervisor.v1",
+            "controlOrigin": format!("http://{CONTROL_SERVER_ADDRESS}")
+        }))
+    } else if method == "GET" && path == "/api/status" {
+        app.state::<BackgroundMonitorState>()
+            .snapshot
+            .lock()
+            .map(|snapshot| serde_json::to_value(snapshot.clone()).unwrap_or(Value::Null))
+            .map_err(|_| "后台监控状态不可用".to_string())
+    } else if method == "POST" {
+        let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+        if segments.len() == 4 && segments[0] == "api" && segments[1] == "services" {
+            let service_id = segments[2].to_string();
+            let action = segments[3];
+            let state = app.state::<BackgroundMonitorState>();
+            if action == "startup-mode" {
+                let body = text.get(header_end + 4..).unwrap_or_default();
+                let mode = serde_json::from_str::<Value>(body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("mode")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .ok_or_else(|| "请求缺少启动模式".to_string());
+                mode.and_then(|mode| {
+                    perform_startup_mode_change(service_id, mode, "main-ui", state).and_then(
+                        |result| serde_json::to_value(result).map_err(|error| error.to_string()),
+                    )
+                })
+            } else {
+                perform_service_action(service_id, action.to_string(), "main-ui", state).and_then(
+                    |result| serde_json::to_value(result).map_err(|error| error.to_string()),
+                )
+            }
+        } else {
+            Err("控制接口不存在".to_string())
+        }
+    } else {
+        Err("控制接口不存在".to_string())
+    };
+    let (status, body) = match response {
+        Ok(value) => ("200 OK", value.to_string()),
+        Err(message) => (
+            if message == "控制接口不存在" {
+                "404 Not Found"
+            } else {
+                "409 Conflict"
+            },
+            serde_json::json!({"success":false,"message":message}).to_string(),
+        ),
+    };
+    let _ = stream.write_all(&control_http_response(status, origin, &body));
+}
+
+pub(crate) fn start_control_server(app: AppHandle) -> tauri::Result<()> {
+    let listener = TcpListener::bind(CONTROL_SERVER_ADDRESS)?;
+    listener.set_nonblocking(true)?;
+    thread::Builder::new()
+        .name("tauri-service-control-http".to_string())
+        .spawn(move || loop {
+            if app
+                .state::<BackgroundMonitorState>()
+                .exiting
+                .load(Ordering::SeqCst)
+            {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, address)) if address.ip().is_loopback() => {
+                    handle_control_client(stream, &app);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => thread::sleep(Duration::from_millis(100)),
+            }
+        })?;
+    Ok(())
 }
 
 pub(crate) fn should_hide_monitor_window(window_label: &str, exiting: bool) -> bool {
@@ -958,6 +1292,73 @@ pub(crate) fn refresh_background_monitor(
 ) -> Result<BackgroundMonitorSnapshot, String> {
     state.refresh_requested.store(true, Ordering::SeqCst);
     read_background_monitor(state)
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackgroundServiceActionResult {
+    success: bool,
+    service_id: String,
+    action: String,
+    message: String,
+}
+
+fn perform_service_action(
+    service_id: String,
+    action: String,
+    source: &str,
+    state: State<'_, BackgroundMonitorState>,
+) -> Result<BackgroundServiceActionResult, String> {
+    let message = state
+        .supervisor
+        .lock()
+        .map_err(|_| "服务 supervisor 状态不可用".to_string())?
+        .action(&service_id, &action, source)?;
+    state.refresh_requested.store(true, Ordering::SeqCst);
+    Ok(BackgroundServiceActionResult {
+        success: true,
+        service_id,
+        action,
+        message,
+    })
+}
+
+fn perform_startup_mode_change(
+    service_id: String,
+    mode: String,
+    source: &str,
+    state: State<'_, BackgroundMonitorState>,
+) -> Result<BackgroundServiceActionResult, String> {
+    let message = state
+        .supervisor
+        .lock()
+        .map_err(|_| "服务 supervisor 状态不可用".to_string())?
+        .set_startup_mode(&service_id, &mode, source)?;
+    state.refresh_requested.store(true, Ordering::SeqCst);
+    Ok(BackgroundServiceActionResult {
+        success: true,
+        service_id,
+        action: "startup-mode".to_string(),
+        message,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn control_background_service(
+    service_id: String,
+    action: String,
+    state: State<'_, BackgroundMonitorState>,
+) -> Result<BackgroundServiceActionResult, String> {
+    perform_service_action(service_id, action, "monitor-ui", state)
+}
+
+#[tauri::command]
+pub(crate) fn set_background_service_startup_mode(
+    service_id: String,
+    mode: String,
+    state: State<'_, BackgroundMonitorState>,
+) -> Result<BackgroundServiceActionResult, String> {
+    perform_startup_mode_change(service_id, mode, "monitor-ui", state)
 }
 
 #[cfg(test)]
@@ -1130,6 +1531,62 @@ mod tests {
     }
 
     #[test]
+    fn retired_bkv_history_adapter_is_removed_from_monitor_snapshots() {
+        let runtime = json!({
+            "status": "degraded",
+            "registry": {
+                "schema": "steel.service-registry.v1",
+                "services": [{ "id": "inspection" }]
+            },
+            "services": [
+                {
+                    "id": "inspection",
+                    "name": "业务服务",
+                    "role": "api",
+                    "kind": "inspection",
+                    "origin": "http://127.0.0.1:4873",
+                    "port": 4873,
+                    "healthPath": "/api/health/live",
+                    "ok": true,
+                    "required": true,
+                    "status": "running",
+                    "responseStatus": 200
+                },
+                {
+                    "id": "bkv-adapter",
+                    "name": "BKV 历史适配器",
+                    "role": "bkv-history-image-worker",
+                    "kind": "probe",
+                    "origin": "http://127.0.0.1:4877",
+                    "port": 4877,
+                    "healthPath": "/api/health/live",
+                    "ok": false,
+                    "required": true,
+                    "status": "unavailable",
+                    "responseStatus": 0
+                }
+            ],
+            "logs": [
+                { "name": "inspection-service.out.log", "serviceId": "inspection" },
+                { "name": "bkv-image-worker.out.log", "serviceId": "bkv-adapter" }
+            ]
+        });
+
+        let RuntimePayloadSnapshots {
+            services,
+            logs,
+            failed_required_services,
+            ..
+        } = runtime_payload_snapshots(Some(&runtime));
+
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id, "inspection");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].service_id.as_deref(), Some("inspection"));
+        assert!(failed_required_services.is_empty());
+    }
+
+    #[test]
     fn parses_bounded_json_http_responses() {
         let body = br#"{"ok":true}"#;
         let response = format!(
@@ -1148,5 +1605,10 @@ mod tests {
         assert!(should_hide_monitor_window(MONITOR_WINDOW, false));
         assert!(!should_hide_monitor_window("other", false));
         assert!(!should_hide_monitor_window(MONITOR_WINDOW, true));
+    }
+
+    #[test]
+    fn native_monitor_refreshes_live_status_and_log_tails_each_second() {
+        assert_eq!(POLL_INTERVAL, Duration::from_secs(1));
     }
 }

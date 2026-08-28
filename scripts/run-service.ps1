@@ -68,6 +68,7 @@ if ($ManagementOnly) {
   $env:STEEL_CAPTURE_SERVICE_AUTOSTART = "0"
   $env:STEEL_CAPTURE_MANAGED_BY_SUPERVISOR = "0"
 }
+$ResultProxyOnlyEnabled = $ResultProxyOnly -or $env:STEEL_RESULT_PROXY_ONLY -eq "1"
 
 # These values are intentionally applied after EnvFile import.  The Tauri
 # development launcher owns the local split-runtime directories and must not
@@ -92,10 +93,16 @@ if ($InspectionWorldCacheRoot.Trim().Length -gt 0) {
   New-Item -ItemType Directory -Force -Path $InspectionWorldCacheRoot | Out-Null
   $env:STEEL_INSPECTION_WORLD_CACHE_ROOT = (Resolve-Path $InspectionWorldCacheRoot).Path
 }
-if ($ResultProxyOnly) {
+if ($ResultProxyOnlyEnabled) {
   $env:STEEL_RESULT_PROXY_ONLY = "1"
   $env:STEEL_IMAGE_PROXY = "1"
   $env:STEEL_CAPTURE_MANAGED_BY_SUPERVISOR = "1"
+  # The inspection service is the business/result proxy in this mode. Remove
+  # inherited raw BKV credentials before creating its process so only the
+  # separately launched adapter can access MySQL or image shares.
+  Get-ChildItem Env: |
+    Where-Object { $_.Name -like "STEEL_BKV_*" } |
+    ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" -ErrorAction SilentlyContinue }
 }
 if ($ManagementOnly) {
   # Result-proxy compatibility must not turn capture-supervisor ownership back

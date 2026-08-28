@@ -1,20 +1,33 @@
 # Independent server task monitor
 
-This Tauri application is a standalone server-side process. It does not start,
-stop, or supervise the operator client or the `SteelInspectionRuntime` Windows
-service. Its Rust worker polls the local inspection service every five seconds
-and keeps running when the monitor window is hidden to the system tray.
+This Tauri application is the standalone process-level lifecycle owner for the
+registered inspection services. Its Rust worker probes every service, starts
+services in `normal` mode, automatically relaunches a normal-mode process after
+an unexpected exit, and keeps running when the window is hidden to the tray.
+It does not supervise the operator client itself.
 
-The service registry is loaded from `config/service-registry.json` (or the
-configured `STEEL_SERVICE_REGISTRY_PATH`). The monitor consumes the
-loopback-only `GET /api/runtime/status` snapshot, which includes registered
-service health, lifecycle state, runtime roots, and bounded log tails.
+The service registry is loaded from `config/service-registry.json` (or
+`STEEL_SERVICE_REGISTRY_PATH`). Each `process` entry declares command
+candidates, environment, output files, and the default startup mode. Persisted
+mode overrides and lifecycle audit logs are stored below
+`target/run/server-monitor` by default.
+
+The Rust worker refreshes every second. Service cards come from live HTTP
+health probes, including the capture provider's internal readiness. The lower
+panel is the supervisor's lifecycle audit: startup, stop, restart, unexpected
+exit, automatic relaunch, and startup-mode changes.
+
+The monitor exposes a loopback-only control API at `http://127.0.0.1:4899` so
+the main application footer can display the same real snapshot and request
+start, stop, restart, or startup-mode changes. Mutation requests require the
+expected local-client header and accepted local/Tauri origins; the listener is
+never bound to a LAN interface.
 
 In development the independent monitor frontend binds `1433`; the operator
 client remains on `1432`. The ports and executable processes are intentionally
 separate.
 
-Build the shared read-only monitor frontend first, then build this executable:
+Build the shared monitor frontend first, then build this executable:
 
 ```powershell
 npm.cmd --prefix app/client run build
@@ -38,8 +51,9 @@ The default service origin is `http://127.0.0.1:4873`. Set
 executable must run in an interactive Windows user session; a process in
 service Session 0 cannot display a desktop tray icon.
 
-The tray is read-only. It reports service health, worker/queue state, registered
-service lifecycle, runtime roots, bounded log tails, and recent tasks. It never
-stores an administrator token or mutates production tasks. The monitor process
-and the inspection service remain separate executables and separate lifecycle
-owners.
+The tray reports service health and worker/queue state. The right-side service
+panel provides start, stop, restart, and `normal` / `manual` / `disabled`
+startup-mode controls. `normal` means desired-running plus automatic relaunch;
+an explicit stop changes a normal service to manual so it stays stopped. The
+monitor does not mutate production tasks and does not store an administrator
+token.

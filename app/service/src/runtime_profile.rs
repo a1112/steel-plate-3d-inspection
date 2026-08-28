@@ -214,6 +214,8 @@ impl RuntimeCapability {
 pub struct RuntimeProfile {
     pub site_id: String,
     pub site_display_name: String,
+    pub site_deprecated: bool,
+    pub site_deprecation_notice: String,
     pub site_mode: SiteMode,
     pub site_compatibility: bool,
     pub site_selection_source: SiteSelectionSource,
@@ -337,6 +339,8 @@ impl RuntimeProfile {
         Ok(Self {
             site_id: active_site.site_id,
             site_display_name: active_site.site_display_name,
+            site_deprecated: active_site.site_deprecated,
+            site_deprecation_notice: active_site.site_deprecation_notice,
             site_mode: active_site.site_mode,
             site_compatibility: active_site.compatibility,
             site_selection_source,
@@ -430,6 +434,8 @@ impl RuntimeProfile {
             "schema": "steel.runtime-profile.public.v1",
             "siteId": self.site_id,
             "siteDisplayName": self.site_display_name,
+            "siteDeprecated": self.site_deprecated,
+            "siteDeprecationNotice": self.site_deprecation_notice,
             "siteMode": self.site_mode,
             "siteCompatibility": self.site_compatibility,
             "siteSelectionSource": self.site_selection_source,
@@ -459,6 +465,8 @@ impl RuntimeProfile {
         Self {
             site_id: format!("test-{provider}-{camera_count}"),
             site_display_name: "test site".to_string(),
+            site_deprecated: false,
+            site_deprecation_notice: String::new(),
             site_mode: if direct {
                 SiteMode::DirectCamera
             } else {
@@ -1064,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_project_uses_the_bkv_six_camera_site_package() {
+    fn checked_in_project_uses_the_sick_six_camera_site_package() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()
@@ -1073,9 +1081,10 @@ mod tests {
         let loaded = RuntimeProfile::load(&workspace.join("config/project.json"), &workspace)
             .expect("checked-in runtime");
 
-        assert_eq!(loaded.site_id, "bkv-default");
-        assert_eq!(loaded.site_mode, SiteMode::Bkv);
+        assert_eq!(loaded.site_id, "sick-array-6");
+        assert_eq!(loaded.site_mode, SiteMode::DirectCamera);
         assert_eq!(loaded.camera_count(), 6);
+        assert!(!loaded.site_deprecated);
         assert!(!loaded.site_compatibility);
     }
 

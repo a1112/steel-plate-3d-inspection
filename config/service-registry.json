@@ -12,7 +12,31 @@
       "healthPath": "/api/health/live",
       "required": true,
       "lifecycle": "service",
-      "logFiles": ["inspection-service-*.out.log", "inspection-service-*.err.log"]
+      "logFiles": ["inspection-service-*.out.log", "inspection-service-*.err.log"],
+      "process": {
+        "command": "target/cargo/release/steel-inspection-service.exe",
+        "commandCandidates": ["target/cargo/debug/steel-inspection-service.exe"],
+        "workingDirectory": ".",
+        "environment": {
+          "STEEL_WORKSPACE_ROOT": "{workspaceRoot}",
+          "STEEL_RUNTIME_PROFILE": "development",
+          "STEEL_SITE_CONFIG_ID": "sick-array-6",
+          "INSPECTION_SERVICE_PORT": "4873",
+          "CAPTURE_SERVICE_ORIGIN": "http://127.0.0.1:4317",
+          "STEEL_CAPTURE_MANAGED_BY_SUPERVISOR": "1",
+          "STEEL_CAPTURE_SERVICE_AUTOSTART": "1",
+          "STEEL_RUNTIME_STATE_ROOT": "{workspaceRoot}\\target\\run\\tauri-dev",
+          "STEEL_RUNTIME_LOG_DIR": "{workspaceRoot}\\target\\run\\tauri-dev\\logs",
+          "STEEL_RESULT_PROXY_ONLY": "1",
+          "STEEL_IMAGE_PROXY": "1",
+          "STEEL_RESULT_ROOT": "D:\\Data\\inspection-results",
+          "STEEL_ALGORITHM_INPUT_ROOTS": "{workspaceRoot}\\target\\run\\tauri-dev\\processing\\algorithm-input",
+          "STEEL_INSPECTION_WORLD_CACHE_ROOT": "{workspaceRoot}\\target\\run\\tauri-dev\\cache\\inspection-world"
+        },
+        "stdoutLog": "inspection-service.out.log",
+        "stderrLog": "inspection-service.err.log",
+        "startupMode": "normal"
+      }
     },
     {
       "id": "image",
@@ -24,7 +48,20 @@
       "healthPath": "/api/health/live",
       "required": true,
       "lifecycle": "health-probe",
-      "logFiles": ["image-service*.log"]
+      "logFiles": ["image-service*.log"],
+      "process": {
+        "command": "target/image-service/release/steel-image-service.exe",
+        "commandCandidates": ["target/image-service/debug/steel-image-service.exe"],
+        "workingDirectory": ".",
+        "environment": {
+          "STEEL_WORKSPACE_ROOT": "{workspaceRoot}",
+          "STEEL_IMAGE_SERVICE_PORT": "4874",
+          "STEEL_RESULT_ROOT": "D:\\Data\\inspection-results"
+        },
+        "stdoutLog": "image-service.out.log",
+        "stderrLog": "image-service.err.log",
+        "startupMode": "normal"
+      }
     },
     {
       "id": "image-worker",
@@ -38,21 +75,23 @@
       "required": true,
       "requiredWhen": "non-bkv",
       "lifecycle": "health-probe",
-      "logFiles": ["image-worker*.log"]
-    },
-    {
-      "id": "bkv-adapter",
-      "name": "BKV 历史适配器",
-      "role": "bkv-history-image-worker",
-      "kind": "probe",
-      "defaultOrigin": "http://127.0.0.1:4877",
-      "originEnv": "STEEL_BKV_IMAGE_WORKER_ORIGIN",
-      "portEnv": "STEEL_BKV_IMAGE_WORKER_PORT",
-      "healthPath": "/api/health/live",
-      "required": true,
-      "requiredWhen": "bkv",
-      "lifecycle": "health-probe",
-      "logFiles": ["bkv-image-worker*.log"]
+      "logFiles": ["image-worker*.log"],
+      "process": {
+        "command": "target/pipeline-workers/release/steel-image-worker.exe",
+        "commandCandidates": ["target/pipeline-workers/debug/steel-image-worker.exe"],
+        "workingDirectory": ".",
+        "environment": {
+          "STEEL_WORKSPACE_ROOT": "{workspaceRoot}",
+          "STEEL_IMAGE_WORKER_PORT": "4875",
+          "STEEL_SICK_CAPTURE_PROFILE": "{workspaceRoot}\\config\\sites\\sick-array-6\\capture.json",
+          "STEEL_PYTHON_EXECUTABLE": "D:\\project\\py312\\python.exe",
+          "CAPTURE_SERVICE_ORIGIN": "http://127.0.0.1:4317",
+          "INSPECTION_SERVICE_ORIGIN": "http://127.0.0.1:4873"
+        },
+        "stdoutLog": "image-worker.out.log",
+        "stderrLog": "image-worker.err.log",
+        "startupMode": "normal"
+      }
     },
     {
       "id": "defect-worker",
@@ -66,7 +105,23 @@
       "required": true,
       "requiredWhen": "non-bkv",
       "lifecycle": "health-probe",
-      "logFiles": ["defect-worker*.log"]
+      "logFiles": ["defect-worker*.log"],
+      "process": {
+        "command": "target/pipeline-workers/release/steel-defect-worker.exe",
+        "commandCandidates": ["target/pipeline-workers/debug/steel-defect-worker.exe"],
+        "workingDirectory": ".",
+        "environment": {
+          "STEEL_WORKSPACE_ROOT": "{workspaceRoot}",
+          "STEEL_DEFECT_WORKER_PORT": "4876",
+          "STEEL_SICK_CAPTURE_PROFILE": "{workspaceRoot}\\config\\sites\\sick-array-6\\capture.json",
+          "STEEL_PYTHON_EXECUTABLE": "D:\\project\\py312\\python.exe",
+          "CAPTURE_SERVICE_ORIGIN": "http://127.0.0.1:4317",
+          "INSPECTION_SERVICE_ORIGIN": "http://127.0.0.1:4873"
+        },
+        "stdoutLog": "defect-worker.out.log",
+        "stderrLog": "defect-worker.err.log",
+        "startupMode": "normal"
+      }
     },
     {
       "id": "capture",
@@ -80,7 +135,28 @@
       "required": true,
       "requiredWhen": "non-bkv",
       "lifecycle": "capture-supervisor",
-      "logFiles": ["capture-child.log", "sick-capture*.log"]
+      "logFiles": ["capture-child.log", "sick-capture*.log"],
+      "process": {
+        "command": "D:\\project\\py312\\python.exe",
+        "commandCandidates": ["C:\\Program Files\\Python312\\python.exe"],
+        "arguments": [
+          "{workspaceRoot}\\scripts\\sick_capture_service.py",
+          "--profile",
+          "{workspaceRoot}\\config\\sites\\sick-array-6\\capture.json",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "4317"
+        ],
+        "workingDirectory": ".",
+        "environment": {
+          "STEEL_WORKSPACE_ROOT": "{workspaceRoot}",
+          "INSPECTION_SERVICE_ORIGIN": "http://127.0.0.1:4873"
+        },
+        "stdoutLog": "sick-capture.out.log",
+        "stderrLog": "sick-capture.err.log",
+        "startupMode": "normal"
+      }
     },
     {
       "id": "trigger",
@@ -92,7 +168,25 @@
       "healthPath": "/health",
       "required": false,
       "lifecycle": "health-probe",
-      "logFiles": ["trigger*.log"]
+      "logFiles": ["trigger*.log"],
+      "process": {
+        "command": "target/trigger/release/steel-trigger-gateway.exe",
+        "commandCandidates": ["target/trigger/debug/steel-trigger-gateway.exe"],
+        "workingDirectory": ".",
+        "environment": {
+          "INSPECTION_SERVICE_ORIGIN": "http://127.0.0.1:4873",
+          "TRIGGER_GATEWAY_HOST": "127.0.0.1",
+          "TRIGGER_GATEWAY_PORT": "4881",
+          "TRIGGER_TCP_PORT": "4882",
+          "TRIGGER_UDP_PORT": "4883",
+          "TRIGGER_MODE": "manual",
+          "STEEL_RUNTIME_PROFILE": "development",
+          "TRIGGER_ALLOW_MODE_MUTATION": "1"
+        },
+        "stdoutLog": "trigger.out.log",
+        "stderrLog": "trigger.err.log",
+        "startupMode": "manual"
+      }
     }
   ]
 }

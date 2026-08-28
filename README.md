@@ -112,8 +112,9 @@ Service registration is configuration-driven from
 service resolves each service origin/port and lifecycle policy from that file,
 and exposes a loopback-only `GET /api/runtime/status` snapshot containing
 service readiness, supervisor/task-worker runtime state, and bounded log tails.
-The independent Tauri server monitor consumes this snapshot; it does not own
-or mutate the service process.
+The independent Tauri server supervisor also loads this registry, probes each
+service directly, owns its process lifecycle, and exposes real status plus
+lifecycle controls to the operator client over loopback port `4899`.
 
 Development and test profiles support SQLite, MySQL, and PostgreSQL through
 SeaORM. Remote development databases can opt into an explicit SQLite fallback:
@@ -203,9 +204,10 @@ Run the Tauri desktop shell in another terminal:
 scripts/run-tauri-dev.ps1 -ServicePort 4873
 ```
 
-For a BKV online debug session, pass an ignored local environment file so the
-algorithm service receives the production source credentials while the
-inspection service remains a result-store proxy:
+BKV online is temporarily deprecated and isolated. For a controlled migration
+or compatibility session only, pass an ignored local environment file. This
+explicitly enables the standalone BKV adapter while the inspection service
+remains a result-store proxy and receives no BKV credentials:
 
 ```powershell
 scripts/run-tauri-dev.ps1 -EnvFile config/env/bkv-online.env.local
@@ -215,8 +217,9 @@ The launcher writes debug service output below `target/run/tauri-dev/logs`,
 requests an initial algorithm rescan, and keeps the Tauri client on the local
 4873 API. The operator client uses frontend port `1432`. The independent
 `steel-inspection-server-monitor.exe` uses frontend port `1433` in development
-and is built with `scripts/build-server-monitor.ps1`; it does not share the
-operator process, start production tasks, or control the Windows service. See
+and is built with `scripts/build-server-monitor.ps1`; it owns registered child
+service processes but does not share the operator process, start production
+tasks, or control the Windows service. See
 [`app/server-monitor/README.md`](app/server-monitor/README.md) for its build and
 runtime boundary.
 
@@ -287,8 +290,8 @@ For a formal package, `checksums.sha256` is a two-way complete inventory: verifi
 Production deployment is intentionally two-stage:
 
 1. An administrator installs the background runtime package as the `SteelInspectionRuntime` Windows service. The signed payload remains in an immutable `RuntimeRoot`; mutable config, logs, SQLite/service state, capture configuration, temporary files, and working directories live in a separate `StateRoot` (default `%ProgramData%\SteelInspectionRuntime`). Secrets and the approved algorithm report must remain outside both roots. The install command requires a real `steel.algorithm-acceptance.v1` report with `status=pass`; the example report is intentionally pending and cannot be used.
-2. The operator installs the signed Tauri MSI or NSIS desktop client separately. The desktop client does not install, start, stop, or supervise the background service.
+2. The operator installs the signed Tauri MSI or NSIS desktop client separately. The desktop client does not own service processes directly; its footer “服务状态” entry communicates with the loopback Tauri supervisor to read real probes and request lifecycle operations.
 
-The server can additionally run `steel-inspection-server-monitor.exe` as an independent interactive-user Tauri process. Its Rust worker reads health and durable-task summaries every five seconds; closing its window hides only that window while the monitor remains in the system tray. It does not depend on the operator client, does not control SCM, and remains separate from the privileged `steel-inspection-tray.exe` companion. See the [independent monitor build and runtime notes](app/server-monitor/README.md).
+The server can additionally run `steel-inspection-server-monitor.exe` as an independent interactive-user Tauri supervisor. Its Rust worker refreshes real service probes every second, owns the registered process lifecycle, and automatically relaunches a dead process in normal mode. The right panel provides start/stop/restart and startup-mode controls; the lower panel contains persistent lifecycle audit records instead of application output tails. Its loopback-only port `4899` supplies the same snapshot and controls to the main application footer. Closing the monitor window hides it to the system tray without stopping services. See the [independent monitor build and runtime notes](app/server-monitor/README.md).
 
 Before either stage, validate the configured offline WebView2 installer and Microsoft-signed `VC_redist.x64.exe`, then verify package signatures, the two-way checksum inventory, and the signed Windows catalog with deployment-controlled first-party and vendor signer thumbprints; follow [the deployment and operations SOP](docs/release-deployment-and-operations.md). The package-only verifier and service installer implement these fail-closed checks, including tamper rejection before mutable state is written. Current artifacts remain unsigned, no signed catalog or formal MSI/NSIS has been generated, and the immutable-runtime/state-root flow still needs elevated target-machine acceptance.

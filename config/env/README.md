@@ -8,7 +8,7 @@ Copy one of these files to a local `.env` file or pass it directly with `-EnvFil
 - `external-api.env.example`: Rust connects to an already running capture API process.
 - `simulated.env.example`: Rust uses the eight-camera simulation fallback.
 - `bkv.env.example`: Rust uses the validated 11-material BKV offline replay batch and starts no camera process.
-- `bkv-online.env.example`: the standalone algorithm service converts the latest BKV MySQL records and six read-only network shares into the unified result store; the business service only proxies that store.
+- `bkv-online.env.example`: **temporarily deprecated and isolated** compatibility profile. It requires an explicit opt-in, and only the standalone BKV adapter may consume MySQL/share credentials; the business service only proxies the unified result store.
 - `simulated-mysql.env.example`: development MySQL primary with explicit SQLite fallback.
 - `simulated-postgres.env.example`: development PostgreSQL primary with explicit SQLite fallback.
 - `trigger-gateway.env.example`: standalone trigger gateway from `app/trigger` forwards L2/PLC/API steel events to the Rust production API.
@@ -31,9 +31,12 @@ cannot be edited later. Activate and validate packages from **后台管理 ->
 全局配置**. Activation sets `pendingRestart` in `config/project.json`; restart
 the Rust service before treating the new package as active.
 
-The checked-in `bkv-default` site uses the six-camera online MySQL conversion
-profile. Copy `bkv-online.env.example` to an ignored local env file and provide
-the approved database/share credentials before starting that profile.
+The checked-in default site is `sick-array-6`. The former `bkv-default` online
+MySQL profile is marked deprecated, fails activation checks, and is retained
+only for controlled compatibility reading and migration. When that isolated
+path is explicitly needed, copy `bkv-online.env.example` to an ignored local
+env file, provide approved credentials, and keep the business service in
+result-proxy-only mode.
 `bkv.env.example` describes offline replay connection values, but it does not
 replace the active site package; select an offline BKV package first when using
 that template.

@@ -15,6 +15,7 @@ describe('TopNav', () => {
       '测径分析',
       '缺陷报表',
       '报警中心',
+      '采集算法日志',
     ]);
     expect(within(navigation).getAllByRole('button', { name: '在线监测' })).toHaveLength(1);
     expect(within(navigation).queryByRole('button', { name: '实时监控' })).not.toBeInTheDocument();
@@ -26,5 +27,7 @@ describe('TopNav', () => {
     expect(onChange).toHaveBeenCalledWith('defects');
     fireEvent.click(within(navigation).getByRole('button', { name: '测径分析' }));
     expect(onChange).toHaveBeenCalledWith('diameter');
+    fireEvent.click(within(navigation).getByRole('button', { name: '采集算法日志' }));
+    expect(onChange).toHaveBeenCalledWith('processing');
   });
 });

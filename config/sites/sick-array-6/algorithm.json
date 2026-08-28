@@ -16,17 +16,20 @@
   "depthGeometry": {
     "schema": "steel.sick-depth-geometry-config.v1",
     "enabled": true,
-    "revision": 1,
+    "revision": 6,
     "candidatePolicy": "review-only",
+    "longitudinalEdgeGuardFrames": 8,
+    "cameraWorkers": 4,
+    "maximumCandidatesPerFlow": 100,
     "baseline": {
       "maximumFrames": 32,
       "rowSampleStep": 4
     },
     "thresholds": {
-      "minimumAbsoluteDeviationMm": 0.35,
+      "minimumAbsoluteDeviationMm": 1.2,
       "columnNoiseMultiplier": 6.0,
       "minimumNeighborhoodSupport": 3,
-      "minimumComponentPoints": 6,
+      "minimumComponentPoints": 16,
       "elongatedAspectRatio": 3.0
     },
     "merge": {
@@ -34,7 +37,7 @@
       "minimumIoU": 0.2
     },
     "reviewCropMinimumSize": 64,
-    "qualityGatePolicy": "camera-local-with-global-risk-tag",
+    "qualityGatePolicy": "global-owned-only",
     "longitudinalScale": null,
     "historyBackfill": {
       "automatic": true,

@@ -1,7 +1,9 @@
 {
   "schema": "steel.site-config.v1",
   "id": "bkv-default",
-  "displayName": "BKV 六相机标准现场",
+  "displayName": "BKV 六相机在线转换（已弃用）",
+  "deprecated": true,
+  "deprecationNotice": "BKV online 已隔离并暂时停用；仅保留兼容读取与迁移，禁止设为运行配置。",
   "mode": "bkv",
   "runtimeProfile": "runtime.json",
   "connectionConfig": "connection.json",

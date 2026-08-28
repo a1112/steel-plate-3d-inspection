@@ -2071,8 +2071,16 @@ def _prepare_geometry_defects(
         if isinstance(row, dict) and row.get("cameraId")
     }
     prepared: list[dict[str, Any]] = []
-    overlap_filtered = 0
-    boundary_filtered = 0
+    existing_statistics = manifest.get("statistics", {})
+    existing_statistics = (
+        existing_statistics if isinstance(existing_statistics, dict) else {}
+    )
+    overlap_filtered = int(
+        existing_statistics.get("overlapDuplicateFilteredCount", 0) or 0
+    )
+    boundary_filtered = int(
+        existing_statistics.get("boundaryArtifactFilteredCount", 0) or 0
+    )
     for source_row in manifest.get("defects", []):
         if execution_gate is not None:
             execution_gate("depth-geometry-artifact")
@@ -2320,6 +2328,27 @@ def build_flow_defect_detection(
                 "defects": [],
             }
 
+    region_map_for_prefilter = read_region_manifest(storage_root, material_id)
+    region_prefilter_available = bool(
+        region_map_for_prefilter
+        and region_map_for_prefilter.get("defectDetectionAllowed")
+    )
+
+    def geometry_candidate_disposition(camera_id: str, bbox: list[int]) -> str:
+        if not region_prefilter_available:
+            return "quality-gate"
+        region_row = (
+            (region_map_for_prefilter or {}).get("cameras", {}).get(camera_id, {})
+        )
+        if not region_row.get("ownedColumnIntervals"):
+            return "quality-gate"
+        center_x = (int(bbox[0]) + int(bbox[2])) / 2.0
+        return candidate_region_disposition(
+            center_x,
+            region_row.get("ownedColumnIntervals", []),
+            region_row.get("overlapColumnIntervals", []),
+        )
+
     try:
         geometry_manifest = build_flow_depth_geometry(
             camera_roots,
@@ -2328,6 +2357,7 @@ def build_flow_defect_detection(
             alignment,
             geometry_settings,
             guarded,
+            geometry_candidate_disposition,
         )
         geometry_manifest = _prepare_geometry_defects(
             geometry_manifest,

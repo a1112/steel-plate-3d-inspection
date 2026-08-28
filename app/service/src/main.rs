@@ -237,6 +237,35 @@ impl CaptureProvider {
     }
 }
 
+fn startup_capture_provider(
+    profile: &runtime_profile::RuntimeProfile,
+    runtime_mode: Option<&str>,
+    requested_provider: Option<&str>,
+) -> Result<CaptureProvider, String> {
+    let configured = CaptureProvider::from_runtime_profile(profile)?;
+    let simulated_requested = requested_provider.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "sim" | "simulated" | "simulation"
+        )
+    });
+    if profile.site_mode == site_config::SiteMode::DirectCamera
+        && !runtime_mode.is_some_and(|value| value.trim().eq_ignore_ascii_case("production"))
+        && simulated_requested
+    {
+        return Ok(CaptureProvider::Simulated);
+    }
+    Ok(configured)
+}
+
+fn result_proxy_only_policy(
+    profile: &runtime_profile::RuntimeProfile,
+    configured_value: Option<&str>,
+) -> bool {
+    configured_value.is_some_and(|value| value.trim() == "1")
+        || (profile.site_deprecated && profile.data_source == "bkv-online-mysql")
+}
+
 fn normalize_capture_output_mode(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "continuous" | "auto" | "automatic" => Some("continuous"),
@@ -5560,6 +5589,15 @@ fn normalize_depth_geometry_config(value: &Value, revision: u64) -> Result<Value
         }
         Ok(())
     };
+    for (key, minimum, maximum) in [
+        ("longitudinalEdgeGuardFrames", 0.0, 64.0),
+        ("cameraWorkers", 1.0, 6.0),
+        ("maximumCandidatesPerFlow", 1.0, 100.0),
+    ] {
+        if config.contains_key(key) {
+            bounded_number(&config, "top-level", key, minimum, maximum, true)?;
+        }
+    }
     {
         let baseline = config
             .get("baseline")
@@ -5967,6 +6005,417 @@ fn depth_geometry_storage_root(state: &ServiceState) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn processing_log_storage_root(state: &ServiceState) -> Option<PathBuf> {
+    for name in [
+        "STEEL_SICK_STORAGE_ROOT",
+        "STEEL_CAPTURE_STORAGE_ROOT",
+        "CAPTURE_CAMERA_STORAGE_ROOT",
+    ] {
+        if let Some(value) = env::var(name).ok().filter(|value| !value.trim().is_empty()) {
+            return Some(PathBuf::from(value));
+        }
+    }
+    if let Some(relative) = state.runtime_config.capture_profile.as_deref() {
+        let path = state
+            .runtime_config
+            .profile_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(workspace_root)
+            .join(relative);
+        if let Some(root) = processing_log_json(&path)
+            .and_then(|document| document.get("storageRoot").cloned())
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(PathBuf::from(root));
+        }
+    }
+    depth_geometry_storage_root(state)
+}
+
+const PROCESSING_LOG_JSON_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+fn processing_log_json(path: &Path) -> Option<Value> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > PROCESSING_LOG_JSON_MAX_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn processing_log_file_time(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+fn processing_log_directory_start(path: &Path, session_id: &str) -> Option<u64> {
+    let created = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.created().ok())
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+    if created.is_some() {
+        return created;
+    }
+    session_id
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|value| value.len() == 13)
+        .filter_map(|value| value.parse::<u64>().ok())
+        .find(|value| (946_684_800_000..4_102_444_800_000).contains(value))
+}
+
+fn processing_log_duration(started_at: Option<u64>, finished_at: Option<u64>) -> Option<u64> {
+    Some(finished_at?.saturating_sub(started_at?))
+}
+
+fn processing_log_status_label(status: &str) -> &'static str {
+    match status {
+        "completed" => "完成",
+        "processing" => "处理中",
+        "degraded" => "降级完成",
+        "failed" => "失败",
+        _ => "等待",
+    }
+}
+
+fn processing_log_camera_details(acquisition: Option<&Value>) -> Vec<Value> {
+    acquisition
+        .and_then(|value| value.get("cameras"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(32)
+        .map(|camera| {
+            let artifacts = camera
+                .get("artifacts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            json!({
+                "cameraId": camera.get("cameraId").and_then(Value::as_str).unwrap_or(""),
+                "sequenceNo": camera.get("sequenceNo").and_then(Value::as_u64),
+                "captureRound": camera.get("captureRound").and_then(Value::as_u64),
+                "capturedAt": camera.get("capturedAt").and_then(Value::as_str),
+                "artifactCount": artifacts.len(),
+                "artifactBytes": artifacts.iter()
+                    .filter_map(|artifact| artifact.get("size").and_then(Value::as_u64))
+                    .sum::<u64>()
+            })
+        })
+        .collect()
+}
+
+fn processing_log_artifact_details(
+    image_result: Option<&Value>,
+    material_root: &Path,
+) -> Vec<Value> {
+    image_result
+        .and_then(|value| value.get("artifacts"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(32)
+        .map(|artifact| {
+            let kind = artifact.get("kind").and_then(Value::as_str).unwrap_or("");
+            let relative_path = match kind {
+                "alignment" => Some("sync/alignment.json"),
+                "measurement" => Some("derived/geometry/measurement.json"),
+                "region-map" => Some("derived/roi/manifest.json"),
+                "surface" => Some("derived/geometry/surface.json"),
+                "playback-index" => Some("derived/playback/index.json"),
+                _ => None,
+            };
+            let updated_at = relative_path
+                .and_then(|relative| processing_log_file_time(&material_root.join(relative)));
+            json!({
+                "kind": kind,
+                "size": artifact.get("size").and_then(Value::as_u64).unwrap_or(0),
+                "sha256": artifact.get("sha256").and_then(Value::as_str).unwrap_or(""),
+                "updatedAt": updated_at,
+                "available": artifact.get("size").and_then(Value::as_u64).unwrap_or(0) > 0
+            })
+        })
+        .collect()
+}
+
+fn processing_log_record(material_root: &Path, material_id: &str, now: u64) -> Option<Value> {
+    let flow_path = material_root.join("flow.json");
+    let flow = processing_log_json(&flow_path)?;
+    let acquisition_path = material_root.join("acquisition").join("manifest.json");
+    let image_path = material_root
+        .join("derived")
+        .join("image")
+        .join("result.json");
+    let algorithm_path = material_root.join("derived").join("algorithm-state.json");
+    let defect_path = material_root
+        .join("derived")
+        .join("defects")
+        .join("manifest.json");
+    let acquisition = processing_log_json(&acquisition_path);
+    let image_result = processing_log_json(&image_path);
+    let algorithm = processing_log_json(&algorithm_path);
+    let defect = processing_log_json(&defect_path);
+
+    let flow_state = flow
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let session_id = flow.get("sessionId").and_then(Value::as_str).unwrap_or("");
+    let capture_started_at = processing_log_directory_start(material_root, session_id);
+    let capture_finished_at = (flow_state == "closed")
+        .then(|| processing_log_file_time(&flow_path))
+        .flatten();
+    let capture_status = if flow_state == "closed" {
+        "completed"
+    } else if matches!(flow_state, "open" | "collecting" | "capturing") {
+        "processing"
+    } else {
+        "waiting"
+    };
+
+    let image_finished_at = image_result
+        .as_ref()
+        .filter(|value| {
+            value
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .and_then(|_| processing_log_file_time(&image_path));
+    let image_status = if image_finished_at.is_some() {
+        "completed"
+    } else if image_result.is_some() {
+        "processing"
+    } else {
+        "waiting"
+    };
+    let image_started_at = capture_finished_at;
+
+    let defect_state = algorithm
+        .as_ref()
+        .and_then(|value| value.get("defectState"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            defect
+                .as_ref()
+                .and_then(|value| value.get("state"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("waiting");
+    let algorithm_state = algorithm
+        .as_ref()
+        .and_then(|value| value.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("waiting");
+    let algorithm_status = if matches!(algorithm_state, "failed" | "error")
+        || matches!(defect_state, "failed" | "error")
+    {
+        "failed"
+    } else if matches!(defect_state, "degraded") {
+        "degraded"
+    } else if algorithm_state == "ready"
+        && matches!(defect_state, "complete" | "completed" | "ready")
+    {
+        "completed"
+    } else if algorithm_state.starts_with("processing")
+        || defect_state.starts_with("processing")
+        || defect_state == "queued-for-defect"
+    {
+        "processing"
+    } else {
+        "waiting"
+    };
+    let reported_algorithm_duration = defect
+        .as_ref()
+        .and_then(|value| value.pointer("/statistics/elapsedMs"))
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    let algorithm_finished_at = algorithm
+        .as_ref()
+        .and_then(|value| value.get("defectCompletedAtUnixMs"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            matches!(algorithm_status, "completed" | "degraded")
+                .then(|| processing_log_file_time(&defect_path))
+                .flatten()
+        });
+    let algorithm_started_at = algorithm
+        .as_ref()
+        .and_then(|value| value.get("defectStartedAtUnixMs"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            reported_algorithm_duration.and_then(|duration| {
+                algorithm_finished_at.map(|finished| finished.saturating_sub(duration as u64))
+            })
+        })
+        .or(image_finished_at);
+    let algorithm_duration = reported_algorithm_duration.or_else(|| {
+        processing_log_duration(
+            algorithm_started_at,
+            algorithm_finished_at.or_else(|| (algorithm_status == "processing").then_some(now)),
+        )
+        .map(|value| value as f64)
+    });
+
+    let data_status = if algorithm_status == "failed" {
+        "failed"
+    } else if algorithm_status == "degraded" {
+        "degraded"
+    } else if capture_status == "completed"
+        && image_status == "completed"
+        && algorithm_status == "completed"
+    {
+        "completed"
+    } else if [capture_status, image_status, algorithm_status].contains(&"processing") {
+        "processing"
+    } else {
+        "waiting"
+    };
+    let camera_details = processing_log_camera_details(acquisition.as_ref());
+    let image_artifacts = processing_log_artifact_details(image_result.as_ref(), material_root);
+    let updated_at = [
+        processing_log_file_time(&flow_path),
+        processing_log_file_time(&acquisition_path),
+        processing_log_file_time(&image_path),
+        processing_log_file_time(&algorithm_path),
+        processing_log_file_time(&defect_path),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .or(capture_started_at)
+    .unwrap_or(0);
+    let risk_tags = defect
+        .as_ref()
+        .and_then(|value| value.get("riskTags"))
+        .and_then(Value::as_array)
+        .map(|values| values.iter().take(32).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    Some(json!({
+        "materialId": material_id,
+        "flowNo": flow.get("flowNo").and_then(Value::as_u64),
+        "sessionId": session_id,
+        "dataStatus": data_status,
+        "dataStatusLabel": processing_log_status_label(data_status),
+        "updatedAt": updated_at,
+        "capture": {
+            "status": capture_status,
+            "statusLabel": processing_log_status_label(capture_status),
+            "state": flow_state,
+            "startedAt": capture_started_at,
+            "finishedAt": capture_finished_at,
+            "durationMs": processing_log_duration(capture_started_at, capture_finished_at.or_else(|| (capture_status == "processing").then_some(now))),
+            "durationSource": "artifact-timestamps",
+            "latestCommittedRound": flow.get("latestCommittedRound").and_then(Value::as_u64),
+            "expectedCameraCount": acquisition.as_ref().and_then(|value| value.get("expectedCameraCount")).and_then(Value::as_u64),
+            "actualCameraCount": acquisition.as_ref().and_then(|value| value.get("actualCameraCount")).and_then(Value::as_u64).unwrap_or(camera_details.len() as u64),
+            "complete": acquisition.as_ref().and_then(|value| value.get("complete")).and_then(Value::as_bool).unwrap_or(flow_state == "closed"),
+            "cameras": camera_details
+        },
+        "image": {
+            "status": image_status,
+            "statusLabel": processing_log_status_label(image_status),
+            "startedAt": image_started_at,
+            "finishedAt": image_finished_at,
+            "durationMs": processing_log_duration(image_started_at, image_finished_at.or_else(|| (image_status == "processing").then_some(now))),
+            "durationSource": "artifact-timestamps",
+            "complete": image_result.as_ref().and_then(|value| value.get("complete")).and_then(Value::as_bool).unwrap_or(false),
+            "productionCameraPipeline": image_result.as_ref().and_then(|value| value.get("productionCameraPipeline")).and_then(Value::as_bool).unwrap_or(false),
+            "artifactCount": image_artifacts.len(),
+            "artifacts": image_artifacts
+        },
+        "algorithm": {
+            "status": algorithm_status,
+            "statusLabel": processing_log_status_label(algorithm_status),
+            "state": algorithm_state,
+            "defectState": defect_state,
+            "mode": algorithm.as_ref().and_then(|value| value.get("mode")).and_then(Value::as_str),
+            "startedAt": algorithm_started_at,
+            "finishedAt": algorithm_finished_at,
+            "durationMs": algorithm_duration,
+            "durationSource": if reported_algorithm_duration.is_some() { "reported-timing" } else { "artifact-timestamps" },
+            "frameCount": algorithm.as_ref().and_then(|value| value.get("frameCount")).and_then(Value::as_u64).unwrap_or(0),
+            "defectCount": defect.as_ref().and_then(|value| value.pointer("/statistics/defectCount")).and_then(Value::as_u64)
+                .or_else(|| algorithm.as_ref().and_then(|value| value.get("defectCount")).and_then(Value::as_u64)).unwrap_or(0),
+            "processedFrames": defect.as_ref().and_then(|value| value.pointer("/statistics/processedFrames")).and_then(Value::as_u64).unwrap_or(0),
+            "skippedFrames": defect.as_ref().and_then(|value| value.pointer("/statistics/skippedFrames")).and_then(Value::as_u64).unwrap_or(0),
+            "throughputFramesPerSecond": defect.as_ref().and_then(|value| value.pointer("/statistics/throughputFramesPerSecond")).and_then(Value::as_f64),
+            "timingsMs": defect.as_ref().and_then(|value| value.pointer("/statistics/timingsMs")).cloned().unwrap_or_else(|| json!({})),
+            "metricValid": algorithm.as_ref().and_then(|value| value.get("metricValid")).and_then(Value::as_bool).unwrap_or(false),
+            "synchronized": algorithm.as_ref().and_then(|value| value.get("synchronized")).and_then(Value::as_bool).unwrap_or(false),
+            "riskTags": risk_tags,
+            "qualityReason": defect.as_ref().and_then(|value| value.pointer("/quality/reason")).and_then(Value::as_str),
+            "modelSetId": defect.as_ref().and_then(|value| value.pointer("/modelSet/id")).and_then(Value::as_str),
+            "algorithmRevision": defect.as_ref().and_then(|value| value.get("algorithmRevision")).cloned(),
+            "configHash": defect.as_ref().and_then(|value| value.get("configHash")).and_then(Value::as_str)
+        }
+    }))
+}
+
+fn processing_log_records(root: &Path, limit: usize) -> Vec<Value> {
+    let mut material_roots = fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            let material_id = entry.file_name().to_string_lossy().to_string();
+            let flow_no = material_id.parse::<u64>().ok()?;
+            file_type
+                .is_dir()
+                .then_some((flow_no, material_id, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    material_roots.sort_by(|left, right| right.0.cmp(&left.0));
+    let now = current_time_millis().min(u128::from(u64::MAX)) as u64;
+    material_roots
+        .into_iter()
+        .take(limit)
+        .filter_map(|(_, material_id, path)| processing_log_record(&path, &material_id, now))
+        .collect()
+}
+
+fn processing_log_response(state: &ServiceState, query: &str) -> Vec<u8> {
+    let Some(root) = processing_log_storage_root(state) else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 503,
+                "error": "processing_log_storage_unavailable",
+                "detail": "capture storage root is not configured"
+            })
+            .to_string(),
+        );
+    };
+    let limit = query_value(query, "limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let records = processing_log_records(&root, limit);
+    http_response(
+        "200 OK",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 0,
+            "schema": "steel.capture-processing-log.v1",
+            "updatedAt": current_time_string(),
+            "total": records.len(),
+            "records": records
+        })
+        .to_string(),
+    )
 }
 
 fn depth_geometry_backfill_status_response(state: &ServiceState) -> Vec<u8> {
@@ -17897,6 +18346,8 @@ fn site_config_summary(
     json!({
         "id": package.document.id,
         "displayName": package.document.display_name,
+        "deprecated": package.document.deprecated,
+        "deprecationNotice": package.document.deprecation_notice,
         "mode": package.document.mode,
         "cameraCount": package.camera_count(),
         "active": package.document.id == state.runtime_config.site_id,
@@ -25687,6 +26138,8 @@ fn admin_site_configuration_overview_value(state: &ServiceState) -> Value {
         "active": {
             "id": state.runtime_config.site_id,
             "displayName": state.runtime_config.site_display_name,
+            "deprecated": state.runtime_config.site_deprecated,
+            "deprecationNotice": state.runtime_config.site_deprecation_notice,
             "mode": state.runtime_config.site_mode,
             "provider": state.runtime_config.provider,
             "dataSource": state.runtime_config.data_source,
@@ -25945,6 +26398,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/alarms/acknowledge", "scope": "admin.records" },
             { "method": "POST", "path": "/api/alarms/resolve", "scope": "admin.records" },
             { "method": "GET", "path": "/api/production/status", "scope": "production" },
+            { "method": "GET", "path": "/api/production/processing-log", "scope": "production" },
             { "method": "POST", "path": "/api/production/tasks", "scope": "production" },
             { "method": "GET", "path": "/api/production/tasks", "scope": "production" },
             { "method": "GET", "path": "/api/production/tasks/detail", "scope": "production" },
@@ -26494,6 +26948,7 @@ fn handle_client<S: Read + Write>(
             ProductionAlarmAction::Resolve,
         ),
         ("GET", "/api/production/status") => production_status_response(&state),
+        ("GET", "/api/production/processing-log") => processing_log_response(&state, query),
         ("GET", "/api/production/flows/latest") => latest_steel_flow_response(&state),
         ("POST", "/api/production/tasks") => {
             production_tasks::enqueue_response(&state, body, actor)
@@ -26586,12 +27041,13 @@ fn handle_client<S: Read + Write>(
         ("GET", "/api/inspection/snapshot") => {
             if let Some(source) = state.bkv_online.as_ref() {
                 match state.runtime.block_on(source.snapshot_json()) {
-                    Ok(payload) => http_response(
+                    Ok(payload) => http_response_with_headers(
                         "200 OK",
                         "application/json; charset=utf-8",
                         &payload,
+                        &[("Cache-Control", "no-store")],
                     ),
-                    Err(error) => http_response(
+                    Err(error) => http_response_with_headers(
                         "503 Service Unavailable",
                         "application/json; charset=utf-8",
                         &json!({
@@ -26599,25 +27055,28 @@ fn handle_client<S: Read + Write>(
                             "detail": error.to_string()
                         })
                         .to_string(),
+                        &[("Cache-Control", "no-store")],
                     ),
                 }
             } else {
             match build_production_snapshot_json(&state) {
-                Ok(Some(payload)) => http_response(
+                Ok(Some(payload)) => http_response_with_headers(
                     "200 OK",
                     "application/json; charset=utf-8",
                     &payload,
+                    &[("Cache-Control", "no-store")],
                 ),
                 Ok(None) => match state
                     .runtime
                     .block_on(db::load_snapshot(&state.database.connection))
                 {
-                    Ok(snapshot) => http_response(
+                    Ok(snapshot) => http_response_with_headers(
                         "200 OK",
                         "application/json; charset=utf-8",
                         &build_database_snapshot_json(snapshot),
+                        &[("Cache-Control", "no-store")],
                     ),
-                    Err(error) => http_response(
+                    Err(error) => http_response_with_headers(
                         "200 OK",
                         "application/json; charset=utf-8",
                         &format!(
@@ -26625,9 +27084,10 @@ fn handle_client<S: Read + Write>(
                             json_escape(&error.to_string()),
                             build_snapshot_json()
                         ),
+                        &[("Cache-Control", "no-store")],
                     ),
                 },
-                Err(error) => http_response(
+                Err(error) => http_response_with_headers(
                     "200 OK",
                     "application/json; charset=utf-8",
                     &format!(
@@ -26638,6 +27098,7 @@ fn handle_client<S: Read + Write>(
                             (*state.fallback_snapshot_json).clone()
                         }
                     ),
+                    &[("Cache-Control", "no-store")],
                 ),
             }
             }
@@ -27038,38 +27499,40 @@ fn main() -> std::io::Result<()> {
         effective_site_selection,
     )
     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let capture_provider = CaptureProvider::from_runtime_profile(&runtime_config)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let capture_provider = startup_capture_provider(
+        &runtime_config,
+        env::var("STEEL_RUNTIME_PROFILE").ok().as_deref(),
+        env::var("STEEL_CAPTURE_PROVIDER").ok().as_deref(),
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let capture_port = capture_port();
     let capture_manager = Arc::new(CaptureServiceManager::new(
         capture_port,
         capture_provider,
         &runtime_config.capture,
     ));
-    let result_proxy_only = env::var("STEEL_RESULT_PROXY_ONLY").as_deref() == Ok("1");
-    let mut bkv_online = match runtime.block_on(bkv_online::BkvSource::from_env(&runtime_config)) {
-        Ok(source) => source,
-        Err(error) if result_proxy_only => {
-            eprintln!("BKV D3IMG fallback disabled: {error}");
-            None
-        }
-        Err(error) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                error.to_string(),
-            ))
-        }
+    let result_proxy_only = result_proxy_only_policy(
+        &runtime_config,
+        env::var("STEEL_RESULT_PROXY_ONLY").ok().as_deref(),
+    );
+    if runtime_config.site_deprecated && runtime_config.data_source == "bkv-online-mysql" {
+        eprintln!(
+            "BKV online is deprecated and isolated; the inspection service will use the unified result store only"
+        );
+    }
+    let bkv_online = if result_proxy_only {
+        // Proxy mode is a credential and source boundary. The business service
+        // must not construct a BKV source, even when inherited STEEL_BKV_*
+        // values happen to be present in its process environment.
+        None
+    } else {
+        runtime
+            .block_on(bkv_online::BkvSource::from_env(&runtime_config))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?
     };
     if let Some(source) = bkv_online.as_ref() {
         match runtime.block_on(source.initialize()) {
             Ok(()) => source.start_refresh_loop(runtime.handle()),
-            Err(error) if result_proxy_only => {
-                // The unified catalog remains usable while MySQL/SMB is
-                // temporarily offline.  Only the lazy D3IMG repair path is
-                // unavailable until the next service restart.
-                eprintln!("BKV D3IMG fallback initialization failed: {error}");
-                bkv_online = None;
-            }
             Err(error) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -27230,6 +27693,91 @@ mod tests {
 
     static CONVERTED_WORLD_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static SITE_CONFIG_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn processing_log_groups_real_artifacts_by_newest_flow() {
+        let sequence = SITE_CONFIG_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = env::temp_dir().join(format!(
+            "steel-processing-log-{}-{sequence}",
+            std::process::id()
+        ));
+        let completed = root.join("4040");
+        let processing = root.join("4039");
+        fs::create_dir_all(completed.join("derived/image")).expect("completed image directory");
+        fs::create_dir_all(completed.join("derived/defects")).expect("completed defect directory");
+        fs::create_dir_all(&processing).expect("processing flow directory");
+        fs::write(
+            completed.join("flow.json"),
+            json!({
+                "flowNo": 4040,
+                "sessionId": "capture-1787922600000",
+                "state": "closed",
+                "latestCommittedRound": 12
+            })
+            .to_string(),
+        )
+        .expect("completed flow");
+        fs::write(
+            completed.join("derived/image/result.json"),
+            json!({
+                "complete": true,
+                "productionCameraPipeline": true,
+                "artifacts": [{ "kind": "surface", "size": 2048, "sha256": "abc" }]
+            })
+            .to_string(),
+        )
+        .expect("image result");
+        fs::write(
+            completed.join("derived/algorithm-state.json"),
+            json!({
+                "state": "ready",
+                "defectState": "complete",
+                "frameCount": 24,
+                "metricValid": true,
+                "synchronized": true
+            })
+            .to_string(),
+        )
+        .expect("algorithm state");
+        fs::write(
+            completed.join("derived/defects/manifest.json"),
+            json!({
+                "state": "complete",
+                "statistics": {
+                    "elapsedMs": 1250.5,
+                    "processedFrames": 24,
+                    "defectCount": 3,
+                    "timingsMs": { "detectorInferenceMs": 900.25 }
+                }
+            })
+            .to_string(),
+        )
+        .expect("defect manifest");
+        fs::write(
+            processing.join("flow.json"),
+            json!({
+                "flowNo": 4039,
+                "sessionId": "capture-1787922500000",
+                "state": "capturing"
+            })
+            .to_string(),
+        )
+        .expect("processing flow");
+
+        let records = processing_log_records(&root, 10);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["materialId"], "4040");
+        assert_eq!(records[0]["dataStatus"], "completed");
+        assert_eq!(records[0]["algorithm"]["durationMs"], 1250.5);
+        assert_eq!(records[0]["algorithm"]["processedFrames"], 24);
+        assert_eq!(records[0]["algorithm"]["defectCount"], 3);
+        assert_eq!(records[0]["image"]["artifactCount"], 1);
+        assert_eq!(records[1]["materialId"], "4039");
+        assert_eq!(records[1]["capture"]["status"], "processing");
+        assert_eq!(records[1]["dataStatus"], "processing");
+        fs::remove_dir_all(root).expect("remove processing log fixture");
+    }
 
     #[test]
     fn defect_manifest_only_completes_online_record_after_database_import() {
@@ -27916,6 +28464,37 @@ mod tests {
     }
 
     #[test]
+    fn development_simulation_override_is_limited_to_direct_camera_sites() {
+        let direct = runtime_profile::RuntimeProfile::test_profile("external-api", 6);
+        assert_eq!(
+            startup_capture_provider(&direct, Some("development"), Some("simulated")).unwrap(),
+            CaptureProvider::Simulated
+        );
+        assert_eq!(
+            startup_capture_provider(&direct, Some("production"), Some("simulated")).unwrap(),
+            CaptureProvider::ExternalApi
+        );
+
+        let bkv = runtime_profile::RuntimeProfile::test_profile("bkv", 6);
+        assert_eq!(
+            startup_capture_provider(&bkv, Some("development"), Some("simulated")).unwrap(),
+            CaptureProvider::Bkv
+        );
+    }
+
+    #[test]
+    fn deprecated_bkv_online_forces_result_proxy_isolation() {
+        let mut profile = runtime_profile::RuntimeProfile::test_profile("bkv", 6);
+        profile.site_deprecated = true;
+        profile.data_source = "bkv-online-mysql".to_string();
+        assert!(result_proxy_only_policy(&profile, None));
+
+        profile.site_deprecated = false;
+        assert!(!result_proxy_only_policy(&profile, None));
+        assert!(result_proxy_only_policy(&profile, Some("1")));
+    }
+
+    #[test]
     fn inhibited_capture_lifecycle_stays_stopped_until_an_explicit_action() {
         let lifecycle = CaptureLifecycleState::with_policy(
             CaptureProvider::HeadlessCpp,
@@ -28303,6 +28882,58 @@ mod tests {
             real_snapshot["captureImages"][0]["metadataPath"],
             real_metadata_path
         );
+    }
+
+    #[test]
+    fn production_snapshot_prefers_the_newest_started_live_inspection() {
+        let state = production_test_state();
+        for (id, material_id, status, started_at, finished_at) in [
+            (
+                "INSP-COMPLETED",
+                "FLOW-COMPLETED",
+                "finished",
+                "1787921000000",
+                "1787922000000",
+            ),
+            ("INSP-LIVE", "FLOW-LIVE", "running", "1787923000000", ""),
+        ] {
+            state
+                .runtime
+                .block_on(db::upsert_production_inspection(
+                    &state.database.connection,
+                    db::ProductionInspectionInput {
+                        id: id.to_string(),
+                        material_id: material_id.to_string(),
+                        session_id: format!("SESSION-{id}"),
+                        status: status.to_string(),
+                        storage_root: String::new(),
+                        summary_path: String::new(),
+                        started_at: started_at.to_string(),
+                        finished_at: finished_at.to_string(),
+                        capture_count: 0,
+                        defect_count: 0,
+                        raw_payload: "{}".to_string(),
+                    },
+                ))
+                .expect("insert production inspection");
+        }
+
+        let latest = state
+            .runtime
+            .block_on(db::latest_production_inspection(&state.database.connection))
+            .expect("query latest inspection")
+            .expect("latest inspection");
+        assert_eq!(latest.id, "INSP-LIVE");
+
+        let snapshot: Value = serde_json::from_str(
+            &build_production_snapshot_json(&state)
+                .expect("build production snapshot")
+                .expect("production snapshot"),
+        )
+        .expect("parse production snapshot");
+        assert_eq!(snapshot["currentPlate"]["plateNo"], "FLOW-LIVE");
+        assert_eq!(snapshot["records"][0]["id"], "SESSION-INSP-LIVE");
+        assert_eq!(snapshot["records"][0]["status"], "detecting");
     }
 
     #[test]
@@ -34184,6 +34815,9 @@ mod tests {
             },
             "merge": { "maximumFrameGap": 1, "minimumIoU": 0.2 },
             "longitudinalScale": null,
+            "longitudinalEdgeGuardFrames": 12,
+            "cameraWorkers": 4,
+            "maximumCandidatesPerFlow": 100,
             "historyBackfill": {
                 "automatic": true,
                 "livePriority": true,
@@ -34193,12 +34827,33 @@ mod tests {
         });
         let normalized = normalize_depth_geometry_config(&config, 2).expect("valid config");
         assert_eq!(normalized["revision"], 2);
+        assert_eq!(normalized["longitudinalEdgeGuardFrames"], 12);
+        assert_eq!(normalized["cameraWorkers"], 4);
+        assert_eq!(normalized["maximumCandidatesPerFlow"], 100);
         for key in [
             "automatic",
             "livePriority",
             "pauseHistoricalIoWhileCaptureActive",
         ] {
             assert_eq!(normalized["historyBackfill"][key], true);
+        }
+
+        for (key, value) in [
+            ("longitudinalEdgeGuardFrames", json!(-1)),
+            ("longitudinalEdgeGuardFrames", json!(65)),
+            ("longitudinalEdgeGuardFrames", json!(1.5)),
+            ("cameraWorkers", json!(0)),
+            ("cameraWorkers", json!(7)),
+            ("cameraWorkers", json!(2.5)),
+            ("maximumCandidatesPerFlow", json!(0)),
+            ("maximumCandidatesPerFlow", json!(101)),
+            ("maximumCandidatesPerFlow", json!(1.5)),
+        ] {
+            let mut invalid_config = config.clone();
+            invalid_config[key] = value;
+            let error = normalize_depth_geometry_config(&invalid_config, 2)
+                .expect_err("out-of-range or non-integer worker guard must be rejected");
+            assert!(error.contains(key), "{key}: {error}");
         }
 
         let mut unsafe_config = config;

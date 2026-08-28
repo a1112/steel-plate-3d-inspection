@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 import weakref
 from pathlib import Path
@@ -101,6 +103,130 @@ class SickDepthGeometryTests(unittest.TestCase):
         self.assertEqual(config.minimum_merge_iou, 0.35)
         self.assertEqual(config.review_crop_minimum_size, 96)
 
+    def test_edge_guard_workers_and_candidate_cap_parse_and_bound(self) -> None:
+        config = DepthGeometryConfig.from_mapping(
+            {
+                "longitudinalEdgeGuardFrames": 12,
+                "cameraWorkers": 5,
+                "maximumCandidatesPerFlow": 12,
+            }
+        )
+        self.assertEqual(config.longitudinal_edge_guard_frames, 12)
+        self.assertEqual(config.camera_workers, 5)
+        self.assertEqual(config.maximum_candidates_per_flow, 12)
+        self.assertEqual(
+            DepthGeometryConfig(
+                longitudinal_edge_guard_frames=-4,
+                camera_workers=0,
+            ).bounded().longitudinal_edge_guard_frames,
+            0,
+        )
+        self.assertEqual(
+            DepthGeometryConfig(
+                longitudinal_edge_guard_frames=999,
+                camera_workers=999,
+            ).bounded().longitudinal_edge_guard_frames,
+            64,
+        )
+        self.assertEqual(
+            DepthGeometryConfig(
+                longitudinal_edge_guard_frames=999,
+                camera_workers=999,
+            ).bounded().camera_workers,
+            6,
+        )
+        self.assertEqual(
+            DepthGeometryConfig(camera_workers=0).bounded().camera_workers,
+            1,
+        )
+        self.assertEqual(
+            DepthGeometryConfig(
+                maximum_candidates_per_flow=999
+            ).bounded().maximum_candidates_per_flow,
+            100,
+        )
+        self.assertEqual(
+            DepthGeometryConfig(
+                maximum_candidates_per_flow=0
+            ).bounded().maximum_candidates_per_flow,
+            1,
+        )
+        defaults = DepthGeometryConfig()
+        self.assertEqual(defaults.minimum_depth_mm, 1.2)
+        self.assertEqual(defaults.minimum_component_points, 16)
+        self.assertEqual(defaults.maximum_candidates_per_flow, 100)
+
+    def test_candidate_groups_are_capped_before_roi_generation(self) -> None:
+        settings = DepthGeometryConfig(maximum_candidates_per_flow=20)
+        groups = [
+            [
+                {
+                    "values": np.full(16, float(index + 1)),
+                    "frameNumber": index,
+                    "minRow": 0,
+                    "minColumn": 0,
+                    "polarity": "protrusion",
+                }
+            ]
+            for index in range(25)
+        ]
+        selected, overflow = depth_geometry_module._limit_candidate_groups(
+            groups, settings
+        )
+        self.assertEqual(len(selected), 20)
+        self.assertEqual(overflow, 5)
+        self.assertEqual(
+            {int(group[0]["frameNumber"]) for group in selected},
+            set(range(5, 25)),
+        )
+
+    def test_region_artifacts_are_filtered_before_candidate_cap(self) -> None:
+        settings = DepthGeometryConfig(maximum_candidates_per_flow=100)
+        groups = [
+            [
+                {
+                    # Make the artifacts the strongest rows so a cap-first
+                    # implementation would consume 70 review slots with them.
+                    "values": np.full(16, float(1000 - index)),
+                    "points": np.asarray([[0, index], [0, index + 1]]),
+                    "frameNumber": index,
+                    "polarity": "protrusion",
+                }
+            ]
+            for index in range(150)
+        ]
+
+        def disposition(_camera_id: str, bbox: list[int]) -> str:
+            if bbox[0] < 50:
+                return "boundary"
+            if bbox[0] < 70:
+                return "overlap-duplicate"
+            if bbox[0] < 80:
+                return "quality-gate"
+            return "owned"
+
+        eligible, overlap_filtered, boundary_filtered, quality_gate_filtered = (
+            depth_geometry_module._filter_candidate_groups_by_disposition(
+                groups,
+                camera_id="C1",
+                roi=(0, 0, 256, 32),
+                candidate_disposition=disposition,
+            )
+        )
+        selected, overflow = depth_geometry_module._limit_candidate_groups(
+            eligible, settings
+        )
+
+        self.assertEqual(boundary_filtered, 50)
+        self.assertEqual(overlap_filtered, 20)
+        self.assertEqual(quality_gate_filtered, 10)
+        self.assertEqual(len(selected), 70)
+        self.assertEqual(overflow, 0)
+        self.assertEqual(
+            {int(group[0]["frameNumber"]) for group in selected},
+            set(range(80, 150)),
+        )
+
     def test_raw_conversion_applies_scale_offset_and_invalid(self) -> None:
         raw = np.asarray([[0, 100, 200], [np.nan, 300, 400]], dtype=np.float32)
         values, valid = convert_raw_depth(raw, self.metadata())
@@ -171,6 +297,7 @@ class SickDepthGeometryTests(unittest.TestCase):
     def test_four_class_polarity_and_shape_with_stable_ids(self) -> None:
         frames = self._synthetic_frames()
         config = DepthGeometryConfig(
+            minimum_depth_mm=0.35,
             minimum_component_points=6,
             calibration_valid=True,
             horizontal_pixel_pitch_mm=0.2,
@@ -254,6 +381,7 @@ class SickDepthGeometryTests(unittest.TestCase):
             metadata=self.metadata(),
             frame_numbers=[0, 1],
             config=DepthGeometryConfig(
+                minimum_depth_mm=0.35,
                 minimum_component_points=6,
                 minimum_merge_iou=0.2,
                 cross_frame_merge_pixels=1,
@@ -266,6 +394,7 @@ class SickDepthGeometryTests(unittest.TestCase):
     def test_cross_frame_bottom_to_top_merges_in_both_entries(self) -> None:
         frames = self._boundary_frames()
         config = DepthGeometryConfig(
+            minimum_depth_mm=0.35,
             minimum_component_points=6,
             minimum_merge_iou=0.2,
             cross_frame_merge_pixels=1,
@@ -319,6 +448,7 @@ class SickDepthGeometryTests(unittest.TestCase):
             metadata=self.metadata(),
             frame_numbers=[0, 1],
             config=DepthGeometryConfig(
+                minimum_depth_mm=0.35,
                 minimum_component_points=6,
                 cross_frame_merge_pixels=1,
                 minimum_merge_iou=0.3,
@@ -352,7 +482,7 @@ class SickDepthGeometryTests(unittest.TestCase):
             metadata=metadata,
             material_id="42",
             camera_id="C1",
-            config=DepthGeometryConfig(),
+            config=DepthGeometryConfig(minimum_depth_mm=0.35),
         )
         self.assertTrue(artifact["metric"]["horizontalValid"])
         compact = next(
@@ -368,7 +498,7 @@ class SickDepthGeometryTests(unittest.TestCase):
             metadata=metadata,
             material_id="42",
             camera_id="C1",
-            config=DepthGeometryConfig(),
+            config=DepthGeometryConfig(minimum_depth_mm=0.35),
         )
         self.assertFalse(artifact["metric"]["horizontalValid"])
 
@@ -406,13 +536,202 @@ class SickDepthGeometryTests(unittest.TestCase):
                 Path(directory) / "derived",
                 "42",
                 {"cameras": {"C1": {}}},
-                DepthGeometryConfig(minimum_component_points=6),
+                DepthGeometryConfig(
+                    minimum_depth_mm=0.35,
+                    minimum_component_points=6,
+                ),
             )
         self.assertIn("C1", artifact["cameras"])
         self.assertEqual(artifact["statistics"]["frameCount"], 2)
         self.assertEqual(artifact["cameras"]["C1"]["cameraId"], "C1")
         for defect in artifact["defects"]:
             self.assertIsNotNone(defect["residualJetRoi"])
+
+    def test_reliable_alignment_adds_temporal_edge_guard_but_clipped_keeps_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            camera_root = Path(directory) / "camera"
+            flow = camera_root / "8"
+            (flow / "3d").mkdir(parents=True)
+            (flow / "json").mkdir(parents=True)
+            # Frames 4 and 19 are transition candidates; frame 12 is the same
+            # small defect in the stable interior.  The alignment boundaries
+            # leave frames 2..21 eligible before the default eight-frame guard.
+            for index in range(24):
+                frame = np.full((24, 32), 1000, dtype=np.uint16)
+                if index in (4, 12, 19):
+                    frame[8:12, 12:16] = 1050
+                np.savez_compressed(flow / "3d" / f"{index}.npz", frame)
+                (flow / "json" / f"{index}.json").write_text(
+                    json.dumps(self.metadata()), encoding="utf-8"
+                )
+            alignment = {
+                "cameras": {
+                    "C1": {
+                        "head": {"detected": True, "frameIndex": 2, "clipped": False},
+                        "tail": {"detected": True, "frameIndex": 21, "clipped": False},
+                    }
+                }
+            }
+            guarded = build_flow_depth_geometry(
+                {"C1": camera_root},
+                Path(directory) / "derived",
+                "8",
+                alignment,
+                DepthGeometryConfig(
+                    minimum_depth_mm=0.35,
+                    minimum_component_points=6,
+                ),
+            )
+            clipped_alignment = {
+                "cameras": {
+                    "C1": {
+                        "head": {"detected": True, "frameIndex": 2, "clipped": True},
+                        "tail": {"detected": True, "frameIndex": 21, "clipped": True},
+                    }
+                }
+            }
+            clipped = build_flow_depth_geometry(
+                {"C1": camera_root},
+                Path(directory) / "derived",
+                "8",
+                clipped_alignment,
+                DepthGeometryConfig(
+                    minimum_depth_mm=0.35,
+                    minimum_component_points=6,
+                ),
+            )
+        self.assertEqual(guarded["cameras"]["C1"]["statistics"]["frameCount"], 4)
+        self.assertEqual([item["peakFrame"] for item in guarded["defects"]], [12])
+        self.assertEqual(clipped["cameras"]["C1"]["statistics"]["frameCount"], 20)
+        self.assertEqual(
+            [item["peakFrame"] for item in clipped["defects"]],
+            [4, 12, 19],
+        )
+
+    def test_clipped_alignment_still_applies_original_boundary_filter(self) -> None:
+        indices = depth_geometry_module._aligned_frame_indices(
+            list(range(10)),
+            {
+                "head": {"detected": True, "frameIndex": 2, "clipped": True},
+                "tail": {"detected": True, "frameIndex": 7, "clipped": True},
+            },
+            8,
+        )
+        self.assertEqual(indices, [2, 3, 4, 5, 6, 7])
+
+    def test_camera_workers_run_in_parallel_and_insert_sorted_results(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            material = "10"
+            camera_roots: dict[str, Path] = {}
+            for camera in ("C3", "C1", "C2"):
+                flow = root / camera / material
+                (flow / "3d").mkdir(parents=True)
+                (flow / "json").mkdir(parents=True)
+                camera_roots[camera] = root / camera
+
+            lock = threading.Lock()
+            active = 0
+            peak_active = 0
+
+            def fake_stream(**kwargs: object) -> dict[str, object]:
+                nonlocal active, peak_active
+                with lock:
+                    active += 1
+                    peak_active = max(peak_active, active)
+                time.sleep(0.03)
+                with lock:
+                    active -= 1
+                camera = str(kwargs["camera_id"])
+                return {
+                    "cameraId": camera,
+                    "defects": [{"cameraId": camera}],
+                    "statistics": {
+                        "frameCount": 0,
+                        "processedFrames": 0,
+                        "candidateCount": 1,
+                        "defectCount": 1,
+                    },
+                }
+
+            with patch.object(
+                depth_geometry_module,
+                "_stream_camera_depth_geometry",
+                side_effect=fake_stream,
+            ):
+                artifact = build_flow_depth_geometry(
+                    camera_roots,
+                    root / "derived",
+                    material,
+                    {},
+                    DepthGeometryConfig(camera_workers=3),
+                )
+        self.assertGreaterEqual(peak_active, 2)
+        self.assertEqual(list(artifact["cameras"]), ["C1", "C2", "C3"])
+        self.assertEqual(
+            [item["cameraId"] for item in artifact["defects"]],
+            ["C1", "C2", "C3"],
+        )
+        self.assertEqual(artifact["statistics"]["candidateCount"], 3)
+
+    def test_candidate_cap_is_global_across_cameras(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            camera_roots: dict[str, Path] = {}
+            for camera in ("C1", "C2", "C3"):
+                flow = root / camera / "11"
+                (flow / "3d").mkdir(parents=True)
+                (flow / "json").mkdir(parents=True)
+                camera_roots[camera] = root / camera
+
+            def fake_stream(**kwargs: object) -> dict[str, object]:
+                camera = str(kwargs["camera_id"])
+                defects = [
+                    {
+                        "id": f"{camera}-{index}",
+                        "cameraId": camera,
+                        "peakFrame": index,
+                        "peakPixel": {"row": 0, "column": index},
+                        "ruleScore": index / 10.0,
+                        "p95AbsoluteDepthMm": float(index),
+                        "absoluteDepthMm": float(index),
+                        "pointCount": 16 + index,
+                    }
+                    for index in range(10)
+                ]
+                return {
+                    "cameraId": camera,
+                    "defects": defects,
+                    "statistics": {
+                        "frameCount": 0,
+                        "processedFrames": 0,
+                        "rawCandidateCount": 10,
+                        "candidateCount": 10,
+                        "candidateOverflowCount": 0,
+                        "defectCount": 10,
+                    },
+                }
+
+            with patch.object(
+                depth_geometry_module,
+                "_stream_camera_depth_geometry",
+                side_effect=fake_stream,
+            ):
+                artifact = build_flow_depth_geometry(
+                    camera_roots,
+                    root / "derived",
+                    "11",
+                    {},
+                    DepthGeometryConfig(maximum_candidates_per_flow=20),
+                )
+        self.assertEqual(artifact["statistics"]["rawCandidateCount"], 30)
+        self.assertEqual(artifact["statistics"]["candidateCount"], 20)
+        self.assertEqual(artifact["statistics"]["candidateOverflowCount"], 10)
+        self.assertEqual(len(artifact["defects"]), 20)
+        self.assertEqual(
+            sum(len(value["defects"]) for value in artifact["cameras"].values()),
+            20,
+        )
 
     def test_file_builder_keeps_only_baseline_sample_and_current_depth_plane(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -454,7 +773,10 @@ class SickDepthGeometryTests(unittest.TestCase):
                     Path(directory) / "derived",
                     "7",
                     {"cameras": {"C1": {}}},
-                    DepthGeometryConfig(minimum_component_points=6),
+                    DepthGeometryConfig(
+                        minimum_depth_mm=0.35,
+                        minimum_component_points=6,
+                    ),
                 )
             self.assertEqual(artifact["statistics"]["frameCount"], frame_count)
             self.assertEqual(len(artifact["cameras"]["C1"]["baseline"]["sampledFrameIndices"]), 32)
