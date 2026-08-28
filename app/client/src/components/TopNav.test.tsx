@@ -11,6 +11,7 @@ describe('TopNav', () => {
     const buttons = within(navigation).getAllByRole('button');
     expect(buttons.map((button) => button.textContent)).toEqual([
       '在线监测',
+      '缺陷分析',
       '测径分析',
       '缺陷报表',
       '报警中心',
@@ -21,6 +22,8 @@ describe('TopNav', () => {
 
     fireEvent.click(within(navigation).getByRole('button', { name: '缺陷报表' }));
     expect(onChange).toHaveBeenCalledWith('report');
+    fireEvent.click(within(navigation).getByRole('button', { name: '缺陷分析' }));
+    expect(onChange).toHaveBeenCalledWith('defects');
     fireEvent.click(within(navigation).getByRole('button', { name: '测径分析' }));
     expect(onChange).toHaveBeenCalledWith('diameter');
   });

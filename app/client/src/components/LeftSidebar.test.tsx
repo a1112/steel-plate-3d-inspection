@@ -56,10 +56,10 @@ function SidebarHarness({
   const [filters, setFilters] = useState<RecordSearchFilters>(emptyRecordSearchFilters);
   const sourceRecords = large ? manyRecords : records;
   const filteredRecords = sourceRecords.filter((record) => {
-    if (filters.serialNo && !record.id.includes(filters.serialNo)) {
+    if (filters.serialNo && !record.plateNo.includes(filters.serialNo)) {
       return false;
     }
-    if (filters.plateNo && !record.plateNo.includes(filters.plateNo)) {
+    if (filters.plateNo && !record.id.includes(filters.plateNo)) {
       return false;
     }
     if (filters.time && !record.time.includes(filters.time)) {
@@ -127,17 +127,17 @@ describe('LeftSidebar', () => {
     render(<SidebarHarness />);
 
     expect(screen.getByRole('columnheader', { name: '流水号' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: '板号' })).toBeInTheDocument();
     const row = screen.getByText('R-001').closest('tr');
-    expect(row).toHaveTextContent('19:00R-001202606131900检测中检测中');
+    expect(row).toHaveTextContent('202606131900R-00119:00检测中检测中');
   });
 
   it('places the current diameter summary above the record query title', () => {
     render(<SidebarHarness showDiameterSummary />);
 
     const diameterSummary = screen.getByRole('status', { name: '当前记录测径摘要' });
-    expect(diameterSummary.closest('.record-search-panel')).not.toBeNull();
-    const panelHeader = diameterSummary.closest('.record-search-panel')!.querySelector('.panel-header')!;
-    expect(diameterSummary.compareDocumentPosition(panelHeader) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(diameterSummary.closest('.record-tools-stack')).not.toBeNull();
+    expect(screen.queryByRole('heading', { name: '查询' })).not.toBeInTheDocument();
     expect(diameterSummary).toHaveTextContent('计量有效');
     expect(diameterSummary).toHaveTextContent('28/30');
     expect(diameterSummary).toHaveTextContent('76.669');
@@ -197,11 +197,12 @@ describe('LeftSidebar', () => {
   it('uses a right-side dropdown to switch record search condition', () => {
     render(<SidebarHarness />);
 
+    fireEvent.click(screen.getByRole('button', { name: '查询' }));
     fireEvent.change(screen.getByLabelText('查询条件'), { target: { value: 'plateNo' } });
-    const input = screen.getByLabelText('钢管号查询');
-    fireEvent.change(input, { target: { value: '1858' } });
+    const input = screen.getByLabelText('板号查询');
+    fireEvent.change(input, { target: { value: 'R-002' } });
 
-    expect(screen.getByDisplayValue('1858')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('R-002')).toBeInTheDocument();
     expect(screen.getByText('202606131858')).toBeInTheDocument();
     expect(screen.queryByText('检测中')).not.toBeInTheDocument();
     expect(screen.getByText('已完成')).toBeInTheDocument();
@@ -210,6 +211,23 @@ describe('LeftSidebar', () => {
     );
     expect(matchCount.closest('.records-panel .panel-header')).not.toBeNull();
     expect(matchCount.closest('.record-search-form')).toBeNull();
+  });
+
+  it('keeps query collapsed by default and exits it after selecting a result', () => {
+    const onRecordSelect = vi.fn();
+    render(<SidebarHarness onRecordSelect={onRecordSelect} />);
+
+    expect(screen.getByRole('heading', { name: '记录' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('查询条件')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '查询' }));
+    expect(screen.getByLabelText('查询条件')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('流水号查询'), { target: { value: '1858' } });
+    fireEvent.click(screen.getByText('R-002').closest('tr')!);
+
+    expect(onRecordSelect).toHaveBeenCalledWith('R-002');
+    expect(screen.queryByLabelText('查询条件')).not.toBeInTheDocument();
+    expect(screen.getByText('R-001')).toBeInTheDocument();
   });
 
   it('identifies BKV records as coming from the standard offline store', () => {

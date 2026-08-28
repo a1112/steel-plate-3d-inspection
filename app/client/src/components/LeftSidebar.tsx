@@ -34,8 +34,8 @@ function cacheStatusLabel(probe?: RecordCacheProbe) {
 }
 
 const recordSearchOptions: Array<{ field: RecordSearchField; label: string; placeholder: string; inputLabel: string }> = [
-  { field: 'serialNo', label: '流水号', placeholder: 'R-001', inputLabel: '流水号查询' },
-  { field: 'plateNo', label: '钢管号', placeholder: '输入钢管号', inputLabel: '钢管号查询' },
+  { field: 'serialNo', label: '流水号', placeholder: '输入流水号', inputLabel: '流水号查询' },
+  { field: 'plateNo', label: '板号', placeholder: '输入板号', inputLabel: '板号查询' },
   { field: 'time', label: '时间', placeholder: 'YYYY-MM-DD / HH:mm', inputLabel: '时间查询' },
 ];
 
@@ -131,6 +131,7 @@ export function LeftSidebar({
 }: LeftSidebarProps) {
   const cacheStatusEnabled = showCacheStatus ?? runtimeMode === 'bkv';
   const [activeSearchField, setActiveSearchField] = useState<RecordSearchField>('serialNo');
+  const [searchOpen, setSearchOpen] = useState(false);
   const [hoveredRecord, setHoveredRecord] = useState<{ record: InspectionRecord; left: number; top: number } | null>(null);
   const [recordCacheProbes, setRecordCacheProbes] = useState<Record<string, RecordCacheProbe>>({});
   const [visibleRecordLimit, setVisibleRecordLimit] = useState(RECORD_RENDER_BATCH);
@@ -195,6 +196,17 @@ export function LeftSidebar({
     onSearchReset();
   };
 
+  const handleSearchToggle = () => {
+    if (searchOpen) handleSearchReset();
+    setSearchOpen((current) => !current);
+  };
+
+  const handleRecordSelect = (recordId: string) => {
+    onRecordSelect(recordId);
+    setSearchOpen(false);
+    handleSearchReset();
+  };
+
   const handleRecordsScroll = (event: UIEvent<HTMLDivElement>) => {
     const element = event.currentTarget;
     if (element.scrollTop + element.clientHeight < element.scrollHeight - 160) return;
@@ -251,10 +263,8 @@ export function LeftSidebar({
         </dl>
       </Panel>
 
-      <Panel
-        title="记录查询"
-        className="record-search-panel"
-        beforeHeader={diameterSummary ? (
+      <div className="record-tools-stack">
+        {diameterSummary ? (
           <div
             className="record-diameter-summary"
             role="status"
@@ -273,51 +283,69 @@ export function LeftSidebar({
             <dl><dt>拟合 P95</dt><dd>{formatDiameterMetric(diameterSummary.fitResidualP95MaximumMm)}</dd></dl>
           </div>
         ) : null}
-        action={
-          <select
-            className="record-search-field-select"
-            value={activeSearchField}
-            aria-label="查询条件"
-            onChange={handleSearchFieldChange}
-          >
-            {recordSearchOptions.map((option) => (
-              <option key={option.field} value={option.field}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        }
-      >
-        <form className="record-search-form" onSubmit={handleSubmit}>
-          <div className="record-search-condition">
-            <label className="record-search-input-wrap">
-              <span>{activeSearchOption.label}</span>
-              <input
-                value={activeSearchValue}
-                aria-label={activeSearchOption.inputLabel}
-                placeholder={activeSearchOption.placeholder}
-                onChange={handleSearchValueChange}
-              />
-            </label>
+        {searchOpen ? (
+          <div id="record-search-region">
+            <Panel
+              title="查询"
+              className="record-search-panel"
+              action={
+                <select
+                  className="record-search-field-select"
+                  value={activeSearchField}
+                  aria-label="查询条件"
+                  onChange={handleSearchFieldChange}
+                >
+                  {recordSearchOptions.map((option) => (
+                    <option key={option.field} value={option.field}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              }
+            >
+              <form className="record-search-form" onSubmit={handleSubmit}>
+                <div className="record-search-condition">
+                  <label className="record-search-input-wrap">
+                    <span>{activeSearchOption.label}</span>
+                    <input
+                      value={activeSearchValue}
+                      aria-label={activeSearchOption.inputLabel}
+                      placeholder={activeSearchOption.placeholder}
+                      onChange={handleSearchValueChange}
+                    />
+                  </label>
+                </div>
+                <div className="record-search-actions">
+                  <button type="submit">
+                    <Search size={14} />
+                    查询
+                  </button>
+                  <button type="button" onClick={handleSearchReset}>
+                    <RotateCcw size={14} />
+                    重置
+                  </button>
+                </div>
+              </form>
+            </Panel>
           </div>
-          <div className="record-search-actions">
-            <button type="submit">
-              <Search size={14} />
-              查询
-            </button>
-            <button type="button" onClick={handleSearchReset}>
-              <RotateCcw size={14} />
-              重置
-            </button>
-          </div>
-        </form>
-      </Panel>
+        ) : null}
+      </div>
 
       <Panel
-        title="检测记录"
-        className="records-panel"
+        title="记录"
+        className={`records-panel ${searchOpen ? 'search-open' : ''}`}
         action={(
           <div className="record-list-sync">
+            <button
+              type="button"
+              className={searchOpen ? 'active' : ''}
+              aria-expanded={searchOpen}
+              aria-controls="record-search-region"
+              onClick={handleSearchToggle}
+            >
+              <Search size={13} />
+              {searchOpen ? '退出查询' : '查询'}
+            </button>
             <div className="record-search-count">
               匹配 <strong>{filteredCount}</strong> / {totalCount}
             </div>
@@ -348,11 +376,11 @@ export function LeftSidebar({
           <table className="records-table">
             <thead>
               <tr>
-                <th>时间</th>
                 <th>流水号</th>
-                <th>钢管号</th>
+                <th>板号</th>
+                <th>时间</th>
                 <th>状态</th>
-                <th>缺陷数</th>
+                <th>缺陷数量</th>
               </tr>
             </thead>
             <tbody>
@@ -362,7 +390,7 @@ export function LeftSidebar({
                     key={record.id}
                     tabIndex={0}
                     className={record.id === selectedRecordId || record.plateNo === selectedRecordId ? 'selected' : ''}
-                    onClick={() => onRecordSelect(record.id)}
+                    onClick={() => handleRecordSelect(record.id)}
                     onMouseEnter={(event) => showRecordDetail(record, event.currentTarget)}
                     onPointerEnter={(event) => showRecordDetail(record, event.currentTarget)}
                     onMouseLeave={() => setHoveredRecord(null)}
@@ -370,9 +398,9 @@ export function LeftSidebar({
                     onFocus={(event) => showRecordDetail(record, event.currentTarget)}
                     onBlur={() => setHoveredRecord(null)}
                   >
-                    <td>{record.time}</td>
-                    <td title={record.id}>{record.id}</td>
                     <td>{record.plateNo}</td>
+                    <td title={record.id}>{record.id}</td>
+                    <td>{record.time}</td>
                     <td className={record.status === 'detecting' ? 'detecting' : 'completed'}>
                       {record.status === 'detecting' ? '检测中' : runtimeMode === 'bkv' ? '旧记录' : '已完成'}
                     </td>

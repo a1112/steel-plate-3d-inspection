@@ -6,6 +6,7 @@ import { createSequentialCameraLanes } from '../lib/camera-display';
 import type { CaptureFlowSurface } from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { fetchCaptureStitchHistory, type CaptureStitchResult } from '../services/capture-roi-api';
+import { readCaptureRawDepthValue, sampleJetResidualMm } from '../services/capture-depth-probe';
 import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { cameraBandCropPadding, cameraBandRotationRadians, capturePrefetchFrameIndexes, captureStitchInitialFrameIndex, mergeCameraBandCropWindow, PlateMap as ProductionPlateMap } from './PlateMap';
 
@@ -24,6 +25,15 @@ vi.mock('../services/capture-roi-api', async () => {
   return {
     ...actual,
     fetchCaptureStitchHistory: vi.fn(),
+  };
+});
+
+vi.mock('../services/capture-depth-probe', async () => {
+  const actual = await vi.importActual<typeof import('../services/capture-depth-probe')>('../services/capture-depth-probe');
+  return {
+    ...actual,
+    sampleJetResidualMm: vi.fn(),
+    readCaptureRawDepthValue: vi.fn(),
   };
 });
 
@@ -122,6 +132,8 @@ beforeEach(() => {
   vi.mocked(fetchCaptureStitchHistory).mockImplementation(async (materialId) => (
     emptyCaptureStitchResult(materialId)
   ));
+  vi.mocked(sampleJetResidualMm).mockResolvedValue(0.25);
+  vi.mocked(readCaptureRawDepthValue).mockResolvedValue(1842);
 });
 
 // These legacy interaction cases intentionally exercise the bundled demo/test
@@ -377,6 +389,50 @@ describe('online inspection world compatibility', () => {
     expect(scrollbar).toHaveAttribute('aria-orientation', 'vertical');
     expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
+  });
+
+  it('shows fitted-cylinder depth on hover and raw camera depth while T is held', async () => {
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('2747', 1));
+    render(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        captureMaterialId="2747"
+        cameraLanes={createSequentialCameraLanes(6)}
+      />,
+    );
+
+    await screen.findByTestId('capture-roi-status');
+    const frame = document.querySelector('.bar-camera-frame[data-camera-id="C2"][data-frame-sequence="1"]') as HTMLElement;
+    expect(frame).toBeInTheDocument();
+    vi.spyOn(frame, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, left: 0, top: 0, right: 176, bottom: 100,
+      width: 176, height: 100, toJSON: () => ({}),
+    });
+    const move = new Event('pointermove', { bubbles: true });
+    Object.defineProperties(move, {
+      clientX: { value: 88 },
+      clientY: { value: 50 },
+      pointerId: { value: 9 },
+    });
+    fireEvent(frame, move);
+
+    const probe = await screen.findByRole('status', { name: '3D 深度探针' });
+    await waitFor(() => expect(probe).toHaveTextContent('+0.250 mm'));
+    expect(probe).toHaveTextContent('相对拟合圆柱');
+    expect(probe).toHaveTextContent('源像素 400, 512');
+
+    fireEvent.keyDown(window, { code: 'KeyT', key: 't' });
+    await waitFor(() => expect(probe).toHaveAttribute('data-probe-mode', 'raw'));
+    await waitFor(() => expect(probe).toHaveTextContent('1842'));
+    expect(readCaptureRawDepthValue).toHaveBeenCalledWith(
+      '2747/capture/C2/2d/1.png',
+      400,
+      512,
+    );
+
+    fireEvent.keyUp(window, { code: 'KeyT', key: 't' });
+    await waitFor(() => expect(probe).toHaveAttribute('data-probe-mode', 'relative'));
   });
 
   it('marks a frame ROI with a rectangle and repeats the defect on the distance ruler', async () => {

@@ -146,7 +146,7 @@ describe('App disconnected startup', () => {
 
     const dialog = await screen.findByRole('alertdialog', { name: '未连接到检测服务' });
     expect(screen.queryByRole('heading', { name: '运行配置不可用' })).not.toBeInTheDocument();
-    expect(await screen.findByRole('heading', { name: '检测记录' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '记录' })).toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole('button', { name: '直接进入' }));
     expect(screen.queryByRole('alertdialog', { name: '未连接到检测服务' })).not.toBeInTheDocument();
@@ -310,7 +310,7 @@ describe('App BKV provider selection', () => {
     expect(screen.getByText('BKV 模式')).toBeInTheDocument();
     expect(screen.getByText('离线数据')).toBeInTheDocument();
     expect(screen.getByText('6/6')).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: '检测记录' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '记录' })).toBeInTheDocument();
     expect(screen.getAllByText('253B09401250925A12004328').length).toBeGreaterThan(0);
     expect(screen.getByText('来源：BKV 标准离线仓库')).toBeInTheDocument();
     expect(screen.getByText(/转换后标准数据/)).toBeInTheDocument();

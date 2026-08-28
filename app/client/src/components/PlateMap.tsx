@@ -1,6 +1,7 @@
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Check, X } from 'lucide-react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type MutableRefObject, type PointerEvent, type ReactNode, type WheelEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { DoubleSide, type Mesh, type PerspectiveCamera } from 'three';
 import heightMapBottomImage from '../assets/plate-surfaces/height-map-bottom.png';
 import heightMapTopImage from '../assets/plate-surfaces/height-map-top.png';
@@ -14,6 +15,11 @@ import {
   type CaptureStitchFrame,
   type CaptureStitchResult,
 } from '../services/capture-roi-api';
+import {
+  mapFramePointerToCapturePixel,
+  readCaptureRawDepthValue,
+  sampleJetResidualMm,
+} from '../services/capture-depth-probe';
 import {
   getRememberedCaptureImage,
   hasRememberedCaptureImageUrl,
@@ -963,6 +969,26 @@ function BarUnfoldedMap({
   const HEAD_CONTEXT_FRAMES = 0.35;
   const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
   const [mapDragging, setMapDragging] = useState(false);
+  const [rawDepthHeld, setRawDepthHeld] = useState(false);
+  const [depthProbe, setDepthProbe] = useState<{
+    key: string;
+    cameraId: string;
+    sequence: number;
+    storageIndex: number;
+    artifactRef: string;
+    jetUrl: string;
+    clientX: number;
+    clientY: number;
+    localX: number;
+    localY: number;
+    sourceX: number;
+    sourceY: number;
+    cropXRatio: number;
+    rowRatio: number;
+    status: 'loading' | 'ready' | 'missing' | 'error';
+    relativeMm: number | null;
+    rawValue: number | null;
+  } | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const mapDragRef = useRef<{
     pointerId: number;
@@ -986,6 +1012,73 @@ function BarUnfoldedMap({
     alignmentKey: '',
   });
   const [scrollWindow, setScrollWindow] = useState({ offset: 0, extent: 1, total: 1 });
+
+  useEffect(() => {
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.code === 'KeyT') setRawDepthHeld(true);
+    };
+    const handleKeyUp = (event: globalThis.KeyboardEvent) => {
+      if (event.code === 'KeyT') setRawDepthHeld(false);
+    };
+    const handleBlur = () => setRawDepthHeld(false);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!depthProbe) return undefined;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setDepthProbe((current) => current?.key === depthProbe.key
+        && current.sourceX === depthProbe.sourceX
+        && current.sourceY === depthProbe.sourceY
+        ? { ...current, status: 'loading' }
+        : current);
+      try {
+        const value = rawDepthHeld
+          ? await readCaptureRawDepthValue(depthProbe.artifactRef, depthProbe.sourceX, depthProbe.sourceY)
+          : await sampleJetResidualMm(depthProbe.jetUrl, depthProbe.cropXRatio, depthProbe.rowRatio);
+        if (cancelled) return;
+        setDepthProbe((current) => current?.key === depthProbe.key
+          && current.sourceX === depthProbe.sourceX
+          && current.sourceY === depthProbe.sourceY
+          ? {
+              ...current,
+              status: value === null ? 'missing' : 'ready',
+              relativeMm: rawDepthHeld ? current.relativeMm : value,
+              rawValue: rawDepthHeld ? value : current.rawValue,
+            }
+          : current);
+      } catch {
+        if (!cancelled) {
+          setDepthProbe((current) => current?.key === depthProbe.key
+            && current.sourceX === depthProbe.sourceX
+            && current.sourceY === depthProbe.sourceY
+            ? { ...current, status: 'error' }
+            : current);
+        }
+      }
+    }, 55);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    depthProbe?.artifactRef,
+    depthProbe?.cropXRatio,
+    depthProbe?.jetUrl,
+    depthProbe?.key,
+    depthProbe?.rowRatio,
+    depthProbe?.sourceX,
+    depthProbe?.sourceY,
+    rawDepthHeld,
+  ]);
   const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
   const hoveredDefect = defects.find((defect) => defect.id === hoveredDefectId) ?? null;
   const hoveredType = hoveredDefect ? defectTypes.find((type) => type.id === hoveredDefect.typeId) : null;
@@ -1364,6 +1457,7 @@ function BarUnfoldedMap({
                       && (defect.artifacts?.sequenceNo === frame.sequence
                         || defect.artifacts?.sequenceNo === cameraFrame?.storageIndex)
                     ));
+                    const probeKey = `${frame.frameId}:${lane.cameraId}`;
                     return <div
                       key={`${frame.frameId}:${lane.cameraId}`}
                       className={`bar-camera-frame ${cameraFrame ? 'has-production-image' : 'is-missing'}`}
@@ -1373,6 +1467,45 @@ function BarUnfoldedMap({
                       style={orientation === 'horizontal'
                         ? { left: (frameIndex + displayPaddingFrames - timelineOriginFrames) * FRAME_SPAN_PX, width: FRAME_SPAN_PX }
                         : { top: (frameIndex + displayPaddingFrames - timelineOriginFrames) * FRAME_SPAN_PX, height: FRAME_SPAN_PX }}
+                      onPointerMove={cameraFrame ? (event) => {
+                        if (mapDragging) return;
+                        const rect = event.currentTarget.getBoundingClientRect();
+                        const localX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+                        const localY = Math.max(0, Math.min(rect.height, event.clientY - rect.top));
+                        const pixel = mapFramePointerToCapturePixel({
+                          localX,
+                          localY,
+                          displayWidth: rect.width,
+                          displayHeight: rect.height,
+                          sourceWidth: cameraFrame.sourceWidth,
+                          sourceHeight: cameraFrame.sourceHeight,
+                          validRoi: cameraFrame.validRoi,
+                          orientation,
+                        });
+                        setDepthProbe((current) => ({
+                          key: probeKey,
+                          cameraId: lane.shortLabel,
+                          sequence: frame.sequence,
+                          storageIndex: cameraFrame.storageIndex,
+                          artifactRef: cameraFrame.artifactRef,
+                          jetUrl: cameraFrame.jetThumbnailUrl,
+                          clientX: event.clientX,
+                          clientY: event.clientY,
+                          localX,
+                          localY,
+                          ...pixel,
+                          status: current?.key === probeKey
+                            && current.sourceX === pixel.sourceX
+                            && current.sourceY === pixel.sourceY
+                            ? current.status
+                            : 'loading',
+                          relativeMm: current?.key === probeKey ? current.relativeMm : null,
+                          rawValue: current?.key === probeKey ? current.rawValue : null,
+                        }));
+                      } : undefined}
+                      onPointerLeave={() => {
+                        setDepthProbe((current) => current?.key === probeKey ? null : current);
+                      }}
                     >
                       {cameraFrame ? <CameraBandImage
                         src={imageMode === 'jet'
@@ -1408,6 +1541,13 @@ function BarUnfoldedMap({
                           onBlur={() => onHoverDefect(null)}
                         />;
                       }) : null}
+                      {depthProbe?.key === probeKey ? (
+                        <i
+                          className="capture-depth-probe-crosshair"
+                          aria-hidden="true"
+                          style={{ left: depthProbe.localX, top: depthProbe.localY }}
+                        />
+                      ) : null}
                     </div>;
                   })}
                 </div>
@@ -1471,6 +1611,33 @@ function BarUnfoldedMap({
         onScrollProgressChange={scrollToProgress}
         onSelectDefect={onSelectDefect}
       />
+      {depthProbe ? createPortal(
+        <div
+          className={`capture-depth-probe-tooltip mode-${rawDepthHeld ? 'raw' : 'relative'}`}
+          role="status"
+          aria-label="3D 深度探针"
+          data-probe-mode={rawDepthHeld ? 'raw' : 'relative'}
+          style={{
+            left: Math.min(depthProbe.clientX + 14, Math.max(8, window.innerWidth - 226)),
+            top: Math.min(depthProbe.clientY + 14, Math.max(8, window.innerHeight - 102)),
+          }}
+        >
+          <strong>{rawDepthHeld ? 'T · 相机原始深度' : '相对拟合圆柱'}</strong>
+          <b>{depthProbe.status === 'loading'
+            ? '读取中…'
+            : depthProbe.status === 'error'
+              ? '深度数据不可用'
+              : depthProbe.status === 'missing'
+                ? '该点无有效 3D 值'
+                : rawDepthHeld
+                  ? `${Number.isInteger(depthProbe.rawValue) ? depthProbe.rawValue : depthProbe.rawValue?.toFixed(3)}`
+                  : `${depthProbe.relativeMm != null && depthProbe.relativeMm >= 0 ? '+' : ''}${depthProbe.relativeMm?.toFixed(3)} mm`}</b>
+          <span>{depthProbe.cameraId} · 帧 {depthProbe.sequence} / 文件 {depthProbe.storageIndex}</span>
+          <span>源像素 {depthProbe.sourceX}, {depthProbe.sourceY}</span>
+          <small>{rawDepthHeld ? '松开 T 返回圆柱偏差' : '按住 T 查看相机原始值'}</small>
+        </div>,
+        document.body,
+      ) : null}
     </div>
   );
 }

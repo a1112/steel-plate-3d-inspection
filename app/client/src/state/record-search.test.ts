@@ -7,7 +7,7 @@ describe('filterInspectionRecords', () => {
 
   it('filters records by serial number', () => {
     const records = filterInspectionRecords(snapshot.records, snapshot.inspections, {
-      serialNo: 'R-002',
+      serialNo: '202606131858',
       plateNo: '',
       time: '',
     });
@@ -15,10 +15,10 @@ describe('filterInspectionRecords', () => {
     expect(records.map((record) => record.id)).toEqual(['R-002']);
   });
 
-  it('filters records by plate number and full detected date', () => {
+  it('filters records by board id and full detected date', () => {
     const records = filterInspectionRecords(snapshot.records, snapshot.inspections, {
       serialNo: '',
-      plateNo: '202606131858',
+      plateNo: 'R-002',
       time: '2026-06-13',
     });
 

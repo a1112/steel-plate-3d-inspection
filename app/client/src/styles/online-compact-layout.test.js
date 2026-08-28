@@ -53,8 +53,12 @@ describe('compact online detection layout CSS contract', () => {
 
     expectDeclaration('.online-workspace', 'gap', '6px');
     expectDeclaration('.online-workspace', 'padding', '0 8px 8px');
+    expectDeclaration('.online-workspace', 'grid-template-columns', 'clamp(275px, 18.8vw, 300px) minmax(0, 1fr)');
     expectDeclaration('.dashboard-grid.online-dashboard-grid', 'gap', '6px');
     expectDeclaration('.dashboard-grid.online-dashboard-grid', 'padding', '6px 0 0');
+    expectDeclaration('.dashboard-grid.online-dashboard-grid', 'grid-template-columns', 'minmax(0, 1fr) clamp(285px, 19vw, 315px)');
+    expectDeclaration('.app-footer', 'height', '34px');
+    expectDeclaration('.app-footer', 'flex', '0 0 34px');
   });
 
   it('centers the title in the space remaining after the embedded navigation', () => {
@@ -124,6 +128,20 @@ describe('compact online detection layout CSS contract', () => {
     expectDeclaration('.bar-unfolded-map.orientation-vertical .bar-camera-frame', 'border-bottom', '0');
   });
 
+  it('renders production defect markers as one-pixel transparent rectangles', () => {
+    expectDeclaration('.defect-image-rect', 'border', '1px solid var(--defect-color, #ff3b30)');
+    expectDeclaration('.defect-image-rect', 'background', 'transparent');
+    expectDeclaration('.defect-image-rect', 'box-shadow', 'none');
+    const selectedMarker = firstRule('.defect-image-rect:hover,\n.defect-image-rect:focus-visible,\n.defect-image-rect.selected');
+    expect(declaration(selectedMarker, 'border-width')).toBe('1px');
+    expect(declaration(selectedMarker, 'outline')).toBe('none');
+    expect(declaration(selectedMarker, 'background')).toBe('transparent');
+    const lightMarker = firstRule('.theme-light button.defect-image-rect:not(.primary):not(.active):not(.severity-filter-inline),\n.theme-light button.defect-image-rect:not(.primary):not(.active):not(.severity-filter-inline):hover,\n.theme-light button.defect-image-rect:not(.primary):not(.active):not(.severity-filter-inline):focus-visible,\n.theme-light button.defect-image-rect.selected:not(.primary):not(.active):not(.severity-filter-inline)');
+    expect(declaration(lightMarker, 'border')).toBe('1px solid var(--defect-color, #ff3b30)');
+    expect(declaration(lightMarker, 'background')).toBe('transparent');
+    expect(declaration(lightMarker, 'box-shadow')).toBe('none');
+  });
+
   it('preserves compact defect filter sizing across every themed style cascade', () => {
     const selector = ".app-shell[class*='style-'] .defect-filter-panel .panel-body";
     expectDeclaration(selector, 'height', 'auto');
@@ -170,8 +188,10 @@ describe('compact online detection layout CSS contract', () => {
 
     expectDeclaration('.density-dense .online-workspace', 'gap', '6px');
     expectDeclaration('.density-dense .online-workspace', 'padding', '0 8px 8px');
+    expectDeclaration('.density-dense .online-workspace', 'grid-template-columns', 'clamp(270px, 20vw, 290px) minmax(0, 1fr)');
     expectDeclaration('.density-dense .dashboard-grid.online-dashboard-grid', 'gap', '6px');
     expectDeclaration('.density-dense .dashboard-grid.online-dashboard-grid', 'padding', '6px 0 0');
+    expectDeclaration('.density-dense .dashboard-grid.online-dashboard-grid', 'grid-template-columns', 'minmax(0, 1fr) clamp(270px, 20vw, 292px)');
     expectDeclaration('.theme-dark .online-workspace', 'gap', '6px');
     expectDeclaration('.theme-dark .online-workspace', 'padding', '0 8px 8px');
     expectDeclaration('.theme-dark .dashboard-grid.online-dashboard-grid', 'gap', '6px');

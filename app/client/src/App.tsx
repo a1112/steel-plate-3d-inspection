@@ -16,6 +16,7 @@ import {
   selectRecord,
   selectDefect,
   clampPreviewPositionM,
+  DEFAULT_PLATE_LENGTH_M,
   toggleDefectType,
 } from './state/inspection-ui';
 import {
@@ -86,6 +87,7 @@ import { AppFooter } from './components/AppFooter';
 import { AlarmAnalysis, type AnalysisViewMode } from './components/AlarmAnalysis';
 import { buildDiameterMetricSummary } from './components/DiameterTrendPanel';
 import { DiameterAnalysisPage } from './components/DiameterAnalysisPage';
+import { DefectAnalysisPage } from './components/DefectAnalysisPage';
 import { AlarmCenter } from './components/AlarmCenter';
 import { DefectDetectionList } from './components/DefectDetectionList';
 import { DefectImagePanel } from './components/DefectImagePanel';
@@ -1515,6 +1517,7 @@ function InspectionDashboard({
   }, [activeInspection?.inspectionId, activeInspection?.summaryPath, activeRecordStatus, activeSnapshot.currentPlate.plateNo, artifactMode, dashboardMode.kind, plateMapViewMode, snapshotTracking, terminalMode]);
 
   const activePlateLengthM = activeSnapshot.currentPlate.lengthMm / 1000;
+  const activeDisplayLengthM = activePlateLengthM > 0 ? activePlateLengthM : DEFAULT_PLATE_LENGTH_M;
   const activeDiameterSummary = useMemo(
     () => recordBoundSurface.inspectionId === activeInspection?.inspectionId
       ? buildDiameterMetricSummary(recordBoundSurface.measurement)
@@ -1937,7 +1940,7 @@ function InspectionDashboard({
           onClose={() => setBkvConversionStatusOpen(false)}
         />
       ) : null}
-      {uiState.activeNav === 'online' || uiState.activeNav === 'diameter' ? (
+      {uiState.activeNav === 'online' || uiState.activeNav === 'defects' || uiState.activeNav === 'diameter' ? (
         <div className="online-unified-page">
           {uiState.activeNav === 'diameter' || onlineWorkspaceMode === 'inspection' ? (
         <div className={`online-workspace ${terminalMode === 'bkv' ? 'runtime-bkv-workspace' : ''}`}>
@@ -1982,6 +1985,17 @@ function InspectionDashboard({
                   );
                   setToast('测径报告已导出');
                 }}
+              />
+            ) : uiState.activeNav === 'defects' ? (
+              <DefectAnalysisPage
+                plate={activeSnapshot.currentPlate}
+                defects={currentPlateDefects}
+                defectTypes={snapshot.defectTypes}
+                inspectionId={activeInspection?.inspectionId}
+                selectedDefectId={selectedOnlineDefectId}
+                expectedCameraCount={runtimeProfile.cameraCount}
+                onSelectDefect={selectDefectById}
+                onReviewDefect={reviewDefect}
               />
             ) : (
             <main className={`dashboard-grid online-dashboard-grid ${rightSidebarCollapsed || !hasCurrentDefects ? 'right-sidebar-collapsed' : ''}`}>
@@ -2062,7 +2076,9 @@ function InspectionDashboard({
                     }))
                   }
                   onSurfaceModeChange={(surfaceDisplayMode) => setState({ surfaceDisplayMode, defectPage: 1 })}
-                  onPreviewPositionChange={(previewPositionM) => setState({ previewPositionM: clampPreviewPositionM(previewPositionM, activePlateLengthM) })}
+                  onPreviewPositionChange={(previewPositionM) => setState({
+                    previewPositionM: clampPreviewPositionM(previewPositionM, activeDisplayLengthM),
+                  })}
                   onSelectDefect={selectDefectById}
                   onViewModeChange={(nextViewMode) => {
                     setLongitudinalVisibleRange(null);
@@ -2088,6 +2104,9 @@ function InspectionDashboard({
                       lengthMm: activeSnapshot.currentPlate.lengthMm,
                     }}
                     diameterVisibleRange={longitudinalVisibleRange}
+                    diameterSelectedPositionRatio={plateMapViewMode === 'section'
+                      ? uiState.previewPositionM / activeDisplayLengthM
+                      : null}
                 />
               </section>
               {rightSidebarCollapsed || !hasCurrentDefects ? null : <aside className="right-column">

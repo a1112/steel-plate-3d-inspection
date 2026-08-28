@@ -1,5 +1,5 @@
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { useMemo } from 'react';
+import { useMemo, useState, type PointerEvent } from 'react';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { fitSurfaceCircle } from './ProductionArtifactView';
 
@@ -8,6 +8,15 @@ type CaptureSectionPoint = {
   y: number;
   z: number;
   residualMm: number;
+};
+
+export type CaptureSectionDiameter = {
+  angleDeg: number;
+  diameterMm: number;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
 };
 
 export type CaptureSection = {
@@ -138,6 +147,70 @@ function jetColor(residual: number, limit: number) {
   return `rgb(${channel(3)}, ${channel(2)}, ${channel(1)})`;
 }
 
+function normalizeAngle(angle: number) {
+  const fullTurn = Math.PI * 2;
+  return ((angle % fullTurn) + fullTurn) % fullTurn;
+}
+
+function angularDistance(left: number, right: number) {
+  const difference = Math.abs(normalizeAngle(left) - normalizeAngle(right));
+  return Math.min(difference, Math.PI * 2 - difference);
+}
+
+function pointAngle(point: CaptureSectionPoint, section: CaptureSection) {
+  return normalizeAngle(Math.atan2(point.z - section.centerZ, point.y - section.centerY));
+}
+
+function radialDistance(point: CaptureSectionPoint, section: CaptureSection) {
+  return Math.hypot(point.y - section.centerY, point.z - section.centerZ);
+}
+
+/** Builds a diameter through the fitted centre using the nearest measured point on each side. */
+export function captureSectionDiameterAtAngle(
+  section: CaptureSection,
+  requestedAngle: number,
+): CaptureSectionDiameter | null {
+  if (section.points.length < 2) return null;
+  const angle = normalizeAngle(requestedAngle);
+  const oppositeAngle = normalizeAngle(angle + Math.PI);
+  const nearest = (target: number) => section.points.reduce((best, point) => (
+    angularDistance(pointAngle(point, section), target) < angularDistance(pointAngle(best, section), target)
+      ? point
+      : best
+  ));
+  const positivePoint = nearest(angle);
+  const negativePoint = nearest(oppositeAngle);
+  if (positivePoint === negativePoint) return null;
+  const positiveRadius = radialDistance(positivePoint, section);
+  const negativeRadius = radialDistance(negativePoint, section);
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  return {
+    angleDeg: normalizeAngle(angle) * 180 / Math.PI,
+    diameterMm: positiveRadius + negativeRadius,
+    x1: -cos * negativeRadius,
+    y1: sin * negativeRadius,
+    x2: cos * positiveRadius,
+    y2: -sin * positiveRadius,
+  };
+}
+
+export function buildCaptureSectionDiameterExtremes(section: CaptureSection) {
+  const candidates = section.points
+    .map((point) => captureSectionDiameterAtAngle(section, pointAngle(point, section)))
+    .filter((diameter): diameter is CaptureSectionDiameter => diameter !== null)
+    .filter((diameter) => diameter.angleDeg < 180);
+  if (!candidates.length) return { minimum: null, maximum: null };
+  return {
+    minimum: candidates.reduce((minimum, diameter) => (
+      diameter.diameterMm < minimum.diameterMm ? diameter : minimum
+    )),
+    maximum: candidates.reduce((maximum, diameter) => (
+      diameter.diameterMm > maximum.diameterMm ? diameter : maximum
+    )),
+  };
+}
+
 function longitudinalLabel(mesh: BarSurfaceMesh, section: CaptureSection) {
   const longitudinal = mesh.longitudinalAxis;
   const displayPosition = mesh.crossSections?.find(
@@ -166,6 +239,7 @@ export function CaptureSectionView({
   recordId: string;
 }) {
   const section = useMemo(() => buildCaptureSection(mesh, row), [mesh, row]);
+  const [hoverAngle, setHoverAngle] = useState<number | null>(null);
   const extent = Math.max(
     1,
     section.radiusMm + section.maximumResidualMm,
@@ -179,6 +253,34 @@ export function CaptureSectionView({
     section.points,
     mesh.colsPerCamera * mesh.cameraCount,
   );
+  const diameterExtremes = useMemo(
+    () => buildCaptureSectionDiameterExtremes(section),
+    [section],
+  );
+  const hoverDiameter = hoverAngle === null
+    ? null
+    : captureSectionDiameterAtAngle(section, hoverAngle);
+  const angleTicks = Array.from({ length: 12 }, (_, index) => index * 30);
+  const handleSectionPointerMove = (event: PointerEvent<SVGSVGElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const dx = (event.clientX - rect.left - rect.width / 2) / rect.width;
+    const dy = (event.clientY - rect.top - rect.height / 2) / rect.height;
+    setHoverAngle(normalizeAngle(Math.atan2(-dy, dx)));
+  };
+
+  const renderDiameter = (
+    diameter: CaptureSectionDiameter | null,
+    kind: 'minimum' | 'maximum',
+    label: string,
+  ) => diameter ? (
+    <g className={`section-diameter-annotation is-${kind}`} data-testid={`${kind}-diameter-annotation`}>
+      <line x1={diameter.x1} y1={diameter.y1} x2={diameter.x2} y2={diameter.y2} />
+      <text x={diameter.x2 * 0.72} y={diameter.y2 * 0.72 - extent * 0.025}>
+        {label} {diameter.diameterMm.toFixed(3)} mm · {diameter.angleDeg.toFixed(0)}°
+      </text>
+    </g>
+  ) : null;
 
   return (
     <div
@@ -192,10 +294,34 @@ export function CaptureSectionView({
           role="img"
           aria-label={`${recordId} 360 度融合横截面`}
           preserveAspectRatio="xMidYMid meet"
+          onPointerMove={handleSectionPointerMove}
+          onPointerLeave={() => setHoverAngle(null)}
         >
           <line x1={-extent} y1={0} x2={extent} y2={0} className="section-axis" />
           <line x1={0} y1={-extent} x2={0} y2={extent} className="section-axis" />
           <circle r={section.radiusMm} className="section-fit-circle" />
+          <g className="section-angle-scale" aria-label="截面角度刻度">
+            {angleTicks.map((degrees) => {
+              const angle = degrees * Math.PI / 180;
+              const innerRadius = section.radiusMm + extent * 0.025;
+              const outerRadius = section.radiusMm + extent * 0.055;
+              const labelRadius = section.radiusMm + extent * 0.095;
+              return <g key={degrees}>
+                <line
+                  x1={Math.cos(angle) * innerRadius}
+                  y1={-Math.sin(angle) * innerRadius}
+                  x2={Math.cos(angle) * outerRadius}
+                  y2={-Math.sin(angle) * outerRadius}
+                />
+                <text
+                  x={Math.cos(angle) * labelRadius}
+                  y={-Math.sin(angle) * labelRadius}
+                >{degrees}°</text>
+              </g>;
+            })}
+          </g>
+          {renderDiameter(diameterExtremes.maximum, 'maximum', '最宽')}
+          {renderDiameter(diameterExtremes.minimum, 'minimum', '最窄')}
           {contourSegments.map((segment, index) => (
             <polyline
               key={`${segment[0]?.column ?? 0}:${index}`}
@@ -214,6 +340,21 @@ export function CaptureSectionView({
               fill={jetColor(point.residualMm, residualLimit)}
             />
           ))}
+          {hoverDiameter ? (
+            <g className="section-hover-diameter" data-testid="hover-diameter-annotation">
+              <line
+                x1={hoverDiameter.x1}
+                y1={hoverDiameter.y1}
+                x2={hoverDiameter.x2}
+                y2={hoverDiameter.y2}
+              />
+              <circle cx={hoverDiameter.x1} cy={hoverDiameter.y1} r={extent * 0.018} />
+              <circle cx={hoverDiameter.x2} cy={hoverDiameter.y2} r={extent * 0.018} />
+              <text x={hoverDiameter.x2 * 0.62} y={hoverDiameter.y2 * 0.62 - extent * 0.035}>
+                当前 {hoverDiameter.diameterMm.toFixed(3)} mm · {hoverDiameter.angleDeg.toFixed(0)}°
+              </text>
+            </g>
+          ) : null}
           <circle r={extent * 0.012} className="section-center-point" />
         </svg>
         <div className="bkv-reconstruction-section-stats">
@@ -252,7 +393,8 @@ export function CaptureSectionView({
             max={Math.max(0, mesh.rows - 1)}
             step={1}
             value={section.row}
-            onChange={(event) => onRowChange(Number(event.target.value))}
+            onInput={(event) => onRowChange(Number(event.currentTarget.value))}
+            onChange={(event) => onRowChange(Number(event.currentTarget.value))}
             aria-label="切面位置"
           />
           <strong>{(section.positionRatio * 100).toFixed(1)}%</strong>

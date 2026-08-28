@@ -1,9 +1,11 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { createEvent, fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import {
+  buildCaptureSectionDiameterExtremes,
   buildCaptureContourSegments,
   buildCaptureSection,
+  captureSectionDiameterAtAngle,
   CaptureSectionView,
 } from './CaptureSectionView';
 
@@ -90,6 +92,18 @@ describe('CaptureSectionView', () => {
     expect(section.p95ResidualMm).toBe(1);
   });
 
+  it('measures opposite radii through the fitted centre and finds the widest and narrowest diameters', () => {
+    const section = buildCaptureSection(captureMesh(), 1);
+    const horizontal = captureSectionDiameterAtAngle(section, 0);
+    const extremes = buildCaptureSectionDiameterExtremes(section);
+
+    expect(horizontal?.diameterMm).toBe(101);
+    expect(horizontal?.y1).toBeCloseTo(0, 5);
+    expect(horizontal?.y2).toBeCloseTo(0, 5);
+    expect(extremes.maximum?.diameterMm).toBe(101);
+    expect(extremes.minimum?.diameterMm).toBeCloseTo(100, 5);
+  });
+
   it('shows head-relative progress for an unverified longitudinal scale and navigates rows', () => {
     const onRowChange = vi.fn();
     render(<CaptureSectionView mesh={captureMesh()} row={1} onRowChange={onRowChange} recordId="4034" />);
@@ -102,6 +116,41 @@ describe('CaptureSectionView', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '下一个切面' }));
     expect(onRowChange).toHaveBeenCalledWith(2);
+
+    fireEvent.change(screen.getByRole('slider', { name: '切面位置' }), { target: { value: '0' } });
+    expect(onRowChange).toHaveBeenCalledWith(0);
+    fireEvent.input(screen.getByRole('slider', { name: '切面位置' }), { target: { value: '2' } });
+    expect(onRowChange).toHaveBeenCalledWith(2);
+  });
+
+  it('renders angle and extreme-diameter annotations and previews the diameter under the pointer', () => {
+    render(<CaptureSectionView mesh={captureMesh()} row={1} onRowChange={vi.fn()} recordId="4034" />);
+
+    expect(screen.getByLabelText('截面角度刻度')).toHaveTextContent('0°');
+    expect(screen.getByTestId('maximum-diameter-annotation')).toHaveTextContent('最宽 101.000 mm');
+    expect(screen.getByTestId('minimum-diameter-annotation')).toHaveTextContent('最窄 100.000 mm');
+
+    const chart = screen.getByRole('img', { name: '4034 360 度融合横截面' });
+    vi.spyOn(chart, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 200,
+      bottom: 200,
+      width: 200,
+      height: 200,
+      toJSON: () => ({}),
+    });
+    const pointerMove = createEvent.pointerMove(chart);
+    Object.defineProperties(pointerMove, {
+      clientX: { value: 175 },
+      clientY: { value: 100 },
+    });
+    fireEvent(chart, pointerMove);
+    expect(screen.getByTestId('hover-diameter-annotation')).toHaveTextContent('当前 101.000 mm · 0°');
+    fireEvent.pointerLeave(chart);
+    expect(screen.queryByTestId('hover-diameter-annotation')).not.toBeInTheDocument();
   });
 
   it('fails closed when a row passes locally but the aggregate surface gate fails', () => {

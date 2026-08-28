@@ -3004,6 +3004,11 @@ export function captureArtifactImageUrl(artifactRef: string, maxWidth = 320) {
   return `${getCaptureServiceOrigin()}/api/capture/file?${query.toString()}`;
 }
 
+export function captureArtifactBinaryUrl(artifactRef: string) {
+  const query = new URLSearchParams({ path: artifactRef });
+  return `${getCaptureServiceOrigin()}/api/capture/file?${query.toString()}`;
+}
+
 export async function readActiveCaptureCalibration(
   profile?: string,
 ): Promise<ActiveCaptureCalibration> {

@@ -57,6 +57,7 @@ describe('buildDiameterMeasurements', () => {
       mesh: mesh(),
       nominalDiameterMm: 200,
       lengthMm: 12_000,
+      selectedPositionRatio: 0.25,
     }));
 
     expect(screen.getAllByRole('img')).toHaveLength(1);
@@ -65,6 +66,8 @@ describe('buildDiameterMeasurements', () => {
     expect(container.querySelector('.diameter-trend-header')).toBeNull();
     expect(container.querySelector('.diameter-curve-card > footer')).toBeNull();
     expect(container.querySelectorAll('canvas')).toHaveLength(2);
+    expect(screen.getByRole('img', { name: '测径（外径）曲线，按钢管长度位置变化' }))
+      .toHaveAttribute('data-selected-axis-value', '3000.000');
     expect(screen.getByRole('group', { name: '测径曲线图例' })).toBeInTheDocument();
     const fittedSeries = screen.getByRole('button', { name: '圆拟合外径' });
     expect(fittedSeries).toHaveAttribute('aria-pressed', 'true');

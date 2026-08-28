@@ -245,12 +245,13 @@ export function buildDiameterMetricSummary(artifact?: CaptureFlowMeasurement | n
   };
 }
 
-export function DiameterTrendPanel({ mesh, artifact, nominalDiameterMm, lengthMm, visibleRange = null }: {
+export function DiameterTrendPanel({ mesh, artifact, nominalDiameterMm, lengthMm, visibleRange = null, selectedPositionRatio = null }: {
   mesh?: BarSurfaceMesh | null;
   artifact?: CaptureFlowMeasurement | null;
   nominalDiameterMm: number;
   lengthMm: number;
   visibleRange?: [number, number] | null;
+  selectedPositionRatio?: number | null;
 }) {
   const artifactSamples = useMemo(() => artifact ? buildArtifactDiameterMeasurements(artifact, nominalDiameterMm, lengthMm) : [], [artifact, lengthMm, nominalDiameterMm]);
   const directionalLines = useMemo(() => artifact ? buildDirectionalDiameterLines(artifact, nominalDiameterMm, lengthMm) : [], [artifact, lengthMm, nominalDiameterMm]);
@@ -316,7 +317,18 @@ export function DiameterTrendPanel({ mesh, artifact, nominalDiameterMm, lengthMm
   const measurementQualified = buildDiameterMetricSummary(artifact)?.qualified ?? false;
   return (
     <div className="diameter-trend-grid" data-testid="diameter-trend-grid" data-measurement-unit="mm" data-measurement-source={artifact ? 'measurement-artifact' : 'surface-fallback'} data-measurement-valid={measurementQualified ? 'true' : 'false'} data-curve-model={directionalContract ? 'fixed-angle-reconstructed-surface' : 'circle-fit-legacy'} data-fixed-angle-series={directionalLines.filter((line) => line.kind === 'fixed-angle').length} data-section-count={allSamples.length} data-visible-section-count={samples.length} data-x-axis-scope={normalizedRange ? 'visible' : 'global'} data-x-axis-mode={axisMode} data-x-axis-start-ratio={rangeStartRatio.toFixed(4)} data-x-axis-end-ratio={rangeEndRatio.toFixed(4)} data-x-axis-start-mm={(rangeStartRatio * lengthMm).toFixed(0)} data-x-axis-end-mm={(rangeEndRatio * lengthMm).toFixed(0)}>
-      <DiameterCanvasChart lines={visibleLines} nominalDiameterMm={nominalDiameterMm} axisMode={axisMode} axisStart={axisStart} axisEnd={axisEnd} />
+      <DiameterCanvasChart
+        lines={visibleLines}
+        nominalDiameterMm={nominalDiameterMm}
+        axisMode={axisMode}
+        axisStart={axisStart}
+        axisEnd={axisEnd}
+        selectedAxisValue={selectedPositionRatio === null
+          ? null
+          : axisMode === 'length-mm'
+            ? Math.max(0, Math.min(1, selectedPositionRatio)) * lengthMm
+            : Math.max(0, Math.min(1, selectedPositionRatio)) * 100}
+      />
     </div>
   );
 }

@@ -143,6 +143,7 @@ export function AlarmAnalysis({
   diameterMeasurement,
   diameterArtifact,
   diameterVisibleRange,
+  diameterSelectedPositionRatio,
 }: {
   selectedDefect: DefectItem | null;
   heightProfile: ChartPoint[];
@@ -158,6 +159,7 @@ export function AlarmAnalysis({
   diameterMeasurement?: { nominalDiameterMm: number; lengthMm: number };
   diameterArtifact?: CaptureFlowMeasurement | null;
   diameterVisibleRange?: [number, number] | null;
+  diameterSelectedPositionRatio?: number | null;
 }) {
   const panelClassName = `alarm-analysis-panel analysis-view-${viewMode}`;
   const defectRoiImages: CaptureImageItem[] = (defects.length ? defects : selectedDefect ? [selectedDefect] : [])
@@ -217,6 +219,7 @@ export function AlarmAnalysis({
             nominalDiameterMm={diameterMeasurement!.nominalDiameterMm}
             lengthMm={diameterMeasurement!.lengthMm}
             visibleRange={diameterVisibleRange}
+            selectedPositionRatio={diameterSelectedPositionRatio}
           />
         ) : (
           <div className="production-artifact-empty compact" role="status">

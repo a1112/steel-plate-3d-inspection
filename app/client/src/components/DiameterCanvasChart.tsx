@@ -90,12 +90,14 @@ export function DiameterCanvasChart({
   axisMode,
   axisStart,
   axisEnd,
+  selectedAxisValue = null,
 }: {
   lines: DiameterCurveLine[];
   nominalDiameterMm: number;
   axisMode: AxisMode;
   axisStart: number;
   axisEnd: number;
+  selectedAxisValue?: number | null;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const backgroundRef = useRef<HTMLCanvasElement>(null);
@@ -258,9 +260,32 @@ export function DiameterCanvasChart({
     const context = prepareCanvas(canvas, layout.width, layout.height);
     if (!context) return;
     context.clearRect(0, 0, layout.width, layout.height);
-    if (!hover?.entries.length) return;
     const text = cssColor(container, '--text', '#10233d');
     const range = Math.max(0.0001, layout.maximum - layout.minimum);
+    if (selectedAxisValue !== null
+      && Number.isFinite(selectedAxisValue)
+      && selectedAxisValue >= axisStart
+      && selectedAxisValue <= axisEnd) {
+      const selectedRatio = (selectedAxisValue - axisStart) / Math.max(0.0001, axisEnd - axisStart);
+      const selectedX = layout.left + selectedRatio * layout.plotWidth;
+      const marker = cssColor(container, '--cyan', '#0ea5e9');
+      context.strokeStyle = marker;
+      context.globalAlpha = 0.86;
+      context.lineWidth = 2;
+      context.beginPath();
+      context.moveTo(selectedX, layout.top);
+      context.lineTo(selectedX, layout.top + layout.plotHeight);
+      context.stroke();
+      context.fillStyle = marker;
+      context.beginPath();
+      context.moveTo(selectedX - 4, layout.top);
+      context.lineTo(selectedX + 4, layout.top);
+      context.lineTo(selectedX, layout.top + 6);
+      context.closePath();
+      context.fill();
+      context.globalAlpha = 1;
+    }
+    if (!hover?.entries.length) return;
     const markerX = layout.left + hover.ratio * layout.plotWidth;
     context.strokeStyle = text;
     context.globalAlpha = 0.42;
@@ -281,7 +306,7 @@ export function DiameterCanvasChart({
       context.strokeStyle = '#ffffff';
       context.stroke();
     }
-  }, [hover, metrics, themeRevision]);
+  }, [axisEnd, axisStart, hover, metrics, selectedAxisValue, themeRevision]);
 
   useEffect(() => {
     const requestDraw = () => {
@@ -337,6 +362,7 @@ export function DiameterCanvasChart({
       aria-label={`测径（外径）曲线，按${axisMode === 'length-mm' ? '钢管长度位置' : '头部相对位置'}变化`}
       onPointerMove={handlePointerMove}
       onPointerLeave={() => setHover(null)}
+      data-selected-axis-value={selectedAxisValue === null ? undefined : selectedAxisValue.toFixed(3)}
     >
       <canvas ref={backgroundRef} className="diameter-canvas-background" aria-hidden="true" />
       <canvas ref={foregroundRef} className="diameter-canvas-foreground" aria-hidden="true" />

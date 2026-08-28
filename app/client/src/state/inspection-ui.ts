@@ -49,7 +49,7 @@ export function persistThemeStyle(themeStyle: ThemeStyle, storage?: Pick<Storage
 export interface InspectionUiState {
   theme: ThemeMode;
   themeStyle: ThemeStyle;
-  activeNav: 'online' | 'diameter' | 'report' | 'alarms' | 'settings' | 'status';
+  activeNav: 'online' | 'defects' | 'diameter' | 'report' | 'alarms' | 'settings' | 'status';
   selectedRecordId: string;
   selectedDefectId: string | null;
   hiddenDefectTypeIds: Set<string>;

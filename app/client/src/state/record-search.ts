@@ -28,10 +28,10 @@ export function filterInspectionRecords(records: InspectionRecord[], inspections
   const detectedAtByPlate = new Map(inspections.map((inspection) => [inspection.plate.plateNo, inspection.plate.detectedAt.toLowerCase()]));
 
   return records.filter((record) => {
-    if (serialNo && !record.id.toLowerCase().includes(serialNo)) {
+    if (serialNo && !record.plateNo.toLowerCase().includes(serialNo)) {
       return false;
     }
-    if (plateNo && !record.plateNo.toLowerCase().includes(plateNo)) {
+    if (plateNo && !record.id.toLowerCase().includes(plateNo)) {
       return false;
     }
     if (time) {
