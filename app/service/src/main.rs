@@ -3121,7 +3121,10 @@ fn production_defect_groups_and_comparison(
         "geometryOnlyCount": geometry_only_count,
         "legacyOnlyCount": legacy_only_count,
         "estimatedUniqueCount": matched + geometry_only_count + legacy_only_count,
-        "cameraLocal": geometry.iter().all(|candidate| candidate.global_position_available != Some(true)),
+        "cameraLocal": !geometry.is_empty()
+            && geometry
+                .iter()
+                .all(|candidate| candidate.global_position_available != Some(true)),
         "riskTags": risk_tags,
         "warning": "Matched pairs are a same-camera/same-frame estimate within each inspection/material in the current response page; both original candidates are retained."
     });
@@ -34079,6 +34082,15 @@ mod tests {
         assert_eq!(cross_comparison["matched"], 0);
         assert_eq!(cross_comparison["geometryOnly"], 2);
         assert_eq!(cross_comparison["legacyOnly"], 3);
+
+        let legacy_only_candidates = candidates
+            .iter()
+            .filter(|candidate| !production_defect_is_geometry_source(&candidate.source))
+            .cloned()
+            .collect::<Vec<_>>();
+        let (_, legacy_only_comparison) =
+            production_defect_groups_and_comparison(&legacy_only_candidates);
+        assert_eq!(legacy_only_comparison["cameraLocal"], false);
     }
 
     #[test]
