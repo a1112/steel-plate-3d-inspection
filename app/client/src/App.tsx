@@ -2040,6 +2040,7 @@ function InspectionDashboard({
                   surfaceMesh={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.mesh : null}
                   surfaceCameraTiles={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameraTiles : null}
                   surfaceHeadAlignment={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.headAlignment : null}
+                  surfaceMeasurement={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.measurement : null}
                   surfaceCameras={recordBoundSurface.inspectionId === activeInspection?.inspectionId ? recordBoundSurface.cameras : undefined}
                   artifactStatus={recordBoundSurface.loading ? '正在加载当前检测记录的生产产物…' : recordBoundSurface.status}
                   viewMode={plateMapViewMode}

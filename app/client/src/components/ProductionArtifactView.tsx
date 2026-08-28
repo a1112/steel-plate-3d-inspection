@@ -6,6 +6,7 @@ import {
   Float32BufferAttribute,
   LinearFilter,
   LinearMipmapLinearFilter,
+  RepeatWrapping,
   SRGBColorSpace,
   TextureLoader,
   Uint32BufferAttribute,
@@ -25,6 +26,20 @@ const DEFAULT_DEPTH_EXAGGERATION = 1;
 export type ArtifactColorMode = 'source' | 'neutral' | 'radial-jet' | 'texture';
 export type ArtifactOrientation = 'horizontal' | 'vertical';
 
+export type ArtifactTextureMetrics = {
+  longitudinalPixels: number;
+  circumferencePixels: number;
+  pixelAspectRatio?: number;
+  overlapPolicy?: 'owned-columns-concatenated' | string;
+  projectionPolicy?: 'calibrated-angle-columns' | string;
+};
+
+export type ArtifactDisplaySpans = {
+  longitudinal: number;
+  crossSection: number;
+  lengthDiameterRatio: number;
+};
+
 export type RadialJetSummary = {
   fittedSectionCount: number;
   fittedPointCount: number;
@@ -36,6 +51,57 @@ export type RadialJetSummary = {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+export function resolveArtifactDisplaySpans(
+  textureMetrics?: ArtifactTextureMetrics | null,
+): ArtifactDisplaySpans {
+  const longitudinalPixels = Number(textureMetrics?.longitudinalPixels);
+  const circumferencePixels = Number(textureMetrics?.circumferencePixels);
+  const pixelAspectRatio = Number(textureMetrics?.pixelAspectRatio ?? 1);
+  if (
+    longitudinalPixels > 0
+    && circumferencePixels > 0
+    && pixelAspectRatio > 0
+    && [longitudinalPixels, circumferencePixels, pixelAspectRatio].every(Number.isFinite)
+  ) {
+    // Texture height is the unwrapped circumference. At square source pixels,
+    // circumference = PI * diameter, so a cylinder is PI times longer than the
+    // flat texture's width/height ratio when expressed as length/diameter.
+    const lengthDiameterRatio = Math.PI
+      * longitudinalPixels
+      * pixelAspectRatio
+      / circumferencePixels;
+    return {
+      longitudinal: NORMALIZED_CROSS_SPAN * lengthDiameterRatio,
+      crossSection: NORMALIZED_CROSS_SPAN,
+      lengthDiameterRatio,
+    };
+  }
+  return {
+    longitudinal: NORMALIZED_LONGITUDINAL_SPAN,
+    crossSection: NORMALIZED_CROSS_SPAN,
+    lengthDiameterRatio: NORMALIZED_LONGITUDINAL_SPAN / NORMALIZED_CROSS_SPAN,
+  };
+}
+
+export function unwrapTriangleTextureSeams(values: ArrayLike<number>) {
+  const output = new Float32Array(values.length);
+  for (let index = 0; index < values.length; index += 1) output[index] = Number(values[index]);
+  // Non-indexed geometry stores three UV pairs per triangle. When a triangle
+  // crosses the 0/360-degree seam, lift its low V coordinates into the next
+  // repeat so interpolation remains local instead of sweeping across the
+  // entire texture.
+  for (let triangleStart = 0; triangleStart + 5 < output.length; triangleStart += 6) {
+    const first = output[triangleStart + 1];
+    const second = output[triangleStart + 3];
+    const third = output[triangleStart + 5];
+    if (Math.max(first, second, third) - Math.min(first, second, third) <= 0.5) continue;
+    [triangleStart + 1, triangleStart + 3, triangleStart + 5].forEach((index) => {
+      if (output[index] < 0.5) output[index] += 1;
+    });
+  }
+  return output;
 }
 
 export function fitSurfaceCircle(points: Array<{ y: number; z: number }>) {
@@ -207,6 +273,7 @@ export function buildDepthExaggeratedPositions(
 export function normalizeArtifactPositions(
   values: ArrayLike<number>,
   validMask?: ArrayLike<number>,
+  spans: ArtifactDisplaySpans = resolveArtifactDisplaySpans(),
 ) {
   const normalized = new Float32Array(values.length);
   if (values.length < 3) {
@@ -244,8 +311,8 @@ export function normalizeArtifactPositions(
   // display axis until an encoder is connected. Fit that axis and the metric
   // circular cross-section independently; one unusually large calibrated
   // centre offset must not make the tube look cropped or fill the viewport.
-  const longitudinalScale = NORMALIZED_LONGITUDINAL_SPAN / Math.max(maxX - minX, 1e-6);
-  const crossSectionScale = NORMALIZED_CROSS_SPAN / Math.max(maxY - minY, maxZ - minZ, 1e-6);
+  const longitudinalScale = spans.longitudinal / Math.max(maxX - minX, 1e-6);
+  const crossSectionScale = spans.crossSection / Math.max(maxY - minY, maxZ - minZ, 1e-6);
   for (let index = 0; index + 2 < values.length; index += 3) {
     normalized[index] = (Number(values[index]) - centerX) * longitudinalScale;
     normalized[index + 1] = (Number(values[index + 1]) - centerY) * crossSectionScale;
@@ -260,8 +327,9 @@ function createArtifactGeometry(
   colorMode: ArtifactColorMode,
   radialUnitScale: number,
   depthExaggeration: number,
+  spans: ArtifactDisplaySpans,
 ) {
-  const geometry = new BufferGeometry();
+  let geometry = new BufferGeometry();
   const pointCount = Math.floor(mesh.positions.length / 3);
   const jet = colorMode === 'radial-jet'
     ? buildRadialJetColors(mesh, radialUnitScale)
@@ -304,7 +372,7 @@ function createArtifactGeometry(
   }
 
   geometry.setAttribute('position', new Float32BufferAttribute(
-    normalizeArtifactPositions(positions, indexed ? validMask : undefined),
+    normalizeArtifactPositions(positions, indexed ? validMask : undefined, spans),
     3,
   ));
   const renderedPointCount = Math.floor(positions.length / 3);
@@ -319,12 +387,24 @@ function createArtifactGeometry(
       const row = Math.floor(pointIndex / columns);
       const column = pointIndex % columns;
       uvs[pointIndex * 2] = rows > 1 ? Math.min(row, rows - 1) / (rows - 1) : 0;
-      uvs[pointIndex * 2 + 1] = columns > 1 ? 1 - column / (columns - 1) : 0;
+      // Sample angular bin centres. Using exact 0/1 endpoints makes the seam
+      // unwrap collapse its first/last strip to zero width.
+      uvs[pointIndex * 2 + 1] = columns > 1 ? 1 - (column + 0.5) / columns : 0.5;
     }
     geometry.setAttribute('uv', new Float32BufferAttribute(uvs, 2));
     geometry.setIndex(new Uint32BufferAttribute(new Uint32Array(mesh.indices), 1));
     if (colorMode === 'source' || colorMode === 'neutral') {
       geometry.computeVertexNormals();
+    }
+    if (colorMode === 'texture') {
+      const seamSafe = geometry.toNonIndexed();
+      geometry.dispose();
+      geometry = seamSafe;
+      const textureUvs = geometry.getAttribute('uv');
+      geometry.setAttribute('uv', new Float32BufferAttribute(
+        unwrapTriangleTextureSeams(textureUvs.array),
+        2,
+      ));
     }
   }
   return { geometry, jetSummary: jet?.summary ?? null };
@@ -333,9 +413,11 @@ function createArtifactGeometry(
 function ArtifactCamera({
   zoom,
   orientation,
+  spans,
 }: {
   zoom: number;
   orientation: ArtifactOrientation;
+  spans: ArtifactDisplaySpans;
 }) {
   const { camera, size } = useThree();
   useEffect(() => {
@@ -343,8 +425,8 @@ function ArtifactCamera({
     const verticalFov = perspective.fov * Math.PI / 180;
     const aspect = Math.max(size.width / Math.max(size.height, 1), 0.25);
     const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * aspect);
-    const width = orientation === 'horizontal' ? NORMALIZED_LONGITUDINAL_SPAN : NORMALIZED_CROSS_SPAN;
-    const height = orientation === 'horizontal' ? NORMALIZED_CROSS_SPAN : NORMALIZED_LONGITUDINAL_SPAN;
+    const width = orientation === 'horizontal' ? spans.longitudinal : spans.crossSection;
+    const height = orientation === 'horizontal' ? spans.crossSection : spans.longitudinal;
     const distance = Math.max(
       width / (2 * Math.tan(horizontalFov / 2)),
       height / (2 * Math.tan(verticalFov / 2)),
@@ -357,7 +439,7 @@ function ArtifactCamera({
     perspective.far = Math.max(100, distance * 20);
     perspective.zoom = zoom;
     perspective.updateProjectionMatrix();
-  }, [camera, orientation, size.height, size.width, zoom]);
+  }, [camera, orientation, size.height, size.width, spans, zoom]);
   return null;
 }
 
@@ -369,9 +451,14 @@ function ArtifactTextureMaterial({ textureUrl }: { textureUrl: string }) {
     texture.generateMipmaps = true;
     texture.minFilter = LinearMipmapLinearFilter;
     texture.magFilter = LinearFilter;
+    texture.wrapT = RepeatWrapping;
     texture.anisotropy = Math.min(16, gl.capabilities.getMaxAnisotropy());
     texture.needsUpdate = true;
   }, [gl, texture]);
+  useEffect(() => () => {
+    texture.dispose();
+    useLoader.clear(TextureLoader, textureUrl);
+  }, [texture, textureUrl]);
   return <meshBasicMaterial color="#ffffff" map={texture} side={DoubleSide} />;
 }
 
@@ -383,6 +470,8 @@ export function ProductionArtifactView({
   className = '',
   colorMode = 'source',
   textureUrl,
+  textureModality,
+  textureMetrics,
   radialUnitScale = 1,
   radialUnit = '显示坐标',
   orientation = 'horizontal',
@@ -399,6 +488,8 @@ export function ProductionArtifactView({
   className?: string;
   colorMode?: ArtifactColorMode;
   textureUrl?: string | null;
+  textureModality?: 'gray' | 'jet';
+  textureMetrics?: ArtifactTextureMetrics | null;
   radialUnitScale?: number;
   radialUnit?: string;
   orientation?: ArtifactOrientation;
@@ -424,9 +515,28 @@ export function ProductionArtifactView({
     pointerId: number;
     grabOffsetRatio: number;
   } | null>(null);
+  const spans = useMemo(
+    () => resolveArtifactDisplaySpans(textureMetrics),
+    [
+      textureMetrics?.circumferencePixels,
+      textureMetrics?.longitudinalPixels,
+      textureMetrics?.pixelAspectRatio,
+    ],
+  );
+  const maximumZoom = Math.max(
+    MAX_ZOOM,
+    spans.lengthDiameterRatio / (NORMALIZED_LONGITUDINAL_SPAN / NORMALIZED_CROSS_SPAN),
+  );
   const artifact = useMemo(
-    () => createArtifactGeometry(mesh, mode === 'surface', colorMode, radialUnitScale, depthExaggeration),
-    [colorMode, depthExaggeration, mesh, mode, radialUnitScale],
+    () => createArtifactGeometry(
+      mesh,
+      mode === 'surface',
+      colorMode,
+      radialUnitScale,
+      depthExaggeration,
+      spans,
+    ),
+    [colorMode, depthExaggeration, mesh, mode, radialUnitScale, spans],
   );
   const { geometry, jetSummary } = artifact;
   const hasColors = geometry.getAttribute('color') !== undefined;
@@ -454,7 +564,7 @@ export function ProductionArtifactView({
     Math.max(0, axisCenter - halfVisibleFraction),
     Math.min(1, axisCenter + halfVisibleFraction),
   ];
-  const axisOffset = (0.5 - axisCenter) * NORMALIZED_LONGITUDINAL_SPAN;
+  const axisOffset = (0.5 - axisCenter) * spans.longitudinal;
   const rulerTicks = Array.from({ length: 5 }, (_, index) => {
     const screenRatio = index / 4;
     const worldRatio = visibleRange[0] + screenRatio * (visibleRange[1] - visibleRange[0]);
@@ -469,6 +579,9 @@ export function ProductionArtifactView({
   useEffect(() => {
     setAxisCenter((current) => clamp(current, minimumAxisCenter, maximumAxisCenter));
   }, [maximumAxisCenter, minimumAxisCenter]);
+  useEffect(() => {
+    setZoom((current) => Math.min(current, maximumZoom));
+  }, [maximumZoom]);
   useEffect(() => {
     if (focusPositionRatio == null || !Number.isFinite(focusPositionRatio)) return;
     setAxisCenter(clamp(focusPositionRatio, minimumAxisCenter, maximumAxisCenter));
@@ -492,7 +605,7 @@ export function ProductionArtifactView({
   const handleWheel = (event: WheelEvent<HTMLDivElement>) => {
     event.preventDefault();
     const factor = event.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
-    const next = clamp(Number((zoom * factor).toFixed(2)), MIN_ZOOM, MAX_ZOOM);
+    const next = clamp(Number((zoom * factor).toFixed(2)), MIN_ZOOM, maximumZoom);
     if (next === zoom) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const hasPointerPosition = rect.width > 0
@@ -517,27 +630,22 @@ export function ProductionArtifactView({
       1 - nextVisibleFraction / 2,
     ));
 
-    if (hasPointerPosition) {
+    if (hasPointerPosition && orientation === 'vertical') {
       const aspect = Math.max(rect.width / rect.height, 0.25);
-      const fitWidth = orientation === 'horizontal'
-        ? NORMALIZED_LONGITUDINAL_SPAN
-        : NORMALIZED_CROSS_SPAN;
-      const fitHeight = orientation === 'horizontal'
-        ? NORMALIZED_CROSS_SPAN
-        : NORMALIZED_LONGITUDINAL_SPAN;
+      const fitWidth = spans.crossSection;
+      const fitHeight = spans.longitudinal;
       const baseViewHeight = Math.max(fitWidth / aspect, fitHeight) * 1.18;
       const baseViewWidth = baseViewHeight * aspect;
       const cursorX = (pointerX - 0.5) * baseViewWidth;
-      const cursorY = (0.5 - pointerY) * baseViewHeight;
       const zoomDelta = 1 / next - 1 / zoom;
       setPan((current) => ({
-        x: orientation === 'vertical'
-          ? current.x + cursorX * zoomDelta
-          : current.x,
-        y: orientation === 'horizontal'
-          ? current.y + cursorY * zoomDelta
-          : current.y,
+        x: current.x + cursorX * zoomDelta,
+        y: 0,
       }));
+    } else if (orientation === 'horizontal') {
+      // Length navigation remains pointer-anchored, while the pipe's cross-section
+      // stays vertically centred at every zoom level.
+      setPan((current) => current.y === 0 ? current : { ...current, y: 0 });
     }
     setZoom(next);
     onZoomChange?.(next);
@@ -554,6 +662,14 @@ export function ProductionArtifactView({
       data-artifact-roll={roll.toFixed(3)}
       data-artifact-zoom={zoom.toFixed(2)}
       data-artifact-color-mode={colorMode}
+      data-artifact-texture-modality={textureModality}
+      data-artifact-overlap-policy={textureMetrics?.overlapPolicy}
+      data-artifact-projection-policy={textureMetrics?.projectionPolicy}
+      data-artifact-pixel-aspect={textureMetrics ? (textureMetrics.pixelAspectRatio ?? 1).toFixed(3) : undefined}
+      data-artifact-longitudinal-pixels={textureMetrics?.longitudinalPixels}
+      data-artifact-circumference-pixels={textureMetrics?.circumferencePixels}
+      data-artifact-longitudinal-span={spans.longitudinal.toFixed(3)}
+      data-artifact-length-diameter-ratio={spans.lengthDiameterRatio.toFixed(3)}
       data-artifact-depth-exaggeration={depthExaggeration.toFixed(1)}
       data-artifact-render-dpr={renderDpr.toFixed(2)}
       data-artifact-axis-center={axisCenter.toFixed(4)}
@@ -607,9 +723,7 @@ export function ProductionArtifactView({
             x: orientation === 'vertical'
               ? current.x + deltaX * 0.006 / zoom
               : current.x,
-            y: orientation === 'horizontal'
-              ? current.y - deltaY * 0.006 / zoom
-              : current.y,
+            y: 0,
           }));
         }
         drag.current = {
@@ -627,7 +741,7 @@ export function ProductionArtifactView({
         dpr={renderDpr}
         gl={{ antialias: true, powerPreference: 'high-performance' }}
       >
-        <ArtifactCamera zoom={zoom} orientation={orientation} />
+        <ArtifactCamera zoom={zoom} orientation={orientation} spans={spans} />
         <color attach="background" args={['#081118']} />
         <ambientLight intensity={0.82} />
         <directionalLight position={[3, 5, 6]} intensity={1.1} />
@@ -664,7 +778,11 @@ export function ProductionArtifactView({
       ) : null}
       {colorMode === 'texture' ? (
         <span className="production-artifact-texture-tag">
-          {textureUrl ? '2D 检测图像贴图' : '贴图准备中 · 暂用基础色'}
+          {textureModality
+            ? textureUrl
+              ? `去重${textureModality === 'jet' ? ' JET' : '灰度'}贴图 · 像素 1:1`
+              : `去重${textureModality === 'jet' ? ' JET' : '灰度'}贴图准备中`
+            : textureUrl ? '2D 检测图像贴图' : '贴图准备中 · 暂用基础色'}
         </span>
       ) : null}
       {jetSummary ? (

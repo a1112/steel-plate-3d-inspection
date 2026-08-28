@@ -9,9 +9,12 @@
   "webView2InstallMode": "offlineInstaller",
   "nsisInstallMode": "perMachine",
   "allowDowngrades": false,
+  "createUpdaterArtifacts": true,
+  "updateEndpoint": "https://github.com/a1112/steel-plate-3d-inspection/releases/latest/download/latest.json",
+  "updatePublicKeyBuildVariable": "STEEL_UPDATE_PUBLIC_KEY",
   "devtools": false,
   "rustTarget": "x86_64-pc-windows-msvc",
   "cargoConfigSha256": "3da3357ad30dd603163bc0dd2bbb3db5ff2ef315bc7dfcc6e281cb4c4624a0e9",
-  "tauriConfigSha256": "628c47d4346d0ef59e913b389da290c2804d20beee1b0032b4c0101f33903979",
-  "tauriCargoSha256": "4cd404157cc93b6c33aa5ab00c1b063a0890cc34d58d11ee8a6cf8eb4ebd2088"
+  "tauriConfigSha256": "1136f24b52c1ccc086718e1ce50acf93731a263c0a897bd5b438b4cac71f7580",
+  "tauriCargoSha256": "bfd67b98f6ac4bc56019981959dac06446c6c357f875476c1c63317cfb0e6f41"
 }

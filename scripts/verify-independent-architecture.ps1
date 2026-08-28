@@ -1717,6 +1717,10 @@ if ([string]$TauriConfig.build.beforeBuildCommand -cne [string]$ReleasePolicy.be
 if ($TauriConfig.bundle.active -ne $true) {
   throw "Tauri production bundling must be active."
 }
+if ($TauriConfig.bundle.createUpdaterArtifacts -ne $true -or
+    $ReleasePolicy.createUpdaterArtifacts -ne $true) {
+  throw "Tauri production bundling must create signed updater artifacts."
+}
 if (@($TauriConfig.build.PSObject.Properties.Name) -cnotcontains 'features' -or
     @($TauriConfig.build.features).Count -ne 0) {
   throw "Tauri production build.features must be explicitly present and empty."
@@ -1743,6 +1747,16 @@ if ($TauriConfig.bundle.windows.allowDowngrades -ne $ReleasePolicy.allowDowngrad
 }
 if ([string]$TauriConfig.bundle.windows.nsis.installMode -cne [string]$ReleasePolicy.nsisInstallMode) {
   throw "Tauri production NSIS bundle must install per-machine."
+}
+$SoftwareUpdateSourcePath = Join-Path $ClientDir 'src-tauri\src\software_update.rs'
+$SoftwareUpdateSource = Get-Content -LiteralPath $SoftwareUpdateSourcePath -Raw
+if ([string]$ReleasePolicy.updateEndpoint -cne 'https://github.com/a1112/steel-plate-3d-inspection/releases/latest/download/latest.json' -or
+    [string]$ReleasePolicy.updatePublicKeyBuildVariable -cne 'STEEL_UPDATE_PUBLIC_KEY' -or
+    $SoftwareUpdateSource -notmatch [regex]::Escape([string]$ReleasePolicy.updateEndpoint) -or
+    $SoftwareUpdateSource -notmatch 'option_env!\("STEEL_UPDATE_PUBLIC_KEY"\)' -or
+    $SoftwareUpdateSource -notmatch 'pubkey\(public_key\)' -or
+    $SoftwareUpdateSource -notmatch 'download_and_install') {
+  throw "Desktop updater must bind the approved HTTPS endpoint and compile-time public key before installation."
 }
 
 $TauriCargoPath = Join-Path $ClientDir "src-tauri\Cargo.toml"
