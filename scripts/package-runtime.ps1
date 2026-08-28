@@ -358,7 +358,9 @@ function Assert-NoUnreviewedTauriConfigInputs {
     'TAURI_WINDOWS_CERTIFICATE_THUMBPRINT',
     'TAURI_WINDOWS_TIMESTAMP_URL',
     'TAURI_WINDOWS_TSP',
-    'TAURI_WINDOWS_PUBLISHER'
+    'TAURI_WINDOWS_PUBLISHER',
+    'TAURI_SIGNING_PRIVATE_KEY',
+    'TAURI_SIGNING_PRIVATE_KEY_PASSWORD'
   )
   $UnapprovedTauriEnvironment = @(Get-ChildItem Env: | Where-Object {
     $_.Name.ToUpperInvariant().StartsWith('TAURI_') -and

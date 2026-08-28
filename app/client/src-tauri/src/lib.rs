@@ -6,6 +6,11 @@ use tauri::Manager;
 mod app_resource_usage;
 use app_resource_usage::app_resource_usage;
 
+mod software_update;
+use software_update::{
+    check_software_update, install_software_update, read_software_update_status,
+};
+
 const CAPTURE_MANAGEMENT_WINDOW: &str = "capture-management";
 const PARAMETER_MANAGEMENT_WINDOW: &str = "parameter-management";
 const BAR_SURFACE_WINDOW: &str = "bar-surface";
@@ -272,9 +277,14 @@ pub fn run() {
             save_binary_file_with_dialog,
             open_local_path,
             read_local_text_file,
-            app_resource_usage
+            app_resource_usage,
+            read_software_update_status,
+            check_software_update,
+            install_software_update
         ])
         .setup(|app| {
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
             if let Some(window) = app.get_webview_window("main") {
                 window.center()?;
             }

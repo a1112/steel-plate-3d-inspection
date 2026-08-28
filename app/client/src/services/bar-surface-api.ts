@@ -312,6 +312,9 @@ export type BarSurfaceMesh = {
     originElapsedFromHeadMs?: number;
     endElapsedFromHeadMs?: number;
     qualifiedDurationMs?: number;
+    headTransitionTrimMs?: number;
+    tailTransitionTrimMs?: number;
+    commonSteelOverlapMs?: number;
     displaySpan?: number;
     displayUnit?: string;
     absoluteScaleVerified?: boolean;

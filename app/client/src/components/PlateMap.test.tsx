@@ -6,14 +6,16 @@ import { createSequentialCameraLanes } from '../lib/camera-display';
 import {
   readCaptureDefects,
   readCaptureRegions,
+  type CaptureFlowMeasurement,
   type CaptureFlowSurface,
   type CaptureRegionMap,
+  type CaptureSurfaceCameraTiles,
 } from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import { fetchCaptureStitchHistory, type CaptureStitchResult } from '../services/capture-roi-api';
 import { readCaptureRawDepthValue, sampleJetResidualMm } from '../services/capture-depth-probe';
 import { fetchInspectionWorldDefects, fetchInspectionWorldMeta, fetchInspectionWorldTile, type InspectionWorldMeta } from '../services/inspection-world-api';
-import { cameraBandCropPadding, cameraBandRotationRadians, capturePrefetchFrameIndexes, captureStitchInitialFrameIndex, mergeCameraBandCropWindow, normalizeOwnedColumnIntervals, PlateMap as ProductionPlateMap, remapOwnedColumnRange, restoreOwnedColumnRatio } from './PlateMap';
+import { cameraBandCropPadding, cameraBandRotationRadians, captureFrameLongitudinalAspect, capturePrefetchFrameIndexes, captureStitchInitialFrameIndex, mergeCameraBandCropWindow, normalizeOwnedColumnIntervals, PlateMap as ProductionPlateMap, remapOwnedColumnRange, restoreOwnedColumnRatio } from './PlateMap';
 
 vi.mock('../lib/capture-api', async () => {
   const actual = await vi.importActual<typeof import('../lib/capture-api')>('../lib/capture-api');
@@ -83,7 +85,7 @@ function captureStitchResult(materialId: string, frameCount = 1): CaptureStitchR
       return {
         frameId: `${materialId}:${String(sequence).padStart(12, '0')}`,
         sequence,
-        capturedAt: '2026-08-24T02:00:00.000Z',
+        capturedAt: new Date(Date.parse('2026-08-24T02:00:00.000Z') + frameIndex * 100).toISOString(),
         cameras: Array.from({ length: 6 }, (_unused, cameraIndex) => ({
           cameraId: `C${cameraIndex + 1}`,
           cameraIp: `192.168.10${cameraIndex + 1}.100`,
@@ -170,6 +172,42 @@ function captureRegionMap(materialId: string): CaptureRegionMap {
         overlapColumnIntervals: [[500, 700]],
       }];
     })),
+  };
+}
+
+function captureSurfaceCameraTiles(): CaptureSurfaceCameraTiles {
+  const ownedColumnCount = 450;
+  return {
+    schema: 'steel.ranger3-camera-jet-tiles.v1',
+    coordinateSpace: 'camera-crop-columns',
+    angleConvention: 'clockwise-degrees-0-360',
+    rowOrder: 'head-to-tail',
+    cameras: Array.from({ length: 6 }, (_, index) => {
+      const cameraId = `C${index + 1}`;
+      const lowerAngle = index * 60;
+      const upperAngle = (index + 1) * 60;
+      const reverseColumns = index % 2 === 1;
+      return {
+        cameraId,
+        state: 'ready',
+        fixedAngleDeg: lowerAngle + 30,
+        sourceShape: [1024, 2560],
+        cropBox: [100, 0, 700, 1024],
+        sourceOffset: { x: 100, y: 0 },
+        rows: 30,
+        columns: 600,
+        coordinateLayout: 'row-major-camera-crop',
+        angleDegByColumn: Array.from({ length: 600 }, (_unused, column) => {
+          const angleOffset = (column + 0.5) * 60 / ownedColumnCount;
+          return reverseColumns ? upperAngle - angleOffset : lowerAngle + angleOffset;
+        }),
+        coverage: {
+          ownedAngleIntervalsDeg: [[lowerAngle, upperAngle]],
+          ownedColumnIntervals: [[100, 550]],
+          overlapColumnIntervals: [[500, 700]],
+        },
+      };
+    }),
   };
 }
 
@@ -367,7 +405,11 @@ describe('online inspection world compatibility', () => {
   });
 
   it('uses the current flow history as a horizontally scrollable six-camera crop stitch', async () => {
-    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('2747', 12));
+    const stitch = captureStitchResult('2747', 12);
+    stitch.frames.forEach((frame, frameIndex) => frame.cameras.forEach((camera) => {
+      camera.sourceBytes = frameIndex >= 9 ? 24 * 1024 : 256 * 1024;
+    }));
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(stitch);
 
     render(
       <ProductionPlateMap
@@ -390,6 +432,13 @@ describe('online inspection world compatibility', () => {
     expect(viewport).toHaveAttribute('data-head-display-padding-applied', 'true');
     expect(viewport).toHaveAttribute('data-head-retained-context-frames', '0.35');
     expect(viewport).toHaveAttribute('data-timeline-origin-frames', '2.650000');
+    expect(viewport).toHaveAttribute('data-tail-trim-applied', 'true');
+    expect(viewport).toHaveAttribute('data-tail-detection-source', 'frame-density');
+    expect(viewport).toHaveAttribute('data-tail-content-frame-index', '8');
+    expect(viewport).toHaveAttribute('data-tail-timeline-frame', '11.000000');
+    expect(viewport).toHaveAttribute('data-tail-retained-context-frames', '0.35');
+    expect(viewport).toHaveAttribute('data-timeline-end-frames', '11.350000');
+    expect(viewport).toHaveAttribute('data-longitudinal-extent-px', '1531.200');
     expect(screen.queryByTestId('head-alignment-summary')).not.toBeInTheDocument();
     const c1First = document.querySelector('.bar-camera-frame[data-camera-id="C1"][data-frame-sequence="1"]');
     const c2First = document.querySelector('.bar-camera-frame[data-camera-id="C2"][data-frame-sequence="1"]');
@@ -424,9 +473,45 @@ describe('online inspection world compatibility', () => {
     );
     Object.defineProperties(viewport, {
       clientWidth: { configurable: true, value: 600 },
+      clientHeight: { configurable: true, value: 360 },
       scrollWidth: { configurable: true, value: 2400 },
       scrollLeft: { configurable: true, value: 600, writable: true },
     });
+    fireEvent(window, new Event('resize'));
+    const cameraBand = screen.getByRole('button', { name: 'camera2 采集图像，双击展开' });
+    expect(cameraBand.querySelector(':scope > span')).toHaveTextContent('C2');
+    expect(cameraBand.querySelector(':scope > span')).not.toHaveTextContent('头偏移');
+    const steadyPointerDown = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.defineProperties(steadyPointerDown, {
+      button: { value: 0 },
+      clientX: { value: 500 },
+      clientY: { value: 200 },
+      pointerId: { value: 40 },
+    });
+    fireEvent(cameraBand, steadyPointerDown);
+    const steadyPointerMove = new Event('pointermove', { bubbles: true, cancelable: true });
+    Object.defineProperties(steadyPointerMove, {
+      clientX: { value: 496 },
+      clientY: { value: 200 },
+      pointerId: { value: 40 },
+    });
+    fireEvent(cameraBand, steadyPointerMove);
+    const steadyPointerUp = new Event('pointerup', { bubbles: true, cancelable: true });
+    Object.defineProperties(steadyPointerUp, {
+      clientX: { value: 496 },
+      clientY: { value: 200 },
+      pointerId: { value: 40 },
+    });
+    fireEvent(cameraBand, steadyPointerUp);
+    expect(viewport.scrollLeft).toBe(600);
+    fireEvent.doubleClick(cameraBand);
+    expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-expanded-camera', 'camera2');
+    expect(viewport).toHaveAttribute('data-expanded-preserve-aspect', 'true');
+    expect(viewport).toHaveAttribute('data-frame-pixel-aspect', '1.706667');
+    expect(viewport).toHaveAttribute('data-frame-span-px', '614.400');
+    fireEvent.doubleClick(cameraBand);
+    expect(screen.getByTestId('bar-unfolded-map')).not.toHaveAttribute('data-expanded-camera');
+    expect(viewport).toHaveAttribute('data-frame-span-px', '176.000');
     const dragPointerDown = new Event('pointerdown', { bubbles: true, cancelable: true });
     Object.defineProperties(dragPointerDown, {
       button: { value: 0 },
@@ -434,7 +519,7 @@ describe('online inspection world compatibility', () => {
       clientY: { value: 200 },
       pointerId: { value: 41 },
     });
-    fireEvent(viewport, dragPointerDown);
+    fireEvent(cameraBand, dragPointerDown);
     expect(viewport).toHaveClass('is-dragging');
     const dragPointerMove = new Event('pointermove', { bubbles: true, cancelable: true });
     Object.defineProperties(dragPointerMove, {
@@ -442,7 +527,7 @@ describe('online inspection world compatibility', () => {
       clientY: { value: 200 },
       pointerId: { value: 41 },
     });
-    fireEvent(viewport, dragPointerMove);
+    fireEvent(cameraBand, dragPointerMove);
     expect(viewport.scrollLeft).toBe(750);
     const dragPointerUp = new Event('pointerup', { bubbles: true, cancelable: true });
     Object.defineProperties(dragPointerUp, {
@@ -450,8 +535,13 @@ describe('online inspection world compatibility', () => {
       clientY: { value: 200 },
       pointerId: { value: 41 },
     });
-    fireEvent(viewport, dragPointerUp);
+    fireEvent(cameraBand, dragPointerUp);
     expect(viewport).not.toHaveClass('is-dragging');
+    expect(screen.getByTestId('bar-unfolded-map')).not.toHaveAttribute('data-expanded-camera');
+    fireEvent.doubleClick(cameraBand);
+    expect(screen.getByTestId('bar-unfolded-map')).toHaveAttribute('data-expanded-camera', 'camera2');
+    fireEvent.doubleClick(cameraBand);
+    expect(screen.getByTestId('bar-unfolded-map')).not.toHaveAttribute('data-expanded-camera');
     fireEvent.click(screen.getByRole('button', { name: '纵向' }));
     expect(viewport).toHaveAttribute('data-scroll-axis', 'y');
     expect(scrollbar).toHaveAttribute('aria-orientation', 'vertical');
@@ -459,14 +549,38 @@ describe('online inspection world compatibility', () => {
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
   });
 
+  it('derives the expanded frame aspect from the visible source ROI', () => {
+    const frame = captureStitchResult('2747').frames[0].cameras[0];
+    expect(captureFrameLongitudinalAspect(frame)).toBeCloseTo(1024 / 600, 6);
+    expect(captureFrameLongitudinalAspect(frame, [[0, 0.75]])).toBeCloseTo(1024 / 450, 6);
+  });
+
   it('shows fitted-cylinder depth on hover and raw camera depth while T is held', async () => {
     vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('2747', 1));
+    const measurement: CaptureFlowMeasurement = {
+      schema: 'steel.ranger3-flow-measurement.v1',
+      generatedAt: '2026-08-24T02:00:00.000Z',
+      materialId: '2747',
+      mode: 'metric',
+      metricValid: true,
+      qualityGate: { passed: true, reasons: [] },
+      selectedSection: {},
+      cameras: {},
+      surfaceFit: {
+        available: true,
+        metricValid: true,
+        sections: [
+          { positionRatio: 0, metricValid: true, circleFit: { available: true, diameterMm: 76.669 } },
+        ],
+      },
+    };
     render(
       <ProductionPlateMap
         {...common}
         artifactMode="production"
         captureMaterialId="2747"
         cameraLanes={createSequentialCameraLanes(6)}
+        surfaceMeasurement={measurement}
       />,
     );
 
@@ -488,6 +602,7 @@ describe('online inspection world compatibility', () => {
     const probe = await screen.findByRole('status', { name: '3D 深度探针' });
     await waitFor(() => expect(probe).toHaveTextContent('+0.250 mm'));
     expect(probe).toHaveTextContent('相对拟合圆柱');
+    expect(probe).toHaveTextContent('测径76.669 mm');
     expect(probe).toHaveTextContent('源像素 400, 512');
 
     fireEvent.keyDown(window, { code: 'KeyT', key: 't' });
@@ -503,6 +618,25 @@ describe('online inspection world compatibility', () => {
     await waitFor(() => expect(probe).toHaveAttribute('data-probe-mode', 'relative'));
   });
 
+  it('keeps camera expansion available without showing a native double-click description', async () => {
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('2747', 1));
+    render(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        captureMaterialId="2747"
+        cameraLanes={createSequentialCameraLanes(6)}
+      />,
+    );
+
+    await screen.findByTestId('capture-roi-status');
+    const camera = screen.getByRole('button', { name: 'camera2 采集图像，双击展开' });
+    expect(camera).not.toHaveAttribute('title');
+    fireEvent.doubleClick(camera);
+    expect(camera).toHaveAttribute('aria-label', 'camera2 采集图像，已展开，双击恢复');
+    expect(camera).not.toHaveAttribute('title');
+  });
+
   it('marks a frame ROI with a rectangle and repeats the defect on the distance ruler', async () => {
     vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('4034', 3));
     const onSelectDefect = vi.fn();
@@ -513,6 +647,7 @@ describe('online inspection world compatibility', () => {
       cameraId: 'C2',
       cameraIndex: 2,
       distanceHeadMm: 3_000,
+      detectionConfidence: 0.95,
       artifacts: {
         schema: 'steel.surface.defect.artifacts.v1',
         cameraId: 'C2',
@@ -540,6 +675,19 @@ describe('online inspection world compatibility', () => {
     const frameMarker = await screen.findByRole('button', { name: /凹坑矩形标记，C2 文件序号 2/ });
     expect(frameMarker).toHaveClass('selected');
     expect(frameMarker).toHaveStyle({ left: '9.765625%', width: '11.71875%' });
+    fireEvent.mouseEnter(frameMarker, { clientX: 700, clientY: 620 });
+    const hoverCard = screen.getByTestId('defect-frame-hover-card');
+    expect(hoverCard).toHaveClass('frame-preview');
+    expect(screen.getByRole('img', { name: '凹坑缺陷大图' })).toHaveAttribute(
+      'src',
+      '/mock-defect-pit.png',
+    );
+    expect(hoverCard).toHaveTextContent('C2');
+    expect(hoverCard).toHaveTextContent('2 / 2');
+    expect(hoverCard).toHaveTextContent('200, 100 · 50×120px');
+    expect(hoverCard).toHaveTextContent('95%');
+    fireEvent.mouseLeave(frameMarker);
+    expect(screen.queryByTestId('defect-frame-hover-card')).not.toBeInTheDocument();
     const rulerMarker = screen.getByRole('button', { name: '凹坑位置，距头3000毫米' });
     expect(rulerMarker).toHaveClass('selected');
     fireEvent.click(frameMarker);
@@ -1493,6 +1641,58 @@ describe('PlateMap', () => {
       'data-overlap-policy',
       'owned-columns-concatenated',
     );
+  });
+
+  it('maps owned-column gray and JET renditions onto the production cylinder at 1:1 pixels', async () => {
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('4033', 134));
+    vi.mocked(readCaptureRegions).mockResolvedValue(captureRegionMap('4033'));
+    render(
+      <ProductionPlateMap
+        defectTypes={defectTypes}
+        defects={[]}
+        defectTypeCounts={{}}
+        hiddenTypeIds={new Set()}
+        selectedDefectId={null}
+        surfaceMode="all"
+        previewPositionM={6}
+        plateLengthM={12}
+        inspectionId="INS-4033"
+        captureMaterialId="4033"
+        cameraLanes={createSequentialCameraLanes(6)}
+        surfaceMesh={{
+          ...productionMesh,
+          materialId: '4033',
+          longitudinalAxis: { absoluteScaleVerified: false },
+        }}
+        surfaceCameraTiles={captureSurfaceCameraTiles()}
+        onToggleType={vi.fn()}
+        onSurfaceModeChange={vi.fn()}
+        onPreviewPositionChange={vi.fn()}
+        onSelectDefect={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '3D' }));
+    fireEvent.click(screen.getByRole('button', { name: '灰度贴图' }));
+
+    await waitFor(() => expect(screen.getByTestId('plate-production-surface')).toHaveAttribute(
+      'data-artifact-overlap-policy',
+      'owned-columns-concatenated',
+    ));
+    const gray = screen.getByTestId('plate-production-surface');
+    expect(gray).toHaveAttribute('data-artifact-color-mode', 'texture');
+    expect(gray).toHaveAttribute('data-artifact-texture-modality', 'gray');
+    expect(gray).toHaveAttribute('data-artifact-pixel-aspect', '1.000');
+    expect(Number(gray.getAttribute('data-artifact-length-diameter-ratio'))).toBeCloseTo(
+      Math.PI * 134 * 1024 / (6 * 450),
+      2,
+    );
+    expect(screen.getByText(/去重灰度贴图准备中/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'JET贴图' }));
+    const jet = screen.getByTestId('plate-production-surface');
+    expect(jet).toHaveAttribute('data-artifact-color-mode', 'radial-jet');
+    expect(screen.getByLabelText('Jet 拟合圆径向偏差图例')).toBeInTheDocument();
   });
 
   it('keeps the existing 2D image visible when calibrated ownership is unavailable', async () => {

@@ -319,6 +319,22 @@ describe('AppFooter', () => {
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
   });
 
+  it('opens software update from the more menu', async () => {
+    render(
+      <AppFooter
+        activeNav="online"
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '软件更新' }));
+
+    expect(await screen.findByRole('dialog', { name: '软件版本更新' })).toBeInTheDocument();
+    expect(screen.getByText(/软件安装仅在正式桌面客户端中可用/)).toBeInTheDocument();
+  });
+
   it('opens management tools through independent-window callbacks', () => {
     const onSettingsOpen = vi.fn();
     const onParameterManagementOpen = vi.fn();

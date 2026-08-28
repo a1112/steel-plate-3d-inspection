@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Activity, ArrowLeft, Box, Database, History, MonitorCog, MoreHorizontal, Play, Radio, Settings2 } from 'lucide-react';
+import { Activity, ArrowLeft, Box, Database, Download, History, MonitorCog, MoreHorizontal, Play, Radio, Settings2 } from 'lucide-react';
 import type { DefectItem } from '../data/inspection';
 import {
   formatResourceBreakdown,
@@ -17,6 +17,7 @@ import { notify } from '../state/notifications';
 import type { AnalysisViewMode } from './AlarmAnalysis';
 import type { NavKey } from './TopNav';
 import { DEFAULT_SYSTEM_NAME } from '../lib/system-brand';
+import { SoftwareUpdateDialog } from './SoftwareUpdateDialog';
 
 interface FooterAnalysisContext {
   defect: DefectItem;
@@ -112,6 +113,7 @@ export function AppFooter({
   onlineWorkspace,
 }: AppFooterProps) {
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [softwareUpdateOpen, setSoftwareUpdateOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const activeAnalysis = activeNav === 'online' ? analysis : null;
   const visibleAnalysis = dashboardMode.kind === 'bkv' ? activeAnalysis : null;
@@ -191,7 +193,8 @@ export function AppFooter({
   };
 
   return (
-    <footer className={`app-footer ${visibleAnalysis ? 'has-analysis-context' : ''}`} data-no-drag>
+    <>
+      <footer className={`app-footer ${visibleAnalysis ? 'has-analysis-context' : ''}`} data-no-drag>
       {connection ? (
         <button
           type="button"
@@ -322,6 +325,17 @@ export function AppFooter({
                 <span>离线回放</span>
               </button>
               {!terminalViews.bkv.available ? <small>仅 BKV 模式可用</small> : null}
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setMoreMenuOpen(false);
+                  setSoftwareUpdateOpen(true);
+                }}
+              >
+                <Download size={15} />
+                <span>软件更新</span>
+              </button>
             </div>
           ) : null}
         </div>
@@ -338,6 +352,8 @@ export function AppFooter({
           </button>
         ) : null}
       </nav>
-    </footer>
+      </footer>
+      {softwareUpdateOpen ? <SoftwareUpdateDialog onClose={() => setSoftwareUpdateOpen(false)} /> : null}
+    </>
   );
 }

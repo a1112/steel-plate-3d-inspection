@@ -1,15 +1,64 @@
 import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import type { ReactNode } from 'react';
+import { TextureLoader } from 'three';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import {
   buildDepthExaggeratedPositions,
   buildRadialJetColors,
   normalizeArtifactPositions,
   ProductionArtifactView,
+  resolveArtifactDisplaySpans,
+  unwrapTriangleTextureSeams,
 } from './ProductionArtifactView';
 
+const textureLifecycle = vi.hoisted(() => {
+  const texture = {
+    anisotropy: 0,
+    colorSpace: '',
+    dispose: vi.fn(),
+    generateMipmaps: false,
+    magFilter: 0,
+    minFilter: 0,
+    needsUpdate: false,
+    wrapT: 0,
+  };
+  return {
+    clear: vi.fn(),
+    renderTextureMaterial: false,
+    texture,
+    useLoader: vi.fn(() => texture),
+  };
+});
+
 vi.mock('@react-three/fiber', () => ({
-  Canvas: () => <div data-testid="mock-three-canvas" />,
+  Canvas: ({ children }: { children?: unknown }) => {
+    let textureMaterial: ReactNode = null;
+    if (textureLifecycle.renderTextureMaterial) {
+      const findTextureMaterial = (node: unknown): ReactNode => {
+        if (Array.isArray(node)) {
+          for (const child of node) {
+            const found = findTextureMaterial(child);
+            if (found) return found;
+          }
+          return null;
+        }
+        if (!node || typeof node !== 'object') return null;
+        const element = node as {
+          props?: { children?: unknown; textureUrl?: unknown };
+          type?: unknown;
+        };
+        if (
+          typeof element.type === 'function'
+          && typeof element.props?.textureUrl === 'string'
+        ) return node as ReactNode;
+        return findTextureMaterial(element.props?.children);
+      };
+      textureMaterial = findTextureMaterial(children);
+    }
+    return <div data-testid="mock-three-canvas">{textureMaterial}</div>;
+  },
+  useLoader: Object.assign(textureLifecycle.useLoader, { clear: textureLifecycle.clear }),
   useThree: () => ({
     camera: {
       position: { set: vi.fn() },
@@ -23,6 +72,13 @@ vi.mock('@react-three/fiber', () => ({
     size: { height: 400, width: 800 },
   }),
 }));
+
+beforeEach(() => {
+  textureLifecycle.renderTextureMaterial = false;
+  textureLifecycle.clear.mockClear();
+  textureLifecycle.texture.dispose.mockClear();
+  textureLifecycle.useLoader.mockClear();
+});
 
 function fixture(): BarSurfaceMesh {
   return {
@@ -86,6 +142,122 @@ describe('ProductionArtifactView', () => {
     expect(normalized[6]).toBeCloseTo(2.1, 5);
     expect(normalized[4]).toBeCloseTo(-0.675, 5);
     expect(normalized[7]).toBeCloseTo(0.675, 5);
+  });
+
+  it('uses square texture pixels to preserve the full cylinder length-to-diameter ratio', () => {
+    const spans = resolveArtifactDisplaySpans({
+      longitudinalPixels: 134 * 1024,
+      circumferencePixels: 6 * 450,
+      pixelAspectRatio: 1,
+    });
+    expect(spans.lengthDiameterRatio).toBeCloseTo(
+      Math.PI * 134 * 1024 / (6 * 450),
+      6,
+    );
+    expect(spans.longitudinal / spans.crossSection).toBeCloseTo(spans.lengthDiameterRatio, 6);
+
+    const normalized = normalizeArtifactPositions(
+      new Float32Array([
+        0, -1, 0,
+        1, 1, 0,
+      ]),
+      undefined,
+      spans,
+    );
+    expect(normalized[3] - normalized[0]).toBeCloseTo(spans.longitudinal, 4);
+    expect(normalized[4] - normalized[1]).toBeCloseTo(spans.crossSection, 4);
+  });
+
+  it('identifies an owned-column gray texture as a 1:1 long-strip surface', () => {
+    render(
+      <ProductionArtifactView
+        mesh={fixture()}
+        mode="surface"
+        testId="deduplicated-gray-texture"
+        ariaLabel="去重灰度贴图表面"
+        colorMode="texture"
+        textureUrl="blob:gray-texture"
+        textureModality="gray"
+        textureMetrics={{
+          longitudinalPixels: 134 * 1024,
+          circumferencePixels: 6 * 450,
+          pixelAspectRatio: 1,
+          overlapPolicy: 'owned-columns-concatenated',
+        }}
+      />,
+    );
+
+    const view = screen.getByTestId('deduplicated-gray-texture');
+    expect(view).toHaveAttribute('data-artifact-color-mode', 'texture');
+    expect(view).toHaveAttribute('data-artifact-texture-modality', 'gray');
+    expect(view).toHaveAttribute('data-artifact-overlap-policy', 'owned-columns-concatenated');
+    expect(view).toHaveAttribute('data-artifact-pixel-aspect', '1.000');
+    expect(Number(view.getAttribute('data-artifact-length-diameter-ratio'))).toBeCloseTo(159.64, 1);
+    expect(screen.getByText('去重灰度贴图 · 像素 1:1')).toBeInTheDocument();
+  });
+
+  it('disposes a texture and clears its loader cache when the material unmounts', () => {
+    textureLifecycle.renderTextureMaterial = true;
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { unmount } = render(
+        <ProductionArtifactView
+          mesh={fixture()}
+          mode="surface"
+          testId="texture-cleanup"
+          ariaLabel="纹理释放测试"
+          colorMode="texture"
+          textureUrl="blob:texture-cleanup"
+        />,
+      );
+
+      expect(textureLifecycle.useLoader).toHaveBeenCalledWith(
+        TextureLoader,
+        'blob:texture-cleanup',
+      );
+      unmount();
+      expect(textureLifecycle.texture.dispose).toHaveBeenCalledTimes(1);
+      expect(textureLifecycle.clear).toHaveBeenCalledWith(
+        TextureLoader,
+        'blob:texture-cleanup',
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it('keeps texture interpolation local across the 0/360-degree UV seam', () => {
+    const unwrapped = unwrapTriangleTextureSeams(new Float32Array([
+      0, 0.98,
+      0.5, 0.02,
+      1, 0.04,
+      0, 0.7,
+      0.5, 0.5,
+      1, 0.4,
+    ]));
+    expect(unwrapped[1]).toBeCloseTo(0.98);
+    expect(unwrapped[3]).toBeCloseTo(1.02);
+    expect(unwrapped[5]).toBeCloseTo(1.04);
+    expect(unwrapped[7]).toBeCloseTo(0.7);
+    expect(unwrapped[9]).toBeCloseTo(0.5);
+    expect(unwrapped[11]).toBeCloseTo(0.4);
+  });
+
+  it('preserves non-zero seam width when circumference UVs use bin centers', () => {
+    const unwrapped = unwrapTriangleTextureSeams(new Float32Array([
+      0, 0.875,
+      0.5, 0.125,
+      1, 0.375,
+    ]));
+    const circumferenceCoordinates = [unwrapped[1], unwrapped[3], unwrapped[5]];
+
+    expect(circumferenceCoordinates[0]).toBeCloseTo(0.875);
+    expect(circumferenceCoordinates[1]).toBeCloseTo(1.125);
+    expect(circumferenceCoordinates[2]).toBeCloseTo(1.375);
+    expect(new Set(circumferenceCoordinates.map((value) => value.toFixed(6))).size).toBe(3);
+    expect(Math.max(...circumferenceCoordinates) - Math.min(...circumferenceCoordinates))
+      .toBeCloseTo(0.5);
+    expect(circumferenceCoordinates.every((value) => value % 1 !== 0)).toBe(true);
   });
 
   it('moves observed points along the fitted section normal while preserving nominal fill points', () => {
@@ -211,7 +383,7 @@ describe('ProductionArtifactView', () => {
     expect(onZoomChange).toHaveBeenLastCalledWith(10);
   });
 
-  it('keeps the longitudinal and cross-section position under the pointer while zooming', () => {
+  it('keeps the longitudinal position under the pointer while the horizontal pipe stays vertically centred', () => {
     render(
       <ProductionArtifactView
         mesh={fixture()}
@@ -233,7 +405,10 @@ describe('ProductionArtifactView', () => {
     const end = Number(view.getAttribute('data-visible-range-end'));
     expect(start + 0.75 * (end - start)).toBeCloseTo(0.75, 3);
     expect(Number(view.getAttribute('data-artifact-axis-center'))).toBeCloseTo(0.5417, 3);
-    expect(Number(view.getAttribute('data-artifact-pan-y'))).toBeLessThan(0);
+    expect(view).toHaveAttribute('data-artifact-pan-y', '0.0000');
+
+    fireEvent.wheel(view, { deltaY: -100, clientX: 750, clientY: 480 });
+    expect(view).toHaveAttribute('data-artifact-pan-y', '0.0000');
   });
 
   it('exposes a millimetre ruler and scrolls the visible pipe-length range after zoom', () => {

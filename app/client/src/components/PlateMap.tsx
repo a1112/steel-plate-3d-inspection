@@ -12,6 +12,7 @@ import {
   captureRenderImageUrl,
   readCaptureDefects,
   readCaptureRegions,
+  type CaptureFlowMeasurement,
   type CaptureFlowSurface,
   type CaptureRegionCamera,
   type CaptureRegionMap,
@@ -20,6 +21,7 @@ import {
 import { barSurfaceFileUrl, type BarSurfaceCamera, type BarSurfaceMesh } from '../services/bar-surface-api';
 import {
   fetchCaptureStitchHistory,
+  type CaptureStitchCameraFrame,
   type CaptureStitchFrame,
   type CaptureStitchResult,
 } from '../services/capture-roi-api';
@@ -34,6 +36,13 @@ import {
   prefetchCaptureImageUrls,
   rememberCaptureImage,
 } from '../lib/capture-image-prefetch';
+import {
+  buildCaptureCylinderTexturePlan,
+  composeCaptureCylinderTexture,
+  normalizeOwnedColumnIntervals,
+  type CaptureTextureModality,
+  type NormalizedColumnInterval,
+} from '../lib/capture-cylinder-texture';
 import {
   fetchInspectionWorldDefects,
   fetchInspectionWorldMeta,
@@ -75,6 +84,7 @@ interface PlateMapProps {
   surfaceMesh?: BarSurfaceMesh | null;
   surfaceCameraTiles?: CaptureSurfaceCameraTiles | null;
   surfaceHeadAlignment?: CaptureFlowSurface['headAlignment'] | null;
+  surfaceMeasurement?: CaptureFlowMeasurement | null;
   surfaceCameras?: BarSurfaceCamera[];
   artifactStatus?: string;
   viewMode?: PlateMapViewMode;
@@ -99,12 +109,14 @@ type Plate3DDisplayMode = 'surface' | 'points' | 'texture' | 'jet';
 type Plate2DDisplayMode = 'gray' | 'jet';
 type OverlapDisplayMode = 'overlap' | 'deduplicated';
 type UnfoldOrientation = 'horizontal' | 'vertical';
-export type NormalizedColumnInterval = [number, number];
+export { normalizeOwnedColumnIntervals } from '../lib/capture-cylinder-texture';
 type DisplayWorld = {
   recordId: string;
   meta: InspectionWorldMeta;
   defects: InspectionWorldDefect[];
 };
+
+const MAP_DRAG_THRESHOLD_PX = 8;
 
 type CaptureStitchState = {
   materialId: string;
@@ -246,33 +258,6 @@ function useCaptureOverlapData(
   return state;
 }
 
-export function normalizeOwnedColumnIntervals(
-  intervals: readonly number[][] | undefined,
-  cropBox: readonly number[] | null | undefined,
-): NormalizedColumnInterval[] {
-  if (!cropBox || cropBox.length !== 4 || !cropBox.every(Number.isFinite)) return [];
-  const cropLeft = Number(cropBox[0]);
-  const cropRight = Number(cropBox[2]);
-  const cropWidth = cropRight - cropLeft;
-  if (cropWidth <= 0 || !intervals) return [];
-  const normalized = intervals.flatMap((interval): NormalizedColumnInterval[] => {
-    if (!Array.isArray(interval) || interval.length !== 2 || !interval.every(Number.isFinite)) return [];
-    const left = Math.max(cropLeft, Math.min(cropRight, Number(interval[0])));
-    const right = Math.max(cropLeft, Math.min(cropRight, Number(interval[1])));
-    return right > left ? [[(left - cropLeft) / cropWidth, (right - cropLeft) / cropWidth]] : [];
-  }).sort((left, right) => left[0] - right[0] || left[1] - right[1]);
-  const merged: NormalizedColumnInterval[] = [];
-  normalized.forEach(([left, right]) => {
-    const previous = merged.at(-1);
-    if (previous && left <= previous[1] + 1e-6) {
-      previous[1] = Math.max(previous[1], right);
-    } else {
-      merged.push([left, right]);
-    }
-  });
-  return merged;
-}
-
 export function remapOwnedColumnRange(
   left: number,
   right: number,
@@ -382,6 +367,46 @@ export function capturePrefetchFrameIndexes(
   return indexes;
 }
 
+export function captureFrameDurationMs(
+  frames: readonly CaptureStitchFrame[],
+  headAlignment?: CaptureFlowSurface['headAlignment'] | null,
+) {
+  const candidates: number[] = [];
+  for (let index = 1; index < frames.length; index += 1) {
+    const previous = frames[index - 1];
+    const current = frames[index];
+    const sequenceSpan = current.sequence - previous.sequence;
+    const elapsedMs = Date.parse(current.capturedAt) - Date.parse(previous.capturedAt);
+    if (sequenceSpan > 0 && elapsedMs > 0) candidates.push(elapsedMs / sequenceSpan);
+  }
+  Object.values(headAlignment?.cameras ?? {}).forEach((camera) => {
+    const offsetFrames = Math.abs(Number(camera.offsetFramesFromReference));
+    const offsetMs = Math.abs(Number(camera.offsetMsFromReference));
+    if (offsetFrames > 0.01 && offsetMs > 0) candidates.push(offsetMs / offsetFrames);
+  });
+  const usable = candidates
+    .filter((value) => Number.isFinite(value) && value >= 1 && value <= 60_000)
+    .sort((left, right) => left - right);
+  if (usable.length === 0) return null;
+  const middle = Math.floor(usable.length / 2);
+  return usable.length % 2 === 0
+    ? (usable[middle - 1] + usable[middle]) / 2
+    : usable[middle];
+}
+
+export function captureTailTimelineFrame(
+  frames: readonly CaptureStitchFrame[],
+  contentAnchorFrame: number,
+  longitudinalAxis: BarSurfaceMesh['longitudinalAxis'] | null | undefined,
+  headAlignment?: CaptureFlowSurface['headAlignment'] | null,
+) {
+  const endElapsedFromHeadMs = Number(longitudinalAxis?.endElapsedFromHeadMs);
+  if (!Number.isFinite(endElapsedFromHeadMs) || endElapsedFromHeadMs <= 0) return null;
+  const frameDurationMs = captureFrameDurationMs(frames, headAlignment);
+  if (frameDurationMs === null) return null;
+  return contentAnchorFrame + endElapsedFromHeadMs / frameDurationMs;
+}
+
 function captureStitchCameraHasContent(camera: CaptureStitchFrame['cameras'][number]) {
   if (camera.sourceBytes === undefined) return true;
   if (!Number.isFinite(camera.sourceBytes) || camera.sourceBytes <= 0) return false;
@@ -421,6 +446,41 @@ export function captureStitchInitialFrameIndex(
     }
   }
   return bestIndex;
+}
+
+export function captureStitchTailFrameIndex(
+  frames: readonly CaptureStitchFrame[],
+  expectedCameraCount: number,
+) {
+  const hasDensityEvidence = frames.some((frame) => frame.cameras.some(
+    (camera) => camera.sourceBytes !== undefined,
+  ));
+  if (!hasDensityEvidence) return null;
+  const requiredContentCameras = Math.max(1, Math.ceil(Math.max(1, expectedCameraCount) / 2));
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const contentCount = frames[index].cameras.filter(captureStitchCameraHasContent).length;
+    if (contentCount >= requiredContentCameras) return index;
+  }
+  return null;
+}
+
+export function captureFrameLongitudinalAspect(
+  cameraFrame: CaptureStitchCameraFrame | null | undefined,
+  sourceIntervals?: readonly NormalizedColumnInterval[],
+) {
+  if (!cameraFrame) return null;
+  const [left, top, right, bottom] = cameraFrame.validRoi
+    ?? [0, 0, cameraFrame.sourceWidth, cameraFrame.sourceHeight];
+  const cropWidth = Math.abs(right - left);
+  const cropHeight = Math.abs(bottom - top);
+  if (!(cropWidth > 0) || !(cropHeight > 0)) return null;
+  const ownedFraction = sourceIntervals?.reduce(
+    (total, [start, end]) => total + Math.max(0, end - start),
+    0,
+  ) ?? 0;
+  const visibleCrossAxisPixels = cropWidth * (ownedFraction > 0 ? ownedFraction : 1);
+  if (!(visibleCrossAxisPixels > 0)) return null;
+  return Math.max(0.25, Math.min(8, cropHeight / visibleCrossAxisPixels));
 }
 
 const viewModeOptions: { id: PlateMapViewMode; label: string }[] = [
@@ -593,6 +653,101 @@ function useInspectionWorldTexture(
   return { textureUrl, textureStatus };
 }
 
+function useCaptureCylinderTexture(
+  materialId: string | undefined,
+  frames: readonly CaptureStitchFrame[],
+  cameraIds: readonly string[],
+  regionMap: CaptureRegionMap | null,
+  surfaceCameraTiles: CaptureSurfaceCameraTiles | null | undefined,
+  headAlignment: CaptureFlowSurface['headAlignment'] | null | undefined,
+  modality: CaptureTextureModality,
+  enabled: boolean,
+) {
+  const cameraKey = cameraIds.join(',');
+  const plan = useMemo(() => enabled ? buildCaptureCylinderTexturePlan({
+    materialId: materialId?.trim() || '',
+    frames,
+    cameraIds: cameraKey.split(',').filter(Boolean),
+    regionMap,
+    surfaceCameraTiles,
+    headAlignment,
+    modality,
+  }) : null, [cameraKey, enabled, frames, headAlignment, materialId, modality, regionMap, surfaceCameraTiles]);
+  const [textureUrl, setTextureUrl] = useState('');
+  const [textureStatus, setTextureStatus] = useState('');
+  const [textureRetryRevision, setTextureRetryRevision] = useState(0);
+  const textureObjectUrlRef = useRef('');
+  const planKey = plan?.cacheKey ?? '';
+  const regionStateKey = regionMap
+    ? `${regionMap.ownership.ready}:${regionMap.ownership.reasons.join(',')}`
+    : '';
+
+  useEffect(() => () => {
+    if (textureObjectUrlRef.current) URL.revokeObjectURL(textureObjectUrlRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) {
+      if (textureObjectUrlRef.current) URL.revokeObjectURL(textureObjectUrlRef.current);
+      textureObjectUrlRef.current = '';
+      setTextureUrl('');
+      setTextureStatus('');
+      return undefined;
+    }
+    const label = modality === 'jet' ? 'JET' : '灰度';
+    if (!plan) {
+      if (textureObjectUrlRef.current) URL.revokeObjectURL(textureObjectUrlRef.current);
+      textureObjectUrlRef.current = '';
+      setTextureUrl('');
+      setTextureStatus(frames.length === 0
+        ? `正在读取${label}逐帧图像…`
+        : !regionMap
+          ? '正在读取六相机去重归属…'
+          : !surfaceCameraTiles
+            ? `当前三维结果缺少逐列角度标定，无法生成去重${label}贴图`
+            : `六相机归属或逐列角度标定不完整，无法生成去重${label}贴图（${surfaceCameraTiles.cameras.length}/${cameraIds.length}）`);
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    let retryTimer = 0;
+    if (textureObjectUrlRef.current) URL.revokeObjectURL(textureObjectUrlRef.current);
+    textureObjectUrlRef.current = '';
+    setTextureUrl('');
+    setTextureStatus(`正在生成去重${label}贴图… 0/${plan.tiles.length}`);
+    void composeCaptureCylinderTexture(plan, controller.signal, (completed, total) => {
+      if (!controller.signal.aborted) {
+        setTextureStatus(`正在生成去重${label}贴图… ${completed}/${total}`);
+      }
+    }).then(({ blob }) => {
+      if (controller.signal.aborted) return;
+      const nextUrl = URL.createObjectURL(blob);
+      textureObjectUrlRef.current = nextUrl;
+      setTextureUrl(nextUrl);
+      setTextureStatus(
+        `去重${label}贴图 · ${plan.frameCount} 帧 · ${plan.canvasWidth}×${plan.canvasHeight} · 像素 1:1 · 长径比 ${plan.lengthDiameterRatio.toFixed(1)}:1`,
+      );
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) {
+        const message = error instanceof Error ? error.message : `去重${label}贴图生成失败`;
+        setTextureStatus(`${message}，稍后自动重试`);
+        retryTimer = window.setTimeout(() => {
+          setTextureRetryRevision((revision) => revision + 1);
+        }, 8_000);
+      }
+    });
+    return () => {
+      controller.abort();
+      window.clearTimeout(retryTimer);
+    };
+  // cacheKey deliberately shields an in-progress composition from periodic
+  // API refreshes that return equivalent frame/region objects.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, frames.length, modality, planKey, regionStateKey, textureRetryRevision]);
+
+  return { textureUrl, textureStatus, texturePlan: plan };
+}
+
 function clampPercent(value: number, min = 0, max = 100) {
   return Math.max(min, Math.min(max, value));
 }
@@ -716,26 +871,47 @@ function DefectHoverCard({
   type,
   xPercent,
   yPercent,
+  frameContext,
 }: {
   defect: DefectItem;
   type: DefectType;
   xPercent?: number;
   yPercent?: number;
+  frameContext?: {
+    cameraId: string;
+    frameSequence: number;
+    storageIndex: number;
+    imageUrl: string;
+    roi: { x: number; y: number; width: number; height: number };
+    clientX: number;
+    clientY: number;
+  };
 }) {
   const actualXPercent = xPercent ?? defect.xRatio * 100;
   const actualYPercent = yPercent ?? yOffsetToPercentValue(defect.yOffsetMm);
   const xPercentValue = clampPercent(actualXPercent, 0, 100);
   const yPercentValue = clampPercent(actualYPercent, 0, 100);
   const edgeClass = `${xPercentValue > 76 ? 'near-right' : xPercentValue < 24 ? 'near-left' : ''} ${yPercentValue < 44 ? 'near-top' : ''}`;
+  const previewImageUrl = defect.previewImageUrl?.trim() || frameContext?.imageUrl || '';
+  const confidence = defect.classificationConfidence
+    ?? defect.detectionConfidence
+    ?? defect.confidence;
+  const floatingStyle = frameContext ? {
+    left: Math.max(8, Math.min(frameContext.clientX + 16, window.innerWidth - 378)),
+    top: frameContext.clientY > window.innerHeight * 0.58
+      ? Math.max(8, frameContext.clientY - 356)
+      : Math.min(frameContext.clientY + 16, Math.max(8, window.innerHeight - 356)),
+  } : null;
 
   return (
     <div
-      className={`defect-hover-card ${edgeClass}`}
+      className={`defect-hover-card ${frameContext ? 'frame-preview' : edgeClass}`}
       role="tooltip"
+      data-testid={frameContext ? 'defect-frame-hover-card' : undefined}
       style={
         {
-          left: `${xPercentValue}%`,
-          top: `${yPercentValue}%`,
+          left: floatingStyle?.left ?? `${xPercentValue}%`,
+          top: floatingStyle?.top ?? `${yPercentValue}%`,
           '--defect-color': type.color,
         } as CSSProperties
       }
@@ -746,21 +922,35 @@ function DefectHoverCard({
         {defect.synthetic ? <em className="synthetic-defect-badge">模拟</em> : null}
         <span>{defect.id}</span>
       </div>
-      {defect.previewImageUrl ? (
-        <div className="defect-hover-preview">
+      {previewImageUrl ? (
+        <div className={`defect-hover-preview ${frameContext ? 'large' : ''}`}>
           <RequestedSizeImage
-            src={defect.previewImageUrl}
-            alt={`${defect.typeLabel}缺陷小图`}
-            requestWidth={256}
-            requestHeight={160}
+            src={previewImageUrl}
+            alt={`${defect.typeLabel}缺陷${frameContext ? '大图' : '小图'}`}
+            requestWidth={frameContext ? 360 : 256}
+            requestHeight={frameContext ? 240 : 160}
           />
         </div>
-      ) : null}
+      ) : frameContext ? <div className="defect-hover-preview large empty">暂无缺陷图像</div> : null}
       <dl>
-        <div>
+        {frameContext ? <>
+          <div>
+            <dt>相机</dt>
+            <dd>{frameContext.cameraId}</dd>
+          </div>
+          <div>
+            <dt>帧/文件</dt>
+            <dd>{frameContext.frameSequence} / {frameContext.storageIndex}</dd>
+          </div>
+          <div className="wide">
+            <dt>ROI</dt>
+            <dd>{frameContext.roi.x}, {frameContext.roi.y} · {frameContext.roi.width}×{frameContext.roi.height}px</dd>
+          </div>
+        </> : null}
+        {!frameContext ? <div>
           <dt>相机</dt>
           <dd>{getDefectCameraLabel(defect)}</dd>
-        </div>
+        </div> : null}
         <div>
           <dt>等级</dt>
           <dd className={defect.severity}>{severityLabels[defect.severity]}</dd>
@@ -785,6 +975,12 @@ function DefectHoverCard({
           <dt>尺寸</dt>
           <dd>{getDefectSizeText(defect)}</dd>
         </div>
+        {typeof confidence === 'number' && Number.isFinite(confidence) ? (
+          <div className="wide">
+            <dt>置信度</dt>
+            <dd>{Math.round(confidence * 100)}%</dd>
+          </div>
+        ) : null}
       </dl>
     </div>
   );
@@ -1111,9 +1307,46 @@ function headAlignmentCamera(
   )?.[1];
 }
 
-function signedFrameOffset(value: number) {
-  if (Math.abs(value) < 0.0005) return '参考头';
-  return `头偏移 ${value > 0 ? '+' : ''}${value.toFixed(2)} 帧`;
+export function captureProbeDiameterMm(
+  measurement: CaptureFlowMeasurement | null | undefined,
+  frames: readonly CaptureStitchFrame[],
+  frameSequence: number,
+) {
+  if (!measurement?.metricValid) return null;
+  const surface = measurement.surfaceFit;
+  const sections = (surface?.available !== false && surface?.metricValid !== false
+    ? surface?.sections ?? []
+    : [])
+    .map((section, index) => {
+      const diameterMm = Number(section.circleFit?.diameterMm);
+      const accepted = section.metricValid ?? section.qualityGate?.passed ?? true;
+      if (!accepted || section.circleFit?.available === false || !Number.isFinite(diameterMm)) return null;
+      const positionRatio = Number(section.positionRatio);
+      return {
+        diameterMm,
+        positionRatio: Number.isFinite(positionRatio)
+          ? Math.max(0, Math.min(1, positionRatio))
+          : index / Math.max(1, (surface?.sections?.length ?? 1) - 1),
+      };
+    })
+    .filter((section): section is { diameterMm: number; positionRatio: number } => section !== null);
+  if (sections.length > 0) {
+    const frameIndex = frames.findIndex((frame) => frame.sequence === frameSequence);
+    const frameRatio = frameIndex >= 0
+      ? frameIndex / Math.max(1, frames.length - 1)
+      : 0;
+    return sections.reduce((nearest, section) => (
+      Math.abs(section.positionRatio - frameRatio) < Math.abs(nearest.positionRatio - frameRatio)
+        ? section
+        : nearest
+    )).diameterMm;
+  }
+  const selectedDiameterMm = Number(measurement.selectedSection.circleFit?.diameterMm);
+  if (measurement.selectedSection.circleFit?.available !== false && Number.isFinite(selectedDiameterMm)) {
+    return selectedDiameterMm;
+  }
+  const averageDiameterMm = Number(surface?.diameterMeanMm);
+  return Number.isFinite(averageDiameterMm) ? averageDiameterMm : null;
 }
 
 function defectFrameRectStyle(
@@ -1180,6 +1413,8 @@ function BarUnfoldedMap({
   headAlignment,
   regionMap,
   deduplicateOverlap = false,
+  measurement,
+  longitudinalAxis,
   cropBlackBorders = false,
   viewportMemory,
 }: {
@@ -1204,14 +1439,27 @@ function BarUnfoldedMap({
   headAlignment?: CaptureFlowSurface['headAlignment'] | null;
   regionMap?: CaptureRegionMap | null;
   deduplicateOverlap?: boolean;
+  measurement?: CaptureFlowMeasurement | null;
+  longitudinalAxis?: BarSurfaceMesh['longitudinalAxis'] | null;
   cropBlackBorders?: boolean;
   viewportMemory?: MutableRefObject<TwoDViewportMemory>;
 }) {
   const FRAME_SPAN_PX = 176;
   const FRAME_OVERSCAN = 3;
   const HEAD_CONTEXT_FRAMES = 0.35;
+  const TAIL_CONTEXT_FRAMES = 0.35;
   const [expandedCamera, setExpandedCamera] = useState<string | null>(null);
   const [mapDragging, setMapDragging] = useState(false);
+  const [frameDefectHover, setFrameDefectHover] = useState<{
+    defectId: string;
+    cameraId: string;
+    frameSequence: number;
+    storageIndex: number;
+    imageUrl: string;
+    roi: { x: number; y: number; width: number; height: number };
+    clientX: number;
+    clientY: number;
+  } | null>(null);
   const [rawDepthHeld, setRawDepthHeld] = useState(false);
   const [depthProbe, setDepthProbe] = useState<{
     key: string;
@@ -1239,6 +1487,7 @@ function BarUnfoldedMap({
     startY: number;
     scrollLeft: number;
     scrollTop: number;
+    moved: boolean;
   } | null>(null);
   const scrollProgressRef = useRef(0);
   const initialScrollProgressRef = useRef(
@@ -1253,8 +1502,15 @@ function BarUnfoldedMap({
     stitchKey,
     frameCount: captureFrames.length,
     alignmentKey: '',
+    frameSpanPx: FRAME_SPAN_PX,
+    expandedCamera: null as string | null,
   });
-  const [scrollWindow, setScrollWindow] = useState({ offset: 0, extent: 1, total: 1 });
+  const [scrollWindow, setScrollWindow] = useState({
+    offset: 0,
+    extent: 1,
+    total: 1,
+    crossExtent: 1,
+  });
 
   useEffect(() => {
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1323,8 +1579,17 @@ function BarUnfoldedMap({
     rawDepthHeld,
   ]);
   const previewPercent = (clampPreviewPositionM(previewPositionM, plateLengthM) / plateLengthM) * 100;
+  const probeDiameterMm = depthProbe
+    ? captureProbeDiameterMm(measurement, captureFrames, depthProbe.sequence)
+    : null;
   const hoveredDefect = defects.find((defect) => defect.id === hoveredDefectId) ?? null;
   const hoveredType = hoveredDefect ? defectTypes.find((type) => type.id === hoveredDefect.typeId) : null;
+  const frameHoveredDefect = frameDefectHover
+    ? defects.find((defect) => defect.id === frameDefectHover.defectId) ?? null
+    : null;
+  const frameHoveredType = frameHoveredDefect
+    ? defectTypes.find((type) => type.id === frameHoveredDefect.typeId) ?? null
+    : null;
   const hoveredXPercent = hoveredDefect ? getDefectLengthPercent(hoveredDefect, plateLengthM) : 0;
   const hoveredYPercent = hoveredDefect ? getDefectUnfoldedTopPercent(hoveredDefect, cameraLanes.length) : 0;
   const captureImageByCamera = useMemo(() => {
@@ -1359,9 +1624,37 @@ function BarUnfoldedMap({
       )),
     )
     : 0;
-  const alignmentKey = displayHeadAlignmentApplied
+  const detectedContentTailFrameIndex = captureStitchTailFrameIndex(
+    captureFrames,
+    cameraLanes.length,
+  );
+  const expandedCameraLaneNumber = expandedCamera
+    ? cameraIdentityNumber(expandedCamera)
+    : null;
+  const expandedCameraFrame = expandedCameraLaneNumber === null
+    ? null
+    : captureFrames.flatMap((frame) => frame.cameras).find((camera) => (
+      cameraIdentityNumber(camera.cameraId) === expandedCameraLaneNumber
+    )) ?? null;
+  const expandedRegionCamera = expandedCamera
+    ? captureRegionCamera(regionMap, expandedCamera)
+    : null;
+  const expandedSourceIntervals = deduplicateOverlap && expandedCameraFrame && expandedRegionCamera
+    ? normalizeOwnedColumnIntervals(
+        expandedRegionCamera.ownedColumnIntervals,
+        expandedCameraFrame.validRoi ?? expandedRegionCamera.stableCrop,
+      )
+    : undefined;
+  const expandedFrameAspect = captureFrameLongitudinalAspect(
+    expandedCameraFrame,
+    expandedSourceIntervals,
+  );
+  const frameSpanPx = expandedCamera && expandedFrameAspect
+    ? Math.max(FRAME_SPAN_PX, scrollWindow.crossExtent * expandedFrameAspect)
+    : FRAME_SPAN_PX;
+  const alignmentKey = `${displayHeadAlignmentApplied
     ? `${headAlignment?.alignedTimelinePositionFrames ?? ''}:${maximumHeadPaddingFrames}:${HEAD_CONTEXT_FRAMES}`
-    : '';
+    : ''}:tail=${detectedContentTailFrameIndex ?? longitudinalAxis?.endElapsedFromHeadMs ?? ''}`;
   const detectedContentAnchorFrame = captureStitchInitialFrameIndex(
     captureFrames,
     cameraLanes.length,
@@ -1379,21 +1672,38 @@ function BarUnfoldedMap({
   const timelineOriginFrames = displayHeadAlignmentApplied
     ? Math.max(0, contentAnchorFrame - HEAD_CONTEXT_FRAMES)
     : 0;
+  const naturalTimelineEndFrames = captureFrames.length + maximumHeadPaddingFrames;
+  const measuredTailTimelineFrame = captureTailTimelineFrame(
+    captureFrames,
+    contentAnchorFrame,
+    longitudinalAxis,
+    headAlignment,
+  );
+  const detectedTailTimelineFrame = detectedContentTailFrameIndex === null
+    ? measuredTailTimelineFrame
+    : detectedContentTailFrameIndex + 1 + maximumHeadPaddingFrames;
+  const tailDetectionSource = detectedContentTailFrameIndex !== null
+    ? 'frame-density'
+    : measuredTailTimelineFrame !== null ? 'measurement-timeline' : 'unavailable';
+  const timelineEndFrames = detectedTailTimelineFrame === null
+    ? naturalTimelineEndFrames
+    : Math.min(naturalTimelineEndFrames, detectedTailTimelineFrame + TAIL_CONTEXT_FRAMES);
+  const tailTrimApplied = timelineEndFrames < naturalTimelineEndFrames - 0.01;
   const longitudinalExtent = Math.max(
-    FRAME_SPAN_PX,
-    (captureFrames.length + maximumHeadPaddingFrames - timelineOriginFrames) * FRAME_SPAN_PX,
+    frameSpanPx,
+    (timelineEndFrames - timelineOriginFrames) * frameSpanPx,
   );
   const firstVisibleFrame = stitchEnabled
     ? Math.max(
       0,
-      Math.floor(timelineOriginFrames + scrollWindow.offset / FRAME_SPAN_PX - maximumHeadPaddingFrames)
+      Math.floor(timelineOriginFrames + scrollWindow.offset / frameSpanPx - maximumHeadPaddingFrames)
       - FRAME_OVERSCAN,
     )
     : 0;
   const lastVisibleFrame = stitchEnabled
     ? Math.min(
       captureFrames.length,
-      Math.ceil(timelineOriginFrames + (scrollWindow.offset + scrollWindow.extent) / FRAME_SPAN_PX) + FRAME_OVERSCAN,
+      Math.ceil(timelineOriginFrames + (scrollWindow.offset + scrollWindow.extent) / frameSpanPx) + FRAME_OVERSCAN,
     )
     : 0;
   const visibleCaptureFrames = stitchEnabled
@@ -1404,7 +1714,7 @@ function BarUnfoldedMap({
       firstVisibleFrame,
       Math.min(
         Math.max(firstVisibleFrame, lastVisibleFrame - 1),
-        Math.floor(timelineOriginFrames + (scrollWindow.offset + scrollWindow.extent / 2) / FRAME_SPAN_PX),
+        Math.floor(timelineOriginFrames + (scrollWindow.offset + scrollWindow.extent / 2) / frameSpanPx),
       ),
     )
     : 0;
@@ -1461,6 +1771,7 @@ function BarUnfoldedMap({
     if (!host) return;
     const offset = orientation === 'horizontal' ? host.scrollLeft : host.scrollTop;
     const extent = orientation === 'horizontal' ? host.clientWidth : host.clientHeight;
+    const crossExtent = orientation === 'horizontal' ? host.clientHeight : host.clientWidth;
     const scrollExtent = orientation === 'horizontal' ? host.scrollWidth : host.scrollHeight;
     const maximum = Math.max(0, scrollExtent - extent);
     scrollProgressRef.current = maximum > 0 ? offset / maximum : 0;
@@ -1474,9 +1785,13 @@ function BarUnfoldedMap({
     atTailRef.current = maximum <= 0 || maximum - offset <= Math.max(24, extent * 0.08);
     const nextExtent = Math.max(1, extent);
     const total = Math.max(nextExtent, scrollExtent, longitudinalExtent);
-    setScrollWindow((current) => current.offset === offset && current.extent === nextExtent && current.total === total
+    const nextCrossExtent = Math.max(1, crossExtent);
+    setScrollWindow((current) => current.offset === offset
+      && current.extent === nextExtent
+      && current.total === total
+      && current.crossExtent === nextCrossExtent
       ? current
-      : { offset, extent: nextExtent, total });
+      : { offset, extent: nextExtent, total, crossExtent: nextCrossExtent });
   };
 
   const scrollToProgress = (progress: number) => {
@@ -1517,6 +1832,8 @@ function BarUnfoldedMap({
     const recordChanged = previous.stitchKey !== stitchKey;
     const orientationChanged = previous.orientation !== orientation;
     const alignmentChanged = previous.alignmentKey !== alignmentKey;
+    const displayScaleChanged = previous.frameSpanPx !== frameSpanPx
+      || previous.expandedCamera !== expandedCamera;
     const recordContentBecameReady = previous.frameCount === 0 && captureFrames.length > 0;
     const appendedAtTail = !recordChanged
       && previous.frameCount > 0
@@ -1531,6 +1848,8 @@ function BarUnfoldedMap({
       stitchKey,
       frameCount: captureFrames.length,
       alignmentKey,
+      frameSpanPx,
+      expandedCamera,
     };
     const frame = window.requestAnimationFrame(() => {
       const extent = orientation === 'horizontal' ? host.clientWidth : host.clientHeight;
@@ -1548,13 +1867,18 @@ function BarUnfoldedMap({
         host.scrollLeft = 0;
         host.scrollTop = target;
       }
-      if (orientationChanged || recordChanged || recordContentBecameReady || alignmentChanged || appendedAtTail) readScrollPosition();
+      if (orientationChanged
+        || recordChanged
+        || recordContentBecameReady
+        || alignmentChanged
+        || displayScaleChanged
+        || appendedAtTail) readScrollPosition();
     });
     return () => window.cancelAnimationFrame(frame);
   // readScrollPosition is deliberately kept local so it always uses the
   // orientation committed by this render.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [alignmentKey, captureFrames.length, orientation, stitchKey, timelineOriginFrames]);
+  }, [alignmentKey, captureFrames.length, expandedCamera, frameSpanPx, orientation, stitchKey, timelineOriginFrames]);
 
   const handleMapWheel = (event: WheelEvent<HTMLDivElement>) => {
     if (!stitchEnabled) {
@@ -1572,14 +1896,17 @@ function BarUnfoldedMap({
   const handleMapPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (!stitchEnabled || event.button !== 0) return;
     const target = event.target as HTMLElement;
-    if (target.closest('[role="button"], button, input, select, textarea, a')) return;
+    if (target.closest('button, input, select, textarea, a')) return;
     mapDragRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
       scrollLeft: event.currentTarget.scrollLeft,
       scrollTop: event.currentTarget.scrollTop,
+      moved: false,
     };
+    setFrameDefectHover(null);
+    setDepthProbe(null);
     setMapDragging(true);
     event.currentTarget.setPointerCapture?.(event.pointerId);
   };
@@ -1590,7 +1917,10 @@ function BarUnfoldedMap({
     const delta = orientation === 'horizontal'
       ? event.clientX - drag.startX
       : event.clientY - drag.startY;
-    if (Math.abs(delta) < 2) return;
+    if (Math.abs(delta) < MAP_DRAG_THRESHOLD_PX) return;
+    drag.moved = true;
+    setFrameDefectHover(null);
+    setDepthProbe(null);
     event.preventDefault();
     if (orientation === 'horizontal') {
       event.currentTarget.scrollLeft = drag.scrollLeft - delta;
@@ -1601,7 +1931,11 @@ function BarUnfoldedMap({
   };
 
   const stopMapDragging = (event: PointerEvent<HTMLDivElement>) => {
-    if (mapDragRef.current?.pointerId !== event.pointerId) return;
+    const drag = mapDragRef.current;
+    if (drag?.pointerId !== event.pointerId) return;
+    if (drag.moved) {
+      event.preventDefault();
+    }
     mapDragRef.current = null;
     setMapDragging(false);
     if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
@@ -1633,6 +1967,16 @@ function BarUnfoldedMap({
         data-head-spread-frames={headAlignment?.timelineSpreadFrames ?? undefined}
         data-head-retained-context-frames={displayHeadAlignmentApplied ? HEAD_CONTEXT_FRAMES : undefined}
         data-timeline-origin-frames={timelineOriginFrames.toFixed(6)}
+        data-tail-trim-applied={tailTrimApplied ? 'true' : 'false'}
+        data-tail-detection-source={tailDetectionSource}
+        data-tail-content-frame-index={detectedContentTailFrameIndex ?? undefined}
+        data-tail-timeline-frame={detectedTailTimelineFrame?.toFixed(6)}
+        data-tail-retained-context-frames={tailTrimApplied ? TAIL_CONTEXT_FRAMES : undefined}
+        data-timeline-end-frames={timelineEndFrames.toFixed(6)}
+        data-longitudinal-extent-px={longitudinalExtent.toFixed(3)}
+        data-frame-span-px={frameSpanPx.toFixed(3)}
+        data-frame-pixel-aspect={expandedFrameAspect?.toFixed(6)}
+        data-expanded-preserve-aspect={expandedCamera ? 'true' : undefined}
         data-image-mode={imageMode}
         data-visible-frame-start={firstVisibleFrame}
         data-visible-frame-end={lastVisibleFrame}
@@ -1647,7 +1991,7 @@ function BarUnfoldedMap({
         onPointerUp={stopMapDragging}
         onPointerCancel={stopMapDragging}
       >
-        <div className="bar-unfolded-scroll-space" style={scrollSpaceStyle}>
+        <div className="bar-unfolded-scroll-space" data-testid="capture-stitch-scroll-space" style={scrollSpaceStyle}>
         <div className="bar-camera-bands">
           {cameraLanes.map((lane) => {
             const camera = surfaceCameras.find((item) => item.name.toLowerCase() === lane.cameraId);
@@ -1664,22 +2008,19 @@ function BarUnfoldedMap({
             const displayPaddingFrames = displayHeadAlignmentApplied
               ? Math.max(0, Number(cameraHead?.displayPaddingFrames ?? 0))
               : 0;
-            const alignmentLabel = cameraHead?.displayAligned
-              && Number.isFinite(headOffsetFrames)
-              ? `${signedFrameOffset(headOffsetFrames)} · 已对齐`
-              : '';
             return <div
               key={lane.cameraId}
               className={`bar-camera-band ${source ? 'has-production-image' : ''} ${expanded ? 'is-expanded' : ''} ${expandedCamera && !expanded ? 'is-collapsed' : ''}`}
               role="button"
               tabIndex={0}
               aria-label={`${lane.cameraId} 采集图像${expanded ? '，已展开，双击恢复' : '，双击展开'}`}
-              title={`${expanded ? `双击恢复 ${cameraLanes.length} 相机展开图` : `双击展开 ${lane.cameraId}`}${alignmentLabel ? `；${alignmentLabel}` : ''}`}
               data-head-offset-frames={Number.isFinite(headOffsetFrames) ? headOffsetFrames.toFixed(6) : undefined}
               data-head-display-padding-frames={cameraHead?.displayAligned ? Number(cameraHead.displayPaddingFrames ?? 0).toFixed(6) : undefined}
               data-head-aligned={cameraHead?.displayAligned ? 'true' : 'false'}
               data-camera-id={lane.cameraId}
-              onDoubleClick={() => {
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
                 setExpandedCamera((current) => current === lane.cameraId ? null : lane.cameraId);
               }}
               onKeyDown={(event) => {
@@ -1722,8 +2063,8 @@ function BarUnfoldedMap({
                       data-frame-storage-index={cameraFrame?.storageIndex}
                       data-camera-id={lane.shortLabel}
                       style={orientation === 'horizontal'
-                        ? { left: (frameIndex + displayPaddingFrames - timelineOriginFrames) * FRAME_SPAN_PX, width: FRAME_SPAN_PX }
-                        : { top: (frameIndex + displayPaddingFrames - timelineOriginFrames) * FRAME_SPAN_PX, height: FRAME_SPAN_PX }}
+                        ? { left: (frameIndex + displayPaddingFrames - timelineOriginFrames) * frameSpanPx, width: frameSpanPx }
+                        : { top: (frameIndex + displayPaddingFrames - timelineOriginFrames) * frameSpanPx, height: frameSpanPx }}
                       onPointerMove={cameraFrame ? (event) => {
                         if (mapDragging) return;
                         const rect = event.currentTarget.getBoundingClientRect();
@@ -1817,10 +2158,52 @@ function BarUnfoldedMap({
                             event.stopPropagation();
                             onSelectDefect(defect.id);
                           }}
-                          onMouseEnter={() => onHoverDefect(defect.id)}
-                          onMouseLeave={() => onHoverDefect(null)}
-                          onFocus={() => onHoverDefect(defect.id)}
-                          onBlur={() => onHoverDefect(null)}
+                          onPointerMove={(event) => event.stopPropagation()}
+                          onMouseEnter={(event) => {
+                            setDepthProbe(null);
+                            setFrameDefectHover({
+                              defectId: defect.id,
+                              cameraId: lane.shortLabel,
+                              frameSequence: frame.sequence,
+                              storageIndex: cameraFrame.storageIndex,
+                              imageUrl: imageMode === 'jet'
+                                ? cameraFrame.jetOriginalUrl
+                                : cameraFrame.grayOriginalUrl,
+                              roi: defect.artifacts?.roi ?? { x: 0, y: 0, width: 0, height: 0 },
+                              clientX: event.clientX,
+                              clientY: event.clientY,
+                            });
+                            onHoverDefect(defect.id);
+                          }}
+                          onMouseMove={(event) => {
+                            setFrameDefectHover((current) => current?.defectId === defect.id
+                              ? { ...current, clientX: event.clientX, clientY: event.clientY }
+                              : current);
+                          }}
+                          onMouseLeave={() => {
+                            setFrameDefectHover((current) => current?.defectId === defect.id ? null : current);
+                            onHoverDefect(null);
+                          }}
+                          onFocus={(event) => {
+                            const rect = event.currentTarget.getBoundingClientRect();
+                            setFrameDefectHover({
+                              defectId: defect.id,
+                              cameraId: lane.shortLabel,
+                              frameSequence: frame.sequence,
+                              storageIndex: cameraFrame.storageIndex,
+                              imageUrl: imageMode === 'jet'
+                                ? cameraFrame.jetOriginalUrl
+                                : cameraFrame.grayOriginalUrl,
+                              roi: defect.artifacts?.roi ?? { x: 0, y: 0, width: 0, height: 0 },
+                              clientX: rect.left + rect.width / 2,
+                              clientY: rect.top + rect.height / 2,
+                            });
+                            onHoverDefect(defect.id);
+                          }}
+                          onBlur={() => {
+                            setFrameDefectHover((current) => current?.defectId === defect.id ? null : current);
+                            onHoverDefect(null);
+                          }}
                         />;
                       }) : null}
                       {depthProbe?.key === probeKey ? (
@@ -1834,7 +2217,7 @@ function BarUnfoldedMap({
                   })}
                 </div>
               ) : null}
-              <span>{lane.shortLabel}{alignmentLabel ? ` · ${alignmentLabel}` : ''}</span>
+              <span>{lane.shortLabel}</span>
             </div>;
           })}
         </div>
@@ -1872,7 +2255,7 @@ function BarUnfoldedMap({
             />
           );
         })}
-        {hoveredDefect && hoveredType ? (
+        {!frameDefectHover && hoveredDefect && hoveredType ? (
           <DefectHoverCard
             defect={hoveredDefect}
             type={hoveredType}
@@ -1893,6 +2276,14 @@ function BarUnfoldedMap({
         onScrollProgressChange={scrollToProgress}
         onSelectDefect={onSelectDefect}
       />
+      {frameDefectHover && frameHoveredDefect && frameHoveredType ? createPortal(
+        <DefectHoverCard
+          defect={frameHoveredDefect}
+          type={frameHoveredType}
+          frameContext={frameDefectHover}
+        />,
+        document.body,
+      ) : null}
       {depthProbe ? createPortal(
         <div
           className={`capture-depth-probe-tooltip mode-${rawDepthHeld ? 'raw' : 'relative'}`}
@@ -1901,7 +2292,7 @@ function BarUnfoldedMap({
           data-probe-mode={rawDepthHeld ? 'raw' : 'relative'}
           style={{
             left: Math.min(depthProbe.clientX + 14, Math.max(8, window.innerWidth - 226)),
-            top: Math.min(depthProbe.clientY + 14, Math.max(8, window.innerHeight - 102)),
+            top: Math.min(depthProbe.clientY + 14, Math.max(8, window.innerHeight - 124)),
           }}
         >
           <strong>{rawDepthHeld ? 'T · 相机原始深度' : '相对拟合圆柱'}</strong>
@@ -1914,6 +2305,8 @@ function BarUnfoldedMap({
                 : rawDepthHeld
                   ? `${Number.isInteger(depthProbe.rawValue) ? depthProbe.rawValue : depthProbe.rawValue?.toFixed(3)}`
                   : `${depthProbe.relativeMm != null && depthProbe.relativeMm >= 0 ? '+' : ''}${depthProbe.relativeMm?.toFixed(3)} mm`}</b>
+          <span>测径</span>
+          <b className="capture-depth-probe-diameter">{probeDiameterMm === null ? '--' : `${probeDiameterMm.toFixed(3)} mm`}</b>
           <span>{depthProbe.cameraId} · 帧 {depthProbe.sequence} / 文件 {depthProbe.storageIndex}</span>
           <span>源像素 {depthProbe.sourceX}, {depthProbe.sourceY}</span>
           <small>{rawDepthHeld ? '松开 T 返回圆柱偏差' : '按住 T 查看相机原始值'}</small>
@@ -2289,8 +2682,8 @@ function PlateDisplaySubModes({
     const options: Array<{ id: Plate3DDisplayMode; label: string }> = [
       { id: 'surface', label: '表面' },
       { id: 'points', label: '点云' },
-      { id: 'texture', label: '贴图' },
-      { id: 'jet', label: 'Jet' },
+      { id: 'texture', label: '灰度贴图' },
+      { id: 'jet', label: 'JET贴图' },
     ];
     return (
       <>
@@ -2878,7 +3271,9 @@ export function PlateMap({
   captureImages = [],
   cameraLanes = DEFAULT_CAMERA_LANES,
   surfaceMesh,
+  surfaceCameraTiles,
   surfaceHeadAlignment,
+  surfaceMeasurement,
   surfaceCameras = [],
   artifactStatus,
   viewMode: controlledViewMode,
@@ -2912,8 +3307,14 @@ export function PlateMap({
   const [worldLoading, setWorldLoading] = useState(false);
   const [worldUnavailable, setWorldUnavailable] = useState(false);
   const [worldError, setWorldError] = useState('');
+  const captureTextureRequested = viewMode === '3d'
+    && (threeDisplayMode === 'texture' || threeDisplayMode === 'jet');
+  const cameraLaneIds = useMemo(
+    () => cameraLanes.map((lane) => lane.shortLabel),
+    [cameraLanes],
+  );
   const captureStitchEligible = artifactMode === 'production'
-    && viewMode === '2d'
+    && (viewMode === '2d' || captureTextureRequested)
     && !requireInspectionWorld
     && Boolean(captureMaterialId?.trim());
   const overlapFeatureVisible = artifactMode === 'production'
@@ -2921,13 +3322,13 @@ export function PlateMap({
     && Boolean(captureMaterialId?.trim());
   const captureStitchState = useCaptureStitchHistory(
     captureMaterialId,
-    cameraLanes.map((lane) => lane.shortLabel),
+    cameraLaneIds,
     captureStitchEligible,
     refreshCaptureRoi,
   );
   const captureOverlapState = useCaptureOverlapData(
     captureMaterialId,
-    overlapFeatureVisible && viewMode === '2d',
+    overlapFeatureVisible && (viewMode === '2d' || captureTextureRequested),
     refreshCaptureRoi,
   );
   const captureStitchResult = captureStitchState.materialId === captureMaterialId?.trim()
@@ -2992,12 +3393,33 @@ export function PlateMap({
     }
     return null;
   }, [displayedWorld?.meta.world.cameras, safePlateLengthM, selectedDefect, surfaceMesh]);
-  const { textureUrl, textureStatus } = useInspectionWorldTexture(
+  const captureTextureModality: CaptureTextureModality = threeDisplayMode === 'jet' ? 'jet' : 'gray';
+  const captureTextureEnabled = artifactMode === 'production'
+    && captureTextureRequested
+    && !requireInspectionWorld
+    && Boolean(captureMaterialId?.trim());
+  const captureTexture = useCaptureCylinderTexture(
+    captureMaterialId,
+    captureStitchResult?.frames ?? [],
+    cameraLaneIds,
+    captureRegionMap,
+    surfaceCameraTiles,
+    surfaceHeadAlignment,
+    captureTextureModality,
+    captureTextureEnabled,
+  );
+  const worldTexture = useInspectionWorldTexture(
     inspectionId,
     displayedWorld?.meta,
-    artifactMode === 'production' && viewMode === '3d' && threeDisplayMode === 'texture',
+    artifactMode === 'production'
+      && viewMode === '3d'
+      && threeDisplayMode === 'texture'
+      && !captureTextureEnabled,
     productionZoom,
   );
+  const textureUrl = captureTextureEnabled ? captureTexture.textureUrl : worldTexture.textureUrl;
+  const textureStatus = captureTextureEnabled ? captureTexture.textureStatus : worldTexture.textureStatus;
+  const captureTextureReady = captureTextureEnabled && Boolean(captureTexture.textureUrl);
   useEffect(() => {
     displayedWorldRef.current = displayedWorld;
   }, [displayedWorld]);
@@ -3228,19 +3650,29 @@ export function PlateMap({
               ariaLabel={threeDisplayMode === 'points'
                 ? '当前检测记录真实点云'
                 : threeDisplayMode === 'texture'
-                  ? '当前检测记录二维贴图三维表面'
+                  ? '当前检测记录去重灰度贴图三维表面'
                   : threeDisplayMode === 'jet'
-                    ? '当前检测记录 Jet 径向偏差三维表面'
+                    ? captureTextureEnabled
+                      ? '当前检测记录去重 JET 贴图三维表面'
+                      : '当前检测记录 Jet 径向偏差三维表面'
                     : '当前检测记录真实三维表面'}
               className="plate-production-artifact"
               colorMode={threeDisplayMode === 'jet'
-                ? 'radial-jet'
+                ? captureTextureReady ? 'texture' : 'radial-jet'
                 : threeDisplayMode === 'texture'
                   ? 'texture'
                   : threeDisplayMode === 'surface'
                     ? 'neutral'
                     : 'source'}
               textureUrl={textureUrl}
+              textureModality={captureTextureEnabled ? captureTextureModality : undefined}
+              textureMetrics={captureTexture.texturePlan ? {
+                longitudinalPixels: captureTexture.texturePlan.longitudinalPixels,
+                circumferencePixels: captureTexture.texturePlan.circumferencePixels,
+                pixelAspectRatio: captureTexture.texturePlan.pixelAspectRatio,
+                overlapPolicy: captureTexture.texturePlan.overlapPolicy,
+                projectionPolicy: captureTexture.texturePlan.projectionPolicy,
+              } : undefined}
               radialUnitScale={surfaceMesh.coordinateUnit === 'mm'
                 ? 1
                 : nominalDiameterMm > 0 ? nominalDiameterMm / 2 : 1}
@@ -3361,6 +3793,8 @@ export function PlateMap({
             headAlignment={surfaceHeadAlignment}
             regionMap={captureRegionMap}
             deduplicateOverlap={effectiveOverlapDisplayMode === 'deduplicated'}
+            measurement={surfaceMeasurement}
+            longitudinalAxis={surfaceMesh?.longitudinalAxis}
             viewportMemory={twoDViewportMemory}
           />
         </div>
@@ -3480,12 +3914,16 @@ export function PlateMap({
             headAlignment={surfaceHeadAlignment}
             regionMap={captureRegionMap}
             deduplicateOverlap={effectiveOverlapDisplayMode === 'deduplicated'}
+            measurement={surfaceMeasurement}
+            longitudinalAxis={surfaceMesh?.longitudinalAxis}
             cropBlackBorders
             viewportMemory={twoDViewportMemory}
           />
         </div>
       )}
-      {viewMode === '3d' && threeDisplayMode === 'texture' && textureStatus ? (
+      {viewMode === '3d'
+        && (threeDisplayMode === 'texture' || (threeDisplayMode === 'jet' && captureTextureEnabled))
+        && textureStatus ? (
         <div className="plate-texture-status" role="status">{textureStatus}</div>
       ) : null}
     </Panel>

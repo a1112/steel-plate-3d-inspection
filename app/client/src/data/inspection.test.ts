@@ -26,6 +26,10 @@ describe('getMockInspectionSnapshot', () => {
     });
 
     expect(snapshot.defectTypes.map((type) => type.label)).toEqual([
+      '凹坑候选',
+      '沟槽候选',
+      '凸起候选',
+      '脊状凸起候选',
       '凹坑',
       '辊印',
       '划伤',
