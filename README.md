@@ -30,6 +30,7 @@ The capture API contract is documented in [docs/capture-api-contract.md](docs/ca
 The integrated capture-management acceptance matrix is in [docs/integrated-capture-management-acceptance.md](docs/integrated-capture-management-acceptance.md).
 The Qt-to-Tauri capability matrix, production gates, and diagnostic-retirement decisions are in [docs/qt-to-tauri-migration.md](docs/qt-to-tauri-migration.md).
 The production readiness gap assessment, closure design, and Go/No-Go checklist are in [docs/production-readiness-gap-and-closure-design.md](docs/production-readiness-gap-and-closure-design.md).
+The research reproducibility, evidence-chain, and runtime-baseline remediation design is in [docs/design/research-reproducibility-and-evidence-chain.md](docs/design/research-reproducibility-and-evidence-chain.md).
 The versioned payload, schema ledger, persistent upgrade journal, crash recovery, and fault-injection contract is in [docs/atomic-upgrade-and-database-migration-design.md](docs/atomic-upgrade-and-database-migration-design.md); it remains a P0 No-Go until its target-machine evidence is complete.
 The release, two-stage installation, offline prerequisites, supervisor acceptance, operations, and evidence SOP is in [docs/release-deployment-and-operations.md](docs/release-deployment-and-operations.md).
 The real SICK GenTL bring-up, single-camera sidecar integration, LG_3D-compatible storage contract, and FAT checklist are in [docs/sick-gentl-capture.md](docs/sick-gentl-capture.md).

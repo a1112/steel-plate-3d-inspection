@@ -225,6 +225,10 @@ STEEL_ALGORITHM_MODE=demo | validation | production
 
 #### 4.1.3 精度验收
 
+冻结数据集、标注与 split、复现身份、许可门禁、统一性能协议和算法证据合同
+以 [`design/research-reproducibility-and-evidence-chain.md`](design/research-reproducibility-and-evidence-chain.md)
+为准；本文继续拥有正式生产 Go/No-Go 结论。
+
 建立现场标注数据集，并由算法负责人和质量负责人共同冻结验收口径：
 
 - 按缺陷类型、尺寸区间、深度区间、表面区域和钢种分层。
