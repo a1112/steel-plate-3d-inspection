@@ -90,7 +90,7 @@ import { createSequentialCameraLanes } from './lib/camera-display';
 import { BrandHeader, type BkvDataHealth } from './components/BrandHeader';
 import { AppFooter } from './components/AppFooter';
 import { AlarmAnalysis, type AnalysisViewMode } from './components/AlarmAnalysis';
-import { buildDiameterMetricSummary } from './components/DiameterTrendPanel';
+import { buildDiameterFitWarning, buildDiameterMetricSummary } from './components/DiameterTrendPanel';
 import { DiameterAnalysisPage } from './components/DiameterAnalysisPage';
 import { DefectAnalysisPage } from './components/DefectAnalysisPage';
 import { AlarmCenter } from './components/AlarmCenter';
@@ -1432,14 +1432,25 @@ function InspectionDashboard({
       inFlight = true;
       try {
         if (dashboardMode.kind === 'direct') {
+          let measurementArtifact: CaptureFlowMeasurement | null = null;
           try {
-            const [captureResult, measurementResult] = await Promise.all([
+            const [surfaceResult, measurementResult] = await Promise.allSettled([
               readCaptureSurface(materialId),
-              readCaptureMeasurement(materialId).catch(() => null),
+              readCaptureMeasurement(materialId),
             ]);
             if (controller.signal.aborted) {
               return;
             }
+            if (
+              measurementResult.status === 'fulfilled'
+              && measurementResult.value.measurement.materialId === materialId
+            ) {
+              measurementArtifact = measurementResult.value.measurement;
+            }
+            if (surfaceResult.status === 'rejected') {
+              throw surfaceResult.reason;
+            }
+            const captureResult = surfaceResult.value;
             if (captureResult.surface.materialId !== materialId) {
               throw new Error('采集拟合结果与当前流水号不一致，已拒绝展示');
             }
@@ -1459,8 +1470,8 @@ function InspectionDashboard({
               mesh,
               cameraTiles: captureResult.surface.cameraTiles ?? null,
               headAlignment: captureResult.surface.headAlignment ?? null,
-              measurement: measurementResult?.measurement.materialId === materialId
-                ? measurementResult.measurement
+              measurement: measurementArtifact
+                ? measurementArtifact
                 : current.inspectionId === inspectionId
                   ? current.measurement
                   : null,
@@ -1473,24 +1484,37 @@ function InspectionDashboard({
               return;
             }
             // A just-closed flow may not have its fast artifacts yet. Keep
-            // the existing record-bound manifest path as a strict fallback.
-            setRecordBoundSurface((current) => current.inspectionId === inspectionId
-              && current.mesh
-              ? {
+            // the measurement independently bound so an unavailable surface
+            // fit still raises its record-local warning.
+            setRecordBoundSurface((current) => {
+              const currentMeasurement = current.inspectionId === inspectionId
+                ? current.measurement ?? null
+                : null;
+              const boundMeasurement = measurementArtifact ?? currentMeasurement;
+              const fitWarning = buildDiameterFitWarning(boundMeasurement);
+              return current.inspectionId === inspectionId && current.mesh
+                ? {
                   ...current,
                   loading: false,
-                  status: captureSurfaceError instanceof Error
-                    ? `流水 ${materialId} 新产物尚未提交，保留上一版：${captureSurfaceError.message}`
-                    : `流水 ${materialId} 新产物尚未提交，保留上一版`,
+                  measurement: boundMeasurement,
+                  status: fitWarning
+                    ? `流水 ${materialId} 外径拟合失败：${fitWarning.message}`
+                    : captureSurfaceError instanceof Error
+                      ? `流水 ${materialId} 新产物尚未提交，保留上一版：${captureSurfaceError.message}`
+                      : `流水 ${materialId} 新产物尚未提交，保留上一版`,
                 }
-              : {
+                : {
                   inspectionId,
-                  loading: true,
+                  loading: !fitWarning,
                   mesh: null,
-                  status: captureSurfaceError instanceof Error
-                    ? `正在等待流水 ${materialId} 的标定曲面：${captureSurfaceError.message}`
-                    : `正在等待流水 ${materialId} 的标定曲面`,
-                });
+                  measurement: boundMeasurement,
+                  status: fitWarning
+                    ? `流水 ${materialId} 外径拟合失败：${fitWarning.message}`
+                    : captureSurfaceError instanceof Error
+                      ? `正在等待流水 ${materialId} 的标定曲面：${captureSurfaceError.message}`
+                      : `正在等待流水 ${materialId} 的标定曲面`,
+                };
+            });
             return;
           }
         }
@@ -1611,6 +1635,32 @@ function InspectionDashboard({
       : null,
     [activeInspection?.inspectionId, recordBoundSurface.inspectionId, recordBoundSurface.measurement],
   );
+  const activeDiameterFitWarning = useMemo(
+    () => activeRecordStatus === 'completed'
+      && recordBoundSurface.inspectionId === activeInspection?.inspectionId
+      ? buildDiameterFitWarning(recordBoundSurface.measurement)
+      : null,
+    [activeInspection?.inspectionId, activeRecordStatus, recordBoundSurface.inspectionId, recordBoundSurface.measurement],
+  );
+  const diameterFitNotificationKeyRef = useRef('');
+  useEffect(() => {
+    if (!activeDiameterFitWarning) {
+      diameterFitNotificationKeyRef.current = '';
+      return;
+    }
+    const warningKey = [
+      activeInspection?.inspectionId ?? '',
+      activeDiameterFitWarning.materialId,
+      activeDiameterFitWarning.reasons.join(','),
+    ].join(':');
+    if (diameterFitNotificationKeyRef.current === warningKey) return;
+    diameterFitNotificationKeyRef.current = warningKey;
+    notify({
+      title: '外径拟合失败',
+      message: `记录 ${activeInspection?.inspectionId || '--'} / 流水 ${activeDiameterFitWarning.materialId || activeSnapshot.currentPlate.plateNo}：${activeDiameterFitWarning.message}`,
+      tone: 'warning',
+    });
+  }, [activeDiameterFitWarning, activeInspection?.inspectionId, activeSnapshot.currentPlate.plateNo]);
   const currentPlateDefects = useMemo(
     () => applyInspectionSettingsToDefects(activeSnapshot.defects, savedSettings),
     [activeSnapshot.defects, savedSettings],

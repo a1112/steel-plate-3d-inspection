@@ -4326,7 +4326,7 @@ class ProviderRuntime:
         self.last_steel_transition_event = event
         try:
             response = self._post_service_json(
-                f"/api/production/{event}",
+                f"/internal/v1/{event}",
                 {
                     "source": "grayscale",
                     "mode": "grayscale",

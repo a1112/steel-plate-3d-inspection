@@ -5,6 +5,7 @@ import type { CaptureFlowMeasurement } from '../lib/capture-api';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import {
   buildArtifactDiameterMeasurements,
+  buildDiameterFitWarning,
   buildDiameterMeasurements,
   buildDiameterMetricSummary,
   DiameterTrendPanel,
@@ -102,6 +103,13 @@ export function DiameterAnalysisPage({
   const [selectedSectionRow, setSelectedSectionRow] = useState<number | null>(null);
   const lengthMm = plate.lengthMm > 0 ? plate.lengthMm : 12_000;
   const summary = useMemo(() => buildDiameterMetricSummary(measurement), [measurement]);
+  const selectedRecordStatus = records.find((record) => record.id === selectedRecordId)?.status;
+  const diameterFitWarning = useMemo(
+    () => !loading && selectedRecordStatus !== 'detecting'
+      ? buildDiameterFitWarning(measurement)
+      : null,
+    [loading, measurement, selectedRecordStatus],
+  );
   const nominalDiameterMm = plate.widthMm > 0
     ? plate.widthMm
     : summary?.averageDiameterMm ?? 0;
@@ -181,7 +189,11 @@ export function DiameterAnalysisPage({
                 <span>{record.time}</span>
                 <strong>{record.plateNo}</strong>
                 <small>{record.id}</small>
-                <b className={record.status}>{record.status === 'completed' ? '已完成' : '检测中'}</b>
+                <b className={`${record.status}${diameterFitWarning && record.id === selectedRecordId ? ' fit-failed' : ''}`}>
+                  {diameterFitWarning && record.id === selectedRecordId
+                    ? '拟合失败'
+                    : record.status === 'completed' ? '已完成' : '检测中'}
+                </b>
               </button>
             ))}
           </div>
@@ -189,17 +201,33 @@ export function DiameterAnalysisPage({
       </aside>}
 
       <section className="diameter-page-center">
-        <header className="diameter-page-heading">
-          <div>
-            <span>独立计量工作台</span>
-            <h1>测径分析</h1>
-            <p>记录 {inspectionId || '--'} · 钢管 {plate.plateNo} · {absoluteScale ? '长度坐标已验证' : '头部相对位置'}</p>
-          </div>
-          <div className={`diameter-page-quality-chip ${summary?.qualified ? 'valid' : 'preview'}`}>
-            {summary?.qualified ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
-            <span>{summary?.qualified ? '计量有效' : loading ? '读取中' : '趋势预览'}</span>
-          </div>
-        </header>
+        <div className="diameter-page-heading-stack">
+          <header className="diameter-page-heading">
+            <div>
+              <span>独立计量工作台</span>
+              <h1>测径分析</h1>
+              <p>记录 {inspectionId || '--'} · 钢管 {plate.plateNo} · {absoluteScale ? '长度坐标已验证' : '头部相对位置'}</p>
+            </div>
+            <div className={`diameter-page-quality-chip ${diameterFitWarning ? 'failed' : summary?.qualified ? 'valid' : 'preview'}`}>
+              {summary?.qualified && !diameterFitWarning ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
+              <span>{diameterFitWarning ? '外径拟合失败' : summary?.qualified ? '计量有效' : loading ? '读取中' : '趋势预览'}</span>
+            </div>
+          </header>
+          {diameterFitWarning ? (
+            <div
+              className="diameter-fit-warning"
+              role="alert"
+              aria-live="assertive"
+              data-material-id={diameterFitWarning.materialId}
+            >
+              <AlertTriangle size={20} />
+              <div>
+                <strong>外径拟合失败</strong>
+                <span>流水 {diameterFitWarning.materialId || plate.plateNo}：{diameterFitWarning.message}</span>
+              </div>
+            </div>
+          ) : null}
+        </div>
 
         <Panel title="外径趋势" className="diameter-page-trend" action={<span>悬停曲线查看截面数值</span>}>
           {loading ? (
@@ -249,11 +277,11 @@ export function DiameterAnalysisPage({
       </section>
 
       <aside className="diameter-page-right">
-        <Panel title="计量判定" className={`diameter-verdict-panel ${withinTolerance ? 'qualified' : 'review'}`}>
+        <Panel title="计量判定" className={`diameter-verdict-panel ${diameterFitWarning ? 'failed' : withinTolerance ? 'qualified' : 'review'}`}>
           <div className="diameter-verdict">
-            {withinTolerance ? <CheckCircle2 size={42} /> : <AlertTriangle size={42} />}
-            <span>{withinTolerance ? '合格' : summary?.qualified ? '超出规格' : '待复核'}</span>
-            <small>{summary?.qualityNote || artifactStatus || '尚无可用测径结果'}</small>
+            {withinTolerance && !diameterFitWarning ? <CheckCircle2 size={42} /> : <AlertTriangle size={42} />}
+            <span>{diameterFitWarning ? '拟合失败' : withinTolerance ? '合格' : summary?.qualified ? '超出规格' : '待复核'}</span>
+            <small>{diameterFitWarning?.message || summary?.qualityNote || artifactStatus || '尚无可用测径结果'}</small>
           </div>
         </Panel>
         <Panel title="测径摘要" className="diameter-summary-panel">
@@ -271,6 +299,7 @@ export function DiameterAnalysisPage({
             <div><dt>数据完整度</dt><dd>{summary ? `${Math.round(summary.validSectionCount / Math.max(1, summary.requestedSectionCount) * 100)}%` : '--'}</dd></div>
             <div><dt>纵向坐标</dt><dd>{absoluteScale ? '长度坐标' : '软同步归一化'}</dd></div>
             <div><dt>产物状态</dt><dd>{loading ? '读取中' : measurement ? 'measurement 已绑定' : mesh ? 'mesh 拟合' : '不可用'}</dd></div>
+            <div><dt>拟合状态</dt><dd className={diameterFitWarning ? 'fit-failed' : ''}>{diameterFitWarning ? '外径拟合失败' : summary?.qualified ? '通过' : '--'}</dd></div>
           </dl>
         </Panel>
         <button

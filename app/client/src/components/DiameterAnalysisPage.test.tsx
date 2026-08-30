@@ -51,6 +51,28 @@ const measurement: CaptureFlowMeasurement = {
   },
 };
 
+const failedMeasurement: CaptureFlowMeasurement = {
+  schema: 'steel.ranger3-flow-measurement.v1',
+  generatedAt: '2026-08-30T12:00:00Z',
+  materialId: '5028',
+  mode: 'preview',
+  metricValid: false,
+  qualityGate: {
+    passed: false,
+    reasons: ['not-enough-qualified-surface-sections', 'camera-depth-precision-out-of-tolerance'],
+  },
+  selectedSection: {},
+  cameras: {},
+  surfaceFit: {
+    available: false,
+    metricValid: false,
+    reason: 'not-enough-qualified-surface-sections',
+    sectionsRequested: 6,
+    sectionsAccepted: 0,
+    sections: [],
+  },
+};
+
 const plate = {
   plateNo: '4034',
   widthMm: 77.1,
@@ -121,6 +143,31 @@ describe('DiameterAnalysisPage', () => {
 
     expect(screen.getByText('当前记录暂无测径产物')).toBeInTheDocument();
     expect(screen.getAllByText('measurement 尚未生成')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: '导出测径报告' })).toBeDisabled();
+  });
+
+  it('shows a persistent warning when the completed record has no outer-diameter fit', () => {
+    render(
+      <DiameterAnalysisPage
+        plate={plate}
+        records={records}
+        selectedRecordId="R-001"
+        inspectionId="INSP-5028"
+        measurement={failedMeasurement}
+        onRecordSelect={vi.fn()}
+        onExport={vi.fn()}
+      />,
+    );
+
+    const pageWarning = document.querySelector('.diameter-fit-warning');
+    expect(pageWarning).toHaveAttribute('role', 'alert');
+    expect(pageWarning).toHaveTextContent('外径拟合失败');
+    expect(pageWarning).toHaveTextContent('流水 5028');
+    expect(pageWarning).toHaveTextContent('有效拟合截面 0/6');
+    expect(pageWarning).toHaveTextContent('相机深度精度超限');
+    expect(document.querySelector('.diameter-page-quality-chip.failed')).toHaveTextContent('外径拟合失败');
+    expect(document.querySelector('.diameter-verdict-panel.failed')).toHaveTextContent('拟合失败');
+    expect(within(screen.getByRole('option', { selected: true })).getByText('拟合失败')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '导出测径报告' })).toBeDisabled();
   });
 

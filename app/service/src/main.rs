@@ -8291,6 +8291,8 @@ fn is_production_mutation_route(method: &str, path: &str) -> bool {
                 path,
                 "/api/bkv/import"
                     | "/api/bkv/replay/reset"
+                    | "/internal/v1/steel-in"
+                    | "/internal/v1/steel-out"
                     | "/internal/v1/defect-batch"
                     | "/api/defects/review"
             ))
@@ -18491,7 +18493,9 @@ fn runtime_capability_for_route(
         || path == "/api/production/capture-once"
         || matches!(
             path,
-            "/api/production/tasks/steel-info"
+            "/internal/v1/steel-in"
+                | "/internal/v1/steel-out"
+                | "/api/production/tasks/steel-info"
                 | "/api/production/tasks/steel-in"
                 | "/api/production/tasks/steel-out"
                 | "/api/production/tasks/trigger-event"
@@ -27000,6 +27004,8 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
             { "method": "POST", "path": "/api/production/capture-once", "scope": "production" },
             { "method": "POST", "path": "/api/production/algorithm/run", "scope": "production" },
             { "method": "POST", "path": "/api/production/defect", "scope": "production" },
+            { "method": "POST", "path": "/internal/v1/steel-in", "scope": "capture" },
+            { "method": "POST", "path": "/internal/v1/steel-out", "scope": "capture" },
             { "method": "POST", "path": "/internal/v1/defect-batch", "scope": "capture" },
             { "method": "GET", "path": "/api/defects/history", "scope": "production" },
             { "method": "GET", "path": "/api/production/defects/history", "scope": "production" },
@@ -27580,6 +27586,22 @@ fn handle_client<S: Read + Write>(
         }
         ("POST", "/api/production/capture-summary") => {
             write_capture_summary_response(&state, body, actor)
+        }
+        ("POST", "/internal/v1/steel-in") | ("POST", "/internal/v1/steel-out") => {
+            if internal_callback_from_loopback(peer) {
+                let event = if path.ends_with("steel-in") {
+                    "steel-in"
+                } else {
+                    "steel-out"
+                };
+                write_production_event_response(&state, body, event, "sick-capture")
+            } else {
+                http_response(
+                    "403 Forbidden",
+                    "application/json; charset=utf-8",
+                    &json!({"code":403,"error":"capture_transition_loopback_only"}).to_string(),
+                )
+            }
         }
         ("POST", "/internal/v1/capture-commit") => {
             if internal_callback_from_loopback(peer) {
@@ -29893,6 +29915,8 @@ mod tests {
 
     #[test]
     fn internal_capture_callbacks_reject_non_loopback_peers() {
+        assert_eq!(permission_for_route("POST", "/internal/v1/steel-in"), None);
+        assert_eq!(permission_for_route("POST", "/internal/v1/steel-out"), None);
         assert!(internal_callback_from_loopback(Some(
             "127.0.0.1:42000".parse().expect("loopback address")
         )));
@@ -33494,6 +33518,14 @@ mod tests {
         assert!(is_production_mutation_route(
             "POST",
             "/internal/v1/defect-batch"
+        ));
+        assert!(is_production_mutation_route(
+            "POST",
+            "/internal/v1/steel-in"
+        ));
+        assert!(is_production_mutation_route(
+            "POST",
+            "/internal/v1/steel-out"
         ));
         assert!(is_production_mutation_route("POST", "/api/defects/review"));
         assert_eq!(

@@ -38,6 +38,15 @@ export type DiameterMetricSummary = {
   qualityNote: string;
 };
 
+export type DiameterFitWarning = {
+  materialId: string;
+  acceptedSectionCount: number;
+  requestedSectionCount: number;
+  reasons: string[];
+  reasonLabels: string[];
+  message: string;
+};
+
 const FIXED_ANGLE_COLORS = ['#00d8ff', '#8bda55', '#ffd166', '#ff8c42', '#ef5da8', '#9d8cff'];
 
 export function buildDiameterMeasurements(mesh: BarSurfaceMesh, nominalDiameterMm: number, lengthMm: number) {
@@ -199,11 +208,69 @@ function format(value: number | null | undefined, digits = 3) {
 const qualityReasonLabels: Record<string, string> = {
   'cross-section-not-synchronized': '截面软同步未通过',
   'cross-section-row-clipped': '同步截面落在帧边界',
+  'cross-section-mapping-incomplete': '截面映射不完整',
+  'cross-section-time-residual-out-of-tolerance': '截面时间残差超限',
   'approved-array-calibration-missing': '阵列标定未批准',
   'camera-extrinsics-incomplete': '相机外参不完整',
+  'camera-profile-points-insufficient': '相机截面有效点不足',
+  'camera-depth-precision-out-of-tolerance': '相机深度精度超限',
+  'camera-calibration-accuracy-out-of-tolerance': '相机标定精度超限',
+  'camera-calibration-bias-out-of-tolerance': '相机标定偏差超限',
+  'calibrated-camera-overlap-out-of-tolerance': '标定相机重叠误差超限',
+  'calibrated-camera-pair-overlap-out-of-tolerance': '相机对重叠误差超限',
   'circle-fit-residual-out-of-tolerance': '圆拟合残差超限',
+  'circle-fit-unavailable': '圆拟合不可用',
   'not-enough-valid-sections': '有效测径截面不足',
+  'not-enough-qualified-surface-sections': '合格表面截面不足',
+  'fixed-angle-coverage-insufficient': '固定角度覆盖不足',
+  'angular-coverage-insufficient': '环向覆盖不足',
+  'metric-projection-unverified': '毫米投影尚未验证',
+  'surface-section-rejected': '表面截面被质量门拒绝',
+  'surface-quality-gate-failed': '表面质量门未通过',
+  'diameter-fit-unavailable': '未生成有效外径拟合',
 };
+
+export function diameterQualityReasonLabel(reason: string) {
+  return qualityReasonLabels[reason] ?? reason;
+}
+
+export function buildDiameterFitWarning(
+  artifact?: CaptureFlowMeasurement | null,
+): DiameterFitWarning | null {
+  const surface = artifact?.surfaceFit;
+  if (!artifact || !surface || surface.available !== false) return null;
+  const acceptedSectionCount = Math.max(0, Number(surface.sectionsAccepted ?? 0) || 0);
+  const requestedSectionCount = Math.max(
+    acceptedSectionCount,
+    Number(surface.sectionsRequested ?? surface.sections?.length ?? 0) || 0,
+  );
+  const rawReasons = [
+    surface.reason,
+    ...(artifact.qualityGate?.reasons ?? []),
+    ...(surface.sections ?? []).flatMap((section) => [
+      ...(section.qualityGate?.reasons ?? []),
+      section.circleFit?.reason,
+    ]),
+  ];
+  const reasons = [...new Set(rawReasons
+    .map((reason) => String(reason ?? '').trim())
+    .filter(Boolean))];
+  if (!reasons.length) reasons.push('diameter-fit-unavailable');
+  const reasonLabels = reasons.map(diameterQualityReasonLabel);
+  const visibleReasons = reasonLabels.slice(0, 3).join('、');
+  const remainingReasonCount = Math.max(0, reasonLabels.length - 3);
+  const sectionMessage = requestedSectionCount > 0
+    ? `有效拟合截面 ${acceptedSectionCount}/${requestedSectionCount}`
+    : '未生成有效拟合截面';
+  return {
+    materialId: artifact.materialId,
+    acceptedSectionCount,
+    requestedSectionCount,
+    reasons,
+    reasonLabels,
+    message: `${sectionMessage}；原因：${visibleReasons}${remainingReasonCount ? `等 ${reasonLabels.length} 项` : ''}。该记录不可用于外径合格判定，请检查点云、标定与同步后重新分析。`,
+  };
+}
 
 function finiteOrNull(...values: Array<number | null | undefined>) {
   const value = values.find((candidate) => typeof candidate === 'number' && Number.isFinite(candidate));
@@ -303,14 +370,18 @@ export function DiameterTrendPanel({ mesh, artifact, nominalDiameterMm, lengthMm
   const axisEnd = axisMode === 'length-mm' ? rangeEndRatio * lengthMm : rangeEndRatio * 100;
 
   if (!allSamples.length) {
+    const fitWarning = buildDiameterFitWarning(artifact);
     const reasons = artifact?.qualityGate.reasons ?? [];
-    return <div className="production-artifact-empty compact" role="status">
-      <strong>{artifact ? '测径结果未通过计量质量门' : '暂无可拟合的外径曲线'}</strong>
-      <span>{reasons.length
-        ? reasons.map((reason) => qualityReasonLabels[reason] ?? reason).join('；')
+    return <div
+      className={`production-artifact-empty compact${fitWarning ? ' diameter-fit-warning-empty' : ''}`}
+      role={fitWarning ? 'alert' : 'status'}
+    >
+      <strong>{fitWarning ? '外径拟合失败' : artifact ? '测径结果未通过计量质量门' : '暂无可拟合的外径曲线'}</strong>
+      <span>{fitWarning?.message ?? (reasons.length
+        ? reasons.map(diameterQualityReasonLabel).join('；')
         : surface?.reason === 'not-enough-valid-sections'
           ? '有效测径截面不足，至少需要两个合格截面。'
-          : '有效切面点不足，无法计算拟合外径。'}</span>
+          : '有效切面点不足，无法计算拟合外径。')}</span>
     </div>;
   }
 

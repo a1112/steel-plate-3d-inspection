@@ -3,7 +3,7 @@ import { createElement } from 'react';
 import { describe, expect, it } from 'vitest';
 import type { BarSurfaceMesh } from '../services/bar-surface-api';
 import type { CaptureFlowMeasurement } from '../lib/capture-api';
-import { buildArtifactDiameterMeasurements, buildDiameterMeasurements, buildDiameterMetricSummary, buildDirectionalDiameterLines, DiameterTrendPanel } from './DiameterTrendPanel';
+import { buildArtifactDiameterMeasurements, buildDiameterFitWarning, buildDiameterMeasurements, buildDiameterMetricSummary, buildDirectionalDiameterLines, DiameterTrendPanel } from './DiameterTrendPanel';
 
 function mesh(): BarSurfaceMesh {
   return {
@@ -207,9 +207,63 @@ describe('buildDiameterMeasurements', () => {
     };
 
     expect(buildDirectionalDiameterLines(artifact, 45, 12_000)).toHaveLength(2);
+    expect(buildDiameterFitWarning(artifact)).toBeNull();
     expect(buildDiameterMetricSummary(artifact)).toMatchObject({ qualified: false, qualityNote: '未通过整卷计量质量门，曲线仅用于趋势查看' });
     render(createElement(DiameterTrendPanel, { artifact, nominalDiameterMm: 45, lengthMm: 12_000 }));
     expect(screen.getByTestId('diameter-trend-grid')).toHaveAttribute('data-measurement-valid', 'false');
     expect(screen.queryByText('趋势预览')).not.toBeInTheDocument();
+  });
+
+  it('turns an unavailable outer-diameter fit into a detailed warning', () => {
+    const artifact: CaptureFlowMeasurement = {
+      schema: 'steel.ranger3-flow-measurement.v1',
+      generatedAt: '2026-08-30T12:00:00Z',
+      materialId: '5028',
+      mode: 'preview',
+      metricValid: false,
+      qualityGate: {
+        passed: false,
+        reasons: [
+          'not-enough-qualified-surface-sections',
+          'camera-depth-precision-out-of-tolerance',
+          'surface-quality-gate-failed',
+        ],
+      },
+      selectedSection: {},
+      cameras: {},
+      surfaceFit: {
+        available: false,
+        metricValid: false,
+        reason: 'not-enough-qualified-surface-sections',
+        sectionsRequested: 6,
+        sectionsAccepted: 0,
+        sections: [
+          {
+            anchorOrdinal: 0,
+            metricValid: false,
+            qualityGate: { passed: false, reasons: ['circle-fit-residual-out-of-tolerance'] },
+            circleFit: { available: false, reason: 'circle-fit-unavailable' },
+          },
+        ],
+      },
+    };
+
+    expect(buildDiameterFitWarning(artifact)).toMatchObject({
+      materialId: '5028',
+      acceptedSectionCount: 0,
+      requestedSectionCount: 6,
+      reasons: expect.arrayContaining([
+        'not-enough-qualified-surface-sections',
+        'camera-depth-precision-out-of-tolerance',
+        'circle-fit-residual-out-of-tolerance',
+      ]),
+    });
+
+    render(createElement(DiameterTrendPanel, { artifact, nominalDiameterMm: 45, lengthMm: 12_000 }));
+    const warning = screen.getByRole('alert');
+    expect(warning).toHaveClass('diameter-fit-warning-empty');
+    expect(warning).toHaveTextContent('外径拟合失败');
+    expect(warning).toHaveTextContent('有效拟合截面 0/6');
+    expect(warning).toHaveTextContent('相机深度精度超限');
   });
 });

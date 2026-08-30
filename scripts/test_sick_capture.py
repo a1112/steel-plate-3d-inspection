@@ -4660,6 +4660,10 @@ class SickProviderTests(unittest.TestCase):
                     self.assertTrue(runtime._apply_grayscale_transition("steel-out"))
                     self.assertTrue(runtime._apply_grayscale_transition("steel-in"))
                 self.assertEqual(post.call_count, 2)
+                self.assertEqual(
+                    [item.args[0] for item in post.call_args_list],
+                    ["/internal/v1/steel-out", "/internal/v1/steel-in"],
+                )
             finally:
                 runtime.close()
 

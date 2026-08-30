@@ -7865,6 +7865,23 @@ button {
   padding: 16px;
 }
 
+.production-artifact-empty.diameter-fit-warning-empty {
+  border-color: color-mix(in srgb, var(--red) 55%, var(--line));
+  color: var(--red);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--red) 11%, transparent), transparent 58%),
+    var(--panel-soft);
+  box-shadow: inset 3px 0 var(--red);
+}
+
+.production-artifact-empty.diameter-fit-warning-empty strong {
+  color: var(--red);
+}
+
+.production-artifact-empty.diameter-fit-warning-empty span {
+  color: var(--text);
+}
+
 .point-cloud-unfold-row {
   min-height: 0;
   display: grid;
@@ -24269,6 +24286,16 @@ button {
   color: var(--blue);
 }
 
+.diameter-records-list b.fit-failed {
+  color: var(--red);
+}
+
+.diameter-page-heading-stack {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
 .diameter-page-heading {
   min-width: 0;
   min-height: 66px;
@@ -24327,10 +24354,53 @@ button {
   background: color-mix(in srgb, var(--amber) 8%, var(--panel));
 }
 
+.diameter-page-quality-chip.failed {
+  border-color: color-mix(in srgb, var(--red) 56%, var(--line));
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, var(--panel));
+}
+
 .diameter-page-quality-chip span {
   color: inherit;
   font-size: 11px;
   font-weight: 900;
+}
+
+.diameter-fit-warning {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--red) 58%, var(--line));
+  border-radius: 6px;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, var(--panel));
+  box-shadow: inset 3px 0 var(--red), var(--shadow);
+}
+
+.diameter-fit-warning > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.diameter-fit-warning > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.diameter-fit-warning strong {
+  color: inherit;
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.diameter-fit-warning span {
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1.5;
 }
 
 .diameter-page-trend .panel-body {
@@ -24500,6 +24570,10 @@ button {
 
 .diameter-verdict-panel.qualified .diameter-verdict {
   color: var(--green);
+}
+
+.diameter-verdict-panel.failed .diameter-verdict {
+  color: var(--red);
 }
 
 .diameter-verdict svg {
@@ -25304,6 +25378,10 @@ button {
   font-size: 10px;
   font-weight: 850;
   white-space: nowrap;
+}
+
+.diameter-quality-panel dd.fit-failed {
+  color: var(--red);
 }
 
 .defect-annotation-title small {
