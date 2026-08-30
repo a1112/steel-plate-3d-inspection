@@ -6,6 +6,7 @@ only committed capture artifacts and writes derived, replaceable results.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ from .alignment import AlignmentConfig, _atomic_json, build_and_write_flow_align
 from .measurement import MeasurementConfig, build_and_write_flow_measurement
 from .playback import build_and_write_playback_index
 from .regions import build_and_write_flow_region_map
-from .surface import build_and_write_flow_surface
+from .surface import build_and_write_flow_surface, measurement_artifact_from_surface
 
 
 def build_flow_image_artifacts(
@@ -36,7 +37,10 @@ def build_flow_image_artifacts(
         material_id,
         alignment,
         calibration_path=calibration_path,
-        config=measurement_config,
+        # This pass only supplies camera crops/audit profiles to the region
+        # builder. The authoritative all-anchor diameter pass is the surface
+        # calculation below.
+        config=replace(measurement_config, maximum_sections=1),
     )
     region_path, region_map = build_and_write_flow_region_map(
         camera_roots,
@@ -59,7 +63,7 @@ def build_flow_image_artifacts(
         "qualityGate": region_map.get("qualityGate"),
         "ownership": region_map.get("ownership"),
     }
-    surface_path, surface, jet_path = build_and_write_flow_surface(
+    surface_path, surface = build_and_write_flow_surface(
         camera_roots,
         storage_root,
         material_id,
@@ -68,16 +72,13 @@ def build_flow_image_artifacts(
         config=measurement_config,
         region_map=region_map,
     )
+    measurement = measurement_artifact_from_surface(surface, measurement)
     measurement["surface"] = {
         "path": str(surface_path),
-        "jetPath": str(jet_path) if jet_path.is_file() else "",
         "state": surface.get("state"),
         "quality": surface.get("quality"),
         "summary": surface.get("summary"),
     }
-    diameter_curves = surface.get("diameterCurves")
-    if isinstance(diameter_curves, dict):
-        measurement.setdefault("surfaceFit", {})["diameterCurves"] = diameter_curves
     _atomic_json(measurement_path, measurement)
     build_and_write_playback_index(camera_roots, storage_root, material_id)
     return alignment_path, alignment, measurement_path, measurement

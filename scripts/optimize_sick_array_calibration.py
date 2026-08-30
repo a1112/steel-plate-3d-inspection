@@ -266,6 +266,9 @@ def _runtime_gate(
         maximum_profile_points=320,
         maximum_sections=int(defaults.get("measurementMaximumSections", 32)),
         minimum_circle_points=48,
+        minimum_camera_profile_points=int(
+            defaults.get("measurementMinimumCameraProfilePoints", 8)
+        ),
         maximum_circle_residual_mm=1.0,
     )
     rows: list[dict[str, Any]] = []

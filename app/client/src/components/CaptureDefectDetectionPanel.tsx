@@ -1,5 +1,5 @@
 import { RefreshCw, ScanSearch, ShieldAlert } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   CaptureApiError,
   captureArtifactImageUrl,
@@ -35,12 +35,15 @@ export function CaptureDefectDetectionPanel({ materialId }: CaptureDefectDetecti
   const [rebuildPending, setRebuildPending] = useState(false);
   const [pendingState, setPendingState] = useState('');
   const [error, setError] = useState('');
+  const loadRevisionRef = useRef(0);
 
-  const load = useCallback(async (showLoading = false) => {
+  const load = useCallback(async (showLoading = false, signal?: AbortSignal) => {
     if (!materialId) return;
+    const revision = ++loadRevisionRef.current;
     if (showLoading) setLoading(true);
     try {
-      const result = await readCaptureDefects(materialId);
+      const result = await readCaptureDefects(materialId, signal);
+      if (signal?.aborted || revision !== loadRevisionRef.current) return;
       if (result.detection) {
         setDetection(result.detection);
         setRebuildPending(false);
@@ -51,6 +54,7 @@ export function CaptureDefectDetectionPanel({ materialId }: CaptureDefectDetecti
         if (result.state === 'failed' || result.state === 'disabled') setRebuildPending(false);
       }
     } catch (loadError) {
+      if (signal?.aborted || revision !== loadRevisionRef.current) return;
       if (loadError instanceof CaptureApiError && loadError.status === 404) {
         setPendingState('尚未生成缺陷检出结果；已提交的任务会自动刷新');
         setError('');
@@ -60,18 +64,27 @@ export function CaptureDefectDetectionPanel({ materialId }: CaptureDefectDetecti
         setError(loadError instanceof Error ? loadError.message : '检出结果读取失败');
       }
     } finally {
-      if (showLoading) setLoading(false);
+      if (!signal?.aborted && revision === loadRevisionRef.current && showLoading) {
+        setLoading(false);
+      }
     }
   }, [materialId]);
 
   useEffect(() => {
+    const controller = new AbortController();
     setDetection(null);
     setRebuildPending(false);
     setPendingState('');
     setError('');
-    void load(true);
-    const timer = window.setInterval(() => void load(false), 3000);
-    return () => window.clearInterval(timer);
+    void load(true, controller.signal);
+    const timer = window.setInterval(
+      () => void load(false, controller.signal),
+      1_500,
+    );
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
   }, [load]);
 
   const rebuild = async () => {

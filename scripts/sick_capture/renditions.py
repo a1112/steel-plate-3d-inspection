@@ -23,6 +23,7 @@ import numpy as np
 from PIL import Image
 
 from .measurement import (
+    CIRCLE_FIT_ALGORITHM,
     MeasurementConfig,
     _coordinate,
     _load_calibration,
@@ -46,7 +47,7 @@ from .regions import RegionConfig, stable_horizontal_roi
 RENDITION_SCHEMA = "steel.capture-readable-rendition.v2"
 RENDITION_STATUS_SCHEMA = "steel.capture-readable-rendition-status.v2"
 GRAY_ALGORITHM = "2d-stable-horizontal-row-envelope-v1"
-JET_ALGORITHM = "six-camera-dynamic-circle-row-residual-v1"
+JET_ALGORITHM = "six-camera-dynamic-robust-circle-row-residual-v2"
 THUMBNAIL_WIDTH = 384
 JET_RANGE_MM = 1.0
 _LEGACY_CACHE_FILE = re.compile(r"^[0-9a-f]{64}(?:-w[0-9]+)?\.(?:jpg|json)$", re.IGNORECASE)
@@ -57,8 +58,11 @@ def rendition_measurement_config(defaults: dict[str, Any]) -> MeasurementConfig:
     return MeasurementConfig(
         row_window=int(defaults.get("measurementRowWindow", 16)),
         maximum_profile_points=int(defaults.get("measurementMaximumProfilePoints", 320)),
-        maximum_sections=int(defaults.get("measurementMaximumSections", 12)),
+        maximum_sections=int(defaults.get("measurementMaximumSections", 0)),
         minimum_circle_points=int(defaults.get("measurementMinimumCirclePoints", 48)),
+        minimum_camera_profile_points=int(
+            defaults.get("measurementMinimumCameraProfilePoints", 8)
+        ),
         maximum_circle_residual_mm=float(
             defaults.get("measurementMaximumCircleResidualMm", 0.5)
         ),
@@ -482,6 +486,36 @@ def _source_signature(source_path: Path, crop: list[int], algorithm: str) -> str
     return digest.hexdigest()
 
 
+def _alignment_fit_signature(alignment: dict[str, Any]) -> str:
+    """Hash only synchronization inputs used by dynamic row fitting.
+
+    Tail discovery and new soft-sync anchors keep changing during capture, but
+    per-row JET uses each camera's head-relative clock and line rate.  Excluding
+    unrelated growing fields prevents quadratic rebuilds while still
+    invalidating every affected JET frame if a detected head moves.
+    """
+    cameras = alignment.get("cameras", {})
+    if not isinstance(cameras, dict):
+        cameras = {}
+    payload = {
+        "algorithm": JET_ALGORITHM,
+        "completeCameras": int(
+            alignment.get("quality", {}).get("completeCameras", 0) or 0
+        ),
+        "cameras": {
+            str(camera_id): {
+                "headDeviceTime": row.get("headDeviceTime"),
+                "lineRateHz": row.get("lineRateHz"),
+            }
+            for camera_id, row in sorted(cameras.items())
+            if isinstance(row, dict)
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _existing_rendition(
     camera_root: Path,
     material_id: str,
@@ -539,6 +573,15 @@ def committed_rendition_file(
         if normalized_modality == "jet" and calibration_path is not None:
             if metadata.get("calibration", {}).get("sha256") != _cached_sha256_file(
                 calibration_path
+            ):
+                return None
+        if normalized_modality == "jet":
+            alignment_metadata = metadata.get("alignment", {})
+            alignment_file = Path(str(alignment_metadata.get("path", "")))
+            if (
+                not alignment_file.is_file()
+                or alignment_metadata.get("fitSignature")
+                != _alignment_fit_signature(_cached_json(alignment_file))
             ):
                 return None
         for required_level in ("thumbnail", "original"):
@@ -721,8 +764,9 @@ def build_jet_rendition(
         raise RenditionNotReady("alignment-manifest-unavailable", processing=True)
     alignment = _cached_json(alignment_file)
     quality = alignment.get("quality", {})
-    if not quality.get("geometrySynchronized") or int(quality.get("completeCameras", 0)) != 6:
+    if int(quality.get("completeCameras", 0)) != 6:
         raise RenditionNotReady("six-camera-alignment-not-ready", processing=True)
+    alignment_fit_signature = _alignment_fit_signature(alignment)
     calibration = _cached_calibration(calibration_path)
     if not calibration.get("approved"):
         raise RenditionNotReady("approved-array-calibration-unavailable")
@@ -735,7 +779,7 @@ def build_jet_rendition(
                 _file_stat_signature(flow_root / "3d" / f"{storage_index}.npz"),
                 _file_stat_signature(flow_root / "json" / f"{storage_index}.json"),
                 _cached_sha256_file(calibration_path),
-                _cached_sha256_file(alignment_file),
+                alignment_fit_signature,
                 str(JET_RANGE_MM),
                 str(config.row_window),
                 str(config.maximum_profile_points),
@@ -823,6 +867,7 @@ def build_jet_rendition(
     valid_plane = np.zeros_like(residual_plane, dtype=bool)
     accepted_rows = 0
     fit_p95_values: list[float] = []
+    diameter_rows_mm: list[float | None] = [None] * int(target_depth.shape[0])
     source_records: dict[str, set[int]] = {current_id: set() for current_id in camera_roots}
     half = max(1, int(config.row_window) // 2)
     for target_row in range(target_depth.shape[0]):
@@ -909,6 +954,7 @@ def build_jet_rendition(
         valid_plane[target_row, columns] = True
         accepted_rows += 1
         fit_p95_values.append(fit_p95)
+        diameter_rows_mm[target_row] = round(float(fit["diameterMm"]), 6)
 
     rgb = _jet_rgb(residual_plane, valid_plane)
     original_body, original_size = _jpeg_bytes(rgb)
@@ -948,6 +994,8 @@ def build_jet_rendition(
         "cameraId": camera_id,
         "storageIndex": storage_index,
         "modality": "jet",
+        "circleFitAlgorithm": CIRCLE_FIT_ALGORITHM,
+        "jetCalculation": "measured-radius-minus-dynamic-six-camera-robust-circle-radius-mm",
         "source": {
             "intensity": str(source_path),
             "depth": str(flow_root / "3d" / f"{storage_index}.npz"),
@@ -963,6 +1011,7 @@ def build_jet_rendition(
         "alignment": {
             "path": str(alignment_file),
             "sha256": _cached_sha256_file(alignment_file),
+            "fitSignature": alignment_fit_signature,
             "strictSixCamera": True,
             "commonWatermarkSeconds": round(watermark, 9),
             "flowClosed": flow_closed,
@@ -979,6 +1028,29 @@ def build_jet_rendition(
         "jetRangeMm": [-JET_RANGE_MM, JET_RANGE_MM],
         "acceptedRows": accepted_rows,
         "invalidRows": int(target_depth.shape[0] - accepted_rows),
+        "validPixelCount": int(np.count_nonzero(valid_plane)),
+        "diameterRowsMm": diameter_rows_mm,
+        "diameterSummary": {
+            "validRowCount": accepted_rows,
+            "minimumMm": (
+                round(min(value for value in diameter_rows_mm if value is not None), 6)
+                if accepted_rows
+                else None
+            ),
+            "maximumMm": (
+                round(max(value for value in diameter_rows_mm if value is not None), 6)
+                if accepted_rows
+                else None
+            ),
+            "averageMm": (
+                round(
+                    float(np.mean([value for value in diameter_rows_mm if value is not None])),
+                    6,
+                )
+                if accepted_rows
+                else None
+            ),
+        },
         "circleFitP95MaximumMm": round(max(fit_p95_values), 6) if fit_p95_values else None,
         "levels": {
             "thumbnail": {"file": f"thumbnail/{storage_index}.jpg", "size": thumbnail_size},
@@ -994,7 +1066,9 @@ def build_jet_rendition(
         "modality": "jet",
         "levels": ["thumbnail", "original"],
         "thumbnailWidth": THUMBNAIL_WIDTH,
-        "source": "3d-plus-alignment-plus-dynamic-six-camera-circle-fit",
+        "source": "3d-plus-alignment-plus-dynamic-six-camera-robust-circle-fit",
+        "circleFitAlgorithm": CIRCLE_FIT_ALGORITHM,
+        "jetCalculation": "measured-radius-minus-dynamic-six-camera-robust-circle-radius-mm",
         "displayCrop": crop,
         "foregroundMask": "same-as-gray-per-row-envelope",
         "jetRangeMm": [-JET_RANGE_MM, JET_RANGE_MM],
@@ -1002,43 +1076,6 @@ def build_jet_rendition(
     }
     _atomic_json(rendition_status_path(camera_root, material_id, "jet"), status)
     return metadata
-
-
-def rendition_file(
-    source_path: Path,
-    modality: str,
-    level: str,
-    *,
-    camera_id: str,
-    camera_roots: dict[str, Path],
-    storage_root: Path,
-    calibration_path: Path,
-    config: MeasurementConfig,
-) -> Path:
-    normalized_modality = modality.strip().lower()
-    normalized_level = level.strip().lower()
-    if normalized_modality not in {"gray", "jet"}:
-        raise ValueError("modality must be gray or jet")
-    if normalized_level not in {"thumbnail", "original"}:
-        raise ValueError("level must be thumbnail or original")
-    if normalized_modality == "gray":
-        build_gray_rendition(source_path)
-    else:
-        build_jet_rendition(
-            source_path,
-            camera_id=camera_id,
-            camera_roots=camera_roots,
-            storage_root=storage_root,
-            calibration_path=calibration_path,
-            config=config,
-        )
-    return rendition_image_path(
-        source_path.parents[2],
-        source_path.parents[1].name,
-        normalized_modality,
-        normalized_level,
-        int(source_path.stem),
-    )
 
 
 def verify_and_cleanup_legacy_renditions(

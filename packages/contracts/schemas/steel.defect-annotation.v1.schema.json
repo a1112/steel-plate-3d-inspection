@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "steel.defect-annotation.v1",
+  "title": "Authoritative steel defect annotation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "annotationId",
+    "sampleId",
+    "materialId",
+    "taxonomyRevision",
+    "status",
+    "disposition",
+    "source",
+    "annotator",
+    "reviewer",
+    "adjudicator",
+    "createdAt",
+    "reviewedAt",
+    "adjudicatedAt",
+    "disputes",
+    "defects"
+  ],
+  "properties": {
+    "schema": { "const": "steel.defect-annotation.v1" },
+    "annotationId": { "$ref": "#/$defs/id" },
+    "sampleId": { "$ref": "#/$defs/id" },
+    "materialId": { "$ref": "#/$defs/id" },
+    "taxonomyRevision": { "$ref": "#/$defs/id" },
+    "status": { "enum": ["pending", "reviewed", "adjudicated"] },
+    "disposition": { "enum": ["defect", "no-defect", "hard-negative", "indeterminate"] },
+    "source": { "type": "string", "minLength": 1 },
+    "annotator": { "type": "string", "minLength": 1 },
+    "reviewer": { "type": ["string", "null"], "minLength": 1 },
+    "adjudicator": { "type": ["string", "null"], "minLength": 1 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "reviewedAt": { "type": ["string", "null"], "format": "date-time" },
+    "adjudicatedAt": { "type": ["string", "null"], "format": "date-time" },
+    "disputes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["recordedAt", "summary", "resolution"],
+        "properties": {
+          "recordedAt": { "type": "string", "format": "date-time" },
+          "summary": { "type": "string", "minLength": 1 },
+          "resolution": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "defects": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/defect" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "bytes", "sha256"],
+      "properties": {
+        "uri": { "$ref": "#/$defs/relativePath" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": { "type": "number", "minimum": 0 },
+        "y": { "type": "number", "minimum": 0 }
+      }
+    },
+    "roi2d": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "width", "height", "imageWidth", "imageHeight"],
+      "properties": {
+        "x": { "type": "number", "minimum": 0 },
+        "y": { "type": "number", "minimum": 0 },
+        "width": { "type": "number", "exclusiveMinimum": 0 },
+        "height": { "type": "number", "exclusiveMinimum": 0 },
+        "imageWidth": { "type": "integer", "minimum": 1 },
+        "imageHeight": { "type": "integer", "minimum": 1 },
+        "contour": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/point" }
+        }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "unit"],
+      "properties": {
+        "kind": { "enum": ["length", "width", "depth", "height", "area"] },
+        "value": { "type": "number", "minimum": 0 },
+        "unit": { "enum": ["mm", "mm2"] }
+      }
+    },
+    "defect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["defectId", "classId", "roi2d", "measurements"],
+      "properties": {
+        "defectId": { "$ref": "#/$defs/id" },
+        "classId": { "$ref": "#/$defs/id" },
+        "roi2d": { "$ref": "#/$defs/roi2d" },
+        "geometry3d": { "$ref": "#/$defs/file" },
+        "measurements": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/measurement" }
+        }
+      }
+    }
+  }
+}

@@ -3,6 +3,13 @@
 > 文档基线：2026-07-16 当前工作区  
 > 适用范围：棒材表面 3D 检测系统的发布候选包、Windows 现场部署、运维交接和生产放行  
 > 当前结论：**No-Go。当前产物只能作为工程验证证据，不能作为正式生产发布包。**
+>
+> Runtime V2 迁移说明（2026-08-29）：本文中的八相机运行记录只保留为迁移前历史证据，
+> 不代表当前正式拓扑，也不能复用于当前候选放行。正式基线以
+> [Runtime Boundaries V2](runtime-boundaries-v2.md) 为准：一个 SCM Supervisor、六个受管子服务、
+> 六路 SICK GenTL 相机；当前正式验收必须重新取得六相机、当前 release/manifest 绑定的证据。
+> Machine-readable status: `Runtime-V2 migration note`; `pre-migration historical evidence`;
+> `six-camera SICK GenTL`.
 
 ## 1. 文档目的与状态口径
 
@@ -28,7 +35,7 @@
 | Tauri 桌面端 | no-bundle Release 已构建，安装器仍阻断 | 完整构建 56.64 秒，产物 `target/cargo/release/steel-plate-3d-inspection-tauri.exe` 为 23,113,728 bytes，production devtools=0；已配置 WebView2 offlineInstaller、NSIS perMachine、禁止降级和 publisher；离线 WiX/NSIS/WebView2 清单生成、包外 hash、精确播种和构建后复验已实现并通过篡改测试 | 仍须由发布负责人提供受审计的真实离线工具 payload 并批准其 manifest hash；历史在线 bundle 未生成 MSI/NSIS。这不是源码编译失败；当前 EXE 为 NotSigned 且依赖 VCRUNTIME140.dll |
 | 代码签名 | 门禁已实现，证据仍为发布阻断 | 正式包已要求桌面 EXE/MSI/NSIS、全部首方后台 EXE 和 vendor SDK DLL 均为 Authenticode Valid 且有可信时间戳；首方文件还绑定批准证书指纹 | 当前本地产物仍为 NotSigned，尚无真实发布证书/时间戳，也没有可归档的 vendor DLL 有效签名证据 |
 | 包完整性 | 生成、独立复验和安装前拒绝代码已实现，正式证据仍阻断 | `checksums.sha256` 双向闭包、SHA-256 Windows catalog、catalog Authenticode/时间戳、部署侧证书指纹和完整 `Test-FileCatalog` 均已接入；安装器在写可变状态前验证 | 当前没有真实证书、签名 `release-integrity.cat` 或可独立复验的 `formal-release` 包，不能把工程包哈希清单当作正式防篡改证据 |
-| SBOM 与外部组件 | 离线生成/语义复验代码已完成，正式审批证据未生成 | CycloneDX 1.5 绑定 commit、四个 lock、脚本 hash、Git/PowerShell 版本和六类外部组件；离线负向测试 11/11；当前工作区可枚举 npm 315、Cargo 627、external 6，共 948 个组件 | 用真实版本、来源、许可证和 artifact SHA-256 把 external policy 从 example/pending 变为批准输入；在最终 clean commit 生成、验真并纳入 formal-release/catalog |
+| SBOM 与外部组件 | 离线生成/语义复验代码已完成，正式审批证据未生成 | CycloneDX 1.5 绑定 commit、12 份依赖锁（1 份 npm、11 份首方 Cargo）、脚本 hash、Git/PowerShell 版本和六类外部组件；离线负向测试 11/11；组件清单从全部锁文件离线派生并去重 | 用真实版本、来源、许可证和 artifact SHA-256 把 external policy 从 example/pending 变为批准输入；在最终 clean commit 生成、验真并纳入 formal-release/catalog |
 | 算法生产策略 | 生产防护、候选降级语义与完整绑定代码已落地，真实准入仍阻断 | 生产档拒绝 mock/synthetic；径向异常保留兼容 ID 但显式标记 `candidate-only`，界面/报告不再冒充已完成材料缺陷分类；版本化配置、校验器、安装器、Python 运行和 Rust readiness/运行门禁逐项绑定 config、calibration、script、core、release commit、dataset/evaluator、报告和输入产物 | 用冻结数据集完成类别、精度和误报/漏报验收，生成有真实指标与两方签字的 status=pass 报告；在最终包与一次真实运行上归档绑定证据 |
 | Windows 统一宿主 | 版本化部署、严格排空和在线轮转本机回归通过，管理员现场仍阻断 | Job Object、句柄白名单、三 listener 和应用 readiness 已落地；Service 134/134、Trigger 17/17、C++ 9/9、Supervisor 综合脚本通过。Trigger→Service drain、连续 4 次零状态、受管 49007 两次确认、标定绕过拒绝、算法计算取消/超时/直接完成后的派生进程整树回收/有界输出、50 MiB 在线轮转/5 代保留已测；Supervisor 环境白名单现与安装器实际生成的采集根、算法根、报告根和超时字段一致；安装器已实现三段完整验证、不可变版本目录、mutex、持久 journal、pre-DB 恢复和 SCM 直指 | 用真实签名 formal-release 在管理员目标机验证 install/upgrade/rollback/uninstall、SCM 状态与约 90 秒最坏 stop 预算、effective ACL、开机自启、逐 phase 恢复、整树回收和五端口释放 |
 | 八相机与标定 | 完整采集功能通过，异常矩阵未全部关闭 | 当前真实材料完成 184/184 完整帧，八台各 23 组 depth/intensity/metadata、零失败；同批重建 20/20，启动自动连接和精确 8/8 readiness 已实测 | 归档无 skip 的正式 24/24 管理报告、标定崩溃恢复、受管 49007 恢复与连续班次报告 |
@@ -109,7 +116,7 @@
 
 正式打包明确禁止 `-SkipBuild`、`-AllowDirtyWorktree`、`-AllowDebugPackage` 和 `-SkipDesktopBundle`，并要求包外审批的 `STEEL_RELEASE_POLICY_SHA256` 精确匹配源控策略。它还要求仓库外 `TAURI_BUNDLE_TOOLCHAIN_ROOT`、批准的 `STEEL_BUNDLE_TOOLCHAIN_MANIFEST_SHA256`、批准的 `STEEL_EXTERNAL_COMPONENTS_PATH` 及其包外 `STEEL_EXTERNAL_COMPONENTS_SHA256`：先验证 WiX/NSIS/WebView2 源清单、全部 payload 和六类外部组件审批，再清空 `target/capture`、`target/cargo`、`target/trigger`、`target/algorithm-core`、`target/client/frontend-dist`，把精确 payload 播种到 `target/cargo/.tauri`，执行干净的 `npm ci`，然后在同一次 `package-runtime.ps1` 调用中重建全部交付物；构建后再次复验工具目录无缺失、增项或篡改。构建完成后和写 manifest 前各再次核对精确 Git HEAD 与空 worktree，任何源文件或提交变化均中止。正式桌面构建显式指定 `x86_64-pc-windows-msvc`，要求 `build.features=[]`、release `debug-assertions=false`，拒绝自动合并的 Tauri 平台配置、未批准 `TAURI_*`/Rust 编译器/Cargo profile 覆盖及包外 Cargo config，并直接核验桌面和后台 PE 的 x86-64 Machine 字段。
 
-Tauri 配置、npm、Tauri Cargo、Rust service 和 trigger 的版本必须同步；`releaseVersion` 绑定该版本，并绑定同一提交上的精确 `v<version>` 或 `<version>` tag。正式安装只接受无数字前导零的规范稳定 `x.y.z`，占位 `0.1.0` 明确阻断。manifest 同时记录 `build.performed=true`、`provenance=built-in-this-invocation`、与 source commit 相同的 build source commit 和 `dependencyInstall=npm-ci`；包内 `build-evidence` 保存 npm `package-lock.json`、Tauri/service/trigger 三个 Cargo.lock、精确 `tauri.conf.json`、Tauri `Cargo.toml`、`desktop-release-policy.json`、`tauri-feature-resolution.json`、`bundle-toolchain-manifest.json`、`external-components.json` 和 CycloneDX 1.5 SBOM，包内 `database` 保存契约与 migration index；manifest 逐项绑定 SHA-256、schema、target、组件数与文件数。
+Tauri 配置、npm 和全部首方 Rust 工程版本必须同步；`releaseVersion` 绑定该版本，并绑定同一提交上的精确 `v<version>` 或 `<version>` tag。正式安装只接受无数字前导零的规范稳定 `x.y.z`，占位 `0.1.0` 明确阻断。manifest 同时记录 `build.performed=true`、`provenance=built-in-this-invocation`、与 source commit 相同的 build source commit 和 `dependencyInstall=npm-ci`；包内 `build-evidence` 保存 npm `package-lock.json`、11 个首方 Rust 工程的 Cargo.lock、精确 `tauri.conf.json`、Tauri `Cargo.toml`、`desktop-release-policy.json`、`tauri-feature-resolution.json`、`bundle-toolchain-manifest.json`、`external-components.json` 和 CycloneDX 1.5 SBOM，包内 `database` 保存契约与 migration index；manifest 逐项绑定 SHA-256、schema、target、组件数与文件数。
 
 正式构建机还必须显式提供 `TAURI_WINDOWS_CERTIFICATE_THUMBPRINT`、HTTPS `TAURI_WINDOWS_TIMESTAMP_URL`、与 Tauri config/release policy 完全一致的 `TAURI_WINDOWS_PUBLISHER`，以及指向 Microsoft 有效签名且带可信时间戳文件的 `VC_REDIST_X64_PATH`。证书须未过期、具代码签名用途且私钥可用。构建侧输入不替代部署侧独立的 signer/vendor/publisher/policy hash 信任锚。
 
@@ -142,9 +149,9 @@ scripts/verify-runtime-package.ps1 `
   -ExpectedExternalComponentsSha256 $env:STEEL_EXTERNAL_COMPONENTS_SHA256
 ```
 
-wrapper 默认要求正式包。首方 signer、vendor allowlist、精确 publisher、策略 SHA-256、bundle-toolchain manifest SHA-256 和 external-components policy SHA-256 这六类信任输入都必须来自包外发布审批；不得从 manifest 或包内证据文件自动接受。它先以这些信任锚、双向 checksum 和完整 catalog 建立信任，再允许执行包内契约/客户端检查；不会先运行未验证包中的脚本。该流程还核对 package class、同次构建来源、`npm ci`、四个 lock、tauri.conf/Tauri Cargo manifest、CycloneDX SBOM/external policy、数据库 contract/migration index、`build-evidence/desktop-release-policy.json`、`tauri-feature-resolution.json`（解析 target/features 且禁用 devtools）和 `bundle-toolchain-manifest.json` 的精确组件/文件清单、releaseVersion/tag/commit，并要求：精确一个 MSI 和一个 NSIS；MSI ProductVersion、NSIS/桌面 EXE 文件版本等于 releaseVersion；桌面 EXE/MSI/NSIS、五个首方后台 EXE 和 catalog 均由指定首方证书有效签名并带时间戳；`nvt_lvm_sdk.dll` 的 signer 位于 vendor allowlist；VC_redist.x64.exe 由 Microsoft Corporation 有效签名；WebView2 声明为 offlineInstaller。
+wrapper 默认要求正式包。首方 signer、vendor allowlist、精确 publisher、策略 SHA-256、bundle-toolchain manifest SHA-256 和 external-components policy SHA-256 这六类信任输入都必须来自包外发布审批；不得从 manifest 或包内证据文件自动接受。它先以这些信任锚、双向 checksum 和完整 catalog 建立信任，再允许执行包内契约/客户端检查；不会先运行未验证包中的脚本。该流程还核对 package class、同次构建来源、`npm ci`、12 份依赖锁、tauri.conf/Tauri Cargo manifest、CycloneDX SBOM/external policy、数据库 contract/migration index、`build-evidence/desktop-release-policy.json`、`tauri-feature-resolution.json`（解析 target/features 且禁用 devtools）和 `bundle-toolchain-manifest.json` 的精确组件/文件清单、releaseVersion/tag/commit，并要求：精确一个 MSI 和一个 NSIS；MSI ProductVersion、NSIS/桌面 EXE 文件版本等于 releaseVersion；桌面 EXE/MSI/NSIS、五个首方后台 EXE 和 catalog 均由指定首方证书有效签名并带时间戳；`nvt_lvm_sdk.dll` 的 signer 位于 vendor allowlist；VC_redist.x64.exe 由 Microsoft Corporation 有效签名；WebView2 声明为 offlineInstaller。
 
-SBOM 当前门禁的边界必须保留在发布风险记录中：六个类别都要求至少一项，但每类允许多项，不能把 external component 总数写死为 6；静态验包已绑定 SBOM/external policy 的 hash、serial、计数、lock 和工具证据，但尚未从四个 lock 独立重建完整 npm/Cargo inventory；PowerShell JSON 解析后也不能可靠识别重复 member。正式构建/语义验证固定使用 Windows PowerShell 5.1 或 PowerShell 6.2+，禁止 6.0/6.1。批准版 `external-components.json` 及其带外 hash 尚未提供，因此当前不能生成真实 formal-release SBOM。
+SBOM 当前门禁的边界必须保留在发布风险记录中：六个类别都要求至少一项，但每类允许多项，不能把 external component 总数写死为 6；静态验包已绑定 SBOM/external policy 的 hash、serial、计数、12 份 lock 和工具证据，但尚未从这些 lock 独立重建完整 npm/Cargo inventory；PowerShell JSON 解析后也不能可靠识别重复 member。正式构建/语义验证固定使用 Windows PowerShell 5.1 或 PowerShell 6.2+，禁止 6.0/6.1。批准版 `external-components.json` 及其带外 hash 尚未提供，因此当前不能生成真实 formal-release SBOM。
 
 工程包必须显式传 `-Engineering`，默认只做静态 manifest/布局/哈希检查，不执行包内脚本。只有本机生成且已通过其他方式确认可信的工程包，才可再显式传 `-AllowPackageCodeExecution` 运行包内检查；该开关不改变其 engineering 身份，也不能用于生产安装。
 
@@ -163,7 +170,7 @@ SBOM 当前门禁的边界必须保留在发布风险记录中：六个类别都
 
 - algorithmName、algorithmVersion、configRevision；
 - 网格、轮廓裁剪、MAD、缺陷深度/面积、严重度和置信度等全部生产阈值；
-- 精确 requiredCameraCount=8；
+- 当前正式 `sick-array-6` 基线精确要求 `requiredCameraCount=6`；
 - 每台相机都必须有标定、重建质量门禁必须通过、maximumSyntheticDefectCount=0。
 
 生产运行禁止通过 CLI 或请求体悄悄覆盖版本化阈值。任何配置内容变化都会改变 configSha256，必须生成新 revision、重跑算法验收并重新签发候选包。
@@ -183,10 +190,16 @@ config/algorithm/acceptance-report.example.json 只是模板，默认 status=pen
       "releaseCommit": "...",
       "datasetRevision": "...",
       "datasetSha256": "...",
+      "datasetValidationSha256": "...",
       "evaluatorRevision": "...",
       "evaluatorSha256": "...",
+      "modelSetRevision": "...",
+      "modelSetSha256": "...",
+      "reproductionManifestRevision": "...",
+      "reproductionManifestSha256": "...",
       "calibrationRevision": "...",
       "calibrationSha256": "...",
+      "evaluatedAt": "...",
       "metrics": {},
       "acceptanceCriteria": {},
       "approvals": {
@@ -196,7 +209,7 @@ config/algorithm/acceptance-report.example.json 只是模板，默认 status=pen
       }
     }
 
-报告中的批准人字段是质量流程记录，不是数字签名。报告文件仍必须通过发布包 SHA-256、ACL 和发布签名链防篡改。只有以下条件全部成立才能把 status 改为 pass：冻结数据集、评测器、算法脚本、C++ core、生产配置和标定文件的哈希均一致；所有指标满足已签字阈值；算法和质量负责人完成审批。
+报告中的批准人字段是质量流程记录，不是数字签名。报告文件仍必须通过发布包 SHA-256、ACL 和发布签名链防篡改。只有以下条件全部成立才能把 status 改为 pass：冻结数据集及其通过的 validator 报告、复现清单、正式模型集、评测器、算法脚本、C++ core、生产配置和标定文件的哈希均一致；所有指标满足已签字阈值；算法和质量负责人在评测完成后审批。
 
 安装时必须显式传入真实报告：
 
@@ -211,7 +224,7 @@ config/algorithm/acceptance-report.example.json 只是模板，默认 status=pen
       AllowedVendorSdkSignerThumbprints = @($env:STEEL_VENDOR_SDK_SIGNER_THUMBPRINTS -split ',')
       StorageRoot = 'H:\'
       CameraStorageRoot = 'H:\'
-      ArtifactAllowedRoots = 'H:\production;H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;H:\camera7;H:\camera8;G:\bar-surface-algorithm'
+      ArtifactAllowedRoots = 'H:\production;H:\camera1;H:\camera2;H:\camera3;H:\camera4;H:\camera5;H:\camera6;G:\bar-surface-algorithm'
     }
     & (Join-Path $package 'install-runtime-service.ps1') @installArgs
 
@@ -219,7 +232,7 @@ config/algorithm/acceptance-report.example.json 只是模板，默认 status=pen
 
     & (Join-Path $package 'test-algorithm-acceptance-report.ps1') -ReportPath 'C:\ProgramData\SteelInspection\release\algorithm-acceptance.json' -ConfigPath (Join-Path $package 'config\algorithm\bar-surface-production.json')
 
-当前校验器强制检查 status、算法/配置身份与配置哈希、dataset/evaluator、calibration、script/core、release commit、六项指标/标准和两方审批。安装器还把报告与包内实际配置、标定、Python 脚本、C++ core 及 manifest release commit 做精确比对。校验通过仍只证明“报告与候选包一致”，不能替代冻结数据集、真实指标和负责人签字本身。
+当前校验器强制检查 status、算法/配置身份与配置哈希、dataset/validator/evaluator、model set、reproduction manifest、calibration、script/core、release commit、六项指标/标准、评测完成时间和两方审批，并拒绝批准早于评测结束。安装器还把报告与包内实际配置、标定、Python 脚本、C++ core、实际模型清单及 manifest release commit 做精确比对；`temporary=true` 或未显式声明 `temporary=false` 的模型清单不能用于正式安装。校验通过仍只证明“报告与候选包一致”，不能替代冻结数据集、真实指标和负责人签字本身。
 
 ### 6.3 每次运行必须持久化的追溯信息
 
@@ -232,6 +245,16 @@ config/algorithm/acceptance-report.example.json 只是模板，默认 status=pen
       "configSha256": "...",
       "calibrationRevision": "...",
       "calibrationSha256": "...",
+      "datasetRevision": "...",
+      "datasetSha256": "...",
+      "datasetValidationSha256": "...",
+      "modelSetRevision": "...",
+      "modelSetSha256": "...",
+      "reproductionManifestRevision": "...",
+      "reproductionManifestSha256": "...",
+      "evaluatorRevision": "...",
+      "evaluatorSha256": "...",
+      "evaluatedAt": "...",
       "inputSummarySha256": "...",
       "inputFrameIds": [],
       "inputArtifactCount": 0,
@@ -244,7 +267,7 @@ config/algorithm/acceptance-report.example.json 只是模板，默认 status=pen
       "syntheticDefectCount": 0
     }
 
-生产实现还把每次运行绑定到 acceptanceReportSha256、datasetRevision/datasetSha256、evaluatorRevision/evaluatorSha256、scriptSha256、coreSha256 和 releaseCommit；Python 与 Rust 分别校验，readiness 也与当前包内文件逐项比对。输入文件在处理前计算逐文件哈希，并在完成后复核，防止处理期间被替换。缺字段、哈希不一致、八相机不完整、质量门禁失败或 synthetic 数量非零时，算法任务必须失败，readiness 必须为 503，不得生成生产质量结论。正式放行仍需用真实通过报告和现场输入跑出一份可复核证据。
+生产实现还把每次运行绑定到 acceptanceReportSha256、datasetRevision/datasetSha256、datasetValidationSha256、modelSetRevision/modelSetSha256、reproductionManifestRevision/reproductionManifestSha256、evaluatorRevision/evaluatorSha256、evaluatedAt、scriptSha256、coreSha256 和 releaseCommit；Python 与 Rust 分别校验，readiness 也与当前包内文件逐项比对。输入文件在处理前计算逐文件哈希，并在完成后复核，防止处理期间被替换。缺字段、哈希不一致、正式六相机输入不完整、质量门禁失败或 synthetic 数量非零时，算法任务必须失败，readiness 必须为 503，不得生成生产质量结论。正式放行仍需用真实通过报告和现场输入跑出一份可复核证据。
 
 ### 6.4 检测报告归档与打印
 

@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "steel.algorithm-dataset.v1",
+  "title": "Frozen steel inspection algorithm dataset",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "datasetRevision",
+    "manifestSha256",
+    "createdAt",
+    "source",
+    "accessLevel",
+    "license",
+    "surface",
+    "taxonomy",
+    "splits",
+    "expectedStatistics"
+  ],
+  "properties": {
+    "schema": { "const": "steel.algorithm-dataset.v1" },
+    "datasetRevision": { "$ref": "#/$defs/id" },
+    "manifestSha256": {
+      "allOf": [{ "$ref": "#/$defs/sha256" }],
+      "description": "SHA-256 of canonical UTF-8 JSON after removing this top-level field."
+    },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "siteId", "sensorProfile"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "siteId": { "$ref": "#/$defs/id" },
+        "sensorProfile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "accessLevel": {
+      "enum": ["public", "internal", "restricted", "confidential"]
+    },
+    "license": { "$ref": "#/$defs/license" },
+    "surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "geometry",
+        "coordinateSystem",
+        "lengthUnit",
+        "depthInvalidValue",
+        "calibration"
+      ],
+      "properties": {
+        "geometry": { "enum": ["cylinder", "plate"] },
+        "coordinateSystem": { "type": "string", "minLength": 1 },
+        "lengthUnit": { "const": "mm" },
+        "depthInvalidValue": {
+          "oneOf": [
+            { "type": "number" },
+            { "enum": ["nan", "none", "masked"] }
+          ]
+        },
+        "calibration": { "$ref": "#/$defs/versionedFile" }
+      }
+    },
+    "taxonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "classes"],
+      "properties": {
+        "revision": { "$ref": "#/$defs/id" },
+        "classes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "name"],
+            "properties": {
+              "id": { "$ref": "#/$defs/id" },
+              "name": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "splits": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "exclusive", "samples"],
+        "properties": {
+          "name": { "enum": ["train", "validation", "test", "qualification"] },
+          "exclusive": { "const": true },
+          "samples": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/sample" }
+          }
+        }
+      }
+    },
+    "expectedStatistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sampleCount",
+        "materialCount",
+        "batchCount",
+        "splitCounts",
+        "classCounts"
+      ],
+      "properties": {
+        "sampleCount": { "type": "integer", "minimum": 0 },
+        "materialCount": { "type": "integer", "minimum": 0 },
+        "batchCount": { "type": "integer", "minimum": 0 },
+        "splitCounts": { "$ref": "#/$defs/countMap" },
+        "classCounts": { "$ref": "#/$defs/countMap" }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "bytes", "sha256"],
+      "properties": {
+        "uri": { "$ref": "#/$defs/relativePath" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "versionedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "uri", "bytes", "sha256"],
+      "properties": {
+        "revision": { "$ref": "#/$defs/id" },
+        "uri": { "$ref": "#/$defs/relativePath" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "purposes", "evidence"],
+      "properties": {
+        "status": { "enum": ["Approved", "Restricted", "Blocked"] },
+        "purposes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["development", "validation", "qualification", "benchmark"] }
+        },
+        "evidence": { "$ref": "#/$defs/file" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactId", "kind", "uri", "bytes", "sha256"],
+      "properties": {
+        "artifactId": { "$ref": "#/$defs/id" },
+        "kind": { "type": "string", "minLength": 1 },
+        "uri": { "$ref": "#/$defs/relativePath" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sampleId",
+        "materialId",
+        "batchId",
+        "acquisitionBatch",
+        "artifacts",
+        "annotation"
+      ],
+      "properties": {
+        "sampleId": { "$ref": "#/$defs/id" },
+        "materialId": { "$ref": "#/$defs/id" },
+        "batchId": { "$ref": "#/$defs/id" },
+        "acquisitionBatch": { "$ref": "#/$defs/id" },
+        "cameraId": { "$ref": "#/$defs/id" },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/artifact" }
+        },
+        "annotation": { "$ref": "#/$defs/file" }
+      }
+    },
+    "countMap": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/id" },
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    }
+  }
+}

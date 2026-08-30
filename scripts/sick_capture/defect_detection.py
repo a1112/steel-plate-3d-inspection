@@ -1,9 +1,10 @@
 """Bounded post-flow surface-defect detection using temporary legacy models.
 
-The detector intentionally runs only after a flow is closed and its storage
-queue is empty.  It consumes the immutable ``2d/*.png``, ``3d/*.npz`` and
-``json/*.json`` artifacts, writes review crops plus a traceable manifest, and
-never mutates the acquisition files.
+The detector runs only after a flow is closed.  Live work may continue at low
+priority while capture still has bounded storage headroom, and pauses again as
+soon as that headroom is consumed.  It consumes the immutable ``2d/*.png``,
+``3d/*.npz`` and ``json/*.json`` artifacts, writes review crops plus a
+traceable manifest, and never mutates the acquisition files.
 """
 
 from __future__ import annotations
@@ -123,7 +124,7 @@ class DefectDetectionConfig:
                 1, min(1000, int(self.maximum_detections_per_frame))
             ),
             inference_batch_size=max(1, min(32, int(self.inference_batch_size))),
-            preprocess_workers=max(1, min(4, int(self.preprocess_workers))),
+            preprocess_workers=max(1, min(8, int(self.preprocess_workers))),
             classification_confidence_threshold=max(
                 0.01, min(0.99, float(self.classification_confidence_threshold))
             ),
@@ -185,7 +186,8 @@ def _letterbox_rgb(
     size: int,
 ) -> tuple[np.ndarray, float, tuple[float, float]]:
     value = np.asarray(image, dtype=np.uint8)
-    if value.ndim != 3 or value.shape[2] != 3:
+    grayscale = value.ndim == 2
+    if not grayscale and (value.ndim != 3 or value.shape[2] != 3):
         raise ValueError(f"detector image must be RGB HWC: {value.shape}")
     height, width = value.shape[:2]
     if height <= 0 or width <= 0:
@@ -195,8 +197,13 @@ def _letterbox_rgb(
     resized_height = max(1, min(size, int(round(height * scale))))
     left = (size - resized_width) // 2
     top = (size - resized_height) // 2
+    if grayscale:
+        channel = Image.fromarray(value, mode="L")
+        source_image = Image.merge("RGB", (channel, channel, channel))
+    else:
+        source_image = Image.fromarray(value, mode="RGB")
     canvas = Image.new("RGB", (size, size), (114, 114, 114))
-    resized = Image.fromarray(value, mode="RGB").resize(
+    resized = source_image.resize(
         (resized_width, resized_height),
         Image.Resampling.BILINEAR,
     )
@@ -294,8 +301,29 @@ def decode_yolov5_predictions(
     ]
 
 
+_JET_LEVELS = np.arange(256, dtype=np.float32) / 255.0
+_JET_RGB_LUT = np.rint(
+    np.stack(
+        (
+            np.clip(1.5 - np.abs(4.0 * _JET_LEVELS - 3.0), 0.0, 1.0),
+            np.clip(1.5 - np.abs(4.0 * _JET_LEVELS - 2.0), 0.0, 1.0),
+            np.clip(1.5 - np.abs(4.0 * _JET_LEVELS - 1.0), 0.0, 1.0),
+        ),
+        axis=-1,
+    )
+    * 255.0
+).astype(np.uint8)
+
+
 def _jet_rgb(gray: np.ndarray) -> np.ndarray:
-    value = np.asarray(gray, dtype=np.float32) / 255.0
+    source = np.asarray(gray)
+    if source.dtype == np.uint8:
+        # Depth rendering previously evaluated three floating-point formulas
+        # for every source pixel.  The input is an 8-bit plane, so a 256-entry
+        # lookup table produces exactly the same bytes with far less CPU and
+        # temporary-memory traffic.
+        return _JET_RGB_LUT[source]
+    value = np.asarray(source, dtype=np.float32) / 255.0
     red = np.clip(1.5 - np.abs(4.0 * value - 3.0), 0.0, 1.0)
     green = np.clip(1.5 - np.abs(4.0 * value - 2.0), 0.0, 1.0)
     blue = np.clip(1.5 - np.abs(4.0 * value - 1.0), 0.0, 1.0)
@@ -416,30 +444,47 @@ class OnnxYoloDetector:
     def detect_many(self, images: list[np.ndarray]) -> list[list[dict[str, Any]]]:
         if not images:
             return []
-        if len(images) > 1 and not self.dynamic_batch:
-            return [self.detect_many([image])[0] for image in images]
         prepared = [
             _letterbox_rgb(image, self.config.image_size) for image in images
         ]
+        return self.detect_prepared_many(
+            prepared,
+            [image.shape[:2] for image in images],
+        )
+
+    def detect_prepared_many(
+        self,
+        prepared: list[tuple[np.ndarray, float, tuple[float, float]]],
+        original_shapes: list[tuple[int, int]],
+    ) -> list[list[dict[str, Any]]]:
+        if not prepared:
+            return []
+        if len(prepared) != len(original_shapes):
+            raise ValueError("prepared detector inputs do not match source shapes")
+        if len(prepared) > 1 and not self.dynamic_batch:
+            return [
+                self.detect_prepared_many([item], [shape])[0]
+                for item, shape in zip(prepared, original_shapes)
+            ]
         tensor = np.concatenate([item[0] for item in prepared], axis=0)
         predictions = np.asarray(
             self.session.run(None, {self.input_name: tensor})[0]
         )
-        if predictions.ndim != 3 or predictions.shape[0] != len(images):
+        if predictions.ndim != 3 or predictions.shape[0] != len(prepared):
             raise ValueError(
                 f"batched YOLOv5 output does not match input: {predictions.shape}"
             )
         return [
             decode_yolov5_predictions(
                 predictions[index],
-                original_shape=image.shape[:2],
+                original_shape=original_shapes[index],
                 scale=prepared[index][1],
                 padding=prepared[index][2],
                 confidence_threshold=self.config.confidence_threshold,
                 iou_threshold=self.config.iou_threshold,
                 maximum_detections=self.config.maximum_detections_per_frame,
             )
-            for index, image in enumerate(images)
+            for index in range(len(prepared))
         ]
 
 
@@ -526,10 +571,13 @@ def _legacy_classifier_crop(image: np.ndarray, rect: list[int]) -> np.ndarray | 
     crop = image[top:bottom, left:right]
     if crop.size == 0:
         return None
-    return np.asarray(
+    resized = np.asarray(
         Image.fromarray(crop).resize((224, 224), Image.Resampling.BILINEAR),
         dtype=np.uint8,
     )
+    if resized.ndim == 2:
+        resized = np.repeat(resized[..., None], 3, axis=2)
+    return resized
 
 
 def _classify_candidates(
@@ -1202,6 +1250,15 @@ def _capture_is_idle(
     maximum_pending_storage_rounds: int,
     realtime_priority_status_path: Path | None = None,
 ) -> bool:
+    """Return whether low-priority analysis may touch capture storage.
+
+    A zero pending-round allowance retains the strict historical-backfill
+    contract: steel must be absent and both pending and active storage work
+    must be empty.  A positive allowance is the live-worker contract.  It may
+    process a previously closed flow during acquisition while the bounded
+    writer queue has explicit headroom, but yields within one inference batch
+    when the configured or physical safety limit is reached.
+    """
     if _realtime_analysis_has_priority(realtime_priority_status_path):
         return False
     try:
@@ -1212,12 +1269,38 @@ def _capture_is_idle(
     except Exception:
         return False
     queue = health.get("storageQueue", {})
+    pending_rounds = int(queue.get("pendingRounds", 0) or 0)
+    active_rounds = int(queue.get("activeRounds", 0) or 0)
+    allowed_pending = max(0, int(maximum_pending_storage_rounds))
+    if allowed_pending == 0:
+        return bool(
+            not steel.get("present")
+            and pending_rounds == 0
+            and active_rounds == 0
+        )
+
+    capacity_rounds = max(
+        1,
+        int(queue.get("capacityRounds", allowed_pending + 1) or 0),
+    )
+    reserved_rounds = max(
+        1,
+        int(queue.get("reservedBoundaryRounds", 1) or 0),
+    )
+    # Never consume the boundary reserve or the final eighth of the queue even
+    # if a site accidentally configures an over-large live-analysis allowance.
+    physical_limit = max(
+        0,
+        capacity_rounds - max(reserved_rounds, capacity_rounds // 8),
+    )
+    pending_limit = min(allowed_pending, physical_limit)
+    active_limit = max(
+        1,
+        min(4, int(queue.get("roundWorkerCount", 1) or 1)),
+    )
     return bool(
-        not steel.get("present")
-        and int(queue.get("pendingRounds", 0) or 0)
-        <= maximum_pending_storage_rounds
-        and int(queue.get("activeRounds", 0) or 0)
-        <= (1 if maximum_pending_storage_rounds > 0 else 0)
+        pending_rounds <= pending_limit
+        and active_rounds <= active_limit
     )
 
 
@@ -1309,9 +1392,13 @@ def _prepare_detection_frame(
         "normalizedDepth": None,
     }
     if need_2d:
-        record["rgb2d"] = np.repeat(
-            intensity[top:bottom, left:right, None], 3, axis=2
-        )
+        # Keep this as one grayscale plane.  The detector performs the required
+        # RGB expansion inside Pillow and candidate classification expands only
+        # the rare review crops, avoiding a long-lived three-channel NumPy
+        # allocation for every full-resolution frame.
+        rgb_2d = intensity[top:bottom, left:right]
+        record["rgb2d"] = rgb_2d
+        record["prepared2d"] = _letterbox_rgb(rgb_2d, settings.image_size)
     timing["preprocessSeconds"] += time.perf_counter() - phase_started
     if need_3d and depth_path is not None:
         phase_started = time.perf_counter()
@@ -1326,6 +1413,7 @@ def _prepare_detection_frame(
             settings.depth_baseline_sample_step,
         )
         record["rgb3d"] = rgb_3d
+        record["prepared3d"] = _letterbox_rgb(rgb_3d, settings.image_size)
         record["normalizedDepth"] = normalized_depth
         timing["preprocessSeconds"] += time.perf_counter() - phase_started
     return record, timing
@@ -1513,6 +1601,18 @@ def _build_legacy_flow_defect_detection(
         "classificationSeconds": 0.0,
         "postprocessSeconds": 0.0,
     }
+    # Reuse the pools for the whole flow.  Creating two pools for every
+    # eight-frame batch used to create hundreds of short-lived Windows threads
+    # per bar and, more importantly, forced source decoding and GPU inference
+    # to run strictly one after the other.
+    preprocess_pool = ThreadPoolExecutor(
+        max_workers=settings.preprocess_workers,
+        thread_name_prefix="defect-preprocess",
+    )
+    inference_pool = ThreadPoolExecutor(
+        max_workers=max(1, len(detectors)),
+        thread_name_prefix="defect-inference",
+    )
 
     for camera_id, camera_root in sorted(camera_roots.items()):
         if execution_gate is not None:
@@ -1567,58 +1667,75 @@ def _build_legacy_flow_defect_detection(
         if tail.get("detected"):
             indices = [index for index in indices if index <= int(tail["frameIndex"])]
         selected_indices = _selected_indices(indices, stride)
-        for batch_start in range(0, len(selected_indices), settings.inference_batch_size):
+        batch_indices_list = [
+            selected_indices[batch_start : batch_start + settings.inference_batch_size]
+            for batch_start in range(
+                0, len(selected_indices), settings.inference_batch_size
+            )
+        ]
+        if not batch_indices_list:
+            continue
+
+        def submit_preprocess_batch(
+            batch_indices: list[int], *, wait_for_capture: bool
+        ) -> list[Any]:
             if execution_gate is not None:
                 execution_gate("defect-batch-preprocess")
-            batch: list[dict[str, Any]] = []
-            batch_indices = selected_indices[
-                batch_start : batch_start + settings.inference_batch_size
-            ]
-            # Probe once per bounded inference batch.  This still yields to live
-            # acquisition within at most one batch while avoiding two HTTP
-            # health calls for every individual historical frame.
-            if execution_gate is None:
+            elif wait_for_capture:
                 timings["captureWaitSeconds"] += _wait_for_capture_idle(
                     settings, capture_idle_state
                 )
-            with ThreadPoolExecutor(
-                max_workers=min(settings.preprocess_workers, len(batch_indices)),
-                thread_name_prefix="defect-preprocess",
-            ) as preprocess_pool:
-                prepared = preprocess_pool.map(
-                    lambda storage_index: _prepare_detection_frame(
-                        storage_index,
-                        intensity_files[storage_index],
-                        depth_files.get(storage_index),
-                        metadata_files[storage_index],
-                        head,
-                        tail,
-                        "2d" in detectors,
-                        "3d" in detectors,
-                        settings,
-                        stable_crop,
-                    ),
-                    batch_indices,
+            return [
+                preprocess_pool.submit(
+                    _prepare_detection_frame,
+                    storage_index,
+                    intensity_files[storage_index],
+                    depth_files.get(storage_index),
+                    metadata_files[storage_index],
+                    head,
+                    tail,
+                    "2d" in detectors,
+                    "3d" in detectors,
+                    settings,
+                    stable_crop,
                 )
-                for record, frame_timing in prepared:
-                    timings["sourceDecodeSeconds"] += frame_timing[
-                        "sourceDecodeSeconds"
-                    ]
-                    timings["preprocessSeconds"] += frame_timing["preprocessSeconds"]
-                    if record is None:
-                        skipped_frames += 1
-                    else:
-                        batch.append(record)
+                for storage_index in batch_indices
+            ]
+
+        pending_preprocess_batches = {
+            0: submit_preprocess_batch(
+                batch_indices_list[0], wait_for_capture=True
+            )
+        }
+        for batch_number, _batch_indices in enumerate(batch_indices_list):
+            batch: list[dict[str, Any]] = []
+            for future in pending_preprocess_batches.pop(batch_number):
+                record, frame_timing = future.result()
+                timings["sourceDecodeSeconds"] += frame_timing[
+                    "sourceDecodeSeconds"
+                ]
+                timings["preprocessSeconds"] += frame_timing["preprocessSeconds"]
+                if record is None:
+                    skipped_frames += 1
+                else:
+                    batch.append(record)
 
             if execution_gate is not None:
                 execution_gate("defect-batch-inference")
 
             detection_jobs: list[
-                tuple[str, str, str, OnnxYoloDetector, list[dict[str, Any]]]
+                tuple[
+                    str,
+                    str,
+                    str,
+                    str,
+                    OnnxYoloDetector,
+                    list[dict[str, Any]],
+                ]
             ] = []
-            for modality, image_key, result_key in (
-                ("2d", "rgb2d", "local2d"),
-                ("3d", "rgb3d", "local3d"),
+            for modality, image_key, prepared_key, result_key in (
+                ("2d", "rgb2d", "prepared2d", "local2d"),
+                ("3d", "rgb3d", "prepared3d", "local3d"),
             ):
                 detector = detectors.get(modality)
                 if detector is None:
@@ -1627,28 +1744,76 @@ def _build_legacy_flow_defect_detection(
                 if not modality_records:
                     continue
                 detection_jobs.append(
-                    (modality, image_key, result_key, detector, modality_records)
-                )
-            phase_started = time.perf_counter()
-            with ThreadPoolExecutor(
-                max_workers=max(1, len(detection_jobs)),
-                thread_name_prefix="defect-inference",
-            ) as inference_pool:
-                detection_results = list(
-                    inference_pool.map(
-                        lambda job: job[3].detect_many(
-                            [record[job[1]] for record in job[4]]
-                        ),
-                        detection_jobs,
+                    (
+                        modality,
+                        image_key,
+                        prepared_key,
+                        result_key,
+                        detector,
+                        modality_records,
                     )
                 )
+            phase_started = time.perf_counter()
+            detection_futures = [
+                inference_pool.submit(
+                    job[4].detect_prepared_many,
+                    [record[job[2]] for record in job[5]],
+                    [record[job[1]].shape[:2] for record in job[5]],
+                )
+                for job in detection_jobs
+            ]
+
+            # Keep exactly one bounded batch in flight.  When a fresh capture
+            # snapshot confirms queue headroom, decode the next batch while the
+            # GPU handles this one.  If headroom is gone, finish the already
+            # submitted inference first and then wait without adding disk I/O.
+            next_batch = batch_number + 1
+            if (
+                next_batch < len(batch_indices_list)
+                and execution_gate is None
+                and _capture_is_idle(
+                    settings.capture_origin,
+                    settings.maximum_pending_storage_rounds,
+                    settings.realtime_priority_status_path,
+                )
+            ):
+                # Two batches (at most 16 frames with the production settings)
+                # absorb per-disk decode jitter without turning the flow into an
+                # unbounded in-memory queue.
+                for candidate_batch in range(
+                    next_batch,
+                    min(len(batch_indices_list), next_batch + 2),
+                ):
+                    if candidate_batch not in pending_preprocess_batches:
+                        pending_preprocess_batches[candidate_batch] = (
+                            submit_preprocess_batch(
+                                batch_indices_list[candidate_batch],
+                                wait_for_capture=False,
+                            )
+                        )
+
+            detection_results = [future.result() for future in detection_futures]
             timings["detectorInferenceSeconds"] += time.perf_counter() - phase_started
+            if (
+                next_batch < len(batch_indices_list)
+                and next_batch not in pending_preprocess_batches
+            ):
+                pending_preprocess_batches[next_batch] = submit_preprocess_batch(
+                    batch_indices_list[next_batch], wait_for_capture=True
+                )
             if execution_gate is not None:
                 execution_gate("defect-batch-postprocess")
             if len(detection_results) != len(detection_jobs):
                 raise RuntimeError("detector batch result count does not match jobs")
             for job, results in zip(detection_jobs, detection_results):
-                _modality, _image_key, result_key, _detector, modality_records = job
+                (
+                    _modality,
+                    _image_key,
+                    _prepared_key,
+                    result_key,
+                    _detector,
+                    modality_records,
+                ) = job
                 inference_count += len(modality_records)
                 if len(results) != len(modality_records):
                     raise RuntimeError(
@@ -1830,6 +1995,8 @@ def _build_legacy_flow_defect_detection(
                 processed_frames += 1
                 timings["postprocessSeconds"] += time.perf_counter() - phase_started
 
+    preprocess_pool.shutdown(wait=True)
+    inference_pool.shutdown(wait=True)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     capture_wait_ms = timings["captureWaitSeconds"] * 1000.0
     compute_elapsed_ms = max(0.0, elapsed_ms - capture_wait_ms)
@@ -2274,6 +2441,23 @@ def build_flow_defect_detection(
     snapshot = load_depth_geometry_config_snapshot(profile_path)
     guarded = config_checkpoint(profile_path, snapshot, execution_gate)
     geometry_settings = DepthGeometryConfig.from_mapping(snapshot.value)
+    guarded("depth-geometry-region-gate")
+    region_map_for_prefilter = read_region_manifest(storage_root, material_id)
+    region_prefilter_available = bool(
+        region_map_for_prefilter
+        and region_map_for_prefilter.get("defectDetectionAllowed")
+    )
+    geometry_quality_gate_policy = str(
+        snapshot.value.get("qualityGatePolicy", "")
+    ).strip().lower()
+    geometry_requires_global_ownership = (
+        geometry_quality_gate_policy == "global-owned-only"
+    )
+    region_quality_reasons = (
+        region_map_for_prefilter.get("qualityGate", {}).get("reasons", [])
+        if isinstance(region_map_for_prefilter, dict)
+        else ["region-manifest-missing"]
+    )
     existing: dict[str, Any] = {}
     path = defect_detection_manifest_path(storage_root, material_id)
     if settings.history_rebuild and path.is_file():
@@ -2328,12 +2512,6 @@ def build_flow_defect_detection(
                 "defects": [],
             }
 
-    region_map_for_prefilter = read_region_manifest(storage_root, material_id)
-    region_prefilter_available = bool(
-        region_map_for_prefilter
-        and region_map_for_prefilter.get("defectDetectionAllowed")
-    )
-
     def geometry_candidate_disposition(camera_id: str, bbox: list[int]) -> str:
         if not region_prefilter_available:
             return "quality-gate"
@@ -2349,40 +2527,120 @@ def build_flow_defect_detection(
             region_row.get("overlapColumnIntervals", []),
         )
 
-    try:
-        geometry_manifest = build_flow_depth_geometry(
-            camera_roots,
-            storage_root,
-            material_id,
-            alignment,
-            geometry_settings,
-            guarded,
-            geometry_candidate_disposition,
-        )
-        geometry_manifest = _prepare_geometry_defects(
-            geometry_manifest,
-            camera_roots,
-            storage_root,
-            material_id,
-            alignment,
-            algorithm_revision=snapshot.revision,
-            config_sha256=snapshot.sha256,
-            execution_gate=guarded,
-        )
-    except DepthGeometryConfigChanged:
-        raise
-    except Exception as error:
+    if geometry_requires_global_ownership and not region_prefilter_available:
+        # The configured policy would reject every local candidate after a
+        # complete second read of all 3-D frames.  Preserve the quality evidence
+        # but avoid that guaranteed-zero work on the realtime path.
         geometry_manifest = {
             "schema": "steel.sick-depth-geometry.v1",
             "materialId": material_id,
             "source": DEPTH_GEOMETRY_SOURCE,
-            "state": "failed",
+            "state": "blocked",
             "algorithmRevision": snapshot.revision,
             "configHash": snapshot.sha256,
-            "error": f"{type(error).__name__}: {error}",
-            "statistics": {"defectCount": 0},
+            "config": geometry_settings.to_dict(),
+            "globalPositionAvailable": False,
+            "riskTags": [
+                "global-position-unavailable",
+                "cross-camera-deduplication-unavailable",
+                *[str(reason) for reason in region_quality_reasons],
+            ],
+            "quality": {
+                "reviewRequired": True,
+                "candidateOnly": True,
+                "blockedReason": "global-owned-region-quality-gate-failed",
+                "reasons": [str(reason) for reason in region_quality_reasons],
+            },
+            "statistics": {
+                "cameraCount": len(camera_roots),
+                "frameCount": 0,
+                "processedFrames": 0,
+                "rawCandidateCount": 0,
+                "eligibleCandidateCount": 0,
+                "preFlowCapCandidateCount": 0,
+                "candidateCount": 0,
+                "candidateOverflowCount": 0,
+                "defectCount": 0,
+                "overlapDuplicateFilteredCount": 0,
+                "boundaryArtifactFilteredCount": 0,
+                "qualityGateFilteredCount": 0,
+            },
+            "cameras": {},
             "defects": [],
         }
+    elif not settings.history_rebuild:
+        # Publish the realtime ONNX result without serially blocking the next
+        # closed bar on a second full read of every 3-D frame.  The existing
+        # newest-first geometry-history scheduler sees this non-terminal group,
+        # reuses the modelHash-bound legacy group, and fills geometry only after
+        # the live queue is empty and capture storage is strictly idle.
+        geometry_manifest = {
+            "schema": "steel.sick-depth-geometry.v1",
+            "materialId": material_id,
+            "source": DEPTH_GEOMETRY_SOURCE,
+            "state": "queued",
+            "algorithmRevision": snapshot.revision,
+            "configHash": snapshot.sha256,
+            "config": geometry_settings.to_dict(),
+            "globalPositionAvailable": True,
+            "riskTags": [],
+            "quality": {
+                "reviewRequired": True,
+                "candidateOnly": True,
+                "reason": "deferred-until-live-defect-queue-is-empty",
+            },
+            "statistics": {
+                "cameraCount": len(camera_roots),
+                "frameCount": 0,
+                "processedFrames": 0,
+                "rawCandidateCount": 0,
+                "eligibleCandidateCount": 0,
+                "preFlowCapCandidateCount": 0,
+                "candidateCount": 0,
+                "candidateOverflowCount": 0,
+                "defectCount": 0,
+                "overlapDuplicateFilteredCount": 0,
+                "boundaryArtifactFilteredCount": 0,
+                "qualityGateFilteredCount": 0,
+            },
+            "cameras": {},
+            "defects": [],
+        }
+    else:
+        try:
+            geometry_manifest = build_flow_depth_geometry(
+                camera_roots,
+                storage_root,
+                material_id,
+                alignment,
+                geometry_settings,
+                guarded,
+                geometry_candidate_disposition,
+            )
+            geometry_manifest = _prepare_geometry_defects(
+                geometry_manifest,
+                camera_roots,
+                storage_root,
+                material_id,
+                alignment,
+                algorithm_revision=snapshot.revision,
+                config_sha256=snapshot.sha256,
+                execution_gate=guarded,
+            )
+        except DepthGeometryConfigChanged:
+            raise
+        except Exception as error:
+            geometry_manifest = {
+                "schema": "steel.sick-depth-geometry.v1",
+                "materialId": material_id,
+                "source": DEPTH_GEOMETRY_SOURCE,
+                "state": "failed",
+                "algorithmRevision": snapshot.revision,
+                "configHash": snapshot.sha256,
+                "error": f"{type(error).__name__}: {error}",
+                "statistics": {"defectCount": 0},
+                "defects": [],
+            }
     manifest = compose_dual_manifest(
         legacy_manifest,
         geometry_manifest,

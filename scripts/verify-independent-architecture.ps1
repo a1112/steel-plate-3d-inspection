@@ -302,14 +302,14 @@ function Assert-PackagedDatabaseMigrationContract {
   $MaxReadable = [long]$Contract.maxReadableSchemaVersion
   $RollbackReadableThrough = [long]$Contract.rollbackReadableThrough
   $ExpectedMaxUpgradeable = if ($SchemaVersion -gt $MinUpgradeable) { $SchemaVersion - 1 } else { $SchemaVersion }
-  if ($SchemaVersion -ne 1 -or
+  if ($SchemaVersion -ne 5 -or
       $MinUpgradeable -gt $MaxUpgradeable -or
       $MaxUpgradeable -ne $ExpectedMaxUpgradeable -or
       $MinReadable -gt $MaxReadable -or
       $MaxReadable -ne $SchemaVersion -or
       $RollbackReadableThrough -lt $MinReadable -or
       $RollbackReadableThrough -gt $SchemaVersion) {
-    throw 'Packaged database version ranges do not match the service schema v1 contract.'
+    throw 'Packaged database version ranges do not match the service schema v5 contract.'
   }
   $Engines = @($Contract.engines)
   if ($Engines.Count -ne 2 -or [string]$Engines[0] -cne 'sqlite' -or [string]$Engines[1] -cne 'mysql') {
@@ -681,8 +681,8 @@ function Test-PackagedRuntimeContract {
   $DatabaseContract = Assert-PackagedDatabaseMigrationContract `
     -PackageDir $PackageDir `
     -Database $Manifest.database
-  if ([long]$DatabaseContract.schemaVersion -ne 1) {
-    throw "Runtime package database contract does not match this verifier's service schema v1 boundary."
+  if ([long]$DatabaseContract.schemaVersion -ne 5) {
+    throw "Runtime package database contract does not match this verifier's service schema v5 boundary."
   }
   $PackagedSbomVerifier = Join-Path $PSScriptRoot 'verify-packaged-release-sbom.ps1'
   Assert-PowerShellScriptParses $PackagedSbomVerifier
@@ -760,9 +760,17 @@ function Test-PackagedRuntimeContract {
     }
     $ExpectedLockPaths = @(
       'build-evidence/client-package-lock.json',
-      'build-evidence/service-Cargo.lock',
       'build-evidence/tauri-Cargo.lock',
-      'build-evidence/trigger-Cargo.lock'
+      'build-evidence/service-Cargo.lock',
+      'build-evidence/trigger-Cargo.lock',
+      'build-evidence/camera-worker-Cargo.lock',
+      'build-evidence/result-contract-Cargo.lock',
+      'build-evidence/pipeline-workers-Cargo.lock',
+      'build-evidence/runtime-contract-Cargo.lock',
+      'build-evidence/image-service-Cargo.lock',
+      'build-evidence/algorithm-service-Cargo.lock',
+      'build-evidence/server-monitor-Cargo.lock',
+      'build-evidence/tray-Cargo.lock'
     )
     $LockEvidence = @($Manifest.build.dependencyLocks)
     if ($LockEvidence.Count -ne $ExpectedLockPaths.Count) {
@@ -788,7 +796,7 @@ function Test-PackagedRuntimeContract {
       throw "Packaged desktop release policy does not match its manifest and out-of-band approved SHA-256."
     }
     try {
-      $PackagedReleasePolicy = Get-Content -LiteralPath $PackagedReleasePolicyPath -Raw | ConvertFrom-Json
+      $PackagedReleasePolicy = Get-Content -LiteralPath $PackagedReleasePolicyPath -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
       throw "Packaged desktop release policy must be valid JSON."
     }
@@ -1548,9 +1556,9 @@ $TrackedDatabaseReportText = (& $DatabaseContractVerifier `
   -IndexPath $TrackedDatabaseMigrationIndex | Out-String)
 $TrackedDatabaseReport = $TrackedDatabaseReportText | ConvertFrom-Json
 if ($TrackedDatabaseReport.code -ne 0 -or
-    [long]$TrackedDatabaseReport.schemaVersion -ne 1 -or
+    [long]$TrackedDatabaseReport.schemaVersion -ne 5 -or
     [int]$TrackedDatabaseReport.migrationCount -ne 0) {
-  throw "Tracked database contract/index must declare the validated initial schema v1 with no upgrade entries."
+  throw "Tracked database contract/index must declare the current service schema v5 with no unsupported upgrade entries."
 }
 $DatabaseContractTestText = (& $DatabaseContractTest | Out-String)
 $DatabaseContractTestReport = $DatabaseContractTestText | ConvertFrom-Json
@@ -1680,12 +1688,12 @@ $TauriConfigPath = Join-Path $ClientDir "src-tauri\tauri.conf.json"
 $ReleasePolicyPath = Join-Path $RepoRoot "config\release\desktop-release-policy.json"
 $SourceCargoConfigPath = Join-Path $RepoRoot ".cargo\config.toml"
 try {
-  $TauriConfig = Get-Content $TauriConfigPath -Raw | ConvertFrom-Json
+  $TauriConfig = Get-Content -LiteralPath $TauriConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 } catch {
   throw "Tauri config must be valid JSON: $TauriConfigPath"
 }
 try {
-  $ReleasePolicy = Get-Content -LiteralPath $ReleasePolicyPath -Raw | ConvertFrom-Json
+  $ReleasePolicy = Get-Content -LiteralPath $ReleasePolicyPath -Raw -Encoding UTF8 | ConvertFrom-Json
 } catch {
   throw "Desktop release policy must be valid JSON: $ReleasePolicyPath"
 }

@@ -609,6 +609,8 @@ function Get-ReleaseSbomExpectedModel {
     [ordered]@{ id = 'cargo-pipeline-workers'; path = 'app/pipeline-workers/Cargo.lock'; kind = 'cargo' },
     [ordered]@{ id = 'cargo-runtime-contract'; path = 'app/runtime-contract/Cargo.lock'; kind = 'cargo' },
     [ordered]@{ id = 'cargo-image-service'; path = 'app/image-service/Cargo.lock'; kind = 'cargo' },
+    [ordered]@{ id = 'cargo-algorithm-service'; path = 'app/algorithm-service/Cargo.lock'; kind = 'cargo' },
+    [ordered]@{ id = 'cargo-server-monitor'; path = 'app/server-monitor/Cargo.lock'; kind = 'cargo' },
     [ordered]@{ id = 'cargo-tray'; path = 'app/tray/Cargo.lock'; kind = 'cargo' }
   )
   $InputEvidence = @()

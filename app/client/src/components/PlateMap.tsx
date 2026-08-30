@@ -157,6 +157,7 @@ function useCaptureStitchHistory(
       return undefined;
     }
     const expectedCameraIds = cameraKey.split(',').filter(Boolean);
+    const controller = new AbortController();
     let cancelled = false;
     let timer: number | undefined;
     let failures = 0;
@@ -167,7 +168,11 @@ function useCaptureStitchHistory(
     };
     const refresh = async () => {
       try {
-        const result = await fetchCaptureStitchHistory(normalizedMaterialId, expectedCameraIds);
+        const result = await fetchCaptureStitchHistory(
+          normalizedMaterialId,
+          expectedCameraIds,
+          controller.signal,
+        );
         if (cancelled) return;
         failures = 0;
         setState({
@@ -176,8 +181,8 @@ function useCaptureStitchHistory(
           result: result.frames.length > 0 ? result : null,
         });
         if (keepRefreshing) schedule(LIVE_ARTIFACT_REFRESH_MS);
-      } catch {
-        if (cancelled) return;
+      } catch (error) {
+        if (cancelled || (error instanceof DOMException && error.name === 'AbortError')) return;
         failures += 1;
         setState({ materialId: normalizedMaterialId, status: 'error', result: null });
         schedule(Math.min(30_000, 4_000 * (2 ** Math.min(3, failures - 1))));
@@ -186,6 +191,7 @@ function useCaptureStitchHistory(
     void refresh();
     return () => {
       cancelled = true;
+      controller.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [cameraKey, enabled, keepRefreshing, materialId]);
@@ -1692,9 +1698,7 @@ function BarUnfoldedMap({
   // Keep only a short pre-head context in the rendered timeline. Applying the
   // origin to frame positions (instead of relying on scrollLeft) makes gray
   // and JET use exactly the same stable aligned window after mode switches.
-  const timelineOriginFrames = displayHeadAlignmentApplied
-    ? Math.max(0, contentAnchorFrame - HEAD_CONTEXT_FRAMES)
-    : 0;
+  const timelineOriginFrames = Math.max(0, contentAnchorFrame - HEAD_CONTEXT_FRAMES);
   const naturalTimelineEndFrames = captureFrames.length + maximumHeadPaddingFrames;
   const measuredTailTimelineFrame = captureTailTimelineFrame(
     captureFrames,
@@ -2169,6 +2173,7 @@ function BarUnfoldedMap({
               }}
             >
               {source ? <CameraBandImage
+                key={`record-preview:${stitchKey}:${lane.cameraId}`}
                 src={source}
                 label={lane.cameraId}
                 orientation={orientation}
@@ -3502,12 +3507,17 @@ export function PlateMap({
     }),
   );
   const effectiveOverlapDisplayMode = overlapAvailable ? overlapDisplayMode : 'overlap';
-  // Online monitoring is stitch-only. Record-bound raw PNGs describe just one
-  // frame per camera and must not impersonate the multi-frame playback view
-  // while its index or committed two-level cache is rebuilt from source images.
+  // A record-bound raw PNG is an identity-safe first paint while the richer
+  // multi-frame playback index is loading. It is never borrowed from another
+  // material and is replaced as soon as the indexed stitch becomes ready.
   const recordBoundRawImages = artifactMode === 'production' ? captureImages : [];
   const allowSingleFrameImageFallback = artifactMode !== 'production';
-  const displayedCaptureImages = allowSingleFrameImageFallback ? recordBoundRawImages : [];
+  const allowProductionQuickPreview = artifactMode === 'production'
+    && captureStitchResult === null
+    && recordBoundRawImages.some((image) => image.dataName.toLowerCase() === 'intensity');
+  const displayedCaptureImages = allowSingleFrameImageFallback || allowProductionQuickPreview
+    ? recordBoundRawImages
+    : [];
   const displayedSurfaceCameras = allowSingleFrameImageFallback ? surfaceCameras : [];
   const productionCameraImageCount = displayedSurfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
   const capturedCameraImageCount = new Set(
@@ -3572,6 +3582,12 @@ export function PlateMap({
     setWorldError('');
     setPendingWorld(null);
     setWorldTileProgress(null);
+    if (displayedWorldRef.current?.recordId !== inspectionId) {
+      // Record identity is a strict rendering boundary. Never keep record A's
+      // canvas mounted while the surrounding UI already refers to record B.
+      displayedWorldRef.current = null;
+      setDisplayedWorld(null);
+    }
     if (artifactMode !== 'production' || viewMode !== '2d') return;
     if (captureStitchEligible) {
       // Direct SICK records are keyed by their numeric flow/material ID in
@@ -4032,10 +4048,10 @@ export function PlateMap({
           {artifactMode === 'production' && worldUnavailable ? <span className="live-preview-badge" data-testid="capture-roi-status">
             {captureStitchResult
               ? `${captureStitchResult.hasMore ? '最近 ' : ''}${captureStitchResult.frames.length}/${captureStitchResult.totalFrames} 轮对齐拼接 · 两级可重建图像 ${captureStitchResult.renderableImageCount}`
-              : captureStitchPending
-                ? '拼接缓存准备中 · 正在校验索引并从原图按需重建'
-                : rawCameraImageCount > 0
-                  ? `拼接缓存尚未就绪 · 已发现 ${rawCameraImageCount}/${cameraLanes.length} 路原图，等待重建`
+              : rawCameraImageCount > 0
+                ? `当前记录快速预览 ${rawCameraImageCount}/${cameraLanes.length} 路 · ${captureStitchPending ? '拼接索引加载中' : '拼接索引尚未就绪'}`
+                : captureStitchPending
+                  ? '拼接缓存准备中 · 正在校验索引并从原图按需重建'
                   : '当前记录缺少可重建的拼接原图'}
           </span> : null}
           <BarUnfoldedMap

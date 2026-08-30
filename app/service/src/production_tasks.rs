@@ -4751,6 +4751,22 @@ fn production_event_payload(task: &production_task::Model) -> String {
 
 pub(super) fn execute_task(state: &ServiceState, task: &production_task::Model) -> Vec<u8> {
     let _execution_scope = WorkerExecutionScope::enter();
+    if let Some(capability) = runtime_capability_for_production_task_kind(&task.kind) {
+        if !state.runtime_config.allows(capability) {
+            return http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 409,
+                    "error": "runtime_capability_unavailable",
+                    "capability": capability.as_str(),
+                    "profileId": state.runtime_config.id,
+                    "message": "The active runtime profile does not provide this task capability"
+                })
+                .to_string(),
+            );
+        }
+    }
     let cancellation_requested = || {
         runtime_is_draining(state)
             || state

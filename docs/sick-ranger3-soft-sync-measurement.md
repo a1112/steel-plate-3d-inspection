@@ -27,7 +27,8 @@
 - `D:\steel-sick-data\<FLOW>\derived\playback\roi.json`：同一流、同一相机共用的稳定横向有效窗口；
 - `<相机根>\<FLOW>\cache\*.jpg`：该相机流水每张有效 2D 图的持久化渐进 JPEG 缩略瓦片，状态写在同目录 `status.json`；缓存不再跨相机集中存放。
 - `<相机根>\<FLOW>\defect\*.jpg`：该相机流水的缺陷复核小图；流水级缺陷清单仍位于中央派生数据目录，图像路径指向这里。
-- `<相机根>\<FLOW>\jet\surface.jpg`：该相机的高质量 JPEG JET 图；参考相机同目录的 `surface-all.jpg` 保存六相机展开图。中央 `surface.json` 只记录这些图像路径和几何数据。
+- `<相机根>\<FLOW>\jet\{thumbnail,original}\<帧号>.jpg`：采集期间每次原子提交 playback 索引快照后，后台立即增量生成该快照内全部逐帧两级 JET；同帧 metadata 保存逐扫描行外径、拟合质量和有效 JET 像素计数。采集写盘、图像拟合和 JET 编码并行运行，仅在写盘积压超过限额时短暂限流，出钢后再做最终封卷校验。HTTP 只读取已提交产物，不再按请求计算。
+- `D:\steel-sick-data\<FLOW>\derived\geometry\surface.json` 与 `measurement.json`：每个实时分析批次按全部软同步锚点更新，JET 残差、样本计数、固定角度测径和汇总外径来自同一版鲁棒圆拟合。系统不再生成 `surface.jpg` 或 `surface-all.jpg` 聚合图。
 
 裁剪先使用灰度连通占比排除孤立亮点，再组合“流级稳定左右边界”和“当前帧头尾边界”。缓存目录中的指纹 JSON 清单保存 `originalSize`、`validRoi`、`frameDetectedRoi` 和 `flowHorizontalRoi`，算法测量结果中的 `sourceCoordinateOffset` 可将裁剪坐标还原到原始相机坐标。
 

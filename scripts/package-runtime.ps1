@@ -621,6 +621,8 @@ foreach ($LockFile in @(
   @{ source = "app\pipeline-workers\Cargo.lock"; destination = "pipeline-workers-Cargo.lock" },
   @{ source = "app\runtime-contract\Cargo.lock"; destination = "runtime-contract-Cargo.lock" },
   @{ source = "app\image-service\Cargo.lock"; destination = "image-service-Cargo.lock" },
+  @{ source = "app\algorithm-service\Cargo.lock"; destination = "algorithm-service-Cargo.lock" },
+  @{ source = "app\server-monitor\Cargo.lock"; destination = "server-monitor-Cargo.lock" },
   @{ source = "app\tray\Cargo.lock"; destination = "tray-Cargo.lock" }
 )) {
   $SourceLock = Join-Path $RepoRoot ([string]$LockFile.source)
@@ -784,6 +786,8 @@ if ($FormalReleasePackage) {
     [ordered]@{ id = 'cargo-pipeline-workers'; sourcePath = 'app/pipeline-workers/Cargo.lock'; evidencePath = 'build-evidence/pipeline-workers-Cargo.lock' },
     [ordered]@{ id = 'cargo-runtime-contract'; sourcePath = 'app/runtime-contract/Cargo.lock'; evidencePath = 'build-evidence/runtime-contract-Cargo.lock' },
     [ordered]@{ id = 'cargo-image-service'; sourcePath = 'app/image-service/Cargo.lock'; evidencePath = 'build-evidence/image-service-Cargo.lock' },
+    [ordered]@{ id = 'cargo-algorithm-service'; sourcePath = 'app/algorithm-service/Cargo.lock'; evidencePath = 'build-evidence/algorithm-service-Cargo.lock' },
+    [ordered]@{ id = 'cargo-server-monitor'; sourcePath = 'app/server-monitor/Cargo.lock'; evidencePath = 'build-evidence/server-monitor-Cargo.lock' },
     [ordered]@{ id = 'cargo-tray'; sourcePath = 'app/tray/Cargo.lock'; evidencePath = 'build-evidence/tray-Cargo.lock' }
   )
   $SbomLockEvidence = @()
@@ -834,6 +838,10 @@ if ($FormalReleasePackage) {
     'steel.input.cargo-runtime-contract.sha256',
     'steel.input.cargo-image-service.path',
     'steel.input.cargo-image-service.sha256',
+    'steel.input.cargo-algorithm-service.path',
+    'steel.input.cargo-algorithm-service.sha256',
+    'steel.input.cargo-server-monitor.path',
+    'steel.input.cargo-server-monitor.sha256',
     'steel.input.cargo-tray.path',
     'steel.input.cargo-tray.sha256',
     'steel.input.external-components.path',

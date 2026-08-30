@@ -4,10 +4,12 @@ import {
   CheckCircle2,
   Clock3,
   FileText,
+  Filter,
   Play,
   RefreshCw,
   RotateCw,
   Server,
+  ServerCog,
   Square,
   XCircle,
 } from 'lucide-react';
@@ -59,6 +61,8 @@ const KIND_LABELS: Record<string, string> = {
   'steel-out': '出钢',
   'trigger-event': '触发事件',
 };
+
+const STATUS_FILTERS = ['queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted', 'blocked'];
 
 function stringValue(value: unknown, fallback = '') {
   return typeof value === 'string' ? value : value == null ? fallback : String(value);
@@ -143,6 +147,15 @@ function monitorStateIcon(state: MonitorState) {
   return AlertTriangle;
 }
 
+function taskStatusTone(status: string) {
+  const normalized = status.toLowerCase();
+  if (normalized === 'succeeded') return 'success';
+  if (normalized === 'running') return 'running';
+  if (normalized === 'queued') return 'queued';
+  if (normalized === 'failed' || normalized === 'interrupted' || normalized === 'blocked') return 'error';
+  return 'muted';
+}
+
 function serviceStatusLabel(status: string, ok: boolean) {
   if (ok) {
     if (['running', 'ready', 'healthy'].includes(status.toLowerCase())) return '运行中';
@@ -173,6 +186,27 @@ function formatRuntimeDuration(value: number | null | undefined) {
   return `${hours} 小时 ${minutes % 60} 分`;
 }
 
+type SummaryCardProps = {
+  label: string;
+  value: string;
+  detail: string;
+  tone?: MonitorTone;
+  icon: typeof Activity;
+};
+
+function SummaryCard({ label, value, detail, tone = 'initializing', icon: Icon }: SummaryCardProps) {
+  return (
+    <article className={`background-monitor-summary-card is-${tone}`} aria-label={label}>
+      <span className="background-monitor-summary-icon"><Icon size={18} /></span>
+      <div>
+        <span>{label}</span>
+        <strong>{value}</strong>
+        <em title={detail}>{detail}</em>
+      </div>
+    </article>
+  );
+}
+
 export type BackgroundMonitorAppProps = {
   origin?: string;
   className?: string;
@@ -190,6 +224,8 @@ export function BackgroundMonitorApp({
   const [refreshing, setRefreshing] = useState(false);
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
   const [logScope, setLogScope] = useState<'service' | 'all'>('service');
+  const [monitorView, setMonitorView] = useState<'tasks' | 'services'>('tasks');
+  const [filters, setFilters] = useState<BackgroundMonitorFilters>({ query: '', status: 'all', kind: 'all' });
   const [operationMessage, setOperationMessage] = useState<string | null>(null);
   const [operationBusy, setOperationBusy] = useState(false);
   const windowApi = useMemo(() => getTauriWindowApi(), []);
@@ -241,6 +277,17 @@ export function BackgroundMonitorApp({
   const state = (snapshot?.state ?? 'initializing') as MonitorState;
   const tone = monitorTone(state);
   const StateIcon = monitorStateIcon(state);
+  const tasks = snapshot?.tasks ?? [];
+  const taskKinds = useMemo(() => {
+    const values = new Set(tasks.map((task) => stringValue(task.kind, 'unknown').toLowerCase()));
+    return Array.from(values).sort((left, right) => (
+      backgroundTaskKindLabel(left).localeCompare(backgroundTaskKindLabel(right), 'zh-CN')
+    ));
+  }, [tasks]);
+  const filteredTasks = useMemo(() => filterBackgroundTasks(tasks, filters), [tasks, filters]);
+  const activeTask = snapshot?.activeTaskId
+    ? tasks.find((task) => task.taskId === snapshot.activeTaskId) ?? null
+    : tasks.find((task) => stringValue(task.status).toLowerCase() === 'running') ?? null;
   const services = snapshot?.services ?? [];
   const lifecycleLogs = snapshot?.lifecycleLogs ?? [];
   const runtime = snapshot?.runtime ?? null;
@@ -319,6 +366,10 @@ export function BackgroundMonitorApp({
 
   const operation = (id: string) => selectedService?.operations?.find((item) => item.id === id);
 
+  const updateFilter = (key: keyof BackgroundMonitorFilters, value: string) => {
+    setFilters((current) => ({ ...current, [key]: value }));
+  };
+
   return (
     <>
       <StandaloneWindowTitlebar
@@ -332,6 +383,7 @@ export function BackgroundMonitorApp({
             {monitorStateLabel(state)}
           </span>
           <span className="background-monitor-title-stat">服务 <strong>{healthyServiceCount}/{serviceCount}</strong></span>
+          <span className="background-monitor-title-stat">任务 <strong>{numberValue(snapshot?.activeTasks)}/{numberValue(snapshot?.queueDepth)}</strong></span>
           <span className={`background-monitor-title-stat ${attentionCount > 0 ? 'has-attention' : ''}`}>关注 <strong>{attentionCount}</strong></span>
           <button type="button" onClick={() => void handleRefresh()} disabled={refreshing} aria-label="刷新后台任务监控">
             <RefreshCw size={15} className={refreshing ? 'is-spinning' : ''} />
@@ -360,7 +412,182 @@ export function BackgroundMonitorApp({
         </div>
       ) : null}
 
-      <section className="background-monitor-runtime-grid" aria-label="服务运行控制台">
+      <section className="background-monitor-summary" aria-label="后台监控摘要">
+        <SummaryCard
+          label="运行健康"
+          value={snapshot ? monitorStateLabel(state) : '读取中'}
+          detail={snapshot?.detail ?? '正在读取后台服务与任务队列状态'}
+          tone={tone}
+          icon={StateIcon}
+        />
+        <SummaryCard
+          label="任务 Worker"
+          value={snapshot?.workerRunning ? '在线' : '离线'}
+          detail={snapshot ? `活动 ${numberValue(snapshot.activeTasks)} 项${snapshot.activeTaskId ? ` · ${snapshot.activeTaskId}` : ''}` : '等待工作线程状态'}
+          tone={snapshot?.workerRunning ? 'healthy' : snapshot ? 'offline' : 'initializing'}
+          icon={ServerCog}
+        />
+        <SummaryCard
+          label="持久队列"
+          value={snapshot ? String(numberValue(snapshot.queueDepth)) : '—'}
+          detail="等待处理的后台任务"
+          tone={snapshot?.queueDepth ? 'busy' : snapshot ? 'healthy' : 'initializing'}
+          icon={Activity}
+        />
+        <SummaryCard
+          label="异常关注"
+          value={String(attentionCount)}
+          detail={snapshot ? `失败/中断 ${numberValue(snapshot.failedTasks)} · 阻塞 ${numberValue(snapshot.blockedTasks)}` : '等待任务状态'}
+          tone={attentionCount > 0 ? 'degraded' : snapshot ? 'healthy' : 'initializing'}
+          icon={attentionCount > 0 ? AlertTriangle : CheckCircle2}
+        />
+      </section>
+
+      <nav className="background-monitor-view-switch" aria-label="后台监控视图">
+        <button
+          type="button"
+          className={monitorView === 'tasks' ? 'is-active' : ''}
+          aria-pressed={monitorView === 'tasks'}
+          onClick={() => setMonitorView('tasks')}
+        >
+          任务队列
+          <span>{tasks.length}</span>
+        </button>
+        <button
+          type="button"
+          className={monitorView === 'services' ? 'is-active' : ''}
+          aria-pressed={monitorView === 'services'}
+          onClick={() => setMonitorView('services')}
+        >
+          服务与日志
+          <span>{healthyServiceCount}/{serviceCount}</span>
+        </button>
+      </nav>
+
+      {monitorView === 'tasks' ? (
+        <section className="background-monitor-content" aria-label="持久任务队列">
+          <Panel title="当前活动任务" className="background-monitor-active-panel">
+            {activeTask ? (
+              <article className="background-monitor-active-task" data-testid="background-monitor-active-task">
+                <div className="background-monitor-active-task-heading">
+                  <div>
+                    <span>任务 ID</span>
+                    <strong title={activeTask.taskId}>{stringValue(activeTask.taskId, '-')}</strong>
+                  </div>
+                  <span className={`background-monitor-status-pill is-${taskStatusTone(stringValue(activeTask.status, 'unknown'))}`}>
+                    {backgroundTaskStatusLabel(stringValue(activeTask.status, 'unknown'))}
+                  </span>
+                </div>
+                <dl className="background-monitor-active-facts">
+                  <div><dt>类型</dt><dd>{backgroundTaskKindLabel(stringValue(activeTask.kind, 'unknown'))}</dd></div>
+                  <div><dt>材料</dt><dd>{stringValue(activeTask.materialId, '-')}</dd></div>
+                  <div><dt>阶段</dt><dd>{stringValue(activeTask.phase, '等待')}</dd></div>
+                  <div><dt>进度</dt><dd>{backgroundTaskProgressPercent(numberValue(activeTask.progress))}%</dd></div>
+                </dl>
+                <div
+                  className="background-monitor-progress"
+                  role="progressbar"
+                  aria-label="活动任务进度"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={backgroundTaskProgressPercent(numberValue(activeTask.progress))}
+                >
+                  <span style={{ width: `${backgroundTaskProgressPercent(numberValue(activeTask.progress))}%` }} />
+                </div>
+                <time>更新于 {formatBackgroundMonitorTime(stringValue(activeTask.updatedAt))}</time>
+              </article>
+            ) : (
+              <div className="background-monitor-empty background-monitor-active-empty">
+                <CheckCircle2 size={24} />
+                <strong>{loading ? '正在读取活动任务' : '当前没有运行中的任务'}</strong>
+                <span>{snapshot?.activeTaskId ? `工作线程报告任务 ${snapshot.activeTaskId}，任务列表尚未同步` : '后台工作线程处于空闲状态'}</span>
+              </div>
+            )}
+          </Panel>
+
+          <Panel
+            title="任务列表"
+            className="background-monitor-task-panel"
+            action={<span className="background-monitor-task-count">显示 {filteredTasks.length} / {tasks.length}</span>}
+          >
+            <div className="background-monitor-task-toolbar">
+              <div className="background-monitor-filter-title"><Filter size={15} /><span>筛选任务</span></div>
+              <label>
+                <span>搜索</span>
+                <input
+                  aria-label="搜索后台任务"
+                  value={filters.query}
+                  placeholder="任务 ID、材料号或阶段"
+                  onChange={(event) => updateFilter('query', event.target.value)}
+                />
+              </label>
+              <label>
+                <span>状态</span>
+                <select aria-label="任务状态过滤" value={filters.status} onChange={(event) => updateFilter('status', event.target.value)}>
+                  <option value="all">全部状态</option>
+                  {STATUS_FILTERS.map((status) => <option key={status} value={status}>{backgroundTaskStatusLabel(status)}</option>)}
+                </select>
+              </label>
+              <label>
+                <span>类型</span>
+                <select aria-label="任务类型过滤" value={filters.kind} onChange={(event) => updateFilter('kind', event.target.value)}>
+                  <option value="all">全部类型</option>
+                  {taskKinds.map((kind) => <option key={kind} value={kind}>{backgroundTaskKindLabel(kind)}</option>)}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="background-monitor-clear-filter"
+                onClick={() => setFilters({ query: '', status: 'all', kind: 'all' })}
+                disabled={!filters.query && filters.status === 'all' && filters.kind === 'all'}
+              >
+                清除
+              </button>
+            </div>
+            <div className="background-monitor-table-wrap">
+              <table className="background-monitor-task-table" data-testid="background-monitor-task-table">
+                <caption className="sr-only">后台任务只读列表</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">任务</th>
+                    <th scope="col">类型</th>
+                    <th scope="col">材料</th>
+                    <th scope="col">阶段 / 进度</th>
+                    <th scope="col">状态</th>
+                    <th scope="col">更新时间</th>
+                    <th scope="col">异常</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredTasks.length ? filteredTasks.map((task) => {
+                    const status = stringValue(task.status, 'unknown').toLowerCase();
+                    const progress = backgroundTaskProgressPercent(numberValue(task.progress));
+                    return (
+                      <tr key={task.taskId} data-testid={`background-monitor-task-${task.taskId}`}>
+                        <td><strong title={task.taskId}>{stringValue(task.taskId, '-')}</strong></td>
+                        <td>{backgroundTaskKindLabel(stringValue(task.kind, 'unknown'))}</td>
+                        <td>{stringValue(task.materialId, '-')}</td>
+                        <td>
+                          <span>{stringValue(task.phase, '-')}</span>
+                          <div className="background-monitor-row-progress" aria-hidden="true"><span style={{ width: `${progress}%` }} /></div>
+                          <em>{progress}%</em>
+                        </td>
+                        <td><span className={`background-monitor-status-pill is-${taskStatusTone(status)}`}>{backgroundTaskStatusLabel(status)}</span></td>
+                        <td><time>{formatBackgroundMonitorTime(stringValue(task.updatedAt))}</time></td>
+                        <td className={task.error ? 'has-error' : ''} title={task.error || undefined}>{stringValue(task.error, '-')}</td>
+                      </tr>
+                    );
+                  }) : (
+                    <tr><td colSpan={7} className="background-monitor-table-empty">{loading ? '正在读取任务列表' : '没有符合当前筛选条件的任务'}</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+        </section>
+      ) : null}
+
+      {monitorView === 'services' ? <section className="background-monitor-runtime-grid" aria-label="服务运行控制台">
         <Panel
           title="运行服务"
           className="background-monitor-runtime-panel background-monitor-services-panel"
@@ -515,7 +742,7 @@ export function BackgroundMonitorApp({
             </div>
           )}
         </Panel>
-      </section>
+      </section> : null}
 
       <footer className="background-monitor-footer" data-no-drag>
         <div>

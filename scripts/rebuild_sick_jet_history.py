@@ -19,11 +19,11 @@ from sick_capture.material_lock import MaterialJobLockedError, exclusive_materia
 from sick_capture.measurement import MeasurementConfig
 from sick_capture.paths import (
     algorithm_state_path,
-    camera_surface_jet_path,
     capture_root,
     measurement_path,
+    rendition_image_path,
+    rendition_metadata_path,
     region_path,
-    surface_jet_path,
     surface_path,
 )
 from sick_capture.profile import load_profile
@@ -32,6 +32,12 @@ from sick_capture.surface import (
     build_and_write_flow_surface,
     measurement_artifact_from_surface,
     upgrade_surface_display_contract,
+)
+from sick_capture.renditions import (
+    GRAY_ALGORITHM,
+    JET_ALGORITHM,
+    build_gray_rendition,
+    build_jet_rendition,
 )
 
 
@@ -65,8 +71,11 @@ def _configs(profile_path: Path) -> tuple[
         maximum_profile_points=int(
             defaults.get("measurementMaximumProfilePoints", 320)
         ),
-        maximum_sections=int(defaults.get("measurementMaximumSections", 12)),
+        maximum_sections=int(defaults.get("measurementMaximumSections", 0)),
         minimum_circle_points=int(defaults.get("measurementMinimumCirclePoints", 48)),
+        minimum_camera_profile_points=int(
+            defaults.get("measurementMinimumCameraProfilePoints", 8)
+        ),
         maximum_circle_residual_mm=float(
             defaults.get("measurementMaximumCircleResidualMm", 0.5)
         ),
@@ -342,17 +351,39 @@ def _source_ready(camera_roots: dict[str, Path], material_id: str) -> tuple[bool
 def _jet_ready(
     camera_roots: dict[str, Path], storage_root: Path, material_id: str
 ) -> bool:
-    return (
-        surface_path(storage_root, material_id).is_file()
-        and any(
-            surface_jet_path(camera_root, material_id).is_file()
-            for camera_root in camera_roots.values()
+    if not surface_path(storage_root, material_id).is_file():
+        return False
+    for camera_id, camera_root in camera_roots.items():
+        flow = capture_root(camera_root, material_id, camera_id)
+        sources = sorted(
+            path
+            for path in (flow / "2d").glob("*.png")
+            if path.is_file() and path.stem.isdecimal()
         )
-        and all(
-            camera_surface_jet_path(camera_root, material_id).is_file()
-            for camera_root in camera_roots.values()
-        )
-    )
+        if not sources:
+            return False
+        for source in sources:
+            storage_index = int(source.stem)
+            for modality in ("gray", "jet"):
+                metadata_file = rendition_metadata_path(
+                    camera_root, material_id, modality, storage_index
+                )
+                metadata = _read_json(metadata_file)
+                expected_algorithm = (
+                    GRAY_ALGORITHM if modality == "gray" else JET_ALGORITHM
+                )
+                if not metadata or metadata.get("algorithm") != expected_algorithm:
+                    return False
+                for level in ("thumbnail", "original"):
+                    if not rendition_image_path(
+                        camera_root,
+                        material_id,
+                        modality,
+                        level,
+                        storage_index,
+                    ).is_file():
+                        return False
+    return True
 
 
 def _write_surface_measurement(
@@ -495,7 +526,7 @@ def _rebuild_one(
                     material_id,
                     config=alignment_config,
                 )
-                rebuilt_surface_path, surface, jet_path = build_and_write_flow_surface(
+                rebuilt_surface_path, surface = build_and_write_flow_surface(
                     camera_roots,
                     storage_root,
                     material_id,
@@ -507,15 +538,35 @@ def _rebuild_one(
                 diameter_path = _write_surface_measurement(
                     storage_root, material_id, surface
                 )
-                camera_jet_paths = [
-                    Path(str(tile.get("jet", {}).get("imagePath", "")))
-                    for tile in surface.get("cameraTiles", {}).get("cameras", [])
-                    if str(tile.get("jet", {}).get("imagePath", "")).strip()
-                ]
-                camera_jet_count = sum(path.is_file() for path in camera_jet_paths)
-                available = (
-                    jet_path.is_file()
-                    and camera_jet_count == len(camera_roots)
+                if calibration_path is None:
+                    raise ValueError("approved array calibration path is required")
+                source_frame_count = 0
+                camera_jet_count = 0
+                for camera_id, camera_root in sorted(camera_roots.items()):
+                    flow = capture_root(camera_root, material_id, camera_id)
+                    sources = sorted(
+                        (
+                            path
+                            for path in (flow / "2d").glob("*.png")
+                            if path.is_file() and path.stem.isdecimal()
+                        ),
+                        key=lambda path: int(path.stem),
+                    )
+                    source_frame_count += len(sources)
+                    for source in sources:
+                        build_gray_rendition(source)
+                        build_jet_rendition(
+                            source,
+                            camera_id=camera_id,
+                            camera_roots=camera_roots,
+                            storage_root=storage_root,
+                            calibration_path=calibration_path,
+                            config=measurement_config,
+                        )
+                        camera_jet_count += 1
+                available = bool(
+                    source_frame_count > 0
+                    and camera_jet_count == source_frame_count
                 )
                 completed_state = "derived-ready" if available else "failed"
                 atomic_summary(
@@ -531,8 +582,9 @@ def _rebuild_one(
                         "alignmentPath": str(alignment_path),
                         "measurementPath": str(diameter_path),
                         "surfacePath": str(rebuilt_surface_path),
-                        "jetPath": str(jet_path) if jet_path.is_file() else "",
-                        "error": "" if available else "calibrated-jet-not-produced",
+                        "jetRenditionCount": camera_jet_count,
+                        "sourceFrameCount": source_frame_count,
+                        "error": "" if available else "per-frame-jet-not-produced",
                     },
                 )
             except Exception as error:
@@ -553,15 +605,15 @@ def _rebuild_one(
         return {
             "materialId": material_id,
             "state": "ready" if available else "unavailable",
-            "reason": "" if available else "calibrated-jet-not-produced",
+            "reason": "" if available else "per-frame-jet-not-produced",
             "regionManifestPath": region_manifest_path,
             "regionMapSource": "flow-local" if region_map else "none",
             "elapsedSeconds": round(time.monotonic() - started, 3),
             "alignmentPath": str(alignment_path),
             "surfacePath": str(rebuilt_surface_path),
             "measurementPath": str(diameter_path),
-            "jetPath": str(jet_path) if jet_path.is_file() else "",
             "cameraJetCount": camera_jet_count,
+            "sourceFrameCount": source_frame_count,
             "displayAligned": bool(
                 surface.get("headAlignment", {}).get("displayAligned")
             ),
@@ -630,7 +682,17 @@ def _run(
                     camera_roots, storage_root, material_id
                 )
             except MaterialJobLockedError:
-                upgrade = {"ready": False}
+                # _upgrade_existing_surface acquires the material lock only
+                # after its authoritative per-frame gray/JET audit succeeds.
+                # A managed realtime worker owning the same flow therefore
+                # means the rendition set is already complete and is being
+                # finalized, not that this resumable job must rebuild it.
+                upgrade = {
+                    "ready": True,
+                    "upgraded": False,
+                    "measurementRestored": False,
+                    "finalizedByConcurrentWorker": True,
+                }
             except (OSError, TypeError, ValueError, IndexError):
                 # Keep a malformed historical artifact in the full rebuild
                 # queue instead of terminating the archive run.
@@ -763,7 +825,7 @@ def main() -> int:
     parser.add_argument(
         "--skip-ready",
         action="store_true",
-        help="Resume without rebuilding materials that already have a main JET and every camera JET.",
+        help="Resume without rebuilding materials that already have every per-frame gray/JET rendition.",
     )
     args = parser.parse_args()
     camera_roots, storage_root, calibration_path, alignment, measurement = _configs(

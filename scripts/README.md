@@ -12,6 +12,28 @@ state, runtime roots, and bounded log tails through the loopback-only
 registry, probes and manages each process without an administrator session,
 and exposes its own loopback-only status/control API on port `4899`.
 
+## Frozen algorithm evidence validation
+
+`validate_algorithm_dataset.py` implements the offline, read-only
+`steel.algorithm-dataset.v1` and `steel.defect-annotation.v1` gate described by
+the research reproducibility design. It accepts only relative file references
+beneath explicitly approved data roots, rejects symlink/reparse and traversal
+boundaries, verifies byte counts and SHA-256 values, detects material/batch
+split leakage, and requires adjudicated labels for a qualification split.
+
+```powershell
+python scripts/validate_algorithm_dataset.py `
+  --manifest D:\evidence\dataset.json `
+  --data-root D:\evidence `
+  --purpose qualification `
+  --output D:\evidence\reports\dataset-validation.json
+```
+
+The report is written atomically as
+`steel.algorithm-dataset-validation.v1`. Any failed check returns exit code 1;
+an output-write/usage failure returns exit code 2. The validator never creates
+license approvals, quality thresholds, metrics, or signatures.
+
 ## SICK GenTL capture sidecar
 
 The SICK sidecar uses the vendor GenTL producer and Harvesters to bind a camera
@@ -36,6 +58,33 @@ py -3.12 scripts\recompress_sick_3d_history.py `
 For multi-million-frame stores, run disjoint flow shards in parallel. Each
 process still uses a thread pool, and `flowNo % shardCount` guarantees that one
 flow's frame metadata and committed events have only one writer.
+
+Merged SICK flows can be re-segmented with the same one-round reference-camera
+boundary used online. The repair is dry-run by default. `--apply` creates a
+SQLite backup, reserves new flow numbers transactionally, hard-links the
+immutable camera evidence, rewrites committed manifests, and marks the source
+manifest `superseded` so neither playback nor algorithm catalogs advertise the
+old merged record. The matching playback-catalog row is removed under the same
+cross-process catalog lock used by live image analysis; normal record reads and
+live appends therefore do not scan every historical `flow.json`. Raw source
+directories are retained for audit and rollback. If a reviewed physical gap is
+shorter than one complete camera round, repeat
+`--split-before-storage-index N` to name the first reference-camera frame of
+each following bar; the explicit boundary is recorded in the repair report.
+
+```powershell
+py -3.12 scripts\repair_sick_flow_boundaries.py `
+  --profile config\sites\sick-array-6\capture.json `
+  --database target\run\sick-live\config\service\steel-inspection.sqlite `
+  --source-flow 4191
+
+py -3.12 scripts\repair_sick_flow_boundaries.py `
+  --profile config\sites\sick-array-6\capture.json `
+  --database target\run\sick-live\config\service\steel-inspection.sqlite `
+  --source-flow 4191 `
+  --apply `
+  --publish-handoff
+```
 
 ```powershell
 python -m pip install -r scripts\sick_capture_requirements.txt
@@ -367,7 +416,7 @@ The two signer inputs are deployment-controlled trust anchors and must be suppli
 
 The CLI name `RuntimeRoot` is retained for compatibility, but it means the read-only source package and is never the installed SCM payload. `InstallRoot` defaults to `%ProgramFiles%\SteelInspectionRuntime`; the installer verifies the source package, copies it to same-volume `releases\.incoming-<transactionId>`, verifies and locks the staged tree, renames it to `releases\<semver>-<commit12>`, and verifies the final immutable tree again. An existing final release directory is never overwritten or silently reused. SCM points directly to that version directory. `StateRoot` is a separate absolute non-root path, defaulting to `%ProgramData%\SteelInspectionRuntime`. SourcePackageRoot, InstallRoot, StateRoot, secret/report policy paths, and the production-data write domain must be mutually disjoint in both ancestor directions. Public runtime configuration, logs, SQLite/service state, capture configuration, temporary data, deployment journal, active receipt, history, and rollback snapshots remain below `StateRoot`. Existing state is owner/DACL/reparse-checked before any write; SYSTEM and Administrators have mutable-state control, while `config\runtime-service.env` is separately protected read-only. Elevated installation, effective ACL/SCM, real signatures, and target-machine upgrade/rollback acceptance remain required.
 
-The secret file accepts only `TRIGGER_SHARED_SECRET`, `TRIGGER_OPERATOR_TOKEN`, `STEEL_DATABASE_URL`, and `STEEL_BOOTSTRAP_ADMIN_PASSWORD`. The two trigger values are mandatory, must differ, and must each contain at least 32 UTF-8 bytes. `AlgorithmAcceptanceReport` must point to a real `steel.algorithm-acceptance.v1` report whose status is `pass` and whose config hash matches the packaged production algorithm config; the pending example is not installable. The elevated installer rejects reparse points, protects the installed runtime tree plus external secret/report files for SYSTEM and Administrators, and rejects an untrusted ancestor that could delete or replace either policy file. Use `-Upgrade` only for an intentional maintenance window. A machine-wide mutex and durable `StateRoot\deployment\upgrade.json` protect the version publication and SCM/env/registry switch. Interrupted transactions are automatically recoverable only while `database.phase=not-started` and every rollback input is intact; all other uncertain database phases fail safe with the service stopped. After the source catalog gate, the installer validates the packaged database contract/index. Because it does not yet execute migrations, it rejects a non-empty migration index before changing deployment state; any deployment that reuses an active receipt, including upgrade or reinstall into a preserved StateRoot, also requires that receipt to prove the same schema version. A signed boot-time `recover-only` tool is still absent.
+The secret file accepts only `TRIGGER_SHARED_SECRET`, `TRIGGER_OPERATOR_TOKEN`, `STEEL_DATABASE_URL`, and `STEEL_BOOTSTRAP_ADMIN_PASSWORD`. The two trigger values are mandatory, must differ, and must each contain at least 32 UTF-8 bytes. `AlgorithmAcceptanceReport` must point to a real `steel.algorithm-acceptance.v1` report whose status is `pass` and which binds the packaged production config, release implementation, passing dataset validation, production model set, reproduction manifest, evaluator, calibration, measured metrics, and post-evaluation approvals; the pending example and any `temporary=true` model set are not installable. The elevated installer rejects reparse points, protects the installed runtime tree plus external secret/report files for SYSTEM and Administrators, and rejects an untrusted ancestor that could delete or replace either policy file. Use `-Upgrade` only for an intentional maintenance window. A machine-wide mutex and durable `StateRoot\deployment\upgrade.json` protect the version publication and SCM/env/registry switch. Interrupted transactions are automatically recoverable only while `database.phase=not-started` and every rollback input is intact; all other uncertain database phases fail safe with the service stopped. After the source catalog gate, the installer validates the packaged database contract/index. Because it does not yet execute migrations, it rejects a non-empty migration index before changing deployment state; any deployment that reuses an active receipt, including upgrade or reinstall into a preserved StateRoot, also requires that receipt to prove the same schema version. A signed boot-time `recover-only` tool is still absent.
 
 The installer also requires `packageClass=formal-release`, a clean `steel.runtime-package.v1` manifest, C++ `Release`, Rust `release`, a canonical stable `x.y.z` release version without numeric leading zeros, an exact release tag/commit, same-invocation build provenance, and a valid signed catalog before it evaluates the algorithm report. `0.1.0` and any `engineering` package—including dirty, debug, `-SkipBuild`, or `-SkipDesktopBundle` output—are rejected.
 
@@ -1149,7 +1198,7 @@ scripts/verify-release-sbom.ps1 `
   -ExpectedCommit (git rev-parse HEAD)
 ```
 
-The CycloneDX 1.5 document binds the source commit, four lock files, generator scripts, local Git/PowerShell versions, and at least one approved component in each of the C++ toolchain, camera SDK, VC Runtime, WebView2, WiX, and NSIS categories. The category set is exactly those six, but a category may contain multiple approved components, so the external component count is not fixed at six. Generation and verification are offline and fail closed on a dirty worktree unless an explicitly non-release test opts out. `scripts/test-release-sbom.ps1` exercises the deterministic output and rejection cases.
+The CycloneDX 1.5 document binds the source commit, all twelve dependency locks (one npm and eleven first-party Cargo locks), generator scripts, local Git/PowerShell versions, and at least one approved component in each of the C++ toolchain, camera SDK, VC Runtime, WebView2, WiX, and NSIS categories. The category set is exactly those six, but a category may contain multiple approved components, so the external component count is not fixed at six. Generation and verification are offline and fail closed on a dirty worktree unless an explicitly non-release test opts out. `scripts/test-release-sbom.ps1` exercises the deterministic output and rejection cases.
 
 The checked-in external policy is only a rejected example. A release owner must supply the approved file and its SHA-256 out of band. The current static packaged verifier binds the SBOM, external policy, counts, serial, lock hashes and tool evidence, but it does not independently rebuild the complete npm/Cargo component inventory from all lock files. PowerShell JSON parsing also cannot reliably reject duplicate object-member names after parsing. Pin the formal build/semantic-verification host to Windows PowerShell 5.1 or PowerShell 6.2+; PowerShell 6.0/6.1 is unsupported because `ConvertFrom-Json -Depth` is unavailable there.
 
@@ -1168,7 +1217,7 @@ scripts/package-runtime.ps1
 
 The release certificate must be an unexpired code-signing certificate with an accessible private key in the current user or local-machine certificate store. The timestamp endpoint must be HTTPS, the publisher must exactly match both the reviewed Tauri config and release policy, and the VC++ prerequisite must carry a valid timestamped Microsoft signature. These are build-side inputs; deployment approval still supplies `STEEL_RELEASE_SIGNER_THUMBPRINT`, vendor allowlist, `STEEL_DESKTOP_PUBLISHER`, and all three approved policy/manifest hashes independently rather than learning them from the package.
 
-Every manifest declares `packageClass=formal-release` or `packageClass=engineering`. Formal packaging requires a clean Git worktree, C++ `Release`, Rust `release`, an enabled Tauri MSI/NSIS bundle, the reviewed source-controlled `config/release/desktop-release-policy.json`, its externally approved SHA-256, an externally supplied approved publisher, the approved external-components policy plus its out-of-band SHA-256, and synchronized product versions. It rejects `-SkipBuild`, `-AllowDirtyWorktree`, `-AllowDebugPackage`, and `-SkipDesktopBundle`; clears `target/capture`, `target/cargo`, `target/trigger`, `target/algorithm-core`, and `target/client/frontend-dist`; runs a clean `npm ci`; rebuilds every deliverable in that invocation; and checks the exact HEAD plus clean worktree after the builds and again before manifest generation. It rejects automatically merged Tauri config variants, unreviewed `TAURI_*`/Rust compiler/Cargo profile overrides, and Cargo config files other than the policy-pinned repository config. The desktop is built explicitly for `x86_64-pc-windows-msvc`; Tauri build features must be explicitly empty, release debug assertions must be false, and the packaged desktop/runtime PE machine values must be x86-64. `manifest.json` binds `releaseVersion`, the source commit, its exact `v<version>` or `<version>` tag, and `built-in-this-invocation` provenance. It records SHA-256 evidence for `package-lock.json`, the Tauri/service/trigger Cargo lockfiles, exact `tauri.conf.json`, Tauri `Cargo.toml`, the Cargo config, `build-evidence/desktop-release-policy.json`, the resolved `tauri-feature-resolution.json`, the approved offline bundle-toolchain manifest, the CycloneDX SBOM/external policy, and the database contract/migration index. Placeholder `0.1.0` is rejected. Any bypass produces an `engineering` package, never a formal release.
+Every manifest declares `packageClass=formal-release` or `packageClass=engineering`. Formal packaging requires a clean Git worktree, C++ `Release`, Rust `release`, an enabled Tauri MSI/NSIS bundle, the reviewed source-controlled `config/release/desktop-release-policy.json`, its externally approved SHA-256, an externally supplied approved publisher, the approved external-components policy plus its out-of-band SHA-256, and synchronized product versions. It rejects `-SkipBuild`, `-AllowDirtyWorktree`, `-AllowDebugPackage`, and `-SkipDesktopBundle`; clears `target/capture`, `target/cargo`, `target/trigger`, `target/algorithm-core`, and `target/client/frontend-dist`; runs a clean `npm ci`; rebuilds every deliverable in that invocation; and checks the exact HEAD plus clean worktree after the builds and again before manifest generation. It rejects automatically merged Tauri config variants, unreviewed `TAURI_*`/Rust compiler/Cargo profile overrides, and Cargo config files other than the policy-pinned repository config. The desktop is built explicitly for `x86_64-pc-windows-msvc`; Tauri build features must be explicitly empty, release debug assertions must be false, and the packaged desktop/runtime PE machine values must be x86-64. `manifest.json` binds `releaseVersion`, the source commit, its exact `v<version>` or `<version>` tag, and `built-in-this-invocation` provenance. It records SHA-256 evidence for `package-lock.json`, all eleven first-party Cargo lockfiles, exact `tauri.conf.json`, Tauri `Cargo.toml`, the Cargo config, `build-evidence/desktop-release-policy.json`, the resolved `tauri-feature-resolution.json`, the approved offline bundle-toolchain manifest, the CycloneDX SBOM/external policy, and the database contract/migration index. Placeholder `0.1.0` is rejected. Any bypass produces an `engineering` package, never a formal release.
 
 Prepare the WiX, NSIS, and offline WebView2 build inputs outside the repository. The generator inventories every payload file with its component, size, and SHA-256; its reported hash is only an approval candidate and must be reviewed/distributed out of band:
 

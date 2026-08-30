@@ -161,8 +161,8 @@ if ([string]$Sbom.schema -cne 'steel.release-sbom.cyclonedx.v1' -or
     $Sbom.dirty -isnot [bool] -or $Sbom.dirty -ne $false -or
     [int]$Sbom.componentCount -lt 6 -or
     [int]$Sbom.externalComponentCount -lt 6 -or
-    [int]$Sbom.metadataPropertyCount -ne 22 -or
-    [int]$Sbom.dependencyLockCount -ne 4 -or
+    [int]$Sbom.metadataPropertyCount -ne 38 -or
+    [int]$Sbom.dependencyLockCount -ne 12 -or
     [int]$Sbom.toolCount -ne 3 -or
     $Sbom.requiredExternalCategories -isnot [System.Array] -or
     (@($Sbom.requiredExternalCategories) -join "`n") -cne ($RequiredCategories -join "`n") -or
@@ -225,6 +225,14 @@ $ExpectedMetadataNames = @(
   'steel.source.commitTimestamp', 'steel.input.npm-client.path', 'steel.input.npm-client.sha256',
   'steel.input.cargo-tauri.path', 'steel.input.cargo-tauri.sha256', 'steel.input.cargo-service.path',
   'steel.input.cargo-service.sha256', 'steel.input.cargo-trigger.path', 'steel.input.cargo-trigger.sha256',
+  'steel.input.cargo-camera-worker.path', 'steel.input.cargo-camera-worker.sha256',
+  'steel.input.cargo-result-contract.path', 'steel.input.cargo-result-contract.sha256',
+  'steel.input.cargo-pipeline-workers.path', 'steel.input.cargo-pipeline-workers.sha256',
+  'steel.input.cargo-runtime-contract.path', 'steel.input.cargo-runtime-contract.sha256',
+  'steel.input.cargo-image-service.path', 'steel.input.cargo-image-service.sha256',
+  'steel.input.cargo-algorithm-service.path', 'steel.input.cargo-algorithm-service.sha256',
+  'steel.input.cargo-server-monitor.path', 'steel.input.cargo-server-monitor.sha256',
+  'steel.input.cargo-tray.path', 'steel.input.cargo-tray.sha256',
   'steel.input.external-components.path', 'steel.input.external-components.sha256',
   'steel.tool.generate.sha256', 'steel.tool.verify.sha256', 'steel.tool.common.sha256',
   'steel.component.count.npm', 'steel.component.count.cargo', 'steel.component.count.external',
@@ -244,10 +252,18 @@ $LockDefinitions = @(
   [ordered]@{ id = 'npm-client'; source = 'app/client/package-lock.json'; evidence = 'build-evidence/client-package-lock.json' },
   [ordered]@{ id = 'cargo-tauri'; source = 'app/client/src-tauri/Cargo.lock'; evidence = 'build-evidence/tauri-Cargo.lock' },
   [ordered]@{ id = 'cargo-service'; source = 'app/service/Cargo.lock'; evidence = 'build-evidence/service-Cargo.lock' },
-  [ordered]@{ id = 'cargo-trigger'; source = 'app/trigger/Cargo.lock'; evidence = 'build-evidence/trigger-Cargo.lock' }
+  [ordered]@{ id = 'cargo-trigger'; source = 'app/trigger/Cargo.lock'; evidence = 'build-evidence/trigger-Cargo.lock' },
+  [ordered]@{ id = 'cargo-camera-worker'; source = 'app/camera-worker/Cargo.lock'; evidence = 'build-evidence/camera-worker-Cargo.lock' },
+  [ordered]@{ id = 'cargo-result-contract'; source = 'app/result-contract/Cargo.lock'; evidence = 'build-evidence/result-contract-Cargo.lock' },
+  [ordered]@{ id = 'cargo-pipeline-workers'; source = 'app/pipeline-workers/Cargo.lock'; evidence = 'build-evidence/pipeline-workers-Cargo.lock' },
+  [ordered]@{ id = 'cargo-runtime-contract'; source = 'app/runtime-contract/Cargo.lock'; evidence = 'build-evidence/runtime-contract-Cargo.lock' },
+  [ordered]@{ id = 'cargo-image-service'; source = 'app/image-service/Cargo.lock'; evidence = 'build-evidence/image-service-Cargo.lock' },
+  [ordered]@{ id = 'cargo-algorithm-service'; source = 'app/algorithm-service/Cargo.lock'; evidence = 'build-evidence/algorithm-service-Cargo.lock' },
+  [ordered]@{ id = 'cargo-server-monitor'; source = 'app/server-monitor/Cargo.lock'; evidence = 'build-evidence/server-monitor-Cargo.lock' },
+  [ordered]@{ id = 'cargo-tray'; source = 'app/tray/Cargo.lock'; evidence = 'build-evidence/tray-Cargo.lock' }
 )
 $Locks = @($Sbom.dependencyLocks)
-if ($Locks.Count -ne 4) { throw 'SBOM must bind exactly four dependency locks.' }
+if ($Locks.Count -ne 12) { throw 'SBOM must bind exactly twelve dependency locks.' }
 if ((@($Locks | ForEach-Object { [string]$_.id }) -join "`n") -cne (@($LockDefinitions | ForEach-Object { [string]$_.id }) -join "`n")) {
   throw 'SBOM dependency lock evidence order is not canonical.'
 }

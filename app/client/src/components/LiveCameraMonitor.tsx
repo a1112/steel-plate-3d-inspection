@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Camera,
   CircleStop,
   HardDrive,
@@ -25,6 +26,7 @@ type MonitorMode = 'live' | 'playback';
 const STREAM_IMAGE_LOAD_TIMEOUT_MS = 8_000;
 const STREAM_CONTROL_TIMEOUT_MS = 8_000;
 const GRID_STREAM_BATCH_SIZE = 2;
+const STALE_FRAME_FAILURE_LIMIT = 3;
 
 export function gridStreamRevision(
   refreshToken: number,
@@ -60,6 +62,7 @@ function stopStreamBestEffort(ip: string) {
 interface LiveMonitoringPageProps {
   statuses: CaptureCameraStatus[];
   health?: CaptureHealth | null;
+  error?: string | null;
 }
 
 interface StableStreamImageProps {
@@ -174,6 +177,11 @@ export function StableStreamImage({
     if (pendingRef.current?.id !== candidate.id) return;
     clearLoadTimer();
     failureCountRef.current += 1;
+    if (failureCountRef.current >= STALE_FRAME_FAILURE_LIMIT) {
+      // A decoded frame is useful during a brief refresh race, but after
+      // repeated failures it is no longer honest realtime evidence.
+      setDisplaySrc('');
+    }
     retryAtRef.current = Date.now() + Math.min(5_000, 500 * (2 ** Math.min(4, failureCountRef.current - 1)));
     setRetrying(true);
     replacePending(null);
@@ -235,13 +243,38 @@ function formatFrameTime(value?: string | null) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString('zh-CN', { hour12: false });
 }
 
-export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPageProps) {
+function imageQualityReasonLabel(reason: string) {
+  const labels: Record<string, string> = {
+    'camera-frame-missing': '相机掉线/无帧',
+    'camera-connection-failed': '相机连接失败',
+    'image-black': '图像近黑，可能被遮挡',
+    'image-low-contrast': '图像低对比度，可能被遮挡',
+    'image-overexposed': '图像过曝',
+    'image-signal-degraded': '灰度信号明显下降',
+    'depth-signal-degraded': '深度有效信号明显下降',
+  };
+  return labels[reason] ?? reason;
+}
+
+function cameraQualityLabel(status: CaptureCameraStatus) {
+  const quality = status.imageQuality;
+  if (!status.connected || quality?.status === 'offline') return '离线';
+  if (quality?.status === 'blocked') return '疑似遮挡';
+  if (quality?.status === 'degraded') return '图像异常';
+  if (quality?.status === 'suspect') return '质量观察中';
+  if (quality?.status === 'warming') return '质量学习中';
+  return '在线';
+}
+
+export function LiveMonitoringPage({ statuses, health = null, error = null }: LiveMonitoringPageProps) {
   const cameras = useMemo(
     () => statuses.filter((status) => status.enabled !== false),
     [statuses],
   );
   const connected = cameras.filter((status) => status.connected);
   const acquiring = cameras.filter((status) => status.continuousAcquiring);
+  const qualityAlarms = cameras.filter((status) => status.imageQuality?.alarmActive);
+  const qualitySuspects = cameras.filter((status) => status.imageQuality?.status === 'suspect');
   const synchronization = health?.provider !== 'bkv'
     ? health?.acquisitionSynchronization
     : undefined;
@@ -657,6 +690,12 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
         {monitorMode === 'live' ? <div className="live-monitor-summary" aria-label="实时采集汇总">
           <span><i className={connected.length > 0 ? 'online' : ''} />相机在线 <b>{connected.length}/{cameras.length}</b></span>
           <span><Waves size={14} />连续采集 <b>{acquiring.length}/{cameras.length}</b></span>
+          <span
+            className={qualityAlarms.length > 0 || qualitySuspects.length > 0 ? 'warning' : ''}
+            title={qualityAlarms.map((status, index) => `${cameraLabel(status, index)}：${(status.imageQuality?.reasons ?? []).map(imageQualityReasonLabel).join('、')}`).join('；') || '实时图像质量正常'}
+          >
+            <AlertTriangle size={14} />图像质量 <b>{qualityAlarms.length > 0 ? `${qualityAlarms.length} 路报警` : qualitySuspects.length > 0 ? `${qualitySuspects.length} 路观察` : '正常'}</b>
+          </span>
           <span className={synchronizationDegraded ? 'warning' : ''} title={synchronization
             ? [
                 synchronization.lastRound?.missingCameras?.length
@@ -706,6 +745,14 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
           </header>
 
           <div className="live-monitor-viewport">
+            {selected?.imageQuality?.alarmActive ? (
+              <div className="live-monitor-quality-alert" role="alert">
+                <AlertTriangle size={16} />
+                <strong>{cameraQualityLabel(selected)}</strong>
+                <span>{(selected.imageQuality.reasons ?? []).map(imageQualityReasonLabel).join('；')}</span>
+                {selected.imageQuality.automaticReconnect?.pending ? <em>正在自动重连</em> : null}
+              </div>
+            ) : null}
             {imageUrl ? (
               <StableStreamImage
                 key={`${selected!.ip}:${kind}`}
@@ -769,7 +816,7 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
                     <small>{status.ip}</small>
                   </span>
                   <span className="live-monitor-camera-telemetry">
-                    <b className={status.connected ? 'online' : ''}>{status.connected ? '在线' : '离线'}</b>
+                    <b className={status.imageQuality?.alarmActive ? 'warning' : status.connected ? 'online' : ''}>{cameraQualityLabel(status)}</b>
                     <small>{formatFps(status.continuousFps)} FPS · {status.continuousFrameCount ?? 0} 帧</small>
                   </span>
                 </button>
@@ -778,8 +825,9 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
           </div>
           {cameras.length === 0 ? (
             <div className="live-monitor-camera-list-empty">
-              <RefreshCw size={24} className="spin" />
-              <span>正在读取相机拓扑…</span>
+              {error ? <AlertTriangle size={24} /> : <RefreshCw size={24} className="spin" />}
+              <span>{error ? '采集服务离线' : '正在读取相机拓扑…'}</span>
+              {error ? <small title={error}>{error}</small> : null}
             </div>
           ) : null}
         </aside>
@@ -814,7 +862,7 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
                 return (
                   <section
                     key={status.ip}
-                    className={`live-monitor-grid-card ${status.connected ? 'online' : 'offline'}`}
+                    className={`live-monitor-grid-card ${status.connected ? 'online' : 'offline'} ${status.imageQuality?.alarmActive ? 'quality-alarm' : status.imageQuality?.status === 'suspect' ? 'quality-suspect' : ''}`}
                     role="button"
                     tabIndex={status.connected ? 0 : -1}
                     aria-label={`放大 ${label} 实时画面`}
@@ -831,7 +879,7 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
                         <b>{label}</b>
                         <span>{status.ip}</span>
                       </div>
-                      <span className={status.connected ? 'online' : ''}><i />{status.connected ? '在线' : '离线'}</span>
+                      <span className={status.imageQuality?.alarmActive ? 'warning' : status.connected ? 'online' : ''}><i />{cameraQualityLabel(status)}</span>
                     </header>
                     <div className="live-monitor-grid-viewport">
                       {gridImageUrl ? (
@@ -857,9 +905,10 @@ export function LiveMonitoringPage({ statuses, health = null }: LiveMonitoringPa
                 );
               })}
               {cameras.length === 0 ? (
-                <div className="live-monitor-camera-list-empty">
-                  <RefreshCw size={24} className="spin" />
-                  <span>正在读取相机拓扑…</span>
+                <div className="live-monitor-camera-list-empty" role={error ? 'alert' : 'status'}>
+                  {error ? <AlertTriangle size={24} /> : <RefreshCw size={24} className="spin" />}
+                  <span>{error ? '采集服务离线，实时画面已清除' : '正在读取相机拓扑…'}</span>
+                  {error ? <small title={error}>{error}</small> : null}
                 </div>
               ) : null}
             </div>

@@ -10,10 +10,12 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Sequence, Union
+from typing import Any, Iterator, Sequence, Union
 
 import numpy as np
 from PIL import Image
@@ -33,6 +35,7 @@ from .paths import (
     resolve_capture_artifact,
 )
 from .storage import replace_file
+from .material_lock import _process_is_running
 
 
 PLAYBACK_INDEX_SCHEMA = "steel.capture-playback-index.v1"
@@ -601,6 +604,113 @@ def playback_catalog_path(storage_root: Path) -> Path:
     return storage_root / "catalog.json"
 
 
+@contextmanager
+def _playback_catalog_write_lock(
+    storage_root: Path,
+    *,
+    timeout_seconds: float = 30.0,
+) -> Iterator[None]:
+    """Serialize catalog read/merge/write cycles across analyzer processes."""
+
+    lock_path = (
+        Path(storage_root)
+        / "system"
+        / "locks"
+        / "playback-catalog.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    process_id = os.getpid()
+    payload = json.dumps(
+        {
+            "schema": "steel.capture-playback-catalog-lock.v1",
+            "processId": process_id,
+            "token": token,
+            "startedAtUnixMs": int(time.time() * 1000),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    while True:
+        try:
+            descriptor = os.open(
+                lock_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            owner: dict[str, Any] = {}
+            try:
+                owner = _read_json(lock_path)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+            try:
+                owner_pid = int(owner.get("processId", 0) or 0)
+            except (TypeError, ValueError):
+                owner_pid = 0
+            try:
+                age_seconds = max(0.0, time.time() - lock_path.stat().st_mtime)
+            except OSError:
+                age_seconds = 0.0
+            stale = bool(
+                owner_pid
+                and not _process_is_running(owner_pid)
+                or not owner_pid
+                and age_seconds >= 300.0
+            )
+            if stale:
+                try:
+                    current = _read_json(lock_path)
+                    if current.get("token") == owner.get("token"):
+                        lock_path.unlink()
+                        continue
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"playback catalog is owned by process {owner_pid or 'unknown'}"
+                )
+            time.sleep(0.05)
+            continue
+        else:
+            try:
+                os.write(descriptor, payload)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            break
+    try:
+        yield
+    finally:
+        try:
+            current = _read_json(lock_path)
+            if (
+                current.get("token") == token
+                and int(current.get("processId", 0) or 0) == process_id
+            ):
+                lock_path.unlink()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+
+def _flow_is_superseded(storage_root: Path, material_id: str) -> bool:
+    """Keep logically replaced captures out of every playback catalog view.
+
+    Boundary repair preserves the source raw files for audit/recovery and marks
+    only the central flow manifest as ``superseded``.  Treating every numeric
+    camera directory as a visible record would otherwise re-advertise the old
+    merged flow beside its corrected children on the next catalog rebuild.
+    Missing or malformed manifests retain the legacy visible behaviour.
+    """
+
+    try:
+        payload = _read_json(Path(storage_root) / material_id / "flow.json")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return str(payload.get("state", "")).strip().lower() == "superseded"
+
+
 def flow_pyramid_cache_status_path(
     camera_storage_root: Path,
     material_id: str,
@@ -870,36 +980,81 @@ def build_and_write_playback_index(
         return path, payload
 
     catalog_path = playback_catalog_path(storage_root)
-    try:
-        catalog = _read_json(catalog_path) if catalog_path.is_file() else {}
-    except (OSError, ValueError, json.JSONDecodeError):
-        catalog = {}
-    entries = [
-        row
-        for row in catalog.get("materials", [])
-        if isinstance(row, dict) and row.get("materialId") != material_id
-    ]
-    entries.append(
-        {
-            "materialId": material_id,
-            "indexFile": path.relative_to(storage_root).as_posix(),
-            "frameCount": len(frames),
-            "firstHostUtcNs": first_ns,
-            "lastHostUtcNs": last_ns,
-        }
-    )
-    entries.sort(key=lambda row: int(row.get("lastHostUtcNs", 0)), reverse=True)
-    _atomic_compact_json(
-        catalog_path,
-        {
-            "schema": PLAYBACK_CATALOG_SCHEMA,
-            "generatedAt": _utc_text(),
-            "materialCount": len(entries),
-            "frameCount": sum(int(row.get("frameCount", 0)) for row in entries),
-            "materials": entries,
-        },
-    )
+    with _playback_catalog_write_lock(storage_root):
+        try:
+            catalog = _read_json(catalog_path) if catalog_path.is_file() else {}
+        except (OSError, ValueError, json.JSONDecodeError):
+            catalog = {}
+        # The catalog is already the visible-record authority. Re-opening one
+        # flow manifest for every existing row made each live append perform
+        # thousands of random disk reads. Boundary repair removes its one
+        # source row explicitly; only the row currently being replaced needs a
+        # manifest check here.
+        entries = [
+            row
+            for row in catalog.get("materials", [])
+            if isinstance(row, dict)
+            and str(row.get("materialId", "")).strip() != material_id
+        ]
+        if not _flow_is_superseded(storage_root, material_id):
+            entries.append(
+                {
+                    "materialId": material_id,
+                    "indexFile": path.relative_to(storage_root).as_posix(),
+                    "frameCount": len(frames),
+                    "firstHostUtcNs": first_ns,
+                    "lastHostUtcNs": last_ns,
+                }
+            )
+        entries.sort(key=lambda row: int(row.get("lastHostUtcNs", 0)), reverse=True)
+        _atomic_compact_json(
+            catalog_path,
+            {
+                "schema": PLAYBACK_CATALOG_SCHEMA,
+                "generatedAt": _utc_text(),
+                "materialCount": len(entries),
+                "frameCount": sum(int(row.get("frameCount", 0)) for row in entries),
+                "materials": entries,
+            },
+        )
     return path, payload
+
+
+def remove_material_from_playback_catalog(
+    storage_root: Path,
+    material_id: str | int,
+) -> bool:
+    """Remove one logically replaced flow without scanning every manifest."""
+
+    normalized = str(int(material_id))
+    catalog_path = playback_catalog_path(storage_root)
+    if not catalog_path.is_file():
+        return False
+    with _playback_catalog_write_lock(storage_root):
+        try:
+            catalog = _read_json(catalog_path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+        rows = [row for row in catalog.get("materials", []) if isinstance(row, dict)]
+        entries = [
+            row
+            for row in rows
+            if str(row.get("materialId", "")).strip() != normalized
+        ]
+        if len(entries) == len(rows):
+            return False
+        _atomic_compact_json(
+            catalog_path,
+            {
+                **catalog,
+                "schema": PLAYBACK_CATALOG_SCHEMA,
+                "generatedAt": _utc_text(),
+                "materialCount": len(entries),
+                "frameCount": sum(int(row.get("frameCount", 0)) for row in entries),
+                "materials": entries,
+            },
+        )
+        return True
 
 
 def rebuild_playback_history(
@@ -931,7 +1086,14 @@ def rebuild_playback_history(
     frame_count = 0
     reused_count = 0
     rebuilt_count = 0
-    ordered_material_ids = sorted(material_ids, key=int)
+    ordered_material_ids = sorted(
+        (
+            material_id
+            for material_id in material_ids
+            if not _flow_is_superseded(storage_root, material_id)
+        ),
+        key=int,
+    )
     completed = 0
     worker_count = max(1, min(max_workers, len(ordered_material_ids) or 1))
 
@@ -993,16 +1155,47 @@ def rebuild_playback_history(
                 if next_material is not None:
                     pending.add(executor.submit(rebuild_one, next_material))
 
-    entries.sort(key=lambda row: int(row.get("lastHostUtcNs", 0)), reverse=True)
-    catalog = {
-        "schema": PLAYBACK_CATALOG_SCHEMA,
-        "generatedAt": _utc_text(),
-        "materialCount": len(entries),
-        "frameCount": frame_count,
-        "materials": entries,
-    }
     path = playback_catalog_path(storage_root)
-    _atomic_compact_json(path, catalog)
+    # A full rebuild can overlap live capture for hours. Merge rows published
+    # after its initial material scan while holding the same short catalog lock
+    # used by incremental image analysis, so finishing history work cannot make
+    # a newer record disappear from the UI.
+    with _playback_catalog_write_lock(storage_root):
+        try:
+            current_catalog = _read_json(path) if path.is_file() else {}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            current_catalog = {}
+        merged_by_id = {
+            str(row.get("materialId", "")).strip(): row
+            for row in entries
+            if str(row.get("materialId", "")).strip()
+            and not _flow_is_superseded(
+                storage_root, str(row.get("materialId", "")).strip()
+            )
+        }
+        for row in current_catalog.get("materials", []):
+            if not isinstance(row, dict):
+                continue
+            material_id = str(row.get("materialId", "")).strip()
+            if (
+                material_id
+                and material_id not in merged_by_id
+                and not _flow_is_superseded(storage_root, material_id)
+            ):
+                merged_by_id[material_id] = row
+        entries = list(merged_by_id.values())
+        entries.sort(
+            key=lambda row: int(row.get("lastHostUtcNs", 0)), reverse=True
+        )
+        frame_count = sum(int(row.get("frameCount", 0)) for row in entries)
+        catalog = {
+            "schema": PLAYBACK_CATALOG_SCHEMA,
+            "generatedAt": _utc_text(),
+            "materialCount": len(entries),
+            "frameCount": frame_count,
+            "materials": entries,
+        }
+        _atomic_compact_json(path, catalog)
     return {
         "catalogPath": str(path),
         "materialCount": len(entries),
@@ -1086,6 +1279,13 @@ def read_indexed_history(
         catalog = _read_json(catalog_path)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
+    if material_id and _flow_is_superseded(storage_root, material_id):
+        # An empty indexed result is intentional here. Returning ``None``
+        # asks the capture API to fall back to a raw camera-directory scan,
+        # which would make the preserved source evidence visible again.
+        return [], False, 0
+    # Catalog publication and boundary repair maintain the visible set. Avoid
+    # opening thousands of flow manifests on every UI history request.
     entries = [row for row in catalog.get("materials", []) if isinstance(row, dict)]
     if material_id:
         entries = [row for row in entries if row.get("materialId") == material_id]

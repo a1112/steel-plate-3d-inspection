@@ -160,8 +160,16 @@ const STORAGE_MIN_FREE_BYTES_DEFAULT: u64 = 20 * 1024 * 1024 * 1024;
 const STORAGE_MIN_FREE_PERCENT_DEFAULT: f64 = 10.0;
 const SYSTEM_HEALTH_ALARM_INITIAL_DELAY_SECS: u64 = 5;
 const SYSTEM_HEALTH_ALARM_INTERVAL_SECS: u64 = 10;
+const CAPTURE_CAMERA_ALARM_INITIAL_DELAY_SECS: u64 = 3;
+const CAPTURE_CAMERA_ALARM_INTERVAL_SECS: u64 = 2;
 const SYSTEM_HEALTH_ALARM_SOURCE: &str = "system-health";
 const SYSTEM_HEALTH_ALARM_ACTOR: &str = "system-health-monitor";
+const CAPTURE_CAMERA_ALARM_ACTOR: &str = "capture-camera-health-monitor";
+const CAPTURE_CAMERA_ALARM_TYPES: [&str; 3] = [
+    "camera-offline",
+    "camera-image-blocked",
+    "camera-image-quality",
+];
 const SYSTEM_HEALTH_ALARM_TYPES: [&str; 10] = [
     "supervisor-restart-budget-exhausted",
     "supervisor-status-invalid",
@@ -4909,6 +4917,10 @@ fn capture_health_component_with_bkv_runtime(
         .as_ref()
         .and_then(|value| value.get("pendingRecoveryCount"))
         .and_then(Value::as_u64);
+    let image_quality = payload
+        .as_ref()
+        .and_then(|value| value.get("imageQuality"))
+        .cloned();
     let contract_valid = sdk_ready.is_some();
     let ok = status_ok
         && sdk_ready == Some(true)
@@ -4945,6 +4957,7 @@ fn capture_health_component_with_bkv_runtime(
             "recoveryRequired": recovery_required,
             "invalidManifest": invalid_manifest,
             "pendingRecoveryCount": pending_recovery_count,
+            "imageQuality": image_quality,
             "httpStatus": response.status_code,
             "latencyMs": latency_ms,
             "reason": reason,
@@ -6738,7 +6751,7 @@ fn algorithm_config_health() -> (bool, Value, Option<Value>) {
         && config
             .pointer("/qualityGate/requiredCameraCount")
             .and_then(Value::as_u64)
-            == Some(8)
+            == Some(6)
         && config
             .pointer("/qualityGate/maximumSyntheticDefectCount")
             .and_then(Value::as_u64)
@@ -6761,6 +6774,84 @@ fn algorithm_config_health() -> (bool, Value, Option<Value>) {
         "configSha256": hash
     });
     (valid, detail, valid.then_some(config))
+}
+
+fn rfc3339_epoch_nanos(value: &str) -> Option<i128> {
+    let text = value.trim();
+    let (date_time, offset_seconds) = if let Some(body) = text.strip_suffix('Z') {
+        (body, 0_i64)
+    } else {
+        let offset_index = text.char_indices().rev().find_map(|(index, character)| {
+            (index > 10 && matches!(character, '+' | '-')).then_some(index)
+        })?;
+        let (body, offset) = text.split_at(offset_index);
+        if offset.len() != 6 || offset.as_bytes().get(3) != Some(&b':') {
+            return None;
+        }
+        let hours = offset.get(1..3)?.parse::<i64>().ok()?;
+        let minutes = offset.get(4..6)?.parse::<i64>().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        let sign = if offset.starts_with('-') { -1 } else { 1 };
+        (body, sign * (hours * 3600 + minutes * 60))
+    };
+    if date_time.len() < 19 {
+        return None;
+    }
+    let bytes = date_time.as_bytes();
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let year = date_time.get(0..4)?.parse::<i64>().ok()?;
+    let month = date_time.get(5..7)?.parse::<i64>().ok()?;
+    let day = date_time.get(8..10)?.parse::<i64>().ok()?;
+    let hour = date_time.get(11..13)?.parse::<i64>().ok()?;
+    let minute = date_time.get(14..16)?.parse::<i64>().ok()?;
+    let second = date_time.get(17..19)?.parse::<i64>().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day < 1 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let fractional_nanos = match date_time.get(19..) {
+        Some("") | None => 0_i128,
+        Some(fraction) => {
+            let digits = fraction.strip_prefix('.')?;
+            if digits.is_empty()
+                || digits.len() > 9
+                || !digits.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            let parsed = digits.parse::<i128>().ok()?;
+            parsed * 10_i128.pow((9 - digits.len()) as u32)
+        }
+    };
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let adjusted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let epoch_days = era * 146_097 + day_of_era - 719_468;
+    let epoch_seconds = epoch_days * 86_400 + hour * 3_600 + minute * 60 + second - offset_seconds;
+    Some(i128::from(epoch_seconds) * 1_000_000_000 + fractional_nanos)
 }
 
 fn algorithm_acceptance_report_valid(report: &Value, config: &Value, config_hash: &str) -> bool {
@@ -6810,6 +6901,17 @@ fn algorithm_acceptance_report_valid(report: &Value, config: &Value, config_hash
             false,
         ),
     ];
+    let timing_valid = report
+        .get("evaluatedAt")
+        .and_then(Value::as_str)
+        .and_then(rfc3339_epoch_nanos)
+        .zip(
+            report
+                .pointer("/approvals/approvedAt")
+                .and_then(Value::as_str)
+                .and_then(rfc3339_epoch_nanos),
+        )
+        .is_some_and(|(evaluated, approved)| approved >= evaluated);
     report.get("schema").and_then(Value::as_str) == Some("steel.algorithm-acceptance.v1")
         && report.get("status").and_then(Value::as_str) == Some("pass")
         && report.get("algorithmName") == config.get("algorithmName")
@@ -6818,10 +6920,16 @@ fn algorithm_acceptance_report_valid(report: &Value, config: &Value, config_hash
         && report.get("configSha256").and_then(Value::as_str) == Some(config_hash)
         && text_present("/datasetRevision")
         && hash_present("/datasetSha256")
+        && hash_present("/datasetValidationSha256")
         && text_present("/evaluatorRevision")
         && hash_present("/evaluatorSha256")
+        && text_present("/modelSetRevision")
+        && hash_present("/modelSetSha256")
+        && text_present("/reproductionManifestRevision")
+        && hash_present("/reproductionManifestSha256")
         && text_present("/calibrationRevision")
         && hash_present("/calibrationSha256")
+        && timing_valid
         && hash_present("/scriptSha256")
         && hash_present("/coreSha256")
         && report
@@ -7088,6 +7196,8 @@ fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
             "calibration": calibration,
             "calibrationBindingValid": calibration_ok,
             "datasetRevision": acceptance.and_then(|value| value.get("datasetRevision")),
+            "modelSetRevision": acceptance.and_then(|value| value.get("modelSetRevision")),
+            "reproductionManifestRevision": acceptance.and_then(|value| value.get("reproductionManifestRevision")),
             "calibrationRevision": acceptance.and_then(|value| value.get("calibrationRevision")),
             "reason": if !config_ok { json!("algorithm_config_invalid") } else if !paths_ok { json!("algorithm_runtime_paths_invalid") } else if !acceptance_ok { json!("algorithm_acceptance_missing_or_invalid") } else if !implementation_ok { json!("algorithm_implementation_not_approved") } else if !calibration_ok { json!("algorithm_calibration_not_approved") } else { Value::Null }
         }),
@@ -7251,6 +7361,133 @@ struct SystemHealthAlarmSpec {
     severity: &'static str,
     message: String,
     details: Value,
+}
+
+fn capture_camera_alarm_message(camera_id: &str, alarm_type: &str) -> String {
+    match alarm_type {
+        "camera-offline" => {
+            format!("相机 {camera_id} 连续无有效帧，故障会话已隔离，系统正在自动重连。")
+        }
+        "camera-image-blocked" => {
+            format!("相机 {camera_id} 图像持续近黑或低对比度，疑似镜头或光路被遮挡。")
+        }
+        _ => format!("相机 {camera_id} 实时图像质量持续异常，请检查曝光、光源和镜头。"),
+    }
+}
+
+fn capture_camera_alarm_id(camera_id: &str, alarm_type: &str) -> String {
+    let sequence = SYSTEM_HEALTH_ALARM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let fingerprint = format!(
+        "capture-camera:{camera_id}:{alarm_type}:{}:{sequence}",
+        current_time_millis()
+    );
+    format!("ALARM-CAMERA-{:016x}", stable_alarm_hash(&fingerprint))
+}
+
+fn reconcile_capture_camera_alarms(
+    state: &ServiceState,
+    capture: &Value,
+) -> Result<Vec<String>, String> {
+    let cameras = capture
+        .pointer("/imageQuality/cameras")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "capture_image_quality_unavailable".to_string())?;
+    let mut events = Vec::new();
+    for camera in cameras {
+        let camera_id = camera
+            .get("cameraId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if camera_id.is_empty() {
+            continue;
+        }
+        let source = format!("capture-camera-image-quality:{camera_id}");
+        let alarm_active = camera.get("alarmActive").and_then(Value::as_bool) == Some(true);
+        let active_type = camera
+            .get("alarmType")
+            .and_then(Value::as_str)
+            .filter(|value| CAPTURE_CAMERA_ALARM_TYPES.contains(value));
+        for alarm_type in CAPTURE_CAMERA_ALARM_TYPES {
+            let input = if alarm_active && active_type == Some(alarm_type) {
+                Some(db::ProductionAlarmInput {
+                    id: capture_camera_alarm_id(camera_id, alarm_type),
+                    source: source.clone(),
+                    alarm_type: alarm_type.to_string(),
+                    severity: if alarm_type == "camera-image-quality" {
+                        "warning".to_string()
+                    } else {
+                        "severe".to_string()
+                    },
+                    material_id: camera
+                        .get("materialId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    session_id: String::new(),
+                    inspection_id: String::new(),
+                    camera_id: camera_id.to_string(),
+                    message: capture_camera_alarm_message(camera_id, alarm_type),
+                    details: json!({
+                        "schema": "steel.capture-camera-alarm.v1",
+                        "cameraId": camera_id,
+                        "alarmType": alarm_type,
+                        "status": camera.get("status"),
+                        "monitoringState": camera.get("monitoringState"),
+                        "reasons": camera.get("reasons"),
+                        "metrics": camera.get("metrics"),
+                        "failureStreak": camera.get("failureStreak"),
+                        "offlineStreak": camera.get("offlineStreak"),
+                        "activeSince": camera.get("activeSince"),
+                        "automaticReconnect": camera.get("automaticReconnect"),
+                        "updatedAt": camera.get("updatedAt")
+                    })
+                    .to_string(),
+                })
+            } else {
+                None
+            };
+            let outcome = state
+                .runtime
+                .block_on(db::reconcile_managed_alarm(
+                    &state.database.connection,
+                    &source,
+                    alarm_type,
+                    input,
+                    CAPTURE_CAMERA_ALARM_ACTOR,
+                ))
+                .map_err(|error| error.to_string())?;
+            match outcome {
+                db::ManagedAlarmReconcile::Created(alarm) => {
+                    events.push(format!("created:{}", alarm.id));
+                    let _ = state.runtime.block_on(db::append_audit_log(
+                        &state.database.connection,
+                        CAPTURE_CAMERA_ALARM_ACTOR,
+                        "capture.camera.alarm.created",
+                        &alarm.id,
+                        &format!("{} {}", alarm.camera_id, alarm.alarm_type),
+                        "warning",
+                    ));
+                }
+                db::ManagedAlarmReconcile::Resolved(alarm) => {
+                    events.push(format!("resolved:{}", alarm.id));
+                    let _ = state.runtime.block_on(db::append_audit_log(
+                        &state.database.connection,
+                        CAPTURE_CAMERA_ALARM_ACTOR,
+                        "capture.camera.alarm.resolved",
+                        &alarm.id,
+                        &format!("{} {} recovered", alarm.camera_id, alarm.alarm_type),
+                        "info",
+                    ));
+                }
+                db::ManagedAlarmReconcile::Updated(alarm) => {
+                    events.push(format!("updated:{}", alarm.id));
+                }
+                db::ManagedAlarmReconcile::Unchanged | db::ManagedAlarmReconcile::Absent => {}
+            }
+        }
+    }
+    Ok(events)
 }
 
 fn health_snapshot_check<'a>(snapshot: &'a Value, name: &str) -> Option<&'a Value> {
@@ -7643,6 +7880,59 @@ fn start_system_health_alarm_monitor(state: Arc<ServiceState>) {
         })
     {
         eprintln!("failed to start system health alarm monitor: {error}");
+    }
+}
+
+fn capture_camera_alarm_signature(capture: &Value) -> Option<String> {
+    let cameras = capture.pointer("/imageQuality/cameras")?.as_array()?;
+    Some(
+        Value::Array(
+            cameras
+                .iter()
+                .map(|camera| {
+                    json!({
+                        "cameraId": camera.get("cameraId"),
+                        "alarmActive": camera.get("alarmActive"),
+                        "alarmType": camera.get("alarmType"),
+                        "status": camera.get("status"),
+                        "reasons": camera.get("reasons"),
+                        "materialId": camera.get("materialId"),
+                        "activeSince": camera.get("activeSince"),
+                        "recoveredAt": camera.get("recoveredAt")
+                    })
+                })
+                .collect(),
+        )
+        .to_string(),
+    )
+}
+
+fn start_capture_camera_alarm_monitor(state: Arc<ServiceState>) {
+    if state.capture.provider != CaptureProvider::ExternalApi {
+        return;
+    }
+    if let Err(error) = std::thread::Builder::new()
+        .name("capture-camera-alarm-monitor".to_string())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(CAPTURE_CAMERA_ALARM_INITIAL_DELAY_SECS));
+            let mut last_reconciled_signature = String::new();
+            loop {
+                let (_, capture) = capture_health_component(&state);
+                if let Some(signature) = capture_camera_alarm_signature(&capture) {
+                    if signature != last_reconciled_signature {
+                        match reconcile_capture_camera_alarms(&state, &capture) {
+                            Ok(_) => last_reconciled_signature = signature,
+                            Err(error) => {
+                                eprintln!("capture camera alarm reconciliation failed: {error}")
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(CAPTURE_CAMERA_ALARM_INTERVAL_SECS));
+            }
+        })
+    {
+        eprintln!("failed to start capture camera alarm monitor: {error}");
     }
 }
 
@@ -8493,6 +8783,47 @@ fn constant_time_runtime_token_matches(expected: &[u8], supplied: &[u8]) -> bool
     difference == 0
 }
 
+fn is_trigger_service_mutation_route(method: &str, path: &str) -> bool {
+    method == "POST"
+        && matches!(
+            path,
+            "/api/production/tasks/steel-info"
+                | "/api/production/tasks/steel-in"
+                | "/api/production/tasks/steel-out"
+                | "/api/production/tasks/trigger-event"
+                | "/api/production/steel-info"
+                | "/api/production/steel-in"
+                | "/api/production/steel-out"
+                | "/api/production/trigger-event"
+                | "/api/production/secondary-data"
+                | "/api/production/capture-summary"
+                | "/api/production/capture-once"
+                | "/api/production/defect"
+        )
+}
+
+fn trusted_trigger_service_request(
+    state: &ServiceState,
+    request: &str,
+    method: &str,
+    path: &str,
+    peer: Option<SocketAddr>,
+) -> bool {
+    if !is_trigger_service_mutation_route(method, path)
+        || !peer.is_some_and(|address| address.ip().is_loopback())
+        || state.runtime_drain_token.len() < 32
+    {
+        return false;
+    }
+    let supplied = request_header(request, "X-Trigger-Operator-Token").unwrap_or_default();
+    !supplied.is_empty()
+        && constant_time_runtime_token_matches(&state.runtime_drain_token, supplied.as_bytes())
+}
+
+fn internal_callback_from_loopback(peer: Option<SocketAddr>) -> bool {
+    peer.is_some_and(|address| address.ip().is_loopback())
+}
+
 fn runtime_drain_status_json(state: &ServiceState) -> Value {
     match state.runtime_admission.lock() {
         Ok(admission) => json!({
@@ -8807,7 +9138,28 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("POST", "/api/trigger/manual/steel-out")
         | ("POST", "/api/trigger/capture-once")
         | ("POST", "/api/bkv/import")
-        | ("POST", "/api/bkv/replay/reset") => Some("admin.services"),
+        | ("POST", "/api/bkv/replay/reset")
+        | ("POST", "/api/production/tasks")
+        | ("POST", "/api/production/tasks/cancel")
+        | ("POST", "/api/production/tasks/retry")
+        | ("POST", "/api/production/tasks/steel-info")
+        | ("POST", "/api/production/tasks/steel-in")
+        | ("POST", "/api/production/tasks/steel-out")
+        | ("POST", "/api/production/tasks/trigger-event")
+        | ("POST", "/api/production/steel-info")
+        | ("POST", "/api/production/steel-in")
+        | ("POST", "/api/production/steel-out")
+        | ("POST", "/api/production/trigger-event")
+        | ("POST", "/api/production/secondary-data")
+        | ("POST", "/api/production/capture-summary")
+        | ("POST", "/api/production/capture-once")
+        | ("POST", "/api/production/algorithm/run")
+        | ("POST", "/api/production/defect")
+        | ("POST", "/api/algorithm/bar-surface/run")
+        | ("POST", "/api/algorithm/bar-surface/calibration/fit")
+        | ("POST", "/api/capture/alignment/rebuild")
+        | ("POST", "/api/capture/measurement/rebuild")
+        | ("POST", "/api/capture/defects/rebuild") => Some("admin.services"),
         ("GET", "/api/admin/overview") => Some("admin.overview"),
         ("GET", "/api/admin/users")
         | ("POST", "/api/admin/users")
@@ -13662,6 +14014,25 @@ fn new_session_storage_admission_response(
     ))
 }
 
+fn minimum_unused_storage_flow_no(storage_root: &str) -> i64 {
+    let Ok(entries) = fs::read_dir(Path::new(storage_root.trim())) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .and_then(|_| entry.file_name().to_str()?.parse::<i64>().ok())
+                .filter(|flow_no| *flow_no > 0)
+        })
+        .max()
+        .and_then(|flow_no| flow_no.checked_add(1))
+        .unwrap_or(0)
+}
+
 fn write_production_event_response(
     state: &ServiceState,
     body: &str,
@@ -13878,6 +14249,11 @@ fn write_production_event_response(
             db::SteelFlowInput {
                 session_id: session_id.clone(),
                 material_id: requested_material_id.clone(),
+                minimum_flow_no: if requested_material_id.is_empty() {
+                    minimum_unused_storage_flow_no(&storage_root)
+                } else {
+                    0
+                },
                 source: source.clone(),
                 status: "starting".to_string(),
                 storage_root: storage_root.clone(),
@@ -15125,8 +15501,14 @@ fn algorithm_traceability_summary(manifest: &Value) -> Value {
         "acceptanceReportSha256": manifest.get("acceptanceReportSha256"),
         "datasetRevision": manifest.get("datasetRevision"),
         "datasetSha256": manifest.get("datasetSha256"),
+        "datasetValidationSha256": manifest.get("datasetValidationSha256"),
         "evaluatorRevision": manifest.get("evaluatorRevision"),
         "evaluatorSha256": manifest.get("evaluatorSha256"),
+        "modelSetRevision": manifest.get("modelSetRevision"),
+        "modelSetSha256": manifest.get("modelSetSha256"),
+        "reproductionManifestRevision": manifest.get("reproductionManifestRevision"),
+        "reproductionManifestSha256": manifest.get("reproductionManifestSha256"),
+        "evaluatedAt": manifest.get("evaluatedAt"),
         "calibrationRevision": manifest.get("calibrationRevision"),
         "calibrationSha256": manifest.get("calibrationSha256"),
         "inputSummarySha256": manifest.get("inputSummarySha256"),
@@ -16239,6 +16621,9 @@ fn write_production_defect_review_response(
         || !matches!(status.as_str(), "pending" | "confirmed" | "false-positive")
         || note.len() > 1024
         || defect_type.len() > 128
+        || (!defect_type.is_empty()
+            && validate_admin_identifier(&defect_type, "defectReview.defectType").is_err())
+        || (status == "false-positive" && note.is_empty())
         || (!severity.is_empty() && !matches!(severity.as_str(), "severe" | "review" | "minor"))
     {
         return http_response(
@@ -16265,13 +16650,25 @@ fn write_production_defect_review_response(
                 actor,
                 "production.defect.reviewed",
                 &id,
-                &format!("status={status} material={}", row.material_id),
+                &format!(
+                    "status={status} type={} severity={} material={}",
+                    row.defect_type, row.severity, row.material_id
+                ),
                 "info",
             ));
             http_response(
                 "200 OK",
                 "application/json; charset=utf-8",
-                &json!({"code":0,"defectId":id,"reviewStatus":status}).to_string(),
+                &json!({
+                    "code":0,
+                    "defectId":id,
+                    "reviewStatus":row.review_status,
+                    "defectType":row.defect_type,
+                    "severity":row.severity,
+                    "reviewedBy":row.reviewed_by,
+                    "reviewedAt":row.reviewed_at
+                })
+                .to_string(),
             )
         }
         Ok(None) => http_response(
@@ -16279,6 +16676,22 @@ fn write_production_defect_review_response(
             "application/json; charset=utf-8",
             &json!({"code":404,"error":"production_defect_not_found"}).to_string(),
         ),
+        Err(sea_orm::DbErr::Custom(message))
+            if message == "production_defect_type_not_configured" =>
+        {
+            http_response(
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json!({"code":400,"error":message}).to_string(),
+            )
+        }
+        Err(sea_orm::DbErr::Custom(message)) if message == "production_defect_inactive" => {
+            http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({"code":409,"error":message}).to_string(),
+            )
+        }
         Err(error) => http_response(
             "500 Internal Server Error",
             "application/json; charset=utf-8",
@@ -16797,6 +17210,9 @@ fn algorithm_traceability_structure_error(manifest: &Value) -> Option<String> {
         "calibrationRevision",
         "datasetRevision",
         "evaluatorRevision",
+        "modelSetRevision",
+        "reproductionManifestRevision",
+        "evaluatedAt",
     ] {
         if manifest
             .get(key)
@@ -16814,7 +17230,10 @@ fn algorithm_traceability_structure_error(manifest: &Value) -> Option<String> {
         "coreSha256",
         "acceptanceReportSha256",
         "datasetSha256",
+        "datasetValidationSha256",
         "evaluatorSha256",
+        "modelSetSha256",
+        "reproductionManifestSha256",
     ] {
         if !sha256_text_is_valid(manifest.get(key)) {
             return Some("algorithm_traceability_sha256_missing".to_string());
@@ -16948,8 +17367,14 @@ fn production_algorithm_traceability_error(payload: &Value) -> Option<String> {
         "releaseCommit",
         "datasetRevision",
         "datasetSha256",
+        "datasetValidationSha256",
         "evaluatorRevision",
         "evaluatorSha256",
+        "modelSetRevision",
+        "modelSetSha256",
+        "reproductionManifestRevision",
+        "reproductionManifestSha256",
+        "evaluatedAt",
     ] {
         let expected = if matches!(key, "scriptSha256" | "coreSha256" | "releaseCommit") {
             implementation.get(key)
@@ -17168,6 +17593,67 @@ fn path_stays_under(path: &Path, root: &Path) -> bool {
 fn path_stays_under_configured_artifact_root(path: &Path) -> bool {
     env::var_os("STEEL_ARTIFACT_ALLOWED_ROOTS")
         .is_some_and(|roots| env::split_paths(&roots).any(|root| path_stays_under(path, &root)))
+}
+
+fn configured_capture_artifact_roots(profile: &runtime_profile::RuntimeProfile) -> Vec<PathBuf> {
+    let Some(relative) = profile.capture_profile.as_deref() else {
+        return Vec::new();
+    };
+    let Some(profile_root) = profile.profile_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(profile_root) = profile_root.canonicalize() else {
+        return Vec::new();
+    };
+    let Ok(capture_path) = profile_root.join(relative).canonicalize() else {
+        return Vec::new();
+    };
+    if !capture_path.starts_with(&profile_root) || !capture_path.is_file() {
+        return Vec::new();
+    }
+    let Ok(document) = fs::read(&capture_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .ok_or(())
+    else {
+        return Vec::new();
+    };
+    let mut configured = Vec::new();
+    if let Some(root) = document
+        .get("storageRoot")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        configured.push(PathBuf::from(root));
+    }
+    if let Some(cameras) = document.get("cameras").and_then(Value::as_array) {
+        configured.extend(cameras.iter().filter_map(|camera| {
+            camera
+                .get("storageRoot")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+        }));
+    }
+    configured
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        // A reviewed camera directory is narrow (for example D:\C1).  Never
+        // turn a capture-profile typo into permission to serve a drive root.
+        .filter(|root| root.parent().is_some())
+        .collect()
+}
+
+fn path_stays_under_configured_capture_root(
+    path: &Path,
+    profile: &runtime_profile::RuntimeProfile,
+) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    configured_capture_artifact_roots(profile)
+        .iter()
+        .any(|root| path.starts_with(root))
 }
 
 fn file_component_is_link(path: &Path) -> bool {
@@ -17853,7 +18339,8 @@ fn production_file_response_with_bkv_root(
     let allowed = (bkv_path && resolved_bkv.is_some())
         || path_stays_under(&path, &bar_surface_capture_root())
         || path_stays_under(&path, &algorithm_data_root())
-        || path_stays_under_configured_artifact_root(&path);
+        || path_stays_under_configured_artifact_root(&path)
+        || path_stays_under_configured_capture_root(&path, state.runtime_config.as_ref());
     if !allowed {
         return http_response(
             "403 Forbidden",
@@ -17952,6 +18439,12 @@ fn runtime_capability_for_route(
     if path == "/api/algorithm/bar-surface/run"
         || path == "/api/algorithm/bar-surface/calibration/fit"
         || path == "/api/production/algorithm/run"
+        || matches!(
+            path,
+            "/api/capture/alignment/rebuild"
+                | "/api/capture/measurement/rebuild"
+                | "/api/capture/defects/rebuild"
+        )
     {
         return Some(RuntimeCapability::Reconstruction);
     }
@@ -17971,6 +18464,17 @@ fn runtime_capability_for_route(
     }
     if path == "/api/config/capture"
         || path == "/api/production/capture-once"
+        || matches!(
+            path,
+            "/api/production/tasks/steel-info"
+                | "/api/production/tasks/steel-in"
+                | "/api/production/tasks/steel-out"
+                | "/api/production/tasks/trigger-event"
+                | "/api/production/steel-info"
+                | "/api/production/steel-in"
+                | "/api/production/steel-out"
+                | "/api/production/trigger-event"
+        )
         || path.starts_with("/api/admin/services/capture/")
         || path.starts_with("/api/capture/")
     {
@@ -17979,12 +18483,66 @@ fn runtime_capability_for_route(
     None
 }
 
+fn runtime_capability_for_production_task_kind(
+    kind: &str,
+) -> Option<runtime_profile::RuntimeCapability> {
+    use runtime_profile::RuntimeCapability;
+
+    match kind.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "algorithm" | "algorithm-run" => Some(RuntimeCapability::Reconstruction),
+        "capture" | "capture-once" | "steel-info" | "steel-in" | "steel-out" | "trigger-event" => {
+            Some(RuntimeCapability::CaptureManagement)
+        }
+        _ => None,
+    }
+}
+
+fn runtime_capability_for_request(
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Option<runtime_profile::RuntimeCapability> {
+    if let Some(capability) = runtime_capability_for_route(method, path) {
+        return Some(capability);
+    }
+    if method != "POST" || path != "/api/production/tasks" {
+        return None;
+    }
+    let request = serde_json::from_str::<Value>(body.trim()).ok()?;
+    let kind = value_string(&request, &["kind", "type", "command"]);
+    runtime_capability_for_production_task_kind(&kind)
+}
+
 fn runtime_capability_guard_response(
     state: &ServiceState,
     method: &str,
     path: &str,
 ) -> Option<Vec<u8>> {
     let capability = runtime_capability_for_route(method, path)?;
+    if state.runtime_config.allows(capability) {
+        return None;
+    }
+    Some(http_response(
+        "409 Conflict",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 409,
+            "error": "runtime_capability_unavailable",
+            "capability": capability.as_str(),
+            "profileId": state.runtime_config.id,
+            "message": "The active runtime profile does not provide this capability"
+        })
+        .to_string(),
+    ))
+}
+
+fn runtime_capability_guard_response_for_request(
+    state: &ServiceState,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Option<Vec<u8>> {
+    let capability = runtime_capability_for_request(method, path, body)?;
     if state.runtime_config.allows(capability) {
         return None;
     }
@@ -26650,18 +27208,29 @@ fn handle_client<S: Read + Write>(
         let _ = stream.write_all(&runtime_drain_response(&state, &request, peer));
         return;
     }
-    let authorized_session = match authorize_request(&state, &request, method, path) {
-        Ok(session) => session,
-        Err(response) => {
-            let _ = stream.write_all(&response);
-            return;
+    let trusted_trigger = trusted_trigger_service_request(&state, &request, method, path, peer);
+    let authorized_session = if trusted_trigger {
+        None
+    } else {
+        match authorize_request(&state, &request, method, path) {
+            Ok(session) => session,
+            Err(response) => {
+                let _ = stream.write_all(&response);
+                return;
+            }
         }
     };
-    let actor = authorized_session
-        .as_ref()
-        .map(|session| session.user_id.as_str())
-        .unwrap_or("admin");
-    if let Some(response) = runtime_capability_guard_response(&state, method, path) {
+    let actor = if trusted_trigger {
+        "trigger-gateway"
+    } else {
+        authorized_session
+            .as_ref()
+            .map(|session| session.user_id.as_str())
+            .unwrap_or("anonymous")
+    };
+    if let Some(response) =
+        runtime_capability_guard_response_for_request(&state, method, path, body)
+    {
         let _ = stream.write_all(&response);
         return;
     }
@@ -26988,10 +27557,18 @@ fn handle_client<S: Read + Write>(
             write_capture_summary_response(&state, body, actor)
         }
         ("POST", "/internal/v1/capture-commit") => {
-            write_capture_commit_response(&state, body)
+            if internal_callback_from_loopback(peer) {
+                write_capture_commit_response(&state, body)
+            } else {
+                http_response(
+                    "403 Forbidden",
+                    "application/json; charset=utf-8",
+                    &json!({"code":403,"error":"capture_commit_loopback_only"}).to_string(),
+                )
+            }
         }
         ("POST", "/internal/v1/capture-regions") => {
-            if peer.is_some_and(|address| address.ip().is_loopback()) {
+            if internal_callback_from_loopback(peer) {
                 write_capture_regions_response(&state, body)
             } else {
                 http_response(
@@ -27011,7 +27588,7 @@ fn handle_client<S: Read + Write>(
             write_production_defect_response(&state, body, actor)
         }
         ("POST", "/internal/v1/defect-batch") => {
-            if peer.is_some_and(|address| address.ip().is_loopback()) {
+            if internal_callback_from_loopback(peer) {
                 write_production_defect_batch_response(&state, body, "sick-capture")
             } else {
                 http_response(
@@ -27597,6 +28174,7 @@ fn main() -> std::io::Result<()> {
     });
     production_tasks::start_worker(Arc::clone(&state));
     start_system_health_alarm_monitor(Arc::clone(&state));
+    start_capture_camera_alarm_monitor(Arc::clone(&state));
     println!("steel inspection service listening on http://127.0.0.1:{port}");
     if let Some(web_root) = active_web_root() {
         println!(
@@ -28186,6 +28764,69 @@ mod tests {
             ))
             .unwrap();
         (format!("bkv://{batch_id}/{relative}"), artifact_path)
+    }
+
+    #[test]
+    fn production_file_serves_every_reviewed_capture_camera_root() {
+        let root = std::env::temp_dir().join(format!(
+            "steel-capture-file-roots-{}-{}",
+            std::process::id(),
+            SITE_CONFIG_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let camera_one = root.join("camera-one");
+        let camera_two = root.join("camera-two");
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&camera_one).unwrap();
+        fs::create_dir_all(&camera_two).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let first_image = camera_one.join("first.png");
+        let second_image = camera_two.join("second.png");
+        let outside_image = outside.join("outside.png");
+        fs::write(&first_image, b"camera-one").unwrap();
+        fs::write(&second_image, b"camera-two").unwrap();
+        fs::write(&outside_image, b"outside").unwrap();
+        fs::write(root.join("runtime.json"), b"{}").unwrap();
+        fs::write(
+            root.join("capture.json"),
+            serde_json::to_vec(&json!({
+                "storageRoot": root.join("canonical"),
+                "cameras": [
+                    { "id": "C1", "storageRoot": camera_one },
+                    { "id": "C2", "storageRoot": camera_two }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut state = production_test_state();
+        let profile = Arc::make_mut(&mut state.runtime_config);
+        profile.profile_path = root.join("runtime.json");
+        profile.capture_profile = Some("capture.json".to_string());
+
+        for image in [&first_image, &second_image] {
+            let response = production_file_response_with_bkv_root(
+                &state,
+                &format!(
+                    "path={}",
+                    url_encode_component(&image.display().to_string())
+                ),
+                None,
+            );
+            assert!(response_text(response).starts_with("HTTP/1.1 200 OK"));
+        }
+        let denied = production_file_response_with_bkv_root(
+            &state,
+            &format!(
+                "path={}",
+                url_encode_component(&outside_image.display().to_string())
+            ),
+            None,
+        );
+        assert!(response_text(denied).starts_with("HTTP/1.1 403 Forbidden"));
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
@@ -29186,6 +29827,60 @@ mod tests {
     }
 
     #[test]
+    fn trigger_service_identity_is_bounded_to_loopback_production_routes() {
+        let state = production_test_state();
+        let request = concat!(
+            "POST /api/production/tasks/steel-in HTTP/1.1\r\n",
+            "X-Trigger-Operator-Token: operator-0123456789abcdef-ABCDEF!\r\n\r\n{}"
+        );
+        let loopback = Some("127.0.0.1:42000".parse().expect("loopback address"));
+        let remote = Some("192.0.2.10:42000".parse().expect("remote address"));
+
+        assert!(trusted_trigger_service_request(
+            &state,
+            request,
+            "POST",
+            "/api/production/tasks/steel-in",
+            loopback,
+        ));
+        assert!(!trusted_trigger_service_request(
+            &state,
+            request,
+            "POST",
+            "/api/production/tasks/steel-in",
+            remote,
+        ));
+        assert!(!trusted_trigger_service_request(
+            &state,
+            request,
+            "POST",
+            "/api/production/algorithm/run",
+            loopback,
+        ));
+        assert!(!trusted_trigger_service_request(
+            &state,
+            "POST /api/production/tasks/steel-in HTTP/1.1\r\n\r\n{}",
+            "POST",
+            "/api/production/tasks/steel-in",
+            loopback,
+        ));
+    }
+
+    #[test]
+    fn internal_capture_callbacks_reject_non_loopback_peers() {
+        assert!(internal_callback_from_loopback(Some(
+            "127.0.0.1:42000".parse().expect("loopback address")
+        )));
+        assert!(internal_callback_from_loopback(Some(
+            "[::1]:42000".parse().expect("ipv6 loopback address")
+        )));
+        assert!(!internal_callback_from_loopback(Some(
+            "192.0.2.10:42000".parse().expect("remote address")
+        )));
+        assert!(!internal_callback_from_loopback(None));
+    }
+
+    #[test]
     fn runtime_drain_atomically_closes_admission_and_counts_preexisting_work() {
         let state = Arc::new(production_test_state());
         let entered = Arc::new(std::sync::Barrier::new(2));
@@ -29569,6 +30264,44 @@ mod tests {
         assert!(!ok);
         assert_eq!(detail["reason"], json!("capture_sdk_restart_required"));
         assert_eq!(detail["restartRequired"], json!(true));
+    }
+
+    #[test]
+    fn capture_health_surfaces_sanitized_camera_image_quality_contract() {
+        let body = json!({
+            "service": "steel_capture_service",
+            "ready": true,
+            "sdkReady": true,
+            "sdkCode": 0,
+            "recoveryRequired": false,
+            "restartRequired": false,
+            "imageQuality": {
+                "schema": "steel.capture-image-quality.v1",
+                "activeAlarmCount": 1,
+                "cameras": [{
+                    "cameraId": "C2",
+                    "status": "blocked",
+                    "alarmActive": true,
+                    "alarmType": "camera-image-blocked",
+                    "reasons": ["image-black"]
+                }]
+            }
+        })
+        .to_string();
+        let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
+        let state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+        let (ok, detail) = capture_health_component(&state);
+        server.join().expect("capture image quality health server");
+
+        assert!(ok);
+        assert_eq!(
+            detail["imageQuality"]["schema"],
+            json!("steel.capture-image-quality.v1")
+        );
+        assert_eq!(
+            detail["imageQuality"]["cameras"][0]["alarmType"],
+            json!("camera-image-blocked")
+        );
     }
 
     #[test]
@@ -30231,6 +30964,7 @@ mod tests {
                 db::SteelFlowInput {
                     session_id: "SESSION-FLOW-IDENTITY".to_string(),
                     material_id: "2603".to_string(),
+                    minimum_flow_no: 0,
                     source: "grayscale".to_string(),
                     status: "completed".to_string(),
                     storage_root: "H:/steel".to_string(),
@@ -31528,6 +32262,31 @@ mod tests {
         assert!(
             runtime_capability_guard_response(&state, "GET", "/api/capture/lifecycle").is_none()
         );
+
+        for (body, capability) in [
+            (r#"{"kind":"capture-once"}"#, "captureManagement"),
+            (r#"{"kind":"algorithm-run"}"#, "reconstruction"),
+        ] {
+            let response = runtime_capability_guard_response_for_request(
+                &state,
+                "POST",
+                "/api/production/tasks",
+                body,
+            )
+            .unwrap_or_else(|| panic!("generic task was not guarded: {body}"));
+            let text = response_text(response);
+            assert!(text.starts_with("HTTP/1.1 409 Conflict"), "{body}");
+            assert!(text.contains(capability), "{body}");
+        }
+
+        let rebuild = runtime_capability_guard_response_for_request(
+            &state,
+            "POST",
+            "/api/capture/measurement/rebuild",
+            "{}",
+        )
+        .expect("measurement rebuild must be guarded");
+        assert!(response_text(rebuild).contains("reconstruction"));
     }
 
     #[test]
@@ -32721,6 +33480,39 @@ mod tests {
             "/api/production/status"
         ));
         assert!(!is_production_mutation_route("POST", "/api/param"));
+    }
+
+    #[test]
+    fn production_and_rebuild_mutations_require_service_permission() {
+        for path in [
+            "/api/production/tasks",
+            "/api/production/tasks/cancel",
+            "/api/production/tasks/retry",
+            "/api/production/tasks/steel-info",
+            "/api/production/tasks/steel-in",
+            "/api/production/tasks/steel-out",
+            "/api/production/tasks/trigger-event",
+            "/api/production/steel-info",
+            "/api/production/steel-in",
+            "/api/production/steel-out",
+            "/api/production/trigger-event",
+            "/api/production/secondary-data",
+            "/api/production/capture-summary",
+            "/api/production/capture-once",
+            "/api/production/algorithm/run",
+            "/api/production/defect",
+            "/api/algorithm/bar-surface/run",
+            "/api/algorithm/bar-surface/calibration/fit",
+            "/api/capture/alignment/rebuild",
+            "/api/capture/measurement/rebuild",
+            "/api/capture/defects/rebuild",
+        ] {
+            assert_eq!(
+                permission_for_route("POST", path),
+                Some("admin.services"),
+                "missing mutation permission for {path}"
+            );
+        }
     }
 
     #[test]
@@ -34932,6 +35724,81 @@ mod tests {
     }
 
     #[test]
+    fn production_defect_annotation_validates_and_persists_structured_fields() {
+        let state = production_test_state();
+        let created = response_json(write_production_defect_response(
+            &state,
+            r#"{
+                "materialId":"MAT-ANNOTATION",
+                "sessionId":"SESSION-ANNOTATION",
+                "inspectionId":"INSP-ANNOTATION",
+                "defectId":"SOURCE-ANNOTATION-001",
+                "cameraId":"CAM-01",
+                "defectType":"review",
+                "severity":"review",
+                "xMm":12.5,
+                "yMm":6.25,
+                "depthMm":0.21,
+                "confidence":0.98
+            }"#,
+            "detector",
+        ));
+        let defect_id = created["defectId"]
+            .as_str()
+            .expect("created defect id")
+            .to_string();
+
+        let missing_reason = response_text(write_production_defect_review_response(
+            &state,
+            &json!({
+                "defectId": defect_id,
+                "status": "false-positive",
+                "defectType": "scratch",
+                "severity": "minor"
+            })
+            .to_string(),
+            "reviewer-01",
+        ));
+        assert!(missing_reason.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(missing_reason.contains("invalid_defect_review"));
+
+        let unknown_type = response_text(write_production_defect_review_response(
+            &state,
+            &json!({
+                "defectId": defect_id,
+                "status": "confirmed",
+                "defectType": "not-configured",
+                "severity": "minor",
+                "note": "invalid category"
+            })
+            .to_string(),
+            "reviewer-01",
+        ));
+        assert!(unknown_type.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(unknown_type.contains("production_defect_type_not_configured"));
+
+        let reviewed = response_json(write_production_defect_review_response(
+            &state,
+            &json!({
+                "defectId": defect_id,
+                "status": "confirmed",
+                "defectType": "pit-compact",
+                "severity": "minor",
+                "note": "人工确认紧凑凹坑"
+            })
+            .to_string(),
+            "reviewer-01",
+        ));
+        assert_eq!(reviewed["reviewStatus"], "confirmed");
+        assert_eq!(reviewed["defectType"], "pit-compact");
+        assert_eq!(reviewed["severity"], "minor");
+        assert_eq!(reviewed["reviewedBy"], "reviewer-01");
+        assert!(reviewed["reviewedAt"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
     fn alarm_transition_requires_acknowledgement_and_preserves_confirming_actor() {
         let state = production_test_state();
         let (alarm, created) = state
@@ -35352,6 +36219,101 @@ mod tests {
     }
 
     #[test]
+    fn capture_camera_quality_alarm_is_persisted_per_camera_and_auto_resolved() {
+        let state = production_test_state();
+        let blocked = json!({
+            "imageQuality": {
+                "schema": "steel.capture-image-quality.v1",
+                "cameras": [{
+                    "cameraId": "C3",
+                    "status": "blocked",
+                    "alarmActive": true,
+                    "alarmType": "camera-image-blocked",
+                    "reasons": ["image-low-contrast"],
+                    "failureStreak": 12,
+                    "activeSince": "2026-08-29T12:00:00.000Z",
+                    "metrics": {"dynamicRange": 0.4, "validDepthRatio": 0.0},
+                    "automaticReconnect": {"enabled": true, "pending": false}
+                }]
+            }
+        });
+
+        let created = reconcile_capture_camera_alarms(&state, &blocked)
+            .expect("persist camera quality alarm");
+        assert_eq!(created.len(), 1);
+        assert!(created[0].starts_with("created:ALARM-CAMERA-"));
+
+        let source = "capture-camera-image-quality:C3".to_string();
+        let open = state
+            .runtime
+            .block_on(db::list_production_alarms(
+                &state.database.connection,
+                db::ProductionAlarmFilter {
+                    status: Some("open".to_string()),
+                    source: Some(source.clone()),
+                    ..db::ProductionAlarmFilter::default()
+                },
+            ))
+            .expect("open camera alarms");
+        assert_eq!(open.total, 1);
+        assert_eq!(open.alarms[0].alarm_type, "camera-image-blocked");
+        assert_eq!(open.alarms[0].camera_id, "C3");
+
+        let recovered = json!({
+            "imageQuality": {
+                "schema": "steel.capture-image-quality.v1",
+                "cameras": [{
+                    "cameraId": "C3",
+                    "status": "healthy",
+                    "alarmActive": false,
+                    "alarmType": "",
+                    "reasons": [],
+                    "recoveredAt": "2026-08-29T12:00:10.000Z"
+                }]
+            }
+        });
+        let resolved = reconcile_capture_camera_alarms(&state, &recovered)
+            .expect("resolve camera quality alarm");
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].starts_with("resolved:ALARM-CAMERA-"));
+
+        let history = state
+            .runtime
+            .block_on(db::list_production_alarms(
+                &state.database.connection,
+                db::ProductionAlarmFilter {
+                    status: Some("history".to_string()),
+                    source: Some(source),
+                    ..db::ProductionAlarmFilter::default()
+                },
+            ))
+            .expect("camera alarm history");
+        assert_eq!(history.total, 1);
+        assert_eq!(history.alarms[0].status, "resolved");
+        assert_eq!(history.alarms[0].resolved_by, CAPTURE_CAMERA_ALARM_ACTOR);
+    }
+
+    #[test]
+    fn capture_camera_alarm_signature_ignores_live_metric_churn() {
+        let first = json!({
+            "imageQuality": {"cameras": [{
+                "cameraId": "C1", "status": "healthy", "alarmActive": false,
+                "alarmType": "", "reasons": [], "metrics": {"meanIntensity": 10.0}
+            }]}
+        });
+        let second = json!({
+            "imageQuality": {"cameras": [{
+                "cameraId": "C1", "status": "healthy", "alarmActive": false,
+                "alarmType": "", "reasons": [], "metrics": {"meanIntensity": 22.0}
+            }]}
+        });
+        assert_eq!(
+            capture_camera_alarm_signature(&first),
+            capture_camera_alarm_signature(&second)
+        );
+    }
+
+    #[test]
     fn calibration_capture_fit_requires_one_complete_frame_from_each_configured_camera() {
         let root = std::env::temp_dir().join(format!(
             "steel-calibration-capture-summary-{}-{}",
@@ -35562,8 +36524,14 @@ mod tests {
                 "acceptanceReportSha256": "1".repeat(64),
                 "datasetRevision": "DATASET-1",
                 "datasetSha256": "2".repeat(64),
+                "datasetValidationSha256": "5".repeat(64),
                 "evaluatorRevision": "EVALUATOR-1",
                 "evaluatorSha256": "3".repeat(64),
+                "modelSetRevision": "MODEL-1",
+                "modelSetSha256": "6".repeat(64),
+                "reproductionManifestRevision": "REPRODUCTION-1",
+                "reproductionManifestSha256": "7".repeat(64),
+                "evaluatedAt": "2026-08-29T00:00:00Z",
                 "releaseCommit": "4".repeat(40),
                 "inputSummarySha256": input_summary,
                 "inputFrameIds": ["frame-001"],
@@ -35606,6 +36574,21 @@ mod tests {
             algorithm_traceability_structure_error(&failed_gate["result"]["manifest"]),
             Some("algorithm_quality_gate_failed".to_string())
         );
+    }
+
+    #[test]
+    fn algorithm_acceptance_timestamps_are_rfc3339_and_orderable_across_offsets() {
+        assert_eq!(
+            rfc3339_epoch_nanos("2026-08-29T00:00:00Z"),
+            rfc3339_epoch_nanos("2026-08-29T08:00:00+08:00")
+        );
+        assert!(
+            rfc3339_epoch_nanos("2026-08-29T00:00:00.123456789Z")
+                > rfc3339_epoch_nanos("2026-08-29T00:00:00Z")
+        );
+        assert_eq!(rfc3339_epoch_nanos("2026-02-29T00:00:00Z"), None);
+        assert_eq!(rfc3339_epoch_nanos("2026-08-29 00:00:00Z"), None);
+        assert_eq!(rfc3339_epoch_nanos("2026-08-29T00:00:00"), None);
     }
 
     #[test]

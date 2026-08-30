@@ -69,25 +69,65 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const switchRevision = useRef(0);
+  const frameIndexRef = useRef(0);
+  const requestedFrameIndexRef = useRef(0);
+  const loadRevisionRef = useRef(0);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError('');
+  useEffect(() => {
+    frameIndexRef.current = frameIndex;
+    requestedFrameIndexRef.current = requestedFrameIndex;
+  }, [frameIndex, requestedFrameIndex]);
+
+  const load = useCallback(async (showLoading = true, signal?: AbortSignal) => {
+    const revision = ++loadRevisionRef.current;
+    if (showLoading) setLoading(true);
     try {
-      const result = await readCaptureHistory(300);
-      setHistory(result);
-      const latest = Math.max(0, result.frames.length - 1);
-      setFrameIndex(latest);
-      setRequestedFrameIndex(latest);
+      const result = await readCaptureHistory(300, undefined, signal);
+      if (signal?.aborted || revision !== loadRevisionRef.current) return;
+      setHistory((current) => {
+        const latest = Math.max(0, result.frames.length - 1);
+        if (!current?.frames.length) {
+          setFrameIndex(latest);
+          setRequestedFrameIndex(latest);
+          return result;
+        }
+        const requested = Math.max(
+          0,
+          Math.min(current.frames.length - 1, requestedFrameIndexRef.current),
+        );
+        const selected = current.frames[requested]
+          ?? current.frames[frameIndexRef.current];
+        const followingLatest = requested >= current.frames.length - 1;
+        const preserved = followingLatest
+          ? latest
+          : result.frames.findIndex((candidate) => candidate.frameId === selected?.frameId);
+        const nextIndex = preserved >= 0 ? preserved : latest;
+        setFrameIndex(nextIndex);
+        setRequestedFrameIndex(nextIndex);
+        return result;
+      });
+      setError('');
     } catch (loadError) {
+      if (signal?.aborted || revision !== loadRevisionRef.current) return;
       setError(loadError instanceof Error ? loadError.message : '历史采集读取失败');
     } finally {
-      setLoading(false);
+      if (!signal?.aborted && revision === loadRevisionRef.current && showLoading) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    void load();
+    const controller = new AbortController();
+    void load(true, controller.signal);
+    const timer = window.setInterval(
+      () => void load(false, controller.signal),
+      1_500,
+    );
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
   }, [load]);
 
   const frames = history?.frames ?? [];

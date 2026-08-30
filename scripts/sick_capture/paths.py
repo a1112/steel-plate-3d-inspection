@@ -81,6 +81,11 @@ def flow_manifest_path(storage_root: Path, value: str | int) -> Path:
     return flow_root(storage_root, value) / "flow.json"
 
 
+def capture_flow_handoff_path(storage_root: Path) -> Path:
+    """Return the bounded capture-to-algorithm realtime hand-off path."""
+    return Path(storage_root) / "system" / "capture" / "latest-flows.json"
+
+
 def acquisition_manifest_path(storage_root: Path, value: str | int) -> Path:
     return flow_root(storage_root, value) / "acquisition" / "manifest.json"
 

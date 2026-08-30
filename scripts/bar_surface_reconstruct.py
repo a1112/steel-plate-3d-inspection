@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an eight-camera bar-surface stitching prototype from captured frames.
+"""Build a configured-camera bar-surface reconstruction from captured frames.
 
 The prototype reads the production capture layout:
   H:/camera1/<material>/depth/*.png
@@ -217,8 +217,8 @@ def load_algorithm_config(path: Path, production: bool) -> dict[str, Any]:
         if not minimum <= float(value) <= maximum:
             raise ValueError(f"algorithm threshold {key} is outside [{minimum}, {maximum}]")
     quality_gate = payload.get("qualityGate")
-    if not isinstance(quality_gate, dict) or int(quality_gate.get("requiredCameraCount", 0)) != 8:
-        raise ValueError("algorithm config qualityGate must require exactly eight cameras")
+    if not isinstance(quality_gate, dict) or int(quality_gate.get("requiredCameraCount", 0)) != 6:
+        raise ValueError("algorithm config qualityGate must require exactly six cameras")
     if quality_gate.get("requireCalibrationForEveryCamera") is not True:
         raise ValueError("algorithm config qualityGate must require calibration for every camera")
     if quality_gate.get("requireReconstructionAcceptance") is not True:
@@ -256,7 +256,7 @@ def apply_algorithm_config(args: argparse.Namespace, production: bool) -> dict[s
             "path": "",
             "thresholds": effective_thresholds,
             "qualityGate": {
-                "requiredCameraCount": 8,
+                "requiredCameraCount": 6,
                 "requireCalibrationForEveryCamera": False,
                 "requireReconstructionAcceptance": True,
                 "maximumSyntheticDefectCount": 64,
@@ -325,11 +325,32 @@ def load_algorithm_qualification(
     for revision_key, hash_key in (
         ("datasetRevision", "datasetSha256"),
         ("evaluatorRevision", "evaluatorSha256"),
+        ("modelSetRevision", "modelSetSha256"),
+        ("reproductionManifestRevision", "reproductionManifestSha256"),
     ):
         if not str(report.get(revision_key, "")).strip():
             raise ValueError(f"algorithm acceptance report requires {revision_key}")
         if not re.fullmatch(r"[0-9a-fA-F]{64}", str(report.get(hash_key, ""))):
             raise ValueError(f"algorithm acceptance report requires valid {hash_key}")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", str(report.get("datasetValidationSha256", ""))):
+        raise ValueError("algorithm acceptance report requires valid datasetValidationSha256")
+    timestamp_pattern = re.compile(
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    )
+    try:
+        evaluated_text = str(report["evaluatedAt"])
+        approved_text = str(report["approvals"]["approvedAt"])
+        if not timestamp_pattern.fullmatch(evaluated_text) or not timestamp_pattern.fullmatch(approved_text):
+            raise ValueError("timestamp is not RFC 3339")
+        evaluated_at = dt.datetime.fromisoformat(evaluated_text.replace("Z", "+00:00"))
+        approved_at = dt.datetime.fromisoformat(approved_text.replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("algorithm acceptance report requires RFC 3339 evaluation and approval times") from error
+    if evaluated_at.tzinfo is None or approved_at.tzinfo is None:
+        raise ValueError("algorithm acceptance report times require an explicit UTC offset")
+    if approved_at < evaluated_at:
+        raise ValueError("algorithm acceptance approval must not precede evaluation completion")
     approvals = report.get("approvals")
     if not isinstance(approvals, dict) or any(
         not str(approvals.get(key, "")).strip()
@@ -361,8 +382,14 @@ def load_algorithm_qualification(
         "acceptanceReportSha256": sha256_file(report_path),
         "datasetRevision": str(report["datasetRevision"]),
         "datasetSha256": str(report["datasetSha256"]).lower(),
+        "datasetValidationSha256": str(report["datasetValidationSha256"]).lower(),
         "evaluatorRevision": str(report["evaluatorRevision"]),
         "evaluatorSha256": str(report["evaluatorSha256"]).lower(),
+        "modelSetRevision": str(report["modelSetRevision"]),
+        "modelSetSha256": str(report["modelSetSha256"]).lower(),
+        "reproductionManifestRevision": str(report["reproductionManifestRevision"]),
+        "reproductionManifestSha256": str(report["reproductionManifestSha256"]).lower(),
+        "evaluatedAt": str(report["evaluatedAt"]),
         "approvedCalibrationRevision": calibration_revision,
         "approvedCalibrationSha256": calibration_sha256,
         **implementation,
@@ -667,8 +694,8 @@ def write_profile(output_root: Path) -> None:
         profile_path,
         {
             "schema": "steel.bar_surface.profile.v1",
-            "name": "eight-camera-bar-surface-prototype",
-            "captureLayout": "H:/camera1..camera8/<material>/{depth,intensity,metadata}",
+            "name": "six-camera-bar-surface-production",
+            "captureLayout": "configured six-camera SICK roots/<material>/{depth,intensity,metadata}",
             "algorithmRoot": str(output_root),
             "outputs": [
                 "cropped-2d",
@@ -2368,7 +2395,7 @@ def finalize_quality_gate(
 ) -> dict[str, Any]:
     policy = algorithm_config.get("qualityGate", {})
     reasons: list[str] = []
-    required_cameras = int(policy.get("requiredCameraCount", 8))
+    required_cameras = int(policy.get("requiredCameraCount", 6))
     if int(manifest.get("cameraCount", 0)) != required_cameras:
         reasons.append("required_camera_count_not_met")
     if bool(policy.get("requireCalibrationForEveryCamera", True)) and int(
@@ -2396,14 +2423,24 @@ def finalize_quality_gate(
         "coreSha256",
         "acceptanceReportSha256",
         "datasetSha256",
+        "datasetValidationSha256",
         "evaluatorSha256",
+        "modelSetSha256",
+        "reproductionManifestSha256",
         "calibrationSha256",
     ):
         if not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get(key, ""))):
             reasons.append(f"{key}_missing")
     if not re.fullmatch(r"[0-9a-f]{40,64}", str(manifest.get("releaseCommit", ""))):
         reasons.append("release_commit_missing")
-    for key in ("datasetRevision", "evaluatorRevision", "calibrationRevision"):
+    for key in (
+        "datasetRevision",
+        "evaluatorRevision",
+        "modelSetRevision",
+        "reproductionManifestRevision",
+        "calibrationRevision",
+        "evaluatedAt",
+    ):
         if not str(manifest.get(key, "")).strip():
             reasons.append(f"{key}_missing")
     return {"passed": not reasons, "reasons": reasons}
@@ -2483,8 +2520,14 @@ def build_manifest(
         "acceptanceReportSha256": algorithm_qualification.get("acceptanceReportSha256", ""),
         "datasetRevision": algorithm_qualification.get("datasetRevision", ""),
         "datasetSha256": algorithm_qualification.get("datasetSha256", ""),
+        "datasetValidationSha256": algorithm_qualification.get("datasetValidationSha256", ""),
         "evaluatorRevision": algorithm_qualification.get("evaluatorRevision", ""),
         "evaluatorSha256": algorithm_qualification.get("evaluatorSha256", ""),
+        "modelSetRevision": algorithm_qualification.get("modelSetRevision", ""),
+        "modelSetSha256": algorithm_qualification.get("modelSetSha256", ""),
+        "reproductionManifestRevision": algorithm_qualification.get("reproductionManifestRevision", ""),
+        "reproductionManifestSha256": algorithm_qualification.get("reproductionManifestSha256", ""),
+        "evaluatedAt": algorithm_qualification.get("evaluatedAt", ""),
         "calibrationRevision": calibration_revision,
         "calibrationSha256": calibration_sha256,
         "inputSummarySha256": input_traceability.get("inputSummarySha256", ""),

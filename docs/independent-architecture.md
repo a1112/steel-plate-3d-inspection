@@ -1,5 +1,12 @@
 # Independent Runtime Architecture
 
+> Historical compatibility note: this document preserves the former LVM/C++
+> and eight-camera implementation history. It is not the current production
+> topology authority. The formal baseline is the six-camera SICK GenTL route
+> with one SCM Supervisor and six managed children defined in
+> [Runtime Boundaries V2](runtime-boundaries-v2.md). Any conflict is resolved in
+> favor of that document and the executable/package contracts.
+
 The inspection system is split into five runtime boundaries:
 
 ```text
@@ -83,13 +90,16 @@ adapter; conversely, a direct profile does not open the converted BKV catalog.
 The reconstruction implementation is not trusted merely because the process exits successfully. Production trust is split across four immutable inputs:
 
 - the packaged `steel.algorithm-config.v1` configuration and its SHA-256;
-- an externally approved `steel.algorithm-acceptance.v1` report binding the exact release commit, Python script, C++ core, frozen dataset/evaluator, and calibration;
-- the exact eight-camera input artifacts and their per-file hashes;
+- an externally approved `steel.algorithm-acceptance.v1` report binding the exact release commit, Python script, C++ core, frozen dataset and passing validator report, production model set, reproduction manifest, evaluator, and calibration;
+- the exact configured six-camera SICK input artifacts and their per-file hashes;
 - the per-run manifest containing algorithm/config/calibration identities, thresholds, quality-gate result, and real/synthetic defect counts.
 
-Rust readiness exposes separate `algorithm` and `productionPolicy` checks. Missing or mismatched qualification evidence, an invalid production profile, an incomplete eight-camera run, a failed quality gate, or any synthetic output closes readiness and must prevent a production quality conclusion. The pending example acceptance report is documentation only and is never a production input.
+Rust readiness exposes separate `algorithm` and `productionPolicy` checks. Missing or mismatched qualification evidence, an invalid production profile, an incomplete configured six-camera SICK run, a failed quality gate, or any synthetic output closes readiness and must prevent a production quality conclusion. The pending example acceptance report is documentation only and is never a production input.
 
-## Capture Provider Modes
+## Historical Capture Provider Modes
+
+The following modes describe retained development/compatibility behavior. They
+must not be interpreted as alternatives to the formal SICK production route.
 
 The Rust service reads these environment variables:
 
@@ -100,7 +110,8 @@ The Rust service reads these environment variables:
   Rust connects to another compatible capture API process.
 
 - `STEEL_CAPTURE_PROVIDER=simulated`
-  Rust does not connect to a local capture API and uses the simulated eight-camera fallback.
+  Rust does not connect to a local capture API and uses a simulated fallback;
+  that mode cannot generate actual-camera production evidence.
 
 - `STEEL_CAPTURE_PROVIDER=bkv`
   The Supervisor starts no camera SDK process in BKV mode. `config/project.json` must select the
@@ -126,17 +137,17 @@ For headless mode, `CAPTURE_SERVICE_PORT` can still be used and defaults to `431
 
 Production delivery has two independent installation lifecycles:
 
-1. The background runtime package is placed in a protected machine directory and registered as the `SteelInspectionRuntime` Windows service. The SCM supervisor owns the image, algorithm, capture, business, and trigger processes; the business service never starts a raw-source or algorithm child.
+1. The background runtime package is placed in a protected machine directory and registered as the `SteelInspectionRuntime` Windows service. The SCM supervisor owns image service, image worker, defect worker, capture, business, and trigger processes; the business service never starts a raw-source or algorithm child.
 2. The signed Tauri MSI/NSIS installs the operator desktop client. Closing or uninstalling it does not stop or uninstall the background service.
 
 The desktop installer does not currently install the service, and the service installer does not currently install the desktop client. Tauri now selects the offline WebView2 installer and per-machine NSIS mode; formal packaging requires a Microsoft-signed `VC_redist.x64.exe`, one MSI, one NSIS, valid timestamped signatures, and the desktop EXE. Camera SDK/driver, database client, signature, and target-machine prerequisites still belong to the release/deployment boundary rather than to the application runtime graph. See [release-deployment-and-operations.md](release-deployment-and-operations.md).
 
 ## Runtime Rules
 
-- Production deployment uses one Windows SCM host named `SteelInspectionRuntime`. The host owns no SDK or business logic; it injects reviewed environment files, starts image, algorithm, capture, business, and trigger processes with loopback application-level readiness gates, stops them in reverse order, and applies a bounded outer restart policy. The outer host atomically publishes `StateRoot/service/supervisor-status.json`; whole-runtime restart-budget exhaustion survives process exit, while per-process failures are reported in health and persistent system-health alarms. The desktop client remains independent of all backend lifecycles. Source/static preflight is not evidence that SCM state, business drain, continuous log rotation, ACLs, recovery, or upgrade rollback work on the target machine.
+- Production deployment uses one Windows SCM host named `SteelInspectionRuntime`. The host owns no SDK or business logic; it injects reviewed environment files, starts image service, image worker, defect worker, capture, business, and trigger processes with loopback application-level readiness gates, stops them in reverse order, and applies a bounded outer restart policy. The outer host atomically publishes `StateRoot/service/supervisor-status.json`; whole-runtime restart-budget exhaustion survives process exit, while per-process failures are reported in health and persistent system-health alarms. The desktop client remains independent of all backend lifecycles. Source/static preflight is not evidence that SCM state, business drain, continuous log rotation, ACLs, recovery, or upgrade rollback work on the target machine.
 - Exactly one process may own camera SDK handles; the formal owner is `steel_capture_service.exe`.
 - The Rust service is the API gateway and business orchestrator, not a camera driver.
-- Rust persists calibration dispatch/reconciliation intent and result, while C++ remains the only process that executes SDK calibration. C++ atomically stages known-good previous files with SHA-256 before formal eight-camera writes; those file-only tokens survive restart, while the vendor runtime structure stays process-local and is never serialized.
+- Rust persists calibration dispatch/reconciliation intent and result, while the capture owner remains the only process that executes SDK calibration. It atomically stages known-good previous files with SHA-256 before formal configured-camera writes; those file-only tokens survive restart, while vendor runtime structures stay process-local and are never serialized.
 - Rust persists one stable production `chainId` per material/session. Safety-critical tasks use `require-success`, are claimed only after their direct predecessor succeeds, and recursively enter terminal `blocked` state after a failed, cancelled, interrupted, or blocked prerequisite. Retrying the failed chain root requeues its blocked descendants; only explicitly safe `trigger-event` cleanup may opt into `always-run`.
 - SQLite backups use an online database snapshot rather than copying the live file. MySQL backup/restore runs as a server-side single-transaction job with credentials in a restricted defaults file; both recovery paths use a versioned SHA-256 manifest and explicit restore confirmation.
 - Rust readiness is gated by database, durable-task worker, capture API/SDK, persistent calibration reconciliation, capture storage/writer queue/capacity, the required trigger gateway, algorithm qualification, and the production-policy check. For non-simulated capture it takes the minimum capacity across the global and every camera root, reports a non-blocking warning at twice the hard byte watermark or five percentage points above the hard percentage watermark, fails closed below either hard watermark, reports recent successful write throughput and estimated remaining time, and rejects only new steel-info/steel-in admission so an existing session can retry or steel-out safely. Provider readiness also fails closed on non-terminal or invalid rollback manifests. Health details expose stable reasons without leaking local paths, origins, IP addresses, or raw dependency bodies.
@@ -158,7 +169,7 @@ The architecture describes the required end state. As of 2026-07-16, the followi
 - The current runtime folder is a dirty-worktree/no-desktop-bundle engineering package, not a release candidate.
 - Supervisor source hardening now uses an explicit inherited stdio handle list, suspended child creation followed by Job Object assignment/resume, KILL_ON_JOB_CLOSE/TerminateJobObject process-tree cleanup, synchronous HTTP/TCP/UDP trigger binding, and application-level HTTP identity/health probes. The elevated installer protects runtime/policy ACLs and ancestor chains, restores its managed service/env/registry state on upgrade failure, bounds SCM failure actions, and the uninstaller waits for service/port release. Supervisor/trigger/security/port-conflict regressions, three PowerShell AST parses and the static installer contract have passed in the engineering workspace. Rust service/trigger business drain, live SCM status semantics, continuous log rotation, effective ACL/ancestor validation, external binary/database rollback, and supervisor-crash recovery remain target-machine gates.
 - The algorithm configuration and acceptance-report contracts exist, but no approved `status=pass` report and frozen-data precision evidence currently close the production algorithm gate.
-- The current eight-camera hardware, calibration, OT, disaster-recovery, and soak evidence remains outstanding.
+- The current six-camera SICK hardware, calibration, OT, disaster-recovery, and soak evidence remains outstanding.
 
 Static architecture contract success must therefore be reported as source-boundary evidence, not as production deployment acceptance.
 

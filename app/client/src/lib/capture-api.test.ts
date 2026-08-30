@@ -332,7 +332,8 @@ describe("readLatestCaptureFile", () => {
     await readCaptureHistory(999);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:4873/api/capture/history?limit=500",
+      "http://127.0.0.1:4317/api/capture/history?limit=500",
+      { headers: { Accept: "application/json" }, signal: undefined },
     );
     expect(captureHistoryImageUrl("63/capture/C1/2d/1.png", 8192, [0, 0, 2560, 1280])).toBe(
       "http://127.0.0.1:4873/api/capture/file?path=63%2Fcapture%2FC1%2F2d%2F1.png&maxWidth=4096&region=valid&cropX=0&cropY=0&cropWidth=2560&cropHeight=1280",
@@ -341,10 +342,10 @@ describe("readLatestCaptureFile", () => {
       "http://127.0.0.1:4873/api/capture/file?path=63%2Fcapture%2FC1%2F2d%2F1.png&maxWidth=2048&region=valid&cropX=665&cropY=0&cropWidth=479&cropHeight=1024",
     );
     expect(captureRenderImageUrl("63/capture/C1/2d/1.png", "gray", "thumbnail")).toBe(
-      "http://127.0.0.1:4873/api/capture/render?path=63%2Fcapture%2FC1%2F2d%2F1.png&modality=gray&level=thumbnail",
+      "http://127.0.0.1:4317/api/capture/render?path=63%2Fcapture%2FC1%2F2d%2F1.png&modality=gray&level=thumbnail",
     );
     expect(captureRenderImageUrl("63/capture/C1/2d/1.png", "jet", "original")).toBe(
-      "http://127.0.0.1:4873/api/capture/render?path=63%2Fcapture%2FC1%2F2d%2F1.png&modality=jet&level=original",
+      "http://127.0.0.1:4317/api/capture/render?path=63%2Fcapture%2FC1%2F2d%2F1.png&modality=jet&level=original",
     );
 
     await readCapturePlaybackCacheStatus();
@@ -365,10 +366,12 @@ describe("readLatestCaptureFile", () => {
     }), { status: 200, headers: { "Content-Type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await readCaptureHistory(500, " 2747 ");
+    const controller = new AbortController();
+    await readCaptureHistory(500, " 2747 ", controller.signal);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:4873/api/capture/history?limit=500&materialId=2747",
+      "http://127.0.0.1:4317/api/capture/history?limit=500&materialId=2747",
+      { headers: { Accept: "application/json" }, signal: controller.signal },
     );
   });
 

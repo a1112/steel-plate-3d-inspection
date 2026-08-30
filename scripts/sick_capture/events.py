@@ -4,16 +4,142 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 from .paths import (
     LAYOUT_SCHEMA,
     acquisition_manifest_path,
+    capture_flow_handoff_path,
     flow_manifest_path,
     frame_event_path,
 )
 from .storage import atomic_summary
+
+
+CAPTURE_FLOW_HANDOFF_SCHEMA = "steel.capture-flow-handoff.v1"
+CAPTURE_FLOW_HANDOFF_LIMIT = 32
+LATEST_COMPLETE_ROUND_PROBE_LIMIT = 4096
+
+
+def _event_is_complete(path: Path, capture_round: int) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        frames = payload.get("frames")
+        expected_count = int(payload.get("expectedCameraCount", 0) or 0)
+        return bool(
+            payload.get("schema") == "steel.capture-frame-committed.v1"
+            and int(payload.get("captureRound", -1)) == capture_round
+            and payload.get("complete") is True
+            and expected_count > 0
+            and int(payload.get("committedCameraCount", 0) or 0)
+            == expected_count
+            and isinstance(frames, list)
+            and len(frames) == expected_count
+            and not payload.get("missingCameraIds")
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _latest_complete_round(
+    storage_root: Path,
+    flow_no: str | int,
+    latest_round: int,
+) -> int | None:
+    lower = max(-1, latest_round - LATEST_COMPLETE_ROUND_PROBE_LIMIT)
+    for capture_round in range(latest_round, lower, -1):
+        path = frame_event_path(storage_root, flow_no, capture_round)
+        if path.is_file() and _event_is_complete(path, capture_round):
+            return capture_round
+    return None
+
+
+def publish_flow_handoff(
+    storage_root: Path,
+    flow_no: str | int,
+    *,
+    session_id: str,
+    state: str,
+    latest_round: int | None = None,
+) -> Path:
+    """Publish a bounded, durable hint without assuming flow ids are monotonic."""
+    material_id = str(int(flow_no))
+    normalized_state = str(state).strip().lower()
+    if normalized_state not in {"capturing", "closed"}:
+        raise ValueError(f"invalid capture flow hand-off state: {state!r}")
+    path = capture_flow_handoff_path(storage_root)
+    now_ns = time.time_ns()
+    existing_rows: list[dict[str, Any]] = []
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8-sig"))
+        if existing.get("schema") == CAPTURE_FLOW_HANDOFF_SCHEMA:
+            rows = existing.get("flows", [])
+            if isinstance(rows, list):
+                existing_rows = [row for row in rows if isinstance(row, dict)]
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+
+    previous = next(
+        (
+            row
+            for row in existing_rows
+            if str(row.get("materialId", "")).strip() == material_id
+        ),
+        None,
+    )
+    first_published_ns = now_ns
+    if previous is not None:
+        try:
+            first_published_ns = int(previous.get("firstPublishedAtUnixNs", now_ns))
+        except (TypeError, ValueError):
+            first_published_ns = now_ns
+    row: dict[str, Any] = {
+        "materialId": material_id,
+        "flowNo": int(material_id),
+        "sessionId": str(session_id),
+        "state": normalized_state,
+        "firstPublishedAtUnixNs": first_published_ns,
+        "updatedAtUnixNs": now_ns,
+    }
+    previous_latest_round = -1
+    if previous is not None and previous.get("latestCommittedRound") is not None:
+        try:
+            previous_latest_round = int(previous["latestCommittedRound"])
+        except (TypeError, ValueError):
+            pass
+    if latest_round is not None:
+        # A process-local capture counter from an older build can restart at
+        # zero. Never let that rolling-upgrade defect lower the durable hint.
+        row["latestCommittedRound"] = max(
+            int(latest_round),
+            previous_latest_round,
+        )
+    elif previous_latest_round >= 0:
+        row["latestCommittedRound"] = previous_latest_round
+
+    merged = [
+        candidate
+        for candidate in existing_rows
+        if str(candidate.get("materialId", "")).strip() != material_id
+    ]
+    merged.append(row)
+
+    def published_order(candidate: dict[str, Any]) -> int:
+        try:
+            return int(candidate.get("firstPublishedAtUnixNs", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    merged.sort(key=published_order, reverse=True)
+    payload = {
+        "schema": CAPTURE_FLOW_HANDOFF_SCHEMA,
+        "updatedAtUnixMs": now_ns // 1_000_000,
+        "flows": merged[:CAPTURE_FLOW_HANDOFF_LIMIT],
+    }
+    atomic_summary(path, payload)
+    return path
 
 
 def publish_committed_round(
@@ -64,6 +190,13 @@ def publish_committed_round(
                 "metadataPath": str(metadata_path),
                 "meanIntensity": float(row.get("meanIntensity", 0.0)),
                 "brightPixelRatio": float(row.get("brightPixelRatio", 0.0)),
+                "steelSignal": bool(row.get("steelSignal")),
+                "materialSignal": bool(row.get("materialSignal")),
+                "materialSignalRatio": float(
+                    row.get("materialSignalRatio", 0.0)
+                ),
+                "boundaryPhase": str(row.get("boundaryPhase", boundary_phase)),
+                "imageQuality": dict(row.get("imageQuality", {})),
                 "checksums": dict(row.get("checksums", {})),
             }
         )
@@ -107,7 +240,18 @@ def write_flow_manifest(
     state: str,
     camera_roots: dict[str, Path],
     latest_round: int | None = None,
+    latest_round_complete: bool | None = None,
+    recover_latest_complete: bool = False,
+    boundary_policy: str | None = None,
 ) -> Path:
+    path = flow_manifest_path(storage_root, flow_no)
+    previous: dict[str, Any] = {}
+    try:
+        candidate = json.loads(path.read_text(encoding="utf-8-sig"))
+        if candidate.get("schema") == LAYOUT_SCHEMA:
+            previous = candidate
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
     payload: dict[str, Any] = {
         "schema": LAYOUT_SCHEMA,
         "flowNo": int(flow_no),
@@ -119,20 +263,55 @@ def write_flow_manifest(
             for camera_id, root in sorted(camera_roots.items())
         },
     }
+    resolved_boundary_policy = str(
+        boundary_policy or previous.get("boundaryPolicy", "")
+    ).strip()
+    if resolved_boundary_policy:
+        payload["boundaryPolicy"] = resolved_boundary_policy
+    latest_complete_round: int | None = None
     if latest_round is not None:
-        payload["latestCommittedRound"] = int(latest_round)
-    path = flow_manifest_path(storage_root, flow_no)
+        latest_round = int(latest_round)
+        payload["latestCommittedRound"] = latest_round
+        if latest_round_complete is None:
+            latest_round_complete = _event_is_complete(
+                frame_event_path(storage_root, flow_no, latest_round),
+                latest_round,
+            )
+        if latest_round_complete:
+            latest_complete_round = latest_round
+        else:
+            try:
+                previous_complete = int(
+                    previous.get("latestCompleteCommittedRound", -1)
+                )
+            except (TypeError, ValueError):
+                previous_complete = -1
+            if (
+                not recover_latest_complete
+                and 0 <= previous_complete <= latest_round
+            ):
+                latest_complete_round = previous_complete
+            else:
+                latest_complete_round = _latest_complete_round(
+                    storage_root,
+                    flow_no,
+                    latest_round,
+                )
+        if latest_complete_round is not None:
+            payload["latestCompleteCommittedRound"] = latest_complete_round
     atomic_summary(path, payload)
     if (
         state == "closed"
-        and latest_round is not None
-        and frame_event_path(storage_root, flow_no, latest_round).is_file()
+        and latest_complete_round is not None
+        and frame_event_path(
+            storage_root, flow_no, latest_complete_round
+        ).is_file()
     ):
         _write_acquisition_manifest(
             storage_root,
             flow_no,
             session_id=session_id,
-            latest_round=latest_round,
+            latest_round=latest_complete_round,
         )
     return path
 

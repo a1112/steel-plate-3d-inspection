@@ -102,6 +102,17 @@ describe('DefectImagePanel review workflow', () => {
     expect(onReviewDefect).not.toHaveBeenCalled();
   });
 
+  it('requires a reason before excluding a false positive', () => {
+    const onReviewDefect = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(window, 'prompt').mockReturnValue('   ');
+    render(<DefectImagePanel defect={defect} onReviewDefect={onReviewDefect} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '排除误报' }));
+
+    expect(onReviewDefect).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('排除误报必须填写判定理由');
+  });
+
   it('keeps review failures inside the panel without an unhandled rejection', async () => {
     const onReviewDefect = vi.fn().mockRejectedValue(new Error('当前账号没有复核权限'));
     vi.spyOn(window, 'prompt').mockReturnValue('确认');

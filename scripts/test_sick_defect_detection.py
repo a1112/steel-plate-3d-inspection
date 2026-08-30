@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -24,8 +25,12 @@ from scripts.sick_capture.defect_detection import (
     DEFECT_DETECTION_SCHEMA,
     DefectDetectionConfig,
     ExecutionGateInterrupted,
+    OnnxYoloDetector,
     _database_import_payload,
     _defect_position_ratios,
+    _capture_is_idle,
+    _jet_rgb,
+    _letterbox_rgb,
     _legacy_classifier_crop,
     _prepare_review_output,
     _realtime_analysis_has_priority,
@@ -695,6 +700,48 @@ class SickDefectDetectionTests(unittest.TestCase):
         self.assertEqual(bounded.inference_batch_size, 32)
         self.assertEqual(bounded.preprocess_workers, 1)
         self.assertEqual(bounded.depth_baseline_sample_step, 1)
+        self.assertEqual(
+            DefectDetectionConfig(preprocess_workers=999).bounded().preprocess_workers,
+            8,
+        )
+
+    def test_live_analysis_uses_bounded_capture_storage_headroom(self) -> None:
+        class Response:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self.payload = payload
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode("utf-8")
+
+        def allowed(pending: int, active: int, maximum: int) -> bool:
+            with patch(
+                "scripts.sick_capture.defect_detection.request.urlopen",
+                side_effect=[
+                    Response({"present": True}),
+                    Response(
+                        {
+                            "storageQueue": {
+                                "pendingRounds": pending,
+                                "activeRounds": active,
+                                "capacityRounds": 128,
+                                "reservedBoundaryRounds": 11,
+                                "roundWorkerCount": 2,
+                            }
+                        }
+                    ),
+                ],
+            ):
+                return _capture_is_idle("http://capture.test", maximum)
+
+        self.assertTrue(allowed(32, 2, 64))
+        self.assertFalse(allowed(65, 2, 64))
+        self.assertFalse(allowed(0, 1, 0))
 
     def test_decodes_defect_class_and_suppresses_overlap(self) -> None:
         predictions = np.zeros((1, 4, 7), dtype=np.float32)
@@ -729,6 +776,71 @@ class SickDefectDetectionTests(unittest.TestCase):
             maximum_detections=10,
         )
         self.assertEqual(result[0]["rect"], [80, 40, 240, 120])
+
+    def test_grayscale_letterbox_matches_expanded_rgb_bytes(self) -> None:
+        grayscale = np.arange(127 * 319, dtype=np.uint32).reshape(127, 319)
+        grayscale = np.asarray(grayscale % 256, dtype=np.uint8)
+        grayscale_tensor, grayscale_scale, grayscale_padding = _letterbox_rgb(
+            grayscale, 640
+        )
+        rgb_tensor, rgb_scale, rgb_padding = _letterbox_rgb(
+            np.repeat(grayscale[..., None], 3, axis=2), 640
+        )
+        self.assertTrue(np.array_equal(grayscale_tensor, rgb_tensor))
+        self.assertEqual(grayscale_scale, rgb_scale)
+        self.assertEqual(grayscale_padding, rgb_padding)
+
+    def test_uint8_jet_lookup_matches_reference_formula(self) -> None:
+        grayscale = np.arange(256, dtype=np.uint8).reshape(16, 16)
+        value = grayscale.astype(np.float32) / 255.0
+        expected = np.rint(
+            np.stack(
+                (
+                    np.clip(1.5 - np.abs(4.0 * value - 3.0), 0.0, 1.0),
+                    np.clip(1.5 - np.abs(4.0 * value - 2.0), 0.0, 1.0),
+                    np.clip(1.5 - np.abs(4.0 * value - 1.0), 0.0, 1.0),
+                ),
+                axis=-1,
+            )
+            * 255.0
+        ).astype(np.uint8)
+        self.assertTrue(np.array_equal(_jet_rgb(grayscale), expected))
+
+    def test_prepared_detector_batch_matches_direct_batch(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.inputs: list[np.ndarray] = []
+
+            def run(
+                self, _outputs: object, inputs: dict[str, np.ndarray]
+            ) -> list[np.ndarray]:
+                tensor = inputs["images"]
+                self.inputs.append(tensor.copy())
+                return [np.zeros((tensor.shape[0], 1, 7), dtype=np.float32)]
+
+        detector = OnnxYoloDetector.__new__(OnnxYoloDetector)
+        detector.session = FakeSession()
+        detector.input_name = "images"
+        detector.dynamic_batch = True
+        detector.config = SimpleNamespace(
+            image_size=640,
+            confidence_threshold=0.5,
+            iou_threshold=0.25,
+            maximum_detections_per_frame=100,
+        )
+        grayscale = np.arange(80 * 160, dtype=np.uint32).reshape(80, 160)
+        grayscale = np.asarray(grayscale % 256, dtype=np.uint8)
+        rgb = np.repeat(grayscale[..., None], 3, axis=2)
+        images = [grayscale, rgb]
+        direct = detector.detect_many(images)
+        direct_tensor = detector.session.inputs[-1]
+        prepared = [_letterbox_rgb(image, 640) for image in images]
+        prepared_result = detector.detect_prepared_many(
+            prepared, [image.shape[:2] for image in images]
+        )
+        prepared_tensor = detector.session.inputs[-1]
+        self.assertEqual(direct, prepared_result)
+        self.assertTrue(np.array_equal(direct_tensor, prepared_tensor))
 
     def test_merges_matching_2d_and_3d_candidates(self) -> None:
         two_d = [{
@@ -899,6 +1011,122 @@ class SickDefectDetectionTests(unittest.TestCase):
             result["statistics"]["overlapDuplicateFilteredCount"], 0
         )
         self.assertIn("region-manifest-missing", result["qualityGate"]["reasons"])
+
+    def test_global_owned_geometry_skips_guaranteed_zero_full_depth_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = root / "capture.json"
+            profile_path.write_text("{}", encoding="utf-8")
+            (root / "algorithm.json").write_text(
+                json.dumps(
+                    {
+                        "depthGeometry": {
+                            "schema": "steel.sick-depth-geometry-config.v1",
+                            "enabled": True,
+                            "revision": 7,
+                            "qualityGatePolicy": "global-owned-only",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            legacy = {
+                "schema": DEFECT_DETECTION_SCHEMA,
+                "materialId": "63",
+                "state": "complete",
+                "statistics": {"defectCount": 0},
+                "defects": [],
+            }
+            with patch(
+                "scripts.sick_capture.defect_detection._build_legacy_flow_defect_detection",
+                return_value=legacy,
+            ), patch(
+                "scripts.sick_capture.defect_detection.configured_legacy_model_hash",
+                return_value="model-a",
+            ), patch(
+                "scripts.sick_capture.defect_detection.build_flow_depth_geometry"
+            ) as geometry_builder:
+                result = build_flow_defect_detection(
+                    {"C1": root / "C1"},
+                    root,
+                    "63",
+                    {"cameras": {}},
+                    config=DefectDetectionConfig(
+                        enabled=True,
+                        depth_geometry_profile_path=profile_path,
+                    ),
+                )
+
+        geometry_builder.assert_not_called()
+        geometry = result["defectGroups"]["geometry"]
+        self.assertEqual(geometry["state"], "blocked")
+        self.assertEqual(geometry["statistics"]["processedFrames"], 0)
+        self.assertIn(
+            "region-manifest-missing", geometry["quality"]["reasons"]
+        )
+
+    def test_live_result_defers_full_geometry_until_realtime_queue_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = root / "capture.json"
+            profile_path.write_text("{}", encoding="utf-8")
+            (root / "algorithm.json").write_text(
+                json.dumps(
+                    {
+                        "depthGeometry": {
+                            "schema": "steel.sick-depth-geometry-config.v1",
+                            "enabled": True,
+                            "revision": 7,
+                            "qualityGatePolicy": "global-owned-only",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            region_path = region_manifest_path(root, "63")
+            region_path.parent.mkdir(parents=True)
+            region_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "steel.capture-region-map.v1",
+                        "defectDetectionAllowed": True,
+                        "qualityGate": {"passed": True, "reasons": []},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            legacy = {
+                "schema": DEFECT_DETECTION_SCHEMA,
+                "materialId": "63",
+                "state": "complete",
+                "statistics": {"defectCount": 0},
+                "defects": [],
+            }
+            with patch(
+                "scripts.sick_capture.defect_detection._build_legacy_flow_defect_detection",
+                return_value=legacy,
+            ), patch(
+                "scripts.sick_capture.defect_detection.configured_legacy_model_hash",
+                return_value="model-a",
+            ), patch(
+                "scripts.sick_capture.defect_detection.build_flow_depth_geometry"
+            ) as geometry_builder:
+                result = build_flow_defect_detection(
+                    {"C1": root / "C1"},
+                    root,
+                    "63",
+                    {"cameras": {}},
+                    config=DefectDetectionConfig(
+                        enabled=True,
+                        depth_geometry_profile_path=profile_path,
+                    ),
+                )
+
+        geometry_builder.assert_not_called()
+        geometry = result["defectGroups"]["geometry"]
+        self.assertEqual(geometry["state"], "queued")
+        self.assertEqual(geometry["statistics"]["processedFrames"], 0)
+        self.assertEqual(result["defectGroups"]["legacy"]["modelHash"], "model-a")
 
     def test_blocked_sick_array_reports_six_actual_cameras(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

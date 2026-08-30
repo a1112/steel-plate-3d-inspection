@@ -1,6 +1,6 @@
 # 研究复现与算法证据链整改实施设计
 
-> 状态：Proposed
+> 状态：Implementation in progress（A0/A1 软件门禁已实现，外部证据仍阻断）
 > 日期：2026-08-28
 > 基线：`ffb2bcc20b2e11aca8467bfe173b5517ce576f7a`
 > 来源：外部研究审查建议与当前代码、配置、测试和运行文档审计
@@ -196,10 +196,11 @@ release commit / package identity
 评测器、输入制品、指标、阈值和批准人。任何组成部分发生变化都形成新的
 资格包，不允许复用旧批准。
 
-### Proposed 离线证据合同
+### 离线证据合同
 
-以下合同是整改目标，当前尚未加入既有 runtime Schema；在实现并完成合同测试前
-均保持 `Proposed`。
+以下合同已经作为严格的离线 JSON Schema 加入
+[`packages/contracts/schemas`](../../packages/contracts/schemas)。它们不属于 runtime
+HTTP Schema，也不因为结构校验通过就获得生产准入语义。
 
 #### `steel.reproduction-manifest.v1`
 
@@ -260,7 +261,8 @@ manifest 只保存相对引用、内容寻址 URI 或经批准的逻辑资产 ID
 python scripts/validate_algorithm_dataset.py --manifest D:\evidence\dataset.json --output D:\evidence\dataset-validation.json
 ```
 
-该入口当前为 Proposed。validator 必须检查：
+该入口已由 [`scripts/validate_algorithm_dataset.py`](../../scripts/validate_algorithm_dataset.py)
+实现，并原子输出 `steel.algorithm-dataset-validation.v1`。validator 必须检查：
 
 - manifest、annotation 和输入文件存在且为普通文件；
 - 路径规范化后仍位于批准的数据根内，不允许 traversal、symlink/reparse 绕过；
@@ -427,6 +429,28 @@ qualification 子集上双跑：
 - 保存均值、方差、失败案例和原始预测，不只发布最佳 checkpoint。
 
 当前整改不得为了满足通用研究模板而虚构 `train.py`、论文 baseline 或训练结果。
+
+## 当前实施状态
+
+截至 2026-08-29，本设计的软件整改状态如下：
+
+- A0：`split-runtime-pipeline.md` 已切换到六相机 SICK、六子服务和三段持久化合同；
+  `verify-source-boundaries.ps1` 会核对 package、正式 Supervisor、交互式 registry、
+  端口、owner 标志、BKV 隔离和历史文档降级标记。
+- A1：`steel.algorithm-dataset.v1`、`steel.defect-annotation.v1`、
+  `steel.reproduction-manifest.v1`、`steel.algorithm-benchmark.v1` 和 validator 输出
+  Schema 已加入；数据 validator 及路径、篡改、split、许可、标注、taxonomy、
+  几何、单位和统计负向测试已加入。
+- A2（软件门禁）：现有 `steel.algorithm-acceptance.v1` 已扩展绑定 dataset validator、
+  model set、reproduction manifest 和评测完成时间；PowerShell 安装校验、Python 每次
+  运行及 Rust readiness/traceability 均 fail-closed，正式安装拒绝 `temporary=true` 模型。
+  真实指标、正式模型、证据文件和双签仍未生成，因此 A2 整体继续为 `Blocked`。
+- B1（软件部分）：仓库入口固定 Node、Python 和 Rust 版本；Windows CI 执行全部
+  首方 Rust crate 的 test/check、Python 测试发现、compile 检查、前端、C++ 和
+  source architecture 门禁。真实相机/CUDA/CTI/固件仍属于独立硬件 lane。
+- A2/A3/B2：真实冻结数据、评测器、指标、native/ONNX 对齐、许可证/权重授权、
+  benchmark 原始证据和双签均未由软件生成，继续保持 `Blocked`，等待对应资产所有者、
+  算法负责人、质量负责人和现场验收人员提供。
 
 ## 实施顺序与责任边界
 

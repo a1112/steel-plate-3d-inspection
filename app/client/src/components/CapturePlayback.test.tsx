@@ -101,7 +101,11 @@ describe('CapturePlayback', () => {
 
     render(<CapturePlayback statuses={statuses} />);
 
-    await waitFor(() => expect(playbackMocks.readHistory).toHaveBeenCalledWith(300));
+    await waitFor(() => expect(playbackMocks.readHistory).toHaveBeenCalledWith(
+      300,
+      undefined,
+      expect.any(AbortSignal),
+    ));
     const readyImage = await screen.findByRole('img', { name: 'C1 历史灰度图' });
     expect(readyImage).toHaveAttribute(
       'src',

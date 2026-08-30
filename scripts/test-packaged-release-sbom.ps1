@@ -107,7 +107,15 @@ try {
     [ordered]@{ id = 'npm-client'; source = 'app/client/package-lock.json'; evidence = 'build-evidence/client-package-lock.json' },
     [ordered]@{ id = 'cargo-tauri'; source = 'app/client/src-tauri/Cargo.lock'; evidence = 'build-evidence/tauri-Cargo.lock' },
     [ordered]@{ id = 'cargo-service'; source = 'app/service/Cargo.lock'; evidence = 'build-evidence/service-Cargo.lock' },
-    [ordered]@{ id = 'cargo-trigger'; source = 'app/trigger/Cargo.lock'; evidence = 'build-evidence/trigger-Cargo.lock' }
+    [ordered]@{ id = 'cargo-trigger'; source = 'app/trigger/Cargo.lock'; evidence = 'build-evidence/trigger-Cargo.lock' },
+    [ordered]@{ id = 'cargo-camera-worker'; source = 'app/camera-worker/Cargo.lock'; evidence = 'build-evidence/camera-worker-Cargo.lock' },
+    [ordered]@{ id = 'cargo-result-contract'; source = 'app/result-contract/Cargo.lock'; evidence = 'build-evidence/result-contract-Cargo.lock' },
+    [ordered]@{ id = 'cargo-pipeline-workers'; source = 'app/pipeline-workers/Cargo.lock'; evidence = 'build-evidence/pipeline-workers-Cargo.lock' },
+    [ordered]@{ id = 'cargo-runtime-contract'; source = 'app/runtime-contract/Cargo.lock'; evidence = 'build-evidence/runtime-contract-Cargo.lock' },
+    [ordered]@{ id = 'cargo-image-service'; source = 'app/image-service/Cargo.lock'; evidence = 'build-evidence/image-service-Cargo.lock' },
+    [ordered]@{ id = 'cargo-algorithm-service'; source = 'app/algorithm-service/Cargo.lock'; evidence = 'build-evidence/algorithm-service-Cargo.lock' },
+    [ordered]@{ id = 'cargo-server-monitor'; source = 'app/server-monitor/Cargo.lock'; evidence = 'build-evidence/server-monitor-Cargo.lock' },
+    [ordered]@{ id = 'cargo-tray'; source = 'app/tray/Cargo.lock'; evidence = 'build-evidence/tray-Cargo.lock' }
   )
   $Locks = @()
   foreach ($Definition in $LockDefinitions) {
@@ -235,8 +243,8 @@ try {
       schema = 'steel.release-sbom.cyclonedx.v1'; format = 'CycloneDX'; specVersion = '1.5'
       path = 'build-evidence/steel-release-sbom.cdx.json'; sha256 = Get-Hash $SbomPath
       sourceCommit = $Commit; dirty = $false; componentCount = 6; npmComponentCount = 0
-      cargoComponentCount = 0; externalComponentCount = 6; metadataPropertyCount = 22
-      dependencyLockCount = 4; toolCount = 3
+      cargoComponentCount = 0; externalComponentCount = 6; metadataPropertyCount = 38
+      dependencyLockCount = 12; toolCount = 3
       requiredExternalCategories = @('cpp-toolchain', 'camera-sdk', 'vc-runtime', 'webview2-runtime', 'wix-toolset', 'nsis')
       externalComponents = [ordered]@{
         path = 'build-evidence/external-components.json'; sha256 = $PolicyHash; sourceName = 'policy.json'

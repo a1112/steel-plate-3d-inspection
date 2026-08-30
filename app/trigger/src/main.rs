@@ -809,8 +809,13 @@ fn post_json(origin: &str, path: &str, body: &str) -> Option<Value> {
         .find(|addr| TcpStream::connect_timeout(addr, Duration::from_millis(200)).is_ok())?;
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let operator_header = env::var("TRIGGER_OPERATOR_TOKEN")
+        .ok()
+        .filter(|token| token.len() >= 32 && !token.contains('\r') && !token.contains('\n'))
+        .map(|token| format!("X-Trigger-Operator-Token: {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{operator_header}\r\n{}",
         body.as_bytes().len(),
         body
     );

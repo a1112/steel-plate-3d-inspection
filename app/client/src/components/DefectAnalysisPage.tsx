@@ -1,4 +1,4 @@
-import { CheckCircle2, ChevronLeft, ChevronRight, Grid2X2, Image as ImageIcon, Maximize2, XCircle } from 'lucide-react';
+import { CheckCircle2, ChevronLeft, ChevronRight, Grid2X2, Image as ImageIcon, Maximize2, RotateCcw, Tags, XCircle } from 'lucide-react';
 import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import type {
   DefectAnalysisTab,
@@ -7,6 +7,7 @@ import type {
   DefectItem,
   DefectReviewStatus,
   DefectType,
+  Severity,
   SteelPlate,
 } from '../data/inspection';
 import { resolveDefectGroups, severityLabels } from '../data/inspection';
@@ -491,6 +492,9 @@ export function DefectAnalysisPage({
   const [page, setPage] = useState(1);
   const [captureFrames, setCaptureFrames] = useState<CaptureStitchCameraFrame[]>([]);
   const [reviewing, setReviewing] = useState(false);
+  const [annotationTypeId, setAnnotationTypeId] = useState('');
+  const [annotationSeverity, setAnnotationSeverity] = useState<Severity>('review');
+  const [annotationNote, setAnnotationNote] = useState('');
   const plateLengthMm = plate.lengthMm > 0 ? plate.lengthMm : 12_000;
   const groups = useMemo(
     () => resolveDefectGroups(defects, defectGroups, comparison),
@@ -568,6 +572,13 @@ export function DefectAnalysisPage({
   const safePage = Math.min(page, pageCount);
   const pageDefects = displayDefects.slice((safePage - 1) * CARD_PAGE_SIZE, safePage * CARD_PAGE_SIZE);
   const selectedMedia = selectedDefect ? mediaForDefect(selectedDefect, captureFrames) : null;
+  const selectedAnnotationType = defectTypes.find((type) => type.id === annotationTypeId);
+
+  useEffect(() => {
+    setAnnotationTypeId(selectedDefect?.typeId ?? '');
+    setAnnotationSeverity(selectedDefect?.severity ?? 'review');
+    setAnnotationNote(selectedDefect?.reviewNote ?? '');
+  }, [selectedDefect?.id, selectedDefect?.reviewNote, selectedDefect?.severity, selectedDefect?.typeId]);
 
   const toggleGray = () => {
     if (showGray && !showJet) return;
@@ -589,12 +600,15 @@ export function DefectAnalysisPage({
 
   const submitReview = async (status: DefectReviewStatus) => {
     if (!selectedDefect || !onReviewDefect || reviewing) return;
-    const promptLabel = status === 'confirmed' ? '确认说明（可选）' : '排除原因（可选）';
-    const note = window.prompt(promptLabel, selectedDefect.reviewNote ?? '');
-    if (note === null) return;
+    if (!selectedAnnotationType || (status === 'false-positive' && !annotationNote.trim())) return;
     setReviewing(true);
     try {
-      await onReviewDefect(selectedDefect, status, note);
+      await onReviewDefect({
+        ...selectedDefect,
+        typeId: selectedAnnotationType.id,
+        typeLabel: selectedAnnotationType.label,
+        severity: annotationSeverity,
+      }, status, annotationNote.trim());
     } catch {
       // The parent owns the user-facing error toast; keep this interaction settled.
     } finally {
@@ -725,13 +739,50 @@ export function DefectAnalysisPage({
                 {showGray ? <figure><figcaption><ImageIcon size={14} />原始大图</figcaption><AnalysisImage large src={selectedMedia.grayOriginalUrl} alt={`${selectedDefect.typeLabel}原始大图`} emptyLabel="原始大图" context={selectedMedia.grayContext} onDoubleClick={() => setDisplayMode('cards')} onWheel={navigateDefect} /></figure> : null}
                 {showJet ? <figure><figcaption><ImageIcon size={14} />JET 大图</figcaption><AnalysisImage large src={selectedMedia.jetOriginalUrl} alt={`${selectedDefect.typeLabel} JET 大图`} emptyLabel="JET 大图" context={selectedMedia.jetContext} onDoubleClick={() => setDisplayMode('cards')} onWheel={navigateDefect} /></figure> : null}
               </div>
+              {onReviewDefect ? (
+                <section className="defect-annotation-panel" aria-label="缺陷标注">
+                  <div className="defect-annotation-title">
+                    <Tags size={15} />
+                    <span>缺陷标注</span>
+                    <small>{selectedDefect.reviewStatus === 'confirmed' ? '已确认' : selectedDefect.reviewStatus === 'false-positive' ? '已排除' : '待复核'}</small>
+                  </div>
+                  <label>
+                    <span>缺陷类别</span>
+                    <select aria-label="标注缺陷类别" value={annotationTypeId} disabled={reviewing} onChange={(event) => setAnnotationTypeId(event.target.value)}>
+                      {!selectedAnnotationType && annotationTypeId ? <option value={annotationTypeId}>{selectedDefect.typeLabel}（未配置）</option> : null}
+                      {defectTypes.map((type) => <option key={type.id} value={type.id}>{type.label}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    <span>严重度</span>
+                    <select aria-label="标注严重度" value={annotationSeverity} disabled={reviewing} onChange={(event) => setAnnotationSeverity(event.target.value as Severity)}>
+                      <option value="severe">严重</option>
+                      <option value="review">待复核</option>
+                      <option value="minor">轻微</option>
+                    </select>
+                  </label>
+                  <label className="defect-annotation-note">
+                    <span>标注说明</span>
+                    <input
+                      aria-label="标注说明"
+                      value={annotationNote}
+                      maxLength={1024}
+                      disabled={reviewing}
+                      placeholder="记录判定依据；排除误报时必填"
+                      onChange={(event) => setAnnotationNote(event.target.value)}
+                    />
+                  </label>
+                  <div className="defect-annotation-actions">
+                    <button type="button" className="confirm" aria-label="确认缺陷" disabled={reviewing || !selectedAnnotationType} onClick={() => void submitReview('confirmed')}><CheckCircle2 size={14} />保存并确认</button>
+                    <button type="button" className="exclude" aria-label="排除误报" disabled={reviewing || !selectedAnnotationType || !annotationNote.trim()} onClick={() => void submitReview('false-positive')}><XCircle size={14} />排除误报</button>
+                    {selectedDefect.reviewStatus && selectedDefect.reviewStatus !== 'pending' ? <button type="button" aria-label="恢复待复核" disabled={reviewing} onClick={() => void submitReview('pending')}><RotateCcw size={14} />恢复待复核</button> : null}
+                  </div>
+                  {selectedDefect.reviewedBy ? <p>最近操作：{selectedDefect.reviewedBy}{selectedDefect.reviewedAt ? ` · ${selectedDefect.reviewedAt}` : ''}</p> : null}
+                </section>
+              ) : null}
               <div className="defect-large-actions">
                 <button type="button" onClick={() => navigateDefect(-1)}><ChevronLeft size={15} />上一处</button>
                 <button type="button" onClick={() => navigateDefect(1)}>下一处<ChevronRight size={15} /></button>
-                {onReviewDefect ? <>
-                  <button type="button" className="confirm" disabled={reviewing} onClick={() => void submitReview('confirmed')}><CheckCircle2 size={15} />确认缺陷</button>
-                  <button type="button" className="exclude" disabled={reviewing} onClick={() => void submitReview('false-positive')}><XCircle size={15} />排除误报</button>
-                </> : null}
               </div>
               <div className="defect-filmstrip" aria-label="缺陷候选缩略图">
                 {displayDefects.slice(0, 12).map((defect, index) => {

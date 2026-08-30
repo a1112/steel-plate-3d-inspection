@@ -488,6 +488,7 @@ describe('online inspection world compatibility', () => {
     expect(fetchCaptureStitchHistory).toHaveBeenCalledWith(
       '2747',
       ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'],
+      expect.anything(),
     );
     Object.defineProperties(viewport, {
       clientWidth: { configurable: true, value: 600 },
@@ -736,7 +737,7 @@ describe('online inspection world compatibility', () => {
     expect(onSelectDefect).toHaveBeenNthCalledWith(2, frameDefect.id);
   });
 
-  it('does not show record-bound raw PNGs while rebuilding stitch cache and upgrades when history appears', async () => {
+  it('shows record-bound raw PNGs immediately and upgrades when stitch history appears', async () => {
     vi.useFakeTimers();
     const requestedImageUrls: string[] = [];
     const NativeImage = globalThis.Image;
@@ -776,17 +777,20 @@ describe('online inspection world compatibility', () => {
       );
       await act(async () => { await Promise.resolve(); });
 
-      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('拼接缓存尚未就绪 · 已发现 6/6 路原图，等待重建');
-      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
-      expect(requestedImageUrls).toHaveLength(0);
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录快速预览 6/6 路 · 拼接索引尚未就绪');
+      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+      expect(requestedImageUrls).toHaveLength(6);
+      expect(requestedImageUrls.every((url) => url.includes('/raw-C'))).toBe(true);
       expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
 
       await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
       await act(async () => { await vi.advanceTimersByTimeAsync(250); });
 
       expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('2/2 轮对齐拼接');
-      expect(requestedImageUrls.length).toBeGreaterThan(0);
-      expect(requestedImageUrls.every((url) => (
+      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+      const stitchImageUrls = requestedImageUrls.filter((url) => url.includes('/api/capture/render'));
+      expect(stitchImageUrls.length).toBeGreaterThan(0);
+      expect(stitchImageUrls.every((url) => (
         url.includes('/api/capture/render')
         && url.includes('modality=gray')
         && url.includes('level=thumbnail')
@@ -800,7 +804,7 @@ describe('online inspection world compatibility', () => {
     }
   });
 
-  it('keeps record-bound raw PNGs hidden while the stitch-history probe is pending or empty', async () => {
+  it('keeps the current record preview visible while the stitch-history probe is pending or empty', async () => {
     let resolveProbe: ((result: CaptureStitchResult) => void) | undefined;
     vi.mocked(fetchCaptureStitchHistory).mockReturnValue(new Promise((resolve) => {
       resolveProbe = resolve;
@@ -826,13 +830,71 @@ describe('online inspection world compatibility', () => {
       />,
     );
 
-    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('拼接缓存准备中 · 正在校验索引并从原图按需重建');
-    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录快速预览 6/6 路 · 拼接索引加载中');
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(6);
 
     await act(async () => { resolveProbe?.(emptyCaptureStitchResult('2822')); });
 
-    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('拼接缓存尚未就绪 · 已发现 6/6 路原图，等待重建');
-    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录快速预览 6/6 路 · 拼接索引尚未就绪');
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+  });
+
+  it('replaces the preview canvas identity immediately when the selected record changes', async () => {
+    const requestedImageUrls: string[] = [];
+    const NativeImage = globalThis.Image;
+    class RequestedImage {
+      complete = false;
+      naturalWidth = 0;
+      naturalHeight = 0;
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(value: string) { requestedImageUrls.push(value); }
+      removeAttribute() {}
+    }
+    vi.stubGlobal('Image', RequestedImage);
+    vi.mocked(fetchCaptureStitchHistory).mockImplementation(() => new Promise(() => undefined));
+    const rawImages = (materialId: string) => Array.from({ length: 6 }, (_, index) => ({
+      id: `${materialId}-${index + 1}`,
+      cameraId: `C${index + 1}`,
+      cameraIp: `192.168.10${index + 1}.100`,
+      dataName: 'intensity',
+      sequenceNo: 1,
+      fileType: 'png',
+      path: `${materialId}/capture/C${index + 1}/2d/0.png`,
+      url: `http://127.0.0.1:4873/${materialId}-C${index + 1}.png`,
+      createdAt: '2026-08-24T04:00:00.000Z',
+    }));
+    try {
+      const view = render(
+        <ProductionPlateMap
+          {...common}
+          artifactMode="production"
+          captureMaterialId="record-a"
+          cameraLanes={createSequentialCameraLanes(6)}
+          captureImages={rawImages('record-a')}
+        />,
+      );
+      await act(async () => { await Promise.resolve(); });
+      const firstCanvas = screen.getAllByLabelText(/实际裁剪图/)[0];
+
+      view.rerender(
+        <ProductionPlateMap
+          {...common}
+          artifactMode="production"
+          captureMaterialId="record-b"
+          cameraLanes={createSequentialCameraLanes(6)}
+          captureImages={rawImages('record-b')}
+        />,
+      );
+      await act(async () => { await Promise.resolve(); });
+      const secondCanvas = screen.getAllByLabelText(/实际裁剪图/)[0];
+
+      expect(secondCanvas).not.toBe(firstCanvas);
+      expect(requestedImageUrls.some((url) => url.includes('/record-b-C1.png'))).toBe(true);
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录快速预览 6/6 路');
+    } finally {
+      vi.stubGlobal('Image', NativeImage);
+    }
   });
 
   it('never borrows stitch images from fallback material records', async () => {
@@ -877,9 +939,9 @@ describe('online inspection world compatibility', () => {
       />,
     );
 
-    expect(await screen.findByText('拼接缓存尚未就绪 · 已发现 1/8 路原图，等待重建')).toBeInTheDocument();
+    expect(await screen.findByText('当前记录快速预览 1/8 路 · 拼接索引尚未就绪')).toBeInTheDocument();
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
-    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(1);
     expect(screen.getByTestId('bar-unfolded-map')).toBeInTheDocument();
   });
 
@@ -927,7 +989,7 @@ describe('online inspection world compatibility', () => {
     expect(screen.queryByTestId('bar-unfolded-map')).not.toBeInTheDocument();
   });
 
-  it('keeps the painted record visible until the next record paints its first tile', async () => {
+  it('clears the painted record while the next record prepares its first tile', async () => {
     const images: Array<{ onload: null | (() => void) }> = [];
     class ManualImage {
       onload: null | (() => void) = null;
@@ -978,14 +1040,11 @@ describe('online inspection world compatibility', () => {
       />,
     );
 
-    expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
+    expect(screen.queryByTestId('inspection-world-viewport')).not.toBeInTheDocument();
     expect(screen.getByRole('status', {
-      name: '正在切换 BKV 检测记录',
+      name: '正在加载 BKV 检测图像世界',
     })).toBeInTheDocument();
     await waitFor(() => expect(images.length).toBeGreaterThan(previousImageCount));
-    await waitFor(() => expect(screen.getByRole('status', {
-      name: '首屏瓦片加载进度',
-    })).toHaveTextContent(/首屏瓦片 \d+\/\d+/));
 
     const nextRecordImages = images.slice(previousImageCount);
     await act(async () => nextRecordImages[0]?.onload?.());
@@ -997,9 +1056,57 @@ describe('online inspection world compatibility', () => {
       expect(screen.getByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893701');
     });
     expect(images.length).toBe(previousImageCount + nextRecordImages.length);
-    expect(screen.queryByRole('status', {
-      name: '正在切换 BKV 检测记录',
-    })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: '正在加载 BKV 检测图像世界' })).not.toBeInTheDocument();
+  });
+
+  it('does not retain the previous record canvas when the next record metadata fails', async () => {
+    class AutoImage {
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(_value: string) { queueMicrotask(() => this.onload?.()); }
+    }
+    vi.stubGlobal('Image', AutoImage);
+    vi.stubGlobal('ResizeObserver', class ResizeObserver {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe() { this.callback([], this); }
+      unobserve() {}
+      disconnect() {}
+    });
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      clearRect: vi.fn(), fillRect: vi.fn(), drawImage: vi.fn(), strokeRect: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    vi.mocked(fetchInspectionWorldMeta).mockImplementation(async (recordId) => {
+      if (recordId === '1893701') throw new Error('record 1893701 metadata unavailable');
+      return { ...onlineWorldMeta, recordId };
+    });
+    vi.mocked(fetchInspectionWorldDefects).mockImplementation(async (recordId) => ({
+      schema: 'steel.inspection-world.defects.v1',
+      provider: 'bkv',
+      recordId,
+      defects: [],
+    }));
+
+    const { rerender } = render(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        inspectionId="1893700"
+        requireInspectionWorld
+      />,
+    );
+    expect(await screen.findByTestId('inspection-world-viewport')).toHaveAttribute('data-record-id', '1893700');
+
+    rerender(
+      <ProductionPlateMap
+        {...common}
+        artifactMode="production"
+        inspectionId="1893701"
+        requireInspectionWorld
+      />,
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('record 1893701 metadata unavailable');
+    expect(screen.queryByTestId('inspection-world-viewport')).not.toBeInTheDocument();
   });
 });
 
@@ -1791,6 +1898,7 @@ describe('PlateMap', () => {
     await waitFor(() => expect(fetchCaptureStitchHistory).toHaveBeenCalledWith(
       '4033',
       expect.any(Array),
+      expect.anything(),
     ));
     expect(screen.getByTestId('surface-gray-unfolded')).toHaveAttribute('data-image-source', 'per-frame-two-level-gray');
     const grayViewport = screen.getByTestId('capture-stitch-viewport');

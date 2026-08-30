@@ -224,6 +224,35 @@ def load_profile(
         )
 
     capture_defaults = payload.get("captureDefaults", {})
+    steel_detection_camera_keys = capture_defaults.get("steelDetectionCameraKeys")
+    if steel_detection_camera_keys is not None:
+        if (
+            not isinstance(steel_detection_camera_keys, list)
+            or not steel_detection_camera_keys
+            or any(
+                not isinstance(camera_key, str) or not camera_key.strip()
+                for camera_key in steel_detection_camera_keys
+            )
+        ):
+            raise ValueError(
+                "captureDefaults.steelDetectionCameraKeys must be a non-empty string array"
+            )
+        normalized_detection_keys = [
+            camera_key.strip() for camera_key in steel_detection_camera_keys
+        ]
+        if len(set(normalized_detection_keys)) != len(normalized_detection_keys):
+            raise ValueError(
+                "captureDefaults.steelDetectionCameraKeys must not contain duplicates"
+            )
+        enabled_camera_keys = {camera.key for camera in enabled}
+        unknown_detection_keys = sorted(
+            set(normalized_detection_keys) - enabled_camera_keys
+        )
+        if unknown_detection_keys:
+            raise ValueError(
+                "captureDefaults.steelDetectionCameraKeys references unknown or disabled "
+                f"camera keys: {', '.join(unknown_detection_keys)}"
+            )
     compatibility = payload.get("compatibility", {})
     timeout_ms = int(capture_defaults.get("timeoutMs", payload.get("timeoutMs", 8000)))
     if timeout_ms < 100 or timeout_ms > 600_000:
@@ -257,8 +286,12 @@ def load_profile(
         ("softSyncAnchorIntervalFrames", 1, 512, 16),
         ("measurementRowWindow", 1, 128, 16),
         ("measurementMaximumProfilePoints", 32, 2048, 320),
-        ("measurementMaximumSections", 1, 64, 12),
+        # Zero selects every soft-sync anchor; positive values retain an
+        # explicit diagnostic sampling cap for constrained lab profiles.
+        ("measurementMaximumSections", 0, 4096, 0),
         ("measurementMinimumCirclePoints", 8, 4096, 48),
+        ("measurementMinimumCameraProfilePoints", 1, 2048, 8),
+        ("synchronizationMaximumSequenceSkew", 0, 100, 1),
     )
     for name, minimum, maximum, default in bounded_integer_settings:
         value = int(capture_defaults.get(name, default))

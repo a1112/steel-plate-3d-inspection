@@ -40,6 +40,53 @@ class InlineExecutor:
 
 
 class RebuildSickJetHistoryTests(unittest.TestCase):
+    def test_skip_ready_treats_concurrently_finalized_renditions_as_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile.json"
+            profile.write_text("{}", encoding="utf-8")
+            status_path = root / "status.json"
+            args = argparse.Namespace(
+                profile=profile,
+                workers=1,
+                minimum_material=0,
+                maximum_material=0,
+                limit=0,
+                oldest_first=True,
+                skip_ready=True,
+            )
+            with (
+                patch.object(history, "_material_ids", return_value=(["41"], [])),
+                patch.object(
+                    history,
+                    "_upgrade_existing_surface",
+                    side_effect=history.MaterialJobLockedError("owned"),
+                ),
+                patch.object(history, "_rebuild_one") as rebuild,
+                patch.object(
+                    history.concurrent.futures,
+                    "ProcessPoolExecutor",
+                    InlineExecutor,
+                ),
+            ):
+                exit_code = history._run(
+                    args,
+                    {"C1": root / "C1"},
+                    root,
+                    None,
+                    AlignmentConfig(),
+                    MeasurementConfig(),
+                    status_path,
+                    {"ownerPid": 123},
+                )
+
+            self.assertEqual(exit_code, 0)
+            rebuild.assert_not_called()
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["state"], "complete")
+            self.assertEqual(status["existingReady"], 1)
+            self.assertEqual(status["total"], 0)
+
     def test_run_submits_the_current_rebuild_signature_and_publishes_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

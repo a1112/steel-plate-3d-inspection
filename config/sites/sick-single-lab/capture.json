@@ -19,6 +19,7 @@
   "captureDefaults": {
     "timeoutMs": 8000,
     "frameTriggerMode": "free-run",
+    "synchronizationMaximumSequenceSkew": 1,
     "blackFrameThreshold": 1.0,
     "grayscaleSteelDetection": true,
     "steelBrightPixelThreshold": 8.0,
@@ -39,8 +40,9 @@
     "arrayCalibrationPath": "",
     "measurementRowWindow": 16,
     "measurementMaximumProfilePoints": 320,
-    "measurementMaximumSections": 12,
+    "measurementMaximumSections": 0,
     "measurementMinimumCirclePoints": 48,
+    "measurementMinimumCameraProfilePoints": 8,
     "measurementMaximumCircleResidualMm": 0.5,
     "defectDetectionEnabled": true,
     "defectRequireApprovedRegionMap": true,

@@ -39,6 +39,7 @@ from sick_capture.paths import (
     alignment_path as canonical_alignment_path,
     acquisition_manifest_path,
     algorithm_state_path,
+    capture_flow_handoff_path,
     defect_report_path,
     frame_event_root,
     frame_event_path,
@@ -54,8 +55,8 @@ from sick_capture.profile import load_profile
 from sick_capture.regions import build_and_write_flow_region_map
 from sick_capture.storage import atomic_summary
 from sick_capture.surface import (
-    apply_surface_quality_gate,
     build_and_write_flow_surface,
+    measurement_artifact_from_surface,
 )
 
 
@@ -64,6 +65,50 @@ HISTORY_CURSOR_FILENAME = "history-cursor.json"
 DEPTH_HISTORY_CURSOR_SCHEMA = "steel.depth-geometry-history-cursor.v1"
 DEPTH_HISTORY_CURSOR_FILENAME = "depth-geometry-history-cursor.json"
 DEFAULT_MAXIMUM_DEFECT_BACKLOG = 64
+CAPTURE_FLOW_HANDOFF_SCHEMA = "steel.capture-flow-handoff.v1"
+_COMMITTED_SIGNATURE_CACHE_LOCK = threading.Lock()
+_COMMITTED_SIGNATURE_CACHE: dict[
+    tuple[str, str], tuple[int, tuple[int, int, int]]
+] = {}
+
+
+def _remember_committed_signature(
+    cache_key: tuple[str, str],
+    manifest_round: int,
+    signature: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    with _COMMITTED_SIGNATURE_CACHE_LOCK:
+        _COMMITTED_SIGNATURE_CACHE[cache_key] = (manifest_round, signature)
+    return signature
+
+
+def _recorded_checkpoint_for_event(
+    storage_root: Path,
+    material_id: str,
+    capture_round: int,
+    event_mtime_ns: int,
+) -> tuple[int, int, int] | None:
+    """Preserve checkpoint identity across old and new event-count strategies."""
+    try:
+        state = json.loads(
+            algorithm_state_path(storage_root, material_id).read_text(
+                encoding="utf-8-sig"
+            )
+        )
+        recorded = (
+            int(state.get("committedEventCount", -1)),
+            int(state.get("latestCommittedRound", -1)),
+            int(state.get("latestCommittedEventMtimeNs", -1)),
+        )
+        if (
+            recorded[0] > 0
+            and recorded[1] == capture_round
+            and recorded[2] == event_mtime_ns
+        ):
+            return recorded
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
 
 
 def lower_process_priority() -> str:
@@ -88,6 +133,48 @@ def lower_process_priority() -> str:
         return "unchanged"
 
 
+def _per_camera_routed_signature(
+    root: Path,
+) -> tuple[int, int, int] | None:
+    """Checkpoint an intentional set of partial per-camera round events.
+
+    A free-running array cannot require six cameras to cross a material edge
+    in the same capture round. These events are partial by design, but every
+    persisted frame must carry the positive local material signal and the
+    camera-routing phase. Any ordinary/legacy partial event still fails this
+    contract and remains excluded from algorithm input.
+    """
+
+    events = sorted(
+        (path for path in root.glob("*.json") if path.stem.isdecimal()),
+        key=lambda path: int(path.stem),
+    )
+    if not events:
+        return None
+    for path in events:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+            capture_round = int(payload.get("captureRound", -1))
+            frames = payload.get("frames")
+            if (
+                payload.get("schema") != "steel.capture-frame-committed.v1"
+                or capture_round != int(path.stem)
+                or not str(payload.get("boundaryPhase", "")).startswith("camera-")
+                or not isinstance(frames, list)
+                or not frames
+                or any(
+                    not isinstance(frame, dict)
+                    or frame.get("materialSignal") is not True
+                    for frame in frames
+                )
+            ):
+                return None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+    latest = events[-1]
+    return len(events), int(latest.stem), latest.stat().st_mtime_ns
+
+
 def committed_signature(
     storage_root: Path, material_id: str
 ) -> tuple[int, int, int] | None:
@@ -100,15 +187,50 @@ def committed_signature(
     # event directly before falling back to a directory scan: a production
     # flow contains thousands of event files, and enumerating 128 completed
     # flows on every poll can delay a newly closed bar by several minutes.
+    cache_key = (str(Path(storage_root).resolve()), material_id)
+    explicit_complete_round = False
+    manifest: dict[str, object] = {}
     try:
         manifest = json.loads(
             flow_manifest_path(storage_root, material_id).read_text(
                 encoding="utf-8-sig"
             )
         )
-        latest_round = int(manifest.get("latestCommittedRound", -1))
+        manifest_round = int(manifest.get("latestCommittedRound", -1))
+        explicit_value = manifest.get("latestCompleteCommittedRound")
+        explicit_complete_round = explicit_value is not None
+        latest_round = int(explicit_value) if explicit_complete_round else manifest_round
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        manifest_round = -1
         latest_round = -1
+    with _COMMITTED_SIGNATURE_CACHE_LOCK:
+        cached_row = _COMMITTED_SIGNATURE_CACHE.get(cache_key)
+    if cached_row is not None and manifest_round < cached_row[0]:
+        cached_row = None
+    routed_policy = (
+        str(manifest.get("boundaryPolicy", ""))
+        == "global-reference-id+per-camera-one-round-boundary"
+    )
+    if not routed_policy and str(manifest.get("state", "")).lower() == "closed":
+        try:
+            latest_payload = json.loads(
+                frame_event_path(
+                    storage_root, material_id, manifest_round
+                ).read_text(encoding="utf-8-sig")
+            )
+            routed_policy = str(
+                latest_payload.get("boundaryPhase", "")
+            ).startswith("camera-")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            routed_policy = False
+    if routed_policy:
+        if cached_row is not None and cached_row[0] == manifest_round:
+            return cached_row[1]
+        routed_signature = _per_camera_routed_signature(root)
+        if routed_signature is not None:
+            return _remember_committed_signature(
+                cache_key, manifest_round, routed_signature
+            )
     if latest_round >= 0:
         latest = frame_event_path(storage_root, material_id, latest_round)
         try:
@@ -130,25 +252,16 @@ def committed_signature(
                 latest_mtime_ns = latest.stat().st_mtime_ns
                 # A completed algorithm checkpoint carries the exact event
                 # count. Reuse it when it names this immutable latest event.
-                try:
-                    state = json.loads(
-                        algorithm_state_path(storage_root, material_id).read_text(
-                            encoding="utf-8-sig"
-                        )
+                recorded = _recorded_checkpoint_for_event(
+                    storage_root,
+                    material_id,
+                    latest_round,
+                    latest_mtime_ns,
+                )
+                if recorded is not None:
+                    return _remember_committed_signature(
+                        cache_key, manifest_round, recorded
                     )
-                    recorded = (
-                        int(state.get("committedEventCount", -1)),
-                        int(state.get("latestCommittedRound", -1)),
-                        int(state.get("latestCommittedEventMtimeNs", -1)),
-                    )
-                    if (
-                        recorded[0] > 0
-                        and recorded[1] == latest_round
-                        and recorded[2] == latest_mtime_ns
-                    ):
-                        return recorded
-                except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                    pass
 
                 # Per-camera sequence numbers are flow-local and start at one;
                 # their maximum is therefore the committed event count.  This
@@ -166,9 +279,104 @@ def committed_signature(
                         value for value in (sequence, storage_count) if value > 0
                     )
                 if sequence_counts:
-                    return max(sequence_counts), latest_round, latest_mtime_ns
+                    return _remember_committed_signature(
+                        cache_key,
+                        manifest_round,
+                        (max(sequence_counts), latest_round, latest_mtime_ns),
+                    )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
+
+        # Rolling-upgrade compatibility: old flow manifests name a partial
+        # latest tail without preserving the newest complete round. Probe by
+        # numeric path for a bounded distance before using the expensive full
+        # directory enumeration recovery path.
+        cached_manifest_round = cached_row[0] if cached_row is not None else -1
+        cache_covers_gap = bool(
+            cached_row is not None
+            and not explicit_complete_round
+            and 0 <= manifest_round - cached_manifest_round <= 4096
+        )
+        lower_round = (
+            cached_manifest_round
+            if cache_covers_gap
+            else max(-1, latest_round - 4096)
+        )
+        for candidate_round in range(latest_round - 1, lower_round, -1):
+            candidate = frame_event_path(storage_root, material_id, candidate_round)
+            if not candidate.is_file():
+                continue
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8-sig"))
+                frames = payload.get("frames")
+                expected_count = int(payload.get("expectedCameraCount", 0) or 0)
+                committed_count = int(payload.get("committedCameraCount", 0) or 0)
+                if (
+                    payload.get("schema") != "steel.capture-frame-committed.v1"
+                    or int(payload.get("captureRound", -1)) != candidate_round
+                    or payload.get("complete") is not True
+                    or not isinstance(frames, list)
+                    or not frames
+                    or expected_count <= 0
+                    or committed_count != expected_count
+                    or len(frames) != expected_count
+                    or payload.get("missingCameraIds")
+                ):
+                    continue
+                candidate_mtime_ns = candidate.stat().st_mtime_ns
+                recorded = _recorded_checkpoint_for_event(
+                    storage_root,
+                    material_id,
+                    candidate_round,
+                    candidate_mtime_ns,
+                )
+                if recorded is not None:
+                    return _remember_committed_signature(
+                        cache_key, manifest_round, recorded
+                    )
+                sequence_counts = []
+                for frame in frames:
+                    if not isinstance(frame, dict):
+                        continue
+                    try:
+                        sequence = int(frame.get("sequenceNo", 0) or 0)
+                        storage_count = int(frame.get("storageIndex", -1)) + 1
+                    except (ValueError, TypeError):
+                        continue
+                    sequence_counts.extend(
+                        value for value in (sequence, storage_count) if value > 0
+                    )
+                if sequence_counts:
+                    return _remember_committed_signature(
+                        cache_key,
+                        manifest_round,
+                        (
+                            max(sequence_counts),
+                            candidate_round,
+                            candidate_mtime_ns,
+                        ),
+                    )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+        if cache_covers_gap and cached_row is not None:
+            cached_signature = cached_row[1]
+            # The image worker may publish its checkpoint after another worker
+            # cached this immutable event. Reconcile the cached count with the
+            # durable checkpoint before returning it, otherwise workers can
+            # disagree about event counts while naming the same round/mtime.
+            recorded = _recorded_checkpoint_for_event(
+                storage_root,
+                material_id,
+                cached_signature[1],
+                cached_signature[2],
+            )
+            if recorded is not None:
+                cached_signature = recorded
+            return _remember_committed_signature(
+                cache_key,
+                manifest_round,
+                cached_signature,
+            )
 
     # Compatibility/recovery path for incomplete manifests and partial tail
     # events.  It deliberately finds the newest complete event, so an
@@ -204,7 +412,35 @@ def committed_signature(
                 or payload.get("missingCameraIds")
             ):
                 continue
-            return event_index + 1, capture_round, latest.stat().st_mtime_ns
+            latest_mtime_ns = latest.stat().st_mtime_ns
+            recorded = _recorded_checkpoint_for_event(
+                storage_root,
+                material_id,
+                capture_round,
+                latest_mtime_ns,
+            )
+            if recorded is not None:
+                return _remember_committed_signature(
+                    cache_key, manifest_round, recorded
+                )
+            sequence_counts = []
+            for frame in frames:
+                if not isinstance(frame, dict):
+                    continue
+                try:
+                    sequence = int(frame.get("sequenceNo", 0) or 0)
+                    storage_count = int(frame.get("storageIndex", -1)) + 1
+                except (ValueError, TypeError):
+                    continue
+                sequence_counts.extend(
+                    value for value in (sequence, storage_count) if value > 0
+                )
+            event_count = max(sequence_counts) if sequence_counts else event_index + 1
+            return _remember_committed_signature(
+                cache_key,
+                manifest_round,
+                (event_count, capture_round, latest_mtime_ns),
+            )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             continue
     return None
@@ -267,6 +503,7 @@ def defect_artifact_complete(
     material_id: str,
     expected_geometry_config_hash: str | None = None,
     expected_legacy_model_hash: str | None = None,
+    expected_capture_signature: tuple[int, int, int] | None = None,
 ) -> bool:
     """A failed database import is retryable and is not a completed defect job."""
     path = defect_detection_manifest_path(storage_root, material_id)
@@ -285,7 +522,9 @@ def defect_artifact_complete(
         if not isinstance(geometry, dict) or (
             str(geometry.get("configHash", "")) != expected_geometry_config_hash
         ) or str(geometry.get("state", "")).lower() in {
+            "deferred",
             "failed",
+            "queued",
             "unavailable",
             "database-write-failed",
         }:
@@ -299,6 +538,26 @@ def defect_artifact_complete(
             "unavailable",
             "database-write-failed",
         }:
+            return False
+    if expected_capture_signature is not None:
+        try:
+            algorithm = json.loads(
+                algorithm_state_path(storage_root, material_id).read_text(
+                    encoding="utf-8-sig"
+                )
+            )
+            recorded_signature = (
+                int(algorithm.get("committedEventCount", -1)),
+                int(algorithm.get("latestCommittedRound", -1)),
+                int(algorithm.get("latestCommittedEventMtimeNs", -1)),
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+        if (
+            recorded_signature != expected_capture_signature
+            or str(algorithm.get("state", "")).lower() != "ready"
+            or str(algorithm.get("mode", "")).lower() != "final"
+        ):
             return False
     return payload.get("databaseImport", {}).get("state") not in {"failed", "partial"}
 
@@ -314,18 +573,238 @@ def flow_state(storage_root: Path, material_id: str) -> str | None:
         return None
 
 
-def recent_materials(first_root: Path, limit: int) -> list[str]:
-    rows = [
-        path
-        for path in first_root.iterdir()
-        if path.is_dir()
-        and path.name.isdigit()
-    ]
-    # Numeric flow numbers are monotonic.  Derived/history writes can update
-    # an old directory's mtime and must never displace a newly closed live
-    # flow from the realtime analysis window.
+def prioritize_materials(
+    materials: list[str], priority_material_ids: list[str], limit: int
+) -> list[str]:
+    """Prepend capture-owned hints without duplicating the history catalog."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in [*priority_material_ids, *materials]:
+        material_id = str(value).strip()
+        if not material_id.isdecimal() or int(material_id) <= 0:
+            continue
+        canonical_id = str(int(material_id))
+        if canonical_id in seen:
+            continue
+        seen.add(canonical_id)
+        result.append(canonical_id)
+        if len(result) >= max(1, limit):
+            break
+    return result
+
+
+def recent_materials(
+    first_root: Path,
+    limit: int,
+    priority_material_ids: list[str] | None = None,
+) -> list[str]:
+    try:
+        rows = [
+            path
+            for path in first_root.iterdir()
+            if path.is_dir() and path.name.isdigit()
+        ]
+    except OSError:
+        rows = []
+    # Numeric order remains a compatibility fallback for old storage. The
+    # capture hand-off is authoritative because production flow ids can reset.
     rows.sort(key=lambda path: int(path.name), reverse=True)
-    return [path.name for path in rows[:limit]]
+    return prioritize_materials(
+        [path.name for path in rows[: max(1, limit)]],
+        list(priority_material_ids or []),
+        limit,
+    )
+
+
+def processed_snapshot_is_current(
+    storage_root: Path,
+    material_id: str,
+    processed_row: tuple[tuple[int, int, int], str] | None,
+    signature: tuple[int, int, int],
+    state: str,
+) -> bool:
+    """Reject a process-local shortcut when another worker overwrote it.
+
+    Image and defect roles intentionally run in parallel and share the final
+    algorithm-state checkpoint. During a rolling upgrade, an older defect
+    worker can publish a stale complete-round signature after the image role
+    already accepted all per-camera routed events. A closed-flow cache hit is
+    therefore valid only while the durable fast artifacts still name the same
+    signature.
+    """
+
+    if processed_row != (signature, state):
+        return False
+    return state != "closed" or fast_artifacts_ready(
+        storage_root,
+        material_id,
+        signature,
+    )
+
+
+def capture_flow_hints(storage_root: Path) -> list[str]:
+    """Read durable hints, finalizing closed flows before live snapshots.
+
+    The capture process publishes newest-first. Under a continuous stream,
+    always taking that first row can repeatedly analyze a still-capturing bar
+    while an older flow's late per-camera tail remains absent from its final
+    result. Closed rows are therefore returned oldest-first (bounded FIFO),
+    followed by capturing rows newest-first.
+    """
+    try:
+        payload = json.loads(
+            capture_flow_handoff_path(storage_root).read_text(encoding="utf-8-sig")
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return []
+    if payload.get("schema") != CAPTURE_FLOW_HANDOFF_SCHEMA:
+        return []
+    raw_rows = payload.get("flows", [])
+    if not isinstance(raw_rows, list):
+        return []
+    rows = [row for row in raw_rows if isinstance(row, dict)]
+    closed = [
+        str(row.get("materialId", ""))
+        for row in reversed(rows)
+        if str(row.get("state", "")).lower() == "closed"
+    ]
+    capturing = [
+        str(row.get("materialId", ""))
+        for row in rows
+        if str(row.get("state", "")).lower() != "closed"
+    ]
+    return prioritize_materials(
+        [],
+        [*closed, *capturing],
+        32,
+    )
+
+
+def playback_catalog_hint(storage_root: Path) -> str:
+    """Bootstrap rolling upgrades from the last generated playback catalog."""
+    try:
+        payload = json.loads(
+            (Path(storage_root) / "catalog.json").read_text(encoding="utf-8-sig")
+        )
+        if payload.get("schema") != "steel.capture-playback-catalog.v1":
+            return ""
+        rows = payload.get("materials", [])
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            return ""
+        material_id = str(rows[0].get("materialId", "")).strip()
+        return (
+            str(int(material_id))
+            if material_id.isdecimal() and int(material_id) > 0
+            else ""
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return ""
+
+
+def capture_service_material_hint(capture_origin: str) -> str:
+    """Support a capture process that has not yet been restarted after upgrade."""
+    origin = str(capture_origin).strip().rstrip("/")
+    if not origin:
+        return ""
+    try:
+        with request.urlopen(f"{origin}/api/steel/status", timeout=0.5) as response:
+            payload = json.loads(response.read().decode("utf-8-sig"))
+        material_id = str(payload.get("materialId", "")).strip()
+        return (
+            str(int(material_id))
+            if material_id.isdecimal() and int(material_id) > 0
+            else ""
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return ""
+
+
+def algorithm_lag_snapshot(storage_root: Path, material_id: str) -> dict[str, object]:
+    """Measure how far the accepted algorithm input trails durable capture."""
+    capture_signature = committed_signature(storage_root, material_id)
+    snapshot: dict[str, object] = {
+        "materialId": material_id,
+        "measuredAtUnixMs": int(time.time() * 1000),
+        "flowState": flow_state(storage_root, material_id),
+        "captureCommittedEventCount": None,
+        "latestCaptureRound": None,
+        "latestCaptureEventUnixMs": None,
+        "algorithmState": None,
+        "algorithmMode": None,
+        "algorithmCommittedEventCount": None,
+        "latestAlgorithmRound": None,
+        "captureToAlgorithmLagEvents": None,
+        "captureToAlgorithmLagRounds": None,
+        "captureToAlgorithmLagMs": None,
+        "inputAccepted": False,
+        "resultCaughtUp": False,
+    }
+    if capture_signature is None:
+        return snapshot
+    snapshot.update(
+        {
+            "captureCommittedEventCount": capture_signature[0],
+            "latestCaptureRound": capture_signature[1],
+            "latestCaptureEventUnixMs": capture_signature[2] // 1_000_000,
+        }
+    )
+    try:
+        state = json.loads(
+            algorithm_state_path(storage_root, material_id).read_text(
+                encoding="utf-8-sig"
+            )
+        )
+        algorithm_signature = (
+            int(state.get("committedEventCount", -1)),
+            int(state.get("latestCommittedRound", -1)),
+            int(state.get("latestCommittedEventMtimeNs", -1)),
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return snapshot
+    algorithm_state = str(state.get("state", ""))
+    exact = algorithm_signature == capture_signature
+    snapshot.update(
+        {
+            "algorithmState": algorithm_state or None,
+            "algorithmMode": str(state.get("mode", "")) or None,
+            "algorithmCommittedEventCount": max(0, algorithm_signature[0]),
+            "latestAlgorithmRound": max(0, algorithm_signature[1]),
+            "captureToAlgorithmLagEvents": max(
+                0, capture_signature[0] - max(0, algorithm_signature[0])
+            ),
+            "captureToAlgorithmLagRounds": max(
+                0, capture_signature[1] - max(0, algorithm_signature[1])
+            ),
+            "captureToAlgorithmLagMs": max(
+                0,
+                (capture_signature[2] - max(0, algorithm_signature[2])) // 1_000_000,
+            ),
+            "inputAccepted": exact,
+            "resultCaughtUp": exact
+            and not algorithm_state.startswith("processing")
+            and algorithm_state != "failed",
+        }
+    )
+    return snapshot
+
+
+def analysis_snapshot_accepted(
+    signature: tuple[int, int, int],
+    state: str,
+    after_signature: tuple[int, int, int] | None,
+    after_state: str | None,
+) -> bool:
+    """Accept a coherent live snapshot even if capture advanced while it ran."""
+    if after_state != state:
+        return False
+    return state == "capturing" or after_signature == signature
+
+
+def defect_queue_tier(*, history: bool, capture_priority: bool) -> int:
+    """Keep capture hand-off flows ahead of numeric recent and history work."""
+    if capture_priority:
+        return -1
+    return 1 if history else 0
 
 
 def all_materials(first_root: Path) -> list[str]:
@@ -637,7 +1116,9 @@ def _analyze_impl(
         material_id,
         alignment,
         calibration_path=calibration_path,
-        config=measurement_config,
+        # Keep the prerequisite crop pass small. The surface pass below owns
+        # all-anchor fitting and replaces every diameter field atomically.
+        config=replace(measurement_config, maximum_sections=1),
     )
     region_path, regions = build_and_write_flow_region_map(
         camera_roots,
@@ -646,7 +1127,7 @@ def _analyze_impl(
         measurement,
     )
     notify_region_commit(database_origin, material_id, region_path, regions)
-    surface_path, surface, jet_path = build_and_write_flow_surface(
+    surface_path, surface = build_and_write_flow_surface(
         camera_roots,
         storage_root,
         material_id,
@@ -655,19 +1136,15 @@ def _analyze_impl(
         config=measurement_config,
         region_map=regions,
     )
+    measurement = measurement_artifact_from_surface(surface, measurement)
     measurement["surface"] = {
         "path": str(surface_path),
-        "jetPath": str(jet_path) if jet_path.is_file() else "",
         "state": surface.get("state"),
         "quality": surface.get("quality"),
         "depthPrecision": surface.get("depthPrecision"),
         "calibrationAccuracy": surface.get("calibrationAccuracy"),
         "summary": surface.get("summary"),
     }
-    apply_surface_quality_gate(measurement, surface)
-    diameter_curves = surface.get("diameterCurves")
-    if isinstance(diameter_curves, dict):
-        measurement.setdefault("surfaceFit", {})["diameterCurves"] = diameter_curves
     atomic_summary(measurement_path, measurement)
     playback_path, playback = build_and_write_playback_index(
         camera_roots,
@@ -681,8 +1158,6 @@ def _analyze_impl(
         ("surface", surface_path),
         ("playback-index", playback_path),
     ]
-    if jet_path.is_file():
-        image_artifacts.append(("surface-preview", jet_path))
     source_manifest = acquisition_manifest_path(storage_root, material_id)
     if not source_manifest.is_file():
         # Compatibility for flows captured before acquisition-manifest.v1 was
@@ -1031,8 +1506,8 @@ def main() -> int:
     parser.add_argument("--profile", required=True)
     parser.add_argument("--capture-origin", default="http://127.0.0.1:4317")
     parser.add_argument("--database-origin", default="http://127.0.0.1:4873")
-    parser.add_argument("--poll-seconds", type=float, default=2.0)
-    parser.add_argument("--settle-seconds", type=float, default=20.0)
+    parser.add_argument("--poll-seconds", type=float, default=0.25)
+    parser.add_argument("--settle-seconds", type=float, default=0.5)
     parser.add_argument("--recent-flows", type=int, default=128)
     parser.add_argument(
         "--full-history",
@@ -1053,7 +1528,15 @@ def main() -> int:
         default=DEFAULT_MAXIMUM_DEFECT_BACKLOG,
         help="bound queued final defect jobs (default: 64)",
     )
-    parser.add_argument("--maximum-storage-backlog", type=int, default=16)
+    parser.add_argument(
+        "--maximum-storage-backlog",
+        type=int,
+        default=64,
+        help=(
+            "pause live defect I/O above this capture storage backlog; zero "
+            "retains strict capture-idle scheduling (default: 64)"
+        ),
+    )
     parser.add_argument("--tile-frames", type=int, default=16)
     parser.add_argument("--once", default="")
     parser.add_argument("--final", action="store_true")
@@ -1078,8 +1561,11 @@ def main() -> int:
     measurement_config = MeasurementConfig(
         row_window=int(defaults.get("measurementRowWindow", 16)),
         maximum_profile_points=int(defaults.get("measurementMaximumProfilePoints", 320)),
-        maximum_sections=int(defaults.get("measurementMaximumSections", 12)),
+        maximum_sections=int(defaults.get("measurementMaximumSections", 0)),
         minimum_circle_points=int(defaults.get("measurementMinimumCirclePoints", 48)),
+        minimum_camera_profile_points=int(
+            defaults.get("measurementMinimumCameraProfilePoints", 8)
+        ),
         maximum_circle_residual_mm=float(
             defaults.get("measurementMaximumCircleResidualMm", 0.5)
         ),
@@ -1171,6 +1657,9 @@ def main() -> int:
                 args.database_origin,
                 final=args.final,
                 include_defects=args.role == "combined",
+                committed_event_signature=committed_signature(
+                    profile.storage_root, args.once
+                ),
             )
         return 0
 
@@ -1203,6 +1692,13 @@ def main() -> int:
     history_last_error = ""
     history_catalog: list[str] = []
     history_catalog_updated_at = 0.0
+    realtime_catalog: list[str] = []
+    realtime_catalog_updated_at = 0.0
+    cached_playback_catalog_hint = ""
+    capture_hint_checked_at = 0.0
+    capture_service_hint = ""
+    latest_flow_status: dict[str, object] | None = None
+    latest_flow_status_updated_at = 0.0
     history_cursor = load_history_cursor(profile.storage_root)
     geometry_snapshot = (
         load_depth_geometry_config_snapshot(profile.source_path)
@@ -1251,6 +1747,29 @@ def main() -> int:
         profile.storage_root / "system" / "jobs" / status_owner / "status.json"
     )
 
+    def refresh_latest_flow_status(
+        material_id: str = "", *, force: bool = False
+    ) -> None:
+        nonlocal latest_flow_status, latest_flow_status_updated_at
+        now = time.monotonic()
+        with queue_state_lock:
+            previous_material_id = str(
+                (latest_flow_status or {}).get("materialId", "")
+            )
+            target = material_id or current_fast_flow or previous_material_id
+            if (
+                not force
+                and target == previous_material_id
+                and now - latest_flow_status_updated_at < 1.0
+            ):
+                return
+        snapshot = (
+            algorithm_lag_snapshot(profile.storage_root, target) if target else None
+        )
+        with queue_state_lock:
+            latest_flow_status = snapshot
+            latest_flow_status_updated_at = now
+
     def write_queue_status() -> None:
         nonlocal status_write_error
         # Keep payload construction and replacement under the same lock.
@@ -1274,7 +1793,9 @@ def main() -> int:
                 "queuedDefectFlowIds": queued_ids[:32],
                 "fastProcessedFlowCount": fast_processed_count,
                 "defectProcessedFlowCount": defect_processed_count,
+                "latestCaptureFlow": latest_flow_status,
                 "recentFlowWindow": max(1, args.recent_flows),
+                "realtimeCatalogRefreshSeconds": history_refresh_seconds,
                 "maximumDefectBacklog": maximum_defect_backlog,
                 "defectBacklogDeferredCount": defect_backlog_deferred_count,
                 "fullHistoryEnabled": bool(args.full_history),
@@ -1349,6 +1870,7 @@ def main() -> int:
         signature: tuple[int, int, int],
         *,
         history: bool = False,
+        capture_priority: bool = False,
         geometry_hash: str = "",
     ) -> None:
         nonlocal queue_serial, defect_backlog_deferred_count
@@ -1357,6 +1879,7 @@ def main() -> int:
             material_id,
             geometry_hash or None,
             active_legacy_model_hash or None,
+            signature,
         ):
             defect_completed[material_id] = signature
             return
@@ -1378,7 +1901,10 @@ def main() -> int:
             queue_serial += 1
             defect_queue.put(
                 (
-                    1 if history else 0,
+                    defect_queue_tier(
+                        history=history,
+                        capture_priority=capture_priority,
+                    ),
                     -int(material_id),
                     queue_serial,
                     material_id,
@@ -1431,6 +1957,11 @@ def main() -> int:
                 continue
             with queue_state_lock:
                 if queued_defects.get(material_id) != signature:
+                    defect_queue.task_done()
+                    continue
+                if flow_state(profile.storage_root, material_id) != "closed":
+                    queued_defects.pop(material_id, None)
+                    queued_defect_history.pop(material_id, None)
                     defect_queue.task_done()
                     continue
                 current_defect_flow = material_id
@@ -1555,6 +2086,7 @@ def main() -> int:
                         material_id,
                         signature,
                         history=history,
+                        capture_priority=_tier < 0,
                         geometry_hash=next_geometry_hash,
                     )
                 except Exception as error:
@@ -1577,6 +2109,7 @@ def main() -> int:
 
     def status_heartbeat() -> None:
         while not stop.wait(5.0):
+            refresh_latest_flow_status(force=True)
             write_queue_status()
 
     heartbeat_thread = threading.Thread(
@@ -1601,6 +2134,43 @@ def main() -> int:
         with queue_state_lock:
             history_catalog = catalog
             history_catalog_updated_at = now
+
+    def refresh_realtime_catalog(force: bool = False) -> None:
+        nonlocal realtime_catalog, realtime_catalog_updated_at
+        nonlocal cached_playback_catalog_hint
+        now = time.monotonic()
+        if (
+            not force
+            and realtime_catalog
+            and now - realtime_catalog_updated_at < history_refresh_seconds
+        ):
+            return
+        # Reuse the full-history enumeration when it was refreshed this loop.
+        # Otherwise enumerate at most once every 15 seconds instead of once per
+        # 250 ms realtime poll.
+        if history_catalog and now - history_catalog_updated_at < history_refresh_seconds:
+            limit = max(1, args.recent_flows)
+            catalog = list(reversed(history_catalog[-limit:]))
+        else:
+            catalog = recent_materials(first_root, max(1, args.recent_flows))
+        with queue_state_lock:
+            realtime_catalog = catalog
+            realtime_catalog_updated_at = now
+            cached_playback_catalog_hint = playback_catalog_hint(
+                profile.storage_root
+            )
+
+    def refresh_capture_service_hint() -> None:
+        nonlocal capture_hint_checked_at, capture_service_hint
+        now = time.monotonic()
+        if now - capture_hint_checked_at < 1.0:
+            return
+        capture_hint_checked_at = now
+        material_id = capture_service_material_hint(args.capture_origin)
+        # Retain the last observed active id across steel-out. This is needed
+        # only during a rolling upgrade before capture publishes hand-off v1.
+        if material_id:
+            capture_service_hint = material_id
 
     def run_history_analysis(
         material_id: str,
@@ -1820,6 +2390,7 @@ def main() -> int:
             candidate,
             active_geometry_hash,
             active_legacy_model_hash,
+            signature,
         ):
             return False
         enqueue_defect(
@@ -1840,9 +2411,29 @@ def main() -> int:
             None,
         ):
             refresh_history_catalog()
+        refresh_realtime_catalog()
+        refresh_capture_service_hint()
         now = time.monotonic()
         defect_candidates: dict[str, tuple[int, int, int]] = {}
-        recent_ids = recent_materials(first_root, max(1, args.recent_flows))
+        priority_ids = prioritize_materials(
+            [],
+            [
+                *capture_flow_hints(profile.storage_root),
+                capture_service_hint,
+                cached_playback_catalog_hint,
+            ],
+            32,
+        )
+        capture_priority_ids = set(priority_ids)
+        recent_ids = prioritize_materials(
+            realtime_catalog,
+            priority_ids,
+            max(1, args.recent_flows),
+        )
+        status_material_id = priority_ids[0] if priority_ids else (
+            recent_ids[0] if recent_ids else ""
+        )
+        refresh_latest_flow_status(status_material_id)
         recent_expensive_pass = False
         for material_id in recent_ids:
             state = flow_state(profile.storage_root, material_id)
@@ -1850,11 +2441,6 @@ def main() -> int:
                 continue
             final = state == "closed"
             processed_row = processed.get(material_id)
-            # An incremental pass intentionally runs only once. Avoid reading
-            # its growing event directory again until flow.json transitions to
-            # closed, at which point the final signature is calculated.
-            if not final and processed_row is not None:
-                continue
             signature = committed_signature(profile.storage_root, material_id)
             if signature is None:
                 continue
@@ -1875,17 +2461,26 @@ def main() -> int:
                 if args.role == "combined":
                     defect_candidates[material_id] = signature
                 continue
-            if processed_row == (signature, state):
+            if processed_snapshot_is_current(
+                profile.storage_root,
+                material_id,
+                processed_row,
+                signature,
+                state,
+            ):
                 if final:
                     if args.role == "combined":
                         defect_candidates[material_id] = signature
                 continue
-            # Existing algorithms are whole-flow calculations rather than
-            # append-only reducers. One early pass is enough to publish live
-            # ROI; repeat once after close instead of rereading the growing
-            # flow every tile and competing with GenTL acquisition.
-            if not final and processed_row is not None:
-                continue
+            if processed_row == (signature, state):
+                # Another role replaced the durable closed-flow checkpoint
+                # after this process cached it. Re-enter settle/analyze rather
+                # than leaving the UI on a stale partial-camera result.
+                processed.pop(material_id, None)
+                observed.pop(material_id, None)
+            # Refresh the complete fitted surface and diameter artifact for
+            # every committed tile. This keeps live measurement current while
+            # bounding whole-flow recalculation frequency.
             previous_count = processed_row[0][0] if processed_row else 0
             if not final and signature[0] - previous_count < max(1, args.tile_frames):
                 continue
@@ -1916,7 +2511,7 @@ def main() -> int:
                 )
                 after = committed_signature(profile.storage_root, material_id)
                 after_state = flow_state(profile.storage_root, material_id)
-                if after == signature and after_state == state:
+                if analysis_snapshot_accepted(signature, state, after, after_state):
                     processed[material_id] = (signature, state)
                     with queue_state_lock:
                         fast_processed_count += 1
@@ -1951,7 +2546,7 @@ def main() -> int:
                 enqueue_defect(
                     material_id,
                     defect_candidates[material_id],
-                    geometry_hash=active_geometry_hash,
+                    capture_priority=material_id in capture_priority_ids,
                 )
         # Realtime/current flows always get the first chance each round. The
         # history worker is asynchronous, bounded to one flow, and never adds

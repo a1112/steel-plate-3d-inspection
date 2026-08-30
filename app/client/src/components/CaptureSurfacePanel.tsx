@@ -1,6 +1,6 @@
 import { Canvas } from '@react-three/fiber';
 import { Box, Image as ImageIcon, RefreshCw } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BufferGeometry,
   DoubleSide,
@@ -10,11 +10,9 @@ import {
 } from 'three';
 import {
   CaptureApiError,
-  captureArtifactImageUrl,
   readCaptureSurface,
   type CaptureFlowSurface,
 } from '../lib/capture-api';
-import { RequestedSizeImage } from './RequestedSizeImage';
 
 interface CaptureSurfacePanelProps {
   materialId: string;
@@ -78,36 +76,83 @@ function SurfaceMesh({ surface }: { surface: CaptureFlowSurface }) {
   return <mesh geometry={geometry} material={material} rotation={[0.18, -0.56, -0.08]} />;
 }
 
+function SurfaceJetMap({ surface }: { surface: CaptureFlowSurface }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const { rows, columns, colors, validMask } = surface.mesh;
+    if (!canvas || rows <= 0 || columns <= 0) return;
+    canvas.width = columns;
+    canvas.height = rows;
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    const image = context.createImageData(columns, rows);
+    for (let index = 0; index < rows * columns; index += 1) {
+      const target = index * 4;
+      const source = index * 3;
+      const valid = validMask[index] === 1;
+      image.data[target] = valid ? Math.round((colors[source] ?? 0) * 255) : 7;
+      image.data[target + 1] = valid ? Math.round((colors[source + 1] ?? 0) * 255) : 18;
+      image.data[target + 2] = valid ? Math.round((colors[source + 2] ?? 0) * 255) : 27;
+      image.data[target + 3] = 255;
+    }
+    context.putImageData(image, 0, 0);
+  }, [surface]);
+  return (
+    <canvas
+      ref={canvasRef}
+      aria-label={`${surface.materialId} JET fitted residual map`}
+      style={{ width: '100%', height: '100%', imageRendering: 'pixelated', objectFit: 'contain' }}
+    />
+  );
+}
+
 export function CaptureSurfacePanel({ materialId }: CaptureSurfacePanelProps) {
   const [surface, setSurface] = useState<CaptureFlowSurface | null>(null);
   const [mode, setMode] = useState<'3d' | 'jet'>('3d');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const loadRevisionRef = useRef(0);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (showLoading = true, signal?: AbortSignal) => {
     if (!materialId) return;
-    setLoading(true);
+    const revision = ++loadRevisionRef.current;
+    if (showLoading) setLoading(true);
     try {
-      const result = await readCaptureSurface(materialId);
+      const result = await readCaptureSurface(materialId, signal);
+      if (signal?.aborted || revision !== loadRevisionRef.current) return;
       setSurface(result.surface);
       setError('');
     } catch (loadError) {
-      setSurface(null);
+      if (signal?.aborted || revision !== loadRevisionRef.current) return;
+      if (showLoading) setSurface(null);
       setError(loadError instanceof CaptureApiError && loadError.status === 404
         ? '尚未生成 3D 拟合结果'
         : loadError instanceof Error ? loadError.message : '3D 拟合结果读取失败');
     } finally {
-      setLoading(false);
+      if (!signal?.aborted && revision === loadRevisionRef.current && showLoading) {
+        setLoading(false);
+      }
     }
   }, [materialId]);
 
   useEffect(() => {
+    const controller = new AbortController();
     setSurface(null);
     setError('');
-    void load();
+    void load(true, controller.signal);
+    const timer = window.setInterval(
+      () => void load(false, controller.signal),
+      1_500,
+    );
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
   }, [load]);
 
   const hasMesh = Boolean(surface?.mesh.indices.length);
+  const hasJet = Boolean(surface && surface.mesh.rows > 0 && surface.mesh.columns > 0);
   return (
     <section className="capture-surface-panel" aria-label="同步三维拟合与 JET 表面图">
       <header>
@@ -138,14 +183,9 @@ export function CaptureSurfacePanel({ materialId }: CaptureSurfacePanelProps) {
                 <directionalLight position={[-3, -1, -2]} intensity={0.8} />
                 <SurfaceMesh surface={surface} />
               </Canvas>
-            ) : mode === 'jet' && surface.jet.imagePath ? (
-              <RequestedSizeImage
-                src={captureArtifactImageUrl(surface.jet.imagePath, 1440)}
-                alt={`${materialId} JET 径向偏差展开图`}
-                requestWidth={1440}
-                requestHeight={720}
-                decoding="async"
-                loading="eager"
+            ) : mode === 'jet' && hasJet ? (
+              <SurfaceJetMap
+                surface={surface}
               />
             ) : (
               <span>当前流水号没有可显示的{mode === '3d' ? '三维网格' : ' JET 图'}</span>

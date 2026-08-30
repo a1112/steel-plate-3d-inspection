@@ -85,4 +85,6 @@ D:\project\py312\python.exe scripts\sick_defect_history_backfill.py `
 
 版本 2 回填会在推理前补齐缺失的测量与区域清单，并为已有区域清单原子补写 `ownership.overlapPairCount`；重跑后的缺陷清单包含 `statistics.overlapDuplicateFilteredCount`。历史只读采集进程不会因上次遗留的进钢状态阻塞回填，但任何真实采集模式、有钢状态或非空落盘队列仍会立即暂停历史任务。
 
-运行进度保存在 `D:\steel-sick-data\system\jobs\defect-history-backfill\status.json`。所有复核缺陷图均为各相机 `defect/*.jpg` 下的 JPEG，宽、高分别不小于 64 像素；中央 manifest 记录每张图的路径和检测结果。前端通过 `/api/defects/history` 分页读取数据库事实，并优先使用 `/api/capture/file` 返回的缺陷小图。人工复核通过 `/api/defects/review` 写回 `pending`、`confirmed` 或 `false-positive`，重跑模型不会覆盖已复核结论。
+运行进度保存在 `D:\steel-sick-data\system\jobs\defect-history-backfill\status.json`。所有复核缺陷图均为各相机 `defect/*.jpg` 下的 JPEG，宽、高分别不小于 64 像素；中央 manifest 记录每张图的路径和检测结果。前端通过 `/api/defects/history` 分页读取数据库事实，并优先使用 `/api/capture/file` 返回的缺陷小图。
+
+大图模式下的“缺陷标注”面板通过 `/api/defects/review` 写回人工选择的 `defectType`、`severity`、`note` 和 `pending`、`confirmed` 或 `false-positive` 状态。类别必须来自后台缺陷类型目录，排除误报必须填写判定理由，已被新算法批次淘汰的非活动缺陷拒绝继续标注。服务端记录操作人、操作时间和审计日志；恢复为 `pending` 时清空旧操作人、时间与说明。标注只修订人工分类，不改变算法产出的 ROI、图像和几何证据，重跑模型也不会覆盖已复核结论。

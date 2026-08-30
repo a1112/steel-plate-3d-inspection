@@ -296,8 +296,11 @@ def create_configs(
         maximum_profile_points=int(
             defaults.get("measurementMaximumProfilePoints", 320)
         ),
-        maximum_sections=int(defaults.get("measurementMaximumSections", 12)),
+        maximum_sections=int(defaults.get("measurementMaximumSections", 0)),
         minimum_circle_points=int(defaults.get("measurementMinimumCirclePoints", 48)),
+        minimum_camera_profile_points=int(
+            defaults.get("measurementMinimumCameraProfilePoints", 8)
+        ),
         maximum_circle_residual_mm=float(
             defaults.get("measurementMaximumCircleResidualMm", 0.5)
         ),

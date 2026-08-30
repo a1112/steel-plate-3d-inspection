@@ -136,6 +136,43 @@ describe('LiveMonitoringPage', () => {
     }
   });
 
+  it('removes a stale committed frame after repeated decode failures', async () => {
+    vi.useFakeTimers();
+    const onError = vi.fn();
+    const view = render(
+      <StableStreamImage src="/frame-a.png" alt="失效实时帧" onFrame={() => undefined} onError={onError} />,
+    );
+
+    try {
+      fireEvent.load(view.container.querySelector<HTMLImageElement>('.live-monitor-image-preload')!);
+      view.rerender(
+        <StableStreamImage src="/frame-b.png" alt="失效实时帧" onFrame={() => undefined} onError={onError} />,
+      );
+
+      for (const retryDelay of [500, 1_000]) {
+        fireEvent.error(view.container.querySelector<HTMLImageElement>('.live-monitor-image-preload')!);
+        expect(screen.getByRole('img', { name: '失效实时帧' })).toHaveAttribute('src', '/frame-a.png');
+        await act(async () => { await vi.advanceTimersByTimeAsync(retryDelay); });
+      }
+      fireEvent.error(view.container.querySelector<HTMLImageElement>('.live-monitor-image-preload')!);
+
+      expect(screen.queryByRole('img', { name: '失效实时帧' })).not.toBeInTheDocument();
+      expect(screen.getByText('等待实时首帧，正在重试')).toBeVisible();
+      expect(onError).toHaveBeenCalledTimes(3);
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows capture polling failure instead of an endless topology spinner', () => {
+    render(<LiveMonitoringPage statuses={[]} error="capture service offline" />);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('采集服务离线，实时画面已清除');
+    expect(screen.getAllByText('capture service offline').length).toBeGreaterThan(0);
+    expect(screen.queryByText('正在读取相机拓扑…')).not.toBeInTheDocument();
+  });
+
   it('starts the 500ms refresh clock before initially empty statuses become available', async () => {
     vi.useFakeTimers();
     const view = render(<LiveMonitoringPage statuses={[]} />);
@@ -289,6 +326,37 @@ describe('LiveMonitoringPage', () => {
     expect(screen.getByText('2/2 · 偏差 0 · 丢帧 9')).toBeInTheDocument();
   });
 
+  it('surfaces a debounced camera obstruction alarm without hiding other cameras', () => {
+    const view = render(<LiveMonitoringPage statuses={statuses.map((status, index) => (
+      index === 0
+        ? {
+            ...status,
+            streamRunning: true,
+            streamFrames: 1,
+            imageQuality: {
+              status: 'blocked',
+              alarmActive: true,
+              alarmType: 'camera-image-blocked',
+              reasons: ['image-low-contrast'],
+              failureStreak: 12,
+              automaticReconnect: { enabled: true, pending: false, attemptCount: 0 },
+            },
+          }
+        : {
+            ...status,
+            streamRunning: true,
+            streamFrames: 1,
+            imageQuality: { status: 'healthy', alarmActive: false, reasons: [] },
+          }
+    ))} />);
+
+    expect(screen.getByText('1 路报警')).toBeInTheDocument();
+    expect(screen.getByText('疑似遮挡')).toBeInTheDocument();
+    expect(view.container.querySelectorAll('.live-monitor-grid-card')).toHaveLength(2);
+    expect(view.container.querySelector('.live-monitor-grid-card.quality-alarm')).toBeInTheDocument();
+    expect(view.container.querySelectorAll('.live-monitor-grid-card.online')).toHaveLength(2);
+  });
+
   it('renders a full monitoring page, auto-starts a stream, and switches cameras and image planes', async () => {
     const health: CaptureHealth = {
       service: 'steel_sick_capture_sidecar',
@@ -367,7 +435,13 @@ describe('LiveMonitoringPage', () => {
     });
 
     fireEvent.click(screen.getByRole('tab', { name: '回放' }));
-    await waitFor(() => expect(captureMocks.history).toHaveBeenCalledWith(300));
+    await waitFor(() =>
+      expect(captureMocks.history).toHaveBeenCalledWith(
+        300,
+        undefined,
+        expect.any(AbortSignal),
+      ),
+    );
     expect(screen.getByLabelText('历史六相机画面')).toBeInTheDocument();
     expect(screen.getByRole('img', { name: 'C1 历史灰度图' })).toHaveAttribute(
       'src',

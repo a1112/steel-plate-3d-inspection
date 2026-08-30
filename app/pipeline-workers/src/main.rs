@@ -139,12 +139,12 @@ fn worker_config(role: WorkerRole) -> Option<WorkerConfig> {
             WorkerRole::Image => "STEEL_IMAGE_WORKER_POLL_SECONDS",
             WorkerRole::Defect => "STEEL_DEFECT_WORKER_POLL_SECONDS",
         })
-        .unwrap_or_else(|_| "1".into()),
+        .unwrap_or_else(|_| "0.25".into()),
         settle_seconds: env::var(match role {
             WorkerRole::Image => "STEEL_IMAGE_WORKER_SETTLE_SECONDS",
             WorkerRole::Defect => "STEEL_DEFECT_WORKER_SETTLE_SECONDS",
         })
-        .unwrap_or_else(|_| "2".into()),
+        .unwrap_or_else(|_| "0.5".into()),
     })
 }
 
@@ -233,7 +233,12 @@ fn update_status(state: &State, running: bool, pid: Option<u32>, error: Option<S
     if let Ok(mut status) = state.status.lock() {
         status.running = running;
         status.pid = pid;
-        if error.is_some() {
+        if running {
+            // A successfully spawned replacement is the current health state;
+            // keep restartCount as history without presenting the previous
+            // child's exit as an active algorithm failure in the UI.
+            status.last_error = None;
+        } else if error.is_some() {
             status.last_error = error;
         }
     }

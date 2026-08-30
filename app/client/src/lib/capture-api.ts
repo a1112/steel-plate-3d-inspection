@@ -53,7 +53,53 @@ export type PhysicalCaptureHealth = {
   cameraCount?: number;
   expectedCameras?: number;
   acquisitionSynchronization?: CaptureSynchronizationStatus;
+  imageQuality?: CaptureImageQualityStatus;
   storageQueue?: CaptureHealthStorageQueueStatus;
+};
+
+export type CaptureCameraImageQuality = {
+  schema?: string;
+  cameraId?: string;
+  cameraKey?: string;
+  connected?: boolean;
+  status: "warming" | "healthy" | "suspect" | "degraded" | "blocked" | "offline" | string;
+  monitoringState?: string;
+  alarmActive: boolean;
+  alarmType?: "camera-offline" | "camera-image-blocked" | "camera-image-quality" | string;
+  reasons?: string[];
+  candidateReasons?: string[];
+  failureStreak?: number;
+  offlineStreak?: number;
+  recoveryStreak?: number;
+  activeSince?: string | null;
+  recoveredAt?: string | null;
+  updatedAt?: string | null;
+  metrics?: {
+    meanIntensity?: number;
+    maximumIntensity?: number;
+    standardDeviation?: number;
+    dynamicRange?: number;
+    highPercentile?: number;
+    brightPixelRatio?: number;
+    saturatedPixelRatio?: number;
+    validDepthRatio?: number;
+  };
+  automaticReconnect?: {
+    enabled?: boolean;
+    pending?: boolean;
+    attemptCount?: number;
+    lastAttemptAt?: string | null;
+  };
+};
+
+export type CaptureImageQualityStatus = {
+  schema?: string;
+  status: "warming" | "healthy" | "suspect" | "alarm" | string;
+  activeAlarmCount: number;
+  suspectCameraCount?: number;
+  cameraCount: number;
+  cameras: CaptureCameraImageQuality[];
+  updatedAt?: string;
 };
 
 export type CaptureSynchronizationRound = {
@@ -183,6 +229,7 @@ export type CaptureCameraStatus = {
   streamValidRoi?: number[] | null;
   streamDisplayWidth?: number;
   streamDisplayHeight?: number;
+  imageQuality?: CaptureCameraImageQuality;
   storageRoot?: string;
   captureConfig?: CaptureSdkReadback;
   error?: string | null;
@@ -557,8 +604,9 @@ export type CapturePlaybackCacheStatus = {
   renditionRoots: Array<{ cameraId: string; gray: string; jet: string }>;
   levels: ["thumbnail", "original"];
   modalities: ["gray", "jet"];
-  generationPolicy: "full-flow-after-alignment";
-  onDemandBuild: "recovery-only";
+  generationPolicy: "eager-incremental-committed-snapshot";
+  onDemandBuild: "disabled";
+  jetMetadata?: "full-row-diameter-and-fit-quality";
   catalogPath: string;
   catalogAvailable: boolean;
   memoryEntries: number;
@@ -887,6 +935,8 @@ export type CaptureFlowSurface = {
     diameterMaximumMm: number | null;
     diameterStdDevMm: number | null;
     jetResidualRangeMm: number;
+    jetValidBinCount?: number;
+    jetSourceSampleCount?: number;
   };
   mesh: {
     rows: number;
@@ -956,7 +1006,12 @@ export type CaptureFlowSurface = {
     minimumMm: number;
     maximumMm: number;
     zeroMm: number;
-    imagePath: string;
+    imagePath?: string;
+    calculation?: string;
+    circleFitAlgorithm?: string;
+    storage?: "per-frame-two-level-renditions" | string;
+    validBinCount?: number;
+    sourceSampleCount?: number;
   };
   cameraTiles?: CaptureSurfaceCameraTiles;
   diameterCurves?: CaptureDirectionalDiameterCurves;
@@ -1695,12 +1750,33 @@ export async function saveCapturePreviewFromUrl(
   return saveCapturePreviewBytes(suggestedName, bytes);
 }
 
-async function readJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${getCaptureServiceOrigin()}${path}`);
+async function readJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const url = `${getCaptureServiceOrigin()}${path}`;
+  const response = signal ? await fetch(url, { signal }) : await fetch(url);
   if (!response.ok) {
     const payload = await response.clone().json().catch(() => undefined);
     throw new CaptureApiError(
       await readAdminErrorMessage(response, "采集服务请求失败"),
+      response.status,
+      payload,
+    );
+  }
+  return response.json() as Promise<T>;
+}
+
+async function readCaptureDataJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  // Historical playback is immutable high-volume data, just like the live
+  // preview stream. In the desktop runtime read it directly from the local
+  // provider so a slow inspection snapshot or control-plane request cannot
+  // delay a record switch. Web-hosted clients remain on their page origin.
+  const response = await fetch(`${getCaptureStreamOrigin()}${path}`, {
+    headers: { Accept: "application/json" },
+    signal,
+  });
+  if (!response.ok) {
+    const payload = await response.clone().json().catch(() => undefined);
+    throw new CaptureApiError(
+      await readAdminErrorMessage(response, "采集历史读取失败"),
       response.status,
       payload,
     );
@@ -1715,7 +1791,7 @@ async function writeJson<T>(
 ): Promise<T> {
   const response = await fetch(`${getCaptureServiceOrigin()}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: createAdminHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
     signal,
   });
@@ -2113,6 +2189,9 @@ function parseCaptureHealth(value: unknown): CaptureHealth {
       : {}),
     ...(isRecord(value.acquisitionSynchronization)
       ? { acquisitionSynchronization: value.acquisitionSynchronization as CaptureSynchronizationStatus }
+      : {}),
+    ...(isRecord(value.imageQuality)
+      ? { imageQuality: value.imageQuality as CaptureImageQualityStatus }
       : {}),
     ...(isRecord(value.storageQueue)
       ? { storageQueue: value.storageQueue as CaptureHealthStorageQueueStatus }
@@ -2975,6 +3054,7 @@ export async function readCaptureCameraStatuses(): Promise<CaptureCameraStatus[]
 export async function readCaptureHistory(
   limit = 240,
   materialId?: string,
+  signal?: AbortSignal,
 ): Promise<CaptureHistoryResult> {
   const query = new URLSearchParams({
     limit: String(Math.max(1, Math.min(500, Math.round(limit)))),
@@ -2983,7 +3063,10 @@ export async function readCaptureHistory(
   if (normalizedMaterialId) {
     query.set("materialId", normalizedMaterialId);
   }
-  return readJson<CaptureHistoryResult>(`/api/capture/history?${query.toString()}`);
+  return readCaptureDataJson<CaptureHistoryResult>(
+    `/api/capture/history?${query.toString()}`,
+    signal,
+  );
 }
 
 export async function readCapturePlaybackCacheStatus(): Promise<CapturePlaybackCacheStatus> {
@@ -2992,16 +3075,24 @@ export async function readCapturePlaybackCacheStatus(): Promise<CapturePlaybackC
 
 export async function readCaptureMeasurement(
   materialId: string,
+  signal?: AbortSignal,
 ): Promise<CaptureMeasurementResponse> {
   const query = new URLSearchParams({ materialId: materialId.trim() });
   return readJson<CaptureMeasurementResponse>(
     `/api/capture/measurement?${query.toString()}`,
+    signal,
   );
 }
 
-export async function readCaptureSurface(materialId: string): Promise<CaptureSurfaceResponse> {
+export async function readCaptureSurface(
+  materialId: string,
+  signal?: AbortSignal,
+): Promise<CaptureSurfaceResponse> {
   const query = new URLSearchParams({ materialId: materialId.trim() });
-  return readJson<CaptureSurfaceResponse>(`/api/capture/surface?${query.toString()}`);
+  return readJson<CaptureSurfaceResponse>(
+    `/api/capture/surface?${query.toString()}`,
+    signal,
+  );
 }
 
 export async function readCaptureRegions(materialId: string): Promise<CaptureRegionMap> {
@@ -3021,10 +3112,12 @@ export async function rebuildCaptureMeasurement(materialId: string) {
 
 export async function readCaptureDefects(
   materialId: string,
+  signal?: AbortSignal,
 ): Promise<CaptureDefectDetectionResponse> {
   const query = new URLSearchParams({ materialId: materialId.trim() });
   return readJson<CaptureDefectDetectionResponse>(
     `/api/capture/defects?${query.toString()}`,
+    signal,
   );
 }
 
@@ -3070,7 +3163,7 @@ export function captureRenderImageUrl(
     modality,
     level,
   });
-  return `${getCaptureServiceOrigin()}/api/capture/render?${query.toString()}`;
+  return `${getCaptureStreamOrigin()}/api/capture/render?${query.toString()}`;
 }
 
 export function captureArtifactImageUrl(artifactRef: string, maxWidth = 320) {

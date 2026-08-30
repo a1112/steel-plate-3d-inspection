@@ -43,6 +43,8 @@ $ProtectedInputs = @(
   (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/pipeline-workers/Cargo.lock'),
   (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/runtime-contract/Cargo.lock'),
   (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/image-service/Cargo.lock'),
+  (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/algorithm-service/Cargo.lock'),
+  (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/server-monitor/Cargo.lock'),
   (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/tray/Cargo.lock'),
   (Join-Path $PSScriptRoot 'generate-release-sbom.ps1'),
   (Join-Path $PSScriptRoot 'verify-release-sbom.ps1'),

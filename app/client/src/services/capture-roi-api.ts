@@ -330,18 +330,20 @@ export function selectCaptureRoiPreviews(
 export async function fetchCaptureRoiPreviews(
   materialId: string,
   expectedCameraIds: readonly string[],
+  signal?: AbortSignal,
 ): Promise<CaptureRoiPreviewResult | null> {
   const normalizedMaterialId = materialId.trim();
   if (!isNumericCaptureFlowId(normalizedMaterialId)) return null;
-  const history = await readCaptureHistory(500, normalizedMaterialId);
+  const history = await readCaptureHistory(500, normalizedMaterialId, signal);
   return selectCaptureRoiPreviews(history, normalizedMaterialId, expectedCameraIds);
 }
 
 export async function fetchCaptureStitchHistory(
   materialId: string,
   expectedCameraIds: readonly string[],
+  signal?: AbortSignal,
 ): Promise<CaptureStitchResult> {
   const normalizedMaterialId = materialId.trim();
-  const history = await readCaptureHistory(500, normalizedMaterialId);
+  const history = await readCaptureHistory(500, normalizedMaterialId, signal);
   return selectCaptureStitchHistory(history, normalizedMaterialId, expectedCameraIds);
 }

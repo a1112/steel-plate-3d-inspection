@@ -109,7 +109,15 @@ try {
   $CargoDefinitions = @(
     [ordered]@{ path = 'app\client\src-tauri\Cargo.lock'; root = 'fixture-tauri' },
     [ordered]@{ path = 'app\service\Cargo.lock'; root = 'fixture-service' },
-    [ordered]@{ path = 'app\trigger\Cargo.lock'; root = 'fixture-trigger' }
+    [ordered]@{ path = 'app\trigger\Cargo.lock'; root = 'fixture-trigger' },
+    [ordered]@{ path = 'app\camera-worker\Cargo.lock'; root = 'fixture-camera-worker' },
+    [ordered]@{ path = 'app\result-contract\Cargo.lock'; root = 'fixture-result-contract' },
+    [ordered]@{ path = 'app\pipeline-workers\Cargo.lock'; root = 'fixture-pipeline-workers' },
+    [ordered]@{ path = 'app\runtime-contract\Cargo.lock'; root = 'fixture-runtime-contract' },
+    [ordered]@{ path = 'app\image-service\Cargo.lock'; root = 'fixture-image-service' },
+    [ordered]@{ path = 'app\algorithm-service\Cargo.lock'; root = 'fixture-algorithm-service' },
+    [ordered]@{ path = 'app\server-monitor\Cargo.lock'; root = 'fixture-server-monitor' },
+    [ordered]@{ path = 'app\tray\Cargo.lock'; root = 'fixture-tray' }
   )
   foreach ($Definition in $CargoDefinitions) {
     $CargoLock = @"

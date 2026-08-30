@@ -10,6 +10,11 @@ ACQUISITION_MANIFEST_SCHEMA = "steel.acquisition-manifest.v1"
 PIPELINE_TASK_SCHEMA = "steel.pipeline-task.v1"
 IMAGE_RESULT_SCHEMA = "steel.image-result.v1"
 DEFECT_REPORT_SCHEMA = "steel.defect-report.v1"
+REPRODUCTION_MANIFEST_SCHEMA = "steel.reproduction-manifest.v1"
+ALGORITHM_DATASET_SCHEMA = "steel.algorithm-dataset.v1"
+DEFECT_ANNOTATION_SCHEMA = "steel.defect-annotation.v1"
+ALGORITHM_BENCHMARK_SCHEMA = "steel.algorithm-benchmark.v1"
+ALGORITHM_DATASET_VALIDATION_SCHEMA = "steel.algorithm-dataset-validation.v1"
 
 WorkerRole = Literal["image", "defect"]
 

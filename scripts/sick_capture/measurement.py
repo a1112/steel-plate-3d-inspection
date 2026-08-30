@@ -26,6 +26,7 @@ from .playback import detect_valid_grayscale_roi
 
 MEASUREMENT_SCHEMA = "steel.ranger3-flow-measurement.v1"
 CALIBRATION_SCHEMA = "steel.sick-array-calibration.v1"
+CIRCLE_FIT_ALGORITHM = "iterative-mad-algebraic-circle-v2"
 DEFAULT_DIAMETER_ANGLES_DEG = (0.0, 30.0, 60.0, 90.0, 120.0, 150.0)
 
 
@@ -46,16 +47,29 @@ def _calibration_metric_projection_valid(calibration: dict[str, Any]) -> bool:
 class MeasurementConfig:
     row_window: int = 16
     maximum_profile_points: int = 320
-    maximum_sections: int = 12
+    # Zero means every synchronized anchor. Production measurement must not
+    # discard longitudinal samples merely to keep a preview artifact small.
+    maximum_sections: int = 0
     minimum_circle_points: int = 48
+    # A six-camera fit is not metric merely because the merged point cloud is
+    # large enough. Every expected view must contribute real profile samples;
+    # otherwise one healthy camera can hide five empty/blocked views.
+    minimum_camera_profile_points: int = 8
     maximum_circle_residual_mm: float = 0.5
 
     def bounded(self) -> "MeasurementConfig":
         return MeasurementConfig(
             row_window=max(1, min(128, int(self.row_window))),
             maximum_profile_points=max(32, min(2048, int(self.maximum_profile_points))),
-            maximum_sections=max(1, min(64, int(self.maximum_sections))),
+            maximum_sections=(
+                0
+                if int(self.maximum_sections) <= 0
+                else min(4096, int(self.maximum_sections))
+            ),
             minimum_circle_points=max(8, min(4096, int(self.minimum_circle_points))),
+            minimum_camera_profile_points=max(
+                1, min(2048, int(self.minimum_camera_profile_points))
+            ),
             maximum_circle_residual_mm=max(
                 0.001, min(100.0, float(self.maximum_circle_residual_mm))
             ),
@@ -216,7 +230,12 @@ def robust_circle_fit(points: np.ndarray, minimum_points: int = 8) -> dict[str, 
     points = np.asarray(points, dtype=np.float64)
     points = points[np.all(np.isfinite(points), axis=1)] if points.ndim == 2 else np.empty((0, 2))
     if points.shape[0] < minimum_points:
-        return {"available": False, "reason": "not-enough-points", "pointCount": int(points.shape[0])}
+        return {
+            "available": False,
+            "algorithm": CIRCLE_FIT_ALGORITHM,
+            "reason": "not-enough-points",
+            "pointCount": int(points.shape[0]),
+        }
     retained = points
     center = np.zeros(2, dtype=np.float64)
     radius = 0.0
@@ -248,6 +267,7 @@ def robust_circle_fit(points: np.ndarray, minimum_points: int = 8) -> dict[str, 
     residual = np.abs(signed_residual)
     return {
         "available": True,
+        "algorithm": CIRCLE_FIT_ALGORITHM,
         "centerX": round(float(center[0]), 6),
         "centerZ": round(float(center[1]), 6),
         "radiusMm": round(radius, 6),
@@ -681,10 +701,15 @@ def build_flow_measurement(
                 )
                 matrix = _matrix_for(calibration, camera_id, details["serialNumber"])
                 transformed = _transform_profile(profile, matrix) if matrix is not None else None
-                if transformed is not None:
-                    global_profiles.append(transformed)
+                profile_point_count = int(profile.shape[0])
+                profile_points_sufficient = bool(
+                    profile_point_count >= settings.minimum_camera_profile_points
+                )
+                if matrix is not None:
                     matrices[camera_id] = matrix
                     calibrated += 1
+                    if profile_points_sufficient:
+                        global_profiles.append(transformed)
                 details.update(
                     {
                         "available": True,
@@ -693,6 +718,11 @@ def build_flow_measurement(
                         "rowClipped": bool(mapping.get("rowClipped")),
                         "mappingMetricValid": _anchor_mapping_metric_valid(
                             mapping, maximum_sync_residual_ms
+                        ),
+                        "minimumMetricProfilePoints": settings.minimum_camera_profile_points,
+                        "profilePointsSufficient": profile_points_sufficient,
+                        "profileMetricValid": bool(
+                            profile_points_sufficient and matrix is not None
                         ),
                         "localBoundsMm": {
                             "x": [round(float(np.min(profile[:, 0])), 6), round(float(np.max(profile[:, 0])), 6)] if profile.size else None,
@@ -720,12 +750,20 @@ def build_flow_measurement(
     selected_section_synchronized = bool(
         selected_anchor
         and len(cameras) == len(camera_roots)
-        and all(row.get("mappingMetricValid") for row in cameras.values())
+        and all(
+            row.get("mappingMetricValid") and row.get("profilePointsSufficient")
+            for row in cameras.values()
+        )
     )
     row_mapping_ok = bool(
         cameras and all(not row.get("rowClipped", True) for row in cameras.values() if row.get("available"))
     )
     every_camera_calibrated = calibrated == len(camera_roots)
+    every_camera_profile_sufficient = bool(
+        cameras
+        and len(cameras) == len(camera_roots)
+        and all(row.get("profilePointsSufficient") for row in cameras.values())
+    )
     residual_ok = bool(
         circle.get("available")
         and float(circle.get("p95AbsResidualMm", math.inf))
@@ -736,6 +774,7 @@ def build_flow_measurement(
         and selected_section_synchronized
         and row_mapping_ok
         and every_camera_calibrated
+        and every_camera_profile_sufficient
         and residual_ok
     )
     reasons: list[str] = []
@@ -749,17 +788,24 @@ def build_flow_measurement(
         reasons.append("metric-projection-unverified")
     if not every_camera_calibrated:
         reasons.append("camera-extrinsics-incomplete")
+    if not every_camera_profile_sufficient:
+        reasons.append("camera-profile-points-insufficient")
     if not residual_ok:
         reasons.append("circle-fit-residual-out-of-tolerance")
     section_fits: list[dict[str, Any]] = []
     if approved and every_camera_calibrated and anchors:
-        count = min(settings.maximum_sections, len(anchors))
-        anchor_indices = sorted(
-            set(int(value) for value in np.linspace(0, len(anchors) - 1, count))
-        )
+        if settings.maximum_sections <= 0:
+            anchor_indices = list(range(len(anchors)))
+        else:
+            count = min(settings.maximum_sections, len(anchors))
+            anchor_indices = sorted(
+                set(int(value) for value in np.linspace(0, len(anchors) - 1, count))
+            )
         for anchor_index in anchor_indices:
             anchor = anchors[anchor_index]
             section_points: list[np.ndarray] = []
+            section_camera_point_counts: dict[str, int] = {}
+            insufficient_point_cameras: list[str] = []
             section_clipped = False
             section_time_mapping_valid = True
             for camera_id, camera_root in sorted(camera_roots.items()):
@@ -777,11 +823,18 @@ def build_flow_measurement(
                         mapping.get("rowIndex"),
                         settings,
                     )
+                    point_count = int(profile.shape[0])
+                    section_camera_point_counts[camera_id] = point_count
+                    if point_count < settings.minimum_camera_profile_points:
+                        insufficient_point_cameras.append(camera_id)
+                        section_clipped = True
+                        continue
                     section_points.append(
                         _transform_profile(profile, matrices[camera_id])
                     )
                 except Exception:
                     section_clipped = True
+                    section_camera_point_counts.setdefault(camera_id, 0)
             section_combined = (
                 np.vstack(section_points) if section_points else np.empty((0, 2))
             )
@@ -793,6 +846,9 @@ def build_flow_measurement(
                     "rowMappingComplete": not section_clipped
                     and len(section_points) == len(camera_roots),
                     "timeMappingValid": section_time_mapping_valid,
+                    "minimumCameraProfilePoints": settings.minimum_camera_profile_points,
+                    "cameraPointCounts": section_camera_point_counts,
+                    "insufficientPointCameras": insufficient_point_cameras,
                     "circleFit": fit,
                 }
             )
@@ -815,6 +871,12 @@ def build_flow_measurement(
             "maximumCircleResidualMm": settings.maximum_circle_residual_mm,
             "maximumAnchorResidualMs": maximum_sync_residual_ms,
             "sectionSynchronizationPolicy": "per-anchor-interpolated-row-residual",
+            "sectionGenerationPolicy": (
+                "all-soft-sync-anchors"
+                if settings.maximum_sections <= 0
+                else "uniformly-sampled-soft-sync-anchors"
+            ),
+            "circleFitAlgorithm": CIRCLE_FIT_ALGORITHM,
             "wholeFlowGeometrySynchronized": whole_flow_geometry_synchronized,
             "note": "Encoder/speed input is required before reporting longitudinal millimetres.",
         }
@@ -835,6 +897,8 @@ def build_flow_measurement(
             "metricProjectionValid": calibration_metric_valid,
             "calibratedCameras": calibrated,
             "expectedCameras": len(camera_roots),
+            "minimumCameraProfilePoints": settings.minimum_camera_profile_points,
+            "profileComplete": every_camera_profile_sufficient,
             "revision": calibration.get("revision"),
         },
         "selectedSection": {

@@ -601,6 +601,10 @@ Content-Type: application/json
 `steelIn` with `value:0` means exit-steel and moves the provider state to `steel-out` / `present:false`.
 It also sets `saveEnabled:false` and `captureSaveState:"discard"`, so internally triggered frames can keep flowing but are not saved as production data.
 
+For automatic grayscale boundaries, `captureDefaults.steelDetectionCameraKeys` selects the received camera rows that are authoritative for steel-in/out. A missing/offline reference-camera row does not imply steel-out. The six-camera SICK production profile uses C4 as the reference with one-round entry and exit decisions and zero no-signal pre-roll: one C4 no-steel round closes the old flow, and the first following C4 steel round is cached and committed to the newly allocated flow even if other camera views remain bright across the boundary.
+
+Historical boundary repair preserves the merged source evidence but changes its central `flow.json` state to `superseded` and atomically removes that one row from the playback catalog. Playback catalog read/merge/write operations use one cross-process lock so a concurrent live image result or full-history rebuild cannot lose a newer record. The catalog is the visible-record authority and ordinary list reads do not reopen every historical manifest; an explicit request for the old material ID still checks its manifest, returns an empty indexed result, and must not fall back to scanning the preserved camera directories.
+
 ```http
 POST /api/steel/event
 Content-Type: application/json

@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -18,8 +19,9 @@ from scripts.sick_capture.surface import (
     _camera_radial_quality,
     _camera_tile_payload,
     _head_aligned_longitudinal_axis,
-    _write_jet_image,
+    _selected_anchor_indices,
     apply_surface_quality_gate,
+    build_and_write_flow_surface,
     jet_rgb,
     measurement_artifact_from_surface,
     upgrade_surface_display_contract,
@@ -28,6 +30,10 @@ from scripts.sick_capture.paths import camera_surface_jet_path, surface_jet_path
 
 
 class SickSurfaceTests(unittest.TestCase):
+    def test_zero_section_limit_keeps_every_realtime_anchor(self) -> None:
+        self.assertEqual(_selected_anchor_indices(75, 0), list(range(75)))
+        self.assertEqual(MeasurementConfig(maximum_sections=0).bounded().maximum_sections, 0)
+
     def test_historical_surface_upgrade_builds_cross_sections_and_diameter_curves(self) -> None:
         rows = 3
         columns = 12
@@ -191,20 +197,44 @@ class SickSurfaceTests(unittest.TestCase):
         self.assertFalse(strict["calibrationBiasMetricValid"])
         self.assertFalse(strict["metricValid"])
 
-    def test_jet_images_use_camera_local_jpeg_paths(self) -> None:
+    def test_surface_commit_removes_aggregate_jpegs_and_keeps_fitted_jet_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "C3"
-            camera_path = camera_surface_jet_path(root, "4018")
-            combined_path = surface_jet_path(root, "4018")
-            self.assertEqual(camera_path, root / "4018" / "jet" / "surface.jpg")
-            self.assertEqual(combined_path, root / "4018" / "jet" / "surface-all.jpg")
-            _write_jet_image(
-                camera_path,
-                np.asarray([[-0.2, 0.0, 0.2]], dtype=np.float64),
-                0.2,
+            central = Path(directory) / "central"
+            camera_root = Path(directory) / "C3"
+            camera_path = camera_surface_jet_path(camera_root, "4018")
+            combined_path = surface_jet_path(camera_root, "4018")
+            camera_path.parent.mkdir(parents=True)
+            camera_path.write_bytes(b"old-camera-surface")
+            combined_path.write_bytes(b"old-combined-surface")
+            payload = {
+                "schema": "steel.ranger3-flow-surface.v1",
+                "materialId": "4018",
+                "jet": {
+                    "palette": "JET",
+                    "calculation": "measured-radius-minus-robust-section-circle-radius-mm",
+                },
+                "cameraTiles": {"cameras": [{"cameraId": "C3", "jet": {}}]},
+            }
+            with patch(
+                "scripts.sick_capture.surface.build_flow_surface",
+                return_value=(payload, np.asarray([[0.0]], dtype=np.float64)),
+            ):
+                manifest_path, committed = build_and_write_flow_surface(
+                    {"C3": camera_root},
+                    central,
+                    "4018",
+                    {},
+                    calibration_path=None,
+                )
+
+            self.assertTrue(manifest_path.is_file())
+            self.assertFalse(camera_path.exists())
+            self.assertFalse(combined_path.exists())
+            self.assertNotIn("imagePath", committed["jet"])
+            self.assertEqual(
+                committed["jet"]["storage"],
+                "per-frame-two-level-renditions",
             )
-            with Image.open(camera_path) as image:
-                self.assertEqual(image.format, "JPEG")
 
     def test_longitudinal_axis_starts_at_first_complete_head_section(self) -> None:
         positions, metadata = _head_aligned_longitudinal_axis(

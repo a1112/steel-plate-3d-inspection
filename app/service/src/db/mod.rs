@@ -568,6 +568,7 @@ pub struct CaptureFileInput {
 pub struct SteelFlowInput {
     pub session_id: String,
     pub material_id: String,
+    pub minimum_flow_no: i64,
     pub source: String,
     pub status: String,
     pub storage_root: String,
@@ -3330,8 +3331,19 @@ pub async fn start_steel_flow(
     } else {
         input.started_at
     };
+    let flow_no = if input.minimum_flow_no > 0 {
+        let latest = steel_flow::Entity::find()
+            .order_by_desc(steel_flow::Column::FlowNo)
+            .one(connection)
+            .await?
+            .map(|flow| flow.flow_no)
+            .unwrap_or(0);
+        Set(input.minimum_flow_no.max(latest.saturating_add(1)))
+    } else {
+        sea_orm::ActiveValue::NotSet
+    };
     let inserted = steel_flow::ActiveModel {
-        flow_no: sea_orm::ActiveValue::NotSet,
+        flow_no,
         flow_code: Set(String::new()),
         session_id: Set(input.session_id),
         material_id: Set(input.material_id.clone()),
@@ -4013,6 +4025,20 @@ pub async fn review_production_defect(
     else {
         return Ok(None);
     };
+    if !model.active {
+        return Err(DbErr::Custom("production_defect_inactive".to_string()));
+    }
+    if let Some(defect_type) = input.defect_type.as_deref() {
+        if defect_type::Entity::find_by_id(defect_type)
+            .one(connection)
+            .await?
+            .is_none()
+        {
+            return Err(DbErr::Custom(
+                "production_defect_type_not_configured".to_string(),
+            ));
+        }
+    }
     let now = now_millis_string();
     let reset_to_pending = input.status == "pending";
     let mut active: production_defect::ActiveModel = model.into();
@@ -6199,9 +6225,7 @@ async fn create_steel_flow_region_schema(connection: &DatabaseConnection) -> Res
 async fn seed_database(connection: &DatabaseConnection) -> Result<(), DbErr> {
     ensure_default_configs(connection).await?;
     ensure_admin_data(connection).await?;
-    if defect_type::Entity::find().count(connection).await? == 0 {
-        seed_defect_types(connection).await?;
-    }
+    ensure_default_defect_types(connection).await?;
     let seed_demo = env::var("STEEL_SEED_DEMO_DATA")
         .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
@@ -6620,7 +6644,7 @@ fn default_capture_config_json() -> String {
     default_capture_config_value().to_string()
 }
 
-async fn seed_defect_types(connection: &DatabaseConnection) -> Result<(), DbErr> {
+async fn ensure_default_defect_types(connection: &DatabaseConnection) -> Result<(), DbErr> {
     let rows = [
         ("pit", "凹坑", "#2f6bff", "circle"),
         ("roll", "辊印", "#ff7f1f", "square"),
@@ -6631,9 +6655,20 @@ async fn seed_defect_types(connection: &DatabaseConnection) -> Result<(), DbErr>
         ("longitudinal", "纵裂", "#17bce1", "rect"),
         ("bubble", "气泡", "#ec4899", "circle"),
         ("inclusion", "夹杂", "#a63a1f", "circle"),
+        ("pit-compact", "紧凑凹坑候选", "#7c4dff", "circle"),
+        ("groove-elongated", "细长沟槽候选", "#00a6a6", "rect"),
+        ("bulge-compact", "紧凑凸起候选", "#e25c2a", "diamond"),
+        ("ridge-elongated", "细长脊状候选", "#c2185b", "rect"),
         ("review", "待复核", "#737373", "star"),
     ];
     for (id, label, color, shape) in rows {
+        if defect_type::Entity::find_by_id(id)
+            .one(connection)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
         defect_type::ActiveModel {
             id: Set(id.to_string()),
             label: Set(label.to_string()),
@@ -6808,6 +6843,7 @@ mod steel_flow_tests {
         SteelFlowInput {
             session_id: session_id.to_string(),
             material_id: String::new(),
+            minimum_flow_no: 0,
             source: "grayscale".to_string(),
             status: "starting".to_string(),
             storage_root: "D:/steel-sick-data".to_string(),
@@ -6937,6 +6973,31 @@ mod steel_flow_tests {
                     .await
                     .expect("next flow first image");
             assert_eq!(next_flow_image.image.image_no, 1);
+        });
+    }
+
+    #[test]
+    fn steel_flow_honors_storage_floor_without_sequence_warmup() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            let mut first_input = flow_input("SESSION-FLOOR-1");
+            first_input.minimum_flow_no = 4_038;
+            let first = start_steel_flow(&database.connection, first_input)
+                .await
+                .expect("first floored flow");
+            let mut second_input = flow_input("SESSION-FLOOR-2");
+            second_input.minimum_flow_no = 4_038;
+            let second = start_steel_flow(&database.connection, second_input)
+                .await
+                .expect("second floored flow");
+            assert_eq!(first.flow_no, 4_038);
+            assert_eq!(first.material_id, "4038");
+            assert_eq!(second.flow_no, 4_039);
+            assert_eq!(second.material_id, "4039");
         });
     }
 
@@ -7107,6 +7168,24 @@ mod steel_flow_tests {
             .await
             .expect("review");
 
+            let unknown_type = review_production_defect(
+                &database.connection,
+                ProductionDefectReviewInput {
+                    id: "SICK-63-C1-000001".to_string(),
+                    status: "confirmed".to_string(),
+                    defect_type: Some("unknown-type".to_string()),
+                    severity: Some("severe".to_string()),
+                    actor: "operator".to_string(),
+                    note: "must not overwrite the accepted label".to_string(),
+                },
+            )
+            .await
+            .expect_err("unknown annotation type must fail closed");
+            assert!(matches!(
+                unknown_type,
+                DbErr::Custom(message) if message == "production_defect_type_not_configured"
+            ));
+
             let rebuilt = import_production_defects(
                 &database.connection,
                 "INSP-HISTORY",
@@ -7165,6 +7244,24 @@ mod steel_flow_tests {
                 .unwrap();
             assert!(!superseded.active);
             assert!(!superseded.superseded_at.is_empty());
+
+            let inactive_review = review_production_defect(
+                &database.connection,
+                ProductionDefectReviewInput {
+                    id: "SICK-63-C1-000001".to_string(),
+                    status: "pending".to_string(),
+                    defect_type: Some("scratch".to_string()),
+                    severity: Some("minor".to_string()),
+                    actor: "operator".to_string(),
+                    note: String::new(),
+                },
+            )
+            .await
+            .expect_err("superseded defects must not be annotated");
+            assert!(matches!(
+                inactive_review,
+                DbErr::Custom(message) if message == "production_defect_inactive"
+            ));
         });
     }
 

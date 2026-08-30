@@ -34,7 +34,7 @@
     "confidenceMaximum": 0.999
   },
   "qualityGate": {
-    "requiredCameraCount": 8,
+    "requiredCameraCount": 6,
     "requireCalibrationForEveryCamera": true,
     "requireReconstructionAcceptance": true,
     "maximumSyntheticDefectCount": 0

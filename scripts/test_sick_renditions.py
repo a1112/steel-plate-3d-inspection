@@ -23,6 +23,7 @@ import sick_capture.renditions as renditions_module
 from sick_capture.renditions import (
     RENDITION_SCHEMA,
     RenditionNotReady,
+    _alignment_fit_signature,
     _cached_calibration,
     _cached_foreground_mask,
     _cached_json,
@@ -50,6 +51,31 @@ class ReadableRenditionTests(unittest.TestCase):
         )
         self.assertEqual(restored.reason, "alignment-building")
         self.assertTrue(restored.processing)
+
+    def test_jet_fit_signature_ignores_growing_tail_but_tracks_head_clock(self) -> None:
+        first = {
+            "quality": {"completeCameras": 6},
+            "softSyncAnchors": [{"ordinal": 1}],
+            "cameras": {
+                "C1": {
+                    "headDeviceTime": 10.25,
+                    "lineRateHz": 4000.0,
+                    "tailDeviceTime": 12.0,
+                }
+            },
+        }
+        growing = json.loads(json.dumps(first))
+        growing["softSyncAnchors"].append({"ordinal": 2})
+        growing["cameras"]["C1"]["tailDeviceTime"] = 18.0
+        self.assertEqual(
+            _alignment_fit_signature(first),
+            _alignment_fit_signature(growing),
+        )
+        growing["cameras"]["C1"]["headDeviceTime"] = 10.5
+        self.assertNotEqual(
+            _alignment_fit_signature(first),
+            _alignment_fit_signature(growing),
+        )
 
     def test_short_names_and_exactly_two_gray_levels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

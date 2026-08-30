@@ -4,6 +4,13 @@
 > 评审对象：当前工作区（包含未提交改动），不是某个已发布 Git 标签  
 > 结论：当前可用于开发联调；从功能性判断，尚未形成可签字的真实生产闭环，暂不满足正式生产上线的 Go 条件
 > 本文排序：优先判断采集、重建、检测、复核、报表和异常恢复能否完成生产任务；签名、证书、ACL、SBOM 等非功能项保留记录，但不作为本轮功能排序依据
+>
+> Runtime V2 迁移说明（2026-08-29）：下文八相机实测和门禁是迁移前历史快照，只能证明当时
+> 候选，不能替代当前候选的生产证据。当前正式拓扑以
+> [Runtime Boundaries V2](runtime-boundaries-v2.md) 为准：一个 SCM Supervisor、六个受管子服务、
+> 六路 SICK GenTL 相机；所有放行指标必须在当前 release/manifest 上重新生成并签字。
+> Machine-readable status: `Runtime-V2 migration note`; `pre-migration historical evidence`;
+> `six-camera SICK GenTL`.
 
 ## 1. 评审结论
 
@@ -147,7 +154,7 @@
 | --- | --- | --- | --- |
 | P0-01 | 生产算法可信度未完全闭环 | synthetic 默认关闭，版本化阈值、准入报告、安装包实际文件/commit 比对、readiness、逐运行 qualification、输入明细与前后哈希复核代码已落地；模板仍为 pending | 生成绑定 release/dataset/evaluator/script/core/config/calibration 的真实通过报告，填入有效指标和两方签字；在最终包/现场输入上完成精度与追溯验收 |
 | P0-02 | 八相机完整采集与候选包多会话稳定性已通过，实机异常和整班验收未闭环 | 当前真实材料已取得连续 23 轮 8/8、184/184 完整帧且零失败；精确 readiness 与启动自动连接已实测。候选包 simulated Release Service 已完成 20/20、包内 5/5，以及带队列/任务/会话收敛和身份隔离门禁的 10/10；最后一轮验收前后包哈希与 111 个文件均不变 | 归档当前提交对应的无 skip 24/24 管理报告、标定崩溃/受管重启恢复证据，并在真实相机与现场节拍下完成完整班次稳定性试运行 |
-| P0-03 | 发布流程代码已收口，最终发布证据未生成 | manifest 区分 `formal-release`/`engineering`；正式包禁止 SkipBuild/dirty/debug/无 bundle，清空五个 build roots、执行 npm ci 后本次全量重建，构建后和写 manifest 前复核同一 HEAD/clean，并绑定 releaseVersion/gitTag/commit、四个 lock、tauri.conf/Tauri Cargo manifest 哈希；双向 checksum 与 signed catalog 已接入；WiX/NSIS/WebView2 外部清单、包外 hash、清理后精确播种和构建后复验测试已通过 | 把各清单版本从占位 `0.1.0` 升为批准版本，清理并评审 worktree，由发布负责人批准真实离线工具链清单，在精确 tag 的 clean commit 上运行完整正式构建与 package-only 复验，归档构建报告 |
+| P0-03 | 发布流程代码已收口，最终发布证据未生成 | manifest 区分 `formal-release`/`engineering`；正式包禁止 SkipBuild/dirty/debug/无 bundle，清空五个 build roots、执行 npm ci 后本次全量重建，构建后和写 manifest 前复核同一 HEAD/clean，并绑定 releaseVersion/gitTag/commit、12 份依赖锁（1 份 npm、11 份首方 Cargo）、tauri.conf/Tauri Cargo manifest 哈希；双向 checksum 与 signed catalog 已接入；WiX/NSIS/WebView2 外部清单、包外 hash、清理后精确播种和构建后复验测试已通过 | 把各清单版本从占位 `0.1.0` 升为批准版本，清理并评审 worktree，由发布负责人批准真实离线工具链清单，在精确 tag 的 clean commit 上运行完整正式构建与 package-only 复验，归档构建报告 |
 | P0-04 | 正式部署物代码路径已补齐，签名、bundle 与服务安装证据待完成 | Tauri/VC++、五个首方后台 EXE、vendor SDK DLL 和 catalog 的 Authenticode+可信时间戳/部署侧 signer 门禁均 fail-closed；安装器先验证只读源包，再发布并复验不可变版本目录，之后才切换 SCM/注册表。当前本地产物仍 NotSigned，无真实证书/签名 catalog/vendor 证据；MSI/NSIS 为 0 | 生成可 package-only 复验的正式包：一个签名 MSI、一个签名 NSIS、签名桌面/后台 PE、Microsoft 签名 VC_redist、vendor allowlist 和签名 catalog；完成断网目标机两阶段安装、ACL/迁移、SCM、drain、轮转、恢复、升级和卸载 |
 | P0-05 | 生产凭据与数据库安全尚未完成部署闭环 | 运行时 fail-closed、单管理员安全引导、首次登录强制改密、默认凭据拒绝、远程 MySQL 证书校验和 URL 脱敏已完成 | 接入部署秘密存储并完成凭据轮换/恢复演练，归档现场证据 |
 | P0-06 | 现场触发安全代码已收口，真实协议与 OT 部署证据待确认 | HMAC-SHA256、时间窗、全传输 nonce 防重放、IP/CIDR allowlist、生产秘密 fail-closed、模式锁定、独立运维凭据、管理员授权/审计、状态脱敏及无通配 CORS 已落地；网关 `17/17`、安全进程 smoke 和架构 `9/9` 均通过 | 冻结真实 PLC/L2 点表与时序、NTP/时钟误差、来源地址、秘密下发/轮换和 ACK/重试策略；在目标 OT 网段用最终 Release 包复跑安全 gate 并归档 |
@@ -245,12 +252,13 @@ STEEL_ALGORITHM_MODE=demo | validation | production
 
 - algorithm name/version、生产配置 revision/SHA-256；
 - Python script 和 C++ core 的 SHA-256、精确 release commit；
-- 冻结 dataset/evaluator 的 revision 和 SHA-256；
+- 冻结 dataset/evaluator 的 revision 和 SHA-256，以及通过的数据 validator 报告 SHA-256；
+- 正式 model set 与 reproduction manifest 的 revision/ID 和 SHA-256；
 - calibration revision/SHA-256；
 - 检出率、误报率、漏报率、定位误差 P95、尺寸误差 P95、端到端延迟 P95，以及逐项通过标准；
-- algorithm owner、quality owner 和批准时间。
+- evaluation 完成时间、algorithm owner、quality owner 和不早于评测完成的批准时间。
 
-报告中的负责人字段是流程审批记录，不是密码学签名；报告本身仍须纳入包哈希、ACL 和发布签名链。当前校验器、安装器、Python 运行和 Rust readiness/运行门禁已逐项比对 report/config/calibration/script/core/release commit/dataset/evaluator；每次生产运行保存 `acceptanceReportSha256` 和全部 qualification 字段。任一不一致会使任务失败和 readiness 关闭。该代码门禁仍不能替代真实标注集、有效指标和负责人签字。
+报告中的负责人字段是流程审批记录，不是密码学签名；报告本身仍须纳入包哈希、ACL 和发布签名链。当前校验器、安装器、Python 运行和 Rust readiness/运行门禁已逐项比对 report/config/calibration/script/core/release commit/dataset/dataset validation/model set/reproduction manifest/evaluator；安装器明确拒绝临时模型，每次生产运行保存 `acceptanceReportSha256` 和全部 qualification 字段。任一不一致会使任务失败和 readiness 关闭。该代码门禁仍不能替代真实标注集、有效指标和负责人签字。
 
 #### 4.1.5 运行配置单一事实源
 
@@ -387,7 +395,7 @@ SQLite 恢复会 checkpoint WAL、生成持久 rollback copy、同卷 `File.Repl
 - 整包 SHA-256 Windows catalog 的生成、Authenticode+时间戳签名、package-only 完整复验、安装前验证和篡改拒绝已经接入。正式包的 `checksums.sha256` 双向覆盖除自身和 catalog 外的全部文件；catalog 覆盖 checksum 与全部 payload，catalog 自身单独签名。当前没有真实证书、签名 catalog 或正式包，证据仍未关闭。
 - 隔离 OT 目标机必须验证 WebView2 离线安装器确实随 bundle 交付，并离线安装包内 VC++ Redistributable；必须在无开发工具、断网的干净机安装验证。
 - 三个后台进程使用 Windows 服务或统一服务宿主，不依赖登录用户打开 PowerShell 窗口。
-- `package-runtime.ps1` 明确输出 `formal-release` 或 `engineering`。正式包禁止 `-SkipBuild`、dirty、debug 和无 desktop bundle，并要求包外批准的 release-policy、bundle-toolchain manifest 与 external-components policy 三个 SHA-256；先验证仓库外 WiX/NSIS/WebView2 源和六类外部组件审批，清空五个已知 build roots，精确播种 `target/cargo/.tauri`，执行 `npm ci`，在本次调用中全量重建，构建后复验工具清单，并在构建后、写 manifest 前两次核对 HEAD/clean。Tauri 显式构建 `x86_64-pc-windows-msvc`，固定空 `build.features` 与 release `debug-assertions=false`，拒绝自动 merge 配置、未批准 TAURI/Rust/Cargo override 和 Cargo config，验包直接读取桌面/后台 PE Machine。包内 `build-evidence` 保存 npm package-lock、Tauri/service/trigger Cargo.lock、tauri.conf、Tauri Cargo.toml、policy 固定的 Cargo config、desktop release policy、Tauri feature resolution、离线工具链清单、external-components policy 和 CycloneDX SBOM 的 SHA-256；`database` 保存契约与 migration index。任何逃生参数都把产物降级为 engineering，只允许布局/开发验证。
+- `package-runtime.ps1` 明确输出 `formal-release` 或 `engineering`。正式包禁止 `-SkipBuild`、dirty、debug 和无 desktop bundle，并要求包外批准的 release-policy、bundle-toolchain manifest 与 external-components policy 三个 SHA-256；先验证仓库外 WiX/NSIS/WebView2 源和六类外部组件审批，清空五个已知 build roots，精确播种 `target/cargo/.tauri`，执行 `npm ci`，在本次调用中全量重建，构建后复验工具清单，并在构建后、写 manifest 前两次核对 HEAD/clean。Tauri 显式构建 `x86_64-pc-windows-msvc`，固定空 `build.features` 与 release `debug-assertions=false`，拒绝自动 merge 配置、未批准 TAURI/Rust/Cargo override 和 Cargo config，验包直接读取桌面/后台 PE Machine。包内 `build-evidence` 保存 npm package-lock、11 个首方 Rust 工程的 Cargo.lock、tauri.conf、Tauri Cargo.toml、policy 固定的 Cargo config、desktop release policy、Tauri feature resolution、离线工具链清单、external-components policy 和 CycloneDX SBOM 的 SHA-256；`database` 保存契约与 migration index。任何逃生参数都把产物降级为 engineering，只允许布局/开发验证。
 - Tauri/npm/Tauri Cargo/service/trigger 版本必须同步；正式包用 `releaseVersion` 绑定精确 `v<version>` 或 `<version>` tag 和 source commit。`0.1.0` 占位版本明确被拒绝。
 - 发布包包含版本清单、SHA-256、SDK/DLL 版本、配置 schema、数据库 migration 版本和回滚说明。
 
@@ -418,9 +426,9 @@ scripts/verify-runtime-package.ps1 `
 
 发布机构建证书必须未过期、具有代码签名用途且私钥可用；时间戳必须是 HTTPS；VC++ 前置包必须有 Microsoft 有效签名和可信时间戳。部署侧的 `STEEL_RELEASE_SIGNER_THUMBPRINT`、vendor allowlist、`STEEL_DESKTOP_PUBLISHER` 与三个批准 hash 仍由独立审批通道提供，不能从刚生成的 manifest 反向抄取。
 
-`manifest.json` 使用 `steel.runtime-package.v1`，记录 packageClass、releaseVersion、Git commit/tag/dirty、同次构建与依赖来源、C++ configuration、Rust profile、桌面安装器数量、checksum/catalog、SBOM/external policy、database contract/index 契约及 `steel.architecture-migration.contract.v1`。wrapper 默认正式验包，必须使用部署侧包外的首方指纹、vendor SDK signer allowlist、publisher，以及 64-hex `ExpectedReleasePolicySha256`、`ExpectedBundleToolchainManifestSha256` 和 `ExpectedExternalComponentsSha256`；它先完成 trust/checksum/catalog 验真，再执行包内检查，并核对 npm ci、四个 lock、tauri.conf/Tauri Cargo manifest、CycloneDX SBOM/external policy、数据库 contract/index、`build-evidence/desktop-release-policy.json`、`tauri-feature-resolution.json`、`bundle-toolchain-manifest.json` 的结构/组件/文件计数、精确 MSI/NSIS/桌面版本与签名、Microsoft VC++ 签名和 WebView2 offlineInstaller 声明。工程包必须显式 `-Engineering`，默认不执行包内脚本；仅本机可信工程包可再显式 `-AllowPackageCodeExecution`。最终构建报告还必须附签名证书主体/指纹、时间戳、构建机、编译器/SDK 版本和外部依赖 SBOM。
+`manifest.json` 使用 `steel.runtime-package.v1`，记录 packageClass、releaseVersion、Git commit/tag/dirty、同次构建与依赖来源、C++ configuration、Rust profile、桌面安装器数量、checksum/catalog、SBOM/external policy、database contract/index 契约及 `steel.architecture-migration.contract.v1`。wrapper 默认正式验包，必须使用部署侧包外的首方指纹、vendor SDK signer allowlist、publisher，以及 64-hex `ExpectedReleasePolicySha256`、`ExpectedBundleToolchainManifestSha256` 和 `ExpectedExternalComponentsSha256`；它先完成 trust/checksum/catalog 验真，再执行包内检查，并核对 npm ci、12 份依赖锁、tauri.conf/Tauri Cargo manifest、CycloneDX SBOM/external policy、数据库 contract/index、`build-evidence/desktop-release-policy.json`、`tauri-feature-resolution.json`、`bundle-toolchain-manifest.json` 的结构/组件/文件计数、精确 MSI/NSIS/桌面版本与签名、Microsoft VC++ 签名和 WebView2 offlineInstaller 声明。工程包必须显式 `-Engineering`，默认不执行包内脚本；仅本机可信工程包可再显式 `-AllowPackageCodeExecution`。最终构建报告还必须附签名证书主体/指纹、时间戳、构建机、编译器/SDK 版本和外部依赖 SBOM。
 
-当前 SBOM 静态验证会绑定 policy/SBOM hash、serial、component count、四个 lock 和三份工具证据，但尚未从 lock 独立重建完整 npm/Cargo inventory；PowerShell JSON 解析也不能可靠拒绝重复 member。六个外部类别要求各至少一项，类别可有多组件，不能把 external 总数固定为 6。正式构建和语义验证固定使用 Windows PowerShell 5.1 或 PowerShell 6.2+，禁止 6.0/6.1；批准版 `external-components.json` 与带外 hash 未到位前仍为 No-Go。
+当前 SBOM 静态验证会绑定 policy/SBOM hash、serial、component count、12 份依赖锁和三份工具证据，但尚未从这些 lock 独立重建完整 npm/Cargo inventory；PowerShell JSON 解析也不能可靠拒绝重复 member。六个外部类别要求各至少一项，类别可有多组件，不能把 external 总数固定为 6。正式构建和语义验证固定使用 Windows PowerShell 5.1 或 PowerShell 6.2+，禁止 6.0/6.1；批准版 `external-components.json` 与带外 hash 未到位前仍为 No-Go。
 
 当前桌面构建机已通过仅作用于构建进程的可用代理成功执行 `cargo fetch --locked` 和 `cargo build --locked --release`，补齐了原先缺失的依赖。该结果证明锁定依赖可构建，不等于供应链已产品化。发布构建机仍应使用经批准的内部镜像或受审计缓存，归档来源、锁文件、许可证和 SBOM；不得把个人代理写入仓库，也不得删除锁文件、临时换未审计版本或忽略 `--locked`。
 
@@ -468,7 +476,7 @@ Get-Service SteelInspectionRuntime
 
 - 将 `test-architecture-migration-contract.ps1` 中对 Rust 固定单行字符串的匹配改为 AST、正则空白归一化或行为测试，避免 `rustfmt` 触发误报。
 - 清理 `test-integrated-acceptance-audit.ps1`、`test-integrated-management-smoke.ps1` 和真实标定脚本中的六相机历史口径；当前 Profile 下必须检查精确 8 个唯一 IP/SN、8 个成功结果、8 个完整帧和 8 个 metadata commit，不能使用 `>=6` 作为通过条件。
-- CI 至少执行前端测试/构建、两个 Rust crate 测试、C++ build/CTest、模拟运行时验收、架构门禁和打包布局检查。
+- CI 至少执行前端测试/构建、全部首方 Rust crate 的 test/check、全部跟踪 Python 单元/合同测试与 compile 检查、SDK-independent C++ build/CTest、模拟运行时验收、架构门禁和打包布局检查；真实 SICK/CUDA/CTI 项必须在独立硬件 lane 明确报告，不能由模拟测试代替。
 - C++ 模拟帧事务测试应在无采集进程的隔离 agent 执行；如果检测到全局 SDK 锁占用，报告 `environment-blocked`，不要伪装成算法/帧事务断言失败。
 - 只有 clean worktree 对应的提交可以生成候选包；报告中记录 commit SHA 和所有产物哈希。
 

@@ -91,11 +91,15 @@ export function DefectImagePanel({ inspectionId, defect, onSidebarCollapse, onRe
     let note = '';
     if (status !== 'pending') {
       const response = window.prompt(
-        status === 'confirmed' ? '确认说明（可选）' : '排除原因（可选）',
+        status === 'confirmed' ? '确认说明（可选）' : '排除原因（必填）',
         defect.reviewNote ?? '',
       );
       if (response === null) return;
-      note = response;
+      note = response.trim();
+      if (status === 'false-positive' && !note) {
+        setReviewError('排除误报必须填写判定理由');
+        return;
+      }
     }
     setReviewError('');
     setReviewing(true);

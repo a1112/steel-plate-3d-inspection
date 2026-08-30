@@ -1,4 +1,4 @@
-import { getInspectionServiceOrigin } from './inspection-api';
+import { createAdminHeaders, getInspectionServiceOrigin } from './inspection-api';
 
 export type BarSurfaceCamera = {
   name: string;
@@ -548,7 +548,7 @@ async function waitForProductionTask<T>(
 ): Promise<T> {
   const response = await fetch(`${origin()}/api/production/tasks`, {
     method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    headers: createAdminHeaders({ Accept: 'application/json', 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       kind,
       idempotencyKey: productionTaskRequestId(kind),
@@ -585,7 +585,7 @@ async function waitForProductionTask<T>(
 export async function cancelBarSurfaceProductionTask<T = unknown>(taskId: string) {
   const response = await fetch(`${origin()}/api/production/tasks/cancel`, {
     method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    headers: createAdminHeaders({ Accept: 'application/json', 'Content-Type': 'application/json' }),
     body: JSON.stringify({ taskId }),
   });
   const payload = await readJsonResponse<ProductionTaskEnvelope<T>>(
@@ -1055,7 +1055,7 @@ export async function sendBarSurfaceProductionEvent(
   }
   const response = await fetch(`${origin()}/api/production/${event}`, {
     method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    headers: createAdminHeaders({ Accept: 'application/json', 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
   });
   return readJsonResponse<BarSurfaceProductionEventResponse>(response, `production ${event} failed`);
@@ -1134,7 +1134,7 @@ export async function runBarSurfacePrototype(options: {
   }
   const response = await fetch(`${origin()}/api/algorithm/bar-surface/run`, {
     method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    headers: createAdminHeaders({ Accept: 'application/json', 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
   });
   const payload = await readJsonResponse<{ result?: BarSurfaceLatestResponse }>(response, 'bar surface run failed');

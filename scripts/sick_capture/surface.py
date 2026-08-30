@@ -9,15 +9,14 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-import uuid
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
 
 from .alignment import _atomic_json
 from .measurement import (
+    CIRCLE_FIT_ALGORITHM,
     MEASUREMENT_SCHEMA,
     MeasurementConfig,
     _load_calibration,
@@ -34,7 +33,6 @@ from .paths import (
     surface_jet_path,
     surface_path,
 )
-from .storage import replace_file
 
 
 SURFACE_SCHEMA = "steel.ranger3-flow-surface.v1"
@@ -61,6 +59,8 @@ def jet_rgb(value: float) -> tuple[int, int, int]:
 def _selected_anchor_indices(anchor_count: int, maximum_sections: int) -> list[int]:
     if anchor_count <= 0:
         return []
+    if maximum_sections <= 0:
+        return list(range(anchor_count))
     count = min(anchor_count, max(1, int(maximum_sections)))
     return sorted(set(int(value) for value in np.linspace(0, anchor_count - 1, count)))
 
@@ -164,7 +164,10 @@ def apply_surface_quality_gate(
     gate["reasons"] = reasons
 
 
-def measurement_artifact_from_surface(surface: dict[str, Any]) -> dict[str, Any]:
+def measurement_artifact_from_surface(
+    surface: dict[str, Any],
+    base_measurement: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build the diameter endpoint artifact from the authoritative surface fit.
 
     Surface reconstruction already performs the calibrated multi-camera circle
@@ -240,6 +243,7 @@ def measurement_artifact_from_surface(surface: dict[str, Any]) -> dict[str, Any]
         if isinstance(surface.get("calibration"), dict)
         else {}
     )
+    jet = surface.get("jet") if isinstance(surface.get("jet"), dict) else {}
     metric_projection_verified = bool(
         quality.get(
             "metricProjectionVerified",
@@ -263,6 +267,10 @@ def measurement_artifact_from_surface(surface: dict[str, Any]) -> dict[str, Any]
             quality.get("absoluteLongitudinalScaleVerified", False)
         ),
         "model": "calibrated-six-camera-surface-sections",
+        "circleFitAlgorithm": CIRCLE_FIT_ALGORITHM,
+        "sectionGenerationPolicy": quality.get(
+            "sectionGenerationPolicy", "all-soft-sync-anchors"
+        ),
         "longitudinalCoordinate": "head-relative-time",
         "note": "Derived from the authoritative calibrated surface artifact without a second depth-data pass.",
         "sectionsRequested": len(sections),
@@ -285,7 +293,7 @@ def measurement_artifact_from_surface(surface: dict[str, Any]) -> dict[str, Any]
         "sections": sections,
         "diameterCurves": curves,
     }
-    return {
+    artifact = {
         "schema": MEASUREMENT_SCHEMA,
         "generatedAt": _utc_text(),
         "materialId": material_id,
@@ -310,8 +318,24 @@ def measurement_artifact_from_surface(surface: dict[str, Any]) -> dict[str, Any]
             "schema": surface.get("schema"),
             "generatedAt": surface.get("generatedAt"),
             "mode": "surface-derived-diameter",
+            "circleFitAlgorithm": CIRCLE_FIT_ALGORITHM,
+            "jetCalculation": jet.get("calculation"),
         },
     }
+    if isinstance(base_measurement, dict):
+        # The first measurement pass owns source crops and per-camera audit
+        # profiles needed by the region builder. Diameter and fit values above
+        # remain exclusively sourced from the newer surface calculation.
+        for key in (
+            "alignment",
+            "calibration",
+            "twoDimensionalCrop",
+            "cameras",
+            "regions",
+        ):
+            if key in base_measurement:
+                artifact[key] = base_measurement[key]
+    return artifact
 
 
 def upgrade_surface_display_contract(
@@ -930,38 +954,6 @@ def _camera_tile_payload(
     return payload, residual_grid
 
 
-def _write_jet_image(path: Path, residuals: np.ndarray, display_range_mm: float) -> None:
-    height, width = residuals.shape
-    rgb = np.zeros((height, width, 3), dtype=np.uint8)
-    rgb[:, :] = np.asarray([7, 18, 27], dtype=np.uint8)
-    finite = np.isfinite(residuals)
-    normalized = np.clip(0.5 + residuals / (2.0 * display_range_mm), 0.0, 1.0)
-    for row, column in zip(*np.nonzero(finite)):
-        rgb[row, column] = jet_rgb(float(normalized[row, column]))
-    # Preserve each synchronized section as a visible band without inventing
-    # longitudinal samples between anchors.
-    image = Image.fromarray(rgb, mode="RGB").resize(
-        (max(720, width * 4), max(96, height * 12)),
-        Image.Resampling.NEAREST,
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        if path.suffix.lower() in {".jpg", ".jpeg"}:
-            image.save(
-                temporary,
-                format="JPEG",
-                quality=95,
-                subsampling=0,
-                optimize=False,
-            )
-        else:
-            image.save(temporary, format="PNG", optimize=False)
-        replace_file(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def build_flow_surface(
     camera_roots: dict[str, Path],
     material_id: str,
@@ -1432,6 +1424,8 @@ def build_flow_surface(
     diagnostic_mesh = not bool(np.any(accepted_quads))
     display_residual_grid = diagnostic_grid if diagnostic_mesh else residual_grid
     row_count = display_residual_grid.shape[0]
+    jet_valid_bin_count = int(np.count_nonzero(np.isfinite(display_residual_grid)))
+    jet_source_sample_count = int(np.sum(count_grid, dtype=np.int64))
     for row in range(row_count):
         y = longitudinal_positions[row]
         fit = sections[row].get("circleFit", {})
@@ -1536,6 +1530,11 @@ def build_flow_surface(
                 else False
             ),
             "candidateRegionPolicy": "owned-columns-valid,calibrated-overlap-recorded",
+            "sectionGenerationPolicy": (
+                "all-soft-sync-anchors"
+                if settings.maximum_sections <= 0
+                else "uniformly-sampled-soft-sync-anchors"
+            ),
             "passed": cross_section_metric_valid,
             "reasons": reasons,
             "rejectedTransitionSections": len(sections) - len(accepted),
@@ -1633,6 +1632,8 @@ def build_flow_surface(
             "diameterMaximumMm": round(float(np.max(diameters)), 6) if diameters.size else None,
             "diameterStdDevMm": round(float(np.std(diameters)), 6) if diameters.size else None,
             "jetResidualRangeMm": round(display_range, 6),
+            "jetValidBinCount": jet_valid_bin_count,
+            "jetSourceSampleCount": jet_source_sample_count,
             "circleFitP95MaximumMm": (
                 round(max(circle_fit_p95_values), 6) if circle_fit_p95_values else None
             ),
@@ -1695,6 +1696,8 @@ def build_flow_surface(
         },
         "jet": {
             "palette": "JET",
+            "calculation": "measured-radius-minus-robust-section-circle-radius-mm",
+            "circleFitAlgorithm": CIRCLE_FIT_ALGORITHM,
             "source": (
                 "quality-gated-surface" if accepted else "diagnostic-unqualified"
             ),
@@ -1703,6 +1706,8 @@ def build_flow_surface(
             "maximumMm": round(display_range, 6),
             "zeroMm": 0.0,
             "missingColor": "#07121b",
+            "validBinCount": jet_valid_bin_count,
+            "sourceSampleCount": jet_source_sample_count,
         },
         "cameraTiles": {
             "schema": CAMERA_TILE_SCHEMA,
@@ -1739,8 +1744,8 @@ def build_and_write_flow_surface(
     config: MeasurementConfig | None = None,
     angular_bins: int = 180,
     region_map: dict[str, Any] | None = None,
-) -> tuple[Path, dict[str, Any], Path]:
-    payload, residuals = build_flow_surface(
+) -> tuple[Path, dict[str, Any]]:
+    payload, _residuals = build_flow_surface(
         camera_roots,
         material_id,
         alignment,
@@ -1749,60 +1754,25 @@ def build_and_write_flow_surface(
         angular_bins=angular_bins,
         region_map=region_map,
     )
-    reference_camera_id = str(alignment.get("referenceCameraId", "")).strip()
-    if reference_camera_id not in camera_roots:
-        reference_camera_id = sorted(camera_roots)[0] if camera_roots else ""
-    jet_path = (
-        surface_jet_path(camera_roots[reference_camera_id], material_id)
-        if reference_camera_id
-        else surface_jet_path(storage_root, material_id)
-    )
-    if residuals.size:
-        _write_jet_image(
-            jet_path,
-            residuals,
-            float(payload["summary"]["jetResidualRangeMm"]),
-        )
-        payload["jet"]["imagePath"] = str(jet_path)
-    else:
-        payload["jet"]["imagePath"] = ""
+    payload["jet"].pop("imagePath", None)
+    payload["jet"]["storage"] = "per-frame-two-level-renditions"
     for tile in payload.get("cameraTiles", {}).get("cameras", []):
-        rows = int(tile.get("rows", 0) or 0)
-        columns = int(tile.get("columns", 0) or 0)
-        serialized = tile.get("residuals", [])
-        camera_id = str(tile.get("cameraId", "")).strip()
-        if (
-            not camera_id
-            or rows <= 0
-            or columns <= 0
-            or len(serialized) != rows * columns
-        ):
-            tile.setdefault("jet", {})["imagePath"] = ""
-            continue
-        camera_grid = np.asarray(
-            [np.nan if value is None else float(value) for value in serialized],
-            dtype=np.float64,
-        ).reshape(rows, columns)
-        if not np.any(np.isfinite(camera_grid)):
-            tile.setdefault("jet", {})["imagePath"] = ""
-            continue
-        camera_root = camera_roots.get(camera_id)
-        if camera_root is None:
-            tile.setdefault("jet", {})["imagePath"] = ""
-            continue
-        camera_path = camera_surface_jet_path(camera_root, material_id)
-        _write_jet_image(
-            camera_path,
-            camera_grid,
-            float(payload["summary"]["jetResidualRangeMm"]),
-        )
-        tile.setdefault("jet", {})["imagePath"] = str(camera_path)
+        tile.setdefault("jet", {}).pop("imagePath", None)
+        tile.setdefault("jet", {})["storage"] = "per-frame-two-level-renditions"
     path = surface_path(storage_root, material_id)
     _atomic_json(path, payload)
-    # Remove only the former derived JET image names after the new camera-local
-    # images and their manifest have committed successfully.
+    # Aggregate surface JPEGs were lossy duplicates which could outlive the
+    # fitting revision that produced them. The fitted JSON and eager per-frame
+    # two-level JET renditions are now the only authoritative representations.
+    for camera_root in camera_roots.values():
+        for legacy in (
+            camera_surface_jet_path(camera_root, material_id),
+            surface_jet_path(camera_root, material_id),
+        ):
+            if legacy.is_file() and not legacy.is_symlink():
+                legacy.unlink()
     legacy_root = surface_path(storage_root, material_id).parent
     for legacy in [legacy_root / "surface-jet.png", *legacy_root.glob("surface-jet-c*.png")]:
         if legacy.is_file() and not legacy.is_symlink():
             legacy.unlink()
-    return path, payload, jet_path
+    return path, payload

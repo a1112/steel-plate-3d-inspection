@@ -1174,8 +1174,9 @@ if (-not (Test-Path -LiteralPath $SickCapturePackage -PathType Container)) {
 $SickProfilePayload = Get-Content -LiteralPath $SickCaptureProfile -Raw -Encoding utf8 | ConvertFrom-Json
 if ([string]$SickProfilePayload.schema -cnotin @('steel.capture.profile.v1', 'steel.capture.profile.v2') -or
     [string]$SickProfilePayload.driverMode -cne 'sick-gentl' -or
-    [int]$SickProfilePayload.expectedCameras -le 0) {
-  throw 'SickCaptureProfile must describe a non-empty steel.capture.profile SICK GenTL camera set.'
+    [int]$SickProfilePayload.expectedCameras -ne 6 -or
+    @($SickProfilePayload.cameras | Where-Object { $_.enabled -eq $true }).Count -ne 6) {
+  throw 'SickCaptureProfile must describe the formal six-camera SICK GenTL camera set.'
 }
 if ($SickProfilePayload.captureDefaults.defectDetectionEnabled -ne $true) {
   throw 'The formal real-camera profile must enable defect detection.'
@@ -1197,6 +1198,7 @@ foreach ($ProfileFile in $RequiredSickProfileFiles) {
   }
 }
 $SickCtiPath = [string]$SickProfilePayload.sick.ctiPath
+$DefectModelManifestPath = [string]$SickProfilePayload.captureDefaults.defectModelManifestPath
 $SickCtiSignature = Get-AuthenticodeSignature -LiteralPath $SickCtiPath
 if ($SickCtiSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
     $null -eq $SickCtiSignature.SignerCertificate -or
@@ -1575,7 +1577,7 @@ foreach ($Line in Get-Content -LiteralPath $SecretEnvFile -Encoding utf8) {
   }
   $SecretNames[$Matches[1]] = $Matches[2].Trim()
 }
-$AcceptanceValidationJson = & $AlgorithmAcceptanceValidator -ReportPath $AlgorithmAcceptanceReport -ConfigPath $AlgorithmConfig -CalibrationPath $AlgorithmCalibration -ScriptPath $AlgorithmScript -CorePath $AlgorithmCore -ReleaseCommit $ReleaseCommit
+$AcceptanceValidationJson = & $AlgorithmAcceptanceValidator -ReportPath $AlgorithmAcceptanceReport -ConfigPath $AlgorithmConfig -CalibrationPath $AlgorithmCalibration -ModelSetPath $DefectModelManifestPath -ScriptPath $AlgorithmScript -CorePath $AlgorithmCore -ReleaseCommit $ReleaseCommit
 $AcceptanceValidation = $AcceptanceValidationJson | ConvertFrom-Json
 if ([string]$AcceptanceValidation.schema -cne 'steel.algorithm-acceptance.audit.v1' -or [int]$AcceptanceValidation.code -ne 0) {
   throw "Algorithm acceptance validator did not return a passing steel.algorithm-acceptance.audit.v1 result."

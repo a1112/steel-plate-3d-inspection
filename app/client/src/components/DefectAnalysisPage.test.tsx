@@ -283,15 +283,76 @@ describe('DefectAnalysisPage', () => {
     expect(jetButton).toBeDisabled();
   });
 
-  it('submits the selected defect review through the existing review callback', async () => {
-    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('人工复核通过');
+  it('submits the selected structured annotation through the review callback', async () => {
     const { onReviewDefect } = renderPage();
 
+    fireEvent.change(screen.getByLabelText('标注缺陷类别'), { target: { value: 'pit' } });
+    fireEvent.change(screen.getByLabelText('标注严重度'), { target: { value: 'severe' } });
+    fireEvent.change(screen.getByLabelText('标注说明'), { target: { value: '人工复核通过' } });
     const confirmButton = screen.getByRole('button', { name: '确认缺陷' });
     fireEvent.click(confirmButton);
-    await waitFor(() => expect(onReviewDefect).toHaveBeenCalledWith(defects[0], 'confirmed', '人工复核通过'));
+    await waitFor(() => expect(onReviewDefect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'D-001',
+        typeId: 'pit',
+        typeLabel: '凹坑',
+        severity: 'severe',
+      }),
+      'confirmed',
+      '人工复核通过',
+    ));
     await waitFor(() => expect(confirmButton).toBeEnabled());
-    promptSpy.mockRestore();
+  });
+
+  it('requires an annotation note before excluding a false positive', async () => {
+    const { onReviewDefect } = renderPage();
+    const excludeButton = screen.getByRole('button', { name: '排除误报' });
+
+    expect(excludeButton).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('标注说明'), { target: { value: '边缘反光，不是表面缺陷' } });
+    expect(excludeButton).toBeEnabled();
+    fireEvent.click(excludeButton);
+
+    await waitFor(() => expect(onReviewDefect).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'D-001', typeId: 'scratch', severity: 'review' }),
+      'false-positive',
+      '边缘反光，不是表面缺陷',
+    ));
+  });
+
+  it('requires replacing a legacy category that is no longer configured', () => {
+    const legacyDefect: DefectItem = {
+      ...defects[0],
+      typeId: 'legacy-unknown',
+      typeLabel: '旧版未知类别',
+    };
+    renderPage({ defects: [legacyDefect, defects[1]] });
+
+    expect(screen.getByRole('option', { name: '旧版未知类别（未配置）' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '确认缺陷' })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('标注缺陷类别'), { target: { value: 'scratch' } });
+    expect(screen.getByRole('button', { name: '确认缺陷' })).toBeEnabled();
+  });
+
+  it('shows review provenance and can restore a reviewed defect to pending', async () => {
+    const reviewedDefect: DefectItem = {
+      ...defects[0],
+      reviewStatus: 'confirmed',
+      reviewedBy: 'reviewer-01',
+      reviewedAt: '2026-08-29T10:30:00+08:00',
+      reviewNote: '形貌符合划伤',
+    };
+    const { onReviewDefect } = renderPage({ defects: [reviewedDefect, defects[1]] });
+
+    expect(screen.getByText(/最近操作：reviewer-01/)).toBeInTheDocument();
+    expect(screen.getByLabelText('标注说明')).toHaveValue('形貌符合划伤');
+    fireEvent.click(screen.getByRole('button', { name: '恢复待复核' }));
+
+    await waitFor(() => expect(onReviewDefect).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'D-001' }),
+      'pending',
+      '形貌符合划伤',
+    ));
   });
 
   it('keeps geometry and legacy detector candidates separate and reports overlap', () => {

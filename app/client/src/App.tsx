@@ -998,9 +998,10 @@ function InspectionDashboard({
       } catch (error) {
         if (!cancelled) {
           const message = error instanceof Error ? error.message : 'capture service offline';
-          setCaptureSnapshot((current) => current.health
-            ? { ...current, error: message }
-            : createEmptyCaptureSnapshot(message));
+          // A failed status poll is a hard freshness boundary. Keeping the
+          // previous health/camera payload would make disconnected cameras
+          // look online and would leave their last image mounted.
+          setCaptureSnapshot(createEmptyCaptureSnapshot(message));
         }
       }
     };
@@ -1756,7 +1757,13 @@ function InspectionDashboard({
 
   const reviewDefect = async (defect: DefectItem, status: DefectReviewStatus, note: string) => {
     try {
-      await reviewProductionDefect({ defectId: defect.id, status, note });
+      await reviewProductionDefect({
+        defectId: defect.id,
+        status,
+        note,
+        defectType: defect.typeId,
+        severity: defect.severity,
+      });
       const [nextSnapshot, history] = await Promise.all([
         fetchInspectionSnapshot(),
         terminalMode === 'online'
@@ -2240,7 +2247,11 @@ function InspectionDashboard({
           </section>
         </div>
           ) : (
-            <LiveMonitoringPage statuses={captureSnapshot.statuses} health={captureSnapshot.health} />
+            <LiveMonitoringPage
+              statuses={captureSnapshot.statuses}
+              health={captureSnapshot.health}
+              error={captureSnapshot.error}
+            />
           )}
         </div>
       ) : (

@@ -959,6 +959,8 @@ describe('persistent production command client', () => {
       defectId: 'SICK-63-C1-000001',
       status: 'confirmed',
       note: '人工确认',
+      defectType: 'scratch',
+      severity: 'minor',
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -970,9 +972,25 @@ describe('persistent production command client', () => {
           defectId: 'SICK-63-C1-000001',
           status: 'confirmed',
           note: '人工确认',
+          defectType: 'scratch',
+          severity: 'minor',
         }),
       }),
     );
+  });
+
+  it('reports a superseded defect annotation conflict in operator-facing language', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+      code: 409,
+      error: 'production_defect_inactive',
+    }, 409)));
+
+    await expect(reviewProductionDefect({
+      defectId: 'SICK-OLD-001',
+      status: 'confirmed',
+      defectType: 'scratch',
+      severity: 'minor',
+    })).rejects.toThrow('该缺陷已被新的算法批次替代，不能继续标注');
   });
 
   it('allows bundled defect fallbacks only for an explicitly marked demo response', async () => {

@@ -94,10 +94,16 @@ def main() -> int:
             "releaseCommit": "a" * 40,
             "datasetRevision": "DATASET-TEST-1",
             "datasetSha256": "b" * 64,
+            "datasetValidationSha256": "d" * 64,
             "evaluatorRevision": "EVALUATOR-TEST-1",
             "evaluatorSha256": "c" * 64,
+            "modelSetRevision": "MODEL-TEST-1",
+            "modelSetSha256": "e" * 64,
+            "reproductionManifestRevision": "REPRODUCTION-TEST-1",
+            "reproductionManifestSha256": "f" * 64,
             "calibrationRevision": f"sha256:{calibration_sha[:16]}",
             "calibrationSha256": calibration_sha,
+            "evaluatedAt": "2026-07-14T00:00:00Z",
             "metrics": {
                 "detectionRecall": 0.99,
                 "falsePositiveRate": 0.01,
@@ -129,6 +135,7 @@ def main() -> int:
         with patch.dict(os.environ, environment, clear=False):
             qualification = MODULE.load_algorithm_qualification(config, calibration, True)
             assert qualification["datasetRevision"] == "DATASET-TEST-1"
+            assert qualification["modelSetRevision"] == "MODEL-TEST-1"
             assert qualification["acceptanceReportSha256"] == MODULE.sha256_file(report_path)
             core.write_bytes(b"tampered-core")
             try:

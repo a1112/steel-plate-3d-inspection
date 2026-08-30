@@ -16,7 +16,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -32,6 +32,7 @@ from .gentl import SickGenTLBackend
 from .calibration_pointer import resolve_active_array_calibration
 from .playback import (
     _capture_image_identity,
+    _flow_is_superseded,
     build_image_pyramid,
     capture_image_cache_root,
     flow_pyramid_cache_status_path,
@@ -47,18 +48,19 @@ from .playback import (
 )
 from .profile import CameraProfile, SickCaptureProfile, load_profile, sha256_file
 from .renditions import (
-    RenditionNotReady,
+    build_gray_rendition,
+    build_jet_rendition,
     committed_rendition_file,
-    rendition_file,
     rendition_measurement_config,
     verify_and_cleanup_legacy_renditions,
 )
-from .events import publish_committed_round, write_flow_manifest
+from .events import publish_committed_round, publish_flow_handoff, write_flow_manifest
 from .paths import (
     algorithm_state_path,
     alignment_path as alignment_manifest_path,
     cache_root as flow_cache_root,
     capture_artifact_ref,
+    capture_flow_handoff_path,
     capture_root,
     defect_manifest_path as defect_detection_manifest_path,
     flow_id,
@@ -87,15 +89,104 @@ LIVE_PREVIEW_BLACK_MAX = 8.0
 LIVE_PREVIEW_MAX_FPS = 2.0
 # Historical rendition rebuilding deliberately keeps the flow queue small.
 # A flow itself is processed with the bounded two-frame process pool below;
-# this queue only holds flow ids waiting for that worker, never one Future per
-# catalog entry.
+# this queue only holds flow ids waiting for the bounded workers, never one
+# Future per catalog entry.  One slot can keep history moving while the second
+# admits the newest/live committed snapshot.
 FULL_HISTORY_FLOW_QUEUE_CAPACITY = 4
 FULL_HISTORY_FLOW_RETRY_LIMIT = 3
-# Rechecking every permanently unaligned catalog row every 15 seconds creates
+PLAYBACK_WARM_FLOW_CONCURRENCY = 2
+# Probe only a recent prefix eagerly. Older rows remain in catalog order and
+# receive the same authoritative readiness/completeness checks when they reach
+# the bounded queue, so startup never waits on six-disk metadata for all flows.
+FULL_HISTORY_EAGER_DISCOVERY_AUDIT_LIMIT = 32
+# Rechecking every permanently unaligned catalog row on every eager tick creates
 # avoidable metadata I/O on a multi-thousand-flow archive.  Rotate through a
 # bounded batch; newly closed flows are still scheduled directly when their
 # alignment finishes.
-FULL_HISTORY_UNREADY_RECHECK_BATCH = 64
+FULL_HISTORY_UNREADY_RECHECK_BATCH = 4
+EAGER_RENDITION_GENERATION_POLICY = "eager-incremental-committed-snapshot"
+
+
+def _image_quality_metrics(
+    intensity: np.ndarray,
+    depth_raw: np.ndarray,
+    *,
+    sample_step: int = 8,
+    bright_threshold: float = 8.0,
+) -> dict[str, float]:
+    """Return bounded-cost image/depth signal metrics for live health checks.
+
+    Ranger frames are large enough that a second full-frame statistics pass can
+    compete with acquisition.  A regular sample is deterministic, includes the
+    full sensor extent, and is sufficient for persistent obstruction/exposure
+    alarms; the existing full-resolution steel detector remains authoritative
+    for steel-in/out.
+    """
+    step = max(1, int(sample_step))
+    intensity_values = np.asarray(intensity)
+    if intensity_values.ndim != 2:
+        intensity_values = np.squeeze(intensity_values)
+    if intensity_values.ndim != 2 or intensity_values.size == 0:
+        return {
+            "sampleCount": 0.0,
+            "meanIntensity": 0.0,
+            "maximumIntensity": 0.0,
+            "standardDeviation": 0.0,
+            "dynamicRange": 0.0,
+            "highPercentile": 0.0,
+            "brightPixelRatio": 0.0,
+            "saturatedPixelRatio": 0.0,
+            "validDepthRatio": 0.0,
+        }
+
+    sampled_intensity = np.ascontiguousarray(
+        intensity_values[::step, ::step]
+    ).astype(np.float32, copy=False)
+    finite_intensity = sampled_intensity[np.isfinite(sampled_intensity)]
+    if finite_intensity.size:
+        low, high = np.percentile(finite_intensity, (1.0, 99.5))
+        maximum = float(np.max(finite_intensity))
+        mean = float(np.mean(finite_intensity))
+        standard_deviation = float(np.std(finite_intensity))
+        bright_ratio = float(
+            np.count_nonzero(finite_intensity > float(bright_threshold))
+            / finite_intensity.size
+        )
+        dtype_max = (
+            float(np.iinfo(intensity_values.dtype).max)
+            if np.issubdtype(intensity_values.dtype, np.integer)
+            else maximum
+        )
+        saturation_threshold = max(1.0, dtype_max * 0.98)
+        saturated_ratio = float(
+            np.count_nonzero(finite_intensity >= saturation_threshold)
+            / finite_intensity.size
+        )
+    else:
+        low = high = maximum = mean = standard_deviation = 0.0
+        bright_ratio = saturated_ratio = 0.0
+
+    depth_values = np.asarray(depth_raw)
+    if depth_values.ndim != 2:
+        depth_values = np.squeeze(depth_values)
+    if depth_values.ndim == 2 and depth_values.size:
+        sampled_depth = depth_values[::step, ::step]
+        valid_depth = np.isfinite(sampled_depth) & (sampled_depth != 0)
+        valid_depth_ratio = float(np.count_nonzero(valid_depth) / valid_depth.size)
+    else:
+        valid_depth_ratio = 0.0
+
+    return {
+        "sampleCount": float(finite_intensity.size),
+        "meanIntensity": round(mean, 6),
+        "maximumIntensity": round(maximum, 6),
+        "standardDeviation": round(standard_deviation, 6),
+        "dynamicRange": round(max(0.0, float(high) - float(low)), 6),
+        "highPercentile": round(float(high), 6),
+        "brightPixelRatio": round(bright_ratio, 8),
+        "saturatedPixelRatio": round(saturated_ratio, 8),
+        "validDepthRatio": round(valid_depth_ratio, 8),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +197,33 @@ class CaptureSyncPolicy:
     stable_rows: int
     anchor_interval_frames: int
     maximum_anchor_residual_ms: float
+
+
+@dataclass(slots=True)
+class CameraMaterialFlow:
+    """One globally numbered bar while cameras finish at different rounds."""
+
+    generation: int
+    material_id: str
+    session_id: str
+    production_event_id: str
+    close_requested: bool = False
+    close_requested_round: int = 0
+    close_reason: str = ""
+    closed: bool = False
+    forced_camera_keys: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class CameraMaterialRouteState:
+    """Per-camera ownership of the locally visible steel segment."""
+
+    local_present: bool = False
+    owner_generation: int | None = None
+    last_assigned_generation: int = 0
+    pending_rows: deque[dict[str, Any]] = field(default_factory=deque)
+    pending_suppressed_until_gap: bool = False
+    last_signal_round: int = 0
 
 
 _STORAGE_PROCESS_WRITER: DualFormatWriter | None = None
@@ -253,29 +371,25 @@ def _build_complete_rendition_pair(
     storage_root: Path,
     calibration_path: Path,
     config: Any,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Commit gray and JET thumbnail/original files for one raw frame."""
-    gray_path = rendition_file(
+    gray = build_gray_rendition(source_path)
+    jet = build_jet_rendition(
         source_path,
-        "gray",
-        "thumbnail",
         camera_id=camera_id,
         camera_roots=camera_roots,
         storage_root=storage_root,
         calibration_path=calibration_path,
         config=config,
     )
-    jet_path = rendition_file(
-        source_path,
-        "jet",
-        "thumbnail",
-        camera_id=camera_id,
-        camera_roots=camera_roots,
-        storage_root=storage_root,
-        calibration_path=calibration_path,
-        config=config,
-    )
-    return {"gray": str(gray_path), "jet": str(jet_path)}
+    return {
+        "gray": str(gray.get("levels", {}).get("thumbnail", {}).get("file", "")),
+        "jet": str(jet.get("levels", {}).get("thumbnail", {}).get("file", "")),
+        "diameterValidRowCount": int(
+            jet.get("diameterSummary", {}).get("validRowCount", 0) or 0
+        ),
+        "jetValidPixelCount": int(jet.get("validPixelCount", 0) or 0),
+    }
 
 
 def _write_storage_shared_frame(
@@ -510,6 +624,97 @@ class ProviderRuntime:
                 ),
             ),
         )
+        self.image_quality_sample_step = max(
+            1,
+            min(64, int(capture_defaults.get("imageQualitySampleStep", 8))),
+        )
+        self.image_quality_alarm_rounds = max(
+            2,
+            min(120, int(capture_defaults.get("imageQualityAlarmRounds", 12))),
+        )
+        self.image_quality_recovery_rounds = max(
+            2,
+            min(120, int(capture_defaults.get("imageQualityRecoveryRounds", 8))),
+        )
+        self.image_quality_baseline_rounds = max(
+            2,
+            min(120, int(capture_defaults.get("imageQualityBaselineRounds", 8))),
+        )
+        self.image_quality_relative_signal_ratio = max(
+            0.01,
+            min(
+                0.9,
+                float(capture_defaults.get("imageQualityRelativeSignalRatio", 0.2)),
+            ),
+        )
+        self.image_quality_minimum_dynamic_range = max(
+            0.0,
+            min(
+                255.0,
+                float(capture_defaults.get("imageQualityMinimumDynamicRange", 4.0)),
+            ),
+        )
+        self.image_quality_maximum_saturation_ratio = max(
+            0.5,
+            min(
+                1.0,
+                float(capture_defaults.get("imageQualityMaximumSaturationRatio", 0.98)),
+            ),
+        )
+        self.camera_offline_alarm_rounds = max(
+            1,
+            min(30, int(capture_defaults.get("cameraOfflineAlarmRounds", 2))),
+        )
+        self.camera_reconnect_interval_seconds = max(
+            1.0,
+            min(
+                60.0,
+                float(capture_defaults.get("cameraReconnectIntervalSeconds", 3.0)),
+            ),
+        )
+        configured_detection_camera_keys: Any = os.environ.get(
+            "SICK_STEEL_DETECTION_CAMERA_KEYS"
+        )
+        if configured_detection_camera_keys is None:
+            configured_detection_camera_keys = capture_defaults.get(
+                "steelDetectionCameraKeys"
+            )
+        if configured_detection_camera_keys is None:
+            requested_detection_camera_keys = [
+                camera.key for camera in profile.enabled_cameras
+            ]
+        elif isinstance(configured_detection_camera_keys, str):
+            requested_detection_camera_keys = [
+                value.strip()
+                for value in configured_detection_camera_keys.split(",")
+                if value.strip()
+            ]
+        elif isinstance(configured_detection_camera_keys, list):
+            requested_detection_camera_keys = [
+                str(value).strip()
+                for value in configured_detection_camera_keys
+                if str(value).strip()
+            ]
+        else:
+            raise ValueError("steelDetectionCameraKeys must be a string array")
+        enabled_camera_keys = {
+            camera.key.casefold(): camera.key for camera in profile.enabled_cameras
+        }
+        normalized_detection_camera_keys: list[str] = []
+        for requested_key in requested_detection_camera_keys:
+            camera_key = enabled_camera_keys.get(requested_key.casefold())
+            if camera_key is None:
+                raise ValueError(
+                    f"steelDetectionCameraKeys references unknown camera key: {requested_key}"
+                )
+            if camera_key not in normalized_detection_camera_keys:
+                normalized_detection_camera_keys.append(camera_key)
+        if not normalized_detection_camera_keys:
+            raise ValueError("steelDetectionCameraKeys must contain at least one enabled camera")
+        self.steel_detection_camera_keys = tuple(normalized_detection_camera_keys)
+        self._steel_detection_camera_key_set = frozenset(
+            self.steel_detection_camera_keys
+        )
         configured_min_cameras = int(
             os.environ.get(
                 "SICK_STEEL_MIN_CAMERAS",
@@ -519,12 +724,72 @@ class ProviderRuntime:
             )
         )
         self.steel_min_cameras = max(
-            1, min(profile.expected_cameras, configured_min_cameras)
+            1, min(len(self.steel_detection_camera_keys), configured_min_cameras)
         )
+        self.per_camera_flow_routing = _truthy(
+            os.environ.get(
+                "SICK_PER_CAMERA_FLOW_ROUTING",
+                capture_defaults.get("perCameraFlowRouting"),
+            ),
+            False,
+        )
+        self.camera_material_signal_ratio = max(
+            0.0001,
+            min(
+                0.5,
+                float(
+                    os.environ.get(
+                        "SICK_CAMERA_MATERIAL_SIGNAL_RATIO",
+                        capture_defaults.get(
+                            "cameraMaterialSignalRatio",
+                            capture_defaults.get("alignmentDepthValidRatio", 0.005),
+                        ),
+                    )
+                ),
+            ),
+        )
+        self.camera_boundary_buffer_rounds = max(
+            2,
+            min(
+                64,
+                int(
+                    os.environ.get(
+                        "SICK_CAMERA_BOUNDARY_BUFFER_ROUNDS",
+                        capture_defaults.get("cameraBoundaryBufferRounds", 16),
+                    )
+                ),
+            ),
+        )
+        self.camera_boundary_close_timeout_rounds = max(
+            self.camera_boundary_buffer_rounds,
+            min(
+                128,
+                int(
+                    os.environ.get(
+                        "SICK_CAMERA_BOUNDARY_CLOSE_TIMEOUT_ROUNDS",
+                        capture_defaults.get("cameraBoundaryCloseTimeoutRounds", 24),
+                    )
+                ),
+            ),
+        )
+        self.camera_material_route_lock = threading.RLock()
+        self.camera_material_route_generation = 0
+        self.camera_material_flows: dict[int, CameraMaterialFlow] = {}
+        self.camera_material_flow_by_id: dict[str, int] = {}
+        self.camera_material_route_states = {
+            camera.key: CameraMaterialRouteState()
+            for camera in profile.enabled_cameras
+        }
+        self.camera_material_route_buffer_warnings = 0
+        self.camera_material_route_orphan_segments = 0
+        self.camera_material_route_discarded_frames = 0
+        self.camera_material_route_forced_closures = 0
+        self.camera_material_route_last_error = ""
         self.steel_entry_streak = 0
         self.steel_exit_streak = 0
         self.last_steel_signal_cameras = 0
         self.last_steel_transition_attempt = 0.0
+        self.last_steel_transition_event = ""
         configured_capture_mode = str(capture_defaults.get("captureMode", "on-demand")).strip().lower()
         self.capture_mode = (
             configured_capture_mode
@@ -760,6 +1025,42 @@ class ProviderRuntime:
             }
             for camera in profile.enabled_cameras
         }
+        self.image_quality_states: dict[str, dict[str, Any]] = {
+            camera.key: {
+                "schema": "steel.capture-camera-image-quality.v1",
+                "cameraId": camera.camera_id,
+                "cameraKey": camera.key,
+                "materialId": "",
+                "status": "warming",
+                "monitoringState": "waiting-for-steel",
+                "alarmActive": False,
+                "alarmType": "",
+                "alarmSource": "",
+                "reasons": [],
+                "candidateReasons": [],
+                "failureStreak": 0,
+                "offlineStreak": 0,
+                "recoveryStreak": 0,
+                "baselineSampleCount": 0,
+                "baseline": {},
+                "metrics": {},
+                "activeSince": "",
+                "recoveredAt": "",
+                "lastFrameAt": "",
+                "updatedAt": _utc_text(),
+                "automaticReconnect": {
+                    "enabled": True,
+                    "pending": False,
+                    "attemptCount": 0,
+                    "lastAttemptAt": "",
+                },
+            }
+            for camera in profile.enabled_cameras
+        }
+        self.camera_reconnect_lock = threading.RLock()
+        self.camera_reconnect_stop = threading.Event()
+        self.camera_reconnect_pending: set[str] = set()
+        self.camera_reconnect_thread: threading.Thread | None = None
         self.synchronization_window: deque[dict[str, Any]] = deque(maxlen=120)
         self.synchronization_warmup_rounds = max(
             0,
@@ -771,6 +1072,13 @@ class ProviderRuntime:
             ),
         )
         self.synchronization_warmup_remaining = self.synchronization_warmup_rounds
+        self.synchronization_maximum_sequence_skew = max(
+            0,
+            min(
+                100,
+                int(capture_defaults.get("synchronizationMaximumSequenceSkew", 1)),
+            ),
+        )
         self.startup_capture_retries = max(
             0,
             min(3, int(capture_defaults.get("startupCaptureRetries", 1))),
@@ -873,7 +1181,7 @@ class ProviderRuntime:
         )
         self.playback_warm_stop = threading.Event()
         self.playback_warm_pool = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=PLAYBACK_WARM_FLOW_CONCURRENCY,
             thread_name_prefix="sick-playback-warm",
         )
         self.playback_warm_compute_pool = ProcessPoolExecutor(
@@ -885,31 +1193,41 @@ class ProviderRuntime:
             initializer=_initialize_flow_analysis_process,
         )
         self.playback_warm_futures: dict[str, Future[Any]] = {}
+        self.playback_warm_progress: dict[str, dict[str, Any]] = {}
         self.playback_warm_status: dict[str, Any] = {
             "state": "idle",
             "materialId": "",
             "committedFrameCount": 0,
             "sourceFrameCount": 0,
+            "diameterValidRowCount": 0,
+            "jetValidPixelCount": 0,
             "failureCount": 0,
-            "generationPolicy": "full-flow-after-alignment",
+            "generationPolicy": EAGER_RENDITION_GENERATION_POLICY,
             "updatedAt": _utc_text(),
         }
         # Full-history discovery is intentionally separate from the per-flow
         # warm status.  Discovery may inspect thousands of catalog rows, but
-        # only a few flow ids are retained in this bounded queue and only one
-        # flow Future is submitted at a time by the discovery thread.
+        # only a few flow ids are retained in this bounded queue and only two
+        # flow Futures can be active (latest/live plus history catch-up).
         self.playback_history_flow_queue: deque[str] = deque(
             maxlen=FULL_HISTORY_FLOW_QUEUE_CAPACITY
         )
         self.playback_history_retry_pending: deque[str] = deque()
         self.playback_history_queued: set[str] = set()
         self.playback_history_catalog_ids: list[str] = []
+        self.playback_history_catalog_frame_counts: dict[str, int] = {}
         self.playback_history_eligible_ids: list[str] = []
         self.playback_history_scan_cursor = 0
         self.playback_history_catalog_mtime_ns = 0
         self.playback_history_catalog_material_count = 0
         self.playback_history_discovered_count = 0
         self.playback_history_completed: set[str] = set()
+        self.playback_history_ready_hint_ids: set[str] = set()
+        # A capturing flow is complete only for the playback index snapshot
+        # that was visible to the warm worker.  Catalog growth invalidates this
+        # marker and schedules the newly committed frames without touching the
+        # already committed rendition files.
+        self.playback_history_completed_frame_counts: dict[str, int] = {}
         self.playback_history_skipped_complete: set[str] = set()
         self.playback_history_failed: set[str] = set()
         self.playback_history_retry_counts: dict[str, int] = {}
@@ -917,7 +1235,7 @@ class ProviderRuntime:
         self.playback_history_unready_queue: deque[str] = deque()
         self.playback_history_status: dict[str, Any] = {
             "state": "idle",
-            "policy": "full-history-after-alignment",
+            "policy": "eager-full-history-after-analysis",
             "catalogMaterialCount": 0,
             "catalogScannedCount": 0,
             "discoveredFlowCount": 0,
@@ -930,6 +1248,9 @@ class ProviderRuntime:
             "retryCount": 0,
             "queueDepth": 0,
             "queueCapacity": FULL_HISTORY_FLOW_QUEUE_CAPACITY,
+            "activeMaterialIds": [],
+            "activeFlowCount": 0,
+            "maximumParallelFlows": PLAYBACK_WARM_FLOW_CONCURRENCY,
             "currentMaterialId": "",
             "currentQueuePosition": 0,
             "currentQueueTotal": 0,
@@ -1163,8 +1484,32 @@ class ProviderRuntime:
                         if camera.key not in self.sessions
                     ]
                     self.last_error = "; ".join(failures)
+                    failed_at = _utc_text()
+                    for camera in self.profile.enabled_cameras:
+                        if camera.key in self.sessions:
+                            continue
+                        quality = self.image_quality_states[camera.key]
+                        quality["status"] = "offline"
+                        quality["monitoringState"] = "connection-failed"
+                        quality["alarmActive"] = True
+                        quality["alarmType"] = "camera-offline"
+                        quality["reasons"] = ["camera-connection-failed"]
+                        quality["offlineStreak"] = max(
+                            self.camera_offline_alarm_rounds,
+                            int(quality.get("offlineStreak", 0)),
+                        )
+                        quality["activeSince"] = quality.get("activeSince") or failed_at
+                        quality["updatedAt"] = failed_at
                 self.connection_in_progress = False
                 self.last_connection_completed_at = _utc_text()
+            if code != 0 and self.capture_mode == "continuous":
+                self._schedule_camera_reconnect(
+                    [
+                        camera.key
+                        for camera in self.profile.enabled_cameras
+                        if camera.key not in self.sessions
+                    ]
+                )
             return {
                 "code": code,
                 "cameras": results,
@@ -1214,6 +1559,7 @@ class ProviderRuntime:
     def close(self) -> None:
         self.acquisition_stop.set()
         self.playback_warm_stop.set()
+        self.camera_reconnect_stop.set()
         if (
             self.playback_discovery_thread.is_alive()
             and self.playback_discovery_thread is not threading.current_thread()
@@ -1222,6 +1568,13 @@ class ProviderRuntime:
         thread = self.acquisition_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(2.0, self.profile.timeout_ms / 1000.0 + 1.0))
+        reconnect_thread = self.camera_reconnect_thread
+        if (
+            reconnect_thread is not None
+            and reconnect_thread.is_alive()
+            and reconnect_thread is not threading.current_thread()
+        ):
+            reconnect_thread.join(timeout=2.0)
         with self.storage_queue_space:
             self.storage_queue_accepting = False
             self.storage_queue_space.notify_all()
@@ -1401,6 +1754,7 @@ class ProviderRuntime:
         session_id: str,
         *,
         latest_round: int | None = None,
+        recover_latest_complete: bool = False,
         reason: str,
     ) -> None:
         if not material_id or not material_id.isdecimal():
@@ -1422,14 +1776,41 @@ class ProviderRuntime:
                     )
                 except (OSError, TypeError, ValueError, json.JSONDecodeError):
                     latest_round = None
-            write_flow_manifest(
-                self.profile.storage_root,
-                material_id,
-                session_id=session_id,
-                state="closed",
-                camera_roots=self._flow_capture_roots(material_id),
-                latest_round=latest_round,
-            )
+            try:
+                write_flow_manifest(
+                    self.profile.storage_root,
+                    material_id,
+                    session_id=session_id,
+                    state="closed",
+                    camera_roots=self._flow_capture_roots(material_id),
+                    latest_round=latest_round,
+                    recover_latest_complete=recover_latest_complete,
+                    boundary_policy=(
+                        "global-reference-id+per-camera-one-round-boundary"
+                        if self.per_camera_flow_routing
+                        else None
+                    ),
+                )
+            finally:
+                # flow.json is committed before the optional acquisition
+                # contract is built. Preserve the algorithm hand-off even when
+                # a partial tail event prevents that secondary contract.
+                try:
+                    closed_manifest = json.loads(
+                        flow_manifest_path(
+                            self.profile.storage_root, material_id
+                        ).read_text(encoding="utf-8-sig")
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    closed_manifest = {}
+                if str(closed_manifest.get("state", "")).lower() == "closed":
+                    publish_flow_handoff(
+                        self.profile.storage_root,
+                        material_id,
+                        session_id=session_id,
+                        state="closed",
+                        latest_round=latest_round,
+                    )
         self._log(
             "info",
             "flow manifest closed",
@@ -1446,6 +1827,49 @@ class ProviderRuntime:
         must be finalized so the algorithm service can run its final pass.
         """
         recovered = 0
+        handoff_candidates: list[tuple[int, str, str, int | None]] = []
+        maximum_committed_round = 0
+        handoff_latest_by_material: dict[str, int] = {}
+        try:
+            handoff = json.loads(
+                capture_flow_handoff_path(self.profile.storage_root).read_text(
+                    encoding="utf-8-sig"
+                )
+            )
+            for row in handoff.get("flows", []):
+                if isinstance(row, dict):
+                    material_id = str(row.get("materialId", "")).strip()
+                    row_latest = int(row.get("latestCommittedRound", 0) or 0)
+                    if material_id.isdecimal():
+                        # One-time recovery for builds that restarted the
+                        # process-local counter at zero before a watermark was
+                        # available. Event names are immutable global rounds.
+                        try:
+                            event_latest = max(
+                                (
+                                    int(path.stem)
+                                    for path in frame_event_root(
+                                        self.profile.storage_root,
+                                        material_id,
+                                    ).glob("*.json")
+                                    if path.stem.isdecimal()
+                                ),
+                                default=0,
+                            )
+                            row_latest = max(row_latest, event_latest)
+                        except OSError:
+                            pass
+                    maximum_committed_round = max(
+                        maximum_committed_round,
+                        row_latest,
+                    )
+                    if material_id.isdecimal() and row_latest > 0:
+                        handoff_latest_by_material[material_id] = max(
+                            handoff_latest_by_material.get(material_id, 0),
+                            row_latest,
+                        )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
         try:
             candidates = list(self.profile.storage_root.iterdir())
         except OSError:
@@ -1458,22 +1882,97 @@ class ProviderRuntime:
                 payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if str(payload.get("state", "")).strip().lower() != "capturing":
+            state = str(payload.get("state", "")).strip().lower()
+            if state not in {"capturing", "closed"}:
                 continue
             latest_round_value = payload.get("latestCommittedRound")
             try:
-                latest_round = (
+                manifest_latest_round = (
                     int(latest_round_value) if latest_round_value is not None else None
                 )
             except (TypeError, ValueError):
-                latest_round = None
-            self._close_flow_manifest(
+                manifest_latest_round = None
+            latest_round = manifest_latest_round
+            durable_handoff_round = handoff_latest_by_material.get(
                 flow_dir.name,
-                str(payload.get("sessionId", "")),
-                latest_round=latest_round,
-                reason="capture-process-restart-recovery",
+                0,
             )
-            recovered += 1
+            if durable_handoff_round > (latest_round or 0):
+                latest_round = durable_handoff_round
+            maximum_committed_round = max(
+                maximum_committed_round,
+                latest_round or 0,
+            )
+            session_id = str(payload.get("sessionId", ""))
+            if state == "capturing":
+                self._close_flow_manifest(
+                    flow_dir.name,
+                    session_id,
+                    latest_round=latest_round,
+                    # A prior rolling-upgrade build may have kept a stale
+                    # latest-complete pointer even when the raw latest round
+                    # itself did not regress. Handoff membership bounds this
+                    # startup recovery to the flows workers can consume next.
+                    recover_latest_complete=(flow_dir.name in handoff_latest_by_material),
+                    reason="capture-process-restart-recovery",
+                )
+                recovered += 1
+            elif flow_dir.name in handoff_latest_by_material:
+                # Repair both a rolling-upgrade counter regression and a stale
+                # latest-complete pointer from immutable event files before
+                # workers inspect the bounded realtime handoff.
+                try:
+                    write_flow_manifest(
+                        self.profile.storage_root,
+                        flow_dir.name,
+                        session_id=session_id,
+                        state="closed",
+                        camera_roots=self._flow_capture_roots(flow_dir.name),
+                        latest_round=latest_round,
+                        recover_latest_complete=True,
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+                    # flow.json is written before its optional acquisition
+                    # manifest; do not make capture startup depend on old raw
+                    # artifacts still being present.
+                    self._log(
+                        "warning",
+                        "capture flow latest-complete repair was partial",
+                        materialId=flow_dir.name,
+                        error=str(error),
+                    )
+            try:
+                modified_ns = manifest_path.stat().st_mtime_ns
+            except OSError:
+                modified_ns = 0
+            handoff_candidates.append(
+                (modified_ns, flow_dir.name, session_id, latest_round)
+            )
+        # Bootstrap a rolling upgrade or clean restart from capture-owned
+        # manifests. This scan already happened for interrupted-flow recovery;
+        # keep only a bounded recent hand-off for the polling workers.
+        newest = sorted(handoff_candidates, reverse=True)[:32]
+        for _, material_id, session_id, latest_round in reversed(newest):
+            try:
+                publish_flow_handoff(
+                    self.profile.storage_root,
+                    material_id,
+                    session_id=session_id,
+                    state="closed",
+                    latest_round=latest_round,
+                )
+            except (OSError, ValueError, TypeError) as error:
+                self._log(
+                    "warning",
+                    "capture flow hand-off bootstrap failed",
+                    materialId=material_id,
+                    error=str(error),
+                )
+        with self.state_lock:
+            self.continuous_round = max(
+                self.continuous_round,
+                maximum_committed_round,
+            )
         if recovered:
             self._log(
                 "warning",
@@ -1485,11 +1984,28 @@ class ProviderRuntime:
         self, *, replace: bool = False, **values: Any
     ) -> None:
         with self.history_lock:
-            self.playback_warm_status = {
-                **({} if replace else self.playback_warm_status),
+            material_id = str(values.get("materialId", "")).strip()
+            progress = getattr(self, "playback_warm_progress", {})
+            previous = progress.get(material_id, {}) if material_id else {}
+            next_status = {
+                **({} if replace else previous),
                 **values,
                 "updatedAt": _utc_text(),
             }
+            if material_id:
+                progress[material_id] = next_status
+                self.playback_warm_progress = progress
+            current_material_id = str(
+                getattr(self, "playback_warm_status", {}).get("materialId", "")
+            ).strip()
+            publish = not current_material_id
+            if material_id:
+                try:
+                    publish = publish or int(material_id) >= int(current_material_id)
+                except ValueError:
+                    publish = publish or material_id >= current_material_id
+            if publish or not material_id:
+                self.playback_warm_status = next_status
 
     def _set_playback_history_status(self, **values: Any) -> None:
         """Publish bounded full-history discovery/rebuild progress."""
@@ -1507,13 +2023,42 @@ class ProviderRuntime:
             }
             self.playback_history_status = status
 
-    def _full_history_active_future(self) -> tuple[str, Future[Any]] | None:
-        """Return the one running/pending warm future, if any."""
+    def _full_history_active_futures(self) -> list[tuple[str, Future[Any]]]:
+        """Return the bounded running/pending warm futures, newest first."""
         with self.history_lock:
-            for material_id, future in self.playback_warm_futures.items():
-                if not future.done():
-                    return material_id, future
-        return None
+            active = [
+                (material_id, future)
+                for material_id, future in self.playback_warm_futures.items()
+                if not future.done()
+            ]
+        return sorted(
+            active,
+            key=lambda row: int(row[0]) if row[0].isdecimal() else -1,
+            reverse=True,
+        )
+
+    def _newer_playback_flow_waiting(self, material_id: str) -> str:
+        """Return the newest queued flow that should preempt older JET work."""
+        if not material_id.isdecimal():
+            return ""
+        current = int(material_id)
+        with self.history_lock:
+            candidates = {
+                candidate
+                for candidate in (
+                    *self.playback_history_retry_pending,
+                    *self.playback_history_flow_queue,
+                    *(
+                        candidate
+                        for candidate, future in getattr(
+                            self, "playback_warm_futures", {}
+                        ).items()
+                        if candidate != material_id and not future.done()
+                    ),
+                )
+                if candidate.isdecimal() and int(candidate) > current
+            }
+        return max(candidates, key=int, default="")
 
     def _discover_full_history_catalog(self, *, force: bool = False) -> bool:
         """Discover every catalog flow eligible for full rendition rebuilding.
@@ -1538,10 +2083,17 @@ class ProviderRuntime:
             )
             return False
 
+        # The atomic playback catalog is already the visible-record authority.
+        # Boundary repair removes replaced rows while publishing the repair;
+        # re-reading a flow manifest for every row here made startup and every
+        # live catalog append perform thousands of random disk reads.
         rows = [
-            row for row in catalog.get("materials", []) if isinstance(row, dict)
+            row
+            for row in catalog.get("materials", [])
+            if isinstance(row, dict)
         ]
         catalog_ids: list[str] = []
+        catalog_frame_counts: dict[str, int] = {}
         seen_ids: set[str] = set()
         for row in rows:
             raw_material_id = str(row.get("materialId", "")).strip()
@@ -1552,6 +2104,12 @@ class ProviderRuntime:
                 continue
             seen_ids.add(material_id)
             catalog_ids.append(material_id)
+            try:
+                catalog_frame_counts[material_id] = max(
+                    0, int(row.get("frameCount", 0) or 0)
+                )
+            except (TypeError, ValueError):
+                catalog_frame_counts[material_id] = 0
         try:
             directory_ids = sorted(
                 {
@@ -1564,12 +2122,130 @@ class ProviderRuntime:
             )
         except OSError:
             directory_ids = []
+        # Only the small orphan set needs a manifest read. Catalog rows have
+        # already passed the publication gate above.
         orphan_ids = [
             material_id
             for material_id in directory_ids
             if material_id not in seen_ids
+            and not _flow_is_superseded(self.profile.storage_root, material_id)
         ]
         catalog_ids.extend(orphan_ids)
+
+        # A live catalog normally changes by prepending one flow or increasing
+        # the current flow's committed-frame count. Re-auditing thousands of
+        # immutable historical rows on every such commit delays the active JET
+        # snapshot. Handle that append/growth shape incrementally after the
+        # first authoritative discovery scan.
+        with self.history_lock:
+            previous_ids = list(self.playback_history_catalog_ids)
+            previous_counts = dict(
+                getattr(self, "playback_history_catalog_frame_counts", {})
+            )
+            prior_discovery_complete = bool(
+                self.playback_history_status.get("discoveryComplete")
+            )
+        previous_id_set = set(previous_ids)
+        retained_order = [
+            material_id
+            for material_id in catalog_ids
+            if material_id in previous_id_set
+        ]
+        append_or_growth_only = bool(
+            previous_ids
+            and retained_order == previous_ids
+            and previous_id_set.issubset(catalog_ids)
+        )
+        changed_ids = [
+            material_id
+            for material_id in catalog_ids
+            if material_id not in previous_id_set
+            or int(catalog_frame_counts.get(material_id, 0))
+            > int(previous_counts.get(material_id, 0))
+        ]
+        if (
+            not force
+            and prior_discovery_complete
+            and append_or_growth_only
+            and (
+                catalog_mtime_ns != self.playback_history_catalog_mtime_ns
+                or changed_ids
+            )
+        ):
+            readiness: dict[str, bool] = {}
+            for material_id in changed_ids:
+                if self.playback_warm_stop.is_set():
+                    return False
+                try:
+                    readiness[material_id] = self._flow_ready_for_full_renditions(
+                        material_id
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    readiness[material_id] = False
+            with self.history_lock:
+                active_ids = {
+                    material_id
+                    for material_id, future in self.playback_warm_futures.items()
+                    if not future.done()
+                }
+                retry_pending = getattr(
+                    self, "playback_history_retry_pending", deque()
+                )
+                for material_id in reversed(changed_ids):
+                    current_count = int(catalog_frame_counts.get(material_id, 0))
+                    completed_count = int(
+                        self.playback_history_completed_frame_counts.get(
+                            material_id, -1
+                        )
+                    )
+                    if current_count > completed_count:
+                        self.playback_history_completed.discard(material_id)
+                        self.playback_history_completed_frame_counts.pop(
+                            material_id, None
+                        )
+                        self.playback_history_skipped_complete.discard(material_id)
+                        self.playback_history_failed.discard(material_id)
+                        self.playback_history_ready_hint_ids.discard(material_id)
+                    if readiness.get(material_id, False):
+                        self.playback_history_unready_ids.discard(material_id)
+                        if material_id in self.playback_history_eligible_ids:
+                            self.playback_history_eligible_ids.remove(material_id)
+                        self.playback_history_eligible_ids.insert(0, material_id)
+                        if (
+                            material_id not in active_ids
+                            and material_id not in self.playback_history_queued
+                            and material_id not in retry_pending
+                            and material_id not in self.playback_history_completed
+                        ):
+                            retry_pending.appendleft(material_id)
+                    else:
+                        self.playback_history_unready_ids.add(material_id)
+                        if material_id not in self.playback_history_unready_queue:
+                            self.playback_history_unready_queue.appendleft(material_id)
+                self.playback_history_retry_pending = retry_pending
+                self.playback_history_catalog_mtime_ns = catalog_mtime_ns
+                self.playback_history_catalog_ids = catalog_ids
+                self.playback_history_catalog_frame_counts = catalog_frame_counts
+                self.playback_history_catalog_material_count = len(rows)
+                self.playback_history_discovered_count = len(catalog_ids)
+                self.playback_history_status = {
+                    **self.playback_history_status,
+                    "catalogMaterialCount": len(rows),
+                    "catalogScannedCount": len(catalog_ids),
+                    "discoveredFlowCount": len(catalog_ids),
+                    "orphanFlowCount": len(orphan_ids),
+                    "rebuildableFlowCount": len(
+                        self.playback_history_eligible_ids
+                    ),
+                    "unreadyFlowCount": len(self.playback_history_unready_ids),
+                    "completedFlowCount": len(self.playback_history_completed),
+                    "discoveryComplete": True,
+                    "incrementalDiscovery": True,
+                    "incrementalChangedFlowCount": len(changed_ids),
+                    "lastError": "",
+                    "updatedAt": _utc_text(),
+                }
+            return True
 
         with self.history_lock:
             already_discovered = (
@@ -1644,6 +2320,7 @@ class ProviderRuntime:
         # immediately before they can be marked complete.
         unhinted_eligible_ids: list[str] = []
         ready_hint_eligible_ids: list[str] = []
+        deferred_eligible_ids: list[str] = []
         eligible_ids: list[str] = []
         unready_ids: set[str] = set()
         completed_ids: set[str] = set()
@@ -1657,11 +2334,16 @@ class ProviderRuntime:
             unreadyFlowCount=0,
             completedFlowCount=0,
             discoveryComplete=False,
+            incrementalDiscovery=False,
+            incrementalChangedFlowCount=0,
             lastError="",
         )
         for scanned_count, material_id in enumerate(catalog_ids, start=1):
             if self.playback_warm_stop.is_set():
                 return False
+            if scanned_count > FULL_HISTORY_EAGER_DISCOVERY_AUDIT_LIMIT:
+                deferred_eligible_ids.append(material_id)
+                continue
             try:
                 if not self._flow_ready_for_full_renditions(material_id):
                     unready_ids.add(material_id)
@@ -1675,10 +2357,21 @@ class ProviderRuntime:
             eligible_count = len(unhinted_eligible_ids) + len(
                 ready_hint_eligible_ids
             )
-            if scanned_count % 32 == 0 or scanned_count == len(catalog_ids):
+            if (
+                scanned_count % 32 == 0
+                or scanned_count
+                == min(
+                    len(catalog_ids),
+                    FULL_HISTORY_EAGER_DISCOVERY_AUDIT_LIMIT,
+                )
+            ):
                 self._set_playback_history_status(
                     state="discovering",
-                    catalogScannedCount=scanned_count,
+                    catalogScannedCount=len(catalog_ids),
+                    eagerAuditedFlowCount=scanned_count,
+                    deferredAuditFlowCount=max(
+                        0, len(catalog_ids) - scanned_count
+                    ),
                     rebuildableFlowCount=eligible_count,
                     unreadyFlowCount=len(unready_ids),
                     completedFlowCount=len(completed_ids),
@@ -1687,23 +2380,44 @@ class ProviderRuntime:
 
         # Keep each group in catalog order, but put flows without a persisted
         # hint first so a restart reaches genuinely missing history quickly.
-        eligible_ids = [*unhinted_eligible_ids, *ready_hint_eligible_ids]
+        eligible_ids = [
+            *unhinted_eligible_ids,
+            *ready_hint_eligible_ids,
+            *deferred_eligible_ids,
+        ]
 
         with self.history_lock:
-            retained_completed = self.playback_history_completed.intersection(
-                eligible_ids
+            completed_frame_counts = getattr(
+                self, "playback_history_completed_frame_counts", {}
             )
+            retained_completed = {
+                material_id
+                for material_id in self.playback_history_completed.intersection(
+                    eligible_ids
+                )
+                if int(completed_frame_counts.get(material_id, -1))
+                >= int(catalog_frame_counts.get(material_id, 0))
+            }
             retained_skipped = self.playback_history_skipped_complete.intersection(
                 retained_completed
             )
             completed_ids.update(retained_completed)
             self.playback_history_catalog_mtime_ns = catalog_mtime_ns
             self.playback_history_catalog_ids = catalog_ids
+            self.playback_history_catalog_frame_counts = catalog_frame_counts
             self.playback_history_eligible_ids = eligible_ids
             self.playback_history_scan_cursor = 0
             self.playback_history_catalog_material_count = len(rows)
             self.playback_history_discovered_count = len(catalog_ids)
             self.playback_history_completed = completed_ids
+            self.playback_history_ready_hint_ids = set(
+                ready_hint_eligible_ids
+            )
+            self.playback_history_completed_frame_counts = {
+                material_id: int(completed_frame_counts[material_id])
+                for material_id in retained_completed
+                if material_id in completed_frame_counts
+            }
             self.playback_history_skipped_complete = retained_skipped
             self.playback_history_failed = set()
             self.playback_history_retry_counts = {}
@@ -1721,6 +2435,11 @@ class ProviderRuntime:
                 "state": "discovered",
                 "catalogMaterialCount": len(rows),
                 "catalogScannedCount": len(catalog_ids),
+                "eagerAuditedFlowCount": min(
+                    len(catalog_ids),
+                    FULL_HISTORY_EAGER_DISCOVERY_AUDIT_LIMIT,
+                ),
+                "deferredAuditFlowCount": len(deferred_eligible_ids),
                 "discoveredFlowCount": len(catalog_ids),
                 "orphanFlowCount": len(orphan_ids),
                 "rebuildableFlowCount": len(eligible_ids),
@@ -1736,6 +2455,8 @@ class ProviderRuntime:
                 "currentCommittedFrameCount": 0,
                 "currentFailureCount": 0,
                 "discoveryComplete": True,
+                "incrementalDiscovery": False,
+                "incrementalChangedFlowCount": 0,
                 "lastError": "",
                 "updatedAt": _utc_text(),
             }
@@ -1752,6 +2473,39 @@ class ProviderRuntime:
                 for material_id, future in self.playback_warm_futures.items()
                 if not future.done()
             }
+            if retry_queue:
+                # A preempted recent flow may arrive while the bounded queue is
+                # already full of older history. Merge and rank both sources so
+                # it cannot be stranded behind those older ids. Preserve normal
+                # catalog order when there is no priority/retry work.
+                ranked_candidates: list[str] = []
+                seen_candidates: set[str] = set()
+                for candidate in (*queue, *retry_queue):
+                    if (
+                        candidate in seen_candidates
+                        or candidate in active_ids
+                        or candidate in self.playback_history_completed
+                        or candidate in self.playback_history_failed
+                    ):
+                        continue
+                    seen_candidates.add(candidate)
+                    ranked_candidates.append(candidate)
+                ranked_candidates.sort(
+                    key=lambda candidate: int(candidate)
+                    if candidate.isdecimal()
+                    else -1,
+                    reverse=True,
+                )
+                queue.clear()
+                self.playback_history_queued.clear()
+                for candidate in ranked_candidates[
+                    :FULL_HISTORY_FLOW_QUEUE_CAPACITY
+                ]:
+                    queue.append(candidate)
+                    self.playback_history_queued.add(candidate)
+                retry_queue = deque(
+                    ranked_candidates[FULL_HISTORY_FLOW_QUEUE_CAPACITY:]
+                )
             while len(queue) < FULL_HISTORY_FLOW_QUEUE_CAPACITY:
                 if self.playback_warm_stop.is_set():
                     break
@@ -1792,6 +2546,9 @@ class ProviderRuntime:
 
     def _finish_full_history_future(self, material_id: str, future: Future[Any]) -> None:
         """Account for one flow and retry boundedly when a frame failed."""
+        with self.history_lock:
+            if self.playback_warm_futures.get(material_id) is not future:
+                return
         try:
             result = future.result()
         except Exception as error:
@@ -1802,17 +2559,43 @@ class ProviderRuntime:
                 "failures": [{"error": str(error)}],
             }
         state = str(result.get("state", "incomplete"))
+        snapshot_frame_count = max(0, int(result.get("frameCount", 0) or 0))
+        snapshot_grew = bool(
+            state == "ready"
+            and self._playback_snapshot_frame_count(material_id)
+            > snapshot_frame_count
+        )
+        if snapshot_grew:
+            state = "snapshot-ready"
         with self.history_lock:
             if self.playback_warm_futures.get(material_id) is not future:
                 return
             self.playback_warm_futures.pop(material_id, None)
+            getattr(self, "playback_warm_progress", {}).pop(material_id, None)
             eligible = material_id in self.playback_history_eligible_ids
             retry_pending = getattr(self, "playback_history_retry_pending", deque())
             if eligible and state == "ready":
                 self.playback_history_completed.add(material_id)
+                self.playback_history_completed_frame_counts[material_id] = (
+                    snapshot_frame_count
+                )
                 self.playback_history_failed.discard(material_id)
+            elif eligible and state == "snapshot-ready":
+                self.playback_history_completed.discard(material_id)
+                self.playback_history_completed_frame_counts.pop(material_id, None)
+                self.playback_history_skipped_complete.discard(material_id)
+                retry_pending.appendleft(material_id)
+            elif eligible and state == "preempted-for-newer-flow":
+                self.playback_history_completed.discard(material_id)
+                self.playback_history_completed_frame_counts.pop(material_id, None)
+                self.playback_history_skipped_complete.discard(material_id)
+                # Latest-flow preemption is normal scheduling, not a failed
+                # rendition attempt. Put the partial flow behind new work and
+                # resume it later from already committed frame files.
+                retry_pending.append(material_id)
             elif eligible:
                 self.playback_history_completed.discard(material_id)
+                self.playback_history_completed_frame_counts.pop(material_id, None)
                 self.playback_history_skipped_complete.discard(material_id)
                 attempts = self.playback_history_retry_counts.get(material_id, 0)
                 if attempts < FULL_HISTORY_FLOW_RETRY_LIMIT:
@@ -1826,6 +2609,21 @@ class ProviderRuntime:
             failed_count = len(self.playback_history_failed)
             queue_depth = len(self.playback_history_flow_queue)
             current_queue_total = len(self.playback_history_eligible_ids)
+            active_ids = sorted(
+                (
+                    candidate
+                    for candidate, candidate_future in self.playback_warm_futures.items()
+                    if not candidate_future.done()
+                ),
+                key=lambda candidate: int(candidate)
+                if candidate.isdecimal()
+                else -1,
+                reverse=True,
+            )
+            current_material_id = active_ids[0] if active_ids else ""
+            current_progress = getattr(
+                self, "playback_warm_progress", {}
+            ).get(current_material_id, {})
             self.playback_history_status = {
                 **self.playback_history_status,
                 "completedFlowCount": completed_count,
@@ -1834,19 +2632,37 @@ class ProviderRuntime:
                 ),
                 "failedFlowCount": failed_count,
                 "retryCount": retry_count,
-                "currentMaterialId": "",
+                "currentMaterialId": current_material_id,
+                "activeMaterialIds": active_ids,
+                "activeFlowCount": len(active_ids),
+                "maximumParallelFlows": PLAYBACK_WARM_FLOW_CONCURRENCY,
                 "currentQueuePosition": 0,
                 "currentQueueTotal": current_queue_total,
-                "currentSourceFrameCount": 0,
-                "currentCommittedFrameCount": 0,
-                "currentFailureCount": 0,
+                "currentSourceFrameCount": int(
+                    current_progress.get("sourceFrameCount", 0)
+                ),
+                "currentCommittedFrameCount": int(
+                    current_progress.get("committedFrameCount", 0)
+                ),
+                "currentFailureCount": int(
+                    current_progress.get("failureCount", 0)
+                ),
                 "queueDepth": queue_depth,
-                "lastError": "" if state == "ready" else str(result.get("failures", "")),
+                "lastError": (
+                    ""
+                    if state
+                    in {
+                        "ready",
+                        "snapshot-ready",
+                        "preempted-for-newer-flow",
+                    }
+                    else str(result.get("failures", ""))
+                ),
                 "updatedAt": _utc_text(),
             }
 
     def _advance_full_history_rebuild(self) -> None:
-        """Discover catalog rows, consume completed flows, and schedule one."""
+        """Discover rows, consume completions, and fill bounded flow slots."""
         if not self._discover_full_history_catalog():
             return
         # A direct history request or the legacy startup warm may have put a
@@ -1861,37 +2677,48 @@ class ProviderRuntime:
             self._finish_full_history_future(material_id, future)
 
         self._refill_full_history_queue()
-        if self._full_history_active_future() is not None:
-            active = self._full_history_active_future()
-            if active is not None:
-                material_id, _ = active
-                with self.history_lock:
-                    warm = dict(self.playback_warm_status)
-                    total = len(self.playback_history_eligible_ids)
-                    position = (
-                        len(self.playback_history_completed)
-                        + len(self.playback_history_failed)
-                        + 1
+        active = self._full_history_active_futures()
+        if active:
+            material_id, _ = active[0]
+            with self.history_lock:
+                warm = dict(
+                    getattr(self, "playback_warm_progress", {}).get(
+                        material_id,
+                        self.playback_warm_status,
                     )
-                    self.playback_history_status = {
-                        **self.playback_history_status,
-                        "state": "building",
-                        "currentMaterialId": material_id,
-                        "currentQueuePosition": min(position, total),
-                        "currentQueueTotal": total,
-                        "currentSourceFrameCount": int(
-                            warm.get("sourceFrameCount", 0)
-                        ),
-                        "currentCommittedFrameCount": int(
-                            warm.get("committedFrameCount", 0)
-                        ),
-                        "currentFailureCount": int(
-                            warm.get("failureCount", 0)
-                        ),
-                        "queueDepth": len(self.playback_history_flow_queue),
-                        "updatedAt": _utc_text(),
-                    }
-            return
+                )
+                total = len(self.playback_history_eligible_ids)
+                position = (
+                    len(self.playback_history_completed)
+                    + len(self.playback_history_failed)
+                    + 1
+                )
+                self.playback_history_status = {
+                    **self.playback_history_status,
+                    "state": "building",
+                    "currentMaterialId": material_id,
+                    "activeMaterialIds": [row[0] for row in active],
+                    "activeFlowCount": len(active),
+                    "maximumParallelFlows": PLAYBACK_WARM_FLOW_CONCURRENCY,
+                    "currentQueuePosition": min(position, total),
+                    "currentQueueTotal": total,
+                    "currentSourceFrameCount": int(
+                        warm.get("sourceFrameCount", 0)
+                    ),
+                    "currentCommittedFrameCount": int(
+                        warm.get("committedFrameCount", 0)
+                    ),
+                    "currentFailureCount": int(
+                        warm.get("failureCount", 0)
+                    ),
+                    "queueDepth": len(self.playback_history_flow_queue),
+                    "updatedAt": _utc_text(),
+                }
+            if len(active) >= PLAYBACK_WARM_FLOW_CONCURRENCY:
+                return
+            with self.history_lock:
+                if not self.playback_history_flow_queue:
+                    return
 
         while True:
             if self.playback_warm_stop.is_set():
@@ -1944,9 +2771,16 @@ class ProviderRuntime:
                 # discovery tick after every batch of four.
                 self._refill_full_history_queue()
                 continue
-            if self._flow_two_level_renditions_complete(material_id):
+            if (
+                material_id
+                in getattr(self, "playback_history_ready_hint_ids", set())
+                and self._flow_two_level_renditions_complete(material_id)
+            ):
                 with self.history_lock:
                     self.playback_history_completed.add(material_id)
+                    self.playback_history_completed_frame_counts[material_id] = (
+                        self._playback_snapshot_frame_count(material_id)
+                    )
                     self.playback_history_skipped_complete.add(material_id)
                     self.playback_history_status = {
                         **self.playback_history_status,
@@ -1959,10 +2793,16 @@ class ProviderRuntime:
                         "updatedAt": _utc_text(),
                     }
                 # Keep the bounded queue full while consuming already-ready
-                # flows, but never submit another active Future here.
+                # flows without exceeding the small flow-worker bound.
                 self._refill_full_history_queue()
                 continue
             if self._schedule_playback_warm(material_id):
+                active_after_schedule = self._full_history_active_futures()
+                primary_material_id = (
+                    active_after_schedule[0][0]
+                    if active_after_schedule
+                    else material_id
+                )
                 with self.history_lock:
                     total = len(self.playback_history_eligible_ids)
                     position = (
@@ -1973,14 +2813,26 @@ class ProviderRuntime:
                     self.playback_history_status = {
                         **self.playback_history_status,
                         "state": "building",
-                        "currentMaterialId": material_id,
+                        "currentMaterialId": primary_material_id,
+                        "activeMaterialIds": [
+                            row[0] for row in active_after_schedule
+                        ],
+                        "activeFlowCount": len(active_after_schedule),
+                        "maximumParallelFlows": PLAYBACK_WARM_FLOW_CONCURRENCY,
                         "currentQueuePosition": min(position, total),
                         "currentQueueTotal": total,
                         "queueDepth": len(self.playback_history_flow_queue),
                         "updatedAt": _utc_text(),
                     }
-                return
-            # Another caller won the single warm slot.  Keep this id for the
+                if (
+                    len(active_after_schedule) >= PLAYBACK_WARM_FLOW_CONCURRENCY
+                ):
+                    return
+                with self.history_lock:
+                    if not self.playback_history_flow_queue:
+                        return
+                continue
+            # Another caller filled the bounded warm slots. Keep this id for the
             # next discovery tick without growing the queue.
             with self.history_lock:
                 retry_queue = getattr(self, "playback_history_retry_pending", deque())
@@ -1988,10 +2840,81 @@ class ProviderRuntime:
                 self.playback_history_retry_pending = retry_queue
             return
 
-    def _playback_warm_worker(self, material_id: str) -> dict[str, Any]:
-        started = time.perf_counter()
+    def _playback_snapshot_frame_count(self, material_id: str) -> int:
+        try:
+            payload = json.loads(
+                playback_index_path(
+                    self.profile.storage_root, material_id
+                ).read_text(encoding="utf-8-sig")
+            )
+            return max(0, int(payload.get("frameCount", 0) or 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return 0
+
+    def _playback_snapshot_sources(
+        self, material_id: str
+    ) -> tuple[dict[str, Any], list[tuple[Path, str]], dict[str, int]]:
+        """Resolve only files committed by one atomic playback-index snapshot."""
         index_path = playback_index_path(self.profile.storage_root, material_id)
         index = json.loads(index_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(index, dict):
+            raise ValueError("playback index must be a JSON object")
+        configured = {
+            camera.camera_id: camera for camera in self.profile.enabled_cameras
+        }
+        source_counts = {camera_id: 0 for camera_id in configured}
+        sources: list[tuple[Path, str]] = []
+        seen: set[tuple[str, int]] = set()
+        frames = index.get("frames", [])
+        if not isinstance(frames, list):
+            raise ValueError("playback index frames must be a JSON array")
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            cameras = frame.get("cameras", [])
+            if not isinstance(cameras, list):
+                continue
+            for row in cameras:
+                if not isinstance(row, dict):
+                    continue
+                camera_id = str(row.get("cameraId", "")).strip()
+                camera = configured.get(camera_id)
+                if camera is None:
+                    continue
+                try:
+                    storage_index = int(row.get("storageIndex", -1))
+                except (TypeError, ValueError):
+                    continue
+                identity = (camera_id, storage_index)
+                if storage_index < 0 or identity in seen:
+                    continue
+                source = (
+                    capture_root(camera.storage_root, material_id, camera_id)
+                    / "2d"
+                    / f"{storage_index}.png"
+                )
+                try:
+                    committed = source.is_file() and not source.is_symlink()
+                except OSError:
+                    committed = False
+                if not committed:
+                    continue
+                seen.add(identity)
+                source_counts[camera_id] += 1
+                sources.append((source, camera_id))
+        return index, sources, source_counts
+
+    @staticmethod
+    def _rendition_storage_backlog_threshold(capacity_rounds: int) -> int:
+        capacity = max(1, int(capacity_rounds))
+        return max(
+            2,
+            min(96, capacity - max(8, capacity // 4)),
+        )
+
+    def _playback_warm_worker(self, material_id: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        index, sources, source_counts = self._playback_snapshot_sources(material_id)
         camera_roots = {
             camera.camera_id: camera.storage_root
             for camera in self.profile.enabled_cameras
@@ -2003,43 +2926,11 @@ class ProviderRuntime:
             ).parent
             for camera in self.profile.enabled_cameras
         }
-        # Full-flow generation is based on immutable raw files, not on which
-        # frames happen to be visible or requested by the UI. Round-robin the
-        # cameras by storage index so every disk starts receiving readable JET
-        # files immediately instead of finishing one camera before the next.
-        camera_order = {
-            camera.camera_id: index
-            for index, camera in enumerate(self.profile.enabled_cameras)
-        }
-        sources: list[tuple[Path, str]] = []
-        source_counts: dict[str, int] = {}
-        for camera in self.profile.enabled_cameras:
-            raw_directory = capture_root(
-                camera.storage_root,
-                material_id,
-                camera.camera_id,
-            ) / "2d"
-            if not raw_directory.is_dir():
-                source_counts[camera.camera_id] = 0
-                continue
-            camera_sources = [
-                (source, camera.camera_id)
-                for source in raw_directory.iterdir()
-                if source.is_file()
-                and not source.is_symlink()
-                and source.stem.isdecimal()
-                and source.suffix.lower() == ".png"
-            ]
-            source_counts[camera.camera_id] = len(camera_sources)
-            sources.extend(camera_sources)
-        sources.sort(
-            key=lambda item: (
-                int(item[0].stem),
-                camera_order.get(item[1], len(camera_order)),
-            )
-        )
-
+        # Generation is based on the immutable files referenced by one atomic
+        # playback-index snapshot, not on which frames the UI requests.
         cached = 0
+        diameter_valid_rows = 0
+        jet_valid_pixels = 0
         failures: list[dict[str, str]] = [
             {
                 "source": "",
@@ -2049,15 +2940,20 @@ class ProviderRuntime:
             for camera in self.profile.enabled_cameras
             if source_counts.get(camera.camera_id, 0) <= 0
         ]
-        idle_since: float | None = None
-        state = "waiting-for-idle"
+        maximum_pending = self._rendition_storage_backlog_threshold(
+            self.storage_queue_capacity_rounds
+        )
+        state = "waiting-for-capacity"
         self._set_playback_warm_status(
             replace=True,
             state=state,
             materialId=material_id,
             committedFrameCount=0,
             sourceFrameCount=len(sources),
+            diameterValidRowCount=0,
+            jetValidPixelCount=0,
             failureCount=0,
+            storageBacklogThresholdRounds=maximum_pending,
         )
 
         if failures:
@@ -2070,12 +2966,14 @@ class ProviderRuntime:
                 "sourceFrameCount": len(sources),
                 "cameraSourceCounts": source_counts,
                 "committedFrameCount": 0,
+                "diameterValidRowCount": 0,
+                "jetValidPixelCount": 0,
                 "failureCount": len(failures),
                 "failures": failures,
                 "levels": ["thumbnail", "original"],
                 "modalities": ["gray", "jet"],
                 "elapsedMs": round((time.perf_counter() - started) * 1000.0, 3),
-                "generationPolicy": "full-flow-after-alignment",
+                "generationPolicy": EAGER_RENDITION_GENERATION_POLICY,
                 "maximumParallelFrames": 2,
             }
             for camera in self.profile.enabled_cameras:
@@ -2083,25 +2981,20 @@ class ProviderRuntime:
             self._set_playback_warm_status(**result)
             return result
 
-        def wait_for_idle() -> bool:
-            nonlocal idle_since, state
+        def wait_for_capacity() -> bool:
+            """Yield only while capture storage has a material write backlog."""
+            nonlocal state
             while not self.playback_warm_stop.is_set():
-                with self.state_lock:
-                    steel_present = self.steel_present
                 with self.storage_queue_lock:
-                    storage_idle = (
-                        self.storage_queue_pending_rounds == 0
-                        and self.storage_queue_active_rounds == 0
+                    pending_rounds = self.storage_queue_pending_rounds
+                if pending_rounds <= maximum_pending:
+                    return True
+                if state != "throttled-for-storage-backlog":
+                    state = "throttled-for-storage-backlog"
+                    self._set_playback_warm_status(
+                        materialId=material_id,
+                        state=state,
                     )
-                if not steel_present and storage_idle:
-                    idle_since = idle_since or time.monotonic()
-                    if time.monotonic() - idle_since >= 0.75:
-                        return True
-                else:
-                    idle_since = None
-                if state != "paused-for-acquisition":
-                    state = "paused-for-acquisition"
-                    self._set_playback_warm_status(state=state)
                 self.playback_warm_stop.wait(0.2)
             return False
 
@@ -2110,20 +3003,47 @@ class ProviderRuntime:
         source_iterator = iter(sources)
         exhausted = False
         while pending or not exhausted:
+            newer_material_id = self._newer_playback_flow_waiting(material_id)
+            if newer_material_id:
+                for future in pending:
+                    future.cancel()
+                result = {
+                    "schema": "steel.capture-two-level-flow-cache.v2",
+                    "state": "preempted-for-newer-flow",
+                    "generatedAt": _utc_text(),
+                    "materialId": material_id,
+                    "preemptedForMaterialId": newer_material_id,
+                    "frameCount": int(index.get("frameCount", 0)),
+                    "sourceFrameCount": len(sources),
+                    "committedFrameCount": cached,
+                    "diameterValidRowCount": diameter_valid_rows,
+                    "jetValidPixelCount": jet_valid_pixels,
+                    "failureCount": len(failures),
+                    "generationPolicy": EAGER_RENDITION_GENERATION_POLICY,
+                    "storageBacklogThresholdRounds": maximum_pending,
+                }
+                self._set_playback_warm_status(**result)
+                return result
             while len(pending) < 2 and not exhausted:
                 try:
                     source, camera_id = next(source_iterator)
                 except StopIteration:
                     exhausted = True
                     break
-                if not wait_for_idle():
+                if not wait_for_capacity():
                     for future in pending:
                         future.cancel()
-                    self._set_playback_warm_status(state="stopped")
+                    self._set_playback_warm_status(
+                        materialId=material_id,
+                        state="stopped",
+                    )
                     return {"state": "stopped", "materialId": material_id}
                 if state != "building":
                     state = "building"
-                    self._set_playback_warm_status(state=state)
+                    self._set_playback_warm_status(
+                        materialId=material_id,
+                        state=state,
+                    )
                 future = self.playback_warm_compute_pool.submit(
                     _build_complete_rendition_pair,
                     source,
@@ -2139,8 +3059,14 @@ class ProviderRuntime:
             completed = next(as_completed(tuple(pending)))
             source, camera_id = pending.pop(completed)
             try:
-                completed.result()
+                frame_result = completed.result()
                 cached += 1
+                diameter_valid_rows += int(
+                    frame_result.get("diameterValidRowCount", 0) or 0
+                )
+                jet_valid_pixels += int(
+                    frame_result.get("jetValidPixelCount", 0) or 0
+                )
             except Exception as error:
                 failures.append(
                     {
@@ -2150,7 +3076,10 @@ class ProviderRuntime:
                     }
                 )
             self._set_playback_warm_status(
+                materialId=material_id,
                 committedFrameCount=cached,
+                diameterValidRowCount=diameter_valid_rows,
+                jetValidPixelCount=jet_valid_pixels,
                 failureCount=len(failures),
             )
 
@@ -2170,6 +3099,8 @@ class ProviderRuntime:
             "sourceFrameCount": len(sources),
             "cameraSourceCounts": source_counts,
             "committedFrameCount": cached,
+            "diameterValidRowCount": diameter_valid_rows,
+            "jetValidPixelCount": jet_valid_pixels,
             "failureCount": len(failures),
             "failures": failures[:20],
             "levels": ["thumbnail", "original"],
@@ -2179,7 +3110,8 @@ class ProviderRuntime:
             ],
             "elapsedMs": round((time.perf_counter() - started) * 1000.0, 3),
             "throttledForAcquisition": True,
-            "generationPolicy": "full-flow-after-alignment",
+            "storageBacklogThresholdRounds": maximum_pending,
+            "generationPolicy": EAGER_RENDITION_GENERATION_POLICY,
             "maximumParallelFrames": 2,
         }
         if complete:
@@ -2258,8 +3190,7 @@ class ProviderRuntime:
         except (TypeError, ValueError):
             return False
         return bool(
-            flow.get("state") == "closed"
-            and quality.get("geometrySynchronized")
+            flow.get("state") in {"capturing", "closed"}
             and complete_cameras == len(self.profile.enabled_cameras)
             and frame_count > 0
         )
@@ -2268,9 +3199,10 @@ class ProviderRuntime:
         """Return whether every camera has a persisted ready *hint*.
 
         This deliberately does not inspect source/cache file completeness and
-        must never add a flow to ``playback_history_completed``.  The hint only
-        moves a flow behind unhinted work during discovery; the full audit in
-        ``_advance_full_history_rebuild`` remains authoritative.
+        must never add a flow to ``playback_history_completed``. The hint only
+        moves a flow behind unhinted work during discovery. Hinted flows get a
+        full preflight audit; unhinted/latest flows get the same per-frame audit
+        immediately inside the warm worker.
         """
         for camera in self.profile.enabled_cameras:
             try:
@@ -2304,35 +3236,30 @@ class ProviderRuntime:
     def _flow_two_level_renditions_complete(self, material_id: str) -> bool:
         try:
             calibration_path = Path(self.active_array_calibration()["path"])
+            _index, snapshot_sources, source_counts = (
+                self._playback_snapshot_sources(material_id)
+            )
         except (OSError, ValueError, TypeError, KeyError):
             return False
-        total_sources = 0
-        for camera in self.profile.enabled_cameras:
-            flow = capture_root(camera.storage_root, material_id, camera.camera_id)
-            sources = [
-                path
-                for path in (flow / "2d").glob("*.png")
-                if path.is_file()
-                and not path.is_symlink()
-                and path.stem.isdecimal()
-            ]
-            if not sources:
+        if not snapshot_sources or any(
+            source_counts.get(camera.camera_id, 0) <= 0
+            for camera in self.profile.enabled_cameras
+        ):
+            return False
+        for source, _camera_id in snapshot_sources:
+            if committed_rendition_file(
+                source,
+                "gray",
+                "thumbnail",
+                calibration_path=calibration_path,
+            ) is None or committed_rendition_file(
+                source,
+                "jet",
+                "thumbnail",
+                calibration_path=calibration_path,
+            ) is None:
                 return False
-            total_sources += len(sources)
-            for source in sources:
-                if committed_rendition_file(
-                    source,
-                    "gray",
-                    "thumbnail",
-                    calibration_path=calibration_path,
-                ) is None or committed_rendition_file(
-                    source,
-                    "jet",
-                    "thumbnail",
-                    calibration_path=calibration_path,
-                ) is None:
-                    return False
-        return total_sources > 0
+        return True
 
     def _schedule_playback_warm(self, material_id: str) -> bool:
         normalized = material_id.strip()
@@ -2343,23 +3270,23 @@ class ProviderRuntime:
             if existing is not None:
                 return False
             # Keep the executor bounded even when several history requests
-            # arrive while the all-history worker is running.  The discovery
-            # queue owns the next flow id; callers cannot pile up Futures.
-            if any(
-                other != normalized and not future.done()
+            # arrive. One flow slot can rebuild older history while the other
+            # accepts the newest/live committed snapshot.
+            if sum(
+                1
                 for other, future in self.playback_warm_futures.items()
-            ):
+                if other != normalized and not future.done()
+            ) >= PLAYBACK_WARM_FLOW_CONCURRENCY:
                 return False
-        if self._flow_two_level_renditions_complete(normalized):
-            return False
         with self.history_lock:
             existing = self.playback_warm_futures.get(normalized)
             if existing is not None:
                 return False
-            if any(
-                other != normalized and not future.done()
+            if sum(
+                1
                 for other, future in self.playback_warm_futures.items()
-            ):
+                if other != normalized and not future.done()
+            ) >= PLAYBACK_WARM_FLOW_CONCURRENCY:
                 return False
             future = self.playback_warm_pool.submit(
                 self._playback_warm_worker, normalized
@@ -2367,32 +3294,11 @@ class ProviderRuntime:
             self.playback_warm_futures[normalized] = future
         return True
 
-    def _schedule_recent_closed_flow_renditions(self, maximum: int = 2) -> int:
-        try:
-            catalog = json.loads(
-                playback_catalog_path(self.profile.storage_root).read_text(
-                    encoding="utf-8-sig"
-                )
-            )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return 0
-        scheduled = 0
-        recent = list(catalog.get("materials", []))[: max(0, int(maximum))]
-        for row in recent:
-            if not isinstance(row, dict):
-                continue
-            material_id = str(row.get("materialId", "")).strip()
-            if self._schedule_playback_warm(material_id):
-                scheduled += 1
-        return scheduled
-
     def _full_rendition_discovery_loop(self) -> None:
         """Discover all eligible history and advance the bounded flow queue."""
-        # A live acquisition runtime normally has no catalog to rebuild. Keep
-        # its first discovery tick delayed so the background bookkeeping never
-        # competes with camera startup; history-only sidecars can begin the
-        # existing-history rebuild immediately.
-        if not self.history_only and self.playback_warm_stop.wait(15.0):
+        # Start promptly after the image worker publishes an atomic playback
+        # snapshot. Work is backlog-throttled, but does not wait for steel-out.
+        if not self.history_only and self.playback_warm_stop.wait(1.0):
             return
         while not self.playback_warm_stop.is_set():
             try:
@@ -2407,7 +3313,7 @@ class ProviderRuntime:
                     "full rendition discovery failed",
                     error=str(error),
                 )
-            if self.playback_warm_stop.wait(15.0):
+            if self.playback_warm_stop.wait(1.0):
                 break
 
     @staticmethod
@@ -2526,39 +3432,128 @@ class ProviderRuntime:
         return 200, {"code": 0, "regions": payload}
 
     def _flow_analysis_queue_status(self) -> dict[str, Any] | None:
-        path = (
-            self.profile.storage_root
-            / "system"
-            / "jobs"
-            / "flow-analysis"
-            / "status.json"
-        )
-        try:
-            value = json.loads(path.read_text(encoding="utf-8-sig"))
+        jobs_root = self.profile.storage_root / "system" / "jobs"
+        now_ms = int(time.time() * 1000)
+
+        def read_status(path: Path) -> dict[str, Any] | None:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return None
             if (
-                isinstance(value, dict)
-                and value.get("schema") == "steel.flow-analysis-queue.v1"
+                not isinstance(value, dict)
+                or value.get("schema") != "steel.flow-analysis-queue.v1"
             ):
-                now_ms = int(time.time() * 1000)
-                updated_ms = int(value.get("updatedAtUnixMs", 0) or 0)
-                heartbeat_age_ms = now_ms - updated_ms if updated_ms else None
-                heartbeat_fresh = bool(
-                    heartbeat_age_ms is not None
-                    and -5_000 <= heartbeat_age_ms <= 20_000
+                return None
+            updated_ms = int(value.get("updatedAtUnixMs", 0) or 0)
+            heartbeat_age_ms = now_ms - updated_ms if updated_ms else None
+            heartbeat_fresh = bool(
+                heartbeat_age_ms is not None
+                and -5_000 <= heartbeat_age_ms <= 20_000
+            )
+            result = {
+                **value,
+                "path": str(path),
+                "heartbeatFresh": heartbeat_fresh,
+                "heartbeatAgeMs": heartbeat_age_ms,
+            }
+            if value.get("state") == "running" and not heartbeat_fresh:
+                result["state"] = "unavailable"
+                result["lastError"] = "flow analysis heartbeat is stale"
+            return result
+
+        legacy = read_status(jobs_root / "flow-analysis" / "status.json")
+        split = {
+            role: status
+            for role in ("image", "defect")
+            if (
+                status := read_status(
+                    jobs_root / f"{role}-worker" / "status.json"
                 )
-                result = {
-                    **value,
-                    "path": str(path),
-                    "heartbeatFresh": heartbeat_fresh,
-                    "heartbeatAgeMs": heartbeat_age_ms,
+            )
+            is not None
+        }
+        if not split:
+            return legacy
+
+        split_updated_ms = max(
+            int(status.get("updatedAtUnixMs", 0) or 0)
+            for status in split.values()
+        )
+        legacy_updated_ms = int((legacy or {}).get("updatedAtUnixMs", 0) or 0)
+        if (
+            legacy is not None
+            and legacy.get("heartbeatFresh")
+            and legacy_updated_ms >= split_updated_ms
+        ):
+            return legacy
+
+        image = split.get("image", {})
+        defect = split.get("defect", {})
+        base = image or defect
+        required_roles = ("image", "defect")
+        heartbeat_fresh = all(
+            bool(split.get(role, {}).get("heartbeatFresh"))
+            for role in required_roles
+        )
+        heartbeat_ages = [
+            int(status["heartbeatAgeMs"])
+            for status in split.values()
+            if status.get("heartbeatAgeMs") is not None
+        ]
+        unhealthy_states = {"failed", "stopped", "unavailable"}
+        workers_healthy = all(
+            str(split.get(role, {}).get("state", "unavailable")).lower()
+            not in unhealthy_states
+            for role in required_roles
+        )
+        errors = [
+            f"{role}: {status.get('lastError')}"
+            for role, status in split.items()
+            if status.get("lastError")
+        ]
+        for role in required_roles:
+            if role not in split:
+                errors.append(f"{role}: worker status is missing")
+
+        result = {
+            **base,
+            "role": "split",
+            "state": "running"
+            if heartbeat_fresh and workers_healthy
+            else "unavailable",
+            "updatedAtUnixMs": split_updated_ms,
+            "heartbeatFresh": heartbeat_fresh,
+            "heartbeatAgeMs": max(heartbeat_ages) if heartbeat_ages else None,
+            "path": str(jobs_root),
+            "paths": {
+                role: str(status.get("path", ""))
+                for role, status in split.items()
+            },
+            "workers": {
+                role: {
+                    "state": status.get("state"),
+                    "currentFlow": status.get("currentFastFlow")
+                    or status.get("currentDefectFlow"),
+                    "heartbeatFresh": status.get("heartbeatFresh"),
+                    "heartbeatAgeMs": status.get("heartbeatAgeMs"),
+                    "lastError": status.get("lastError"),
                 }
-                if value.get("state") == "running" and not heartbeat_fresh:
-                    result["state"] = "unavailable"
-                    result["lastError"] = "flow analysis heartbeat is stale"
-                return result
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
-        return None
+                for role, status in split.items()
+            },
+            "lastError": "; ".join(errors) or None,
+        }
+        for field in (
+            "currentDefectFlow",
+            "pendingDefectFlows",
+            "queuedDefectFlowIds",
+            "defectBacklogDeferredCount",
+            "defectProcessedFlowCount",
+            "maximumDefectBacklog",
+        ):
+            if field in defect:
+                result[field] = defect[field]
+        return result
 
     def _pending_defect_detection_json(
         self, material_id: str
@@ -2997,7 +3992,16 @@ class ProviderRuntime:
                             "brightPixelRatio": float(
                                 source_row.get("brightPixelRatio", 0.0)
                             ),
+                            "imageQuality": dict(
+                                source_row.get("imageQuality", {})
+                            ),
                             "steelSignal": bool(source_row.get("steelSignal")),
+                            "materialSignal": bool(
+                                source_row.get("materialSignal")
+                            ),
+                            "materialSignalRatio": float(
+                                source_row.get("materialSignalRatio", 0.0)
+                            ),
                             "capturedAt": str(
                                 source_row.get("capturedAt", _utc_text())
                             ),
@@ -3105,6 +4109,19 @@ class ProviderRuntime:
                             state=manifest_state,
                             camera_roots=self._flow_capture_roots(material_id),
                             latest_round=latest_round,
+                            latest_round_complete=len(
+                                {
+                                    str(row.get("cameraId", "")).strip()
+                                    for row in committed
+                                    if str(row.get("cameraId", "")).strip()
+                                }
+                            )
+                            == len(self.profile.enabled_cameras),
+                            boundary_policy=(
+                                "global-reference-id+per-camera-one-round-boundary"
+                                if self.per_camera_flow_routing
+                                else None
+                            ),
                         )
                     for row in committed:
                         row["frameCommittedEvent"] = str(event_path)
@@ -3270,6 +4287,12 @@ class ProviderRuntime:
                     boundaryPhase=boundary_phase,
                     error=str(error),
                 )
+            if not failed:
+                # A later durable round is the recovery proof for a transient
+                # writer failure. Keep lifetime counters, but do not leave the
+                # readiness gate permanently red after storage has recovered.
+                with self.storage_queue_lock:
+                    self.storage_queue_last_error = ""
             with self.storage_queue_space:
                 self.storage_queue_pending_rounds = max(
                     0, self.storage_queue_pending_rounds - 1
@@ -3291,9 +4314,16 @@ class ProviderRuntime:
 
     def _apply_grayscale_transition(self, event: str) -> bool:
         now = time.monotonic()
-        if now - self.last_steel_transition_attempt < 1.0:
+        # Throttle repeated retries of the same failed edge, but never delay a
+        # real one-round gap: steel-out followed immediately by steel-in is the
+        # normal shape of two tightly spaced bars on the reference camera.
+        if (
+            event == self.last_steel_transition_event
+            and now - self.last_steel_transition_attempt < 1.0
+        ):
             return False
         self.last_steel_transition_attempt = now
+        self.last_steel_transition_event = event
         try:
             response = self._post_service_json(
                 f"/api/production/{event}",
@@ -3327,6 +4357,14 @@ class ProviderRuntime:
             else:
                 self.active_flow_no = None
                 self.active_flow_code = ""
+                # Reset flow-scoped quality debounce at the transition itself.
+                # On a tightly spaced production line the next plate can enter
+                # before there is a full no-steel acquisition round.
+                # Per-camera routing has independent entry/exit boundaries, so
+                # the reference camera leaving must not clear a lagging view's
+                # quality state. Each view resets on its own local boundary.
+                if not self.per_camera_flow_routing:
+                    self._reset_image_quality_material_state_locked(_utc_text())
         self._log(
             "info",
             "grayscale steel transition applied",
@@ -3336,13 +4374,473 @@ class ProviderRuntime:
         )
         return True
 
+    def _steel_detection_rows(
+        self, results: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Return received rows from the configured material-boundary cameras."""
+        return [
+            row
+            for row in results
+            if bool(row.get("frameReceived"))
+            and str(row.get("cameraKey", "")) in self._steel_detection_camera_key_set
+        ]
+
+    def _open_camera_material_flow(
+        self,
+        material_id: str,
+        session_id: str,
+        production_event_id: str,
+    ) -> None:
+        """Register the next globally numbered bar for per-camera assignment."""
+
+        if not self.per_camera_flow_routing or not material_id or not session_id:
+            return
+        with self.camera_material_route_lock:
+            existing_generation = self.camera_material_flow_by_id.get(material_id)
+            if existing_generation is not None:
+                existing = self.camera_material_flows.get(existing_generation)
+                if existing is not None and not existing.closed:
+                    existing.session_id = session_id
+                    existing.production_event_id = production_event_id
+                    existing.close_requested = False
+                    return
+            self.camera_material_route_generation += 1
+            generation = self.camera_material_route_generation
+            self.camera_material_flows[generation] = CameraMaterialFlow(
+                generation=generation,
+                material_id=material_id,
+                session_id=session_id,
+                production_event_id=production_event_id,
+            )
+            self.camera_material_flow_by_id[material_id] = generation
+
+    def _request_camera_material_flow_close(
+        self,
+        material_id: str,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> bool:
+        """Delay final flow closure until every camera has crossed its own gap."""
+
+        if not self.per_camera_flow_routing:
+            return False
+        with self.camera_material_route_lock:
+            generation = self.camera_material_flow_by_id.get(material_id)
+            flow = self.camera_material_flows.get(generation or 0)
+            if flow is None:
+                # A service restart can deliver steel-out for a flow that was
+                # opened before this process. Register it so closure remains
+                # deterministic rather than silently bypassing camera routing.
+                self.camera_material_route_generation += 1
+                generation = self.camera_material_route_generation
+                flow = CameraMaterialFlow(
+                    generation=generation,
+                    material_id=material_id,
+                    session_id=session_id,
+                    production_event_id="",
+                )
+                self.camera_material_flows[generation] = flow
+                self.camera_material_flow_by_id[material_id] = generation
+            flow.close_requested = True
+            flow.close_requested_round = max(0, int(self.continuous_round))
+            flow.close_reason = reason
+        return True
+
+    @staticmethod
+    def _camera_material_batch_key(
+        flow: CameraMaterialFlow, row: dict[str, Any]
+    ) -> tuple[int, int]:
+        return int(row.get("round", 0) or 0), flow.generation
+
+    def _route_camera_material_round(
+        self,
+        results: list[dict[str, Any]],
+        *,
+        active_material_id: str,
+    ) -> list[tuple[list[dict[str, Any]], CameraMaterialFlow, str]]:
+        """Assign frames by each camera's local one-round material boundary.
+
+        C4 remains the authority that creates one production flow number. A
+        camera that sees the next head early is buffered until that number is
+        available; a lagging camera keeps writing its tail to the preceding
+        flow until its own first no-material round. Dark inter-bar rounds are
+        never persisted.
+        """
+
+        if not self.per_camera_flow_routing:
+            return []
+        grouped: dict[
+            tuple[int, int],
+            tuple[list[dict[str, Any]], CameraMaterialFlow, str],
+        ] = {}
+
+        def add_row(
+            row: dict[str, Any], flow: CameraMaterialFlow, phase: str
+        ) -> None:
+            row["cameraMaterialId"] = flow.material_id
+            row["cameraMaterialGeneration"] = flow.generation
+            key = self._camera_material_batch_key(flow, row)
+            existing = grouped.get(key)
+            if existing is None:
+                grouped[key] = ([row], flow, phase)
+            else:
+                existing[0].append(row)
+
+        def discard_pending_segment(
+            camera_key: str,
+            state: CameraMaterialRouteState,
+            *,
+            reason: str,
+            suppress_until_gap: bool,
+        ) -> None:
+            discarded = len(state.pending_rows)
+            if not discarded:
+                return
+            state.pending_rows.clear()
+            state.pending_suppressed_until_gap = suppress_until_gap
+            self.camera_material_route_orphan_segments += 1
+            self.camera_material_route_discarded_frames += discarded
+            self.camera_material_route_last_error = (
+                f"{camera_key} discarded {discarded} unmatched material frames: "
+                f"{reason}"
+            )
+            self._log(
+                "warning",
+                "unmatched camera material segment discarded",
+                cameraKey=camera_key,
+                discardedFrames=discarded,
+                reason=reason,
+                suppressUntilGap=suppress_until_gap,
+            )
+
+        with self.camera_material_route_lock:
+            active_generation = self.camera_material_flow_by_id.get(
+                active_material_id
+            )
+            active_flow = self.camera_material_flows.get(active_generation or 0)
+            if active_flow is not None and (
+                active_flow.closed or active_flow.close_requested
+            ):
+                active_flow = None
+
+            # A single local no-material round is an authoritative boundary.
+            # Clear an unmatched segment before considering a newly opened
+            # global flow in this same round; otherwise a previous tail held
+            # across restart (or a transient reference mismatch) becomes the
+            # first image of the next bar.
+            current_signals = {
+                str(row.get("cameraKey", "")): bool(row.get("materialSignal"))
+                for row in results
+                if bool(row.get("frameReceived")) and row.get("_rawFrame") is not None
+            }
+            for camera_key, state in self.camera_material_route_states.items():
+                if current_signals.get(camera_key) is False:
+                    discard_pending_segment(
+                        camera_key,
+                        state,
+                        reason="one-round-local-gap-before-global-reference",
+                        suppress_until_gap=False,
+                    )
+                    state.pending_suppressed_until_gap = False
+                    state.local_present = False
+                    state.owner_generation = None
+
+            # Cameras positioned before the reference view can see a new head
+            # several rounds before C4 creates the production flow. Flush those
+            # immutable raw frames first, preserving capture-round order.
+            if active_flow is not None:
+                for camera_key, state in self.camera_material_route_states.items():
+                    if (
+                        state.pending_rows
+                        and state.local_present
+                        and current_signals.get(camera_key) is True
+                        and active_flow.generation > state.last_assigned_generation
+                    ):
+                        while state.pending_rows:
+                            add_row(
+                                state.pending_rows.popleft(),
+                                active_flow,
+                                "camera-leading-buffer",
+                            )
+                        state.last_assigned_generation = active_flow.generation
+                        state.pending_suppressed_until_gap = False
+                        if state.local_present:
+                            state.owner_generation = active_flow.generation
+
+            for row in results:
+                camera_key = str(row.get("cameraKey", ""))
+                state = self.camera_material_route_states.get(camera_key)
+                if (
+                    state is None
+                    or not bool(row.get("frameReceived"))
+                    or row.get("_rawFrame") is None
+                ):
+                    continue
+                capture_round = int(row.get("round", 0) or 0)
+                signal = bool(row.get("materialSignal"))
+                state.last_signal_round = capture_round
+                if not signal:
+                    if state.local_present:
+                        state.local_present = False
+                        state.owner_generation = None
+                    state.pending_suppressed_until_gap = False
+                    continue
+
+                phase = "camera-normal"
+                if not state.local_present:
+                    state.local_present = True
+                    phase = "camera-entry"
+                    if (
+                        active_flow is not None
+                        and active_flow.generation
+                        > state.last_assigned_generation
+                    ):
+                        state.owner_generation = active_flow.generation
+                        state.last_assigned_generation = active_flow.generation
+                    else:
+                        state.owner_generation = None
+
+                owner = self.camera_material_flows.get(
+                    state.owner_generation or 0
+                )
+                if owner is not None and not owner.closed:
+                    add_row(row, owner, phase)
+                    continue
+
+                if state.pending_suppressed_until_gap:
+                    continue
+                state.pending_rows.append(row)
+                if len(state.pending_rows) > self.camera_boundary_buffer_rounds:
+                    self.camera_material_route_buffer_warnings += 1
+                    buffered_rounds = len(state.pending_rows)
+                    self._log(
+                        "warning",
+                        "camera material boundary buffer exceeded",
+                        cameraKey=camera_key,
+                        bufferedRounds=buffered_rounds,
+                    )
+                    discard_pending_segment(
+                        camera_key,
+                        state,
+                        reason=(
+                            "global-reference-not-seen-within-"
+                            f"{self.camera_boundary_buffer_rounds}-round-buffer"
+                        ),
+                        suppress_until_gap=True,
+                    )
+
+        return [
+            grouped[key]
+            for key in sorted(grouped, key=lambda item: (item[0], item[1]))
+        ]
+
+    def _finalize_camera_material_flows(
+        self, round_index: int
+    ) -> None:
+        """Close routed flows only after local tails and queued writes finish."""
+
+        if not self.per_camera_flow_routing:
+            return
+        ready: list[CameraMaterialFlow] = []
+        missing_signal_alarms: list[tuple[str, list[str]]] = []
+        with self.camera_material_route_lock:
+            active_open = [
+                flow
+                for flow in self.camera_material_flows.values()
+                if not flow.closed and not flow.close_requested
+            ]
+            newest_open = max(active_open, key=lambda item: item.generation, default=None)
+            for flow in sorted(
+                self.camera_material_flows.values(),
+                key=lambda item: item.generation,
+            ):
+                if flow.closed or not flow.close_requested:
+                    continue
+                unfinished = [
+                    camera_key
+                    for camera_key, state in self.camera_material_route_states.items()
+                    if state.owner_generation == flow.generation
+                    or state.last_assigned_generation < flow.generation
+                ]
+                elapsed = max(0, int(round_index) - flow.close_requested_round)
+                if unfinished and elapsed >= self.camera_boundary_close_timeout_rounds:
+                    missing_entry_keys = sorted(
+                        camera_key
+                        for camera_key in unfinished
+                        if self.camera_material_route_states[
+                            camera_key
+                        ].last_assigned_generation
+                        < flow.generation
+                    )
+                    flow.forced_camera_keys = sorted(set(unfinished))
+                    self.camera_material_route_forced_closures += 1
+                    self.camera_material_route_last_error = (
+                        f"flow {flow.material_id} camera boundary timeout: "
+                        f"{','.join(flow.forced_camera_keys)}"
+                    )
+                    for camera_key in unfinished:
+                        state = self.camera_material_route_states[camera_key]
+                        if state.owner_generation == flow.generation:
+                            state.owner_generation = None
+                            if (
+                                newest_open is not None
+                                and newest_open.generation > flow.generation
+                                and state.local_present
+                            ):
+                                state.owner_generation = newest_open.generation
+                                state.last_assigned_generation = newest_open.generation
+                        elif state.last_assigned_generation < flow.generation:
+                            state.last_assigned_generation = flow.generation
+                    self._log(
+                        "warning",
+                        "camera material boundary close timeout",
+                        materialId=flow.material_id,
+                        cameraKeys=flow.forced_camera_keys,
+                        elapsedRounds=elapsed,
+                    )
+                    if missing_entry_keys:
+                        missing_signal_alarms.append(
+                            (flow.material_id, missing_entry_keys)
+                        )
+                    unfinished = []
+                if not unfinished:
+                    ready.append(flow)
+
+        # Never take state_lock while camera_material_route_lock is held. The
+        # status API deliberately takes these snapshots in the opposite phases
+        # to keep acquisition and health reads deadlock-free.
+        for material_id, camera_keys in missing_signal_alarms:
+            self._mark_camera_material_signal_missing(material_id, camera_keys)
+
+        for flow in ready:
+            with self.storage_queue_lock:
+                pending = self.storage_queue_pending_by_material.get(
+                    flow.material_id, 0
+                )
+            if pending:
+                continue
+            with self.camera_material_route_lock:
+                if flow.closed:
+                    continue
+                flow.closed = True
+            self._close_flow_manifest(
+                flow.material_id,
+                session_id=flow.session_id,
+                reason=flow.close_reason or "per-camera-material-boundaries-complete",
+            )
+            with self.camera_material_route_lock:
+                self.camera_material_flows.pop(flow.generation, None)
+                if (
+                    self.camera_material_flow_by_id.get(flow.material_id)
+                    == flow.generation
+                ):
+                    self.camera_material_flow_by_id.pop(flow.material_id, None)
+            self._log(
+                "info",
+                "per-camera material flow closed",
+                materialId=flow.material_id,
+                forcedCameraKeys=flow.forced_camera_keys,
+            )
+
+    def _mark_camera_material_signal_missing(
+        self, material_id: str, camera_keys: list[str]
+    ) -> None:
+        """Raise a durable obstruction alarm after a camera misses a full bar."""
+
+        updated_at = _utc_text()
+        marked: list[str] = []
+        with self.state_lock:
+            for camera_key in sorted(set(camera_keys)):
+                state = self.image_quality_states.get(camera_key)
+                if state is None or state.get("alarmType") == "camera-offline":
+                    continue
+                if state.get("alarmSource") != "material-signal-timeout":
+                    state["activeSince"] = updated_at
+                state["materialId"] = material_id
+                state["alarmActive"] = True
+                state["alarmType"] = "camera-image-blocked"
+                state["alarmSource"] = "material-signal-timeout"
+                state["reasons"] = ["camera-material-signal-missing"]
+                state["candidateReasons"] = []
+                state["failureStreak"] = 0
+                state["recoveryStreak"] = 0
+                state["status"] = "blocked"
+                state["monitoringState"] = "awaiting-camera-material-recovery"
+                state["updatedAt"] = updated_at
+                marked.append(camera_key)
+        if marked:
+            self._log(
+                "error",
+                "camera did not observe material before flow close timeout",
+                materialId=material_id,
+                cameraKeys=marked,
+            )
+
+    def _camera_material_routing_json(self) -> dict[str, Any]:
+        with self.camera_material_route_lock:
+            flows = [
+                {
+                    "generation": flow.generation,
+                    "materialId": flow.material_id,
+                    "closeRequested": flow.close_requested,
+                    "closed": flow.closed,
+                    "forcedCameraKeys": list(flow.forced_camera_keys),
+                }
+                for flow in sorted(
+                    self.camera_material_flows.values(),
+                    key=lambda item: item.generation,
+                )
+                if not flow.closed
+            ]
+            cameras = {
+                camera_key: {
+                    "materialPresent": state.local_present,
+                    "ownerMaterialId": (
+                        self.camera_material_flows[state.owner_generation].material_id
+                        if state.owner_generation in self.camera_material_flows
+                        else ""
+                    ),
+                    "pendingNextFrames": len(state.pending_rows),
+                    "pendingSuppressedUntilGap": (
+                        state.pending_suppressed_until_gap
+                    ),
+                    "lastSignalRound": state.last_signal_round,
+                }
+                for camera_key, state in self.camera_material_route_states.items()
+            }
+        return {
+            "enabled": self.per_camera_flow_routing,
+            "policy": "global-reference-id+per-camera-one-round-boundary",
+            "materialSignalRatio": self.camera_material_signal_ratio,
+            "bufferRounds": self.camera_boundary_buffer_rounds,
+            "closeTimeoutRounds": self.camera_boundary_close_timeout_rounds,
+            "bufferWarnings": self.camera_material_route_buffer_warnings,
+            "orphanSegments": self.camera_material_route_orphan_segments,
+            "discardedUnassignedFrames": (
+                self.camera_material_route_discarded_frames
+            ),
+            "forcedClosures": self.camera_material_route_forced_closures,
+            "lastError": self.camera_material_route_last_error or None,
+            "openFlows": flows,
+            "cameras": cameras,
+        }
+
     def _evaluate_grayscale_steel(self, results: list[dict[str, Any]]) -> None:
         if not self.grayscale_steel_detection:
             return
-        received = [row for row in results if bool(row.get("frameReceived"))]
+        received = self._steel_detection_rows(results)
         if not received:
             return
-        signal_cameras = sum(bool(row.get("steelSignal")) for row in received)
+        # Routed capture must use the same full-frame material contract for
+        # global numbering and per-camera ownership. The legacy tail-row
+        # signal is intentionally very sensitive; with one-round edges it can
+        # create an empty flow from a few bright bottom pixels even though no
+        # camera has accepted a material frame.
+        boundary_signal = (
+            "materialSignal" if self.per_camera_flow_routing else "steelSignal"
+        )
+        signal_cameras = sum(bool(row.get(boundary_signal)) for row in received)
         required = min(self.steel_min_cameras, len(received))
         with self.state_lock:
             present = self.steel_present
@@ -3364,6 +4862,440 @@ class ProviderRuntime:
                 self.steel_entry_streak = 0
                 self.steel_exit_streak = 0
 
+    @staticmethod
+    def _image_quality_alarm_type(reasons: list[str]) -> str:
+        if any(reason in {"image-black", "image-low-contrast"} for reason in reasons):
+            return "camera-image-blocked"
+        return "camera-image-quality"
+
+    def _reset_image_quality_material_state_locked(self, updated_at: str) -> None:
+        """Clear flow-scoped state while preserving alarms needing recovery."""
+        for state in self.image_quality_states.values():
+            if state.get("alarmType") == "camera-offline" or state.get(
+                "alarmSource"
+            ) == "material-signal-timeout":
+                continue
+            state["failureStreak"] = 0
+            state["recoveryStreak"] = 0
+            state["candidateReasons"] = []
+            if state.get("alarmActive"):
+                state["alarmActive"] = False
+                state["alarmType"] = ""
+                state["alarmSource"] = ""
+                state["reasons"] = []
+                state["activeSince"] = ""
+                state["recoveredAt"] = updated_at
+            state["status"] = (
+                "warming"
+                if int(state.get("baselineSampleCount", 0))
+                < self.image_quality_baseline_rounds
+                else "healthy"
+            )
+            state["monitoringState"] = "waiting-for-steel"
+            state["updatedAt"] = updated_at
+
+    def _image_quality_candidates(
+        self,
+        state: dict[str, Any],
+        metrics: dict[str, float],
+    ) -> list[str]:
+        maximum = float(metrics.get("maximumIntensity", 0.0))
+        standard_deviation = float(metrics.get("standardDeviation", 0.0))
+        dynamic_range = float(metrics.get("dynamicRange", 0.0))
+        high_percentile = float(metrics.get("highPercentile", 0.0))
+        bright_ratio = float(metrics.get("brightPixelRatio", 0.0))
+        saturated_ratio = float(metrics.get("saturatedPixelRatio", 0.0))
+        valid_depth_ratio = float(metrics.get("validDepthRatio", 0.0))
+        reasons: list[str] = []
+
+        if maximum <= max(2.0, float(self.profile.black_frame_threshold)):
+            reasons.append("image-black")
+        elif (
+            dynamic_range < self.image_quality_minimum_dynamic_range
+            and standard_deviation < max(1.0, self.image_quality_minimum_dynamic_range / 2.0)
+            and maximum - high_percentile
+            <= max(8.0, self.image_quality_minimum_dynamic_range * 2.0)
+        ):
+            reasons.append("image-low-contrast")
+
+        if saturated_ratio >= self.image_quality_maximum_saturation_ratio:
+            reasons.append("image-overexposed")
+
+        baseline = state.get("baseline", {})
+        baseline_ready = (
+            int(state.get("baselineSampleCount", 0))
+            >= self.image_quality_baseline_rounds
+        )
+        if baseline_ready and not reasons:
+            ratio = self.image_quality_relative_signal_ratio
+            baseline_dynamic_range = float(baseline.get("dynamicRange", 0.0))
+            baseline_high = float(baseline.get("highPercentile", 0.0))
+            baseline_bright = float(baseline.get("brightPixelRatio", 0.0))
+            baseline_depth = float(baseline.get("validDepthRatio", 0.0))
+            intensity_signal_lost = bool(
+                baseline_dynamic_range >= self.image_quality_minimum_dynamic_range * 2.0
+                and dynamic_range < baseline_dynamic_range * ratio
+                and high_percentile < max(2.0, baseline_high * 0.5)
+                and bright_ratio < max(0.0001, baseline_bright * ratio)
+            )
+            if intensity_signal_lost:
+                reasons.append("image-signal-degraded")
+            if (
+                baseline_depth >= 0.005
+                and valid_depth_ratio < baseline_depth * ratio
+            ):
+                reasons.append("depth-signal-degraded")
+        return reasons
+
+    @staticmethod
+    def _update_image_quality_baseline(
+        state: dict[str, Any], metrics: dict[str, float]
+    ) -> None:
+        baseline = dict(state.get("baseline", {}))
+        for key in (
+            "dynamicRange",
+            "highPercentile",
+            "brightPixelRatio",
+            "validDepthRatio",
+            "standardDeviation",
+        ):
+            baseline[key] = round(
+                max(float(baseline.get(key, 0.0)), float(metrics.get(key, 0.0))),
+                8,
+            )
+        state["baseline"] = baseline
+        state["baselineSampleCount"] = int(state.get("baselineSampleCount", 0)) + 1
+
+    def _record_image_quality_round_locked(
+        self,
+        results: list[dict[str, Any]],
+        *,
+        steel_context: bool,
+    ) -> list[str]:
+        """Advance per-camera debounced quality state while state_lock is held."""
+        rows_by_camera = {
+            str(row.get("cameraKey", "")): row
+            for row in results
+            if str(row.get("cameraKey", ""))
+        }
+        camera_context_by_camera = {
+            camera.key: (
+                bool(rows_by_camera.get(camera.key, {}).get("materialSignal"))
+                if self.per_camera_flow_routing
+                else steel_context
+            )
+            for camera in self.profile.enabled_cameras
+        }
+        candidates_by_camera: dict[str, list[str]] = {}
+        for camera_key, row in rows_by_camera.items():
+            if not camera_context_by_camera.get(camera_key) or not bool(
+                row.get("frameReceived")
+            ):
+                continue
+            candidates_by_camera[camera_key] = self._image_quality_candidates(
+                self.image_quality_states[camera_key],
+                dict(row.get("imageQualityMetrics", {})),
+            )
+        relative_signal_reasons = {
+            "image-signal-degraded",
+            "depth-signal-degraded",
+        }
+        relative_degraded_camera_count = sum(
+            bool(reasons)
+            and all(reason in relative_signal_reasons for reason in reasons)
+            for reasons in candidates_by_camera.values()
+        )
+        degraded_camera_count = sum(bool(reasons) for reasons in candidates_by_camera.values())
+        reconnect: list[str] = []
+        updated_at = _utc_text()
+        for camera in self.profile.enabled_cameras:
+            state = self.image_quality_states[camera.key]
+            row = rows_by_camera.get(camera.key)
+            frame_received = bool(row and row.get("frameReceived"))
+            camera_context = camera_context_by_camera[camera.key]
+            state["updatedAt"] = updated_at
+            state["candidateReasons"] = []
+            if camera_context and self.active_material_id:
+                state["materialId"] = self.active_material_id
+
+            if not frame_received:
+                state["offlineStreak"] = int(state.get("offlineStreak", 0)) + 1
+                state["recoveryStreak"] = 0
+                state["monitoringState"] = "frame-missing"
+                if state["offlineStreak"] >= self.camera_offline_alarm_rounds:
+                    if state.get("alarmType") != "camera-offline":
+                        state["activeSince"] = updated_at
+                    state["status"] = "offline"
+                    state["alarmActive"] = True
+                    state["alarmType"] = "camera-offline"
+                    state["alarmSource"] = "frame-missing"
+                    state["reasons"] = ["camera-frame-missing"]
+                    if camera.key in self.sessions:
+                        reconnect.append(camera.key)
+                continue
+
+            state["offlineStreak"] = 0
+            state["lastFrameAt"] = str(row.get("capturedAt", updated_at))
+            metrics = dict(row.get("imageQualityMetrics", {}))
+            state["metrics"] = metrics
+            frame_reasons = list(candidates_by_camera.get(camera.key, []))
+            material_boundary = bool(
+                relative_degraded_camera_count >= 1
+                and degraded_camera_count >= 2
+                and frame_reasons
+            )
+            # A plate enters and leaves the six longitudinal views at slightly
+            # different times.  Simultaneous relative signal loss on multiple
+            # cameras is therefore a material boundary, not an isolated camera
+            # fault.  Keep the frame rejection metadata for algorithms/audit,
+            # but do not advance a camera alarm from that shared transition.
+            reasons = [] if material_boundary else frame_reasons
+            state["candidateReasons"] = reasons
+            row["imageQuality"] = {
+                "schema": "steel.capture-frame-image-quality.v1",
+                "acceptedForAnalysis": not frame_reasons,
+                "status": "rejected" if frame_reasons else "accepted",
+                "reasons": frame_reasons,
+                "alarmSuppressed": "material-boundary" if material_boundary else "",
+                "metrics": metrics,
+            }
+
+            if state.get("alarmType") == "camera-offline":
+                if reasons:
+                    state["recoveryStreak"] = 0
+                else:
+                    state["recoveryStreak"] = int(state.get("recoveryStreak", 0)) + 1
+                    if state["recoveryStreak"] >= self.image_quality_recovery_rounds:
+                        state["alarmActive"] = False
+                        state["alarmType"] = ""
+                        state["alarmSource"] = ""
+                        state["reasons"] = []
+                        state["activeSince"] = ""
+                        state["recoveredAt"] = updated_at
+                if state.get("alarmActive"):
+                    state["monitoringState"] = "camera-recovering"
+                    continue
+
+            if not camera_context:
+                state["monitoringState"] = (
+                    "awaiting-camera-material"
+                    if self.per_camera_flow_routing and steel_context
+                    else "waiting-for-steel"
+                )
+                # Image-quality failures are scoped to one material pass.  The
+                # six views enter and leave at different rounds. A dark frame
+                # before this camera's local entry is expected even while the
+                # reference view owns an active flow.
+                state["failureStreak"] = 0
+                state["recoveryStreak"] = 0
+                durable_missing_signal = (
+                    state.get("alarmSource") == "material-signal-timeout"
+                )
+                if state.get("alarmActive") and not durable_missing_signal:
+                    state["alarmActive"] = False
+                    state["alarmType"] = ""
+                    state["alarmSource"] = ""
+                    state["reasons"] = []
+                    state["activeSince"] = ""
+                    state["recoveredAt"] = updated_at
+                if durable_missing_signal:
+                    state["status"] = "blocked"
+                else:
+                    state["status"] = (
+                        "warming"
+                        if int(state.get("baselineSampleCount", 0))
+                        < self.image_quality_baseline_rounds
+                        else "healthy"
+                    )
+                continue
+
+            state["monitoringState"] = (
+                "material-boundary" if material_boundary else "evaluating-steel"
+            )
+            if reasons:
+                state["failureStreak"] = int(state.get("failureStreak", 0)) + 1
+                state["recoveryStreak"] = 0
+                if state["failureStreak"] >= self.image_quality_alarm_rounds:
+                    alarm_type = self._image_quality_alarm_type(reasons)
+                    if state.get("alarmType") != alarm_type:
+                        state["activeSince"] = updated_at
+                    state["alarmActive"] = True
+                    state["alarmType"] = alarm_type
+                    if state.get("alarmSource") != "material-signal-timeout":
+                        state["alarmSource"] = "frame-quality"
+                    state["reasons"] = list(reasons)
+                    state["status"] = (
+                        "blocked"
+                        if alarm_type == "camera-image-blocked"
+                        else "degraded"
+                    )
+                elif not state.get("alarmActive"):
+                    state["status"] = "suspect"
+            else:
+                state["failureStreak"] = 0
+                if state.get("alarmActive"):
+                    state["recoveryStreak"] = int(state.get("recoveryStreak", 0)) + 1
+                    if state["recoveryStreak"] >= self.image_quality_recovery_rounds:
+                        state["alarmActive"] = False
+                        state["alarmType"] = ""
+                        state["alarmSource"] = ""
+                        state["reasons"] = []
+                        state["activeSince"] = ""
+                        state["recoveredAt"] = updated_at
+                if not state.get("alarmActive"):
+                    if not material_boundary:
+                        self._update_image_quality_baseline(state, metrics)
+                    state["status"] = (
+                        "healthy"
+                        if int(state.get("baselineSampleCount", 0))
+                        >= self.image_quality_baseline_rounds
+                        else "warming"
+                    )
+                    state["recoveryStreak"] = 0
+        return reconnect
+
+    def _camera_image_quality_json(self) -> dict[str, Any]:
+        with self.state_lock:
+            cameras = [
+                {
+                    **dict(self.image_quality_states[camera.key]),
+                    "connected": camera.key in self.sessions,
+                    "automaticReconnect": dict(
+                        self.image_quality_states[camera.key].get(
+                            "automaticReconnect", {}
+                        )
+                    ),
+                    "metrics": dict(
+                        self.image_quality_states[camera.key].get("metrics", {})
+                    ),
+                    "baseline": dict(
+                        self.image_quality_states[camera.key].get("baseline", {})
+                    ),
+                    "reasons": list(
+                        self.image_quality_states[camera.key].get("reasons", [])
+                    ),
+                    "candidateReasons": list(
+                        self.image_quality_states[camera.key].get(
+                            "candidateReasons", []
+                        )
+                    ),
+                }
+                for camera in self.profile.enabled_cameras
+            ]
+        active_count = sum(bool(camera.get("alarmActive")) for camera in cameras)
+        suspect_count = sum(camera.get("status") == "suspect" for camera in cameras)
+        return {
+            "schema": "steel.capture-image-quality.v1",
+            "status": (
+                "alarm"
+                if active_count
+                else "suspect"
+                if suspect_count
+                else "healthy"
+                if cameras
+                and all(camera.get("status") == "healthy" for camera in cameras)
+                else "warming"
+            ),
+            "activeAlarmCount": active_count,
+            "suspectCameraCount": suspect_count,
+            "cameraCount": len(cameras),
+            "alarmRounds": self.image_quality_alarm_rounds,
+            "recoveryRounds": self.image_quality_recovery_rounds,
+            "baselineRounds": self.image_quality_baseline_rounds,
+            "cameras": cameras,
+            "updatedAt": _utc_text(),
+        }
+
+    def _schedule_camera_reconnect(self, camera_keys: list[str]) -> None:
+        requested = sorted(set(camera_keys))
+        if not requested:
+            return
+        quarantined: list[tuple[str, Any]] = []
+        with self.state_lock:
+            for camera_key in requested:
+                session = self.sessions.pop(camera_key, None)
+                reconnect = self.image_quality_states[camera_key]["automaticReconnect"]
+                reconnect["pending"] = True
+                if session is None:
+                    continue
+                message = f"{camera_key} stopped returning frames; reconnect scheduled"
+                self.session_errors[camera_key] = message
+                quarantined.append((camera_key, session))
+        for camera_key, session in quarantined:
+            try:
+                session.close()
+            except Exception as error:
+                self._log(
+                    "warning",
+                    "SICK failed camera session close failed",
+                    cameraKey=camera_key,
+                    error=str(error),
+                )
+            self._log(
+                "warning",
+                "SICK camera quarantined after consecutive frame failures",
+                cameraKey=camera_key,
+            )
+        with self.camera_reconnect_lock:
+            self.camera_reconnect_pending.update(requested)
+            thread = self.camera_reconnect_thread
+            if thread is not None and thread.is_alive():
+                return
+            self.camera_reconnect_thread = threading.Thread(
+                target=self._camera_reconnect_loop,
+                name="sick-camera-reconnect",
+                daemon=True,
+            )
+            self.camera_reconnect_thread.start()
+
+    def _camera_reconnect_loop(self) -> None:
+        try:
+            while not self.camera_reconnect_stop.is_set():
+                with self.camera_reconnect_lock:
+                    pending = set(self.camera_reconnect_pending)
+                    if not pending:
+                        if self.camera_reconnect_thread is threading.current_thread():
+                            self.camera_reconnect_thread = None
+                        return
+                attempted_at = _utc_text()
+                with self.state_lock:
+                    for camera_key in pending:
+                        reconnect = self.image_quality_states[camera_key][
+                            "automaticReconnect"
+                        ]
+                        reconnect["attemptCount"] = int(
+                            reconnect.get("attemptCount", 0)
+                        ) + 1
+                        reconnect["lastAttemptAt"] = attempted_at
+                try:
+                    self.connect_all()
+                except Exception as error:
+                    self._log(
+                        "error",
+                        "SICK automatic camera reconnect failed",
+                        error=str(error),
+                    )
+                with self.state_lock:
+                    remaining = {
+                        camera_key
+                        for camera_key in pending
+                        if camera_key not in self.sessions
+                    }
+                    for camera_key in pending - remaining:
+                        self.image_quality_states[camera_key]["automaticReconnect"][
+                            "pending"
+                        ] = False
+                with self.camera_reconnect_lock:
+                    self.camera_reconnect_pending.difference_update(pending - remaining)
+                if remaining:
+                    self.camera_reconnect_stop.wait(
+                        self.camera_reconnect_interval_seconds
+                    )
+        finally:
+            with self.camera_reconnect_lock:
+                if self.camera_reconnect_thread is threading.current_thread():
+                    self.camera_reconnect_thread = None
+
     def _camera_row(self, camera: CameraProfile) -> dict[str, Any]:
         session = self.sessions.get(camera.key)
         identity = getattr(session, "identity", {}) if session else {}
@@ -3372,6 +5304,29 @@ class ProviderRuntime:
             stats = {
                 **stats_source,
                 "ticks": tuple(stats_source["ticks"]),
+            }
+            image_quality = {
+                **self.image_quality_states[camera.key],
+                "connected": camera.key in self.sessions,
+                "automaticReconnect": dict(
+                    self.image_quality_states[camera.key].get(
+                        "automaticReconnect", {}
+                    )
+                ),
+                "metrics": dict(
+                    self.image_quality_states[camera.key].get("metrics", {})
+                ),
+                "baseline": dict(
+                    self.image_quality_states[camera.key].get("baseline", {})
+                ),
+                "reasons": list(
+                    self.image_quality_states[camera.key].get("reasons", [])
+                ),
+                "candidateReasons": list(
+                    self.image_quality_states[camera.key].get(
+                        "candidateReasons", []
+                    )
+                ),
             }
             frame_counts = [
                 int(item["frameCount"]) for item in self.continuous_stats.values()
@@ -3510,6 +5465,7 @@ class ProviderRuntime:
                 else self.stream_dimensions.get(camera.key, (0, 0))[0]
             ),
             "streamDisplayHeight": self.stream_dimensions.get(camera.key, (0, 0))[1],
+            "imageQuality": image_quality,
             "deviceTemperature": device_temperature,
             "deviceTemperatureMin": device_temperature_min,
             "deviceTemperatureMax": device_temperature_max,
@@ -3555,7 +5511,35 @@ class ProviderRuntime:
     def health_json(self) -> dict[str, Any]:
         backend_ready = bool(getattr(self.backend, "started", False))
         connected = len(self.sessions)
-        provider_ready = backend_ready and connected == self.profile.expected_cameras
+        image_quality = self._camera_image_quality_json()
+        synchronization = self._synchronization_json()
+        storage_queue = self._queue_json()
+        readiness_reasons: list[str] = []
+        if not backend_ready:
+            readiness_reasons.append("capture-backend-unavailable")
+        if connected != self.profile.expected_cameras:
+            readiness_reasons.append("camera-connection-count-mismatch")
+        if int(image_quality.get("activeAlarmCount", 0)) > 0:
+            readiness_reasons.append("camera-image-or-frame-alarm")
+        # A globally aligned round is a metric-quality signal, but it is not a
+        # capture-readiness prerequisite when the site deliberately routes
+        # material boundaries per camera.  Free-running Ranger3 cameras are
+        # read sequentially and can therefore exceed the host timestamp skew
+        # budget while every camera is connected, lossless, and acquiring.
+        # Keep that condition visible in acquisitionSynchronization without
+        # stopping the independent per-camera capture path.
+        if (
+            not self.history_only
+            and self.capture_mode == "continuous"
+            and not self.per_camera_flow_routing
+            and synchronization.get("status") != "synchronized"
+        ):
+            readiness_reasons.append("capture-synchronization-unqualified")
+        if storage_queue.get("lastError"):
+            readiness_reasons.append("capture-storage-write-failed")
+        if self.database_commit_last_error:
+            readiness_reasons.append("capture-database-commit-pending")
+        provider_ready = not readiness_reasons
         with self.alignment_lock:
             alignment = dict(self.alignment_status)
             measurement = dict(self.measurement_status)
@@ -3575,6 +5559,7 @@ class ProviderRuntime:
             "ip": self.profile.enabled_cameras[0].ip if self.profile.enabled_cameras else "",
             "ready": provider_ready,
             "providerReady": provider_ready,
+            "readinessReasons": readiness_reasons,
             "sdkReady": backend_ready,
             "sdkCode": 0 if backend_ready else 49110,
             "driverMode": "sick-gentl",
@@ -3587,7 +5572,7 @@ class ProviderRuntime:
             "cameraCount": connected,
             "expectedCameras": self.profile.expected_cameras,
             "restartRequired": False,
-            "recoveryRequired": False,
+            "recoveryRequired": bool(readiness_reasons) and backend_ready,
             "invalidManifest": False,
             "pendingRecoveryCount": 0,
             "sdkCaptureState": {
@@ -3617,7 +5602,8 @@ class ProviderRuntime:
             "blackFramesDiscarded": self.black_frame_count,
             "continuousAcquisitionFrameCount": self.continuous_acquisition_frame_count,
             "continuousDiscardedFrameCount": self.continuous_discarded_frame_count,
-            "acquisitionSynchronization": self._synchronization_json(),
+            "imageQuality": image_quality,
+            "acquisitionSynchronization": synchronization,
             "flowAlignment": alignment,
             "flowMeasurement": measurement,
             "flowDefectDetection": defect_detection,
@@ -3625,7 +5611,7 @@ class ProviderRuntime:
             "lastError": self.last_error or None,
             "uptimeSeconds": round(time.time() - self.started_at, 3),
             "cameras": [self._camera_row(camera) for camera in self.profile.enabled_cameras],
-            "storageQueue": self._queue_json(),
+            "storageQueue": storage_queue,
         }
 
     @staticmethod
@@ -3800,7 +5786,7 @@ class ProviderRuntime:
         with self.alignment_lock:
             alignment = dict(self.alignment_status)
         with self.state_lock:
-            return {
+            status = {
                 "code": 0,
                 "provider": "sick-gentl-harvesters",
                 "phase": (
@@ -3830,23 +5816,34 @@ class ProviderRuntime:
                 "steelDetectionRegion": "tail-rows",
                 "steelDetectionEdge": self.steel_detection_edge,
                 "steelDetectionTailRows": self.steel_detection_tail_rows,
+                "steelDetectionCameraKeys": list(self.steel_detection_camera_keys),
                 "steelMinCameras": self.steel_min_cameras,
                 "steelEntryRounds": self.steel_entry_rounds,
                 "steelExitRounds": self.steel_exit_rounds,
                 "steelPreRollFrames": self.steel_pre_roll_frames,
                 "steelPostRollFrames": self.steel_post_roll_frames,
                 "blackFrameCacheRounds": self.black_frame_cache_rounds,
+                "perCameraFlowRouting": self.per_camera_flow_routing,
                 "steelSignalCameras": self.last_steel_signal_cameras,
+                "steelBoundarySignal": (
+                    "materialSignal" if self.per_camera_flow_routing else "steelSignal"
+                ),
                 "steelEntryStreak": self.steel_entry_streak,
                 "steelExitStreak": self.steel_exit_streak,
                 "continuousAcquisitionFrameCount": self.continuous_acquisition_frame_count,
                 "continuousDiscardedFrameCount": self.continuous_discarded_frame_count,
-                "acquisitionSynchronization": self._synchronization_json(),
                 "flowAlignment": alignment,
                 "connectedCameras": len(self.sessions),
                 "storageRoot": str(self.profile.storage_root),
                 "updatedAt": _utc_text(),
             }
+        # Never hold state_lock while taking camera_material_route_lock.  The
+        # acquisition thread may write a routing warning while it owns the
+        # route lock, and _log takes state_lock.  Nesting these in the opposite
+        # order deadlocks /api/steel/status and then every health/status read.
+        status["cameraMaterialRouting"] = self._camera_material_routing_json()
+        status["acquisitionSynchronization"] = self._synchronization_json()
+        return status
 
     def continuous_settings_json(self) -> dict[str, Any]:
         try:
@@ -3875,12 +5872,19 @@ class ProviderRuntime:
             "steelDetectionRegion": "tail-rows",
             "steelDetectionEdge": self.steel_detection_edge,
             "steelDetectionTailRows": self.steel_detection_tail_rows,
+            "steelDetectionCameraKeys": list(self.steel_detection_camera_keys),
             "steelMinCameras": self.steel_min_cameras,
             "steelEntryRounds": self.steel_entry_rounds,
             "steelExitRounds": self.steel_exit_rounds,
             "steelPreRollFrames": self.steel_pre_roll_frames,
             "steelPostRollFrames": self.steel_post_roll_frames,
             "blackFrameCacheRounds": self.black_frame_cache_rounds,
+            "perCameraFlowRouting": self.per_camera_flow_routing,
+            "cameraMaterialSignalRatio": self.camera_material_signal_ratio,
+            "cameraBoundaryBufferRounds": self.camera_boundary_buffer_rounds,
+            "cameraBoundaryCloseTimeoutRounds": (
+                self.camera_boundary_close_timeout_rounds
+            ),
             "alignmentSearchFrames": self.alignment_config.search_frames,
             "alignmentStableRows": self.alignment_config.stable_rows,
             "softSyncAnchorIntervalFrames": self.alignment_config.anchor_interval_frames,
@@ -3965,6 +5969,9 @@ class ProviderRuntime:
                 return mode_result
         completed_material_id = ""
         completed_session_id = ""
+        opened_material_id = ""
+        opened_session_id = ""
+        opened_production_event_id = ""
         if normalized in {"steelin", "in"} and value:
             try:
                 flow_no = int(payload.get("flowNo", material_id))
@@ -3988,6 +5995,9 @@ class ProviderRuntime:
                     self.active_session_id = session_id
                     self.active_flow_no = int(payload.get("flowNo", 0) or 0) or None
                     self.active_flow_code = str(payload.get("flowCode", ""))
+                    opened_material_id = material_id
+                    opened_session_id = session_id
+                    opened_production_event_id = self.active_flow_code
                     self.steel_present = True
                     self.save_enabled = bool(payload.get("saveEnabled", True))
                     write_flow_manifest(
@@ -3996,6 +6006,17 @@ class ProviderRuntime:
                         session_id=session_id,
                         state="capturing",
                         camera_roots=self._flow_capture_roots(material_id),
+                        boundary_policy=(
+                            "global-reference-id+per-camera-one-round-boundary"
+                            if self.per_camera_flow_routing
+                            else None
+                        ),
+                    )
+                    publish_flow_handoff(
+                        self.profile.storage_root,
+                        material_id,
+                        session_id=session_id,
+                        state="capturing",
                     )
                 else:
                     completed_material_id = self.active_material_id or material_id
@@ -4055,21 +6076,41 @@ class ProviderRuntime:
                 ),
                 "discardBlackFrames": True,
                 "grayscaleSteelDetection": self.grayscale_steel_detection,
+                "perCameraFlowRouting": self.per_camera_flow_routing,
                 "driverMode": "sick-gentl",
             }
+        deferred_close = False
         if completed_material_id:
-            self._close_flow_manifest(
-                completed_material_id,
-                session_id=completed_session_id,
-                reason=(
-                    "superseded-by-new-flow"
-                    if normalized in {"steelin", "in"} and value
-                    else "steel-out-or-reset"
-                ),
+            close_reason = (
+                "superseded-by-new-flow"
+                if normalized in {"steelin", "in"} and value
+                else "steel-out-or-reset"
             )
+            deferred_close = self._request_camera_material_flow_close(
+                completed_material_id,
+                completed_session_id,
+                reason=close_reason,
+            )
+            if not deferred_close:
+                self._close_flow_manifest(
+                    completed_material_id,
+                    session_id=completed_session_id,
+                    reason=close_reason,
+                )
+        if opened_material_id:
+            self._open_camera_material_flow(
+                opened_material_id,
+                opened_session_id,
+                opened_production_event_id,
+            )
+        if completed_material_id:
             self._log(
                 "info",
-                "flow closed; algorithm service owns derived processing",
+                (
+                    "flow closure waiting for per-camera material boundaries"
+                    if deferred_close
+                    else "flow closed; algorithm service owns derived processing"
+                ),
                 materialId=completed_material_id,
                 algorithmEventRoot=str(
                     self.profile.storage_root
@@ -4785,6 +6826,7 @@ class ProviderRuntime:
 
     def _record_continuous_round(self, results: list[dict[str, Any]], persist_frame: bool) -> None:
         now = time.monotonic()
+        reconnect_camera_keys: list[str] = []
         with self.state_lock:
             healthy_round = len(results) == len(self.profile.enabled_cameras) and all(
                 bool(row.get("frameReceived"))
@@ -4824,6 +6866,26 @@ class ProviderRuntime:
                     NO_STEEL_FRAME_DISCARDED,
                 }:
                     self.continuous_discarded_frame_count += 1
+            # The reference signal supplies the global flow context. With
+            # per-camera routing the quality state machine additionally gates
+            # each view on its own materialSignal, because the six cameras do
+            # not observe the head/tail in the same acquisition round.
+            boundary_rows = self._steel_detection_rows(results)
+            signal_cameras = sum(bool(row.get("steelSignal")) for row in boundary_rows)
+            required = (
+                min(self.steel_min_cameras, len(boundary_rows))
+                if boundary_rows
+                else 1
+            )
+            reconnect_camera_keys = self._record_image_quality_round_locked(
+                results,
+                steel_context=bool(
+                    persist_frame
+                    or (boundary_rows and signal_cameras >= required)
+                ),
+            )
+        if reconnect_camera_keys:
+            self._schedule_camera_reconnect(reconnect_camera_keys)
 
     def _record_synchronization_round(self, results: list[dict[str, Any]]) -> None:
         received = [row for row in results if bool(row.get("frameReceived"))]
@@ -4920,9 +6982,25 @@ class ProviderRuntime:
             if last and last.get("hostCaptureSkewMs") is not None
             else None
         )
+        last_camera_sequence_skew = (
+            int(last["cameraSequenceSkew"])
+            if last and last.get("cameraSequenceSkew") is not None
+            else None
+        )
         host_skew_within_limit = bool(
             last_host_skew_ms is not None
             and last_host_skew_ms <= maximum_live_skew_ms
+        )
+        sequence_skew_within_limit = bool(
+            (
+                self.profile.expected_cameras <= 1
+                and last_camera_sequence_skew in {None, 0}
+            )
+            or (
+                last_camera_sequence_skew is not None
+                and last_camera_sequence_skew
+                <= self.synchronization_maximum_sequence_skew
+            )
         )
         synchronized = bool(
             last
@@ -4931,6 +7009,7 @@ class ProviderRuntime:
             and frame_count_skew <= 1
             and sum(transport_gap_counts.values()) == 0
             and host_skew_within_limit
+            and sequence_skew_within_limit
             and len(self.sessions) == self.profile.expected_cameras
             and (
                 self.frame_trigger_mode != "software"
@@ -4950,6 +7029,8 @@ class ProviderRuntime:
             quality_reasons.append("transport-frame-gaps")
         if window and not host_skew_within_limit:
             quality_reasons.append("host-capture-skew-out-of-tolerance")
+        if window and not sequence_skew_within_limit:
+            quality_reasons.append("camera-sequence-skew-out-of-tolerance")
         if len(self.sessions) != self.profile.expected_cameras:
             quality_reasons.append("camera-connection-count-mismatch")
         if (
@@ -4981,6 +7062,9 @@ class ProviderRuntime:
             "maximumHostCaptureSkewMs": maximum_live_skew_ms,
             "lastHostCaptureSkewMs": last_host_skew_ms,
             "hostCaptureSkewWithinLimit": host_skew_within_limit,
+            "maximumCameraSequenceSkew": self.synchronization_maximum_sequence_skew,
+            "lastCameraSequenceSkew": last_camera_sequence_skew,
+            "cameraSequenceSkewWithinLimit": sequence_skew_within_limit,
             "transportFrameGapCounts": transport_gap_counts,
             "transportFrameGaps": sum(transport_gap_counts.values()),
             "hasRecentFrameDrops": sum(transport_gap_counts.values()) > 0,
@@ -5058,7 +7142,36 @@ class ProviderRuntime:
                 if continuous:
                     self._record_continuous_round(results, persist_frame)
                     self._record_synchronization_round(results)
-                    received = [row for row in results if bool(row.get("frameReceived"))]
+                    if self.per_camera_flow_routing:
+                        # The reference camera owns only the global flow
+                        # number. Persisted ownership is then decided per
+                        # camera so free-running/longitudinally offset views do
+                        # not leak the preceding tail into the next bar.
+                        self._evaluate_grayscale_steel(results)
+                        with self.state_lock:
+                            routed_active_material_id = self.active_material_id
+                        routed_batches = self._route_camera_material_round(
+                            results,
+                            active_material_id=routed_active_material_id,
+                        )
+                        for routed_rows, routed_flow, routed_phase in routed_batches:
+                            self._enqueue_storage_round(
+                                routed_rows,
+                                material_id=routed_flow.material_id,
+                                session_id=routed_flow.session_id,
+                                boundary_phase=routed_phase,
+                                force=routed_phase != "camera-normal",
+                                production_event_id=(
+                                    routed_flow.production_event_id or None
+                                ),
+                            )
+                        self._finalize_camera_material_flows(round_index)
+                        if results and all(
+                            not row.get("frameReceived") for row in results
+                        ):
+                            self.acquisition_stop.wait(0.05)
+                        continue
+                    received = self._steel_detection_rows(results)
                     signal_cameras = sum(bool(row.get("steelSignal")) for row in received)
                     required = min(self.steel_min_cameras, len(received)) if received else 1
                     was_present = persist_frame
@@ -5071,8 +7184,14 @@ class ProviderRuntime:
                                     else []
                                 )
                             entry_candidate_cache.append(results)
+                            # Keep the first head frame while a transient
+                            # service callback retry is pending. The cache is
+                            # bounded independently of the main writer queue.
                             entry_candidate_cache = entry_candidate_cache[
-                                -self.steel_entry_rounds :
+                                -max(
+                                    self.steel_entry_rounds,
+                                    self.black_frame_cache_rounds,
+                                ) :
                             ]
                         elif received:
                             if self.steel_pre_roll_frames:
@@ -5237,6 +7356,17 @@ class ProviderRuntime:
                 }
                 mean_intensity = float(np.mean(frame.intensity))
                 max_intensity = float(np.max(frame.intensity)) if frame.intensity.size else 0.0
+                image_quality_metrics = _image_quality_metrics(
+                    frame.intensity,
+                    frame.depth_raw,
+                    sample_step=self.image_quality_sample_step,
+                    bright_threshold=self.steel_bright_threshold,
+                )
+                # Preserve the existing full-frame extrema for obstruction
+                # decisions.  A narrow but valid laser/steel stripe can fall
+                # between regular sample columns and must not look black.
+                image_quality_metrics["meanIntensity"] = round(mean_intensity, 6)
+                image_quality_metrics["maximumIntensity"] = round(max_intensity, 6)
                 (
                     steel_detection_max_intensity,
                     bright_pixel_ratio,
@@ -5251,12 +7381,23 @@ class ProviderRuntime:
                     steel_detection_max_intensity > self.steel_bright_threshold
                     and bright_pixel_ratio >= self.steel_bright_ratio
                 )
+                material_signal_ratio = max(
+                    float(image_quality_metrics.get("brightPixelRatio", 0.0)),
+                    float(image_quality_metrics.get("validDepthRatio", 0.0)),
+                )
+                material_signal = (
+                    max_intensity > self.steel_bright_threshold
+                    and material_signal_ratio >= self.camera_material_signal_ratio
+                )
                 frame_telemetry.update(
                     {
                         "steelDetectionRegion": "tail-rows",
                         "steelDetectionEdge": self.steel_detection_edge,
                         "steelDetectionRows": steel_detection_rows,
                         "steelDetectionMaxIntensity": steel_detection_max_intensity,
+                        "materialSignal": material_signal,
+                        "materialSignalRatio": material_signal_ratio,
+                        "imageQualityMetrics": image_quality_metrics,
                     }
                 )
                 retained_frame = (
@@ -6036,8 +8177,6 @@ class ProviderRuntime:
         except (TypeError, ValueError):
             limit = 240
         material_id = (query.get("materialId") or [""])[0].strip()
-        if material_id:
-            self._schedule_playback_warm(material_id)
         catalog_path = playback_catalog_path(self.profile.storage_root)
         try:
             catalog_mtime_ns = catalog_path.stat().st_mtime_ns
@@ -6349,70 +8488,17 @@ class ProviderRuntime:
         )
         if committed is not None:
             return 200, ("image/jpeg", committed.read_bytes())
-        key_digest = hashlib.sha256(
-            f"{path.resolve()}|{normalized_modality}".encode("utf-8")
-        ).digest()
-        build_lock = self.playback_cache_build_locks[key_digest[0] % len(self.playback_cache_build_locks)]
-        with build_lock:
-            started = time.monotonic()
-            try:
-                rendered_path = committed_rendition_file(
-                    path,
-                    normalized_modality,
-                    normalized_level,
-                    calibration_path=calibration_path,
-                )
-                if rendered_path is None:
-                    rendered_path = self.playback_compute_pool.submit(
-                        rendition_file,
-                        path,
-                        normalized_modality,
-                        normalized_level,
-                        camera_id=camera.camera_id,
-                        camera_roots={
-                            value.camera_id: value.storage_root
-                            for value in self.profile.enabled_cameras
-                        },
-                        storage_root=self.profile.storage_root,
-                        calibration_path=calibration_path,
-                        config=self.rendition_config,
-                    ).result()
-                body = rendered_path.read_bytes()
-                if not body.startswith(b"\xff\xd8"):
-                    raise ValueError("rendered file is not JPEG")
-            except RenditionNotReady as error:
-                status = 409 if error.processing else 422
-                return status, {
-                    "code": status,
-                    "error": "capture_render_processing" if error.processing else "capture_render_not_ready",
-                    "reason": error.reason,
-                    "modality": normalized_modality,
-                    "level": normalized_level,
-                }
-            except Exception as error:
-                with self.history_lock:
-                    self.playback_cache_build_failures += 1
-                self._log(
-                    "warning",
-                    "two-level capture rendition failed",
-                    path=str(path),
-                    modality=normalized_modality,
-                    level=normalized_level,
-                    error=str(error),
-                )
-                return 422, {
-                    "code": 422,
-                    "error": "capture_render_not_ready",
-                    "reason": str(error),
-                    "modality": normalized_modality,
-                    "level": normalized_level,
-                }
-            with self.history_lock:
-                self.playback_cache_builds += 1
-                self.playback_cache_build_ms.append(
-                    (time.monotonic() - started) * 1000.0
-                )
-            return 200, ("image/jpeg", body)
+        # HTTP reads never perform fitting or encoding. The eager background
+        # worker commits every frame after analysis; callers retry while that
+        # bounded producer catches up.
+        return 409, {
+            "code": 409,
+            "error": "capture_render_processing",
+            "reason": "eager-rendition-not-committed",
+            "modality": normalized_modality,
+            "level": normalized_level,
+            "generationPolicy": EAGER_RENDITION_GENERATION_POLICY,
+        }
 
     def playback_cache_status_json(self) -> dict[str, Any]:
         with self.history_lock:
@@ -6490,8 +8576,9 @@ class ProviderRuntime:
                 "renditionRoots": rendition_roots,
                 "levels": ["thumbnail", "original"],
                 "modalities": ["gray", "jet"],
-                "generationPolicy": "full-flow-after-alignment",
-                "onDemandBuild": "recovery-only",
+                "generationPolicy": EAGER_RENDITION_GENERATION_POLICY,
+                "onDemandBuild": "disabled",
+                "jetMetadata": "full-row-diameter-and-fit-quality",
                 "catalogPath": str(playback_catalog_path(self.profile.storage_root)),
                 "catalogAvailable": playback_catalog_path(self.profile.storage_root).is_file(),
                 "memoryEntries": len(self.playback_image_cache),

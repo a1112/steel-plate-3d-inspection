@@ -59,6 +59,7 @@ export function CaptureMeasurementPanel({ materialId }: CaptureMeasurementPanelP
   const [rebuildPending, setRebuildPending] = useState(false);
   const [error, setError] = useState('');
   const mountedRef = useRef(true);
+  const loadRevisionRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -67,19 +68,23 @@ export function CaptureMeasurementPanel({ materialId }: CaptureMeasurementPanelP
     };
   }, []);
 
-  const load = useCallback(async (showLoading = true) => {
+  const load = useCallback(async (showLoading = true, signal?: AbortSignal) => {
     if (!materialId) return;
+    const revision = ++loadRevisionRef.current;
     if (showLoading) setLoading(true);
     try {
-      const result = await readCaptureMeasurement(materialId);
-      if (mountedRef.current) {
+      const result = await readCaptureMeasurement(materialId, signal);
+      if (mountedRef.current && !signal?.aborted && revision === loadRevisionRef.current) {
         setMeasurement(result.measurement);
         setRebuildPending(false);
         setError('');
       }
     } catch (loadError) {
-      if (mountedRef.current) {
-        setMeasurement(null);
+      if (signal?.aborted) return;
+      if (mountedRef.current && revision === loadRevisionRef.current) {
+        // Keep the latest committed snapshot visible if one background poll
+        // briefly loses the worker while acquisition continues.
+        if (showLoading) setMeasurement(null);
         if (loadError instanceof CaptureApiError && loadError.status === 404) {
           setError('尚未生成截面分析；已提交的任务会自动刷新');
         } else {
@@ -88,22 +93,30 @@ export function CaptureMeasurementPanel({ materialId }: CaptureMeasurementPanelP
         }
       }
     } finally {
-      if (mountedRef.current && showLoading) setLoading(false);
+      if (
+        mountedRef.current
+        && !signal?.aborted
+        && revision === loadRevisionRef.current
+        && showLoading
+      ) setLoading(false);
     }
   }, [materialId]);
 
   useEffect(() => {
+    const controller = new AbortController();
     setMeasurement(null);
     setRebuildPending(false);
     setError('');
-    void load();
+    void load(true, controller.signal);
+    const timer = window.setInterval(
+      () => void load(false, controller.signal),
+      1_500,
+    );
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
   }, [load]);
-
-  useEffect(() => {
-    if (!rebuildPending) return undefined;
-    const timer = window.setInterval(() => void load(false), 2_000);
-    return () => window.clearInterval(timer);
-  }, [load, rebuildPending]);
 
   const rebuild = async () => {
     setLoading(true);

@@ -845,7 +845,10 @@ fn apply_supervisor_snapshot(
                 .collect::<Vec<_>>()
                 .join("、")
         );
-    } else if snapshot.service_available && snapshot.active_tasks == 0 && snapshot.queue_depth == 0
+    } else if snapshot.state == "healthy"
+        && snapshot.service_available
+        && snapshot.active_tasks == 0
+        && snapshot.queue_depth == 0
     {
         snapshot.state = "healthy";
         snapshot.detail = "服务 supervisor 与生产任务队列运行正常".to_string();
@@ -1365,6 +1368,7 @@ pub(crate) fn set_background_service_startup_mode(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
 
     fn healthy_payload() -> Value {
         json!({
@@ -1471,6 +1475,50 @@ mod tests {
             snapshot_from_payloads(DEFAULT_ORIGIN, &healthy_payload(), None, None, None, 1);
         assert_eq!(missing.state, "degraded");
         assert_eq!(missing.detail, "任务状态接口暂时不可用");
+    }
+
+    #[test]
+    fn healthy_supervisor_overlay_does_not_hide_business_degradation() {
+        let mut snapshot =
+            snapshot_from_payloads(DEFAULT_ORIGIN, &healthy_payload(), None, None, None, 1);
+        let original_detail = snapshot.detail.clone();
+        assert_eq!(snapshot.state, "degraded");
+
+        apply_supervisor_snapshot(
+            &mut snapshot,
+            SupervisorSnapshot {
+                services: vec![SupervisorServiceSnapshot {
+                    id: "inspection".to_string(),
+                    name: "业务服务".to_string(),
+                    role: "api".to_string(),
+                    kind: "inspection".to_string(),
+                    origin: DEFAULT_ORIGIN.to_string(),
+                    port: 4873,
+                    health_path: "/api/health/live".to_string(),
+                    ok: true,
+                    required: true,
+                    status: "running".to_string(),
+                    response_status: 200,
+                    latency_ms: 1,
+                    uptime_ms: Some(1_000),
+                    reason: None,
+                    lifecycle: json!({"phase":"ready"}),
+                    operations: Vec::new(),
+                    control: json!({"mode":"observe"}),
+                    startup_mode: "normal".to_string(),
+                    auto_restart: true,
+                    managed: true,
+                }],
+                lifecycle_logs: Vec::new(),
+                registry: json!({"schema":"steel.service-registry.v1"}),
+                state_root: PathBuf::from("state"),
+                log_root: PathBuf::from("logs"),
+            },
+        );
+
+        assert_eq!(snapshot.state, "degraded");
+        assert_eq!(snapshot.detail, original_detail);
+        assert_eq!(snapshot.healthy_service_count, 1);
     }
 
     #[test]

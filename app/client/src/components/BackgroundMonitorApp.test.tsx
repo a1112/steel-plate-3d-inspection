@@ -245,7 +245,7 @@ describe('BackgroundMonitorApp', () => {
     cleanup();
   });
 
-  it('renders concise title stats, selectable services, details and scoped logs', async () => {
+  it('renders live task status by default and keeps service controls in a dedicated view', async () => {
     render(<BackgroundMonitorApp origin="http://127.0.0.1:4873" />);
 
     expect(await screen.findByText('后台任务监控')).toBeInTheDocument();
@@ -253,9 +253,23 @@ describe('BackgroundMonitorApp', () => {
     expect(monitorApi.configure).not.toHaveBeenCalled();
 
     expect(screen.getByText(/^服务/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('1/2');
+    expect(screen.getByText(/^任务/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('1/2');
+    expect(screen.getByText(/^关注/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('2');
+    expect(screen.getByRole('region', { name: '后台监控摘要' })).toHaveTextContent('正在执行 1 项任务');
+    expect(screen.getByTestId('background-monitor-active-task')).toHaveTextContent('TASK-ACTIVE');
+    expect(screen.getByRole('progressbar', { name: '活动任务进度' })).toHaveAttribute('aria-valuenow', '50');
+    expect(screen.getByTestId('background-monitor-task-table')).toHaveTextContent('TASK-FAILED');
+    expect(screen.getByTestId('background-monitor-task-TASK-FAILED')).toHaveTextContent('算法进程退出码 1');
+
+    fireEvent.change(screen.getByRole('combobox', { name: '任务状态过滤' }), { target: { value: 'failed' } });
+    expect(screen.getByTestId('background-monitor-task-table')).toHaveTextContent('TASK-FAILED');
+    expect(screen.queryByTestId('background-monitor-task-TASK-ACTIVE')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '清除' }));
+    expect(screen.getByTestId('background-monitor-task-TASK-ACTIVE')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /^服务与日志/ }));
     expect(screen.getByText('实时探针 1 / 2')).toBeInTheDocument();
     expect(screen.getByText('实时审计 · 1 条')).toBeInTheDocument();
-    expect(screen.getByText(/^关注/, { selector: '.background-monitor-title-stat' })).toHaveTextContent('2');
     expect(screen.getByTestId('background-monitor-service-inspection')).toHaveTextContent('检测服务');
     expect(screen.getByTestId('background-monitor-service-capture')).toHaveTextContent('采集服务');
     expect(screen.getByTestId('background-monitor-service-detail')).toHaveTextContent('inspection');
@@ -277,8 +291,7 @@ describe('BackgroundMonitorApp', () => {
     expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('检测服务启动命令已执行');
     expect(screen.getByTestId('background-monitor-logs')).toHaveTextContent('采集服务已停止');
     expect(screen.queryByText('当前活动任务')).not.toBeInTheDocument();
-    expect(screen.queryByText('任务列表')).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('后台监控摘要')).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: '后台监控摘要' })).toBeInTheDocument();
   });
 
   it('refreshes from the native monitor, reacts to events, and hides to tray', async () => {

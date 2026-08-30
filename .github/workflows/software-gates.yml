@@ -33,7 +33,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 22.x
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: app/client/package-lock.json
           package-manager-cache: true
@@ -41,7 +41,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.12"
+          python-version-file: .python-version
 
       - name: Record toolchain versions
         shell: pwsh
@@ -68,11 +68,31 @@ jobs:
       - name: Test Rust trigger gateway
         run: cargo test --locked --manifest-path app/trigger/Cargo.toml --target-dir target/ci-trigger
 
+      - name: Test all remaining first-party Rust components
+        shell: pwsh
+        run: |
+          $manifests = @(
+            'app/runtime-contract/Cargo.toml',
+            'app/result-contract/Cargo.toml',
+            'app/image-service/Cargo.toml',
+            'app/algorithm-service/Cargo.toml',
+            'app/pipeline-workers/Cargo.toml',
+            'app/camera-worker/Cargo.toml',
+            'app/server-monitor/Cargo.toml'
+          )
+          foreach ($manifest in $manifests) {
+            cargo test --locked --manifest-path $manifest --target-dir target/ci-rust-components
+            if ($LASTEXITCODE -ne 0) { throw "Rust component tests failed: $manifest" }
+          }
+          cargo check --locked --manifest-path app/tray/Cargo.toml --target x86_64-pc-windows-msvc --target-dir target/ci-rust-components
+          if ($LASTEXITCODE -ne 0) { throw 'Tray Rust check failed.' }
+
       - name: Test SICK GenTL sidecar contracts
         shell: pwsh
         run: |
           python -m pip install --requirement scripts/sick_capture_requirements.txt
-          python -m unittest scripts.test_sick_capture -v
+          python -m compileall -q scripts packages/contracts/python
+          python -m unittest discover -s scripts -p "test_*.py" -v
 
       - name: Check production Tauri target
         shell: pwsh
@@ -92,6 +112,7 @@ jobs:
         shell: pwsh
         run: |
           python -m unittest scripts.test_fetch_sample_data -v
+          ./scripts/test-algorithm-acceptance-report-contract.ps1
           ./scripts/test-tauri-bundle-toolchain-provisioning.ps1
           ./scripts/test-release-sbom.ps1
           ./scripts/test-packaged-release-sbom.ps1
@@ -111,6 +132,7 @@ jobs:
       - name: Run source architecture contract
         shell: pwsh
         run: |
+          ./scripts/verify-source-boundaries.ps1
           ./scripts/verify-independent-architecture.ps1 `
             -SkipFrontendBuild `
             -SkipClientTests `
