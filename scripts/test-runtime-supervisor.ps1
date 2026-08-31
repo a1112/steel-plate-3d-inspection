@@ -320,7 +320,7 @@ try {
       "[string]`$_ -ceq 'release-integrity.cat'",
       'ExpectedFirstPartyThumbprint',
       'AllowedVendorSdkSignerThumbprints',
-      'SecretEnvFile and AlgorithmAcceptanceReport must be outside the source package, InstallRoot, and StateRoot',
+      'SecretEnvFile, AlgorithmAcceptanceReport, SickCaptureProfile, and PythonExecutable must be outside the source package, InstallRoot, and StateRoot',
       'RuntimeRoot must be a dedicated package directory and must not be a volume root',
       'InstallRoot must be a non-root path that does not overlap the source package RuntimeRoot',
       'StateRoot must be a non-root path that does not overlap the source package or InstallRoot',
@@ -366,7 +366,7 @@ try {
       'RuntimeRoot must be a dedicated package directory and must not be a volume root',
       'InstallRoot must be a non-root path that does not overlap the source package RuntimeRoot',
       'StateRoot must be a non-root path that does not overlap the source package or InstallRoot',
-      'SecretEnvFile and AlgorithmAcceptanceReport must be outside the source package, InstallRoot, and StateRoot',
+      'SecretEnvFile, AlgorithmAcceptanceReport, SickCaptureProfile, and PythonExecutable must be outside the source package, InstallRoot, and StateRoot',
       'Deployment storage and artifact roots must not overlap protected runtime, state, secret, or acceptance paths'
     )) {
       $BoundaryOffset = $InstallText.IndexOf($BoundaryToken, [StringComparison]::Ordinal)
