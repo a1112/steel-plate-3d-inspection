@@ -21,6 +21,8 @@ import {
   pauseAdminDepthGeometryBackfill,
   resumeAdminDepthGeometryBackfill,
   saveAdminDepthGeometry,
+  saveConnectionConfig,
+  testConnectionConfig,
   fetchProductionTasks,
   formatProductionDateTime,
   formatProductionRecordTime,
@@ -95,7 +97,8 @@ describe('persistent production command client', () => {
     expect(getInspectionServiceOrigin()).toBe('http://10.50.111.141:4873');
   });
 
-  it('binds the standalone background-management route to its serving API', () => {
+  it('binds the standalone route to its serving API until the operator explicitly selects another service', () => {
+    vi.stubEnv('MODE', 'production');
     window.localStorage.setItem('steel-inspection-connection-config', JSON.stringify({
       mode: 'online',
       host: '10.50.111.141',
@@ -106,9 +109,69 @@ describe('persistent production command client', () => {
     try {
       window.history.replaceState({}, '', '/?app=parameters&service=page');
       expect(getInspectionServiceOrigin()).toBe(window.location.origin);
+      activateInspectionServiceFallback({
+        mode: 'online',
+        host: '10.50.111.141',
+        port: 4873,
+        protocol: 'http',
+      });
+      expect(getInspectionServiceOrigin()).toBe('http://10.50.111.141:4873');
     } finally {
       window.history.replaceState({}, '', originalUrl);
     }
+  });
+
+  it('saves an explicitly entered browser address to that service instead of the page origin', async () => {
+    vi.stubEnv('MODE', 'production');
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ code: 0 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+
+    try {
+      window.history.replaceState({}, '', '/?view=online&service=page');
+      await saveConnectionConfig({
+        mode: 'online',
+        host: '10.50.111.141',
+        port: 4873,
+        protocol: 'http',
+      });
+    } finally {
+      window.history.replaceState({}, '', originalUrl);
+    }
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://10.50.111.141:4873/api/config/connection',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(JSON.parse(window.localStorage.getItem('steel-inspection-connection-config') || '{}').host)
+      .toBe('10.50.111.141');
+  });
+
+  it('tests an entered service without saving or activating it', async () => {
+    vi.stubEnv('MODE', 'production');
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      ok: true,
+      status: 'ready',
+      service: 'steel-inspection-service',
+      uptimeMs: 1234,
+      checks: {},
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const health = await testConnectionConfig({
+      mode: 'online',
+      host: '10.50.111.141',
+      port: 4873,
+      protocol: 'http',
+    });
+
+    expect(health.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://10.50.111.141:4873/api/health/details',
+      expect.objectContaining({ headers: { Accept: 'application/json' } }),
+    );
+    expect(window.localStorage.getItem('steel-inspection-connection-config')).toBeNull();
+    expect(getInspectionServiceOrigin()).toBe(window.location.origin);
   });
 
   it('discovers the advertised LAN service and de-duplicates addresses', async () => {

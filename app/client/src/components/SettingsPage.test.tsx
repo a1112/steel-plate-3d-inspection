@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultSettings, validateSettings } from '../state/operations';
 import { SettingsPage } from './SettingsPage';
@@ -87,10 +87,10 @@ describe('SettingsPage', () => {
     expect(screen.queryByRole('button', { name: '选择浅色巡检主题' })).not.toBeInTheDocument();
   });
 
-  it('automatically refreshes after the server IP entry settles', () => {
-    vi.useFakeTimers();
+  it('keeps the connection editor open until the operator explicitly saves', () => {
     const settings = createDefaultSettings();
-    const onConnectionRefresh = vi.fn();
+    const onConnectionChange = vi.fn();
+    const onConnectionSave = vi.fn();
     render(
       <SettingsPage
         embedded
@@ -102,8 +102,8 @@ describe('SettingsPage', () => {
         connection={{ mode: 'online', host: '127.0.0.1', port: 4873, protocol: 'http' }}
         onThemeChange={vi.fn()}
         onDraftChange={vi.fn()}
-        onConnectionChange={vi.fn()}
-        onConnectionRefresh={onConnectionRefresh}
+        onConnectionChange={onConnectionChange}
+        onConnectionSave={onConnectionSave}
         onSave={vi.fn()}
         onReset={vi.fn()}
         onApplyToPlate={vi.fn()}
@@ -111,11 +111,48 @@ describe('SettingsPage', () => {
     );
 
     fireEvent.change(screen.getByLabelText('服务端 IP'), { target: { value: '10.50.111.141' } });
-    expect(onConnectionRefresh).not.toHaveBeenCalled();
+    expect(onConnectionChange).toHaveBeenCalledWith({ host: '10.50.111.141' });
+    expect(onConnectionSave).not.toHaveBeenCalled();
+    expect(screen.getByText(/点击“保存连接”/)).toBeInTheDocument();
 
-    act(() => vi.advanceTimersByTime(800));
+    fireEvent.click(screen.getByRole('button', { name: '保存连接' }));
+    expect(onConnectionSave).toHaveBeenCalledTimes(1);
+  });
 
-    expect(onConnectionRefresh).toHaveBeenCalledTimes(1);
+  it('renders connection actions in one group and tests without saving', () => {
+    const settings = createDefaultSettings();
+    const onConnectionTest = vi.fn();
+    const onConnectionSave = vi.fn();
+    const { container } = render(
+      <SettingsPage
+        embedded
+        initialSection="connection"
+        theme="light"
+        draft={settings}
+        saved={settings}
+        errors={{}}
+        connection={{ mode: 'online', host: '10.50.111.141', port: 4873, protocol: 'http' }}
+        onThemeChange={vi.fn()}
+        onDraftChange={vi.fn()}
+        onConnectionDiscover={vi.fn()}
+        onConnectionTest={onConnectionTest}
+        onConnectionSave={onConnectionSave}
+        onSave={vi.fn()}
+        onReset={vi.fn()}
+        onApplyToPlate={vi.fn()}
+      />,
+    );
+
+    const actions = screen.getByRole('group', { name: '连接操作' });
+    expect(actions).toHaveClass('connection-actions');
+    expect(container.querySelector('.connection-actions')).toContainElement(screen.getByRole('button', { name: '自动发现' }));
+    expect(actions).toContainElement(screen.getByRole('button', { name: '测试连接' }));
+    expect(actions).toContainElement(screen.getByRole('button', { name: '保存连接' }));
+    expect(actions).toContainElement(screen.getByRole('button', { name: '参数管理' }));
+
+    fireEvent.click(screen.getByRole('button', { name: '测试连接' }));
+    expect(onConnectionTest).toHaveBeenCalledTimes(1);
+    expect(onConnectionSave).not.toHaveBeenCalled();
   });
 
   it('discovers LAN services and applies the selected IP to connection settings', () => {

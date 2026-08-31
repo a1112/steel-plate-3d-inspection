@@ -58,7 +58,7 @@ import {
   fetchProductionStatus,
   saveAdminInspectionSettings,
   saveConnectionConfig,
-  saveLocalConnectionConfig,
+  testConnectionConfig,
   readLocalConnectionConfig,
   type ConnectionConfig,
   type DiscoveredInspectionService,
@@ -810,6 +810,7 @@ function InspectionDashboard({
   const [discoveredServices, setDiscoveredServices] = useState<DiscoveredInspectionService[]>([]);
   const [connectionDiscoveryStatus, setConnectionDiscoveryStatus] = useState<string | null>(null);
   const [connectionDiscoveryBusy, setConnectionDiscoveryBusy] = useState(false);
+  const [connectionTestBusy, setConnectionTestBusy] = useState(false);
   const [operationState, setOperationState] = useState(() => createInitialOperationState());
   const [toast, setToast] = useState<string | null>(null);
   const [viewportSize, setViewportSize] = useState(readViewportSize);
@@ -1871,25 +1872,55 @@ function InspectionDashboard({
   };
 
   const saveConnection = async () => {
+    const normalizedConnection = {
+      ...connectionDraft,
+      host: connectionDraft.host.trim(),
+    };
+    setConnectionStatus(`正在连接 ${normalizedConnection.host}:${normalizedConnection.port}…`);
     try {
-      await saveConnectionConfig(connectionDraft);
-      setConnectionStatus(connectionDraft.mode === 'online' ? '在线模式已保存' : '演示模式已保存');
+      await saveConnectionConfig(normalizedConnection);
+      activateInspectionServiceFallback(normalizedConnection);
+      setConnectionDraft(normalizedConnection);
       const nextSnapshot = await fetchInspectionSnapshot();
       onSnapshotChange(nextSnapshot);
       setUiState(createInitialUiState(nextSnapshot));
-      setToast(connectionDraft.mode === 'online' ? '已切换到服务端数据库数据' : '已切换到本地演示数据');
+      const successMessage = normalizedConnection.mode === 'online'
+        ? `连接成功 · ${normalizedConnection.host}:${normalizedConnection.port}`
+        : '演示模式已保存';
+      setConnectionStatus(successMessage);
+      setToast(normalizedConnection.mode === 'online' ? '连接已保存并刷新服务端数据' : '已切换到本地演示数据');
     } catch (error) {
-      setConnectionStatus(error instanceof Error ? error.message : '连接设置保存失败');
+      setConnectionStatus(error instanceof Error ? `连接保存失败：${error.message}` : '连接设置保存失败');
       setToast('连接设置保存失败');
     }
   };
 
-  const refreshConnection = () => {
-    saveLocalConnectionConfig({
+  const testConnection = async () => {
+    const normalizedConnection = {
       ...connectionDraft,
       host: connectionDraft.host.trim(),
-    });
-    window.location.reload();
+    };
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 4_000);
+    setConnectionTestBusy(true);
+    setConnectionStatus(`正在测试 ${normalizedConnection.host}:${normalizedConnection.port}…`);
+    try {
+      const health = await testConnectionConfig(normalizedConnection, controller.signal);
+      const successMessage = health.ok
+        ? `测试成功 · 服务健康 · ${normalizedConnection.host}:${normalizedConnection.port}`
+        : `测试成功 · 服务可达但状态为 ${health.status}`;
+      setConnectionStatus(successMessage);
+      setToast(successMessage);
+    } catch (error) {
+      const failureMessage = error instanceof DOMException && error.name === 'AbortError'
+        ? '连接超时，请检查 IP、端口与防火墙'
+        : error instanceof Error ? error.message : '无法访问目标服务';
+      setConnectionStatus(`测试失败 · ${failureMessage}`);
+      setToast('连接测试失败');
+    } finally {
+      window.clearTimeout(timeout);
+      setConnectionTestBusy(false);
+    }
   };
 
   const discoverConnections = async () => {
@@ -2414,6 +2445,7 @@ function InspectionDashboard({
               discoveredServices={discoveredServices}
               discoveryStatus={connectionDiscoveryStatus}
               discoveryBusy={connectionDiscoveryBusy}
+              connectionTestBusy={connectionTestBusy}
               onThemeChange={(theme) => setState({ theme })}
               onThemeStyleChange={(themeStyle) => setState({ themeStyle })}
               onDraftChange={(patch) => {
@@ -2424,8 +2456,8 @@ function InspectionDashboard({
                 }
               }}
               onConnectionChange={updateConnectionDraft}
-              onConnectionRefresh={refreshConnection}
               onConnectionSave={() => void saveConnection()}
+              onConnectionTest={() => void testConnection()}
               onConnectionDiscover={() => void discoverConnections()}
               onConnectionAutoSet={applyDiscoveredConnection}
               onSave={() => saveSettings('参数已保存')}

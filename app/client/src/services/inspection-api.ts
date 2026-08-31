@@ -1355,7 +1355,7 @@ export function saveLocalConnectionConfig(config: ConnectionConfig) {
  */
 export function activateInspectionServiceFallback(config: ConnectionConfig) {
   saveLocalConnectionConfig(config);
-  if (!isWebHostedRuntime() || getPageBoundConnectionConfig()) {
+  if (!isWebHostedRuntime()) {
     return;
   }
   activeBrowserFallbackOrigin = formatServiceOrigin(
@@ -1437,11 +1437,13 @@ export function createAdminHeaders(headers: Record<string, string> = {}) {
 
 export function getInspectionServiceOrigin(config = getStoredConnectionConfig()) {
   const pageBound = getPageBoundConnectionConfig();
-  if (pageBound) {
-    return formatServiceOrigin(pageBound.host, pageBound.port, pageBound.protocol ?? 'http');
-  }
   if (isWebHostedRuntime()) {
-    return activeBrowserFallbackOrigin ?? window.location.origin.replace(/\/$/, '');
+    if (activeBrowserFallbackOrigin) {
+      return activeBrowserFallbackOrigin;
+    }
+    return pageBound
+      ? formatServiceOrigin(pageBound.host, pageBound.port, pageBound.protocol ?? 'http')
+      : window.location.origin.replace(/\/$/, '');
   }
   if (config.host && config.port) {
     return formatServiceOrigin(config.host, config.port, config.protocol ?? 'http');
@@ -2573,7 +2575,12 @@ export async function saveConnectionConfig(config: ConnectionConfig): Promise<vo
     saveLocalConnectionConfig(config);
     return;
   }
-  const response = await fetch(`${getInspectionServiceOrigin(config)}/api/config/connection`, {
+  const host = config.host.trim();
+  if (!host || !Number.isInteger(config.port) || config.port < 1 || config.port > 65535) {
+    throw new Error('服务端 IP 或端口无效');
+  }
+  const targetOrigin = formatServiceOrigin(host, config.port, config.protocol ?? 'http');
+  const response = await fetch(`${targetOrigin}/api/config/connection`, {
     method: 'POST',
     headers: createAdminHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
@@ -2586,7 +2593,26 @@ export async function saveConnectionConfig(config: ConnectionConfig): Promise<vo
   if (!response.ok) {
     throw new Error(await readAdminErrorMessage(response, '连接设置保存失败'));
   }
-  saveLocalConnectionConfig(config);
+  saveLocalConnectionConfig({ ...config, host });
+}
+
+export async function testConnectionConfig(
+  config: ConnectionConfig,
+  signal?: AbortSignal,
+): Promise<ServiceHealthDetails> {
+  const host = config.host.trim();
+  if (config.mode !== 'online' || !host || !Number.isInteger(config.port) || config.port < 1 || config.port > 65535) {
+    throw new Error('服务端 IP 或端口无效');
+  }
+  const targetOrigin = formatServiceOrigin(host, config.port, config.protocol ?? 'http');
+  const response = await fetch(`${targetOrigin}/api/health/details`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  if (response.status !== 503 && !response.ok) {
+    throw new Error(await readAdminErrorMessage(response, '连接测试失败'));
+  }
+  return response.json() as Promise<ServiceHealthDetails>;
 }
 
 export async function fetchConfigRevisions(

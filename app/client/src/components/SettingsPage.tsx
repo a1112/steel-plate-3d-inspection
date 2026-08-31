@@ -1,5 +1,5 @@
-import { ClipboardCheck, Cpu, Factory, Gauge, LoaderCircle, Monitor, Palette, Radar, RadioTower, RotateCcw, Save, Send, Server, Sparkles } from 'lucide-react';
-import { useEffect, useRef, useState, type ChangeEvent, type ElementType } from 'react';
+import { Activity, ClipboardCheck, Cpu, Factory, Gauge, LoaderCircle, Monitor, Palette, Radar, RadioTower, RotateCcw, Save, Send, Server, Sparkles } from 'lucide-react';
+import { useState, type ChangeEvent, type ElementType } from 'react';
 import type { ThemeMode, ThemeStyle } from '../data/inspection';
 import { openParameterManagementWindow } from '../lib/app-windows';
 import { isWebHostedRuntime, type ConnectionConfig, type ConnectionMode, type DiscoveredInspectionService } from '../services/inspection-api';
@@ -153,12 +153,13 @@ export function SettingsPage({
   discoveredServices = [],
   discoveryStatus,
   discoveryBusy = false,
+  connectionTestBusy = false,
   onThemeChange,
   onThemeStyleChange = () => undefined,
   onDraftChange,
   onConnectionChange = () => undefined,
-  onConnectionRefresh = () => undefined,
   onConnectionSave = () => undefined,
+  onConnectionTest = () => undefined,
   onConnectionDiscover = () => undefined,
   onConnectionAutoSet = () => undefined,
   onSave,
@@ -177,12 +178,13 @@ export function SettingsPage({
   discoveredServices?: DiscoveredInspectionService[];
   discoveryStatus?: string | null;
   discoveryBusy?: boolean;
+  connectionTestBusy?: boolean;
   onThemeChange: (theme: ThemeMode) => void;
   onThemeStyleChange?: (themeStyle: ThemeStyle) => void;
   onDraftChange: (patch: Partial<InspectionSettings>) => void;
   onConnectionChange?: (patch: Partial<ConnectionConfig>) => void;
-  onConnectionRefresh?: () => void;
   onConnectionSave?: () => void;
+  onConnectionTest?: () => void;
   onConnectionDiscover?: () => void;
   onConnectionAutoSet?: (service: DiscoveredInspectionService) => void;
   onSave: () => void;
@@ -192,29 +194,6 @@ export function SettingsPage({
   initialSection?: SettingsSection;
 }) {
   const [activeSection, setActiveSection] = useState<SettingsSection>(initialSection);
-  const [connectionHostEdited, setConnectionHostEdited] = useState(false);
-  const connectionRefreshRef = useRef(onConnectionRefresh);
-  useEffect(() => {
-    connectionRefreshRef.current = onConnectionRefresh;
-  }, [onConnectionRefresh]);
-  useEffect(() => {
-    if (
-      !connectionHostEdited
-      || connection.mode === 'demo'
-      || connection.host.trim().length === 0
-      || !Number.isInteger(connection.port)
-      || connection.port < 1
-      || connection.port > 65535
-      || discoveryBusy
-    ) {
-      return;
-    }
-    const timeout = window.setTimeout(() => {
-      setConnectionHostEdited(false);
-      connectionRefreshRef.current();
-    }, 800);
-    return () => window.clearTimeout(timeout);
-  }, [connection.host, connection.mode, connection.port, connectionHostEdited, discoveryBusy]);
   const setNumber = (key: NumberSettingKey) => (value: number) => onDraftChange({ [key]: value });
   const setBoolean = (key: BooleanSettingKey) => (checked: boolean) => onDraftChange({ [key]: checked });
   const setConnectionMode = (mode: ConnectionMode) => onConnectionChange({ mode });
@@ -222,6 +201,10 @@ export function SettingsPage({
   const currentThemeLabel = themeOptions.find((option) => option.id === theme)?.label ?? '深色工业';
   const webHosted = isWebHostedRuntime();
   const displayedServiceAddress = `${connection.protocol ?? 'http'}://${connection.host}:${connection.port}`;
+  const connectionValid = connection.host.trim().length > 0
+    && Number.isInteger(connection.port)
+    && connection.port >= 1
+    && connection.port <= 65535;
 
   return (
     <div className={`settings-page ${embedded ? 'settings-page-embedded' : 'workspace-page'}`}>
@@ -294,12 +277,9 @@ export function SettingsPage({
                   aria-label="服务端 IP"
                   value={connection.host}
                   disabled={connection.mode === 'demo'}
-                  onChange={(event) => {
-                    onConnectionChange({ host: event.target.value });
-                    setConnectionHostEdited(true);
-                  }}
+                  onChange={(event) => onConnectionChange({ host: event.target.value })}
                 />
-                <em>修改 IP 后停止输入 0.8 秒，将自动保存到本机并刷新界面</em>
+                <em>输入完成后点击“保存连接”；页面不会自动退出，保存结果将在下方显示</em>
               </label>
               <label className="setting-field">
                 <span>服务端端口</span>
@@ -316,12 +296,24 @@ export function SettingsPage({
                   <b>port</b>
                 </div>
               </label>
-              <div className="settings-actions">
-                <button type="button" disabled={connection.mode === 'demo' || discoveryBusy} onClick={onConnectionDiscover}>
+              <div className="settings-actions connection-actions" role="group" aria-label="连接操作">
+                <button type="button" disabled={connection.mode === 'demo' || discoveryBusy || connectionTestBusy} onClick={onConnectionDiscover}>
                   {discoveryBusy ? <LoaderCircle className="spin" size={16} /> : <Radar size={16} />}
                   {discoveryBusy ? '正在发现' : '自动发现'}
                 </button>
-                <button type="button" onClick={onConnectionSave}>
+                <button
+                  type="button"
+                  disabled={connection.mode === 'demo' || !connectionValid || discoveryBusy || connectionTestBusy}
+                  onClick={onConnectionTest}
+                >
+                  {connectionTestBusy ? <LoaderCircle className="spin" size={16} /> : <Activity size={16} />}
+                  {connectionTestBusy ? '测试中' : '测试连接'}
+                </button>
+                <button
+                  type="button"
+                  disabled={connection.mode === 'online' && (!connectionValid || discoveryBusy || connectionTestBusy)}
+                  onClick={onConnectionSave}
+                >
                   <Save size={16} />
                   保存连接
                 </button>
@@ -370,7 +362,7 @@ export function SettingsPage({
                 </div>
                 <div>
                   <dt>状态</dt>
-                  <dd>{connectionStatus ?? '待保存'}</dd>
+                  <dd role="status" aria-live="polite">{connectionStatus ?? '待保存'}</dd>
                 </div>
                 <div>
                   <dt>局域网访问</dt>

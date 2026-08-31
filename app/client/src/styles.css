@@ -10113,6 +10113,16 @@ button {
   gap: 10px;
 }
 
+.settings-actions.connection-actions {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.connection-actions button {
+  min-width: 0;
+  white-space: nowrap;
+}
+
 .settings-actions button,
 .status-actions button {
   height: 38px;
