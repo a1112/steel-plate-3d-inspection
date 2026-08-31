@@ -8084,7 +8084,15 @@ fn read_windows_network_snapshot_json() -> Result<String, String> {
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $statsByName = @{}
+$ipv4ByIndex = @{}
 Get-NetAdapterStatistics -ErrorAction SilentlyContinue | ForEach-Object { $statsByName[$_.Name] = $_ }
+Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+  $interfaceIndex = [int]$_.InterfaceIndex
+  if (-not $ipv4ByIndex.ContainsKey($interfaceIndex)) {
+    $ipv4ByIndex[$interfaceIndex] = @()
+  }
+  $ipv4ByIndex[$interfaceIndex] += "$(($_.IPAddress))/$(($_.PrefixLength))"
+}
 Get-NetAdapter -ErrorAction SilentlyContinue |
   Sort-Object Name |
   ForEach-Object {
@@ -8102,6 +8110,7 @@ Get-NetAdapter -ErrorAction SilentlyContinue |
     [pscustomobject]@{
       name = [string]$_.Name
       description = [string]$_.InterfaceDescription
+      ipv4Addresses = ,[object[]]@($ipv4ByIndex[[int]$_.ifIndex])
       status = [string]$_.Status
       linkSpeed = [string]$_.LinkSpeed
       linkSpeedBitsPerSecond = [UInt64]($_.Speed -as [UInt64])
@@ -8178,6 +8187,21 @@ fn system_network_status_response() -> Vec<u8> {
         .map(|(index, item)| {
             let name = json_value_string(item.get("name"));
             let description = json_value_string(item.get("description"));
+            let ipv4_addresses = match item.get("ipv4Addresses") {
+                Some(Value::Array(values)) => values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+                Some(Value::String(value)) if !value.trim().is_empty() => {
+                    vec![value.trim().to_owned()]
+                }
+                _ => Vec::new(),
+            };
+            let ipv4_addresses_json = serde_json::to_string(&ipv4_addresses)
+                .unwrap_or_else(|_| "[]".to_string());
             let status = json_value_string(item.get("status"));
             let link_speed = json_value_string(item.get("linkSpeed"));
             let link_speed_bits = json_value_u64(item.get("linkSpeedBitsPerSecond"));
@@ -8210,10 +8234,11 @@ fn system_network_status_response() -> Vec<u8> {
                 },
             );
             format!(
-                "{{\"index\":{},\"name\":\"{}\",\"description\":\"{}\",\"status\":\"{}\",\"linkSpeed\":\"{}\",\"linkSpeedBitsPerSecond\":{},\"receivedBytes\":{},\"transmittedBytes\":{},\"packetsReceived\":{},\"packetsTransmitted\":{},\"uploadMbps\":{:.6},\"downloadMbps\":{:.6},\"bandwidthMbps\":{:.6},\"online\":{}}}",
+                "{{\"index\":{},\"name\":\"{}\",\"description\":\"{}\",\"ipv4Addresses\":{},\"status\":\"{}\",\"linkSpeed\":\"{}\",\"linkSpeedBitsPerSecond\":{},\"receivedBytes\":{},\"transmittedBytes\":{},\"packetsReceived\":{},\"packetsTransmitted\":{},\"uploadMbps\":{:.6},\"downloadMbps\":{:.6},\"bandwidthMbps\":{:.6},\"online\":{}}}",
                 index + 1,
                 json_escape(&name),
                 json_escape(&description),
+                ipv4_addresses_json,
                 json_escape(&status),
                 json_escape(&link_speed),
                 link_speed_bits,

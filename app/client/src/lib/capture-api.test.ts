@@ -98,6 +98,7 @@ describe("calculateSystemNetworkRates", () => {
   it("calculates real-time upload and download Mbps from consecutive byte counters", () => {
     const previous = snapshot(1_000, 1_000_000, 2_000_000);
     const current = snapshot(2_000, 26_000_000, 14_500_000);
+    current.interfaces[0].ipv4Addresses = "192.168.101.10/24";
 
     const rates = calculateSystemNetworkRates(current, previous);
 
@@ -106,6 +107,7 @@ describe("calculateSystemNetworkRates", () => {
     expect(rates.interfaces[0].uploadMbps).toBe(100);
     expect(rates.interfaces[0].bandwidthMbps).toBe(1000);
     expect(rates.interfaces[0].online).toBe(true);
+    expect(rates.interfaces[0].ipv4Addresses).toEqual(["192.168.101.10/24"]);
     expect(rates.totalDownloadMbps).toBe(200);
     expect(rates.totalUploadMbps).toBe(100);
   });

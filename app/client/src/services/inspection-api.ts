@@ -1308,24 +1308,28 @@ function getPageBoundConnectionConfig(): ConnectionConfig | null {
   };
 }
 
+function getPersistedConnectionConfig(): ConnectionConfig | null {
+  const storage = getSafeLocalStorage();
+  if (!storage) {
+    return null;
+  }
+  const raw = storage.getItem(CONNECTION_CONFIG_KEY);
+  if (!raw) {
+    return null;
+  }
+  try {
+    return { ...createDefaultConnectionConfig(), ...(JSON.parse(raw) as Partial<ConnectionConfig>) };
+  } catch {
+    return null;
+  }
+}
+
 function getStoredConnectionConfig(): ConnectionConfig {
   const pageBound = getPageBoundConnectionConfig();
   if (pageBound) {
     return pageBound;
   }
-  const storage = getSafeLocalStorage();
-  if (!storage) {
-    return createDefaultConnectionConfig();
-  }
-  const raw = storage.getItem(CONNECTION_CONFIG_KEY);
-  if (!raw) {
-    return createDefaultConnectionConfig();
-  }
-  try {
-    return { ...createDefaultConnectionConfig(), ...(JSON.parse(raw) as Partial<ConnectionConfig>) };
-  } catch {
-    return createDefaultConnectionConfig();
-  }
+  return getPersistedConnectionConfig() ?? createDefaultConnectionConfig();
 }
 
 export function readLocalConnectionConfig(): ConnectionConfig {
@@ -2491,6 +2495,18 @@ function connectionDiscoveryOrigins(config: ConnectionConfig) {
   }
   if (config.host && config.port) {
     origins.add(formatServiceOrigin(config.host, config.port, config.protocol ?? 'http'));
+  }
+  // Page-bound standalone deployments deliberately use their own origin for
+  // normal API calls, but discovery must still probe the operator's persisted
+  // LAN endpoint. Otherwise opening `?service=page` hides the only known
+  // remote service address and "automatic discovery" can see loopback only.
+  const persistedConfig = getPersistedConnectionConfig();
+  if (persistedConfig?.host && persistedConfig.port) {
+    origins.add(formatServiceOrigin(
+      persistedConfig.host,
+      persistedConfig.port,
+      persistedConfig.protocol ?? 'http',
+    ));
   }
   if (typeof window !== 'undefined') {
     const pageHost = window.location?.hostname?.trim();

@@ -155,6 +155,59 @@ describe('persistent production command client', () => {
     expect(result.addresses).toHaveLength(1);
   });
 
+  it('still probes the persisted LAN service from a page-bound local deployment', async () => {
+    window.localStorage.setItem('steel-inspection-connection-config', JSON.stringify({
+      mode: 'online',
+      host: '10.50.111.141',
+      port: 4873,
+      protocol: 'http',
+    }));
+    const discovery = {
+      schema: 'steel.inspection-service-discovery.v1',
+      code: 0,
+      runtime: {
+        service: 'steel-inspection-service',
+        bindHost: '0.0.0.0',
+        advertisedHost: '10.50.111.141',
+        port: 4873,
+        origin: 'http://10.50.111.141:4873',
+        lanAccess: true,
+        databaseEngine: 'sqlite',
+        databaseStatus: 'up',
+        databaseFallbackActive: false,
+        schemaVersion: 5,
+      },
+      preferred: {
+        host: '10.50.111.141',
+        port: 4873,
+        origin: 'http://10.50.111.141:4873',
+        scope: 'lan',
+        preferred: true,
+      },
+      addresses: [{
+        host: '10.50.111.141',
+        port: 4873,
+        origin: 'http://10.50.111.141:4873',
+        scope: 'lan',
+        preferred: true,
+      }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(discovery));
+    vi.stubGlobal('fetch', fetchMock);
+    const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+
+    try {
+      window.history.replaceState({}, '', '/?view=online&service=page');
+      await discoverInspectionServices({ mode: 'online', host: '127.0.0.1', port: 4873 });
+    } finally {
+      window.history.replaceState({}, '', originalUrl);
+    }
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toContain(
+      'http://10.50.111.141:4873/api/config/discovery',
+    );
+  });
+
   it('keeps the reachable LAN host when the shared connection record still uses loopback', async () => {
     window.localStorage.setItem('steel-inspection-connection-config', JSON.stringify({
       mode: 'online',

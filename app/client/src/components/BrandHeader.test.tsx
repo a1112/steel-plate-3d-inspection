@@ -150,6 +150,46 @@ describe('BrandHeader', () => {
     expect(screen.queryByText('192.168.20.108')).not.toBeInTheDocument();
   });
 
+  it('shows each camera with its corresponding adapter realtime speed', () => {
+    renderHeader({
+      expectedCameraCount: 6,
+      network: {
+        code: 0,
+        source: 'windows-get-netadapter',
+        sampledAtMs: Date.parse('2026-08-28T12:00:00.000Z'),
+        totalUploadMbps: 31.25,
+        totalDownloadMbps: 250,
+        totalBandwidthMbps: 1000,
+        interfaces: [
+          {
+            index: 4,
+            name: 'SLOT 4 相机网卡',
+            description: 'Intel I350 camera network',
+            ipv4Addresses: ['192.168.20.10/24'],
+            status: 'Up',
+            linkSpeed: '1 Gbps',
+            linkSpeedBitsPerSecond: 1_000_000_000,
+            receivedBytes: 1024,
+            transmittedBytes: 2048,
+            uploadMbps: 31.25,
+            downloadMbps: 250,
+            bandwidthMbps: 1000,
+            online: true,
+          },
+        ],
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '相机状态，在线 5 路，异常 1 路' }));
+
+    const panel = screen.getByRole('dialog', { name: '相机状态详细信息' });
+    expect(within(panel).getByText('6 路 3D 线扫相机与对应网卡实时状态')).toBeInTheDocument();
+    expect(within(panel).getAllByText('SLOT 4 相机网卡')).toHaveLength(6);
+    expect(within(panel).getAllByText('↓ 250 Mbps')).toHaveLength(6);
+    expect(within(panel).getAllByText('↑ 31.3 Mbps · 带宽 1000 Mbps')).toHaveLength(6);
+    expect(within(panel).getAllByText('192.168.20.10/24 · 子网匹配')).toHaveLength(6);
+  });
+
   it('keeps configuration controls out of the business header and renders one notification entry', () => {
     renderHeader();
 

@@ -1280,7 +1280,7 @@ The Rust service exposes a read-only Windows network monitor for the terminal he
 GET /api/system/network
 ```
 
-The endpoint samples `Get-NetAdapter` and `Get-NetAdapterStatistics`, returns cumulative byte counters, and derives realtime upload/download Mbps from the previous service-side sample. It never sets upload, download, QoS, or bandwidth limits.
+The endpoint samples `Get-NetAdapter`, `Get-NetIPAddress`, and `Get-NetAdapterStatistics`, returns each adapter's IPv4 CIDR addresses and cumulative byte counters, and derives realtime upload/download Mbps from the previous service-side sample. The client uses the CIDR values to associate a camera IP with its host adapter. It never sets upload, download, QoS, or bandwidth limits.
 
 Required response shape:
 
@@ -1294,6 +1294,7 @@ Required response shape:
       "index": 1,
       "name": "SLOT 3 port 1",
       "description": "Intel I350",
+      "ipv4Addresses": ["192.168.101.10/24"],
       "status": "Up",
       "linkSpeed": "1 Gbps",
       "linkSpeedBitsPerSecond": 1000000000,

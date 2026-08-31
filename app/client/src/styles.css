@@ -866,6 +866,10 @@ button {
   width: min(900px, calc(100vw - 24px));
 }
 
+.camera-network-detail-popover {
+  width: min(760px, calc(100vw - 24px));
+}
+
 .camera-detail-popover::before {
   content: '';
   position: absolute;
@@ -969,6 +973,16 @@ button {
   border-radius: 5px;
 }
 
+.camera-detail-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border-radius: 5px;
+}
+
+.camera-network-detail-popover .camera-detail-table {
+  min-width: 700px;
+}
+
 .camera-detail-table {
   position: relative;
   width: 100%;
@@ -1020,6 +1034,11 @@ button {
 .camera-detail-table tr.ok td:last-child {
   color: var(--green);
   font-weight: 800;
+}
+
+.camera-detail-table td.camera-network-offline,
+.camera-detail-table td.camera-network-offline small {
+  color: var(--red);
 }
 
 .receiver-detail-popover .camera-detail-table {
@@ -14357,6 +14376,10 @@ button {
 
   .receiver-detail-popover {
     width: min(820px, calc(100vw - 24px));
+  }
+
+  .camera-network-detail-popover {
+    width: min(740px, calc(100vw - 24px));
   }
 
   .camera-detail-table {

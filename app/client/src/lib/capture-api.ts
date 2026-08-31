@@ -334,6 +334,7 @@ export type SystemNetworkInterfaceSnapshot = {
   index: number;
   name: string;
   description?: string;
+  ipv4Addresses?: string[] | string;
   status?: string;
   linkSpeed?: string;
   linkSpeedBitsPerSecond?: number;
@@ -360,7 +361,8 @@ export type SystemNetworkSnapshot = {
   error?: string | null;
 };
 
-export type SystemNetworkRateInterface = SystemNetworkInterfaceSnapshot & {
+export type SystemNetworkRateInterface = Omit<SystemNetworkInterfaceSnapshot, "ipv4Addresses"> & {
+  ipv4Addresses?: string[];
   uploadMbps: number;
   downloadMbps: number;
   bandwidthMbps: number;
@@ -2441,6 +2443,13 @@ function normalizeOptionalNumber(value: unknown) {
     : undefined;
 }
 
+function normalizeNetworkIpv4Addresses(value: string[] | string | undefined) {
+  const values = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  return values
+    .map((address) => address.trim())
+    .filter((address) => address.length > 0);
+}
+
 function bytesDeltaToMbps(bytes: number, elapsedSeconds: number) {
   if (
     !Number.isFinite(bytes) ||
@@ -2488,6 +2497,7 @@ export function calculateSystemNetworkRates(
       const apiDownloadMbps = normalizeOptionalNumber(item.downloadMbps);
       return {
         ...item,
+        ipv4Addresses: normalizeNetworkIpv4Addresses(item.ipv4Addresses),
         receivedBytes: normalizeNumber(item.receivedBytes),
         transmittedBytes: normalizeNumber(item.transmittedBytes),
         packetsReceived: normalizeNumber(item.packetsReceived),
@@ -2532,6 +2542,7 @@ export async function readSystemNetworkSnapshot(): Promise<SystemNetworkSnapshot
       ...item,
       index: normalizeNumber(item.index) || index + 1,
       name: item.name || `network-${index + 1}`,
+      ipv4Addresses: normalizeNetworkIpv4Addresses(item.ipv4Addresses),
       receivedBytes: normalizeNumber(item.receivedBytes),
       transmittedBytes: normalizeNumber(item.transmittedBytes),
       linkSpeedBitsPerSecond: normalizeNumber(item.linkSpeedBitsPerSecond),

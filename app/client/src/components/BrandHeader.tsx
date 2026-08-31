@@ -115,6 +115,15 @@ interface CameraDetail {
   sdkStatus: string;
   buffer: string;
   lastFrame: string;
+  network?: {
+    name: string;
+    address: string;
+    uploadMbps: number;
+    downloadMbps: number;
+    bandwidthMbps: number;
+    online: boolean;
+    match: 'subnet' | 'order';
+  };
 }
 
 interface ReceiverDetail {
@@ -273,6 +282,57 @@ function selectReceiverNetworkInterfaces(network?: SystemNetworkRateSnapshot | n
       return left.name.localeCompare(right.name, 'zh-CN', { numeric: true });
     })
     .slice(0, 8);
+}
+
+function ipv4Number(value: string) {
+  const parts = value.trim().split('.');
+  if (parts.length !== 4) return null;
+  let result = 0;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet < 0 || octet > 255) return null;
+    result = ((result << 8) | octet) >>> 0;
+  }
+  return result;
+}
+
+function interfaceContainsCameraIp(item: SystemNetworkRateInterface, cameraIp: string) {
+  const camera = ipv4Number(cameraIp);
+  if (camera === null) return false;
+  return (item.ipv4Addresses ?? []).some((cidr) => {
+    const [address, prefixText = '32'] = cidr.split('/');
+    const host = ipv4Number(address);
+    const prefix = Number(prefixText);
+    if (host === null || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) return false;
+    const mask = prefix === 0 ? 0 : (0xffff_ffff << (32 - prefix)) >>> 0;
+    return (camera & mask) === (host & mask);
+  });
+}
+
+function attachCameraNetworkDetails(
+  details: CameraDetail[],
+  network?: SystemNetworkRateSnapshot | null,
+): CameraDetail[] {
+  if (!network?.interfaces.length) return details;
+  const fallbackInterfaces = selectReceiverNetworkInterfaces(network);
+  return details.map((camera, index) => {
+    const subnetMatch = network.interfaces.find((item) => interfaceContainsCameraIp(item, camera.ip));
+    const adapter = subnetMatch ?? fallbackInterfaces[index];
+    if (!adapter) return camera;
+    return {
+      ...camera,
+      network: {
+        name: adapter.name || `网卡 ${adapter.index}`,
+        address: adapter.ipv4Addresses?.join(', ') || adapter.description || '--',
+        uploadMbps: adapter.uploadMbps,
+        downloadMbps: adapter.downloadMbps,
+        bandwidthMbps: adapter.bandwidthMbps,
+        online: adapter.online,
+        match: subnetMatch ? 'subnet' : 'order',
+      },
+    };
+  });
 }
 
 function createReceiverDetailsFromNetwork(network?: SystemNetworkRateSnapshot | null): ReceiverDetail[] {
@@ -596,11 +656,11 @@ function CameraStatusPanel({ details }: { details: CameraDetail[] }) {
   const offlineCount = details.length - onlineCount;
 
   return (
-    <div className="camera-detail-popover camera-detail-popover-wide" id="camera-detail-panel" role="dialog" aria-label="相机状态详细信息" data-no-drag>
+    <div className="camera-detail-popover camera-detail-popover-wide camera-network-detail-popover" id="camera-detail-panel" role="dialog" aria-label="相机状态详细信息" data-no-drag>
       <div className="camera-detail-head">
         <div>
           <strong>相机状态详细信息</strong>
-          <span>{details.length} 路 3D 线扫相机实时状态</span>
+          <span>{details.length} 路 3D 线扫相机与对应网卡实时状态</span>
         </div>
         <div className="camera-detail-metrics">
           <span aria-label={`在线相机 ${onlineCount}`}>
@@ -611,40 +671,52 @@ function CameraStatusPanel({ details }: { details: CameraDetail[] }) {
           </span>
         </div>
       </div>
-      <table className="camera-detail-table">
-        <thead>
-          <tr>
-            <th>编号</th>
-            <th>站位</th>
-            <th>IP</th>
-            <th>型号 / SN</th>
-            <th>帧率</th>
-            <th>温度</th>
-            <th>SDK / 缓冲</th>
-            <th>状态</th>
-          </tr>
-        </thead>
-        <tbody>
-          {details.map((camera) => (
-            <tr key={camera.index} className={camera.status === '在线' ? 'ok' : 'bad'}>
-              <td>{camera.index}</td>
-              <td>{camera.station}</td>
-              <td>{camera.ip}</td>
-              <td>
-                {camera.model}
-                <small>{camera.sn}</small>
-              </td>
-              <td>{camera.frameRate}</td>
-              <td>{camera.temperature}</td>
-              <td>
-                {camera.sdkStatus}
-                <small>{camera.buffer} / {camera.lastFrame}</small>
-              </td>
-              <td>{camera.status}</td>
+      <div className="camera-detail-table-wrap">
+        <table className="camera-detail-table">
+          <thead>
+            <tr>
+              <th>相机</th>
+              <th>IP</th>
+              <th>型号 / SN</th>
+              <th>帧率 / 温度</th>
+              <th>对应网卡</th>
+              <th>实时网速</th>
+              <th>状态</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {details.map((camera) => (
+              <tr key={camera.index} className={camera.status === '在线' ? 'ok' : 'bad'}>
+                <td>
+                  C{camera.index}
+                  {camera.station !== `C${camera.index}` ? <small>{camera.station}</small> : null}
+                </td>
+                <td>{camera.ip}</td>
+                <td>
+                  {camera.model}
+                  <small>{camera.sn}</small>
+                </td>
+                <td>
+                  {camera.frameRate}
+                  <small>{camera.temperature}</small>
+                </td>
+                <td>
+                  {camera.network?.name ?? '--'}
+                  <small>{camera.network ? `${camera.network.address} · ${camera.network.match === 'subnet' ? '子网匹配' : '顺序匹配'}` : '未获取网卡'}</small>
+                </td>
+                <td className={camera.network?.online === false ? 'camera-network-offline' : ''}>
+                  {camera.network ? `↓ ${formatMbps(camera.network.downloadMbps)} Mbps` : '--'}
+                  <small>{camera.network ? `↑ ${formatMbps(camera.network.uploadMbps)} Mbps · 带宽 ${formatMbps(camera.network.bandwidthMbps)} Mbps` : '实时速率未就绪'}</small>
+                </td>
+                <td>
+                  {camera.status}
+                  <small>{camera.sdkStatus} · {camera.buffer} / {camera.lastFrame}</small>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -759,8 +831,11 @@ export function BrandHeader({
     [receiverDetails],
   );
   const cameraDetails = useMemo(
-    () => createCameraDetailsFromCapture(capture, status.cameraPorts, expectedCameraCount),
-    [capture, expectedCameraCount, status.cameraPorts],
+    () => attachCameraNetworkDetails(
+      createCameraDetailsFromCapture(capture, status.cameraPorts, expectedCameraCount),
+      network,
+    ),
+    [capture, expectedCameraCount, network, status.cameraPorts],
   );
   const cameraPorts = useMemo(
     () =>
