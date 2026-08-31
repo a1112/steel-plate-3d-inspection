@@ -2085,6 +2085,7 @@ class SickProviderTests(unittest.TestCase):
         runtime.playback_warm_futures = {}
         runtime.playback_history_flow_queue = deque(maxlen=4)
         runtime.playback_history_retry_pending = deque()
+        runtime.playback_view_priority = deque(maxlen=16)
         runtime.playback_history_queued = set()
         runtime.playback_history_catalog_ids = []
         runtime.playback_history_catalog_frame_counts = {}
@@ -2304,6 +2305,28 @@ class SickProviderTests(unittest.TestCase):
         self.assertEqual(set(runtime.playback_warm_futures), {"41", "42"})
         runtime.playback_warm_pool.submit.assert_called_once()
 
+    def test_operator_view_can_schedule_partial_flow_for_gray_renditions(self) -> None:
+        runtime = self._history_runtime_fixture(Mock())
+        runtime.playback_warm_pool = Mock()
+        future = Mock()
+        future.done.return_value = False
+        runtime.playback_warm_pool.submit.return_value = future
+        runtime.playback_view_priority.append("42")
+
+        with patch.object(
+            runtime,
+            "_flow_ready_for_full_renditions",
+            return_value=False,
+        ), patch.object(
+            runtime,
+            "_flow_ready_for_gray_view",
+            return_value=True,
+        ):
+            self.assertTrue(runtime._schedule_playback_warm("42"))
+
+        self.assertIs(runtime.playback_warm_futures["42"], future)
+        runtime.playback_warm_pool.submit.assert_called_once()
+
     def test_rendition_backlog_threshold_keeps_capture_headroom(self) -> None:
         self.assertEqual(
             ProviderRuntime._rendition_storage_backlog_threshold(128),
@@ -2333,6 +2356,33 @@ class SickProviderTests(unittest.TestCase):
 
         self.assertEqual(runtime._newer_playback_flow_waiting("41"), "44")
         self.assertEqual(runtime._newer_playback_flow_waiting("44"), "")
+
+    def test_operator_view_priority_preempts_background_regardless_of_flow_number(self) -> None:
+        runtime = self._history_runtime_fixture(Mock())
+        runtime.playback_view_priority.append("40")
+        active = Mock()
+        active.done.return_value = False
+        runtime.playback_warm_futures = {"44": active}
+
+        self.assertEqual(runtime._newer_playback_flow_waiting("44"), "40")
+        self.assertEqual(runtime._newer_playback_flow_waiting("40"), "")
+
+    def test_operator_view_moves_material_to_front_of_bounded_history_queue(self) -> None:
+        runtime = self._history_runtime_fixture(Mock())
+        runtime.playback_history_flow_queue.extend(["41", "42", "43", "44"])
+        runtime.playback_history_queued.update({"41", "42", "43", "44"})
+        runtime.playback_history_eligible_ids.extend(["41", "42", "43", "44"])
+
+        with patch.object(
+            runtime,
+            "_flow_ready_for_full_renditions",
+            return_value=True,
+        ):
+            self.assertTrue(runtime._prioritize_playback_warm("40", known_missing=True))
+        runtime._refill_full_history_queue()
+
+        self.assertEqual(runtime.playback_view_priority[0], "40")
+        self.assertEqual(runtime.playback_history_flow_queue[0], "40")
 
     def test_latest_flow_preemption_requeues_without_retry_penalty(self) -> None:
         profile = Mock()

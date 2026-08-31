@@ -392,6 +392,24 @@ def _build_complete_rendition_pair(
     }
 
 
+def _build_gray_view_rendition(
+    source_path: Path,
+    _camera_id: str,
+    _camera_roots: dict[str, Path],
+    _storage_root: Path,
+    _calibration_path: Path,
+    _config: Any,
+) -> dict[str, Any]:
+    """Commit a truthful gray rendition when a partial flow cannot fit JET."""
+    gray = build_gray_rendition(source_path)
+    return {
+        "gray": str(gray.get("levels", {}).get("thumbnail", {}).get("file", "")),
+        "jet": "",
+        "diameterValidRowCount": 0,
+        "jetValidPixelCount": 0,
+    }
+
+
 def _write_storage_shared_frame(
     camera_root: Path,
     material_id: str,
@@ -1213,6 +1231,10 @@ class ProviderRuntime:
             maxlen=FULL_HISTORY_FLOW_QUEUE_CAPACITY
         )
         self.playback_history_retry_pending: deque[str] = deque()
+        # A material explicitly opened by the operator must not wait behind the
+        # full-history backfill. Keep a tiny, newest-first list so rendition
+        # workers can yield their bounded slots to the material on screen.
+        self.playback_view_priority: deque[str] = deque(maxlen=16)
         self.playback_history_queued: set[str] = set()
         self.playback_history_catalog_ids: list[str] = []
         self.playback_history_catalog_frame_counts: dict[str, int] = {}
@@ -2039,10 +2061,24 @@ class ProviderRuntime:
 
     def _newer_playback_flow_waiting(self, material_id: str) -> str:
         """Return the newest queued flow that should preempt older JET work."""
-        if not material_id.isdecimal():
-            return ""
-        current = int(material_id)
         with self.history_lock:
+            view_priority = [
+                candidate
+                for candidate in getattr(self, "playback_view_priority", ())
+                if candidate != material_id
+            ]
+            # Operator navigation outranks numeric/catalog order. When this
+            # flow is itself the newest viewed material, let it finish instead
+            # of allowing unrelated newer history to preempt it.
+            current_is_priority = bool(
+                getattr(self, "playback_view_priority", ())
+                and self.playback_view_priority[0] == material_id
+            )
+            if view_priority and not current_is_priority:
+                return view_priority[0]
+            if current_is_priority or not material_id.isdecimal():
+                return ""
+            current = int(material_id)
             candidates = {
                 candidate
                 for candidate in (
@@ -2059,6 +2095,59 @@ class ProviderRuntime:
                 if candidate.isdecimal() and int(candidate) > current
             }
         return max(candidates, key=int, default="")
+
+    def _prioritize_playback_warm(
+        self,
+        material_id: str,
+        *,
+        known_missing: bool = False,
+        allow_partial: bool = False,
+    ) -> bool:
+        """Move one operator-visible flow ahead of background history work."""
+        normalized = material_id.strip()
+        if not self._flow_ready_for_full_renditions(normalized) and not (
+            allow_partial and self._flow_ready_for_gray_view(normalized)
+        ):
+            return False
+        with self.history_lock:
+            priority = getattr(self, "playback_view_priority", deque(maxlen=16))
+            priority = deque(
+                (candidate for candidate in priority if candidate != normalized),
+                maxlen=16,
+            )
+            priority.appendleft(normalized)
+            self.playback_view_priority = priority
+
+            if known_missing:
+                self.playback_history_completed.discard(normalized)
+                self.playback_history_completed_frame_counts.pop(normalized, None)
+                self.playback_history_skipped_complete.discard(normalized)
+                self.playback_history_failed.discard(normalized)
+            elif normalized in self.playback_history_completed:
+                return False
+
+            existing = self.playback_warm_futures.get(normalized)
+            if existing is not None:
+                return not existing.done()
+
+            queue = self.playback_history_flow_queue
+            try:
+                queue.remove(normalized)
+            except ValueError:
+                pass
+            self.playback_history_queued.discard(normalized)
+            retry_pending = deque(
+                candidate
+                for candidate in self.playback_history_retry_pending
+                if candidate != normalized
+            )
+            retry_pending.appendleft(normalized)
+            self.playback_history_retry_pending = retry_pending
+            self.playback_history_unready_ids.discard(normalized)
+            if normalized in self.playback_history_eligible_ids:
+                self.playback_history_eligible_ids.remove(normalized)
+            self.playback_history_eligible_ids.insert(0, normalized)
+            return True
 
     def _discover_full_history_catalog(self, *, force: bool = False) -> bool:
         """Discover every catalog flow eligible for full rendition rebuilding.
@@ -2490,10 +2579,21 @@ class ProviderRuntime:
                         continue
                     seen_candidates.add(candidate)
                     ranked_candidates.append(candidate)
+                view_priority = list(
+                    getattr(self, "playback_view_priority", ())
+                )
+                priority_rank = {
+                    candidate: len(view_priority) - index
+                    for index, candidate in enumerate(view_priority)
+                }
                 ranked_candidates.sort(
-                    key=lambda candidate: int(candidate)
-                    if candidate.isdecimal()
-                    else -1,
+                    key=lambda candidate: (
+                        1 if candidate in priority_rank else 0,
+                        priority_rank.get(
+                            candidate,
+                            int(candidate) if candidate.isdecimal() else -1,
+                        ),
+                    ),
                     reverse=True,
                 )
                 queue.clear()
@@ -2572,6 +2672,11 @@ class ProviderRuntime:
                 return
             self.playback_warm_futures.pop(material_id, None)
             getattr(self, "playback_warm_progress", {}).pop(material_id, None)
+            priority = getattr(self, "playback_view_priority", deque(maxlen=16))
+            self.playback_view_priority = deque(
+                (candidate for candidate in priority if candidate != material_id),
+                maxlen=16,
+            )
             eligible = material_id in self.playback_history_eligible_ids
             retry_pending = getattr(self, "playback_history_retry_pending", deque())
             if eligible and state == "ready":
@@ -2761,7 +2866,13 @@ class ProviderRuntime:
                     return
                 material_id = self.playback_history_flow_queue.popleft()
                 self.playback_history_queued.discard(material_id)
-            if not self._flow_ready_for_full_renditions(material_id):
+            with self.history_lock:
+                view_priority = material_id in getattr(
+                    self, "playback_view_priority", ()
+                )
+            if not self._flow_ready_for_full_renditions(material_id) and not (
+                view_priority and self._flow_ready_for_gray_view(material_id)
+            ):
                 with self.history_lock:
                     if material_id not in self.playback_history_unready_ids:
                         self.playback_history_unready_ids.add(material_id)
@@ -2931,7 +3042,7 @@ class ProviderRuntime:
         cached = 0
         diameter_valid_rows = 0
         jet_valid_pixels = 0
-        failures: list[dict[str, str]] = [
+        missing_camera_failures: list[dict[str, str]] = [
             {
                 "source": "",
                 "cameraId": camera.camera_id,
@@ -2940,6 +3051,13 @@ class ProviderRuntime:
             for camera in self.profile.enabled_cameras
             if source_counts.get(camera.camera_id, 0) <= 0
         ]
+        with self.history_lock:
+            partial_gray_view = bool(
+                material_id in getattr(self, "playback_view_priority", ())
+                and not self._flow_ready_for_full_renditions(material_id)
+                and self._flow_ready_for_gray_view(material_id)
+            )
+        failures: list[dict[str, str]] = [] if partial_gray_view else missing_camera_failures
         maximum_pending = self._rendition_storage_backlog_threshold(
             self.storage_queue_capacity_rounds
         )
@@ -3045,7 +3163,9 @@ class ProviderRuntime:
                         state=state,
                     )
                 future = self.playback_warm_compute_pool.submit(
-                    _build_complete_rendition_pair,
+                    _build_gray_view_rendition
+                    if partial_gray_view
+                    else _build_complete_rendition_pair,
                     source,
                     camera_id,
                     camera_roots,
@@ -3114,6 +3234,12 @@ class ProviderRuntime:
             "generationPolicy": EAGER_RENDITION_GENERATION_POLICY,
             "maximumParallelFrames": 2,
         }
+        if partial_gray_view:
+            result["state"] = "partial-gray-ready" if cached else "incomplete"
+            result["partialCameraFlow"] = True
+            result["failures"] = missing_camera_failures[:20]
+            result["failureCount"] = len(missing_camera_failures)
+            result["modalities"] = ["gray"]
         if complete:
             cleanup = verify_and_cleanup_legacy_renditions(
                 {
@@ -3195,6 +3321,39 @@ class ProviderRuntime:
             and frame_count > 0
         )
 
+    def _flow_ready_for_gray_view(self, material_id: str) -> bool:
+        """Allow existing cameras in a partial indexed flow to remain viewable."""
+        normalized = material_id.strip()
+        if not normalized.isdecimal():
+            return False
+        try:
+            flow = json.loads(
+                flow_manifest_path(self.profile.storage_root, normalized).read_text(
+                    encoding="utf-8-sig"
+                )
+            )
+            playback_index = json.loads(
+                playback_index_path(self.profile.storage_root, normalized).read_text(
+                    encoding="utf-8-sig"
+                )
+            )
+            frame_count = int(playback_index.get("frameCount", 0))
+            frames = playback_index.get("frames", [])
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+        return bool(
+            isinstance(flow, dict)
+            and flow.get("state") in {"capturing", "closed"}
+            and frame_count > 0
+            and isinstance(frames, list)
+            and any(
+                isinstance(frame, dict)
+                and isinstance(frame.get("cameras"), list)
+                and bool(frame["cameras"])
+                for frame in frames
+            )
+        )
+
     def _flow_two_level_renditions_ready_hint(self, material_id: str) -> bool:
         """Return whether every camera has a persisted ready *hint*.
 
@@ -3263,7 +3422,11 @@ class ProviderRuntime:
 
     def _schedule_playback_warm(self, material_id: str) -> bool:
         normalized = material_id.strip()
-        if not self._flow_ready_for_full_renditions(normalized):
+        with self.history_lock:
+            view_priority = normalized in getattr(self, "playback_view_priority", ())
+        if not self._flow_ready_for_full_renditions(normalized) and not (
+            view_priority and self._flow_ready_for_gray_view(normalized)
+        ):
             return False
         with self.history_lock:
             existing = self.playback_warm_futures.get(normalized)
@@ -8177,6 +8340,10 @@ class ProviderRuntime:
         except (TypeError, ValueError):
             limit = 240
         material_id = (query.get("materialId") or [""])[0].strip()
+        if material_id:
+            # Queue the currently opened flow before returning its atomic index;
+            # image requests can then retry against an actively building cache.
+            self._prioritize_playback_warm(material_id)
         catalog_path = playback_catalog_path(self.profile.storage_root)
         try:
             catalog_mtime_ns = catalog_path.stat().st_mtime_ns
@@ -8488,6 +8655,11 @@ class ProviderRuntime:
         )
         if committed is not None:
             return 200, ("image/jpeg", committed.read_bytes())
+        self._prioritize_playback_warm(
+            material_id,
+            known_missing=True,
+            allow_partial=normalized_modality == "gray",
+        )
         # HTTP reads never perform fitting or encoding. The eager background
         # worker commits every frame after analysis; callers retry while that
         # bounded producer catches up.

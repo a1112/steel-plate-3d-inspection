@@ -32,7 +32,8 @@ const MAX_TASKS: usize = 16;
 const MAX_LOG_TAIL_CHARS: usize = 64 * 1024;
 const RECENT_FAILURE_WINDOW_MS: u64 = 30 * 60 * 1000;
 const RETIRED_SERVICE_IDS: [&str; 1] = ["bkv-adapter"];
-const CONTROL_SERVER_ADDRESS: &str = "127.0.0.1:4899";
+const CONTROL_SERVER_ADDRESS: &str = "0.0.0.0:4899";
+const CONTROL_SERVER_ORIGIN: &str = "http://127.0.0.1:4899";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -811,7 +812,7 @@ fn apply_supervisor_snapshot(
         supervisor: Some(serde_json::json!({
             "status": "running",
             "owner": "tauri-service-supervisor",
-            "controlOrigin": format!("http://{CONTROL_SERVER_ADDRESS}"),
+            "controlOrigin": CONTROL_SERVER_ORIGIN,
             "pollIntervalMs": POLL_INTERVAL.as_millis()
         })),
     });
@@ -821,9 +822,9 @@ fn apply_supervisor_snapshot(
         "selectionKey": "serviceId",
         "logScopes": ["service", "all"],
         "operationEffects": ["query", "mutation"],
-        "mutationPolicy": "tauri-supervisor-owned",
-        "readAccess": "loopback-only",
-        "controlOrigin": format!("http://{CONTROL_SERVER_ADDRESS}")
+        "mutationPolicy": "server-loopback-only",
+        "readAccess": "lan-read-only",
+        "controlOrigin": CONTROL_SERVER_ORIGIN
     }));
     let failed_required = snapshot
         .services
@@ -1050,13 +1051,31 @@ pub(crate) fn start_worker(app: AppHandle) {
 
 fn control_origin_allowed(value: &str) -> bool {
     let origin = value.trim();
-    matches!(
+    if matches!(
         origin,
         "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost" | "null"
-    ) || origin
-        .strip_prefix("http://127.0.0.1:")
-        .or_else(|| origin.strip_prefix("http://localhost:"))
-        .is_some_and(|port| port.parse::<u16>().is_ok())
+    ) {
+        return true;
+    }
+    let Some(authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|value| matches!(value, '/' | '\\' | '@'))
+        || authority.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '-'))
+        && port.parse::<u16>().is_ok_and(|value| value > 0)
 }
 
 fn control_http_response(status: &str, origin: Option<&str>, body: &str) -> Vec<u8> {
@@ -1070,7 +1089,7 @@ fn control_http_response(status: &str, origin: Option<&str>, body: &str) -> Vec<
     .into_bytes()
 }
 
-fn handle_control_client(mut stream: TcpStream, app: &AppHandle) {
+fn handle_control_client(mut stream: TcpStream, app: &AppHandle, remote_control_allowed: bool) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let mut request = Vec::new();
@@ -1153,11 +1172,20 @@ fn handle_control_client(mut stream: TcpStream, app: &AppHandle) {
         let _ = stream.write_all(&control_http_response("403 Forbidden", origin, &body));
         return;
     }
+    if method == "POST" && !remote_control_allowed {
+        let body = serde_json::json!({
+            "success": false,
+            "message": "远程客户端只允许读取服务状态；启动、停止和重启仅限服务器本机"
+        })
+        .to_string();
+        let _ = stream.write_all(&control_http_response("403 Forbidden", origin, &body));
+        return;
+    }
     let response = if method == "GET" && path == "/api/health" {
         Ok(serde_json::json!({
             "ok": true,
             "schema": "steel.tauri-service-supervisor.v1",
-            "controlOrigin": format!("http://{CONTROL_SERVER_ADDRESS}")
+            "controlOrigin": CONTROL_SERVER_ORIGIN
         }))
     } else if method == "GET" && path == "/api/status" {
         app.state::<BackgroundMonitorState>()
@@ -1226,10 +1254,9 @@ pub(crate) fn start_control_server(app: AppHandle) -> tauri::Result<()> {
                 break;
             }
             match listener.accept() {
-                Ok((stream, address)) if address.ip().is_loopback() => {
-                    handle_control_client(stream, &app);
+                Ok((stream, address)) => {
+                    handle_control_client(stream, &app, address.ip().is_loopback());
                 }
-                Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
                 }
@@ -1475,6 +1502,15 @@ mod tests {
             snapshot_from_payloads(DEFAULT_ORIGIN, &healthy_payload(), None, None, None, 1);
         assert_eq!(missing.state, "degraded");
         assert_eq!(missing.detail, "任务状态接口暂时不可用");
+    }
+
+    #[test]
+    fn supervisor_status_cors_accepts_lan_http_origins_only() {
+        assert!(control_origin_allowed("http://192.168.1.47:4873"));
+        assert!(control_origin_allowed("http://inspection-host:4873"));
+        assert!(!control_origin_allowed("https://192.168.1.47:4873"));
+        assert!(!control_origin_allowed("http://user@192.168.1.47:4873"));
+        assert!(!control_origin_allowed("http://192.168.1.47:4873/private"));
     }
 
     #[test]

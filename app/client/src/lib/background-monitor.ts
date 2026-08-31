@@ -289,8 +289,13 @@ export function refreshBackgroundMonitor(): Promise<BackgroundMonitorSnapshot> {
   return invoke<BackgroundMonitorSnapshot>('refresh_background_monitor');
 }
 
+const browserSupervisorOrigin = typeof window !== 'undefined'
+  && /^https?:$/.test(window.location.protocol)
+  && !['127.0.0.1', 'localhost'].includes(window.location.hostname.toLowerCase())
+  ? `http://${window.location.hostname}:4899`
+  : 'http://127.0.0.1:4899';
 const serviceSupervisorOrigin = (
-  import.meta.env.VITE_SERVICE_SUPERVISOR_ORIGIN || 'http://127.0.0.1:4899'
+  import.meta.env.VITE_SERVICE_SUPERVISOR_ORIGIN || browserSupervisorOrigin
 ).replace(/\/$/, '');
 
 async function readSupervisorResponse<T>(response: Response): Promise<T> {

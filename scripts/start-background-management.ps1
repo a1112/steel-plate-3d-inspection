@@ -116,7 +116,7 @@ $serviceArguments = @(
   "-ExecutionPolicy", "Bypass",
   "-File", (Join-Path $PSScriptRoot "run-service.ps1"),
   "-Provider", "headless-cpp",
-  "-HostAddress", "127.0.0.1",
+  "-HostAddress", "0.0.0.0",
   "-Port", [string]$ServicePort,
   "-Profile", $Profile,
   "-ServiceExe", $serviceExe,

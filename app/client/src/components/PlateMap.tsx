@@ -3507,24 +3507,18 @@ export function PlateMap({
     }),
   );
   const effectiveOverlapDisplayMode = overlapAvailable ? overlapDisplayMode : 'overlap';
-  // A record-bound raw PNG is an identity-safe first paint while the richer
-  // multi-frame playback index is loading. It is never borrowed from another
-  // material and is replaced as soon as the indexed stitch becomes ready.
-  const recordBoundRawImages = artifactMode === 'production' ? captureImages : [];
+  // Production 2D display is stitch-only. A per-camera raw PNG has no timeline
+  // extent, so rendering it while the indexed stitch is loading creates a
+  // convincing but non-scrollable first screen. Keep single-frame fallback
+  // strictly outside production and wait for the record-bound stitch instead.
   const allowSingleFrameImageFallback = artifactMode !== 'production';
-  const allowProductionQuickPreview = artifactMode === 'production'
-    && captureStitchResult === null
-    && recordBoundRawImages.some((image) => image.dataName.toLowerCase() === 'intensity');
-  const displayedCaptureImages = allowSingleFrameImageFallback || allowProductionQuickPreview
-    ? recordBoundRawImages
-    : [];
+  const displayedCaptureImages: CaptureImageItem[] = [];
   const displayedSurfaceCameras = allowSingleFrameImageFallback ? surfaceCameras : [];
   const productionCameraImageCount = displayedSurfaceCameras.filter((camera) => Boolean(camera.relative.intensityPreview || camera.latest.intensityPreview)).length;
   const capturedCameraImageCount = new Set(
     captureStitchResult?.frames.flatMap((frame) => frame.cameras.map((camera) => camera.cameraId))
       ?? displayedCaptureImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId),
   ).size;
-  const rawCameraImageCount = new Set(recordBoundRawImages.filter((image) => image.dataName.toLowerCase() === 'intensity').map((image) => image.cameraId)).size;
   const displayedCameraImageCount = Math.min(cameraLanes.length, Math.max(productionCameraImageCount, capturedCameraImageCount));
   const safePlateLengthM = plateLengthM > 0 ? plateLengthM : DEFAULT_PLATE_LENGTH_M;
   const selectedDefect = defects.find((defect) => defect.id === selectedDefectId) ?? null;
@@ -4048,11 +4042,9 @@ export function PlateMap({
           {artifactMode === 'production' && worldUnavailable ? <span className="live-preview-badge" data-testid="capture-roi-status">
             {captureStitchResult
               ? `${captureStitchResult.hasMore ? '最近 ' : ''}${captureStitchResult.frames.length}/${captureStitchResult.totalFrames} 轮对齐拼接 · 两级可重建图像 ${captureStitchResult.renderableImageCount}`
-              : rawCameraImageCount > 0
-                ? `当前记录快速预览 ${rawCameraImageCount}/${cameraLanes.length} 路 · ${captureStitchPending ? '拼接索引加载中' : '拼接索引尚未就绪'}`
-                : captureStitchPending
-                  ? '拼接缓存准备中 · 正在校验索引并从原图按需重建'
-                  : '当前记录缺少可重建的拼接原图'}
+              : captureStitchPending
+                ? '拼接缓存准备中 · 正在校验索引并从原图按需重建'
+                : '当前记录缺少可重建的拼接原图'}
           </span> : null}
           <BarUnfoldedMap
             defects={defects}

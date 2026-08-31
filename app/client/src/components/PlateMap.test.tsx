@@ -737,7 +737,7 @@ describe('online inspection world compatibility', () => {
     expect(onSelectDefect).toHaveBeenNthCalledWith(2, frameDefect.id);
   });
 
-  it('shows record-bound raw PNGs immediately and upgrades when stitch history appears', async () => {
+  it('waits for stitch history without rendering record-bound static PNGs', async () => {
     vi.useFakeTimers();
     const requestedImageUrls: string[] = [];
     const NativeImage = globalThis.Image;
@@ -777,10 +777,9 @@ describe('online inspection world compatibility', () => {
       );
       await act(async () => { await Promise.resolve(); });
 
-      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录快速预览 6/6 路 · 拼接索引尚未就绪');
-      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(6);
-      expect(requestedImageUrls).toHaveLength(6);
-      expect(requestedImageUrls.every((url) => url.includes('/raw-C'))).toBe(true);
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录缺少可重建的拼接原图');
+      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+      expect(requestedImageUrls).toHaveLength(0);
       expect(fetchInspectionWorldMeta).not.toHaveBeenCalled();
 
       await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
@@ -804,7 +803,7 @@ describe('online inspection world compatibility', () => {
     }
   });
 
-  it('keeps the current record preview visible while the stitch-history probe is pending or empty', async () => {
+  it('keeps production display stitch-only while the history probe is pending or empty', async () => {
     let resolveProbe: ((result: CaptureStitchResult) => void) | undefined;
     vi.mocked(fetchCaptureStitchHistory).mockReturnValue(new Promise((resolve) => {
       resolveProbe = resolve;
@@ -830,16 +829,16 @@ describe('online inspection world compatibility', () => {
       />,
     );
 
-    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录快速预览 6/6 路 · 拼接索引加载中');
-    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('拼接缓存准备中');
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
 
     await act(async () => { resolveProbe?.(emptyCaptureStitchResult('2822')); });
 
-    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录快速预览 6/6 路 · 拼接索引尚未就绪');
-    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(6);
+    expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录缺少可重建的拼接原图');
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
   });
 
-  it('replaces the preview canvas identity immediately when the selected record changes', async () => {
+  it('never requests static record previews when the selected production record changes', async () => {
     const requestedImageUrls: string[] = [];
     const NativeImage = globalThis.Image;
     class RequestedImage {
@@ -875,7 +874,7 @@ describe('online inspection world compatibility', () => {
         />,
       );
       await act(async () => { await Promise.resolve(); });
-      const firstCanvas = screen.getAllByLabelText(/实际裁剪图/)[0];
+      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
 
       view.rerender(
         <ProductionPlateMap
@@ -887,11 +886,9 @@ describe('online inspection world compatibility', () => {
         />,
       );
       await act(async () => { await Promise.resolve(); });
-      const secondCanvas = screen.getAllByLabelText(/实际裁剪图/)[0];
-
-      expect(secondCanvas).not.toBe(firstCanvas);
-      expect(requestedImageUrls.some((url) => url.includes('/record-b-C1.png'))).toBe(true);
-      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('当前记录快速预览 6/6 路');
+      expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
+      expect(requestedImageUrls).toHaveLength(0);
+      expect(screen.getByTestId('capture-roi-status')).toHaveTextContent('拼接缓存准备中');
     } finally {
       vi.stubGlobal('Image', NativeImage);
     }
@@ -939,9 +936,9 @@ describe('online inspection world compatibility', () => {
       />,
     );
 
-    expect(await screen.findByText('当前记录快速预览 1/8 路 · 拼接索引尚未就绪')).toBeInTheDocument();
+    expect(await screen.findByText('当前记录缺少可重建的拼接原图')).toBeInTheDocument();
     expect(screen.queryByTestId('inspection-world-canvas')).not.toBeInTheDocument();
-    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(1);
+    expect(screen.queryAllByLabelText(/实际裁剪图/)).toHaveLength(0);
     expect(screen.getByTestId('bar-unfolded-map')).toBeInTheDocument();
   });
 
