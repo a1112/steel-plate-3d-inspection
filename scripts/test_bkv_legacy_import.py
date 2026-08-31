@@ -530,10 +530,11 @@ INSERT INTO `allexcel` VALUES (1893700, 'first');
                 len(list((output / "normalized-generations").iterdir())), 2
             )
             subject.cleanup_orphan_sql_generations(output)
-            self.assertEqual(
-                list((output / "normalized-generations").iterdir()),
-                [old_generation],
+            remaining_generations = list(
+                (output / "normalized-generations").iterdir()
             )
+            self.assertEqual(len(remaining_generations), 1)
+            self.assertTrue(remaining_generations[0].samefile(old_generation))
 
             result = subject.filter_sql_dump(
                 io.BytesIO(invalid), subject.TARGET_SEQ_NOS
