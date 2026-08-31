@@ -61,6 +61,7 @@ if (-not (Test-ServiceLive)) {
     "-SkipBuild",
     "-Detach",
     "-NoBrowser",
+    "-EnableCaptureControl",
     "-ServicePort", [string]$ServicePort
   )
   $launcher = Start-Process `
@@ -113,7 +114,9 @@ if (-not (Test-CaptureHistoryLive)) {
     -RedirectStandardOutput (Join-Path $MonitorLogDir "sick-capture-history-only-current.out.log") `
     -RedirectStandardError (Join-Path $MonitorLogDir "sick-capture-history-only-current.err.log") `
     -WindowStyle Hidden | Out-Null
-  $captureDeadline = (Get-Date).AddSeconds(30)
+  # Importing the vendor GenTL stack can take well over 30 seconds on a cold
+  # workstation start, even in history-only mode.
+  $captureDeadline = (Get-Date).AddSeconds(120)
   while ((Get-Date) -lt $captureDeadline -and -not (Test-CaptureHistoryLive)) {
     Start-Sleep -Milliseconds 250
   }

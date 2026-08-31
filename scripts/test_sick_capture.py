@@ -2120,6 +2120,32 @@ class SickProviderTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_history_only_runtime_can_be_started_and_stopped_by_service_control(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = load_profile(write_profile(Path(directory)))
+            backend = FakeBackend()
+            runtime = ProviderRuntime(profile, backend=backend, history_only=True)
+            try:
+                started = runtime.start_service()
+                self.assertEqual(started["code"], 0)
+                self.assertFalse(runtime.history_only)
+                self.assertIsNotNone(runtime.service_start_thread)
+                runtime.service_start_thread.join(timeout=2)
+                self.assertEqual(runtime.service_state, "running")
+                self.assertEqual(len(runtime.sessions), 1)
+                self.assertFalse(runtime.health_json()["historyOnly"])
+
+                stopped = runtime.stop_service()
+                self.assertEqual(stopped["code"], 0)
+                self.assertTrue(runtime.history_only)
+                self.assertIsNotNone(runtime.service_stop_thread)
+                runtime.service_stop_thread.join(timeout=2)
+                self.assertEqual(runtime.service_state, "stopped")
+                self.assertEqual(runtime.sessions, {})
+                self.assertTrue(runtime.health_json()["historyOnly"])
+            finally:
+                runtime.close()
+
     def test_connect_all_rejects_wrong_expected_count_before_device_access(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile = replace(

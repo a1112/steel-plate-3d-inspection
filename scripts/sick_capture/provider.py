@@ -1028,6 +1028,10 @@ class ProviderRuntime:
         self.last_connection_code: int | None = None
         self.acquisition_stop = threading.Event()
         self.acquisition_thread: threading.Thread | None = None
+        self.service_transition_lock = threading.RLock()
+        self.service_start_thread: threading.Thread | None = None
+        self.service_stop_thread: threading.Thread | None = None
+        self.service_state = "stopped" if history_only else "running"
         self.continuous_round = 0
         self.continuous_acquisition_frame_count = 0
         self.continuous_discarded_frame_count = 0
@@ -1459,6 +1463,8 @@ class ProviderRuntime:
         try:
             results = []
             for camera in self.profile.enabled_cameras:
+                if self.history_only:
+                    break
                 with self.state_lock:
                     connected_session = self.sessions.get(camera.key)
                 if connected_session is not None:
@@ -1469,8 +1475,14 @@ class ProviderRuntime:
                     session = self.backend.connect(camera)
                     session.start()
                     with self.state_lock:
-                        self.sessions[camera.key] = session
-                        self.session_errors.pop(camera.key, None)
+                        if self.history_only:
+                            session.close()
+                            session = None
+                        else:
+                            self.sessions[camera.key] = session
+                            self.session_errors.pop(camera.key, None)
+                    if session is None:
+                        break
                     self._log(
                         "info",
                         "SICK camera connected",
@@ -1547,6 +1559,94 @@ class ProviderRuntime:
                 self.connection_in_progress = False
                 self.last_connection_completed_at = _utc_text()
             self.connection_lock.release()
+
+    def _start_service_worker(self) -> None:
+        try:
+            result = self.connect_all()
+            if not self.history_only and self.sessions and self.capture_mode == "continuous":
+                self._ensure_acquisition_worker()
+            with self.service_transition_lock:
+                self.service_state = (
+                    "running"
+                    if not self.history_only and int(result.get("code", 500)) == 0
+                    else "degraded"
+                    if not self.history_only
+                    else "stopped"
+                )
+            self._log(
+                "info" if int(result.get("code", 500)) == 0 else "warning",
+                "SICK capture service start completed",
+                code=int(result.get("code", 500)),
+                connectedCameras=len(self.sessions),
+            )
+        except Exception as error:
+            with self.service_transition_lock:
+                self.service_state = "degraded"
+            self._log("error", "SICK capture service start failed", error=str(error))
+
+    def start_service(self) -> dict[str, Any]:
+        with self.service_transition_lock:
+            if self.service_stop_thread is not None and self.service_stop_thread.is_alive():
+                return {
+                    "code": 409,
+                    "error": "service_stop_in_progress",
+                    "serviceState": self.service_state,
+                    **self._connection_status_json(),
+                }
+            self.history_only = False
+            self.camera_reconnect_stop.clear()
+            self.service_state = "starting"
+            if self.service_start_thread is None or not self.service_start_thread.is_alive():
+                self.service_start_thread = threading.Thread(
+                    target=self._start_service_worker,
+                    name="sick-service-start",
+                    daemon=True,
+                )
+                self.service_start_thread.start()
+            return {
+                "code": 0,
+                "accepted": True,
+                "serviceState": self.service_state,
+                **self._connection_status_json(),
+            }
+
+    def _stop_service_worker(self) -> None:
+        start_thread = self.service_start_thread
+        if start_thread is not None and start_thread.is_alive():
+            start_thread.join(timeout=max(2.0, self.profile.timeout_ms / 1000.0 + 1.0))
+        acquisition_thread = self.acquisition_thread
+        if (
+            acquisition_thread is not None
+            and acquisition_thread.is_alive()
+            and acquisition_thread is not threading.current_thread()
+        ):
+            acquisition_thread.join(timeout=max(2.0, self.profile.timeout_ms / 1000.0 + 1.0))
+        self.disconnect(force=True)
+        with self.service_transition_lock:
+            self.service_state = "stopped"
+        self._log("info", "SICK capture service stopped")
+
+    def stop_service(self) -> dict[str, Any]:
+        with self.service_transition_lock:
+            self.history_only = True
+            self.service_state = "stopping"
+            self.acquisition_stop.set()
+            self.camera_reconnect_stop.set()
+            with self.camera_reconnect_lock:
+                self.camera_reconnect_pending.clear()
+            if self.service_stop_thread is None or not self.service_stop_thread.is_alive():
+                self.service_stop_thread = threading.Thread(
+                    target=self._stop_service_worker,
+                    name="sick-service-stop",
+                    daemon=True,
+                )
+                self.service_stop_thread.start()
+            return {
+                "code": 0,
+                "accepted": True,
+                "serviceState": self.service_state,
+                **self._connection_status_json(),
+            }
 
     def disconnect(self, identity: str = "", *, force: bool = False) -> dict[str, Any]:
         if self.capture_lock.locked() and not force:
@@ -5718,6 +5818,7 @@ class ProviderRuntime:
             # to the legacy eight-camera defaults.
             "provider": "external-api",
             "historyOnly": self.history_only,
+            "serviceState": self.service_state,
             "connected": connected > 0,
             "ip": self.profile.enabled_cameras[0].ip if self.profile.enabled_cameras else "",
             "ready": provider_ready,
@@ -9058,6 +9159,12 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
                 else 503
             )
             self._send_json(status, result)
+        elif path == "/api/service/start":
+            result = self.runtime.start_service()
+            self._send_json(200 if result["code"] == 0 else result["code"], result)
+        elif path == "/api/service/stop":
+            result = self.runtime.stop_service()
+            self._send_json(200 if result["code"] == 0 else result["code"], result)
         elif path == "/api/camera/connect":
             result = self.runtime.connect_all(payload)
             status = (

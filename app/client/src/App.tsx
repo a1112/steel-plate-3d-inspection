@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { PanelRightOpen, X } from 'lucide-react';
-import { getAllDefects, getMockInspectionSnapshot, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
+import { getAllDefects, getPlateInspectionSnapshot, summarizeDefects } from './data/inspection';
 import type { DefectItem, DefectReviewStatus, InspectionSnapshot, Severity } from './data/inspection';
 import type { InspectionUiState } from './state/inspection-ui';
 import {
@@ -568,9 +568,7 @@ function ConfiguredApp({
           const detail = error instanceof Error ? error.message : '后台数据接口不可用';
           setLoadError(detail);
           if (!dashboardMode.requestsStandardRecords) {
-            setSnapshot(getMockInspectionSnapshot());
             onConnectionIssue(detail);
-            return;
           }
           if (dashboardMode.requestsStandardRecords || dashboardMode.kind === 'bkv-online') {
             setBkvDataHealth({ state: 'store-error', detail });
@@ -1050,7 +1048,7 @@ function InspectionDashboard({
       if (document.visibilityState === 'visible') void refreshSnapshot();
     };
     void refreshSnapshot();
-    const timer = window.setInterval(() => void refreshSnapshot(), refreshInterval);
+    const timer = window.setInterval(refreshWhenVisible, refreshInterval);
     window.addEventListener('focus', refreshWhenVisible);
     document.addEventListener('visibilitychange', refreshWhenVisible);
     return () => {

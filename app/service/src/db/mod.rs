@@ -953,9 +953,24 @@ fn database_connect_timeout_ms() -> u64 {
         .clamp(100, 30_000)
 }
 
+fn database_max_connections(url: &str) -> u32 {
+    let configured = env::var("STEEL_DATABASE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    if url.starts_with("sqlite:") && !url.contains(":memory:") {
+        configured.unwrap_or(32).clamp(4, 64)
+    } else {
+        configured.unwrap_or(10).clamp(1, 64)
+    }
+}
+
 async fn connect_database(url: &str) -> Result<DatabaseConnection, DbErr> {
     let mut options = ConnectOptions::new(url.to_string());
-    options.connect_timeout(Duration::from_millis(database_connect_timeout_ms()));
+    let timeout = Duration::from_millis(database_connect_timeout_ms());
+    options
+        .max_connections(database_max_connections(url))
+        .connect_timeout(timeout)
+        .acquire_timeout(timeout);
     Database::connect(options).await
 }
 
@@ -6511,7 +6526,7 @@ fn default_capture_config_value() -> Value {
         "capture": {
             "mode": "eight-camera",
             "driver": "lvm-nvt",
-            "fallback": "simulated",
+            "fallback": "disabled",
             "cameras": cameras
         }
     })

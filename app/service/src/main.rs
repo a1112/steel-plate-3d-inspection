@@ -120,6 +120,7 @@ const CAPTURE_CAMERA_SERIALS: [&str; 8] = [
 const LOGIN_MAX_FAILURES: u32 = 5;
 const LOGIN_MAX_FAILURES_MIN: u32 = 1;
 const LOGIN_MAX_FAILURES_MAX: u32 = 20;
+const DEFAULT_INSPECTION_HISTORY_LIMIT: u64 = 200;
 const LOGIN_FAILURE_WINDOW_MS: u128 = 10 * 60 * 1000;
 const LOGIN_FAILURE_WINDOW_MIN_MINUTES: u64 = 1;
 const LOGIN_FAILURE_WINDOW_MAX_MINUTES: u64 = 24 * 60;
@@ -284,7 +285,6 @@ fn normalize_capture_output_mode(value: &str) -> Option<&'static str> {
 }
 
 struct ServiceState {
-    fallback_snapshot_json: Arc<String>,
     config_json: Mutex<String>,
     capture: Arc<CaptureServiceManager>,
     bkv: Option<Arc<bkv::BkvManager>>,
@@ -1301,6 +1301,11 @@ fn build_config_json(capture_port: u16) -> String {
 
 fn build_config_json_for(capture_port: u16, provider: CaptureProvider) -> String {
     let origin = capture_origin(capture_port);
+    let fallback = if provider == CaptureProvider::Simulated {
+        "simulated"
+    } else {
+        "disabled"
+    };
     json!({
         "service": {
             "name": "steel-inspection-service",
@@ -1315,7 +1320,7 @@ fn build_config_json_for(capture_port: u16, provider: CaptureProvider) -> String
             "mode": "eight-camera",
             "driver": "lvm-nvt",
             "provider": provider.as_str(),
-            "fallback": "simulated",
+            "fallback": fallback,
             "cameras": default_capture_cameras_value()
         }
     })
@@ -1507,20 +1512,51 @@ impl CaptureServiceManager {
         }
 
         if !self.provider.is_managed() {
-            let listening = self.endpoint_listening();
+            let health = self
+                .probe_response("/health", Duration::from_millis(1_500))
+                .filter(|response| (200..300).contains(&response.status_code))
+                .and_then(|response| serde_json::from_slice::<Value>(&response.body).ok());
+            let listening = health.is_some();
             if let Ok(mut lifecycle) = self.lifecycle.lock() {
-                lifecycle.desired_running = true;
-                lifecycle.phase = if listening { "ready" } else { "degraded" };
-                if listening {
+                let history_only = health
+                    .as_ref()
+                    .and_then(|value| value.get("historyOnly"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let provider_ready = health
+                    .as_ref()
+                    .and_then(|value| value.get("providerReady").or_else(|| value.get("ready")))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let connection_in_progress = health
+                    .as_ref()
+                    .and_then(|value| value.pointer("/cameraConnection/inProgress"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                lifecycle.phase = if !lifecycle.desired_running || history_only {
+                    "stopped"
+                } else if provider_ready {
+                    "ready"
+                } else if listening && connection_in_progress {
+                    "starting"
+                } else {
+                    "degraded"
+                };
+                if provider_ready {
                     lifecycle.ready_at.get_or_insert_with(current_time_millis);
+                    lifecycle.last_error.clear();
                 } else {
                     lifecycle.ready_at = None;
+                    lifecycle.last_error = if !listening {
+                        "external capture endpoint unavailable".to_string()
+                    } else if history_only {
+                        String::new()
+                    } else if connection_in_progress {
+                        "external capture provider is connecting cameras".to_string()
+                    } else {
+                        "external capture provider is not ready".to_string()
+                    };
                 }
-                lifecycle.last_error = if listening {
-                    String::new()
-                } else {
-                    "external capture endpoint unavailable".to_string()
-                };
             }
             return;
         }
@@ -1714,6 +1750,24 @@ impl CaptureServiceManager {
             self.supervisor_tick();
             return true;
         }
+        if self.provider == CaptureProvider::ExternalApi {
+            let accepted = self
+                .proxy_response_with_read_timeout(
+                    "POST",
+                    "/api/service/start",
+                    "{}",
+                    Duration::from_secs(3),
+                )
+                .is_some_and(|response| {
+                    (200..300).contains(&response.status_code)
+                        && serde_json::from_slice::<Value>(&response.body)
+                            .ok()
+                            .and_then(|value| value.get("code").and_then(Value::as_i64))
+                            == Some(0)
+                });
+            self.supervisor_tick();
+            return accepted;
+        }
         if !self.provider.is_managed() {
             self.supervisor_tick();
             return self.endpoint_listening();
@@ -1743,6 +1797,24 @@ impl CaptureServiceManager {
         if self.provider.is_embedded() {
             self.supervisor_tick();
             return true;
+        }
+        if self.provider == CaptureProvider::ExternalApi {
+            let accepted = self
+                .proxy_response_with_read_timeout(
+                    "POST",
+                    "/api/service/stop",
+                    "{}",
+                    Duration::from_secs(3),
+                )
+                .is_some_and(|response| {
+                    (200..300).contains(&response.status_code)
+                        && serde_json::from_slice::<Value>(&response.body)
+                            .ok()
+                            .and_then(|value| value.get("code").and_then(Value::as_i64))
+                            == Some(0)
+                });
+            self.supervisor_tick();
+            return accepted;
         }
         if !self.provider.is_managed() {
             self.supervisor_tick();
@@ -1834,7 +1906,11 @@ impl CaptureServiceManager {
             "origin": self.origin,
             "processAvailable": process_available,
             "executable": exe,
-            "fallback": "simulated-eight-camera",
+            "fallback": if self.provider == CaptureProvider::Simulated {
+                "simulated"
+            } else {
+                "disabled"
+            },
             "lifecycle": {
                 "phase": lifecycle.phase,
                 "desiredRunning": lifecycle.desired_running,
@@ -4014,7 +4090,7 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             .runtime
             .block_on(db::list_recent_production_inspections(
                 &state.database.connection,
-                20,
+                DEFAULT_INSPECTION_HISTORY_LIMIT,
             ))
             .map_err(|error| error.to_string())?
     };
@@ -10024,7 +10100,7 @@ fn write_auth_password_response(state: &ServiceState, request: &str, body: &str)
 fn admin_services_json(state: &ServiceState) -> String {
     let service_port = env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string());
     let capture_status = serde_json::from_str::<Value>(&state.capture.status_json())
-        .unwrap_or_else(|_| json!({ "running": false, "fallback": "simulated-eight-camera" }));
+        .unwrap_or_else(|_| json!({ "running": false, "fallback": "disabled" }));
     let now = current_time_millis();
     let active_sessions = state
         .sessions
@@ -11194,7 +11270,11 @@ fn sanitize_public_capture_config(value: &Value, state: &ServiceState) -> Value 
             "name": capture_field("name"),
             "driver": capture_field("driver"),
             "provider": state.capture.provider.as_str(),
-            "fallback": capture_field("fallback"),
+            "fallback": if state.capture.provider == CaptureProvider::Simulated {
+                "simulated"
+            } else {
+                "disabled"
+            },
             "expectedCameras": capture_field("expectedCameras"),
             "cameras": cameras
         }
@@ -26768,7 +26848,7 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
                 "name": "capture-service",
                 "managed": true,
                 "running": false,
-                "fallback": "simulated-eight-camera"
+                "fallback": "disabled"
             })
         });
     let service_port = env::var("INSPECTION_SERVICE_PORT").unwrap_or_else(|_| "4873".to_string());
@@ -27701,27 +27781,24 @@ fn handle_client<S: Read + Write>(
                         &[("Cache-Control", "no-store")],
                     ),
                     Err(error) => http_response_with_headers(
-                        "200 OK",
+                        "503 Service Unavailable",
                         "application/json; charset=utf-8",
-                        &format!(
-                            "{{\"error\":\"database_snapshot_unavailable\",\"detail\":\"{}\",\"fallback\":{}}}",
-                            json_escape(&error.to_string()),
-                            build_snapshot_json()
-                        ),
+                        &json!({
+                            "error": "database_snapshot_unavailable",
+                            "detail": error.to_string()
+                        })
+                        .to_string(),
                         &[("Cache-Control", "no-store")],
                     ),
                 },
                 Err(error) => http_response_with_headers(
-                    "200 OK",
+                    "503 Service Unavailable",
                     "application/json; charset=utf-8",
-                    &format!(
-                        "{}",
-                        if state.fallback_snapshot_json.is_empty() {
-                            format!("{{\"error\":\"{}\"}}", json_escape(&error.to_string()))
-                        } else {
-                            (*state.fallback_snapshot_json).clone()
-                        }
-                    ),
+                    &json!({
+                        "error": "production_snapshot_unavailable",
+                        "detail": error.to_string()
+                    })
+                    .to_string(),
                     &[("Cache-Control", "no-store")],
                 ),
             }
@@ -28178,7 +28255,6 @@ fn main() -> std::io::Result<()> {
         .map(|config| config.value)
         .unwrap_or_else(|| build_config_json_for(capture_port, capture_provider));
     let state = Arc::new(ServiceState {
-        fallback_snapshot_json: Arc::new(build_snapshot_json()),
         config_json: Mutex::new(config_json),
         capture: Arc::clone(&capture_manager),
         bkv: bkv_manager,
@@ -29699,7 +29775,6 @@ mod tests {
             SITE_CONFIG_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         ServiceState {
-            fallback_snapshot_json: Arc::new(build_snapshot_json()),
             config_json: Mutex::new(String::new()),
             capture: Arc::new(CaptureServiceManager {
                 host: capture_host_from_origin(origin).unwrap_or_else(|| "127.0.0.1".to_string()),

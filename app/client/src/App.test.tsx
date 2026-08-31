@@ -146,7 +146,8 @@ describe('App disconnected startup', () => {
 
     const dialog = await screen.findByRole('alertdialog', { name: '未连接到检测服务' });
     expect(screen.queryByRole('heading', { name: '运行配置不可用' })).not.toBeInTheDocument();
-    expect(await screen.findByRole('heading', { name: '记录' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '后台连接失败' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '记录' })).not.toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole('button', { name: '直接进入' }));
     expect(screen.queryByRole('alertdialog', { name: '未连接到检测服务' })).not.toBeInTheDocument();

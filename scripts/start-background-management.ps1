@@ -1,6 +1,8 @@
 param(
   [ValidateRange(1024, 65535)]
   [int]$ServicePort = 4873,
+  [ValidateRange(1024, 65535)]
+  [int]$CapturePort = 4317,
   [ValidateRange(5, 120)]
   [int]$ReadyTimeoutSec = 30,
   [ValidateSet("debug", "release")]
@@ -14,6 +16,7 @@ param(
   [switch]$SkipBuild,
   [switch]$NoBrowser,
   [switch]$Detach,
+  [switch]$EnableCaptureControl,
   [switch]$ProbeOnly
 )
 
@@ -111,18 +114,22 @@ $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $stdoutPath = Join-Path $RuntimeLogDir "background-management-$stamp.out.log"
 $stderrPath = Join-Path $RuntimeLogDir "background-management-$stamp.err.log"
 $servicePidPath = Join-Path $RuntimeStateRoot "background-management-$stamp.pid"
+$serviceProvider = if ($EnableCaptureControl) { "external-api" } else { "headless-cpp" }
 $serviceArguments = @(
   "-NoProfile",
   "-ExecutionPolicy", "Bypass",
   "-File", (Join-Path $PSScriptRoot "run-service.ps1"),
-  "-Provider", "headless-cpp",
+  "-Provider", $serviceProvider,
   "-HostAddress", "0.0.0.0",
   "-Port", [string]$ServicePort,
   "-Profile", $Profile,
   "-ServiceExe", $serviceExe,
   "-ServicePidFile", $servicePidPath,
+  # Keep the local administrator bootstrap policy compatible with the existing
+  # workstation database. Real data is selected independently by the external
+  # capture provider and the production algorithm mode below.
   "-RuntimeProfile", "development",
-  "-AlgorithmMode", "demo",
+  "-AlgorithmMode", "production",
   "-DatabaseEngine", "sqlite",
   "-DatabaseFallback", "none",
   "-ConfigRoot", $ConfigRoot,
@@ -130,9 +137,13 @@ $serviceArguments = @(
   "-RuntimeLogDir", $RuntimeLogDir,
   "-WebRoot", $WebRoot,
   "-NoCaptureAutostart",
-  "-ManagementOnly",
   "-ForceParameters"
 )
+if ($EnableCaptureControl) {
+  $serviceArguments += @("-CaptureOrigin", "http://127.0.0.1:$CapturePort")
+} else {
+  $serviceArguments += "-ManagementOnly"
+}
 if (-not [string]::IsNullOrWhiteSpace($EnvFile)) {
   $serviceArguments += @("-EnvFile", (Resolve-Path -LiteralPath $EnvFile).Path)
 }
@@ -176,7 +187,9 @@ try {
     throw "Background management service published an invalid PID: $servicePidText"
   }
   $trackedService = Get-Process -Id $parsedServicePid -ErrorAction Stop
-  if (-not $trackedService.Path.Equals($serviceExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+  $trackedServicePath = $trackedService.Path
+  if (-not [string]::IsNullOrWhiteSpace($trackedServicePath) -and
+      -not $trackedServicePath.Equals($serviceExe, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Background management PID points to an unexpected executable: $($trackedService.Path)"
   }
   $servicePid = $parsedServicePid
@@ -197,14 +210,25 @@ try {
   $captureStarted = [bool]$lifecycle.running -or
     [bool]$lifecycle.lifecycle.desiredRunning -or
     $null -ne $lifecycle.lifecycle.pid
-  $managementFenceMissing = [bool]$lifecycle.controlAllowed -or -not [bool]$lifecycle.managementOnly
-  if ($captureStarted -or $managementFenceMissing -or [bool]$lifecycle.lifecycle.autostart) {
-    throw "Management-only safety check failed: capture lifecycle is not fenced and stopped."
+  if ($EnableCaptureControl) {
+    $captureControlMissing = -not [bool]$lifecycle.controlAllowed -or [bool]$lifecycle.managementOnly
+    if ($captureStarted -or $captureControlMissing -or [bool]$lifecycle.lifecycle.autostart) {
+      throw "Real capture control check failed: controls must be enabled while capture remains stopped until requested."
+    }
+  } else {
+    $managementFenceMissing = [bool]$lifecycle.controlAllowed -or -not [bool]$lifecycle.managementOnly
+    if ($captureStarted -or $managementFenceMissing -or [bool]$lifecycle.lifecycle.autostart) {
+      throw "Management-only safety check failed: capture lifecycle is not fenced and stopped."
+    }
   }
 
   Write-Host "Background management ready: $ManagementUrl"
   Write-Host "Business API PID: $servicePid"
-  Write-Host "Capture autostart: disabled; capture controls: disabled; capture PID: none"
+  if ($EnableCaptureControl) {
+    Write-Host "Capture autostart: disabled; real capture controls: enabled; capture PID: none"
+  } else {
+    Write-Host "Capture autostart: disabled; capture controls: disabled; capture PID: none"
+  }
   Write-Host "Logs: $RuntimeLogDir"
 
   if (-not $NoBrowser -and -not $ProbeOnly) {
@@ -226,7 +250,9 @@ try {
   if (-not $keepService) {
     if ($servicePid) {
       $trackedService = Get-Process -Id $servicePid -ErrorAction SilentlyContinue
-      if ($trackedService -and $trackedService.Path.Equals($serviceExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+      if ($trackedService -and
+          ([string]::IsNullOrWhiteSpace($trackedService.Path) -or
+            $trackedService.Path.Equals($serviceExe, [System.StringComparison]::OrdinalIgnoreCase))) {
         Stop-Process -Id $servicePid -Force -ErrorAction SilentlyContinue
       }
     }
