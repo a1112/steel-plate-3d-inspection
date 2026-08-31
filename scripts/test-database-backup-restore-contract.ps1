@@ -7,6 +7,11 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $CommonScript = Join-Path $RepoRoot 'scripts\database-recovery-common.ps1'
 $RestoreScript = Join-Path $RepoRoot 'scripts\restore-database.ps1'
 $BackupScript = Join-Path $RepoRoot 'scripts\backup-database.ps1'
+$PowerShellExecutable = if (Get-Command powershell -ErrorAction SilentlyContinue) {
+  (Get-Command powershell -ErrorAction Stop).Source
+} else {
+  (Get-Process -Id $PID -ErrorAction Stop).Path
+}
 . $CommonScript
 
 function Assert-True {
@@ -86,7 +91,7 @@ function Invoke-RestoreProcess {
   $PreviousErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = 'Continue'
-    $Output = @(& powershell @Arguments 2>&1)
+    $Output = @(& $PowerShellExecutable @Arguments 2>&1)
     $ExitCode = $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $PreviousErrorActionPreference
@@ -97,7 +102,19 @@ function Invoke-RestoreProcess {
   }
 }
 
-$TestRoot = Join-Path $env:TEMP ('steel-database-recovery-test-' + [Guid]::NewGuid().ToString('N'))
+$SystemTemp = [System.IO.Path]::GetTempPath()
+if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [System.Runtime.InteropServices.OSPlatform]::Windows) -and
+    (Test-Path -LiteralPath '/bin/pwd' -PathType Leaf)) {
+  Push-Location $SystemTemp
+  try {
+    $SystemTemp = ((& /bin/pwd -P) | Out-String).Trim()
+  } finally {
+    Pop-Location
+  }
+}
+$SystemTemp = [System.IO.Path]::GetFullPath($SystemTemp).TrimEnd('\', '/')
+$TestRoot = Join-Path $SystemTemp ('steel-database-recovery-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $TestRoot | Out-Null
 try {
   $RuntimeRoot = Join-Path $TestRoot 'runtime\releases\1.0.0-0123456789ab'
@@ -277,7 +294,11 @@ try {
     -SelectedBackupDir $BackupDir `
     -ManifestHash ('0' * 64) `
     -Confirmation $Confirmation
-  Assert-True ($BadHashResult.exitCode -ne 0 -and $BadHashResult.output -match 'independently supplied') 'Out-of-band manifest hash mismatch was not rejected.'
+  Assert-True `
+    ($BadHashResult.exitCode -ne 0 -and
+      $BadHashResult.output -match 'independently' -and
+      $BadHashResult.output -match 'supplied') `
+    "Out-of-band manifest hash mismatch was not rejected. exit=$($BadHashResult.exitCode) output=$($BadHashResult.output)"
 
   $BadConfirmResult = Invoke-RestoreProcess `
     -SelectedBackupDir $BackupDir `
@@ -306,7 +327,12 @@ try {
     -SelectedBackupDir $IncompatibleBackupDir `
     -ManifestHash $IncompatibleHash `
     -Confirmation $Confirmation
-  Assert-True ($IncompatibleResult.exitCode -ne 0 -and $IncompatibleResult.output -match 'readable/rollback bounds') 'Unreadable schema backup was not rejected.'
+  Assert-True `
+    ($IncompatibleResult.exitCode -ne 0 -and
+      $IncompatibleResult.output -match 'readable' -and
+      $IncompatibleResult.output -match 'rollback' -and
+      $IncompatibleResult.output -match 'bounds') `
+    "Unreadable schema backup was not rejected. exit=$($IncompatibleResult.exitCode) output=$($IncompatibleResult.output)"
 
   $RestoreSource = Get-Content -LiteralPath $RestoreScript -Raw -Encoding UTF8
   $BackupSource = Get-Content -LiteralPath $BackupScript -Raw -Encoding UTF8
@@ -344,7 +370,7 @@ try {
   } | ConvertTo-Json -Depth 6
 } finally {
   $ResolvedTestRoot = [System.IO.Path]::GetFullPath($TestRoot)
-  $ResolvedTempRoot = [System.IO.Path]::GetFullPath($env:TEMP).TrimEnd('\', '/')
+  $ResolvedTempRoot = $SystemTemp
   if ($ResolvedTestRoot.StartsWith($ResolvedTempRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -and
       (Test-Path -LiteralPath $ResolvedTestRoot -PathType Container)) {
     Remove-Item -LiteralPath $ResolvedTestRoot -Recurse -Force

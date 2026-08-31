@@ -129,13 +129,30 @@ function Get-SteelMySqlLedger {
 }
 
 function Assert-SteelServiceStopped {
-  $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+  $GetServiceCommand = Get-Command Get-Service -ErrorAction SilentlyContinue
+  $Service = if ($null -eq $GetServiceCommand) {
+    $null
+  } else {
+    Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+  }
   if ($null -ne $Service -and $Service.Status -ne 'Stopped') {
     throw "Windows service $ServiceName must be stopped before database restore."
   }
-  $Listener = Get-NetTCPConnection -State Listen -LocalPort $ServicePort -ErrorAction SilentlyContinue
-  if ($null -ne $Listener) {
-    throw "Service port $ServicePort is still listening. Stop the runtime before database restore."
+  $GetConnectionCommand = Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue
+  if ($null -ne $GetConnectionCommand) {
+    $Listener = Get-NetTCPConnection -State Listen -LocalPort $ServicePort -ErrorAction SilentlyContinue
+    if ($null -ne $Listener) {
+      throw "Service port $ServicePort is still listening. Stop the runtime before database restore."
+    }
+  } else {
+    $Probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $ServicePort)
+    try {
+      $Probe.Start()
+    } catch {
+      throw "Service port $ServicePort cannot be proven released. Stop the runtime before database restore."
+    } finally {
+      try { $Probe.Stop() } catch { }
+    }
   }
 }
 
@@ -316,10 +333,16 @@ if ($Engine -eq 'sqlite') {
   Assert-SteelNoReparseChain -Path $RollbackRoot | Out-Null
   $PreRestore = $null
   $TargetAcl = $null
+  $TargetUnixMode = $null
   $TargetExisted = Test-Path -LiteralPath $DatabasePath -PathType Leaf
   if ($TargetExisted) {
     Assert-SteelNoReparseChain -Path $DatabasePath | Out-Null
-    $TargetAcl = Get-Acl -LiteralPath $DatabasePath
+    if ($null -ne (Get-Command Get-Acl -ErrorAction SilentlyContinue)) {
+      $TargetAcl = Get-Acl -LiteralPath $DatabasePath
+    } elseif (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+        [System.Runtime.InteropServices.OSPlatform]::Windows)) {
+      $TargetUnixMode = [System.IO.File]::GetUnixFileMode($DatabasePath)
+    }
     $CheckpointRows = Invoke-SteelSqliteQuery -DatabasePath $DatabasePath -Mode ReadWrite -Sql 'PRAGMA wal_checkpoint(TRUNCATE)'
     if ($CheckpointRows.Count -ne 1 -or $CheckpointRows[0].Count -lt 1 -or [string]$CheckpointRows[0][0] -cne '0') {
       throw 'Unable to prove a non-busy SQLite WAL checkpoint before restore.'
@@ -377,6 +400,8 @@ if ($Engine -eq 'sqlite') {
     $Switched = $true
     if ($null -ne $TargetAcl) {
       Set-Acl -LiteralPath $DatabasePath -AclObject $TargetAcl
+    } elseif ($null -ne $TargetUnixMode) {
+      [System.IO.File]::SetUnixFileMode($DatabasePath, $TargetUnixMode)
     }
     foreach ($SidecarPath in @("$DatabasePath-wal", "$DatabasePath-shm")) {
       if (Test-Path -LiteralPath $SidecarPath -PathType Leaf) {
@@ -417,6 +442,8 @@ if ($Engine -eq 'sqlite') {
         [System.IO.File]::Replace($RollbackStage, $DatabasePath, $FailedRestoreQuarantine, $true)
         if ($null -ne $TargetAcl) {
           Set-Acl -LiteralPath $DatabasePath -AclObject $TargetAcl
+        } elseif ($null -ne $TargetUnixMode) {
+          [System.IO.File]::SetUnixFileMode($DatabasePath, $TargetUnixMode)
         }
         $RollbackValidation = Get-SteelSqliteSnapshotEvidence -DatabasePath $DatabasePath
         if ([string]$RollbackValidation.sha256 -cne [string]$PreRestore.sha256) {

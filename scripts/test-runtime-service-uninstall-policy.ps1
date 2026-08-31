@@ -111,7 +111,18 @@ if ($PreflightJournalOffset -lt 0 -or $StopOffset -le $PreflightJournalOffset -o
 }
 $Checks.ordering = $true
 
-$TempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("steel-uninstall-policy-" + [Guid]::NewGuid().ToString('N'))
+$SystemTemp = [System.IO.Path]::GetTempPath()
+if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [System.Runtime.InteropServices.OSPlatform]::Windows) -and
+    (Test-Path -LiteralPath '/bin/pwd' -PathType Leaf)) {
+  Push-Location $SystemTemp
+  try {
+    $SystemTemp = ((& /bin/pwd -P) | Out-String).Trim()
+  } finally {
+    Pop-Location
+  }
+}
+$TempRoot = Join-Path $SystemTemp ("steel-uninstall-policy-" + [Guid]::NewGuid().ToString('N'))
 $TempBoundary = [System.IO.Path]::GetFullPath($TempRoot).TrimEnd('\', '/')
 try {
   $Install = Join-Path $TempRoot 'ProgramFiles\SteelInspectionRuntime'
@@ -244,8 +255,8 @@ try {
     (Test-Path -LiteralPath (Join-Path $State 'database') -PathType Container)
 } finally {
   $ResolvedTemp = [System.IO.Path]::GetFullPath($TempRoot).TrimEnd('\', '/')
-  $SystemTemp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
-  if (-not $ResolvedTemp.StartsWith($SystemTemp + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
+  $SystemTempBoundary = [System.IO.Path]::GetFullPath($SystemTemp).TrimEnd('\', '/')
+  if (-not $ResolvedTemp.StartsWith($SystemTempBoundary + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
       -not (Test-PathEquals -Left $ResolvedTemp -Right $TempBoundary)) {
     throw "Refusing test cleanup outside the exact temporary fixture root: $ResolvedTemp"
   }

@@ -97,7 +97,12 @@ function Read-SteelJsonFile {
   }
   Assert-SteelNoReparseChain -Path $Path | Out-Null
   try {
-    return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $ConvertCommand = Get-Command ConvertFrom-Json -ErrorAction Stop
+    $ConvertArgs = @{}
+    if ($ConvertCommand.Parameters.ContainsKey('DateKind')) {
+      $ConvertArgs.DateKind = 'String'
+    }
+    return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json @ConvertArgs
   } catch {
     throw "$Label must be valid UTF-8 JSON: $Path"
   }
@@ -239,7 +244,20 @@ function Initialize-SteelWinSqlite {
     return
   }
 
-  Add-Type -TypeDefinition @'
+  $RunningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [System.Runtime.InteropServices.OSPlatform]::Windows
+  )
+  $RunningOnMacOS = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [System.Runtime.InteropServices.OSPlatform]::OSX
+  )
+  $SqliteLibrary = if ($RunningOnWindows) {
+    'winsqlite3.dll'
+  } elseif ($RunningOnMacOS) {
+    '/usr/lib/libsqlite3.dylib'
+  } else {
+    'libsqlite3.so.0'
+  }
+  $TypeDefinition = @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -337,6 +355,7 @@ namespace Steel.DatabaseRecovery {
   }
 }
 '@
+  Add-Type -TypeDefinition $TypeDefinition.Replace('winsqlite3.dll', $SqliteLibrary)
 }
 
 function Invoke-SteelSqliteQuery {
@@ -367,7 +386,7 @@ function Get-SteelSqliteSnapshotEvidence {
     throw "SQLite snapshot is missing: $DatabasePath"
   }
   Assert-SteelNoReparseChain -Path $DatabasePath | Out-Null
-  $File = Get-Item -LiteralPath $DatabasePath
+  $File = Get-Item -LiteralPath $DatabasePath -Force
   if ($File.Length -lt 100) {
     throw "SQLite snapshot is too small to be valid: $DatabasePath"
   }

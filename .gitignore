@@ -11,6 +11,8 @@ app/capture/build/
 app/service/build/
 .vite/
 .worktrees/
+.codex-artifacts/
+~$*
 *.log
 *.local
 *.local.env

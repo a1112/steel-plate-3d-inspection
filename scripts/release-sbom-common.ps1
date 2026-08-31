@@ -575,9 +575,15 @@ function Get-ReleaseSbomExpectedModel {
   $ResolvedRepo = (Resolve-Path -LiteralPath $RepoRoot -ErrorAction Stop).Path.TrimEnd('\', '/')
   $GitRoot = Invoke-GitRead -RepoRoot $ResolvedRepo -Arguments @('rev-parse', '--show-toplevel')
   $GitRoot = [System.IO.Path]::GetFullPath($GitRoot).TrimEnd('\', '/')
-  if (-not $GitRoot.Equals($ResolvedRepo, [System.StringComparison]::OrdinalIgnoreCase)) {
+  $GitPrefix = Invoke-GitRead -RepoRoot $ResolvedRepo -Arguments @('rev-parse', '--show-prefix')
+  if (-not [string]::IsNullOrWhiteSpace($GitPrefix)) {
     throw "RepoRoot must be the exact Git worktree root: $ResolvedRepo"
   }
+  # Git canonicalizes macOS paths such as /var through /private/var while
+  # PowerShell's Resolve-Path preserves the caller's spelling. Once Git has
+  # confirmed that the supplied path is the worktree root, use Git's canonical
+  # root for all subsequent boundary checks and source evidence.
+  $ResolvedRepo = $GitRoot
   $Commit = (Invoke-GitRead -RepoRoot $ResolvedRepo -Arguments @('rev-parse', 'HEAD')).ToLowerInvariant()
   if ($Commit -notmatch '^[0-9a-f]{40,64}$') { throw 'Git HEAD is not an exact commit.' }
   if (-not [string]::IsNullOrWhiteSpace($ExpectedCommit)) {

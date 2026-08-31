@@ -32,6 +32,17 @@ $ModelArgs = @{
 }
 $Model = Get-ReleaseSbomExpectedModel @ModelArgs
 
+# Git canonicalizes macOS aliases such as /var to /private/var. Keep an output
+# requested beneath the caller's repository path on that same canonical root so
+# protected-input and Git-administration boundary checks cannot be bypassed by
+# using the alternate spelling.
+$RequestedRepoBoundary = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
+if ($OutputPath.StartsWith($RequestedRepoBoundary + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+  $RelativeOutputPath = [System.IO.Path]::GetRelativePath($RequestedRepoBoundary, $OutputPath)
+  $OutputPath = [System.IO.Path]::GetFullPath((Join-Path $Model.repoRoot $RelativeOutputPath))
+  $OutputParent = Split-Path -Parent $OutputPath
+}
+
 $ProtectedInputs = @(
   (Resolve-Path -LiteralPath $ExternalComponentsPath -ErrorAction Stop).Path,
   (Resolve-RepositoryFile -RepoRoot $Model.repoRoot -RelativePath 'app/client/package-lock.json'),
