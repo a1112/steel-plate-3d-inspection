@@ -1219,6 +1219,10 @@ describe('ParameterManagementApp', () => {
     vi.stubGlobal('confirm', vi.fn(() => true));
   });
 
+  // This covers the full admin bootstrap plus several management tabs. Keep
+  // its timeout scoped because Windows CI can spend more than Vitest's 5s
+  // default starting concurrent JSDOM workers, while a stuck fetch still
+  // fails deterministically within this bounded budget.
   it('renders backend overview and switches to config and audit management sections', async () => {
     setAdminOverviewSiteMode('direct-camera');
     const { container } = render(<ParameterManagementApp />);
@@ -1321,7 +1325,7 @@ describe('ParameterManagementApp', () => {
     });
     expect(screen.getByText('2', { selector: '.admin-api-summary strong' })).toBeInTheDocument();
     expect(screen.getByText('个后台接口已纳入管理概览')).toBeInTheDocument();
-  });
+  }, 15_000);
 
   it('loads split runtime status and bounded service logs in the runtime log tab', async () => {
     render(<ParameterManagementApp />);
