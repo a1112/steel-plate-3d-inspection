@@ -1532,14 +1532,14 @@ describe('ParameterManagementApp', () => {
     });
     fireEvent.change(connectionEditor, {
       target: {
-        value: JSON.stringify({ mode: 'online', host: '127.0.0.1', port: 70000 }, null, 2),
+        value: JSON.stringify({ mode: 'online', host: '127.0.0.1', port: 4874 }, null, 2),
       },
     });
     fireEvent.click(screen.getByRole('button', { name: /保存连接/ }));
 
     expect(await screen.findByText('连接设置保存失败：connection.port 必须在 1..65535 范围内')).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://127.0.0.1:70000/api/config/connection',
+      'http://127.0.0.1:4874/api/config/connection',
       expect.objectContaining({ method: 'POST' }),
     );
     expect(JSON.parse(storage.get('steel-inspection-connection-config') ?? '{}')).toMatchObject({
