@@ -17,8 +17,18 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 }
 $ReportPath = (Resolve-Path -LiteralPath $ReportPath).Path
 $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
-$Report = Get-Content -LiteralPath $ReportPath -Raw -Encoding utf8 | ConvertFrom-Json
-$Config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding utf8 | ConvertFrom-Json
+
+function ConvertFrom-JsonPreservingDates {
+  param([string]$Json)
+  $ConvertFromJson = Get-Command ConvertFrom-Json -ErrorAction Stop
+  if ($ConvertFromJson.Parameters.ContainsKey('DateKind')) {
+    return $Json | ConvertFrom-Json -DateKind String
+  }
+  return $Json | ConvertFrom-Json
+}
+
+$Report = ConvertFrom-JsonPreservingDates (Get-Content -LiteralPath $ReportPath -Raw -Encoding utf8)
+$Config = ConvertFrom-JsonPreservingDates (Get-Content -LiteralPath $ConfigPath -Raw -Encoding utf8)
 $ConfigHash = (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $Failures = [System.Collections.Generic.List[string]]::new()
 
@@ -34,7 +44,13 @@ function Test-Sha256 {
 
 function Convert-RequiredTimestamp {
   param([object]$Value, [string]$Failure)
-  $Text = ([string]$Value).Trim()
+  $Text = if ($Value -is [DateTimeOffset]) {
+    $Value.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffffzzz", [Globalization.CultureInfo]::InvariantCulture)
+  } elseif ($Value -is [DateTime]) {
+    ([DateTimeOffset]$Value).ToString("yyyy-MM-dd'T'HH:mm:ss.fffffffzzz", [Globalization.CultureInfo]::InvariantCulture)
+  } else {
+    ([string]$Value).Trim()
+  }
   $Parsed = [DateTimeOffset]::MinValue
   $HasRfc3339Shape = $Text -cmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$'
   $Valid = $HasRfc3339Shape -and [DateTimeOffset]::TryParse(
@@ -76,6 +92,11 @@ $ApprovedAt = Convert-RequiredTimestamp $Report.approvals.approvedAt 'approval_t
 if ($null -ne $EvaluatedAt -and $null -ne $ApprovedAt) {
   Require-Condition ($ApprovedAt -ge $EvaluatedAt) 'approval_precedes_evaluation'
 }
+$EvaluatedAtText = if ($null -ne $EvaluatedAt) {
+  $EvaluatedAt.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffffzzz", [Globalization.CultureInfo]::InvariantCulture)
+} else {
+  [string]$Report.evaluatedAt
+}
 
 $MetricChecks = @(
   @('detectionRecall', 'minimumDetectionRecall', 'minimum'),
@@ -107,7 +128,7 @@ if (-not [string]::IsNullOrWhiteSpace($CalibrationPath)) {
 if (-not [string]::IsNullOrWhiteSpace($ModelSetPath)) {
   $ModelSetPath = (Resolve-Path -LiteralPath $ModelSetPath).Path
   $ModelSetHash = (Get-FileHash -LiteralPath $ModelSetPath -Algorithm SHA256).Hash.ToLowerInvariant()
-  $ModelSet = Get-Content -LiteralPath $ModelSetPath -Raw -Encoding utf8 | ConvertFrom-Json
+  $ModelSet = ConvertFrom-JsonPreservingDates (Get-Content -LiteralPath $ModelSetPath -Raw -Encoding utf8)
   Require-Condition (-not [string]::IsNullOrWhiteSpace([string]$ModelSet.id)) 'model_set_id_missing'
   Require-Condition ([string]$Report.modelSetRevision -ceq [string]$ModelSet.id) 'model_set_revision_mismatch'
   Require-Condition ([string]$Report.modelSetSha256 -ceq $ModelSetHash) 'model_set_file_sha256_mismatch'
@@ -143,7 +164,7 @@ $Result = [ordered]@{
   reproductionManifestRevision = [string]$Report.reproductionManifestRevision
   reproductionManifestSha256 = ([string]$Report.reproductionManifestSha256).ToLowerInvariant()
   calibrationRevision = [string]$Report.calibrationRevision
-  evaluatedAt = [string]$Report.evaluatedAt
+  evaluatedAt = $EvaluatedAtText
   releaseCommit = ([string]$Report.releaseCommit).ToLowerInvariant()
   metrics = $Report.metrics
   acceptanceCriteria = $Report.acceptanceCriteria
