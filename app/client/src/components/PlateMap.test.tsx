@@ -894,6 +894,100 @@ describe('online inspection world compatibility', () => {
     }
   });
 
+  it('remounts the stitch viewport and returns to gray images when the selected record changes', async () => {
+    const requestedImageUrls: string[] = [];
+    const NativeImage = globalThis.Image;
+    class RequestedImage {
+      complete = false;
+      naturalWidth = 0;
+      naturalHeight = 0;
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      set src(value: string) { requestedImageUrls.push(value); }
+      removeAttribute() {}
+    }
+    vi.stubGlobal('Image', RequestedImage);
+    vi.mocked(fetchCaptureStitchHistory).mockImplementation(async (materialId) => captureStitchResult(materialId, 2));
+    try {
+      const view = render(
+        <ProductionPlateMap
+          {...common}
+          artifactMode="production"
+          inspectionId="INSP-record-a"
+          captureMaterialId="record-a"
+          cameraLanes={createSequentialCameraLanes(6)}
+        />,
+      );
+
+      await screen.findByTestId('surface-gray-unfolded');
+      const firstViewport = screen.getByTestId('capture-stitch-viewport');
+      fireEvent.click(screen.getByRole('button', { name: 'Jet' }));
+      expect(screen.getByTestId('surface-jet-unfolded')).toBeInTheDocument();
+
+      view.rerender(
+        <ProductionPlateMap
+          {...common}
+          artifactMode="production"
+          inspectionId="INSP-record-b"
+          captureMaterialId="record-b"
+          cameraLanes={createSequentialCameraLanes(6)}
+        />,
+      );
+
+      await waitFor(() => expect(screen.getByTestId('surface-gray-unfolded')).toBeInTheDocument());
+      expect(screen.getByTestId('capture-stitch-viewport')).not.toBe(firstViewport);
+      await waitFor(() => expect(requestedImageUrls.some((url) => (
+        url.includes('record-b') && url.includes('modality=gray')
+      ))).toBe(true));
+      expect(screen.queryByTestId('surface-jet-unfolded')).not.toBeInTheDocument();
+    } finally {
+      vi.stubGlobal('Image', NativeImage);
+    }
+  });
+
+  it('keeps retrying a historical rendition after the previous five-attempt limit', async () => {
+    vi.useFakeTimers();
+    const NativeImage = globalThis.Image;
+    const requestedImages: RequestedImage[] = [];
+    class RequestedImage {
+      complete = false;
+      naturalWidth = 0;
+      naturalHeight = 0;
+      onload: null | (() => void) = null;
+      onerror: null | (() => void) = null;
+      sources: string[] = [];
+      constructor() { requestedImages.push(this); }
+      set src(value: string) { this.sources.push(value); }
+      removeAttribute() {}
+    }
+    vi.stubGlobal('Image', RequestedImage);
+    vi.mocked(fetchCaptureStitchHistory).mockResolvedValue(captureStitchResult('retry-record'));
+    try {
+      render(
+        <ProductionPlateMap
+          {...common}
+          artifactMode="production"
+          captureMaterialId="retry-record"
+          cameraLanes={createSequentialCameraLanes(6)}
+        />,
+      );
+      await act(async () => { await Promise.resolve(); });
+      const firstImage = requestedImages[0];
+      expect(firstImage?.sources[0]).toContain('retry-record');
+
+      const delays = [750, 1_500, 3_000, 6_000, 8_000, 8_000];
+      for (let retry = 1; retry <= delays.length; retry += 1) {
+        act(() => { firstImage.onerror?.(); });
+        await act(async () => { await vi.advanceTimersByTimeAsync(delays[retry - 1]); });
+        expect(firstImage.sources.at(-1)).toContain(`renditionRetry=${retry}`);
+      }
+      expect(firstImage.sources).toHaveLength(7);
+    } finally {
+      vi.stubGlobal('Image', NativeImage);
+      vi.useRealTimers();
+    }
+  });
+
   it('never borrows stitch images from fallback material records', async () => {
     vi.mocked(fetchCaptureStitchHistory).mockImplementation(async (materialId) => (
       materialId === '2818'

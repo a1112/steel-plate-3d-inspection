@@ -1216,11 +1216,18 @@ function CameraBandImage({
       draw();
     };
     const requestImage = () => {
-      if (!disposed) image.src = requestedSource;
+      if (disposed) return;
+      const retrySource = retryCount > 0
+        ? `${requestedSource}${requestedSource.includes('?') ? '&' : '?'}renditionRetry=${retryCount}`
+        : requestedSource;
+      image.src = retrySource;
     };
     image.onerror = () => {
       if (disposed) return;
-      if (retryCount < 5) {
+      // A newly selected historical record may still be building its requested
+      // rendition. Keep polling while this canvas is mounted; switching records
+      // unmounts it and cancels the pending timer below.
+      if (retryCount < 30) {
         const retryDelayMs = Math.min(8_000, 750 * (2 ** retryCount));
         retryCount += 1;
         canvas.dataset.renderState = retainingPaintedFrame
@@ -3456,6 +3463,14 @@ export function PlateMap({
   const [worldLoading, setWorldLoading] = useState(false);
   const [worldUnavailable, setWorldUnavailable] = useState(false);
   const [worldError, setWorldError] = useState('');
+  useEffect(() => {
+    if (artifactMode === 'production') {
+      // Historical records are guaranteed to have the grayscale reconstruction
+      // first. Do not carry a JET selection from the previous record into a
+      // record whose JET rendition is not available yet.
+      setTwoDDisplayMode('gray');
+    }
+  }, [artifactMode, captureMaterialId]);
   const captureTextureRequested = viewMode === '3d'
     && (threeDisplayMode === 'texture' || threeDisplayMode === 'jet');
   const cameraLaneIds = useMemo(
@@ -3926,6 +3941,7 @@ export function PlateMap({
             {`${captureStitchResult.hasMore ? '最近 ' : ''}${captureStitchResult.frames.length}/${captureStitchResult.totalFrames} 轮对齐拼接 · 两级可重建图像 ${captureStitchResult.renderableImageCount}`}
           </span> : null}
           <BarUnfoldedMap
+            key={`capture-stitch:${captureMaterialId?.trim() || inspectionId || ''}`}
             defects={defects}
             defectTypes={defectTypes}
             selectedDefectId={selectedDefectId}
@@ -4047,6 +4063,7 @@ export function PlateMap({
                 : '当前记录缺少可重建的拼接原图'}
           </span> : null}
           <BarUnfoldedMap
+            key={`capture-stitch:${captureMaterialId?.trim() || inspectionId || ''}`}
             defects={defects}
             defectTypes={defectTypes}
             selectedDefectId={selectedDefectId}
